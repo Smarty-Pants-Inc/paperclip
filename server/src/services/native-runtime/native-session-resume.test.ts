@@ -1158,7 +1158,7 @@ const recoveryFakeCodex = resolve(
 (databaseSupported ? describe : describe.skip)(
   "native session recovery database orchestration",
   () => {
-    it.each(["accepted", "no_result", "rejected", "backup_current"] as const)(
+    it.each(["accepted", "no_result", "rejected", "backup_current", "evidence_current"] as const)(
       "marks the checkpoint not resumable only after an accepted result (%s)", async (outcome) => {
         const database = await startEmbeddedPostgresTestDatabase("paperclip-native-unsaved-state-");
         const db = createDb(database.connectionString);
@@ -1183,24 +1183,28 @@ const recoveryFakeCodex = resolve(
             completionContractId: sourceExecution.completionContract.id, serverFingerprint: "test",
             schemaStatus: outcome === "rejected" ? "rejected" : "accepted", resultJson, canonicalSha256: "a".repeat(64) });
           await db.insert(nativeRunFinalizations).values({ runId: previousRunId, companyId, issueId,
-            phase: outcome === "accepted" || outcome === "backup_current" ? "committed" : "observed",
+            phase: outcome === "accepted" || outcome === "backup_current" || outcome === "evidence_current" ? "committed" : "observed",
             resultId: outcome === "no_result" ? null : resultId });
           // The durable backup became current before a later step failed.
-          if (outcome === "backup_current") await db.insert(nativeHarnessBackups).values({ companyId, issueId, runId: previousRunId,
-            scopeDigest: "b".repeat(64), manifestSha256: `sha256:${"c".repeat(64)}`, status: "current", reference: {} });
+          if (outcome === "backup_current" || outcome === "evidence_current") await db.insert(nativeHarnessBackups).values({ companyId, issueId, runId: previousRunId,
+            scopeDigest: "b".repeat(64), manifestSha256: `sha256:${"c".repeat(64)}`, status: "current", reference: outcome === "evidence_current" ? { kind: "paperclip.native-session-evidence.v1" } : {} });
           const binding = { companyId, issueId, runId: previousRunId };
           const selection = { companyId, agentId, issueId, normalizedSessionId, currentRunId,
             beforeCreatedAt: new Date(Date.UTC(2026, 10, 11, 0, 1, 0)) };
           const [before] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, previousRunId));
 
-          expect(await markAcceptedRunProviderStateUnsaved(db, binding)).toBe(outcome === "accepted");
+          const marked = await markAcceptedRunProviderStateUnsaved(db, binding);
+          const rf7Selected = await findNativeSessionResumeRun(db, selection);
+          const rf7Rebound = rebindNativeSessionCheckpoint({ previousRun: rf7Selected!, currentExecution: execution(currentRunId) });
+          console.log(JSON.stringify({ RF7eligibility: { outcome, markedUnsaved: marked, checkpointRebindAllowed: rf7Rebound !== null } }));
+          expect(marked).toBe(outcome === "accepted" || outcome === "evidence_current");
           const [after] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, previousRunId));
           // The accepted result and the run outcome are untouched.
           expect({ ...after, runnerProfileJson: null }).toEqual({ ...before, runnerProfileJson: null });
           const selected = await findNativeSessionResumeRun(db, selection);
           expect(selected?.id).toBe(previousRunId);
           const rebound = rebindNativeSessionCheckpoint({ previousRun: selected!, currentExecution: execution(currentRunId) });
-          if (outcome === "accepted") {
+          if (outcome === "accepted" || outcome === "evidence_current") {
             expect(after.runnerProfileJson).toMatchObject({ ...source.runnerProfileJson,
               [NATIVE_PROVIDER_STATE_UNSAVED_KEY]: { code: NATIVE_PROVIDER_STATE_INCOMPATIBLE, reason: "harness_backup_not_saved" } });
             expect(rebound).toBeNull();

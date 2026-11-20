@@ -12065,8 +12065,12 @@ describe("warm native session evidence copy", () => {
     await mkdir(remoteCwd, { recursive: true });
     // The real storage service over local-disk object storage.
     const realStorage = createStorageService(createLocalDiskStorageProvider(join(home, "objects")));
-    const storageFaults = { putFailures: 0 };
+    const storageFaults = { putFailures: 0, readbackFailures: 0 };
     const storage = new Proxy(realStorage, { get(target, property) {
+      if (property === "getObject") return async (...args: Parameters<typeof realStorage.getObject>) => {
+        if (storageFaults.readbackFailures > 0) { storageFaults.readbackFailures--; throw new Error("RF7 destination readback unavailable"); }
+        return realStorage.getObject(...args);
+      };
       if (property === "putFile") return async (...args: Parameters<typeof realStorage.putFile>) => {
         if (storageFaults.putFailures > 0) { storageFaults.putFailures--; throw new Error("injected storage outage before publication"); }
         return realStorage.putFile(...args);
@@ -12222,6 +12226,57 @@ describe("warm native session evidence copy", () => {
     return { db, tables, companyId, issueId, environmentId, session, runTurn, evidenceRows, waitFor, openEvidence, boxInventory, boxTree,
       leaseMetadata, storageFaults, evidenceGate, commands, turnMs, cleanup, realStorage, codexHome, logger, commandRunner };
   }
+
+  it("RF7 readback failure never publishes a complete receipt", async () => {
+    const f = await warmEvidenceFixture("rf7-readback");
+    const evidence = await import("./native-session-evidence.js");
+    const delay = evidence.nativeSessionEvidenceRetry.delayMs;
+    evidence.nativeSessionEvidenceRetry.delayMs = 1;
+    try {
+      f.storageFaults.readbackFailures = 1000;
+      const first = await f.runTurn();
+      await Promise.all([...evidence.nativeSessionEvidenceCopies.values()]);
+      const rows = await f.evidenceRows(first.runId);
+      const metadata = await f.leaseMetadata(first.leaseId);
+      console.log(JSON.stringify({ RF7readback: { statuses: rows.map(r => r.status), marker: metadata?.nativeSessionEvidencePending } }));
+      expect(await f.evidenceRows(first.runId, "current"), "persisted destination could not be read: must not publish complete").toHaveLength(0);
+      expect(await f.evidenceRows(first.runId, "pending"), "readback failures retire in-progress receipts").toHaveLength(0);
+      expect(metadata?.nativeSessionEvidencePending).toMatchObject({ runId: first.runId, attempts: 3 });
+      expect(f.session.close).not.toHaveBeenCalled();
+    } finally { evidence.nativeSessionEvidenceRetry.delayMs = delay; await f.cleanup(); }
+  }, 120_000);
+
+  it("RF7 pending write failure must not cross the remote-read custody boundary", async () => {
+    const f = await warmEvidenceFixture("rf7-pending-failure");
+    const evidence = await import("./native-session-evidence.js");
+    const delay = evidence.nativeSessionEvidenceRetry.delayMs;
+    evidence.nativeSessionEvidenceRetry.delayMs = 1;
+    let release!: () => void;
+    try {
+      // A real PostgreSQL write failure, not a fabricated update receipt.
+      const { sql } = await import("drizzle-orm");
+      await f.db.execute(sql`CREATE FUNCTION rf7_reject_pending() RETURNS trigger AS $$ BEGIN
+        IF NEW.metadata ? 'nativeSessionEvidencePending' THEN RAISE EXCEPTION 'RF7 marker store unavailable'; END IF;
+        RETURN NEW;
+      END; $$ LANGUAGE plpgsql`);
+      await f.db.execute(sql`CREATE TRIGGER rf7_reject_pending BEFORE UPDATE ON environment_leases
+        FOR EACH ROW EXECUTE FUNCTION rf7_reject_pending()`);
+      f.evidenceGate.stalled = new Promise<void>(r => { release = r; });
+      const reached = new Promise<void>(r => { f.evidenceGate.reached = r; });
+      const first = await f.runTurn();
+      const remoteTarReached = await Promise.race([reached.then(() => true),
+        Promise.all([...evidence.nativeSessionEvidenceCopies.values()]).then(() => false),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("RF7 copy did not settle or reach the controlled boundary")), 15_000))]);
+      const metadata = await f.leaseMetadata(first.leaseId);
+      console.log(JSON.stringify({ RF7pendingWriteFailure: { runId: first.runId, metadata, remoteTarReached, currentRows: (await f.evidenceRows(first.runId, "current")).length } }));
+      if (remoteTarReached) expect(metadata?.nativeSessionEvidencePending, "remote copy started without the durable custody marker").toMatchObject({ runId: first.runId });
+      else expect(await f.evidenceRows(first.runId, "current"), "marker store failure must remain incomplete").toHaveLength(0);
+    } finally {
+      f.evidenceGate.stalled = null; release?.();
+      await Promise.all([...evidence.nativeSessionEvidenceCopies.values()]);
+      evidence.nativeSessionEvidenceRetry.delayMs = delay; await f.cleanup();
+    }
+  }, 120_000);
 
   it("(a)(d) copies each succeeded warm turn's trace off the box before any close, verified, while the warm box and session are reused", async () => {
     const f = await warmEvidenceFixture("warm");
