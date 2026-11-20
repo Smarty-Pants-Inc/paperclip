@@ -81,6 +81,16 @@ Boat's last finite TTL remains the fallback. Legacy warm handoffs without
 `runId` retain their existing one-shot `Boat warm lease TTL refresh`, with no
 idle RUN timer. This behavior is fixture-tested, not live Boat qualification.
 
+On a proof-bearing warm resume, GET still comes first. Only a live
+`ready`/`idle`/`running` observation without a refused/failing stop starts the
+one-shot TTL PATCH and read-only workspace sentinel check together. The PATCH
+receipt is settled and logged before the sentinel result is used, including a
+sentinel timeout that throws to preserve the lease. The live branch logs
+`Boat lease resume path` with `resumePath: "live-parallel"`; lease metadata is
+unchanged. Stopped/archived and refused-stop resumes keep the existing
+resume → waitReady → sentinel sequence; nothing PATCHes before GET. This
+removes serial I/O from the warm path, but is not a live end-to-end latency claim.
+
 ## Ready spare pool
 
 The Boat plugin's company-scoped instance settings are `spares` (0–3, default 0),

@@ -3299,6 +3299,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     let ttlRefresh: { status: "ok" | "unconfirmed"; at: string; archiveAfter: string | null }
       | { status: "failed"; at: string; category: RequestErrorCategory; httpStatus: number | null; archiveAfter: string | null } | undefined;
     let refreshExpiresAt: string | null = null;
+    let liveSentinel: Promise<PromiseSettledResult<Awaited<ReturnType<typeof verifyWorkspaceSentinel>>>> | undefined;
     // A RUNNING box whose stop Boat refused (our cached refusal, or the box's own stop
     // reads `failing`) is not warm: Boat retries that stop until it archives the box,
     // and "Only a resume ends it early (`superseded`)" (staged boat-llms-full.txt :1855;
@@ -3325,10 +3326,19 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       const orgHeaders = typeof boatOrgId === "string" && boatOrgId.trim() ? { "X-Boat-Org": boatOrgId } : undefined;
       const ttlSeconds = effectiveTtlSeconds(c), requestedAt = Date.now();
       const at = new Date(requestedAt).toISOString();
+      duplexLogger?.info("Boat lease resume path", { providerLeaseId: redactKey(c, id), resumePath: "live-parallel" });
       try {
-        const candidate = await patchLeaseTtl(c, id, orgHeaders, { sendGuard: () => {
+        const refresh = patchLeaseTtl(c, id, orgHeaders, { sendGuard: () => {
           if (renewUntil !== undefined && Date.now() >= renewUntil) throw new Error("Boat RUN renewal cap reached");
         } });
+        // Only the preceding live GET authorizes this read. Settle its failure
+        // immediately, but await/record the PATCH receipt before using or throwing
+        // the proof result. A fast cat timeout must not strand a slow renewal.
+        liveSentinel = sentinel ? verifyWorkspaceSentinel(sentinel, {
+          request: (path, init) => request(c, path, init),
+          run: (command, timeout) => runCommand(c, id, command, timeout, undefined, undefined, { intent: "idempotent_probe" }),
+        }).then(value => ({ status: "fulfilled" as const, value }), reason => ({ status: "rejected" as const, reason })) : undefined;
+        const candidate = await refresh;
         const archiveAfter = parseDeadline(candidate.archiveAfter);
         const expectedDeadline = requestedAt + ttlSeconds * 1000;
         const confirmed = archiveAfter !== null && Math.abs(Date.parse(archiveAfter) - expectedDeadline) <= 120_000;
@@ -3346,7 +3356,9 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       if (ttlRefresh.status === "ok") duplexLogger?.info("Boat warm lease TTL refresh", details);
       else duplexLogger?.warn("Boat warm lease TTL refresh", details);
     }
-    const workspaceSentinel = sentinel ? await verifyWorkspaceSentinel(sentinel, {
+    const liveProof = liveSentinel ? await liveSentinel : undefined;
+    if (liveProof?.status === "rejected") throw liveProof.reason;
+    const workspaceSentinel = liveProof ? liveProof.value : sentinel ? await verifyWorkspaceSentinel(sentinel, {
       request: (path, init) => request(c, path, init),
       // R1: sentinel cat is read-only; an ECONNRESET must retain resume recovery.
       run: (command, timeout) => runCommand(c, id, command, timeout, undefined, undefined, { intent: "idempotent_probe" }),
