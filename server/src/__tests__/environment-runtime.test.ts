@@ -1390,6 +1390,57 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     },
   );
 
+  // rg4 (3): the sandbox driver's plugin-backed release (releasePluginBackedSandboxLease ->
+  // environmentReleaseLease) is reached from the dispatcher, whose own export check reads only
+  // the released lease's run. A box that ANOTHER cut run's prepared, unexported work names must
+  // never be released there: stop and keep it (or keep it running, owned and bounded).
+  it.each(["stop", "no_stop", "finalized_control"] as const)(
+    "rg4 (3) the plugin-backed sandbox release never releases a box holding a cut run's unexported prepared work: %s", async mode => {
+      const seeded = await seedReusablePluginSandboxLease("paperclip_runner");
+      const lease = seeded.reusableLease;
+      const box = lease.providerLeaseId!;
+      await db.update(environmentLeases).set({ leasePolicy: "ephemeral", metadata: { ...lease.metadata, reuseLease: false } })
+        .where(eq(environmentLeases.id, lease.id));
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, seeded.runId));
+      const cutRunId = randomUUID();
+      const h = (c: string) => c.repeat(64);
+      await db.insert(heartbeatRuns).values({ id: cutRunId, companyId: seeded.companyId, agentId: seeded.agentId,
+        invocationSource: "manual", status: "cancelled", runtimeMode: "native", processPid: 4242, processGroupId: 4242,
+        runnerProfileJson: { nativeWorkspaceSync: { schema: "paperclip.native-workspace-sync/v3",
+          state: mode === "finalized_control" ? "finalized" : "prepared", descriptorSha256: h("a"), baselineSha256: h("b"),
+          finalHostSha256: mode === "finalized_control" ? h("c") : null, workspaceId: randomUUID(), leaseId: randomUUID(),
+          providerLeaseId: box, remoteCwd: "/workspace", resourceDisposition: "keep_running" } } as never });
+      const call = vi.fn(async (_id: string, method: string) =>
+        ({ providerLeaseId: box, state: method === "environmentDestroyLease" ? "destroyed" : "stopped" }));
+      const runtime = environmentRuntimeService(db, { pluginWorkerManager: {
+        isRunning: () => true, call,
+        getWorker: () => ({ supportedMethods: ["environmentReleaseLease", "environmentDestroyLease",
+          ...(mode === "no_stop" ? [] : ["environmentStopLease"])] }),
+      } as unknown as PluginWorkerManager });
+      await runtime.releaseRunLeases(seeded.runId, "released");
+      const methods = call.mock.calls.map(entry => entry[1]);
+      const row = (await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]!;
+      if (mode === "finalized_control") {
+        expect(methods).toContain("environmentReleaseLease");
+        expect(row.metadata?.unexportedWorkKept).toBeUndefined();
+        return;
+      }
+      expect(methods).not.toContain("environmentReleaseLease");
+      expect(methods).not.toContain("environmentDestroyLease");
+      if (mode === "stop") {
+        expect(methods).toEqual(["environmentStopLease"]);
+        expect(row.metadata).toMatchObject({ unexportedWorkKept: { runIds: [cutRunId], providerLeaseId: box },
+          remoteExecutionTermination: { providerLeaseId: box, state: "stopped" } });
+      } else {
+        expect(methods).toEqual([]);
+        expect(row.status).toBe("retained");
+        expect(row.metadata?.remoteExecutionTermination).toBeUndefined();
+        expect(row.metadata).toMatchObject({ unexportedWorkKept: { runIds: [cutRunId], providerLeaseId: box, providerStop: "unavailable" } });
+        expect(row.expiresAt).not.toBeNull();
+      }
+    },
+  );
+
   it.each(["stop_error", "missing_stop_method"])(
     "F2 ordinary reusable plugin release persists stop-only intent on failure across restart: %s", async outcome => {
       const seeded = await seedReusablePluginSandboxLease();

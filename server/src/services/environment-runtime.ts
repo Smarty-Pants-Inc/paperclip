@@ -291,6 +291,8 @@ export {
 } from "./environment-driver-traits.js";
 import { ENVIRONMENT_DRIVER_CAPABILITY_SUPPORT } from "./environment-driver-traits.js";
 import { KEPT_UNSTOPPED_BOX_BOUND_MS, warmSandboxWindowMetadata } from "./warm-sandbox-expiry.js";
+import { raiseKeptBoxAlarm } from "./kept-box-alarm.js";
+import { readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
 
 /**
  * The one general capability classifier. It resolves each of the eight effective
@@ -1432,6 +1434,64 @@ async function assertLeaseStartable(db: Db, companyId: string, providerLeaseId: 
     throw new SandboxLeaseStartDeniedError();
   }
 }
+
+/** A box we could not stop (no provider stop capability or no stop receipt):
+ * it still RUNS, so nothing may say it stopped, and it holds unexported work,
+ * so nothing may release it. Keep it, owned by its run, with a named expiry
+ * bound for the kept-box expiry sweep (settleKeptUnstoppedBoxesPastExpiry),
+ * and raise ONE alarm on the task's recovery card (kept-box-alarm.ts). */
+async function keepUnstoppedBoxRow(db: Db, lease: EnvironmentLease, runIds: string[]) {
+  const scope = and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, lease.companyId));
+  // The bound never slides: a repeated keep of the same box (a retry) keeps the
+  // deadline it already has, so the expiry always comes.
+  const [current] = await db.select({ metadata: environmentLeases.metadata }).from(environmentLeases).where(scope);
+  type KeptRecord = { providerLeaseId?: unknown; providerStop?: unknown; keptUntil?: unknown } | undefined;
+  // The caller's snapshot first: a stop-only retry rewrites the record before keeping.
+  const priorUntil = [lease.metadata?.unexportedWorkKept as KeptRecord, current?.metadata?.unexportedWorkKept as KeptRecord]
+    .map(prior => prior?.providerStop === "unavailable" && prior.providerLeaseId === lease.providerLeaseId
+      && typeof prior.keptUntil === "string" ? new Date(prior.keptUntil) : null)
+    .find(until => until && Number.isFinite(until.getTime())) ?? null;
+  const expiresAt = priorUntil && Number.isFinite(priorUntil.getTime()) ? priorUntil : new Date(Date.now() + KEPT_UNSTOPPED_BOX_BOUND_MS);
+  const [row] = await db.update(environmentLeases).set({ expiresAt, updatedAt: new Date(),
+    metadata: sql`(coalesce(${environmentLeases.metadata}, '{}'::jsonb) - 'remoteExecutionTermination') || ${JSON.stringify({
+      unexportedWorkKept: { runIds, providerLeaseId: lease.providerLeaseId, at: new Date().toISOString(),
+        providerStop: "unavailable", keptUntil: expiresAt.toISOString() },
+    })}::jsonb` }).where(scope).returning();
+  await raiseKeptBoxAlarm(db, { companyId: lease.companyId, leaseId: lease.id, providerLeaseId: lease.providerLeaseId,
+    runIds, keptUntil: expiresAt, level: "kept" }).catch(() => {
+    // The once-only mark could not be written: still raise the alarm, never silent.
+    logger.error({ alarm: "kept_box_still_running", companyId: lease.companyId, leaseId: lease.id,
+      providerLeaseId: lease.providerLeaseId, runIds, expiresAt: expiresAt.toISOString() },
+      "ALARM: box still running and kept (not stopped, not released): it holds unexported prepared work and the provider offered no stop");
+  });
+  return row ?? null;
+}
+
+/** Lease rows the kept-box expiry sweep owns: kept because they hold
+ * unexported prepared work and could not be stopped, and past their bound. */
+function keptUnstoppedBoxPastExpiryCondition(now: Date) {
+  return and(eq(environmentLeases.status, "retained"),
+    sql`${environmentLeases.metadata}#>>'{unexportedWorkKept,providerStop}' = 'unavailable'`,
+    sql`${environmentLeases.providerLeaseId} is not null`,
+    sql`${environmentLeases.expiresAt} is not null and ${environmentLeases.expiresAt} <= ${now.toISOString()}::timestamptz`);
+}
+
+/** The existing export of a 'prepared' reference: resolve the box's execution
+ * target and run native-workspace-sync's resumeNativeWorkspaceSync, which
+ * copies the box's files to the server copy and writes the finalized reference
+ * (finalHostSha256). The caller reads the reference back before any release. */
+export type KeptBoxExport = (input: { db: Db; runId: string; lease: EnvironmentLease;
+  environment: Environment; environmentRuntime: unknown }) => Promise<boolean>;
+const defaultKeptBoxExport: KeptBoxExport = async input => {
+  const { resolveEnvironmentExecutionTarget } = await import("./environment-execution-target.js");
+  const { resumeNativeWorkspaceSync } = await import("./native-runtime/native-workspace-sync.js");
+  const target = await resolveEnvironmentExecutionTarget({ db: input.db, companyId: input.lease.companyId,
+    adapterType: "paperclip_runner", environment: input.environment, leaseId: input.lease.id,
+    leaseMetadata: input.lease.metadata ?? null, lease: input.lease,
+    environmentRuntime: input.environmentRuntime as EnvironmentRuntimeService });
+  if (!target) return false;
+  return await resumeNativeWorkspaceSync({ db: input.db, runId: input.runId, target });
+};
 
 function createSandboxEnvironmentDriver(
   db: Db,
@@ -3680,11 +3740,59 @@ function createSandboxEnvironmentDriver(
     return lease.leasePolicy !== "reuse_by_environment";
   }
 
+  /** Stop and KEEP a plugin-backed sandbox whose files were never exported:
+   * never environmentReleaseLease. A provider stop (files retained by contract)
+   * when the worker verifies one; otherwise the box still runs and is kept,
+   * owned, bounded and alarmed exactly as the plugin driver keeps it. */
+  async function stopAndKeepUnexportedSandboxBox(input: EnvironmentDriverReleaseInput, runIds: string[]) {
+    const lease = input.lease;
+    const metadata = lease.metadata ?? {};
+    const pluginId = readString(metadata.pluginId);
+    const providerKey = readString(metadata.provider);
+    let receipt: unknown;
+    if (pluginId && providerKey && pluginWorkerManager?.isRunning(pluginId)
+      && pluginWorkerVerifiesLifecycleMethod(pluginId, "environmentStopLease")) {
+      try {
+        const config = await resolvePluginSandboxRuntimeConfig({ environment: input.environment, lease, provider: providerKey });
+        const workerConfig = stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig);
+        receipt = await runLeaseReleaseWithRunParent(lease.id, () => pluginWorkerManager.call(pluginId, "environmentStopLease", {
+          driverKey: providerKey, companyId: lease.companyId, environmentId: input.environment.id, issueId: lease.issueId,
+          config: workerConfig, providerLeaseId: lease.providerLeaseId, leaseMetadata: metadata,
+        }, resolvePluginSandboxRpcTimeoutMs(workerConfig)));
+      } catch {
+        logger.warn({ event: "sandbox_stop_failed", leaseId: lease.id, reasonClass: "stop_error" }, "sandbox stop of a box holding unexported work did not complete");
+        receipt = undefined;
+      }
+    }
+    const termination = remoteTerminationReceipt(lease, receipt as Parameters<typeof remoteTerminationReceipt>[1]);
+    if (!termination) {
+      const kept = await environmentsSvc.releaseLease(lease.id, "retained", {});
+      if (!kept) return null;
+      const row = await keepUnstoppedBoxRow(db, lease, runIds);
+      return row ? toEnvironmentLeaseSnapshot(row) : kept;
+    }
+    logger.warn({ leaseId: lease.id, providerLeaseId: lease.providerLeaseId, runIds },
+      "box kept, not released: it holds unexported prepared workspace work");
+    await db.update(environmentLeases).set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({
+      unexportedWorkKept: { runIds, providerLeaseId: lease.providerLeaseId, at: new Date().toISOString() },
+    })}::jsonb` }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, lease.companyId)));
+    return await environmentsSvc.releaseLease(lease.id, input.status, { cleanupStatus: "success", remoteExecutionTermination: termination });
+  }
+
   async function releasePluginBackedSandboxLease(
     input: EnvironmentDriverReleaseInput,
   ): Promise<EnvironmentLease | null> {
     if (input.resourceDisposition === "stop_and_retain") {
       throw new Error("Stop-only sandbox cleanup requires a durable stop intent.");
+    }
+    // Never-OK: environmentReleaseLease may erase the box. Whatever lease row or
+    // disposition reached here (the dispatcher's own export check reads only
+    // this lease and is skipped for keep_running), never release a box that
+    // holds the only copy of a cut run's files ('prepared', no final sha).
+    if (input.lease.providerLeaseId) {
+      const unexported = await boxHasUnexportedPreparedWork(db, {
+        companyId: input.lease.companyId, providerLeaseId: input.lease.providerLeaseId });
+      if (unexported.held) return await stopAndKeepUnexportedSandboxBox(input, unexported.runIds);
     }
     const metadata = input.lease.metadata ?? {};
     const pluginId = readString(metadata.pluginId);
@@ -4136,22 +4244,8 @@ function createPluginEnvironmentDriver(
     return undefined;
   }
 
-  /** A box we could not stop (no provider stop capability or no stop receipt):
-   * it still RUNS, so nothing may say it stopped, and it holds unexported work,
-   * so nothing may release it. Keep it, owned by its run, with a named expiry
-   * bound for the retained-box sweep, and raise ONE alarm naming the box. */
   async function keepUnstoppedBox(lease: EnvironmentLease, runIds: string[]) {
-    const scope = and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, lease.companyId));
-    const expiresAt = new Date(Date.now() + KEPT_UNSTOPPED_BOX_BOUND_MS);
-    const [row] = await db.update(environmentLeases).set({ expiresAt, updatedAt: new Date(),
-      metadata: sql`(coalesce(${environmentLeases.metadata}, '{}'::jsonb) - 'remoteExecutionTermination') || ${JSON.stringify({
-        unexportedWorkKept: { runIds, providerLeaseId: lease.providerLeaseId, at: new Date().toISOString(),
-          providerStop: "unavailable", keptUntil: expiresAt.toISOString() },
-      })}::jsonb` }).where(scope).returning();
-    logger.error({ alarm: "kept_box_still_running", leaseId: lease.id, providerLeaseId: lease.providerLeaseId,
-      runId: lease.heartbeatRunId, runIds, keptUntil: expiresAt.toISOString() },
-      "ALARM: box still running and kept (not stopped, not released): it holds unexported prepared work and the provider offered no stop");
-    return row ?? null;
+    return await keepUnstoppedBoxRow(db, lease, runIds);
   }
 
   /** Stop and KEEP a box whose files were never exported: no provider release
@@ -4585,6 +4679,9 @@ export function environmentRuntimeService(
     orphanCleanupSpoolDir?: string;
     /** Aggregate collect-before-retire deadline; default AGENT_FILE_RETIREMENT_COLLECTION_DEADLINE_MS. */
     agentFileRetirementCollectionDeadlineMs?: number;
+    /** The export a kept box's expiry runs; default resolves the box target and
+     * calls native-workspace-sync's resumeNativeWorkspaceSync. */
+    keptBoxExport?: KeptBoxExport;
   } = {},
 ) {
   // One dispatch fence shared by sandbox/plugin drivers AND the task runtime.
@@ -4773,7 +4870,7 @@ export function environmentRuntimeService(
     }
   }
 
-  return {
+  const runtime = {
     getDriver,
 
     /** CR6: the instruction-copy owner binds the Stop collector for box retirements. */
@@ -4898,6 +4995,95 @@ export function environmentRuntimeService(
         lease,
         leaseContext,
       };
+    },
+
+    /**
+     * The kept-box expiry. A box kept because it holds a cut turn's only copy of
+     * unexported work and could not be stopped carries a bounded expiresAt. At
+     * that bound: export the work (the server copy) and READ IT BACK (finalized
+     * reference with a final sha, and the box no longer holds unexported work),
+     * then release the box through its driver, whose release guard rechecks.
+     * If the export or the read-back fails: keep the box, extend its bound once,
+     * and raise the louder second alarm. Never a silent release or wipe.
+     */
+    async settleKeptUnstoppedBoxesPastExpiry(now = new Date()): Promise<{ released: string[]; kept: string[] }> {
+      const result = { released: [] as string[], kept: [] as string[] };
+      const rows = await db.select().from(environmentLeases).where(keptUnstoppedBoxPastExpiryCondition(now));
+      for (const due of rows) {
+        // Claim the row for one attempt: move its bound past the attempt window so
+        // a concurrent tick skips it, and a crashed attempt is retried later.
+        const [claimed] = await db.update(environmentLeases).set({ expiresAt: new Date(now.getTime() + 15 * 60_000), updatedAt: new Date() })
+          .where(and(eq(environmentLeases.id, due.id), keptUnstoppedBoxPastExpiryCondition(now),
+            eq(environmentLeases.expiresAt, due.expiresAt!))).returning();
+        if (!claimed) continue;
+        const lease = toEnvironmentLeaseSnapshot(claimed);
+        const kept = claimed.metadata?.unexportedWorkKept as { runIds?: unknown } | undefined;
+        const held = await boxHasUnexportedPreparedWork(db, { companyId: lease.companyId, providerLeaseId: lease.providerLeaseId! });
+        const runIds = [...new Set([...(Array.isArray(kept?.runIds) ? kept.runIds.filter((id): id is string => typeof id === "string") : []),
+          ...held.runIds])].sort();
+        let failure: string | null = null;
+        const environment = lease.environmentId ? await environmentsSvc.getById(lease.environmentId) : null;
+        if (!environment) failure = "environment_missing";
+        for (const runId of held.runIds) {
+          if (failure) break;
+          try {
+            const exported = await (options.keptBoxExport ?? defaultKeptBoxExport)({ db, runId, lease, environment: environment!, environmentRuntime: runtime });
+            if (!exported) failure = "export_unavailable";
+          } catch {
+            failure = "export_failed";
+          }
+          if (failure) break;
+          // Read back: the server copy exists only when the run's reference is
+          // finalized with a final host sha. Nothing else counts as exported.
+          const [after] = await db.select({ profile: heartbeatRuns.runnerProfileJson }).from(heartbeatRuns)
+            .where(and(eq(heartbeatRuns.companyId, lease.companyId), eq(heartbeatRuns.id, runId)));
+          const reference = readNativeWorkspaceSyncReference(after?.profile?.nativeWorkspaceSync);
+          if (reference?.state !== "finalized" || !reference.finalHostSha256 || !/^[0-9a-f]{64}$/.test(reference.finalHostSha256)) {
+            failure = "export_not_read_back";
+          }
+        }
+        if (!failure && (await boxHasUnexportedPreparedWork(db, { companyId: lease.companyId, providerLeaseId: lease.providerLeaseId! })).held) {
+          failure = "export_not_read_back";
+        }
+        if (!failure && environment) {
+          await db.update(environmentLeases).set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({
+            keptBoxExported: { runIds, at: new Date().toISOString() } })}::jsonb` }).where(eq(environmentLeases.id, lease.id));
+          try {
+            const driver = requireDriverKey(getLeaseDriverKey(lease, environment));
+            const released = await driver.releaseRunLease({ environment, lease: { ...lease, metadata: { ...lease.metadata,
+              keptBoxExported: { runIds } } }, status: "released" });
+            if (released && released.status !== "retained") { result.released.push(lease.id); continue; }
+            failure = "release_kept";
+          } catch {
+            failure = "release_failed";
+          }
+          // The work is saved; a release that did not complete keeps the box
+          // and retries at the next bound. Not an export failure: no alarm.
+          if (failure === "release_kept" || failure === "release_failed") {
+            await db.update(environmentLeases).set({ expiresAt: new Date(now.getTime() + KEPT_UNSTOPPED_BOX_BOUND_MS) })
+              .where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.status, "retained")));
+            result.kept.push(lease.id);
+            continue;
+          }
+        }
+        const keptUntil = new Date(now.getTime() + KEPT_UNSTOPPED_BOX_BOUND_MS);
+        await db.update(environmentLeases).set({ expiresAt: keptUntil, updatedAt: new Date(),
+          metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ unexportedWorkKept: {
+            ...(claimed.metadata?.unexportedWorkKept as Record<string, unknown>), keptUntil: keptUntil.toISOString(),
+            expiryExportFailed: { at: new Date().toISOString(), reason: failure } } })}::jsonb` })
+          .where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.status, "retained")));
+        await raiseKeptBoxAlarm(db, { companyId: lease.companyId, leaseId: lease.id, providerLeaseId: lease.providerLeaseId,
+          runIds, keptUntil, level: "export_failed" }).then(first => {
+          if (!first) logger.warn({ event: "kept_box_export_retry_failed", leaseId: lease.id, providerLeaseId: lease.providerLeaseId,
+            runIds, expiresAt: keptUntil.toISOString(), reason: failure }, "kept box export failed again at its bound; the box stays kept");
+        }, () => {
+          logger.fatal({ alarm: "kept_box_export_failed", companyId: lease.companyId, leaseId: lease.id,
+            providerLeaseId: lease.providerLeaseId, runIds, expiresAt: keptUntil.toISOString() },
+            "ALARM (second): the kept box's unexported work could not be exported at its bound; the box stays kept, not released");
+        });
+        result.kept.push(lease.id);
+      }
+      return result;
     },
 
     async releaseRunLeases(
@@ -5574,6 +5760,7 @@ export function environmentRuntimeService(
       return await driver.getRunnerIngressEndpoint(input);
     },
   };
+  return runtime;
 }
 
 async function releaseRestoreSourcesForEnvironmentDelete(db: Db, input: { environmentId: string; consentedBy: string }): Promise<number> {

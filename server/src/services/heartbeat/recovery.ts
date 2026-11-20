@@ -1894,6 +1894,11 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     if (!manualRetry) await stopWarmSandboxesPastWindowWhenDue(db).catch(() => {
       logger.warn({ errorKind: "warm_sandbox_expiry_failed" }, "warm sandbox expiry failed; a later sweep retries");
     });
+    // A box kept because it holds unexported work and could not be stopped,
+    // past its bound: export + read back, then release; or keep + second alarm.
+    if (!manualRetry) await environmentRuntime.settleKeptUnstoppedBoxesPastExpiry?.().catch(() => {
+      logger.warn({ errorKind: "kept_box_expiry_failed" }, "kept box expiry failed; a later sweep retries");
+    });
 
     const rows = await db
       .select()
