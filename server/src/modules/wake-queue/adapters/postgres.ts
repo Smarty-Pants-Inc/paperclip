@@ -1205,23 +1205,27 @@ async function gatherPersonStoppedChatMessages(tx: Db, run: ReleaseRun, issue: I
     .from(issueComments).where(and(
     eq(issueComments.companyId, run.companyId), eq(issueComments.issueId, issue.id), inArray(issueComments.id, allIds))) : [];
   const byId = new Map(comments.map((comment) => [comment.id, comment]));
-  // Only the stopping person's own messages join (the ONE same-person fact):
-  // another person's held input stays where it is and never rides this Send.
+  // After a person's Stop, only the stopping person's own messages join (the
+  // ONE same-person fact): another person's held input stays where it is and
+  // never rides this Send. With no Stop (an ordinary steering run end) there
+  // is no stopping person, so no person filter: restored steers and waiting
+  // input join exactly as before.
+  const personStop = isPersonStoppedChatRun(run, issue);
   const stoppedBy = parseObject(run.resultJson).cancelledByUserId;
   const stopUserId = typeof stoppedBy === "string" ? stoppedBy : null;
+  const stoppingPersonsOwn = (authorUserId: string | null) => !personStop || isStoppingPersonsOwn(authorUserId, stopUserId);
   const messages: typeof waiting = [];
   for (const wake of waiting) {
     const ids = queuedCommentIdsFromWakePayload(wake.payload);
     if (ids.length > 0 && ids.every((id) => { const comment = byId.get(id);
-      return comment && !comment.deletedAt && !isStoppingPersonsOwn(comment.authorUserId, stopUserId); })) continue;
+      return comment && !comment.deletedAt && !stoppingPersonsOwn(comment.authorUserId); })) continue;
     const plain = ids.length > 0 && parseObject(parseObject(wake.payload)[DEFERRED_WAKE_CONTEXT_KEY]).forceFreshSession !== true &&
       ids.every((id) => { const comment = byId.get(id);
         return comment && !comment.deletedAt && (comment.authorType ?? (comment.authorAgentId ? "agent" : "user")) === "user" &&
-          isStoppingPersonsOwn(comment.authorUserId, stopUserId) && !isConversationReset(comment.body); });
+          stoppingPersonsOwn(comment.authorUserId) && !isConversationReset(comment.body); });
     if (!plain) break;
     messages.push(wake);
   }
-  const personStop = isPersonStoppedChatRun(run, issue);
   if (messages.length === 0 || (messages.length < 2 && !personStop)) return;
   const [queue, ...rest] = messages;
   const all = [...new Set(messages.flatMap((wake) => queuedCommentIdsFromWakePayload(wake.payload)))];
