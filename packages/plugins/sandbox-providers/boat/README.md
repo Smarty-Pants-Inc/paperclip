@@ -1,4 +1,4 @@
-# Boat sandbox provider 0.1.17-spare.12c2 (unreleased)
+# Boat sandbox provider 0.1.17-spare.12c3 (unreleased)
 
 ## Concurrent setup and file synchronization
 
@@ -19,7 +19,11 @@ waiting for the sync drain or the commands it cancels. The provider Stop still
 requires a confirmed stop-and-retain receipt; this is not a command-only receipt.
 An admitted sync may fail on the fence or the provider Stop, and keeps ownership
 of its per-call scratch through settlement. Resume refuses while that work is
-still settling. New syncs and further command sends remain fenced.
+still settling. New syncs and further command sends remain fenced. The settling
+sync's cleanup DELETE alone is exempt from that cancellation fence: it targets
+only the exact remote UUID archive path that mapping generated, never a glob or
+another sync's file. Cleanup remains bounded and best effort on provider failure;
+Stop does not wait for it.
 
 `src/file-sync.test.ts` exercises command overlap, bidirectional byte-exact sync,
 scratch isolation and teardown drains against the fake provider using real files

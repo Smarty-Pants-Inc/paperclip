@@ -53,7 +53,8 @@ export async function sweepStaleSyncTemps(now = Date.now(), directory = os.tmpdi
   return { removed, kept };
 }
 export interface SyncTransport {
-  request(path: string, init?: RequestInit): Promise<any>;
+  /** ownedTempPath is supplied only by the exact UUID-path cleanup in finally. */
+  request(path: string, init?: RequestInit, ownedTempPath?: string): Promise<any>;
   run(command: string, timeoutMs: number, cwd?: string): Promise<PluginEnvironmentExecuteResult>;
 }
 const q = (value: string) => `'${value.replace(/'/g, `'"'"'`)}'`;
@@ -264,7 +265,7 @@ export async function syncFiles(params: PluginEnvironmentSyncInParams, outbound:
         filesTransferred++;
       } finally {
         try {
-          if (remoteAttempted) await io.request(`${base}/files?path=${encodeURIComponent(remote)}`, { method: "DELETE", signal: AbortSignal.timeout(timeout) }).catch(() => undefined);
+          if (remoteAttempted) await io.request(`${base}/files?path=${encodeURIComponent(remote)}`, { method: "DELETE", signal: AbortSignal.timeout(timeout) }, remote).catch(() => undefined);
         } finally { await fs.rm(temp, { recursive: true, force: true }); }
       }
     }

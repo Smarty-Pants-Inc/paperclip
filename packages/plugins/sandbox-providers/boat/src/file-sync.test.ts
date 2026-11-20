@@ -141,6 +141,99 @@ async function clean() {
   for (const directory of [host, remote]) expect((await fs.readdir(directory)).filter(name => name.startsWith(".paperclip-upload") || name.startsWith("paperclip-boat-sync"))).toEqual([]);
 }
 describe("Boat native hybrid file sync", () => {
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4605#issuecomment-7038092045
+  // Real archive bytes/files, controlled signed transfer interruption. The
+  // first cancelled sync must clean ONLY its own tar while the second owns one.
+  it.each([false, true])("Stop mid-sync cleans only its UUID temp after cancellation (outbound=%s)", async outbound => {
+    const latch = () => {
+      let release!: () => void;
+      const promise = new Promise<void>(resolve => { release = resolve; });
+      return { promise, release };
+    };
+    const entered = [latch(), latch()], held = [latch(), latch()];
+    const remotePaths: string[] = [], deleted: string[] = [], made: string[] = [], partial: number[] = [];
+    const mkdtemp = fs.mkdtemp;
+    vi.spyOn(fs, "mkdtemp").mockImplementation(async (...args: Parameters<typeof fs.mkdtemp>) => {
+      const directory = await mkdtemp(...args); made.push(String(directory)); return directory;
+    });
+    let next = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/files") && init.method === "DELETE") deleted.push(url.searchParams.get("path")!);
+      if (url.hostname !== "signed.invalid") return mockFetch(input, init);
+      const index = next++, name = url.searchParams.get("path")!;
+      remotePaths[index] = name;
+      const file = localRemote(name);
+      if (init.method === "PUT") {
+        // Boat has received some actual upload bytes when Stop cuts the body.
+        const reader = (init.body as unknown as Readable)[Symbol.asyncIterator]();
+        try {
+          const first = await reader.next();
+          if (first.done) throw new Error("expected upload bytes before Stop");
+          partial[index] = first.value.length;
+          await fs.writeFile(file, first.value, { mode: 0o600 });
+          entered[index].release();
+          await held[index].promise;
+          throw new Error("injected Stop during upload");
+        } finally { await reader.return?.(); }
+      }
+      const bytes = (await fs.readFile(file)).subarray(0, 1024);
+      partial[index] = bytes.length;
+      return new Response(new ReadableStream({
+        start(controller) { controller.enqueue(bytes); entered[index].release(); },
+        async pull(controller) { await held[index].promise; controller.error(new Error("injected Stop during download")); },
+      }));
+    }));
+    const mappings = await Promise.all([0, 1].map(async index => {
+      const sourcePath = path.join(outbound ? remote : host, `source-${index}`);
+      const targetPath = path.join(outbound ? host : remote, `target-${index}`);
+      await fs.writeFile(sourcePath, Buffer.alloc(1024 * 1024 + 17, 31 + index));
+      await fs.writeFile(targetPath, `old-${index}`);
+      return { sourcePath, targetPath, kind: "file" as const };
+    }));
+    const calls: Promise<{ error?: string; result?: unknown }>[] = [];
+    let elapsedMs = -1;
+    try {
+      for (const [index, mapping] of mappings.entries()) {
+        calls.push(sync(mapping, outbound).then(result => ({ result }), error => ({ error: String(error) })));
+        await entered[index].promise;
+      }
+      expect(new Set(remotePaths).size).toBe(2);
+      for (const name of remotePaths) expect(name).toMatch(/^\/tmp\/paperclip-boat-sync-[a-f0-9-]{36}\.tar$/);
+      for (const count of partial) { expect(count).toBeGreaterThan(0); expect(count).toBeLessThan(1024 * 1024); }
+      const secondBefore = await fs.readFile(localRemote(remotePaths[1]));
+      const start = performance.now();
+      const receipt = await plugin.definition.onEnvironmentStopLease!({ ...params([]), providerLeaseId: leaseId, cancelActiveWork: true });
+      elapsedMs = performance.now() - start;
+      console.log("STOP_TEMP_LATENCY", JSON.stringify({ outbound, elapsedMs, receipt, partial }));
+      expect(receipt).toMatchObject({ providerLeaseId: leaseId, state: "stopped" });
+      expect(elapsedMs, "Stop returns while both transfer bodies are still held").toBeLessThan(5);
+      await expect(sync(mappings[0], outbound)).rejects.toThrow("no longer active");
+      held[0].release();
+      expect(await calls[0]).toMatchObject({ error: expect.stringContaining(outbound ? "download failed" : "upload failed") });
+      const orphans = (await fs.readdir(remote)).filter(name => /^paperclip-boat-sync-.*\.tar$/.test(name));
+      console.log("STOP_TEMP_CLEANUP", JSON.stringify({ outbound, elapsedMs, remotePaths, deleted, orphans, partial }));
+      // Inspect actual files, not merely whether the DELETE callback was called.
+      await expect(fs.lstat(localRemote(remotePaths[0]))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await fs.readFile(localRemote(remotePaths[1]))).toEqual(secondBefore);
+      expect(deleted).toEqual([remotePaths[0]]);
+      expect(orphans).toEqual([path.basename(remotePaths[1])]);
+    } finally {
+      for (const gate of held) gate.release();
+      await Promise.allSettled(calls);
+    }
+    expect(await calls[1]).toMatchObject({ error: expect.stringContaining(outbound ? "download failed" : "upload failed") });
+    expect(deleted).toEqual(remotePaths);
+    for (const [index, mapping] of mappings.entries()) expect(await fs.readFile(mapping.targetPath, "utf8")).toBe(`old-${index}`);
+    const scratch = made.filter(name => path.basename(name).startsWith("paperclip-boat-sync-"));
+    expect(scratch).toHaveLength(2);
+    for (const name of scratch) await expect(fs.lstat(name)).rejects.toMatchObject({ code: "ENOENT" });
+    await clean();
+    console.log("STOP_TEMP_SETTLED", JSON.stringify({ outbound,
+      remoteOrphans: (await fs.readdir(remote)).filter(name => /^paperclip-boat-sync-.*\.tar$/.test(name)),
+      hostScratchRemoved: scratch.length, deleted }));
+  });
+
   // BRIEF.md row (a): real shell commands, fake provider transport. A serial
   // provider cannot reach this barrier; each command leaves its own byte output.
   it("concurrent capability: three commands on one box overlap", async () => {

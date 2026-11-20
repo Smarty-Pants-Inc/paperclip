@@ -850,6 +850,8 @@ type RequestOptions = {
   sendAdmission?: () => Promise<boolean>;
   /** Our own stop: it ends the box's lifecycle and is never revoked by it. */
   ownStop?: boolean;
+  /** Only syncFiles' finally supplies its own generated UUID path for deletion. */
+  syncTempCleanupPath?: string;
   /** F-04B: only explicitly repeatable plugin probes retain the frozen7 transient shape. */
   intent?: "idempotent_probe";
   /** F-04: the POST /commands payload. Each send marks its command text with its own attempt nonce. */
@@ -875,8 +877,14 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
   // The evidence read is a read of the same box: never after our stop of it or a closed admission.
   let evidenceAllowed = () => false;
   try {
-    if (init.method && init.method !== "GET") assertBoatActivityAdmission();
     const allocation = /^\/sandboxes\/([^/?]+)/.exec(path)?.[1];
+    // Stop revokes new work, not the cleanup owner of this sync's exact temp.
+    // Never exempt a glob, another path, a write, or a recovery resume.
+    const ownSyncTempCleanup = init.method === "DELETE" && allocation !== undefined
+      && responseOptions.syncTempCleanupPath !== undefined
+      && /^\/tmp\/paperclip-boat-sync-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.tar$/.test(responseOptions.syncTempCleanupPath)
+      && path === `/sandboxes/${allocation}/files?path=${encodeURIComponent(responseOptions.syncTempCleanupPath)}`;
+    if (init.method && init.method !== "GET" && !ownSyncTempCleanup) assertBoatActivityAdmission();
     const boxKey = allocation ? activityKey(config, decodeURIComponent(allocation)) : undefined;
     if (boxKey) idleActivity.resource(boxKey);
     const generation = boxKey ? boxLifecycle(boxKey) : 0;
@@ -886,8 +894,8 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
     // enclosing call passed down (a 409 recovery runs under its call's check).
     const sideEffecting = (init.method ?? "GET").toUpperCase() !== "GET";
     const sendGuard = () => {
-      if (sideEffecting) assertBoatActivityAdmission();
-      if (boxKey && sideEffecting && !responseOptions.ownStop && boxLifecycle(boxKey) !== generation) throw new Error("Boat sandbox lease is no longer active.");
+      if (sideEffecting && !ownSyncTempCleanup) assertBoatActivityAdmission();
+      if (boxKey && sideEffecting && !responseOptions.ownStop && !ownSyncTempCleanup && boxLifecycle(boxKey) !== generation) throw new Error("Boat sandbox lease is no longer active.");
       responseOptions.sendGuard?.();
       // F-03-R: a late response must not authorize another send, including a
       // recovery resume or a retry after a late ready observation.
@@ -3454,14 +3462,14 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
   async onEnvironmentSyncIn(params) {
     const c = parse(params.config);
     return syncFiles(params, false, {
-      request: (path, init) => request(c, path, init, init?.method === "DELETE"),
+      request: (path, init, syncTempCleanupPath) => request(c, path, init, init?.method === "DELETE", { syncTempCleanupPath }),
       run: (command, timeout, cwd) => runCommand(c, params.lease.providerLeaseId!, command, timeout, cwd),
     });
   },
   async onEnvironmentSyncOut(params) {
     const c = parse(params.config);
     return syncFiles(params, true, {
-      request: (path, init) => request(c, path, init, init?.method === "DELETE"),
+      request: (path, init, syncTempCleanupPath) => request(c, path, init, init?.method === "DELETE", { syncTempCleanupPath }),
       run: (command, timeout, cwd) => runCommand(c, params.lease.providerLeaseId!, command, timeout, cwd),
     });
   },
