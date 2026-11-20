@@ -1,3 +1,5 @@
+import * as cancellationLocks from "../agent-run-cancellation.js";
+import { lockAgentForRunAdmission } from "../services/heartbeat-run-admission-lock.js";
 import { wiredHeartbeatFor } from "../services/heartbeat-registry.js";
 import { nativeWorkspaceFinalizationWork } from "../services/native-runtime/native-workspace-finalization-work.js";
 import { recordNativeWorkspaceFinalizationFailure } from "../services/native-runtime/native-workspace-finalizer.js";
@@ -221,6 +223,7 @@ type Outcome = { result?: Awaited<ReturnType<typeof executePaperclipNativeSessio
 const scheduled = new Map<string, { bodies: string[]; peers: RecordingPiPeer[]; executions: Promise<unknown>[];
   first: RecordingPiPeer; outcomes: Map<string, Outcome>; contendAtFinalization?: boolean; deferCommitAtReturn?: boolean;
   holdSuccessors?: boolean;
+  readHistory?: Array<{ runId: string; result: unknown }>;
   finishTasks?: boolean;
   taskError?: string;
   successorStartGate?: Promise<void>;
@@ -307,14 +310,27 @@ beforeAll(async () => {
     const peer = first ? owner.first : new RecordingPiPeer(); owner.peers.push(peer);
     if (!first) peer.onPrompt = message => setImmediate(() => {
       if (owner.holdSuccessors) return;
-      const envelope = JSON.parse(message);
-      const prompt = String(envelope.task?.prompt ?? message);
-      peer.boundary();
-      const inputs = owner.bodies.filter(body => prompt.includes(body));
-      if (inputs.length) peer.answer(inputs);
-      if (owner.finishTasks) void finishTask(peer, input.execution.binding.runId)
-        .catch(error => { owner.taskError = String(error); }).finally(() => peer.finish());
-      else peer.finish();
+      void (async () => {
+        const envelope = JSON.parse(message);
+        let prompt = String(envelope.task?.prompt ?? message);
+        if (owner.readHistory) {
+          // Prompts intentionally inline at most eight comments. A scripted
+          // peer handling a burst must read the remaining real task history,
+          // just as the provider is instructed to do, not invent unseen text.
+          const authority = new PaperclipRunnerToolAuthority(db, input.execution.binding);
+          try {
+            const result = await authority.execute({ tool: "get_task_history", callId: `history:${input.execution.binding.runId}`,
+              arguments: { limit: 100 } });
+            owner.readHistory.push({ runId: input.execution.binding.runId, result });
+            prompt += JSON.stringify(result);
+          } finally { authority.close(); }
+        }
+        peer.boundary();
+        const inputs = owner.bodies.filter(body => prompt.includes(body));
+        if (inputs.length) peer.answer(inputs);
+        if (owner.finishTasks) await finishTask(peer, input.execution.binding.runId);
+        peer.finish();
+      })().catch(error => { owner.taskError = String(error); peer.finish(); });
     });
     const start = () => realExecute({ ...input, useRunnerd: false, backend: backendFor(input.execution, input.runnerInstanceId, peer) });
     const execution = (!first && owner.successorStartGate ? owner.successorStartGate.then(start) : start()).then(async result => {
@@ -389,9 +405,13 @@ async function fixture(label: string, conversation = true, skipIssueComment = tr
   }
   const running = owner.executions[0];
   const post = async (body: string, deliveryIntent?: "queue") => {
+    // The scripted provider may receive the committed input before the HTTP
+    // caller gets its receipt. Register its vocabulary before sending, not
+    // after admission has already started an answering successor.
+    owner.bodies.push(body);
     const receipt = await request(app).post(`/api/issues/${issueId}/comments`).send({ body, deliveryIntent, clientRequestId: randomUUID() });
     expect(receipt.status, JSON.stringify(receipt.body)).toBe(201);
-    owner.bodies.push(body); return receipt.body as { id: string; body: string };
+    return receipt.body as { id: string; body: string };
   };
   const commands = (type: string) => peer.requests.filter(command => command.type === type);
   const comments = () => db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
@@ -462,7 +482,8 @@ async function fixture(label: string, conversation = true, skipIssueComment = tr
         companyId, agentId, issueId, runId, commands: peer.requests, previousRunEvents: peer.previousRunEvents,
         consumed: peer.consumed, replies: peer.replies, outcome: owner.outcomes.get(runId),
         successorPeers: owner.peers.slice(1).map(peer => ({ commands: peer.requests, facadeCalls: peer.facadeCalls, consumed: peer.consumed, replies: peer.replies })), workerErrors,
-        queues, issue: (await db.select().from(issues).where(eq(issues.id, issueId)))[0],
+        queues, historyReads: owner.readHistory, taskError: owner.taskError,
+        issue: (await db.select().from(issues).where(eq(issues.id, issueId)))[0],
         finalizations: await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.companyId, companyId)),
         runs: await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId)),
         wakes: await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)),
@@ -660,6 +681,92 @@ it.each([100, 400, 800].flatMap(gap => [500, 2000].map(lag => ({ gap, lag }))))
       actualOffsetMs: commentAt.getTime() - finishedAt.getTime(),
       wakes: (await f.wakes()).map(w => ({ id: w.id, status: w.status, runId: w.runId, requestedAt: w.requestedAt })) });
   } finally { f.admit(); await f.close(); }
+}, 90_000);
+
+// MERGE4: two actual PostgreSQL transactions force the reported inversion.
+// The observing hook returns the REAL agent lock; it never supplies an outcome.
+it("MERGE4 lock order: native last-second tool and issue-first late admission do not deadlock", async () => {
+  const f = await fixture("merge4lockorder");
+  const hb = await wiredHeartbeatFor(db, "test:merge4-lock-order");
+  const authority = new PaperclipRunnerToolAuthority(db, { companyId: f.companyId, issueId: f.issueId,
+    agentId: f.agentId, runId: f.runId });
+  let issueReady!: () => void, agentReady!: () => void;
+  const issueHeld = new Promise<void>(resolve => { issueReady = resolve; });
+  const agentHeld = new Promise<void>(resolve => { agentReady = resolve; });
+  const deadlocks = async () => Number((await db.execute<{ deadlocks: string }>(sql`select deadlocks::text from pg_stat_database where datname = current_database()`))[0].deadlocks);
+  const before = await deadlocks();
+  const realLock = cancellationLocks.lockAgentForRunWrite;
+  const observe = vi.spyOn(cancellationLocks, "lockAgentForRunWrite").mockImplementation(async (...args) => {
+    const result = await realLock(...args); agentReady(); return result;
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const admission = db.transaction(async tx => {
+    await tx.execute(sql`select id from issues where company_id = ${f.companyId} and id = ${f.issueId} for update`);
+    issueReady();
+    await Promise.race([agentHeld, new Promise(resolve => { timer = setTimeout(resolve, 500); })]);
+    await lockAgentForRunAdmission(tx, { companyId: f.companyId, agentId: f.agentId });
+  });
+  await issueHeld;
+  const tool = authority.execute({ tool: "report_progress", callId: "merge4-lock-tool",
+    arguments: { idempotencyKey: "merge4-lock-tool", body: "The original work is finishing." } });
+  try {
+    const outcomes = await Promise.allSettled([admission, tool]);
+    const errors = outcomes.flatMap(o => {
+      if (o.status !== "rejected") return [];
+      const chain: Array<{ message: string; code?: string }> = [];
+      for (let error = o.reason; error; error = error.cause) chain.push({ message: String(error.message ?? error), code: error.code });
+      return chain;
+    });
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    await db.execute(sql`select pg_stat_clear_snapshot()`);
+    const delta = await deadlocks() - before;
+    console.info("MERGE4 lock order evidence", { companyId: f.companyId, issueId: f.issueId, errors, deadlocks: delta });
+    if (process.env.PAPERCLIP_STEER_RED_EVIDENCE) await writeFile(join(process.env.PAPERCLIP_STEER_RED_EVIDENCE, "merge4-lock-result.json"),
+      JSON.stringify({ companyId: f.companyId, issueId: f.issueId, errors, deadlocks: delta }, null, 2));
+    expect(delta).toBe(0); expect(errors).toEqual([]);
+    const message = await f.post("LOCKORDER late person question", "queue");
+    f.peer.boundary(); f.peer.answer(["Original work done"]); f.peer.finish();
+    await f.running; await hb.waitForRunExecutionDrain(f.runId, { timeoutMs: 15_000 });
+    await hb.drainActiveRunExecutions();
+    await f.assertAnsweredOnce([message]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    await Promise.allSettled([admission, tool]); observe.mockRestore(); authority.close(); await f.close();
+  }
+}, 60_000);
+
+// MERGE4: PostgreSQL's counter includes deadlocks hidden by DB-only retries.
+it.each([1, 2, 3])("MERGE4 burst %i: 20 late comments + tool + end release/admission answer once without a deadlock", async round => {
+  const f = await fixture(`merge4burst${round}`);
+  f.owner.readHistory = [];
+  const hb = await wiredHeartbeatFor(db, "test:merge4-burst");
+  const authority = new PaperclipRunnerToolAuthority(db, { companyId: f.companyId, issueId: f.issueId,
+    agentId: f.agentId, runId: f.runId });
+  const deadlocks = async () => Number((await db.execute<{ deadlocks: string }>(sql`select deadlocks::text from pg_stat_database where datname = current_database()`))[0].deadlocks);
+  const before = await deadlocks();
+  try {
+    const tool = authority.execute({ tool: "report_progress", callId: `merge4-tool-${round}`,
+      arguments: { idempotencyKey: `merge4-tool-${round}`, body: "The original work is finishing." } });
+    const posts = Array.from({ length: 20 }, (_, i) => f.post(`BURST${round} message-${String(i).padStart(2, "0")}`, "queue"));
+    await tool;
+    f.peer.boundary(); f.peer.answer(["original work complete"]); f.peer.finish();
+    const messages = await Promise.all(posts);
+    await f.running; await hb.waitForRunExecutionDrain(f.runId, { timeoutMs: 15_000 });
+    await hb.resumeQueuedRunsForAgent(f.companyId, f.agentId);
+    await hb.drainActiveRunExecutions();
+    await hb.sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId });
+    await hb.drainActiveRunExecutions();
+    await f.assertAnsweredOnce(messages);
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
+    const setupFailed = runs.filter(r => r.errorCode === "setup_failed");
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    await db.execute(sql`select pg_stat_clear_snapshot()`);
+    const delta = await deadlocks() - before;
+    console.info("MERGE4 burst evidence", { round, companyId: f.companyId, issueId: f.issueId,
+      messages: messages.map(m => m.id), deadlocks: delta, setupFailed: setupFailed.length, answered: 20,
+      runs: runs.map(r => ({ id: r.id, status: r.status, errorCode: r.errorCode })) });
+    expect(delta).toBe(0); expect(setupFailed).toHaveLength(0);
+  } finally { authority.close(); await f.close(); }
 }, 90_000);
 
 it("MERGE row11: release promotion races late admission; the deferred wake owns exactly ONE run", async () => {

@@ -156,6 +156,45 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     return { companyId, agentId, issueId, userId, message, run, reply, boardHold, sweep, visible, at, nativeSuccessor };
   }
 
+  // MERGE4: real sweep, elapsed durable wait clock; no provider needed for a held receipt.
+  it.each(["paused", "stop", "error", "terminated", "no-adapter", "terminal-lock"] as const)(
+    "MERGE4 custody: %s recent deferred person input is answered or named once within the bound", async shape => {
+      const f = await fixture();
+      const messageId = await f.message(`MERGE4 ${shape} still owed`);
+      const later = await f.message(`MERGE4 ${shape} later input`);
+      const answeredRun = await f.run({ commentId: later, status: "succeeded" });
+      await f.reply(answeredRun);
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+        source: "on_demand", reason: "issue_commented", status: "deferred_issue_execution",
+        requestedByActorType: "user", requestedByActorId: f.userId,
+        requestedAt: f.at(), payload: { issueId: f.issueId, commentId: messageId,
+          _paperclipWakeContext: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: messageId,
+            wakeCommentIds: [messageId] } } }).returning();
+      if (shape === "paused") await db.update(agents).set({ status: "paused", lifecycleState: "paused",
+        lifecycleHolds: ["manual"], pauseReason: "manual" }).where(eq(agents.id, f.agentId));
+      if (shape === "error" || shape === "terminated") await db.update(agents).set({ status: shape }).where(eq(agents.id, f.agentId));
+      if (shape === "no-adapter") await db.update(agents).set({ adapterType: "missing-merge4-adapter" }).where(eq(agents.id, f.agentId));
+      if (shape === "stop") {
+        const stopRun = await f.run({ status: "cancelled" });
+        await db.update(heartbeatRuns).set({ resultJson: { cancelledByActorType: "user", cancelledByUserId: "other-person" } })
+          .where(eq(heartbeatRuns.id, stopRun));
+      }
+      if (shape === "terminal-lock") await db.update(issues).set({ executionRunId: answeredRun,
+        checkoutRunId: answeredRun, executionLockedAt: f.at() }).where(eq(issues.id, f.issueId));
+      await f.sweep();
+      // Persisted wait T0, not Date.now mocking: run the production sweep at its due pass.
+      await db.update(activityLog).set({ createdAt: new Date(Date.now() - PENDING_WAIT_BOUND_MS - 1000) }).where(and(
+        eq(activityLog.companyId, f.companyId), eq(activityLog.action, PENDING_WAIT_ACTION)));
+      await f.sweep();
+      await f.sweep();
+      const notes = (await f.visible()).filter(c => c.metadata?.authorizationReason === `unanswered_message:${messageId}`);
+      const evidence = { shape, companyId: f.companyId, issueId: f.issueId, messageId,
+        wakeId: wake!.id, notes: notes.map(c => ({ id: c.id, body: c.body, metadata: c.metadata })) };
+      console.info("MERGE4 custody evidence", evidence);
+      if (process.env.MERGE4_SWEEP_EVIDENCE) appendFileSync(process.env.MERGE4_SWEEP_EVIDENCE, JSON.stringify(evidence) + "\n");
+      expect(notes, `${shape}: exactly one naming card for the earlier never-carried person message`).toHaveLength(1);
+    });
+
   const codeOf = (comment: { metadata: unknown }) => {
     const sections = ((comment.metadata as Record<string, unknown>)?.sections ?? []) as Array<{ rows: Array<{ label?: string; value?: string }> }>;
     return sections.flatMap(section => section.rows).find(row => row.label === "Failure code")?.value;

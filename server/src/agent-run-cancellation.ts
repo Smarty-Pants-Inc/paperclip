@@ -28,10 +28,12 @@ export function publishesAcceptedReplyOfCancelledRun(run: {
 }
 
 /**
- * Shared lock order for agent-run writes: agents FOR SHARE -> issue(s) FOR
- * UPDATE -> heartbeat_runs (FOR SHARE here, or FOR UPDATE OF heartbeat_runs in
- * the native authority). Writers that lock the run must take the agent row
- * first, in SHARE mode, and must never lock the agent row FOR UPDATE through a
+ * Shared lock order for agent-run writes: issue(s) FOR UPDATE -> agents FOR
+ * SHARE -> heartbeat_runs (FOR SHARE here, or FOR UPDATE OF heartbeat_runs in
+ * the native authority). Lock every needed issue before this agent fence:
+ * queue admission takes issue -> agent UPDATE, so agent -> issue can deadlock.
+ * Writers that lock the run must take the agent row before it, in SHARE mode,
+ * and must never lock the agent row FOR UPDATE through a
  * join after the run: that inverts the order of assertInteractionRunWriteAllowed
  * and of any FK insert that key-shares the agent row before
  * assertAgentRunWriteAllowed, and the two deadlock (40P01). FOR SHARE on the

@@ -3321,21 +3321,18 @@ export class PaperclipRunnerToolAuthority {
     issue: typeof issues.$inferSelect;
     actor: typeof agents.$inferSelect;
   }> {
-    // One lock order for every run write (agent-run-cancellation.ts
-    // lockAgentForRunWrite): agents FOR SHARE -> issue FOR UPDATE ->
-    // heartbeat_runs FOR UPDATE. The agent row is never locked FOR UPDATE here:
-    // after the run that inverted assertInteractionRunWriteAllowed and FK
-    // key-share writers and deadlocked (40P01). FOR SHARE still blocks
-    // pause/terminate until commit, so the actor status check below holds.
+    // Match queue admission, release and predecessor admission: issue -> agent
+    // -> run. Agent-first deadlocks with late input holding this issue while
+    // admission requests the agent UPDATE lock (MERGE4 two-session 40P01 row).
+    // Keep the agent SHARE fence: pause/terminate must still wait for commit.
+    await tx.select({ id: issues.id }).from(issues).where(and(
+      eq(issues.id, this.binding.issueId), eq(issues.companyId, this.binding.companyId),
+    )).for("update");
     await lockAgentForRunWrite(tx, this.binding.companyId, this.binding.agentId);
     if (this.binding.museRuntime) {
       await withExternalExecutionAdmission(tx as unknown as ExternalAdmissionTransaction,
         this.binding.companyId, this.binding.agentId, this.binding.runId, async () => {});
     }
-    // Match identity activation and queue mutations before locking the run.
-    await tx.select({ id: issues.id }).from(issues).where(and(
-      eq(issues.id, this.binding.issueId), eq(issues.companyId, this.binding.companyId),
-    )).for("update");
     // Authorization for writes is intentionally re-read only after the
     // transaction starts. Locking the run here, with the issue and agent rows
     // already locked above, closes the gap between the discovery-time check and the mutation: a
