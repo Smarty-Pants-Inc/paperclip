@@ -1589,6 +1589,30 @@ describe("LiveUpdatesProvider visible issue comment hydration", () => {
     client.clear();
   });
 
+  // noteslive: the stranded sweep's note (server unanswered-person-message.ts announceNoteToOpenChat) is added,
+  // rewritten in place under the same id, and retired; each event re-reads that id into the open chat.
+  it("an open chat shows the sweep's note, its in-place rewrite and its retire without a reload", async () => {
+    const client = new QueryClient();
+    client.setQueryData(queryKeys.issues.detail("PAP-759"), {
+      id: "issue-1", identifier: "PAP-759", conversationAgentId: "agent-1",
+    });
+    const sweepEvent = (change: string) => ({ entityType: "issue", entityId: "issue-1", issueId: "issue-1",
+      action: "issue.comment_added", actorType: "system", actorId: "recovery",
+      details: { commentId: "note-1", source: "recovery.unanswered_message", change } });
+    const note = { id: "note-1", issueId: "issue-1", authorType: "system", body: "Waiting to start.", deletedAt: null };
+    const shown = () => client.getQueryData(queryKeys.issues.acknowledgedComments("PAP-759"));
+    for (const [change, row] of [["added", note], ["rewritten", { ...note, body: "Your message wasn't answered." }],
+      ["retired", { ...note, body: "", deletedAt: "2026-11-20T04:00:00.000Z" }]] as const) {
+      expect(__liveUpdatesTestUtils.shouldDeferVisibleIssueCommentActivity(client, "/PAP/issues/PAP-759",
+        sweepEvent(change), { isForegrounded: true })).toBe(true);
+      getCommentMock.mockResolvedValueOnce(row);
+      expect(await __liveUpdatesTestUtils.hydrateVisibleIssueComment(client, "/PAP/issues/PAP-759", sweepEvent(change),
+        { isForegrounded: true })).toBe(true);
+      expect(shown()).toEqual([row]);
+    }
+    client.clear();
+  });
+
   it("hydrates the visible issue comments cache with only the new comment", async () => {
     getCommentMock.mockResolvedValueOnce({
       id: "comment-2",
