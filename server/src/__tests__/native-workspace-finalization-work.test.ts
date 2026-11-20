@@ -1,3 +1,5 @@
+import { logger } from "../middleware/logger.js";
+import { NATIVE_WORKSPACE_FINALIZATION_OVERDUE_MS } from "../services/native-runtime/native-workspace-finalization-timeout.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { randomUUID } from "node:crypto";
@@ -319,6 +321,46 @@ describe("workspace finalization scheduled lifecycle", () => {
     expect(pending.dueAt).toBeLessThanOrEqual(Date.now());
     expect([...entries].sort((a, b) => a.dueAt - b.dueAt).map(item => item.id))
       .toEqual([overdue.runId, interrupted.runId]);
+  });
+  it.each([false, true])("bounds an abandoned durable retry through the registered periodic recovery, restart=%s", async restart => {
+    const binding = await seed(); await complete(binding);
+    const dueAt = new Date(Date.now() + 30_000);
+    await db.update(nativeRunFinalizations).set({ phase: "retryable_failure", nextAttemptAt: dueAt, leaseOwner: null, leaseExpiresAt: null })
+      .where(eq(nativeRunFinalizations.runId, binding.runId));
+    await db.update(heartbeatRuns).set({ status: "running", nativePhase: "retryable_failure", errorCode: null, runnerProfileJson: null })
+      .where(eq(heartbeatRuns.id, binding.runId));
+    const heartbeat = heartbeatService(db);
+    coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => admitted, canReconcile: () => admitted,
+      onError: error => errors.push(error) });
+    let recovery = heartbeat.registerResidualRecoveryWork(coordinator, () => admitted);
+    try {
+      await recovery.ready;
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, binding.runId)))[0].status).toBe("running");
+      if (restart) {
+        await recovery.stop(); await coordinator.stop();
+        coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => admitted, canReconcile: () => admitted,
+          onError: error => errors.push(error) });
+        recovery = heartbeatService(db).registerResidualRecoveryWork(coordinator, () => admitted); await recovery.ready;
+      }
+      await vi.advanceTimersByTimeAsync(NATIVE_WORKSPACE_FINALIZATION_OVERDUE_MS - 30_000);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, binding.runId)))[0].status).toBe("running");
+      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.waitFor(async () => expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, binding.runId)))[0])
+        .toMatchObject({ status: "failed", nativePhase: "terminal_failure", finishedAt: expect.any(Date) }), { timeout: 10_000 });
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).not.toEqual([]);
+    } finally { await recovery.stop(); }
+  }, 30_000);
+  it("warns once per run when owner_active silently used to drop its retry, including a reconstructed worker", async () => {
+    const binding = await seed(); await complete(binding);
+    const warn = vi.spyOn(logger, "warn");
+    await withNativeWorkspaceFinalizationOwnership({ db, companyId, runId: binding.runId }, async () => {
+      for (let pass = 0; pass < 2; pass++) {
+        const service = nativeWorkspaceFinalizationWork(db, { onWorkspaceSettled: settled });
+        const [entry] = await service.load({ companyId, runId: binding.runId }); await service.check(entry);
+      }
+      expect(warn.mock.calls.filter(([fields]) => (fields as any)?.runId === binding.runId && (fields as any)?.reason === "owner_active")).toHaveLength(1);
+    });
   });
   it("waits quietly for the actual local owner to release", async () => {
     const binding = await seed(); await complete(binding);
