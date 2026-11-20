@@ -112,6 +112,7 @@ vi.mock("@/components/MarkdownEditor", async (importOriginal) => {
 // before the file's mocks replace it; the steering rows replay it through fetch.
 const realIssuesApiFns = vi.hoisted(() => ({
   addComment: null as null | ((...args: unknown[]) => Promise<unknown>),
+  reads: {} as Pick<typeof issuesApi, "get" | "getCore" | "listComments" | "recentComments">,
 }));
 
 const mockGrokBotApi = vi.hoisted(() => ({ stop: vi.fn().mockResolvedValue({ stopped: true }) }));
@@ -172,6 +173,9 @@ const mockActivityApi = vi.hoisted(() => ({
 }));
 
 const mockHeartbeatsApi = vi.hoisted(() => ({
+  events: vi.fn(),
+  conversationEvents: vi.fn(),
+  log: vi.fn(),
   get: vi.fn(),
   liveRunsForIssue: vi.fn(),
   activeRunForIssue: vi.fn(),
@@ -261,6 +265,8 @@ class ResizeObserverStub {
 vi.mock("../api/issues", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/issues")>();
   realIssuesApiFns.addComment = actual.issuesApi.addComment as never;
+  const { get, getCore, listComments, recentComments } = actual.issuesApi;
+  realIssuesApiFns.reads = { get, getCore, listComments, recentComments };
   // Keep composed API operations real while replacing their request methods.
   // This also exercises the current-revision check used by both queue surfaces.
   return { ...actual, issuesApi: Object.assign(actual.issuesApi, mockIssuesApi) };
@@ -1650,6 +1656,9 @@ describe("IssueDetail", () => {
     mockActivityApi.runsForIssue.mockResolvedValue([]);
     mockHeartbeatsApi.liveRunsForIssue.mockResolvedValue([]);
     mockHeartbeatsApi.activeRunForIssue.mockResolvedValue(null);
+    mockHeartbeatsApi.events.mockResolvedValue([]);
+    mockHeartbeatsApi.conversationEvents.mockResolvedValue([]);
+    mockHeartbeatsApi.log.mockResolvedValue({ content: "", nextOffset: 0 });
     mockAgentsApi.list.mockResolvedValue([]);
     mockAccessApi.getCurrentBoardAccess.mockResolvedValue({
       companyIds: ["company-1"],
@@ -7179,6 +7188,213 @@ describe("IssueDetail", () => {
       expect(header.find((item) => item.text === "Pause work")).toMatchObject({ disabled: false });
     },
   );
+
+  // Shape C: reconstructed HTTP candidates, NOT a captured interruption body.
+  // ER4-DB-READ-RESULT.md supplies stopq/1440's full IDs/statuses/times and five1's
+  // real automatic successor. ER4-RED.md supplies the separate stopq/390 observed
+  // predecessor candidate. Historical browser interruption/local state was NOT
+  // retained. Keep the cases named as candidates; do not call this a live replay.
+  async function renderEmptyReplyCandidate(width: number, five1 = false) {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(five1 ? "2026-11-20T07:47:35.600Z" : "2026-11-20T07:40:35.200Z"));
+    const { TaskChatThread } = await vi.importActual<typeof import("../components/TaskChatThread")>("../components/TaskChatThread");
+    const { heartbeatsApi: realHeartbeats } = await vi.importActual<typeof import("../api/heartbeats")>("../api/heartbeats");
+    const { activityApi: realActivity } = await vi.importActual<typeof import("../api/activity")>("../api/activity");
+    taskChatThreadFixture.Real = TaskChatThread as never;
+    markdownEditorFixture.stub = true;
+    mockSidebarState.isMobile = width === 390;
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+    const issueId = five1 ? "76b52fd9-afd9-4c67-b2cf-c0f5c8320e29" : "441ec52c-08ad-4bc0-aed4-3891f8cf1a8d";
+    const agentId = five1 ? "4f37be00-9a5c-4492-84c2-c6823f272a9e" : "4172d6e3-c283-4ab0-897a-ca15e5d9b45e";
+    const runId = five1 ? "1579797d-5849-49fa-8ec4-3968ce679199" : "7377c533-fc42-435b-a164-1b6ed7ceae68";
+    const replyId = five1 ? "b8ad0efd-819c-471f-b8ec-f2c7b947823d" : "47d68bc0-982a-4366-8cad-4f6509cf007f";
+    const companyId = "0e778df7-19c4-4064-ae7c-42576082f096";
+    const agent = createAgent({ id: agentId, companyId, name: "Runner", adapterType: "paperclip_runner" });
+    const settled = { runId, agentId, agentName: agent.name, runtimeMode: "native" as const, adapterType: "paperclip_runner",
+      status: "succeeded", createdAt: five1 ? "2026-11-20T07:44:48.873Z" : "2026-11-20T07:39:45.785Z",
+      startedAt: five1 ? "2026-11-20T07:44:49.308Z" : "2026-11-20T07:39:45.899Z",
+      finishedAt: five1 ? "2026-11-20T07:47:35.111Z" : "2026-11-20T07:40:34.941Z" };
+    const reply = createIssueComment({ id: replyId, issueId, companyId, authorType: "agent", authorAgentId: agentId,
+      authorUserId: null, createdByRunId: runId, body: five1 ? "DONE" : "19",
+      createdAt: new Date(five1 ? "2026-11-20T07:47:35.228Z" : "2026-11-20T07:40:35.080Z") });
+    const state = {
+      issue: createIssue({ id: issueId, companyId, status: "in_progress", assigneeAgentId: agentId, identifier: null,
+        interruption: { state: "working", intentId: null, responsibility: "system", nextRetryAt: null, canRetry: false,
+          userAction: null, sourceRunIds: [runId], observedRunId: runId } }),
+      comments: [reply], runs: [settled], live: [] as unknown[], active: null as unknown,
+      events: {} as Record<string, unknown[]>,
+    };
+    const requests: string[] = [];
+    const posts: Record<string, unknown>[] = [];
+    const response = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
+      status, headers: { "content-type": "application/json" },
+    });
+    const postResponse = createDeferred<Response>();
+    vi.mocked(globalThis.fetch).mockImplementation(async (input, init) => {
+      const url = new URL(String(input), "http://localhost");
+      const path = url.pathname;
+      requests.push(`${init?.method ?? "GET"} ${path}${url.search}`);
+      if (init?.method === "POST" && path.endsWith("/comments")) {
+        posts.push(JSON.parse(String(init.body)));
+        return postResponse.promise;
+      }
+      if (path === `/api/issues/${issueId}`) return response(state.issue);
+      if (path.endsWith("/recent-comments")) return response({ comments: state.comments, latestCommentId: state.comments.at(-1)?.id, hasMore: false });
+      if (path.endsWith("/comments")) return response(url.searchParams.get("order") === "desc" ? [...state.comments].reverse() : state.comments);
+      if (path.endsWith("/live-runs")) return response(state.live);
+      if (path.endsWith("/active-run")) return response(state.active);
+      if (path.endsWith("/runs")) return response(state.runs);
+      if (/\/events$/.test(path)) return response(state.events[path.split("/")[3]] ?? []);
+      if (/\/log$/.test(path)) return response({ content: "", nextOffset: 0 });
+      return response(/pending-questions|\/browsers$|\/mcp-app-views$/.test(path) ? [] : { items: [], nextCursor: null });
+    });
+    // Real API clients -> real IssueDetail queries/projection -> real TaskChatThread.
+    // Only transport is replaced; the thread is never rerendered with planted props.
+    for (const key of ["get", "getCore", "listComments", "recentComments"] as const) {
+      mockIssuesApi[key].mockReset().mockImplementation(realIssuesApiFns.reads[key] as never);
+    }
+    mockIssuesApi.addComment.mockReset().mockImplementation((...args: unknown[]) => realIssuesApiFns.addComment!(...args));
+    mockHeartbeatsApi.liveRunsForIssue.mockImplementation(realHeartbeats.liveRunsForIssue);
+    mockHeartbeatsApi.activeRunForIssue.mockImplementation(realHeartbeats.activeRunForIssue);
+    mockHeartbeatsApi.events.mockImplementation(realHeartbeats.events);
+    mockHeartbeatsApi.conversationEvents.mockImplementation(realHeartbeats.conversationEvents);
+    mockHeartbeatsApi.log.mockImplementation(realHeartbeats.log);
+    mockActivityApi.runsForIssue.mockImplementation(realActivity.runsForIssue);
+    mockActivityApi.recentRunsForIssue.mockImplementation(realActivity.recentRunsForIssue);
+    mockActivityApi.runsByIdsForIssue.mockImplementation(realActivity.runsByIdsForIssue);
+    mockAgentsApi.list.mockResolvedValue([agent]);
+    mockAccessApi.getCurrentBoardAccess.mockResolvedValue({ companyIds: [companyId], isInstanceAdmin: true, source: "session", userId: "user-1" });
+    mockAuthApi.getSession.mockResolvedValue({ session: { userId: "user-1" }, user: { id: "user-1" } });
+    mockRouteParams.issueId = issueId;
+    mockLocation.pathname = `/issues/${issueId}`;
+    queryClient.setQueryData(["issues", "history-expanded", issueId], true);
+    await act(async () => renderIssueView());
+    try {
+      await waitForAssertion(() => expect(container.querySelector(`[data-thread-anchor="${replyId}"]`)).not.toBeNull(), 100);
+    } catch (error) {
+      if (process.env.EMPTY_REPLY_EVIDENCE) writeFileSync(`${process.env.EMPTY_REPLY_EVIDENCE}/setup-${width}.json`, JSON.stringify({
+        html: container.innerHTML, requests, errors: consoleErrorSpy.mock.calls.map((call: unknown[]) => call.map(String)),
+      }, null, 2));
+      throw error;
+    }
+    let refreshCount = 0;
+    const refresh = async () => {
+      await act(async () => { await queryClient.invalidateQueries(); });
+      await flushReact();
+      await flushReact();
+      if (process.env.EMPTY_REPLY_EVIDENCE) writeFileSync(`${process.env.EMPTY_REPLY_EVIDENCE}/refresh-${width}-${++refreshCount}.json`, JSON.stringify({
+        html: container.innerHTML, requests, props: Object.fromEntries(["comments", "activeRun", "liveRuns", "linkedRuns", "interruption", "composerPause", "composerDisabledReason"].map(key => [key, mockIssueChatThreadRender.mock.calls.at(-1)?.[0]?.[key]])), errors: consoleErrorSpy.mock.calls.map((call: unknown[]) => call.map(String)),
+      }, null, 2));
+    };
+    const lane = () => container.querySelector('[data-testid="task-chat-live-transcript"]');
+    return { state, settled, reply, runId, issueId, agentId, companyId, requests, posts, postResponse, response, refresh, lane };
+  }
+
+  describe.each([390, 1440])("shape C HTTP startup authority at %i", width => {
+    afterEach(() => vi.useRealTimers());
+    it.each([
+      { name: "older stopped observed run (cross-case abbf candidate)", observedRunId: "abbf21f5-6bbd-4900-9d94-38be18f3c68c", joined: true },
+      { name: "missing observed run candidate", observedRunId: null, joined: true },
+      { name: "answered observed run without run/comment join candidate", observedRunId: "7377c533-fc42-435b-a164-1b6ed7ceae68", joined: false },
+    ])("candidate: $name cannot add an identity/Working/Thinking after the reply", async candidate => {
+      const view = await renderEmptyReplyCandidate(width);
+      view.state.issue.interruption!.observedRunId = candidate.observedRunId;
+      if (!candidate.joined) view.state.runs = [];
+      const started = performance.now();
+      await view.refresh();
+      await waitForAssertion(() => expect(view.lane()).toBeNull());
+      expect(performance.now() - started).toBeLessThan(1000);
+      for (let frame = 0; frame < 5; frame++) {
+        await flushReact();
+        expect(view.lane()).toBeNull();
+        expect(container.textContent).not.toMatch(/Working|Thinking/);
+        expect(container.querySelectorAll(`[data-thread-anchor="${view.reply.id}"]`)).toHaveLength(1);
+        expect(container.querySelector(`[data-thread-anchor="${view.reply.id}"]`)?.textContent).toContain("19");
+      }
+      expect(view.requests).toEqual(expect.arrayContaining([
+        `GET /api/issues/${view.issueId}?view=core`, `GET /api/issues/${view.issueId}/comments?order=desc&limit=50`,
+        `GET /api/issues/${view.issueId}/runs`, `GET /api/issues/${view.issueId}/live-runs`, `GET /api/issues/${view.issueId}/active-run`,
+      ]));
+    });
+
+    it.each(["intent", "recovery"] as const)("preserves genuinely owed %s startup after the settled reply", async owed => {
+      const view = await renderEmptyReplyCandidate(width);
+      if (owed === "intent") view.state.issue.interruption!.intentId = "pending-intent-candidate";
+      else view.state.issue.interruption!.recoveryStep = "finishing_recovery";
+      await view.refresh();
+      expect(view.lane()).not.toBeNull();
+      expect(container.textContent).toContain("Working");
+      expect(container.textContent).toContain("Thinking");
+    });
+
+    it("preserves immediate local send and acknowledged admission, then clears after its answer", async () => {
+      const view = await renderEmptyReplyCandidate(width);
+      await act(async () => markdownEditorFixture.change("Continue"));
+      await act(async () => container.querySelector<HTMLButtonElement>('[data-testid="task-chat-composer-send"]')!.click());
+      // POST is still pending, no run/intent: startup must already be visible.
+      expect(view.lane(), container.textContent ?? "").not.toBeNull();
+      expect(container.textContent).toContain("Thinking");
+      await waitForAssertion(() => expect(view.posts, container.textContent ?? "").toHaveLength(1));
+      const echo = createIssueComment({ issueId: view.issueId, companyId: view.companyId, id: "f8f37bf4-5c3e-4878-9949-12cafc90f5ba",
+        clientRequestId: String(view.posts[0].clientRequestId), body: "Continue", createdAt: new Date("2026-11-20T07:41:00.945Z") });
+      view.state.comments.push(echo);
+      view.postResponse.resolve(view.response(echo, 201));
+      await view.refresh();
+      expect(view.lane()).not.toBeNull();
+      expect(container.textContent).toContain("Thinking");
+      const nextRunId = "fb96c417-81e4-49f1-a703-795f0361e53c";
+      view.state.issue.interruption!.observedRunId = nextRunId;
+      view.state.runs.push({ ...view.settled, runId: nextRunId, createdAt: "2026-11-20T07:41:01.492Z",
+        startedAt: "2026-11-20T07:41:01.666Z", finishedAt: "2026-11-20T07:43:45.480Z" });
+      view.state.comments.push(createIssueComment({ ...view.reply, id: "03c6c76a-4309-46d3-8da6-aeca1049e057",
+        createdByRunId: nextRunId, body: "DONE", createdAt: new Date("2026-11-20T07:43:45.572Z") }));
+      await view.refresh();
+      expect(view.lane()).toBeNull();
+      expect(container.textContent).not.toMatch(/Working|Thinking/);
+    });
+
+    it("keeps real five1 successor 5751bc11 queued/running until its report", async () => {
+      const view = await renderEmptyReplyCandidate(width, true);
+      const successor = { id: "5751bc11-c02a-4eda-babe-c6a31375e88a", runtimeMode: "native", adapterType: "paperclip_runner",
+        status: "queued", invocationSource: "automation", triggerDetail: "chat_task_completed", agentId: view.agentId,
+        agentName: "Runner", createdAt: "2026-11-20T07:47:35.264Z", startedAt: null as string | null, finishedAt: null as string | null };
+      for (const status of ["queued", "running"]) {
+        successor.status = status;
+        successor.startedAt = status === "running" ? "2026-11-20T07:47:35.501Z" : null;
+        view.state.live = [{ ...successor }];
+        view.state.active = { ...successor };
+        await view.refresh();
+        expect(view.lane()).not.toBeNull();
+        expect(container.textContent).toContain("Working");
+        expect(container.textContent).toContain("Thinking");
+        expect(container.querySelector(`[data-thread-anchor="${view.reply.id}"]`)?.textContent).toContain("DONE");
+      }
+      view.state.live = [];
+      view.state.active = null;
+      view.state.issue.interruption!.observedRunId = successor.id;
+      view.state.runs.push({ ...view.settled, runId: successor.id, createdAt: successor.createdAt,
+        startedAt: successor.startedAt!, finishedAt: "2026-11-20T07:47:58.827Z" });
+      // Report body was not retained in ER4; marker text is reconstructed, not recorded.
+      view.state.comments.push(createIssueComment({ ...view.reply, id: "02c7c94e-542e-4293-9596-c434356dbf27",
+        createdByRunId: successor.id, body: "Five-task report (reconstructed content)", createdAt: new Date("2026-11-20T07:47:58.929Z") }));
+      // Reconstructed native envelopes let the real transcript transport complete
+      // its persistence handoff; these are not claimed as captured event bodies.
+      view.state.events[successor.id] = [
+        ["item.completed", { kind: "agentMessage", channel: "final", text: "Five-task report (reconstructed content)" }],
+        ["run.terminal", { schema: "paperclip.prp.terminal.v1", turnTerminalState: "completed", runTerminalState: "succeeded", reportedWorkDisposition: "done" }],
+      ].map(([eventType, payload], index) => ({
+        id: index + 1, companyId: view.companyId, runId: successor.id, agentId: view.agentId, seq: index + 1,
+        eventType, stream: "system", level: "info", color: null, message: null, createdAt: "2026-11-20T07:47:58.827Z",
+        payload: { prpEvent: { schema: "paperclip.prp.event.v1", sourceEventId: `candidate-${index + 1}`, sourceSeq: index + 1,
+          sourceInstanceId: "candidate-runner", sourceKind: "runner", runId: successor.id, normalizedSessionId: "candidate-session",
+          eventType, schemaVersion: 1, priority: 1, emittedAt: "2026-11-20T07:47:58.827Z", payload } },
+      }));
+      await view.refresh();
+      expect(view.lane()).toBeNull();
+      await waitForAssertion(() => expect(container.textContent).toContain("Five-task report (reconstructed content)"));
+      expect(container.textContent).not.toMatch(/Working|Thinking/);
+    });
+  });
 
   // Steering placement end to end (steer-ui2, Paul 11-19). The REAL TaskChatThread
   // (vi.importActual; the TaskChatThread stub renders it via taskChatThreadFixture
