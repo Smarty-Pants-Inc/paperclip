@@ -1661,6 +1661,51 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     expect(buildNativeModelEnvelope(selected.nativeExecution).completionContract).toEqual(contract);
   });
 
+  // answered-a8: a successor after an Interrupt gets the carried person questions as wake comments
+  // (pending_comment_N). Only its final reply is posted, so each requirement asks for the final reply.
+  const FINAL_REPLY = "Answer it in your final reply";
+  const occurrences = (text: string, needle: string) => text.split(needle).length - 1;
+  async function conversationSelection(comments: Array<{ id: string; body: string }>, conversation = true) {
+    const { input, issue, agent } = await fixture();
+    const [row] = await db.update(issues).set(conversation
+      ? { title: "Chat with CEO", description: null, conversationAgentId: agent.id, conversationUserId: "runtime-test-operator", conversationState: "active" }
+      : { title: "Nightly report", description: "Write the nightly report." })
+      .where(eq(issues.id, issue.id)).returning();
+    input.task.issueRef = row!;
+    if (conversation) input.task.context.conversationMode = true;
+    input.task.safeWakeComments = comments;
+    const selected = await selectHeartbeatRuntime(db, input);
+    if (!selected.selected || !selected.nativeExecution) throw new Error("Expected native selection");
+    return buildNativeModelEnvelope(selected.nativeExecution).completionContract.criteria as Array<{ id: string; requirement?: string }>;
+  }
+
+  it("C1 (answered-a8 red): a successor after Interrupt with two carried read questions ⇒ each submitted requirement asks for the final reply exactly once", async () => {
+    const questions = [{ id: randomUUID(), body: "Q1: what is in the logs?" }, { id: randomUUID(), body: "Q2: which test failed?" }];
+    const criteria = await conversationSelection(questions);
+    expect(criteria.map(c => c.id)).toEqual(["pending_comment_1", "pending_comment_2"]);
+    for (const [index, question] of questions.entries()) {
+      const requirement = criteria[index]!.requirement!;
+      expect(occurrences(requirement, FINAL_REPLY), `pending_comment_${index + 1}`).toBe(1);
+      expect(occurrences(requirement, question.body)).toBe(1);
+      expect(requirement).toBe(`Address this request in the current authorized conversation response. Answer it in your final reply: ${question.body}`);
+    }
+  });
+
+  it("C2 (answered-a8): a fresh wake for a single ordinary message ⇒ the same final-reply wording, once", async () => {
+    const message = { id: randomUUID(), body: "What is 2+2?" };
+    const criteria = await conversationSelection([message]);
+    expect(criteria).toEqual([{ id: "objective",
+      requirement: `Address this request in the current authorized conversation response. Answer it in your final reply: ${message.body}` }]);
+  });
+
+  it("C3 (answered-a8): a non-conversation (system/automation task) wake ⇒ unchanged, no final-reply wording", async () => {
+    const comment = { id: randomUUID(), body: "Automation: rerun the nightly report." };
+    const criteria = await conversationSelection([comment], false);
+    expect(criteria.map(c => c.id)).toEqual(["objective"]);
+    expect(JSON.stringify(criteria)).not.toContain(FINAL_REPLY);
+    expect(JSON.stringify(criteria)).not.toContain("current authorized conversation response");
+  });
+
   it("keeps recovery out of live preparation before the workspace descriptor exists", async () => {
     const { input, run, issue } = await fixture();
     input.workspace.executionTarget = sandbox;

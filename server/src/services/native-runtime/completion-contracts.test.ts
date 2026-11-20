@@ -56,7 +56,7 @@ describe("buildNativeCompletionContract", () => {
       conversationAgentId: "ceo", conversationUserId: "operator" });
     expect(contract.objective).toMatch(/current conversation response/i);
     expect(contract.criteria).toEqual([{ id: "objective", requirement:
-      `Address this request in the current authorized conversation response: ${description?.trim() || "Respond to the current conversation context."}` }]);
+      `Address this request in the current authorized conversation response. Answer it in your final reply: ${description?.trim() || "Respond to the current conversation context."}` }]);
   });
 
   it("uses the task description as the single initial criterion", () => {

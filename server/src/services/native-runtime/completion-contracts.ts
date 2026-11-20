@@ -87,6 +87,11 @@ export function resolveNativeCompletionPolicy(issue: {
     : { risk: "low", completionAuthority: "agent_claim_policy" } as const;
 }
 
+/** A conversation criterion's lead (answered-a8). Only the final reply is posted, so a pending or
+ * carried person message answered only in working text never reaches the chat; the scope words stay
+ * ("current authorized conversation response" is the objective's and tools' term for this response). */
+export const CONVERSATION_REQUIREMENT_PREFIX = "Address this request in the current authorized conversation response. Answer it in your final reply";
+
 export function buildNativeCompletionContract(
   issue: { title: string; description: string | null } & ConversationIdentity,
   options: {
@@ -107,7 +112,7 @@ export function buildNativeCompletionContract(
   const hasFollowUp = immediateRequests.length > 0 || Boolean(humanResponseId);
   const conversation = isConversation(issue);
   const requirement = (request: string) => conversation
-    ? `Address this request in the current authorized conversation response: ${request}`
+    ? `${CONVERSATION_REQUIREMENT_PREFIX}: ${request}`
     : request;
   // Reference existing context rather than copying the brief/history into every
   // follow-up contract. Keep this guidance stable across comments and resumes.
