@@ -24,6 +24,7 @@ import { forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import { accessService } from "../services/access.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { processHeartbeatFor } from "../services/heartbeat-registry.js";
 import { issueService } from "../services/issues.js";
 import type { IssueAssignmentWakeupDeps } from "../services/issue-assignment-wakeup.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
@@ -112,7 +113,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
   const proposals = createSecretProposalsService(db);
   const access = accessService(db);
   const issues = deps.issues ?? issueService(db);
-  const heartbeat = deps.heartbeat ?? heartbeatService(db);
+  const heartbeat = deps.heartbeat ?? processHeartbeatFor(db) ?? heartbeatService(db);
   const runRedactions = createRunSecretRedactionRegistry(db);
   const defaultProvider = getConfiguredSecretProvider();
 

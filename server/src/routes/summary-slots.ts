@@ -4,6 +4,7 @@ import { generateSummarySlotSchema, writeSummarySlotSchema } from "@paperclipai/
 import { validate } from "../middleware/validate.js";
 import { forbidden, notFound } from "../errors.js";
 import { accessService, heartbeatService, instanceSettingsService, logActivity } from "../services/index.js";
+import { processHeartbeatFor } from "../services/heartbeat-registry.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
 import { summarySlotService } from "../services/summary-slots.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
@@ -28,7 +29,7 @@ export function summarySlotRoutes(db: Db) {
   const access = accessService(db);
   const settings = instanceSettingsService(db);
   const svc = summarySlotService(db);
-  const heartbeat = heartbeatService(db);
+  const heartbeat = processHeartbeatFor(db) ?? heartbeatService(db);
 
   async function assertSummariesEnabled() {
     const experimental = await settings.getExperimental();

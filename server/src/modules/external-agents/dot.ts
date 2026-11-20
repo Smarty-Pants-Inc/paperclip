@@ -7,6 +7,7 @@ import { grokRoutineService, grokWakeAcknowledgementSchema, lockGrokRoutineAccep
 import { authorizeExternalBotBinding, authorizeExternalBotOperator, externalBotEnabled } from "../../services/external-bot-authority.js";
 import { updateAgentConfigurationInTransaction } from "../../services/agent-configuration-transaction.js";
 import type { heartbeatService } from "../../services/heartbeat.js";
+import { processHeartbeatFor } from "../../services/heartbeat-registry.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { and, asc, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -36,7 +37,7 @@ async function admissionHeartbeat(db: Db): Promise<DotHeartbeat> {
   const configured = heartbeatContexts.get(db);
   if (configured) return configured;
   const { heartbeatService } = await import("../../services/heartbeat.js");
-  return heartbeatService(db);
+  return processHeartbeatFor(db) ?? heartbeatService(db);
 }
 export function dotRunnerBroker(db: Db, options?: { heartbeat?: DotHeartbeat }) {
   if (options?.heartbeat) heartbeatContexts.set(db, options.heartbeat);

@@ -14,6 +14,7 @@ import { forbidden, notFound, unprocessable } from "../errors.js";
 import { validate } from "../middleware/validate.js";
 import { authorizationDeniedDetails, issueReadSqlCondition } from "../services/authorization.js";
 import { accessService, heartbeatService, instanceSettingsService, issueService, logActivity, statusCardService } from "../services/index.js";
+import { processHeartbeatFor } from "../services/heartbeat-registry.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "../services/issue-assignment-wakeup.js";
 import { assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 
@@ -29,7 +30,7 @@ export function statusCardRoutes(db: Db, opts: { heartbeat?: IssueAssignmentWake
   const settings = instanceSettingsService(db);
   const service = statusCardService(db);
   const issueSvc = issueService(db);
-  const heartbeat = opts.heartbeat ?? heartbeatService(db);
+  const heartbeat = opts.heartbeat ?? processHeartbeatFor(db) ?? heartbeatService(db);
 
   // People view, restore and refresh a card on the company's Status page. Single-card responses carry that
   // route so an agent can give the person a usable link instead of an API instruction.
