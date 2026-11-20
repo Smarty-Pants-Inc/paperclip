@@ -5,7 +5,8 @@ import { promisify } from "node:util";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { buildRemotePidLockAcquireScript, buildRemotePidLockCleanupScript } from "./remote-pid-lock.js";
 import { githubLauncherSource } from "./github-launcher.js";
 import { ACP_PROCESS_TERMINAL_SIGNALS, type ACP_PROCESS_TERMINAL_SOURCES } from "./acpx-engine/constants.js";
 import type { SshRemoteExecutionSpec } from "./ssh.js";
@@ -1773,20 +1774,64 @@ export async function cleanupGitHubOperationLaunchers(input: GitHubLauncherLocat
   }
 }
 
+const GITHUB_LAUNCHER_PROFILES = [".zshenv", ".zprofile", ".zshrc", ".bash_profile", ".bashrc", ".profile"];
+const GITHUB_LAUNCHER_HASHES_START = "\0PAPERCLIP_GITHUB_LAUNCHER_HASHES_V1\0";
+const GITHUB_LAUNCHER_HASHES_END = "\0PAPERCLIP_GITHUB_LAUNCHER_HASHES_END\0";
+
 async function githubOperationLauncherBasePath(
   target: AdapterCommandCapableExecutionTarget | null,
   env: Record<string, string>,
-): Promise<string> {
-  if (!target) return env.PATH || process.env.PATH || "/usr/bin:/bin";
+  directory: string,
+  staticFiles: Record<string, string>,
+): Promise<{ basePath: string; hashes?: Record<string, string> }> {
+  if (!target) return { basePath: env.PATH || process.env.PATH || "/usr/bin:/bin" };
   const configuredPath = sanitizeRemoteExecutionEnv(env).PATH;
-  if (configuredPath !== undefined) return configuredPath;
+  if (configuredPath !== undefined) return { basePath: configuredPath };
 
   // The provider owns login/profile setup. Query its effective PATH before
   // staging BASH_ENV, rather than substituting the controller's toolchain or
   // a minimal PATH that hides legacy NVM/user-local agent installations.
+  // Read the current files in that same round trip: only after learning PATH
+  // can the controller compute the expected profile hashes. A miss still uses
+  // the existing atomic upload batch; no saved receipt or PATH cache is trusted.
+  const probes = [...Object.keys(staticFiles), ...GITHUB_LAUNCHER_PROFILES].map((name) => {
+    const script = [
+      "set -eu",
+      `remote_path=${shellQuote(path.posix.join(directory, name))}`,
+      `lock_dir=${shellQuote(path.posix.join(directory, `.${name}.lock`))}`,
+      ...buildRemotePidLockAcquireScript('"$lock_dir"', "Timed out acquiring GitHub operation launcher upload lock."),
+      ...buildRemotePidLockCleanupScript('"$lock_dir"', []),
+      'current_sha=""',
+      'if [ -f "$remote_path" ]; then',
+      '  if command -v sha256sum >/dev/null 2>&1; then',
+      '    current_sha="$(sha256sum "$remote_path" | awk \'{print $1}\')" || current_sha=""',
+      '  elif command -v shasum >/dev/null 2>&1; then',
+      '    current_sha="$(shasum -a 256 "$remote_path" | awk \'{print $1}\')" || current_sha=""',
+      "  fi",
+      "fi",
+      // As in the upload's hash-skip branch, repair executable permissions only
+      // for a matching wrapper, under its PID lock. Never chmod a stale body.
+      ...((name === "git" || name === "gh") ? [
+        `if [ "$current_sha" = ${shellQuote(createHash("sha256").update(staticFiles[name]!).digest("hex"))} ]; then`,
+        '  chmod 700 "$remote_path"',
+        "fi",
+      ] : []),
+      `printf '%s\\000%s\\000' ${shellQuote(name)} "$current_sha"`,
+    ].join("\n");
+    return `sh -c ${shellQuote(script)}`;
+  });
   const result = await adapterExecutionTargetCommandRunner(target).execute({
     command: "sh",
-    args: ["-c", "printf '\\000%s\\000' \"$PATH\""],
+    args: ["-c", [
+      "set -eu",
+      "printf '\\000%s\\000' \"$PATH\"",
+      '[ -n "$PATH" ]',
+      `if [ -d ${shellQuote(path.posix.join(directory, "gh-config"))} ]; then`,
+      "  printf '\\000PAPERCLIP_GITHUB_LAUNCHER_HASHES_V1\\000'",
+      ...probes,
+      "  printf '\\000PAPERCLIP_GITHUB_LAUNCHER_HASHES_END\\000'",
+      "fi",
+    ].join("\n")],
     cwd: target.remoteCwd,
     timeoutMs: 15_000,
   });
@@ -1795,7 +1840,13 @@ async function githubOperationLauncherBasePath(
   if (result.timedOut || result.exitCode !== 0 || !remotePath) {
     throw new Error("Could not resolve remote PATH for managed GitHub launchers");
   }
-  return remotePath;
+  const payload = result.stdout.split(GITHUB_LAUNCHER_HASHES_START)[1]?.split(GITHUB_LAUNCHER_HASHES_END);
+  const hashes: Record<string, string> = {};
+  if (payload?.length === 2) {
+    const records = payload[0]!.split("\0");
+    for (let i = 0; i + 1 < records.length; i += 2) hashes[records[i]!] = records[i + 1]!;
+  }
+  return { basePath: remotePath, hashes };
 }
 
 export const EXECUTION_TARGET_GIT_CONTEXT_UNAVAILABLE_CODE = "execution_target_git_context_unavailable";
@@ -1967,7 +2018,8 @@ export async function prepareGitHubOperationLaunchers(input: {
   const remote = input.target?.kind === "remote" ? input.target : null;
   const directory = githubOperationLauncherDirectory(input);
   const configDirectory = path.posix.join(directory, "gh-config");
-  const basePath = await githubOperationLauncherBasePath(remote, input.env);
+  const staticFiles = { "package.json": '{"type":"commonjs"}\n', git: githubLauncherSource(), gh: githubLauncherSource() };
+  const { basePath, hashes } = await githubOperationLauncherBasePath(remote, input.env, directory, staticFiles);
   const managedPath = basePath ? `${directory}:${basePath}` : directory;
   // Login shells may reorder PATH through /etc/profile or path_helper. Restore
   // the managed launchers after startup without loading a host user's profile.
@@ -1978,14 +2030,14 @@ export async function prepareGitHubOperationLaunchers(input: {
     .map((key) => `if [ -z "\${${key}-}" ]; then unset ${key}; fi\n`)
     .join("");
   const profile = `export PATH=${shellQuote(managedPath)}\n${clearEmptyGitIdentity}`;
-  const files: Record<string, string> = Object.fromEntries([
-    // Remote launchers live beneath the checkout. Pin their own package scope
-    // so an enclosing project's "type": "module" cannot reinterpret require().
-    ["package.json", '{"type":"commonjs"}\n'],
-    ...["git", "gh"].map((name) => [name, githubLauncherSource()] as const),
-    ...[".zshenv", ".zprofile", ".zshrc", ".bash_profile", ".bashrc", ".profile"].map((name) => [name, profile] as const),
-  ]);
-  if (remote) {
+  // Pin remote launchers' package scope so an enclosing project's "type":
+  // "module" cannot reinterpret require().
+  const files: Record<string, string> = { ...staticFiles,
+    ...Object.fromEntries(GITHUB_LAUNCHER_PROFILES.map((name) => [name, profile])),
+  };
+  const current = hashes && Object.entries(files).every(([name, body]) =>
+    hashes[name] === createHash("sha256").update(body).digest("hex"));
+  if (remote && !current) {
     const runner = adapterExecutionTargetCommandRunner(remote);
     await syncRemoteTextFilesWithHashSkip({
       runner, remoteCwd: remote.remoteCwd,
@@ -1998,7 +2050,7 @@ export async function prepareGitHubOperationLaunchers(input: {
       ensureDirectories: [configDirectory], action: "stage GitHub operation launchers",
       timeoutMs: 15_000, shellCommand: adapterExecutionTargetShellCommand(remote),
     });
-  } else {
+  } else if (!remote) {
     await fs.mkdir(directory, { recursive: true, mode: 0o700 });
     await fs.mkdir(configDirectory, { recursive: true, mode: 0o700 });
     for (const [program, body] of Object.entries(files)) await fs.writeFile(path.join(directory, program), body, { mode: 0o700 });
