@@ -130,7 +130,7 @@ describe.skipIf(!support.supported)("recovery cleanup recorded stopped sandbox",
     });
 
   it.each([[true, false, "receipt only"], [false, true, "snapshot only"], [false, false, "neither"]] as const)(
-    "holds the gate row with %s receipt / %s snapshot (%s)", async (receipt, snapshot) => {
+    "holds the gate row with %s receipt / %s snapshot (%s)", async (receipt, snapshot, _label) => {
       const f = await seed(receipt, snapshot);
       await f.heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
       expect(f.call).not.toHaveBeenCalled();
