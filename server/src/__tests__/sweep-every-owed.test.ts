@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
@@ -12,6 +12,7 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { answeredPersonMessageIds } from "../services/person-message-answer.js";
+import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import { taskInterruptionPresentation } from "../services/task-interruption-presentation.js";
 import {
   settleUnansweredPersonMessages, UNANSWERED_CARRIED_STEER_FAILED_TEXT, UNANSWERED_MESSAGE_NO_RUN_TEXT,
@@ -193,9 +194,21 @@ describe.skipIf(!support.supported)("the sweep cards every owed person message, 
       error: "adapter_failed: the provider exited", errorCode: "adapter_failed",
       responsibleUserId: userId, nativeIssueId: f.issueId, issueId: f.issueId,
       contextSnapshot: { issueId: f.issueId, wakeCommentId: m, commentId: m, wakeCommentIds: [m], responsibleUserId: userId } });
+    // noteslive: each card the sweep writes (cut A's carried-steer one included) is announced to an open chat.
+    const told: string[] = [];
+    const stop = subscribeCompanyLiveEvents(f.companyId, event => {
+      const details = event.payload.details as Record<string, unknown> | undefined;
+      if (event.type === "activity.logged" && event.payload.action === "issue.comment_added"
+        && details?.source === "recovery.unanswered_message") told.push(String(details.commentId));
+    });
     const swept = await sweep(f);
+    stop();
     const cards = await allCards(f);
     await evidence("rowBprime", { m0, m, m2: f.m2, swept, cards });
+    const toldReasons = told.length === 0 ? [] : (await db.select({ metadata: issueComments.metadata }).from(issueComments)
+      .where(inArray(issueComments.id, told))).map(row => String((row.metadata as any)?.authorizationReason));
+    expect(toldReasons.sort(), "each new card is announced once").toEqual(
+      [m, m0].map(id => `${UNANSWERED_MESSAGE_REASON_PREFIX}${id}`).sort());
     const forM = cards.filter(c => c.message === m), forM0 = cards.filter(c => c.message === m0);
     expect(forM, `exactly one card for m: ${JSON.stringify({ swept, cards })}`).toHaveLength(1);
     expect(forM[0]!.body, "m's card is cut A's carried-steer notice").toBe(UNANSWERED_CARRIED_STEER_FAILED_TEXT);
