@@ -71,6 +71,7 @@ import { issueRoutes } from "../../routes/issues.js";
 import { activityRoutes } from "../../routes/activity.js";
 import { issueTreeControlRoutes } from "../../routes/issue-tree-control.js";
 import { settleUnansweredPersonMessagesForTask } from "../recovery/unanswered-person-message.js";
+import { answeredPersonMessageIds } from "../person-message-answer.js";
 import { errorHandler } from "../../middleware/index.js";
 import { materializeIsolatedTaskDirectory } from "../isolated-task-directory.js";
 import { NativeRunCoordinatorStore } from "./native-run-coordinator-store.js";
@@ -205,12 +206,15 @@ describe.skipIf(!support.supported)("a parked person's message after R ends by a
     const stallReached = new Promise<void>(resolve => { reached = resolve; });
     const stallRelease = new Promise<void>(resolve => { release = resolve; });
     let turns = 0;
-    const turnGate = { hold: null as null | Promise<void>, entered: null as null | (() => void) };
+    const turnGate = { hold: null as null | Promise<void>, entered: null as null | (() => void), answer: null as string | null };
     const faultedBox = { index: -1 };
     box.session = async input => {
       const turn = ++turns;
       // P's turn: the default scripted answer. TURN-GATE (named): the control row holds P's provider turn open.
-      if (turn > 2) { if (turn === 3 && turnGate.hold) { turnGate.entered?.(); await turnGate.hold; } return null; }
+      if (turn > 2) {
+        if (turn === 3 && turnGate.hold) { turnGate.entered?.(); await turnGate.hold; }
+        if (!turnGate.answer) return null;
+      }
       const execution = input.execution, runId: string = execution.binding.runId;
       const sessionId: string = execution.session.normalizedSessionId ?? `session-${runId}`;
       const runnerId = input.runnerInstanceId, controlPlaneId = `${runnerId}:control`;
@@ -233,13 +237,14 @@ describe.skipIf(!support.supported)("a parked person's message after R ends by a
         runId, normalizedSessionId: sessionId, turnId: "answer-turn", sourceInstanceId: controlPlaneId, sourceEventId: `${controlPlaneId}:${runId}:${sourceSeq}`,
         sourceSeq, sourceKind: "control_plane", eventType, priority: 0, emittedAt: new Date().toISOString(), payload } as PrpEvent);
       await port.openRun({ identity: { companyId, issueId, runId, agentId, sessionId }, backendKind: "runner", sourceInstanceId: runnerId });
-      const answer = turn === 1 ? "Done. I wrote the report." : ANSWER;
+      const answer = turn > 2 ? turnGate.answer! : turn === 1 ? "Done. I wrote the report." : ANSWER;
       await port.appendEvent(event("item.delta", { kind: "agentMessage", channel: "final", text: answer }));
       await port.appendEvent(event("item.completed", { kind: "agentMessage", channel: "final", providerPhase: "final", text: answer }));
       await port.appendEvent(control(1, "run.result.accepted", { result: RESULT }));
       await port.appendEvent(control(2, "run.terminal", TERMINAL));
       await port.completeRun({ result: RESULT, terminal: TERMINAL, turnId: "answer-turn",
         callerResultId: `${runnerId}:${runId}:result`, callerDedupeKey: `${runId}:${execution.completionContract.sha256}` });
+      if (turn > 2) return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: answer };
       // This run's own box: the directory behind the lease the real acquisition gave it.
       const runLeases = (await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, runId))).map(lease => lease.id);
       const boxIndex = boxes.findIndex(entry => entry.leaseIds.some(leaseId => runLeases.includes(leaseId)));
@@ -624,6 +629,70 @@ describe.skipIf(!support.supported)("a parked person's message after R ends by a
         afterDelete: { reason: OWN_STOP_REASON, message: OWN_STOP_LINE.one }, afterNewMessage: null });
       evidence.STOPWORDS = { said, panel, other: theirs.executionWait, afterDelete: { executionWait: afterDelete.executionWait, entries: ids(afterDelete) },
         laterRuns: later.map(brief) };
+    } finally { await h.stop(); }
+  }, 300_000);
+
+  // RFL 00:05Z: prove the no-Send line's promise at the same real boundary, without deleting the held message.
+  // REAL: comment POSTs, Stop route, queue/runs/thread GETs, real executor and the ONE answered-person-message reader.
+  // SCRIPTED: provider reply, accepted and published through PaperclipControlPlanePort. PLANTED: nothing.
+  it("STOP-WORDS NEW-MESSAGE: no-Send own-Stop hold -> a new person message carries the held message; one real GET run names both, one reply answers both by the shared answered function, no second run", async () => {
+    const h = await hungRWithParkedMessage(NO_CAP);
+    try {
+      const stopped = await request(h.s.app).post(`/api/heartbeat-runs/${h.r.id}/cancel`).send({ cancellationRequestId: randomUUID() });
+      expect(stopped.status, JSON.stringify(stopped.body)).toBe(200);
+      expect((await h.admitParked(5_000)).runs).toEqual([]);
+      h.s.releaseStall();
+      await h.heartbeat.drainActiveRunExecutions();
+      await h.sweep(h.r.id);
+      await h.present();
+      const queue = async () => (await request(h.s.app).get(`/api/issues/${h.s.issueId}/queued-comments`).expect(200)).body;
+      const runGet = async () => (await request(h.s.app).get(`/api/issues/${h.s.issueId}/runs`).expect(200)).body as Array<{
+        runId: string; status: string; wakeCommentIds: string[] | null; firstTurnCommentIds: string[] | null;
+      }>;
+      const held = await queue();
+      expect(held.executionWait).toEqual({ reason: OWN_STOP_REASON, message: OWN_STOP_LINE.one });
+      expect(held.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual([h.next]);
+      const answered = (commentIds: string[]) => answeredPersonMessageIds(db, { companyId: h.s.companyId, issueId: h.s.issueId, commentIds });
+      expect([...await answered([h.next])]).toEqual([]);
+      const initialRuns = await runGet(), turnsBefore = box.inputs.length;
+      const reply = "Done. I added the summary section and the short changelog.";
+      h.s.turnGate.answer = reply;
+      const again = await h.s.say("And add a short changelog.");
+      const both = [h.next, again];
+      for (const startAt = Date.now(); Date.now() - startAt < 30_000 && box.inputs.length === turnsBefore;) {
+        await h.heartbeat.resumeQueuedRuns(); await sleep(250);
+      }
+      await h.heartbeat.drainActiveRunExecutions();
+      await h.present();
+      const after = await runGet(), oldIds = new Set(initialRuns.map(run => run.runId));
+      const started = after.filter(run => !oldIds.has(run.runId));
+      expect(started.map(run => run.status), JSON.stringify(after)).toEqual(["succeeded"]);
+      expect(started[0].wakeCommentIds).toEqual(expect.arrayContaining(both));
+      expect(box.inputs.length - turnsBefore).toBe(1);
+      const input = JSON.stringify(box.inputs.at(-1));
+      for (const id of both) expect(input).toContain(id);
+      expect(input).toContain("Also add a summary section to the report.");
+      expect(input).toContain("And add a short changelog.");
+      const replies = (await h.thread()).filter(comment => comment.authorType === "agent" && comment.createdByRunId === started[0].runId);
+      expect(replies.map(comment => comment.body)).toEqual([reply]);
+      expect([...await answered(both)].sort()).toEqual([...both].sort());
+      expect((await queue()).entries).toEqual([]);
+      // Repeated real admission and presentation, plus the real unanswered sweep: no repeat run, reply or card.
+      for (let pass = 0; pass < 6; pass += 1) { await h.heartbeat.resumeQueuedRuns(); await sleep(250); }
+      await h.heartbeat.drainActiveRunExecutions();
+      await h.present();
+      await h.sweepUnanswered(new Date(Date.now() + 10 * 60_000));
+      await h.sweepUnanswered(new Date(Date.now() + 20 * 60_000));
+      const finalRuns = await runGet(), thread = await h.thread();
+      expect(finalRuns.map(run => run.runId).sort()).toEqual(after.map(run => run.runId).sort());
+      expect(box.inputs.length - turnsBefore).toBe(1);
+      expect(thread.filter(comment => comment.authorType === "agent" && comment.createdByRunId === started[0].runId)).toEqual(replies);
+      expect(thread.filter(comment => comment.authorType === "system" && /your message/i.test(comment.body))).toEqual([]);
+      expect([...await answered(both)].sort()).toEqual([...both].sort());
+      expect(h.errors).toEqual([]);
+      evidence.STOPWORDS_NEW_MESSAGE = { held, messageIds: both, runs: finalRuns, replies, answered: [...await answered(both)],
+        providerTurns: box.inputs.length - turnsBefore, queueAfter: await queue() };
+      process.stdout.write(`STOPWORDS-NEW-MESSAGE ${JSON.stringify(evidence.STOPWORDS_NEW_MESSAGE)}\n`);
     } finally { await h.stop(); }
   }, 300_000);
 
