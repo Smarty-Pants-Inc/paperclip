@@ -22,15 +22,6 @@ export type PersonCommentSteeringOptions = {
 };
 
 export type PersonCommentFallbackTrace = { reason: string; runId: string | null };
-/** Logging only: the durable receipt a steer->queue fallback admitted (its id, never content). Never throws. */
-async function fallbackQueuedWakeId(db: Db, companyId: string, agentId: string, commentId: string): Promise<string | null> {
-  try {
-    const rows = await db.execute(sql`select id from agent_wakeup_requests where company_id = ${companyId}::uuid
-      and agent_id = ${agentId}::uuid and idempotency_key = ${`conversation-comment:${commentId}`} order by created_at desc limit 1`);
-    const id = (rows as unknown as Array<{ id?: unknown }>)[0]?.id;
-    return typeof id === "string" ? id : null;
-  } catch { return null; }
-}
 export function logPersonCommentFallback(comment: Pick<SteerablePersonComment, "id" | "issueId">,
   trace: PersonCommentFallbackTrace, wakeId: string | null = null, wakeStatus = "unknown") {
   logger.info({ commentId: comment.id, issueId: comment.issueId, runId: trace.runId,
@@ -240,7 +231,7 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
         });
       });
       logPersonCommentFallback(comment, { runId: run.id, reason: steeringUnavailableReason },
-        queued ? await fallbackQueuedWakeId(db, issue.companyId, agentId, comment.id) : null, queued ? "queued" : "not_admitted");
+        null, queued ? "queued" : "not_admitted"); // strict logging: no extra query (rf-2 / rf-3)
       if (queued) {
         // Reannounce this saved comment through the thread's existing keyed
         // comment hydration channel, AFTER ordinary admission and cleanup commit.
