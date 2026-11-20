@@ -454,7 +454,12 @@ async function owedOlderMessageIds(db: Db, issue: DecisionIssue, newestId: strin
         or r.context_snapshot->>'conversationReplyBoundaryCommentId' = ${issueComments.id}::text
         or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? ${issueComments.id}::text
         or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${issueComments.id}::text)
-      and not ${failedCarrierRunSql("r", { id: sql`${issueComments.id}` })})`,
+      and not ${failedCarrierRunSql("r", { id: sql`${issueComments.id}` })}
+      -- JDB4: a carrier that STOPPED (interrupted / timed out) without a reply of its own left the older message
+      -- just as owed as a failed one; the newest message of that same run already gets its card for it.
+      and not (r.status in ('interrupted', 'timed_out') and not exists (select 1 from ${issueComments} sr
+        where sr.company_id = r.company_id and sr.created_by_run_id = r.id and sr.author_type = 'agent'
+          and sr.deleted_at is null)))`,
     // SUPERSEDE-LOSTDOUBLE-PER-BATCH-TO-PER-MESSAGE-1119 (RFL): no 'covering' rule. A failed run that carried
     // M1 AND M2 leaves TWO owed messages and so TWO cards, each naming its own message, retiring on its own.
     eq(issueComments.authorType, "user")))
