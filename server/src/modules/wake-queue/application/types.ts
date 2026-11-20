@@ -80,8 +80,18 @@ export type IssueReopenedEffect = {
   reopenedFrom: string;
 };
 
+/** A 'wasn't answered' note the unanswered-message writer saved inside the release transaction (a cancelled
+ * user-held wake settles its messages there); it is announced to an open chat only after that commit. */
+export type UnansweredNoteSavedEffect = {
+  kind: "unanswered_note_saved";
+  companyId: string;
+  issueId: string;
+  commentId: string;
+  change: "added" | "rewritten" | "retired";
+};
+
 /** Explicit post-commit work a caller applies only after the release transaction commits. */
-export type PostCommitEffect = RunQueuedEffect | IssueReopenedEffect | {
+export type PostCommitEffect = RunQueuedEffect | IssueReopenedEffect | UnansweredNoteSavedEffect | {
   kind: "conversation_retry_requested";
   companyId: string;
   runId: string;

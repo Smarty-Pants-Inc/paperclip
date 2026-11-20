@@ -24,6 +24,11 @@ import {
 } from "@paperclipai/db";
 import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
 import { subscribeCompanyLiveEvents } from "../live-events.js";
+import express from "express";
+import request from "supertest";
+import { issueRoutes } from "../../routes/issues.js";
+import { errorHandler } from "../../middleware/index.js";
+import { createPostgresWakeQueueAdapter } from "../../modules/wake-queue/adapters/postgres.js";
 import { and, eq, gt, isNull, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -39,7 +44,8 @@ import { REMOTE_RUNNER_SUPERVISION_EXHAUSTED, REMOTE_RUNNER_SUPERVISION_EXHAUSTE
 import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
 import { HELD_PREDECESSOR_NOTICE as HELD, noticeHeldUnfinishedPredecessor } from "../native-runtime/native-session-executor.js";
 import { buildNoRunningExecutionNoticeSeed, buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
-import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
+import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition, publishUnansweredNoteAnnouncement,
+  type UnansweredNoteAnnouncement,
   UNANSWERED_MESSAGE_TEXT as NOT_ANSWERED, UNANSWERED_MESSAGE_NO_RUN_TEXT as NO_RUN,
   UNANSWERED_MESSAGE_NO_REPLY_TEXT as NO_REPLY, UNANSWERED_MESSAGE_WAITING_TEXT as WAITING,
   PENDING_WAIT_ACTION, PENDING_WAIT_BOUND_MS, PENDING_WAIT_START_BOUND_MS,
@@ -1899,6 +1905,99 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(told).toEqual([tell(waiting!.id, "added"), tell(waiting!.id, "rewritten"), tell(waiting!.id, "retired")]);
     } finally {
       stop();
+    }
+  });
+
+  // Keep: noteslive2 RED (rf-6 NL-01 on cbfadfbc): the wake queue's cancel path settles a user-held wake's
+  // messages INSIDE its release transaction; the note's event fired there, before the commit (comment GET 404 at
+  // the event; a rollback still told the chat about a note that never existed). The real adapter now returns the
+  // note as a post-commit effect, published (heartbeat applyWakeQueuePostCommitEffects) only after the commit.
+  async function heldWakeFixture() {
+    const f = await fixture();
+    const messageId = await f.message("Please check my saved request.");
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "succeeded",
+      runtimeMode: "native", nativeIssueId: f.issueId, contextSnapshot: { issueId: f.issueId }, finishedAt: f.at() }).returning();
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "on_demand",
+      reason: "issue_commented", status: "deferred_issue_execution", requestedByActorType: "user", requestedByActorId: f.userId,
+      payload: { issueId: f.issueId, _paperclipWakeContext: { wakeReason: "issue_commented", wakeCommentIds: [messageId] } } }).returning();
+    const adapter = createPostgresWakeQueueAdapter(db, { resolveResponsibleUserId: async () => f.userId,
+      getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }), resolveSessionBeforeForWakeup: async () => null });
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => { (req as unknown as { actor: unknown }).actor = { type: "board", source: "local_implicit",
+      userId: f.userId, isInstanceAdmin: true, companyIds: [f.companyId] }; next(); });
+    app.use("/api", issueRoutes(db, {} as never, {}));
+    app.use(errorHandler);
+    // Each event's note is read through the real comment API the moment the event fires (a separate connection).
+    const told: Array<{ commentId: string; change: unknown; source: unknown }> = [];
+    const readAtEvent: Array<Promise<number>> = [];
+    const stop = subscribeCompanyLiveEvents(f.companyId, event => {
+      if (event.type !== "activity.logged" || event.payload.action !== "issue.comment_added") return;
+      const details = event.payload.details as Record<string, unknown>;
+      told.push({ commentId: String(details.commentId), change: details.change, source: details.source });
+      readAtEvent.push(request(app).get(`/api/issues/${f.issueId}/comments/${details.commentId}`).then(res => res.status));
+    });
+    const cancel = (ports: { transaction: { cancelDeferredWake: (input: { companyId: string; wakeId: string; agentId: string;
+      reason: string; now: Date }) => Promise<boolean> } }) => ports.transaction.cancelDeferredWake({ companyId: f.companyId,
+      wakeId: wake!.id, agentId: f.agentId, reason: "The conversation moved on", now: new Date() });
+    return { ...f, messageId, runId: run!.id, wakeId: wake!.id, adapter, told, readAtEvent, stop, cancel };
+  }
+
+  it("noteslive2: the wake queue's cancel path announces its note once, only after its transaction commits (GET 200 at the event)", async () => {
+    const f = await heldWakeFixture();
+    try {
+      const result = await f.adapter.withIssueExecutionLock({ companyId: f.companyId, runId: f.runId, now: new Date() },
+        async (_locked, ports) => {
+          expect(await f.cancel(ports)).toBe(true);
+          // Hold the transaction open until any read started by an event has its answer.
+          expect({ told: f.told, commentGetAtEvent: await Promise.all(f.readAtEvent) },
+            "no event while the release transaction is open").toEqual({ told: [], commentGetAtEvent: [] });
+          return { outcome: { kind: "released" as const }, postCommitEffects: [] };
+        });
+      const [note] = await f.visible();
+      expect(note!.body).toContain(NO_RUN);
+      const announced = result.postCommitEffects.filter(effect => effect.kind === "unanswered_note_saved");
+      expect(announced).toEqual([{ kind: "unanswered_note_saved", companyId: f.companyId, issueId: f.issueId,
+        commentId: note!.id, change: "added" }]);
+      // The caller's post-commit step (heartbeat applyWakeQueuePostCommitEffects) publishes it.
+      for (const effect of announced) publishUnansweredNoteAnnouncement(effect);
+      expect(f.told).toEqual([{ commentId: note!.id, change: "added", source: "recovery.unanswered_message" }]);
+      expect(await Promise.all(f.readAtEvent), "the note is readable when its one event fires").toEqual([200]);
+    } finally {
+      f.stop();
+    }
+  });
+
+  it("noteslive2: a rolled-back wake-queue cancellation sends no event and leaves no note", async () => {
+    const f = await heldWakeFixture();
+    try {
+      await expect(f.adapter.withIssueExecutionLock({ companyId: f.companyId, runId: f.runId, now: new Date() },
+        async (_locked, ports) => {
+          expect(await f.cancel(ports)).toBe(true);
+          throw new Error("release rolled back");
+        })).rejects.toThrow("release rolled back");
+      expect(f.told).toEqual([]);
+      expect(await f.visible()).toHaveLength(0);
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+      expect(wake!.status).toBe("deferred_issue_execution");
+      // Any caller's transaction: the writer collects and never publishes; one that does not collect is refused
+      // before it writes (no event can precede that commit).
+      const collected: UnansweredNoteAnnouncement[] = [];
+      const cancelWake = (tx: unknown) => (tx as typeof db).update(agentWakeupRequests).set({ status: "cancelled" })
+        .where(eq(agentWakeupRequests.id, f.wakeId));
+      await expect(db.transaction(async tx => {
+        await cancelWake(tx);
+        expect(await settleUnansweredPersonMessage(tx as never, { companyId: f.companyId, issueId: f.issueId,
+          settleMessageId: f.messageId, announcements: collected })).toMatchObject({ kind: "noticed" });
+        throw new Error("caller rolled back");
+      })).rejects.toThrow("caller rolled back");
+      expect(collected).toHaveLength(1);
+      await expect(db.transaction(async tx => { await cancelWake(tx); return settleUnansweredPersonMessage(tx as never, {
+        companyId: f.companyId, issueId: f.issueId, settleMessageId: f.messageId }); })).rejects.toThrow("needs input.announcements");
+      expect(f.told).toEqual([]);
+      expect(await f.visible()).toHaveLength(0);
+    } finally {
+      f.stop();
     }
   });
 
