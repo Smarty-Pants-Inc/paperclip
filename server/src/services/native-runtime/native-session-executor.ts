@@ -913,6 +913,8 @@ function isSuspendedRemoteCheckpointRefusal(error: unknown): boolean {
 
 async function closeWarmNativeSession(entry: WarmNativeSession, reason: string, options?: {
   preserveInstructionsForRunId?: string;
+  /** Identity-only replacement still needs this run's adopted working copy. */
+  preserveInstructionWorkingCopyForRunId?: string;
   discardUnsettledSession?: boolean;
   /** Retirement by a successor: a checkpoint the fence refused as superseded
    * is discarded like an unsettled session, under the same stop proofs. */
@@ -979,7 +981,8 @@ async function closeWarmNativeSession(entry: WarmNativeSession, reason: string, 
         throw error;
       }
     }
-    await entry.instructionWorkingCopy?.collectStopped();
+    if (options?.preserveInstructionWorkingCopyForRunId === undefined ||
+        entry.instructionWorkingCopy?.runId !== options.preserveInstructionWorkingCopyForRunId) await entry.instructionWorkingCopy?.collectStopped();
     if (entry.instructionCopy?.runId !== options?.preserveInstructionsForRunId) await entry.instructionCopy?.collectStopped();
   }
   finally { await stopping; }
@@ -13442,8 +13445,7 @@ async function executePaperclipNativeSessionAttempt(
       // keep the predecessor registered and prevent any replacement dispatch.
       const unverifiedRunner = input.useRunnerd && resumedSandboxRunner(input.runnerExecutionTarget)
         && await resumedSandboxRunnerNeedsProbe(input);
-      if (
-        unverifiedRunner ||
+      const incompatibleWarmSession =
         ((entry.pluginTaskId ?? entry.sandboxProviderLeaseId) !== undefined && (input.runnerExecutionTarget?.kind !== "remote" || input.runnerExecutionTarget.transport !== "sandbox" ||
           (entry.pluginTaskId ?? entry.sandboxProviderLeaseId) !== input.runnerExecutionTarget.sandboxLeaseAcquisition?.providerLeaseId)) ||
         entry.closeOnReleaseReason !== undefined ||
@@ -13454,8 +13456,8 @@ async function executePaperclipNativeSessionAttempt(
           && Object.keys(pluginTaskConfiguredEnvironment(input.runnerEnvironment)).length > 0) ||
         Boolean(entry.githubAccess) !== needsCoreGitHubAccess(input) ||
         entry.githubAccess?.ready === false ||
-        (entry.githubAccess !== undefined && entry.githubAccess.duplexRequested !== adapterExecutionTargetEnablesSandboxDuplexBridge(input.runnerExecutionTarget))
-      ) {
+        (entry.githubAccess !== undefined && entry.githubAccess.duplexRequested !== adapterExecutionTargetEnablesSandboxDuplexBridge(input.runnerExecutionTarget));
+      if (unverifiedRunner || incompatibleWarmSession) {
         await finishStartupContextForFallback();
         pluginTaskDescription=undefined;
         const preparedCopy = entry.instructionPreparationRunId === input.execution.binding.runId;
@@ -13472,7 +13474,11 @@ async function executePaperclipNativeSessionAttempt(
             throw new NativePredecessorRetirementUnprovenError(entry.runId, entry.providerLeaseId ?? null,
               new Error("retained Runner stop unconfirmed after controller detach"));
           }
-          await retireWarmPredecessor(entry, entry.closeOnReleaseReason, { preserveInstructionsForRunId: input.execution.binding.runId });
+          await retireWarmPredecessor(entry, entry.closeOnReleaseReason, {
+            preserveInstructionsForRunId: input.execution.binding.runId,
+            ...(!incompatibleWarmSession && unverifiedRunner
+              ? { preserveInstructionWorkingCopyForRunId: input.execution.binding.runId } : {}),
+          });
           forgetWarmNativeSession(warmSessionId, entry);
         } catch (error) {
           // This late preparation step is outside the earlier task-prepare
@@ -13484,7 +13490,7 @@ async function executePaperclipNativeSessionAttempt(
           }
           throw error;
         } finally { entry.busy = false; }
-        if (preparedCopy && !unverifiedRunner) throw new Error("native_instruction_preparation_configuration_changed");
+        if (preparedCopy && incompatibleWarmSession) throw new Error("native_instruction_preparation_configuration_changed");
         if (input.useRunnerd && input.runnerExecutionTarget?.kind === "remote") {
           await refreshRetiredWarmOwnerProjection(controllerProjectionInput(input, { runId: entry.runId, issueId: entry.issueId }));
         }
