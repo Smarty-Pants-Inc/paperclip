@@ -24,6 +24,7 @@ import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
 import type { NativeHarnessBackupExpirationScope } from "../native-harness-backup-expiration-notifications.js";
 import { deleteRetiredNativeHarnessBackup, durableNativeHarnessStorage, nativeHarnessBackupIsExpirable } from "./native-harness-backup-storage.js";
 import { retireObsoleteNativeHarnessBackup } from "./native-harness-backup-retention.js";
+import { resumableNativeHarnessBackupRow } from "./native-harness-backup-kind.js";
 import type { StorageService } from "../../storage/types.js";
 import { releaseExpiredNativeProviderArtifactRun } from "./native-provider-artifacts.js";
 import { retainNativePiConversationEvidence } from "./native-pi-conversation-evidence.js";
@@ -355,7 +356,7 @@ export function nativeHarnessBackupExpirationService(
       companyId: nativeHarnessBackups.companyId, runId: nativeHarnessBackups.runId, survivingRunId: heartbeatRuns.id,
       sessionId: heartbeatRuns.nativeSessionId, status: nativeHarnessBackups.status, reference: nativeHarnessBackups.reference })
       .from(nativeHarnessBackups).leftJoin(heartbeatRuns, eq(heartbeatRuns.id, nativeHarnessBackups.runId))
-      .where(and(durableBackupCursor ? gt(nativeHarnessBackups.id, durableBackupCursor) : undefined,
+      .where(and(resumableNativeHarnessBackupRow, durableBackupCursor ? gt(nativeHarnessBackups.id, durableBackupCursor) : undefined,
         or(eq(nativeHarnessBackups.status, "retired"), lt(nativeHarnessBackups.createdAt, options.closedBefore))))
       .orderBy(asc(nativeHarnessBackups.id)).limit(options.maxEntries + 1);
     let processed = 0;
@@ -390,7 +391,7 @@ export function nativeHarnessBackupExpirationService(
           if ("reason" in blocker) return false;
           const [recent] = await tx.select({ id: nativeHarnessBackups.id }).from(nativeHarnessBackups).where(and(
             eq(nativeHarnessBackups.companyId, blocker.companyId), eq(nativeHarnessBackups.scopeDigest, candidate.scopeDigest),
-            gte(nativeHarnessBackups.createdAt, options.closedBefore))).limit(1);
+            gte(nativeHarnessBackups.createdAt, options.closedBefore), resumableNativeHarnessBackupRow)).limit(1);
           if (recent) return false;
           result.candidates++;
           if (options.dryRun) return false;
@@ -403,7 +404,7 @@ export function nativeHarnessBackupExpirationService(
               sql`${agentTaskSessions.sessionParamsJson}->>'sessionId' = ${candidate.sessionId}`))).returning({ id: agentTaskSessions.id });
           result.clearedTaskSessions += cleared.length;
           await tx.update(nativeHarnessBackups).set({ status: "retired", updatedAt: new Date() }).where(and(
-            eq(nativeHarnessBackups.companyId, blocker.companyId), eq(nativeHarnessBackups.scopeDigest, candidate.scopeDigest)));
+            eq(nativeHarnessBackups.companyId, blocker.companyId), eq(nativeHarnessBackups.scopeDigest, candidate.scopeDigest), resumableNativeHarnessBackupRow));
           return true;
         });
         if (retired && !options.dryRun && await deleteRetiredNativeHarnessBackup(db, storage, candidate.id, AbortSignal.timeout(60_000))) result.expired++;

@@ -12,6 +12,8 @@ import { NativeHarnessBackupSourceError, readNativeHarnessBackupSource } from ".
 import { settledNativeHarnessBackupOwner } from "./native-harness-preservation-source.js";
 import { hasValidNativeHarnessFilesystemIndependence } from "./native-harness-filesystem-independence.js";
 
+import { resumableNativeHarnessBackupRow } from "./native-harness-backup-kind.js";
+
 const MAX_PARALLEL_INDEPENDENCE_CHECKS = 4;
 
 export async function hasLocalNativeHarnessObligations(db: Db): Promise<boolean> {
@@ -29,8 +31,9 @@ export async function hasLocalNativeHarnessObligations(db: Db): Promise<boolean>
     join environment_leases e on e.company_id = s.company_id and e.issue_id = s.native_issue_id
       and e.metadata->'nativeHarnessBackup'->>'normalizedSessionId' = s.native_session_id::text
     where e.metadata->'nativeHarnessBackup'->>'schema' = 'paperclip.native-harness-backup-stamp.v2'
-      and not exists (select 1 from native_harness_backups b where b.company_id = s.company_id
-        and b.scope_digest = e.metadata->'nativeHarnessBackup'->>'sessionScopeSha256' and b.status = 'current')
+      and not exists (select 1 from ${nativeHarnessBackups} where ${nativeHarnessBackups.companyId} = s.company_id
+        and ${nativeHarnessBackups.scopeDigest} = e.metadata->'nativeHarnessBackup'->>'sessionScopeSha256'
+        and ${nativeHarnessBackups.status} = 'current' and ${resumableNativeHarnessBackupRow})
       and (s.id::text, coalesce(e.metadata->'nativeHarnessBackup'->>'sessionScopeSha256', '')) > (${afterSession}, ${afterScope})
     order by selected_session_id, scope_digest limit 100`);
     let next = 0, invalid = false;
@@ -114,7 +117,7 @@ async function migrateSource(db: Db, input: { storage: StorageService; signal: A
   const { root, scopeDigest, manifestSha256 } = source, run = await sourceRun(db, source);
   if (!run) return 0;
   const [current] = await db.select().from(nativeHarnessBackups).where(and(eq(nativeHarnessBackups.companyId, run.companyId),
-    eq(nativeHarnessBackups.scopeDigest, scopeDigest), eq(nativeHarnessBackups.status, "current")));
+    eq(nativeHarnessBackups.scopeDigest, scopeDigest), eq(nativeHarnessBackups.status, "current"), resumableNativeHarnessBackupRow));
   if (current) {
     if (current.manifestSha256 !== manifestSha256) throw new Error("native_harness_migration_durable_source_conflict");
     await verifyDurableNativeHarnessBackup({ db, storage: input.storage, companyId: run.companyId,
@@ -202,7 +205,7 @@ export async function prestageNativeHarnessBackups(db: Db, input: { storage: Sto
     });
     if (!run) return "missing_run";
     const [current] = await db.select().from(nativeHarnessBackups).where(and(eq(nativeHarnessBackups.companyId, run.companyId),
-      eq(nativeHarnessBackups.scopeDigest, source.scopeDigest), eq(nativeHarnessBackups.status, "current")));
+      eq(nativeHarnessBackups.scopeDigest, source.scopeDigest), eq(nativeHarnessBackups.status, "current"), resumableNativeHarnessBackupRow));
     if (current) {
       if (current.manifestSha256 !== source.manifestSha256) return "durable_source_changed";
       await verifyDurableNativeHarnessBackup({ db, storage: input.storage, companyId: run.companyId,

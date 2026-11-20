@@ -6,6 +6,7 @@ import { currentControllerProcess } from "../controller-process-identity.js";
 import { probePiSessionResumeFile, restorePiSessionResumeFile } from "./pi-session-file-repair.js";
 import { readRemoteCheckpointManifest, verifyLocalCheckpointManifest } from "./remote-checkpoint-manifest.js";
 import { scheduleNativeSessionEvidenceCopy, type NativeSessionEvidenceSource } from "./native-session-evidence.js";
+import { resumableNativeHarnessBackupRow } from "./native-harness-backup-kind.js";
 import { clearProviderIdentityBreak, noteProviderIdentityBreak, recordedProviderIdentityTransitionIsAllowed, type ProviderIdentityLineageScope } from "./provider-identity-lineage.js";
 import { settleReattachRun } from "../heartbeat/run-admission.js";
 import { remoteRecoveryLeaseMismatch } from "./remote-recovery-lease-mismatch.js";
@@ -15071,13 +15072,13 @@ async function executePaperclipNativeSessionAttempt(
       }
       // READ.md §4: a retained (not closed) succeeded session gets an
       // evidence-only trace copy off the box. Started here, after the turn
-      // settled and before either hand-back branch below, never awaited: it
-      // cannot delay the reply or the next turn. Closed sessions keep the
+      // settled and before either hand-back branch below. Join only the one
+      // durable marker write, never the remote copy. Closed sessions keep the
       // existing suspended resumable capture.
       const evidenceSource = retainSession && ownedSession?.ownerToken === warmSessionOwnerToken && !ownedSession.closeOnReleaseReason
         ? nativeSessionEvidenceSources.get(ownedSession.session) : undefined;
-      if (evidenceSource) void scheduleNativeSessionEvidenceCopy({ db: input.db, source: evidenceSource,
-        companyId: input.execution.binding.companyId, issueId: input.execution.binding.issueId, runId: input.execution.binding.runId });
+      if (evidenceSource) await scheduleNativeSessionEvidenceCopy({ db: input.db, source: evidenceSource,
+        companyId: input.execution.binding.companyId, issueId: input.execution.binding.issueId, runId: input.execution.binding.runId }).admitted;
       if (retainSession && ownedSession?.ownerToken === warmSessionOwnerToken && !ownedSession.closeOnReleaseReason
         && warmOwnerHasReleaseResumePair(ownedSession.session)) {
         const scope = warmSessionId, entry = ownedSession, token = warmSessionOwnerToken;
@@ -19535,7 +19536,7 @@ async function createRunnerdBackendWithinSessionClaim(
       eq(nativeHarnessBackups.companyId, input.execution.binding.companyId),
       eq(nativeHarnessBackups.scopeDigest, createHash("sha256").update(nativeSessionScopeKey(input.execution)).digest("hex")),
       // An unreadable lineage leaves the fork unrecorded: the later read refuses, as before.
-      eq(nativeHarnessBackups.status, "current"))).limit(1).catch(() => []);
+      eq(nativeHarnessBackups.status, "current"), resumableNativeHarnessBackupRow)).limit(1).catch(() => []);
     if (!lineageBackup) return;
     if (!(await noteProviderIdentityBreak(input.db, providerIdentityLineageScope(input.execution), "resume_failed_on_new_box",
       input.execution.binding.runId, providerLeaseId))) {

@@ -28,11 +28,8 @@ import type { SettledNativeHarnessBackupOwner } from "./native-harness-preservat
 import { logActivity, publishActivity, type ActivityPublication } from "../activity-log.js";
 
 const SCHEMA = "paperclip.native-harness-object.v1";
-/** Evidence-only warm-session trace copy (native-session-evidence.ts). Never
- * offered for restore, recoverability or destroy proof. */
-export const NATIVE_SESSION_EVIDENCE_KIND = "paperclip.native-session-evidence.v1";
-/** Every restore/recoverability read selects only resumable rows. */
-const resumableNativeHarnessBackupRow = sql`(${nativeHarnessBackups.reference}->>'kind') is distinct from ${NATIVE_SESSION_EVIDENCE_KIND}`;
+export { NATIVE_SESSION_EVIDENCE_KIND } from "./native-harness-backup-kind.js";
+import { NATIVE_SESSION_EVIDENCE_KIND, resumableNativeHarnessBackupRow } from "./native-harness-backup-kind.js";
 type SessionEvidenceOwner = { kind: "session_evidence"; companyId: string; issueId: string; runId: string };
 type Binding = { companyId: string; scopeDigest: string; id: string };
 type Reference = Binding & {
