@@ -62,6 +62,7 @@ import { unescapeIntrawordUnderscores } from "../lib/underscore-markdown";
 import { unescapeEqualsSigns } from "../lib/equals-markdown";
 import { restoreTrailingMarkdownSpaces } from "../lib/trailing-markdown-spaces";
 import { pasteNormalizationPlugin } from "../lib/paste-normalization";
+import { typedFencePlugin, VERBATIM_TO_MARKDOWN_OPTIONS } from "../lib/verbatim-markdown";
 import { cn } from "../lib/utils";
 import { useEditorAutocomplete, type SlashCommandOption } from "../context/EditorAutocompleteContext";
 
@@ -108,6 +109,12 @@ interface MarkdownEditorProps {
   submitKey?: "enter" | "mod-enter";
   /** Render the rich editor without allowing edits. */
   readOnly?: boolean;
+  /**
+   * Send what the person typed, character for character (chat composers):
+   * no markdown escapes in text, no autolink rewrite of a typed URL, and a
+   * typed ``` fence stays a fence.
+   */
+  verbatimText?: boolean;
 }
 
 export interface MarkdownEditorRef {
@@ -757,6 +764,7 @@ function applyMention(markdown: string, state: MentionState, option: Autocomplet
 export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>(function MarkdownEditor({
   value,
   onChange,
+  verbatimText = false,
   ariaLabel,
   placeholder,
   className,
@@ -1026,7 +1034,7 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
       listsPlugin(),
       quotePlugin(),
       tablePlugin(),
-      linkPlugin({ validateUrl: isSafeMarkdownLinkUrl }),
+      linkPlugin({ validateUrl: isSafeMarkdownLinkUrl, disableAutoLink: verbatimText }),
       linkDialogPlugin(),
       mentionDeletionPlugin(),
       pasteNormalizationPlugin(),
@@ -1038,9 +1046,10 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
       codeMirrorPlugin({ codeBlockLanguages: CODE_BLOCK_LANGUAGES }),
       markdownShortcutPlugin(),
     ];
+    if (verbatimText) all.push(typedFencePlugin());
     all.push(imagePlugin({ imageUploadHandler: imageHandler, disableImageSettingsButton: true }));
     return all;
-  }, [hasImageUpload]);
+  }, [hasImageUpload, verbatimText]);
 
   useEffect(() => {
     if (editorValue !== latestValueRef.current) {
@@ -1579,6 +1588,7 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
           markdown={editorValue}
           iconComponentFor={editorIconFor}
           suppressHtmlProcessing
+          toMarkdownOptions={verbatimText ? VERBATIM_TO_MARKDOWN_OPTIONS : undefined}
           placeholder={placeholder}
           readOnly={readOnly}
           onChange={(rawNext, initialMarkdownNormalize) => {
