@@ -10,6 +10,8 @@ import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { environmentRoutes } from "../routes/environments.js";
 import { errorHandler } from "../middleware/index.js";
 import { hasRecoveredCleanupStopReceipt } from "../services/remote-execution-termination.js";
+import { ORPHANED_SANDBOX_RECOVERY_KEY } from "../services/sandbox-stop-and-retain.js";
+import { createOwnershipReportState, runOwnershipReconciliationPass } from "../services/recovery/ownership-invariant-report.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -41,6 +43,9 @@ describe.skipIf(!support.supported)("recovery cleanup recorded stopped sandbox",
     await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId: environment!.id, heartbeatRunId: runId,
       provider, providerLeaseId, leasePolicy: "reuse_by_environment", status: "pending_cleanup", cleanupStatus: "failed",
       failureReason: "retained_orphan_sandbox_released", acquiredAt: new Date(Date.now() - 120_000), releasedAt: new Date(),
+      // Historical provider leases can retain recorded config without the
+      // sandboxProviderPlugin discriminator. Recorded teardown must not depend
+      // on that old dispatch marker or on the current reuse policy.
       updatedAt: new Date(Date.now() - 60_000), metadata: { driver: "sandbox", ...config, pluginId,
         pendingCleanupRetryAttempts: 6, pendingCleanupRetryCapWarned: true,
         pendingCleanupInFlight: false, pendingCleanupRetryAfterMs: 0, pendingCleanupLeaseExpiresAtMs: 0,
@@ -55,7 +60,9 @@ describe.skipIf(!support.supported)("recovery cleanup recorded stopped sandbox",
       // allocations to a destroyed receipt; these are not guessed from errors.
       return { providerLeaseId, state: "destroyed", providerState: outcome };
     });
-    const worker = { isRunning: (id: string) => id === pluginId, call,
+    const worker = { isRunning: (id: string) => id === pluginId,
+      call: (id: string, method: string, input: Record<string, unknown>) => method === "environmentValidateConfig"
+        ? Promise.resolve({ ok: true, normalizedConfig: input.config }) : call(id, method, input),
       getWorker: (id: string) => id === pluginId ? { supportedMethods: ["environmentDestroyLease", "environmentStopLease", "environmentInspectLease"] } : undefined } as unknown as PluginWorkerManager;
     const heartbeat = heartbeatService(db, { environmentRuntime: environmentRuntimeService(db, { pluginWorkerManager: worker }) });
     const row = async () => (await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId)))[0]!;
@@ -91,13 +98,32 @@ describe.skipIf(!support.supported)("recovery cleanup recorded stopped sandbox",
     expect(f.call).toHaveBeenCalledTimes(1);
   });
 
-  it("counts a transient provider failure, backs off, and retries", async () => {
+  it("destroys the handoff produced by the real retained-orphan settlement", async () => {
+    const f = await seed();
+    const original = await f.row();
+    const { workspaceRecoveryCleanup: _cleanup, ...metadata } = original.metadata!;
+    await db.update(environmentLeases).set({ status: "failed", cleanupStatus: "success",
+      metadata: { ...metadata, remoteExecutionTermination: f.stopReceipt,
+        [ORPHANED_SANDBOX_RECOVERY_KEY]: { recoveredOrphanedRunLease: true, runId: f.stopReceipt.runId } },
+    }).where(eq(environmentLeases.id, f.leaseId));
+    const report = await runOwnershipReconciliationPass(db, { state: createOwnershipReportState(), record: true });
+    expect(report.kinds.find(kind => kind.kind === "environment_retained_orphan_sandbox")?.settled).toBe(1);
+    expect(await f.row()).toMatchObject({ status: "pending_cleanup", failureReason: "retained_orphan_sandbox_released" });
+    expect(hasRecoveredCleanupStopReceipt(await f.row())).toBe(true);
+    await f.heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+    expect(f.call).toHaveBeenCalledTimes(1);
+    expect(await f.row()).toMatchObject({ status: "expired", cleanupStatus: "success", metadata: {
+      workspaceRecoveryCleanup: { stopReceipt: f.stopReceipt } } });
+  });
+
+  it.each([0, 6])("counts a transient provider failure at attempt %s, backs off, and retries", async startingAttempts => {
     const f = await seed(); f.answer("transient");
+    await db.update(environmentLeases).set({ metadata: sql`${environmentLeases.metadata} || ${JSON.stringify({ pendingCleanupRetryAttempts: startingAttempts })}::jsonb` }).where(eq(environmentLeases.id, f.leaseId));
     await f.heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
     expect(f.call).toHaveBeenCalledTimes(1);
     const failed = await f.row();
     expect(failed).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed", metadata: {
-      pendingCleanupRetryAttempts: 7, pendingCleanupInFlight: false, workspaceRecoveryCleanup: { stopReceipt: f.stopReceipt } } });
+      pendingCleanupRetryAttempts: Math.min(startingAttempts, 5) + 1, pendingCleanupInFlight: false, workspaceRecoveryCleanup: { stopReceipt: f.stopReceipt } } });
     expect(Number(failed.metadata?.pendingCleanupRetryAfterMs)).toBeGreaterThan(Date.now());
     await f.heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
     expect(f.call).toHaveBeenCalledTimes(1);
@@ -110,8 +136,22 @@ describe.skipIf(!support.supported)("recovery cleanup recorded stopped sandbox",
 
   it("never destroys a released-for-cleanup row without its stop receipt", async () => {
     const f = await seed(false);
+    await db.update(environmentLeases).set({ leasePolicy: "ephemeral" }).where(eq(environmentLeases.id, f.leaseId));
     await f.heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
     expect(f.call).not.toHaveBeenCalled();
     expect(await f.row()).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed" });
   });
+
+  it.each(["companyId", "runId", "leaseId", "provider", "providerLeaseId", "schema", "state"] as const)(
+    "never destroys with a mismatched stop receipt %s", async field => {
+      const f = await seed();
+      const lease = await f.row();
+      const cleanup = lease.metadata!.workspaceRecoveryCleanup as Record<string, unknown>;
+      await db.update(environmentLeases).set({ leasePolicy: "ephemeral", metadata: { ...lease.metadata,
+        workspaceRecoveryCleanup: { ...cleanup, stopReceipt: { ...f.stopReceipt, [field]: "foreign-or-invalid" } },
+      } }).where(eq(environmentLeases.id, f.leaseId));
+      await f.heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+      expect(f.call).not.toHaveBeenCalled();
+      expect(await f.row()).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed" });
+    });
 });
