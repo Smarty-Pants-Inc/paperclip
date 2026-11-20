@@ -221,6 +221,8 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
     conversationMode: input.conversationMode,
   }, {
     resumedSession: false,
+    // The server's verified resume fact (buildNativeExecutionWithCheckpoint): wording only.
+    sessionHoldsInterruptedTurn: input.resumedSession === true,
     includeCommunicationGuidance: false,
     nativeWakeReaderAvailable: true,
   });
