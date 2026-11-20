@@ -2214,16 +2214,16 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       expect(take.thread.filter((c: any) => c.authorType === "system")).toEqual([]);
     }, 30_000);
 
-    // A2 stays RED here on purpose (it.fails): answered-by-unposted-log-text is D3's streamed-steer arm
-    // (person-message-answer.ts:109-113). Requiring a posted reply there is RULE Half 1 and re-carries
-    // messages (S-d2), so it ships only with Half 2's send-path bound (neworg-lead's unit), not here.
-    it.fails("A2: the steer's answer exists only in the run log, never posted -> owed (not answered by unposted text)", async () => {
-      const take = await steerTake([{ steer: "what is 100+1?" }, { answerSteer: "101", progress: false }], { publish: false });
-      await save("A2", take.record);
-      expect(take.agent).toEqual([]);
-      expect(take.evidence.answered).toEqual(take.sent);
-      expect(take.record.answered[take.sent[0]!]).toBe(false);
-    }, 30_000);
+    // A2 owed-not-answered: ships with RULE-ANSWERED-MEANS-ANSWERED-1119 Half 1+2 (owner neworg-lead); arm proven in answered-a's answered-arm1-NOT-SHIPPED.patch
+    it.todo("A2: the steer's answer exists only in the run log, never posted -> owed (not answered by unposted text)");
+    // Preserved regression body for the combined Half 1+2 unit:
+    // async () => {
+    //   const take = await steerTake([{ steer: "what is 100+1?" }, { answerSteer: "101", progress: false }], { publish: false });
+    //   await save("A2", take.record);
+    //   expect(take.agent).toEqual([]);
+    //   expect(take.evidence.answered).toEqual(take.sent);
+    //   expect(take.record.answered[take.sent[0]!]).toBe(false);
+    // }, 30_000);
 
     it("A2b: the agent reads the steer and never writes text after it; its own earlier final is not the steer's answer -> owed", async () => {
       const take = await steerTake([{ text: "Own task finished.", progress: false }, { steer: "what is 100+1?" }]);
