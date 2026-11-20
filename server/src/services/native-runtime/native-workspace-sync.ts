@@ -1,3 +1,4 @@
+import { captureRemoteWorkspaceDirectory } from "../remote-workspace-snapshot-archive.js";
 import { remoteRecoveryLeaseMismatch } from "./remote-recovery-lease-mismatch.js";
 import { hasMigratedLegacyWorkspaceSource } from "../legacy-workspace-recovery-migration.js";
 import { notifyCancelledWorkspacePreservation } from "../cancelled-workspace-preservation-notifications.js";
@@ -28,9 +29,12 @@ import {
   openDirectorySnapshot,
   parseDirectorySnapshot,
   serializeDirectorySnapshot,
+  withDirectoryMergeLock,
+  withDirectoryPublicationLock,
   type DirectorySnapshot,
   type SerializedDirectorySnapshot,
 } from "@paperclipai/adapter-utils/workspace-restore-merge";
+import { restoreVerifiedSnapshotArchive } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
 import type {
   WorkspaceDurableSeedPaths,
   WorkspaceInboundMode,
@@ -80,6 +84,9 @@ interface NativeWorkspaceSyncDescriptor {
   createdAt: string;
   finalizedAt: string | null;
   finalHostSha256: string | null;
+  // Optional for descriptors written before ordered publication. The archive is
+  // immutable, run-scoped custody, not the mutable host workspace or warm stamp.
+  finalSnapshot?: { sha256: string; manifestDigest: string; byteSize: number };
   resourceDisposition: NativeWorkspaceResourceDisposition | null;
 }
 
@@ -171,6 +178,11 @@ function descriptorPath(runId: string, descriptorSha256: string): string {
     descriptorDirectory(runId),
     `${DESCRIPTOR_NAME}.${descriptorSha256}.json`,
   );
+}
+
+function finalSnapshotPath(runId: string, digest: string): string {
+  if (!/^[0-9a-f]{64}$/.test(digest)) throw new Error("native_workspace_sync_snapshot_digest_invalid");
+  return path.join(descriptorDirectory(runId), `snapshot.${digest}.pcws`);
 }
 
 function legacyDescriptorPath(runId: string): string {
@@ -537,6 +549,13 @@ async function readDescriptor(input: {
       : candidate.finalHostSha256 === null
         ? null
         : undefined;
+  const rawFinalSnapshot = candidate.finalSnapshot === undefined ? null : parseObject(candidate.finalSnapshot);
+  const finalSnapshot = rawFinalSnapshot && typeof rawFinalSnapshot.sha256 === "string"
+    && /^[0-9a-f]{64}$/.test(rawFinalSnapshot.sha256) && typeof rawFinalSnapshot.manifestDigest === "string"
+    && /^[0-9a-f]{64}$/.test(rawFinalSnapshot.manifestDigest) && typeof rawFinalSnapshot.byteSize === "number"
+    && Number.isSafeInteger(rawFinalSnapshot.byteSize) && rawFinalSnapshot.byteSize > 0
+    ? { sha256: rawFinalSnapshot.sha256, manifestDigest: rawFinalSnapshot.manifestDigest, byteSize: rawFinalSnapshot.byteSize } : undefined;
+  if (rawFinalSnapshot && (!finalSnapshot || candidate.state !== "finalized")) throw new Error("native_workspace_sync_snapshot_invalid");
   const resourceDisposition =
     candidate.resourceDisposition === "keep_running" ||
     candidate.resourceDisposition === "stop_and_retain" ||
@@ -605,6 +624,7 @@ async function readDescriptor(input: {
           ? candidate.finalizedAt
           : null,
       finalHostSha256,
+      ...(finalSnapshot ? { finalSnapshot } : {}),
       resourceDisposition,
     },
     baseline,
@@ -655,6 +675,10 @@ async function persistLeaseStamp(input: {
       .limit(1)
       .then((rows) => rows[0] ?? null);
     if (!lease) throw new Error("native_workspace_sync_lease_missing");
+    const previous = parseObject(parseObject(lease.metadata).nativeWorkspaceSync);
+    if (previous.workspaceId === input.stamp.workspaceId && previous.providerLeaseId === input.stamp.providerLeaseId
+      && previous.remoteCwd === input.stamp.remoteCwd && typeof previous.preparedAt === "string" && typeof input.stamp.preparedAt === "string"
+      && Date.parse(previous.preparedAt) > Date.parse(input.stamp.preparedAt)) return;
     await notifyEnvironmentCleanup(tx, { companyId: lease.companyId, runId: lease.heartbeatRunId ?? undefined });
     await tx
       .update(environmentLeases)
@@ -686,10 +710,23 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-async function writeRemoteStamp(input: {
+async function withNativeStampPublication<T>(input: {
   target: Extract<AdapterExecutionTarget, { transport: "sandbox" }>;
   stamp: Record<string, unknown>;
-}): Promise<void> {
+}, work: () => Promise<T>): Promise<T> {
+  // Serialize the WHOLE export, not only the last rename: a previously captured
+  // payload must not merge over a successor that already published newer files.
+  const root = nativeWorkspaceSyncStateRoot();
+  await ensurePrivateDirectory(root);
+  const key = sha256([input.stamp.workspaceId, input.stamp.providerLeaseId, input.target.remoteCwd]);
+  return withDirectoryPublicationLock(path.join(root, `stamp.${key}`), work);
+}
+
+async function remoteStampMayPublish(input: {
+  db: Db;
+  target: Extract<AdapterExecutionTarget, { transport: "sandbox" }>;
+  stamp: Record<string, unknown>;
+}): Promise<boolean> {
   if (!input.target.runner) {
     throw new Error("native_workspace_sync_runner_missing");
   }
@@ -699,7 +736,52 @@ async function writeRemoteStamp(input: {
     "paperclip-runner",
   );
   const stampPath = path.posix.join(runtimeDir, REMOTE_STAMP_NAME);
-  const tempPath = `${stampPath}.tmp`;
+  const prior = await input.target.runner.execute({
+    command: input.target.shellCommand ?? "sh", args: ["-c", `if test -f ${shellQuote(stampPath)}; then cat ${shellQuote(stampPath)}; fi`],
+    cwd: "/", timeoutMs: 15_000, bypassSession: true,
+  });
+  if (prior.timedOut || prior.exitCode !== 0) throw new Error("native_workspace_sync_remote_stamp_failed");
+  let current: Record<string, unknown> = {};
+  try { current = parseObject(JSON.parse(prior.stdout)); } catch { /* invalid stamps cannot authorize warm adoption */ }
+  if (current.schema === STAMP_SCHEMA && current.workspaceId === input.stamp.workspaceId
+    && current.providerLeaseId === input.stamp.providerLeaseId && current.remoteCwd === input.stamp.remoteCwd) {
+    let currentPreparedAt = typeof current.preparedAt === "string" ? Date.parse(current.preparedAt) : NaN;
+    if (!Number.isFinite(currentPreparedAt) && typeof current.finalizedRunId === "string") {
+      // Old v1 stamps have no order field. Use their existing descriptor.
+      // A queued run's creation time is NOT its workspace generation; if its
+      // descriptor was cleaned, retain custody without guessing a promotion.
+      const [run] = await input.db.select({ runnerProfileJson: heartbeatRuns.runnerProfileJson })
+        .from(heartbeatRuns).where(eq(heartbeatRuns.id, current.finalizedRunId)).limit(1);
+      const reference = readNativeWorkspaceSyncReference(parseObject(run?.runnerProfileJson).nativeWorkspaceSync);
+      if (reference) {
+        const saved = await readDescriptor({ runId: current.finalizedRunId, reference }).catch(() => null);
+        if (saved) {
+          currentPreparedAt = Date.parse(saved.descriptor.createdAt);
+          await disposeDirectorySnapshot(saved.baseline);
+          await disposeGitWorkspaceSnapshot(saved.descriptor.gitSnapshot);
+          for (const repository of saved.descriptor.repositories ?? []) await disposeGitWorkspaceSnapshot(repository.snapshot);
+        }
+      }
+    }
+    const incomingPreparedAt = Date.parse(String(input.stamp.preparedAt));
+    // Unknown legacy order fails closed. Custody still completes below; only
+    // promotion of the shared head is refused, never the older export itself.
+    if (!Number.isFinite(currentPreparedAt) || incomingPreparedAt < currentPreparedAt
+      || incomingPreparedAt === currentPreparedAt && current.finalizedRunId !== input.stamp.finalizedRunId) return false;
+  }
+  return true;
+}
+
+// Called only under withNativeStampPublication, after the ordering check and
+// file export; no other finalizer can change the head between check and write.
+async function writeRemoteStamp(input: {
+  target: Extract<AdapterExecutionTarget, { transport: "sandbox" }>;
+  stamp: Record<string, unknown>;
+}): Promise<void> {
+  if (!input.target.runner) throw new Error("native_workspace_sync_runner_missing");
+  const runtimeDir = path.posix.join(input.target.remoteCwd, ".paperclip-runtime", "paperclip-runner");
+  const stampPath = path.posix.join(runtimeDir, REMOTE_STAMP_NAME);
+  const tempPath = `${stampPath}.${randomUUID()}.tmp`;
   const encoded = Buffer.from(
     `${canonicalJson(input.stamp)}\n`,
     "utf8",
@@ -804,6 +886,9 @@ function finalizedWorkspaceStamp(input: {
     remoteCwd: input.descriptor.binding.remoteCwd,
     hostSha256: input.hostSha256,
     finalizedRunId: input.descriptor.binding.runId,
+    // Order by preparation, never by export completion: a cancelled turn's
+    // export can finish after its successor has already saved newer work.
+    preparedAt: input.descriptor.createdAt,
   };
 }
 
@@ -859,16 +944,44 @@ async function finalizePreparedRuntime(input: {
   onPhase?: RuntimeSpanRunner;
   onCheckpoint?: (metrics: WorkspaceCheckpointMetrics) => Promise<void>;
 }): Promise<NativeWorkspaceSyncReference> {
-  if (input.onPhase) await input.onPhase("workspace.restore", () => input.runtime.restoreWorkspace());
-  else await input.runtime.restoreWorkspace();
-  return measureRunPhase("execution.workspace_commit", async () => {
+  const order = finalizedWorkspaceStamp({ descriptor: input.descriptor, hostSha256: input.descriptor.baselineSha256 });
+  return withNativeStampPublication({ target: input.target, stamp: order }, async () => {
+  const published = await remoteStampMayPublish({ db: input.db, target: input.target, stamp: order });
+  let runtime = input.runtime;
+  let localCwd = input.descriptor.binding.localCwd;
+  let shadowRoot: string | undefined;
+  try {
+    if (!published) {
+      // Keep the old export's own bytes, without ever merging them into a
+      // newer host workspace. Reuse the native v3 seed/verified-restore path;
+      // no second Runner/Pi and no inbound write to the live allocation.
+      if (!input.descriptor.seed) throw new Error("workspace_sync_out_unrecoverable");
+      const seed = await verifiedDurableSeed({ runId: input.runId, seed: input.descriptor.seed,
+        gitSnapshot: input.descriptor.gitSnapshot, repositories: input.descriptor.repositories });
+      shadowRoot = await fs.mkdtemp(path.join(await ensureRunDirectory(input.runId), "custody-"));
+      localCwd = path.join(shadowRoot, "workspace");
+      const restore = async (archivePath: string, sha256: string, localDir: string) =>
+        restoreVerifiedSnapshotArchive({ archivePath, sha256, localDir, byteSize: (await fs.stat(archivePath)).size });
+      if (seed.gitArchivePath && seed.gitArchiveSha256) await restore(seed.gitArchivePath, seed.gitArchiveSha256, localCwd);
+      const overlay = path.join(shadowRoot, "overlay");
+      if (!seed.workspaceArchiveSha256) throw new Error("workspace_sync_out_unrecoverable");
+      await restore(seed.workspaceArchivePath, seed.workspaceArchiveSha256, overlay);
+      await fs.cp(overlay, localCwd, { recursive: true });
+      runtime = await prepareRuntime({ runId: input.runId, target: input.target, workspaceLocalDir: localCwd,
+        mode: "adopt_remote", baseline: input.runtime.workspaceSyncSnapshot?.baseline,
+        gitSnapshot: input.descriptor.gitSnapshot, repositories: input.descriptor.repositories,
+        onPhase: input.onPhase, onCheckpoint: input.onCheckpoint });
+    }
+    if (input.onPhase) await input.onPhase("workspace.restore", () => runtime.restoreWorkspace());
+    else await runtime.restoreWorkspace();
+    return await measureRunPhase("execution.workspace_commit", () => withDirectoryMergeLock(localCwd, async () => {
     await input.assertOwnership?.();
     const finalSnapshot =
       await import("@paperclipai/adapter-utils/workspace-restore-merge").then(
         ({ captureDirectorySnapshotOffThread: captureDirectorySnapshot }) =>
-          captureDirectorySnapshot(input.descriptor.binding.localCwd, {
-            exclude: input.runtime.workspaceSyncSnapshot?.baseline.exclude ?? [],
-            ignoredPaths: input.runtime.workspaceSyncSnapshot?.baseline.ignoredPaths,
+          captureDirectorySnapshot(localCwd, {
+            exclude: runtime.workspaceSyncSnapshot?.baseline.exclude ?? [],
+            ignoredPaths: runtime.workspaceSyncSnapshot?.baseline.ignoredPaths,
             diskBacked: true,
           }),
       );
@@ -878,22 +991,39 @@ async function finalizePreparedRuntime(input: {
       descriptor: input.descriptor,
       hostSha256: finalHostSha256,
     });
-    await writeRemoteStamp({ target: input.target, stamp });
+    const directory = await ensureRunDirectory(input.runId);
+    const temporaryArchive = path.join(directory, `snapshot.${randomUUID()}.tmp`);
+    let custodySnapshot: NonNullable<NativeWorkspaceSyncDescriptor["finalSnapshot"]>;
+    try {
+      const captured = await captureRemoteWorkspaceDirectory({ cwd: localCwd,
+        archivePath: temporaryArchive, exclude: runtime.workspaceSyncSnapshot?.baseline.exclude ?? [] });
+      custodySnapshot = { sha256: captured.sha256, manifestDigest: captured.manifestDigest, byteSize: captured.byteSize };
+      await fs.rename(temporaryArchive, finalSnapshotPath(input.runId, captured.sha256));
+    } finally { await fs.rm(temporaryArchive, { force: true }); }
+    if (published) await writeRemoteStamp({ target: input.target, stamp });
     const finalizedDescriptor: NativeWorkspaceSyncDescriptor = {
       ...input.descriptor,
       state: "finalized",
       finalizedAt: new Date().toISOString(),
       finalHostSha256,
+      finalSnapshot: custodySnapshot,
     };
     await input.assertOwnership?.();
     const reference = await writeDescriptor(finalizedDescriptor);
     await persistRunReference(input.db, input.runId, reference);
-    await persistLeaseStamp({
+    if (published) await persistLeaseStamp({
       db: input.db,
       leaseId: input.descriptor.binding.leaseId,
       stamp,
     });
     return reference;
+  }));
+  } finally {
+    if (shadowRoot) {
+      if (runtime !== input.runtime) await runtime.cleanupWorkspaceSnapshot?.();
+      await fs.rm(shadowRoot, { recursive: true, force: true });
+    }
+  }
   });
 }
 
@@ -1221,15 +1351,11 @@ export async function resumeNativeWorkspaceSync(input: {
       descriptor: existing.descriptor,
       hostSha256: existing.descriptor.finalHostSha256,
     });
-    if (
-      !(await remoteStampMatches({ target: input.target, expected: stamp }))
-    ) {
-      await writeRemoteStamp({ target: input.target, stamp });
-    }
-    await persistLeaseStamp({
-      db: input.db,
-      leaseId: existing.descriptor.binding.leaseId,
-      stamp,
+    const target = input.target;
+    await withNativeStampPublication({ target, stamp }, async () => {
+      if (!await remoteStampMayPublish({ db: input.db, target, stamp })) return;
+      await writeRemoteStamp({ target, stamp });
+      await persistLeaseStamp({ db: input.db, leaseId: existing.descriptor.binding.leaseId, stamp });
     });
     return true;
   }
@@ -1263,6 +1389,7 @@ export async function cleanupNativeWorkspaceSync(runId: string): Promise<void> {
 
 export const nativeWorkspaceSyncInternals = {
   descriptorPath,
+  finalSnapshotPath,
   legacyDescriptorPath,
   durableSeedPaths,
   persistSnapshotManifests,
