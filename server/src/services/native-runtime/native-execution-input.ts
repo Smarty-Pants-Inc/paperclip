@@ -237,6 +237,10 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
     resumedSession: false,
     // The server's verified resume fact (buildNativeExecutionWithCheckpoint): wording only.
     sessionHoldsInterruptedTurn: input.resumedSession === true,
+    // answered-b3: the selected session + cut run that readInResumedSessionOnly verified against; the shared
+    // renderer omits a read steer only when its binding equals this one.
+    readInSessionBinding: input.resumedSession === true && input.previousTurn?.runId && input.normalizedSessionId
+      ? { sessionId: input.normalizedSessionId, runId: input.previousTurn.runId } : null,
     includeCommunicationGuidance: false,
     nativeWakeReaderAvailable: true,
   });
