@@ -383,6 +383,56 @@ describe("MarkdownEditor", () => {
     }
   });
 
+  it.each([
+    String.raw`a\_b`, String.raw`a\=b`, String.raw`a\<b`, String.raw`\>`,
+    "a == b", "<tag>", "x_y_z", "2 * 3 * 4", "```\nls -la ~/x_y\n```",
+    String.raw`C:\Users\paul\file_name.txt`, "https://example.com/a_b/~user?q=x_y",
+  ])("verbatim mode stores the editor's exact export %j with no cleanup pass", async (typed) => {
+    // In verbatim mode the export is the typed text itself (verbatim-markdown.test).
+    mdxEditorMockState.emitMountChange = typed;
+    const handleChange = vi.fn();
+    const root = createRoot(container);
+    try {
+      await act(async () => {
+        root.render(<MarkdownEditor value="" onChange={handleChange} verbatimText />);
+      });
+      await flush();
+      expect(handleChange).toHaveBeenCalledWith(typed);
+      expect(handleChange.mock.calls.every(([next]) => next === typed)).toBe(true);
+    } finally {
+      await act(async () => root.unmount());
+    }
+  });
+
+  it("verbatim mode hands a stored draft to the editor as literal text, not markdown", async () => {
+    const root = createRoot(container);
+    try {
+      await act(async () => {
+        root.render(<MarkdownEditor value={"__bold__ a\\_b\n> q"} onChange={() => {}} verbatimText />);
+      });
+      expect(mdxEditorMockState.markdownValues[0]).toBe(verbatimMarkdown.verbatimTextToEditorMarkdown("__bold__ a\\_b\n> q"));
+      expect(mdxEditorMockState.markdownValues[0]).toBe("\\_\\_bold\\_\\_ a\\\\\\_b\\\n\\> q");
+    } finally {
+      await act(async () => root.unmount());
+    }
+  });
+
+  it("other editors keep the transport cleanup and the markdown import", async () => {
+    mdxEditorMockState.emitMountChange = String.raw`a\_b a\=b`;
+    const handleChange = vi.fn();
+    const root = createRoot(container);
+    try {
+      await act(async () => {
+        root.render(<MarkdownEditor value="__bold__" onChange={handleChange} />);
+      });
+      await flush();
+      expect(mdxEditorMockState.markdownValues[0]).toBe("__bold__");
+      expect(handleChange).toHaveBeenCalledWith("a_b a=b");
+    } finally {
+      await act(async () => root.unmount());
+    }
+  });
+
   it.each([false, true])("handles submission, newlines, and IME confirmation (raw fallback=%s)", async (fallback) => {
     mdxEditorMockState.emitMountParseError = fallback;
     const onSubmit = vi.fn();
