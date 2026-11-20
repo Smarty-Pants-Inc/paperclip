@@ -84,6 +84,31 @@ export async function recordChatCompletion(tx: Connection, before: Issue, after:
   return true;
 }
 
+/** A refused, already-recorded continuation is not new task news. Tell its
+ * current handoff audience directly, without requiring the blocked chat agent
+ * to run. The caller holds the task lock; the source lock serializes the one
+ * note across workers/restarts. A new execution hold gets its own receipt. */
+export async function reportChatHandoffExecutionHold(tx: Connection, task: Pick<Issue, "id" | "companyId" | "identifier" | "statusVersion">,
+  input: { runId: string; recoveryActionId: string | null }) {
+  const [handoff] = await tx.select().from(handoffs).where(and(eq(handoffs.taskId, task.id), eq(handoffs.companyId, task.companyId)));
+  if (!handoff) return;
+  const [source] = await tx.select().from(issues).where(and(eq(issues.id, handoff.conversationId), eq(issues.companyId, task.companyId))).for("update");
+  if (!source || source.conversationAgentId !== handoff.agentId || source.conversationSessionGeneration !== handoff.sessionGeneration) return;
+  const reason = `chat_handoff_execution_hold:${task.id}:${input.runId}:${input.recoveryActionId ?? "ownership"}`;
+  const [existing] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, task.companyId), eq(issueComments.issueId, source.id), eq(issueComments.authorType, "system"),
+    sql`${issueComments.metadata}->>'authorizationReason' = ${reason}`)).limit(1);
+  const note = existing ?? (await insertIssueComment(tx, { companyId: task.companyId, issueId: source.id, authorType: "system",
+    body: `[${task.identifier ?? "Delegated task"}](/issues/${task.identifier ?? task.id}) is stuck: its agent can't continue it while recovery of its previous execution is unresolved. See the task for recovery details.`,
+    metadata: { version: 1, sections: [], authorizationReason: reason } }))[0];
+  // The factual note satisfies this unchanged blocked report. Do not leave an
+  // older pending delivery to wake the chat or narrate the same failure again.
+  const settled = await tx.update(deliveries).set({ status: "delivered", responseCommentId: note.id, error: null }).where(and(
+    eq(deliveries.companyId, task.companyId), eq(deliveries.taskId, task.id), lte(deliveries.statusVersion, task.statusVersion),
+    inArray(deliveries.status, [...pending]))).returning({ id: deliveries.id });
+  if (settled.length) await notifyDeliveryWork(tx, DELIVERY_QUEUES.chatCompletion);
+}
+
 async function loadAudience(tx: Connection, deliveryId: string) {
   const [row] = await tx.select({ delivery: deliveries, handoff: handoffs, task: issues }).from(deliveries)
     .innerJoin(handoffs, and(eq(handoffs.taskId, deliveries.taskId), eq(handoffs.companyId, deliveries.companyId)))
