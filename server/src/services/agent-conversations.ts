@@ -1,5 +1,5 @@
 import { isContextCompactionRun } from "./context-compaction.js";
-import { personCommentDeliveryLockKey, trySteerConversationComment } from "./conversation-steering.js";
+import { logPersonCommentFallback, personCommentDeliveryLockKey, trySteerConversationComment } from "./conversation-steering.js";
 import { queuedCommentIdsFromWakePayload, withQueuedCommentIdsInWakePayload } from "./issue-queued-comment-queue.js";
 import { notifyDeferredExecutionWork } from "./deferred-execution-notifications.js";
 import { nativeRunHasStopRequest } from "./native-runtime/native-run-stop-request.js";
@@ -822,7 +822,8 @@ export async function deliverConversationComments(
             },
           });
         };
-        if (await trySteerConversationComment(db, comment, { lockHeld: true, onRejected: queueComment })) continue;
+        const fallbackTrace = { reason: "not_steer", runId: null as string | null };
+        if (await trySteerConversationComment(db, comment, { lockHeld: true, onRejected: queueComment, fallbackTrace })) continue;
         try {
           await queueComment();
         } catch (error) {
@@ -835,6 +836,8 @@ export async function deliverConversationComments(
             ? (error.details as Record<string, unknown>).reason : null;
           if (current && !current.invokable && reason === current.reason) return "deferred" as const;
           throw error;
+        } finally {
+          if (fallbackTrace.reason !== "not_steer") logPersonCommentFallback(comment, fallbackTrace);
         }
       }
       return "delivered" as const;
