@@ -2,9 +2,19 @@
 
 import { act } from "react";
 import { createRoot } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApprovalPayloadRenderer, approvalLabel } from "./ApprovalPayload";
 import { ThemeProvider } from "../context/ThemeContext";
+
+// Reuse the policy-off getter used by Companies and AgentOverview; default to the real policy.
+const costPolicy = vi.hoisted(() => ({ hidden: undefined as boolean | undefined }));
+vi.mock("../lib/cost-visibility", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../lib/cost-visibility")>();
+  return {
+    ...actual,
+    get COST_BUDGET_UI_HIDDEN() { return costPolicy.hidden ?? actual.COST_BUDGET_UI_HIDDEN; },
+  };
+});
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -31,12 +41,30 @@ describe("ApprovalPayloadRenderer", () => {
     container.remove();
   });
 
+  describe("budget overrides with money UI enabled", () => {
+    beforeEach(() => { costPolicy.hidden = false; });
+    afterEach(() => { costPolicy.hidden = undefined; });
+
+  // org 11-17 03:13Z hide-costs: with COST_BUDGET_UI_HIDDEN these surfaces are hidden; this row pins the #20670 mask for when they show
   it.each([0, 5000])("shows a configured %s-cent override limit while masking observed spend", (budgetAmount) => {
     const root = createRoot(container);
     act(() => root.render(<ApprovalPayloadRenderer type="budget_override_required"
       payload={{ budgetAmount, observedAmount: 1234 }} />));
     expect(container.textContent).toContain(`Limit $${(budgetAmount / 100).toFixed(2)} · Observed —`);
     act(() => root.unmount());
+  });
+
+  });
+
+  it("hides a budget_override_required approval under the default hide-costs policy", () => {
+    const root = createRoot(container);
+    try {
+      act(() => root.render(<ApprovalPayloadRenderer type="budget_override_required"
+        payload={{ budgetAmount: 5000, observedAmount: 1234 }} />));
+      expect(container.innerHTML).toBe("");
+    } finally {
+      act(() => root.unmount());
+    }
   });
 
   it("renders request_board_approval payload fields without falling back to raw JSON", () => {
