@@ -1,4 +1,6 @@
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
+import { getExecutionBlocker } from "../execution-blocker.js";
+import { reportChatHandoffExecutionHold } from "../chat-completion-delivery.js";
 import { and, desc, eq, gte, inArray, isNull, or, sql, type SQL, type SQLWrapper } from "drizzle-orm";
 import {
   activityLog,
@@ -596,6 +598,7 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
       return { verdict, outcome: "deferred_rate_limit", retryAt: new Date(repairTimes[0] + 60_000 + Math.floor(Math.random() * 5_000)) };
     }
     const claimed = await claimContinuation(issue, at);
+    if (claimed.kind === "held") return { verdict, outcome: "waiting_on_recovery", retryAt: null };
     if (claimed.kind !== "claimed") return { verdict, outcome: claimed.kind === "capped" ? "deferred_cap" : claimed.kind === "changed" ? "changed" : "deferred_rate_limit",
       retryAt: claimed.kind === "changed" ? null : claimed.retryAt };
     repairTimes.push(at.getTime());
@@ -670,7 +673,7 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
    * produces one continuation.
    */
   async function claimContinuation(issue: IssueRow, at: Date):
-    Promise<Claimed | { kind: "capped" | "spaced"; retryAt: Date } | { kind: "changed" }> {
+    Promise<Claimed | { kind: "capped" | "spaced"; retryAt: Date } | { kind: "changed" } | { kind: "held" }> {
     const publications: ActivityPublication[] = [];
     return db.transaction(async tx => {
       const [current] = await tx.select(issueColumns).from(issues)
@@ -681,6 +684,19 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
       const verdict = evaluateAssignedWork(fresh, at);
       if (verdict.kind !== "violation" || verdict.stale || verdict.reason === "run_owner_gone" || verdict.reason === "native_run_stalled"
         || (current.status === "blocked" && fresh.activeRecoveryAction && !fresh.activeRecoveryAction.continuedBySweep)) return { kind: "changed" as const };
+      // A fresh continuation already owns this work, but admission refused it
+      // for reconciliation and its pending grace has expired (otherwise the
+      // predicate above would see a pending path). Lifting and reverting its
+      // block cannot repair that execution; it only manufactures a new status
+      // version/outbox report every pass. Leave recovery with its real owner.
+      if (fresh.latestRun?.errorCode === "execution_reconciliation_required"
+        && await wakeBecameFreshContinuation(tx as unknown as Db, issue.companyId, issue.id)) {
+        const blocker = await getExecutionBlocker(tx as unknown as Db, issue.companyId, issue.id);
+        if (blocker) {
+          await reportChatHandoffExecutionHold(tx, current, { runId: fresh.latestRun.id, recoveryActionId: blocker.recoveryActionId });
+          return { kind: "held" as const };
+        }
+      }
       const attempts = await taskAutomaticAttempts(tx as unknown as Db, issue.companyId, issue.id, at);
       const recent = attempts.continuations;
       const allowance = continuationAllowance(attempts.started, at, attempts.all);
