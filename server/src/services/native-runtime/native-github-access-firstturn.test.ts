@@ -143,6 +143,23 @@ it("cold real GitHub create + activate uses at most six remote execs and publish
   expect(count).toBeLessThanOrEqual(6);
 }, 30_000);
 
+// catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4605#issuecomment-7037417771
+it("keeps the native GitHub broker at 403 for a previous generation after reactivation", async () => {
+  const f = await fixture();
+  const broker = await f.create();
+  const releasePrevious = await broker.activate({ ...scope, runId: "previous-run" });
+  const previousGeneration = f.generations[0];
+  expect((await f.hostRequest(previousGeneration)).status).toBe(200);
+  await releasePrevious();
+  const releaseCurrent = await broker.activate({ ...scope, runId: "current-run" });
+  expect((await f.hostRequest(previousGeneration)).status).toBe(403);
+  expect((await f.hostRequest(f.generations[1])).status).toBe(200);
+  expect(f.resolveCredentials).toHaveBeenCalledTimes(2);
+  expect(f.resolveCredentials).toHaveBeenNthCalledWith(1, { ...scope, runId: "previous-run" });
+  expect(f.resolveCredentials).toHaveBeenNthCalledWith(2, { ...scope, runId: "current-run" });
+  await releaseCurrent();
+}, 30_000);
+
 it("a failed combined setup rejects bridge creation and keeps native GitHub optional/unavailable", async () => {
   const f = await fixture({ fail: script => script.includes("printf '%s' paused") });
   const broker = await f.create();
