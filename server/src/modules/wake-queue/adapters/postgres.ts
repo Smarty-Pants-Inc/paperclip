@@ -1,4 +1,5 @@
 import { getServerProcessStartedAt } from "../../../server-info.js";
+import { settleUnansweredPersonMessage } from "../../../services/recovery/unanswered-person-message.js";
 import { insertIssueComment } from "../../../services/issue-comment-writes.js";
 import { lockAgentForRunAdmission } from "../../../services/heartbeat-run-admission-lock.js";
 import { pendingContinuationCommentInput } from "../../../services/continuation-comment-input.js";
@@ -503,6 +504,17 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           const deliveryIds = payload.chatCompletionDeliveryIds ?? context.chatCompletionDeliveryIds;
           await supersedeStaleChatCompletionWake(tx, { companyId, conversationId: issueId, agentId, wakeId,
             deliveryIds: Array.isArray(deliveryIds) ? deliveryIds.filter((id): id is string => typeof id === "string" && isUuidLike(id)) : [] });
+        } else if (issueId && cancelled.requestedByActorType === "user") {
+          // Settle this receipt's person messages before committing its cancellation,
+          // not minutes later in the sweep. Its existing per-message writer owns
+          // the floor, exact named text, issue fence and idempotency key.
+          const commentIds = queuedCommentIdsFromWakePayload(payload).filter(isUuidLike);
+          const messages = commentIds.length ? await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+            eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
+            eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt), inArray(issueComments.id, commentIds))) : [];
+          for (const message of messages) await settleUnansweredPersonMessage(tx, {
+            companyId, issueId, settleMessageId: message.id, now,
+          });
         } else if (issueId && cancelled.requestedByActorType === "system") {
           // A system update is not a person input to resend. Its cancelled
           // receipt owns ONE truthful note, including monitor/restore updates.

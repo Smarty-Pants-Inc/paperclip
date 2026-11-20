@@ -356,14 +356,14 @@ function nonStaleWakeCondition(issueId: string): SQL {
   })})`;
 }
 
-/** One task: answer, supersede or notice its person's last message. Idempotent. */
+/** One task, or one named message whose wake just settled. Idempotent. */
 /** The recovery service's own native blocked-request repair check (it publishes
  * the run's unblock request itself when it applies). */
 export type NativeBlockedRepairApplies = (input: { companyId: string; issueId: string; runId: string }, database: Db) => Promise<boolean>;
 
 export async function settleUnansweredPersonMessage(
   db: Db,
-  input: { companyId: string; issueId: string; now?: Date; issueCreatedAtGte?: Date | null;
+  input: { companyId: string; issueId: string; settleMessageId?: string; now?: Date; issueCreatedAtGte?: Date | null;
     nativeBlockedRepairApplies?: NativeBlockedRepairApplies; olderOutcomes?: UnansweredMessageOutcome[] },
 ): Promise<UnansweredMessageOutcome> {
   const now = input.now ?? new Date();
@@ -373,6 +373,9 @@ export async function settleUnansweredPersonMessage(
   }).from(issues).where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)));
   if (!issue) return { kind: "none" };
   if (input.issueCreatedAtGte && issue.createdAt < input.issueCreatedAtGte) return { kind: "out_of_scope" };
+  // Event-driven receipt settlement uses the SAME per-message decision/writer
+  // as the sweep, without its discovery age/page limits or unrelated messages.
+  if (input.settleMessageId) return (await settleOneMessage(db, issue, now, input.nativeBlockedRepairApplies, input.settleMessageId)).outcome;
 
   // An answer to a message supersedes that message's notice (and its
   // retrying line): the relation is message -> answer, not the notice's time.
@@ -994,12 +997,13 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
       code = UNANSWERED_MESSAGE_NO_RUN_CODE;
     }
   } else if (!run) {
-    // Paperclip records a deferred or coalesced wake that could not start as
-    // FAILED: that is the trigger. The grace covers a wake that threw before
-    // any wake row existed (the comment route logs and returns 201).
+    // A failed wake or an explicitly moved-on cancellation is settled no-run
+    // evidence for THIS message. The grace still covers a wake that threw
+    // before any receipt existed; a cancelled receipt cannot start later.
     const failedWakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
-      eq(agentWakeupRequests.status, "failed"), gt(agentWakeupRequests.updatedAt, message.createdAt)));
+      or(eq(agentWakeupRequests.status, "failed"), and(eq(agentWakeupRequests.status, "cancelled"),
+        eq(agentWakeupRequests.error, "The conversation moved on"))), gt(agentWakeupRequests.updatedAt, message.createdAt)));
     // Only THIS message's own wake (Paperclip's queued-comment attribution) is
     // evidence; an unrelated failed wake on the issue is not.
     const wakeFailed = failedWakes.some(wake => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id));
