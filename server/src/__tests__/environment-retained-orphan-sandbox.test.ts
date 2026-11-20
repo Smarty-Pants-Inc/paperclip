@@ -166,10 +166,33 @@ suite("retained orphan sandbox on the shared ownership path", () => {
     expect(await nextEnvironmentCleanupAt(db)).toBeLessThanOrEqual(Date.now());
     const teardown = vi.fn(async ({ lease }: { lease: { providerLeaseId: string | null } }) =>
       ({ providerLeaseId: lease.providerLeaseId, state: "destroyed" }));
-    await heartbeatService(db, { environmentRuntime: { retryPendingSandboxTeardown: teardown } as unknown as HeartbeatEnvironmentRuntime })
-      .sweepPendingCleanupLeases({ backoffMs: 5 * 60_000 });
+    // RFL 10:12Z bar (2): the carried stop receipt alone does not prove
+    // custody. Read back Boat's completed snapshot for this exact allocation.
+    const inspectLeaseResource = vi.fn(async (id: string) => ({
+      providerLeaseId: (await row(id)).providerLeaseId,
+      state: "stopped",
+      ...(id === leaseId ? { snapshot: { id: `snapshot-${leaseId}`, state: "completed" } } : {}),
+    }));
+    const heartbeat = heartbeatService(db, { environmentRuntime: {
+      inspectLeaseResource, retryPendingSandboxTeardown: teardown,
+    } as unknown as HeartbeatEnvironmentRuntime });
+    await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+    expect(inspectLeaseResource).toHaveBeenCalledExactlyOnceWith(leaseId);
     expect(teardown).toHaveBeenCalledOnce();
     expect((await row(leaseId)).status).toBe("expired");
+
+    // The same orphan with a stop receipt but no completed snapshot stays held.
+    const withoutSnapshotId = await retainedOrphan(await run("failed"));
+    expect((await pass()).kind).toMatchObject({ settled: 1 });
+    expect(hasRecoveredCleanupStopReceipt(await row(withoutSnapshotId))).toBe(true);
+    inspectLeaseResource.mockClear();
+    teardown.mockClear();
+    await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+    expect(inspectLeaseResource).toHaveBeenCalledExactlyOnceWith(withoutSnapshotId);
+    expect(teardown).not.toHaveBeenCalled();
+    expect(await row(withoutSnapshotId)).toMatchObject({ status: "pending_cleanup", metadata: {
+      pendingCleanupHoldReason: "completed_provider_snapshot_missing",
+    } });
   });
 
   it.each([
