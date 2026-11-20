@@ -1780,13 +1780,19 @@ function invalidateActivityQueries(
           return !!context?.conversation && context.issueRefs.has(entityId);
         })();
       for (const ref of issueRefs) {
+        const recoveryAction = queryClient.getQueryData<Issue>(queryKeys.issues.detail(ref))?.activeRecoveryAction;
+        const hasRecoveryCard = recoveryAction?.ownerType === "board" &&
+          ["active", "escalated"].includes(recoveryAction.status);
         const invalidationOptions =
           selfCommentActivity ||
           visibleIssueAgentActivity ||
           visibleIssueCommentActivity
             ? { refetchType: "inactive" as const }
             : undefined;
-        queryClient.invalidateQueries({ queryKey: queryKeys.issues.detail(ref), ...invalidationOptions });
+        // Streamed replies do not carry recovery state. A reply/update can
+        // follow cancellation, so an open card must re-read the server even
+        // when ordinary visible conversation traffic defers detail refreshes.
+        queryClient.invalidateQueries({ queryKey: queryKeys.issues.detail(ref), ...(hasRecoveryCard ? undefined : invalidationOptions) });
         queryClient.invalidateQueries({ queryKey: queryKeys.issues.activity(ref), ...invalidationOptions });
         if (action === "issue.comment_added" || action === "issue.conversation_session_started" || visibleConversation) {
           queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments(ref), ...(visibleConversation ? undefined : invalidationOptions) });
