@@ -62,7 +62,7 @@ import { unescapeIntrawordUnderscores } from "../lib/underscore-markdown";
 import { unescapeEqualsSigns } from "../lib/equals-markdown";
 import { restoreTrailingMarkdownSpaces } from "../lib/trailing-markdown-spaces";
 import { pasteNormalizationPlugin } from "../lib/paste-normalization";
-import { typedFencePlugin, VERBATIM_TO_MARKDOWN_OPTIONS } from "../lib/verbatim-markdown";
+import { typedFencePlugin, VERBATIM_TO_MARKDOWN_OPTIONS, verbatimTextToEditorMarkdown } from "../lib/verbatim-markdown";
 import { cn } from "../lib/utils";
 import { useEditorAutocomplete, type SlashCommandOption } from "../context/EditorAutocompleteContext";
 
@@ -780,7 +780,18 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
   submitKey = "mod-enter",
   readOnly = false,
 }: MarkdownEditorProps, forwardedRef) {
-  const editorValue = useMemo(() => prepareMarkdownForEditor(value), [value]);
+  // A verbatim composer's value is the person's exact text, not markdown: it
+  // enters the editor as literal text and leaves it as the exact export, with
+  // none of the transport-unescape passes (they would delete a typed `\`).
+  const toEditorSpace = useCallback(
+    (stored: string) => (verbatimText ? verbatimTextToEditorMarkdown(stored) : prepareMarkdownForEditor(stored)),
+    [verbatimText],
+  );
+  const toStoredSpace = useCallback(
+    (exported: string) => (verbatimText ? exported : toStoredMarkdown(exported)),
+    [verbatimText],
+  );
+  const editorValue = useMemo(() => toEditorSpace(value), [toEditorSpace, value]);
   function isSubmitShortcut(event: KeyboardEvent<HTMLElement>): boolean {
     return !readOnly
       && event.key === "Enter"
@@ -808,6 +819,9 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
    * normalize or transform values cannot loop. Replaces the older blur/focus gate for the same concern.
    */
   const echoIgnoreMarkdownRef = useRef<string | null>(null);
+  /** Verbatim mode: the stored text the mention picker edits. */
+  const mentionStoredTextRef = useRef(value);
+  mentionStoredTextRef.current = value;
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
   const [richEditorError, setRichEditorError] = useState<RichEditorError | null>(null);
@@ -1015,7 +1029,7 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
                 ref.current?.setMarkdown(updated);
                 // `updated` derives from `latestValueRef`, which is editor
                 // space; the parent only ever sees stored space.
-                onChange(toStoredMarkdown(updated));
+                onChange(toStoredSpace(updated));
                 requestAnimationFrame(() => {
                   ref.current?.focus(undefined, { defaultSelection: "rootEnd" });
                 });
@@ -1241,14 +1255,40 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
       if (!state) return false;
       if (option.kind === "action" && option.disabled) return false;
       const current = latestValueRef.current;
-      const next = applyMention(current, state, option);
-      if (next !== current) {
-        latestValueRef.current = next;
-        echoIgnoreMarkdownRef.current = next;
-        ref.current?.setMarkdown(next);
-        // `next` derives from `latestValueRef`, which is editor space; the
-        // parent only ever sees stored space.
-        onChange(toStoredMarkdown(next));
+      if (verbatimText) {
+        // Editor space is escaped literal text here: find the escaped query,
+        // put the mention's markdown in its place, and hand the parent the
+        // stored text (the mention markdown inside the person's exact text).
+        const search = verbatimTextToEditorMarkdown(`${state.marker}${state.query}`);
+        const idx = current.lastIndexOf(search);
+        if (idx !== -1) {
+          const replacement = autocompleteMarkdown(option);
+          const next = current.slice(0, idx) + replacement + current.slice(idx + search.length);
+          const stored = mentionStoredTextRef.current;
+          const storedSearch = `${state.marker}${state.query}`;
+          const storedIdx = stored.lastIndexOf(storedSearch);
+          const nextStored = storedIdx === -1
+            ? stored
+            : stored.slice(0, storedIdx) + replacement + stored.slice(storedIdx + storedSearch.length);
+          // The parent's next value maps to this editor space; the editor
+          // itself holds the imported mention, so the prop sync must not
+          // re-import over it.
+          latestValueRef.current = verbatimTextToEditorMarkdown(nextStored);
+          echoIgnoreMarkdownRef.current = next;
+          ref.current?.setMarkdown(next);
+          mentionStoredTextRef.current = nextStored;
+          onChange(nextStored);
+        }
+      } else {
+        const next = applyMention(current, state, option);
+        if (next !== current) {
+          latestValueRef.current = next;
+          echoIgnoreMarkdownRef.current = next;
+          ref.current?.setMarkdown(next);
+          // `next` derives from `latestValueRef`, which is editor space; the
+          // parent only ever sees stored space.
+          onChange(toStoredMarkdown(next));
+        }
       }
 
       const restoreSelection = (attemptsRemaining: number) => {
@@ -1281,7 +1321,7 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
       setMentionState(null);
       return true;
     },
-    [decorateProjectMentions, onChange],
+    [decorateProjectMentions, onChange, verbatimText],
   );
 
   const handleAutocompletePress = useCallback((
@@ -1597,7 +1637,7 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
             // as `\>` (so a `>`-prefixed line the user typed survives even when
             // the WYSIWYG shortcut didn't fire), and the `\<` transport escaping
             // that keeps bare angle brackets off the HTML parser.
-            const next = toStoredMarkdown(rawNext);
+            const next = toStoredSpace(rawNext);
             const echo = echoIgnoreMarkdownRef.current;
             if (echo !== null) {
               echoIgnoreMarkdownRef.current = null;
@@ -1605,8 +1645,9 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
               // space while `next` is in stored space. Accept either form —
               // otherwise every prop sync of a value containing an escaped
               // bracket reads as a real edit and notifies the parent.
-              if (next === echo || next === toStoredMarkdown(echo)) {
-                latestValueRef.current = echo;
+              if (next === echo || next === toStoredSpace(echo) || toEditorSpace(next) === echo) {
+                // Verbatim: hold the editor space of what the parent stores.
+                latestValueRef.current = verbatimText ? toEditorSpace(next) : echo;
                 return;
               }
             }
@@ -1630,7 +1671,8 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
             // hold editor space; storing `next` would make every edit containing
             // an escaped bracket look like a pending prop sync and trigger a
             // redundant `setMarkdown` that resets the caret.
-            latestValueRef.current = prepareMarkdownForEditor(next);
+            latestValueRef.current = toEditorSpace(next);
+            mentionStoredTextRef.current = next;
             onChange(next);
           }}
           onBlur={() => onBlur?.()}
