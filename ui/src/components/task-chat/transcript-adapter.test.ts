@@ -289,10 +289,17 @@ describe("omitProgressRepeatedByResponseAcrossSegments", () => {
     // A long unrelated history is not hidden.
     const history = [Array.from({ length: 500 }, (_, index) => progress(`p${index}`, `Step ${index} of a long run.`))];
     expect(omitProgressRepeatedByResponseAcrossSegments(history, "Short reply.")).toBe(history);
-    // A response that only shares a progress message's text does not hide it.
+    // A visible closing line that points back at the answer ("Answered above.") keeps that answer, even when the
+    // response restates it among other lines: hiding it would leave the line pointing at nothing (ui-doubles4).
     expect(
       omitProgressRepeatedByResponseAcrossSegments(segments, "Something else.\n\nTwo items need you: COM-2 and COM-1."),
     ).toBe(segments);
+    // Without that back-reference the same steered run's answer, restated whole by the final, is hidden in every
+    // segment (ui-doubles4 brief + RFL/rf-5 ruling: a progress text that is a whole sentence of the final is hidden).
+    const steered = [[work, answer], [progress("step", "Step 3 done.")]];
+    expect(
+      omitProgressRepeatedByResponseAcrossSegments(steered, "Something else.\n\nTwo items need you: COM-2 and COM-1."),
+    ).toEqual([[work], [steered[1]![0]]]);
   });
 
   it("hides every progress in the response's own segment whose sentences the response restates whole", () => {
@@ -302,10 +309,20 @@ describe("omitProgressRepeatedByResponseAcrossSegments", () => {
     expect(
       omitProgressRepeatedByResponseAcrossSegments([[work, first, second]], "Done. Also, 100+1 = 101. 9+10 = 19."),
     ).toEqual([[work]]);
-    // Only the response's own (last populated) segment: an earlier segment's answer stays, as in the guard above.
+    // ui-doubles4: every segment of the final's own run, not only the last populated one. A second steer splits
+    // the drawing of one run; the answer before it is still the one the final restates.
     expect(
       omitProgressRepeatedByResponseAcrossSegments([[work, first], [second], []], "Done. Also, 100+1 = 101. 9+10 = 19."),
-    ).toEqual([[work, first], [], []]);
+    ).toEqual([[work], [], []]);
+    const step = progress("step", "Step 3 done.");
+    expect(
+      omitProgressRepeatedByResponseAcrossSegments([[work, first], [step]], "Done. Also, 100+1 = 101."),
+    ).toEqual([[work], [step]]);
+    // A later back-reference keeps only the nearest answer above it.
+    const coda = progress("coda", "See the sum above.");
+    expect(
+      omitProgressRepeatedByResponseAcrossSegments([[first, work], [second, coda]], "Done. Also, 100+1 = 101. 9+10 = 19."),
+    ).toEqual([[work], [second, coda]]);
     const answers = [[progress("a", "101."), progress("b", "19.")]];
     expect(omitProgressRepeatedByResponseAcrossSegments(answers, "Done. 100+1 = 101. 9+10 = 19.")).toEqual([[]]);
     // Word-bounded: a progress "101" is not restated by "1010", nor by a sentence that only contains it.

@@ -2439,8 +2439,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
         const runtimeRequests = runtimeRequestSegmentContext(entries, {
           runId: liveRun.id, agentName: liveRun.agentName, running: true,
         });
-        for (const [segmentIndex, segment] of segments.slice(0, -1).entries()) {
-          if (segment.entries.length === 0) continue;
+        const liveSegmentTimelines = segments.map((segment) => {
           const parsedTranscript = reconcileSegmentRuntimeRequests(transcriptToTaskChatItems(segment.entries, {
             runLogHref: `/agents/${encodeURIComponent(agentMap?.get(liveRun.agentId)?.urlKey ?? liveRun.agentId)}/runs/${encodeURIComponent(liveRun.id)}`,
             runId: liveRun.id,
@@ -2451,11 +2450,30 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
             liveRun.id === planDocumentSourceRunId && planTurnItem
               ? embedPlanDocumentAtWriteBoundary(parsedTranscript, planTurnItem)
               : parsedTranscript;
-          const runHealth = partitionRunHealthItems(
-            isNativePaperclipRunnerRun(liveRun)
-              ? paperclipRunnerTimelineItems(parsed)
-              : parsed,
-          );
+          return isNativePaperclipRunnerRun(liveRun)
+            ? paperclipRunnerTimelineItems(parsed)
+            : parsed;
+        });
+        // The live final belongs to this same run: once it exists, the frozen
+        // pre-steer segments drop the progress it restates exactly as the
+        // settled projection will (one run, every segment), so the answer is
+        // drawn once live and the terminal handoff does not change the rows.
+        const liveFinalText = isNativePaperclipRunnerRun(liveRun)
+          ? paperclipRunnerFinalResponse(
+              transcriptToTaskChatItems(entries, {
+                runId: liveRun.id,
+                agentName: liveRun.agentName,
+                running: true,
+              }),
+              { runId: liveRun.id, agentName: liveRun.agentName, allowFallback: false },
+            )?.text
+          : undefined;
+        const liveTimelinesBySegment = liveFinalText
+          ? omitProgressRepeatedByResponseAcrossSegments(liveSegmentTimelines, liveFinalText)
+          : liveSegmentTimelines;
+        for (const [segmentIndex, segment] of segments.slice(0, -1).entries()) {
+          if (segment.entries.length === 0) continue;
+          const runHealth = partitionRunHealthItems(liveTimelinesBySegment[segmentIndex] ?? []);
           const liveRunReasoningDisplay = resolveReasoningDisplay(reasoningPreferences, liveRun.agentId, liveRun.adapterType);
           const children = settledRunChildren(runHealth.rest, liveRunReasoningDisplay);
           if (children.length === 0 && runHealth.failures.length === 0) continue;

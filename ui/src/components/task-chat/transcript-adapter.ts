@@ -1439,37 +1439,48 @@ function omitProgressRestatedByResponse(
   segments: readonly (readonly TaskChatItem[])[],
   normalizedResponse: string,
 ): readonly (readonly TaskChatItem[])[] {
-  return omitFinalSegmentProgressRestatedBySentence(omitProgressOpeningResponse(segments, normalizedResponse), normalizedResponse);
+  return omitRunProgressRestatedBySentence(omitProgressOpeningResponse(segments, normalizedResponse), normalizedResponse);
 }
+
+/** A closing line that points back at an earlier answer ("Answered above.", "See the list above."). */
+const BACK_REFERENCE_SENTENCE = /\b(?:answered|replied|see|shown|noted|mentioned|listed|covered|given|stated|said)(?:\s+[\w-]+){0,2}\s+above\b/i;
+
+const isProgressMessage = (item: TaskChatItem) =>
+  item.kind === "message" && Boolean(item.interstitial) && item.channel === "progress" && Boolean(item.text.trim());
 
 /**
  * A steered answer written as working text ("100+1 = 101.") and restated by
  * the final among other lines ("Done. Also, 100+1 = 101."), often with more
- * working text in between ("Step 3 done."). Within the response's own segment
- * (the last one holding items: the final is the last thing the run wrote),
- * drop every progress message whose sentences the response restates whole;
- * progress it does not restate stays. Earlier segments are never touched: an
- * answer there that the response only happens to share stays ("Answered
- * above." coda).
+ * working text or another steer in between ("Continue the remaining steps.",
+ * "Step 3 done."). The segments passed here are the steering segments of ONE
+ * run, the run that wrote the final (every caller splits a single run's
+ * transcript at its steering anchors), so this drops every progress message
+ * of that run whose sentences the response restates whole, in every segment:
+ * a later steer only splits the drawing, it does not make the answer a
+ * different one (ui-doubles4: answer drawn twice after a second steer).
+ * Answers of other runs never reach here and always stay.
+ *
+ * One keep: a later progress line of the same run that stays visible and
+ * points back at an answer ("Answered above.") keeps the nearest restated
+ * answer before it, so the line is never left pointing at nothing.
  */
-function omitFinalSegmentProgressRestatedBySentence(
+function omitRunProgressRestatedBySentence(
   segments: readonly (readonly TaskChatItem[])[],
   normalizedResponse: string,
 ): readonly (readonly TaskChatItem[])[] {
-  let segmentIndex = segments.length - 1;
-  while (segmentIndex >= 0 && segments[segmentIndex]!.length === 0) segmentIndex -= 1;
-  if (segmentIndex < 0) return segments;
-  const items = segments[segmentIndex]!;
-  const kept = items.filter(
-    (item) =>
-      item.kind !== "message" ||
-      !item.interstitial ||
-      item.channel !== "progress" ||
-      !item.text.trim() ||
-      !responseRestatesProgressSentences(item.text, normalizedResponse),
-  );
-  if (kept.length === items.length) return segments;
-  return segments.map((segment, index) => (index === segmentIndex ? kept : segment));
+  const flat = segments.flatMap((items, segmentIndex) => items.map((item, index) => ({ item, segmentIndex, index })));
+  const restated = flat.map(({ item }) =>
+    isProgressMessage(item) && responseRestatesProgressSentences((item as TaskChatMessageItem).text, normalizedResponse));
+  if (!restated.some(Boolean)) return segments;
+  for (let position = flat.length - 1; position >= 0; position -= 1) {
+    const { item } = flat[position]!;
+    if (restated[position] || !isProgressMessage(item) || !BACK_REFERENCE_SENTENCE.test((item as TaskChatMessageItem).text)) continue;
+    const referent = restated.lastIndexOf(true, position);
+    if (referent >= 0) restated[referent] = false;
+  }
+  const hidden = new Set(flat.filter((_, position) => restated[position]).map(({ item }) => item));
+  if (hidden.size === 0) return segments;
+  return segments.map((items) => (items.some((item) => hidden.has(item)) ? items.filter((item) => !hidden.has(item)) : items));
 }
 
 function omitProgressOpeningResponse(
