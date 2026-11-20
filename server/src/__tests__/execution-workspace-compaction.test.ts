@@ -406,10 +406,11 @@ describeEmbeddedPostgres("terminal workspace compaction", () => {
   // most one read-back budget; what it could not read back is KEPT for the next pass, never released.
   // The real scheduled sweep and its real lifecycle lock (embedded Postgres), the real writer, store,
   // journal, instance cleanup and files. The one planted fault is `store-hung`.
-  it("a hung object store holds the lifecycle lock for one read-back budget; every unread spill is kept, then proven once the store answers", async () => {
-    // RFL's bound: one guard pass reads back for 30 s in total. On top of it, the cleanup's
-    // own work under the lock (Git, the database, the filesystem).
-    const BUDGET_MS = 30_000, LOCK_WORK_ALLOWANCE_MS = 5_000;
+  it.each([undefined, "2000"])("a hung object store holds the lifecycle lock for one read-back budget (env override %s); every unread spill is kept, then proven once the store answers", async (override) => {
+    // RFL's bound: one guard pass reads back for 10 s by default, or the configured budget.
+    // On top of it, the cleanup's own work under the lock (Git, the database, the filesystem).
+    vi.stubEnv("RUN_LOG_SPILL_READ_BACK_BUDGET_MS", override);
+    const BUDGET_MS = override ? Number(override) : 10_000, LOCK_WORK_ALLOWANCE_MS = 5_000;
     const seeded = await seedWorkspace({ populate: false });
     const worktreesDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-budget-instances-")));
     tempDirs.add(worktreesDir);
@@ -450,13 +451,13 @@ describeEmbeddedPostgres("terminal workspace compaction", () => {
     expect(holds[0]!.heldAtMostMs).toBeLessThanOrEqual(BUDGET_MS + LOCK_WORK_ALLOWANCE_MS);
     expect(stillHung).toBe(true);
     // The read-backs, from the store: the pass waited on it no longer than its budget.
-    expect(RUN_LOG_SPILL_READ_BACK_BUDGET_MS).toBe(BUDGET_MS);
+    expect(RUN_LOG_SPILL_READ_BACK_BUDGET_MS).toBe(10_000);
     expect(hung.state.unansweredGets).toBeGreaterThan(0);
     expect(hung.state.lastGiveUpAt - hung.state.firstGetAt).toBeLessThanOrEqual(BUDGET_MS + 250);
     // KEPT: all 20, each with a custody row; the ones the budget did not reach say so.
     expect(rows.map(row => row.spill).sort()).toEqual(spills.map(spill => spill.path).sort());
     const reasons = rows.map(row => row.reason);
-    expect(reasons.filter(reason => reason === "read_back_budget_exhausted").length).toBeGreaterThanOrEqual(17);
+    expect(reasons.filter(reason => reason === "read_back_budget_exhausted").length).toBeGreaterThanOrEqual(19);
     expect(reasons.filter(reason => !["read_back_budget_exhausted", "recovered_copy_read_timeout", "recovered_copy_unreadable"].includes(reason))).toEqual([]);
     for (const spill of spills) {
       expect((await fs.readFile(spill.path)).equals(spill.bytes)).toBe(true);
