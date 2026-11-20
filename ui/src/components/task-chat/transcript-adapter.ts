@@ -1393,10 +1393,40 @@ const CONTINUATION_SENTENCE = /^(?:resuming|continuing|proceeding|moving on|now 
  */
 export function responseRestatesProgress(progressText: string, responseText: string): boolean {
   const response = collapseWhitespace(responseText);
-  const sentences = progressText.trim().split(/(?<=[.!?])\s+|\n+/).map(collapseWhitespace).filter(Boolean);
-  if (sentences.length > 1 && CONTINUATION_SENTENCE.test(sentences[sentences.length - 1]!)) sentences.pop();
-  const progress = sentences.join(" ");
+  const progress = progressSentences(progressText).join(" ");
   return Boolean(progress && response) && (response === progress || response.startsWith(`${progress} `));
+}
+
+const splitSentences = (text: string, normalize: (sentence: string) => string) =>
+  text.trim().split(/(?<=[.!?])\s+|\n+/).map(normalize).filter(Boolean);
+
+/** Progress sentences, without a closing line that only announces more work. */
+function progressSentences(progressText: string, normalize = collapseWhitespace): string[] {
+  const sentences = splitSentences(progressText, normalize);
+  if (sentences.length > 1 && CONTINUATION_SENTENCE.test(sentences[sentences.length - 1]!)) sentences.pop();
+  return sentences;
+}
+
+/** Sentence text as read: whitespace collapsed, markdown emphasis and backticks stripped. */
+const plainSentence = (text: string) => collapseWhitespace(text.replace(/`+|\*+|~~|(?<![\p{L}\p{N}])_+|_+(?![\p{L}\p{N}])/gu, ""));
+
+/**
+ * True when every sentence of a progress message is a whole sentence of the
+ * response, or ends one after a word break ("Also, 100+1 = 101." restates
+ * "100+1 = 101."). Never a match inside a sentence or a word: "101" is not
+ * restated by "Processed 1010 rows.".
+ */
+export function responseRestatesProgressSentences(progressText: string, responseText: string): boolean {
+  const progress = progressSentences(progressText, plainSentence);
+  if (!progress.length) return false;
+  const response = splitSentences(responseText, plainSentence);
+  return progress.every((sentence) =>
+    response.some(
+      (whole) =>
+        whole === sentence ||
+        (whole.endsWith(sentence) && whole.charAt(whole.length - sentence.length - 1) === " "),
+    ),
+  );
 }
 
 /**
@@ -1406,6 +1436,38 @@ export function responseRestatesProgress(progressText: string, responseText: str
  * restates. Progress the response does not restate stays.
  */
 function omitProgressRestatedByResponse(
+  segments: readonly (readonly TaskChatItem[])[],
+  normalizedResponse: string,
+): readonly (readonly TaskChatItem[])[] {
+  return omitTrailingProgressRestatedBySentence(omitProgressOpeningResponse(segments, normalizedResponse), normalizedResponse);
+}
+
+/**
+ * A steered answer written as working text ("100+1 = 101.") and restated by
+ * the final among other lines ("Done. Also, 100+1 = 101."). Walk back from the
+ * response over the run's latest progress: drop each one whose sentences the
+ * response restates whole; stop at the first progress it does not restate.
+ * Earlier text the response only happens to share stays.
+ */
+function omitTrailingProgressRestatedBySentence(
+  segments: readonly (readonly TaskChatItem[])[],
+  normalizedResponse: string,
+): readonly (readonly TaskChatItem[])[] {
+  const hidden = new Set<string>();
+  walk: for (let segmentIndex = segments.length - 1; segmentIndex >= 0; segmentIndex -= 1) {
+    const items = segments[segmentIndex]!;
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const item = items[index]!;
+      if (item.kind !== "message" || !item.interstitial || item.channel !== "progress" || !item.text.trim()) continue;
+      if (!responseRestatesProgressSentences(item.text, normalizedResponse)) break walk;
+      hidden.add(`${segmentIndex}:${index}`);
+    }
+  }
+  if (!hidden.size) return segments;
+  return segments.map((items, segmentIndex) => items.filter((_, index) => !hidden.has(`${segmentIndex}:${index}`)));
+}
+
+function omitProgressOpeningResponse(
   segments: readonly (readonly TaskChatItem[])[],
   normalizedResponse: string,
 ): readonly (readonly TaskChatItem[])[] {
