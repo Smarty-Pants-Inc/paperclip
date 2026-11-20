@@ -419,7 +419,10 @@ describe("sandbox callback bridge", () => {
       expect(fake.listCommands).toHaveLength(listsWhilePaused);
 
       await worker.resume("generation-b");
-      enqueue("first-resumed");
+      // The real gateway stamps the generation present at acceptance.
+      fake.requests.set(`${fake.directories.requestsDir}/first-resumed.json`,
+        JSON.stringify({ ...JSON.parse(bridgeRequestJson("first-resumed")),
+          bridgeGeneration: "generation-b" }));
       const resumedAt = Date.now();
       await vi.advanceTimersByTimeAsync(100);
       expect.soft(handled).toContain("first-resumed");
@@ -565,6 +568,111 @@ describe("sandbox callback bridge", () => {
       vi.useRealTimers();
     }
   }, 30_000);
+
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4605#issuecomment-7037417771
+  // Keep reason: a Stopped turn must never mutate Paperclip under a later run.
+  it.each([
+    ["read", "POST", "/api/issues/issue-1/comments"],
+    ["read", "PATCH", "/api/issues/issue-1"],
+    ["read", "POST", "/runtime-tools/github/credentials"],
+    ["writes", "POST", "/api/issues/issue-1/comments"],
+    ["writes", "PATCH", "/api/issues/issue-1"],
+    ["writes", "POST", "/runtime-tools/github/credentials"],
+  ])("refuses and removes a previous-generation %s leftover on %s %s", async (fault, method, route) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "bridge-stale-generation-"));
+    cleanupDirs.push(root);
+    const queueDir = path.join(root, "queue");
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const base = createFileSystemSandboxCallbackBridgeQueueClient();
+    const forwarded: { runId: string | undefined; path: string | undefined; body: string }[] = [];
+    const host = createServer(async (req, res) => {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      forwarded.push({ runId: req.headers["x-paperclip-run-id"] as string | undefined, path: req.url, body });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ applied: true }));
+    });
+    await new Promise<void>(resolve => host.listen(0, "127.0.0.1", resolve));
+    cleanupFns.push(async () => {
+      host.closeAllConnections();
+      await new Promise<void>(resolve => host.close(() => resolve()));
+    });
+    const address = host.address();
+    if (!address || typeof address === "string") throw new Error("host did not listen");
+    let currentRun = "previous-run";
+    let quarantine = false;
+    let injected = 0;
+    const stalePath = path.join(directories.requestsDir, "stale.json");
+    const client: SandboxCallbackBridgeQueueClient = {
+      ...base,
+      readTextFile: async (file, limit) => {
+        if (quarantine && file === stalePath && fault === "read") {
+          injected += 1;
+          throw new Error("injected quarantine read failure");
+        }
+        return base.readTextFile(file, limit);
+      },
+      writeResponseFile: async (file, body, options) => {
+        if (quarantine && file.endsWith("/stale.json") && fault === "writes") {
+          injected += 1;
+          throw new Error("injected recovery response write failure");
+        }
+        return base.writeResponseFile!(file, body, options);
+      },
+      writeTextFile: async (file, body) => {
+        if (quarantine && file.endsWith("run-state.json.ever-attached")) {
+          // This is the retained-file path, not a new request after activation.
+          expect(await readFile(stalePath, "utf8")).toContain("previous-generation");
+          expect(injected).toBe(fault === "read" ? 1 : 3);
+          quarantine = false;
+        }
+        return base.writeTextFile(file, body);
+      },
+    };
+    const worker = await startSandboxCallbackBridgeWorker({
+      client, queueDir, startPaused: true, requireActivationQuarantine: true,
+      pollIntervalMs: 5,
+      handleRequest: async request => {
+        const result = await fetch(`http://127.0.0.1:${address.port}${request.path}`, {
+          method: request.method, headers: { "content-type": "application/json", "x-paperclip-run-id": currentRun },
+          body: request.body.toString(), signal: AbortSignal.timeout(2_000),
+        });
+        return { status: result.status, body: await result.text() };
+      },
+    });
+    cleanupFns.push(() => worker.stop({ drainTimeoutMs: 0 }));
+    await worker.resume("previous-generation");
+    await worker.pause();
+    const envelope = (id: string, generation: string) => JSON.stringify({
+      id, method, path: route, query: "", headers: {}, bridgeGeneration: generation,
+      body: JSON.stringify({ body: id, status: "done" }), createdAt: new Date().toISOString(),
+    });
+    // A request accepted by the old gateway may finish publishing after pause.
+    await publishBridgeRequest(stalePath, envelope("stale", "previous-generation"));
+    currentRun = "current-run";
+    quarantine = true;
+    await worker.resume("current-generation");
+    await waitForJsonFile(directories.responsesDir);
+    const stale = JSON.parse(await readFile(path.join(directories.responsesDir, "stale.json"), "utf8"));
+    await expect.poll(() => readFile(stalePath).then(() => true, () => false)).toBe(false);
+    const requestRemains = await readFile(stalePath).then(() => true, () => false);
+    console.log("STALE_GENERATION_ROW", JSON.stringify({ fault, method, route, injected,
+      status: stale.status, removed: !requestRemains, forwarded: [...forwarded] }));
+    expect.soft(stale.status).toBe(503);
+    expect.soft(requestRemains).toBe(false);
+    expect.soft(forwarded).toEqual([]);
+    await rm(path.join(directories.responsesDir, "stale.json"));
+    // A current accepted generation still reaches the real host under its run.
+    const freshPath = path.join(directories.requestsDir, "fresh.json");
+    await publishBridgeRequest(freshPath, envelope("fresh", "current-generation"));
+    await waitForJsonFile(directories.responsesDir);
+    expect(JSON.parse(await readFile(path.join(directories.responsesDir, "fresh.json"), "utf8"))).toMatchObject({ status: 200 });
+    expect(forwarded.at(-1)).toMatchObject({ runId: "current-run", path: route });
+    expect(forwarded.at(-1)!.body).toContain("fresh");
+    await expect.poll(() => readFile(freshPath).then(() => true, () => false)).toBe(false);
+    console.log("CURRENT_GENERATION_ROW", JSON.stringify({ fault, method, route, status: 200,
+      removed: true, forwarded: forwarded.at(-1) }));
+  }, 15_000);
 
   it("preserves the default attached 100ms poll interval when idle backoff is unset", async () => {
     vi.useFakeTimers();
