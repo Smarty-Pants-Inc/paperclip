@@ -4,6 +4,8 @@ export { resolvePluginTaskResume } from "./plugin-task-resume.js";
 import { attachSandboxCreation, environmentService } from "./environments.js";
 import { createOwnedSandbox, queueSandboxCreationCleanup, recordSandboxCreationResource } from "./sandbox-creation-operations.js";
 import { writeEnvironmentCleanup } from "./environment-cleanup-notifications.js";
+import { guardedNativeWorkspaceReleasePatch } from "./native-runtime/native-workspace-release-guard.js";
+import { notifyCancelledWorkspacePreservation } from "./cancelled-workspace-preservation-notifications.js";
 import { releaseProviderRecoveryTransfers, stageProviderFreshWorkspace } from "./provider-fresh-workspace.js";
 import { readWorkspaceProviderBinding } from "@paperclipai/shared";
 import { canReadStoppedPluginTaskCredential, settlePluginTaskCredentialHandoff } from "./plugin-task-credential-writeback.js";
@@ -571,10 +573,14 @@ export async function executeEnvironmentTask(db: Db, workers: Pick<PluginWorkerM
         for(const owner of owners) {
           const receipt=remoteTerminationReceipt(owner,{providerLeaseId:taskId,state:"stopped"});
           if(!receipt) continue;
-          await writeEnvironmentCleanup(db, tx => tx.update(environmentLeases).set({
-            ...(owner.id !== lease.id && owner.status === "retained" ? {status:"released" as const,releasedAt:new Date(),cleanupStatus:"success" as const}:{}),
-            metadata:sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({remoteExecutionTermination:receipt,runnerTaskExecutionStopped:true})}::jsonb`,
-          }).where(and(eq(environmentLeases.id,owner.id),eq(environmentLeases.providerLeaseId,taskId))), { companyId: owner.companyId, runId: owner.heartbeatRunId ?? undefined });
+          await writeEnvironmentCleanup(db, async tx => {
+            await notifyCancelledWorkspacePreservation(tx, { companyId: owner.companyId, runId: owner.heartbeatRunId ?? undefined });
+            return tx.update(environmentLeases).set({
+              ...(owner.id !== lease.id && owner.status === "retained" ? guardedNativeWorkspaceReleasePatch({
+                status: "released", releasedAt: new Date(), cleanupStatus: "success", failureReason: owner.failureReason }) : {}),
+              metadata:sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({remoteExecutionTermination:receipt,runnerTaskExecutionStopped:true})}::jsonb`,
+            }).where(and(eq(environmentLeases.id,owner.id),eq(environmentLeases.providerLeaseId,taskId)));
+          }, { companyId: owner.companyId, runId: owner.heartbeatRunId ?? undefined });
         }
       }
       await db.update(environmentLeases).set({

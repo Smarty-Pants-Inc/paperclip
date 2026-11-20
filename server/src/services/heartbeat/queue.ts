@@ -87,6 +87,8 @@ import { nativeCleanupHoldsAdmission, recordNativeCleanupHold } from "../native-
 import { classifyAddressedInteractionExecutionCandidate } from "../native-runtime/native-addressed-interaction.js";
 import { adapterExecutionControls } from "../adapter-execution-control.js";
 import { preserveTaskRemoteWorkspaceWriter } from "../native-runtime/native-failed-workspace-recovery.js";
+import { isFailedTurnContinuationRun } from "../native-runtime/native-failed-turn-continuation.js";
+import { noRetainedExecutionPredicate } from "../pre-dispatch-execution-evidence.js";
 import { executionFailureRetryCount } from "../execution-recovery-attempt.js";
 import {
   slackMentionAllowsRunStart,
@@ -4434,6 +4436,45 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             return true;
           };
 
+          // A native failure's automatic retry is only a fallback. A real
+          // person's new comment must not wait behind it before it has started.
+          // Prove both the dispatcher-owned intent and absence of execution in
+          // the cancellation UPDATE; never cut a retry which acquired custody.
+          const cancelUnstartedFailedTurnRetry = async (candidate: typeof heartbeatRuns.$inferSelect) => {
+            if (opts.requestedByActorType !== "user" || !opts.requestedByActorId || !wakeCommentId
+              || !["queued", "scheduled_retry"].includes(candidate.status)
+              || await nativeManualAdmissionHoldsExecution(tx as unknown as Db,
+                { companyId: issue.companyId, issueId: issue.id, runId: candidate.id })
+              || !await isFailedTurnContinuationRun(tx as unknown as Db, candidate, issue.id)) return false;
+            const [comment] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+              eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+              eq(issueComments.id, wakeCommentId), eq(issueComments.authorType, "user"),
+              eq(issueComments.authorUserId, opts.requestedByActorId), isNull(issueComments.createdByRunId),
+              isNull(issueComments.deletedAt),
+            )).limit(1);
+            if (!comment) return false;
+            const now = new Date();
+            const [cancelled] = await tx.update(heartbeatRuns).set({ status: "cancelled", finishedAt: now, updatedAt: now,
+              errorCode: "native_failed_retry_superseded_by_person",
+              error: "Unstarted automatic failed-turn retry superseded by the person's new message" })
+              .where(and(eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, candidate.id),
+                eq(heartbeatRuns.status, candidate.status), noRetainedExecutionPredicate())).returning();
+            if (!cancelled) return false;
+            const carried = queuedCommentIdsFromRunContext(candidate.contextSnapshot);
+            if (carried.length) Object.assign(enrichedContextSnapshot, withQueuedCommentIdsInRunContext(
+              enrichedContextSnapshot, [...new Set([...queuedCommentIdsFromRunContext(enrichedContextSnapshot), ...carried])]));
+            if (candidate.wakeupRequestId) await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: now,
+              updatedAt: now, error: "Superseded by person input before execution" }).where(and(
+                eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.id, candidate.wakeupRequestId)));
+            await notifyInstructionCollection(tx, { companyId: cancelled.companyId, runId: cancelled.id });
+            await notifyExternalAgentSettlement(tx, { companyId: cancelled.companyId, runId: cancelled.id });
+            await notifyCancelledWorkspacePreservation(tx, { companyId: cancelled.companyId, runId: cancelled.id });
+            await notifyScheduledRetryCancellation(tx, { companyId: cancelled.companyId, runId: cancelled.id });
+            await notifyChatRunMilestones(tx, { companyId: cancelled.companyId, issueId: issue.id });
+            cancelledRunsToEmit.push(cancelled);
+            return true;
+          };
+
           let activeExecutionRun = issue.executionRunId
             ? await tx
                 .select()
@@ -4456,7 +4497,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
           if (
             activeExecutionRun &&
-            (await cancelStaleScheduledRetry(activeExecutionRun))
+            (await cancelStaleScheduledRetry(activeExecutionRun) || await cancelUnstartedFailedTurnRetry(activeExecutionRun))
           ) {
             activeExecutionRun = null;
           }
@@ -4573,8 +4614,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               continue;
             }
             if (legacyRun) {
-              if (await cancelStaleScheduledRetry(legacyRun)) {
-                activeExecutionRun = null;
+              if (await cancelStaleScheduledRetry(legacyRun) || await cancelUnstartedFailedTurnRetry(legacyRun)) {
+                continue;
               } else {
                 activeExecutionRun = legacyRun;
                 const legacyAgent = await tx

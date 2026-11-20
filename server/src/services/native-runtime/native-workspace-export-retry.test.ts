@@ -218,13 +218,25 @@ describe("board retry of accepted workspace export", () => {
     expect(runtime.retryPendingSandboxTeardown).toHaveBeenCalledOnce();
     expect(runtime.retryPendingSandboxTeardown).toHaveBeenCalledWith(expect.objectContaining({ lease: expect.objectContaining({ id: f.leaseId, heartbeatRunId: f.runId }) }));
     const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
-    expect(lease).toMatchObject(kind === "stop_failed" ? { status: "pending_cleanup", cleanupStatus: "failed" } : { status: "released", cleanupStatus: "success" });
+    expect(lease).toMatchObject(kind === "stop_failed" ? { status: "pending_cleanup", cleanupStatus: "failed" }
+      : { status: "retained", cleanupStatus: "failed", failureReason: "workspace_export_pending", releasedAt: null });
     if (kind === "stop_failed") {
       expect(lease.metadata?.remoteExecutionTermination).toBeUndefined();
       expect(lease.metadata?.pendingCleanupInFlight).toBe(false);
       expect(lease.metadata?.nativeWorkspaceExportResume).toMatchObject({ runId: f.runId, leaseId: f.leaseId });
     } else expect(lease.metadata?.remoteExecutionTermination).toMatchObject({ runId: f.runId, leaseId: f.leaseId, state: "stopped" });
     expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId)))[0]).toMatchObject({ phase: "terminal_failure", resultId: f.resultId });
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(0);
+  });
+  it("can retry the exact stopped export hold without treating it as released", async () => {
+    const f = await seed();
+    probe.mockRejectedValueOnce(new Error("probe unavailable"));
+    await expect(retryNativeWorkspaceExport(f.request)).rejects.toThrow();
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId)))[0]).toMatchObject({
+      status: "retained", failureReason: "workspace_export_pending", releasedAt: null });
+    probe.mockResolvedValue({ exitCode: 0, timedOut: false });
+    await expect(retryNativeWorkspaceExport(f.request)).resolves.toMatchObject({ status: "queued", leaseId: f.leaseId });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.nativeIssueId, f.issueId))).toHaveLength(1);
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(0);
   });
   it.each(["rebound_lease", "competing_owner", "retained_owner", "late_stop_receipt"])("does not stop or overwrite a newer sandbox owner: %s", async kind => {
@@ -257,7 +269,8 @@ describe("board retry of accepted workspace export", () => {
       metadata: { remoteCwd: kind === "wrong_root" ? "/other" : "/work" } });
     await expect(retryNativeWorkspaceExport(f.request)).rejects.toThrow("Resume and repair");
     expect(probe).not.toHaveBeenCalled();
-    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId)))[0].status).toBe("released");
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId)))[0]).toMatchObject({
+      status: "retained", cleanupStatus: "failed", failureReason: "workspace_export_pending", releasedAt: null });
   });
   it("fences an old failure whose transaction arrives after explicit repair admission", async () => {
     const f = await seed();
@@ -297,7 +310,8 @@ describe("board retry of accepted workspace export", () => {
   it("leaves repair intact when the exact sandbox is not running", async () => {
     const f = await seed(); probe.mockRejectedValueOnce(new Error("stopped"));
     await expect(retryNativeWorkspaceExport(f.request)).rejects.toThrow("Resume and repair");
-    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId)))[0].status).toBe("released");
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId)))[0]).toMatchObject({
+      status: "retained", cleanupStatus: "failed", failureReason: "workspace_export_pending", releasedAt: null });
     expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId)))[0].phase).toBe("terminal_failure");
   });
   it("revalidates the lease after the read-only probe", async () => {

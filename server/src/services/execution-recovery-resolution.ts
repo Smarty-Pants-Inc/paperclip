@@ -36,7 +36,7 @@ import {
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
-import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
+import { remoteLeaseExecutionStopped } from "./remote-execution-termination.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
 import { isReattachPhaseActive } from "./heartbeat/run-admission.js";
 import { provenGoneLegacyControllerBootId } from "./legacy-controller-lease.js";
@@ -171,10 +171,10 @@ async function validateExecutionReconciliationInScope(input: ExecutionReconcilia
     // acknowledgements can establish that repair will not race active writes.
     if (!Array.isArray(retainedIds) || !retainedIds.length ||
         !retainedIds.every(id => typeof id === "string" && leases.some(lease =>
-          lease.id === id && hasRemoteTerminationReceipt(lease))) ||
+          lease.id === id && remoteLeaseExecutionStopped(lease))) ||
         leases.some(lease => lease.provider === "local"
           ? !lease.releasedAt || lease.status === "pending_cleanup" || lease.cleanupStatus === "failed"
-          : !hasRemoteTerminationReceipt(lease))) {
+          : !remoteLeaseExecutionStopped(lease))) {
       throw conflict("The retained workspace environment has not confirmed that it stopped. Wait for cleanup before recording workspace repair.");
     }
     checkLocalProcesses = !operatorContained && leases.some(lease => lease.provider === "local");

@@ -68,9 +68,10 @@ function piDescendant(runnerPid: number): number | null {
   return visit(runnerPid);
 }
 
-it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallback", "finished", "FILESTOP", "FILESTOP-fallback", "FILESTOP-forged-proof", "FILESTOP-restart-hook", "FILESTOP-validation-fails", "FILESTOP-late-export", "FILESTOP-successor-fails", "FILESTOP-restart-process", "FILESTOP-fast-question"] as const)(`warm turnstop T1-F: %s (real Runner/Pi, two prior turns)`, async scenario => {
+it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallback", "finished", "FILESTOP", "FILESTOP-fallback", "FILESTOP-forged-proof", "FILESTOP-restart-hook", "FILESTOP-validation-fails", "FILESTOP-late-export", "FILESTOP-successor-fails", "FILESTOP-restart-process", "FILESTOP-fast-question", "FILEFAILED"] as const)(`warm turnstop T1-F: %s (real Runner/Pi, two prior turns)`, async scenario => {
   const stopTurn = 3;
-  const filestop = scenario.startsWith("FILESTOP");
+  const filefailed = scenario === "FILEFAILED";
+  const filestop = scenario.startsWith("FILESTOP") || filefailed;
   const forgedProof = scenario === "FILESTOP-forged-proof";
   const restartHook = scenario === "FILESTOP-restart-hook";
   const validationFails = scenario === "FILESTOP-validation-fails";
@@ -128,6 +129,8 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
   const sockets = new Set<WebSocket>();
   let modelServer: Server | undefined, http: Server | undefined;
   let app: Awaited<ReturnType<typeof import("../app.js").createApp>> | undefined;
+  let fileExportWorker: ReturnType<typeof import("../services/delivery-work-coordinator.js").createDeliveryWorkCoordinator> | undefined;
+  let failedRetryDrain = false;
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | undefined;
   let db: ReturnType<typeof createDb> | undefined;
   let companyId = "", agentId = "", issueId = "";
@@ -158,7 +161,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       if (db && agentId) {
         const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
         const failure = runs.find(run => run.status === "failed" || run.status === "timed_out");
-        if (failure) throw new Error(`${label}: run failed ${JSON.stringify({ id: failure.id, status: failure.status, errorCode: failure.errorCode, error: failure.error })}`);
+        if (failure && !filefailed) throw new Error(`${label}: run failed ${JSON.stringify({ id: failure.id, status: failure.status, errorCode: failure.errorCode, error: failure.error })}`);
         if (runs.some(run => run.resultJson?.failureCode === "native_workspace_sync_out_failed")) {
           const operations = await db.select().from(workspaceOperations).where(eq(workspaceOperations.companyId, companyId));
           const finalizations = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.companyId, companyId));
@@ -228,7 +231,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
         const completed = completedSteps(inputItems);
         const request: ModelRequest = { at: submittedAt, turn, completed, input: inputItems, model: parsed.model,
           tools: (parsed.tools ?? []).map((tool: { name?: string }) => tool.name ?? "") };
-        if (filestop && !warmup && turn === 1 && !requests.some(row => row.turn === 1)) {
+        if (filestop && !warmup && turn >= 1 && !requests.some(row => row.turn === turn)) {
           // This request has not received any response/tool call yet: observe
           // the real box workspace, not the server snapshot or a successor tool.
           const path = join(remoteWorkspace, "filestop.txt");
@@ -250,6 +253,14 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
         }
         const boundary = scenario === "R-double" ? (turn === 0 ? 1 : turn === 1 ? 2 : null) : turn === 0 ? (filestop ? 1 : 2) : null;
         if (!warmup && scenario !== "finished" && boundary !== null && completed.includes(boundary)) {
+          if (filefailed) {
+            // A real provider failure AFTER Pi's completed real Bash write,
+            // not a hand-edited terminal row or a cancelled turn.
+            stage("FILEFAILED real provider error after completed write", { completed });
+            res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({
+              error: { type: "invalid_request_error", message: "filefailed deliberate provider error after write" } }));
+            return;
+          }
           barriers.push(request);
           stage("completed-tool boundary reached", { turn, completed });
           await new Promise<void>(done => res.on("close", done));
@@ -428,7 +439,14 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
           refresh: async () => endpoint, close: async () => {} };
         return endpoint;
       },
-      retryPendingSandboxTeardown: async ({ lease }) => { stopCalls.push(lease.id); stage("provider stop requested", { leaseId: lease.id }); return { providerLeaseId: lease.providerLeaseId!, state: "stopped" }; },
+      retryPendingSandboxTeardown: async ({ lease }) => {
+        stopCalls.push(lease.id); stage("provider stop requested", { leaseId: lease.id });
+        // The local allocation transport owns these Runner children. For the
+        // failed-source row, actually stop them before returning its bound
+        // provider receipt; never waive the product's remote-cleanup gate.
+        if (filefailed) for (const bundle of bundles) await bundle.transport.close();
+        return { providerLeaseId: lease.providerLeaseId!, state: "stopped" };
+      },
     }];
     await db.insert(environments).values({ id: environmentId, name: "Turnstop loopback allocation", driver: "sandbox",
       config: providerConfig }).onConflictDoNothing();
@@ -553,7 +571,8 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       const first = await waitFor("R4 successor first model request", async () => requests[0] ?? null);
       const [nextLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, next.id));
       expect(nextLease?.providerLeaseId).not.toBe(sourceLease!.providerLeaseId);
-      expect(first.fileBeforeTools?.exists).toBe(false);
+      expect(first.fileBeforeTools?.exists, "the pre-restart terminal write reaches the new box before its first tool").toBe(true);
+      expect(first.fileBeforeTools?.base64).toBe(fileBytes.toString("base64"));
       const final = await waitFor("R4 restarted question completes", async () =>
         (await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next.id))).find(run => run.status === "succeeded") ?? null);
       const { heartbeatService } = await import("../services/heartbeat.js");
@@ -614,7 +633,9 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
     await db.update(agents).set({ defaultEnvironmentId: environmentId }).where(eq(agents.id, agentId));
     const issue = await api("POST", `/companies/${companyId}/issues`, { title: "Six steps through native Pi", description: "Execute STEP1 through STEP6 once each. After Interrupt continue from the completed tool results, never redo completed steps. Stop revokes this work; answer only the newly authorized question after Stop.", status: "todo", assigneeAgentId: agentId }, 201);
     issueId = issue.id;
-    await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: "local-board", conversationState: "active" }).where(eq(issues.id, issueId));
+    // FILEFAILED covers task retry admission, not the chat-only policy which
+    // intentionally suppresses all issue_status_changed execution wakes.
+    if (!filefailed) await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: "local-board", conversationState: "active" }).where(eq(issues.id, issueId));
     for (let turn = 1; turn < stopTurn; turn++) {
       const warmup = await waitFor(`warmup ${turn} settled`, async () => (await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
         .find(run => run.status === "succeeded" && !warmupRunIds.has(run.id)) ?? null);
@@ -654,6 +675,98 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       return;
     }
     const { heartbeatService } = await import("../services/heartbeat.js");
+    if (filefailed) {
+      const failed = await waitFor("actual failed source after completed Bash write", async () =>
+        (await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, admitted.id))).find(run => run.status === "failed") ?? null);
+      expect(readFileSync(join(remoteWorkspace, "filestop.txt")).toString("base64")).toBe(fileBytes.toString("base64"));
+      await heartbeatService(db).waitForRunExecutionDrain(failed.id, { timeoutMs: 15_000 });
+      stage("FILEFAILED source terminal", { runId: failed.id, status: failed.status, errorCode: failed.errorCode });
+      const { createDeliveryWorkCoordinator } = await import("../services/delivery-work-coordinator.js");
+      fileExportWorker = createDeliveryWorkCoordinator({ owner: db, canRun: () => true,
+        onError: error => stage("FILEFAILED registered export worker error", { error: String(error) }) });
+      await heartbeatService(db).registerCancelledWorkspacePreservationWork(fileExportWorker, () => true).ready;
+      const exported = await waitFor("registered worker verified failed source file", async () => {
+        const [source] = await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, failed.id));
+        return source?.runnerProfileJson?.nativeWorkspaceSync?.state === "finalized"
+          && existsSync(join(workspace, "filestop.txt")) ? source : null;
+      }, 120_000);
+      stage("FILEFAILED registered worker verified file", { finalReference: exported.runnerProfileJson?.nativeWorkspaceSync,
+        fileSha256: createHash("sha256").update(readFileSync(join(workspace, "filestop.txt"))).digest("hex") });
+      // This focused app fixture does not run index.ts's maintenance owners.
+      // Drive their existing stop-only owner explicitly after verified export,
+      // rather than manufacturing a receipt or relaxing continuation admission.
+      const [sourceLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, failed.id));
+      const { prepareUnconfirmedSourceSandboxStop } = await import("../services/sandbox-stop-and-retain.js");
+      expect(await prepareUnconfirmedSourceSandboxStop(db, sourceLease!)).toBeTruthy();
+      await heartbeatService(db).sweepPendingCleanupLeases({ backoffMs: 0 });
+      const [stoppedLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, sourceLease!.id));
+      const { hasRemoteTerminationReceipt } = await import("../services/remote-execution-termination.js");
+      expect(hasRemoteTerminationReceipt(stoppedLease!)).toBe(true);
+      await writeFile(join(root, "FILEFAILED-stopped-source-lease.json"), JSON.stringify(stoppedLease, null, 2));
+      const successors: unknown[] = [];
+      let controlledRetryId: string | undefined;
+      for (const turn of [1, 2]) {
+        const sentAt = Date.now();
+        const comment = await api("POST", `/issues/${issueId}/comments`, { body: `T1F_INPUT_${turn}: read filestop.txt and answer.` }, 201);
+        if (failedRetryDrain) {
+          // The comment route commits before its asynchronous wake admission.
+          // Join that real boundary without releasing the claim drain early.
+          const superseded = await waitFor("person admission cancels the retry while claims remain drained", async () => {
+            const [retry] = await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, controlledRetryId!));
+            return retry?.status === "cancelled" ? retry : null;
+          }, 15_000);
+          expect(superseded.errorCode).toBe("native_failed_retry_superseded_by_person");
+          expect(superseded.startedAt).toBeNull();
+          heartbeatService(db).stopTaskDrain();
+          failedRetryDrain = false;
+          await heartbeatService(db).resumeQueuedRunsAfterDrain({ companyId });
+        }
+        const first = await waitFor(`FILEFAILED follow-up ${turn} first provider request`, async () => requests.find(row => row.turn === turn) ?? null);
+        expect(first.fileBeforeTools?.exists, "failed source file reaches each new native turn").toBe(true);
+        expect(first.fileBeforeTools?.base64).toBe(fileBytes.toString("base64"));
+        const done = await waitFor(`FILEFAILED follow-up ${turn} completed`, async () =>
+          (await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).find(run =>
+            run.status === "succeeded" && run.contextSnapshot?.wakeCommentId === comment.id) ?? null);
+        await heartbeatService(db).waitForRunExecutionDrain(done.id, { timeoutMs: 15_000 });
+        successors.push({ turn, runId: done.id, commentId: comment.id, elapsedMs: Date.now() - sentAt, file: first.fileBeforeTools });
+        stage("FILEFAILED person's follow-up answered", successors.at(-1));
+        if (turn === 1) {
+          // Freeze the actual claim boundary and replay the persisted committer
+          // intent through normal wake admission: a dispatcher can have read it
+          // before the previous question completed. No fake run or copied intent
+          // ID qualifies; admission creates its own authenticated dispatch receipt.
+          const intent = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId)))
+            .find(row => row.requestedByActorId === "native-status-committer" && row.payload?.retryCause === "native_run_failed");
+          expect(intent).toBeTruthy();
+          heartbeatService(db).startTaskDrain();
+          failedRetryDrain = true;
+          const payload = intent!.payload ?? {};
+          const retry = await heartbeatService(db).wakeup(agentId, {
+            allowRunCoalescing: false, source: "automation", triggerDetail: "system", reason: intent!.reason,
+            payload, idempotencyKey: `${intent!.idempotencyKey}:controlled-unstarted-dispatch-race`,
+            requestedByActorType: "system", requestedByActorId: `native-status-wake-dispatch:${intent!.id}`,
+            contextSnapshot: { ...(payload._paperclipWakeContext as Record<string, unknown>), issueId, taskId: issueId,
+              wakeReason: intent!.reason, source: "native_status_decision", statusDecisionSource: "native_status_decision",
+              nativeStatusWakeIntentId: intent!.id },
+          });
+          expect(retry?.status).toBe("queued");
+          expect(retry?.startedAt).toBeNull();
+          controlledRetryId = retry!.id;
+          await writeFile(join(root, "FILEFAILED-retries-before-third.json"), JSON.stringify({ interruption: "task drain before claim; persisted real committer intent replay through public wake admission", intent, retry }, null, 2));
+        }
+      }
+      const [supersededRetry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, controlledRetryId!));
+      expect(supersededRetry?.status).toBe("cancelled");
+      expect(supersededRetry?.errorCode).toBe("native_failed_retry_superseded_by_person");
+      expect(supersededRetry?.startedAt).toBeNull();
+      const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, failed.id));
+      expect(source?.runnerProfileJson?.nativeWorkspaceSync?.state).toBe("finalized");
+      expect(source?.runnerProfileJson?.nativeWorkspaceSync?.finalHostSha256).toBeTruthy();
+      expect(readFileSync(join(workspace, "filestop.txt")).toString("base64")).toBe(fileBytes.toString("base64"));
+      await writeFile(join(root, "FILEFAILED-oracle.json"), JSON.stringify({ source, successors, supersededRetry,
+        fileSha256: createHash("sha256").update(fileBytes).digest("hex"), serverFile: join(workspace, "filestop.txt") }, null, 2));
+      return;
+    }
     let current = admitted;
     const interrupts = scenario === "R-double" ? 2 : 1;
     for (let press = 1; press <= interrupts; press++) {
@@ -972,6 +1085,11 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
     stage("BLOCKED", { error: error instanceof Error ? error.stack : String(error), companyId, agentId, issueId });
     throw error;
   } finally {
+    if (failedRetryDrain && db) {
+      const { heartbeatService } = await import("../services/heartbeat.js");
+      heartbeatService(db).stopTaskDrain();
+    }
+    await fileExportWorker?.stop();
     await writeFile(join(root, "proof.json"), JSON.stringify({ scenario, stopTurn, warmupIdentities, stages, observations, requests }, null, 2) + "\n");
     await writeFile(join(root, "remote-pack-verification.json"), JSON.stringify(packVerificationCommands, null, 2) + "\n");
     if (db && agentId) {

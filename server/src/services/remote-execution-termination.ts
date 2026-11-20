@@ -1,4 +1,5 @@
 import { and, desc, eq, inArray, isNull } from "drizzle-orm";
+import { isNativeWorkspaceExportReleaseHold } from "./native-runtime/native-workspace-release-guard.js";
 import { environmentLeases, heartbeatRunEvents, type Db } from "@paperclipai/db";
 import { retiredReusableLeasePredecessors } from "./environment-lease-handoff.js";
 import { OWN_PROCESS_START_EVENT_TYPES } from "./native-process-start-events.js";
@@ -26,7 +27,7 @@ export function remoteTerminationReceipt(lease: LeaseIdentity, value: unknown) {
 }
 
 type ReceiptLease = LeaseIdentity & {
-  releasedAt: unknown; cleanupStatus: string | null; status: string;
+  releasedAt: unknown; cleanupStatus: string | null; status: string; failureReason?: string | null;
   metadata: Record<string, unknown> | null;
 };
 
@@ -61,8 +62,9 @@ function leaseReleaseStarted(lease: Pick<ReceiptLease, "metadata">): boolean {
  * task recorded the provider's stop when it settled. Release can be held long
  * after that stop (for example by a pending workspace export); once release
  * starts, it owns the receipt until the lease is released. */
-function remoteLeaseExecutionStopped(lease: ReceiptLease): boolean {
+export function remoteLeaseExecutionStopped(lease: ReceiptLease): boolean {
   return hasRemoteTerminationReceipt(lease) ||
+    isNativeWorkspaceExportReleaseHold({ ...lease, failureReason: lease.failureReason ?? null }) && hasBoundRemoteStopReceipt(lease) ||
     lease.status === "active" && !lease.releasedAt && !leaseReleaseStarted(lease) && hasBoundRemoteStopReceipt(lease);
 }
 

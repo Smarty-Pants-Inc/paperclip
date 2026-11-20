@@ -498,6 +498,51 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     return { company, agent, issue, wake, run };
   }
 
+  it.each(["unstarted", "started", "resource", "copied-intent"] as const)("person input is never parked behind an unstarted failed-turn retry (%s)", async guard => {
+    const f = await fixture("queued");
+    const userId = "queue-test-user";
+    const [source] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.agent.id,
+      status: "failed", runtimeMode: "native", nativeIssueId: f.issue.id, finishedAt: new Date(),
+      contextSnapshot: { issueId: f.issue.id } }).returning();
+    const [intent] = await db.insert(agentWakeupRequests).values({ companyId: f.company.id, agentId: f.agent.id,
+      source: "automation", status: "coalesced", requestedByActorType: "system", requestedByActorId: "native-status-committer",
+      payload: { issueId: f.issue.id, retryCause: "native_run_failed" } }).returning();
+    await db.update(agentWakeupRequests).set({ runId: f.run.id, requestedByActorType: "system",
+      requestedByActorId: guard === "copied-intent" ? "unrelated" : `native-status-wake-dispatch:${intent.id}` })
+      .where(eq(agentWakeupRequests.id, f.wake.id));
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issue.id, nativeStatusWakeIntentId: intent.id },
+      ...(guard === "started" ? { status: "running", startedAt: new Date() } : {}) }).where(eq(heartbeatRuns.id, f.run.id));
+    if (guard === "resource") await db.insert(environmentLeases).values({ companyId: f.company.id,
+      heartbeatRunId: f.run.id, provider: "fake", providerLeaseId: randomUUID(), status: "active" });
+    const [comment] = await db.insert(issueComments).values({ companyId: f.company.id, issueId: f.issue.id,
+      authorType: "user", authorUserId: userId, body: "Please read the saved file now." }).returning();
+    const deps = callbacks(db);
+    deps.getAgent.mockResolvedValue(f.agent);
+    deps.instanceSettings.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: false, enableNativeRunner: true } as Awaited<ReturnType<typeof deps.instanceSettings.getExperimental>>);
+    deps.getSchedulingSuppression.mockResolvedValue({ suppressed: true, reason: "task_drain" });
+    const admission = createWakeQueue(db, {
+      resolveResponsibleUserId: async () => userId,
+      getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+      resolveSessionBeforeForWakeup: async () => null,
+      wakeAdmissionHelpers: { filterZombieCoalesceTarget: deps.filterZombieCoalesceTarget,
+        mergeCoalescedContextSnapshot, shouldDeferFollowupWakeForSameIssue, shouldQueueFollowupForRunningIssueWake },
+      recovery: { escalateStrandedAssignedIssue: async () => undefined, escalateStrandedRecoveryIssueInPlace: async () => undefined },
+    });
+    deps.wakeQueue.createAdmissionTransactionScope.mockImplementation(admission.createAdmissionTransactionScope);
+    deps.wakeQueue.admitWakeBehindIssueExecution.mockImplementation(admission.admitWakeBehindIssueExecution);
+    await createHeartbeatQueue(db, deps).enqueueWakeup(f.agent.id, { source: "on_demand", triggerDetail: "manual",
+      reason: "issue_commented", requestedByActorType: "user", requestedByActorId: userId, allowRunCoalescing: false,
+      payload: { issueId: f.issue.id, commentId: comment.id },
+      contextSnapshot: { issueId: f.issue.id, commentId: comment.id, wakeCommentId: comment.id, wakeCommentIds: [comment.id], source: "issue.comment" } });
+    const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.run.id));
+    if (guard === "unstarted") {
+      expect(retry).toMatchObject({ status: "cancelled", errorCode: "native_failed_retry_superseded_by_person" });
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agent.id));
+      expect(runs.filter(run => run.status === "queued")).toEqual([expect.objectContaining({ contextSnapshot: expect.objectContaining({ wakeCommentId: comment.id }) })]);
+    } else expect(retry.status).toBe(guard === "started" ? "running" : "queued");
+    expect(deps.executeRun).not.toHaveBeenCalled();
+  });
+
   it("coalesces five plugin wakes behind one running issue run", async () => {
     const f = await fixture();
     const initialRunContext = f.run.contextSnapshot;
