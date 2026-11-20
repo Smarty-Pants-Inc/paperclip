@@ -169,8 +169,10 @@ describe("Interrupt successor carrying a new message answers it first (adopt-a2-
     return { built, text: strings.join("\n\n") };
   }
   const ANSWER_FIRST = "The person interrupted your previous turn and sent a new message. Answer their new message first.";
-  const CUT_NOT_RERUN = "A call marked interrupted was cut mid-flight. If it was only a wait or sleep, do not run it again unless the person asks.";
-  const LIST = /\n## Commands already run in the interrupted turn \(do not run these again\)\n[\s\S]*Do not run them again[.;][\s\S]*\n1\. `bash` \(`echo STEP1 > \/tmp\/step1`\): completed\n {3}result: STEP1-RESULT-wrote-step1\n2\. `bash` \(`sleep 600`\): interrupted/;
+  const CUT_NOT_RERUN = "A call marked interrupted did not finish. If it was a long wait (minutes) that the new message may have meant to cut short, answer first and ask before re-running it.";
+  const CUT_STEP_RERUN = "Otherwise check whether it took effect and, if not, run it again before the remaining steps; do not report the task done while a step is unfinished.";
+  const COMPLETED_ONLY = "The completed calls below must not be run again.";
+  const LIST = /\n## Commands already run in the interrupted turn \(do not run these again\)\n[\s\S]*(?:Do not run them again[.;]|The completed calls below must not be run again\.)[\s\S]*\n1\. `bash` \(`echo STEP1 > \/tmp\/step1`\): completed\n {3}result: STEP1-RESULT-wrote-step1\n2\. `bash` \(`sleep 600`\): interrupted/;
 
   for (const [name, previousRun, sameSession] of [
     ["fresh successor (new session)", null, false],
@@ -187,8 +189,42 @@ describe("Interrupt successor carrying a new message answers it first (adopt-a2-
       // Nothing points the model back at the old request ahead of the new message.
       expect(text).not.toMatch(/continue from the next step|continue from the (conversation|history|existing work)|Continue from the latest user request/i);
       expect(text.indexOf(ANSWER_FIRST), "answer first, before any re-run check").toBeLessThan(text.indexOf("check whether it took effect"));
+      // adopt-cutstep: the cut sleep 600 is never told to be re-run: the only 'run it again' is the Otherwise clause
+      // for a call that is not a long wait, and it comes after the ask-first rule for a long wait.
+      expect(text.split("run it again"), "one 'run it again', in the Otherwise clause").toHaveLength(2);
+      expect(text.indexOf(CUT_NOT_RERUN), "long wait: ask first, before the Otherwise clause").toBeLessThan(text.indexOf(CUT_STEP_RERUN));
     });
   }
+
+  // adopt-cutstep (Paul interrupts a 6-step task while STEP2 `sleep 15; echo STEP2-x` runs and asks "9 + 10").
+  // The successor read 'already ran in this session (completed or started) ... Do not run them again' and the
+  // cut-wait rule, skipped STEP2 and reported DONE with step 2 unfinished. Only COMPLETED calls are never
+  // re-run; a cut task step that is not a long wait is checked and run again before the remaining steps.
+  it("6-step task cut mid-STEP2 (a short sleep inside a step): completed calls not re-run, the cut step is run again", () => {
+    const midStep2Wake = { ...interruptWake,
+      interruptedTurnToolCalls: [
+        { name: "bash", target: "echo STEP1 > /tmp/step1", status: "completed", output: "STEP1-done" },
+        { name: "bash", target: "sleep 15; echo STEP2-x", status: "interrupted", output: "" },
+      ],
+      executionContinuation: { ...continuation, objective: "Run STEP1 to STEP6 in order" },
+    };
+    for (const previousRun of [null, "prior"] as const) {
+      const { built, text } = request(midStep2Wake, previousRun === "prior" ? prior(successor(midStep2Wake, sessionId, false, firstRun)) : null);
+      expect(built.checkpoint !== null, "session identity of this row").toBe(previousRun === "prior");
+      expect(text).toContain("9 + 10");
+      expect(text).toMatch(/\n1\. `bash` \(`echo STEP1 > \/tmp\/step1`\): completed[\s\S]*\n2\. `bash` \(`sleep 15; echo STEP2-x`\): interrupted/);
+      expect(text, "answer first, then continue").toContain("Answer their new message first. Then continue the task from the next unfinished step.");
+      expect(text, "only completed calls are never re-run").toContain(COMPLETED_ONLY);
+      expect(text, "a cut task step is checked and run again").toContain(CUT_STEP_RERUN);
+      expect(text, "a long wait (minutes) is the visible criterion").toContain(CUT_NOT_RERUN);
+      // The blanket rule that skipped STEP2 is gone from every Interrupt sentence the model reads.
+      expect(text).not.toContain("(completed or started)");
+      expect(text).not.toMatch(/Do not run them again[.;]/);
+      expect(text).not.toContain("already ran; do not run them again");
+      expect(text).not.toContain("If it was only a wait or sleep");
+      expect(text.indexOf("Answer their new message first."), "answer before the re-run rule").toBeLessThan(text.indexOf(CUT_STEP_RERUN));
+    }
+  });
 
   // adopt-a2-order2 (rf-4 T2 bar): the person interrupts a 6-step task after STEP2 while STEP3 (not a wait) is
   // mid-flight and asks "9 + 10". The answer comes first, but STEP3-6 must still be done: the words must say to
@@ -210,8 +246,9 @@ describe("Interrupt successor carrying a new message answers it first (adopt-a2-
       expect(resume, "says to continue the task from the next unfinished step").toBeGreaterThan(-1);
       expect(text.indexOf("Answer their new message first."), "answer before continuing").toBeLessThan(resume);
       expect(text, "STEP3 (not a wait) is not forbidden").not.toMatch(/cut mid-flight\. Do not run it again unless the person asks/);
-      expect(text, "only a wait or sleep is not re-run").toContain("If it was only a wait or sleep, do not run it again unless the person asks.");
-      expect(text, "a cut non-wait call is checked, then run again").toContain("Otherwise check whether it took effect before you run it again.");
+      expect(text, "only a long wait is not re-run without asking").toContain(CUT_NOT_RERUN);
+      expect(text, "a cut non-wait call is checked, then run again").toContain(CUT_STEP_RERUN);
+      expect(text, "only completed calls are never re-run").toContain(COMPLETED_ONLY);
       expect(text).not.toMatch(/continue from the (conversation|history|existing work)/i);
       expect(text).toMatch(/\n1\. `bash` \(`echo STEP1 > \/tmp\/step1`\): completed[\s\S]*\n2\. `bash` \(`echo STEP2 > \/tmp\/step2`\): completed[\s\S]*\n3\. `bash` \(`echo STEP3 > \/tmp\/step3`\): interrupted/);
     }
