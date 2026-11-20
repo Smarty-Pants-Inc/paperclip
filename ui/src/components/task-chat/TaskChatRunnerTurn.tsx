@@ -304,8 +304,13 @@ export function TaskChatRunnerTurn({
   for (const item of runAnswerItems ?? turnItems) {
     if (item.kind !== "message" || item.channel !== "final" || !item.text.trim()) continue;
     if ((yielded || awaitingContinuation) && isYieldedWaitStub(item.text, waitSummaries)) continue;
-    const latched = answersRef.current.byId.get(item.id);
-    if (!latched || item.text.length >= latched.text.length) answersRef.current.byId.set(item.id, item);
+    // Item ids are transcript positions; a rebuild that shifts entries re-keys
+    // the same answer (same time, same text). Keep it under its first key.
+    const text = item.text.trim().replace(/\s+/g, " ");
+    const key = answersRef.current.byId.has(item.id) ? item.id : [...answersRef.current.byId].find(([, answer]) =>
+      item.atMs != null && answer.atMs === item.atMs && answer.text.trim().replace(/\s+/g, " ") === text)?.[0] ?? item.id;
+    const latched = answersRef.current.byId.get(key);
+    if (!latched || item.text.length >= latched.text.length) answersRef.current.byId.set(key, item);
   }
   // The latest answer is `final` (drawn below, with its read identity). An
   // earlier answer whose reply the thread already shows is not drawn twice.
