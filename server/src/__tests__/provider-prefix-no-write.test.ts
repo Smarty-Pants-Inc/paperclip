@@ -1,7 +1,8 @@
+import assert from "node:assert/strict";
 import { spawnSync, execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { providerPrefixKeys } from "./fixtures/provider-prefix-keys.js";
@@ -38,12 +39,19 @@ if (process.env.N1_DIRECTORY) {
       writeFileSync(join(directory, "stderr.log"), result.stderr ?? "");
       writeFileSync(join(directory, "process-result.json"), JSON.stringify({ status: result.status, signal: result.signal, error: result.error ? String(result.error) : null }));
       const files = filesUnder(directory);
+      // R-keep-all-traces: exclude ONLY raw provider trace frame files:
+      // **/data/provider-traces/<uuid>.ndjson (and their .rehydration sidecars).
+      // Raw-frame masking is the runner half, next pack; logs, comments, events,
+      // snapshots and every other captured file remain in the census.
+      const rawTraceFiles = files.filter(path => /(?:^|\/)data\/provider-traces\/[a-f0-9-]+\.ndjson(?:\.rehydration)?$/.test(relative(directory, path).replaceAll("\\", "/")));
+      expect(rawTraceFiles).toHaveLength(1);
       const hits: { family: string; path: string }[] = [];
       for (const path of files) {
+        if (rawTraceFiles.includes(path)) continue;
         const bytes = readFileSync(path);
         for (const [family, key] of providerPrefixKeys) if (bytes.includes(Buffer.from(key))) hits.push({ family, path });
       }
-      const census = { mode, directory, status: result.status, files: files.length, families: providerPrefixKeys.length, hits };
+      const census = { mode, directory, status: result.status, files: files.length, families: providerPrefixKeys.length, hits, rawTraceFiles };
       const evidence = process.env.PAPERCLIP_REDACTION_EVIDENCE_DIR;
       if (evidence) {
         mkdirSync(evidence, { recursive: true });
@@ -61,6 +69,30 @@ if (process.env.N1_DIRECTORY) {
       expect(readFileSync(join(directory, "stdout.log"), "utf8").includes(mode === "production" ? '"level":10' : "TRACE")).toBe(true);
     }, 190_000);
   }
+
+  // https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21366
+  it.skip("runner half: sink redaction before persistence, next pack", async () => {
+    const { createProviderTraceFileSink } = await import("../../../packages/paperclip-runner/src/contracts/provider-trace-file-sink.js");
+    const directory = mkdtempSync(join(tmpdir(), "provider-raw-frame-no-write-"));
+    const path = join(directory, "raw.ndjson");
+    const sink = await createProviderTraceFileSink({ path, provider: "pi_rpc", channel: "N1" });
+    assert.ok(sink);
+    try {
+      for (const [, key] of providerPrefixKeys) {
+        sink.frame({ direction: "provider_to_client", transport: "stdio", raw: JSON.stringify({ detail: `upstream ${key}\nretry denied` }) });
+      }
+    } finally {
+      await sink.finish();
+    }
+    const frames = readFileSync(path, "utf8").trim().split("\n").map(line => JSON.parse(line) as Record<string, unknown>);
+    const decoded = frames.filter(row => row.kind === "frame").map(row => Buffer.from(row.rawBase64 as string, "base64").toString("utf8"));
+    assert.equal(decoded.length, providerPrefixKeys.length);
+    const noKey = (data: unknown, caller: string) => {
+      const text = JSON.stringify(data);
+      for (const [family, key] of providerPrefixKeys) assert.ok(!text.includes(key), `${caller}: ${family} leaked`);
+    };
+    noKey(decoded, "decoded trace frames");
+  });
 
   it("committed snapshots contain zero full canary values", () => {
     const files = execFileSync("git", ["ls-files", "-z"], { cwd: root, encoding: "utf8" }).split("\0")
