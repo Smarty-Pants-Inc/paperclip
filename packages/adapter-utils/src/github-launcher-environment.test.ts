@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { watch } from "node:fs";
-import { chmod, mkdtemp, mkdir, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -84,14 +85,13 @@ describe("managed GitHub launcher environment", () => {
     expect(result.stdout).toBe("git started\ngh started\n");
   });
 
-  it("checks all warm hashes with PATH in one command, preserves file inodes and repairs wrapper permissions", async () => {
+  it("checks all warm hashes with PATH in one command and preserves current regular files", async () => {
     const fixture = await sandbox("tools with 'quotes'/bin", true);
     const input = { runId: "warm-hashes", target: fixture.target, cwd: fixture.root, env: {} };
     const first = await prepareGitHubOperationLaunchers(input);
     const directory = first.PAPERCLIP_GITHUB_LAUNCHER_DIR!;
     const names = (await readdir(directory)).filter(name => name !== "gh-config");
     const inodes = await Promise.all(names.map(name => stat(path.join(directory, name)).then(file => file.ino)));
-    await chmod(path.join(directory, "git"), 0o600);
     // A killed prior upload can leave scratch even when the committed file is current.
     await writeFile(path.join(directory, "git.partial"), "orphan partial");
     await writeFile(path.join(directory, "git.paperclip-upload.b64"), "orphan upload");
@@ -102,6 +102,50 @@ describe("managed GitHub launcher environment", () => {
     expect(await Promise.all(names.map(name => stat(path.join(directory, name)).then(file => file.ino)))).toEqual(inodes);
     expect((await stat(path.join(directory, "git"))).mode & 0o777).toBe(0o700);
     expect((await readdir(directory)).sort()).toEqual([...names, "gh-config"].sort());
+  });
+
+  // Keep reason: never trust a mutable symlink or unsafe mode as a verified launcher.
+  it.each(["package.json", "git", "gh", ".zshenv", ".zprofile", ".zshrc", ".bash_profile", ".bashrc", ".profile"].flatMap(
+    name => (["symlink", "wrong-mode"] as const).map(defect => ({ name, defect })),
+  ))("repairs hash-matching $defect at $name before trusting it", async ({ name, defect }) => {
+    const fixture = await sandbox("tools with 'quotes'/bin");
+    const input = { runId: "launcher-metadata", target: fixture.target, cwd: fixture.root, env: {} };
+    const first = await prepareGitHubOperationLaunchers(input);
+    const file = path.join(first.PAPERCLIP_GITHUB_LAUNCHER_DIR!, name);
+    const body = await readFile(file, "utf8");
+    const hash = (value: string) => createHash("sha256").update(value).digest("hex");
+    const expectedMode = name === "git" || name === "gh" ? 0o700 : 0o644;
+    const outside = path.join(fixture.root, "mutable-target");
+    if (defect === "symlink") {
+      await writeFile(outside, body, { mode: expectedMode });
+      await rm(file);
+      await symlink(outside, file);
+    } else {
+      await chmod(file, expectedMode === 0o700 ? 0o600 : 0o755);
+    }
+    expect(hash(await readFile(file, "utf8"))).toBe(hash(body));
+    fixture.runner.execute.mockClear();
+    expect(await prepareGitHubOperationLaunchers(input)).toEqual(first);
+    const calls = fixture.runner.execute.mock.calls.length;
+    const repaired = await lstat(file);
+    console.log("launcher-metadata-row", JSON.stringify({ name, defect, calls,
+      regular: repaired.isFile(), symlink: repaired.isSymbolicLink(),
+      mode: (repaired.mode & 0o7777).toString(8), expectedMode: expectedMode.toString(8),
+      hash: hash(await readFile(file, "utf8")), expectedHash: hash(body) }));
+    expect(calls).toBe(2);
+    expect(repaired.isSymbolicLink()).toBe(false);
+    expect(repaired.isFile()).toBe(true);
+    expect(repaired.mode & 0o7777).toBe(expectedMode);
+    expect(hash(await readFile(file, "utf8"))).toBe(hash(body));
+    if (defect === "symlink") {
+      expect((await stat(outside)).mode & 0o7777).toBe(expectedMode);
+      await writeFile(outside, "changed after verification\n");
+      expect(await readFile(file, "utf8")).toBe(body);
+    }
+    fixture.runner.execute.mockClear();
+    expect(await prepareGitHubOperationLaunchers(input)).toEqual(first);
+    expect(fixture.runner.execute).toHaveBeenCalledTimes(1);
+    expect((await lstat(file)).ino).toBe(repaired.ino);
   });
 
   it.each(["package.json", "git", "gh", ".zshenv", ".zprofile", ".zshrc", ".bash_profile", ".bashrc", ".profile"])(
