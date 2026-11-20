@@ -738,7 +738,7 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
     const fresh = await successorPrompt(chat, withContinuation, false);
     expect(fresh, "the fresh input holds no conversation history").not.toContain("Prior tool calls are history");
     expect(fresh).not.toContain("using the conversation history");
-    expect(fresh).toContain("This is a fresh session: that run's conversation and tool calls are not in this input, except the tool calls listed under \"Commands already run in the interrupted turn (do not run these again)\"");
+    expect(fresh).toContain("This is a fresh session: that run's conversation and tool calls are not in this input, except the tool calls listed under \"Calls from the interrupted turn\"");
     expect(await successorPrompt(chat, withContinuation, true)).toContain("Prior tool calls are history, not commands to replay");
   });
 
@@ -810,7 +810,7 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
     const { carry } = await steerThenInterrupt(chat, "unread");
     const successor = await admitSuccessor(chat, carry);
     const prompt = await successorPrompt(chat, successor, false);
-    const section = prompt.slice(prompt.indexOf("## Commands already run in the interrupted turn (do not run these again)\nThis list may not include file edits made in that turn; check the files before redoing any edit.\n"));
+    const section = prompt.slice(prompt.indexOf("## Calls from the interrupted turn\nThis list may not include file edits made in that turn; check the files before redoing any edit.\n"));
     expect(section).toMatch(/1\. `write` \(`[^`\n]*\/work\/notes\/step1\.md[^`\n]*STEP1 CONTENT A[^`\n]*`\): completed/);
     expect(section).toMatch(/2\. `write` \(`[^`\n]*\/work\/notes\/step2\.md[^`\n]*STEP2 CONTENT B[^`\n]*`\): completed/);
     expect(section).toContain("3. `echo STEP3 > /tmp/step3`: completed\n   result: STEP3-RESULT");
