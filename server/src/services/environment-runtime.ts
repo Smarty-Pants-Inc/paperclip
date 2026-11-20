@@ -1230,6 +1230,23 @@ function reusableLeaseCanBeResumed(input: {
 
 const PREVIOUS_BOOT_TIP_TERMINAL_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out", "interrupted"]);
 
+/** A prepared Stop export is not a reason to move a qualified idle Pi to a
+ * different allocation. This is the warm door's live-owner proof, not merely
+ * a durable checkpoint marker; after restart it deliberately returns false. */
+async function retainedTurnStopMayAdoptPendingWorkspace(db: Db, lease: EnvironmentLease,
+  input: Pick<EnvironmentDriverAcquireInput, "companyId" | "issueId" | "agentId" | "adapterType">): Promise<boolean> {
+  if (input.adapterType !== "paperclip_runner" || !input.issueId || !input.agentId
+    || lease.companyId !== input.companyId || lease.issueId !== input.issueId
+    || lease.metadata?.agentId !== input.agentId || !lease.heartbeatRunId) return false;
+  const [run] = await db.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.id, lease.heartbeatRunId), eq(heartbeatRuns.companyId, input.companyId),
+    eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.nativeIssueId, input.issueId),
+  )).limit(1);
+  if (!run?.runnerProfileJson?.nativeRetainedIdleCheckpoint) return false;
+  const { hasRetainedNativeTurnStop } = await import("./native-runtime/native-session-executor.js");
+  return hasRetainedNativeTurnStop(run, lease) === true;
+}
+
 function reusableLeaseCanBeCleanedUp(lease: Pick<EnvironmentLease, "status" | "metadata">): boolean {
   if (abandonedWorkspaceFilesParked(lease)) return false;
   return lease.status === "released" || lease.status === "retained";
@@ -2227,7 +2244,8 @@ function createSandboxEnvironmentDriver(
           : [];
         for (let index = reusableCandidateLeases.length - 1; index >= 0; index--) {
           // Protected allocations must stay out of both selection and obsolete cleanup.
-          if (await nativeWorkspaceExportPendingForResource(db, reusableCandidateLeases[index]!, input.heartbeatRunId)) {
+          if (await nativeWorkspaceExportPendingForResource(db, reusableCandidateLeases[index]!, input.heartbeatRunId)
+            && !await retainedTurnStopMayAdoptPendingWorkspace(db, reusableCandidateLeases[index]!, input)) {
             reuseProbeReasons.set(reusableCandidateLeases[index]!.id, "workspace_export_pending");
             reusableCandidateLeases.splice(index, 1);
           } else if (await legacyShutdownWorkspaceResourceProtected(db, reusableCandidateLeases[index]!)) {
@@ -2697,6 +2715,7 @@ function createSandboxEnvironmentDriver(
       for (let index = reusableCandidateLeases.length - 1; index >= 0; index--) {
         // Protected allocations must stay out of both selection and obsolete cleanup.
         if (await nativeWorkspaceExportPendingForResource(db, reusableCandidateLeases[index]!, input.heartbeatRunId)
+          && !await retainedTurnStopMayAdoptPendingWorkspace(db, reusableCandidateLeases[index]!, input)
           || await legacyShutdownWorkspaceResourceProtected(db, reusableCandidateLeases[index]!))
           reusableCandidateLeases.splice(index, 1);
       }
