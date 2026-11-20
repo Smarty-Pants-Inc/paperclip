@@ -5031,8 +5031,10 @@ guards still apply.
 Read-backs wait on object storage, and the deleting paths ask while they hold
 the workspace lifecycle lock. One guard pass (one instance cleanup, one
 whole-worktree removal with its instance cleanup, or one compaction move)
-therefore reads back for at most 30 seconds in total
-(`RUN_LOG_SPILL_READ_BACK_BUDGET_MS`), counted from its first read-back. When
+therefore reads back for at most 10 seconds in total by default
+(`RUN_LOG_SPILL_READ_BACK_BUDGET_MS`; a positive integer environment override in
+milliseconds), counted from its first read-back. The override is read once per
+pass; invalid values use the default. When
 the budget is spent, every spill not yet read back is kept with reason
 `read_back_budget_exhausted` and the pass ends; the next pass starts with a new
 budget. No proof is carried from one pass to the next, so a directory with more

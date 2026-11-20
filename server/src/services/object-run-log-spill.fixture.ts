@@ -206,7 +206,9 @@ export async function custodySpill(workspacePath: string, candidate: string, fau
 // object log holds them. One store only, so one journal reads each copy back.
 export async function recoveredSpills(spillDir: string, count: number) {
   const m = spillMemory(), store = newStore(m, spillDir);
-  const runs = Array.from({ length: count }, (_, n) => ({ ...ids, runId: `recovered-${String(n).padStart(2, "0")}` }));
+  // Each row owns distinct log references; stores from earlier rows cannot prove or contradict its bytes.
+  const batch = randomUUID();
+  const runs = Array.from({ length: count }, (_, n) => ({ ...ids, runId: `recovered-${batch}-${String(n).padStart(2, "0")}` }));
   const warning = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
   try {
     const handles = await Promise.all(runs.map(run => store.begin(run)));
