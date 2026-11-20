@@ -1241,8 +1241,9 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         ...(options.resumeStrandedQueue ? { resumeStrandedQueue: true } : {}),
         ...(options.personWakeBound ? { personWakeBound: true } : {}),
       });
-      trace.outcome = outcome.kind;
-      trace.promotedWakeId = outcome.kind === "promoted" ? outcome.run.wakeupRequestId : null;
+      // Logging only: read no field the release path itself would not.
+      trace.outcome = outcome?.kind ?? "none";
+      trace.promotedWakeId = outcome?.kind === "promoted" ? outcome.run.wakeupRequestId : null;
       if (options.deferredPostCommitEffects) {
         options.deferredPostCommitEffects.push(...postCommitEffects);
       } else {
