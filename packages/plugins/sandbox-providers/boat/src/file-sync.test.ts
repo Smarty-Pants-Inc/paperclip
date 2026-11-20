@@ -214,7 +214,7 @@ describe("Boat native hybrid file sync", () => {
     ["onEnvironmentReleaseLease", false], ["onEnvironmentReleaseLease", true],
     ["onEnvironmentStopLease", false], ["onEnvironmentStopLease", true],
     ["onEnvironmentDestroyLease", false], ["onEnvironmentDestroyLease", true],
-  ] as const)("concurrent capability: %s cancelActiveWork=%s drains both directions before provider stop", async (hook, cancelActiveWork) => {
+  ] as const)("concurrent capability: %s cancelActiveWork=%s honors Stop versus sync-drain ordering", async (hook, cancelActiveWork) => {
     let reached!: () => void, release!: () => void, arrived = 0;
     const ready = new Promise<void>(resolve => { reached = resolve; });
     const parked = new Promise<void>(resolve => { release = resolve; });
@@ -230,10 +230,17 @@ describe("Boat native hybrid file sync", () => {
     try {
       await ready;
       terminal = plugin.definition[hook]!({ ...params([]), providerLeaseId: leaseId, cancelActiveWork }).then(value => { settled = true; return value; });
-      await new Promise(resolve => setTimeout(resolve, 30));
-      expect(stops, "no provider stop before all sync cleanup finishes").toBe(0);
-      expect(settled, "no teardown receipt while sync owns scratch").toBe(false);
       await expect(sync(mappings[0].file)).rejects.toThrow("no longer active");
+      await new Promise(resolve => setTimeout(resolve, 30));
+      if (hook === "onEnvironmentStopLease") {
+        // superseded 11-20 by rf-3 FAIL row 4: Stop must not wait behind a sync
+        expect(stops, "Stop reaches the provider while sync cleanup is held").toBe(1);
+        expect(settled, "Stop returns its receipt without draining sync scratch").toBe(true);
+        expect(await terminal).toMatchObject({ providerLeaseId: leaseId, state: "stopped" });
+      } else {
+        expect(stops, "no provider stop before all sync cleanup finishes").toBe(0);
+        expect(settled, "no teardown receipt while sync owns scratch").toBe(false);
+      }
     } finally { release(); await Promise.allSettled([...calls, ...(terminal ? [terminal] : [])]); }
     expect(await terminal).toMatchObject({ state: "stopped" });
     for (const [index, { file }] of mappings.entries()) expect(await fs.readFile(file.targetPath, "utf8")).toBe(`drained-${index}`);
