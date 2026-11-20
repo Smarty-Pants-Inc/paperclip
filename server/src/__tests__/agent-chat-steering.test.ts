@@ -1998,7 +1998,8 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
           sent.push(response.body.id); await waitForPendingCommentSteers();
           const text = options.sameText ? "Same answer." : `${100 + i} + 1 = ${101 + i}.`;
           const commentary = options.commentaryOnly;
-          peer.answerNextSteer(text, commentary); if (!commentary) expected.push(text);
+          // answered-a: a steer's first answer is posted even when it is progress text (its next tool follows).
+          peer.answerNextSteer(text, commentary); expected.push(text);
           await vi.waitFor(() => { if (pumpError) throw pumpError;
             expect(events.filter(e => e.eventType === "item.completed" && e.payload.kind === "agentMessage"
               && e.payload.text === text)).toHaveLength(i + 1 === count && options.sameText ? count : 1); }, { timeout: 5000 });
@@ -2034,7 +2035,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
           JSON.stringify({ scope, sent, expected, replies, evidence, events, thread: thread.body }, null, 2));
         expect(replies.map((c: any) => c.body)).toEqual(expected);
         expect(thread.body.filter((c: any) => c.authorType === "system")).toEqual([]);
-        const expectedAnswered = options.commentaryOnly ? [] : sent;
+        const expectedAnswered = sent;
         expect(evidence.answered).toEqual(expectedAnswered); expect(new Set(evidence.answered).size).toBe(expectedAnswered.length);
         for (const id of sent) expect(await answered(id)).toBe(expectedAnswered.includes(id));
         return { chat, scope, replies, sent };
@@ -2065,13 +2066,15 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
 
     describe("St final-only accounting (separate patch)", () => {
       it("st-final: a published final_answer answers the steer", async () => { await multiFinal(1); }, 30_000);
-      it("st-commentary: commentary after a read is not answered by an unrelated own final; one sweep card", async () => {
+      // answered-a (org 11-20 06:38Z (1)(a)): the progress text right after the read IS the steer's answer and is now
+      // posted (once, after the own final), so the steer is answered by a posted reply and no card is owed.
+      it("st-commentary: a progress answer after a read is posted after the unrelated own final; answered, no sweep card", async () => {
         const { chat, scope, sent } = await multiFinal(1, { ownFinal: true, commentaryOnly: true });
         for (const offset of [180_000, 240_000]) await settleUnansweredPersonMessage(db,
           { ...scope, now: new Date(Date.now() + offset) });
         const notices = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id),
           sql`${issueComments.metadata}->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX + sent[0]}`));
-        expect(notices).toHaveLength(1); expect(await answered(sent[0]!)).toBe(false);
+        expect(notices).toHaveLength(0); expect(await answered(sent[0]!)).toBe(true);
       }, 30_000);
       it("st-days-old: boot discovery, delivery and two sweeps preserve stored old commentary answers without a wake or card", async () => {
         const { chat, scope, sent } = await multiFinal(1, { ownFinal: true, commentaryOnly: true });
@@ -2100,6 +2103,164 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
         expect(await answered(sent[0]!)).toBe(true);
       }, 30_000);
     });
+  });
+
+  // answered-a (org 11-20 06:38Z (1)(a) "ANSWERED MEANS ANSWERED"; gate runs 1f10e1c8, 8fa5ce12, b4dfae3f):
+  // Paul steers "what is 100+1?" while a step runs; the agent answers "101" in progress text (its
+  // next tool follows) and later posts a final about something else. Real producer: the production
+  // Pi RPC driver, Pi app-server proxy and Codex facade emit item.completed agentMessage events,
+  // ingested by the production PaperclipControlPlanePort; the steer goes through the real POST route;
+  // the reply is published by the real finalizer and read back through the real thread GET.
+  describe("answered-a: a steer's answer in an intermediate agent message is posted, once", () => {
+    type Step = { steer: string } | { answerSteer: string; progress: boolean } | { text: string; progress: boolean } | { tool: true };
+    async function steerTake(script: Step[], options: { publish?: boolean } = {}) {
+      const chat = await seedChat(); await attachSteerable(chat);
+      const sessionId = randomUUID(), runnerId = randomUUID();
+      const [contract] = await db.insert(completionContracts).values({ companyId: chat.companyId, issueId: chat.issue.id,
+        revision: 1, schemaVersion: "paperclip.completion-contract.v1", policyVersion: "test", risk: "standard",
+        completionAuthority: "server_arbiter", incompleteCriteriaPolicy: "preserve_non_terminal",
+        contractJson: { revision: "test", objective: "Answer every question", criteria: [] }, canonicalSha256: "answered-a-contract",
+        createdByActorType: "system", createdByActorId: "test" }).returning();
+      await db.update(heartbeatRuns).set({ nativeIssueId: chat.issue.id, nativeSessionId: sessionId,
+        runnerInstanceId: runnerId, responsibleUserId: owner, completionContractId: contract.id,
+        completionContractSha256: contract.canonicalSha256 }).where(eq(heartbeatRuns.id, chat.runId));
+      const root = await mkdtemp(join(tmpdir(), "answered-a-"));
+      const peer = await openPiSteeringPeer(root, chat.runId, { normalizedSessionId: sessionId });
+      const events: PrpEvent[] = []; let pumpError: unknown;
+      let port: PaperclipControlPlanePort | undefined;
+      const pump = (async () => { for await (const event of peer.session.events()) {
+        port ??= new PaperclipControlPlanePort(db, { companyId: chat.companyId, issueId: chat.issue.id, runId: chat.runId,
+          agentId: chat.agentId, sessionId, completionContractId: contract.id, completionContractSha256: contract.canonicalSha256,
+          sourceInstanceId: event.sourceInstanceId, controlPlaneSourceInstanceId: event.sourceInstanceId });
+        await port.appendEvent(event); events.push(event);
+      } })().catch(error => { pumpError = error; });
+      const sent: string[] = [];
+      const settled = (predicate: (e: PrpEvent) => boolean) => vi.waitFor(() => { if (pumpError) throw pumpError;
+        expect(events.some(predicate)).toBe(true); }, { timeout: 5000 });
+      try {
+        const { turnId } = await peer.session.startTurn({ message: { role: "user", text: chat.first.body } });
+        await settled(e => e.eventType === "tool.execution.started");
+        mocks.probe.mockResolvedValue({ disposition: "available", activeTurnId: turnId });
+        mocks.steer.mockImplementation(async (input: { message: string; correlationId: string }) => {
+          await peer.session.steer!({ turnId, message: { role: "user", text: input.message }, correlationId: input.correlationId });
+          return { turnId };
+        });
+        for (const step of script) {
+          if ("steer" in step) {
+            const response = await postDefault(chat, step.steer).expect(201);
+            sent.push(response.body.id); await waitForPendingCommentSteers();
+          } else if ("answerSteer" in step) {
+            peer.answerNextSteer(step.answerSteer, step.progress);
+            await settled(e => e.eventType === "item.completed" && e.payload.kind === "agentMessage" && e.payload.text === step.answerSteer);
+          } else if ("text" in step) {
+            peer.answerOwnInput(step.text, step.progress);
+            await settled(e => e.eventType === "item.completed" && e.payload.kind === "agentMessage" && e.payload.text === step.text);
+          }
+        }
+        peer.endTurn();
+        await settled(e => e.eventType === "turn.completed");
+        const scope = { companyId: chat.companyId, issueId: chat.issue.id, runId: chat.runId };
+        if (options.publish !== false) {
+          const store = new NativeRunCoordinatorStore(db, { companyId: chat.companyId, issueId: chat.issue.id,
+            runId: chat.runId, agentId: chat.agentId, normalizedSessionId: sessionId, runnerSourceInstanceId: runnerId,
+            completionContractId: contract.id, completionContractSha256: contract.canonicalSha256,
+            completionContractRevision: "test", completionContractCriterionIds: [] });
+          await store.completeRun({ turnId, result: { schema: "paperclip.run_result.v1", reportedWorkDisposition: "done",
+            summary: "Step done", completionClaim: { contractRevision: "test", objectiveSatisfied: true,
+              criteria: [], remainingWork: [] }, evidence: [], verification: [], attentionRequests: [], artifacts: [] },
+            terminal: { schema: "paperclip.prp.terminal.v1", runTerminalState: "succeeded", turnTerminalState: "completed",
+              reportedWorkDisposition: "done" } });
+          await finalizeNativeRun({ db, runId: chat.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: false });
+          runningProcesses.delete(chat.runId);
+          await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, chat.runId));
+          await recoverCommittedNativeChatResponse(db, scope);
+        }
+        const replies = async () => {
+          const thread = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/comments`).expect(200);
+          return { thread: thread.body as any[], agent: (thread.body as any[]).filter((c: any) => c.authorType === "agent")
+            .sort((a: any, b: any) => Date.parse(a.createdAt) - Date.parse(b.createdAt) || a.id.localeCompare(b.id)) };
+        };
+        const { thread, agent } = await replies();
+        const evidence = await readSteeredMessageAnswers(db, scope);
+        const record = { scope, sent, replies: agent.map((c: any) => ({ body: c.body, createdAt: c.createdAt, clientRequestId: c.clientRequestId })),
+          evidence, answered: Object.fromEntries(await Promise.all(sent.map(async id => [id, await answered(id)]))),
+          events: events.map(e => ({ eventType: e.eventType, itemId: e.itemId, kind: e.payload?.kind, channel: e.payload?.channel,
+            providerPhase: e.payload?.providerPhase, text: e.payload?.text })) };
+        return { chat, scope, sent, agent, thread, evidence, record, replies };
+      } finally { await peer.close(); await pump; await rm(root, { recursive: true, force: true }); }
+    }
+    const save = async (name: string, record: unknown) => {
+      if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `answered-a-${name}.json`), JSON.stringify(record, null, 2));
+    };
+    const with101 = (agent: any[]) => agent.filter((c: any) => /\b101\b/.test(c.body));
+
+    it("A1: an answer in an intermediate agent message is posted once, before the final; the steer is answered", async () => {
+      const take = await steerTake([{ steer: "what is 100+1?" }, { answerSteer: "101", progress: true },
+        { text: "Finished the step you asked for.", progress: false }]);
+      await save("A1", take.record);
+      expect(take.record.events.some((e: any) => e.kind === "agentMessage" && e.channel === "progress" && e.text === "101")).toBe(true);
+      expect(take.agent.map((c: any) => c.body)).toEqual(["101", "Finished the step you asked for."]);
+      expect(with101(take.agent)).toHaveLength(1);
+      expect(take.record.answered[take.sent[0]!]).toBe(true);
+      expect(take.thread.filter((c: any) => c.authorType === "system")).toEqual([]);
+    }, 30_000);
+
+    it("A1b: Pi reads the steer after the agent's own final; its progress answer is still posted once, after it", async () => {
+      const take = await steerTake([{ text: "Own task finished.", progress: false }, { steer: "what is 100+1?" },
+        { answerSteer: "101", progress: true }]);
+      await save("A1b", take.record);
+      expect(take.agent.map((c: any) => c.body)).toEqual(["Own task finished.", "101"]);
+      expect(take.record.answered[take.sent[0]!]).toBe(true);
+      expect(take.thread.filter((c: any) => c.authorType === "system")).toEqual([]);
+    }, 30_000);
+
+    // A2 stays RED here on purpose (it.fails): answered-by-unposted-log-text is D3's streamed-steer arm
+    // (person-message-answer.ts:109-113). Requiring a posted reply there is RULE Half 1 and re-carries
+    // messages (S-d2), so it ships only with Half 2's send-path bound (neworg-lead's unit), not here.
+    it.fails("A2: the steer's answer exists only in the run log, never posted -> owed (not answered by unposted text)", async () => {
+      const take = await steerTake([{ steer: "what is 100+1?" }, { answerSteer: "101", progress: false }], { publish: false });
+      await save("A2", take.record);
+      expect(take.agent).toEqual([]);
+      expect(take.evidence.answered).toEqual(take.sent);
+      expect(take.record.answered[take.sent[0]!]).toBe(false);
+    }, 30_000);
+
+    it("A2b: the agent reads the steer and never writes text after it; its own earlier final is not the steer's answer -> owed", async () => {
+      const take = await steerTake([{ text: "Own task finished.", progress: false }, { steer: "what is 100+1?" }]);
+      await save("A2b", take.record);
+      expect(with101(take.agent)).toHaveLength(0);
+      expect(take.record.answered[take.sent[0]!]).toBe(false);
+    }, 30_000);
+
+    it("A3: control: the steer answered in the final is one reply, answered, nothing extra posted", async () => {
+      const take = await steerTake([{ steer: "what is 100+1?" }, { answerSteer: "101", progress: false }]);
+      await save("A3", take.record);
+      expect(take.agent.map((c: any) => c.body)).toEqual(["101"]);
+      expect(take.record.answered[take.sent[0]!]).toBe(true);
+    }, 30_000);
+
+    it("A4: control: progress chatter and tool output that are not a steer's answer are never posted", async () => {
+      const take = await steerTake([{ text: "Let me look at the files first.", progress: true }, { steer: "what is 100+1?" },
+        { answerSteer: "101", progress: true }, { text: "Checking the next file now.", progress: true },
+        { text: "Finished the step you asked for.", progress: false }]);
+      await save("A4", take.record);
+      expect(take.agent.map((c: any) => c.body)).toEqual(["101", "Finished the step you asked for."]);
+      expect(take.agent.some((c: any) => /README contents|done|Let me look|Checking the next/.test(c.body))).toBe(false);
+    }, 30_000);
+
+    it("A5: restart/replay of the same run never posts the intermediate answer twice", async () => {
+      const take = await steerTake([{ steer: "what is 100+1?" }, { answerSteer: "101", progress: true },
+        { text: "Finished the step you asked for.", progress: false }]);
+      expect(await Promise.all([recoverCommittedNativeChatResponse(db, take.scope), recoverCommittedNativeChatResponse(db, take.scope)]))
+        .toEqual([false, false]);
+      await finalizeNativeRun({ db, runId: take.chat.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: false }).catch(() => undefined);
+      await Promise.all([1, 2].map(() => issueService(db).addComment(take.chat.issue.id, "Finished the step you asked for.",
+        { agentId: take.chat.agentId, runId: take.chat.runId }, { completionReply: true, authorizationReason: "internal_agent_write" })));
+      const { agent } = await take.replies();
+      await save("A5", { ...take.record, afterReplay: agent.map((c: any) => c.body) });
+      expect(agent.map((c: any) => c.body)).toEqual(["101", "Finished the step you asked for."]);
+      expect(with101(agent)).toHaveLength(1);
+    }, 30_000);
   });
 
   describe("restored steer captions at the thread GET and POST receipt boundary", () => {
