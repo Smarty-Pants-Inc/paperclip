@@ -3152,29 +3152,35 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
       throw error;
     }
   } : undefined, [liveRunId, onCancelRun]);
-  // With no live tail, a bare 'working' projection is not startup authority
-  // after a saved reply. Its observed run can be old, absent, or not joined to
-  // history yet (gate 7 stopq). New intent/recovery and local submissions still
-  // owe feedback; a real successor owns its live tail independently of this arm.
-  const hasAnsweredReply = useMemo(() => {
+  // A known observed run owns its own startup responsibility: a different
+  // run's answer cannot cancel it, even when live/active polls have no tail.
+  // Release bare 'working' only after that run ends with a visible saved or
+  // settled transcript reply. With no known observed run, retain the visible-
+  // reply fallback; explicit intent/recovery and local submissions still win.
+  const interruptionRunAnswered = useMemo(() => {
     const statusByRunId = new Map(runs.map(run => [run.id, run.status]));
+    const observedRunId = props.interruption?.observedRunId;
+    const observedStatus = observedRunId ? statusByRunId.get(observedRunId) : undefined;
+    if (observedStatus !== undefined && !isTerminalRunStatus(observedStatus)) return false;
+    const replyInScope = (runId: string) => observedStatus === undefined || runId === observedRunId;
+    if ([...settledReplyRunIds].some(replyInScope)) return true;
     return comments.some(comment => {
       const runId = comment.createdByRunId ?? comment.runId ?? comment.derivedCreatedByRunId;
-      if (!runId || comment.deletedAt || comment.clientStatus || comment.authorType !== "agent" ||
+      if (!runId || !replyInScope(runId) || comment.deletedAt || comment.clientStatus || comment.authorType !== "agent" ||
         !comment.body.trim() || comment.body === LEGACY_WITHHELD_RUN_COMMENT) return false;
       if (presentedReplyRunIds.has(runId)) return true;
       const status = statusByRunId.get(runId);
       return (status === undefined || status === "succeeded") &&
         !semanticProgressCommentIds(linkedRunMetaById.get(runId)?.resultJson).has(comment.id);
     });
-  }, [comments, runs, presentedReplyRunIds, linkedRunMetaById]);
+  }, [props.interruption?.observedRunId, comments, runs, presentedReplyRunIds, settledReplyRunIds, linkedRunMetaById]);
   const optimisticRunnerStartup =
     hasAgentAssignee &&
     !startupBlocked &&
     !tailRunId &&
     (props.retryPreparing ||
       (props.interruption?.state === "working" &&
-        (!hasAnsweredReply || props.interruption.intentId || props.interruption.recoveryStep) &&
+        (!interruptionRunAnswered || props.interruption.intentId || props.interruption.recoveryStep) &&
         !(personStoppedRunId && props.interruption.observedRunId === personStoppedRunId)) ||
       runnerSubmissionPending ||
       commentItems.some(

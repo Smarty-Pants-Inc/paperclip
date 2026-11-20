@@ -7396,6 +7396,178 @@ describe("IssueDetail", () => {
     });
   });
 
+  // Independent judge-only reconstructed transport discriminators. Not a captured replay.
+  describe.each([390, 1440])("independent authority at %i", width => {
+    afterEach(() => vi.useRealTimers());
+    const save = (name: string, view: Awaited<ReturnType<typeof renderEmptyReplyCandidate>>) => {
+      if (process.env.EMPTY_REPLY_EVIDENCE) writeFileSync(`${process.env.EMPTY_REPLY_EVIDENCE}/${name}-${width}.json`, JSON.stringify({
+        html: container.innerHTML, requests: view.requests, state: view.state,
+        props: Object.fromEntries(["comments", "activeRun", "liveRuns", "linkedRuns", "interruption"].map(key => [key, mockIssueChatThreadRender.mock.calls.at(-1)?.[0]?.[key]])),
+      }, null, 2));
+    };
+    it.each(["queued", "running", "scheduled_retry"])("preserves known %s successor when separate live endpoints have no tail", async status => {
+      const view = await renderEmptyReplyCandidate(width);
+      const successorId = "bdc97038-b764-4e56-9b51-00f149214a7a";
+      view.state.issue.interruption!.observedRunId = successorId;
+      view.state.issue.interruption!.sourceRunIds = [successorId];
+      view.state.runs.push({ ...view.settled, runId: successorId, status,
+        createdAt: "2026-11-20T07:40:35.150Z", startedAt: status === "running" ? "2026-11-20T07:40:35.170Z" : null,
+        finishedAt: null, scheduledRetryReason: status === "scheduled_retry" ? "workspace_busy" : undefined } as never);
+      // Independent GETs: core+run history know the new run. For queued/running,
+      // live/active retain the preceding empty poll; a scheduled resource retry
+      // legitimately has no live run yet. No local submission or intent exists.
+      await view.refresh();
+      save(`known-${status}-lag`, view);
+      const props = mockIssueChatThreadRender.mock.calls.at(-1)?.[0];
+      expect(props?.linkedRuns).toEqual(expect.arrayContaining([expect.objectContaining({ runId: successorId, status })]));
+      expect(props?.interruption).toMatchObject({ state: "working", intentId: null, observedRunId: successorId });
+      expect(view.lane(), `new ${status} run is owed feedback despite the earlier reply`).not.toBeNull();
+      expect(container.textContent).toContain("Working");
+      expect(container.querySelector(`[data-thread-anchor="${view.reply.id}"]`)?.textContent).toContain("19");
+    });
+    it("keeps actual same-turn tool activity after an early saved answer", async () => {
+      const view = await renderEmptyReplyCandidate(width);
+      view.state.runs[0] = { ...view.settled, status: "running", finishedAt: null } as never;
+      const live = { id: view.runId, agentId: view.agentId, agentName: "Runner", runtimeMode: "native", adapterType: "paperclip_runner",
+        status: "running", createdAt: view.settled.createdAt, startedAt: view.settled.startedAt, finishedAt: null };
+      view.state.live = [live]; view.state.active = live;
+      view.state.events[view.runId] = [
+        ["item.completed", { kind: "agentMessage", channel: "final", text: "19" }],
+        ["tool.execution.started", { schema: "paperclip.tool.execution.v1", executionId: "independent-tool", transport: "dynamic", operation: "update", name: "write_document", status: "running", input: { key: "plan" }, output: null }],
+      ].map(([eventType, payload], index) => ({ id: index + 1, companyId: view.companyId, runId: view.runId, agentId: view.agentId,
+        seq: index + 1, eventType, stream: "system", level: "info", message: null, color: null, createdAt: "2026-11-20T07:40:35.100Z",
+        payload: { prpEvent: { schema: "paperclip.prp.event.v1", sourceEventId: `judge-${index + 1}`, sourceSeq: index + 1,
+          sourceInstanceId: "judge-runner", sourceKind: "runner", runId: view.runId, normalizedSessionId: "judge-session", eventType,
+          schemaVersion: 1, priority: 1, emittedAt: "2026-11-20T07:40:35.100Z", payload } } }));
+      await view.refresh();
+      await waitForAssertion(() => expect(container.textContent).toContain("Writing a document"));
+      save("ongoing-tool", view);
+      expect(view.lane()).not.toBeNull();
+      expect(container.textContent).toContain("19");
+    });
+    it.each([true, false])("holds a streamed terminal answer through a missing late final-comment join (older saved answer=%s)", async olderAnswer => {
+      const view = await renderEmptyReplyCandidate(width);
+      if (!olderAnswer) view.state.comments = [];
+      const successorId = "eb160bb6-ce12-498e-a278-d447862f89b9";
+      const body = "Independent final awaiting durable comment";
+      const live = { id: successorId, agentId: view.agentId, agentName: "Runner", runtimeMode: "native", adapterType: "paperclip_runner",
+        status: "running", createdAt: "2026-11-20T07:40:35.150Z", startedAt: "2026-11-20T07:40:35.170Z", finishedAt: null };
+      view.state.live = [live]; view.state.active = live;
+      view.state.issue.interruption!.observedRunId = successorId;
+      const events = [
+        ["item.completed", { kind: "agentMessage", channel: "final", text: body }],
+        ["run.terminal", { schema: "paperclip.prp.terminal.v1", turnTerminalState: "completed", runTerminalState: "succeeded", reportedWorkDisposition: "done" }],
+      ].map(([eventType, payload], index) => ({ id: index + 1, companyId: view.companyId, runId: successorId, agentId: view.agentId,
+        seq: index + 1, eventType, stream: "system", level: "info", message: null, color: null, createdAt: "2026-11-20T07:40:35.180Z",
+        payload: { prpEvent: { schema: "paperclip.prp.event.v1", sourceEventId: `late-${index + 1}`, sourceSeq: index + 1,
+          sourceInstanceId: "judge-runner", sourceKind: "runner", runId: successorId, normalizedSessionId: "judge-session", eventType,
+          schemaVersion: 1, priority: 1, emittedAt: "2026-11-20T07:40:35.180Z", payload } } }));
+      view.state.events[successorId] = events;
+      await view.refresh();
+      await waitForAssertion(() => expect(container.textContent).toContain(body));
+      view.state.live = []; view.state.active = null;
+      view.state.runs.push({ ...view.settled, runId: successorId, createdAt: live.createdAt, startedAt: live.startedAt, finishedAt: "2026-11-20T07:40:35.185Z" });
+      await view.refresh();
+      save(`terminal-before-comment-older-${olderAnswer}`, view);
+      expect(mockIssueChatThreadRender.mock.calls.at(-1)?.[0]?.comments).toHaveLength(olderAnswer ? 1 : 0);
+      expect(container.textContent).toContain(body);
+      expect(container.textContent).not.toContain("Thinking");
+      view.state.comments.push(createIssueComment({ ...view.reply, id: "120ad480-c6ea-4825-8762-b2d9b643ff73", createdByRunId: successorId, body,
+        createdAt: new Date("2026-11-20T07:40:35.190Z") }));
+      await view.refresh();
+      save(`terminal-after-comment-older-${olderAnswer}`, view);
+      expect(view.lane()).toBeNull();
+      expect(container.textContent?.split(body)).toHaveLength(2);
+    });
+    it("retains Retry preparation feedback before any new intent or run echo", async () => {
+      const view = await renderEmptyReplyCandidate(width);
+      const failedId = "aa4ceae4-d372-4d87-8b99-e26a36bdbcf9";
+      view.state.runs.push({ ...view.settled, runId: failedId, status: "failed" } as never);
+      Object.assign(view.state.issue.interruption!, { state: "failed", canRetry: true, observedRunId: failedId, sourceRunIds: [failedId] });
+      const retry = createDeferred<unknown>();
+      mockIssuesApi.retryTask.mockReturnValue(retry.promise);
+      await view.refresh();
+      const button = [...container.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent === "Retry" && !button.disabled);
+      expect(button).toBeDefined();
+      await act(async () => button!.click());
+      await waitForAssertion(() => expect(mockIssuesApi.retryTask).toHaveBeenCalled());
+      save("retry-preparing", view);
+      expect(view.lane()).not.toBeNull();
+      expect(container.textContent).toContain("Thinking");
+      Object.assign(view.state.issue.interruption!, { state: "working", intentId: "judge-retry", canRetry: false });
+      await act(async () => retry.resolve({ requestId: "judge-retry", accepted: true, stale: false, presentation: view.state.issue.interruption }));
+      await view.refresh();
+      expect(view.lane()).not.toBeNull();
+    });
+    it("keeps genuine pending confirmation usable after the saved answer", async () => {
+      const view = await renderEmptyReplyCandidate(width);
+      const { genericPendingRequestConfirmationInteraction } = await import("@/fixtures/issueThreadInteractionFixtures");
+      mockIssuesApi.listInteractions.mockResolvedValue([{ ...genericPendingRequestConfirmationInteraction,
+        issueId: view.issueId, companyId: view.companyId, sourceRunId: view.runId,
+        payload: { version: 1, prompt: "Approve independent follow-up?" },
+      }]);
+      await view.refresh();
+      save("pending-confirmation", view);
+      expect(container.textContent).toContain("Approve independent follow-up?");
+      expect(container.querySelector('[data-testid="task-chat-composer-send"]')).not.toBeNull();
+    });
+    it("does not mistake a saved report_progress receipt for an answered turn", async () => {
+      const view = await renderEmptyReplyCandidate(width);
+      view.state.runs[0] = { ...view.settled, resultJson: { semanticToolReceipts: { progress: {
+        operationId: "report_progress", result: { commentId: view.reply.id },
+      } } } } as never;
+      await view.refresh();
+      save("progress-only", view);
+      expect(view.lane()).not.toBeNull();
+      expect(container.textContent).toContain("Thinking");
+    });
+  });
+
+  describe.each([390, 1440])("startup observed-run scope at %i", width => {
+    afterEach(() => vi.useRealTimers());
+
+    it("keeps feedback for a known running observed run after its early saved answer", async () => {
+      const view = await renderEmptyReplyCandidate(width);
+      view.state.runs[0] = { ...view.settled, status: "running", finishedAt: null } as never;
+      await view.refresh();
+      await waitForAssertion(() => {
+        expect(mockIssueChatThreadRender.mock.calls.at(-1)?.[0]?.linkedRuns).toEqual(expect.arrayContaining([
+          expect.objectContaining({ runId: view.runId, status: "running" }),
+        ]));
+        expect(view.lane()).not.toBeNull();
+        expect(container.textContent).toContain("Working");
+      });
+      expect(container.querySelector(`[data-thread-anchor="${view.reply.id}"]`)?.textContent).toContain("19");
+    });
+
+    it("does not let a different historical answer settle a known terminal observed run", async () => {
+      const view = await renderEmptyReplyCandidate(width);
+      const observedRunId = "de99de12-3d27-4f17-a847-24723bff8f26";
+      view.state.issue.interruption!.observedRunId = observedRunId;
+      view.state.issue.interruption!.sourceRunIds = [observedRunId];
+      view.state.runs.push({ ...view.settled, runId: observedRunId,
+        createdAt: "2026-11-20T07:40:35.100Z", startedAt: "2026-11-20T07:40:35.110Z",
+        finishedAt: "2026-11-20T07:40:35.190Z" });
+      await view.refresh();
+      await waitForAssertion(() => {
+        const props = mockIssueChatThreadRender.mock.calls.at(-1)?.[0];
+        expect(props?.linkedRuns).toEqual(expect.arrayContaining([
+          expect.objectContaining({ runId: observedRunId, status: "succeeded" }),
+        ]));
+        expect(props?.interruption).toMatchObject({ observedRunId, state: "working" });
+        expect(view.lane()).not.toBeNull();
+        expect(container.textContent).toContain("Working");
+      });
+      expect(container.querySelector(`[data-thread-anchor="${view.reply.id}"]`)?.textContent).toContain("19");
+      view.state.comments.push(createIssueComment({ ...view.reply, id: "bcefc06b-3b63-4f55-ae77-5f43009d271e",
+        createdByRunId: observedRunId, body: "Observed run answer", createdAt: new Date("2026-11-20T07:40:35.195Z") }));
+      await view.refresh();
+      await waitForAssertion(() => expect(view.lane()).toBeNull());
+      expect(container.textContent).not.toMatch(/Working|Thinking/);
+      expect(container.textContent?.split("Observed run answer")).toHaveLength(2);
+    });
+  });
+
   // Steering placement end to end (steer-ui2, Paul 11-19). The REAL TaskChatThread
   // (vi.importActual; the TaskChatThread stub renders it via taskChatThreadFixture
   // with IssueDetail's own props), the REAL TaskChatComposer inside it (Enter / Send ▾),
