@@ -15,6 +15,9 @@ import {
   authUsers,
   companies,
   companyMemberships,
+  completionContracts,
+  nativeRunResults,
+  nativeRunFinalizations,
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -34,6 +37,7 @@ import {
 } from "../services/agent-conversations.js";
 import { answeredPersonMessageIds, answeredPersonMessageSql, personMessageOwedSql } from "../services/person-message-answer.js";
 import { readContinuationCommentInput } from "../services/continuation-comment-input.js";
+import { recordSteeredMessageEvidence } from "../services/native-runtime/steered-message-answers.js";
 import { createWakeQueue } from "../modules/wake-queue/index.js";
 import { settleUnansweredPersonMessage, settleUnansweredPersonMessages, UNANSWERED_MESSAGE_REASON_PREFIX } from "../services/recovery/unanswered-person-message.js";
 import { getServerAdapter, registerServerAdapter, runningProcesses } from "../adapters/index.js";
@@ -528,9 +532,8 @@ describeEmbeddedPostgres("person-message floor after Stop (RFL 19:05Z)", () => {
   }, 60_000);
   afterAll(async () => { await db?.$client.end(); await database?.cleanup(); });
 
-  async function fixture() {
+  async function fixture(start = Date.now() - 30 * 60_000) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
-    const start = Date.now() - 30 * 60_000;
     const receiptIds: string[] = [];
     const at = (minute: number) => new Date(start + minute * 60_000);
     await db.insert(companies).values({ id: companyId, name: "Person floor", issuePrefix: `FP${companyId.slice(0, 6)}` });
@@ -543,7 +546,7 @@ describeEmbeddedPostgres("person-message floor after Stop (RFL 19:05Z)", () => {
         body, clientRequestId: randomUUID(), origin: "comment", createdAt: at(minute), updatedAt: at(minute) }).returning();
       return row!;
     };
-    const run = async (status: "cancelled" | "failed" | "succeeded", minute: number, ids: string[] = [],
+    const run = async (status: "cancelled" | "failed" | "succeeded" | "timed_out", minute: number, ids: string[] = [],
       context: Record<string, unknown> = {}, resultJson: Record<string, unknown> = {}) => {
       const [row] = await db.insert(heartbeatRuns).values({ companyId, agentId, nativeIssueId: issueId,
         runtimeMode: "native", status, createdAt: at(minute), updatedAt: at(minute + 0.5),
@@ -554,8 +557,9 @@ describeEmbeddedPostgres("person-message floor after Stop (RFL 19:05Z)", () => {
       return row!;
     };
     const reply = async (runId: string, minute: number, body = "Continued the saved work.") => {
-      await db.insert(issueComments).values({ companyId, issueId, authorType: "agent", authorAgentId: agentId,
-        createdByRunId: runId, body, createdAt: at(minute), updatedAt: at(minute) });
+      const [row] = await db.insert(issueComments).values({ companyId, issueId, authorType: "agent", authorAgentId: agentId,
+        createdByRunId: runId, body, createdAt: at(minute), updatedAt: at(minute) }).returning();
+      return row!;
     };
     const claimedReceipt = async (messageId: string, runId: string, minute: number) => {
       const [receipt] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "on_demand",
@@ -724,5 +728,241 @@ describeEmbeddedPostgres("person-message floor after Stop (RFL 19:05Z)", () => {
     evidence("fp-cr-1117", { m: f.m.id, n: f.n.id, pending });
     expect(pending).toEqual({});
     expect((await f.wakes()).map(w => w.id)).toEqual(f.receiptIds);
+  });
+
+  describe("RULE-ANSWERED-MEANS-ANSWERED-1119", () => {
+  it("F4: streamed progress materializes read/text evidence, publication withheld, terminal run owes ONE naming card", async () => {
+    const f = await fixture();
+    const m = await f.message("F4 saved README question", 1);
+    const r = await f.run("succeeded", 2, [], { steeredCommentIds: [m.id] });
+    await f.claimedReceipt(m.id, r.id, 2);
+    const events = [
+      { type: "item.started", itemId: "turn-f4:input", kind: "userMessage" },
+      { type: "item.completed", itemId: `turn-f4:steer:${m.id}`, kind: "steering_acknowledgement" },
+      { type: "item.started", itemId: "turn-f4:read", kind: "userMessage" },
+      { type: "item.started", itemId: "turn-f4:progress", kind: "agentMessage" },
+      { type: "item.completed", itemId: "turn-f4:progress", kind: "agentMessage", text: "I'm checking; I'll get back to you.", channel: "final" },
+      { type: "turn.completed", itemId: "turn-f4:end", kind: "turn" },
+    ];
+    for (const [index, e] of events.entries()) await db.insert(heartbeatRunEvents).values({
+      companyId: f.companyId, runId: r.id, agentId: f.agentId, seq: index + 1,
+      eventType: e.type, sourceEventId: randomUUID(), createdAt: f.at(2 + index / 100),
+      payload: { prpEvent: { type: e.type, turnId: "turn-f4", itemId: e.itemId,
+        payload: { kind: e.kind, text: "text" in e ? e.text : undefined, channel: "channel" in e ? e.channel : undefined } } },
+    });
+    await recordSteeredMessageEvidence(db, { companyId: f.companyId, runId: r.id });
+    const [materialized] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, r.id));
+    expect(materialized!.contextSnapshot?.answeredSteeredCommentIds).toEqual([m.id]);
+    const posted = await db.select().from(issueComments).where(and(eq(issueComments.createdByRunId, r.id), eq(issueComments.authorType, "agent")));
+    expect(posted).toEqual([]);
+    const answered = [...await answeredPersonMessageIds(db, { ...f, commentIds: [m.id] })];
+    const owed = await f.owed(m.id), before = (await f.runs()).map(run => run.id);
+    await f.sweep(); await f.sweep();
+    const cards = (await f.cards()).filter(c => c.metadata?.authorizationReason === UNANSWERED_MESSAGE_REASON_PREFIX + m.id);
+    evidence("F4-publication-withheld", { messageId: m.id, runId: r.id, materialized: materialized!.contextSnapshot,
+      posted, answered, owed, cards });
+    expect.soft(answered).toEqual([]);
+    expect.soft(owed).toBe(true);
+    expect.soft(cards).toHaveLength(1);
+    if (cards[0]) expect.soft(cards[0].body).toContain(m.body);
+    await noResend(f, before);
+  });
+  it("INSTALL three boots: seeded 3-day answered-to-owed history gets one note per owed PERSON, zero new runs", async () => {
+    const f = await fixture(Date.now() - 3 * 24 * 60 * 60_000);
+    const expected: { messageId: string; body: string; notes: number }[] = [];
+    for (const [index, row] of [
+      { status: "succeeded", progress: false, owed: false, label: "P3 real final" },
+      { status: "failed", progress: true, owed: true, label: "P1 progress FAIL" },
+      { status: "succeeded", progress: true, owed: true, label: "P2 progress SUCCEED" },
+      { status: "failed", progress: false, owed: true, label: "failed partial" },
+      { status: "timed_out", progress: false, owed: true, label: "timed out partial" },
+      { status: "cancelled", progress: false, owed: true, label: "cancelled partial" },
+    ].entries()) {
+      const minute = index * 4 + 1;
+      const m = await f.message(row.label + ": please answer my README question", minute);
+      const r = await f.run(row.status as "succeeded" | "failed" | "timed_out" | "cancelled", minute + 1, [m.id]);
+      await f.claimedReceipt(m.id, r.id, minute + 1);
+      const a = await f.reply(r.id, minute + 2, row.progress ? "I'm checking, I'll get back to you." : "Saved answer text.");
+      if (row.progress) await db.update(heartbeatRuns).set({ resultJson: { semanticToolReceipts: {
+        p: { operationId: "report_progress", result: { commentId: a.id } },
+      } } }).where(eq(heartbeatRuns.id, r.id));
+      expected.push({ messageId: m.id, body: m.body, notes: row.owed ? 1 : 0 });
+    }
+    const before = (await f.runs()).map(r => r.id).sort();
+    console.log("AMMA-INSTALL-EXPECTED", JSON.stringify(expected));
+    for (let boot = 0; boot < 3; boot++) {
+      const bootDb = createDb(database.connectionString);
+      try {
+        const [issue] = await bootDb.select().from(issues).where(eq(issues.id, f.issueId));
+        await deliverConversationComments(bootDb, issue!, heartbeatService(bootDb).wakeup);
+        await deliverConversationComments(bootDb, issue!, heartbeatService(bootDb).wakeup);
+        for (let pass = 0; pass < 2; pass++) await settleUnansweredPersonMessages(bootDb, { companyId: f.companyId, issueId: f.issueId });
+      } finally { await bootDb.$client.end(); }
+    }
+    const cards = await f.cards();
+    const actual = expected.map(m => ({ ...m, actualNotes: cards.filter(c => c.metadata?.authorizationReason === UNANSWERED_MESSAGE_REASON_PREFIX + m.messageId).length }));
+    console.log("AMMA-INSTALL-ACTUAL", JSON.stringify({ actual, before, after: (await f.runs()).map(r => r.id).sort() }));
+    for (const m of actual) expect.soft(m.actualNotes, m.body).toBe(m.notes);
+    expect((await f.runs()).map(r => r.id).sort()).toEqual(before);
+  });
+  // D3 port: persisted PG rows for RFL 20:14Z (2), review-fleet-5 rf5-d3gap.
+  // catch: https://github.com/Smarty-Pants-Inc/paperclip/commit/97a09117
+  it.each([
+    { label: "d3-fail (P1)", status: "failed", progress: true, accepted: false, answered: false },
+    { label: "d3-progress (P2)", status: "succeeded", progress: true, accepted: false, answered: false },
+    { label: "d3-failed-reply", status: "failed", progress: false, accepted: false, answered: false },
+    { label: "d3-timeout", status: "timed_out", progress: false, accepted: false, answered: false },
+    { label: "d3-cancel", status: "cancelled", progress: false, accepted: false, answered: false },
+    { label: "d3-accepted", status: "failed", progress: false, accepted: true, answered: true },
+    { label: "d3-plain (P3)", status: "succeeded", progress: false, accepted: false, answered: true },
+  ] as const)("$label: only a succeeded final reply or accepted publication answers M", async row => {
+    const f = await fixture();
+    const m = await f.message(`${row.label}: please answer my question`, 1);
+    const r = await f.run(row.status, 2, [m.id]);
+    await f.claimedReceipt(m.id, r.id, 2);
+    const a = await f.reply(r.id, 3, row.progress ? "I'm still working on it." : "The answer is 19.");
+    if (row.progress) await db.update(heartbeatRuns).set({ resultJson: { semanticToolReceipts: {
+      "progress-1": { operationId: "report_progress", result: { commentId: a.id } },
+    } } }).where(eq(heartbeatRuns.id, r.id));
+    if (row.accepted) await acceptedPublication(f, r.id, a.id);
+    const answered = [...await answeredPersonMessageIds(db, { ...f, commentIds: [m.id] })];
+    const owed = await f.owed(m.id);
+    const pending = await readContinuationCommentInput(db, { ...f, runId: r.id });
+    const before = (await f.runs()).map(run => run.id);
+    await f.sweep(); await f.sweep();
+    const cards = await f.cards();
+    evidence(row.label, { messageId: m.id, runId: r.id, replyId: a.id, status: row.status,
+      progress: row.progress, accepted: row.accepted, answered, owed, pending, cards });
+    expect(answered).toEqual(row.answered ? [m.id] : []);
+    expect(owed).toBe(!row.answered);
+    if (row.answered) expect(pending).toEqual({});
+    else expect(pending).toMatchObject({ wakeCommentIds: [m.id], wakeCommentId: m.id, commentId: m.id });
+    expect(cards).toHaveLength(row.answered ? 0 : 1);
+    if (!row.answered) expect(cards[0]!.metadata?.authorizationReason).toBe(`${UNANSWERED_MESSAGE_REASON_PREFIX}${m.id}`);
+    await noResend(f, before);
+  });
+
+  async function acceptedPublication(f: FloorFixture, runId: string, commentId: string) {
+    const contractId = randomUUID(), resultId = randomUUID(), canonicalSha256 = "a".repeat(64);
+    await db.insert(completionContracts).values({ id: contractId, companyId: f.companyId, issueId: f.issueId,
+      revision: 1, schemaVersion: "1", policyVersion: "d3", risk: "low", completionAuthority: "agent_claim_policy",
+      incompleteCriteriaPolicy: "block", contractJson: {}, canonicalSha256: "b".repeat(64),
+      createdByActorType: "system", createdByActorId: "d3-row" });
+    await db.update(heartbeatRuns).set({ completionContractId: contractId }).where(eq(heartbeatRuns.id, runId));
+    await db.insert(nativeRunResults).values({ id: resultId, companyId: f.companyId, issueId: f.issueId, runId,
+      completionContractId: contractId, serverFingerprint: randomUUID(), schemaStatus: "accepted",
+      resultJson: { response: "The answer is 19." }, canonicalSha256 });
+    await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId,
+      phase: "committed", resultId });
+    await db.update(heartbeatRuns).set({ resultJson: { presentationDecision: { commentId },
+      nativeCommittedChatResponse: { resultId, canonicalSha256 } } }).where(eq(heartbeatRuns.id, runId));
+    return { resultId, canonicalSha256 };
+  }
+
+  it.each(["not-published", "not-accepted", "wrong-result", "wrong-hash", "different-finalization", "progress"] as const)(
+    "d3-accepted-guard: %s is not the accepted result's published final answer", async shape => {
+      const f = await fixture();
+      const m = await f.message("An accepted result must actually be published", 1);
+      const r = await f.run("failed", 2, [m.id]);
+      const a = await f.reply(r.id, 3);
+      const accepted = await acceptedPublication(f, r.id, a.id);
+      const resultJson: Record<string, unknown> = { presentationDecision: { commentId: a.id },
+        nativeCommittedChatResponse: accepted };
+      if (shape === "not-published") resultJson.presentationDecision = { commentId: randomUUID() };
+      if (shape === "wrong-result") resultJson.nativeCommittedChatResponse = { ...accepted, resultId: randomUUID() };
+      if (shape === "wrong-hash") resultJson.nativeCommittedChatResponse = { ...accepted, canonicalSha256: "c".repeat(64) };
+      if (shape === "progress") resultJson.semanticToolReceipts = { p: { operationId: "report_progress", result: { commentId: a.id } } };
+      await db.update(heartbeatRuns).set({ resultJson }).where(eq(heartbeatRuns.id, r.id));
+      if (shape === "not-accepted") await db.update(nativeRunResults).set({ schemaStatus: "rejected" })
+        .where(eq(nativeRunResults.id, accepted.resultId));
+      if (shape === "different-finalization") {
+        const [original] = await db.select().from(nativeRunResults).where(eq(nativeRunResults.id, accepted.resultId));
+        const otherId = randomUUID();
+        await db.insert(nativeRunResults).values({ ...original!, id: otherId, serverFingerprint: randomUUID() });
+        await db.update(nativeRunFinalizations).set({ resultId: otherId }).where(eq(nativeRunFinalizations.runId, r.id));
+      }
+      const answered = [...await answeredPersonMessageIds(db, { ...f, commentIds: [m.id] })];
+      evidence(`d3-accepted-guard-${shape}`, { messageId: m.id, runId: r.id, answered });
+      expect(answered).toEqual([]);
+      expect(await f.owed(m.id)).toBe(true);
+    });
+
+  it("d3-days-old: boot outbox + two sweeps never resurrect a two-day-old progress-only message after later answers", async () => {
+    const f = await fixture(Date.now() - 2 * 24 * 60 * 60_000);
+    const old = await f.message("Read the README from two days ago", 1);
+    const progress = await f.run("succeeded", 2, [old.id]);
+    await f.claimedReceipt(old.id, progress.id, 2);
+    const note = await f.reply(progress.id, 3, "I'm reading it now.");
+    await db.update(heartbeatRuns).set({ resultJson: { semanticToolReceipts: {
+      p: { operationId: "report_progress", result: { commentId: note.id } },
+    } } }).where(eq(heartbeatRuns.id, progress.id));
+    for (const [minute, question, answer] of [[24 * 60, "What is 9 + 10?", "19"], [25 * 60, "What is 2 + 2?", "4"]] as const) {
+      const newer = await f.message(question, minute);
+      const r = await f.run("succeeded", minute + 1, [newer.id]);
+      await f.claimedReceipt(newer.id, r.id, minute + 1);
+      await f.reply(r.id, minute + 2, answer);
+    }
+    const beforeRuns = (await f.runs()).map(r => r.id).sort();
+    const beforeWakes = (await f.wakes()).map(w => w.id).sort();
+    // New Db client over the saved history: the boot crash-window outbox and
+    // per-message discovery/settle run against persisted state, not cached objects.
+    const bootDb = createDb(database.connectionString);
+    try {
+      const [issue] = await bootDb.select().from(issues).where(eq(issues.id, f.issueId));
+      await deliverConversationComments(bootDb, issue!, heartbeatService(bootDb).wakeup);
+      for (let pass = 0; pass < 2; pass++) await settleUnansweredPersonMessages(bootDb, {
+        companyId: f.companyId, issueId: f.issueId, now: new Date(),
+      });
+    } finally { await bootDb.$client.end(); }
+    const cards = await f.cards(), runs = (await f.runs()).map(r => r.id).sort(), wakes = (await f.wakes()).map(w => w.id).sort();
+    evidence("d3-days-old", { oldMessageId: old.id, createdAt: old.createdAt, simulatedBoot: new Date(),
+      beforeRuns, runs, beforeWakes, wakes, cards });
+    expect(runs, "NO new run at boot").toEqual(beforeRuns);
+    expect(wakes, "NO new wake at boot").toEqual(beforeWakes);
+    expect(cards.length, "at most ONE true note").toBeLessThanOrEqual(1);
+    expect(await f.owed(old.id)).toBe(false);
+    expect(await undeliveredConversationComments(db, f.companyId, f.issueId)).toEqual([]);
+  });
+
+  it.each([23, 25, 72])("HALF 2 boot: %sh owed input, outbox twice + two sweeps never starts a run after 24h", async hours => {
+    const now = Date.now();
+    const f = await fixture(now - hours * 60 * 60_000 - 60_000);
+    const m = await f.message(`Read my saved ${hours}-hour-old README request`, 1);
+    await db.update(issues).set({ status: "in_review", conversationState: "waiting" }).where(eq(issues.id, f.issueId));
+    await db.update(agents).set({ adapterConfig: { command: process.execPath, args: ["-e", "process.stdout.write('done')"], cwd: process.cwd() },
+      runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } } }).where(eq(agents.id, f.agentId));
+    const bootDb = createDb(database.connectionString), heartbeat = heartbeatService(bootDb);
+    try {
+      const [issue] = await bootDb.select().from(issues).where(eq(issues.id, f.issueId));
+      console.log("HALF2-stage", hours, "before outbox", f.issueId);
+      await deliverConversationComments(bootDb, issue!, heartbeat.wakeup);
+      console.log("HALF2-stage", hours, "after outbox", (await f.runs()).map(r => ({ id: r.id, status: r.status, runtimeMode: r.runtimeMode })));
+      await heartbeat.drainActiveRunExecutions();
+      console.log("HALF2-stage", hours, "after drain");
+      await waitForPendingRunFailureReports();
+      await deliverConversationComments(bootDb, issue!, heartbeat.wakeup);
+      await heartbeat.drainActiveRunExecutions();
+      for (let pass = 0; pass < 2; pass++) await settleUnansweredPersonMessages(bootDb, {
+        companyId: f.companyId, issueId: f.issueId, now: new Date(now + 5 * 60_000),
+      });
+      const runs = await f.runs(), wakes = await f.wakes(), cards = await f.cards();
+      evidence(`HALF2-boot-${hours}h`, { messageId: m.id, body: m.body, createdAt: m.createdAt,
+        runs: runs.map(r => ({ id: r.id, status: r.status, startedAt: r.startedAt })),
+        wakes: wakes.map(w => ({ id: w.id, status: w.status, runId: w.runId })), cards });
+      expect.soft(await f.owed(m.id), "unanswered input stays owed").toBe(true);
+      expect.soft(runs, hours > 24 ? "NO run may start for an old person message" : "23h input is still inside the delivery window")
+        .toHaveLength(hours > 24 ? 0 : 1);
+      expect.soft(cards.length, "outbox + two sweeps writes at most ONE note").toBeLessThanOrEqual(1);
+      if (hours === 72) {
+        expect.soft(cards, "a three-day-old owed message gets ONE true naming note").toHaveLength(1);
+        if (cards[0]) expect.soft(cards[0].body).toContain(m.body);
+      }
+    } finally {
+      await drainHeartbeatRunsToQuiescence(bootDb, heartbeat);
+      await waitForPendingRunFailureReports();
+      await heartbeat.drainActiveRunExecutions();
+      await bootDb.$client.end();
+    }
+  }, 60_000); // Includes the existing 30s owned-run drain; keep the three-phase row joined.
   });
 });

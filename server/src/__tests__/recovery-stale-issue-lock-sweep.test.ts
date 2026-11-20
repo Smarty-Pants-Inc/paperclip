@@ -1642,6 +1642,66 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       await c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId });
       expect(await queuedRuns(w.id)).toHaveLength(1);
     });
+    it.each([25, 24, 23])("H24: boot settle of held succeeded owner with %ih person input", async hours => {
+      const { c, w, r, messages } = await boundFixture();
+      const ids = [messages[0].id];
+      await db.delete(issueComments).where(inArray(issueComments.id, messages.slice(1).map(m => m.id)));
+      await db.update(agentWakeupRequests).set({ payload: withQueuedCommentIdsInWakePayload(w.payload, ids) })
+        .where(eq(agentWakeupRequests.id, w.id));
+      await db.update(issueComments).set({ createdAt: ago(hours * hour), updatedAt: ago(hours * hour) })
+        .where(inArray(issueComments.id, ids));
+      await db.update(agentWakeupRequests).set({ requestedAt: ago(hours * hour) }).where(eq(agentWakeupRequests.id, w.id));
+      await db.update(issues).set({ executionRunId: r.id, checkoutRunId: r.id,
+        executionLockedAt: ago(hours * hour) }).where(eq(issues.id, c.issueId));
+      await db.update(heartbeatRuns).set({ contextSnapshot: { ...r.contextSnapshot, steeredCommentIds: [ids[0]] },
+        resultJson: { steeringIngestionReleaseHeld: true,
+          nativeSteeringIngestion: { state: "open", sourceInstanceId: "h24-old-boot" } },
+      }).where(eq(heartbeatRuns.id, r.id));
+      await db.update(nativeRunFinalizations).set({ controllerHostHash: currentProcessSpaceHash(),
+        controllerBootId: randomUUID(), controllerPid: 2147483647, controllerProcessStartedAt: ago(26 * hour) })
+        .where(eq(nativeRunFinalizations.runId, r.id));
+      const noteCounts: number[] = [];
+      for (let pass = 1; pass <= 2; pass++) {
+        await c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId });
+        const notes = await systemNotes(c);
+        const runs = await queuedRuns(w.id);
+        process.stdout.write(`H24 evidence ${JSON.stringify({ path: "settle", hours, pass, wakeId: w.id,
+          sourceRunId: r.id, notes: notes.map(n => ({ id: n.id, body: n.body, metadata: n.metadata })), runs: runs.map(x => x.id) })}\n`);
+        expect(runs).toHaveLength(hours < 24 ? 1 : 0);
+        noteCounts.push(notes.length);
+        if (hours >= 24 && pass === 2) {
+          expect(noteCounts).toEqual([1, 1]);
+          expect(notes).toHaveLength(ids.length);
+          for (const id of ids) expect(notes.filter(n => n.metadata?.authorizationReason === `unanswered_message:${id}`)).toHaveLength(1);
+          expect(notes.every(n => n.body.includes("BOUND"))).toBe(true);
+        }
+      }
+    });
+    it("H24: bound with 25h person input writes naming notes without a run, twice", async () => {
+      const { c, w, messages } = await boundFixture();
+      const ids = [messages[0].id];
+      await db.delete(issueComments).where(inArray(issueComments.id, messages.slice(1).map(m => m.id)));
+      await db.update(agentWakeupRequests).set({ payload: withQueuedCommentIdsInWakePayload(w.payload, ids) })
+        .where(eq(agentWakeupRequests.id, w.id));
+      await db.update(issueComments).set({ createdAt: ago(25 * hour), updatedAt: ago(25 * hour) })
+        .where(inArray(issueComments.id, ids));
+      await db.update(agentWakeupRequests).set({ requestedAt: ago(25 * hour) }).where(eq(agentWakeupRequests.id, w.id));
+      const noteCounts: number[] = [];
+      for (let pass = 1; pass <= 2; pass++) {
+        await c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId });
+        const notes = await systemNotes(c);
+        const runs = await queuedRuns(w.id);
+        process.stdout.write(`H24 evidence ${JSON.stringify({ path: "bound", pass, wakeId: w.id,
+          notes: notes.map(n => ({ id: n.id, body: n.body, metadata: n.metadata })), runs: runs.map(x => x.id) })}\n`);
+        expect(runs).toHaveLength(0);
+        noteCounts.push(notes.length);
+        if (pass === 2) {
+          expect(noteCounts).toEqual([1, 1]);
+          for (const id of ids) expect(notes.filter(n => n.metadata?.authorizationReason === `unanswered_message:${id}`)).toHaveLength(1);
+          expect(notes.every(n => n.body.includes("BOUND"))).toBe(true);
+        }
+      }
+    });
     it("BOUNDCLOCK: requested_at remains the lower bound when it is newer than the marker", async () => {
       const { c, w } = await boundFixture();
       const requestedAt = new Date();
@@ -2357,7 +2417,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       expect(enqueue).not.toHaveBeenCalled(); expect(await queuedRuns(w.id)).toEqual([]);
       const notes = await systemNotes(c);
       expect(notes).toHaveLength(1); expect(notes[0].body).toContain(`Your message is saved: "${old.body}".`);
-      expect(notes[0].body).toContain("no run started for it");
+      expect(notes[0].body).toContain("will not run automatically"); // rule 13: old input has no automatic retry
       console.info("R2-stale-unclaimed boot sends 0; ONE naming card:", notes[0].body);
     });
 

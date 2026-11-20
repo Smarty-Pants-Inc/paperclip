@@ -93,8 +93,13 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       return row!.id;
     };
     const reply = async (runId: string) => {
+      const [carrier] = await db.select({ startedAt: heartbeatRuns.startedAt }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      // Rule line 6: the reply must follow the ACTUAL claim, not this fixture's
+      // older synthetic clock when a queued run is claimed using Date.now().
+      const createdAt = new Date(Math.max(at().getTime(), (carrier?.startedAt?.getTime() ?? 0) + 1));
+      clock = createdAt.getTime();
       await db.insert(issueComments).values({ companyId, issueId, body: "Here is my answer.", authorType: "agent", authorAgentId: agentId,
-        createdByRunId: runId, createdAt: at() });
+        createdByRunId: runId, createdAt });
     };
     const boardHold = async (cause: string, runId: string, kind = "active_run_watchdog") => {
       const [row] = await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId, kind, status: "active",

@@ -356,7 +356,8 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
         expect(comments.body.find((comment: any) => comment.id === response.body.id)).toMatchObject({
           steeredIntoRunId: chat.runId, steeringStatus: "delivered", steeringDeliveryEventSeq: expect.any(Number),
         });
-        expect(await answered(response.body.id)).toBe(reply);
+        // Rule lines 6-9: Pi text is not a posted reply, and this run is still running.
+        expect(await answered(response.body.id)).toBe(false);
       }, { timeout: 5000 });
       // The production facade deliberately projects an input receipt rather
       // than echoing its text. Its second userMessage is paired to M's real
@@ -812,7 +813,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     const [streaming] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
     const streamingSqlAnswered = await answered(response.body.id);
     expect((streaming!.contextSnapshot as any).answeredSteeredCommentIds).toEqual([response.body.id]);
-    expect(streamingSqlAnswered).toBe(true);
+    expect(streamingSqlAnswered).toBe(false); // rule 6: no posted reply / succeeded run yet
     await port.appendEvent(receipts.at(-1)!);
     const [atTerminal] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
     const terminalSqlAnswered = await answered(response.body.id);
@@ -836,7 +837,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     const expectedIds = expectsAnswer ? [response.body.id] : [];
     expect(evidence.answered).toEqual(expectedIds);
     expect((atTerminal!.contextSnapshot as any).answeredSteeredCommentIds).toEqual(expectedIds);
-    expect(terminalSqlAnswered).toBe(expectsAnswer);
+    expect(terminalSqlAnswered).toBe(false); // provider terminal is not the run's published answer
     expect((ended!.contextSnapshot as any).answeredSteeredCommentIds ?? []).toEqual(expectedIds);
     expect(sqlAnswered).toBe(expectsAnswer);
     expect(replay.disposition).toBe("duplicate");
@@ -983,11 +984,13 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       resume();
       await vi.waitFor(() => { if (pumpError) throw pumpError; expect(terminal).toBe(true); }, { timeout: 5000 });
       await release; await releaseRun(chat);
-      expect(await answered(response.body.id)).toBe(true);
+      // Rule lines 6-9: the ordered suffix proves a read and text, but this
+      // fixture never publishes that text. Keep the owed input exactly once.
+      expect(await answered(response.body.id)).toBe(false);
       const carriers = await carriersOf(chat, response.body.id);
-      expect(carriers.wakes.length + carriers.runs.length, "M must have no second-answer carrier").toBe(0);
+      expect(carriers.wakes.length + carriers.runs.length, "unposted M retains ONE carrier").toBe(1);
       const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
-      expect((ended!.resultJson as any).restoredSteeredCommentIds ?? []).not.toContain(response.body.id);
+      expect((ended!.resultJson as any).restoredSteeredCommentIds ?? []).toContain(response.body.id);
     } finally { resume(); await peer.close(); await pump; await rm(root, { recursive: true, force: true }); }
   }, 20_000);
 
@@ -1020,8 +1023,8 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     await port.settleEventIngestion();
     await releaseRun(chat);
     const carriers = await carriersOf(chat, response.body.id);
-    expect(carriers.wakes.length + carriers.runs.length).toBe(retained ? 0 : 1);
-    expect(await answered(response.body.id)).toBe(retained);
+    expect(carriers.wakes.length + carriers.runs.length).toBe(1);
+    expect(await answered(response.body.id)).toBe(false); // rule 8: a failed run's text never answers
   });
 
   it.each(["interrupt-first", "release-first", "concurrent"] as const)("S-d2: unread steers are carried once under the release lock (%s)", async order => {
@@ -1055,16 +1058,14 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     if (order === "interrupt-first") { taken = await take(); await releaseRun(chat); }
     else if (order === "release-first") { await releaseRun(chat); taken = await take(); }
     else [taken] = await Promise.all([take(), releaseRun(chat)]);
-    if (order === "interrupt-first") expect(taken).toEqual(sent.slice(1).map(message => message.id));
+    if (order === "interrupt-first") expect(taken).toEqual(sent.map(message => message.id)); // rule 8: cancelled first input is owed too
     if (order === "release-first") expect(taken).toEqual([]);
     expect(await take()).toEqual([]);
-    for (const message of sent.slice(1)) {
+    for (const message of sent) {
       const carriers = await carriersOf(chat, message.id);
       expect(carriers.wakes.length + carriers.runs.length).toBe(1);
     }
-    const answeredCarriers = await carriersOf(chat, sent[0].id);
-    expect(answeredCarriers.wakes.length + answeredCarriers.runs.length).toBe(0);
-    expect(await answered(sent[0].id)).toBe(true);
+    expect(await answered(sent[0].id)).toBe(false); // read/text before Stop was not a posted successful reply
   });
 
   it("S-f: explicit Queue never calls steer even on an attached Pi turn", async () => {
@@ -1511,16 +1512,16 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
         { eventType: "item.completed", kind: "agentMessage", itemId: "turn-1:reply", text: "B: yes" }] : []),
     ]);
     await personStop(chat);
-    const expected = variant === "read-answered" ? [c!.id] : [b!.id, c!.id];
+    const expected = [b!.id, c!.id]; // rule 8: even read text from a cancelled turn is owed
     const queue = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200);
     expect(queue.body.entries.map((entry: any) => entry.comment.id)).toEqual(expected);
     expect(queue.body.executionWait).toEqual({ reason: "stopped_by_person", message: STOPPED_LINE });
     const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
     expect((stopped!.contextSnapshot as any).wakeCommentIds)
-      .toEqual(variant === "read-answered" ? [chat.first.id, b!.id] : [chat.first.id]);
+      .toEqual([chat.first.id]);
     // The shared predicate now recognizes durable streamed text immediately;
     // neither an acknowledgement nor a userMessage alone is an answer.
-    expect(await answered(b!.id)).toBe(variant === "read-answered");
+    expect(await answered(b!.id)).toBe(false);
 
     // The owner's Send: one turn with the waiting messages, each once, in order.
     const sent = await request(app(chat.companyId)).post(`/api/issues/${chat.issue.id}/queued-comments/interrupt`)
@@ -1643,7 +1644,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     await finishTurn(chat, { status, log: false });
     const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
     const carriers = await carriersOf(chat, b!.id);
-    if (shape === "read-answered" || shape === "read-tool-final") {
+    if (status === "succeeded" && (shape === "read-answered" || shape === "read-tool-final")) {
       expect(await answered(b!.id)).toBe(true);
       expect((ended!.contextSnapshot as any).answeredSteeredCommentIds).toEqual([b!.id]);
       // No second delivery.
@@ -1673,6 +1674,9 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       contextSnapshot: (again.wakes[0]!.payload as any)._paperclipWakeContext,
     }).returning();
     expect((successor!.contextSnapshot as any).wakeCommentIds).toContain(b!.id);
+    // Rule line 6: the successor must actually finish successfully, not merely
+    // post while queued/running. This is the positive answer control.
+    await db.update(heartbeatRuns).set({ status: "succeeded", startedAt: new Date(), finishedAt: new Date() }).where(eq(heartbeatRuns.id, successor!.id));
     await db.insert(issueComments).values({
       companyId: chat.companyId, issueId: chat.issue.id, authorType: "agent", authorAgentId: chat.agentId,
       createdByRunId: successor!.id, body: "B: answered by the next turn",
@@ -2073,7 +2077,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
           sql`${issueComments.metadata}->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX + sent[0]}`));
         expect(notices).toHaveLength(1); expect(await answered(sent[0]!)).toBe(false);
       }, 30_000);
-      it("st-days-old: boot discovery, delivery and two sweeps preserve stored old commentary answers without a wake or card", async () => {
+      it("st-days-old: boot discovery, delivery and two sweeps name old commentary once without a run", async () => {
         const { chat, scope, sent } = await multiFinal(1, { ownFinal: true, commentaryOnly: true });
         const old = new Date(Date.now() - 3 * 24 * 60 * 60_000);
         const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
@@ -2084,7 +2088,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
         await db.update(issueComments).set({ createdAt: old, updatedAt: old }).where(eq(issueComments.issueId, chat.issue.id));
         await db.update(issueComments).set({ createdAt: new Date(old.getTime() + 1000) })
           .where(and(eq(issueComments.issueId, chat.issue.id), eq(issueComments.authorType, "agent")));
-        expect(await answered(sent[0]!)).toBe(true);
+        expect(await answered(sent[0]!)).toBe(false); // rule 9: persisted commentary is not a posted answer
         const beforeRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, chat.companyId));
         const beforeWakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, chat.companyId));
         // Reconstruct boot's durable presentation discovery and ordinary
@@ -2096,8 +2100,10 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
           { ...scope, now: new Date(Date.now() + offset) });
         expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, chat.companyId))).toHaveLength(beforeRuns.length);
         expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, chat.companyId))).toHaveLength(beforeWakes.length);
-        expect(await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id), eq(issueComments.authorType, "system")))).toEqual([]);
-        expect(await answered(sent[0]!)).toBe(true);
+        const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id), eq(issueComments.authorType, "system"),
+          sql`${issueComments.metadata}->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX + sent[0]}`));
+        expect(notes).toHaveLength(1); // rule 13: one naming note, never a late run
+        expect(await answered(sent[0]!)).toBe(false);
       }, 30_000);
     });
   });

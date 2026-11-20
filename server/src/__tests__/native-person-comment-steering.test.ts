@@ -1103,7 +1103,9 @@ describe("person comment default steering eligibility and asynchronous receipt",
         expect(String(prompts[0].input?.message)).not.toContain(message.body);
       }
       const after = (await f.comments()).filter(c => steered.some(m => m.id === c.id));
-      expect(after.map(c => [c.id, c.steerDeliveredAt])).toEqual(before.map(c => [c.id, c.steerDeliveredAt]));
+      // This asserts identity -> receipt preservation, not unstable DB row order.
+      const receiptsById = (rows: typeof after) => rows.map(c => [c.id, c.steerDeliveredAt]).sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+      expect(receiptsById(after)).toEqual(receiptsById(before));
     } finally { oldSuccess?.mockRestore(); observe.mockRestore(); await f.close(); }
   }, 60_000);
   it("S-task: a person comment on a TASK enters its attached Pi turn, without a wake or a restart", async () => {
@@ -1159,7 +1161,7 @@ describe("person comment default steering eligibility and asynchronous receipt",
 
   // B4: fault only the provider receipt boundary. Timeout rows retain the real
   // native timeout implementation; shorten its deadline, not the dispatch path.
-  it.each([true, false])("B4 timeout: Pi took M=%s; answer once, carry only unread input", async took => {
+  it.each([true, false])("B4 timeout: Pi took M=%s; only a posted answer discharges input", async took => {
     const f = await fixture(`B4-timeout-${took}`);
     const realSteer = nativeExecutor.steerNativeSession;
     const fault = vi.spyOn(nativeExecutor, "steerNativeSession").mockImplementation(input => realSteer({ ...input, timeoutMs: 40 }));
@@ -1175,7 +1177,7 @@ describe("person comment default steering eligibility and asynchronous receipt",
       f.peer.boundary();
       if (took) {
         // B5: RPC timed out; hold the ACK through terminal settlement/release.
-        // Actual Pi read/text, not the still-pending ACK, must discharge M.
+        // Actual Pi read/text proves delivery, not a posted answer (rule 6/9).
         await vi.waitFor(async () => {
           const [read] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
           expect(read.contextSnapshot?.answeredSteeredCommentIds).toContain(message.id);
@@ -1183,20 +1185,30 @@ describe("person comment default steering eligibility and asynchronous receipt",
       }
       await f.complete();
       const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
-      expect((ended.resultJson?.restoredSteeredCommentIds as string[] | undefined) ?? []).toEqual(took ? [] : [message.id]);
+      const sourceReplyPosted = (await f.comments()).some(comment => comment.authorType === "agent"
+        && comment.createdByRunId === f.runId && comment.body.includes(`ANSWER:${message.body}`));
+      console.log("AMMA-B4-TIMEOUT-PUBLICATION", JSON.stringify({ took, sourceReplyPosted, messageId: message.id,
+        runId: f.runId, status: ended.status, deliveredAts: ended.contextSnapshot?.steeredDeliveredAts,
+        restored: ended.resultJson?.restoredSteeredCommentIds,
+        posted: (await f.comments()).filter(comment => comment.authorType === "agent")
+          .map(comment => ({ id: comment.id, runId: comment.createdByRunId, body: comment.body })) }));
+      // Native text alone cannot discharge M (rule 6/9). If the separate
+      // publisher posts the source answer, retain it; otherwise ONE successor
+      // must answer visibly. This oracle does not demand a publisher change.
+      expect((ended.resultJson?.restoredSteeredCommentIds as string[] | undefined) ?? [])
+        .toEqual(sourceReplyPosted ? [] : [message.id]);
       // Ordinary release may already have promoted and answered the successor;
       // count its actual native prompt below, not an intermediate wake shape.
       release();
       await f.startDelivery();
       if (took) {
-        // Mid-run reply publication belongs to the parallel builder. This gate
-        // checks the native answer/read/carry boundary, not that separate writer.
+        // Preserve the native read/text proof without treating it as publication.
         expect(f.peer.replies.filter(reply => reply === `ANSWER:${message.body}`)).toHaveLength(1);
-        expect((await f.wakes()).filter(w => !w.runId && JSON.stringify(w.payload).includes(message.id))).toEqual([]);
-      } else await vi.waitFor(async () => { await f.assertAnsweredOnce([message]); }, { timeout: 15_000 });
+      }
+      await vi.waitFor(async () => { await f.assertAnsweredOnce([message]); }, { timeout: 15_000 });
       expect(f.peer.consumed.filter(body => body === message.body)).toHaveLength(took ? 1 : 0);
       const successors = f.owner.peers.slice(1).flatMap(peer => peer.requests.filter(r => r.type === "prompt"));
-      expect(successors.filter(r => String(r.input?.message).includes(message.body))).toHaveLength(took ? 0 : 1);
+      expect(successors.filter(r => String(r.input?.message).includes(message.body))).toHaveLength(sourceReplyPosted ? 0 : 1);
     } finally { release(); fault.mockRestore(); await f.close(); }
   }, 60_000);
 
