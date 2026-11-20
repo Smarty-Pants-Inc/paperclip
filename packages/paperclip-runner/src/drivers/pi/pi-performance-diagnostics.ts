@@ -72,7 +72,7 @@ export function piExtensionOpenPerformanceSpans(line: string, observedAtMs: numb
   if (line.length > 1024 || !line.startsWith(PI_OPEN_PERFORMANCE_PREFIX)) return [];
   try {
     return parseProviderPerformanceSpans(JSON.parse(line.slice(PI_OPEN_PERFORMANCE_PREFIX.length)), observedAtMs)
-      .filter(span => span.name.startsWith("runner.pi.open.extension_")).slice(0, 1);
+      .filter(span => span.name.startsWith("runner.pi.open.extension_") || span.name === "runner.pi.open.node_preload_start").slice(0, 1);
   } catch { return []; }
 }
 

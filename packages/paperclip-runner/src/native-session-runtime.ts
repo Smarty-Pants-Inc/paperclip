@@ -351,6 +351,8 @@ export interface NativeSessionGoalControl {
 }
 
 export interface ExecuteNativeSessionOptions {
+  /** Content-free waits, recorded by the embedding controller's current attempt. */
+  measureOperation?<T>(phase: string, work: () => T | PromiseLike<T>): Promise<T>;
   /** The control plane proved the old local runner stopped and charged a recovery attempt. */
   resumeInterruptedTurn?: boolean;
   /** Read bounded task history only after recovery requires a fresh conversation. */
@@ -795,6 +797,7 @@ async function persistCheckpointWithin(input: {
   snapshot: PersistedNativeSession;
   controlPlane: ControlPlanePort;
   onCheckpoint: ExecuteNativeSessionOptions["onCheckpoint"];
+  measureOperation?: ExecuteNativeSessionOptions["measureOperation"];
   timeoutMs: number;
   externalSignal?: AbortSignal;
 }): Promise<void> {
@@ -822,17 +825,18 @@ async function persistCheckpointWithin(input: {
     : new Promise<never>(() => undefined);
   const checkpointing = (async () => {
     const checkpointOptions = { signal: checkpointAbort.signal };
-    await input.controlPlane.checkpointSession?.(
+    const measure = input.measureOperation ?? (<T>(_phase: string, work: () => T | PromiseLike<T>) => Promise.resolve(work()));
+    await measure("runner.session.resume.checkpoint_write", () => input.controlPlane.checkpointSession?.(
       input.snapshot,
       checkpointOptions,
-    );
+    ));
     if (checkpointAbort.signal.aborted) {
       throw (
         checkpointAbort.signal.reason ??
         new Error("native session checkpoint aborted")
       );
     }
-    await input.onCheckpoint?.(input.snapshot, checkpointOptions);
+    await measure("runner.session.resume.checkpoint_callback", () => input.onCheckpoint?.(input.snapshot, checkpointOptions));
   })();
   // The timeout path intentionally stops awaiting an uncooperative adapter.
   // Keep its eventual rejection observed after execution has quarantined and
@@ -2464,7 +2468,8 @@ export async function executeNativeSession(
   options: ExecuteNativeSessionOptions,
 ): Promise<NativeSessionExecutionResult> {
   const input = parseNativeExecutionInput(options.input);
-  const descriptor = await options.backend.descriptor();
+  const measure = options.measureOperation ?? (<T>(_phase: string, work: () => T | PromiseLike<T>) => Promise.resolve(work()));
+  const descriptor = await measure("runner.session.resume.descriptor", () => options.backend.descriptor());
   const cleanupDomain: NativeSessionCleanupDomain = {
     key: JSON.stringify([
       input.binding.companyId,
@@ -2483,13 +2488,13 @@ export async function executeNativeSession(
       ]),
     ],
   };
-  await retryQuarantinedSessionCleanups(
+  await measure("runner.session.resume.cleanup_owners", () => retryQuarantinedSessionCleanups(
     cleanupDomain,
     options.signal,
     options.retainedRunnerReattachment && options.remoteCleanupScope
       ? input.binding.runId
       : undefined,
-  );
+  ));
   if ("runtimeContext" in input) {
     const capabilities = descriptor.runtimeContextCapabilities;
     const unsupported = (["instructions", "skills", "mcp"] as const).filter(
@@ -2504,7 +2509,7 @@ export async function executeNativeSession(
   let persistedSession = options.existingSession
     ? null
     : (options.persistedSession ??
-      (await options.controlPlane.loadSessionCheckpoint?.()) ??
+      (await measure("runner.session.resume.checkpoint_load", () => options.controlPlane.loadSessionCheckpoint?.())) ??
       null);
   if (
     persistedSession &&
@@ -2549,15 +2554,15 @@ export async function executeNativeSession(
       || validation.result.completionClaim?.contractRevision !== input.completionContract.contract.revision) {
       throw new Error("native_governed_wait_checkpoint_mismatch");
     }
-    await runAbortableOperationWithin({
+    await measure("runner.session.resume.governed_replay", () => runAbortableOperationWithin({
       timeoutMs: options.timeoutMs ?? 900_000,
       timeoutMessage: "native governed-wait recovery replay timed out",
       operation: async signal => {
         let afterSourceSeq = event.sourceSeq - 1;
         let gapObserved = false;
         while (true) {
-          const page = await options.controlPlane.replayEvents({ runId: identity.runId,
-            sourceInstanceId: options.runnerInstanceId, afterSourceSeq, limit: 1_000 }, { signal });
+          const page = await measure("runner.session.resume.governed_replay_page", () => options.controlPlane.replayEvents({ runId: identity.runId,
+            sourceInstanceId: options.runnerInstanceId, afterSourceSeq, limit: 1_000 }, { signal }));
           signal.throwIfAborted();
           if (!page.events.length) break;
           for (const entry of page.events) {
@@ -2576,7 +2581,7 @@ export async function executeNativeSession(
           }
         }
       },
-    });
+    }));
     if (canonicalJson(governedReplay[0]) !== canonicalJson(event)) throw new Error("native_governed_wait_trigger_unproven");
     if (governedReplay.some(entry => entry.eventType === "turn.started" && entry.turnId !== event.turnId)) {
       throw new Error("native_governed_wait_turn_mismatch");
@@ -2599,7 +2604,7 @@ export async function executeNativeSession(
     // usable. Keep its terminal fingerprint so replay cannot execute it twice.
     persistedSession = { ...persistedSession, terminal: null };
   }
-  await options.onSessionAdmission?.();
+  await measure("runner.session.resume.on_session_admission", () => options.onSessionAdmission?.());
   if (options.existingSession) {
     if (options.existingSession.attachRun === undefined) {
       throw new Error("native_session_multi_run_unavailable");
@@ -2623,13 +2628,12 @@ export async function executeNativeSession(
         });
         signal?.throwIfAborted();
       };
-      if (options.startup) await runAbortableOperationWithin({
+      await measure("runner.session.resume.attach", () => options.startup ? runAbortableOperationWithin({
         timeoutMs: Math.max(0, options.startup.deadlineAtMs - Date.now()),
         timeoutMessage: "native_execution_startup_expired",
         signal: options.startup.signal,
         operation: attach,
-      });
-      else await attach();
+      }) : attach());
     } catch (error) {
       // attachRun has no transactional guarantee: a provider may bind the new
       // run before reporting a later failure. Conservatively quarantine the
@@ -2651,7 +2655,7 @@ export async function executeNativeSession(
     // rollback operation if same-session recovery fails.
     const recoveryCheckpoint = persistedSession;
     const recoveryTimeoutMs = options.timeoutMs ?? 900_000;
-    persistedSession = await runAbortableOperationWithin({
+    persistedSession = await measure("runner.session.resume.recovery_replay", () => runAbortableOperationWithin({
       timeoutMs: recoveryTimeoutMs,
       timeoutMessage: `native session recovery replay timed out after ${recoveryTimeoutMs}ms`,
       operation: (signal) =>
@@ -2662,7 +2666,7 @@ export async function executeNativeSession(
           sourceInstanceId: options.runnerInstanceId,
           signal,
         }),
-    });
+    }));
     reconciledRecoveryCheckpoint = persistedSession;
     const providerRecoveryCheckpoint = persistedSession;
 
@@ -2682,7 +2686,7 @@ export async function executeNativeSession(
           reason: "provider session ended with a failed terminal",
         }
       : options.backend.recoverSession
-        ? await runAbortableOperationWithin({
+        ? await measure("runner.session.resume.provider_recovery", () => runAbortableOperationWithin({
             timeoutMs: recoveryTimeoutMs,
             timeoutMessage: `native session provider recovery timed out after ${recoveryTimeoutMs}ms`,
             timeoutError: () => new NativeProviderRecoveryDeadlineError(recoveryTimeoutMs),
@@ -2700,7 +2704,7 @@ export async function executeNativeSession(
                 );
               }
             },
-          })
+          }))
         : {
             recovered: false as const,
             reason: "driver does not support recovery",
@@ -2719,14 +2723,14 @@ export async function executeNativeSession(
       if (recovery.failureClass === PROVIDER_REFRESH_REQUIRED) {
         throw new NativeRunnerRefreshRequiredError(recovery.refreshWaitForTurn === true, recovery.prepareRefusalCode);
       }
-      const governedWaitFollowUpLostState = !replacementAllowed && await governedWaitFollowUpMayStartFresh({
+      const governedWaitFollowUpLostState = !replacementAllowed && await measure("runner.session.resume.governed_followup_check", () => governedWaitFollowUpMayStartFresh({
         input,
         checkpoint: providerRecoveryCheckpoint,
         recovery,
         restartInterruption: Boolean(checkpointedInterruption),
         controlPlane: options.controlPlane,
         timeoutMs: recoveryTimeoutMs,
-      });
+      }));
       if (!replacementAllowed && !governedWaitFollowUpLostState) {
         if (recovery.failureClass === PROVIDER_STATE_INCOMPATIBLE) {
           throw new NativeProviderStateIncompatibleError(recovery.reason ?? "unknown");
@@ -2758,7 +2762,7 @@ export async function executeNativeSession(
         identity,
         workingDirectory: input.workspace.cwd ?? undefined,
       };
-      session = await runAbortableOperationWithin({
+      session = await measure("runner.session.resume.replacement_bootstrap", () => runAbortableOperationWithin({
         timeoutMs: recoveryTimeoutMs,
         timeoutMessage: `native session replacement bootstrap timed out after ${recoveryTimeoutMs}ms`,
         operation: (signal) => {
@@ -2776,7 +2780,7 @@ export async function executeNativeSession(
             "native session replacement bootstrap timed out",
             cleanupDomain,
           ),
-      });
+      }));
     } else {
       session = recovery.session;
       recovered = true;
@@ -2791,7 +2795,7 @@ export async function executeNativeSession(
       identity,
       workingDirectory: input.workspace.cwd ?? undefined,
     };
-    session = await runAbortableOperationWithin({
+    session = await measure("runner.session.resume.bootstrap", () => runAbortableOperationWithin({
       timeoutMs: bootstrapTimeoutMs,
       timeoutMessage: `native session bootstrap timed out after ${bootstrapTimeoutMs}ms`,
       signal: options.startup?.signal,
@@ -2806,14 +2810,14 @@ export async function executeNativeSession(
           "native session bootstrap timed out",
           cleanupDomain,
         ),
-    });
+    }));
   }
   try {
-    await options.controlPlane.openRun({
+    await measure("runner.session.resume.open_run", () => options.controlPlane.openRun({
       identity,
       backendKind: descriptor.kind,
       sourceInstanceId: options.runnerInstanceId,
-    });
+    }));
   } catch (error) {
     if (session) {
       // Attachment and recovery both establish provider-side authority before
@@ -2920,20 +2924,21 @@ export async function executeNativeSession(
     // Ownership publication is part of the execution-owned lifetime. If the
     // callback fails, the finally block below still quarantines and closes the
     // provider session.
-    await options.onSession?.(session);
+    await measure("runner.session.resume.on_session", () => options.onSession?.(session));
     const checkpointTimeoutMs =
       options.checkpointTimeoutMs ?? DEFAULT_NATIVE_CHECKPOINT_TIMEOUT_MS;
     const persistCheckpoint = (
       snapshot: PersistedNativeSession,
       externalSignal?: AbortSignal,
     ) =>
-      persistCheckpointWithin({
+      measure("runner.session.resume.checkpoint_persist", () => persistCheckpointWithin({
         snapshot: governedWait ? { ...snapshot, governedWait } : snapshot,
         controlPlane: options.controlPlane,
         onCheckpoint: options.onCheckpoint,
+        measureOperation: options.measureOperation,
         timeoutMs: checkpointTimeoutMs,
         externalSignal,
-      });
+      }));
     // Cursor reconciliation is provisional until both provider recovery and
     // durable run admission succeed. Persist it only after those boundaries;
     // the execution-owned finally below quarantines the recovered session if
@@ -2942,12 +2947,12 @@ export async function executeNativeSession(
       await persistCheckpoint(reconciledRecoveryCheckpoint);
     }
     const checkpoint = async (signal?: AbortSignal) => {
-      const snapshot = await session.snapshot(signal ? { signal } : undefined);
+      const snapshot = await measure("runner.session.resume.snapshot", () => session.snapshot(signal ? { signal } : undefined));
       signal?.throwIfAborted();
       await persistCheckpoint(snapshot, signal);
       return snapshot;
     };
-    const recoveredSnapshot = await session.snapshot();
+    const recoveredSnapshot = await measure("runner.session.resume.initial_snapshot", () => session.snapshot());
     const attachmentInput = (value: string | NativeWakeAttachmentInput | undefined): NativeWakeAttachmentInput =>
       typeof value === "string" ? { prompt: value } : value ?? { prompt: "" };
     const restartContinuation = (steeredMessages: Array<{ id: string; text: string }>, attachments: NativeWakeAttachmentInput) => ({
@@ -3015,9 +3020,9 @@ export async function executeNativeSession(
       continuationSetup = (async () => {
         // The driver reports the borrowed marker with the accepted turn; a
         // later snapshot may already show the marker returned.
-        const steeredMessages = await options.getUnreadSteeredMessages?.() ?? [];
+        const steeredMessages = await measure("runner.session.resume.steered_messages", () => options.getUnreadSteeredMessages?.()) ?? [];
         signal?.throwIfAborted();
-        const attachments = attachmentInput(await options.prepareWakeAttachmentPrompt?.());
+        const attachments = attachmentInput(await measure("runner.session.resume.attachment_prompt", () => options.prepareWakeAttachmentPrompt?.()));
         signal?.throwIfAborted();
         // The fenced checkpoint proves this controller still owns the run
         // right before the submit; input preparation above may have taken a while.
@@ -3031,10 +3036,10 @@ export async function executeNativeSession(
     };
     const requestContinuationDisposition = async (event: PrpEvent, signal: AbortSignal) => {
       if (continuationDispositionRequested || event.eventType !== "turn.completed") return false;
-      await continuationSetup?.catch(() => undefined);
+      await measure("runner.session.resume.continuation_setup", () => continuationSetup?.catch(() => undefined));
       signal.throwIfAborted();
       if (borrowedContinuationTurnId === null || event.turnId !== borrowedContinuationTurnId) return false;
-      const snapshot = await session.snapshot();
+      const snapshot = await measure("runner.session.resume.continuation_snapshot", () => session.snapshot());
       signal.throwIfAborted();
       if (snapshot.semanticResult || snapshot.activeTurnId || snapshot.goal || snapshot.pendingRuntimeRequests?.length ||
           snapshot.dispositionOnlyRecoveryConsumed !== false ||
@@ -3050,11 +3055,11 @@ export async function executeNativeSession(
       if (!recovered || event.eventType !== "turn.failed" ||
           !isNativeRestartInterruption(event.payload.error) || !event.turnId) return false;
       if (checkpointedInterruption) {
-        await startupDecision;
+        await measure("runner.session.resume.startup_decision", () => startupDecision);
         signal.throwIfAborted();
       }
       if (!restartContinuationStarted) return false;
-      await continuationSetup?.catch(() => undefined);
+      await measure("runner.session.resume.continuation_setup", () => continuationSetup?.catch(() => undefined));
       signal.throwIfAborted();
       return restartContinuationTurnId !== null && event.turnId !== restartContinuationTurnId;
     };
@@ -3068,7 +3073,7 @@ export async function executeNativeSession(
           recoveredSnapshot.goal || persistedSession?.semanticResult || persistedSession?.pendingRuntimeRequests?.length ||
           event.eventType !== "turn.failed" || !isNativeRestartInterruption(event.payload.error) ||
           event.turnId !== persistedSession?.activeTurnId) return false;
-      const snapshot = await session.snapshot();
+      const snapshot = await measure("runner.session.resume.interrupted_snapshot", () => session.snapshot());
       signal.throwIfAborted();
       if (nativeRestartInterruptedTurnId(snapshot) !== event.turnId || snapshot.pendingRuntimeRequests?.length) return false;
       restartContinuationStarted = true;
@@ -3096,12 +3101,12 @@ export async function executeNativeSession(
       ),
     );
     if (continuityBreak) {
-      await options.onContinuityBreak?.({
+      await measure("runner.session.resume.continuity_break", () => options.onContinuityBreak?.({
         ...continuityBreak,
         replacementDriverSessionId: recoveredSnapshot.sessionId,
         replacementProviderSessionId:
           recoveredSnapshot.providerSessionId ?? null,
-      });
+      }));
     }
     // recoverSession may adopt a provider terminal and enqueue its normalized
     // event before returning. Do not checkpoint that terminal fingerprint
@@ -3127,7 +3132,7 @@ export async function executeNativeSession(
     if (governedWait) {
       for (const event of governedReplay) {
         if (event.turnId === governedWait.sourceEvent.turnId && (event.payload.kind === "usage" || isTurnTerminal(event))) {
-          await options.controlPlane.appendEvent(event);
+          await measure("runner.session.resume.governed_event_append", () => options.controlPlane.appendEvent(event));
         }
       }
     }
@@ -3182,15 +3187,15 @@ export async function executeNativeSession(
       );
       const replayedDisposition =
         dispositionRecoveryWasSubmitted && dispositionRecoveryTurnId !== null
-          ? await replayCheckpointedTurnTerminal({
+          ? await measure("runner.session.resume.terminal_replay", () => replayCheckpointedTurnTerminal({
               controlPlane: options.controlPlane,
               runId: input.binding.runId,
               sourceInstanceId: options.runnerInstanceId,
               priorTerminalTurnIds: (persistedSession?.terminalTurns ?? []).map(
                 (terminal) => terminal.turnId,
               ),
-              expectedTurnId: dispositionRecoveryTurnId,
-            })
+              expectedTurnId: dispositionRecoveryTurnId!,
+            }))
           : null;
       // Durable replay remains authoritative. If it has no terminal, an exact
       // consumed marker bound to the same terminal fingerprint in both
@@ -3297,18 +3302,18 @@ export async function executeNativeSession(
           // Explicit controls remain authoritative after controller loss. In
           // particular, pause/clear/edit must reach a recovered session even
           // while its provider turn is still active.
-          await applyNativeSessionGoalControl(session, options.sessionGoalControl);
+          await measure("runner.session.resume.goal_control", () => applyNativeSessionGoalControl(session, options.sessionGoalControl!));
           await checkpoint();
         } else if (options.resumeSessionGoalHeartbeat && shouldStartFreshTurn) {
           const requestId = `recovery_${input.binding.runId}`;
           if (recoveredSnapshot.goal?.status === "active") {
-            await applyNativeSessionGoalControl(session, { requestId, action: "resume" });
+            await measure("runner.session.resume.goal_resume", () => applyNativeSessionGoalControl(session, { requestId, action: "resume" }));
           } else {
             // Reconcile completed/paused/cleared state without changing it.
             // An already-delivered outbox control must not be replayed as a
             // new resume just because the old heartbeat is being recovered.
             if (!session.goal) throw new Error("native_session_goal_unavailable");
-            await session.goal({ action: "get", requestId });
+            await measure("runner.session.resume.goal_get", () => session.goal!({ action: "get", requestId }));
           }
           await checkpoint();
         } else if (shouldStartFreshTurn && recovered && checkpointedInterruption) {
@@ -3318,7 +3323,7 @@ export async function executeNativeSession(
             ? buildNativeModelEnvelope(input, { resumedSession: true })
             : buildNativeModelEnvelope(input);
           if (!recovered && options.getFreshSessionHandoff && "task" in modelEnvelope) {
-            const handoff = await options.getFreshSessionHandoff();
+            const handoff = await measure("runner.session.resume.fresh_session_handoff", () => options.getFreshSessionHandoff!());
             if (handoff) modelEnvelope.task.prompt = `${handoff}\n\n${modelEnvelope.task.prompt}`;
           }
           const dispositionOnlyRecovery = Boolean(
@@ -3329,12 +3334,12 @@ export async function executeNativeSession(
           );
           const effectFreeInitialAcpxTurn =
             dispositionOnlyRecovery && persistedSession
-              ? await replayProvesEffectFreeInitialAcpxTurn({
+              ? await measure("runner.session.resume.effect_free_replay", () => replayProvesEffectFreeInitialAcpxTurn({
                   controlPlane: options.controlPlane,
-                  checkpoint: persistedSession,
+                  checkpoint: persistedSession!,
                   runId: input.binding.runId,
                   sourceInstanceId: options.runnerInstanceId,
-                })
+                }))
               : false;
           if (dispositionOnlyRecovery && !effectFreeInitialAcpxTurn) {
             modelEnvelope = buildNativeModelEnvelope(input);
@@ -3356,9 +3361,9 @@ export async function executeNativeSession(
           }
           let localImagePaths: readonly string[] | undefined;
           if (!dispositionOnlyRecovery || effectFreeInitialAcpxTurn) {
-            const attachments = attachmentInput(await options.prepareWakeAttachmentPrompt?.());
+            const attachments = attachmentInput(await measure("runner.session.resume.attachment_prompt", () => options.prepareWakeAttachmentPrompt?.()));
             localImagePaths = attachments.localImagePaths;
-            const queuedInput = await options.getFirstTurnQueuedInput?.();
+            const queuedInput = await measure("runner.session.resume.queued_input", () => options.getFirstTurnQueuedInput?.());
             const supplemental = [attachments.prompt, queuedInput].filter(Boolean).join("\n\n");
 
             if (supplemental && "task" in modelEnvelope) {

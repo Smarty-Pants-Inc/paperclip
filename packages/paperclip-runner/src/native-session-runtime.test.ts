@@ -6247,6 +6247,62 @@ describe("executeNativeSession recovery", () => {
     }
   });
 
+  // Keep reason: pre-submit instrumentation must include callback tails that
+  // are invisible in the provider/DB's own inner spans (timing-only brief).
+  it("records retained resume waits through the checkpoint callback before submission", async () => {
+    const spans: Array<{ name: string; startedAtMs: number; endedAtMs: number }> = [];
+    let beforeSubmit: string[] = [], submitted = "", attached = false, callbackSettled = false;
+    const capabilities = { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true };
+    const session: NativeSession = {
+      identity: () => identity,
+      capabilities: async () => capabilities,
+      attachRun: async () => { attached = true; },
+      async *events() { yield runnerEvent(1, "turn.completed"); },
+      startTurn: async turn => {
+        expect(attached).toBe(true);
+        expect(callbackSettled).toBe(true);
+        beforeSubmit = spans.map(span => span.name);
+        submitted = turn.message.text;
+        return { turnId: "turn-recovery" };
+      },
+      result: async () => ({ result, terminal, turnId: "turn-recovery" }),
+      snapshot: async () => ({ backendKind: "mock", sessionId: "driver-recovery", identity,
+        providerSessionId: "provider-recovery", activeTurnId: null, pendingRuntimeRequests: [], lineage: [] }),
+      close: async () => {},
+    };
+    const execution = await executeNativeSession({
+      input, existingSession: session, runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery",
+      backend: {
+        descriptor: async () => ({ kind: "mock", name: "resume-span-evidence", version: "1", capabilities }),
+        openSession: async () => { throw new Error("retained session must not reopen"); },
+      },
+      controlPlane: {
+        openRun: async () => {}, checkpointSession: async () => {}, completeRun: async () => {},
+        appendEvent: async event => ({ cursor: event.sourceSeq, highestContiguousSourceSeq: event.sourceSeq, disposition: "committed" }),
+        replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }),
+      },
+      prepareWakeAttachmentPrompt: async () => "attachment-evidence",
+      getFirstTurnQueuedInput: async () => "queued-evidence",
+      onSession: async () => { await Promise.resolve(); },
+      onCheckpoint: async () => { await Promise.resolve(); callbackSettled = true; },
+      measureOperation: async (name, work) => {
+        const startedAtMs = Date.now();
+        try { return await work(); }
+        finally { spans.push({ name, startedAtMs, endedAtMs: Math.max(startedAtMs, Date.now()) }); }
+      },
+    });
+    expect(execution).toMatchObject({ result, terminal });
+    expect(submitted).toContain("attachment-evidence");
+    expect(submitted).toContain("queued-evidence");
+    expect(beforeSubmit).toEqual(expect.arrayContaining([
+      "descriptor", "cleanup_owners", "on_session_admission", "attach", "open_run", "on_session",
+      "initial_snapshot", "snapshot", "checkpoint_persist", "checkpoint_write", "checkpoint_callback",
+      "attachment_prompt", "queued_input",
+    ].map(step => `runner.session.resume.${step}`)));
+    expect(beforeSubmit).not.toContain("runner.session.resume.checkpoint_load");
+    expect(spans.every(span => span.endedAtMs >= span.startedAtMs)).toBe(true);
+  });
+
   it("rejects a mismatched checkpoint before it mutates control-plane state", async () => {
     const openRun = vi.fn(async () => undefined);
     const checkpointSession = vi.fn(async () => undefined);

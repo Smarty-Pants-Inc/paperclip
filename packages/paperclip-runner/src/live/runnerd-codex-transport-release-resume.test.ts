@@ -104,6 +104,7 @@ it.skipIf(process.platform === "win32").each(["cached", "lost claim reply", "cac
     const binary = defaultCapabilityRunnerdBinary();
     const runnerFile = join(root, "runner/runner-state.json");
     const claimTicketDigests: string[] = [], routeRuns: string[] = [];
+    const resumeSpans: Array<{ name: string; startedAtMs: number; endedAtMs: number }> = [];
     let deliverOldClose!: () => void;
     const oldCloseGate = new Promise<void>(resolve => { deliverOldClose = resolve; });
     const goalGate = join(root, "goal-tail-gate");
@@ -185,10 +186,12 @@ it.skipIf(process.platform === "win32").each(["cached", "lost claim reply", "cac
       codexCommand: fakeCodex, codexArgs: fakeCodexArgs(root, ...(mode === "empty goal snapshot" ? ["--durable-turn-ids", "--late-accounting-tail-gate", goalGate, "--late-active-goal"] : [])), prpIdentity: identity,
       get authorityRunId() { return claimantRunId; }, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 },
       runnerProcessLauncher: launch, controlPlaneRegistration: registration, releaseResume: pair,
-      ...((mode === "release admission" || mode === "deferred turn after close") ? { measureOperation: async <T>(phase: string, work: () => Promise<T>): Promise<T> => {
+      measureOperation: async <T>(phase: string, work: () => Promise<T>): Promise<T> => {
         if (phase === "runner.transport.turn_start" && holdMeasuredTurn) { enterMeasuredTurn(); await heldMeasuredTurn; }
-        return work();
-      } } : {}),
+        const startedAtMs = Date.now();
+        try { return await work(); }
+        finally { if (phase.startsWith("runner.session.resume.")) resumeSpans.push({ name: phase, startedAtMs, endedAtMs: Math.max(startedAtMs, Date.now()) }); }
+      },
       ...(acpx ? { provider: "acpx" as const, acpxAgent: "claude" as const, acpxRuntimeDirectory: join(root, "acpx"),
         prepareLaunch: async (input: RunnerProviderLaunchRequirements) => ({ configurationId: `fixture-${input.identity.runId}`, requirementsDigest: runnerLaunchRequirementsDigest(input),
           provider: createRunnerProviderLaunch(input, { options: {}, root, cwd: root, codexHome: root, codexCommand: "", providerNodeCommand: sidecar, opencodeProxyPath: "", acpxSidecarPath: sidecarScript }) }) } : {}) };
@@ -437,6 +440,16 @@ it.skipIf(process.platform === "win32").each(["cached", "lost claim reply", "cac
         return;
       }
       expect(pair.resume).toHaveBeenCalledTimes(mode === "lost claim reply" ? 2 : 1);
+      if (mode === "cached" || mode === "lost claim reply") {
+        expect(resumeSpans.map(span => span.name)).toEqual(expect.arrayContaining([
+          "released_claim", "release_checkpoint", "release_resume_rpc", "resume_released_runner",
+          "warm_readiness", "warm_connection", "readiness_probe", "register_control_plane",
+          "registration_activate", "registration_ready", "previous_route_release",
+          ...(mode === "lost claim reply" ? ["release_retry_backoff"] : []),
+        ].map(step => `runner.session.resume.${step}`)));
+        expect(resumeSpans.every(span => span.endedAtMs >= span.startedAtMs)).toBe(true);
+        expect(resumeSpans.filter(span => span.name === "runner.session.resume.readiness_probe").length).toBeGreaterThanOrEqual(2);
+      }
       if (mode === "cache adoption" || mode === "acpx cache adoption" || mode === "late wire close") {
         expect(routeRuns.filter(runId => runId === identity.runId)).toHaveLength(2);
       }

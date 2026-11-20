@@ -115,7 +115,7 @@ describe("Pi open performance evidence", () => {
     const driver = new PiRpcDriver({ command: process.execPath, model: `${managed ? "paperclip" : "neutral"}/faux`, piRpcThinkingLevel: "off",
       runtimeDirectory: join(root, "sessions"), startupTimeoutMs: 10000,
       environment: { HOME: root, PI_CODING_AGENT_DIR: home, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", OTEL_SDK_DISABLED: "true",
-        ...(managed ? { PAPERCLIP_AI_PROVIDER_URL: "http://127.0.0.1:9/v1", PAPERCLIP_AI_PROVIDER_PROTOCOL: "chat", PAPERCLIP_AI_PROVIDER_AUTH: "none" } : {}) },
+        ...(managed ? { PAPERCLIP_PI_OPEN_TIMING_PRELOAD: "1", PAPERCLIP_AI_PROVIDER_URL: "http://127.0.0.1:9/v1", PAPERCLIP_AI_PROVIDER_PROTOCOL: "chat", PAPERCLIP_AI_PROVIDER_AUTH: "none" } : {}) },
       transportFactory(options) {
         transport = new PiRpcTransport({ ...options, args: [join(runtime, "dist/bundle/cli.js"), ...options.args!] });
         const request = transport.request.bind(transport);
@@ -134,6 +134,21 @@ describe("Pi open performance evidence", () => {
         ...(managed ? ["extension_directory", "extension_home_admission", "extension_tools", "extension_socket_listen", "extension_session_start"] : [])]));
       const duration = (span: ProviderPerformanceSpan) => span.endedAtMs - span.startedAtMs;
       const byName = (step: string) => spans.find(span => span.name === `runner.pi.open.${step}`)!;
+      // These are cumulative intervals from the actual spawn call, not
+      // additive siblings; stderr and stdout do not have a fixed order.
+      const split = ["spawn_to_spawn_event", "spawn_to_first_stdout", "spawn_to_first_stderr", "spawn_to_get_state_answer"].map(byName);
+      expect(split.every(Boolean)).toBe(true);
+      expect(new Set(split.map(span => span.startedAtMs)).size).toBe(1);
+      for (const span of split) {
+        expect(span.outcome).toBe("ok");
+        expect(span.endedAtMs).toBeGreaterThanOrEqual(span.startedAtMs);
+        expect(span.endedAtMs).toBeLessThanOrEqual(byName("pi_spawn_to_get_state").endedAtMs);
+      }
+      expect(byName("spawn_to_spawn_event").endedAtMs).toBeLessThanOrEqual(byName("spawn_to_first_stdout").endedAtMs);
+      expect(byName("spawn_to_spawn_event").endedAtMs).toBeLessThanOrEqual(byName("spawn_to_first_stderr").endedAtMs);
+      expect(byName("prewarm_read_ms")).toMatchObject({ outcome: "ok" });
+      expect(byName("prewarm_read_ms").endedAtMs).toBeLessThanOrEqual(split[0]!.startedAtMs);
+      expect(spans.filter(span => span.name === "runner.pi.open.node_preload_start")).toHaveLength(managed ? 1 : 0);
       for (const span of owned) {
         expect(duration(span)).toBeGreaterThanOrEqual(0);
         expect(span.startedAtMs).toBeGreaterThanOrEqual(byName("pi_spawn_to_get_state").startedAtMs);
@@ -153,6 +168,10 @@ describe("Pi open performance evidence", () => {
   }, 25000);
   it("keeps late startup stderr but rejects duplicate and later-session timings without extra RPC", async () => {
     const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    // Force distinct timestamps: an outer measure starts before the spawn
+    // boundary and ends after the first-state fence, even with a fake transport.
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => ++now);
     const f = await fixture();
     const session = await f.driver.openSession(f.input);
     const events: PrpEvent[] = [];
@@ -162,14 +181,17 @@ describe("Pi open performance evidence", () => {
       const spans = events.flatMap(event => parseProviderPerformanceSpans(event.payload, Date.now()));
       const startup = spans.find(span => span.name === "runner.pi.open.pi_spawn_to_get_state")!;
       const commands = [...f.transport.requests];
-      const late: ProviderPerformanceSpan = { name: "runner.pi.open.extension_subagents_start", startedAtMs: startup.startedAtMs, endedAtMs: startup.endedAtMs, outcome: "ok" };
+      const spawn = spans.find(span => span.name === "runner.pi.open.pi_spawn")!;
+      const firstState = spans.find(span => span.name === "runner.pi.open.get_state")!;
+      const late: ProviderPerformanceSpan = { name: "runner.pi.open.extension_subagents_start", startedAtMs: spawn.startedAtMs, endedAtMs: firstState.endedAtMs, outcome: "ok" };
       f.observeOpenSpan(late); f.observeOpenSpan(late);
+      f.observeOpenSpan({ ...late, name: "runner.pi.open.extension_composition", startedAtMs: spawn.startedAtMs - 1 });
       f.observeOpenSpan({ ...late, name: "runner.pi.open.extension_factory", startedAtMs: startup.endedAtMs + 1, endedAtMs: startup.endedAtMs + 2 });
       await tick();
       expect(events.flatMap(event => parseProviderPerformanceSpans(event.payload, Date.now())).filter(span => span.name.startsWith("runner.pi.open.extension_") && span.name !== "runner.pi.open.extension_resolve"))
         .toEqual([late]);
       expect(f.transport.requests).toEqual(commands);
-    } finally { await session.close(); await drained; log.mockRestore(); }
+    } finally { await session.close(); await drained; clock.mockRestore(); log.mockRestore(); }
   });
 
   it.each([false, true])("flushes ordered numeric spans before the first turn (managed=%s)", async managed => {

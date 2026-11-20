@@ -7,6 +7,40 @@ import { measureRunnerOperation } from "./runner-operation-timing.js";
 afterEach(() => vi.restoreAllMocks());
 
 describe("controller warm-start wait attribution", () => {
+  it("emits canonical resume child names with nested waits and milestone clipping", async () => {
+    let now = 100;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const events: AdapterRuntimeEvent[] = [];
+    const trace = createNativeRunTrace({ runId: "split-resume", onEvent: async event => { events.push(event); } });
+    const timing = createNativeControllerStepTiming(trace);
+    let release!: () => void;
+    const held = runWithNativeControllerSteps(timing, () => measureRunnerOperation("runner.session.resume.on_session", async () => {
+      now = 110;
+      await measureNativeControllerStep("run_authority_read", async () => { now = 120; });
+      await new Promise<void>(resolve => { release = resolve; });
+    }));
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    now = 150;
+    await trace.record({ name: "runner.session.resume", startedAtMs: 100, endedAtMs: 140 });
+    timing.flush("resume", 100, 140);
+    // The wrapper exists, but new children are not persisted on the critical path.
+    expect(events.filter(event => event.payload?.span !== "runner.session.resume")).toEqual([]);
+    timing.flush("submit", 140, 150);
+    timing.finish();
+    release(); await held;
+    await trace.finish("ok");
+    const children = events.filter(event => event.eventType === "run.performance.span" && (
+      String(event.payload?.span).startsWith("runner.session.resume.") || String(event.payload?.span).startsWith("native.controller.resume.")
+    )).map(event => event.payload!);
+    expect(children.filter(row => row.span === "runner.session.resume.on_session").map(row => row.durationMs)).toEqual([10, 20]);
+    expect(children.find(row => row.span === "native.controller.resume.run_authority_read")?.durationMs).toBe(10);
+    expect(children.every(row => row.parentSpan === "runner.session.resume")).toBe(true);
+    expect(children.reduce((sum, row) => sum + Number(row.durationMs), 0)).toBe(40);
+    expect(children.every(row => Number(row.wallStartedAtMs) + Number(row.durationMs) <= 140)).toBe(true);
+    expect(events.some(event => String(event.payload?.span).includes("runner.session.resume.") &&
+      event.payload?.parentSpan === "runner.turn.submitted_to_started")).toBe(false);
+  });
+
   it("partitions nested waits across warm resume and submitted-to-started without double counting", async () => {
     let now = 100;
     vi.spyOn(Date, "now").mockImplementation(() => now);

@@ -13820,6 +13820,7 @@ async function executePaperclipNativeSessionAttempt(
         trace.activate(runnerSessionStartupScope);
         const runExecution = () =>
           executeNativeSession({
+            measureOperation: measureNativeControllerStep,
             resumeInterruptedTurn: input.restartRecovery?.kind === "resume_dead_runner"
               || input.restartRecovery?.kind === "reattach_remote_runner" || scheduledResumeContinuation,
             getFreshSessionHandoff: input.getFreshSessionHandoff
@@ -14018,19 +14019,19 @@ async function executePaperclipNativeSessionAttempt(
               snapshot = identityRedactor.redact(snapshot);
               if (input.runnerExecutionTarget?.kind === "remote") snapshot = redactRunnerApiPayloads(snapshot);
               if (warmSessionId !== null && warmConfigDigest !== null) {
-                await persistWarmNativeCheckpoint(
+                await controllerSteps.measure("runner.session.resume.warm_checkpoint_persist", () => persistWarmNativeCheckpoint(
                   input.execution,
-                  warmConfigDigest,
+                  warmConfigDigest!,
                   snapshot,
                   controllerCompatibility.processConfigDigest ?? undefined,
-                );
+                ));
               }
               if (
                 snapshot.goal ||
                 input.sessionGoalControl ||
                 input.resumeSessionGoalHeartbeat
               ) {
-                await input.onGoalCheckpoint?.(snapshot);
+                await controllerSteps.measure("runner.session.resume.goal_checkpoint_callback", () => input.onGoalCheckpoint?.(snapshot));
               }
             },
             onPostCompletionEnrichmentFailure: async ({ stage, error }) => {

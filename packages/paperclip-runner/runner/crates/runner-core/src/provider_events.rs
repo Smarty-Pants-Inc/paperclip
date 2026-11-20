@@ -948,6 +948,9 @@ fn provider_performance_spans(params: &Value) -> Vec<Value> {
             | "runner.pi.open.admission" | "runner.pi.open.available_models" | "runner.pi.open.tool_inventory"
             | "runner.pi.open.settle" | "runner.pi.open.bind_receipt" | "runner.pi.open.begin_turn"
             | "runner.pi.open.pi_spawn" | "runner.pi.open.get_state" | "runner.pi.open.pre_extension_factory"
+            | "runner.pi.open.prewarm_read_ms" | "runner.pi.open.spawn_to_spawn_event"
+            | "runner.pi.open.spawn_to_first_stdout" | "runner.pi.open.spawn_to_first_stderr"
+            | "runner.pi.open.spawn_to_get_state_answer" | "runner.pi.open.node_preload_start"
             | "runner.pi.open.extension_factory" | "runner.pi.open.extension_initial_read" | "runner.pi.open.extension_composition"
             | "runner.pi.open.extension_subagents_start" | "runner.pi.open.extension_session_start"
             | "runner.pi.open.extension_directory" | "runner.pi.open.extension_home_admission"
@@ -3181,6 +3184,24 @@ mod tests {
                 {"name":"runner.pi.open.native_mcp_config","startedAtMs":1001.0,"endedAtMs":1005.0,"outcome":"failed"}
             ])
         );
+        for name in [
+            "runner.pi.open.prewarm_read_ms",
+            "runner.pi.open.spawn_to_spawn_event",
+            "runner.pi.open.spawn_to_first_stdout",
+            "runner.pi.open.spawn_to_first_stderr",
+            "runner.pi.open.spawn_to_get_state_answer",
+            "runner.pi.open.node_preload_start",
+        ] {
+            let events = normalize_codex_notification(
+                "paperclip/providerPerformance",
+                &json!({"spans":[{"name":name,"startedAtMs":1000,"endedAtMs":1001,
+                    "outcome":"ok","stdout":"private","hrtimeNs":"123"}]}),
+            );
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].payload["spans"], json!([
+                {"name":name,"startedAtMs":1000.0,"endedAtMs":1001.0,"outcome":"ok"}
+            ]));
+        }
     }
 
     #[test]

@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { readFileSync, realpathSync } from "node:fs";
+import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
+import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { redactProviderDiagnostic } from "../diagnostic-redaction.js";
 import type { ProviderPerformanceSpan } from "../../contracts/provider-performance.js";
 import { piExtensionOpenPerformanceSpans } from "./pi-performance-diagnostics.js";
@@ -121,6 +122,60 @@ class AsyncRecordQueue implements AsyncIterable<PiRpcRecord> {
   }
 }
 
+/** The opt-in preload has no imports, timers, hooks or RPC. hrtime is a
+ * same-process mark only; the recorder uses the accompanying wall-clock point.
+ * beforeExit is NOT module-graph completion for a resident RPC process, so we
+ * deliberately do not install a misleading beforeExit mark. */
+function piStartupEnvironment(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  if (environment.PAPERCLIP_PI_OPEN_TIMING_PRELOAD !== "1") return environment;
+  // Restore the application's original options before Pi can spawn any Node
+  // tools. The observer must not inject its own stderr marker into descendants.
+  const restore = environment.NODE_OPTIONS === undefined ? "delete process.env.NODE_OPTIONS;"
+    : `process.env.NODE_OPTIONS=${JSON.stringify(environment.NODE_OPTIONS)};`;
+  const source = `if(process.env.PAPERCLIP_PI_OPEN_TIMING_PRELOAD==="1"){try{${restore}const hrtimeNs=process.hrtime.bigint().toString();const at=Date.now();process.stderr.write("pi.open.span "+JSON.stringify({code:"provider_performance_spans",hrtimeNs,spans:[{name:"runner.pi.open.node_preload_start",startedAtMs:at,endedAtMs:at,outcome:"ok"}]})+"\\n")}catch{}}`;
+  return { ...environment, NODE_OPTIONS: `${environment.NODE_OPTIONS ?? ""} --import=data:text/javascript,${encodeURIComponent(source)}`.trim() };
+}
+
+function observePiBundleRead(options: PiRpcTransportOptions): void {
+  let startedAtMs = Date.now(), outcome: ProviderPerformanceSpan["outcome"] = "failed";
+  try {
+    const path = (options.env ?? process.env).PATH ?? (process.platform === "win32" ? process.env.PATH ?? "" : "/usr/bin:/bin");
+    const commandCandidates = isAbsolute(options.command) || options.command.includes("/")
+      ? [resolve(options.cwd, options.command)]
+      : path.split(delimiter).slice(0, 128).map(directory => resolve(options.cwd, directory, options.command));
+    let executable: string | undefined;
+    for (const candidate of commandCandidates) {
+      try { accessSync(candidate, constants.X_OK); executable = realpathSync(candidate); break; }
+      catch { /* Observe only the executable spawn would select. */ }
+    }
+    // The normal launch selects the CLI itself (including an owned /proc FD).
+    // A direct Node launch may instead pass it as its first argument. Never
+    // search past a different executable into another installed Pi.
+    const cli = executable?.endsWith("/dist/bundle/cli.js") ? executable
+      : executable && (executable === realpathSync(process.execPath) || /^(?:node|node\.exe)$/u.test(basename(executable))) && options.args?.[0]
+        ? realpathSync(resolve(options.cwd, options.args[0])) : undefined;
+    if (!cli?.endsWith("/dist/bundle/cli.js")) return;
+    // Pi 1.5.2's CLI stub imports main from a bundled chunk. Discover only that
+    // relative, content-hashed chunk; never execute or log bundle contents.
+    const runtimePath = join(dirname(cli), "cli-runtime.js");
+    const runtimeStat = statSync(runtimePath);
+    if (!runtimeStat.isFile() || runtimeStat.size > 64 * 1024) return;
+    const runtime = readFileSync(runtimePath, "utf8");
+    const chunk = /import\{[^}]*\bmain\b[^}]*\}from["']\.\/chunks\/(chunk-[A-Za-z0-9_-]+\.js)["']/u.exec(runtime)?.[1];
+    if (!chunk) return;
+    const main = join(dirname(cli), "chunks", chunk);
+    startedAtMs = Date.now();
+    const mainStat = statSync(main);
+    if (!mainStat.isFile() || mainStat.size > 16 * 1024 * 1024) return;
+    readFileSync(main);
+    outcome = "ok";
+  } catch { /* A timing probe must not change process launch or its error. */ }
+  finally {
+    try { options.onOpenPerformanceSpan?.({ name: "runner.pi.open.prewarm_read_ms", startedAtMs,
+      endedAtMs: Math.max(startedAtMs, Date.now()), outcome }); } catch { /* log-only */ }
+  }
+}
+
 /** A strict LF-framed JSONL client for Pi's resident RPC process. */
 export class PiRpcTransport {
   readonly #child: ChildProcessWithoutNullStreams;
@@ -146,6 +201,8 @@ export class PiRpcTransport {
   // Pi's bash tool creates detached groups too. Capture descendants before
   // TERM can orphan them; retain birth identities, never signal a reused PID.
   readonly #descendants = new Map<number, string>();
+  #observeStartup?: (name: ProviderPerformanceSpan["name"], outcome?: ProviderPerformanceSpan["outcome"]) => void;
+  #firstGetStateObserved = false;
 
   constructor(options: PiRpcTransportOptions) {
     this.#maxRecordBytes = options.maxRecordBytes ?? 64 * 1024 * 1024;
@@ -161,15 +218,26 @@ export class PiRpcTransport {
       while (stdio.length <= options.commandFd) stdio.push("ignore");
       stdio[options.commandFd] = options.commandFd;
     }
+    // Observation only: never make file discovery/readability an admission gate.
+    // This intentionally touches the main bundle, so it is a latency hint, NOT
+    // evidence that the directory was cold or had never been read before.
+    if (options.onOpenPerformanceSpan) observePiBundleRead(options);
+    const environment = piStartupEnvironment(options.env ?? process.env);
     options.commandLifecycle?.beforeSpawn();
+    const spawnedAtMs = Date.now();
+    this.#observeStartup = (name, outcome = "ok") => {
+      try { options.onOpenPerformanceSpan?.({ name, startedAtMs: spawnedAtMs,
+        endedAtMs: Math.max(spawnedAtMs, Date.now()), outcome }); } catch { /* log-only */ }
+    };
     this.#child = spawn(options.command, [...(options.args ?? [])], {
       cwd: options.cwd,
-      env: options.env ?? process.env,
+      env: environment,
       stdio,
       // Never signal the runner's group. Escalation owns Pi and its tool children.
       detached: process.platform !== "win32",
       windowsHide: true,
     }) as ChildProcessWithoutNullStreams;
+    this.#child.once("spawn", () => this.#observeStartup?.("runner.pi.open.spawn_to_spawn_event"));
     options.commandLifecycle?.afterSpawn();
     let resolveExit!: (value: { code: number | null; signal: NodeJS.Signals | null }) => void;
     this.#exit = new Promise((resolve) => { resolveExit = resolve; });
@@ -199,6 +267,7 @@ export class PiRpcTransport {
       resolveExit(info);
     });
     this.#child.once("error", (error) => {
+      this.#observeStartup?.("runner.pi.open.spawn_to_spawn_event", "failed");
       const failure = new Error(`Pi RPC process could not start: ${error.message}`, { cause: error });
       for (const pending of this.#pending.values()) pending.reject(failure);
       this.#pending.clear();
@@ -212,13 +281,24 @@ export class PiRpcTransport {
     this.#child.stdin.on("error", (error) => {
       if (!this.#closed && !this.#exited) this.#fail(new Error(`Pi RPC stdin failed: ${error.message}`, { cause: error }));
     });
-    this.#child.stdout.on("data", (chunk: Buffer | string) => this.#read(chunk));
+    let firstStdout = true, firstStderr = true;
+    this.#child.stdout.on("data", (chunk: Buffer | string) => {
+      if (firstStdout && chunk.length > 0) {
+        firstStdout = false;
+        this.#observeStartup?.("runner.pi.open.spawn_to_first_stdout");
+      }
+      this.#read(chunk);
+    });
     this.#child.stdout.on("error", (error) => this.#fail(new Error(`Pi RPC stdout failed: ${error.message}`, { cause: error })));
     this.#child.stdout.on("end", () => {
       if (this.#buffer.length > 0) this.#fail(new Error("Pi RPC stdout ended with an unterminated JSONL record"));
     });
     let timingLine = "", timingLineOverflow = false, timingCount = 0;
     this.#child.stderr.on("data", (chunk: Buffer | string) => {
+      if (firstStderr && chunk.length > 0) {
+        firstStderr = false;
+        this.#observeStartup?.("runner.pi.open.spawn_to_first_stderr");
+      }
       const text = chunk.toString();
       const stderr = this.#stderr + text;
       this.#stderrTruncated ||= stderr.length > 8192;
@@ -277,7 +357,13 @@ export class PiRpcTransport {
         this.#pending.get(id)?.reject(new PiRpcRequestTimeoutError(command, timeoutMs));
       }, timeoutMs);
       this.#pending.set(id, { command,
-        resolve: value => { cleanup(); resolve(value); },
+        resolve: value => {
+          if (command === "get_state" && !this.#firstGetStateObserved) {
+            this.#firstGetStateObserved = true;
+            this.#observeStartup?.("runner.pi.open.spawn_to_get_state_answer");
+          }
+          cleanup(); resolve(value);
+        },
         reject: error => { cleanup(); reject(error); },
       });
     });

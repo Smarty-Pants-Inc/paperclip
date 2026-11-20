@@ -36,29 +36,34 @@ export function createNativeControllerStepTiming(trace: NativeRunTrace) {
   const flush = (phase: "resume" | "submit", startedAtMs: number, endedAtMs: number) => {
     if (finished) return;
     endedAtMs = Math.max(startedAtMs, endedAtMs);
+    // Resume-only probes must not acquire a second submit-phase name when a
+    // checkpoint tail crosses turn.submitted. Existing submit waits stay intact.
+    const phaseWaits = phase === "resume" ? waits : waits.filter(wait => !wait.step.startsWith("runner.session.resume."));
     // Runner milestones are emitted before controller observation. Clip to the
     // same bounds as the wrapper, including a wait still active at that milestone.
     // Prefer the latest-starting (inner) wait; outer RPC remainders retain their
     // name. Thus nested DB/observer waits never double-count the wrapper's time.
-    const points = [...new Set([startedAtMs, endedAtMs, ...waits.flatMap(wait => [
+    const points = [...new Set([startedAtMs, endedAtMs, ...phaseWaits.flatMap(wait => [
       Math.max(startedAtMs, Math.min(endedAtMs, wait.startedAtMs)),
       Math.max(startedAtMs, Math.min(endedAtMs, wait.endedAtMs ?? endedAtMs)),
     ])])].sort((a, b) => a - b);
     const spans: NativeRunHistoricalSpan[] = [];
+    const spanName = (step: string) => phase === "resume" && step.startsWith("runner.session.resume.")
+      ? step : `native.controller.${phase}.${step}`;
     for (let i = 1; i < points.length; i++) {
       const start = points[i - 1]!, end = points[i]!;
       if (end <= start) continue;
-      const wait = waits.findLast(wait => wait.startedAtMs <= start && (wait.endedAtMs ?? endedAtMs) >= end);
+      const wait = phaseWaits.findLast(wait => wait.startedAtMs <= start && (wait.endedAtMs ?? endedAtMs) >= end);
       if (!wait) continue; // Unobserved time is not evidence of an ingress/DB wait.
-      const name = `native.controller.${phase}.${wait.step}`;
+      const name = spanName(wait.step);
       const previous = spans.at(-1);
       if (previous?.name === name && previous.endedAtMs === start && previous.outcome === wait.outcome) previous.endedAtMs = end;
       else spans.push({ name, parentName: phase === "resume" ? "runner.session.resume" : "runner.turn.submitted_to_started",
         startedAtMs: start, endedAtMs: end, outcome: wait.outcome });
     }
     // Sub-millisecond waits still need a named receipt at Date.now precision.
-    for (const wait of waits) {
-      const name = `native.controller.${phase}.${wait.step}`;
+    for (const wait of phaseWaits) {
+      const name = spanName(wait.step);
       if (wait.startedAtMs >= startedAtMs && wait.startedAtMs <= endedAtMs && !spans.some(span => span.name === name)) {
         spans.push({ name, parentName: phase === "resume" ? "runner.session.resume" : "runner.turn.submitted_to_started",
           startedAtMs: wait.startedAtMs, endedAtMs: wait.startedAtMs, outcome: wait.outcome });

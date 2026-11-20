@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { createPiEventProjector } from "./pi-event-projector.js";
 import { PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
+import type { ProviderPerformanceSpan } from "../../contracts/provider-performance.js";
 import { realpathSync } from "node:fs";
 import { mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -65,6 +66,38 @@ async function queuedRecords(child: PiRpcTransport): Promise<PiRpcRecord[]> {
 }
 
 describe("PiRpcTransport large tool output and lagging consumers", () => {
+  it.each(["0", "1"])("gates the tiny Node preload and retains the raw hrtime mark (enabled=%s)", async enabled => {
+    const spans: ProviderPerformanceSpan[] = [];
+    const child = emittingTransport(`
+      await emit({ type: "original_node_options", retained: process.env.NODE_OPTIONS === "--no-warnings" });
+      const tool = require("node:child_process").spawnSync(process.execPath, ["-e", "process.stdout.write('tool')"], { encoding: "utf8" });
+      await emit({ type: "descendant_node", stdout: tool.stdout, stderr: tool.stderr, status: tool.status });
+    `, {
+      env: { ...process.env, NODE_OPTIONS: "--no-warnings", PAPERCLIP_PI_OPEN_TIMING_PRELOAD: enabled },
+      onOpenPerformanceSpan: span => { spans.push(span); },
+    });
+    try {
+      await expect(child.request("get_state")).resolves.toMatchObject({ command: "get_state", success: true });
+      await child.close();
+      const records: PiRpcRecord[] = [];
+      for await (const record of child.events()) records.push(record);
+      expect(records).toContainEqual({ type: "original_node_options", retained: true });
+      expect(records).toContainEqual({ type: "descendant_node", stdout: "tool", stderr: "", status: 0 });
+      const mark = spans.filter(span => span.name === "runner.pi.open.node_preload_start");
+      expect(mark).toHaveLength(enabled === "1" ? 1 : 0);
+      const stderr = records.find(record => record.type === "process_exit")?.stderr;
+      if (enabled === "1") {
+        const raw = JSON.parse(String(stderr).split("\n").find(line => line.startsWith("pi.open.span "))!.slice("pi.open.span ".length));
+        expect(BigInt(raw.hrtimeNs)).toBeGreaterThan(0n);
+        expect(mark[0]!.startedAtMs).toBe(mark[0]!.endedAtMs);
+        expect(Object.keys(mark[0]!).sort()).toEqual(["endedAtMs", "name", "outcome", "startedAtMs"]);
+      } else {
+        expect(stderr).toBeUndefined();
+        expect(spans.some(span => span.name === "runner.pi.open.spawn_to_first_stderr")).toBe(false);
+      }
+    } finally { await child.close(); }
+  });
+
   // The startup entry subscription does not yet exist in real Pi. Exercise actual
   // stderr pipes (fragmentation, noise, projection, caps) without changing RPCs.
   it.each([false, true])("forwards bounded startup timings from stderr without affecting RPC (observer throws=%s)", async observerThrows => {
@@ -87,9 +120,16 @@ describe("PiRpcTransport large tool output and lagging consumers", () => {
       const response = await child.request("get_state");
       expect(response).toMatchObject({ type: "response", command: "get_state", success: true });
       await child.close();
-      expect(spans).toHaveLength(32);
-      expect(spans[0]).toMatchObject({ name: "runner.pi.open.extension_factory", outcome: "ok" });
-      expect(spans.slice(1).every(span => (span as { name: string }).name === "runner.pi.open.extension_tools")).toBe(true);
+      const extensionSpans = spans.filter(span => (span as { name: string }).name.startsWith("runner.pi.open.extension_"));
+      expect(extensionSpans).toHaveLength(32);
+      expect(extensionSpans[0]).toMatchObject({ name: "runner.pi.open.extension_factory", outcome: "ok" });
+      expect(extensionSpans.slice(1).every(span => (span as { name: string }).name === "runner.pi.open.extension_tools")).toBe(true);
+      for (const name of ["spawn_to_spawn_event", "spawn_to_first_stdout", "spawn_to_first_stderr", "spawn_to_get_state_answer"]) {
+        expect(spans.filter(span => (span as { name: string }).name === `runner.pi.open.${name}`)).toHaveLength(1);
+      }
+      // This fixture launches `node -e`, not Pi: discovery is best-effort and
+      // a missing main bundle must not change the command or successful reply.
+      expect(spans.find(span => (span as { name: string }).name === "runner.pi.open.prewarm_read_ms")).toMatchObject({ outcome: "failed" });
       expect(JSON.stringify(spans)).not.toContain("PRIVATE");
     } finally { await child.close(); }
   });
