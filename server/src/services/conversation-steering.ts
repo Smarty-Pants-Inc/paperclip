@@ -17,7 +17,16 @@ export type PersonCommentSteeringOptions = {
   deliveryIntent?: "steer" | "queue" | "interrupt";
   /** Definite provider refusal uses the caller's ordinary, idempotent admission. */
   onRejected?: () => Promise<unknown>;
+  /** Logging-only context passed to the existing outbox admission. */
+  fallbackTrace?: PersonCommentFallbackTrace;
 };
+
+export type PersonCommentFallbackTrace = { reason: string; runId: string | null };
+export function logPersonCommentFallback(comment: Pick<SteerablePersonComment, "id" | "issueId">,
+  trace: PersonCommentFallbackTrace, wakeId: string | null = null, wakeStatus = "unknown") {
+  logger.info({ commentId: comment.id, issueId: comment.issueId, runId: trace.runId,
+    reason: trace.reason, wakeId, wakeStatus }, "Person send steering fallback");
+}
 
 // The native attachment is process-owned. This promise chain only preserves RPC
 // order at that owner; durable custody remains the saved comment + carrying run.
@@ -59,6 +68,12 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
     await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${personCommentDeliveryLockKey(comment.issueId)}, 0))`);
     return trySteerPersonComment(db, comment, { ...options, lockHeld: true });
   });
+  const fallback = (reason: string, runId: string | null = null): false => {
+    const trace = { reason, runId };
+    if (options.fallbackTrace) Object.assign(options.fallbackTrace, trace);
+    else logPersonCommentFallback(comment, trace);
+    return false;
+  };
   // POST retries retain their original custody even if its run has now ended.
   const [carrying] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, comment.companyId),
@@ -69,28 +84,28 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
   const intent = options.deliveryIntent ?? await deliveryIntent(db, comment);
   if (intent === "queue" || intent === "interrupt") return false;
   const [issue] = await db.select().from(issues).where(and(eq(issues.id, comment.issueId), eq(issues.companyId, comment.companyId)));
-  if (!issue || ["done", "cancelled"].includes(issue.status)) return false;
+  if (!issue || ["done", "cancelled"].includes(issue.status)) return fallback("issue_unavailable");
   // Chat stays owner-only. Task comments have already passed the ordinary
   // comment route's access/pause checks; they target the current task assignee.
-  if (issue.conversationAgentId && issue.conversationUserId !== comment.authorUserId) return false;
+  if (issue.conversationAgentId && issue.conversationUserId !== comment.authorUserId) return fallback("not_conversation_owner");
   const agentId = issue.conversationAgentId ?? issue.assigneeAgentId;
-  if (!agentId) return false;
+  if (!agentId) return fallback("no_assignee");
   const [agent] = await db.select({ adapterType: agents.adapterType, adapterConfig: agents.adapterConfig }).from(agents)
     .where(and(eq(agents.id, agentId), eq(agents.companyId, issue.companyId)));
-  if (agent?.adapterType !== "paperclip_runner" || object(agent.adapterConfig).provider !== "pi_rpc") return false;
+  if (agent?.adapterType !== "paperclip_runner" || object(agent.adapterConfig).provider !== "pi_rpc") return fallback("unsupported_adapter");
   // An explicit queued message (especially /new or a fresh-session response)
   // is an ordering boundary. Default Send never jumps across it.
   const waiting = await db.execute(sql`select 1 from agent_wakeup_requests w
     where w.company_id = ${issue.companyId}::uuid and w.agent_id = ${agentId}::uuid
       and w.status in ('queued', 'deferred_issue_execution') and w.payload->>'issueId' = ${issue.id}
       and w.run_id is null limit 1`);
-  if (waiting.length) return false;
+  if (waiting.length) return fallback("queue_ordering_boundary");
   const [run] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, issue.companyId),
     eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.runtimeMode, "native"), eq(heartbeatRuns.status, "running"),
     sql`(${heartbeatRuns.nativeIssueId} = ${issue.id}::uuid or ${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id})`,
     issue.executionRunId ? eq(heartbeatRuns.id, issue.executionRunId) : undefined,
   )).orderBy(desc(heartbeatRuns.createdAt)).limit(1);
-  if (!run || nativeRunHasStopRequest(run.resultJson) || (issue.conversationAgentId && run.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration)) return false;
+  if (!run || nativeRunHasStopRequest(run.resultJson) || (issue.conversationAgentId && run.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration)) return fallback("no_live_attachment", run?.id ?? null);
   // Lazy import keeps the existing conversation/runtime dependency cycle inert.
   const { getNativeSessionSteeringState, steerNativeSession, NativeSessionSteeringError } = await import("./native-runtime/native-session-executor.js");
   let state: Awaited<ReturnType<typeof getNativeSessionSteeringState>>;
@@ -99,9 +114,9 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
   } catch (error) {
     // Probe failure precedes custody; ordinary admission still owns the comment.
     logSteeringFailure(error);
-    return false;
+    return fallback("unknown", run.id);
   }
-  if (state?.disposition !== "available" || !state.activeTurnId) return false; // includes provider-ended / saving-files
+  if (state?.disposition !== "available" || !state.activeTurnId) return fallback("steering_temporarily_unavailable", run.id); // includes provider-ended / saving-files
   const prepared = await db.transaction(async tx => {
     const [currentIssue] = await tx.select().from(issues).where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
     const [current] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, issue.companyId))).for("no key update");
@@ -118,7 +133,7 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
     } }, updatedAt: now }).where(eq(heartbeatRuns.id, run.id));
     return true;
   });
-  if (!prepared) return false;
+  if (!prepared) return fallback("stale_turn", run.id);
   // Return the durable steer-or-queue decision now. Identity reservation and
   // RPC ACK belong to ordered dispatch, not the HTTP latency path. Reserving a
   // second identity before the first ACK would otherwise reject rapid Sends.
@@ -132,7 +147,10 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
       // An ACK-blocked predecessor can outlive Stop or run end. Do not dispatch
       // a later accepted input after that fence; the existing release/hold owns it.
       if (!currentRun || currentRun.status !== "running" || nativeRunHasStopRequest(currentRun.resultJson) ||
-        !ids(currentRun.contextSnapshot?.steeredCommentIds).includes(comment.id)) return;
+        !ids(currentRun.contextSnapshot?.steeredCommentIds).includes(comment.id)) {
+        logPersonCommentFallback(comment, { runId: run.id, reason: "stale_turn" }, null, "deferred_to_release");
+        return;
+      }
       const currentState = await getNativeSessionSteeringState(run.id);
       if (currentState.disposition !== "available" || currentState.activeTurnId !== state.activeTurnId)
         throw new NativeSessionSteeringError("steering_stale_turn", "The accepted native turn is no longer attached.");
@@ -161,7 +179,10 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
       // the shared answered predicate can reconcile read/answer evidence.
       if (error instanceof NativeSessionSteeringError && error.code === "steering_timeout") return;
       if (!(error instanceof NativeSessionSteeringError)) logSteeringFailure(error);
-      if (!options.onRejected) return; // fail closed: still owed at run end
+      if (!options.onRejected) {
+        logPersonCommentFallback(comment, { runId: run.id, reason: "unknown" }, null, "deferred_to_release");
+        return; // fail closed: still owed at run end
+      }
       if (identity) await rejectSteeredIdentity(db, identity);
       const steeringUnavailableReason = error instanceof NativeSessionSteeringError ? error.code : "steering_error";
       const queued = await db.transaction(async lock => {
@@ -208,6 +229,11 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
           return true;
         });
       });
+      logPersonCommentFallback(comment, { runId: run.id,
+        reason: error instanceof NativeSessionSteeringError
+          ? ({ steering_stale_turn: "stale_turn", steering_rejected: "rejected",
+              steering_temporarily_unavailable: "steering_temporarily_unavailable" } as Record<string, string>)[error.code] ?? "unknown"
+          : "unknown" });
       if (queued) {
         // Reannounce this saved comment through the thread's existing keyed
         // comment hydration channel, AFTER ordinary admission and cleanup commit.

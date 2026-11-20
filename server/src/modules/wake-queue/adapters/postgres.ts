@@ -23,6 +23,7 @@ import { nativeManualAdmissionHoldsExecution } from "../../../services/native-ru
 import { readSteeredMessageAnswers } from "../../../services/native-runtime/steered-message-answers.js";
 import { answeredPersonMessageSql } from "../../../services/person-message-answer.js";
 import { and, asc, desc, eq, inArray, isNotNull, isNull, notInArray, or, sql } from "drizzle-orm";
+import { logger } from "../../../middleware/logger.js";
 import { readReleaseRun, type ReleaseRun } from "./release-run-read.js";
 import { steeringIngestionPending, waitForSteeringIngestion } from "../../../services/native-runtime/steering-ingestion.js";
 import { isGovernancePauseStop } from "../../../services/governance-pause-stop.js";
@@ -499,6 +500,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         const payload = parseObject(cancelled.payload);
         const context = parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]);
         const issueId = readNonEmptyString(payload.issueId);
+        logger.info({ wakeId, issueId, commentIdsCount: queuedCommentIdsFromWakePayload(payload).length }, "Deferred wake cancelled: conversation moved on");
         if (issueId && (context.wakeReason ?? cancelled.reason) === CHAT_COMPLETION_WAKE_REASON) {
           const deliveryIds = payload.chatCompletionDeliveryIds ?? context.chatCompletionDeliveryIds;
           await supersedeStaleChatCompletionWake(tx, { companyId, conversationId: issueId, agentId, wakeId,
@@ -1621,6 +1623,15 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
     async withIssueExecutionLock(input, fn): Promise<ReleaseTransactionResult & { run: RunSnapshot }> {
       // Never wait while holding the issue/run locks needed by ordered ingestion.
       await waitForSteeringIngestion(db, input);
+      const trace = { caller: "wake_queue.release_drain", runId: input.runId, issueId: null as string | null,
+        companyId: input.companyId, outcome: "error", reason: "error", deferredHeadWakeId: null as string | null,
+        promotedWakeId: null as string | null };
+      const decision = <T extends ReleaseTransactionResult & { run: RunSnapshot }>(reason: string, result: T): T => {
+        trace.reason = reason;
+        trace.outcome = result.outcome.kind;
+        trace.promotedWakeId = result.outcome.kind === "promoted" ? result.outcome.run.wakeupRequestId : null;
+        return result;
+      };
       return db.transaction(async (rawTx) => {
         const tx = rawTx as unknown as Db;
         const evidence = await readReleaseRun(tx, input);
@@ -1629,8 +1640,9 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           throw new Error(`wake-queue: run ${input.runId} was not found while releasing issue execution`);
         }
         const runSnapshot = toRunSnapshot(run);
+        trace.issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId) ?? run.nativeIssueId ?? null;
         if (input.resumeStrandedQueue && (!run.finishedAt || !["succeeded", "failed", "cancelled", "timed_out", "interrupted"].includes(run.status))) {
-          return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+          return decision("source_not_terminal", { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot });
         }
         const contextIssueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
 
@@ -1674,7 +1686,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           // ownership settlement uses this same drain after it commits.
           const awaitingFinalization = run.status === "succeeded" && finalization && ["observed", "applied"].includes(finalization.phase);
           if (awaitingFinalization || (input.resumeStrandedQueue && finalization?.phase !== "committed")) {
-            return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+            return decision("native_finalization_pending", { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot });
           }
         }
         // These two holds protect the old executor's workspace and resources. A
@@ -1684,10 +1696,10 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         const isolatedReplacement = agentRunSupersededByFreshContinuation(run)
           ? await freshContinuationIsolatesRun(tx, { companyId: input.companyId, runId: run.id }) : false;
         if (!isolatedReplacement && await nativeManualAdmissionHoldsExecution(tx, { companyId: input.companyId, runId: run.id })) {
-          return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+          return decision("manual_admission_hold", { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot });
         }
         if (input.resumeStrandedQueue && !isolatedReplacement && await hasPendingRunCleanup(tx, input.companyId, run.id)) {
-          return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+          return decision("run_cleanup_pending", { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot });
         }
 
         const candidateIssues = await tx
@@ -1719,7 +1731,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         if (Array.isArray(carryOwner?.context?.steeredCommentIds) && carryOwner.context.steeredCommentIds.length && steeringIngestionPending(carryOwner.result)) {
           await tx.update(heartbeatRuns).set({ resultJson: { ...parseObject(carryOwner.result), steeringIngestionReleaseHeld: true } })
             .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id)));
-          return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+          return decision("steering_ingestion_pending", { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot });
         }
         // Two separate updates: a retry can move `executionRunId` to a new run
         // while `checkoutRunId` still points at this one finishing.
@@ -1734,6 +1746,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
 
         const issueRow =
           (contextIssueId ? candidateIssues.find((candidate) => candidate.id === contextIssueId) : candidateIssues[0]) ?? null;
+        trace.issueId = issueRow?.id ?? trace.issueId;
         // Every run end accounts for the messages steered into it before anything
         // reads the queue: an unanswered steer waits again at its place.
         if (issueRow) await restoreUnansweredSteersAtRunEnd(tx, run, issueRow, input.now);
@@ -1794,7 +1807,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           if (releasedOnlyByStop && issueRow) {
             await gatherPersonStoppedChatMessages(tx, run, issueRow, input.now);
           }
-          return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+          return decision("pre_drain_released", { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot });
         }
 
         // decidePreDrain only returns "blocked" or "proceed" when the issue row is present.
@@ -1817,10 +1830,10 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
               SELECT source.created_at, source.id FROM heartbeat_runs source
               WHERE source.company_id = ${input.companyId} AND source.id = ${run.id})` : undefined),
         )).limit(1);
-        if (successor) return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+        if (successor) return decision("successor_exists", { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot });
 
         if (preDrain.kind === "blocked") {
-          return {
+          return decision("pre_drain_blocked", {
             outcome: {
               kind: "blocked",
               issue: toIssueSnapshot(issueRow),
@@ -1829,7 +1842,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
             },
             postCommitEffects: [],
             run: runSnapshot,
-          };
+          });
         }
 
         // The durable external answer owns the sole successor of this retired
@@ -1845,11 +1858,11 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
             runId: run.id,
           }))
         ) {
-          return {
+          return decision("retired_external_chat_source", {
             outcome: { kind: "released" },
             postCommitEffects: [],
             run: runSnapshot,
-          };
+          });
         }
 
         // A native run blocked for a rejected model or incomplete configuration waits for that
@@ -1857,13 +1870,13 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         // reconcile; a reconciliation incident would also hide the run's Retry.
         if (!handoffAssigneeAgentId && run.runtimeMode === "native" && isConfigurationIncompleteFailedRun(run)
           && issueRow.status === "blocked" && issueRow.assigneeAgentId === run.agentId) {
-          return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+          return decision("configuration_incomplete", { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot });
         }
         // The fallback already decided this run's continuation; a reconciliation
         // incident would re-block the task it just released.
         if (!handoffAssigneeAgentId && !agentRunSupersededByFreshContinuation(run)
           && await recordNativeTerminalRecoveryIfNeeded(tx, run, issueRow, input.now)) {
-          return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+          return decision("native_terminal_recovery", { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot });
         }
 
         // A release must leave deferred messages intact while execution is held.
@@ -1876,26 +1889,34 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         // continuation). The follow-up stays deferred and is promoted behind
         // the continuation when that run is released.
         if (isolatedReplacement && isolatedReplacement.continuationPending) {
-          return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+          return decision("isolated_continuation_pending", { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot });
         }
         const executionBlocker = await getExecutionBlocker(tx, issueRow.companyId, issueRow.id);
         const recoveryOnly = Boolean(executionBlocker &&
           executionBlocker.cause === "execution_owner_active" && executionBlocker.runId === run.id &&
           runSnapshot.conversationContinuation && ["failed", "timed_out", "interrupted"].includes(run.status));
         if (executionBlocker && !recoveryOnly) {
-          return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+          return decision("execution_blocked", { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot });
         }
 
         // Releases still settle while Agent Chat is disabled, but no deferred
         // turn or recovery successor may be created. Check here in the shared
         // transaction so cleanup retries and restart sweeps use the same gate.
         if (issueRow.conversationAgentId && !(await instanceSettingsService(tx).getExperimental()).enableAgentChat) {
-          return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+          return decision("agent_chat_disabled", { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot });
         }
 
         const locked: LockedIssueExecution = { primaryIssue: toIssueSnapshot(issueRow), run: runSnapshot,
           recoveryOnly: recoveryOnly && !handoffAssigneeAgentId, ...(handoffAssigneeAgentId ? { handoffAssigneeAgentId } : {}) };
-        const result = await fn(locked, { host: buildHost(tx, deps), transaction: buildTransaction(tx, deps, db, run) });
+        const host = buildHost(tx, deps);
+        const transaction = buildTransaction(tx, deps, db, run);
+        const findNextDeferredWake = transaction.findNextDeferredWake;
+        transaction.findNextDeferredWake = async args => {
+          const candidate = await findNextDeferredWake(args);
+          trace.deferredHeadWakeId ??= candidate?.id ?? null;
+          return candidate;
+        };
+        const result = await fn(locked, { host, transaction });
         // Explicit retry admission requires the exact source's task claim.
         // Preserve it only when the existing queue-first recovery policy
         // requests that retry. The clear/restore stays inside this task lock.
@@ -1908,7 +1929,9 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           }).where(and(eq(issues.companyId, input.companyId), eq(issues.id, issueRow.id),
             sql`${issues.executionRunId} is null`));
         }
-        return { ...result, run: runSnapshot };
+        return decision(result.outcome.kind, { ...result, run: runSnapshot });
+      }).finally(() => {
+        logger.info(trace, "Issue execution release decision");
       });
     },
   };
