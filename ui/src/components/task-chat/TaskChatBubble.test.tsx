@@ -77,6 +77,7 @@ describe("TaskChatBubble attachment chips", () => {
     flushSync(() => root?.unmount());
     root = null;
     container.remove();
+    vi.unstubAllGlobals();
   });
 
   function renderMessage(
@@ -97,7 +98,8 @@ describe("TaskChatBubble attachment chips", () => {
   // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21334
   // D hardening: case5's selected owner has length13. Empty/whitespace are
   // controlled payload mutations, NOT captured stored bodies.
-  it.each(["", " \n "])("emptyreply D hides a payload-free agent identity (%j)", (text) => {
+  it.each([390, 1440].flatMap(width => ["", " \n "].map(text => ({ width, text }))))("emptyreply D at $width hides a payload-free agent identity ($text)", ({ width, text }) => {
+    vi.stubGlobal("innerWidth", width);
     flushSync(() => root!.render(<ThemeProvider><TaskChatBubble item={{
       id: "d34ec738-a433-4600-9cc5-ef3d10e0ae73", sourceRunId: "e682914d-6688-4634-a513-53efd2d30ea1",
       kind: "message", author: "agent", authorName: "Runner", text, timestamp: "3:52 AM",
@@ -107,7 +109,8 @@ describe("TaskChatBubble attachment chips", () => {
     expect(container.textContent).toBe("");
   });
 
-  it.each(["bound file", "bound image", "attached activity", "before turn", "verification caveat", "human pending", "streaming"])("emptyreply D control preserves %s with no prose", (payload) => {
+  it.each([390, 1440].flatMap(width => ["bound file", "bound image", "attached activity", "before turn", "verification caveat", "human pending", "streaming"].map(payload => ({ width, payload }))))("emptyreply D at $width control preserves $payload with no prose", ({ width, payload }) => {
+    vi.stubGlobal("innerWidth", width);
     const item: TaskChatMessageItem = { id: "m1", kind: "message", author: payload === "human pending" ? "human" : "agent", authorName: "Runner", text: "",
       ...(payload === "human pending" ? { optimistic: "pending" } : {}),
       ...(payload === "streaming" ? { streaming: true } : {}),

@@ -17,7 +17,8 @@ import { activityApi } from "@/api/activity";
 import capture from "./__fixtures__/case1-empty-reply-http.json";
 
 // Shell context only: no transcript hook, projection, adapter, turn or bubble is mocked.
-vi.mock("@/context/SidebarContext", () => ({ useSidebar: () => ({ isMobile: false }) }));
+const sidebarState = vi.hoisted(() => ({ isMobile: false }));
+vi.mock("@/context/SidebarContext", () => ({ useSidebar: () => sidebarState }));
 vi.mock("@/lib/router", () => ({
   useLocation: () => ({ pathname: "/issues/case1", hash: "", search: "", key: "case1", state: null }),
   Link: ({ to, children, ...props }: { to: string; children: React.ReactNode }) => <a href={to} {...props}>{children}</a>,
@@ -150,7 +151,7 @@ function keepTransportBoundary() {
 function saveEvidence(label: string) {
   const turn = host.querySelector(TURN);
   const anchors = [...host.querySelectorAll("[data-thread-anchor]")].map(node => node.getAttribute("data-thread-anchor"));
-  const observation = { label, identityOnly: Boolean(turn?.querySelector(IDENTITY)) && !turn?.querySelector(BODIES),
+  const observation = { label, width: window.innerWidth, identityOnly: Boolean(turn?.querySelector(IDENTITY)) && !turn?.querySelector(BODIES),
     turnText: turn?.textContent ?? null,
     timeline: Boolean(turn?.querySelector('[data-testid="task-chat-turn-timeline"]')),
     final: Boolean(turn?.querySelector('[data-testid="task-chat-final-response"]')),
@@ -161,8 +162,8 @@ function saveEvidence(label: string) {
     turnText: observation.turnText, timeline: observation.timeline, final: observation.final, health: observation.health,
     chronologicalAnchors: observation.chronologicalAnchors }));
   if (process.env.CASE1_EVIDENCE_DIR) {
-    writeFileSync(`${process.env.CASE1_EVIDENCE_DIR}/${label}.html`, host.innerHTML);
-    writeFileSync(`${process.env.CASE1_EVIDENCE_DIR}/${label}.json`, JSON.stringify(observation, null, 2) + "\n");
+    writeFileSync(`${process.env.CASE1_EVIDENCE_DIR}/${window.innerWidth}-${label}.html`, host.innerHTML);
+    writeFileSync(`${process.env.CASE1_EVIDENCE_DIR}/${window.innerWidth}-${label}.json`, JSON.stringify(observation, null, 2) + "\n");
   }
 }
 beforeEach(() => {
@@ -177,7 +178,11 @@ beforeEach(() => {
 });
 afterEach(async () => { releaseLog?.(); if (root) await unmount(); host.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
-describe("case 1 / run 475641c1: captured HTTP fallback, not a fabricated transcript", () => {
+describe.each([390, 1440])("case 1 / run 475641c1: captured HTTP fallback, not a fabricated transcript at %i", (width) => {
+  beforeEach(() => {
+    sidebarState.isMobile = width === 390;
+    vi.stubGlobal("innerWidth", width);
+  });
   it("omits the historical identity-only row between Paul's saved messages after hydration and a fresh-cache remount", async () => {
     expect(capture.runs).toHaveLength(21); expect(capture.comments).toHaveLength(50);
     expect(chunk).toHaveLength(202); expect(chunk.split("\n")).toHaveLength(1); expect(() => JSON.parse(chunk)).toThrow();
