@@ -30,6 +30,7 @@ import { heartbeatsApi } from "@/api/heartbeats";
 import { issuesApi } from "@/api/issues";
 import { AgentChatReadProvider } from "@/hooks/useAgentChatRead";
 import { nativeRunEventsToTranscript } from "./transcript/native-run-events";
+import { PI_STOP_COMMAND, piStoppedRunEvents } from "./transcript/pi-stop-mid-shell.test-support";
 import * as nativeTranscriptTransport from "./transcript/useNativeRunTranscripts";
 import { genericPendingRequestConfirmationInteraction, pendingConnectionIntentInteraction } from "@/fixtures/issueThreadInteractionFixtures";
 import { TaskChatScrollNavigation, useTaskChatScrollNavigation } from "./task-chat/scroll-navigation";
@@ -6613,6 +6614,86 @@ describe.each([390, 1440])("STOPQ stopped tool card at %s", width => {
       execution: { ...stopped.execution, successorRunId: "next" } }]} />);
     expect(container.querySelector('[data-testid="task-chat-turn-summary"]')?.textContent).not.toContain("Stopped");
     expect(container.querySelector('[data-testid="task-chat-activity-phase-toggle"]')).not.toBeNull();
+  });
+});
+
+// catch: stopcard2 VERDICT findings 1-3 (al/stopcard-final5c3 340d6db4).
+describe.each([390, 1440])("stopped tool body tells what arrived at %s", width => {
+  const run = nativeRunningRun();
+  const command = "sleep 60; echo STEP1-74584f";
+  const props = { comments: [], onAdd: async () => {}, issueId: "stopcard2", issueStatus: "in_progress",
+    agentMap: new Map([[run.agentId, { id: run.agentId, name: "Runner", adapterType: "paperclip_runner" } as Agent]]) };
+  const stopped = { ...run, runId: run.id, status: "cancelled", finishedAt: "2026-08-25T18:00:11.000Z",
+    execution: { phase: "completed" as const, label: "Stopped", cause: null, nextAction: "Send a new message to continue from saved work.",
+      lastConfirmedActivityAt: null, retryAt: null, attempt: 1, maxAttempts: 3, recoveryOwner: null,
+      permittedActions: [], predecessorRunId: null, successorRunId: null } };
+  const call = { kind: "tool_call", ts: run.startedAt, name: "Bash", input: { command }, toolUseId: "shell" };
+  const spill = "[Full output: /tmp/pi-spill/shell.txt (2048 bytes; read it with offset/limit)]";
+
+  /** Settled (live run, then the stopped linked run) and cold-mounted; expanded each time. */
+  function openedBodies(entries: unknown[], expectedCommand = command): string[] {
+    sidebarState.isMobile = width === 390;
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+    nativeTranscriptState.transcriptByRun.set(run.id, entries);
+    const bodies: string[] = [];
+    const open = () => {
+      expect(container.querySelector('[data-testid="task-chat-turn-summary"]')?.textContent).toContain("Stopped for 11s");
+      const toggle = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-activity-phase-toggle"]');
+      expect(toggle).not.toBeNull();
+      flushSync(() => toggle!.click());
+      const history = container.querySelector('[data-testid="task-chat-runner-activity-list"]');
+      expect(history?.textContent).toContain(expectedCommand);
+      flushSync(() => history!.querySelector<HTMLButtonElement>("button")!.click());
+      const detail = container.querySelector('[data-testid="task-chat-runner-activity-detail"]');
+      expect(detail).not.toBeNull();
+      bodies.push(detail!.textContent ?? "");
+    };
+    render(<TaskChatThread {...props} activeRun={run} />);
+    render(<TaskChatThread {...props} activeRun={{ ...run, status: "cancelled", finishedAt: stopped.finishedAt }}
+      linkedRuns={[{ ...stopped, execution: undefined }]} />);
+    render(<TaskChatThread {...props} linkedRuns={[stopped]} />);
+    open();
+    render(<TaskChatThread key="cold-stopcard2" {...props} linkedRuns={[stopped]} />);
+    open();
+    return bodies;
+  }
+
+  it("(1) a spill-only partial shows the spill line and never claims no output", () => {
+    for (const body of openedBodies([call, { kind: "tool_result", ts: run.startedAt, toolUseId: "shell", content: spill, delta: true }])) {
+      expect(body).toContain("The full output is kept");
+      expect(body).not.toContain("Stopped before output");
+      expect(body).not.toContain("[Full output:");
+    }
+  });
+
+  it("(2) real Pi progress output, then a Stop: the expanded row shows the output that arrived", () => {
+    const transcript = nativeRunEventsToTranscript(piStoppedRunEvents(["STEP1-74584f\n", "STEP1-74584f\nSTEP2-74584f\n"]));
+    for (const body of openedBodies(transcript, PI_STOP_COMMAND)) {
+      expect(body).toContain("STEP2-74584f");
+      expect(body.match(/STEP1-74584f/g)).toHaveLength(1);
+      expect(body).not.toContain("Stopped before output");
+    }
+  });
+
+  it("(3) a stopped tool with only a blank context diff is never a blank body", () => {
+    for (const body of openedBodies([call, { kind: "diff", ts: run.startedAt, changeType: "context", text: "", toolUseId: "shell" }])) {
+      expect(body.trim()).not.toBe("");
+      expect(body).toContain(command);
+      expect(body).toContain("Stopped before output");
+    }
+  });
+
+  it("control: a true no-output stop says so, once, beside the command", () => {
+    for (const body of openedBodies([call])) {
+      expect(body).toContain(command);
+      expect(body.match(/Stopped before output/g)).toHaveLength(1);
+      expect(body).not.toContain("The full output is kept");
+    }
+  });
+
+  it("control: real Pi Stop before any output still says Stopped before output", () => {
+    for (const body of openedBodies(nativeRunEventsToTranscript(piStoppedRunEvents([])), PI_STOP_COMMAND))
+      expect(body).toContain("Stopped before output");
   });
 });
 

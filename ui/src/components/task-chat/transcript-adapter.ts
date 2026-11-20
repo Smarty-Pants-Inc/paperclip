@@ -726,6 +726,10 @@ export function transcriptToTaskChatItems(
 ): TaskChatItem[] {
   const items: TaskChatItem[] = [];
   const toolIndexById = new Map<string, number>();
+  // Output provenance per tool row: a result reported bytes, a truncation flag
+  // or a spill reference. Only its absence authorizes "Stopped before output."
+  // (the displayed detail can be empty once a spill marker is hidden).
+  const toolsWithOutput = new Set<TaskChatItem>();
   const messageIndexById = new Map<string, number>();
   const protocolIndexByKey = new Map<string, number>();
   const thinkingStartTs = new Map<number, string>();
@@ -928,6 +932,7 @@ export function transcriptToTaskChatItems(
             }
             const displayedOutput = savedOutputForDisplay(entry.content, entry.outputTruncated);
             if (displayedOutput.outputTruncated) existing.outputTruncated = true;
+            if (entry.content || displayedOutput.outputTruncated) toolsWithOutput.add(existing);
             const detail = formatToolResultDetail(displayedOutput.output);
             if (detail) {
               existing.detail =
@@ -1237,9 +1242,12 @@ export function transcriptToTaskChatItems(
         (item.status === "pending" || item.status === "in_progress")
       ) {
         item.status = "interrupted";
+        const outputArrived = toolsWithOutput.has(item) || Boolean(item.outputTruncated);
         item.detail = item.detail
           ? `${item.detail}\nInterrupted before the provider reported completion.`
-          : "Stopped before output. Interrupted before the provider reported completion.";
+          : outputArrived
+            ? "Interrupted before the provider reported completion."
+            : "Stopped before output. Interrupted before the provider reported completion.";
       } else if (
         item.kind === "protocol" &&
         item.surface === "provider_activity" &&
