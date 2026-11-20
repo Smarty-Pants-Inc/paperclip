@@ -67,6 +67,29 @@ function mayWriteDraft(draftKey: string, attemptId?: string) {
   return !pending || pending.attemptId === attemptId;
 }
 
+/**
+ * Load the draft of a composer that stores the person's exact text (the chat
+ * composer). Drafts saved before it did so hold the editor's markdown export
+ * (`a\*b\*c`, `\_\_bold\_\_`); an untagged draft is converted once with
+ * `fromLegacyMarkdown`, saved back, and the key is tagged verbatim, so every
+ * later save and restore is the exact text, backslashes included.
+ */
+export function loadVerbatimDraft(draftKey: string, fromLegacyMarkdown: (markdown: string) => string): string {
+  const stored = loadDraft(draftKey);
+  try {
+    const storage = draftStorage(draftKey);
+    const tag = `${draftKey}:verbatim:v1`;
+    if (storage.getItem(tag) === "1") return stored;
+    const text = stored ? fromLegacyMarkdown(stored) : stored;
+    if (!mayWriteDraft(draftKey)) return text;
+    if (text !== stored) saveDraft(draftKey, text);
+    storage.setItem(tag, "1");
+    return text;
+  } catch {
+    return stored;
+  }
+}
+
 export function saveDraft(draftKey: string, value: string, attemptId?: string) {
   try {
     if (!mayWriteDraft(draftKey, attemptId)) return;
