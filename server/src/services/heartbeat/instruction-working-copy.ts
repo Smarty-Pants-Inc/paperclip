@@ -6,7 +6,8 @@ import { adapterExecutionTargetEnablesSandboxDuplexBridge } from "@paperclipai/a
 import { parseObject } from "../../adapters/utils.js";
 import { logger } from "../../middleware/logger.js";
 import { AgentDirectoryReuseInvalidatedError, isAgentDirectoryCopy } from "../agent-directory-working-copies.js";
-import type { AgentFileConflict } from "../agent-file-store.js";
+import { AgentFilesUnverifiedError, readVerifiedAgentFiles, type AgentFileConflict } from "../agent-file-store.js";
+import { agentInstructionsBundleMode } from "../agent-instructions.js";
 import { collectStoppedInstructionCopyWithRetries, instructionWorkingCopyGuidance, type agentInstructionWorkingCopyService } from "../agent-instruction-working-copies.js";
 import { claimWarmNativeInstructionCopy, nativeSessionWorkspaceScope, reserveWarmNativeInstructionDirectory } from "../native-runtime/index.js";
 import { parseNativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
@@ -152,6 +153,28 @@ export function createHeartbeatInstructionWorkingCopy(input: InstructionWorkingC
     retirementFailed: async () => { await instructionCopies.reportRetirementUnconfirmed(agent.companyId, readRun().id); },
   } : undefined;
 
+  // Without a working copy the adapter reads the configured entry file itself
+  // (`instructionsFilePath`). For a managed bundle that file is in the on-disk
+  // projection of the durable head, so it goes through the reader guard first
+  // (agent row lock, restore from the durable head): after a failed save whose
+  // rollback also failed, the raw tree holds bytes that were never saved. When
+  // the files cannot be verified the path is withheld and the run says so.
+  async function verifiedCanonicalInstructions(runtimeConfig: Record<string, unknown>) {
+    if (!readNonEmptyString(runtimeConfig.instructionsFilePath)) return runtimeConfig;
+    if (agentInstructionsBundleMode({ id: agent.id, companyId: agent.companyId, name: agent.name, adapterConfig: agent.adapterConfig }) === "external") return runtimeConfig;
+    try {
+      await readVerifiedAgentFiles(db, { companyId: agent.companyId, id: agent.id }, async () => undefined);
+      return runtimeConfig;
+    } catch (error) {
+      if (!(error instanceof AgentFilesUnverifiedError)) throw error;
+      await appendRunEvent(readRun(), { eventType: "instruction_save", stream: "system", level: "warn",
+        message: "Agent instructions are not available while the agent's files are being verified.",
+        payload: { state: "unavailable", code: "AGENT_FILES_UNVERIFIED" } });
+      const { instructionsFilePath: _unverified, ...withheld } = runtimeConfig;
+      return withheld;
+    }
+  }
+
   async function prepare({ runtimeConfig, nativeRuntimeResolution, hasInstructionFilesystem, nativeLifecyclePolicy }: {
     runtimeConfig: Record<string, unknown>;
     nativeRuntimeResolution: Selection["nativeRuntimeResolution"];
@@ -228,6 +251,7 @@ export function createHeartbeatInstructionWorkingCopy(input: InstructionWorkingC
         for (const key of ["paperclipTaskMarkdown", "paperclipTaskMarkdownCompact"]) {
           context[key] = [readNonEmptyString(context[key]), guidance].filter(Boolean).join("\n\n");
         }
+        runtimeConfig = await verifiedCanonicalInstructions(runtimeConfig);
       }
       if (instructionCopy) {
         if (isAgentDirectoryCopy(instructionCopy)) {
