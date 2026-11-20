@@ -18,5 +18,5 @@ export async function createNativeRunLogTestTables(db: Db) {
     sql`create table native_run_finalizations(run_id uuid, company_id uuid, lease_expires_at timestamptz)`,
   );
   await db.execute(sql`create table agent_identity_keys(agent_id uuid primary key,company_id uuid,algorithm text,key_id text,
-    public_key_pem text,private_key_material jsonb,created_at timestamptz default now())`);
+    public_key_pem text,private_key_material jsonb,created_at timestamptz default now(),revoked_at timestamptz)`);
 }

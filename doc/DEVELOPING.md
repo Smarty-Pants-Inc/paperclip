@@ -3160,13 +3160,19 @@ service environment; `0` disables this compaction. For example, a bounded thresh
 PAPERCLIP_RUN_LOG_MAX_CHUNK_CHARS=1048576
 ```
 
-Restart the server after changing its service environment. Secret, invitation-token
-and inline-image redaction still run before the compaction decision. Positive
-values retain the existing 60% head, omission marker and 25% tail format; the marker
-can exceed very small thresholds. This does not change stdout/stderr excerpt caps,
-database event-payload bounds, lossless canonical native events, or the object
-store's separate 8 MiB encoded-record limit. Existing compacted native prefixes
-are verified against their original retained lengths, not the new setting.
+Restart the server after changing its service environment. Secret and invitation-token
+redaction still run before the compaction decision. Legacy/diagnostic chunks matching
+the existing compact inline-image omission pattern (at least 1,024 base64 characters)
+keep the image inline, even above the configured threshold: these chunks have no
+required durable raw-image copy elsewhere, so neither image omission nor chunk
+truncation is safe.
+Canonical native image omission is unchanged; its raw source is persisted in the
+database first. Other chunks retain the existing 60% head, omission marker and 25%
+tail format; the marker can exceed very small thresholds. This does not change
+stdout/stderr excerpt caps, database event-payload bounds, lossless canonical native
+events, or the object store's separate 8 MiB encoded-record limit. Existing compacted
+native prefixes still verify with their historical image omission and original
+retained lengths, not the new setting.
 
 Workspace preparation is in `server/src/services/heartbeat/workspaces.ts`. It
 owns managed checkout materialization, workspace validation and reuse, referenced

@@ -148,31 +148,27 @@ describe("heartbeat run-log chunk formatting", () => {
     );
   });
 
-  it.each([1023, 1024])("preserves the image omission threshold at %i characters", (length) => {
+  it.each([1023, 1024])("keeps unbacked inline image data at %i characters", (length) => {
     const data = "A".repeat(length);
     const chunk = `{"type":"image","source":{"type":"base64","data":"${data}"}}`;
-    expect(compactRunLogChunk(chunk)).toBe(length < 1024
-      ? chunk
-      : chunk.replace(data, `[omitted base64 image data: ${length} chars]`));
+    expect(compactRunLogChunk(chunk)).toBe(chunk);
   });
 
-  it("omits every large image consistently across repeated calls", () => {
+  it("keeps every large image consistently across repeated calls", () => {
     const chunk = [1024, 2048].map((length) =>
       `{"type":"image","source":{"type":"base64","data":"${"A".repeat(length)}"}}`,
     ).join("\n");
-    const expected = [1024, 2048].map((length) =>
-      `{"type":"image","source":{"type":"base64","data":"[omitted base64 image data: ${length} chars]"}}`,
-    ).join("\n");
-    expect(compactRunLogChunk(chunk)).toBe(expected);
-    expect(compactRunLogChunk(chunk)).toBe(expected);
+    expect(compactRunLogChunk(chunk)).toBe(chunk);
+    expect(compactRunLogChunk(chunk)).toBe(chunk);
   });
 
-  it("redacts credentials and image data before deciding whether a chunk needs truncation", () => {
+  it("redacts credentials but keeps unbacked image data even above the chunk cap", () => {
     const chunk = `Authorization: Bearer fixture-secret-token\n{"type":"image","source":{"type":"base64","data":"${"A".repeat(70_000)}"}}`;
     const compacted = compactRunLogChunk(chunk, 512);
     expect(compacted).toContain("***REDACTED***");
     expect(compacted).not.toContain("fixture-secret-token");
-    expect(compacted).toContain("[omitted base64 image data: 70000 chars]");
+    expect(compacted).toContain("A".repeat(70_000));
+    expect(compacted).not.toContain("[omitted base64 image data:");
     expect(compacted).not.toContain("[paperclip truncated");
   });
 });

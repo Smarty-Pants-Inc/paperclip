@@ -106,6 +106,7 @@ export function boundHeartbeatRunEventPayloadForStorage(
   return parseObject(bounded) ?? { _truncated: true };
 }
 
+// Historical native projections only: their raw source is already durable.
 function redactInlineBase64ImageData(chunk: string) {
   return chunk.replace(
     INLINE_BASE64_IMAGE_DATA_RE,
@@ -127,9 +128,13 @@ export function compactRunLogChunk(
   maxChars = persistedLogChunkMaxChars(),
   options: { redactInvitations?: boolean } = {},
 ) {
+  // Legacy stdout/stderr has no required raw-image copy. Keep these images
+  // inline, including above the size cap: truncating the chunk would lose the
+  // same bytes as omission. Privacy redaction still applies before persistence.
+  const containsInlineImage = chunk.search(INLINE_BASE64_IMAGE_DATA_RE) !== -1;
   const normalized = redactRunLogInvitationTokens(
-    redactSensitiveText(redactInlineBase64ImageData(chunk)), options.redactInvitations !== false);
-  if (maxChars === 0 || normalized.length <= maxChars) return normalized;
+    redactSensitiveText(chunk), options.redactInvitations !== false);
+  if (containsInlineImage || maxChars === 0 || normalized.length <= maxChars) return normalized;
 
   const headChars = Math.max(0, Math.floor(maxChars * 0.6));
   const tailChars = Math.max(0, Math.floor(maxChars * 0.25));
@@ -192,8 +197,8 @@ export function* canonicalNativeRunLogRedactionForms(chunk: string, options: Can
         ...options, redactInvitations, currentUser: { ...options.currentUser, enabled },
       });
     for (const enabled of [false, true])
-      yield compactRunLogChunk(redactCurrentUserText(options.redactIdentity(chunk), {
+      yield compactRunLogChunk(redactInlineBase64ImageData(redactCurrentUserText(options.redactIdentity(chunk), {
         ...options.currentUser, enabled,
-      }), Number.MAX_SAFE_INTEGER, { redactInvitations });
+      })), Number.MAX_SAFE_INTEGER, { redactInvitations });
   }
 }

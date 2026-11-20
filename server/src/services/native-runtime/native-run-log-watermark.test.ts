@@ -564,7 +564,10 @@ describe.skipIf(!support.supported)("native run log source watermarks", () => {
     } } };
     await f.persist(event, 1);
     await f.persist(f.event(2), 2);
-    const chunk = compactRunLogChunk(formatNativeRunLogEvent(event));
+    // This is an archive written by the old formatter, not a new diagnostic
+    // chunk. Keep its historical image omission independent of today's helper.
+    const raw = formatNativeRunLogEvent(event);
+    const chunk = omitted ? raw.replace(data, "[omitted base64 image data: 1024 chars]") : raw;
     expect(chunk.includes("[omitted base64 image data: 1024 chars]")).toBe(omitted);
     await store.append(handle, { stream: "stdout", ts: "original", seq: 1, chunk });
     await store.finalize(handle);
