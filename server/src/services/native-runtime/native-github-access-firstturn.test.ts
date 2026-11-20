@@ -89,6 +89,9 @@ async function fixture(options: { fail?: (script: string) => boolean; fault?: (s
     setPhase(value: string) { phase = value; },
     beforeExec(hook: (script: string) => Promise<void>) { beforeExec = hook; },
     releaseHangs() { for (const release of hungWrites.splice(0)) release(); },
+    sandboxRequest: () => fetch(broker!.env.PAPERCLIP_GITHUB_BROKER_URL + "/runtime-tools/github/credentials", {
+      method: "POST", body: "{}", headers: { authorization: `Bearer ${broker!.env.PAPERCLIP_GITHUB_BRIDGE_TOKEN}`, "content-type": "application/json" },
+    }),
     hostRequest: (generation?: string) => fetch(hostUrl + "/runtime-tools/github/credentials", {
       method: "POST", body: "{}", headers: { authorization: `Bearer ${hostToken}`, "content-type": "application/json",
         ...(generation ? { "x-paperclip-bridge-generation": generation, "x-paperclip-bridge-transport": "queue_v1" } : {}) },
@@ -187,7 +190,7 @@ it.each(["ever-attached", "run-state"])("one %s timeout retries once and the fir
     const deactivate = await broker.activate({ ...scope, runId: "run" });
     armed = false;
     expect(attempts).toBe(2);
-    expect((await f.hostRequest()).status).toBe(200);
+    expect((await f.sandboxRequest()).status).toBe(200);
     expect(f.resolveCredentials).toHaveBeenCalledOnce();
     expect(warn).not.toHaveBeenCalled();
     await deactivate();
@@ -256,7 +259,7 @@ it("one quarantine listing timeout retries once and the first turn succeeds with
     const deactivate = await broker.activate({ ...scope, runId: "run" });
     armed = false;
     expect(attempts).toBe(2);
-    expect((await f.hostRequest(f.generations[0])).status).toBe(200);
+    expect((await f.sandboxRequest()).status).toBe(200);
     expect(f.resolveCredentials).toHaveBeenCalledOnce();
     await deactivate();
   } finally { armed = false; }
@@ -291,7 +294,7 @@ it("hung quarantine listing gets two five-second attempts, refuses authority, an
     if ("deactivate" in result) await result.deactivate();
   }
   const deactivate = await broker.activate({ ...scope, runId: "retry-run" });
-  expect((await f.hostRequest(f.generations[1])).status).toBe(200);
+  expect((await f.sandboxRequest()).status).toBe(200);
   expect((await f.hostRequest(f.generations[0])).status).toBe(403);
   await deactivate();
 }, 30_000);
@@ -321,7 +324,7 @@ it("failed quarantine listing rejects authority for that generation, records Git
   const release = await broker.activate({ ...scope, runId: "retry-run" });
   expect(f.generations[1]).not.toBe(f.generations[0]);
   expect((await f.hostRequest(f.generations[0])).status).toBe(403);
-  expect((await f.hostRequest(f.generations[1])).status).toBe(200);
+  expect((await f.sandboxRequest()).status).toBe(200);
   expect(f.resolveCredentials).toHaveBeenCalledExactlyOnceWith({ ...scope, runId: "retry-run" });
   expect(JSON.parse(await readFile(path.join(f.queue, "responses", "untrusted.json"), "utf8"))).toMatchObject({ status: 503 });
   await release();
