@@ -1011,7 +1011,12 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         if (process.env.PAUSEWAKE_EVIDENCE_FILE) appendFileSync(process.env.PAUSEWAKE_EVIDENCE_FILE,
           `${JSON.stringify({ row: "F1", minute, manager, report, wake, notes })}\n`);
         expect(notes).toHaveLength(1);
-        expect.soft(notes[0]!.body, "No pause or resume was requested for this report").toBe(NO_RUN);
+        // SUPERSEDED by RFL 11:09Z (pausewake F1): an active board hold names the hold; this row still proves a terminated manager is not called 'paused'
+        expect.soft(notes[0]!.body, "No pause or resume was requested for this report").toBe(
+          "Not answered yet: this task is on hold (recovery needs board review) until the board clears it. Your message is kept.");
+        expect.soft(rowsOf(notes[0]!).find(row => row.label === "Next action")?.value).toBe(
+          "Ask the board to review and clear this task's recovery hold. Your message is kept.");
+        expect.soft(JSON.stringify(notes[0]!)).not.toMatch(/paused|resend|send.*again/i);
         expect.soft(codeOf(notes[0]!)).toBe("no_run");
       }
       expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
