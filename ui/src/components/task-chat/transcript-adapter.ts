@@ -1368,12 +1368,64 @@ export function omitProgressRepeatedByResponseAcrossSegments(
       }
     }
   }
-  if (redundantSegmentIndex < 0) return omitProgressComposingResponse(segments, normalizedResponse);
+  if (redundantSegmentIndex < 0) {
+    const composed = omitProgressComposingResponse(segments, normalizedResponse);
+    return composed === segments ? omitProgressRestatedByResponse(segments, normalizedResponse) : composed;
+  }
   return segments.map((items, segmentIndex) =>
     segmentIndex === redundantSegmentIndex
       ? items.filter((_, index) => index !== redundantIndex)
       : items,
   );
+}
+
+const collapseWhitespace = (text: string) => text.trim().replace(/\s+/g, " ");
+
+/** A closing line that only says the turn goes on ("Resuming the remaining steps..."). */
+const CONTINUATION_SENTENCE = /^(?:resuming|continuing|proceeding|moving on|now (?:i(?:'|’)ll|i will|let me)|next,? i(?:'|’)ll|back to)\b/i;
+
+/**
+ * True when a response restates a progress message: whitespace collapsed, the
+ * response opens with the progress text, sentence by sentence. A closing line
+ * that only announces the remaining work does not count against it. Text that
+ * appears only later in the response does not count: that is a shared line,
+ * not a restatement.
+ */
+export function responseRestatesProgress(progressText: string, responseText: string): boolean {
+  const response = collapseWhitespace(responseText);
+  const sentences = progressText.trim().split(/(?<=[.!?])\s+|\n+/).map(collapseWhitespace).filter(Boolean);
+  if (sentences.length > 1 && CONTINUATION_SENTENCE.test(sentences[sentences.length - 1]!)) sentences.pop();
+  const progress = sentences.join(" ");
+  return Boolean(progress && response) && (response === progress || response.startsWith(`${progress} `));
+}
+
+/**
+ * The answer a turn wrote as working text is often restated, with more, by its
+ * response ("9 + 10 = 19." then "9 + 10 = 19. The sleep call was cut off...").
+ * The response bubble owns that text: drop the last progress message it
+ * restates. Progress the response does not restate stays.
+ */
+function omitProgressRestatedByResponse(
+  segments: readonly (readonly TaskChatItem[])[],
+  normalizedResponse: string,
+): readonly (readonly TaskChatItem[])[] {
+  for (let segmentIndex = segments.length - 1; segmentIndex >= 0; segmentIndex -= 1) {
+    const items = segments[segmentIndex]!;
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const item = items[index]!;
+      if (
+        item.kind === "message" &&
+        item.interstitial &&
+        item.channel === "progress" &&
+        responseRestatesProgress(item.text, normalizedResponse)
+      ) {
+        return segments.map((segment, i) =>
+          i === segmentIndex ? segment.filter((_, j) => j !== index) : segment,
+        );
+      }
+    }
+  }
+  return segments;
 }
 
 /**
