@@ -1,4 +1,5 @@
 import { getServerProcessStartedAt } from "../../server-info.js";
+import { settleSteeringIngestion, steeringIngestionPending } from "../native-runtime/steering-ingestion.js";
 import { UNANSWERED_MESSAGE_LOOKBACK_MS } from "./unanswered-person-message.js";
 import { deferredPersonWakeQuietAtSql } from "../deferred-person-wake-clock.js";
 import { DEFERRED_PERSON_WAKE_BOUND_MS } from "../../modules/wake-queue/domain/policy.js";
@@ -7034,8 +7035,24 @@ export function recoveryService(
       if (outcome.terminalized) result.terminalizedRunIds.push(row.id);
     }
 
+    // A successful retained consumer can leave a terminal run held behind a
+    // run-scoped cursor gap. On restart, prove its recorded controller gone
+    // and resume the SAME ingestion/release owner; never clear around it.
+    const pendingIngestionRunIds = new Set<string>();
+    for (const row of runRows) {
+      const ingestion = row.resultJson?.nativeSteeringIngestion as { sourceInstanceId?: unknown } | undefined;
+      if (steeringIngestionPending(row.resultJson) && typeof ingestion?.sourceInstanceId === "string") {
+        await settleSteeringIngestion(db, { companyId: row.companyId, runId: row.id,
+          sourceInstanceId: ingestion.sourceInstanceId, recoverStoppedController: true });
+        const [current] = await db.select({ result: heartbeatRuns.resultJson }).from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.companyId, row.companyId), eq(heartbeatRuns.id, row.id)));
+        if (steeringIngestionPending(current?.result)) pendingIngestionRunIds.add(row.id);
+      }
+    }
+
     const isCleanable = (runId: string | null) => {
       if (!runId) return true;
+      if (pendingIngestionRunIds.has(runId)) return false;
       const status = runStatusById.get(runId);
       if (!status) return true; // missing run row → no real claim
       return TERMINAL_HEARTBEAT_RUN_STATUSES.has(status);
@@ -7110,9 +7127,10 @@ export function recoveryService(
         const ownerRunIds = [...new Set([locked.checkoutRunId, locked.executionRunId]
           .filter((id): id is string => id !== null))];
         if (ownerRunIds.length) {
-          await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+          const lockedRuns = await tx.select({ id: heartbeatRuns.id, result: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(
             eq(heartbeatRuns.companyId, issue.companyId), inArray(heartbeatRuns.id, ownerRunIds),
           )).orderBy(asc(heartbeatRuns.id)).for("update");
+          if (lockedRuns.some(run => steeringIngestionPending(run.result))) return null;
           if (!await runExecutionsHaveStopped(tx as unknown as Db, issue.companyId, ownerRunIds)) {
             if (await onlyUnreleasedLeasesWithinBoundBlockStop(tx as unknown as Db, locked, ownerRunIds, opts?.onDeferredDeadline)) return null;
             await recordTaskStopPending(tx as unknown as Db, { companyId: issue.companyId, issueId: issue.id,
