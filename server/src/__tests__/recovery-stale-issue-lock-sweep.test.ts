@@ -1,3 +1,10 @@
+import { reconcileNativeFinalizations } from "../services/native-runtime/native-finalization-reconciler.js";
+import { pendingNativeWithheldReply } from "../services/native-runtime/native-withheld-reply-trigger.js";
+import { nativeResponsePresentationWork } from "../services/native-runtime/native-response-presentation-work.js";
+import { workspaceOperations, issueRecoveryActions } from "@paperclipai/db";
+import { nativeWorkspaceFinalizationWork } from "../services/native-runtime/native-workspace-finalization-work.js";
+import { recordNativeWorkspaceFinalizationFailure } from "../services/native-runtime/native-workspace-finalizer.js";
+import { taskInterruptionPresentation } from "../services/task-interruption-presentation.js";
 import { persistHeartbeatRunProcessMetadata } from "../services/heartbeat/run-lifecycle.js";
 import { currentProcessSpaceHash } from "../services/controller-process-identity.js";
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
@@ -8,6 +15,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { settleOwnableKind } from "../services/recovery/ownership-invariant-report.js";
 import {
   subscribeDatabaseWork,
+  agentRuntimeState,
   costEvents,
   activityLog,
   agents,
@@ -80,6 +88,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     await db.delete(completionContracts);
     await db.delete(issues);
     await db.delete(agentWakeupRequests);
+    await db.delete(agentRuntimeState);
     await db.delete(agents);
     await db.delete(companyMemberships);
     await db.delete(companies);
@@ -1514,6 +1523,137 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       const ownerId = (await issue(c)).executionRunId;
       if (ownerId) await settleOwnableKind(db, "issue_execution_lock", { runIds: [ownerId] });
     }
+
+    it.each(["observed", "applied"] as const)("SYNCOUT: persisted %s result fails copyback across restart, ends and carries later person input", async phase => {
+      const c = await chat();
+      const m = await message(c, "Please carry my next question after copyback fails", new Date());
+      const w = await deferred(c, m.id, new Date());
+      const r = await run(c, [], ago(hour), "running");
+      const contractId = randomUUID(), resultId = randomUUID();
+      await db.insert(completionContracts).values({ id: contractId, companyId: c.companyId, issueId: c.issueId,
+        revision: 1, schemaVersion: "paperclip.completion-contract.v1", policyVersion: "syncout-row",
+        risk: "standard", completionAuthority: "server_arbiter", incompleteCriteriaPolicy: "preserve_non_terminal",
+        contractJson: { objective: "Save completed work" }, canonicalSha256: contractId,
+        createdByActorType: "system", createdByActorId: "syncout-row" });
+      await db.update(heartbeatRuns).set({ finishedAt: null, completionContractId: contractId,
+        resultJson: { prpRunTerminalState: "succeeded" } }).where(eq(heartbeatRuns.id, r.id));
+      await db.insert(nativeRunResults).values({ id: resultId, companyId: c.companyId, issueId: c.issueId,
+        runId: r.id, completionContractId: contractId, serverFingerprint: resultId,
+        schemaStatus: "accepted", resultJson: {}, canonicalSha256: resultId });
+      await db.insert(nativeRunFinalizations).values({ companyId: c.companyId, issueId: c.issueId,
+        runId: r.id, resultId, phase, attempt: 1 });
+      await db.update(issues).set({ executionRunId: r.id, checkoutRunId: r.id })
+        .where(eq(issues.id, c.issueId));
+      // Actual production failure recorder, not a hand-authored watchdog action.
+      await recordNativeWorkspaceFinalizationFailure(db, r.id, { stderrExcerpt: "workspace_sync_out_failed" });
+      const settledLocks = await settleOwnableKind(db, "issue_execution_lock", { runIds: [r.id] });
+      expect(settledLocks).toEqual([]);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, r.id)))[0].status).toBe("running");
+      console.info("SYNCOUT registry running owner", JSON.stringify({ settledLocks,
+        finalization: (await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, r.id)))[0] }));
+      // A reconstructed worker discovers the persisted retry independently of
+      // any pre-boot system wake. Only the external export operation is injected.
+      const attempt = vi.fn(async () => ({ kind: "failed" as const,
+        operation: { stderrExcerpt: "plugin_workspace_inspection_failed" as const } }));
+      for (let retry = 0; retry < 2; retry++) {
+        await db.update(nativeRunFinalizations).set({ nextAttemptAt: new Date(Date.now() - 1) })
+          .where(eq(nativeRunFinalizations.runId, r.id));
+        const worker = nativeWorkspaceFinalizationWork(db, { attempt,
+          onWorkspaceSettled: async () => {} });
+        const entries = await worker.load({ companyId: c.companyId, runId: r.id });
+        expect(entries).toHaveLength(1);
+        await worker.check(entries[0]);
+      }
+      // Terminal failure itself must hand off custody: no explicit sweep or
+      // caller release may be required for the message to acquire a run.
+      expect(await queuedRuns(w.id)).toHaveLength(1);
+      await c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId });
+      const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, r.id));
+      expect(ended).toMatchObject({ status: "failed", finishedAt: expect.any(Date),
+        errorCode: "native_workspace_sync_out_retry_exhausted" });
+      console.info("SYNCOUT card after deferred promotion", JSON.stringify(await taskInterruptionPresentation(db, await issue(c))));
+      expect((await issue(c)).executionRunId).not.toBe(r.id);
+      // Real release admission, without a model invocation: prove custody of
+      // the exact deferred person id in one successor run.
+      await c.heartbeat.releaseIssueExecutionAndPromote(ended);
+      const successors = await queuedRuns(w.id);
+      console.info("SYNCOUT persisted proof", JSON.stringify({ phase, ended: ended.status,
+        lock: (await issue(c)).executionRunId, wake: await wake(w.id), successors }));
+      expect(successors).toHaveLength(1);
+      expect(successors[0].contextSnapshot?.wakeCommentIds).toContain(m.id);
+    });
+
+    async function abandonedCopyback(age: number, hasMessage = false) {
+      const c = await chat();
+      const m = hasMessage ? await message(c, "Please answer after saving files", ago(age)) : null;
+      const w = m ? await deferred(c, m.id, ago(age)) : null;
+      const r = await run(c, [], ago(age + hour), "running");
+      const contractId = randomUUID(), resultId = randomUUID();
+      await db.insert(completionContracts).values({ id: contractId, companyId: c.companyId, issueId: c.issueId,
+        revision: 1, schemaVersion: "paperclip.completion-contract.v1", policyVersion: "bound-row",
+        risk: "standard", completionAuthority: "server_arbiter", incompleteCriteriaPolicy: "preserve_non_terminal",
+        contractJson: { objective: "Save completed work" }, canonicalSha256: contractId,
+        createdByActorType: "system", createdByActorId: "bound-row" });
+      await db.update(heartbeatRuns).set({ finishedAt: null, nativePhase: "retryable_failure", errorCode: null,
+        completionContractId: contractId, resultJson: { prpRunTerminalState: "succeeded",
+          ...pendingNativeWithheldReply(resultId, null, "acceptance") } }).where(eq(heartbeatRuns.id, r.id));
+      await db.insert(nativeRunResults).values({ id: resultId, companyId: c.companyId, issueId: c.issueId,
+        runId: r.id, completionContractId: contractId, serverFingerprint: resultId, schemaStatus: "accepted",
+        resultJson: { summary: "OLD_SAVED_REPLY_MUST_NOT_BE_RESENT" }, canonicalSha256: resultId });
+      await db.insert(nativeRunFinalizations).values({ companyId: c.companyId, issueId: c.issueId,
+        runId: r.id, resultId, phase: "retryable_failure", attempt: 1, nextAttemptAt: ago(age) });
+      await db.insert(workspaceOperations).values({ companyId: c.companyId, issueId: c.issueId,
+        heartbeatRunId: r.id, phase: "workspace_finalize", status: "failed" });
+      await db.update(issues).set({ status: "in_progress", executionRunId: r.id, checkoutRunId: r.id })
+        .where(eq(issues.id, c.issueId));
+      return { c, r, m, w };
+    }
+    it("SYNCOUT no deferred message: terminal retry drain creates no extra run", async () => {
+      const { c, r } = await abandonedCopyback(1);
+      for (let attempt = 0; attempt < 4; attempt++) {
+        await recordNativeWorkspaceFinalizationFailure(db, r.id, { stderrExcerpt: "workspace_sync_out_failed" });
+      }
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, r.id)))[0])
+        .toMatchObject({ status: "failed", finishedAt: expect.any(Date), nativePhase: "terminal_failure" });
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, c.companyId))).toHaveLength(1);
+      expect((await issue(c)).executionRunId).toBeNull();
+      expect(await taskInterruptionPresentation(db, await issue(c))).toMatchObject({ state: "failed", canRetry: true });
+    });
+    it.each(["boot", "periodic"])("BOUND: d6e5a901 durable shape ends at %s with one true card and Retry, no extra run", async trigger => {
+      const { c, r } = await abandonedCopyback(11 * 60_000);
+      // The same boot and periodic production entry points, not a fake watchdog.
+      if (trigger === "boot") await c.heartbeat.recoverNativeRunsAfterRestart(new Date(), [r.id], { skipDelegatedWork: true });
+      else await c.heartbeat.reapOrphanedRuns({ skipNativeWorkspaceFinalization: true, skipNativeResultCommit: true });
+      const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, r.id));
+      const card = await taskInterruptionPresentation(db, await issue(c));
+      console.info("BOUND persisted proof", JSON.stringify({ trigger, ended, card }));
+      expect(ended).toMatchObject({ status: "failed", nativePhase: "terminal_failure", finishedAt: expect.any(Date),
+        errorCode: "native_workspace_sync_out_retry_exhausted" });
+      expect(card).toMatchObject({ state: "failed", canRetry: true });
+      expect((await issue(c)).executionRunId).toBeNull();
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, c.companyId))).toHaveLength(1);
+      expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, c.issueId))).toHaveLength(1);
+    });
+    it("BOUND days-old: boot ends the run once, with one card, no replay, no old message woken", async () => {
+      const { c, r, w } = await abandonedCopyback(3 * 24 * hour, true);
+      for (let pass = 0; pass < 2; pass++) {
+        await c.heartbeat.recoverNativeRunsAfterRestart(new Date(), [r.id], { skipDelegatedWork: true });
+        await reconcileNativeFinalizations(db, [r.id]);
+        await c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId });
+      }
+      const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, r.id));
+      const card = await taskInterruptionPresentation(db, await issue(c));
+      console.info("BOUND days-old proof", JSON.stringify({ ended, card, wake: await wake(w!.id) }));
+      expect(ended).toMatchObject({ status: "failed", finishedAt: expect.any(Date), nativePhase: "terminal_failure" });
+      expect(card).toMatchObject({ state: "failed", canRetry: true });
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, c.companyId))).toHaveLength(1);
+      expect(await queuedRuns(w!.id)).toEqual([]);
+      expect(ended.resultJson?.nativeWithheldReply).toMatchObject({ state: "skipped", reason: "historical_workspace_retry_timeout" });
+      expect(await nativeResponsePresentationWork(db).load({ companyId: c.companyId, runId: r.id })).toEqual([]);
+      expect(await db.select().from(issueComments).where(and(eq(issueComments.issueId, c.issueId), eq(issueComments.authorType, "agent")))).toEqual([]);
+      expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, c.issueId))).toHaveLength(1);
+      expect((await issue(c)).executionRunId).toBeNull();
+    });
 
     it.each(["automation_no_new_person", "deferred_restore_recovery", "issue_blocker_stalled", "issue_monitor"])(
       "boot-4b/406/4c: pre-boot %s retains its base promotion or hold across two sweeps", async reason => {

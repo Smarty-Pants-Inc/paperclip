@@ -1,3 +1,5 @@
+import { nativeWorkspaceFinalizationWork } from "../services/native-runtime/native-workspace-finalization-work.js";
+import { recordNativeWorkspaceFinalizationFailure } from "../services/native-runtime/native-workspace-finalizer.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
@@ -554,6 +556,73 @@ describe("native completion promotion (rf3-ibpair)", () => {
       console.info("P-DEFERRED persisted proof", JSON.stringify({ elapsedMs: Date.now() - started, messageId: message.id,
         wake: (await personWakes())[0], successor: successors[0].id, successorContext: successors[0].contextSnapshot }));
     } finally { await f.close(); }
+  }, 60_000);
+
+  it.each(["exhausted-1", "exhausted-2", "exhausted-3", "overdue-live", "overdue-restart"] as const)("FAILEDRUN route %s: saved result fails copy-back; deferred person gets ONE successor and answer", async mode => {
+    const f = await fixture(`failedrun-${mode}`, true, false);
+    let release!: () => void;
+    let owned: Promise<unknown> | undefined;
+    try {
+      const message = await f.post(`FAILEDRUN-${mode}: answer my last-second question`, "queue");
+      await waitForPendingCommentSteers();
+      expect((await f.wakes()).filter(w => w.status === "deferred_issue_execution")).toHaveLength(1);
+      let entered = false;
+      const held = new Promise<void>(resolve => { release = resolve; });
+      owned = withNativeWorkspaceFinalizationOwnership({ db, companyId: f.companyId, runId: f.runId },
+        async () => { entered = true; await held; });
+      await vi.waitFor(() => expect(entered).toBe(true));
+      f.owner.contendAtFinalization = true;
+      f.peer.finish(); await f.running;
+      await heartbeatService(db).waitForRunExecutionDrain(f.runId, { timeoutMs: 15_000 });
+      expect(f.owner.outcomes.get(f.runId)?.error).toContain("native_workspace_finalization_busy");
+      release(); await owned;
+      const heartbeat = heartbeatService(db);
+      const worker = () => nativeWorkspaceFinalizationWork(db, {
+        // Only the external failed export result is injected. Native ownership,
+        // finalizer, saved-result retry policy, wake admission/executor and answer
+        // publication below are real and use embedded Postgres.
+        attempt: async () => ({ kind: "failed", operation: { stderrExcerpt: "plugin_workspace_inspection_failed" } }),
+        onWorkspaceSettled: async input => {
+          await heartbeat.releaseEnvironmentLeasesForRun({ ...input, status: "failed" });
+          await heartbeat.releaseIssueExecutionAndPromote({ id: input.runId, companyId: input.companyId }, { resumeStrandedQueue: true });
+        },
+      });
+      await recordNativeWorkspaceFinalizationFailure(db, f.runId, { stderrExcerpt: "workspace_sync_out_failed" });
+      const overdue = mode.startsWith("overdue");
+      if (overdue) {
+        await db.update(nativeRunFinalizations).set({ nextAttemptAt: new Date(Date.now() - 11 * 60_000) })
+          .where(eq(nativeRunFinalizations.runId, f.runId));
+        // Reconstruct the same worker after a controller restart, or use the
+        // existing live worker. The deadline is exclusively durable DB state.
+        if (mode === "overdue-restart") await heartbeat.recoverNativeRunsAfterRestart(new Date(), [f.runId], { skipDelegatedWork: true });
+        const resumed = worker();
+        const [entry] = await resumed.load({ companyId: f.companyId, runId: f.runId });
+        if (entry) await resumed.check(entry);
+        await heartbeat.releaseEnvironmentLeasesForRun({ runId: f.runId, companyId: f.companyId, agentId: f.agentId, status: "failed" });
+        await heartbeat.releaseIssueExecutionAndPromote({ id: f.runId, companyId: f.companyId }, { resumeStrandedQueue: true });
+      } else for (let retry = 0; retry < 2; retry++) {
+        await db.update(nativeRunFinalizations).set({ nextAttemptAt: new Date(Date.now() - 1) })
+          .where(eq(nativeRunFinalizations.runId, f.runId));
+        const resumed = worker();
+        const [entry] = await resumed.load({ companyId: f.companyId, runId: f.runId });
+        expect(entry).toBeDefined(); await resumed.check(entry);
+      }
+      const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      expect(ended).toMatchObject({ status: "failed", finishedAt: expect.any(Date), errorCode: "native_workspace_sync_out_retry_exhausted" });
+      await vi.waitFor(async () => { await f.assertAnsweredOnce([message]); }, { timeout: 30_000 });
+      await heartbeat.drainActiveRunExecutions();
+      const successors = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).filter(r => r.id !== f.runId);
+      expect(successors).toHaveLength(1);
+      expect(successors[0].contextSnapshot?.wakeCommentIds).toContain(message.id);
+      expect(successors[0].status).toBe("succeeded");
+      // Replaying both failure recording and release cannot mint another run.
+      await recordNativeWorkspaceFinalizationFailure(db, f.runId, { stderrExcerpt: "workspace_sync_out_failed" });
+      await heartbeat.releaseIssueExecutionAndPromote(ended, { resumeStrandedQueue: true });
+      await heartbeat.drainActiveRunExecutions(); await f.assertAnsweredOnce([message]);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).filter(r => r.id !== f.runId)).toHaveLength(1);
+      console.info("FAILEDRUN route proof", JSON.stringify({ mode, source: f.runId, successor: successors[0].id,
+        status: successors[0].status, messageId: message.id, comments: await f.comments() }));
+    } finally { release?.(); await owned; await f.close(); }
   }, 60_000);
 
   it.each(["observed", "applied"] as const)("P2: normal end with %s finalization; standalone commit answers deferred person batch ONCE", async phase => {
