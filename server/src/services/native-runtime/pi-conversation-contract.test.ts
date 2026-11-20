@@ -172,7 +172,12 @@ describe("Interrupt successor carrying a new message answers it first (adopt-a2-
   const CUT_NOT_RERUN = "A call marked interrupted did not finish. If it was a long wait (minutes) that the new message may have meant to cut short, answer first and ask before re-running it.";
   const CUT_STEP_RERUN = "Otherwise check whether it took effect and, if not, run it again before the remaining steps; do not report the task done while a step is unfinished.";
   const COMPLETED_ONLY = "The completed calls below must not be run again.";
-  const LIST = /\n## Commands already run in the interrupted turn \(do not run these again\)\n[\s\S]*(?:Do not run them again[.;]|The completed calls below must not be run again\.)[\s\S]*\n1\. `bash` \(`echo STEP1 > \/tmp\/step1`\): completed\n {3}result: STEP1-RESULT-wrote-step1\n2\. `bash` \(`sleep 600`\): interrupted/;
+  // adopt-cutstep-heading: the Interrupt-with-new-message list has its own heading; every other branch keeps the old one.
+  const OLD_HEADING = "## Commands already run in the interrupted turn (do not run these again)";
+  const INTERRUPT_HEADING = "## Calls from the interrupted turn";
+  const receiptsHeadings = (text: string) => text.split("\n").filter((line) => line.startsWith("## ") && line.includes("interrupted turn"));
+  const LIST = /\n## Calls from the interrupted turn\n[\s\S]*The completed calls below must not be run again\.[\s\S]*\n1\. `bash` \(`echo STEP1 > \/tmp\/step1`\): completed\n {3}result: STEP1-RESULT-wrote-step1\n2\. `bash` \(`sleep 600`\): interrupted/;
+  const STOP_LIST = /\n## Commands already run in the interrupted turn \(do not run these again\)\n[\s\S]*Do not run them again\.[\s\S]*\n1\. `bash` \(`echo STEP1 > \/tmp\/step1`\): completed\n {3}result: STEP1-RESULT-wrote-step1\n2\. `bash` \(`sleep 600`\): interrupted/;
 
   for (const [name, previousRun, sameSession] of [
     ["fresh successor (new session)", null, false],
@@ -222,6 +227,11 @@ describe("Interrupt successor carrying a new message answers it first (adopt-a2-
       expect(text).not.toMatch(/Do not run them again[.;]/);
       expect(text).not.toContain("already ran; do not run them again");
       expect(text).not.toContain("If it was only a wait or sleep");
+      // adopt-cutstep-heading: headings are read first. The list over the cut STEP2 must not be headed
+      // 'do not run these again' (the model skipped STEP2 under it), and nothing may point back at that name.
+      expect(receiptsHeadings(text), "one receipts heading, the Interrupt one").toEqual([INTERRUPT_HEADING]);
+      expect(receiptsHeadings(text)[0], "heading over the cut STEP2").not.toContain("do not run these again");
+      expect(text.toLowerCase(), "no 'do not run these again' anywhere in the Interrupt input").not.toContain("do not run these again");
       expect(text.indexOf("Answer their new message first."), "answer before the re-run rule").toBeLessThan(text.indexOf(CUT_STEP_RERUN));
     }
   });
@@ -275,7 +285,9 @@ describe("Interrupt successor carrying a new message answers it first (adopt-a2-
       expect(text).toContain("9 + 10");
       expect(text, "the Stop note is kept, once").toContain(PAPERCLIP_PERSON_STOPPED_PREVIOUS_TURN_NOTE);
       expect(text.split(PAPERCLIP_PERSON_STOPPED_PREVIOUS_TURN_NOTE)).toHaveLength(2);
-      expect(text, "the receipts list is never removed (C1)").toMatch(LIST);
+      expect(text, "the receipts list is never removed (C1)").toMatch(STOP_LIST);
+      expect(receiptsHeadings(text), "Stop keeps its heading byte-identical").toEqual([OLD_HEADING]);
+      expect(text).toContain(`\n${OLD_HEADING}\nThis list may not include file edits made in that turn; check the files before redoing any edit.\n${STOP_SENTENCE}`);
       expect(text, "the Stop sentence").toContain(STOP_SENTENCE);
       expect(text, "no Interrupt text leaks into a Stop").not.toContain("continue the task from the next unfinished step");
       expect(text, "no Interrupt text leaks into a Stop").not.toContain("Then continue");
@@ -288,6 +300,7 @@ describe("Interrupt successor carrying a new message answers it first (adopt-a2-
     for (const previousRun of [null, prior(successor(noMessageWake, sessionId, false, firstRun))]) {
       const { text } = request({ ...noMessageWake, reason: "issue_assigned" }, previousRun);
       expect(text).toContain("Do not run them again; continue from the next step. A call marked interrupted was cut mid-flight: check whether it took effect before you run it again.");
+      expect(receiptsHeadings(text), "no new message: heading unchanged").toEqual([OLD_HEADING]);
       expect(text).not.toContain("new message first");
       expect(text).not.toContain("next unfinished step");
     }
