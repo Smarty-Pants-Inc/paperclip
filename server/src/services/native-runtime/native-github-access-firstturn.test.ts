@@ -116,6 +116,21 @@ it("a failed combined setup rejects bridge creation and keeps native GitHub opti
   expect(f.calls.some(call => call.script.includes("nohup"))).toBe(true);
 }, 30_000);
 
+it("an actual entrypoint decode failure aborts the combined command before server launch", async () => {
+  const f = await fixture();
+  // Fail the entrypoint's first decode after emitting partial bytes; remove only
+  // this fixture shim so the unchanged anonymous-launcher fallback can stage.
+  await writeFile(path.join(f.root, "bin", "base64"), "#!/bin/sh\nrm -- \"$0\"\nprintf incomplete\nexit 1\n", { mode: 0o700 });
+  const broker = await f.create();
+  expect(broker.ready).toBe(false);
+  expect(f.transportError).toBeInstanceOf(Error);
+  const setup = f.calls.find(call => call.script.includes("nohup"))!.script;
+  const queue = setup.match(/(\/[^'\"\n]+\/queue)\/requests/)?.[1];
+  expect(queue).toBeTruthy();
+  await expect(readFile(path.join(queue!, "server.pid"))).rejects.toMatchObject({ code: "ENOENT" });
+  expect(f.resolveCredentials).not.toHaveBeenCalled();
+}, 30_000);
+
 it.each(["ever-attached", "run-state"])("a failed %s activation write rejects without publishing authority", async marker => {
   let armed = false;
   const f = await fixture({ fail: script => armed && script.includes("base64 -d") &&
