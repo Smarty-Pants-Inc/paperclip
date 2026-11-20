@@ -478,9 +478,9 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     const carriers = await carriersOf(chat, response.body.id);
     expect(carriers.wakes.length + carriers.runs.length).toBe(1);
     if (variant === "stale-turn") {
-      const [queuedWake] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
-        .where(eq(agentWakeupRequests.idempotencyKey, `conversation-comment:${response.body.id}`));
-      expect((traces[0][0] as Record<string, unknown>).wakeId).toBe(queuedWake.id);
+      // Strict logging (rf-2 / rf-3): no extra query, so the queued wake id is not looked up.
+      expect((traces[0][0] as Record<string, unknown>).wakeId).toBeNull();
+      expect((traces[0][0] as Record<string, unknown>).wakeStatus).toBe("queued");
     }
     expect(await answered(response.body.id)).toBe(false);
     // An RPC refusal occurs after POST's custody decision. Depending on whether
