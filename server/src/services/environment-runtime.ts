@@ -140,7 +140,7 @@ import {
   type SandboxOrphanCleanupSpool,
 } from "./sandbox-orphan-cleanup-spool.js";
 import { logger } from "../middleware/logger.js";
-import { resumeWithSpeculation, startSpeculativeResume, type CommentResumeInput } from "./speculative-sandbox-resume.js";
+import { resumeWithSpeculation, speculativeResumeCustodyHeld, startSpeculativeResume, type CommentResumeInput } from "./speculative-sandbox-resume.js";
 import { resolveRunnerEnvironmentForRun, resolveRunnerReconnectGraceMsForRun, resolveWarmRunnerIdleTimeoutMsForRun } from "./runner-environment-lifecycle.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
 
@@ -2112,6 +2112,9 @@ function createSandboxEnvironmentDriver(
       // Ambiguity is a miss, not permission to wake several paid allocations.
       if (candidates.length !== 1) return;
       const lease = candidates[0]!;
+      // Custody/qualified Stop owns this allocation. Do not even inspect it or
+      // write a speculative journal that could later release it on expiry.
+      if (await speculativeResumeCustodyHeld(db, lease as typeof environmentLeases.$inferSelect)) return;
       // A provider may auto-suspend a retained warm lease without writing a
       // stop receipt here. Qualify that actual suspended case, never guess from
       // an idle DB label or wake a known-running warm runner.

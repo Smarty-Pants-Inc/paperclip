@@ -13,6 +13,8 @@ import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { createHeartbeatQueue } from "./heartbeat/queue.js";
 import { resolveRunnerReconnectGraceMsForRun, resolveWarmRunnerIdleTimeoutMsForRun } from "./runner-environment-lifecycle.js";
 import { createHeartbeatQueueTestDependencies } from "../__tests__/helpers/heartbeat-queue.js";
+import { SANDBOX_STOP_AND_RETAIN_KEY } from "./sandbox-stop-and-retain.js";
+import { startSpeculativeResume } from "./speculative-sandbox-resume.js";
 
 // Keep reason: never-OK money/duplicate-provider-effect guard. The task explicitly
 // requests controlled latency peers; these are not live Boat latency evidence.
@@ -119,6 +121,103 @@ describe.skipIf(!support.supported)("comment speculative Boat resume", () => {
     };
     return { companyId, agentId, issueId, runtime, input, start, newRun, acquire, read, call, spans, ingressQueue, worker, whenResumeStarted, running: () => running };
   }
+
+  // Keep reason: never-OK saved-work custody guard. Exercise the real runtime,
+  // persisted lease/run markers and cleanup owner; only the provider is a peer.
+  async function custodyFixture(kind: "stop-intent" | "export-intent" | "stop-receipt" | "qualified-stop") {
+    const f = await fixture();
+    const lease = await f.read();
+    const { remoteExecutionTermination: _stop, sandboxStopAndRetainReceipt: _receipt, ...warmMetadata } = lease.metadata!;
+    let metadata = lease.metadata!;
+    if (kind === "stop-intent") metadata = { ...metadata, [SANDBOX_STOP_AND_RETAIN_KEY]: {
+      schema: "paperclip.sandbox-stop-and-retain.v1", requestId: randomUUID(), companyId: lease.companyId,
+      runId: lease.heartbeatRunId, leaseId: lease.id, provider: lease.provider,
+      providerLeaseId: lease.providerLeaseId, pluginId: metadata.pluginId,
+    } };
+    if (kind === "export-intent") metadata = { ...metadata, nativeWorkspaceExportResume: {
+      schema: "paperclip.workspace-export-resume.v2", requestId: randomUUID(), resultId: randomUUID(),
+      companyId: lease.companyId, runId: lease.heartbeatRunId, leaseId: lease.id,
+      provider: lease.provider, providerLeaseId: lease.providerLeaseId, pluginId: metadata.pluginId,
+    } };
+    if (kind === "qualified-stop") {
+      metadata = warmMetadata;
+      await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: f.issueId, status: "cancelled",
+        resultJson: { cancelledByActorType: "user", cancelledByUserId: "board", nativeCancellation: {
+          schema: "paperclip.native-cancellation.v1", companyId: f.companyId, issueId: f.issueId, runId: lease.heartbeatRunId,
+          scope: "run", reasonCode: "cancellation_run_only", dispatched: true, dispatchState: "acknowledged",
+          intentAuditId: "intent", acknowledgementAuditId: "ack",
+        } },
+        runnerProfileJson: { nativeResourceDisposition: "keep_running", nativeRetainedIdleCheckpoint: {
+          schema: "paperclip.native-retained-idle-checkpoint.v1", companyId: f.companyId, issueId: f.issueId,
+          runId: lease.heartbeatRunId, sessionId: "saved-tier1-session", bootId: "tier1-boot", generation: 1,
+        } },
+      }).where(eq(heartbeatRuns.id, lease.heartbeatRunId!));
+    }
+    // Retained custody is not an ordinary released stop-and-reuse. The settled
+    // receipt remains authoritative while export/read-back is still owed.
+    await db.update(environmentLeases).set({ status: "retained", metadata }).where(eq(environmentLeases.id, lease.id));
+    return f;
+  }
+
+  it.each(["stop-intent", "export-intent", "stop-receipt", "qualified-stop"] as const)(
+    "custody: never touches a retained %s lease at comment ingress", async kind => {
+      const f = await custodyFixture(kind);
+      const held = await f.read();
+      await f.start();
+      expect(f.running()).toBe(false);
+      expect(f.call.mock.calls).toEqual([]);
+      expect(await f.read()).toEqual(held);
+    });
+
+  it.each(["stop-intent", "export-intent", "stop-receipt", "qualified-stop"] as const)(
+    "custody: reservation itself refuses a retained %s lease", async kind => {
+      const f = await custodyFixture(kind);
+      const held = await f.read();
+      const resume = vi.fn(async () => ({ providerLeaseId: held.providerLeaseId! }));
+      await startSpeculativeResume(db, { lease: held, commentId: f.input.commentId,
+        configDigest: "custody-row", rpcTimeoutMs: 1_000, resume });
+      expect(await f.read()).toEqual(held);
+      expect(resume).not.toHaveBeenCalled();
+    });
+
+  it("custody: refuses a tier-1 keep recorded during provider inspection", async () => {
+    const f = await fixture();
+    const original = await f.read();
+    const { remoteExecutionTermination: _stop, sandboxStopAndRetainReceipt: _receipt, ...metadata } = original.metadata!;
+    await db.update(environmentLeases).set({ status: "retained", metadata }).where(eq(environmentLeases.id, original.id));
+    const held = await f.read();
+    const provider = f.call.getMockImplementation()!;
+    f.call.mockImplementation(async (...args) => {
+      const result = await provider(...args);
+      if (args[1] === "environmentInspectLease") await db.update(heartbeatRuns).set({
+        runnerProfileJson: { nativeRetainedIdleCheckpoint: { schema: "paperclip.native-retained-idle-checkpoint.v1",
+          companyId: f.companyId, issueId: f.issueId, runId: held.heartbeatRunId,
+          sessionId: "saved-tier1-session", bootId: "tier1-boot", generation: 1 } },
+      }).where(eq(heartbeatRuns.id, held.heartbeatRunId!));
+      return result;
+    });
+    await f.start();
+    expect(await f.read()).toEqual(held);
+    expect(f.call.mock.calls.map(c => c[1])).toEqual(["environmentInspectLease"]);
+    expect(f.running()).toBe(false);
+  });
+
+  it.each(["stop-receipt", "qualified-stop"] as const)(
+    "custody: unclaimed speculation cannot suspend or release a retained %s lease", async kind => {
+      vi.stubEnv("PAPERCLIP_SPECULATIVE_RESUME_TTL_MS", "80");
+      const f = await custodyFixture(kind);
+      const held = await f.read();
+      await f.start();
+      await delay(100);
+      const hb = heartbeatService(db, { environmentRuntime: f.runtime });
+      await hb.sweepPendingCleanupLeases();
+      await hb.drainActiveRunExecutions();
+      // Assert durable custody first: the old path stops and releases the box.
+      expect((await f.read()).status).toBe("retained");
+      expect(await f.read()).toEqual(held);
+      expect(f.call.mock.calls).toEqual([]);
+      expect(f.running()).toBe(false);
+    });
 
   it("overlaps a 0.9s resume with 0.9s admission, retaining one authoritative resume", async () => {
     const f = await fixture(900);

@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { and, eq, sql } from "drizzle-orm";
-import { environmentLeases, type Db } from "@paperclipai/db";
+import { environmentLeases, heartbeatRuns, type Db } from "@paperclipai/db";
 import type { PluginEnvironmentLease } from "@paperclipai/plugin-sdk";
 import { logger } from "../middleware/logger.js";
 import { writeEnvironmentCleanup } from "./environment-cleanup-notifications.js";
+import { hasStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
 
 /** Internal lease journal, not an execution grant or a cached eligibility decision. */
 export const SPECULATIVE_RESUME_KEY = "speculativeCommentResume";
@@ -45,6 +46,23 @@ export function readSpeculativeResume(metadata: Record<string, unknown> | null |
     && ["resuming", "ready", "failed"].includes(r.state) ? r : null;
 }
 
+/** Retained custody is not an idle warm lease. A settled stop receipt outlives
+ * its intent while export/read-back is owed; tier 1 records its keep on the run.
+ * Presence denies speculation even if the stronger process-local proof is gone:
+ * only authoritative continuation may reconcile that saved work. */
+export async function speculativeResumeCustodyHeld(db: Db, lease: Pick<Lease,
+  "status" | "metadata" | "companyId" | "heartbeatRunId">): Promise<boolean> {
+  if (hasStopOnlyCleanup(lease)) return true;
+  if (lease.status !== "retained") return false;
+  if (Object.hasOwn(lease.metadata ?? {}, "sandboxStopAndRetainReceipt")
+    || Object.hasOwn(lease.metadata ?? {}, "remoteExecutionTermination")) return true;
+  if (!lease.heartbeatRunId) return false;
+  const [owner] = await db.select({ profile: heartbeatRuns.runnerProfileJson }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, lease.companyId), eq(heartbeatRuns.id, lease.heartbeatRunId),
+  ));
+  return Object.hasOwn(owner?.profile ?? {}, "nativeRetainedIdleCheckpoint");
+}
+
 /** Commit the cleanup obligation BEFORE touching the provider. An authoritative
  * acquisition also writes this row, so it cannot race an unrecorded speculation.
  * The existing warm-expiry owner reconstructs this deadline after a restart. */
@@ -53,6 +71,7 @@ export async function startSpeculativeResume(db: Db, input: {
   resume(timeoutMs: number): Promise<PluginEnvironmentLease>;
 }): Promise<void> {
   const { lease } = input;
+  if (await speculativeResumeCustodyHeld(db, lease)) return;
   const now = Date.now(), ttl = speculativeResumeTtlMs();
   const rpcTimeoutMs = Math.max(1, Math.min(ttl, input.rpcTimeoutMs));
   const reservation: Reservation = { schema: "paperclip.speculative-comment-resume.v1", id: randomUUID(),
@@ -69,7 +88,9 @@ export async function startSpeculativeResume(db: Db, input: {
     sql`${environmentLeases.metadata} is not distinct from ${JSON.stringify(lease.metadata)}::jsonb`,
     sql`exists (select 1 from heartbeat_runs owner where owner.id = ${lease.heartbeatRunId}
       and owner.company_id = ${lease.companyId}
-      and owner.status in ('succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted'))`,
+      and owner.status in ('succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted')
+      and (${environmentLeases.status} <> 'retained'
+        or not (coalesce(owner.runner_profile_json, '{}'::jsonb) ? 'nativeRetainedIdleCheckpoint')))`,
     sql`not exists (select 1 from environment_leases peer where peer.id <> ${lease.id}
       and peer.provider = ${lease.provider} and peer.provider_lease_id = ${lease.providerLeaseId}
       and peer.status in ('active', 'retained', 'pending_cleanup'))`,
