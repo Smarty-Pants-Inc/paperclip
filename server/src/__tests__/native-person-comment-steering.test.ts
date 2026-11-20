@@ -1796,3 +1796,183 @@ describe("person comment default steering eligibility and asynchronous receipt",
     }
   }, 60_000);
 });
+
+// catch: https://github.com/Smarty-Pants-Inc/paperclip/commit/e08708ddb1d66e87f1a849099f447cd96ff6808e
+// Reuses review-fleet-3's real tool/real admission-lock two-session schedule.
+// Only the observation gate is scripted; both PostgreSQL lock calls are real.
+async function crossIssueAdmissionRace(round: number, phase: "prepare" | "commit" | "recover" = "prepare") {
+  const f = await fixture(`lock2cross${phase}${round}`);
+  const authority = new PaperclipRunnerToolAuthority(db, { companyId: f.companyId, issueId: f.issueId,
+    agentId: f.agentId, runId: f.runId });
+  const { transactionRetryStats } = await import("../services/transaction-retry.js");
+  const deadlocks = async () => {
+    await db.execute(sql`select pg_stat_clear_snapshot()`);
+    return Number((await db.execute<{ n: string }>(sql`select deadlocks::text as n from pg_stat_database where datname = current_database()`))[0].n);
+  };
+  const before = { deadlocks: await deadlocks(), retries: transactionRetryStats.retried };
+  let releaseTool!: () => void, agentReady!: () => void, releaseAdmission!: () => void;
+  const toolGate = new Promise<void>(resolve => { releaseTool = resolve; });
+  const agentHeld = new Promise<void>(resolve => { agentReady = resolve; });
+  const admissionGate = new Promise<void>(resolve => { releaseAdmission = resolve; });
+  let targetAcquired = false, agentLocks = 0, gateEnabled = phase !== "recover";
+  const pauseAt = phase === "commit" ? 2 : 1;
+  const realLock = cancellationLocks.lockAgentForRunWrite;
+  const observe = vi.spyOn(cancellationLocks, "lockAgentForRunWrite").mockImplementation(async (...args) => {
+    const result = await realLock(...args);
+    if (args[1] === f.companyId && args[2] === f.agentId && gateEnabled && ++agentLocks === pauseAt) {
+      agentReady(); await toolGate;
+    }
+    return result;
+  });
+  const transaction = db.transaction.bind(db);
+  const failures: Array<Array<{ code?: string; message: string }>> = [];
+  db.transaction = (async (...args: Parameters<typeof db.transaction>) => {
+    try { return await transaction(...args); } catch (error) {
+      const chain: Array<{ code?: string; message: string }> = [];
+      for (let e = error as { code?: string; message: string; cause?: unknown } | undefined; e; e = e.cause as typeof e)
+        chain.push({ code: e.code, message: e.message });
+      failures.push(chain); throw error;
+    }
+  }) as typeof db.transaction;
+  const settle = <T,>(promise: Promise<T>) => promise.then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error: String(error) }));
+  let tool: ReturnType<typeof settle> | undefined, admission: ReturnType<typeof settle> | undefined;
+  try {
+    const targetIssueId = randomUUID(), workerId = randomUUID();
+    await db.insert(issues).values({ id: targetIssueId, companyId: f.companyId, title: "Target of Paul's incoming message", status: "todo", assigneeAgentId: f.agentId });
+    await db.insert(agents).values({ id: workerId, companyId: f.companyId, name: "Delegate", status: "idle", adapterType: "process" });
+    const call = { tool: "reassign_task", callId: `lock2-${round}`, arguments: {
+      idempotencyKey: `lock2-${round}`, taskId: targetIssueId, expectedAssigneeActorId: f.agentId,
+      expectedStatusVersion: 0, assigneeActorId: workerId, reason: "Delegate this task while a person message is admitted",
+    } };
+    if (phase === "recover") { await authority.execute(call); gateEnabled = true; }
+    tool = settle(phase === "recover" ? authority.recover(call).then(receipt => receipt?.result) : authority.execute(call));
+    let held = false; void agentHeld.then(() => { held = true; });
+    await vi.waitFor(() => expect(held).toBe(true), { timeout: 15_000 });
+    admission = settle(db.transaction(async tx => {
+      await tx.execute(sql`set local deadlock_timeout = '100ms'`);
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, targetIssueId)).for("update");
+      targetAcquired = true; await admissionGate;
+      await lockAgentForRunAdmission(tx, { companyId: f.companyId, agentId: f.agentId });
+      return "admission-committed";
+    }));
+    // On head, admission cannot acquire the target: the tool already fenced BOTH issues.
+    const until = Date.now() + 500;
+    while (!targetAcquired && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 5));
+    const protectedByEarlierIssueLock = !targetAcquired;
+    releaseTool(); releaseAdmission();
+    const outcomes = await Promise.all([tool, admission]);
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    const [target] = await db.select().from(issues).where(eq(issues.id, targetIssueId));
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
+    const result = { round, phase, targetIssueId, sourceIssueId: f.issueId, companyId: f.companyId,
+      runId: f.runId, protectedByEarlierIssueLock, failures, outcomes,
+      deadlocks: await deadlocks() - before.deadlocks, retries: transactionRetryStats.retried - before.retries,
+      assigneeAgentId: target.assigneeAgentId, expectedAssigneeAgentId: workerId,
+      setupFailed: runs.filter(run => run.errorCode === "setup_failed").length };
+    console.info("LOCK2 crossissue evidence", JSON.stringify(result));
+    if (process.env.PAPERCLIP_STEER_RED_EVIDENCE) await writeFile(join(process.env.PAPERCLIP_STEER_RED_EVIDENCE, `lock2-${phase === "prepare" ? "cross" : phase}-${round}.json`), JSON.stringify(result, null, 2));
+    expect(result.deadlocks).toBe(0); expect(result.retries).toBe(0); expect(failures).toEqual([]);
+    expect(outcomes.every(outcome => outcome.ok)).toBe(true);
+    expect(target.assigneeAgentId).toBe(workerId); expect(result.setupFailed).toBe(0);
+    // Replay exercises the receipt-only path after preparation; it must retain the same authority fences.
+    const replay = await authority.execute({ tool: "reassign_task", callId: `lock2-replay-${round}`, arguments: {
+      idempotencyKey: `lock2-${round}`, taskId: targetIssueId, expectedAssigneeActorId: f.agentId,
+      expectedStatusVersion: 0, assigneeActorId: workerId, reason: "Delegate this task while a person message is admitted",
+    } });
+    expect(replay).toEqual(outcomes[0].ok ? outcomes[0].value : undefined);
+  } finally {
+    releaseTool(); releaseAdmission(); await Promise.all([tool, admission]);
+    observe.mockRestore(); db.transaction = transaction; authority.close(); await f.complete(); await f.close();
+  }
+}
+it.each([1, 2, 3])("LOCK2 crossissue %i: reassign preparation and target admission both commit without retry", round => crossIssueAdmissionRace(round), 60_000);
+it.each(["commit", "recover"] as const)("LOCK2 %s: target admission cannot invert the second phase or receipt recovery", phase => crossIssueAdmissionRace(phase === "commit" ? 4 : 5, phase), 60_000);
+
+it("LOCK2 same issue: reassign current task retains its existing refusal and assignment", async () => {
+  const f = await fixture("lock2same");
+  const authority = new PaperclipRunnerToolAuthority(db, { companyId: f.companyId, issueId: f.issueId, agentId: f.agentId, runId: f.runId });
+  try {
+    await expect(authority.execute({ tool: "reassign_task", callId: "lock2-same", arguments: {
+      idempotencyKey: "lock2-same", taskId: f.issueId, expectedAssigneeActorId: f.agentId,
+      expectedStatusVersion: 0, assigneeActorId: f.agentId, reason: "Keep this task's current assignment",
+    } })).rejects.toThrow("paperclip_runner_reassignment_current_task");
+    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    expect(issue.assigneeAgentId).toBe(f.agentId); expect(issue.executionRunId).toBe(f.runId);
+  } finally { authority.close(); await f.complete(); await f.close(); }
+}, 60_000);
+
+// The full scheduler boundary, in addition to the exact review-fleet-3 lock schedule.
+// Keep the target's owner unchanged so the admitted person's message can run after
+// the original source task releases its agent slot, rather than changing its recipient.
+it.each([1, 2, 3])("LOCK2 live admission %i: real person wake races reassign without a deadlock or retry", async round => {
+  const f = await fixture(`lock2live${round}`);
+  const hb = await wiredHeartbeatFor(db, "test:lock2-live-admission");
+  const { transactionRetryStats } = await import("../services/transaction-retry.js");
+  const admissionLocks = await import("../services/heartbeat-run-admission-lock.js");
+  const targetId = randomUUID(), commentId = randomUUID(), body = `PAUL lock2 live ${round}`;
+  await db.insert(issues).values({ id: targetId, companyId: f.companyId, title: "Paul's target task", status: "todo", assigneeAgentId: f.agentId });
+  await db.insert(issueComments).values({ id: commentId, companyId: f.companyId, issueId: targetId, authorType: "user", authorUserId: f.userId, body });
+  f.owner.bodies.push(body); f.owner.finishTasks = true;
+  const deadlocks = async () => {
+    await db.execute(sql`select pg_stat_clear_snapshot()`);
+    return Number((await db.execute<{ n: string }>(sql`select deadlocks::text as n from pg_stat_database where datname = current_database()`))[0].n);
+  };
+  const before = { deadlocks: await deadlocks(), retries: transactionRetryStats.retried };
+  let releaseTool!: () => void, releaseAdmission!: () => void, agentAcquired = false, admissionReached = false;
+  const toolGate = new Promise<void>(resolve => { releaseTool = resolve; });
+  const admissionGate = new Promise<void>(resolve => { releaseAdmission = resolve; });
+  const realWriteLock = cancellationLocks.lockAgentForRunWrite;
+  const writeObserve = vi.spyOn(cancellationLocks, "lockAgentForRunWrite").mockImplementation(async (...args) => {
+    const result = await realWriteLock(...args);
+    if (args[1] === f.companyId && args[2] === f.agentId) { agentAcquired = true; await toolGate; }
+    return result;
+  });
+  const realAdmissionLock = admissionLocks.lockAgentForRunAdmission;
+  const admissionErrors: string[] = [];
+  const admissionObserve = vi.spyOn(admissionLocks, "lockAgentForRunAdmission").mockImplementation(async (...args) => {
+    if (args[1].companyId === f.companyId) {
+      admissionReached = true; await args[0].execute(sql`set local deadlock_timeout = '100ms'`); await admissionGate;
+    }
+    try { return await realAdmissionLock(...args); } catch (error) {
+      admissionErrors.push(String((error as { cause?: { code?: string } }).cause?.code ?? (error as { code?: string }).code)); throw error;
+    }
+  });
+  const authority = new PaperclipRunnerToolAuthority(db, { companyId: f.companyId, issueId: f.issueId, agentId: f.agentId, runId: f.runId });
+  const settle = <T,>(promise: Promise<T>) => promise.then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error: String(error) }));
+  let tool: ReturnType<typeof settle> | undefined, admission: ReturnType<typeof settle> | undefined;
+  try {
+    tool = settle(authority.execute({ tool: "reassign_task", callId: `lock2-live-${round}`, arguments: {
+      idempotencyKey: `lock2-live-${round}`, taskId: targetId, expectedAssigneeActorId: f.agentId,
+      expectedStatusVersion: 0, assigneeActorId: f.agentId, reason: "Confirm the target's existing owner while admitting Paul's message",
+    } }));
+    await vi.waitFor(() => expect(agentAcquired).toBe(true), { timeout: 15_000 });
+    admission = settle(hb.wakeup(f.agentId, { source: "automation", triggerDetail: "system", reason: "issue_commented",
+      requestedByActorType: "user", requestedByActorId: f.userId, idempotencyKey: `lock2-person-${round}`,
+      payload: { issueId: targetId, commentId, mutation: "comment" },
+      contextSnapshot: { issueId: targetId, taskId: targetId, wakeCommentId: commentId, wakeCommentIds: [commentId], skipIssueComment: false } }));
+    const until = Date.now() + 500;
+    while (!admissionReached && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 5));
+    const protectedByEarlierIssueLock = !admissionReached;
+    releaseTool(); releaseAdmission();
+    const outcomes = await Promise.all([tool, admission]);
+    await f.complete(); await hb.resumeQueuedRunsForAgent(f.companyId, f.agentId); await hb.drainActiveRunExecutions();
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, targetId));
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
+    const wakes = await f.wakes();
+    const answers = comments.filter(comment => comment.authorAgentId === f.agentId).map(comment => comment.body).join("\n").split(`ANSWER:${body}`).length - 1;
+    const result = { round, companyId: f.companyId, sourceIssueId: f.issueId, targetId, commentId, outcomes,
+      protectedByEarlierIssueLock, admissionErrors, deadlocks: await deadlocks() - before.deadlocks,
+      retries: transactionRetryStats.retried - before.retries, answers,
+      setupFailed: runs.filter(run => run.errorCode === "setup_failed").length,
+      runs: runs.map(run => ({ id: run.id, issueId: run.nativeIssueId, status: run.status, errorCode: run.errorCode })),
+      wakes: wakes.map(wake => ({ id: wake.id, status: wake.status, runId: wake.runId, payload: wake.payload })) };
+    console.info("LOCK2 live admission evidence", JSON.stringify(result));
+    if (process.env.PAPERCLIP_STEER_RED_EVIDENCE) await writeFile(join(process.env.PAPERCLIP_STEER_RED_EVIDENCE, `lock2-live-${round}.json`), JSON.stringify(result, null, 2));
+    expect(outcomes.every(outcome => outcome.ok)).toBe(true); expect(result.deadlocks).toBe(0);
+    expect(result.retries).toBe(0); expect(admissionErrors).toEqual([]); expect(result.answers).toBe(1); expect(result.setupFailed).toBe(0);
+  } finally {
+    releaseTool(); releaseAdmission(); await Promise.all([tool, admission]);
+    writeObserve.mockRestore(); admissionObserve.mockRestore(); authority.close(); await f.close();
+  }
+}, 90_000);

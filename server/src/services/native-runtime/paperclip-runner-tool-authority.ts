@@ -2427,17 +2427,27 @@ export class PaperclipRunnerToolAuthority {
       if (prior.details?.inputFingerprint !== fingerprint) throw new Error("paperclip_runner_tool_idempotency_conflict");
       return record(prior.details?.receipt);
     };
+    const lockIssues = async (tx: Db) => {
+      // Fence BOTH tasks before the actor SHARE lock. Admission of the target
+      // takes target UPDATE -> actor UPDATE; locking it after the actor would
+      // invert that order. Use the same order in preparation, commit and replay.
+      for (const issueId of [this.binding.issueId, taskId].sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))) {
+        await tx.select({ id: issues.id }).from(issues).where(and(
+          eq(issues.id, issueId), eq(issues.companyId, this.binding.companyId),
+        )).for("update", this.binding.museRuntime && issueId === taskId ? { noWait: true } : undefined).catch((error: unknown) => {
+          if (this.binding.museRuntime && issueId === taskId &&
+              (record(error).code === "55P03" || record(record(error).cause).code === "55P03")) {
+            throw new HttpError(409, "paperclip_runner_reassignment_conflict: target is busy; retry after current work settles");
+          }
+          throw error;
+        });
+      }
+    };
     const authorize = async (tx: Db, run: typeof heartbeatRuns.$inferSelect) => {
-      // Muse idle comments lock this target before admission. Never wait for
-      // their target while holding the caller's admission lock.
+      // lockIssues already fenced the target before mutation-context authority.
       const [target] = await tx.select().from(issues).where(and(
         eq(issues.id, taskId), eq(issues.companyId, this.binding.companyId),
-      )).for("update", this.binding.museRuntime ? { noWait: true } : undefined).catch((error: unknown) => {
-        if (this.binding.museRuntime && (record(error).code === "55P03" || record(record(error).cause).code === "55P03")) {
-          throw new HttpError(409, "paperclip_runner_reassignment_conflict: target is busy; retry after current work settles");
-        }
-        throw error;
-      });
+      ));
       if (!target) throw new Error("paperclip_runner_task_not_found");
       const actor = this.#privacyActor(run);
       for (const action of ["issue:read", "tasks:assign"] as const) {
@@ -2475,6 +2485,7 @@ export class PaperclipRunnerToolAuthority {
     // Stop outside row locks: the runtime needs those locks to acknowledge cancellation.
     // A second locked check below prevents any intervening ownership/version change.
     const prepared = receiptOnly ? null : await withTransactionRetry(this.db, () => this.db.transaction(async (tx) => {
+      await lockIssues(tx as unknown as Db);
       const context = await this.#lockAuthorizedMutationContext(tx as unknown as Db);
       if (context.issue.workMode !== "standard") throw new Error("paperclip_runner_tool_mode_denied");
       const target = await authorize(tx as unknown as Db, context.run);
@@ -2565,7 +2576,7 @@ export class PaperclipRunnerToolAuthority {
       });
       publication = activity.publication;
       return receipt;
-    }, { receiptOnly, beforeAttempt: () => { publication = null; },
+    }, { receiptOnly, beforeAttempt: () => { publication = null; }, beforeContextLock: lockIssues,
       beforeReceiptReplay: async (tx, context) => { await authorize(tx, context.run); } }).catch(async (error: unknown) => {
       await restoreInterruptedWork(error);
       throw error;
@@ -3194,6 +3205,8 @@ export class PaperclipRunnerToolAuthority {
       receiptOnly?: boolean;
       /** Runs at the start of every transaction attempt: reset caller closure state a rolled-back attempt set. */
       beforeAttempt?: () => void;
+      /** Fence additional issues in a stable order before the context's agent/run locks, including replay. */
+      beforeContextLock?: (tx: Db) => Promise<void>;
       onDefinitePreCommitFailure?: () => Promise<void>;
       beforeReceiptReplay?: (
         tx: Db,
@@ -3207,6 +3220,7 @@ export class PaperclipRunnerToolAuthority {
   ): Promise<unknown> {
     const mutate = async (tx: ExternalAdmissionTransaction) => {
       try {
+        if (options.beforeContextLock) await options.beforeContextLock(tx as unknown as Db);
         const context = await this.#lockAuthorizedMutationContext(
           tx as unknown as Db,
         );
