@@ -1005,6 +1005,46 @@ describe("agent directory collection aborted after the canonical commit boundary
     expect.soft(lockFreeAfter).toBe(true);
   }, 60_000);
 
+  it("R15 a failed-save record held mid-write for 10 s: answer within 200 ms + 200 ms slack as still saving; settle records the failed hold and DB == tree", async () => {
+    const BOUND_MS = 200, ANSWER_SLACK_MS = 200, RECORD_HOLD_MS = 10_000;
+    const { service, executionTarget, runId, note } = await stoppedRunWithUnsavedNote({ agentFileLateAbortSettleMs: BOUND_MS });
+    const before = await canonical(note);
+    await plantDurableHeadRejection();
+    const slow = "planted_ten_second_failed_save_record";
+    await db.execute(sql.raw(`create or replace function ${slow}() returns trigger language plpgsql as $$
+      begin if new.company_id = '${companyId}'::uuid and new.error_code = 'AGENT_FILES_SAVE_FAILED' and old.error_code is distinct from 'AGENT_FILES_SAVE_FAILED'
+        then perform pg_sleep(${RECORD_HOLD_MS / 1000}); end if; return new; end $$`));
+    await db.execute(sql.raw(`create trigger ${slow} before update on agent_instruction_working_copies for each row execute function ${slow}()`)); // PLANTED 10 s mid-write hold, in real PostgreSQL
+    plantedInPostgres.push(`drop function if exists ${slow}() cascade`);
+    const { controller, reason, fault } = plantAbortAsPersistStarts(note, false);
+    const collection = outcomeOf(service.collectStopped({ companyId, runId, target: executionTarget, signal: controller.signal }));
+    const timedAnswer = collection.then(value => ({ ...value, at: performance.now() }));
+    await Promise.race([sleep(15_000), collection, (async () => { while (!fault.abortedAt) await sleep(5); })()]);
+    const atDeadline = await Promise.race([timedAnswer, sleep(Math.max(0, fault.abortedAt + BOUND_MS + ANSWER_SLACK_MS - performance.now())).then(() => null)]);
+    const recordedAtDeadline = await copyRow(runId), lockFreeAtDeadline = await independentPoolCanTakeLock();
+    const answer = await timedAnswer;
+    await drainAgentFileCheckpoints();
+    await appliesSettled();
+    const recorded = await copyRow(runId), after = await canonical(note), lockFreeAfter = await independentPoolCanTakeLock();
+    await evidence("r15-ten-second-mid-write-bound.json", { boundMs: BOUND_MS, answerSlackMs: ANSWER_SLACK_MS, recordHoldMs: RECORD_HOLD_MS,
+      fault: { ...fault, abortedAt: undefined }, answeredWithinBoundAndSlack: atDeadline !== null, answeredAfterAbortMs: answer.at - fault.abortedAt,
+      reported: briefRow(answer.row), error: answer.error ? String(answer.error) : null, recordedAtDeadline: briefRow(recordedAtDeadline), lockFreeAtDeadline,
+      recorded: briefRow(recorded), before, after, lockFreeAfter });
+    expect.soft(fault).toMatchObject({ applies: 1, appliesSettled: 1, realPersistCalls: 1, treeMergedAtPersist: true });
+    expect.soft(atDeadline, "the 10 s failed-save UPDATE must not extend the caller's bound").not.toBeNull();
+    expect.soft(answer.at - fault.abortedAt).toBeLessThanOrEqual(BOUND_MS + ANSWER_SLACK_MS);
+    expect.soft(answer.error, "never cancelled").toBeNull();
+    expect.soft(answer.error).not.toBe(reason);
+    expect.soft(answer.row, "never saved or failed-save before its record is durable").toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_SAVE_STILL_RUNNING",
+      receipt: { abortCameTooLate: true, savePending: { code: "AGENT_FILES_SAVE_STILL_RUNNING" } } });
+    expect.soft(recordedAtDeadline.errorCode, "fixture: failed-save record really is still in flight").toBeNull();
+    expect.soft(lockFreeAtDeadline, "the mid-write collection keeps its lock after answering").toBe(false);
+    expect.soft(recorded).toMatchObject({ ...failedHold, receipt: { abortCameTooLate: true, savePending: { code: "AGENT_FILES_SAVE_FAILED" } } });
+    expect.soft(after.manifestHash, "settled durable DB == raw tree").toBe(after.treeHash);
+    expect.soft(after).toMatchObject({ generation: before.generation, manifestHasNote: false, treeHasNote: false });
+    expect.soft(lockFreeAfter).toBe(true);
+  }, 60_000);
+
   it("R14 the failed-save hold is still being WRITTEN when the bound passes (PostgreSQL delays that write), then the unpin lingers: the collection answers as soon as the hold is durable, not when its bookkeeping ends", async () => {
     const BOUND_MS = 200, RECORD_MS = 1_500, OBSERVE_MS = 1_500;
     const { service, executionTarget, runId, note } = await stoppedRunWithUnsavedNote({ agentFileLateAbortSettleMs: BOUND_MS });
