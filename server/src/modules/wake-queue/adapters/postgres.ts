@@ -1,3 +1,5 @@
+import { UNANSWERED_MESSAGE_LOOKBACK_MS } from "../../../services/recovery/unanswered-person-message.js";
+import { DEFERRED_PERSON_WAKE_BOUND_MS } from "../domain/policy.js";
 import { getServerProcessStartedAt } from "../../../server-info.js";
 import { settleUnansweredPersonMessage } from "../../../services/recovery/unanswered-person-message.js";
 import { insertIssueComment } from "../../../services/issue-comment-writes.js";
@@ -275,7 +277,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         paused: !invokability.invokable && invokability.reason === "paused" };
     },
 
-    async findNextDeferredWake({ companyId, issueId, excludedWakeIds }) {
+    async findNextDeferredWake({ companyId, issueId, excludedWakeIds, personWakeDueAt }) {
       const locallyExcludedWakeIds = [...(excludedWakeIds ?? [])];
       while (true) {
         const row = await tx
@@ -285,6 +287,10 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
             and(
               eq(agentWakeupRequests.companyId, companyId),
               eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+              personWakeDueAt ? eq(agentWakeupRequests.source, "on_demand") : undefined,
+              personWakeDueAt ? eq(agentWakeupRequests.requestedByActorType, "user") : undefined,
+              personWakeDueAt ? sql`${agentWakeupRequests.updatedAt} >= ${new Date(Date.parse(getServerProcessStartedAt()) - UNANSWERED_MESSAGE_LOOKBACK_MS).toISOString()}::timestamptz` : undefined,
+              personWakeDueAt ? sql`${agentWakeupRequests.updatedAt} <= ${new Date(personWakeDueAt.getTime() - DEFERRED_PERSON_WAKE_BOUND_MS).toISOString()}::timestamptz` : undefined,
               locallyExcludedWakeIds.length ? notInArray(agentWakeupRequests.id, locallyExcludedWakeIds) : undefined,
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
               interruptQueueId ? eq(agentWakeupRequests.id, interruptQueueId) : undefined,
@@ -1548,6 +1554,8 @@ export function createWakeAdmissionWriter(): WakeAdmissionWriter {
       )).for("update");
       if (!prior) throw new Error("wake-queue: the deferred wake to merge into was not found for this company");
       const priorPayload = parseObject(prior.payload), issueId = readNonEmptyString(priorPayload.issueId);
+      if (issueId && prior.source === "on_demand" && (prior.requestedByActorType === "user" || input.manualUserWakeActorId))
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.staleIssueLocks, JSON.stringify({ companyId: input.companyId, issueId }));
       const previousComments = new Set(queuedCommentIdsFromWakePayload(priorPayload));
       const newComments = queuedCommentIdsFromWakePayload(input.mergedPayload).some(id => !previousComments.has(id));
       const newInteraction = readNonEmptyString(input.mergedPayload.interactionId);
@@ -1624,6 +1632,9 @@ export function createWakeAdmissionWriter(): WakeAdmissionWriter {
 
     async insertNewDeferredWake(scope, input) {
       const tx = requireAdmissionTx(scope, input.companyId);
+      const issueId = readNonEmptyString(input.payload.issueId);
+      if (issueId && input.source === "on_demand" && input.requestedByActorType === "user")
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.staleIssueLocks, JSON.stringify({ companyId: input.companyId, issueId }));
       await notifyDeferredExecutionWork(tx, { companyId: input.companyId });
       await tx.insert(agentWakeupRequests).values({
         ...input.durableReceipt,
@@ -1844,7 +1855,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           input.resumeStrandedQueue ? undefined : sql`${heartbeatRuns.id} <> ${run.id}`,
           or(eq(heartbeatRuns.nativeIssueId, issueRow.id),
             sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueRow.id}`),
-          or(inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+          or(inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry", ...(input.personWakeBound ? ["finalizing"] : [])]),
             input.resumeStrandedQueue ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (
               SELECT source.created_at, source.id FROM heartbeat_runs source
               WHERE source.company_id = ${input.companyId} AND source.id = ${run.id})` : undefined),

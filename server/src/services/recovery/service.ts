@@ -1,3 +1,6 @@
+import { getServerProcessStartedAt } from "../../server-info.js";
+import { UNANSWERED_MESSAGE_LOOKBACK_MS } from "./unanswered-person-message.js";
+import { DEFERRED_PERSON_WAKE_BOUND_MS } from "../../modules/wake-queue/domain/policy.js";
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
 import { wakeWaitersOfStalledIssues, type BlockerStallWakeup } from "./blocker-stall-wakeups.js";
 import { INTERACTION_DELIVERY_DENIED, isInteractionDeliveryDeniedRun } from "../agent-interaction-delivery.js";
@@ -1005,7 +1008,8 @@ export function recoveryService(
     /** The one release drain for a TERMINAL execution owner whose own release never ran its drain (a native
      * turn whose workspace finalization was busy returns before it: heartbeat.ts executor). It clears the lock
      * and promotes deferred wakes under all its own gates; the bare clear below starts nothing. */
-    releaseTerminalExecutionOwner?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void>;
+    releaseTerminalExecutionOwner?: (run: typeof heartbeatRuns.$inferSelect,
+      options?: { personWakeBound?: boolean }) => Promise<void>;
     /**
      * Whether a failed or interrupted run has consumed every bounded
      * transient retry, so `scheduleRecoveryRetry` can no longer produce a
@@ -7200,6 +7204,44 @@ export function recoveryService(
         && TERMINAL_HEARTBEAT_RUN_STATUSES.has(owner.status)) {
         await deps.releaseTerminalExecutionOwner(owner).catch(err =>
           logger.warn({ err, issueId: issue.id, runId: owner.id }, "release drain after stale-lock clear failed; lock remains released"));
+      }
+    }
+
+    // A last-millisecond coalesce can outlive the normal release handoff.
+    // Re-enter that SAME drain, never synthesize a wake or copy message IDs.
+    // The adapter rechecks quiet time, actor, finalization and successor under
+    // the issue lock shared by Send and end-of-run release.
+    if (deps.releaseTerminalExecutionOwner) {
+      const personWakes = await db.select({ companyId: agentWakeupRequests.companyId,
+        agentId: agentWakeupRequests.agentId, issueId: issues.id, updatedAt: agentWakeupRequests.updatedAt })
+        .from(agentWakeupRequests).innerJoin(issues, and(
+          eq(issues.companyId, agentWakeupRequests.companyId),
+          sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+        )).where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          eq(agentWakeupRequests.source, "on_demand"), eq(agentWakeupRequests.requestedByActorType, "user"),
+          // Historical input belongs to the existing boot notice path, not
+          // this live-handoff bound. A fresh coalesce makes a receipt current.
+          gte(agentWakeupRequests.updatedAt, new Date(Date.parse(getServerProcessStartedAt()) - UNANSWERED_MESSAGE_LOOKBACK_MS)),
+          opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
+          opts?.issueId ? eq(issues.id, opts.issueId) : undefined));
+      for (const wake of personWakes) {
+        const dueAt = wake.updatedAt.getTime() + DEFERRED_PERSON_WAKE_BOUND_MS;
+        if (dueAt > Date.now()) { opts?.onDeferredDeadline?.(dueAt); continue; }
+        const [live] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.companyId, wake.companyId),
+          or(eq(heartbeatRuns.nativeIssueId, wake.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${wake.issueId}`),
+          inArray(heartbeatRuns.status, ["queued", "running", "finalizing", "scheduled_retry"]),
+        )).limit(1);
+        if (live) continue;
+        const [source] = await db.select().from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.companyId, wake.companyId), eq(heartbeatRuns.agentId, wake.agentId),
+          or(eq(heartbeatRuns.nativeIssueId, wake.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${wake.issueId}`),
+          inArray(heartbeatRuns.status, [...TERMINAL_HEARTBEAT_RUN_STATUSES]), isNotNull(heartbeatRuns.finishedAt),
+        )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+        if (!source) continue;
+        await deps.releaseTerminalExecutionOwner(source, { personWakeBound: true }).catch(err =>
+          logger.warn({ err, issueId: wake.issueId, runId: source.id }, "deferred person wake release will retry"));
+        opts?.onDeferredDeadline?.(Date.now() + DEFERRED_PERSON_WAKE_BOUND_MS);
       }
     }
 
