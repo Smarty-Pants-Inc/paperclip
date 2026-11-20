@@ -654,8 +654,10 @@ export async function prepareManagedAiRuntime(
 }
 
 /** Whether a probe's cleanup failure carries an unrecoverable native session
- * close (matched by code across the vendored and source runtime boundaries). */
-function nativeSessionCloseUnrecoverable(error: InstanceType<typeof NativeEnvironmentProbeCleanupError>): boolean {
+ * close (matched by code across the vendored and source runtime boundaries).
+ * A type guard, so the caller keeps the narrowed type even where the runner's
+ * declarations are unbuilt and `instanceof` (an `any` class) cannot narrow. */
+function nativeSessionCloseUnrecoverable(error: InstanceType<typeof NativeEnvironmentProbeCleanupError>): error is InstanceType<typeof NativeEnvironmentProbeCleanupError> {
   const seen = new Set<unknown>();
   const visit = (value: unknown, depth: number): boolean => {
     if (!value || typeof value !== "object" || depth > 4 || seen.has(value)) return false;
