@@ -4,7 +4,7 @@ import { recordNativeWorkspaceFinalizationFailure } from "../services/native-run
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { currentProcessSpaceHash } from "../services/controller-process-identity.js";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -57,10 +57,18 @@ import { CONTROL_PLANE_CONFORMANCE_RESULT, CONTROL_PLANE_CONFORMANCE_TERMINAL } 
 // Only Pi's RPC peer is scripted, at the existing executor backend test seam.
 // The comment route, wake admission, Pi driver, native executor, event persistence,
 // answer publication and queue/Stop readers remain production code.
+// answered-a4: a steer into a RUNNING turn reaches Pi as the person's text plus ONE instruction.
+// Literal on purpose: removing the sentence from the product must turn these rows red.
+const A4_INSTRUCTION = "Answer this message in your final reply too, even if you already answered it while working.";
+const steered = (body: string) => `${body}\n\n${A4_INSTRUCTION}`;
+const countOf = (text: string, needle: string) => text.split(needle).length - 1;
+
 class RecordingPiPeer {
   preAttached = false;
   previousRunEvents: unknown[] = [];
   clock = Date.now();
+  args: string[] = [];
+  systemPrompt: string | null = null;
   tick() { return ++this.clock; }
   closed = false;
   exited = false;
@@ -227,6 +235,9 @@ function backendFor(execution: Parameters<typeof realExecute>[0]["execution"], r
     piRpcThinkingLevel: "off", runtimeDirectory: workspace, runnerInstanceId,
     environment: { PI_CODING_AGENT_DIR: join(workspace, "agent") }, transportFactory: options => {
       const args = options.args ?? [];
+      peer.args = [...args];
+      const instructionFile = args.includes("--append-system-prompt") ? args[args.indexOf("--append-system-prompt") + 1] : undefined;
+      peer.systemPrompt = instructionFile && existsSync(instructionFile) ? readFileSync(instructionFile, "utf8") : null;
       peer.sessionFile = args[args.indexOf("--session") + 1];
       // The scripted Pi process owns its session file, just as real Pi does.
       // Keep a valid native header so the real driver's next-run recovery,
@@ -575,9 +586,9 @@ describe("native completion promotion (rf3-ibpair)", () => {
   }
   async function answerNewer(f: Awaited<ReturnType<typeof fixture>>, body: string) {
     const message = await f.post(body);
-    await vi.waitFor(() => expect(f.commands("steer").some(command => command.input?.message === body)).toBe(true));
+    await vi.waitFor(() => expect(f.commands("steer").some(command => command.input?.message === steered(body))).toBe(true));
     f.peer.boundary();
-    await vi.waitFor(() => expect(f.peer.replies).toContain(`ANSWER:${message.body}`));
+    await vi.waitFor(() => expect(f.peer.replies).toContain(`ANSWER:${steered(message.body)}`));
   }
   async function held(f: Awaited<ReturnType<typeof fixture>>, task: Awaited<ReturnType<typeof completionTask>>) {
     const delivery = await task.finish();
@@ -598,7 +609,7 @@ describe("native completion promotion (rf3-ibpair)", () => {
       const personWakes = () => f.wakes().then(rows => rows.filter(w => w.idempotencyKey === `conversation-comment:${message.id}`));
       await vi.waitFor(async () => expect(await personWakes()).toHaveLength(1), { timeout: 5000 });
       expect((await personWakes())[0]).toMatchObject({ status: "deferred_issue_execution", runId: null });
-      expect(f.peer.consumed).not.toContain(message.body);
+      expect(f.peer.consumed.filter(text => text.includes(message.body))).toEqual([]);
       expect(f.commands("steer")).toEqual([]);
       expect(f.owner.peers).toHaveLength(1);
       const started = Date.now();
@@ -1099,7 +1110,8 @@ describe("person comment default steering eligibility and asynchronous receipt",
       expect(prompts).toHaveLength(1);
       expect(String(prompts[0].input?.message)).toContain(last.body);
       for (const message of steered) {
-        expect(f.peer.replies.filter(reply => reply === `ANSWER:${message.body}`)).toHaveLength(1);
+        // answered-a4 (pick onto final5c3): `steered` is this row's local array here, so the steer text is spelled out.
+        expect(f.peer.replies.filter(reply => reply === `ANSWER:${message.body}\n\n${A4_INSTRUCTION}`)).toHaveLength(1);
         expect(String(prompts[0].input?.message)).not.toContain(message.body);
       }
       const after = (await f.comments()).filter(c => steered.some(m => m.id === c.id));
@@ -1111,7 +1123,7 @@ describe("person comment default steering eligibility and asynchronous receipt",
     try {
       const message = await f.post("TASK-M: change the next step, do not stop");
       expect(message).toMatchObject({ steeredIntoRunId: f.runId, steerDeliveredAt: null });
-      await vi.waitFor(() => expect(f.commands("steer").map(command => command.input?.message)).toEqual([message.body]));
+      await vi.waitFor(() => expect(f.commands("steer").map(command => command.input?.message)).toEqual([steered(message.body)]));
       expect(f.commands("abort")).toEqual([]);
       expect((await f.wakes()).filter(wake => JSON.stringify(wake.payload).includes(message.id))).toEqual([]);
       expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(1);
@@ -1144,7 +1156,7 @@ describe("person comment default steering eligibility and asynchronous receipt",
         expect(responses[0].body.id).toBe(responses[1].body.id);
         expect((await f.comments()).filter(comment => comment.clientRequestId === clientRequestId)).toHaveLength(1);
         release(); await waitForPendingCommentSteers();
-        expect(f.commands("steer").map(command => command.input?.message)).toEqual([body]);
+        expect(f.commands("steer").map(command => command.input?.message)).toEqual([steered(body)]);
         expect((await f.wakes()).filter(wake => JSON.stringify(wake.payload).includes(responses[0].body.id))).toEqual([]);
         expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(1);
         f.peer.boundary();
@@ -1152,7 +1164,7 @@ describe("person comment default steering eligibility and asynchronous receipt",
           const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
           expect(run.contextSnapshot?.answeredSteeredCommentIds).toEqual([responses[0].body.id]);
         });
-        expect(f.peer.consumed).toEqual([body]);
+        expect(f.peer.consumed).toEqual([steered(body)]);
       } finally { release(); await f.close(); }
     }, 45_000,
   );
@@ -1191,10 +1203,10 @@ describe("person comment default steering eligibility and asynchronous receipt",
       if (took) {
         // Mid-run reply publication belongs to the parallel builder. This gate
         // checks the native answer/read/carry boundary, not that separate writer.
-        expect(f.peer.replies.filter(reply => reply === `ANSWER:${message.body}`)).toHaveLength(1);
+        expect(f.peer.replies.filter(reply => reply === `ANSWER:${steered(message.body)}`)).toHaveLength(1);
         expect((await f.wakes()).filter(w => !w.runId && JSON.stringify(w.payload).includes(message.id))).toEqual([]);
       } else await vi.waitFor(async () => { await f.assertAnsweredOnce([message]); }, { timeout: 15_000 });
-      expect(f.peer.consumed.filter(body => body === message.body)).toHaveLength(took ? 1 : 0);
+      expect(f.peer.consumed.filter(body => body === steered(message.body))).toHaveLength(took ? 1 : 0);
       const successors = f.owner.peers.slice(1).flatMap(peer => peer.requests.filter(r => r.type === "prompt"));
       expect(successors.filter(r => String(r.input?.message).includes(message.body))).toHaveLength(took ? 0 : 1);
     } finally { release(); fault.mockRestore(); await f.close(); }
@@ -1222,7 +1234,7 @@ describe("person comment default steering eligibility and asynchronous receipt",
       await f.complete();
       await f.startDelivery();
       await vi.waitFor(async () => { await f.assertAnsweredOnce([message]); }, { timeout: 15_000 });
-      expect(f.peer.consumed).not.toContain(message.body);
+      expect(f.peer.consumed.filter(text => text.includes(message.body))).toEqual([]);
       expect(f.owner.peers.slice(1).flatMap(peer => peer.requests.filter(r => r.type === "prompt"))
         .filter(r => String(r.input?.message).includes(message.body))).toHaveLength(1);
       await new Promise<void>(resolve => setImmediate(resolve));
@@ -1253,7 +1265,7 @@ describe("person comment default steering eligibility and asynchronous receipt",
       // event has occurred; acceptance must not be labelled delivered.
       expect((await f.wakes()).filter(wake => messages.some(message => JSON.stringify(wake.payload).includes(message.id)))).toEqual([]);
       release();
-      await vi.waitFor(() => expect(f.commands("steer").map(command => command.input?.message)).toEqual(messages.map(message => message.body)), { timeout: 10_000 });
+      await vi.waitFor(() => expect(f.commands("steer").map(command => command.input?.message)).toEqual(messages.map(message => steered(message.body))), { timeout: 10_000 });
       f.peer.boundary();
       await vi.waitFor(async () => {
         const thread = (await request(f.app).get(`/api/issues/${f.issueId}/comments`).expect(200)).body;
@@ -1272,5 +1284,122 @@ describe("person comment default steering eligibility and asynchronous receipt",
       }, null, 2));
       await f.close();
     }
+  }, 60_000);
+});
+
+// answered-a4 (PERSON CASE gate runs 1f10e1c8, 8fa5ce12, b4dfae3f): a steered question answered only in
+// working text ("101") never reached the chat, because only the final is posted. Real producer per
+// RULING-FIXTURES-FROM-REAL-PRODUCER-1118: comment POST route -> conversation steering -> steerNativeSession
+// -> production PiRpcDriver through the real Pi app-server proxy; only Pi's RPC peer is scripted.
+describe("answered-a4: a steer into a running turn asks for the answer in the final reply", () => {
+  // The scripted model of the recorded shape: it answers the steer in working text next to a tool
+  // call, then writes its final. It restates the answer in the final only when told to.
+  function workingTextAnswerThenFinal(peer: RecordingPiPeer, answer: string, finalBase = "Original work done.") {
+    peer.toolEnd("step-1"); peer.toolStart("step-2"); peer.toolEnd("step-2");
+    peer.send({ type: "turn_end", toolResults: [] });
+    const inputs = peer.pending.splice(0);
+    for (const text of inputs) { peer.send({ type: "turn_start" }); peer.user(text); peer.consumed.push(text); }
+    peer.assistant([{ type: "text", text: answer },
+      { type: "toolCall", id: "after-steer", name: "bash", arguments: { command: "echo after-steer" } }], "toolUse");
+    peer.toolStart("after-steer"); peer.toolEnd("after-steer");
+    peer.send({ type: "turn_end", toolResults: [] });
+    peer.send({ type: "turn_start" });
+    const told = inputs.some(text => text.includes(A4_INSTRUCTION));
+    const final = told ? `${finalBase} You also asked what is 100+1: ${answer}.` : finalBase;
+    peer.replies.push(final);
+    const message = peer.assistant([{ type: "text", text: final }]);
+    peer.send({ type: "turn_end", message, toolResults: [] });
+    peer.finish();
+  }
+
+  it("S1: a steer delivered mid-turn reaches the Pi session with the instruction exactly once", async () => {
+    const f = await fixture("A4-S1");
+    try {
+      const message = await f.post("what is 100+1?");
+      expect(message).toMatchObject({ steeredIntoRunId: f.runId });
+      await vi.waitFor(() => expect(f.commands("steer")).toHaveLength(1));
+      const sent = String(f.commands("steer")[0].input?.message);
+      expect(sent).toBe(steered(message.body));
+      expect(countOf(sent, A4_INSTRUCTION)).toBe(1);
+      f.peer.boundary();
+      // What the Pi session actually reads: the user message it emitted for that steer.
+      expect(f.peer.consumed).toEqual([steered(message.body)]);
+      expect(countOf(f.peer.consumed[0], A4_INSTRUCTION)).toBe(1);
+      process.stdout.write(`A4 S1 evidence ${JSON.stringify({ steerRequest: f.commands("steer")[0].input, consumed: f.peer.consumed })}\n`);
+    } finally { await f.close(); }
+  }, 45_000);
+
+  it("S2: two steers in one turn each carry the instruction once, no duplication", async () => {
+    const f = await fixture("A4-S2");
+    try {
+      const first = await f.post("what is 100+1?");
+      const second = await f.post("and what is 2+2?");
+      await vi.waitFor(() => expect(f.commands("steer")).toHaveLength(2), { timeout: 10_000 });
+      expect(f.commands("steer").map(command => command.input?.message)).toEqual([steered(first.body), steered(second.body)]);
+      f.peer.boundary();
+      expect(f.peer.consumed).toEqual([steered(first.body), steered(second.body)]);
+      for (const text of f.peer.consumed) expect(countOf(text, A4_INSTRUCTION)).toBe(1);
+      expect(countOf(f.peer.consumed.join("\n"), A4_INSTRUCTION)).toBe(2);
+    } finally { await f.close(); }
+  }, 45_000);
+
+  it("S3: a queued (not steered) message reaches the next turn WITHOUT the instruction", async () => {
+    const f = await fixture("A4-S3", true, false);
+    try {
+      const message = await f.post("A4-QUEUED: what is 100+1?", "queue");
+      await waitForPendingCommentSteers();
+      expect(f.commands("steer")).toEqual([]);
+      f.peer.boundary();
+      await f.complete();
+      await f.startDelivery();
+      await vi.waitFor(async () => { await f.assertAnsweredOnce([message]); }, { timeout: 15_000 });
+      const prompts = f.owner.peers.slice(1).flatMap(peer => peer.requests.filter(r => r.type === "prompt"))
+        .map(r => String(r.input?.message));
+      expect(prompts.filter(prompt => prompt.includes(message.body))).toHaveLength(1);
+      for (const prompt of prompts) expect(prompt).not.toContain(A4_INSTRUCTION);
+      for (const peer of f.owner.peers) expect(peer.consumed.join("\n")).not.toContain(A4_INSTRUCTION);
+    } finally { await f.close(); }
+  }, 60_000);
+
+  it("S4: the start-of-session prompt and the system prompt carry no instruction (normalized bytes written for base/head compare)", async () => {
+    const f = await fixture("A4-S4");
+    try {
+      const prompt = String(f.commands("prompt")[0]?.input?.message);
+      expect(prompt).toContain("Do the original two-step work.");
+      expect(prompt).not.toContain(A4_INSTRUCTION);
+      expect(f.peer.systemPrompt, "the real driver wrote its --append-system-prompt file").toEqual(expect.any(String));
+      expect(f.peer.systemPrompt).not.toContain(A4_INSTRUCTION);
+      if (process.env.A4_S4_OUT) {
+        const normalize = (text: string) => text.split(root).join("<ROOT>")
+          .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, "<UUID>")
+          .replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z/g, "<TS>")
+          .replace(/\b[0-9a-f]{16,}\b/gi, "<HEX>").replace(/\bSA4S4-\d+\b/g, "<IDENT>");
+        await writeFile(process.env.A4_S4_OUT, `=== start-of-session prompt\n${normalize(prompt)}\n=== system prompt (--append-system-prompt file)\n${normalize(f.peer.systemPrompt ?? "")}\n`);
+      }
+    } finally { await f.close(); }
+  }, 45_000);
+
+  it("S6: steer 'what is 100+1?' answered in working text -> exactly ONE posted reply, and it contains 101", async () => {
+    const f = await fixture("A4-S6", true, false);
+    try {
+      const message = await f.post("what is 100+1?");
+      await vi.waitFor(() => expect(f.commands("steer")).toHaveLength(1));
+      workingTextAnswerThenFinal(f.peer, "101");
+      await f.complete();
+      await f.startDelivery(true);
+      await vi.waitFor(async () => {
+        const posted = (await f.comments()).filter(comment => comment.authorType === "agent");
+        expect(posted.length).toBeGreaterThan(0);
+      }, { timeout: 15_000 });
+      await heartbeatService(db).drainActiveRunExecutions();
+      await new Promise(resolve => setTimeout(resolve, 300));
+      const thread = (await request(f.app).get(`/api/issues/${f.issueId}/comments`).expect(200)).body as Array<{ id: string; authorType: string; body: string }>;
+      const posted = thread.filter(comment => comment.authorType !== "user");
+      process.stdout.write(`A4 S6 evidence ${JSON.stringify({ messageId: message.id, consumed: f.peer.consumed, posted })}\n`);
+      expect(posted, "exactly one posted reply, nothing else posted").toHaveLength(1);
+      expect(posted[0].body).toContain("101");
+      expect(posted[0].body).not.toContain(A4_INSTRUCTION);
+      expect(f.owner.peers).toHaveLength(1);
+    } finally { await f.close(); }
   }, 60_000);
 });

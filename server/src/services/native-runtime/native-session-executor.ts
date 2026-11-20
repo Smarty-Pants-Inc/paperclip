@@ -10764,6 +10764,10 @@ function clearSteeringDeliveries(runId: string) {
     if (key.startsWith(`${runId}:`)) steeringDeliveries.delete(key);
 }
 
+/** The one instruction a person message steered into a RUNNING turn carries (answered-a4): only the
+ * final reply is posted, so an answer given only in working text never reaches the person's chat. */
+export const STEER_ANSWER_IN_FINAL_INSTRUCTION = "Answer this message in your final reply too, even if you already answered it while working.";
+
 /** Dispatches a true same-turn steering message and resolves only after ack. */
 export async function steerNativeSession(input: {
   runId: string;
@@ -10801,7 +10805,7 @@ export async function steerNativeSession(input: {
     delivery = active.session
       .steer({
         turnId,
-        message: { role: "user", text: input.message },
+        message: { role: "user", text: `${input.message}\n\n${STEER_ANSWER_IN_FINAL_INSTRUCTION}` },
         correlationId: input.correlationId,
       })
       .then(() => ({ turnId }));
