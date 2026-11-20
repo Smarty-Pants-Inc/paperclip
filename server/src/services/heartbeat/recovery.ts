@@ -1921,6 +1921,21 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     let capped = 0;
     for (let row of rows) {
       if (pendingCleanupAttemptsInFlight.has(row.id)) continue;
+      // A terminal display state (including cancellation before launch) does
+      // not export a prepared workspace. Use the same persisted reference reader
+      // as release/retained-orphan recovery, with no terminal-kind exemption.
+      const owner = row.heartbeatRunId ? await getRun(row.heartbeatRunId) : null;
+      const workspace = owner?.companyId === row.companyId
+        ? readNativeWorkspaceSyncReference(owner.runnerProfileJson?.nativeWorkspaceSync) : null;
+      if (!hasStopOnlyCleanup(row) && workspace?.state === "prepared" && workspace.finalHostSha256 === null
+        && workspace.leaseId === row.id && workspace.providerLeaseId === row.providerLeaseId) {
+        await writeEnvironmentCleanup(db, tx => tx.update(environmentLeases).set({
+          updatedAt: new Date(), metadata: sql`${pendingCleanupMetadataObjectSql()} ||
+            '{"pendingCleanupHoldReason":"prepared_workspace_without_final_sha"}'::jsonb`,
+        }).where(and(eq(environmentLeases.id, row.id), eq(environmentLeases.status, "pending_cleanup"))),
+        { companyId: row.companyId, leaseId: row.id });
+        continue;
+      }
       // Convert an unsaved native allocation to stop-only BEFORE any hold can
       // defer destruction: stopping preserves the very bytes those holds need.
       if (!hasStopOnlyCleanup(row) && await nativeLeaseCustodyMissing(db, row.id)) {
@@ -2037,37 +2052,58 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           runId: row.heartbeatRunId ?? undefined, details: { attempt: attempts + 1, reason: "environment_deleted" },
         });
         if (useRecordedTeardown) {
-          // Tear the sandbox down from the recorded provider config and the
-          // cleanup-authorized secret versions. Preserve any provider receipt;
-          // a completed retry must grant the same evidence as initial cleanup.
-          // The durable stop-only claim owns this read. Provider I/O is outside
-          // all task/gate transactions; an exact stopped/destroyed observation
-          // settles through the SAME attempt-fenced receipt owner. Live, unknown
-          // or unavailable observations grant nothing and keep ordinary cleanup.
-          const observation = hasStopOnlyCleanup(lease) && !hasNativeWorkspaceExportResume(lease)
-            && !hasBoundRemoteStopReceipt(lease)
-            ? await environmentRuntime.inspectLeaseResource?.(lease.id).catch(() => undefined)
-            : undefined;
-          const observedStop = acceptedStopOnlyReceipt(lease, observation);
-          const endedStopAlreadyAttempted = attempts > 0
-            && (lease.metadata?.sandboxStopAndRetain as Record<string, unknown> | undefined)?.endedLeaseEvidence !== undefined;
-          // RFL 22:57Z (2): this receipt-less ended row authorizes ONE stop,
-          // not a new stop per read. Later bounded sweeps only look for proof.
-          // The durable attempt counter also preserves this bound on restart.
-          const receipt = observedStop ? observation : endedStopAlreadyAttempted ? undefined
-            : await environmentRuntime.retryPendingSandboxTeardown({ environment, lease });
-          const released = hasStopOnlyCleanup(lease)
-            ? await settleStopOnlyCleanup(db, lease, { attemptId: claimed, receipt,
-              ...(observedStop ? { receiptSource: "provider_inspection" as const } : {}) })
-            : await environmentsSvc.releaseLease(lease.id, "expired", {
-            expectedPendingCleanupAttemptId: claimed,
-            cleanupStatus: "success",
-            failureReason: "pending_cleanup_retry",
-            remoteExecutionTermination: remoteTerminationReceipt(lease, receipt),
-          });
-          if (released) {
-            destroyed += 1;
-            await recordAbandonedWorkspaceFilesRemoved(db, row);
+          // A recovery handoff proves execution stopped, not that its files
+          // survived. Read the exact provider allocation before destructive RPC.
+          // Exact absence settles without destroy; unknown/transport failure and
+          // an unfinished snapshot authorize nothing. Stop-only cleanup remains
+          // with its existing owner and is never converted into destroy here.
+          const recoveryObservation = recoveredCleanup && !hasStopOnlyCleanup(lease)
+            ? await environmentRuntime.inspectLeaseResource?.(lease.id) : undefined;
+          const recoveryGone = recoveryObservation?.providerLeaseId === lease.providerLeaseId
+            && recoveryObservation?.state === "destroyed";
+          if (recoveredCleanup && !hasStopOnlyCleanup(lease) && !recoveryGone
+            && !(recoveryObservation?.providerLeaseId === lease.providerLeaseId
+              && recoveryObservation.state === "stopped" && recoveryObservation.snapshot?.state === "completed"
+              && typeof recoveryObservation.snapshot.id === "string" && recoveryObservation.snapshot.id.trim().length > 0)) {
+            await writeEnvironmentCleanup(db, tx => tx.update(environmentLeases).set({
+              metadata: sql`${pendingCleanupMetadataObjectSql()} ||
+                '{"pendingCleanupHoldReason":"completed_provider_snapshot_missing"}'::jsonb`,
+            }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.status, "pending_cleanup"),
+              sql`${environmentLeases.metadata}->>'pendingCleanupAttemptId' = ${claimed}`)),
+            { companyId: lease.companyId, leaseId: lease.id });
+          } else {
+            // Tear the sandbox down from the recorded provider config and the
+            // cleanup-authorized secret versions. Preserve any provider receipt;
+            // a completed retry must grant the same evidence as initial cleanup.
+            // The durable stop-only claim owns this read. Provider I/O is outside
+            // all task/gate transactions; an exact stopped/destroyed observation
+            // settles through the SAME attempt-fenced receipt owner. Live, unknown
+            // or unavailable observations grant nothing and keep ordinary cleanup.
+            const observation = hasStopOnlyCleanup(lease) && !hasNativeWorkspaceExportResume(lease)
+              && !hasBoundRemoteStopReceipt(lease)
+              ? await environmentRuntime.inspectLeaseResource?.(lease.id).catch(() => undefined)
+              : undefined;
+            const observedStop = acceptedStopOnlyReceipt(lease, observation);
+            const endedStopAlreadyAttempted = attempts > 0
+              && (lease.metadata?.sandboxStopAndRetain as Record<string, unknown> | undefined)?.endedLeaseEvidence !== undefined;
+            // RFL 22:57Z (2): this receipt-less ended row authorizes ONE stop,
+            // not a new stop per read. Later bounded sweeps only look for proof.
+            // The durable attempt counter also preserves this bound on restart.
+            const receipt = recoveryGone ? recoveryObservation : observedStop ? observation : endedStopAlreadyAttempted ? undefined
+              : await environmentRuntime.retryPendingSandboxTeardown({ environment, lease });
+            const released = hasStopOnlyCleanup(lease)
+              ? await settleStopOnlyCleanup(db, lease, { attemptId: claimed, receipt,
+                ...(observedStop ? { receiptSource: "provider_inspection" as const } : {}) })
+              : await environmentsSvc.releaseLease(lease.id, "expired", {
+              expectedPendingCleanupAttemptId: claimed,
+              cleanupStatus: "success",
+              failureReason: "pending_cleanup_retry",
+              remoteExecutionTermination: remoteTerminationReceipt(lease, receipt),
+            });
+            if (released) {
+              destroyed += 1;
+              await recordAbandonedWorkspaceFilesRemoved(db, row);
+            }
           }
         } else if (environment) {
           const result = await environmentRuntime.destroyRunLease({
