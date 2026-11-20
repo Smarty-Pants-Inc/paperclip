@@ -143,11 +143,6 @@ function chainCarriesCommentSql(alias: string, commentId: SQL, m: PersonMessageS
       where ${carriesCommentSql("carrying", commentId, requireSteeredText)}))`;
 }
 
-// A presented card and either kind of reply remain an answer to the input
-// carried by its source run. Administrative invalidation alone does not prove
-// delivery; cancelled cards need evidence of a human skip/withdraw/cancel reply.
-const PERSON_MESSAGE_ANSWER_CARD_STATUSES = ["pending", "answered", "accepted", "rejected"] as const;
-
 /** The accepted result's own published reply (D3): identity, hash and finalization agree. */
 const ACCEPTED_RESULT_PUBLISHED_SQL = sql`(r.result_json#>>'{presentationDecision,commentId}' = a.id::text
   and exists (select 1 from ${nativeRunResults} accepted
@@ -159,31 +154,24 @@ const ACCEPTED_RESULT_PUBLISHED_SQL = sql`(r.result_json#>>'{presentationDecisio
         and committed.company_id = r.company_id and committed.result_id is not null and committed.result_id <> accepted.id)))`;
 
 /** A person message is answered by a published non-progress reply from a succeeded run (or its accepted result published),
- * an open or resolved interaction card on its run chain, or imported history. Answering the card is new input;
- * it never makes the original message unanswered again. Shared by recovery input selection (continuation-comment-input.ts) and the
+ * an agent-posted pending card addressed to this input after its carry, or imported history with a posted reply.
+ * A person's response to the card is new input, not the agent's reply: without a posted reply the original remains owed.
+ * Shared by recovery input selection (continuation-comment-input.ts) and the
  * unanswered-person-message notice, so the carry and the notice never disagree on a message.
  * - Provider acceptance/delivery alone is NOT an answer.
  * - A run-less agent comment NEVER answers (RFL 20:22Z): the Muse external agent's task.comment and agent chat
  *   messages outside a run post them.
- * - Imported history: a PERSON comment marked origin='import' at insertion, regardless of its source timestamp.
+ * - Imported history requires an imported AGENT reply posted after the person input.
+ *   Provenance is a PERSON comment marked origin='import' at insertion, regardless of its source timestamp.
  *   For legacy unmarked comments only, use the issue's import arrival record (issue.imported), or, for imports
  *   made before that record existed, the company's FIRST company.imported row on a company_import issue.
  *   With neither provenance nor an arrival record, nothing is history.
  */
 export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
-  // Failed-carrier exception (L1b, SMA-4 11-19 06:15:44Z d2840901): a message
-  // whose OWN carrying run FAILED without a reply was never seen through by the
-  // agent, so a reply to a LATER message does not answer it. It stays owed
-  // until a run that carries it (its re-delivery) answers, or its card stands.
-  // Reached clause (RFL 08:41Z): a reply to a LATER message answers m ONLY if m
-  // REACHED the agent: m was in some run's input (any carried key, including
-  // wakeCommentIds and context.commentId) of a run that STARTED (started_at, set
-  // at claim; a run cancelled before start never reached the model). A STEERED m counts as reached only
-  // when its matching text segment went into a model request (the persisted
-  // answeredSteeredCommentIds projection). This is carry/segment evidence,
-  // never an answer without the posted-reply/status/progress gates below. A message
-  // held and never carried stays owed (carried next, or a true card). Imported
-  // history is answered by its own arm below, never by this one.
+  // RFL by-purpose ruling: a later person's input reaching the agent never
+  // answers m. Every non-imported reply follows m's own durable carry chain.
+  // A pending agent card must name this input and be posted after its carry;
+  // a person's answer to a card is new input, not an agent's posted answer.
   // Half 1: a run-log acknowledgement is not a posted answer. All prose, including
   // steers, goes through this ONE published-reply arm and its success/progress gates.
   return sql`(exists (select 1 from ${issueComments} a
@@ -197,30 +185,20 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
       and not exists (select 1 from jsonb_each(case when jsonb_typeof(r.result_json->'semanticToolReceipts') = 'object'
           then r.result_json->'semanticToolReceipts' else '{}'::jsonb end) receipt
         where receipt.value->>'operationId' = 'report_progress' and receipt.value->'result'->>'commentId' = a.id::text)
-      and exists (select 1 from ${issueComments} b
-        where b.company_id = a.company_id and b.issue_id = a.issue_id and b.author_type = 'user'
-          and (b.id = ${m.id} or (b.created_at > ${m.createdAt}
-            -- A steer can overtake an earlier queued message: it answers only itself.
-            and not coalesce(r.context_snapshot->'steeredCommentIds', '[]'::jsonb) ? b.id::text
-            and not ${failedCarrierSql(m)}
-            -- Reached clause (RFL 08:41Z): ...and only if m REACHED the agent (see the comment above),
-            -- by a run that STARTED its turn: the claim sets started_at; a run cancelled before
-            -- start (still null) never put m before a model, so m stays owed.
-            and exists (select 1 from ${heartbeatRuns} rc
-              where rc.company_id = ${m.companyId} and rc.started_at is not null
-                and ${carriesCommentSql("rc", m.id, true)})))
-          and ${chainCarriesCommentSql("r", sql`b.id`, m)}))
+      -- A reply to a later person's input never answers this message merely
+      -- because an earlier run reached it. Follow this message's own carry.
+      and ${chainCarriesCommentSql("r", m.id, m)})
     or exists (select 1 from ${issueThreadInteractions} q
       join ${heartbeatRuns} r on r.id = q.source_run_id and r.company_id = q.company_id
       where q.company_id = ${m.companyId} and q.issue_id = ${m.issueId}
         and q.created_by_agent_id = r.agent_id
-        and (q.status in (${sql.join(PERSON_MESSAGE_ANSWER_CARD_STATUSES.map(status => sql`${status}`), sql`, `)})
-          or (q.status = 'cancelled' and q.resolved_by_user_id is not null
-            and (q.result->>'outcome' in ('skipped', 'withdrawn') or q.result->>'cancelled' = 'true')))
+        and q.created_by_user_id is null and q.status = 'pending'
+        and q.resolved_by_user_id is null
+        and coalesce(q.origin_comment_ids, '[]'::jsonb) ? ${m.id}::text
         and q.created_at > ${m.createdAt}
-        -- Preserve c3's explicit interaction-answer contract (PV2 card-answer):
-        -- a published card is already a response to its own carried input.
-        -- Only the generic reply arm needs the new streamed-text guard.
+        and q.created_at >= coalesce(r.started_at, r.created_at)
+        and (not coalesce(r.context_snapshot->'steeredCommentIds', '[]'::jsonb) ? ${m.id}::text
+          or q.created_at >= (r.context_snapshot->'steeredDeliveredAts'->>${m.id}::text)::timestamptz)
         and ${chainCarriesCommentSql("r", m.id, m, false)})
     or ${importedPersonHistorySql(m)})`;
 }
@@ -311,9 +289,9 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
  * The ids among `commentIds` that answeredPersonMessageSql says are answered.
  * The ONE reader for callers holding ids (the Interrupt route's carry of the
  * interrupted turn's input, a saved Interrupt's resume): an AGENT reply (never
- * a system notice) by a run carrying the message (any carried key, including
- * context.commentId) or a later person input, a card on its chain, or imported
- * history; a failed carrier never counts (L1b). Never a second partial predicate.
+ * a system notice) by a run carrying the message, its addressed pending agent
+ * card after carry, or imported history with a posted reply. Never a second
+ * partial predicate.
  */
 export async function answeredPersonMessageIds(
   db: Pick<Db, "select">,
@@ -330,12 +308,6 @@ export async function answeredPersonMessageIds(
   return new Set(rows.map(row => row.id));
 }
 
-/** SQL: a run that carried message m FAILED and posted no reply of its own. */
-function failedCarrierSql(m: PersonMessageSql): SQL {
-  return sql`exists (select 1 from ${heartbeatRuns} fc
-    where fc.company_id = ${m.companyId} and ${failedCarrierRunSql("fc", m)})`;
-}
-
 /** SQL over the heartbeat_runs row `alias`: that run carried message m (any carried key), FAILED, and posted no
  * agent reply of its own: the ONE failed-carrier notion (L1b). failedCarrierSql above and the unanswered-message
  * sweep's older selection (G1: an owed message carried only by failed runs still gets its one card) both read it. */
@@ -349,6 +321,10 @@ export function failedCarrierRunSql(alias: string, m: Pick<PersonMessageSql, "id
 /** SQL: message m is a PERSON comment that arrived by a company import (see answeredPersonMessageSql). */
 export function importedPersonHistorySql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }): SQL {
   return sql`exists (select 1 from ${issueComments} p where p.id = ${m.id} and p.author_type = 'user'
+    and exists (select 1 from ${issueComments} imported_reply
+      where imported_reply.company_id = ${m.companyId} and imported_reply.issue_id = ${m.issueId}
+        and imported_reply.author_type = 'agent' and imported_reply.deleted_at is null
+        and imported_reply.origin = 'import' and imported_reply.created_at > ${m.createdAt})
     and case when p.origin = 'import' then true else ${m.createdAt} < coalesce(
       (select min(l.created_at) from ${activityLog} l where l.company_id = ${m.companyId}
         and l.action = ${ISSUE_IMPORTED_ACTION} and l.entity_type = 'issue' and l.entity_id = ${m.issueId}::text),

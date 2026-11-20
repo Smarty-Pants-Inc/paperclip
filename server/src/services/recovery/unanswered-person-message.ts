@@ -21,7 +21,6 @@ import { isWellFormedExecutionWait, wellFormedExecutionWaitSql } from "../deferr
 import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
 import { PROVIDER_POLICY_REFUSAL_CODE, PROVIDER_POLICY_REFUSAL_MESSAGE } from "../native-runtime/native-provider-failure.js";
 import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-session-recovery-notice.js";
-import { conversationTurnAnswered } from "../native-runtime/native-governance.js";
 import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { noticeMetadataReferencesRecoveryAction } from "./successful-run-handoff.js";
 import { keyValueRow } from "./notice-format.js";
@@ -252,8 +251,33 @@ const rawMessage = (alias: string) => ({ id: sql.raw(`${alias}.id`), companyId: 
  * or a wake for it changed. An obligation that is still open never ages out
  * silently because the message itself is old.
  */
+function oldMessageHasAutomaticPathSql(m: { id: SQL; companyId: SQL; issueId: SQL }): SQL {
+  // Chats have the boot outbox. Old task discussion is not an outbox: only
+  // a saved wake, held execution or active recovery can reopen that input.
+  return sql`(exists (select 1 from ${issues} task where task.id = ${m.issueId}
+      and task.company_id = ${m.companyId} and task.conversation_agent_id is not null)
+    or exists (select 1 from ${agentWakeupRequests} wake where wake.company_id = ${m.companyId}
+      and wake.status <> 'completed'
+      and (wake.idempotency_key = 'conversation-comment:' || ${m.id}::text
+        or wake.payload->>'commentId' = ${m.id}::text
+        or wake.payload->'_paperclipWakeContext'->>'wakeCommentId' = ${m.id}::text
+        or coalesce(wake.payload->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text))
+    or exists (select 1 from ${heartbeatRuns} held where held.company_id = ${m.companyId}
+      and (held.native_issue_id = ${m.issueId} or held.context_snapshot->>'issueId' = ${m.issueId}::text)
+      and (held.context_snapshot->>'wakeCommentId' = ${m.id}::text
+        or coalesce(held.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text
+        or coalesce(held.context_snapshot->'steeredCommentIds', '[]'::jsonb) ? ${m.id}::text)
+      and (held.status in ('queued', 'running', 'scheduled_retry')
+        or exists (select 1 from ${nativeRunFinalizations} finalizer where finalizer.run_id = held.id
+          and finalizer.company_id = held.company_id
+          and finalizer.phase in ('result_persisted', 'ready_for_assessment', 'arbitrating', 'workspace_pending', 'retryable_failure'))
+        or exists (select 1 from ${issueRecoveryActions} recovery where recovery.company_id = held.company_id
+          and recovery.source_issue_id = ${m.issueId} and recovery.status in ('active', 'escalated')
+          and recovery.evidence->>'runId' = held.id::text))))`;
+}
 function inScopeSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }, since: string): SQL {
-  return sql`(${m.createdAt} > ${since}::timestamptz
+  return sql`((${personMessageWithinSendWindowSql(m.createdAt)} or ${oldMessageHasAutomaticPathSql(m)}) and (
+    ${m.createdAt} > ${since}::timestamptz
     or not (${personMessageWithinSendWindowSql(m.createdAt)})
     or exists (select 1 from ${heartbeatRuns} r where r.company_id = ${m.companyId} and r.native_issue_id = ${m.issueId}
       and coalesce(r.finished_at, r.updated_at) > ${since}::timestamptz
@@ -264,7 +288,7 @@ function inScopeSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }
     or exists (select 1 from ${agentWakeupRequests} w where w.company_id = ${m.companyId} and w.updated_at > ${since}::timestamptz
       and (w.payload->>'commentId' = ${m.id}::text
         or w.payload->'_paperclipWakeContext'->>'wakeCommentId' = ${m.id}::text
-        or coalesce(w.payload->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text)))`;
+        or coalesce(w.payload->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text))))`;
 }
 
 /**
@@ -330,6 +354,10 @@ function runCarriesMessage(contextSnapshot: unknown, messageId: string): boolean
   const ids = [
     ...(Array.isArray(context.wakeCommentIds) ? context.wakeCommentIds : []),
     ...(Array.isArray(firstTurn.commentIds) ? firstTurn.commentIds : []),
+    // A reserved/ACKed steer is not model input. The event-boundary projector
+    // records these sequence numbers only after the matching userMessage read.
+    ...Object.entries((context.steeredDeliveryEventSeqs ?? {}) as Record<string, unknown>)
+      .filter(([, seq]) => typeof seq === "number" && Number.isFinite(seq) && seq > 0).map(([id]) => id),
     context.wakeCommentId, context.commentId, context.conversationReplyBoundaryCommentId,
   ];
   return ids.includes(messageId);
@@ -699,6 +727,8 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
 
   const [message] = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt,
     body: issueComments.body, authorUserId: issueComments.authorUserId,
+    hasAutomaticPath: oldMessageHasAutomaticPathSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+      issueId: sql`${issueComments.issueId}` }).mapWith(Boolean),
     sendable: personMessageWithinSendWindowSql(sql`${issueComments.createdAt}`, sql`${now.toISOString()}::timestamptz`).mapWith(Boolean) }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt),
@@ -728,10 +758,12 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   // Half 2 wins over every pending wake/finalizer/setup wait. Age never marks
   // input answered: its existing fenced writer owns one truthful naming note.
   if (!message.sendable) {
+    if (!message.hasAutomaticPath) return { kind: "out_of_scope" };
     const quote = message.body.length > 60 ? `${message.body.slice(0, 59)}…` : message.body;
+    const savedAt = `${String(message.createdAt.getHours()).padStart(2, "0")}:${String(message.createdAt.getMinutes()).padStart(2, "0")}`;
     const notice = buildStrandedRecoveryEscalationNotice({
       seed: { title: "Your message wasn't answered", tone: "warning",
-        body: `Your message is saved: "${quote}". It was not answered. It is at least 24 hours old, so it will not run automatically. Send a new message to try again.`,
+        body: `Your message is saved: "${quote}" (${savedAt}). It was not answered. It is at least 24 hours old, so it will not run automatically. Send a new message to try again.`,
         nextAction: "Send a new message to try again." },
       recoveryActionId: null, recoveryOwner: null, recoveryResponsibility: "user",
       sourceRun: null, failureCode: "unanswered_message_too_old",
@@ -755,14 +787,8 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   // run (a timer, or the continuation that replaced a cancelled deferred wake
   // with no comment ids) is not: the message's own wake path decides.
   const messageRun = runs.find(candidate => runCarriesMessage(candidate.contextSnapshot, message.id)) ?? null;
-  // Paperclip's per-turn response rule (doc/execution-semantics.md:2649-2658,
-  // native-governance.ts conversationTurnAnswered): only a pending question or
-  // confirmation card that the message's OWN run created stands in for its
-  // reply. A card from an earlier turn or one the board addressed to someone
-  // else, and any approval, can hold the task but do not answer the message.
-  if (messageRun && !(await conversationTurnAnswered({ db: q, companyId: issue.companyId, issueId: issue.id, runId: messageRun.id }))) {
-    return { kind: "answered" };
-  }
+  // Interaction cards are answered evidence only through the shared
+  // predicate above: the run's status gate cannot answer a different input.
 
   // A failed fresh continuation that descends from the message's run is the
   // run the person's message ended on: the automatic lineage, typed or not,
@@ -1141,8 +1167,6 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   const paused = code === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   const pausedName = agentRow?.name?.trim() || "This agent";
   const waiting = WAITING_KIND_CODES.has(code);
-  // A standing working note whose run ended without answering: the run
-  // STARTED, so the SAME note gets RFL's started-run text (never 'safe').
   const workingEnded = Boolean(standingWaitingCode === UNANSWERED_MESSAGE_WORKING_CODE && !waiting
     && run && TERMINAL.includes(run.status));
   // The ONE bound: the message's automatic lineage used its K=2 fresh
@@ -1152,23 +1176,29 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
       >= FRESH_CONTINUATION_BOUND);
   // Server-local HH:MM: the instance's time zone, not an assumed UTC zone.
   const since = `${String(message.createdAt.getHours()).padStart(2, "0")}:${String(message.createdAt.getMinutes()).padStart(2, "0")}`;
-  // A never-claimed stale receipt gets its existing ONE no-run card, but
-  // names the saved message. Ordinary no-run notices keep their wording.
+  // A consumed steer or a message left behind while unrelated work continued
+  // needs its own naming card. The later run is not evidence about this input.
+  const readSteer = run && Object.hasOwn((run.contextSnapshot?.steeredDeliveryEventSeqs ?? {}) as object, message.id);
+  const namedTerminal = Boolean(run && TERMINAL.includes(run.status) && (readSteer || (latest && latest.id !== run.id)));
+  const quote = message.body.length > 60 ? `${message.body.slice(0, 59)}…` : message.body;
+  const named = (text: string) => `Your message is saved: "${quote}" (${since}). ${text}`;
   const staleReceipts = code === UNANSWERED_MESSAGE_NO_RUN_CODE ? await q.select({ payload: agentWakeupRequests.payload })
     .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, issue.companyId),
       inArray(agentWakeupRequests.status, ["deferred", "deferred_issue_execution", "cancelled"]),
       deferredWakeIsStaleSql({ companyId: sql`${agentWakeupRequests.companyId}`, agentId: sql`${agentWakeupRequests.agentId}`,
         issueId: sql`${issue.id}::uuid`, requestedAt: sql`${agentWakeupRequests.requestedAt}`, payload: sql`${agentWakeupRequests.payload}` }))) : [];
   const namedNoRun = staleReceipts.some(wake => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id))
-    ? `Your message is saved: "${message.body}". It was not answered because no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.`
+    ? named("It was not answered because no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.")
     : UNANSWERED_MESSAGE_NO_RUN_TEXT;
   const body = policyRefused ? PROVIDER_POLICY_REFUSAL_MESSAGE : settingUp ? `${pausedName} is still being set up (since ${since}). Your message is saved and will be answered as soon as it's ready.`
     : paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
     : supervisionUnconfirmed ? REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
-    : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? (workingEnded ? UNANSWERED_MESSAGE_STARTED_NO_REPLY_TEXT : UNANSWERED_MESSAGE_NO_REPLY_TEXT)
+    : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? (namedTerminal ? named(UNANSWERED_MESSAGE_STARTED_NO_REPLY_TEXT)
+      : workingEnded ? UNANSWERED_MESSAGE_STARTED_NO_REPLY_TEXT : UNANSWERED_MESSAGE_NO_REPLY_TEXT)
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? namedNoRun
-      : held ? HELD_PREDECESSOR_NOTICE : workingEnded ? UNANSWERED_MESSAGE_STARTED_FAILED_TEXT : UNANSWERED_MESSAGE_TEXT;
+      : held ? HELD_PREDECESSOR_NOTICE : namedTerminal ? named(UNANSWERED_MESSAGE_STARTED_FAILED_TEXT)
+        : workingEnded ? UNANSWERED_MESSAGE_STARTED_FAILED_TEXT : UNANSWERED_MESSAGE_TEXT;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
       title: policyRefused ? "The provider refused this request" : settingUp ? `${pausedName} is still being set up` : paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start" : "Your message wasn't answered",
@@ -1180,7 +1210,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
         : waiting ? "No action is needed; it will start by itself."
         : supervisionUnconfirmed ? "Retry or send a new message to continue through fenced recovery."
         : held || boundReached ? "Send a new message to try again."
-        : workingEnded ? UNANSWERED_MESSAGE_STARTED_NEXT_ACTION : "Send the message again; if it fails again, assign this agent a new task.",
+        : namedTerminal || workingEnded ? UNANSWERED_MESSAGE_STARTED_NEXT_ACTION : "Send the message again; if it fails again, assign this agent a new task.",
     },
     recoveryActionId: boardHold?.id ?? null,
     recoveryOwner: null,
