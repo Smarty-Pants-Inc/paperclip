@@ -10,20 +10,19 @@ import { PENDING_CLEANUP_SWEEP_ATTEMPT_CAP } from "../environment-cleanup-state.
 import { isBuiltinSandboxProvider } from "../sandbox-provider-runtime.js";
 import { currentProcessSpaceHash } from "../controller-process-identity.js";
 import { hostname } from "node:os";
-import { isInstructionRefreshPrepareCode } from "../../vendor/paperclip-runner/index.js";
+import { parseNativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
+import { launchProfileChanges, launchProfileChangeLabel, type LaunchProfileChange } from "./pi-session-recovery-notice.js";
 
 export const FRESH_THREAD_STARTED_NOTE = "The earlier provider thread could not be safely restored. Starting a fresh thread in this conversation from its saved history. Earlier actions with unknown outcomes are not confirmed or replayed.";
 
-/** Only the typed instruction/skill refresh may claim the change took effect.
- * Environment loss and launch mismatch retain the generic truthful notice. */
+/** A typed refresh establishes a configuration refresh, not which setting
+ * changed. Name model/skills only from the admitted launch-input diff. */
 export async function freshThreadStartedNote(db: Pick<Db, "select">, run: typeof heartbeatRuns.$inferSelect): Promise<string> {
   const refusal = run.resultJson?.nativeFreshContinuationRefusal as { code?: unknown; prepareRefusalCode?: unknown } | undefined;
   const code = freshThreadRefusalCode({ code: run.errorCode }) ?? freshThreadRefusalCode(refusal);
-  // Only the Runner's typed instruction-refresh channel proves a skill change.
-  // Generic prepare refusal and unrelated specific prepare refusals stay neutral.
-  if (code !== "native_runner_refresh_required"
-    || (refusal?.prepareRefusalCode != null
-      && !isInstructionRefreshPrepareCode(refusal.prepareRefusalCode))) {
+  // The prepare refusal cannot identify which launch setting changed. Only
+  // the persisted input diff below can make that claim.
+  if (code !== "native_runner_refresh_required") {
     // A first start whose Runner never connected had no provider thread: its
     // continuation says so plainly instead of narrating a restore (r104c).
     const [coordinator] = await db.select({ phase: nativeRunFinalizations.phase, attempt: nativeRunFinalizations.attempt,
@@ -33,9 +32,25 @@ export async function freshThreadStartedNote(db: Pick<Db, "select">, run: typeof
     return nativeStartupNeverConnectedExhausted(coordinator)
       ? nativeStartupNeverConnectedFreshRunNote(coordinator!.attempt) : FRESH_THREAD_STARTED_NOTE;
   }
+  let changes: LaunchProfileChange[] = [];
+  const current = run.runnerProfileJson?.nativeExecutionInput;
+  const issueId = run.nativeIssueId ?? run.issueId;
+  if (current && issueId) {
+    const [previous] = await db.select({ profile: heartbeatRuns.runnerProfileJson }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.agentId, run.agentId),
+      eq(heartbeatRuns.nativeIssueId, issueId),
+      sql`${heartbeatRuns.createdAt} < (select created_at from ${heartbeatRuns} where id = ${run.id})`,
+      inArray(heartbeatRuns.status, ["succeeded", "cancelled"]),
+    )).orderBy(sql`${heartbeatRuns.createdAt} desc`, sql`${heartbeatRuns.id} desc`).limit(1);
+    if (previous?.profile?.nativeExecutionInput) {
+      try { changes = launchProfileChanges(parseNativeExecutionInput(previous.profile.nativeExecutionInput), parseNativeExecutionInput(current)); }
+      catch { /* Missing/old launch inputs do not prove a model or skill edit. */ }
+    }
+  }
+  if (!changes.length) return FRESH_THREAD_STARTED_NOTE;
   const [agent] = await db.select({ name: agents.name }).from(agents).where(and(
     eq(agents.companyId, run.companyId), eq(agents.id, run.agentId))).limit(1);
-  return `your skill change is in effect; ${agent?.name ?? "the agent"} restarted its working thread to pick it up. The fresh thread in this conversation reads its saved history. Earlier actions with unknown outcomes are not confirmed or replayed.`;
+  return `your ${launchProfileChangeLabel(changes)} change is in effect; ${agent?.name ?? "the agent"} restarted its working thread to pick it up. The fresh thread in this conversation reads its saved history. Earlier actions with unknown outcomes are not confirmed or replayed.`;
 }
 
 type ProofReader = Pick<Db, "select" | "selectDistinctOn">;

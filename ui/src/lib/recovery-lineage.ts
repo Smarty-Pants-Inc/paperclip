@@ -77,7 +77,8 @@ export type RecoveryLineageInput = Pick<IssueRecoveryAction, "wakePolicy"> &
  * The source issue's scheduled-retry record, which is what lets a surface tell a run that is
  * really executing from a run id the server wrote down once and never started.
  */
-export type RecoveryScheduledRetryInput = Partial<Pick<IssueScheduledRetry, "runId" | "status">>;
+export type RecoveryScheduledRetryInput = Partial<Pick<IssueScheduledRetry,
+  "runId" | "status" | "retryOfRunId" | "scheduledRetryAt" | "retryExhaustedReason">>;
 
 /**
  * Everything outside the stored action that decides whether a lane is still live. Callers

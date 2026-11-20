@@ -44,6 +44,7 @@ import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import {
   deriveRecoveryDisplayState,
+  hasAutomaticRecoveryRetry,
   type RecoveryDisplayState,
 } from "@/lib/recovery-display";
 import {
@@ -1034,6 +1035,9 @@ export function IssueRecoveryActionCard({
     if (cardState === "resolved" && action.outcome) {
       return `Recovery resolved as ${OUTCOME_LABEL[action.outcome] ?? action.outcome}.`;
     }
+    if (hasAutomaticRecoveryRetry(action, liveness)) {
+      return "Paperclip is retrying this task automatically. No human decision is needed.";
+    }
     if (
       (cardState === "needed" || cardState === "escalated") &&
       action.kind === "active_run_watchdog" &&
@@ -1043,7 +1047,7 @@ export function IssueRecoveryActionCard({
     }
     if (lineage) return lineageHeadline(lineage);
     return KIND_HEADLINE[action.kind] ?? KIND_HEADLINE.missing_disposition;
-  }, [action.kind, action.outcome, action.ownerType, cardState, lineage]);
+  }, [action, cardState, lineage, liveness]);
 
   // A lane with no path left must not keep advertising a retry that will never run — whether
   // the budget ran out or the scheduled attempt simply never fired.
@@ -1532,7 +1536,9 @@ export function IssueRecoveryActionCard({
               </span>
             ) : (
               <span className="text-(length:--text-micro) text-muted-foreground">
-                The card stays open until an explicit decision is recorded.
+                {cardState === "in_progress"
+                  ? "Paperclip is continuing automatically; no decision is needed while recovery is in progress."
+                  : "The card stays open until an explicit decision is recorded."}
               </span>
             )
           ) : null}

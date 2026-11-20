@@ -26619,6 +26619,34 @@ describe("runnerd provider runtime wiring", () => {
           identity: identityOf("fresh-provider-thread") })]);
       });
 
+      it("distinguishes model, skill, instruction and other launch changes without treating a run's working-copy path as a change", async () => {
+        const { launchProfileChanges } = await vi.importActual<typeof import("./pi-session-recovery-notice.js")>("./pi-session-recovery-notice.js");
+        const fixture = await floorFixture("launch-diff");
+        const previous = { ...fixture.current, runtimeContext: { prompt: "hello", mcp: [], skills: [],
+          instructions: { bundle: { digest: "original-instructions" }, workingCopy: { rootPath: "/prior-run", entryPath: "AGENTS.md" } } } };
+        const model = { ...previous, provider: { ...previous.provider, model: "another-model" } } as typeof previous;
+        expect(launchProfileChanges(previous, model)).toEqual(["model"]);
+        expect(launchProfileChanges(previous, previous)).toEqual([]);
+        const current = { ...previous, session: { ...previous.session, lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } } } as typeof previous;
+        expect(launchProfileChanges(previous, current)).toEqual(["runtime configuration"]);
+        const skills = { ...previous, runtimeContext: { ...previous.runtimeContext, skills: [{ key: "changed-skill", bundle: { digest: "changed" } }] } } as unknown as typeof previous;
+        expect(launchProfileChanges(previous, skills)).toEqual(["skills"]);
+        const instructions = { ...previous, runtimeContext: { ...previous.runtimeContext,
+          instructions: { ...previous.runtimeContext.instructions, bundle: { ...previous.runtimeContext.instructions?.bundle, digest: "changed" } } } } as typeof previous;
+        expect(launchProfileChanges(previous, instructions)).toEqual(["instructions"]);
+        const pathOnly = { ...previous, runtimeContext: { ...previous.runtimeContext,
+          instructions: { ...previous.runtimeContext.instructions, workingCopy: { rootPath: "/next-run", entryPath: "AGENTS.md" } } } } as typeof previous;
+        expect(launchProfileChanges(previous, pathOnly)).toEqual([]);
+      });
+
+      it("the person-visible note names a model change from the launch-profile diff", async () => {
+        const { restoreUnavailableContinuationNoticeBody } = await vi.importActual<typeof import("./pi-session-recovery-notice.js")>(
+          "./pi-session-recovery-notice.js");
+        const body = restoreUnavailableContinuationNoticeBody("launch_profile_changed", ["model"]);
+        expect(body).toContain("model");
+        expect(body).not.toContain("skill change");
+      });
+
       it("the person-visible note for a changed launch profile names the change, never a new sandbox", async () => {
         const { restoreUnavailableContinuationNoticeBody } = await vi.importActual<typeof import("./pi-session-recovery-notice.js")>(
           "./pi-session-recovery-notice.js");
@@ -26634,6 +26662,9 @@ describe("runnerd provider runtime wiring", () => {
         ["a goal working now", { goal: { status: "paused", workingNow: true } }],
         ["a deferred Pi terminal", { piDeferredTerminal: { turnId: "turn-1" } }],
         ["an ambiguous turn start", { ambiguousTurnStartPending: true }],
+        ["a provider startup", { startupAttempt: { state: "starting" } }],
+        ["a pending tool call", { toolBridge: { pending: { call: { tool: "bash" } } } }],
+        ["a descendant thread", { descendantThreadIds: ["child-thread"] }],
       ])("guard: a box with %s keeps the launch-profile refusal (nothing set aside)", async (_name, box) => {
         const fixture = await dressFixture(`guard-${Object.keys(box)[0]}`, box);
         await expect(open(fixture)).rejects.toMatchObject({ runnerCommandResult: expect.objectContaining({ commandType: "run.prepare" }) });
