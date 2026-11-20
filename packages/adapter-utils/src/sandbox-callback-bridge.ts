@@ -1871,7 +1871,9 @@ export async function startSandboxCallbackBridgeWorker(input: {
     },
     stop: async (options = {}) => {
       stopping = true;
-      if (runStateManaged) await input.client.writeTextFile(runStatePath, "paused").catch(() => undefined);
+      // Teardown must not hang a finished turn on an advisory marker. Match
+      // pause's five-second, value-free warning policy; authority is already off.
+      if (runStateManaged) await writeRunStateBestEffort(runStatePath, "paused");
       resumePolling?.();
       resumePolling = null;
       pausedPromise = null;
