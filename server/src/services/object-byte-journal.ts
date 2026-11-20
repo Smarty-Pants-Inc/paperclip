@@ -540,7 +540,19 @@ export function createObjectByteJournal(options: ObjectByteJournalOptions) {
   async function claim(input: {
     assertAuthority: () => Promise<void>;
     signal?: AbortSignal;
+    /** Optimistic create only; an existing head is recovered, never replaced. */
+    newJournal?: boolean;
   }) {
+    input.signal?.throwIfAborted();
+    if (input.newJournal) {
+      try { return await claimFrom(null, input); }
+      catch (error) {
+        // The run row may not have recorded an earlier claim before a crash.
+        // Conditional publication (including lost-response reconciliation) is
+        // still authoritative; recover its prefix through the ordinary path.
+        if (!(error instanceof ObjectJournalConflictError)) throw error;
+      }
+    }
     const deadline = Date.now() + HEAD_VISIBILITY_WAIT_MS;
     for (let wait = 250; ; wait = Math.min(wait * 2, 4_000)) {
       const current = await head(input.signal);
