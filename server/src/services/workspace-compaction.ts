@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { candidateHoldsUnrecoveredRunLogSpill, listUnrecoveredObjectRunLogSpills } from "./object-run-log-store.js";
+import { candidateHoldsUnrecoveredRunLogSpill, listUnrecoveredObjectRunLogSpills, runLogSpillCustodyPass } from "./object-run-log-store.js";
 import { listWorktreeRunLogSpillRoots } from "./workspace-instance-cleanup.js";
 
 // Directory names that hold regenerable output: installed dependencies, build
@@ -151,9 +151,16 @@ export async function isLinkedGitWorktree(worktreePath: string) {
 // worktree root. Symlinks are never followed or returned. A directory with a
 // regenerable name that does not qualify (for example a tracked `build/`) is
 // searched in turn, so eligible directories inside it are still found.
-export async function findRegenerableWorkspaceDirs(
+export function findRegenerableWorkspaceDirs(
   worktreePath: string,
   options: { signal?: AbortSignal } = {},
+): Promise<string[]> {
+  // One guard pass: the spill roots and every candidate share one read-back budget.
+  return runLogSpillCustodyPass(() => findRegenerableWorkspaceDirsInPass(worktreePath, options));
+}
+async function findRegenerableWorkspaceDirsInPass(
+  worktreePath: string,
+  options: { signal?: AbortSignal },
 ): Promise<string[]> {
   options.signal?.throwIfAborted();
   const protectedSpills = await unrecoveredSpillRoots(worktreePath);
@@ -211,7 +218,14 @@ export type WorkspaceCompactionMove = {
 // move is one rename, so the whole step is fast enough to run while the caller
 // holds the workspace lifecycle lock. A path that is no longer a real
 // directory, or that sits on another filesystem, is left in place.
-export async function moveWorkspaceDirsToTrash(
+export function moveWorkspaceDirsToTrash(
+  worktreePath: string,
+  relativePaths: string[],
+): Promise<WorkspaceCompactionMove> {
+  // One guard pass, as above: the caller holds the lifecycle lock for all of it.
+  return runLogSpillCustodyPass(() => moveWorkspaceDirsToTrashInPass(worktreePath, relativePaths));
+}
+async function moveWorkspaceDirsToTrashInPass(
   worktreePath: string,
   relativePaths: string[],
 ): Promise<WorkspaceCompactionMove> {

@@ -1,4 +1,4 @@
-import { candidateHoldsUnrecoveredRunLogSpill } from "./object-run-log-store.js";
+import { candidateHoldsUnrecoveredRunLogSpill, runLogSpillCustodyPass } from "./object-run-log-store.js";
 import { formatCommandForDisplay } from "./workspace-command-display.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { insertIssueComment } from "./issue-comment-writes.js";
@@ -4381,7 +4381,11 @@ async function deleteGitBranchAtVerifiedTip(input: {
   }
 }
 
-export async function cleanupExecutionWorkspaceArtifacts(input: {
+/** One guard pass: the content guards and the instance cleanup share one run-log read-back budget. */
+export function cleanupExecutionWorkspaceArtifacts(input: Parameters<typeof cleanupExecutionWorkspaceArtifactsInPass>[0]) {
+  return runLogSpillCustodyPass(() => cleanupExecutionWorkspaceArtifactsInPass(input));
+}
+async function cleanupExecutionWorkspaceArtifactsInPass(input: {
   workspace: {
     id: string;
     companyId: string;
