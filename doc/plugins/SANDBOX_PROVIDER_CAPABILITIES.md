@@ -244,13 +244,98 @@ unknown state.
   object on a valid, identified plugin is a different state; the host defers to
   verified discovery for that case.
 
-## Concurrency capabilities are not part of the contract
+## Concurrent sync operations need an explicit opt-in
 
-Earlier drafts listed two concurrency keys, `concurrentSyncAndExec` and
-`concurrentSyncOperations`. The runtime never exposed a scheduling choice that
-read either key, so a declaration had no effect. The host removed both keys. The
-strict capability validator now rejects them as unknown keys. The host can
-reintroduce a concurrency capability when a runtime path enforces it.
+Declare `sandboxCapabilities.concurrentSyncOperations: true` only when the
+provider can safely overlap file transfers into and out of the same sandbox,
+including simultaneous inbound and outbound calls. This key is accepted by the
+strict validator; `concurrentSyncAndExec` is not a supported key
+([packages/shared/src/validators/plugin.ts:169](https://github.com/Smarty-Pants-Inc/paperclip/blob/088401bf237a55a61cbf9fd3dad63ba666b6276b/packages/shared/src/validators/plugin.ts#L169-L173)).
+
+This is an opt-in behavioral guarantee, not a discovery default. An omitted key
+or `false` denies it. Even with `true`, the live worker must verify **both**
+`environmentSyncIn` and `environmentSyncOut`; one direction alone is insufficient
+([packages/shared/src/types/plugin.ts:167](https://github.com/Smarty-Pants-Inc/paperclip/blob/088401bf237a55a61cbf9fd3dad63ba666b6276b/packages/shared/src/types/plugin.ts#L167-L175),
+[server/src/services/environment-runtime.ts:219](https://github.com/Smarty-Pants-Inc/paperclip/blob/088401bf237a55a61cbf9fd3dad63ba666b6276b/server/src/services/environment-runtime.ts#L219-L224),
+[server/src/services/environment-runtime.ts:243](https://github.com/Smarty-Pants-Inc/paperclip/blob/088401bf237a55a61cbf9fd3dad63ba666b6276b/server/src/services/environment-runtime.ts#L243)).
+Static driver support and per-target narrowing can still deny it. Missing verified
+methods, an unknown provider identity, or an unavailable effective snapshot must
+fail closed, not become permission to overlap. The classifier intersects these
+gates, and the sandbox execution target propagates only an effective `true` as
+`runner.allowConcurrentSyncOperations === true`
+([server/src/services/environment-runtime.ts:328](https://github.com/Smarty-Pants-Inc/paperclip/blob/088401bf237a55a61cbf9fd3dad63ba666b6276b/server/src/services/environment-runtime.ts#L328-L345),
+[server/src/services/environment-execution-target.ts:542](https://github.com/Smarty-Pants-Inc/paperclip/blob/088401bf237a55a61cbf9fd3dad63ba666b6276b/server/src/services/environment-execution-target.ts#L542-L548)).
+
+The shipping server at `088401bf237a55a61cbf9fd3dad63ba666b6276b` consumes the
+permission in these paths:
+
+- **GitHub preparation.** Heartbeat can defer managed, read-only GitHub context
+  discovery on a direct sandbox runner only with the flag enabled, a deferral
+  request, no host credentials, and no provider-owned runner task
+  ([server/src/services/heartbeat-github-launchers.ts:22](https://github.com/Smarty-Pants-Inc/paperclip/blob/088401bf237a55a61cbf9fd3dad63ba666b6276b/server/src/services/heartbeat-github-launchers.ts#L22-L34)).
+  The native executor can overlap GitHub environment/access preparation with
+  Runner backend setup for `codex` and `opencode`; for `pi_rpc`, it additionally
+  requires sandbox transport and the concurrent-sync flag. The common gates
+  require GitHub preparation work, Runnerd, no supplied backend, a remote target,
+  and an execution schema other than v6 or v8. The flag is **not** an additional
+  gate on the `codex` / `opencode` branches
+  ([server/src/services/native-runtime/native-session-executor.ts:13625](https://github.com/Smarty-Pants-Inc/paperclip/blob/088401bf237a55a61cbf9fd3dad63ba666b6276b/server/src/services/native-runtime/native-session-executor.ts#L13625-L13635)).
+- **Runner and harness artifacts.** With the runner flag enabled, Runner
+  preparation and discovery/verification/linking of a preinstalled Codex binary
+  run together when a remote Codex binary is needed and neither an explicit
+  binary nor an npm spec was selected. Both operations settle before failure is
+  reported; otherwise preparation remains serial
+  ([server/src/services/native-runtime/native-session-executor.ts:21984](https://github.com/Smarty-Pants-Inc/paperclip/blob/088401bf237a55a61cbf9fd3dad63ba666b6276b/server/src/services/native-runtime/native-session-executor.ts#L21984-L21991)).
+- **Remote launch assets.** Only sandbox transport plus the runner flag enables
+  this overlap
+  ([server/src/services/native-runtime/remote-launch-assets.ts:109](https://github.com/Smarty-Pants-Inc/paperclip/blob/088401bf237a55a61cbf9fd3dad63ba666b6276b/server/src/services/native-runtime/remote-launch-assets.ts#L109)).
+  Changed runtime-context assets use a supplied `stageAssets` batch when present;
+  otherwise the concurrent path stages batches of at most four, settling each
+  batch before reporting failure
+  ([server/src/services/native-runtime/remote-launch-assets.ts:174](https://github.com/Smarty-Pants-Inc/paperclip/blob/088401bf237a55a61cbf9fd3dad63ba666b6276b/server/src/services/native-runtime/remote-launch-assets.ts#L174-L186)).
+  After Codex-skills reset/staging, launch-state materialization and runtime-context
+  staging may overlap and both settle. Recovery remains serial, and CA-bundle
+  staging follows the barrier
+  ([server/src/services/native-runtime/remote-launch-assets.ts:213](https://github.com/Smarty-Pants-Inc/paperclip/blob/088401bf237a55a61cbf9fd3dad63ba666b6276b/server/src/services/native-runtime/remote-launch-assets.ts#L213-L226)).
+- **Workspace and asset transfers.** The managed sandbox coordinator uses the
+  sync client's flag for both the inbound startup barrier and the outbound
+  restore/teardown barrier
+  ([packages/adapter-utils/src/sandbox-managed-runtime.ts:1999](https://github.com/Smarty-Pants-Inc/paperclip/blob/088401bf237a55a61cbf9fd3dad63ba666b6276b/packages/adapter-utils/src/sandbox-managed-runtime.ts#L1999-L2001),
+  [packages/adapter-utils/src/sandbox-managed-runtime.ts:2419](https://github.com/Smarty-Pants-Inc/paperclip/blob/088401bf237a55a61cbf9fd3dad63ba666b6276b/packages/adapter-utils/src/sandbox-managed-runtime.ts#L2419-L2421)).
+  Each schedule allows at most **four** active operations, or one at a time in
+  input order when disabled. It waits for every started operation to settle;
+  this is a per-schedule bound, not a global provider-wide limit
+  ([packages/adapter-utils/src/sync-operation-schedule.ts:9](https://github.com/Smarty-Pants-Inc/paperclip/blob/088401bf237a55a61cbf9fd3dad63ba666b6276b/packages/adapter-utils/src/sync-operation-schedule.ts#L9),
+  [packages/adapter-utils/src/sync-operation-schedule.ts:31](https://github.com/Smarty-Pants-Inc/paperclip/blob/088401bf237a55a61cbf9fd3dad63ba666b6276b/packages/adapter-utils/src/sync-operation-schedule.ts#L31-L35)).
+  The command-managed sync client copies the verified flag for native hooks only
+  when both hooks exist. Its generic base64 inbound fallback independently
+  permits concurrency; that does not grant a provider capability or supply a
+  generic outbound hook
+  ([packages/adapter-utils/src/command-managed-runtime.ts:520](https://github.com/Smarty-Pants-Inc/paperclip/blob/088401bf237a55a61cbf9fd3dad63ba666b6276b/packages/adapter-utils/src/command-managed-runtime.ts#L520-L531),
+  [packages/adapter-utils/src/command-managed-runtime.ts:532](https://github.com/Smarty-Pants-Inc/paperclip/blob/088401bf237a55a61cbf9fd3dad63ba666b6276b/packages/adapter-utils/src/command-managed-runtime.ts#L532-L534)).
+
+Before opting in, guarantee per-call scratch isolation (including temporary host
+files and remote archive names), safe transfers to disjoint destinations, and no
+shared mutable transfer state that one call can remove while another is using it.
+Normal teardown and worker shutdown must drain active sync calls before deleting
+scratch or terminating their allocation. A Stop's command cancellation must not
+wait behind the very command it must cancel: close new admission, cancel/stop
+active work promptly, and retain safe ownership of unfinished cleanup. Daytona's
+manifest documents isolated scratch and draining, and its release path separates
+Stop cancellation from graceful draining
+([packages/plugins/sandbox-providers/daytona/src/manifest.ts:48](https://github.com/Smarty-Pants-Inc/paperclip/blob/088401bf237a55a61cbf9fd3dad63ba666b6276b/packages/plugins/sandbox-providers/daytona/src/manifest.ts#L48-L54),
+[packages/plugins/sandbox-providers/daytona/src/plugin.ts:3331](https://github.com/Smarty-Pants-Inc/paperclip/blob/088401bf237a55a61cbf9fd3dad63ba666b6276b/packages/plugins/sandbox-providers/daytona/src/plugin.ts#L3331-L3342)).
+If these guarantees cannot be made, omit the key or declare `false`. This is not a
+blanket permission for arbitrary sync/exec overlap or conflicting writes.
+
+Daytona declares the capability (since 0.1.4)
+([packages/plugins/sandbox-providers/daytona/src/manifest.ts:13](https://github.com/Smarty-Pants-Inc/paperclip/blob/088401bf237a55a61cbf9fd3dad63ba666b6276b/packages/plugins/sandbox-providers/daytona/src/manifest.ts#L13),
+[packages/plugins/sandbox-providers/daytona/src/manifest.ts:65](https://github.com/Smarty-Pants-Inc/paperclip/blob/088401bf237a55a61cbf9fd3dad63ba666b6276b/packages/plugins/sandbox-providers/daytona/src/manifest.ts#L65)).
+The separately versioned Boat provider opts in from `0.1.17-spare.12c1`
+([provider opt-in commit](https://github.com/Smarty-Pants-Inc/paperclip/commit/bcc3767e405d4527603430fee3ec378ea317de6b));
+its implementation is not bundled in this server revision. Always use the
+installed provider's declaration and verified methods, not its name or version
+alone, to decide whether concurrency is effective.
 
 ### Preserving an unexported workspace
 
