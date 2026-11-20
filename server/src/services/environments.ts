@@ -1,6 +1,9 @@
 import { AGENT_FILE_DESTROY_CLAIM_ATTEMPT_KEY, AGENT_FILE_DESTROY_CLAIM_KEY } from "./agent-file-save-hold.js";
 import { notifyEnvironmentConfigChange, withEnvironmentConfigChange } from "./environment-config-revision.js";
-import { carryReusableLeasePreparation, createReusableLeaseHandoff, preserveReusableLeaseHandoff, withoutPredecessorStopReceipts, withoutReusableLeaseHandoff } from "./environment-lease-handoff.js";
+import { carryReusableLeasePreparation, createReusableLeaseHandoff, preserveReusableLeaseHandoff, withoutPredecessorStopReceipts, withoutReusableLeaseHandoff,
+  RETAINED_NATIVE_TURN_HANDOFF_KEY, RETAINED_NATIVE_TURN_HANDOFF_SCHEMA, type RetainedNativeTurnHandoffSeed } from "./environment-lease-handoff.js";
+import { hasStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
+import { readLeaseReleaseDeferral } from "./environment-lease-release-deferral.js";
 import { inheritWarmRetentionMetadata } from "./environment-warm-retention.js";
 import { promoteDeferredWorkIntents } from "./work-intent-outbox.js";
 import { clearRemoteWorkspaceLocationForReleasedLease } from "./remote-workspace-snapshot-retention.js";
@@ -1542,6 +1545,9 @@ export function environmentService(db: Db) {
        * reusable owners for one sandbox.
        */
       replacesReusableLeaseId?: string | null;
+      /** Live-certified stopped turn, persisted on its old lease in this same
+       * transaction. This is a warm handoff, NOT a physical Runner exit. */
+      retainedNativeTurnHandoff?: RetainedNativeTurnHandoffSeed | null;
       /**
        * Reactivate the exact lease row already owned by this heartbeat run.
        * Native same-run recovery re-enters environment startup after the
@@ -1604,6 +1610,9 @@ export function environmentService(db: Db) {
           "A same-run reusable lease reacquisition requires a heartbeat run id.",
         );
       }
+      if (input.retainedNativeTurnHandoff && !input.replacesReusableLeaseId) {
+        throw new Error("A retained native turn handoff requires a successor lease.");
+      }
       if (input.replacesReusableLeaseId && input.reusesReusableLeaseId) {
         throw new Error(
           "A reusable lease cannot be replaced and reacquired in the same operation.",
@@ -1653,6 +1662,9 @@ export function environmentService(db: Db) {
                         "released",
                         "retained",
                       ]),
+                      input.retainedNativeTurnHandoff ? and(eq(environmentLeases.status, "retained"),
+                        isNull(environmentLeases.releasedAt),
+                        sql`${environmentLeases.cleanupStatus} is distinct from 'failed'`) : undefined,
                       // A source whose harness backup was restored into another
                       // lease holds older session state. That claim and this
                       // handoff compete on this row, so only one of them wins.
@@ -1666,6 +1678,13 @@ export function environmentService(db: Db) {
                     "Reusable sandbox lease ownership changed during acquisition.",
                   );
                 }
+                const stoppedTurn = input.retainedNativeTurnHandoff;
+                if (stoppedTurn && (stoppedTurn.leaseId !== retired[0]!.id || stoppedTurn.runId !== retired[0]!.heartbeatRunId
+                  || stoppedTurn.checkpoint.companyId !== input.companyId || stoppedTurn.checkpoint.runId !== stoppedTurn.runId
+                  || stoppedTurn.checkpoint.issueId !== retired[0]!.issueId || hasStopOnlyCleanup(retired[0]!)
+                  || retired[0]!.metadata?.pendingCleanupInFlight === true || readLeaseReleaseDeferral(retired[0]!.metadata))) {
+                  throw conflict("Retained native turn ownership changed during acquisition.");
+                }
                 const handoff = createReusableLeaseHandoff(retired[0]!, { ...values, id: replacementLeaseId! });
                 // adopt-receipt-own-run: never the predecessor run's stop receipt / termination.
                 values.metadata = { ...withoutPredecessorStopReceipts(inheritWarmRetentionMetadata(retired[0]!.metadata,
@@ -1673,6 +1692,9 @@ export function environmentService(db: Db) {
                   reusableLeasePredecessor: handoff };
                 await tx.update(environmentLeases).set({ metadata: {
                   ...retired[0]!.metadata, reusableLeaseSuccessor: handoff,
+                  ...(stoppedTurn ? { [RETAINED_NATIVE_TURN_HANDOFF_KEY]: {
+                    ...handoff, ...stoppedTurn, schema: RETAINED_NATIVE_TURN_HANDOFF_SCHEMA,
+                  } } : {}),
                 } }).where(eq(environmentLeases.id, retired[0]!.id));
               }
               if (input.reusesReusableLeaseId) {

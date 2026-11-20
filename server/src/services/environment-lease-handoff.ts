@@ -6,12 +6,21 @@ type Binding = Pick<Lease, "id" | "companyId" | "environmentId" | "executionWork
   "heartbeatRunId" | "provider" | "providerLeaseId" | "metadata" | "acquiredAt">;
 const outgoingKey = "reusableLeaseSuccessor";
 const incomingKey = "reusableLeasePredecessor";
+export const RETAINED_NATIVE_TURN_HANDOFF_KEY = "retainedNativeTurnHandoff";
+export const RETAINED_NATIVE_TURN_HANDOFF_SCHEMA = "paperclip.retained-native-turn-handoff.v1";
+/** Issued only by environment-runtime's live idle-owner proof. The acquisition
+ * transaction supplies the successor/allocation binding, never caller metadata. */
+export type RetainedNativeTurnHandoffSeed = {
+  leaseId: string; runId: string; checkpoint: Record<string, unknown>;
+  runner: { instanceId: string; pid: number; startedAt: string };
+};
 
 export function withoutReusableLeaseHandoff(metadata: Record<string, unknown> | null | undefined) {
   if (metadata == null) return null;
   const result = { ...metadata };
   delete result[outgoingKey];
   delete result[incomingKey];
+  delete result[RETAINED_NATIVE_TURN_HANDOFF_KEY];
   return result;
 }
 
@@ -19,7 +28,8 @@ export function withoutReusableLeaseHandoff(metadata: Record<string, unknown> | 
  * lease (and run) whose box stopped. A successor lease never inherits them. */
 export function withoutPredecessorStopReceipts(metadata: Record<string, unknown> | null | undefined) {
   if (metadata == null) return null;
-  const { remoteExecutionTermination: _termination, sandboxStopAndRetainReceipt: _receipt, ...rest } = metadata;
+  const { remoteExecutionTermination: _termination, sandboxStopAndRetainReceipt: _receipt,
+    [RETAINED_NATIVE_TURN_HANDOFF_KEY]: _turnHandoff, ...rest } = metadata;
   return rest;
 }
 
@@ -36,7 +46,7 @@ export function ownLeaseStopRecord(lease: { heartbeatRunId: string | null; metad
 export function preserveReusableLeaseHandoff(previous: Record<string, unknown> | null,
   metadata: Record<string, unknown> | null | undefined) {
   const result = withoutReusableLeaseHandoff(metadata);
-  const proof = Object.fromEntries([outgoingKey, incomingKey]
+  const proof = Object.fromEntries([outgoingKey, incomingKey, RETAINED_NATIVE_TURN_HANDOFF_KEY]
     .filter(key => Object.hasOwn(previous ?? {}, key)).map(key => [key, previous![key]]));
   return Object.keys(proof).length ? { ...result, ...proof } : result;
 }

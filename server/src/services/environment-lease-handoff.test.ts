@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { EnvironmentLease } from "@paperclipai/shared";
-import { carryReusableLeasePreparation } from "./environment-lease-handoff.js";
+import { carryReusableLeasePreparation, preserveReusableLeaseHandoff, withoutPredecessorStopReceipts,
+  withoutReusableLeaseHandoff } from "./environment-lease-handoff.js";
 import { prepareHeartbeatGitHubLaunchers } from "./heartbeat-github-launchers.js";
 
 type Binding = Parameters<typeof carryReusableLeasePreparation>[0];
@@ -12,6 +13,14 @@ function binding(id = "lease-1"): Binding {
 const receipt = { key: "a".repeat(64), leaseId: "lease-1", layout: { PATH: "/wrappers" } };
 
 describe("retained-allocation preparation handoff", () => {
+  it("keeps an adopted turn's proof on its old owner, never on a successor or from caller metadata", () => {
+    const proof = { runId: "old-run", leaseId: "old-lease" };
+    const previous = { retainedNativeTurnHandoff: proof, reusableLeaseSuccessor: { successorRunId: "next-run" } };
+    expect(withoutReusableLeaseHandoff(previous)).toEqual({});
+    expect(withoutPredecessorStopReceipts(previous)).toEqual({ reusableLeaseSuccessor: { successorRunId: "next-run" } });
+    expect(preserveReusableLeaseHandoff(previous, { nativeWorkspaceSync: "finalized",
+      retainedNativeTurnHandoff: { runId: "forged" } })).toEqual({ ...previous, nativeWorkspaceSync: "finalized" });
+  });
   it("rebinds only known successful receipts, including cached realization ownership", () => {
     const previous = binding();
     previous.metadata = { ...previous.metadata, anonymousGitHubLaunchers: receipt,
