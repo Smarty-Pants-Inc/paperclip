@@ -44,7 +44,7 @@ it("advertises and dispatches BOTH native sync verbs through the SDK and grants 
     });
     expect(effective.nativeSyncIn).toBe(true);
     expect(effective.nativeSyncOut).toBe(true);
-    expect(effective.concurrentSyncOperations).toBe(false);
+    expect(effective.concurrentSyncOperations).toBe(true);
     // SSH hooks are implemented, but cannot grant capability without a genuine
     // config-aware host gate. This disabled artifact must stay denied in Core.
     expect(effective.duplexCommandStream).toBe(true);

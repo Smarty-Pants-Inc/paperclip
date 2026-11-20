@@ -9,6 +9,7 @@ function gateStore() {
   const gates = new Map<string, Gate>();
   return {
     current: (key: string) => gates.get(key),
+    idle: async () => { await Promise.all([...gates.values()].map(gate => gate.promise)); },
     begin(key: string): Gate {
       const existing = gates.get(key);
       if (existing) { existing.refCount++; return existing; }
@@ -50,13 +51,23 @@ export async function withBoatLeaseActivity<T>(key: string, fn: () => Promise<T>
 }
 export function gateBoatHooks(definition: PluginDefinition, keyFor: (params: any, id: string) => string): PluginDefinition {
   const result = { ...definition };
+  const syncActivity = gateStore();
+  const sync = new Set(["onEnvironmentSyncIn", "onEnvironmentSyncOut"]);
+  let shuttingDown = false;
   const active = new Set(["onEnvironmentExecute", "onEnvironmentSyncIn", "onEnvironmentSyncOut", "onEnvironmentRealizeWorkspace", "onEnvironmentRunnerIngressEndpoint"]);
   const terminal = new Set(["onEnvironmentReleaseLease", "onEnvironmentStopLease", "onEnvironmentDestroyLease"]);
   for (const [name, hook] of Object.entries(definition)) {
     if (typeof hook !== "function") continue;
-    if (!active.has(name) && !terminal.has(name) && name !== "onEnvironmentAcquireLease" && name !== "onEnvironmentResumeLease") continue;
+    if (!active.has(name) && !terminal.has(name) && name !== "onEnvironmentAcquireLease" && name !== "onEnvironmentResumeLease" && name !== "setup" && name !== "onShutdown") continue;
     Object.defineProperty(result, name, { enumerable: true, value: async (params: any) => {
       const invoke = async (): Promise<any> => Reflect.apply(hook, definition, [params]);
+      if (name === "setup") { shuttingDown = false; return invoke(); }
+      if (name === "onShutdown") {
+        shuttingDown = true;
+        await boundedWait(syncActivity.idle());
+        return invoke();
+      }
+      if (sync.has(name) && shuttingDown) throw new Error("Boat provider is shutting down");
       if (name === "onEnvironmentAcquireLease") {
         const lease = await invoke(); if (lease.providerLeaseId) open(keyFor(params, lease.providerLeaseId)); return lease;
       }
@@ -66,6 +77,11 @@ export function gateBoatHooks(definition: PluginDefinition, keyFor: (params: any
       if (terminal.has(name)) {
         const gate = teardown.begin(key); close(key);
         try {
+          // Stop must still cancel commands promptly, but never archive while a
+          // sync hook owns transfer/staging state. Closing admission above
+          // prevents new sync calls and fences further sends by admitted calls.
+          const transferring = syncActivity.current(key);
+          if (transferring) await boundedWait(transferring.promise);
           if (name !== "onEnvironmentStopLease" && !params.cancelActiveWork) {
             const running = activity.current(key); if (running) await boundedWait(running.promise);
           }
@@ -76,7 +92,11 @@ export function gateBoatHooks(definition: PluginDefinition, keyFor: (params: any
         if (state(key).closed && activity.current(key)) throw new Error("The stopped Boat sandbox is still settling cancelled work. Retry shortly.");
         return withBoatLeaseActivity(key, async () => { const lease = await invoke(); assertBoatActivityAdmission(); if (lease.providerLeaseId) open(key); return lease; }, true);
       }
-      return withBoatLeaseActivity(key, invoke);
+      return withBoatLeaseActivity(key, async () => {
+        if (!sync.has(name)) return invoke();
+        const gate = syncActivity.begin(key);
+        try { return await invoke(); } finally { syncActivity.end(key, gate); }
+      });
     } });
   }
   return result;

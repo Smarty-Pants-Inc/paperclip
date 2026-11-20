@@ -10,20 +10,35 @@ import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginSyncFileMapping, PluginSyncOperation } from "@paperclipai/plugin-sdk";
 import plugin from "./plugin.js";
+// Retain real filesystem behavior; expose configurable exports only so the
+// concurrency rows can observe scratch creation and control the mkdir race.
+vi.mock("node:fs/promises", async importOriginal => ({ ...await importOriginal<typeof import("node:fs/promises")>() }));
 // Keep: data safety and the untrusted sandbox/host boundary. The mock implements
 // documented JSON/signed-byte endpoints, but executes actual tar/mv/chmod and
 // streams real files. No Boat network, credential or sandbox is used.
 const exec = promisify(execFile);
-let root: string, remote: string, host: string;
+let root: string, remote: string, host: string, leaseId: string;
 let commands: string[], transfers: string[], remoteTemps: Set<string>;
 let fault: "upload" | "download" | "corrupt" | "command" | "cleanup" | undefined;
 let partialUploadBytes: number, downloadOverride: Buffer | undefined;
 let cleanupStatus: number;
+let beforeTransfer: (() => Promise<void>) | undefined;
+let beforeCleanup: (() => Promise<void>) | undefined;
+let stops: number, stopped: boolean;
+const barrier = (count: number) => {
+  let arrived = 0, release!: () => void;
+  let timer: ReturnType<typeof setTimeout>;
+  const ready = new Promise<void>((resolve, reject) => {
+    release = resolve;
+    timer = setTimeout(() => reject(new Error(`Only ${arrived}/${count} concurrent calls reached the barrier`)), 2000);
+  });
+  return async () => { if (++arrived === count) { clearTimeout(timer); release(); } await ready; };
+};
 const cfg = { apiKey: "boat_mock_only" };
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status });
-const localRemote = (value: string) => value.replace(/\/tmp\/paperclip-boat-sync-/g, `${remote}/paperclip-boat-sync-`);
+const localRemote = (value: string) => value.replace(/\/tmp\/(paperclip-boat-sync-|paperclip-boat-env-|paperclip-stdin-)/g, `${remote}/$1`);
 function params(operations: PluginSyncOperation[]) {
-  return { driverKey: "boat", companyId: "c", environmentId: "e", config: cfg, lease: { providerLeaseId: "bx_test", metadata: { remoteCwd: remote } }, operations };
+  return { driverKey: "boat", companyId: "c", environmentId: "e", config: cfg, lease: { providerLeaseId: leaseId, metadata: { remoteCwd: remote } }, operations };
 }
 function operation(file: PluginSyncFileMapping, operationId = "opaque/not/a/path") { return { operationId, files: [file] }; }
 async function sync(file: PluginSyncFileMapping, outbound = false) {
@@ -36,6 +51,7 @@ async function mockFetch(input: string | URL | Request, init: RequestInit = {}) 
     expect(init.redirect).toBe("error");
     const file = localRemote(url.searchParams.get("path")!);
     transfers.push(init.method!);
+    await beforeTransfer?.();
     if (init.method === "PUT") {
       const staging = `${file}.uploading`;
       try {
@@ -59,6 +75,8 @@ async function mockFetch(input: string | URL | Request, init: RequestInit = {}) 
   }
   expect(url.origin).toBe("https://boat.dev");
   expect(new Headers(init.headers).get("Authorization")).toBe("Bearer boat_mock_only");
+  if (url.pathname.endsWith("/stop")) { stops++; stopped = true; return json({}); }
+  if (url.pathname.endsWith(`/${leaseId}`)) return json({ sandbox: { id: leaseId, state: stopped ? "archived" : "ready" } });
   if (url.pathname.endsWith("/upload-url") || url.pathname.endsWith("/download-url")) {
     const request = JSON.parse(String(init.body));
     expect(request.path).toMatch(/^\/tmp\/paperclip-boat-sync-[\w-]+\.tar$/);
@@ -74,7 +92,13 @@ async function mockFetch(input: string | URL | Request, init: RequestInit = {}) 
       return json({ exitCode: 0, timedOut: false, ...result });
     } catch (error: any) { return json({ exitCode: error.code ?? 1, timedOut: false, stdout: error.stdout, stderr: error.stderr }); }
   }
+  if (url.pathname.endsWith("/files") && init.method === "PUT") {
+    const body = JSON.parse(String(init.body));
+    await fs.writeFile(localRemote(body.path), body.content, body.encoding === "base64" ? "base64" : "utf8");
+    return json({ ok: true });
+  }
   if (url.pathname.endsWith("/files") && init.method === "DELETE") {
+    await beforeCleanup?.();
     const file = localRemote(url.searchParams.get("path")!);
     const missing = { message: `No such file or directory: ${url.searchParams.get("path")}` };
     if (fault === "cleanup") return json(cleanupStatus === 503 ? { message: "injected cleanup failure" } : missing, cleanupStatus);
@@ -85,12 +109,14 @@ async function mockFetch(input: string | URL | Request, init: RequestInit = {}) 
 }
 beforeEach(async () => {
   root = await fs.mkdtemp(path.join(os.tmpdir(), "boat-sync-test-"));
+  leaseId = `bx_${path.basename(root)}`;
   remote = path.join(root, "sandbox"); host = path.join(root, "host");
   await fs.mkdir(remote); await fs.mkdir(host);
   commands = []; transfers = []; remoteTemps = new Set(); fault = undefined; partialUploadBytes = 0; downloadOverride = undefined; cleanupStatus = 503;
+  beforeTransfer = undefined; beforeCleanup = undefined; stops = 0; stopped = false;
   vi.stubGlobal("fetch", vi.fn(mockFetch));
 });
-afterEach(async () => { vi.unstubAllGlobals(); await fs.rm(root, { recursive: true, force: true }); });
+afterEach(async () => { vi.restoreAllMocks(); vi.unstubAllGlobals(); await fs.rm(root, { recursive: true, force: true }); });
 async function fixture() {
   const source = path.join(host, "source ' ; $(not-a-command)");
   await fs.mkdir(source, { mode: 0o700 }); await fs.mkdir(path.join(source, "empty"), { mode: 0o750 });
@@ -115,6 +141,105 @@ async function clean() {
   for (const directory of [host, remote]) expect((await fs.readdir(directory)).filter(name => name.startsWith(".paperclip-upload") || name.startsWith("paperclip-boat-sync"))).toEqual([]);
 }
 describe("Boat native hybrid file sync", () => {
+  // BRIEF.md row (a): real shell commands, fake provider transport. A serial
+  // provider cannot reach this barrier; each command leaves its own byte output.
+  it("concurrent capability: three commands on one box overlap", async () => {
+    const enter = barrier(3), staged: string[] = [];
+    let active = 0, peak = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/files") && init.method === "PUT") staged.push(JSON.parse(String(init.body)).path);
+      const userCommand = url.pathname.endsWith("/commands") && JSON.parse(String(init.body)).command.includes("sleep 0.1;");
+      if (!userCommand) return mockFetch(input, init);
+      peak = Math.max(peak, ++active);
+      try { await enter(); return await mockFetch(input, init); } finally { active--; }
+    }));
+    const settled = await Promise.allSettled([0, 1, 2].map(index => plugin.definition.onEnvironmentExecute!({
+      ...params([]), command: "sh", args: ["-c", 'sleep 0.1; printf "%s:" "$CONCURRENT_VALUE"; cat'],
+      env: { CONCURRENT_VALUE: `command-${index}` }, stdin: `stdin-${index}`,
+    })));
+    const results = settled.map(result => { if (result.status === "rejected") throw result.reason; return result.value; });
+    expect(results.map(result => result.stdout)).toEqual(["command-0:stdin-0", "command-1:stdin-1", "command-2:stdin-2"]);
+    expect(results.every(result => result.exitCode === 0 && !result.timedOut)).toBe(true);
+    expect(peak).toBe(3); expect(new Set(staged).size).toBe(6);
+    for (const file of staged) await expect(fs.lstat(localRemote(file))).rejects.toMatchObject({ code: "ENOENT" });
+    console.log("CONCURRENT_COMMAND_EVIDENCE", JSON.stringify({ peak, staged, outputs: results.map(result => result.stdout) }));
+  });
+
+  // BRIEF.md row (b): BOTH directions overlap, not merely parallel commands.
+  // The four-transfer barrier also makes a fixed scratch-name mutation bite.
+  it("concurrent capability: two sync-ins and two sync-outs preserve bytes and isolate every scratch", async () => {
+    const made: string[] = [], mkdtemp = fs.mkdtemp;
+    vi.spyOn(fs, "mkdtemp").mockImplementation(async (...args: Parameters<typeof fs.mkdtemp>) => {
+      const directory = await mkdtemp(...args); made.push(String(directory)); return directory;
+    });
+    const mappings = await Promise.all([0, 1, 2, 3].map(async index => {
+      const outbound = index >= 2;
+      const sourcePath = path.join(outbound ? remote : host, `source-${index}`);
+      const targetPath = path.join(outbound ? host : remote, `target-${index}`);
+      const bytes = Buffer.alloc(1024 * 1024 + index + 1, 31 + index);
+      await fs.writeFile(sourcePath, bytes);
+      return { outbound, bytes, file: { sourcePath, targetPath, kind: "file" as const } };
+    }));
+    beforeTransfer = barrier(4);
+    const settled = await Promise.allSettled(mappings.map(({ file, outbound }) => sync(file, outbound)));
+    const results = settled.map(result => { if (result.status === "rejected") throw result.reason; return result.value; });
+    for (const [index, { file, bytes }] of mappings.entries()) {
+      expect((await fs.readFile(file.targetPath)).equals(bytes)).toBe(true);
+      expect(results[index].operations[0].filesTransferred).toBe(1);
+    }
+    expect(remoteTemps.size).toBe(4);
+    const scratch = made.filter(directory => path.basename(directory).startsWith("paperclip-boat-sync-"));
+    expect(scratch).toHaveLength(4); expect(new Set(scratch).size).toBe(4);
+    for (const directory of made) await expect(fs.lstat(directory)).rejects.toMatchObject({ code: "ENOENT" });
+    console.log("CONCURRENT_SYNC_EVIDENCE", JSON.stringify({ directions: ["in", "in", "out", "out"],
+      bytes: mappings.map(({ bytes }) => bytes.length), hostScratch: scratch, remoteScratch: [...remoteTemps] }));
+    await clean();
+  });
+
+  it("concurrent capability: distinct outbound targets may create the same missing canonical parent", async () => {
+    const parent = path.join(host, "new-parent"), source = path.join(remote, "source");
+    await fs.writeFile(source, "same-parent bytes");
+    const lstat = fs.lstat, enter = barrier(2);
+    vi.spyOn(fs, "lstat").mockImplementation(async (...args: Parameters<typeof fs.lstat>) => {
+      try { return await lstat(...args); }
+      catch (error) { if (String(args[0]) === parent) await enter(); throw error; }
+    });
+    await Promise.all([0, 1].map(index => sync({ sourcePath: source, targetPath: path.join(parent, `file-${index}`), kind: "file" }, true)));
+    for (const index of [0, 1]) expect(await fs.readFile(path.join(parent, `file-${index}`), "utf8")).toBe("same-parent bytes");
+    await clean();
+  });
+
+  it.each([
+    ["onEnvironmentReleaseLease", false], ["onEnvironmentReleaseLease", true],
+    ["onEnvironmentStopLease", false], ["onEnvironmentStopLease", true],
+    ["onEnvironmentDestroyLease", false], ["onEnvironmentDestroyLease", true],
+  ] as const)("concurrent capability: %s cancelActiveWork=%s drains both directions before provider stop", async (hook, cancelActiveWork) => {
+    let reached!: () => void, release!: () => void, arrived = 0;
+    const ready = new Promise<void>(resolve => { reached = resolve; });
+    const parked = new Promise<void>(resolve => { release = resolve; });
+    beforeCleanup = async () => { if (++arrived === 4) reached(); await parked; };
+    const mappings = await Promise.all([0, 1, 2, 3].map(async index => {
+      const outbound = index >= 2, sourcePath = path.join(outbound ? remote : host, `source-${index}`);
+      const targetPath = path.join(outbound ? host : remote, `target-${index}`);
+      await fs.writeFile(sourcePath, `drained-${index}`);
+      return { outbound, file: { sourcePath, targetPath, kind: "file" as const } };
+    }));
+    const calls = mappings.map(({ file, outbound }) => sync(file, outbound));
+    let terminal: Promise<unknown> | undefined, settled = false;
+    try {
+      await ready;
+      terminal = plugin.definition[hook]!({ ...params([]), providerLeaseId: leaseId, cancelActiveWork }).then(value => { settled = true; return value; });
+      await new Promise(resolve => setTimeout(resolve, 30));
+      expect(stops, "no provider stop before all sync cleanup finishes").toBe(0);
+      expect(settled, "no teardown receipt while sync owns scratch").toBe(false);
+      await expect(sync(mappings[0].file)).rejects.toThrow("no longer active");
+    } finally { release(); await Promise.allSettled([...calls, ...(terminal ? [terminal] : [])]); }
+    expect(await terminal).toMatchObject({ state: "stopped" });
+    for (const [index, { file }] of mappings.entries()) expect(await fs.readFile(file.targetPath, "utf8")).toBe(`drained-${index}`);
+    await clean();
+  });
+
   it("round-trips links, entry modes, empty directory and >5 MiB via one command per mapping", async () => {
     const source = await fixture(), target = path.join(remote, "workspace ' quoted");
     const incoming = await sync({ sourcePath: source, targetPath: target, kind: "directory" });
@@ -308,4 +433,25 @@ describe("Boat native hybrid file sync", () => {
       expect(await fs.readFile(target, "utf8")).toBe("new");
     },
   );
+
+  it("concurrent capability: worker shutdown drains sync cleanup and refuses new transfers", async () => {
+    const source = path.join(remote, "source"), target = path.join(host, "restored");
+    await fs.writeFile(source, "shutdown bytes");
+    let reached!: () => void, release!: () => void;
+    const ready = new Promise<void>(resolve => { reached = resolve; });
+    const parked = new Promise<void>(resolve => { release = resolve; });
+    beforeCleanup = async () => { reached(); await parked; };
+    const call = sync({ sourcePath: source, targetPath: target, kind: "file" }, true);
+    let shutdown: Promise<unknown> | undefined, settled = false;
+    try {
+      await ready;
+      shutdown = plugin.definition.onShutdown!().then(() => { settled = true; });
+      await new Promise(resolve => setTimeout(resolve, 30));
+      expect(settled).toBe(false);
+      await expect(sync({ sourcePath: source, targetPath: path.join(host, "late"), kind: "file" }, true)).rejects.toThrow("shutting down");
+    } finally { release(); await Promise.allSettled([call, ...(shutdown ? [shutdown] : [])]); }
+    expect(settled).toBe(true);
+    expect(await fs.readFile(target, "utf8")).toBe("shutdown bytes");
+    await clean();
+  });
 });

@@ -1,4 +1,28 @@
-# Boat sandbox provider 0.1.16-spare (unreleased)
+# Boat sandbox provider 0.1.17-spare.12c1 (unreleased)
+
+## Concurrent setup and file synchronization
+
+This version declares `concurrentSyncOperations: true`. Core grants the opt-in
+only when the live worker advertises **both** native sync verbs. This allows
+eligible host-side setup and distinct-target sync operations to overlap; it does
+not batch GitHub preparation commands or admit an agent before GitHub activation.
+
+Every mapping keeps its own host temporary directory, remote UUID archive/list,
+and publication staging directory. Distinct outbound targets may share a newly
+created canonical parent. Same-target directory replacement is not transactional;
+callers must still provide disjoint destinations for parallel operations.
+Release, Stop, destroy and worker shutdown wait for active sync hooks, including
+cleanup, before teardown. Stop still fences command sends immediately and need
+not wait for the commands it cancels. An admitted sync may fail on that fence;
+teardown does not archive underneath its remaining local work. A drain exceeding
+30 seconds fails without invoking teardown, rather than pretending to confirm it.
+
+`src/file-sync.test.ts` exercises command overlap, bidirectional byte-exact sync,
+scratch isolation and teardown drains against the fake provider using real files
+and shell operations. `test/concurrent-sync-server.mjs` boots the real local app,
+database and worker to check the persisted declaration through the effective
+snapshot and runner. These are boundary checks, not a measurement of a person's
+first-message latency on live Boat.
 
 ## Operator-only fault-proxy API override
 

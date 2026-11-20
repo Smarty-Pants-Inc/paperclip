@@ -189,7 +189,11 @@ async function ensureHostParent(parent: string): Promise<void> {
     try { stat = await fs.lstat(current); }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      await fs.mkdir(current, { mode: 0o700 }); stat = await fs.lstat(current);
+      // Distinct concurrent targets may share a newly created ancestor. Only
+      // tolerate another creator winning; still lstat and reject links/files.
+      try { await fs.mkdir(current, { mode: 0o700 }); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+      stat = await fs.lstat(current);
     }
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Boat target parent is not canonical");
   }
