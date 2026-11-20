@@ -16,6 +16,7 @@ import { fastResponseRoutes } from "./routes/fast-responses.js";
 import { fastResponseService } from "./services/fast-responses.js";
 import { createDeliveryWorkCoordinator } from "./services/delivery-work-coordinator.js";
 import { DELIVERY_QUEUES } from "./services/delivery-work-notifications.js";
+import { logRecoveryCoordinatorGate } from "./services/scoped-deadline-work.js";
 import { createLifecycleDriver } from "./services/agent-lifecycle-driver.js";
 import { startAgentLifecycle } from "./services/agent-lifecycle.js";
 import { idleAdmissionMiddleware, trackIdleRequestHandlers } from "./middleware/idle-admission.js";
@@ -1268,7 +1269,13 @@ export async function createApp(
   jobCoordinator.start();
   const deliveryWork = createDeliveryWorkCoordinator({
     owner: db,
-    canRun: () => !isWarmStandby() && !isIdleTaskDrainActive(),
+    canRun: () => {
+      const warmStandby = isWarmStandby();
+      let idleTaskDrain: boolean | null = null;
+      const allowed = !warmStandby && !(idleTaskDrain = isIdleTaskDrainActive());
+      if (!allowed) logRecoveryCoordinatorGate(deliveryWork, { warmStandby, idleTaskDrain });
+      return allowed;
+    },
     canReconcile: () => !isWarmStandby(),
     onError: (err, queue) => logger.error({ err, queue }, "Delivery reconciliation failed"),
   });

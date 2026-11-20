@@ -2,7 +2,23 @@ import { randomUUID } from "node:crypto";
 import type { DeadlineReconciliationSnapshot } from "./deadline-reconciliation.js";
 import { takeCompanyWorkBatch } from "./company-work-batch.js";
 import type { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";
-import type { DeliveryQueue } from "./delivery-work-notifications.js";
+import { DELIVERY_QUEUES, type DeliveryQueue } from "./delivery-work-notifications.js";
+import { logger } from "../middleware/logger.js";
+
+// TEMP gate-only diagnostics. No timers, queries, or scheduling decisions.
+export type RecoveryDiagnosticCanRun = (() => boolean) & {
+  recoveryDiagnostics?: () => Record<string, unknown>;
+};
+const recoveryQueues: ReadonlySet<DeliveryQueue> = new Set([
+  DELIVERY_QUEUES.strandedAssignments, DELIVERY_QUEUES.orphanBlockers,
+  DELIVERY_QUEUES.activeRecoveryActions, DELIVERY_QUEUES.resolvedDependencies,
+  DELIVERY_QUEUES.staleIssueLocks, DELIVERY_QUEUES.taskWatchdogs, DELIVERY_QUEUES.assignedWorkInvariant,
+]);
+const recoveryGateObservers = new WeakMap<object, Set<(gates: Record<string, boolean | null>) => void>>();
+/** The coordinator can refuse a poll before the scoped worker sees it. */
+export function logRecoveryCoordinatorGate(coordinator: object, gates: Record<string, boolean | null>) {
+  for (const observe of recoveryGateObservers.get(coordinator) ?? []) observe(gates);
+}
 
 type ScheduledEntry = { id: string; companyId: string; dueAt: number };
 
@@ -27,6 +43,7 @@ export function registerScopedDeadlineWork<Entry extends ScheduledEntry, Scope>(
     };
     reconstructionIntervalMs?: number | ((scope: Scope | undefined) => number);
     beforePass?(): Promise<void>;
+    diagnostics?(): Record<string, unknown>;
     decodeScope(hint: string): Scope | undefined;
     matches(entry: Entry, scope?: Scope): boolean;
     load(scope?: Scope, signal?: AbortSignal): Promise<Entry[] | { rows: Entry[] | null; complete: boolean }>;
@@ -36,7 +53,7 @@ export function registerScopedDeadlineWork<Entry extends ScheduledEntry, Scope>(
     check(entry: Entry, signal?: AbortSignal): Promise<Entry | null>;
     onStop?(): void;
   },
-  canRun: () => boolean,
+  canRun: RecoveryDiagnosticCanRun,
 ) {
   if (options.concurrentChecks && (!Number.isInteger(options.concurrentChecks.limit) || options.concurrentChecks.limit < 1)) {
     throw new RangeError("Concurrent check limit must be a positive integer");
@@ -52,6 +69,31 @@ export function registerScopedDeadlineWork<Entry extends ScheduledEntry, Scope>(
   const reconstructAfter = new Map<string, number>();
   let earliest = 0;
   let lastCompany: string | null = null;
+  let lastDiagnosticAt = -Infinity;
+  let lastCompletedPassAt: number | null = null;
+  let dueEntryCount = 0, checksRunThisPass = 0;
+  function diagnostic(phase: string, extra: Record<string, unknown> = {}) {
+    if (!recoveryQueues.has(options.queue)) return;
+    const now = Date.now();
+    if (now - lastDiagnosticAt < 60_000) return;
+    // Logging failure must never change recovery, including its error path.
+    try {
+      lastDiagnosticAt = now;
+      const backoffs = (map: typeof failures, key: string) => [...map].slice(0, 25).map(([id, failure]) => ({
+        [key]: id, ...failure, backoffMs: Math.max(0, failure.retryAt - now),
+      }));
+      logger.info({ queue: options.queue, phase,
+        ...canRun.recoveryDiagnostics?.(), ...options.diagnostics?.(),
+        dueEntryCount, checksRunThisPass, pendingEntryCount: entries.size, dirtyScopeCount: dirty.size,
+        scopeFailureCount: scopeFailures.size, entryFailureCount: failures.size,
+        scopeFailures: backoffs(scopeFailures, "scope"), entryFailures: backoffs(failures, "id"),
+        lastCompletedPassAgoMs: lastCompletedPassAt === null ? null : now - lastCompletedPassAt,
+        ...extra,
+      }, "[recovery-diag]");
+    } catch { /* Diagnostic-only: retain the original scheduling and failure. */ }
+  }
+  const observeCoordinatorGate = (gates: Record<string, boolean | null>) =>
+    diagnostic("coordinator-blocked", { ...gates, canRun: false });
   function failed(map: typeof failures, id: string) {
     const count = Math.min((map.get(id)?.count ?? 0) + 1, 5);
     map.set(id, { count, retryAt: Date.now() + Math.min(300_000, 30_000 * 2 ** (count - 1)) });
@@ -63,7 +105,10 @@ export function registerScopedDeadlineWork<Entry extends ScheduledEntry, Scope>(
       .map(hint => { try { return options.decodeScope(hint); } catch { return undefined; } });
   }
   function next() {
-    if (!canRun()) return dirty.size > 0 || entries.size > 0 ? Date.now() + 30_000 : null;
+    if (!canRun()) {
+      diagnostic("poll-blocked", { canRun: false });
+      return dirty.size > 0 || entries.size > 0 ? Date.now() + 30_000 : null;
+    }
     let nextAt: number | null = null;
     const take = (at: number) => { nextAt = nextAt === null ? at : Math.min(nextAt, at); };
     for (const hint of dirty) take(Math.max(earliest, reconstructAfter.get(hint) ?? 0, scopeFailures.get(hint)?.retryAt ?? 0));
@@ -75,20 +120,24 @@ export function registerScopedDeadlineWork<Entry extends ScheduledEntry, Scope>(
   const worker = coordinator.register(options.queue, {
     retryMs: 30_000,
     pausePassiveMaintenance: true,
-    onStop: () => { stopped = true; revision++; options.onStop?.(); },
+    onStop: () => { recoveryGateObservers.get(coordinator)?.delete(observeCoordinatorGate); stopped = true; revision++; options.onStop?.(); },
     onSettled: hints => { revision++; for (const hint of hints ?? ["*"]) {
       dirty.add(hint); versions.set(hint, (versions.get(hint) ?? 0) + 1);
     } },
     run: async signal => {
       revision++; running = true;
+      let passStarted = false, passFailed = false, passCompleted = false;
       try {
-        if (!canRun() || Date.now() < earliest) return;
+        if (!canRun()) { diagnostic("pass-blocked", { canRun: false }); return; }
+        if (Date.now() < earliest) return;
         for (const [hint, until] of reconstructAfter) {
           if (until <= Date.now()) reconstructAfter.delete(hint);
         }
         const ready = [...dirty].filter(hint => Math.max(reconstructAfter.get(hint) ?? 0, scopeFailures.get(hint)?.retryAt ?? 0) <= Date.now());
         if (ready.length === 0 && ![...entries.values()].some(entry => Math.max(entry.dueAt, failures.get(entry.id)?.retryAt ?? 0) <= Date.now())) return;
         earliest = Date.now() + (options.minimumPassIntervalMs ?? 1000);
+        passStarted = true;
+        dueEntryCount = 0; checksRunThisPass = 0;
         try { await options.beforePass?.(); } catch (error) {
           for (const hint of ready) failed(scopeFailures, hint);
           for (const entry of entries.values()) if (entry.dueAt <= Date.now()) failed(failures, entry.id);
@@ -138,6 +187,7 @@ export function registerScopedDeadlineWork<Entry extends ScheduledEntry, Scope>(
           && Math.max(entry.dueAt, failures.get(entry.id)?.retryAt ?? 0) <= Date.now())
           .sort((a, b) => (options.priority?.(b) ?? 0) - (options.priority?.(a) ?? 0)
             || a.dueAt - b.dueAt || a.id.localeCompare(b.id));
+        dueEntryCount = due.length;
         const batch = takeCompanyWorkBatch(due, options.batchSize ?? 25, lastCompany); lastCompany = batch.lastCompany;
         // An owner may share more than one resource (for example a task and an
         // endpoint). Merge intersecting keys before dispatch so waiting siblings
@@ -193,6 +243,7 @@ export function registerScopedDeadlineWork<Entry extends ScheduledEntry, Scope>(
         let changed: (() => void) | null = null;
         const notify = () => { const resolve = changed; changed = null; resolve?.(); };
         const checkEntry = async (entry: Entry) => {
+          checksRunThisPass++;
           running += 1;
           try {
             const current = await options.check(entry, signal);
@@ -269,8 +320,15 @@ export function registerScopedDeadlineWork<Entry extends ScheduledEntry, Scope>(
         for (const result of checks) if (result.status === "rejected") errors.push(result.reason);
         if (errors.length) throw new AggregateError(errors, `${options.queue} could not settle`);
         lastRunFailed = false;
-      } catch (error) { lastRunFailed = true; throw error; }
-      finally { running = false; revision++; }
+        passCompleted = true;
+      } catch (error) { passFailed = true; lastRunFailed = true; throw error; }
+      finally {
+        if (passStarted) {
+          diagnostic(passFailed ? "pass-failed" : signal.aborted ? "pass-aborted" : passCompleted ? "pass-completed" : "pass-interrupted");
+          if (passCompleted) lastCompletedPassAt = Date.now();
+        }
+        running = false; revision++;
+      }
     },
     // Retain scopes/deadlines for resume without retaining a settled write's
     // idle hold during drain. The coordinator still fences unresolved XIDs.
@@ -278,6 +336,11 @@ export function registerScopedDeadlineWork<Entry extends ScheduledEntry, Scope>(
     nextRunAt: next,
     nextRunAtOnError: next,
   });
+  if (recoveryQueues.has(options.queue)) {
+    const observers = recoveryGateObservers.get(coordinator) ?? new Set();
+    observers.add(observeCoordinatorGate);
+    recoveryGateObservers.set(coordinator, observers);
+  }
   function invalidate(hint = "*") {
     revision++;
     dirty.add(hint); versions.set(hint, (versions.get(hint) ?? 0) + 1);

@@ -977,6 +977,8 @@ async function startServerWithDatabaseTeardown(
   const heartbeat = config.heartbeatSchedulerEnabled
     ? heartbeatService(db as any, { pluginWorkerManager })
     : null;
+  if (!config.heartbeatSchedulerEnabled) logger.info({ IssueStateRecoveryRegistered: false,
+    startupPassResult: "not-run-scheduler-disabled", HEARTBEAT_SCHEDULER_ENABLED: config.heartbeatSchedulerEnabled }, "[recovery-diag] startup");
   const accountingHeartbeat = heartbeat ?? heartbeatService(db as any, { pluginWorkerManager });
   // Settlement, the native finalizer's drain and steering ingestion promote
   // runs outside a heartbeat closure; they must use this wired instance.
@@ -1887,15 +1889,27 @@ async function startServerWithDatabaseTeardown(
     //   for the server to finish recovery (see startup-recovery-state.ts).
     // - Idle sleep stays blocked while the passes run (tracked work), and
     //   shutdown waits for them like any scheduler work.
+    let issueStateRecoveryRegistered = false;
     const runStartupRecoveryPasses = async () => {
       if (!config.heartbeatSchedulerEnabled) return;
       // Each pass is isolated: one that throws is logged and the passes after
       // it still run. A pass's queue stays registered and retries on its own
       // schedule (retry interval, deadlines, commit wakes).
       const pass = async (name: string, work: () => unknown) => {
-        if (heartbeatSchedulerStopped) return;
+        if (heartbeatSchedulerStopped) {
+          if (name === "IssueStateRecovery") logger.info({ IssueStateRecoveryRegistered: issueStateRecoveryRegistered,
+            startupPassResult: "not-run-scheduler-stopped", HEARTBEAT_SCHEDULER_ENABLED: config.heartbeatSchedulerEnabled }, "[recovery-diag] startup");
+          return;
+        }
+        let startupPassResult = "ready-resolved";
         try { await work(); }
-        catch (err) { logger.error({ err, startupRecoveryPass: name }, "startup recovery pass failed; its queue retries on its own schedule"); }
+        catch (err) { startupPassResult = "failed"; logger.error({ err, startupRecoveryPass: name }, "startup recovery pass failed; its queue retries on its own schedule"); }
+        finally {
+          // ready resolves even when the coordinator has scheduled a retry. The
+          // per-worker pass-failed line is the actual check outcome, not this receipt.
+          if (name === "IssueStateRecovery") logger.info({ IssueStateRecoveryRegistered: issueStateRecoveryRegistered,
+            startupPassResult, HEARTBEAT_SCHEDULER_ENABLED: config.heartbeatSchedulerEnabled }, "[recovery-diag] startup");
+        }
       };
       await pass("ResidualRecovery", () => heartbeat.registerResidualRecoveryWork(deliveryWork,
       () => !isIdleTaskDrainActive() && !isWarmStandby() && !heartbeatSchedulerStopped).ready);
@@ -1908,8 +1922,15 @@ async function startServerWithDatabaseTeardown(
       await pass("ActiveRunSilence", () => heartbeat.registerActiveRunSilenceWork(deliveryWork,
       () => !isIdleTaskDrainActive() && !isWarmStandby() && !heartbeatSchedulerStopped).ready);
       await pass("IssueStateRecovery", async () => {
+        let diagnosticGates: Record<string, boolean | null> = { idleTaskDrain: null, warmStandby: null, schedulerStopped: null };
         const work = heartbeat.registerIssueStateRecoveryWork(deliveryWork,
-          () => !isIdleTaskDrainActive() && !isWarmStandby() && !heartbeatSchedulerStopped);
+          () => {
+            diagnosticGates = { idleTaskDrain: null, warmStandby: null, schedulerStopped: null };
+            return !(diagnosticGates.idleTaskDrain = isIdleTaskDrainActive())
+              && !(diagnosticGates.warmStandby = isWarmStandby()) && !(diagnosticGates.schedulerStopped = heartbeatSchedulerStopped);
+          },
+          () => diagnosticGates);
+        issueStateRecoveryRegistered = true;
         idleDeadlineOwners.watchdogs = bindIdleDeadlineOwner(work.watchdogs.reconciliationSnapshot,
           heartbeat.readIdleWatchdogSchedule, () => ({ coverage: { kind: "watchdogs" } }));
         await work.ready;

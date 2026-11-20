@@ -36,11 +36,12 @@ export function registerIssueRecoveryWork(
   function register(queue: DeliveryQueue, statuses: string[] | null, check: (scope: Scope) => Promise<unknown>,
     alsoBlockedWhen?: () => ReturnType<typeof unansweredPersonMessageCondition>) {
     const cursors = new Map<string, string>();
-    let enabled = false;
+    let enabled = false, suppressionObserved = false;
     return registerScopedDeadlineWork<Entry, IssueRecoveryScope>(coordinator, {
       queue,
       reconstructionIntervalMs: 30_000,
-      beforePass: async () => { enabled = !(await owner.schedulingSuppressed()); },
+      beforePass: async () => { enabled = !(await owner.schedulingSuppressed()); suppressionObserved = true; },
+      diagnostics: () => ({ enabled, schedulingSuppressed: suppressionObserved ? !enabled : null }),
       decodeScope: hint => hint === "*" ? undefined : JSON.parse(hint) as IssueRecoveryScope,
       matches: (entry, scope) => !scope || (entry.companyId === scope.companyId && (!scope.issueId || entry.id === scope.issueId)),
       load: async scope => {
@@ -104,12 +105,13 @@ export function registerIssueRecoveryWork(
   function registerAssignedWork(sweep: NonNullable<typeof owner.assignedWork>) {
     type Suspect = Entry & { updatedAt: number };
     const cursors = new Map<string, string>();
-    let enabled = false;
+    let enabled = false, suppressionObserved = false;
     return registerScopedDeadlineWork<Suspect, IssueRecoveryScope>(coordinator, {
       queue: DELIVERY_QUEUES.assignedWorkInvariant,
       reconstructionIntervalMs: 30_000,
       batchSize: 25,
-      beforePass: async () => { enabled = !(await owner.schedulingSuppressed()); },
+      beforePass: async () => { enabled = !(await owner.schedulingSuppressed()); suppressionObserved = true; },
+      diagnostics: () => ({ enabled, schedulingSuppressed: suppressionObserved ? !enabled : null }),
       decodeScope: hint => hint === "*" ? undefined : JSON.parse(hint) as IssueRecoveryScope,
       matches: (entry, scope) => !scope || (entry.companyId === scope.companyId && (!scope.issueId || entry.id === scope.issueId)),
       priority: entry => entry.updatedAt,
@@ -133,11 +135,12 @@ export function registerIssueRecoveryWork(
   }
   function registerCompany(queue: DeliveryQueue, kind: "blockers" | "actions", check: (scope: { companyId: string }) => Promise<number | null | void>) {
     const cursors = new Map<string, string>();
-    let enabled = false;
+    let enabled = false, suppressionObserved = false;
     return registerScopedDeadlineWork<Entry, IssueRecoveryScope>(coordinator, {
       queue,
       reconstructionIntervalMs: 30_000,
-      beforePass: async () => { enabled = !(await owner.schedulingSuppressed()); },
+      beforePass: async () => { enabled = !(await owner.schedulingSuppressed()); suppressionObserved = true; },
+      diagnostics: () => ({ enabled, schedulingSuppressed: suppressionObserved ? !enabled : null }),
       decodeScope: hint => hint === "*" ? undefined : JSON.parse(hint) as IssueRecoveryScope,
       matches: (entry, scope) => !scope || entry.companyId === scope.companyId,
       load: async scope => {

@@ -981,11 +981,14 @@ export function heartbeatService(
     }
     return cachedWorktreeRunExecutionOverride;
   };
+  let recoverySchedulingSuppression: ReturnType<typeof resolveHeartbeatSchedulingSuppression> | null = null;
   const getSchedulingSuppression = async (fresh = false) => {
     const override = await resolveWorktreeRunExecutionOverride(fresh);
-    return resolveHeartbeatSchedulingSuppression(runtimeEnv, {
+    const suppression = resolveHeartbeatSchedulingSuppression(runtimeEnv, {
       allowWorktreeRunExecution: override.allowed,
     });
+    recoverySchedulingSuppression = suppression; // TEMP diagnostic snapshot; no extra settings query.
+    return suppression;
   };
   const getWorktreeExecutionCutoff = async () => {
     const override = await resolveWorktreeRunExecutionOverride();
@@ -4802,8 +4805,10 @@ export function heartbeatService(
         schedulingSuppressed: async () => (await getSchedulingSuppression(true)).suppressed,
         prepareChatRetry,
       }, () => canRun() && readTaskDrain(new Date()) === null),
-    registerIssueStateRecoveryWork: (coordinator: Parameters<typeof registerIssueRecoveryWork>[1], canRun: () => boolean) =>
-      registerIssueRecoveryWork(db, coordinator, {
+    registerIssueStateRecoveryWork: (coordinator: Parameters<typeof registerIssueRecoveryWork>[1], canRun: () => boolean,
+      diagnosticGates?: () => Record<string, boolean | null>) => {
+      let diagnosticTaskDrain: boolean | null = null;
+      return registerIssueRecoveryWork(db, coordinator, {
         stranded: scope => reconcileStrandedAssignedIssues({ ...scope, skipExternalConversationSettlement: true, skipRelatedRecovery: true }),
         orphanBlockers: recovery.reconcileUnassignedBlockingIssues,
         recoveryActions: recovery.reconcileActiveRecoveryActions,
@@ -4816,7 +4821,21 @@ export function heartbeatService(
           checkIssue: recovery.assignedWork.checkIssue,
         },
         schedulingSuppressed: async () => (await getSchedulingSuppression(true)).suppressed,
-      }, () => canRun() && readTaskDrain(new Date()) === null),
+      }, Object.assign(() => {
+        // Preserve the original short circuit and its sole drain read. A read
+        // can expire a drain and notify listeners, so diagnostics must not add one.
+        diagnosticTaskDrain = null;
+        return canRun() && !(diagnosticTaskDrain = readTaskDrain(new Date()) !== null);
+      }, {
+        recoveryDiagnostics: () => ({ ...diagnosticGates?.(),
+          taskDrain: diagnosticTaskDrain,
+          enabled: recoverySchedulingSuppression === null ? null : !recoverySchedulingSuppression.suppressed,
+          schedulingSuppressed: recoverySchedulingSuppression?.suppressed ?? null,
+          suppressionReason: recoverySchedulingSuppression?.reason ?? null,
+          issueCreatedAtGte: cachedWorktreeRunExecutionOverride.allowed ? cachedWorktreeRunExecutionOverride.cutoff : null,
+        }),
+      }));
+    },
     registerRunDispatchWork: (coordinator: Parameters<typeof registerRunDispatchWork>[0], canRun: () => boolean) =>
       registerRunDispatchWork(coordinator, {
         promoteDueScheduledRetries,
