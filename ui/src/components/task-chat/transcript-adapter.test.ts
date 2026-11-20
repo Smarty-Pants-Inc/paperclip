@@ -295,6 +295,25 @@ describe("omitProgressRepeatedByResponseAcrossSegments", () => {
     ).toBe(segments);
   });
 
+  it("hides the latest progress whose sentences the response restates whole", () => {
+    const work = progress("work", "Let me check that.");
+    const first = progress("first", "100+1 = 101.");
+    const second = progress("second", "**9+10** = `19`.\n\nResuming the original task.");
+    expect(
+      omitProgressRepeatedByResponseAcrossSegments([[work, first], [second]], "Done. Also, 100+1 = 101. 9+10 = 19."),
+    ).toEqual([[work], []]);
+    const answers = [[progress("a", "101."), progress("b", "19.")]];
+    expect(omitProgressRepeatedByResponseAcrossSegments(answers, "Done. 100+1 = 101. 9+10 = 19.")).toEqual([[]]);
+    // Word-bounded: a progress "101" is not restated by "1010", nor by a sentence that only contains it.
+    const bare = [[progress("bare", "101")]];
+    expect(omitProgressRepeatedByResponseAcrossSegments(bare, "Processed 1010 rows.")).toBe(bare);
+    const inside = [[progress("inside", "Tests pass.")]];
+    expect(omitProgressRepeatedByResponseAcrossSegments(inside, "Not all Tests passed.")).toBe(inside);
+    // A later progress the response does not restate keeps the earlier shared line.
+    const later = [[first, work]];
+    expect(omitProgressRepeatedByResponseAcrossSegments(later, "Done. Also, 100+1 = 101.")).toBe(later);
+  });
+
   it("preserves segment identity when there is no durable-response match", () => {
     const segments = [[progress("first", "Progress only")]];
     expect(
