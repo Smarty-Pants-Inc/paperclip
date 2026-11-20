@@ -163,8 +163,11 @@ export function agentHarnessVerificationService(db: Db, manager: PluginWorkerMan
     // A lifecycle retry must settle the previous probe's physical retirement
     // and credential handoff BEFORE resolveAdapterTestExecutionContext can acquire
     // another box/lease. withManagedAiProbe's cleanup 422 occurs after acquisition.
+    // Only this agent's own probe entries gate it: runs on the same account
+    // already proceed while one is pending (prepareManagedAiRuntime), so another
+    // agent's unfinished cleanup protects nothing here and must not block a hire.
     if (selected) {
-      try { await reconcileRetainedAiCleanup({ companyId: agent.companyId, accountKey: selected.grant.id }); }
+      try { await reconcileRetainedAiCleanup({ companyId: agent.companyId, accountKey: selected.grant.id }, { agentId: agent.id }); }
       catch (error) {
         if (error instanceof HttpError && (error.details as { code?: unknown } | null)?.code === "ai_credential_cleanup_pending") {
           throw unprocessable("The native account test is still cleaning up. Retry after runtime cleanup completes.", { code: "native_probe_cleanup_pending" });

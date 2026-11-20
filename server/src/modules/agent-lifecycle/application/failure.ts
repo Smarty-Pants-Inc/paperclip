@@ -26,12 +26,15 @@ const reasons = {
   test_environment_unavailable: "The test environment is unavailable. Check the agent's environment in Configuration. Paperclip will retry automatically.",
   required_plugin_unavailable: "A required plugin is unavailable. Check the plugin's status in Settings. Paperclip will retry automatically.",
   invalid_lifecycle_result: "A required plugin returned an invalid result. Check the plugin's status in Settings. Paperclip will retry automatically.",
+  native_probe_cleanup_failed: "The execution test failed and its runtime could not be closed cleanly. Paperclip finished the test's cleanup.",
 } as const;
 
 const transientCodes = new Set(["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "PLUGIN_RPC_TIMEOUT", "40001", "40P01", "53300", "57P01"]);
 const configurationFailures = new Set([
   "ai_connection_required", "harness_auth_failed", "harness_model_unavailable",
   "harness_command_unavailable", "harness_cwd_invalid", "harness_probe_unexpected_output",
+  // A failed test whose native close was unrecoverable: a true failure, not cleanup still running.
+  "native_probe_cleanup_failed",
 ]);
 
 export function lifecycleVerificationNeedsRetry(context: LifecycleFailure, error: unknown): boolean {
@@ -45,7 +48,7 @@ export function lifecycleFailureCode(error: unknown): string | undefined {
   const selectionFailure = readAiConnectionConfigurationFailure(error);
   if (selectionFailure) return selectionFailure;
   const detailCode = readHttpErrorCode(error);
-  if (detailCode === "native_probe_cleanup_pending") return detailCode;
+  if (detailCode === "native_probe_cleanup_pending" || detailCode === "native_probe_cleanup_failed") return detailCode;
   const candidate = error as { code?: unknown; cause?: { code?: unknown } } | null;
   const codes = [candidate?.code, candidate?.cause?.code];
   if (codes.includes(PLUGIN_RPC_ERROR_CODES.TIMEOUT)) return "PLUGIN_RPC_TIMEOUT";
