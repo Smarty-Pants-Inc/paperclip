@@ -195,6 +195,9 @@ const retryWaitMessages: Record<string, string> = {
   retry_source_changed: "Retry cannot continue because its saved message changed. Send a new message to continue from saved work.",
 };
 
+/** Input sent during a turn that succeeded, never started afterwards. */
+const NOT_STARTED_WAIT = { reason: "not_started", message: "Your messages haven’t started yet. They’re saved." };
+
 const UNIDENTIFIED_RUNNER_STOP_MESSAGE = "Paperclip can't confirm that the previous run stopped. The server restarted after it started the agent but before it recorded the agent's process. "
   + "If no agent is still working on this task, a board operator can confirm that it stopped, and your Retry starts right away. Your message is saved.";
 
@@ -402,11 +405,17 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
       canRetry: heldRetryOffersRetry(reason, input.cleanupSettling), retryWait: { reason,
       message: retryWaitMessages[reason] ?? "Retry is waiting for execution checks. Your message is saved." } };
   }
-  const queuedDuringRun = Boolean(wait && run.status === "succeeded" && (["todo", "in_progress", "in_review"].includes(issue.status)
-      || (issue.status === "blocked" && input.waitingOnOpenSubtasks && !wait.sourceRunId && wait.queuedComment)) && run.finishedAt && wait.requestedAt.getTime() <= run.finishedAt.getTime()
-    && now - run.finishedAt.getTime() < QUEUED_INPUT_DISPATCH_GRACE_MS);
+  const waitedOnSucceededRun = Boolean(wait && run.status === "succeeded" && (["todo", "in_progress", "in_review"].includes(issue.status)
+      || (issue.status === "blocked" && input.waitingOnOpenSubtasks && !wait.sourceRunId && wait.queuedComment)) && run.finishedAt && wait.requestedAt.getTime() <= run.finishedAt.getTime());
+  const queuedDuringRun = waitedOnSucceededRun && now - run.finishedAt!.getTime() < QUEUED_INPUT_DISPATCH_GRACE_MS;
   if (wait && (wait.requestedAt.getTime() > now - 10_000 || queuedDuringRun) && system?.state !== "exhausted")
     return { ...base, state: "working" };
+  // The turn succeeded and the person's input sent during it was never
+  // started: nothing failed, so this is not the failed-attempt line. Name the
+  // wait. A queued comment already has Send on the chat's waiting bar, so the
+  // card offers no second action; other input keeps the one Retry that starts it.
+  if (waitedOnSucceededRun && system?.state !== "exhausted")
+    return { ...base, state: "failed", canRetry: !wait!.queuedComment, retryWait: { ...NOT_STARTED_WAIT } };
   if (run.errorCode === NATIVE_SESSION_CLEANUP_QUARANTINED) {
     // The provider turn completed and its work is saved; only shutdown of the
     // old session is unproven, and that settles by itself. A task that waits on

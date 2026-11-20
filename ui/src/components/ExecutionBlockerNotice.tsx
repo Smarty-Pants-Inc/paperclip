@@ -161,6 +161,18 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
   // the stopped attempt is not a failure to retry (org 11-19 04:36Z).
   if (optimistic || !presentation || presentation.responsibility !== "system" || heldByPersonStop ||
       !["failed", "retry_scheduled"].includes(presentation.state)) return null;
+  // The turn succeeded; the person's messages only have not started yet.
+  // Nothing failed, so this is a neutral status, not the red failure banner.
+  // Its one action starts them (the Retry path); a queued message already has
+  // Send on the waiting bar, so the server offers no second action then.
+  if (presentation.state === "failed" && presentation.retryWait?.reason === "not_started") return (
+    <div role="status" aria-label="Task status" data-testid="task-execution-not-started"
+      className={cn("flex items-center justify-between gap-3 text-sm text-muted-foreground", className)}>
+      <span className="min-w-0 flex-1">{presentation.retryWait.message}</span>
+      {canRetry && presentation.canRetry && <Button variant="outline" size="sm" className="shrink-0" onClick={retryOnce}
+        disabled={retryPressed} data-testid="task-execution-retry">Start now</Button>}
+    </div>
+  );
   return (
     <div className={cn(presentation.state === "failed" && "pt-4", className)}>
       <div role="status" aria-label="Task status" className={cn(
