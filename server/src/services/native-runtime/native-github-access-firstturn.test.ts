@@ -18,7 +18,8 @@ afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) awai
 async function fixture(options: { fail?: (script: string) => boolean } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "github-firstturn-"));
   cleanups.push(() => rm(root, { recursive: true, force: true }));
-  const calls: { script: string; phase: string }[] = [];
+  const calls: { script: string; phase: string; depth: number; settled: boolean }[] = [];
+  let completedDepth = 0;
   let phase = "create";
   let queue = "";
   let hostUrl = "";
@@ -29,19 +30,25 @@ async function fixture(options: { fail?: (script: string) => boolean } = {}) {
   const resolveCredentials = vi.fn(async () => ({ status: "available", env: {} }));
   const execute: CommandManagedRuntimeRunner["execute"] = async input => {
     const script = [...(input.args ?? []), input.stdin ?? ""].join("\n");
-    calls.push({ script, phase });
-    await beforeExec?.(script);
-    if (options.fail?.(script)) return { exitCode: 1, stdout: "", stderr: "injected provider failure", timedOut: false, signal: null, pid: null, startedAt: new Date().toISOString() };
-    // A real shell executes every command; this fake provider does not fabricate
-    // readiness, uploads or queue results. In particular the ready gate launches
-    // the actual generated callback server.
-    const child = promisify(execFile)(input.command, input.args ?? [], {
-      cwd: input.cwd ?? root, env: { ...process.env, ...input.env }, timeout: 15_000, maxBuffer: 4 * 1024 * 1024,
-    });
-    child.child.stdin?.on("error", () => undefined);
-    child.child.stdin?.end(input.stdin ?? "");
-    const result = await child;
-    return { ...result, exitCode: 0, timedOut: false, signal: null, pid: null, startedAt: new Date().toISOString() };
+    const call = { script, phase, depth: completedDepth + 1, settled: false };
+    calls.push(call);
+    try {
+      await beforeExec?.(script);
+      if (options.fail?.(script)) return { exitCode: 1, stdout: "", stderr: "injected provider failure", timedOut: false, signal: null, pid: null, startedAt: new Date().toISOString() };
+      // A real shell executes every command; this fake provider does not fabricate
+      // readiness, uploads or queue results. In particular the ready gate launches
+      // the actual generated callback server.
+      const child = promisify(execFile)(input.command, input.args ?? [], {
+        cwd: input.cwd ?? root, env: { ...process.env, ...input.env }, timeout: 15_000, maxBuffer: 4 * 1024 * 1024,
+      });
+      child.child.stdin?.on("error", () => undefined);
+      child.child.stdin?.end(input.stdin ?? "");
+      const result = await child;
+      return { ...result, exitCode: 0, timedOut: false, signal: null, pid: null, startedAt: new Date().toISOString() };
+    } finally {
+      call.settled = true;
+      completedDepth = Math.max(completedDepth, call.depth);
+    }
   };
   const bin = path.join(root, "bin");
   await mkdir(bin);
@@ -70,6 +77,7 @@ async function fixture(options: { fail?: (script: string) => boolean } = {}) {
   };
   return { root, calls, create, resolveCredentials, runner: { execute },
     get queue() { return queue; }, get transportError() { return transportError; },
+    get serialDepth() { return completedDepth; },
     setPhase(value: string) { phase = value; },
     beforeExec(hook: (script: string) => Promise<void>) { beforeExec = hook; },
     hostRequest: () => fetch(hostUrl + "/runtime-tools/github/credentials", {
@@ -88,9 +96,18 @@ it("cold real GitHub create + activate uses at most six remote execs and publish
   });
   expect((await request()).status).toBe(403);
   const createCount = f.calls.length;
+  const createDepth = f.serialDepth;
   f.setPhase("activate");
   const deactivate = await broker.activate({ ...scope, runId: "run" });
   const count = f.calls.length;
+  const depth = f.serialDepth;
+  // Setup's awaited calls form a linear dependency chain at both revisions.
+  // The resumed poll is admitted before activate resolves, but is not awaited:
+  // count it in total work, not in completed critical-path depth. A completion
+  // frontier is exact for this chain (and conservative if unrelated work overlaps).
+  const pending = f.calls.filter(call => !call.settled);
+  expect(pending).toHaveLength(1);
+  expect(pending[0]!.script).toContain("wait_checks");
   const state = await readFile(path.join(f.queue, "run-state.json"), "utf8");
   expect(state).toMatch(/^attached:.+/);
   expect(await readFile(path.join(f.queue, "run-state.json.ever-attached"), "utf8")).toBe("attached");
@@ -100,9 +117,11 @@ it("cold real GitHub create + activate uses at most six remote execs and publish
   const attachmentIndex = f.calls.findIndex(call => call.phase === "activate" && call.script.includes("ever-attached"));
   expect(quarantineIndex).toBeGreaterThanOrEqual(createCount);
   expect(attachmentIndex).toBeGreaterThan(quarantineIndex);
-  console.log("FIRSTTURN_COUNTS", JSON.stringify({ create: createCount, activate: count - createCount, total: count }));
+  console.log("FIRSTTURN_COUNTS", JSON.stringify({ create: createCount, activate: count - createCount, total: count,
+    serialDepth: { create: createDepth, activate: depth - createDepth, total: depth } }));
   f.setPhase("cleanup");
   await deactivate();
+  expect(depth).toBeLessThanOrEqual(6);
   expect(count).toBeLessThanOrEqual(6);
 }, 30_000);
 
