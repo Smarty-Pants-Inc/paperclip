@@ -102,20 +102,43 @@ try {
   noKey(audit, "audit");
   await save("caller-results.json", results);
   await save("comment-readback-audit.json", { comments: comments.body, audit });
+  // R-keep-all-traces: the server masks inspection, never the sink's raw bytes.
+  const sinkBytes = await readFile(capture.path);
+  const sha256 = (bytes: Buffer) => `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+  const sinkSha = sha256(sinkBytes);
+  const sinkFrames = sinkBytes.toString("utf8").trim().split("\n")
+    .map(line => JSON.parse(line) as Record<string, unknown>).filter(row => row.kind === "frame");
   await traces.finalize(runId, companyId);
   const persisted = await traces.getByRun(runId, companyId);
   assert.equal(persisted?.frameCount, providerPrefixKeys.length);
   const frames = await traces.readExactEntries(runId, companyId);
   assert.ok(frames);
   const inspection = await traces.inspect(runId, companyId);
+  assert.deepEqual(await traces.inspect(runId, companyId), inspection, "inspection survives reopen");
+  assert.equal(inspection.entries.filter(row => "kind" in row && row.kind === "frame").length, providerPrefixKeys.length);
+  const visibleFamilies = providerPrefixKeys.filter(([, key]) => JSON.stringify(inspection).includes(key)).map(([family]) => family);
   await save("trace-server-readback-census.json", { trace: inspection.trace,
-    visibleFamilies: providerPrefixKeys.filter(([, key]) => JSON.stringify(inspection).includes(key)).map(([family]) => family) });
+    inputFamilies: providerPrefixKeys.length, visibleFamilies });
   noKey(inspection, "server trace inspection");
   noKey(await traces.revealFrame(runId, companyId, 1), "server exact frame reveal");
-  const decoded = frames.filter(row => row.kind === "frame").map(row => Buffer.from(row.rawBase64 as string, "base64").toString("utf8"));
+  const rawFrames = frames.filter(row => row.kind === "frame");
+  const decoded = rawFrames.map(row => Buffer.from(row.rawBase64 as string, "base64").toString("utf8"));
   assert.equal(decoded.length, providerPrefixKeys.length);
-  noKey(decoded, "decoded trace frames");
-  await save("trace-decoded.json", decoded);
+  assert.deepEqual(rawFrames, sinkFrames, "server readback retains the sink's frames and digests");
+  for (const frame of rawFrames) {
+    const raw = Buffer.from(frame.rawBase64 as string, "base64");
+    assert.equal(frame.digest, sha256(raw), "stored frame SHA matches sink bytes");
+    assert.equal(frame.byteLength, raw.byteLength);
+  }
+  const storedBytes = await readFile(capture.path);
+  assert.ok(sinkBytes.equals(storedBytes), "server finalize/inspection must not rewrite raw trace bytes");
+  assert.equal(sha256(storedBytes), sinkSha, "stored SHA equals the SHA the sink wrote");
+  assert.equal(persisted?.digest, sinkSha, "persisted trace SHA equals the SHA the sink wrote");
+  assert.ok((await traces.download(runId, companyId))?.bytes.equals(sinkBytes), "exact download retains sink bytes");
+  // Do not copy decoded raw bytes into diagnostic files. The runner-half no-key
+  // assertion is retained as it.skip in provider-prefix-no-write.test.ts.
+  await save("trace-raw-integrity.json", { sinkSha, storedSha: sha256(storedBytes), recordedSha: persisted?.digest,
+    unchanged: sinkBytes.equals(storedBytes), frames: rawFrames.map(row => ({ frameId: row.frameId, digest: row.digest, byteLength: row.byteLength })) });
   await save("coverage.json", { canaries: providerPrefixKeys.length, callers: ["redactSensitiveText", "authenticated comment route + denied route + audit", "Pino trace/debug/info/warn/error/fatal + Error stack + metric labels", "trace frames + interpretations"], level: logger.level, mode: process.env.NODE_ENV });
   // Check files while the database/logs still exist, before its helper cleanup.
   const inventory: { path: string; bytes: number }[] = [];
@@ -125,7 +148,11 @@ try {
       if (entry.isDirectory()) await inspect(path);
       else if (entry.isFile()) {
         const bytes = await readFile(path);
-        for (const [family, key] of providerPrefixKeys) assert.ok(!bytes.includes(Buffer.from(key)), `${family}: raw secret in file ${path}`);
+        // Only the exact raw provider-trace file is exempt (R-keep-all-traces).
+        // Raw-frame masking is the runner half, next pack; every other file is scanned.
+        if (path !== capture.path) {
+          for (const [family, key] of providerPrefixKeys) assert.ok(!bytes.includes(Buffer.from(key)), `${family}: raw secret in file ${path}`);
+        }
         inventory.push({ path, bytes: bytes.length });
       }
     }
