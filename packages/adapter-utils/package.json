@@ -15,12 +15,12 @@
   "exports": {
     ".": "./src/index.ts",
     "./provider-prefix-redaction": {
-      "types": "./dist/provider-prefix-redaction.d.ts",
-      "import": "./dist/provider-prefix-redaction.js"
+      "types": "./src/provider-prefix-redaction.ts",
+      "import": "./src/provider-prefix-redaction.ts"
     },
     "./pi-rpc-default-thinking": {
-      "types": "./dist/pi-rpc-default-thinking.d.ts",
-      "import": "./dist/pi-rpc-default-thinking.js"
+      "types": "./src/pi-rpc-default-thinking.ts",
+      "import": "./src/pi-rpc-default-thinking.ts"
     },
     "./*": "./src/*.ts"
   },
