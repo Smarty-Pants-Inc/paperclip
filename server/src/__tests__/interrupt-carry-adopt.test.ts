@@ -912,6 +912,50 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
     expect(prompt).toMatch(/in order, all of them/);
   });
 
+  /** adopt-receipts5: the two interrupt acknowledgements the harness session really emits (codex-harness-session
+   * interrupt()): a QUEUED one (no turn identity yet) and the one that ACCEPTED the active turn. */
+  const queuedAck = (seq: number) => ({ seq, eventType: "item.completed", itemId: "interrupt:queued:1",
+    payload: { kind: "interrupt_acknowledgement", text: "Interrupt queued until the provider assigns the turn identity.", status: "queued" } });
+  const acceptedAck = (seq: number) => ({ seq, eventType: "item.completed", itemId: "pi-turn-1:interrupt:2",
+    payload: { kind: "interrupt_acknowledgement", text: "Interrupt accepted for the active turn.", status: "acknowledged" } });
+
+  it("RF6-2ACK (rf-3 F2 red): a QUEUED ack, then STEP2 ran and its receipts were lost, then the ack that ACCEPTED the active turn ⇒ STEP2 is never silently dropped: the 'interrupted, may or may not have taken effect' entry follows STEP1", async () => {
+    const chat = await seedChat();
+    const b1 = "pi-turn-1:pi-tool:bash-1", b2 = "pi-turn-1:pi-tool:bash-2";
+    await realPiRows(chat, [
+      piItem(b1, "item.started", 1), piExec(b1, "echo STEP1 >> /work/c", "process", "running", "", 2), piItem(b1, "item.completed", 3),
+      piExec(b1, "echo STEP1 >> /work/c", "process", "completed", "RF_STEP1_RESULT", 4),
+      queuedAck(5),
+      // STEP2 started AFTER the first (queued) ack; the cut discarded its receipts.
+      piItem(b2, "item.started", null), piExec(b2, "echo STEP2 >> /work/c", "process", "running", "", null),
+      piExec(b2, "echo STEP2 >> /work/c", "process", "completed", "RF_STEP2_RESULT", null),
+      acceptedAck(9),
+    ]);
+    const { carry } = await steerThenInterrupt(chat, "unread");
+    const prompt = await successorPrompt(chat, await admitSuccessor(chat, carry), false);
+    expect(prompt).toContain("1. `echo STEP1 >> /work/c`: completed");
+    expect(prompt, "STEP2 ran between the queued and the accepted ack: it must be listed or flagged, never silently redone")
+      .toMatch(/\n2\. A further call may have run right before the interrupt[^\n]*interrupted: it may or may not have taken effect/);
+    expect(prompt).toMatch(/in order, but NOT all of them/);
+  });
+
+  it("RF6-2ACK control: queued + accepted acks with every receipt before the accepted ack durable (gap only AFTER it) ⇒ STEP1/STEP2 completed, no 'further call' line", async () => {
+    const chat = await seedChat();
+    const b1 = "pi-turn-1:pi-tool:bash-1", b2 = "pi-turn-1:pi-tool:bash-2";
+    await realPiRows(chat, [
+      piExec(b1, "echo STEP1 >> /work/c", "process", "running", "", 1), piExec(b1, "echo STEP1 >> /work/c", "process", "completed", "R1", 2),
+      queuedAck(3),
+      piExec(b2, "echo STEP2 >> /work/c", "process", "running", "", 4), piExec(b2, "echo STEP2 >> /work/c", "process", "completed", "R2", 5),
+      acceptedAck(6),
+      { seq: 9, eventType: "turn.cancelled", payload: { status: "cancelled" } },
+    ]);
+    const { carry } = await steerThenInterrupt(chat, "unread");
+    const prompt = await successorPrompt(chat, await admitSuccessor(chat, carry), false);
+    expect(prompt).toContain("2. `echo STEP2 >> /work/c`: completed");
+    expect(prompt).not.toMatch(/A further call may have run/);
+    expect(prompt).toMatch(/in order, all of them/);
+  });
+
   it("RF5-WAIT (rf-3 #2 red): STEP2's completion is still in ordered ingestion when the successor builds its input ⇒ the build waits (bounded) for the cut run's ingestion fence and lists STEP2 completed", async () => {
     const chat = await seedChat();
     const b2 = "pi-turn-1:pi-tool:bash-2";

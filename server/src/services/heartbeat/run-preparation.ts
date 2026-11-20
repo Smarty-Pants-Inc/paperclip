@@ -2467,8 +2467,12 @@ export async function readInterruptCutToolCalls(db: Db, input: { companyId: stri
   }
   // A cut run whose ordered source record has a gap BEFORE the press (its interrupt acknowledgement) lost
   // events when it was cut: a call that ran then has no receipt. Never let that read as "nothing ran".
+  // adopt-receipts5 (rf-3 F2): the press is the ack that ACCEPTED the active turn, not the first ack. A
+  // "queued" ack (the harness had no turn identity yet) is not the press: work kept running after it, so
+  // bounding the check there hid a STEP2 lost between it and the accepting ack, and STEP2 ran twice.
   const sourceRows = await db.select({ runId: heartbeatRunEvents.runId, instance: heartbeatRunEvents.sourceInstanceId,
-    seq: heartbeatRunEvents.sourceSeq, ack: sql<boolean>`(${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'kind') = 'interrupt_acknowledgement'` })
+    seq: heartbeatRunEvents.sourceSeq, ack: sql<boolean>`(${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'kind') = 'interrupt_acknowledgement'
+      and coalesce(${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'status', '') <> 'queued'` })
     .from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.companyId, input.companyId), inArray(heartbeatRunEvents.runId, cutRunIds),
       sql`${heartbeatRunEvents.sourceSeq} is not null and ${heartbeatRunEvents.sourceInstanceId} is not null`,
       sql`coalesce(${heartbeatRunEvents.payload}->'prpEvent'->>'sourceKind', 'runner') <> 'control_plane'`))
@@ -2480,7 +2484,8 @@ export async function readInterruptCutToolCalls(db: Db, input: { companyId: stri
     const seq = Number(row.seq);
     source.seqs.add(seq);
     source.max = Math.max(source.max, seq);
-    if (row.ack && source.press === null) source.press = seq;
+    // The latest accepting ack bounds the check (a repeated interrupt only moves the press later).
+    if (row.ack) source.press = Math.max(source.press ?? seq, seq);
     sources.set(key, source);
   }
   let recordIncomplete = false;
