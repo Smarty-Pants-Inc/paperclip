@@ -117,8 +117,8 @@ const SPILL_LOG_REF = /^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/;
  * person's next turn waits on that lock: a store that stops answering costs a
  * pass this budget once, not one read deadline per spill.
  */
-export const RUN_LOG_SPILL_READ_BACK_BUDGET_MS = 30_000;
-const spillCustodyPass = new AsyncLocalStorage<{ readBackDeadline?: number }>();
+export const RUN_LOG_SPILL_READ_BACK_BUDGET_MS = 10_000;
+const spillCustodyPass = new AsyncLocalStorage<{ budgetMs: number; readBackDeadline?: number }>();
 /**
  * Run `work` as one guard pass: every custody decision made inside it shares
  * one read-back budget, counted from its first read-back. When the budget is
@@ -128,7 +128,11 @@ const spillCustodyPass = new AsyncLocalStorage<{ readBackDeadline?: number }>();
  * many times it asks.
  */
 export function runLogSpillCustodyPass<T>(work: () => Promise<T>): Promise<T> {
-  return spillCustodyPass.getStore() ? work() : spillCustodyPass.run({}, work);
+  if (spillCustodyPass.getStore()) return work();
+  const configured = Number(process.env.RUN_LOG_SPILL_READ_BACK_BUDGET_MS);
+  const budgetMs = Number.isSafeInteger(configured) && configured > 0 && configured <= 2_147_483_647
+    ? configured : RUN_LOG_SPILL_READ_BACK_BUDGET_MS;
+  return spillCustodyPass.run({ budgetMs }, work);
 }
 const SPILL_CUSTODY_ROW = "kept: run-log spill custody unknown";
 // Every run-log record, spilled or not, is `{"ts":…,"attemptId":…,"stream":…,"chunk":…}`.
@@ -305,9 +309,9 @@ async function runLogSpillCustody(indexPath: string, insideSpillDir: boolean): P
     } finally { await file.close(); }
     // (b) Read the recovered copy back from where it lives, inside this pass's budget.
     const pass = spillCustodyPass.getStore()!;
-    const budgetLeft = (pass.readBackDeadline ??= Date.now() + RUN_LOG_SPILL_READ_BACK_BUDGET_MS) - Date.now();
+    const budgetLeft = (pass.readBackDeadline ??= Date.now() + pass.budgetMs) - Date.now();
     if (budgetLeft <= 0)
-      return kept("read_back_budget_exhausted", { ...named, budgetMs: RUN_LOG_SPILL_READ_BACK_BUDGET_MS });
+      return kept("read_back_budget_exhausted", { ...named, budgetMs: pass.budgetMs });
     const signal = AbortSignal.timeout(budgetLeft);
     let failure: SpillReadBackFailure = { reason: "recovered_copy_store_unavailable" }, equal = false;
     for (const readBack of spillReadBackStores) {
