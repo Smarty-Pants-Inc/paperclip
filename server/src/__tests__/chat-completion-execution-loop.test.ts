@@ -10,11 +10,13 @@ import { assignedWorkSweep } from "../services/recovery/assigned-work-sweep.js";
 import { issueService } from "../services/issues.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { deliverReconciledExecutions, markExecutionReconciliation, validateExecutionReconciliation } from "../services/execution-recovery-resolution.js";
 import { chatCompletionDeliveryService, prepareChatCompletionTurn, recordAcceptedChatHandoff } from "../services/chat-completion-delivery.js";
 
 // catch: GAT-497 / GAT-498 (gate 2, 2026-11-20). Real PostgreSQL, status writers,
 // assigned-work continuation, completion worker and durable queue admission.
-// Only provider execution is held: the regression must never admit a run.
+// Only provider execution is held: unresolved recovery must never admit a run;
+// after real reconciliation, ordinary queue dispatch must start exactly one.
 (support.supported ? describe : describe.skip)("unrecoverable delegated execution does not re-arm chat delivery", () => {
   let db: ReturnType<typeof createDb>;
   let temporary: Awaited<ReturnType<typeof startRecoveryPostgres>>;
@@ -56,7 +58,7 @@ import { chatCompletionDeliveryService, prepareChatCompletionTurn, recordAccepte
           cause: "legacy_execution_requires_reconciliation", fingerprint: `parent:${sourceRunId}`,
           nextAction: "Paperclip cannot recover the unsaved files from the previous run.",
           evidence: { runId: sourceRunId, automaticRecovery: { replay: "blocked" }, workspaceRestoreFailure: "restore_unsafe_archive" } },
-        { companyId, sourceIssueId: task.id, kind: "active_run_watchdog", status: "resolved", ownerType: "board",
+        { companyId, sourceIssueId: task.id, kind: "active_run_watchdog", status: "resolved", ownerType: "board", returnOwnerAgentId: workerId,
           cause: "legacy_execution_requires_reconciliation", fingerprint: `child:${taskRunId}`,
           nextAction: "Paperclip cannot recover the unsaved files from the previous run.",
           evidence: { runId: taskRunId, automaticRecovery: { replay: "blocked" }, workspaceRestoreFailure: "restore_unsafe_archive",
@@ -115,8 +117,7 @@ import { chatCompletionDeliveryService, prepareChatCompletionTurn, recordAccepte
     expect(result.wakes).toBeLessThanOrEqual(5);
     expect(result.admittedRuns).toBe(0);
     expect(result.notes).toHaveLength(1);
-    expect(result.notes[0].body).toContain(`/issues/${f.task.identifier}`);
-    expect(result.notes[0].body).toContain("stuck");
+    expect(result.notes[0].body).toBe(`[${f.task.identifier}](/issues/${f.task.identifier}) has stopped: its agent can't continue it until the problem with its last run is sorted out. Open the task to see what's needed.`);
     expect(result.notes[0].body).not.toMatch(/finished|completed|try again shortly/i);
     expect(checkpoints.map(c => [c.deliveries, c.wakes, c.notes.length])).toEqual([
       [result.deliveries, result.wakes, 1], [result.deliveries, result.wakes, 1], [result.deliveries, result.wakes, 1],
@@ -136,6 +137,74 @@ import { chatCompletionDeliveryService, prepareChatCompletionTurn, recordAccepte
     expect(await f.snapshot()).toEqual(result);
     expect(deadlines).toEqual([]);
     console.log("EXECUTION_RESTART_ROW " + JSON.stringify({ minute: 61, deadlines, ...await f.snapshot() }));
+  }, 60_000);
+
+  it("resolved previous execution releases the block and starts exactly one automatic run after restart", async () => {
+    const f = await seed();
+    const start = Date.now() + 1_000;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(start);
+    expect(await f.continuation.checkIssue({ companyId: f.companyId, issueId: f.task.id }))
+      .toMatchObject({ outcome: "waiting_on_recovery", retryAt: null });
+    vi.setSystemTime(start + 61 * 60_000);
+    const restarted = assignedWorkSweep(db, { enqueueWakeup: f.queue.trackWakeup });
+    expect(await restarted.checkIssue({ companyId: f.companyId, issueId: f.task.id }))
+      .toMatchObject({ outcome: "waiting_on_recovery", retryAt: null });
+    const held = await f.snapshot();
+    expect(held.admittedRuns).toBe(0);
+    expect(held.notes).toHaveLength(1);
+    const [before] = await db.select().from(issues).where(eq(issues.id, f.task.id));
+    expect(before).toMatchObject({ status: "blocked", statusVersion: f.task.statusVersion });
+    const [action] = await db.select().from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.companyId, f.companyId), eq(issueRecoveryActions.sourceIssueId, f.task.id)));
+    const decision = { runId: f.taskRunId, providerStopped: true, actionOutcome: "mixed" as const,
+      outcomeEvidence: "Inspected the previous execution and verified its recorded external action outcomes.",
+      workspaceRepairEvidence: "Verified safe workspace staging; the unsafe archive will not be applied." };
+    // The same validation + durable reconciliation writer used by real recovery.
+    // No deleting holds, changing evidence directly or blocked -> done shortcut.
+    await validateExecutionReconciliation({ db, companyId: f.companyId, issueId: f.task.id,
+      agentId: f.workerId, sourceRunId: f.taskRunId, decision });
+    await markExecutionReconciliation(db, action, decision, "operator");
+    expect(await getExecutionBlocker(db, f.companyId, f.task.id)).toBeNull();
+    const [resolved] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(resolved.evidence).toMatchObject({ executionReconciliation: { runId: f.taskRunId }, continuationDelivery: "pending" });
+    expect(resolved.evidence.automaticRecovery).toBeUndefined();
+    // Merely repairing the previous execution must not manufacture a status edit.
+    expect((await db.select().from(issues).where(eq(issues.id, f.task.id)))[0])
+      .toMatchObject({ status: "blocked", statusVersion: f.task.statusVersion });
+    // No manual task edit, agent-status reset or Retry is needed.
+    // The recovery delivery owner admits its exact reconciled continuation.
+    // Keep dispatch held until the automatic sweep lifts the old block.
+    await deliverReconciledExecutions(db, f.queue.trackWakeup);
+    const checks = await Promise.all([restarted.checkIssue({ companyId: f.companyId, issueId: f.task.id }),
+      restarted.checkIssue({ companyId: f.companyId, issueId: f.task.id })]);
+    // startNextQueuedRunForAgent is the real dispatch path, not a manufactured run.
+    f.deps.getSchedulingSuppression.mockResolvedValue({ suppressed: false, reason: null });
+    await f.queue.startNextQueuedRunForAgent(f.workerId);
+    await Promise.all([...f.deps.activeRunExecutionPromises]);
+    const runs = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+      .filter(r => r.id !== f.sourceRunId && r.id !== f.taskRunId);
+    const [after] = await db.select().from(issues).where(eq(issues.id, f.task.id));
+    await restarted.checkIssue({ companyId: f.companyId, issueId: f.task.id });
+    await f.worker.sweepPending({ companyId: f.companyId, taskId: f.task.id });
+    const result = await f.snapshot();
+    console.log("EXECUTION_RESOLVED_ROW " + JSON.stringify({ companyId: f.companyId, taskId: f.task.id,
+      recoveryActionId: action.id, held, recovery: resolved, checks,
+      before: { status: before.status, version: before.statusVersion }, after: { status: after.status, version: after.statusVersion },
+      runs: runs.map(r => ({ id: r.id, status: r.status, startedAt: r.startedAt, context: r.contextSnapshot })), final: result }));
+    expect(checks.some(c => c?.outcome === "repaired")).toBe(true);
+    expect(after.status).toBe("todo");
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({ status: "running", agentId: f.workerId });
+    expect(runs[0].startedAt).not.toBeNull();
+    expect(f.deps.executeRun).toHaveBeenCalledExactlyOnceWith(runs[0].id);
+    expect(result.admittedRuns).toBe(1);
+    const [delivered] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(delivered.evidence).toMatchObject({ continuationDelivery: "delivered", continuationRunId: runs[0].id });
+    expect(result.notes).toEqual(held.notes);
+    expect(result.deliveries).toBe(0);
+    f.continuation.flushPassLog();
+    restarted.flushPassLog();
   }, 60_000);
 
   it.each(["pending", "exhausted"])("a pre-upgrade %s delivery does not leave an extra failure report or wake", async status => {
