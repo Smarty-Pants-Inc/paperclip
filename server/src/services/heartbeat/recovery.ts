@@ -38,6 +38,7 @@ import { hasNativeWorkspaceExportResume } from "../native-runtime/native-workspa
 import { nativeWorkspaceExportPendingForLease, pendingNativeWorkspaceFinalizationCondition } from "../native-runtime/native-workspace-finalization-state.js";
 import { expireAbandonedWorkspaceFileHoldsWhenDue, parkAbandonedWorkspaceFilesLease, recordAbandonedWorkspaceFilesRemoved } from "../remote-workspace-abandoned-files-hold.js";
 import { stopWarmSandboxesPastWindowWhenDue } from "../warm-sandbox-expiry.js";
+import { readSpeculativeResume, speculativeResumeCleanupPendingSql, speculativeResumeOutcomeUnknown, SPECULATIVE_RESUME_KEY } from "../speculative-sandbox-resume.js";
 import { CHAT_COMPLETION_WAKE_REASON } from "../chat-completion-delivery.js";
 import {
   acceptedStopOnlyReceipt,
@@ -1911,7 +1912,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           // can re-arm the validated intent without discarding its evidence.
           !manualRetry ? sql`not (coalesce(${environmentLeases.metadata}->'sandboxStopAndRetain' ? 'endedLeaseEvidence', false)
             and ${pendingCleanupAttemptsSql()} >= ${PENDING_CLEANUP_SWEEP_ATTEMPT_CAP})` : undefined,
-          backoffMs > 0 ? or(lte(environmentLeases.updatedAt, cutoff), recoveredOrphanFirstAttemptSql()) : undefined,
+          backoffMs > 0 ? or(lte(environmentLeases.updatedAt, cutoff), recoveredOrphanFirstAttemptSql(), speculativeResumeCleanupPendingSql()) : undefined,
         ),
       )
       .orderBy(asc(environmentLeases.updatedAt))
@@ -2037,8 +2038,11 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           // all task/gate transactions; an exact stopped/destroyed observation
           // settles through the SAME attempt-fenced receipt owner. Live, unknown
           // or unavailable observations grant nothing and keep ordinary cleanup.
+          // A temporarily stopped box may still have a timed-out resume in
+          // flight. Speculation requires a real stop after its response, not an
+          // observation that can race that outstanding provider mutation.
           const observation = hasStopOnlyCleanup(lease) && !hasNativeWorkspaceExportResume(lease)
-            && !hasBoundRemoteStopReceipt(lease)
+            && !readSpeculativeResume(lease.metadata) && !hasBoundRemoteStopReceipt(lease)
             ? await environmentRuntime.inspectLeaseResource?.(lease.id).catch(() => undefined)
             : undefined;
           const observedStop = acceptedStopOnlyReceipt(lease, observation);
@@ -2126,11 +2130,15 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       // Persist the cooldown independently of process memory. A crash before
       // this write leaves the bounded in-flight lease for a later sweep.
       await writeEnvironmentCleanup(db, tx => tx.update(environmentLeases).set({
-        metadata: sql`${pendingCleanupMetadataObjectSql()} || ${JSON.stringify({
-          pendingCleanupInFlight: false,
-          pendingCleanupRetryAfterMs: Date.now() + (escalated
-            ? 30 * 60_000 : Math.min(30 * 60_000, Math.max(30_000, backoffMs))),
-        })}::jsonb`,
+        // If the resume response arrived during this attempt, do not overwrite
+        // its immediate cleanup wake with the ordinary (possibly 30m) backoff.
+        metadata: sql`${pendingCleanupMetadataObjectSql()} || jsonb_build_object(
+          'pendingCleanupInFlight', false,
+          'pendingCleanupRetryAfterMs', case when ${speculativeResumeOutcomeUnknown(metadata)} then
+            case when ${environmentLeases.metadata}->${SPECULATIVE_RESUME_KEY}->>'rpcSettled' = 'true' then 0
+              else ${Date.now() + 30_000}::bigint end
+            else ${Date.now() + (escalated
+              ? 30 * 60_000 : Math.min(30 * 60_000, Math.max(30_000, backoffMs)))}::bigint end)`,
       }).where(and(eq(environmentLeases.id, lease.id),
         sql`${environmentLeases.metadata}->>'pendingCleanupAttemptId' = ${claimed}`)), { companyId: lease.companyId, runId: lease.heartbeatRunId ?? undefined });
       if (lease.heartbeatRunId) {

@@ -9,6 +9,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { environmentRuntimeService } from "./environment-runtime.js";
 import { heartbeatService, type HeartbeatEnvironmentRuntime } from "./heartbeat.js";
 import { nextWarmSandboxStopAt } from "./warm-sandbox-expiry.js";
+import { nextEnvironmentCleanupAt } from "./environment-cleanup-state.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { createHeartbeatQueue } from "./heartbeat/queue.js";
 import { resolveRunnerReconnectGraceMsForRun, resolveWarmRunnerIdleTimeoutMsForRun } from "./runner-environment-lifecycle.js";
@@ -52,13 +53,15 @@ describe.skipIf(!support.supported)("comment speculative Boat resume", () => {
     let running = false;
     let signalResumeStarted!: () => void;
     const whenResumeStarted = new Promise<void>(resolve => { signalResumeStarted = resolve; });
-    const call = vi.fn(async (_id: string, method: string) => {
+    const call = vi.fn(async (_id: string, method: string, _params?: unknown, _timeoutMs?: number,
+      _executeLogSink?: unknown, onWorkerSettled?: () => void) => {
       if (method === "environmentAcquireLease") { running = true; return { providerLeaseId, metadata: { ...environment.config, remoteCwd: "/workspace" } }; }
       if (method === "environmentResumeLease") {
         spans.push({ name: "boat.resume.start", at: Date.now() });
         signalResumeStarted();
         await delay(resumeMs); running = true;
         spans.push({ name: "boat.resume.end", at: Date.now() });
+        onWorkerSettled?.();
         return { providerLeaseId, metadata: { ...environment.config, remoteCwd: "/workspace" } };
       }
       if (method === "environmentStopLease") { running = false; return { providerLeaseId, state: "stopped" }; }
@@ -265,6 +268,147 @@ describe.skipIf(!support.supported)("comment speculative Boat resume", () => {
       cleanupStatus: saved.cleanupStatus, stopReceipt: saved.metadata?.remoteExecutionTermination,
       unclaimedSuspensions: saved.metadata?.speculativeResumeUnclaimedSuspensions,
     }) + "\n");
+  });
+
+  it("RF9: late provider resume after RPC timeout must not outlive its cleanup owner", async () => {
+    vi.stubEnv("PAPERCLIP_SPECULATIVE_RESUME_TTL_MS", "80");
+    const f = await fixture();
+    const provider = f.call.getMockImplementation()!;
+    let completeResume!: () => void;
+    const completion = new Promise<void>(resolve => { completeResume = resolve; });
+    let providerDone: ReturnType<typeof provider> | undefined;
+    f.call.mockImplementation(async (...args) => {
+      if (args[1] !== "environmentResumeLease") return provider(...args);
+      // Same non-cancelling contract as plugin-worker-manager: timeout rejects
+      // the caller; the provider still finishes and reports worker settlement.
+      providerDone = completion.then(() => provider(...args));
+      return Promise.race([providerDone, delay(args[3]!).then(() => { throw new Error("RPC timeout"); })]);
+    });
+    const hb = heartbeatService(db, { environmentRuntime: f.runtime });
+    try {
+      await f.start();
+      const deadline = (await nextWarmSandboxStopAt(db))!;
+      await delay(Math.max(0, deadline - Date.now()) + 5);
+      await hb.sweepPendingCleanupLeases();
+      await hb.drainActiveRunExecutions();
+      const beforeLateResume = await f.read();
+      // First finish the RF9 sequence even on RED; then assert the outcome.
+      completeResume();
+      await providerDone;
+      // Flush the real completion-hook journal write before the next sweep.
+      await vi.waitFor(async () => {
+        const journal = (await f.read()).metadata?.speculativeCommentResume as { rpcSettled?: boolean };
+        if (journal?.rpcSettled !== undefined) expect(journal.rpcSettled).toBe(true);
+      });
+      const completionWake = await nextEnvironmentCleanupAt(db);
+      await hb.sweepPendingCleanupLeases({ backoffMs: 300_000 });
+      await hb.drainActiveRunExecutions();
+      const after = await f.read();
+      console.log("RF9_LATE_RESUME", JSON.stringify({ beforeLateResume, after, providerRunning: f.running(),
+        methods: f.call.mock.calls.map(c => c[1]), nextWarmDeadline: await nextWarmSandboxStopAt(db) }));
+      expect(f.running(), "late resume must still have a stop/inspection owner").toBe(false);
+      expect(completionWake, "late completion must bypass generic five-minute backoff").toBeLessThanOrEqual(Date.now());
+      expect((after.metadata?.speculativeCommentResume as { rpcSettled: boolean }).rpcSettled).toBe(true);
+      expect(beforeLateResume.status, "unknown resume must retain cleanup custody").toBe("pending_cleanup");
+      expect(beforeLateResume.metadata?.speculativeResumeUnclaimedSuspensions).toBeUndefined();
+      expect(after).toMatchObject({ status: "released", cleanupStatus: "success" });
+      expect(after.metadata?.speculativeResumeUnclaimedSuspensions).toBe(1);
+      expect(f.call.mock.calls.filter(c => c[1] === "environmentResumeLease")).toHaveLength(1);
+      expect(f.call.mock.calls.filter(c => c[1] === "environmentStopLease")).toHaveLength(2);
+      expect(await nextWarmSandboxStopAt(db)).toBeNull();
+    } finally {
+      completeResume();
+      await providerDone;
+      await hb.drainActiveRunExecutions();
+    }
+  });
+
+  it("retains ownership and the immediate wake when resume settles during a stop", async () => {
+    vi.stubEnv("PAPERCLIP_SPECULATIVE_RESUME_TTL_MS", "80");
+    const f = await fixture();
+    const provider = f.call.getMockImplementation()!;
+    let completeResume!: () => void;
+    const completion = new Promise<void>(resolve => { completeResume = resolve; });
+    let providerDone: ReturnType<typeof provider> | undefined;
+    let stopCount = 0;
+    f.call.mockImplementation(async (...args) => {
+      if (args[1] === "environmentResumeLease") {
+        providerDone = completion.then(() => provider(...args));
+        return Promise.race([providerDone, delay(args[3]!).then(() => { throw new Error("RPC timeout"); })]);
+      }
+      const reply = await provider(...args);
+      if (args[1] === "environmentStopLease" && ++stopCount === 1) {
+        // The stop succeeds first; resume then finishes before its stale stop
+        // receipt returns. Neither that receipt nor cooldown may erase custody.
+        completeResume();
+        await providerDone;
+        await vi.waitFor(async () => expect((await f.read()).metadata?.speculativeCommentResume)
+          .toMatchObject({ rpcSettled: true }));
+      }
+      return reply;
+    });
+    const hb = heartbeatService(db, { environmentRuntime: f.runtime });
+    try {
+      await f.start();
+      await delay(Math.max(0, (await nextWarmSandboxStopAt(db))! - Date.now()) + 5);
+      await hb.sweepPendingCleanupLeases({ backoffMs: 300_000 });
+      await hb.drainActiveRunExecutions();
+      expect(f.running()).toBe(true); // The late resume really followed stop.
+      expect(await f.read()).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed" });
+      expect((await f.read()).metadata?.speculativeResumeUnclaimedSuspensions).toBeUndefined();
+      expect(await nextEnvironmentCleanupAt(db)).toBeLessThanOrEqual(Date.now());
+      await hb.sweepPendingCleanupLeases({ backoffMs: 300_000 });
+      await hb.drainActiveRunExecutions();
+      expect(f.running()).toBe(false);
+      expect(await f.read()).toMatchObject({ status: "released", cleanupStatus: "success" });
+      expect((await f.read()).metadata?.speculativeResumeUnclaimedSuspensions).toBe(1);
+      expect(stopCount).toBe(2);
+    } finally {
+      completeResume();
+      await providerDone;
+      await hb.drainActiveRunExecutions();
+    }
+  });
+
+  it.each(["unknown", "failed"] as const)("restart keeps a %s resume owned and on the 30s stop deadline even after escalation", async state => {
+    vi.stubEnv("PAPERCLIP_SPECULATIVE_RESUME_TTL_MS", "80");
+    const f = await fixture();
+    const provider = f.call.getMockImplementation()!;
+    f.call.mockImplementation(async (...args) => {
+      if (args[1] === "environmentResumeLease") throw new Error("worker lost without settlement receipt");
+      return provider(...args);
+    });
+    await f.start();
+    const row = await f.read();
+    const journal = row.metadata?.speculativeCommentResume as Record<string, unknown>;
+    const { rpcSettled: _settled, ...legacyJournal } = journal;
+    await db.update(environmentLeases).set({ metadata: { ...row.metadata,
+      speculativeCommentResume: { ...legacyJournal, state } } }).where(eq(environmentLeases.id, row.id));
+    // A real authoritative claimant may not turn an unknown call into a second
+    // provider resume (nor treat it as a successful ready result).
+    const claimant = await f.newRun();
+    await expect(f.acquire(claimant)).rejects.toThrow();
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date() }).where(eq(heartbeatRuns.id, claimant));
+    expect(f.call.mock.calls.filter(c => c[1] === "environmentResumeLease")).toHaveLength(1);
+    const restarted = heartbeatService(db, { environmentRuntime: environmentRuntimeService(db, { pluginWorkerManager: f.worker }) });
+    await delay(Math.max(0, (await nextWarmSandboxStopAt(db))! - Date.now()) + 5);
+    await restarted.sweepPendingCleanupLeases({ backoffMs: 300_000 });
+    await restarted.drainActiveRunExecutions();
+    expect(await f.read()).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed" });
+    expect(f.running()).toBe(false);
+    const next = await nextEnvironmentCleanupAt(db);
+    expect(next).toBeGreaterThan(Date.now());
+    expect(next).toBeLessThanOrEqual(Date.now() + 30_000);
+    await db.update(environmentLeases).set({ metadata: sql`${environmentLeases.metadata}
+      || '{"pendingCleanupRetryAttempts":5}'::jsonb` }).where(eq(environmentLeases.id, row.id));
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 31_000);
+    await restarted.sweepPendingCleanupLeases({ backoffMs: 300_000 });
+    await restarted.drainActiveRunExecutions();
+    expect(await f.read()).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed" });
+    expect((await f.read()).metadata?.speculativeResumeUnclaimedSuspensions).toBeUndefined();
+    expect(f.call.mock.calls.filter(c => c[1] === "environmentStopLease")).toHaveLength(2);
+    expect(await nextEnvironmentCleanupAt(db)).toBeLessThanOrEqual(Date.now() + 30_000);
   });
 
   it("concurrent ingress and two runtime instances cannot double-resume an allocation", async () => {

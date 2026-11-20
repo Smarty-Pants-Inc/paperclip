@@ -3,6 +3,7 @@ import { environmentLeases, sandboxCreationOperations, type Db } from "@papercli
 import { hasDeferredEnvironmentCleanup } from "./environment-cleanup-notifications.js";
 import { nextAbandonedWorkspaceFileHoldExpiryAt } from "./remote-workspace-abandoned-files-hold.js";
 import { nextWarmSandboxStopAt } from "./warm-sandbox-expiry.js";
+import { speculativeResumeCleanupPendingSql } from "./speculative-sandbox-resume.js";
 
 export const ENVIRONMENT_CLEANUP_RETRY_MS = 5 * 60_000;
 
@@ -86,7 +87,7 @@ export function pendingCleanupDeadlineSql(now = Date.now()) {
 }
 
 export async function nextEnvironmentCleanupAt(db: Db, backoffMs = ENVIRONMENT_CLEANUP_RETRY_MS): Promise<number | null> {
-  const [row] = await db.select({ next: sql<string | null>`min(case when ${recoveredOrphanFirstAttemptSql()}
+  const [row] = await db.select({ next: sql<string | null>`min(case when ${or(recoveredOrphanFirstAttemptSql(), speculativeResumeCleanupPendingSql())}
     then ${pendingCleanupDeadlineSql()} else greatest(
     extract(epoch from ${environmentLeases.updatedAt}) * 1000 + ${backoffMs},
     ${pendingCleanupDeadlineSql()}) end)` }).from(environmentLeases).where(eq(environmentLeases.status, "pending_cleanup"));
