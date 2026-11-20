@@ -12256,6 +12256,23 @@ describe("warm native session evidence copy", () => {
     } finally { evidence.nativeSessionEvidenceRetry.delayMs = delay; await f.cleanup(); }
   }, 120_000);
 
+  it("RF7 restore ignores a valid evidence receipt queried in its own scope", async () => {
+    const f = await warmEvidenceFixture("rf7-valid-restore");
+    try {
+      const first = await f.runTurn();
+      const [row] = await f.waitFor(() => f.evidenceRows(first.runId, "current"), rows => rows.length === 1);
+      expect(row).toBeDefined();
+      const backupRoot = await mkdtemp(join(tmpdir(), "rf7-evidence-restore-"));
+      try {
+        // The persisted reference/AAD/row are untouched and internally consistent.
+        await expect(harnessStorage.restoreDurableNativeHarnessBackup({ db: f.db, storage: f.realStorage,
+          companyId: f.companyId, scopeDigest: row!.scopeDigest, backupRoot })).resolves.toBe(false);
+        await expect(harnessStorage.verifyDurableNativeHarnessBackup({ db: f.db, storage: f.realStorage,
+          companyId: f.companyId, scopeDigest: row!.scopeDigest, manifestSha256: row!.manifestSha256 })).resolves.toBe(false);
+      } finally { await rm(backupRoot, { recursive: true, force: true }); }
+    } finally { await f.cleanup(); }
+  }, 120_000);
+
   it.each(["reject", "zero_rows"] as const)("RF7 pending write failure (%s) must not cross the remote-read custody boundary", async mode => {
     const f = await warmEvidenceFixture(`rf7-pending-${mode}`);
     const alarms = vi.spyOn(f.logger, "error");
