@@ -3,7 +3,7 @@ import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 const manifest: PaperclipPluginManifestV1 = {
   id: "paperclip.boat-sandbox-provider",
   apiVersion: 1,
-  version: "0.1.17-spare.12c1",
+  version: "0.1.17-spare.12c2",
   displayName: "Boat Sandbox Provider",
   description: "Provisions isolated Boat cloud sandboxes as Paperclip execution environments.",
   author: "Paperclip",
@@ -33,7 +33,7 @@ const manifest: PaperclipPluginManifestV1 = {
     displayName: "Boat Cloud Sandbox",
     description: "Boat sandboxes with private Runner ingress and reusable workspace leases.",
     // Per-mapping host mkdtemp / remote UUID scratch isolates both sync verbs.
-    // Lease teardown and worker shutdown drain active sync calls before cleanup.
+    // Release/destroy and worker shutdown drain syncs; Stop cancels promptly.
     // Core grants the opt-in only after the worker verifies BOTH sync verbs.
     sandboxCapabilities: { concurrentSyncOperations: true, reusableLeases: true, runnerWebSocketIngress: true, persistentProcessSessions: false, incrementalSessionOutput: false, independentControlCommands: true, duplexCommandStream: true },
     templateRefKind: "snapshot",

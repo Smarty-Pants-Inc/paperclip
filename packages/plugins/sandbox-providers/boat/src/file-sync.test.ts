@@ -240,6 +240,93 @@ describe("Boat native hybrid file sync", () => {
     await clean();
   });
 
+  // catch: rf-3 rf3-concsync row 4 (BRIEF.md): Stop must not queue command
+  // cancellation behind an unrelated held file sync. The provider transport is
+  // fake, but the active command is a real local process terminated by /stop.
+  it("Stop cancels an active command promptly while sync cleanup is held", async () => {
+    const sourcePath = path.join(remote, "source"), targetPath = path.join(host, "target");
+    await fs.writeFile(sourcePath, "held sync bytes");
+    let reached!: () => void, release!: () => void, commandStarted!: () => void;
+    const ready = new Promise<void>(resolve => { reached = resolve; });
+    const parked = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { commandStarted = resolve; });
+    beforeCleanup = async () => { reached(); await parked; };
+    let command: ReturnType<typeof execFile> | undefined, cancelledAt: number | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/commands") && JSON.parse(String(init.body)).command.endsWith("exec 'sleep' '60'")) {
+        return new Promise<Response>(resolve => {
+          command = execFile("sleep", ["60"], error => {
+            cancelledAt = performance.now();
+            resolve(json({ exitCode: error ? null : 0, signal: error?.signal ?? null, timedOut: false, stdout: "", stderr: "" }));
+          });
+          commandStarted();
+        });
+      }
+      if (url.pathname.endsWith("/stop")) command?.kill("SIGTERM");
+      return mockFetch(input, init);
+    }));
+    const transfer = sync({ sourcePath, targetPath, kind: "file" }, true);
+    let executing: Promise<unknown> | undefined, terminal: Promise<unknown> | undefined;
+    let observed: { elapsedMs: number; cancelledMs: number | null; commandRunning: boolean; stops: number; receipt?: unknown; error?: string } | undefined;
+    try {
+      await ready;
+      executing = plugin.definition.onEnvironmentExecute!({ ...params([]), command: "sleep", args: ["60"] });
+      await started;
+      const start = performance.now();
+      terminal = plugin.definition.onEnvironmentStopLease!({ ...params([]), providerLeaseId: leaseId, cancelActiveWork: true });
+      const outcome = await terminal.then(receipt => ({ receipt }), error => ({ error: String(error) }));
+      // /stop's response is provider-confirmed; also observe process exit before
+      // recording the receipt, rather than accepting a mock call-count alone.
+      if (stops) await executing;
+      observed = { elapsedMs: performance.now() - start, cancelledMs: cancelledAt === undefined ? null : cancelledAt - start,
+        commandRunning: command!.exitCode === null && command!.signalCode === null, stops, ...outcome };
+      console.log("STOP_SYNC_EVIDENCE", JSON.stringify(observed));
+      await expect(sync({ sourcePath, targetPath: path.join(host, "late"), kind: "file" }, true)).rejects.toThrow("no longer active");
+    } finally {
+      release(); command?.kill("SIGTERM");
+      await Promise.allSettled([transfer, ...(executing ? [executing] : []), ...(terminal ? [terminal] : [])]);
+    }
+    expect(observed?.receipt).toMatchObject({ providerLeaseId: leaseId, state: "stopped" });
+    expect(observed?.elapsedMs).toBeLessThan(1000);
+    expect(observed?.cancelledMs).not.toBeNull();
+    expect(observed!.cancelledMs!).toBeLessThan(1000);
+    expect(observed?.commandRunning).toBe(false);
+    expect(await fs.readFile(targetPath, "utf8")).toBe("held sync bytes");
+    await clean();
+  }, 35_000);
+
+  it.each([
+    ["onEnvironmentReleaseLease", false], ["onEnvironmentReleaseLease", true],
+    ["onEnvironmentDestroyLease", false], ["onEnvironmentDestroyLease", true],
+  ] as const)("%s cancelActiveWork=%s reports bounded sync drain timeout without stopping the box", async (hook, cancelActiveWork) => {
+    const sourcePath = path.join(remote, "source"), targetPath = path.join(host, "target");
+    await fs.writeFile(sourcePath, "timeout preserves bytes");
+    let reached!: () => void, release!: () => void;
+    const ready = new Promise<void>(resolve => { reached = resolve; });
+    const parked = new Promise<void>(resolve => { release = resolve; });
+    beforeCleanup = async () => { reached(); await parked; };
+    const transfer = sync({ sourcePath, targetPath, kind: "file" }, true);
+    try {
+      await ready;
+      vi.useFakeTimers();
+      const start = Date.now();
+      const terminal = plugin.definition[hook]!({ ...params([]), providerLeaseId: leaseId, cancelActiveWork })
+        .then(receipt => ({ receipt }), error => ({ error: String(error) }));
+      await vi.advanceTimersByTimeAsync(30_000);
+      const outcome = await terminal;
+      console.log("SYNC_DRAIN_TIMEOUT_EVIDENCE", JSON.stringify({ hook, cancelActiveWork, elapsedMs: Date.now() - start, stops, ...outcome }));
+      expect(outcome).toMatchObject({ error: expect.stringContaining("did not drain within 30 seconds") });
+      expect(Date.now() - start).toBe(30_000);
+      expect(stops).toBe(0);
+      await expect(sync({ sourcePath, targetPath: path.join(host, "late"), kind: "file" }, true)).rejects.toThrow("no longer active");
+    } finally { vi.useRealTimers(); release(); await transfer; }
+    expect(await fs.readFile(targetPath, "utf8")).toBe("timeout preserves bytes");
+    await expect(plugin.definition[hook]!({ ...params([]), providerLeaseId: leaseId, cancelActiveWork })).resolves.toMatchObject({ state: "stopped" });
+    expect(stops).toBe(1);
+    await clean();
+  });
+
   it("round-trips links, entry modes, empty directory and >5 MiB via one command per mapping", async () => {
     const source = await fixture(), target = path.join(remote, "workspace ' quoted");
     const incoming = await sync({ sourcePath: source, targetPath: target, kind: "directory" });

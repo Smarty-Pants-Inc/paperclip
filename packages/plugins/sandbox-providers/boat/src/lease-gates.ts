@@ -77,11 +77,12 @@ export function gateBoatHooks(definition: PluginDefinition, keyFor: (params: any
       if (terminal.has(name)) {
         const gate = teardown.begin(key); close(key);
         try {
-          // Stop must still cancel commands promptly, but never archive while a
-          // sync hook owns transfer/staging state. Closing admission above
-          // prevents new sync calls and fences further sends by admitted calls.
+          // Stop is cancellation: invoke it immediately, as before concurrent
+          // sync, so a held transfer cannot leave commands running. Closing
+          // admission fences new syncs and further sends by admitted calls.
+          // Release/destroy still drain sync ownership before box teardown.
           const transferring = syncActivity.current(key);
-          if (transferring) await boundedWait(transferring.promise);
+          if (name !== "onEnvironmentStopLease" && transferring) await boundedWait(transferring.promise);
           if (name !== "onEnvironmentStopLease" && !params.cancelActiveWork) {
             const running = activity.current(key); if (running) await boundedWait(running.promise);
           }

@@ -1,4 +1,4 @@
-# Boat sandbox provider 0.1.17-spare.12c1 (unreleased)
+# Boat sandbox provider 0.1.17-spare.12c2 (unreleased)
 
 ## Concurrent setup and file synchronization
 
@@ -11,11 +11,15 @@ Every mapping keeps its own host temporary directory, remote UUID archive/list,
 and publication staging directory. Distinct outbound targets may share a newly
 created canonical parent. Same-target directory replacement is not transactional;
 callers must still provide disjoint destinations for parallel operations.
-Release, Stop, destroy and worker shutdown wait for active sync hooks, including
-cleanup, before teardown. Stop still fences command sends immediately and need
-not wait for the commands it cancels. An admitted sync may fail on that fence;
-teardown does not archive underneath its remaining local work. A drain exceeding
-30 seconds fails without invoking teardown, rather than pretending to confirm it.
+Release, destroy and worker shutdown wait for active sync hooks, including
+cleanup, before teardown. Their drain exceeding 30 seconds fails without invoking
+teardown, rather than pretending to confirm it. Stop is the cancellation path:
+it closes admission and invokes the existing provider Stop immediately, without
+waiting for the sync drain or the commands it cancels. The provider Stop still
+requires a confirmed stop-and-retain receipt; this is not a command-only receipt.
+An admitted sync may fail on the fence or the provider Stop, and keeps ownership
+of its per-call scratch through settlement. Resume refuses while that work is
+still settling. New syncs and further command sends remain fenced.
 
 `src/file-sync.test.ts` exercises command overlap, bidirectional byte-exact sync,
 scratch isolation and teardown drains against the fake provider using real files
