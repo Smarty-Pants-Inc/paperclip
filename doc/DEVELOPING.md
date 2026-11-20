@@ -5015,11 +5015,36 @@ read-back that fails, times out, comes back short or differs. Each of those
 unknown cases logs `kept: run-log spill custody unknown` with `spill`, `index`
 and `reason`; count these warnings when diagnosing retained disk use. A server
 with no object run-log store cannot read a copy back, so it keeps every spill it
-finds. A `*.ndjson` with no record beside it is treated as a spill unless it is
-empty or, read in full, holds no run-log record (files over 64 MiB are kept
-unread). The local run-log store writes the same record shape, so its logs keep
-their directory too. A released spill adds no content-based refusal; other
-trace/ownership guards still apply.
+finds.
+
+Where a file sits decides how a file with no record beside it is treated. Inside
+a run-log spill directory (a root the writer's resolver names, or any directory
+named `.spill`) every non-empty file is kept unless a record proves it
+recovered: whatever it holds, whatever its name, and whether or not it can be
+read. Outside one, a `*.ndjson` with no record beside it is treated as a spill
+unless it is empty or, read in full, holds no run-log record (files over 64 MiB
+are kept unread), so another tool's `*.ndjson` does not block removal. The local
+run-log store writes the same record shape, so its logs keep their directory
+too. A released spill adds no content-based refusal; other trace/ownership
+guards still apply.
+
+Read-backs wait on object storage, and the deleting paths ask while they hold
+the workspace lifecycle lock. One guard pass (one instance cleanup, one
+whole-worktree removal with its instance cleanup, or one compaction move)
+therefore reads back for at most 30 seconds in total
+(`RUN_LOG_SPILL_READ_BACK_BUDGET_MS`), counted from its first read-back. When
+the budget is spent, every spill not yet read back is kept with reason
+`read_back_budget_exhausted` and the pass ends; the next pass starts with a new
+budget. No proof is carried from one pass to the next, so a directory with more
+recovered spills than one pass can read back stays kept.
+
+Each instance that cleanup keeps for run-log custody has one row:
+`<worktrees dir>/instances/.run-log-custody/<instance id>.json`, with
+`instance`, `instanceRoot`, the first kept `path`, its `reason` and `keptPaths`.
+A pass that keeps the instance replaces its row; a pass that releases it removes
+the row. `listKeptWorktreeInstances` in `workspace-instance-cleanup.ts` lists
+the rows whose instance directory still exists; use it to count the instances
+being kept.
 
 The content walk is bounded at 1,000,000 entries. The repository's installed
 `node_modules` measured 141,591 entries and a full content scan took about 1.6
