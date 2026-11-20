@@ -23,6 +23,7 @@ import {
   subscribeDatabaseWork,
 } from "@paperclipai/db";
 import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
+import { subscribeCompanyLiveEvents } from "../live-events.js";
 import { and, eq, gt, isNull, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -1855,6 +1856,50 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.reply(successor);
     expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
     expect(await f.visible()).toHaveLength(0);
+  });
+
+  // Keep: noteslive RED (final4 pl-fresh-F4-LASTINSTANT-m4 390): the sweep's notes reached an open chat only on
+  // reload. Each write (add, in-place rewrite, retire) is announced on the thread's keyed comment hydration
+  // channel (ui LiveUpdatesProvider hydrateVisibleIssueComment: issue.comment_added + details.commentId).
+  it("noteslive: an open chat is told at once when the sweep adds, rewrites in place, or retires its note", async () => {
+    const f = await fixture();
+    const told: Array<Record<string, unknown>> = [];
+    const stop = subscribeCompanyLiveEvents(f.companyId, event => {
+      if (event.type !== "activity.logged" || event.payload.entityId !== f.issueId
+        || !String(event.payload.action).startsWith("issue.comment_")) return;
+      const details = event.payload.details as Record<string, unknown>;
+      told.push({ action: event.payload.action, actorType: event.payload.actorType, commentId: details.commentId,
+        source: details.source, change: details.change });
+    });
+    const tell = (commentId: string, change: string) => ({ action: "issue.comment_added", actorType: "system",
+      commentId, source: "recovery.unanswered_message", change });
+    try {
+      const root = await f.run({ commentId: await f.message(), status: "failed", errorCode: "native_run_failed" });
+      const successor = await f.nativeSuccessor(root, "queued");
+      expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "pending" });
+      expect(told).toEqual([]);
+      expect(await settleUnansweredPersonMessage(db, { ...f, now: new Date(Date.now() + 180_000) }))
+        .toMatchObject({ kind: "noticed", code: "waiting_to_start" });
+      const [waiting] = await f.visible();
+      expect(waiting!.body).toBe(WAITING);
+      expect(told).toEqual([tell(waiting!.id, "added")]);
+      // The waiting turn fails: the SAME note becomes the failure text, and the open chat re-reads that id.
+      await db.update(heartbeatRuns).set({ status: "failed", errorCode: "native_run_failed", finishedAt: f.at() })
+        .where(eq(heartbeatRuns.id, successor));
+      expect(await settleUnansweredPersonMessage(db, { ...f, now: new Date(Date.now() + 600_000) }))
+        .toMatchObject({ kind: "noticed", commentId: waiting!.id });
+      const [rewritten] = await f.visible();
+      expect(rewritten!.id).toBe(waiting!.id);
+      expect(rewritten!.body).not.toBe(WAITING);
+      expect(told).toEqual([tell(waiting!.id, "added"), tell(waiting!.id, "rewritten")]);
+      // An answer retires it: the open chat re-reads the id and sees it deleted.
+      await f.reply(successor);
+      await settleUnansweredPersonMessage(db, f);
+      expect(await f.visible()).toHaveLength(0);
+      expect(told).toEqual([tell(waiting!.id, "added"), tell(waiting!.id, "rewritten"), tell(waiting!.id, "retired")]);
+    } finally {
+      stop();
+    }
   });
 
   // Keep: recorded PV2 gate-1 catch (11:27Z): answering the run's question
