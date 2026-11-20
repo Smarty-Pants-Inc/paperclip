@@ -12,7 +12,7 @@ import {
   nativeRunFinalizations,
   type Db,
 } from "@paperclipai/db";
-import type { AnyPgColumn } from "drizzle-orm/pg-core";
+import { PgTransaction, type AnyPgColumn } from "drizzle-orm/pg-core";
 import { issueService } from "../issues.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { logActivity } from "../activity-log.js";
@@ -365,8 +365,19 @@ export type NativeBlockedRepairApplies = (input: { companyId: string; issueId: s
 export async function settleUnansweredPersonMessage(
   db: Db,
   input: { companyId: string; issueId: string; settleMessageId?: string; now?: Date; issueCreatedAtGte?: Date | null;
-    nativeBlockedRepairApplies?: NativeBlockedRepairApplies; olderOutcomes?: UnansweredMessageOutcome[] },
+    nativeBlockedRepairApplies?: NativeBlockedRepairApplies; olderOutcomes?: UnansweredMessageOutcome[];
+    /** A caller that runs this inside ITS transaction collects the notes' announcements here and publishes them
+     * after that transaction commits (the wake queue returns them as post-commit effects). Omitted: this call
+     * owns its writes' transactions and each note is announced right after its own commit. */
+    announcements?: UnansweredNoteAnnouncement[] },
 ): Promise<UnansweredMessageOutcome> {
+  // A caller's transaction may still roll back: announcing there would tell an open chat about a note that is
+  // not readable yet, or never will be. Such a caller must collect the announcements and publish after its commit.
+  if (!input.announcements && db instanceof PgTransaction) {
+    throw new Error("settleUnansweredPersonMessage inside a caller's transaction needs input.announcements, published after that commit");
+  }
+  const collected = input.announcements;
+  const announce: AnnounceNote = collected ? (note) => { collected.push(note); } : publishUnansweredNoteAnnouncement;
   const now = input.now ?? new Date();
   const [issue] = await db.select({
     id: issues.id, companyId: issues.companyId, status: issues.status, hiddenAt: issues.hiddenAt,
@@ -376,7 +387,7 @@ export async function settleUnansweredPersonMessage(
   if (input.issueCreatedAtGte && issue.createdAt < input.issueCreatedAtGte) return { kind: "out_of_scope" };
   // Event-driven receipt settlement uses the SAME per-message decision/writer
   // as the sweep, without its discovery age/page limits or unrelated messages.
-  if (input.settleMessageId) return (await settleOneMessage(db, issue, now, input.nativeBlockedRepairApplies, input.settleMessageId)).outcome;
+  if (input.settleMessageId) return (await settleOneMessage(db, issue, now, input.nativeBlockedRepairApplies, input.settleMessageId, announce)).outcome;
 
   // An answer to a message supersedes that message's notice (and its
   // retrying line): the relation is message -> answer, not the notice's time.
@@ -400,7 +411,7 @@ export async function settleUnansweredPersonMessage(
     returning n.id`)];
   });
   // A retired note leaves an open chat at once: its id is re-read there (a deleted note reads as deleted).
-  for (const row of retired) announceNoteToOpenChat(issue, row.id, "retired");
+  for (const row of retired) announce({ companyId: issue.companyId, issueId: issue.id, commentId: row.id, change: "retired" });
 
   // The AGREED order (adopt-lead + rf-4, 10:09Z), one card per message:
   // (a) cut A's carried steers FIRST: a carried steer whose carrying turn failed or was stopped gets its own ONE
@@ -409,12 +420,12 @@ export async function settleUnansweredPersonMessage(
   // (c) then each OLDER message the ONE answered predicate says is owed (RFL 09:03Z), newest first, at most
   //     OWED_OLDER_MESSAGES_PER_SWEEP per task per pass. The older selection SKIPS every message (a) just noticed,
   //     by the notice key, so a carried steer never gets a second card from (c).
-  const carried = await settleCarriedSteerNotices(db, issue, now);
-  const newest = await settleOneMessage(db, issue, now, input.nativeBlockedRepairApplies, null);
+  const carried = await settleCarriedSteerNotices(db, issue, now, announce);
+  const newest = await settleOneMessage(db, issue, now, input.nativeBlockedRepairApplies, null, announce);
   const older: UnansweredMessageOutcome[] = [];
   if (newest.outcome.kind !== "out_of_scope" && newest.outcome.kind !== "none" && newest.messageId) {
     for (const id of await owedOlderMessageIds(db, issue, newest.messageId, carried.noticedReasons)) {
-      older.push((await settleOneMessage(db, issue, now, input.nativeBlockedRepairApplies, id)).outcome);
+      older.push((await settleOneMessage(db, issue, now, input.nativeBlockedRepairApplies, id, announce)).outcome);
     }
   }
   // Returned: the newest's 'noticed' wins; else (a)'s noticed; else, when the newest or (a) is pending, pending at
@@ -468,7 +479,7 @@ async function owedOlderMessageIds(db: Db, issue: DecisionIssue, newestId: strin
 }
 
 async function settleOneMessage(db: Db, issue: DecisionIssue, now: Date,
-  nativeBlockedRepairApplies: NativeBlockedRepairApplies | undefined, messageId: string | null,
+  nativeBlockedRepairApplies: NativeBlockedRepairApplies | undefined, messageId: string | null, announce: AnnounceNote,
 ): Promise<{ outcome: UnansweredMessageOutcome; messageId: string | null }> {
   const input = { nativeBlockedRepairApplies };
   const decided = { messageId: messageId as string | null };
@@ -517,26 +528,32 @@ async function settleOneMessage(db: Db, issue: DecisionIssue, now: Date,
     }, tx);
     return comment?.id ?? null;
   });
-  if (commentId) announceNoteToOpenChat(issue, commentId, decision.upgradeCommentId ? "rewritten" : "added");
+  if (commentId) announce({ companyId: issue.companyId, issueId: issue.id, commentId,
+    change: decision.upgradeCommentId ? "rewritten" : "added" });
   return done(commentId ? { kind: "noticed", code: decision.code, commentId } : { kind: "noticed_before" });
 }
 
 /** The live source of a note this sweep wrote or rewrote. */
 export const UNANSWERED_NOTE_LIVE_SOURCE = "recovery.unanswered_message";
 
+/** A note this sweep added, rewrote in place under the same id, or retired. */
+export type UnansweredNoteAnnouncement = { companyId: string; issueId: string; commentId: string;
+  change: "added" | "rewritten" | "retired" };
+type AnnounceNote = (note: UnansweredNoteAnnouncement) => void;
+
 /**
- * An open chat sees the note at once (noteslive): the note, added, rewritten in place under the same id, or
- * retired, is announced AFTER its commit on the thread's existing keyed comment hydration channel (ui
- * LiveUpdatesProvider hydrateVisibleIssueComment re-reads that id; authenticated sockets refetch the thread's
- * comments on the same action), the way conversation-steering re-announces a saved comment. No audit row: the
- * sweep's notes never had one.
+ * An open chat sees the note at once (noteslive): the note is announced on the thread's existing keyed comment
+ * hydration channel (ui LiveUpdatesProvider hydrateVisibleIssueComment re-reads that id; authenticated sockets
+ * refetch the thread's comments on the same action), the way conversation-steering re-announces a saved comment.
+ * Called ONLY after the transaction that saved the note commits: by this sweep after its own transaction, or by
+ * the caller whose transaction the sweep ran in (wake queue: its post-commit effects). No audit row: the sweep's
+ * notes never had one.
  */
-function announceNoteToOpenChat(issue: { id: string; companyId: string }, commentId: string,
-  change: "added" | "rewritten" | "retired") {
-  publishLiveEvent({ companyId: issue.companyId, type: "activity.logged", payload: {
-    issueId: issue.id, action: "issue.comment_added", entityType: "issue", entityId: issue.id,
+export function publishUnansweredNoteAnnouncement(note: UnansweredNoteAnnouncement) {
+  publishLiveEvent({ companyId: note.companyId, type: "activity.logged", payload: {
+    issueId: note.issueId, action: "issue.comment_added", entityType: "issue", entityId: note.issueId,
     actorType: "system", actorId: "recovery",
-    details: { commentId, source: UNANSWERED_NOTE_LIVE_SOURCE, change },
+    details: { commentId: note.commentId, source: UNANSWERED_NOTE_LIVE_SOURCE, change: note.change },
   } });
 }
 
@@ -635,7 +652,7 @@ async function decideCarriedSteerNotices(q: Db, issue: DecisionIssue, now: Date)
 }
 
 /** Posts the carried-steer notices; each is decided again unchanged under the issue fence before it is written. */
-async function settleCarriedSteerNotices(db: Db, issue: DecisionIssue, now: Date):
+async function settleCarriedSteerNotices(db: Db, issue: DecisionIssue, now: Date, announce: AnnounceNote):
   Promise<{ noticed: UnansweredMessageOutcome | null; noticedReasons: string[]; recheckAt: number | null }> {
   const decided = await decideCarriedSteerNotices(db, issue, now);
   let noticed: UnansweredMessageOutcome | null = null;
@@ -662,7 +679,8 @@ async function settleCarriedSteerNotices(db: Db, issue: DecisionIssue, now: Date
       return comment?.id ?? null;
     });
     if (commentId) {
-      announceNoteToOpenChat(issue, commentId, candidate.upgradeCommentId ? "rewritten" : "added");
+      announce({ companyId: issue.companyId, issueId: issue.id, commentId,
+        change: candidate.upgradeCommentId ? "rewritten" : "added" });
       noticed ??= { kind: "noticed", code: candidate.code, commentId };
       noticedReasons.push(candidate.reason);
     }
