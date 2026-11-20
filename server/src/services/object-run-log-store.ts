@@ -1032,9 +1032,19 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
     // in-memory accounting: spilled batches have already released that count.
     // Do not infer missing bytes from a null final size or an open head (a
     // close/digest failure can leave every byte stored).
-    const { spilled, recovered } = await readSpillIndex(spillPaths(options.spillDir, logRef).indexPath);
+    const paths = spillPaths(options.spillDir, logRef);
+    const custody = await runLogSpillCustody(paths.indexPath);
+    const unknown = custody.state === "kept" && custody.reason !== "unrecovered";
+    // Only an ordinary, validated unrecovered index may use the range proof
+    // below. A corrupt/unreadable index is not an empty, complete-looking log.
+    const { spilled, recovered } = custody.state === "kept" && !unknown
+      ? await readSpillIndex(paths.indexPath) : { spilled: [], recovered: new Set<number>() };
     let bytes = 0, position = -1;
     const causes: RunLogPersistenceCause[] = [];
+    if (unknown) {
+      bytes = (await fs.stat(paths.path).catch(() => null))?.size ?? 0;
+      causes.push({ name: "ObjectRunLogSpillCustodyUnknown", reason: "spill_custody_unknown", code: custody.reason });
+    }
     for (const entry of spilled) {
       position = Math.max(position, entry.journalEnd);
       // The recovery record can fail AFTER its bytes reached object storage.
@@ -1051,7 +1061,7 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
       bytes += state.pendingBytes;
       causes.push(state.failure ? finalizationError(state.failure) : { name: "ObjectRunLogPendingWrite" });
     }
-    return bytes > 0 ? { incomplete: { bytes, causes: [...new Map(causes.map(cause =>
+    return bytes > 0 || unknown ? { incomplete: { bytes, causes: [...new Map(causes.map(cause =>
       [JSON.stringify(cause), cause])).values()] } } : {};
   }
   const api: RunLogStore = {
