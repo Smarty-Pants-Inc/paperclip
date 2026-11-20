@@ -68,7 +68,7 @@ describe("TaskChatRunnerTurn", () => {
       ),
     );
 
-  it.each([null, "run-1"].flatMap(runId => [false, true].map(projected => ({ runId, projected }))))(
+  it.each(["run-1"].flatMap(runId => [false, true].map(projected => ({ runId, projected }))))(
     "shows Working and Thinking during ordinary admission (runId=$runId, projected=$projected)",
     ({ runId, projected }) => {
       render([], "queued", runId, undefined, false, false, projected ? {
@@ -88,9 +88,17 @@ describe("TaskChatRunnerTurn", () => {
     },
   );
 
+  it("never claims Working or Thinking when admission has no run behind it", () => {
+    render([], "queued", null);
+    expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent).toBe("Waiting to start");
+    expect(container.textContent).not.toContain("Working");
+    expect(container.textContent).not.toContain("Thinking");
+  });
+
   it("preserves a specific preparation label before a run ID exists", () => {
     render([], "queued", null, undefined, false, false, undefined, "Preparing workspace");
-    expect(container.querySelector('[data-testid="task-chat-current-activity-label"]')?.textContent).toBe("Preparing workspace");
+    expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent).toBe("Preparing workspace");
+    expect(container.querySelector('[data-testid="task-chat-current-activity-label"]')).toBeNull();
   });
 
   it.each([
