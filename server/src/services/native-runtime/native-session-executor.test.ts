@@ -11975,9 +11975,14 @@ describe("native session same-turn steering", () => {
     },
     {
       label: "provider rejection",
-      prepare: () => steer.mockRejectedValue(new Error("request rejected")),
+      prepare: () => steer.mockRejectedValue(new NativeSessionSteeringError("steering_rejected", "request rejected")),
       code: "steering_rejected",
     },
+    ...["RPC disconnected", "receipt unavailable: active turn terminal", "request rejected"].map(message => ({
+      label: `unknown transport outcome (${message})`,
+      prepare: () => steer.mockRejectedValue(new Error(message)),
+      code: "steering_outcome_unknown",
+    })),
   ])("keeps $label retryable with a stable code", async ({ prepare, code }) => {
     prepare();
     const { running } = await startActiveSession();

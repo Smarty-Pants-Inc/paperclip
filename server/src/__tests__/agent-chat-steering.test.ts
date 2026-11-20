@@ -486,6 +486,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       ? "a newer answered person input prevents re-send" : "the ordinary successor answers once" })))
   ("A3: $variant steer failure returns 201 and $outcome", async ({ variant }) => {
     const chat = await seedChat(); await attachSteerable(chat);
+    const uncertain = ["generic", "disconnect", "unexpected-disposition"].includes(variant);
     const { NativeSessionSteeringError } = await import("../services/native-runtime/native-session-executor.js");
     let refuseAfter201: (() => void) | undefined;
     if (variant === "generic") mocks.steer.mockImplementationOnce(() => new Promise((_resolve, reject) => {
@@ -515,27 +516,29 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     unsubscribe();
     const messageId = response.body.id;
     const thread = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/comments`).expect(200);
-    expect(thread.body.find((comment: any) => comment.id === messageId)).toMatchObject({
-      deliveryOutcome: "queued", steeringStatus: null, steeringUnavailableReason: expect.any(String),
-    });
+    const display = uncertain
+      ? { deliveryOutcome: "steered", steeringStatus: "accepted", steeringUnavailableReason: null }
+      : { deliveryOutcome: "queued", steeringStatus: null, steeringUnavailableReason: expect.any(String) };
+    expect(thread.body.find((comment: any) => comment.id === messageId)).toMatchObject(display);
     // LiveUpdatesProvider hydrates the exact id via this endpoint, not listComments.
     const hydrated = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/comments/${messageId}`).expect(200);
-    expect(hydrated.body).toMatchObject({ deliveryOutcome: "queued", steeringStatus: null,
-      steeringUnavailableReason: thread.body.find((comment: any) => comment.id === messageId).steeringUnavailableReason });
-    if (variant !== "probe" && variant !== "newer-first-never-carried") expect(events.filter(event => event.type === "activity.logged" &&
+    expect(hydrated.body).toMatchObject(display);
+    const refusalEvents = events.filter(event => event.type === "activity.logged" &&
       event.payload.action === "issue.comment_added" &&
       (event.payload.details as any)?.source === "steering.refused" &&
-      (event.payload.details as any)?.commentId === messageId)).toHaveLength(1);
+      (event.payload.details as any)?.commentId === messageId);
+    expect(refusalEvents).toHaveLength(uncertain || variant === "probe" || variant === "newer-first-never-carried" ? 0 : 1);
     const [reserved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
-    expect((reserved!.contextSnapshot as any).steeredCommentIds ?? []).not.toContain(messageId);
-    expect((reserved!.contextSnapshot as any).wakeCommentIds ?? []).not.toContain(messageId);
+    for (const key of ["steeredCommentIds", "wakeCommentIds"]) {
+      expect(((reserved!.contextSnapshot as any)[key] ?? []).includes(messageId)).toBe(uncertain);
+    }
     if (variant !== "probe" && variant !== "newer-first-never-carried") {
       const result = reserved!.resultJson as any;
-      expect((result.rejectedSteeringAcknowledgements?.[messageId] ?? result.queuedSteeringAcknowledgements?.[messageId]).status).toBe("rejected");
+      expect((result.rejectedSteeringAcknowledgements?.[messageId] ?? result.queuedSteeringAcknowledgements?.[messageId]).status).toBe(uncertain ? "pending" : "rejected");
     }
     await deliverConversationComments(db, chat.issue, heartbeatService(db).wakeup);
     const carriers = await carriersOf(chat, messageId);
-    expect(carriers.wakes.length + carriers.runs.length).toBe(1);
+    expect(carriers.wakes.length + carriers.runs.length).toBe(uncertain ? 0 : 1);
     if (variant.startsWith("newer-first")) {
       // RFL 17:07Z: an answered newer PERSON input makes the deferred receipt
       // stale: no re-send. A DEFINITELY REJECTED reservation never carried M;
