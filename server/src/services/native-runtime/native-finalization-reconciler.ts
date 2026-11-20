@@ -1,3 +1,4 @@
+import { expireOverdueNativeWorkspaceFinalizations } from "./native-workspace-finalization-timeout.js";
 import { sameRunResumeClaimEntry } from "./scheduled-resume-continuation.js";
 import { appendBoundedRecoveryHistory } from "./native-restart-recovery.js";
 import { notifyLiveRunRecovery } from "../live-run-recovery-notifications.js";
@@ -471,6 +472,9 @@ export async function reconcileNativeFinalizations(
   const timing = createNativeReconciliationPassTiming();
   let outcome: "ok" | "failed" = "ok";
   try {
+    if (runIds?.length) {
+      for (const runId of runIds) await expireOverdueNativeWorkspaceFinalizations(db, { runId, onExpired: options.onWorkspaceSettled });
+    } else await expireOverdueNativeWorkspaceFinalizations(db, { onExpired: options.onWorkspaceSettled });
     return await reconcileNativeFinalizationsPass(db, runIds, options, timing);
   } catch (error) {
     outcome = "failed";

@@ -47,6 +47,7 @@ import {
   issueRelations,
   issues,
   nativeRunFinalizations,
+  nativeRunResults,
 } from "@paperclipai/db";
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
 import { readQueuedInteractionResponse } from "../../../services/queued-interaction-response.js";
@@ -1220,6 +1221,19 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: ReleaseRun, iss
     issue.assigneeAgentId === run.agentId &&
     !["done", "cancelled"].includes(issue.status);
   if (!applies || isAcknowledgedNativeStop(run) || isAcknowledgedNativeReassignmentStop(run)) return false;
+  // A saved, accepted result that exhausted only file finalization has a
+  // known provider outcome and its own Retry card. Do not manufacture the
+  // generic unknown-execution hold that used to swallow every deferred wake.
+  // Physical cleanup and unreconciled remote files are still gated below by
+  // hasPendingRunCleanup/getExecutionBlocker; this grants no workspace access.
+  const [savedExportFailure] = await tx.select({ id: nativeRunResults.id }).from(nativeRunFinalizations)
+    .innerJoin(nativeRunResults, and(eq(nativeRunResults.id, nativeRunFinalizations.resultId),
+      eq(nativeRunResults.companyId, nativeRunFinalizations.companyId), eq(nativeRunResults.issueId, nativeRunFinalizations.issueId),
+      eq(nativeRunResults.runId, nativeRunFinalizations.runId), eq(nativeRunResults.schemaStatus, "accepted")))
+    .where(and(eq(nativeRunFinalizations.companyId, run.companyId), eq(nativeRunFinalizations.issueId, issue.id),
+      eq(nativeRunFinalizations.runId, run.id), eq(nativeRunFinalizations.phase, "terminal_failure"),
+      inArray(nativeRunFinalizations.failureCode, ["native_workspace_sync_out_retry_exhausted", "native_workspace_sync_out_unrecoverable"]))).limit(1);
+  if (savedExportFailure) return false;
   // The native owner, not HTTP status or the queue, proves no execution. An
   // affirmative pre-dispatch failure leaves the saved input on the normal
   // admission path; inventing a reconciliation hold would dead-end resends.
@@ -1673,7 +1687,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           // available. Normal completeRun must not race reconciliation either;
           // ownership settlement uses this same drain after it commits.
           const awaitingFinalization = run.status === "succeeded" && finalization && ["observed", "applied"].includes(finalization.phase);
-          if (awaitingFinalization || (input.resumeStrandedQueue && finalization?.phase !== "committed")) {
+          if (awaitingFinalization || (input.resumeStrandedQueue && !["committed", "terminal_failure"].includes(finalization?.phase ?? ""))) {
             return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
           }
         }
@@ -1734,6 +1748,12 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
 
         const issueRow =
           (contextIssueId ? candidateIssues.find((candidate) => candidate.id === contextIssueId) : candidateIssues[0]) ?? null;
+        // Boot may discover a retry abandoned days ago. End its run and clear
+        // only its locks, but do not replay its saved answer or wake old input.
+        // The durable receipt also makes subsequent release/recovery calls inert.
+        if (parseObject(run.resultJson?.workspaceRetryTimeout).historical === true) {
+          return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+        }
         // Every run end accounts for the messages steered into it before anything
         // reads the queue: an unanswered steer waits again at its place.
         if (issueRow) await restoreUnansweredSteersAtRunEnd(tx, run, issueRow, input.now);

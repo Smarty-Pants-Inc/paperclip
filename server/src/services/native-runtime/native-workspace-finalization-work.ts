@@ -1,4 +1,4 @@
-import { and, asc, eq, gt, ne, notExists } from "drizzle-orm";
+import { and, asc, eq, gt, ne, notExists, sql } from "drizzle-orm";
 import { heartbeatRuns, issues, nativeRunFinalizations, nativeRunResults, workspaceOperations, type Db } from "@paperclipai/db";
 import type { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
 import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
@@ -8,6 +8,7 @@ import { registerScopedDeadlineWork } from "../scoped-deadline-work.js";
 import { measureRunPhase, withRunWorkspaceFinalizationTiming } from "../execution-preparation-timing.js";
 import { nativeRunnerOwnershipNotHeldCondition } from "./native-runner-ownership.js";
 import { attemptNativeWorkspaceFinalization, recordNativeWorkspaceFinalizationFailure } from "./native-workspace-finalizer.js";
+import { expireOverdueNativeWorkspaceFinalizations } from "./native-workspace-finalization-timeout.js";
 
 type Entry = { id: string; companyId: string; issueId: string; agentId: string; dueAt: number };
 type AttemptInput = Parameters<typeof attemptNativeWorkspaceFinalization>[0];
@@ -72,6 +73,7 @@ export function nativeWorkspaceFinalizationWork(db: Db, options: {
   async function checkWithinTrace(current: Entry, signal?: AbortSignal): Promise<Entry | null> {
     if (signal?.aborted) throw new Error("Native workspace finalization stopped");
     const scope = { companyId: current.companyId, runId: current.id };
+    await expireOverdueNativeWorkspaceFinalizations(db, { ...scope, onExpired: options.onWorkspaceSettled });
     const [row] = await candidates(scope);
     if (!row) return null;
     const due = entry(row);
@@ -82,14 +84,20 @@ export function nativeWorkspaceFinalizationWork(db: Db, options: {
     }));
     if (outcome.kind === "retry") return { ...due, dueAt: outcome.retryAt.getTime() };
     if (outcome.kind === "waiting") {
+      // Durable CAS: overlapping checks and a restart still warn once per run,
+      // including owner_active, which used to silently drop this obligation.
+      const [logged] = await db.update(heartbeatRuns).set({
+        resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
+          workspaceFinalizationPause: { reason: outcome.reason, at: new Date().toISOString() },
+        })}::jsonb`,
+      }).where(and(eq(heartbeatRuns.id, current.id), eq(heartbeatRuns.companyId, current.companyId),
+        sql`${heartbeatRuns.resultJson}->'workspaceFinalizationPause' is null`)).returning({ id: heartbeatRuns.id });
+      if (logged) logger.warn({ runId: current.id, reason: outcome.reason }, "Native workspace finalization retry paused; durable recovery deadline remains responsible");
       // A pending stop proof rechecks on its own; the board action stays visible meanwhile.
       if (outcome.reason === "busy" || outcome.reason === "platform_stop_pending" || outcome.reason === "local_stop_pending") {
         return { ...due, dueAt: Date.now() + OWNERSHIP_RECHECK_MS };
       }
       // This run is revisited only after a restart or a release notification.
-      if (outcome.reason !== "owner_active") {
-        logger.info({ runId: current.id, reason: outcome.reason }, "native workspace finalization paused until the run is notified again");
-      }
       return null;
     }
     if (outcome.kind === "inactive" || (outcome.kind === "completed" && outcome.operation.status === "succeeded")) return null;

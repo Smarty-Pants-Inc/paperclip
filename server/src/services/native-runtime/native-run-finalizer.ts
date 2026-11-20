@@ -476,6 +476,7 @@ async function recordRetryableFailure(input: {
   failureScope?: "provider" | "workspace";
   permanent?: boolean;
   failureCause?: string | null;
+  workspaceRetryTimeout?: { overdueBefore: Date; historical: boolean };
 }) {
   const now = new Date();
   const nextAttemptAt = new Date(now.getTime() + 30_000);
@@ -512,6 +513,10 @@ async function recordRetryableFailure(input: {
       || current.leaseOwner !== input.coordinator.leaseOwner) return current;
     const [currentRun] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.run.id)).limit(1);
     if (!currentRun) throw new Error("native_finalization_run_missing");
+    if (input.workspaceRetryTimeout && (current.phase !== "retryable_failure" || !current.resultId
+      || !current.nextAttemptAt || current.nextAttemptAt > input.workspaceRetryTimeout.overdueBefore
+      || current.leaseOwner && current.leaseExpiresAt && current.leaseExpiresAt > now
+      || currentRun.status !== "running")) return current;
     if (input.failureScope === "workspace") {
       const exported = await tx.select({ id: workspaceOperations.id }).from(workspaceOperations).where(and(
         eq(workspaceOperations.companyId, input.run.companyId),
@@ -635,6 +640,7 @@ async function recordRetryableFailure(input: {
     // notifyNativeFinalizationWork also wakes the reply-presentation worker,
     // which publishes a withheld accepted reply from the marker written below.
     const withheldReplyResultId = phase === "terminal_failure" && !supersededByNewerRun && input.failureScope === "workspace"
+      && !input.workspaceRetryTimeout?.historical
       && (NATIVE_WITHHELD_REPLY_FAILURE_CODES as readonly string[]).includes(failureCode) ? input.coordinator.resultId : null;
     await notifyNativeFinalizationWork(tx, { companyId: input.run.companyId, runId: input.run.id });
     if (phase === "terminal_failure") await notifyDeliveryWork(tx, DELIVERY_QUEUES.accounting, input.run.companyId);
@@ -654,6 +660,10 @@ async function recordRetryableFailure(input: {
           message: input.message.slice(0, 2_000),
           originalFailureCode: input.failureCode,
           ...(failureCause ? { failureCause } : {}),
+          ...(input.workspaceRetryTimeout ? { workspaceRetryTimeout: {
+            dueAt: input.coordinator.nextAttemptAt?.toISOString(), at: now.toISOString(),
+            historical: input.workspaceRetryTimeout.historical,
+          } } : {}),
           ...(priorFailureDetail.workspaceExportRetry ? { workspaceExportRetry: priorFailureDetail.workspaceExportRetry } : {}),
           ...(workspaceFinalizeAttempt === null
             ? {}
@@ -694,7 +704,9 @@ async function recordRetryableFailure(input: {
         executionStatusDeliveryId: randomUUID(),
         ...(projectsTerminalStatus
           ? terminalFinalizationRunPatch({ status: terminalRunStatus, failureCode, now,
-              error: terminalFinalizationFailureMessage(failureCode, input.failureScope, failureCause) })
+              error: input.workspaceRetryTimeout
+                ? "Saving the workspace did not finish before its recovery deadline. The agent's result is kept; use Retry to continue from saved work."
+                : terminalFinalizationFailureMessage(failureCode, input.failureScope, failureCause) })
           : {}),
         nativePhase: phase,
         nativePhaseUpdatedAt: now,
@@ -708,6 +720,15 @@ async function recordRetryableFailure(input: {
           failureCause,
           ...(finalizationFailureCount === null ? {} : { finalizationFailureCount }),
           nextAttemptAt: supersededByNewerRun || exhausted ? null : nextAttemptAt.toISOString(),
+          ...(input.workspaceRetryTimeout ? { workspaceRetryTimeout: {
+            dueAt: input.coordinator.nextAttemptAt?.toISOString(), at: now.toISOString(),
+            historical: input.workspaceRetryTimeout.historical,
+          } } : {}),
+          // Boot repair must also retire an acceptance outbox entry that was
+          // already pending before the server stopped, not just avoid a new one.
+          ...(input.workspaceRetryTimeout?.historical && record(currentRun.resultJson?.nativeWithheldReply).state === "pending"
+            ? { nativeWithheldReply: { ...record(currentRun.resultJson?.nativeWithheldReply), state: "skipped",
+              reason: "historical_workspace_retry_timeout" } } : {}),
           // The accepted answer will never reach the committed reply path now.
           ...(withheldReplyResultId ? pendingNativeWithheldReply(withheldReplyResultId, failureCode) : {}),
         })}::jsonb`,
@@ -814,6 +835,11 @@ async function recordRetryableFailure(input: {
     void reportRunFailure(input.db, terminalRunToEmit);
     await completeNativeRunTerminal(input.db, (terminalRunToEmit as typeof heartbeatRuns.$inferSelect).id);
   }
+  // A retry worker has no live heartbeat completion tail. Re-enter the same
+  // guarded, issue-locked drain on terminal failure, including a repeated call.
+  if (outcome.phase === "terminal_failure" && input.projectRunStatus) {
+    await drainNativeFinalization(input.db, input.run.id, input.run.companyId);
+  }
   return {
     ...input.coordinator,
     ...outcome,
@@ -829,6 +855,8 @@ export async function recordNativeFinalizationFailure(input: {
   failureScope?: "provider" | "workspace";
   permanent?: boolean;
   failureCause?: string | null;
+  /** Durable overdue retry guard, rechecked under the finalization lock. */
+  workspaceRetryTimeout?: { overdueBefore: Date; historical: boolean };
 }) {
   const [run, coordinator] = await Promise.all([
     input.db
@@ -870,6 +898,7 @@ export async function recordNativeFinalizationFailure(input: {
     failureScope: input.failureScope,
     permanent: input.permanent,
     failureCause: input.failureCause,
+    workspaceRetryTimeout: input.workspaceRetryTimeout,
   });
 }
 
@@ -1539,6 +1568,16 @@ export async function recoverCommittedNativeReviewResponse(db: Db, input: {
   return materialized !== null;
 }
 
+async function drainNativeFinalization(db: Db, runId: string, companyId: string) {
+  try {
+    const { wiredHeartbeatFor } = await import("../heartbeat-registry.js");
+    await (await wiredHeartbeatFor(db)).releaseIssueExecutionAndPromote(
+      { id: runId, companyId }, { resumeStrandedQueue: true });
+  } catch (err) {
+    logger.warn({ err, runId }, "Post-finalization release drain failed; the deferred wake stays saved");
+  }
+}
+
 /**
  * Finalizes a native run. When this call projects the terminal run status, the
  * shared post-commit terminal step runs once after every finalizer branch
@@ -1558,13 +1597,7 @@ export async function finalizeNativeRun(input: Parameters<typeof finalizeNativeR
     // concurrent settlement drain idempotent. Keep heartbeat loading lazy.
     // A drain failure never turns a committed finalization into a thrown error
     // (rf-3 row 7). The deferred wake stays saved for the next drain.
-    try {
-      const { wiredHeartbeatFor } = await import("../heartbeat-registry.js");
-      await (await wiredHeartbeatFor(input.db)).releaseIssueExecutionAndPromote(
-        { id: input.runId, companyId: finalized.companyId }, { resumeStrandedQueue: true });
-    } catch (err) {
-      logger.warn({ err, runId: input.runId }, "Post-commit release drain failed; the deferred wake stays saved");
-    }
+    await drainNativeFinalization(input.db, input.runId, finalized.companyId);
   }
   return finalized;
 }

@@ -5,6 +5,7 @@ import { ENVIRONMENT_LEASE_CONTROLLER_KEY } from "../environment-lease-controlle
 import { leaseReleaseRetryDueAt, readLeaseReleaseDeferral } from "../environment-lease-release-deferral.js";
 import { readNativeStartupCleanup, readNativeStartupContext } from "../native-runtime/native-startup-cleanup.js";
 import { legacyWorkspaceRecoveryNotMigrated } from "../legacy-workspace-recovery-migration.js";
+import { expireOverdueNativeWorkspaceFinalizations } from "../native-runtime/native-workspace-finalization-timeout.js";
 import { pendingFailedNativeRetryCancellationCondition } from "../native-runtime/native-cancellation-request.js";
 import { notifyLiveRunRecovery } from "../live-run-recovery-notifications.js";
 import { registerLiveRecoveryWork } from "./live-recovery-work.js";
@@ -150,7 +151,9 @@ type HeartbeatRetries = ReturnType<typeof createHeartbeatRetries>;
 /** Recovery owns reconciliation; the service retains execution and lifecycle effects. */
 export interface HeartbeatRecoveryDependencies extends Pick<HeartbeatRetryDependencies,
   "getAgent" | "appendRunEvent" | "setRunStatusIfRunning" |
-  "setWakeupStatus" | "releaseIssueExecutionAndPromote" | "finalizeAgentStatus"> {
+  "setWakeupStatus" | "finalizeAgentStatus"> {
+  releaseIssueExecutionAndPromote: (run: Pick<HeartbeatRun, "id" | "companyId">,
+    options?: { resumeStrandedQueue?: boolean }) => Promise<unknown>;
   enterShutdown: () => void;
   getRun: (runId: string, options?: Parameters<ReturnType<typeof createHeartbeatRunState>["getRun"]>[1]) => Promise<
     Awaited<ReturnType<ReturnType<typeof createHeartbeatRunState>["getRun"]>> | null
@@ -954,6 +957,10 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
   }
 
   async function recoverNativeRunsAfterRestart(now = new Date(), runIds?: string[], options?: { skipDelegatedWork?: boolean; trigger?: "same_run_retry" }) {
+    // Settle abandoned durable retries before any boot copy-back/reply replay.
+    if (runIds?.length) {
+      for (const runId of runIds) await expireOverdueNativeWorkspaceFinalizations(db, { now, runId, onExpired: settleRecoveredNativeWorkspace });
+    } else await expireOverdueNativeWorkspaceFinalizations(db, { now, onExpired: settleRecoveredNativeWorkspace });
     // A hard kill cannot release its accepted results the way a graceful drain
     // does. The shared ownership path settles each lease whose controller is
     // proven gone, so the finalization below settles it now instead of after
@@ -2266,6 +2273,9 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           : undefined,
       },
     ).catch(() => undefined);
+    // The terminal writer can reach the drain before environment cleanup. Once
+    // that last hold is released, retry the same idempotent queue handoff.
+    if (settledRun) await releaseIssueExecutionAndPromote(settledRun, { resumeStrandedQueue: true });
   }
 
   function cleanupRetainedNativeSession(input: { companyId: string; runId: string }) {
@@ -2539,6 +2549,9 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     staleThresholdMs?: number; resumedRunIds?: Set<string>;
   } = {}) {
     const now = new Date();
+    // The existing active-run recovery queue runs at boot and retains this
+    // 30-second deadline while an unowned saved-result retry is pending.
+    await expireOverdueNativeWorkspaceFinalizations(db, { ...scope, now, onExpired: settleRecoveredNativeWorkspace });
     const staleThresholdMs = options.staleThresholdMs ?? 5 * 60_000;
     const resumedRunIds = options.resumedRunIds ?? new Set<string>();
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
