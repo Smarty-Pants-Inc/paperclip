@@ -1,3 +1,5 @@
+import { redactProviderKeys } from "./provider-prefix-redaction.js";
+
 export const REDACTED_COMMAND_TEXT_VALUE = "***REDACTED***";
 
 // Public Executor helper addresses retained for callers of this predicate.
@@ -87,6 +89,7 @@ export function redactCommandText(
   command: string,
   redactedValue = REDACTED_COMMAND_TEXT_VALUE,
 ): string {
+  command = redactProviderKeys(command, redactedValue);
   if (!maybeContainsSecretText(command)) return command;
   return command
     .replace(COMMAND_AUTHORIZATION_BEARER_RE, `$1${redactedValue}`)
