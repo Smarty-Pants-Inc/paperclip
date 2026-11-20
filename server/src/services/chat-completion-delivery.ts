@@ -19,6 +19,7 @@ export const CHAT_COMPLETION_WAKE_REASON = "chat_task_completed";
 export const COMPLETED_HANDOFF_READ_EVENT = "chat_handoff.completed_read";
 const MAX_ATTEMPTS = 5;
 const LEASE_MS = 60_000;
+const BLOCKED_REPORT_NOTE = (listed: string, count: number) => `Blocked, not finished (${count === 1 ? "this report was" : "these reports were"} delayed): ${listed}.`;
 type Issue = typeof issues.$inferSelect;
 type Run = typeof heartbeatRuns.$inferSelect;
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -109,7 +110,7 @@ export function clipForNote(text: string | null | undefined, max = 60): string {
 /** Retire this stale wake's deliveries AND the conversation's pre-boot backlog
  * in the cancellation transaction. Post-boot siblings retain ordinary carry.
  * The status CAS is also the note's idempotency gate:
- * a retry (or a second wake naming D) cannot write the same finished-task news.
+ * a retry (or a second wake naming D) cannot write the same task news.
  * Completion display text stays here, not in the wake-queue orchestrator. */
 export async function supersedeStaleChatCompletionWake(tx: Connection, input: {
   companyId: string; conversationId: string; agentId: string; wakeId: string; deliveryIds: string[];
@@ -127,14 +128,17 @@ export async function supersedeStaleChatCompletionWake(tx: Connection, input: {
       eq(handoffs.conversationId, input.conversationId), eq(handoffs.agentId, input.agentId),
       inArray(deliveries.status, [...pending]))).orderBy(asc(deliveries.createdAt), asc(deliveries.id));
   const named: string[] = [];
+  const blockedNamed: string[] = [];
   let superseded = false;
   for (const { delivery, task } of rows) {
     const advanced = await tx.update(deliveries).set({ status: "superseded" })
       .where(and(eq(deliveries.companyId, input.companyId), eq(deliveries.id, delivery.id),
         inArray(deliveries.status, [...pending]))).returning({ id: deliveries.id });
     superseded ||= advanced.length > 0;
-    // Only finished tasks are news; a task no longer done owes no report (superseded silently).
+    // Name only tasks still done or blocked at supersede time. Later transitions
+    // to backlog, todo, in_progress, monitoring, in_review or cancelled stay unnamed.
     if (advanced.length && task.status === "done") named.push(`${task.identifier ?? task.id} — ${clipForNote(task.title)}`);
+    if (advanced.length && task.status === "blocked") blockedNamed.push(`${task.identifier ?? task.id} — ${clipForNote(task.title)}`);
   }
   if (superseded) {
     // A blocked younger report may already have taken its retry lease before
@@ -150,12 +154,20 @@ export async function supersedeStaleChatCompletionWake(tx: Connection, input: {
     ));
     await notifyDeliveryWork(tx, DELIVERY_QUEUES.chatCompletion);
   }
-  if (!named.length) return;
+  if (!named.length && !blockedNamed.length) return;
   // RFL words 18:26Z: say it is LATE and that nothing new happened; at most 3 named, then 'and N more'.
-  const listed = named.slice(0, 3).join("; ") + (named.length > 3 ? `; and ${named.length - 3} more` : "");
-  const body = named.length === 1
-    ? `Finished earlier (this report was delayed): ${listed}.`
-    : `Finished earlier (these reports were delayed): ${listed}.`;
+  const sentences: string[] = [];
+  if (named.length) {
+    const listed = named.slice(0, 3).join("; ") + (named.length > 3 ? `; and ${named.length - 3} more` : "");
+    sentences.push(named.length === 1
+      ? `Finished earlier (this report was delayed): ${listed}.`
+      : `Finished earlier (these reports were delayed): ${listed}.`);
+  }
+  if (blockedNamed.length) {
+    const listed = blockedNamed.slice(0, 3).join("; ") + (blockedNamed.length > 3 ? `; and ${blockedNamed.length - 3} more` : "");
+    sentences.push(BLOCKED_REPORT_NOTE(listed, blockedNamed.length));
+  }
+  const body = sentences.join("\n");
   await insertIssueComment(tx, { companyId: input.companyId, issueId: input.conversationId,
     authorType: "system", body,
     metadata: { version: 1, sections: [], authorizationReason: `stale_chat_completion:${input.wakeId}` } });
