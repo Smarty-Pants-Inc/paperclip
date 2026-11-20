@@ -3548,7 +3548,7 @@ describe("remote provider pack manifest", () => {
         runnerArtifact?: { version: string; digest: string };
       };
       if (nativePi) {
-        expect(transport).toMatchObject({ provider: "pi_rpc", piRpcThinkingLevel,
+        expect(transport).toMatchObject({ provider: "pi_rpc", piRpcThinkingLevel, closeGraceMs: 1_000,
           piCommand: "/opt/paperclip-runner/provider-pack/provider-assets/pi_rpc/linux-x64/runtime/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
           piCommandSha256: digest, piProxyPath: "/opt/paperclip-runner/provider-pack/dist/cli/pi-rpc-app-server-proxy.cjs",
           piProxySha256: digest,
@@ -6592,6 +6592,14 @@ describe("retained native cleanup activation", () => {
     "active_finalization_lease",
     "active_provider_process",
   ])("preserves exact original evidence for %s", async (mode) => {
+    if (["settled", "provider_transport_failed", "canonical_source"].includes(mode)) {
+      // These are offline Codex maintenance/custody rows, not Pi Stop or
+      // retained-turn qualification. Keep the original 15s budget and exact
+      // evidence assertions; neither a 2s nor a 5s Pi wait is a prerequisite.
+      expect(execution.provider.kind).toBe("codex");
+      expect(execution.session.driverKind).toBe("codex_app_server");
+      expect(execution.session.lifecyclePolicy?.mode).toBe("per_turn");
+    }
     const directory = await mkdtemp(
       join(tmpdir(), "paperclip-maintenance-activation-"),
     );
@@ -11234,6 +11242,25 @@ describe("native session cancellation", () => {
       expect(await Promise.all([first, duplicate])).toEqual([true, true]);
       expect(state.cancel).toHaveBeenCalledOnce();
     } finally { releaseCleanup(); state.release?.(); await running; }
+  });
+
+  it("retires the exact owner when interrupt cleanup never acknowledges and joins repeated Stop", async () => {
+    state.cancel.mockReturnValue({ cleanup: new Promise<void>(() => {}) });
+    const close = vi.fn(async () => { state.release?.(); });
+    const execute = state.execute.getMockImplementation()!;
+    state.execute.mockImplementationOnce(options => execute({ ...options,
+      onSession: (session: NativeSession | null) => options.onSession?.(session ? { ...session, close } : null),
+    }));
+    const running = executePaperclipNativeSession({ db: leaseDb(), execution, runnerInstanceId: "runner" });
+    await vi.waitFor(() => expect(state.release).toBeTypeOf("function"));
+    try {
+      const first = cancelNativeSession(execution.binding.runId, "operator Stop");
+      const duplicate = cancelNativeSession(execution.binding.runId, "repeated Stop");
+      await Promise.all([first, duplicate, running]);
+      expect(state.cancel).toHaveBeenCalledOnce();
+      expect(close).toHaveBeenCalledExactlyOnceWith({ reason: "native stop acknowledgement deadline expired" });
+      expect(state.cancel.mock.calls[0]![0].signal.aborted).toBe(true);
+    } finally { state.release?.(); await running; }
   });
 
   it("allows cancellation to be retried when the session dispatch fails", async () => {
@@ -17770,7 +17797,14 @@ describe("native session bounded recovery", () => {
           leaseId: null, retained, reason, elapsedMs: expect.any(Number) }),
       }));
       if (!["not-warm", "not-user-stop"].includes(mode)) {
-        expect(close).toHaveBeenCalledTimes(["clean", "warm-checkpoint", "probe-write-failed", "probe-held", "probe-twice"].includes(mode) ? 0 : 1);
+        // Expiry revokes the iterator immediately; the ordinary finally then
+        // joins the same idempotent close. Both calls are required, not a warm
+        // retention or a second physical teardown.
+        expect(close).toHaveBeenCalledTimes(mode === "cleanup-timeout" ? 2
+          : ["clean", "warm-checkpoint", "probe-write-failed", "probe-held", "probe-twice"].includes(mode) ? 0 : 1);
+        if (mode === "cleanup-timeout") expect(close).toHaveBeenNthCalledWith(1, {
+          reason: "native stop acknowledgement deadline expired",
+        });
         expect(updates.some(update => update.table === heartbeatRuns && update.values.status === "failed")).toBe(false);
       }
       expect(probe.mock.calls.filter(([, event]) => event.eventType === "native.warm_retention.probe"
