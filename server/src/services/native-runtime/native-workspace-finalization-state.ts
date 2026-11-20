@@ -104,6 +104,32 @@ export async function nativeWorkspaceExportPendingForLease(db: Db, lease: Worksp
   return await held();
 }
 
+/**
+ * Never-OK guard for a box release: true while ANY run whose nativeWorkspaceSync
+ * reference names this box (by providerLeaseId, or by any lease row on the box)
+ * is still 'prepared' with no final host sha, i.e. its files were never
+ * exported and the box holds the only copy. Fails closed on a partial reference.
+ * Only positive proof the run never started (cancelled, no process ids, no
+ * start/session/turn/tool event) lets the cut run's reference stop holding.
+ */
+export async function boxHasUnexportedPreparedWork(db: Db, box: { companyId: string; providerLeaseId: string }):
+  Promise<{ held: boolean; runIds: string[] }> {
+  const reference = sql`${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceSync'`;
+  const rows = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, box.companyId),
+    sql`${reference}->>'state' = 'prepared'`,
+    sql`coalesce(${reference}->>'finalHostSha256', '') = ''`,
+    sql`(${reference}->>'providerLeaseId' = ${box.providerLeaseId} or ${reference}->>'leaseId' in (
+      select ${environmentLeases.id}::text from ${environmentLeases}
+      where ${environmentLeases.companyId} = ${box.companyId} and ${environmentLeases.providerLeaseId} = ${box.providerLeaseId}))`,
+    sql`not (${heartbeatRuns.status} = 'cancelled' and ${heartbeatRuns.processPid} is null
+      and ${heartbeatRuns.processGroupId} is null and ${heartbeatRuns.processStartedAt} is null
+      and not exists (select 1 from ${heartbeatRunEvents} where ${and(eq(heartbeatRunEvents.companyId, heartbeatRuns.companyId),
+        eq(heartbeatRunEvents.runId, heartbeatRuns.id), executionStartedEventPredicate())}))`,
+  ));
+  return { held: rows.length > 0, runIds: rows.map(row => row.id).sort() };
+}
+
 export async function nativeWorkspaceExportPendingForResource(db: Db, lease: WorkspaceSourceLease, resumingRunId: string | null) {
   if (!lease.provider || !lease.providerLeaseId || lease.provider === "local") return false;
   const sources = await db.select({ lease: { id: environmentLeases.id, companyId: environmentLeases.companyId,
