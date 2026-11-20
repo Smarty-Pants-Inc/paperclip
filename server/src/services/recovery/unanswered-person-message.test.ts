@@ -2001,6 +2001,61 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     }
   });
 
+  // Keep: nlport5c real-applier row (rf-6 06:40Z: the REAL heartbeat applier must publish, not a test that publishes the
+  // returned effects by hand). A person's held message the conversation moved past is cancelled by the REAL end-of-run
+  // release (heartbeatService releaseIssueExecutionAndPromote -> wake queue -> cancelDeferredWake -> post-commit
+  // applyWakeQueuePostCommitEffects). Its note's ONE event is on the live bus only after the commit: GET 200 at the event.
+  it("noteslive2 real applier: the heartbeat end-of-run release publishes the moved-on note once, after its commit, with no manual publish", async () => {
+    const f = await fixture();
+    const heldId = await f.message("Please check my saved request.");
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "on_demand",
+      reason: "issue_commented", status: "deferred_issue_execution", requestedByActorType: "user", requestedByActorId: f.userId,
+      requestedAt: f.at(), payload: { issueId: f.issueId, _paperclipWakeContext: { issueId: f.issueId, taskKey: f.issueId,
+        wakeReason: "issue_commented", wakeCommentIds: [heldId] } } }).returning();
+    const newerId = await f.message("Just answer this last one.");
+    const runId = await f.run({ commentId: newerId, status: "succeeded" });
+    await f.reply(runId);
+    await db.update(issues).set({ executionRunId: runId, executionLockedAt: new Date() }).where(eq(issues.id, f.issueId));
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => { (req as unknown as { actor: unknown }).actor = { type: "board", source: "local_implicit",
+      userId: f.userId, isInstanceAdmin: true, companyIds: [f.companyId] }; next(); });
+    app.use("/api", issueRoutes(db, {} as never, {}));
+    app.use(errorHandler);
+    const told: Array<{ commentId: string; change: unknown; source: unknown }> = [];
+    const readAtEvent: Array<Promise<number>> = [];
+    // The release transaction holds the issue row FOR UPDATE until it commits: a NOWAIT probe from another
+    // connection at the event says deterministically whether that transaction is still open.
+    const issueLockAtEvent: Array<Promise<string>> = [];
+    const stop = subscribeCompanyLiveEvents(f.companyId, event => {
+      if (event.type !== "activity.logged" || event.payload.action !== "issue.comment_added") return;
+      const details = event.payload.details as Record<string, unknown>;
+      told.push({ commentId: String(details.commentId), change: details.change, source: details.source });
+      issueLockAtEvent.push(db.execute(sql`select id from issues where id = ${f.issueId} for update nowait`)
+        .then(() => "committed", (err: { code?: string; cause?: { code?: string } }) =>
+          (err.code ?? err.cause?.code) === "55P03" ? "release transaction still open" : `error ${String(err)}`));
+      readAtEvent.push(request(app).get(`/api/issues/${f.issueId}/comments/${details.commentId}`).then(res => res.status));
+    });
+    try {
+      const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      await heartbeatService(db).releaseIssueExecutionAndPromote(source!);
+      const [cancelled] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake!.id));
+      expect(cancelled).toMatchObject({ status: "cancelled", error: "The conversation moved on", runId: null });
+      const notes = await f.visible();
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.body).toContain("Please check my saved request.");
+      expect(told, "ONE event, published by the real heartbeat applier").toEqual([
+        { commentId: notes[0]!.id, change: "added", source: "recovery.unanswered_message" }]);
+      expect(await Promise.all(issueLockAtEvent), "the event fires only after the release transaction commits")
+        .toEqual(["committed"]);
+      expect(await Promise.all(readAtEvent), "the note is readable when its one event fires").toEqual([200]);
+      console.info("nlport5c real-applier", JSON.stringify({ wake: cancelled!.status, note: notes[0]!.id, told,
+        issueLockAtEvent: await Promise.all(issueLockAtEvent), getAtEvent: await Promise.all(readAtEvent) }));
+    } finally {
+      stop();
+    }
+  });
+
   // Keep: recorded PV2 gate-1 catch (11:27Z): answering the run's question
   // removed its pending-card exemption before response delivery could wake it.
   it.each([true, false])("PV2 card-answer: no resend notice before, during or after one answer delivery (chat=%s)", async chat => {
