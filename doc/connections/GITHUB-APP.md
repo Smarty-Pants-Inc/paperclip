@@ -11,7 +11,7 @@ the PEM is never sent to MCP. Existing managed OAuth and PAT methods remain avai
 ## Setup
 
 1. Register an App in [GitHub settings](https://github.com/settings/apps/new).
-   Install it on the selected repositories. Webhooks and OAuth callbacks are not
+   Install it on selected repositories or choose **All repositories** in GitHub. Webhooks and OAuth callbacks are not
    required for this method.
 2. Grant the App the permissions required by a template below or your custom
    selection. Generate an RSA private key. Keep the App ID and installation ID (the number in the
@@ -22,7 +22,7 @@ the PEM is never sent to MCP. Existing managed OAuth and PAT methods remain avai
    requires neither Paperclip Cloud enrollment nor authorization of the official
    Paperclip OAuth app. Choose personal or shared ownership, then select agents
    or allow all agents. Dedicated ownership remains available for one agent.
-4. Enter the App ID or Client ID, installation ID, and explicit `owner/repository` list.
+4. Enter the App ID or Client ID, installation ID, and either `*` alone or an explicit `owner/repository` list.
    Paste the complete PEM key, including its header, footer, and line breaks,
    into the masked multiline private-key field. Use **Show private key** only when
    you need to inspect it. Connecting automatically stores the key as an encrypted
@@ -39,11 +39,21 @@ the PEM is never sent to MCP. Existing managed OAuth and PAT methods remain avai
 | Author | Write | Write | Read |
 | Reviewer | Read | Write | Read |
 
-All repositories must belong to the selected installation's account. The list
-must contain 1–500 repositories. An empty list is denied. Paperclip sends explicit
-repository and permission restrictions on every token request and never retries
-with broader access. GitHub also enforces the installation's current access.
-The templates do not request administration or workflow permissions.
+For an explicit list, all repositories must belong to the selected installation's
+account and the list must contain 1–500 repositories. An empty list is denied.
+Paperclip sends that repository restriction on every token request.
+
+Use exactly `*` to inherit every repository this installation grants. Paperclip
+omits the `repositories` field when minting the token; it still sends the same
+chosen permissions. GitHub enforces the installation's own selection. With
+**All repositories** selected in GitHub, repositories added later are included
+without changing the Paperclip configuration. With selected repositories, only
+those granted by GitHub are included. Do not mix `*` with names. The setup API
+uses the same `configValues.repositories` string as the form, not an array.
+Repository metadata is paged from `/installation/repositories` and refreshed by
+ordinary credential renewal or a forced connection health check. No webhook is
+required. Neither mode retries with broader access. The templates do not request
+administration or workflow permissions.
 
 Choose **Custom permissions** to enter a non-empty JSON object in **Custom
 permissions (JSON)**. Use GitHub API permission names and `read`, `write`, or
@@ -90,7 +100,7 @@ assignments fail closed. Create **separate App registrations** for independent
 author and reviewer bot identities; two installations of one App share its bot.
 
 For shared and dedicated connections, company members (or the local trusted
-board) can select the App's verified, explicitly configured repositories when creating or configuring a project.
+board) can select the App's verified repositories within its configured scope when creating or configuring a project.
 Personal App repository metadata remains visible only to the credential owner.
 Shared App metadata follows the saved human audience.
 The project picker refreshes App access and shows connection failures through
@@ -108,7 +118,7 @@ per-tool Ask-first controls; the installation token's scope is their limit.
 The setup/API `configValues` form accepts an omitted version, string `"1"`, or
 numeric `1`. Setup normalizes and stores the version as string `"1"`; unsupported
 versions are rejected. The credential parser separately produces a runtime
-configuration with numeric `version: 1`, a repository array, and resolved
+configuration with numeric `version: 1`, a repository array or the literal `"*"`, and resolved
 permissions. That runtime object is not a setup/API form payload.
 
 ## Renewal, rotation, and removal
