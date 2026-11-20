@@ -131,7 +131,7 @@ describe("execute environment files", () => {
     });
     await plugin.definition.onEnvironmentExecute!({ ...params, env: { SECRET_X: sentinel } });
     expect(f.commands.filter(body => body.command.includes("/bin/mkdir -p -m 0700"))).toHaveLength(1);
-    await plugin.definition.onEnvironmentResumeLease!({ driverKey: "boat", companyId: "c", environmentId: "e", config: { apiKey: "boat_test", duplexCarrier: "off" }, providerLeaseId: "bx_test" });
+    await plugin.definition.onEnvironmentResumeLease!({ driverKey: "boat", companyId: "c", environmentId: "e", config: { hydrationWaitSeconds: 0, apiKey: "boat_test", duplexCarrier: "off" }, providerLeaseId: "bx_test" });
     await plugin.definition.onEnvironmentExecute!({ ...params, env: { SECRET_X: sentinel } });
     expect(f.commands.filter(body => body.command.includes("/bin/mkdir -p -m 0700"))).toHaveLength(2);
     const lastPut = f.fetch.mock.calls.findLastIndex(([input, init]) => String(input) === `${API}/files` && init?.method === "PUT");

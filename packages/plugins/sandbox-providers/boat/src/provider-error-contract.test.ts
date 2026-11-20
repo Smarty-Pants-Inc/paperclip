@@ -14,7 +14,7 @@ const providerErrorDiagnostic = (error: unknown) => environmentResumeErrorData(e
 // HTTP fixtures with synthetic noncredential keys, never live Boat.
 const id = "bx_23456789";
 const canary = "synthetic-transport-canary";
-const config = { apiKey: "synthetic-boat-key", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
+const config = { hydrationWaitSeconds: 0, apiKey: "synthetic-boat-key", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
 const params = { driverKey: "boat", companyId: "company", environmentId: "environment", runId: "run", creationOperationId: "attempt", config };
 const labels = { owner: "paperclip:company", environment: "environment", run: "run", "paperclip-acquire": "attempt" };
 // server/src/services/environment-provider-unavailable-error.ts:17-23 (acquire, structure only).

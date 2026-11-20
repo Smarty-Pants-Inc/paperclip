@@ -4,7 +4,7 @@ import plugin from "./plugin.js";
 import { readTransientEnvironmentProviderFailure } from "../../../../../server/src/services/environment-provider-unavailable-error.js";
 vi.mock("node:timers/promises", () => ({ setTimeout: (ms = 0) => new Promise(r => globalThis.setTimeout(r, ms)) }));
 const key = "boat_REVIEW_SECRET_CANARY_4819";
-const cfg = { apiKey: key, type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
+const cfg = { hydrationWaitSeconds: 0, apiKey: key, type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
 const p = { driverKey: "boat", companyId: "u3co", environmentId: "u3env", runId: "u3run", creationOperationId: "u3attempt", config: cfg };
 const owned = (attempt = "u3attempt") => ({ owner: "paperclip:u3co", environment: "u3env", run: "u3run", "paperclip-acquire": attempt });
 const res = (x: unknown, status = 200) => new Response(JSON.stringify(x), { status, headers: { "Content-Type": "application/json" } });

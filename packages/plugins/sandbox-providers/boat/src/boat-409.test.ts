@@ -17,7 +17,7 @@ import plugin, { boatResumeStateTransition, boatStartDeadlineMessage } from "./p
 // Each test uses its own box: "our resume" is worker state keyed by box.
 let boxes = 0, id = "bx_00000000";
 const canary = "synthetic-409-body-canary";
-const config = { apiKey: "synthetic-boat-key", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
+const config = { hydrationWaitSeconds: 0, apiKey: "synthetic-boat-key", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
 const scope = { driverKey: "boat", companyId: "c", environmentId: "e", config };
 const SERVER_RESUME_TEXT = /\b(timeout|timed out|rate limit|temporar|network|connection reset|service unavailable)\b/;
 type Reply = { status: number; body: unknown; headers?: Record<string, string> };

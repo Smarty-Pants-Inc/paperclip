@@ -5,7 +5,7 @@ import plugin from "./plugin.js";
 
 // Keep: data safety and the provider/core trust boundary (review 0.1.3 F1–F3).
 // HTTP is mocked; these checks do not establish a live Boat session survived.
-const config = { apiKey: "boat_test", type: "small", ttlSeconds: 1800, setupTimeoutSeconds: 180, reuseLease: true, labels: {} };
+const config = { hydrationWaitSeconds: 0, apiKey: "boat_test", type: "small", ttlSeconds: 1800, setupTimeoutSeconds: 180, reuseLease: true, labels: {} };
 const base = { driverKey: "boat", companyId: "company", environmentId: "environment", config, providerLeaseId: "bx_23456789" };
 function response(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });

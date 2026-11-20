@@ -7,7 +7,7 @@ import { transientSandboxResumeFailure } from "./test-fixtures/real-resume-predi
 // Keep: F-04B R1-R5, real archived-resume/execute hooks with injected transport
 // faults. Data-safety boundary: arbitrary commands must NEVER acquire the
 // retryable shape of our explicitly repeatable sentinel/env-directory probes.
-const config = { apiKey: "not-live-f04b", type: "small", ttlSeconds: 1800, reuseLease: true, labels: {} };
+const config = { hydrationWaitSeconds: 0, apiKey: "not-live-f04b", type: "small", ttlSeconds: 1800, reuseLease: true, labels: {} };
 const scope = { driverKey: "boat", companyId: "f04b-c", environmentId: "f04b-e", config };
 const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status });
 const reset = () => Object.assign(new TypeError("PRIVATE-TRANSPORT-TEXT"), {

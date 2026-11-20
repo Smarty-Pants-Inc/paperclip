@@ -17,7 +17,7 @@ import plugin from "./plugin.js";
 import { READY_SPARE_STOP_BACKOFF_MS } from "./ready-spares.js";
 
 const apiKey = "boat_spare_off_test";
-const baseConfig = { apiKey, type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
+const baseConfig = { hydrationWaitSeconds: 0, apiKey, type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
 const IDLE_MINUTES = 15;
 const CREATE_LATENCY_MS = 2_000;
 const TICK_MS = 15_000;

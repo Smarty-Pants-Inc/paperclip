@@ -3,7 +3,7 @@ import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 const manifest: PaperclipPluginManifestV1 = {
   id: "paperclip.boat-sandbox-provider",
   apiVersion: 1,
-  version: "0.1.17-spare.12",
+  version: "0.1.17-spare.12h1",
   displayName: "Boat Sandbox Provider",
   description: "Provisions isolated Boat cloud sandboxes as Paperclip execution environments.",
   author: "Paperclip",
@@ -48,7 +48,8 @@ const manifest: PaperclipPluginManifestV1 = {
         type: { type: "string", enum: ["small", "default", "large", "xlarge"], default: "small" },
         ttlSeconds: { type: "number", default: 1800, description: "Sandbox auto-stop TTL (seconds; maximum 30 days). Raised above a host warm idle or reconnect window plus five minutes; hard caller expiry is unsupported and rejected before allocation." },
         runLeaseRenewCapSeconds: { type: "integer", minimum: 1, maximum: 2592000, default: 86400, description: "Absolute RUN renewal budget from acquire/resume entry. The SDK does not expose the run timeout; the 86400-second (24 h) default accommodates agents with no run timeout. Renewal stops at the cap even if release never arrives; the last finite Boat TTL then expires. For timed runs, set this to the run timeout plus one renewal cadence and a small margin." },
-        setupTimeoutSeconds: { type: "number", default: 180, minimum: 1, maximum: 600, description: "Maximum seconds to wait for setupScript to finish. The whole acquisition, setup included, is capped at 180 seconds from the start of the create, so a value above 180 has no effect beyond 180; setup gets at most what remains of that budget." },
+        hydrationWaitSeconds: { type: "integer", minimum: 0, default: 150, description: "Maximum seconds to wait for Boat hydrated=true before cold-create or resumed workspace handoff. 0 disables hydration reads/waits. At the bound, hand off the valid lease with a warning. This optional wait is separate from the acquisition work budget." },
+        setupTimeoutSeconds: { type: "number", default: 180, minimum: 1, maximum: 600, description: "Maximum seconds to wait for setupScript to finish. Acquisition work, setup included but excluding the optional hydration wait, is capped at 180 seconds from the start of the create, so setup gets at most what remains of that work budget." },
         labels: { type: "object", additionalProperties: { type: "string" }, description: "Additional Boat labels, merged with Paperclip ownership labels." },
         setupScript: { type: "string", maxLength: 16384, description: "Optional Boat setup script (maximum 16 KiB UTF-8)." },
         snapshot: { type: "string", minLength: 1, description: "Saved-snapshot name or immutable UUID. UUIDs resolve to exactly one name and are checked again immediately before create. Cannot be combined with from or pinnedSnapshotId." },

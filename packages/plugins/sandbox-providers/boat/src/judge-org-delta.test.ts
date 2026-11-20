@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import plugin from "./plugin.js";
 const id = "bx_23456789";
-const scope = { driverKey: "boat", companyId: "judge", environmentId: "judge", config: { apiKey: "judge-noncredential" } };
+const scope = { driverKey: "boat", companyId: "judge", environmentId: "judge", config: { hydrationWaitSeconds: 0, apiKey: "judge-noncredential" } };
 const reply = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
 const inspect = (leaseMetadata: Record<string, unknown>) => plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: id, leaseMetadata });
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });

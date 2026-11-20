@@ -19,7 +19,7 @@ import { localGuardian } from "./guardian-local.js";
 import { sha, qualify, launch, observe, wire } from "./s9-frames.mjs";
 export const exec=promisify(execFile), cleanups:Array<()=>Promise<unknown>>=[];
 afterEach(async()=>{const errors=[];try{for(const c of cleanups.splice(0).reverse())try{await c();}catch(e){errors.push(e);}}finally{vi.restoreAllMocks();vi.unstubAllGlobals();}if(errors.length)throw new AggregateError(errors,"cleanup failed");});
-export const scope={driverKey:"boat",companyId:"company",environmentId:"environment",providerLeaseId:"bx_sshfixture",config:{apiKey:"fixture-not-a-credential",duplexCarrier:"ssh",reuseLease:true}};
+export const scope={driverKey:"boat",companyId:"company",environmentId:"environment",providerLeaseId:"bx_sshfixture",config:{hydrationWaitSeconds:0,apiKey:"fixture-not-a-credential",duplexCarrier:"ssh",reuseLease:true}};
 export async function obs(kind:string,data:unknown){if(process.env.JUDGE_OBS)await appendFile(process.env.JUDGE_OBS,JSON.stringify({kind,data})+"\n");}
 export async function fixture(mode=""){
  const f=await localGuardian();cleanups.push(()=>f.close());vi.stubGlobal("fetch",f.uploadFetch);

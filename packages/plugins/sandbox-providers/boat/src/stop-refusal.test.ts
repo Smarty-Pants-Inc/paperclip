@@ -20,7 +20,7 @@ import plugin from "./plugin.js";
 const BOAT_REFUSAL = "Refusing archive/stop: no successful snapshot in the last 30 minutes";
 const LAST_GOOD = "2026-11-18T17:12:04Z";
 let boxes = 0, id = "bx_s0000000";
-const config = { apiKey: "synthetic-boat-key", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
+const config = { hydrationWaitSeconds: 0, apiKey: "synthetic-boat-key", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
 const scope = { driverKey: "boat", companyId: "c", environmentId: "e", config };
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 type Call = { method: string; route: string; body?: any; at: number };

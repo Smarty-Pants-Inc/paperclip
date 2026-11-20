@@ -15,7 +15,7 @@ vi.mock("node:timers/promises", () => ({
     options?.signal?.addEventListener?.("abort", () => { globalThis.clearTimeout(handle); reject(options.signal!.reason); }, { once: true });
   }),
 }));
-const cfg = { apiKey: "boat_test", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
+const cfg = { hydrationWaitSeconds: 0, apiKey: "boat_test", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
 const base = { driverKey: "boat", companyId: "lco", environmentId: "lenv", config: cfg };
 const res = (x: unknown, status = 200) => new Response(JSON.stringify(x), { status, headers: { "Content-Type": "application/json" } });
 beforeEach(async () => {

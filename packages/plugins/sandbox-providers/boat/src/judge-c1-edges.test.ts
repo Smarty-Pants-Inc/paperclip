@@ -3,7 +3,7 @@ import plugin from "./plugin.js";
 import { environmentAcquireErrorData } from "@paperclipai/plugin-sdk";
 import { readTransientEnvironmentProviderFailure } from "../../../../../server/src/services/environment-provider-unavailable-error.js";
 vi.mock("node:timers/promises", () => ({ setTimeout: (ms = 0) => new Promise(r => globalThis.setTimeout(r, ms)) }));
-const cfg = { apiKey: "boat_edge_fixture", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
+const cfg = { hydrationWaitSeconds: 0, apiKey: "boat_edge_fixture", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
 const p = { driverKey: "boat", companyId: "edgeco", environmentId: "edgeenv", runId: "edgerun", creationOperationId: "edgeattempt", config: cfg };
 const labels = { owner: "paperclip:edgeco", environment: "edgeenv", run: "edgerun", "paperclip-acquire": "edgeattempt" };
 const res = (x: unknown, status = 200) => new Response(JSON.stringify(x), { status, headers: { "Content-Type": "application/json" } });

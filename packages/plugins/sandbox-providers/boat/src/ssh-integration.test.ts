@@ -20,7 +20,7 @@ import { localGuardian } from './test-fixtures/guardian-local.js';
 import { sha, qualify, launch, observe, park, claim, retire, source, wire } from './test-fixtures/s9-frames.mjs';
 const exec=promisify(execFile),cleanups:Array<()=>Promise<unknown>>=[];
 afterEach(async()=>{const errors=[];try{for(const c of cleanups.splice(0).reverse())try{await c();}catch(e){errors.push(e);}}finally{vi.unstubAllGlobals();}if(errors.length)throw new AggregateError(errors,'cleanup failed');});
-const scope={driverKey:'boat',companyId:'company',environmentId:'environment',providerLeaseId:'bx_sshfixture',config:{apiKey:'fixture-not-a-credential',duplexCarrier:'ssh',reuseLease:true}};
+const scope={driverKey:'boat',companyId:'company',environmentId:'environment',providerLeaseId:'bx_sshfixture',config:{hydrationWaitSeconds:0,apiKey:'fixture-not-a-credential',duplexCarrier:'ssh',reuseLease:true}};
 async function evidence(kind:string,data:unknown){if(process.env.ROUTEA_EVIDENCE)await appendFile(join(process.env.ROUTEA_EVIDENCE,'ssh-measurements.jsonl'),JSON.stringify({kind,data})+'\n');}
 async function fixture(mode=''){
  const f=await localGuardian();cleanups.push(()=>f.close());vi.stubGlobal('fetch',f.uploadFetch);

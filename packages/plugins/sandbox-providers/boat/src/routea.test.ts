@@ -2,7 +2,7 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import plugin from './plugin.js';
 import manifest from './manifest.js';
-const base = {driverKey:'boat',companyId:'route-company',environmentId:'route-env',config:{apiKey:'fixture-only'},runId:'run'};
+const base = {driverKey:'boat',companyId:'route-company',environmentId:'route-env',config:{hydrationWaitSeconds:0,apiKey:'fixture-only'},runId:'run'};
 afterEach(()=>vi.unstubAllGlobals());
 it('declares verified route-A methods while keeping environment opt-in off',()=>{
  expect(manifest.environmentDrivers![0].sandboxCapabilities).toMatchObject({reusableLeases:true,duplexCommandStream:true});

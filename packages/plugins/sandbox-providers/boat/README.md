@@ -1,5 +1,31 @@
 # Boat sandbox provider 0.1.16-spare (unreleased)
 
+## Workspace hydration handoff (0.1.17-spare.12h1)
+
+Boat can report a sandbox running before its workspace finishes hydrating. Cold
+acquire and an actual resume now wait for `hydrated === true` before workspace
+preparation and lease handoff. The existing readiness GET supplies the first
+observation; already-hydrated boxes add no GET or delay. Ready spare claims retain
+their existing hydration checks and do not enter this wait.
+
+`hydrationWaitSeconds` is a nonnegative integer, default **150**; **0** preserves
+the previous call sequence without extra hydration GETs. While an active handoff
+is unresolved, the plugin polls the existing sandbox GET at the readiness
+helper's 500 ms cadence, with its existing bounded request retries. It stops at
+hydration or the configured bound, never adding an idle/background poller.
+Missing hydration evidence or failed observation reads do not introduce a new
+lease failure: at the bound, return the valid lease and log one warning,
+`Boat box not hydrated at handoff after Ns`. Each actual wait also emits one
+`Boat hydration wait` info receipt with box ID, waited milliseconds, and outcome
+`hydrated` or `bound`. The optional wait is excluded from the existing 180-second
+acquisition work budget; other phases retain that budget. Operators choosing a
+larger wait must allow enough host hook time for it and the normal acquisition.
+
+This is bounded best effort, not a guarantee for boxes that never hydrate or
+hydrate after the bound. Local fake-provider worker evidence does not establish
+that an installed live Boat runner uses the correct workspace; rollout and a
+real daily-work check remain separate.
+
 ## Operator-only fault-proxy API override
 
 Normal environments omit `apiBaseUrl` and use `https://boat.dev/api/v1`; no

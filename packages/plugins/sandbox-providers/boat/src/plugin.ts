@@ -30,8 +30,12 @@ import type {
   EnvironmentCreationIdempotencyCode,
 } from "@paperclipai/plugin-sdk";
 
-type Config = RunnerConfig & { apiBaseUrl?: string; provider: string; setupTimeoutSeconds: number; runLeaseRenewCapSeconds: number; retainOnDestroy: boolean; labels: Record<string, string>; duplexCarrier: "off" | "ssh" };
+type Config = RunnerConfig & { apiBaseUrl?: string; provider: string; setupTimeoutSeconds: number; hydrationWaitSeconds: number; runLeaseRenewCapSeconds: number; retainOnDestroy: boolean; labels: Record<string, string>; duplexCarrier: "off" | "ssh" };
 const DEFAULT_RUN_LEASE_RENEW_CAP_SECONDS = 86400;
+const HYDRATION_WAIT_MS = 150_000;
+function validHydrationWait(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER / 1000;
+}
 function validRunLeaseRenewCap(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 2_592_000;
 }
@@ -766,6 +770,7 @@ function parse(raw: Record<string, unknown>): Config {
     type: typeof raw.type === "string" ? raw.type : "small",
     ttlSeconds: Number(raw.ttlSeconds ?? 1800),
     setupTimeoutSeconds: Number(raw.setupTimeoutSeconds ?? 180),
+    hydrationWaitSeconds: validHydrationWait(raw.hydrationWaitSeconds) ? raw.hydrationWaitSeconds : HYDRATION_WAIT_MS / 1000,
     // Even a direct SDK caller bypassing validation cannot disable the money cap.
     runLeaseRenewCapSeconds: validRunLeaseRenewCap(raw.runLeaseRenewCapSeconds) ? raw.runLeaseRenewCapSeconds : DEFAULT_RUN_LEASE_RENEW_CAP_SECONDS,
     reuseLease: raw.reuseLease === true,
@@ -1708,6 +1713,29 @@ async function waitReady(config: Config, id: string, allowArchived = false, boun
     }
   }
   throw new Error(boatStartDeadlineMessage(id, lastObservedState));
+}
+/** Boat restores workspace files after readiness, including after resume. This
+ * active handoff has no hydration callback; reuse readiness's 500 ms cadence
+ * and the GET helper's retries, never a background/idle poller. A read failure
+ * is not a new lease failure: keep waiting within the same fail-open bound. */
+async function waitHydrated(config: Config, id: string, observation: any): Promise<void> {
+  if (config.hydrationWaitSeconds === 0 || observation?.hydrated === true) return;
+  const startedAt = Date.now(), until = startedAt + config.hydrationWaitSeconds * 1000;
+  let hydrated = false;
+  while (Date.now() < until) {
+    await delay(Math.min(500, Math.max(0, until - Date.now())));
+    if (Date.now() >= until) break;
+    try {
+      const result = await request(config, `/sandboxes/${encodeURIComponent(id)}`, {
+        cache: "no-store", signal: withinBudget(until, BOAT_CALL_BUDGET_MS),
+      }, false, { deadline: until });
+      const sandbox = result?.sandbox ?? result;
+      if (sandbox?.id === id && sandbox.hydrated === true) { hydrated = true; break; }
+    } catch { /* Optional hydration observation never invalidates a valid lease. */ }
+  }
+  const details = { providerLeaseId: redactKey(config, id), waitedMs: Date.now() - startedAt, outcome: hydrated ? "hydrated" : "bound" };
+  duplexLogger?.info("Boat hydration wait", details);
+  if (!hydrated) duplexLogger?.warn(`Boat box not hydrated at handoff after ${config.hydrationWaitSeconds}s`, details);
 }
 async function waitSetup(config: Config, id: string, deadline?: number): Promise<any> {
   const setupUntil = Date.now() + config.setupTimeoutSeconds * 1000;
@@ -2920,6 +2948,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     if (!Number.isInteger(c.ttlSeconds) || c.ttlSeconds < 60 || c.ttlSeconds > 2_592_000) errors.push("ttlSeconds must be an integer from 60 through 2592000.");
     if (!Number.isInteger(c.setupTimeoutSeconds) || c.setupTimeoutSeconds < 1 || c.setupTimeoutSeconds > 600) errors.push("setupTimeoutSeconds must be an integer from 1 through 600.");
     if (params.config.runLeaseRenewCapSeconds !== undefined && !validRunLeaseRenewCap(params.config.runLeaseRenewCapSeconds)) errors.push("runLeaseRenewCapSeconds must be an integer from 1 through 2592000.");
+    if (params.config.hydrationWaitSeconds !== undefined && !validHydrationWait(params.config.hydrationWaitSeconds)) errors.push("hydrationWaitSeconds must be a nonnegative safe integer number of seconds.");
     if (Object.keys(c.labels).length > 15 || Object.entries(c.labels).some(([k,v]) => !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,62}$/.test(k) || typeof v !== "string" || new TextEncoder().encode(v).length > 256)) errors.push("labels must have valid Boat keys, values <=256 bytes, and at most 15 entries (ownership labels are added).");
     // Storage must not materialize read-time defaults: even an unrelated save
     // would change the lease fingerprint and rotate retained conversations.
@@ -3042,12 +3071,13 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         : new Date(Date.now() + ttl * 1000).toISOString()));
       const createBody = JSON.stringify(createSandboxBody(c, ttl, labels, from));
       const createStartedAt = Date.now();
-      // One budget bounds the whole acquisition: create, adoption, readiness,
-      // setup and handoff (rf-4 U3 C1). Daytona: one deadline (daytona
+      // One work budget bounds create, adoption, readiness, setup and handoff
+      // (rf-4 U3 C1), excluding only the optional hydration observation below.
+      // Daytona: one deadline (daytona
       // plugin.ts:2981-2987) asserted between phases (assertActive, :3011-3013,
       // :3061-3092). A lease is never handed off after it; the catch below
       // stops the box and the host retries the ETIMEDOUT.
-      const deadline = createStartedAt + BOAT_ACQUIRE_ATTEMPT_BUDGET_MS;
+      let deadline = createStartedAt + BOAT_ACQUIRE_ATTEMPT_BUDGET_MS;
       // rf-4 U3b C1: the budget also bounds a step IN FLIGHT. Each step gets an
       // abort signal for the time that remains (withinBudget), as each Daytona
       // phase gets `deadline - Date.now()` inside its enclosing deadline race
@@ -3099,6 +3129,16 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
           }
           throw error;
         });
+        if (c.hydrationWaitSeconds > 0 && ready.hydrated !== true) {
+          assertActive("hydration");
+          const hydrationStartedAt = Date.now();
+          await waitHydrated(c, sb.id, ready);
+          // This optional fail-open wait must not turn the existing 180 s work
+          // budget into a new acquisition failure. All other phases retain that
+          // budget; only time spent observing hydration is excluded.
+          deadline += Date.now() - hydrationStartedAt;
+          budget.deadline = deadline;
+        }
         assertActive("setup");
         const ownershipObservation = c.setupScript !== undefined ? await waitSetup(c, sb.id, deadline) : ready;
         assertActive("handoff");
@@ -3310,6 +3350,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       assertSandboxId(sb, id);
       markOurResume(c, id);
       sandbox = await waitReady(c, id, true);
+      if (c.hydrationWaitSeconds > 0 && sandbox.hydrated !== true) await waitHydrated(c, id, sandbox);
       runnerIngressGenerationStore.invalidate(ingressScopeKey(params, c, id));
     } else {
       // Boat auto-stop counts from create/last resume, not activity:

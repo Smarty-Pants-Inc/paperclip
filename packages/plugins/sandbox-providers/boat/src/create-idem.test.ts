@@ -24,7 +24,7 @@ vi.mock("node:timers/promises", () => ({
 // sandbox is still being created -> 409 idempotency_in_progress. Retry shortly
 // with the same key." (:2242); "Same key, different request body -> 409
 // idempotency_key_reused." (:2243). This fake Boat enforces exactly that.
-const cfg = { apiKey: "boat_test", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
+const cfg = { hydrationWaitSeconds: 0, apiKey: "boat_test", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
 const params = { driverKey: "boat", companyId: "co", environmentId: "env", runId: "run", creationOperationId: "op-1", config: cfg };
 const response = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 

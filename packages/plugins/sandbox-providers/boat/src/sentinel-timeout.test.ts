@@ -6,7 +6,7 @@ import { writeWorkspaceSentinel } from "./runner-support.js";
 // out". Fix A: the error is ETIMEDOUT, the code the host reads as transient
 // (server environment-provider-unavailable-error.ts:19-22), so the server
 // retries on a fresh box. Strict HTTP fixtures, never live Boat.
-const cfg = { apiKey: "boat_test", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
+const cfg = { hydrationWaitSeconds: 0, apiKey: "boat_test", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
 const p = { driverKey: "boat", companyId: "hco", environmentId: "henv", runId: "hrun", creationOperationId: "hattempt", config: cfg };
 const res = (x: unknown, status = 200) => new Response(JSON.stringify(x), { status, headers: { "Content-Type": "application/json" } });
 beforeEach(async () => {

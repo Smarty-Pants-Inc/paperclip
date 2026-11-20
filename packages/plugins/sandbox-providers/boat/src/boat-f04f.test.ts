@@ -5,7 +5,7 @@ import plugin from "./plugin.js";
 // no-OUR-resume tests. Boat readiness.md:21-22 proves refusal; :31 requires
 // resume first without requiring an earlier Paperclip-owned resume. Keep:
 // #20974 real incident / data-safety boundary, not shell-text replay inference.
-const config = { apiKey: "synthetic-f04f", type: "small", ttlSeconds: 1800, labels: {} };
+const config = { hydrationWaitSeconds: 0, apiKey: "synthetic-f04f", type: "small", ttlSeconds: 1800, labels: {} };
 const scope = { driverKey: "boat", companyId: "f04f", environmentId: "f04f", config };
 let sequence = 0;
 afterEach(async () => { await plugin.definition.onShutdown?.(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });

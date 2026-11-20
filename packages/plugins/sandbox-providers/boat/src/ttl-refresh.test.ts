@@ -8,8 +8,8 @@ const id = "bx_ttlrenew";
 const oldDeadline = "2026-11-13T18:00:00Z";
 const refreshedDeadline = "2026-11-14T02:30:00Z";
 const configs = [
-  { apiKey, reuseLease: true, ttlSeconds: 30600, runnerLifecycleMode: "warm", runnerIdleTimeoutMs: 28800000 },
-  { apiKey, reuseLease: true, ttlSeconds: 88200, runnerLifecycleMode: "warm", runnerIdleTimeoutMs: 86400000 },
+  { hydrationWaitSeconds: 0, apiKey, reuseLease: true, ttlSeconds: 30600, runnerLifecycleMode: "warm", runnerIdleTimeoutMs: 28800000 },
+  { hydrationWaitSeconds: 0, apiKey, reuseLease: true, ttlSeconds: 88200, runnerLifecycleMode: "warm", runnerIdleTimeoutMs: 86400000 },
 ];
 const scope = { driverKey: "boat", companyId: "ttl-company", environmentId: "ttl-environment" };
 function reply(data: unknown, status = 200) { return new Response(JSON.stringify(data), { status }); }

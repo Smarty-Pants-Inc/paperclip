@@ -29,7 +29,7 @@ vi.mock("node:timers/promises", () => ({
 let row = 0;
 let params: any;
 const freshParams = () => ({ driverKey: "boat", companyId: "co", environmentId: "env", runId: "run", creationOperationId: "op-1",
-  config: { apiKey: `boat_test_${++row}`, type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} } });
+  config: { hydrationWaitSeconds: 0, apiKey: `boat_test_${++row}`, type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} } });
 const response = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
 type Box = { id: string; state: string; labels: Record<string, string>; stop?: { id: string; status: string; error?: string } };

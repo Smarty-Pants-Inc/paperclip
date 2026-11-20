@@ -16,7 +16,7 @@ vi.mock("node:timers/promises", () => ({
     options?.signal?.addEventListener?.("abort", () => { globalThis.clearTimeout(handle); reject(options.signal!.reason); }, { once: true });
   }),
 }));
-const cfg = { apiKey: "boat_test", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
+const cfg = { hydrationWaitSeconds: 0, apiKey: "boat_test", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
 const base = { driverKey: "boat", companyId: "rco", environmentId: "renv", config: cfg };
 const first = { ...base, runId: "run-a", creationOperationId: "op-a" };
 const retry = { ...base, runId: "run-b", creationOperationId: "op-b" };

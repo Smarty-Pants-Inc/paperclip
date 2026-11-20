@@ -7,7 +7,7 @@ import manifest from "./manifest.js";
 import * as guardianStage from "./guardian-stage.js";
 import { OwnedSshAgent } from "./ssh-agent.js";
 import { guardianCommand } from "./guardian-contract.js";
-const cfg = { apiKey: "boat_test", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
+const cfg = { hydrationWaitSeconds: 0, apiKey: "boat_test", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
 function response(data: unknown, status = 200) { return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } }); }
 beforeEach(async () => { await plugin.definition.setup({ logger: { info() {}, warn() {}, error() {}, debug() {} } } as any); });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });

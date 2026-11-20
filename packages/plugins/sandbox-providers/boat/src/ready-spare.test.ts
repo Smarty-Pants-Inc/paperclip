@@ -69,7 +69,7 @@ function fixture(initial: ReadySpare[] = [], warmExitCode = 0, warmTimedOut = fa
     if (method === "POST" && /^\/sandboxes\/[^/]+\/commands$/.test(route)) return response({ exitCode: warmExitCode, timedOut: warmTimedOut, stdout: "{}\n", stderr: "" });
     if (method === "POST" && /^\/sandboxes\/[^/]+\/resume$/.test(route)) {
       const id = route.split("/").at(-2)!;
-      const sb = inventory.find(item => item.id === id) ?? { id, state: "running", labels: {}, team: { id: "team-spare-test" } };
+      const sb = inventory.find(item => item.id === id) ?? { id, hydrated: true, state: "running", labels: {}, team: { id: "team-spare-test" } };
       if (!inventory.some(item => item.id === id)) inventory.push(sb);
       sb.state = "running";
       return response({ sandbox: sb }, 202);
@@ -172,6 +172,18 @@ describe("Boat ready spare", () => {
         spareEnvironmentIds: { type: "array", maxItems: 10, uniqueItems: true },
       },
     });
+  });
+
+  it("r6 hydrated spare claim retains the existing immediate handoff without a hydration wait", async () => {
+    const spare = inventorySpare();
+    const f = fixture([spare]);
+    const logger = await setup(1);
+    const lease = await acquire("run-hydration-spare");
+    expect(lease.providerLeaseId).toBe(spare.id);
+    expect(lease.metadata?.providerClaimName).toMatch(/^paperclip-claim:/);
+    expect(logger.info.mock.calls.filter(([message]) => message === "Boat hydration wait")).toHaveLength(0);
+    expect(logger.warn.mock.calls.filter(([message]) => String(message).startsWith("Boat box not hydrated"))).toHaveLength(0);
+    expect(f.calls.some(call => call.method === "PATCH" && call.body?.name?.startsWith("paperclip-claim:"))).toBe(true);
   });
 
   it("records exactly one outcome per acquire in plugin state, structured logs, and health", async () => {

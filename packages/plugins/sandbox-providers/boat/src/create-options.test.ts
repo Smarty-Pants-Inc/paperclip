@@ -3,7 +3,7 @@ import plugin from "./plugin.js";
 import manifest from "./manifest.js";
 // Keep: provider boundary. Fixed identity/time allows literal wire-byte comparison
 // with 0.1.6, rather than merely asserting absence of one parsed property.
-const config = { apiKey: "boat_test", type: "small", ttlSeconds: 1800, labels: {} };
+const config = { hydrationWaitSeconds: 0, apiKey: "boat_test", type: "small", ttlSeconds: 1800, labels: {} };
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 async function create(extra: Record<string, unknown>) {
   vi.useFakeTimers(); vi.setSystemTime(new Date("2030-01-01T00:00:00.000Z"));

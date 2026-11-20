@@ -20,7 +20,7 @@ vi.mock("node:timers/promises", () => ({
 // makes the lost create safe, :2236-2242). A box Boat could not start is
 // `error` (api/v1 lifecycle, :2255).
 const BOX = "bx_adopt123";
-const cfg = { apiKey: "boat_test", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
+const cfg = { hydrationWaitSeconds: 0, apiKey: "boat_test", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
 const params = { driverKey: "boat", companyId: "co", environmentId: "env", runId: "run", creationOperationId: "attempt", config: cfg };
 const owned = { owner: "paperclip:co", environment: "env", run: "run", "paperclip-acquire": "attempt" };
 const response = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });

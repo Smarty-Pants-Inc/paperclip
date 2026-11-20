@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import plugin from "./plugin.js";
-const cfg = { apiKey: "boat_LOG_SECRET_CANARY", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
+const cfg = { hydrationWaitSeconds: 0, apiKey: "boat_LOG_SECRET_CANARY", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
 const p = { driverKey: "boat", companyId: "logco", environmentId: "logenv", runId: "logrun", creationOperationId: "logattempt", config: cfg };
 let info: ReturnType<typeof vi.fn>;
 beforeEach(async () => {

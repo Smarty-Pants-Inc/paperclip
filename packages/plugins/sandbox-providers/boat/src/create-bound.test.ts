@@ -12,7 +12,7 @@ vi.mock("node:timers/promises", () => ({
     options?.signal?.addEventListener?.("abort", () => { globalThis.clearTimeout(handle); reject(options.signal!.reason); }, { once: true });
   }),
 }));
-const cfg = { apiKey: "boat_test", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
+const cfg = { hydrationWaitSeconds: 0, apiKey: "boat_test", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
 const p = { driverKey: "boat", companyId: "bco", environmentId: "benv", runId: "brun", creationOperationId: "battempt", config: cfg };
 const owned = { owner: "paperclip:bco", environment: "benv", run: "brun", "paperclip-acquire": "battempt" };
 const res = (x: unknown, status = 200) => new Response(JSON.stringify(x), { status, headers: { "Content-Type": "application/json" } });

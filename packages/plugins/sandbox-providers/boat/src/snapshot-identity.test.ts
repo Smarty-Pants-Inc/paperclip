@@ -2,7 +2,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import plugin, { resolveBoatSnapshotIdentity } from "./plugin.js";
 import manifest from "./manifest.js";
 // Keep: provider identity trust boundary and data safety. A moved name must not allocate an unqualified image.
-const config = { apiKey: "test-only", from: "runner-base", pinnedSnapshotId: "artifact-1" };
+const config = { hydrationWaitSeconds: 0, apiKey: "test-only", from: "runner-base", pinnedSnapshotId: "artifact-1" };
 const snapshot = { name: "runner-base", snapshotId: "artifact-1", createdAt: "2026-11-12T00:00:00Z", status: "ready" };
 const params = { driverKey: "boat", companyId: "company", environmentId: "environment", config };
 afterEach(() => vi.unstubAllGlobals());

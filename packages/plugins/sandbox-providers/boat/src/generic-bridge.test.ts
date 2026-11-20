@@ -11,7 +11,7 @@ import { DUPLEX_COUNTER_FALLBACK_TOTAL } from '../../../../adapter-utils/src/dup
 import plugin from './plugin.js';
 it.each([undefined,true])('generic bridge on an SSH-off lease: setting=%s, typed refusal then working file bridge, no retry',async setting=>{
  const root=await mkdtemp(join(tmpdir(),'routea-bridge-'));
- const scope={driverKey:'boat',companyId:'bridge-company',environmentId:'bridge-env',config:{apiKey:'fixture'},runId:'bridge-run'};
+ const scope={driverKey:'boat',companyId:'bridge-company',environmentId:'bridge-env',config:{hydrationWaitSeconds:0,apiKey:'fixture'},runId:'bridge-run'};
  vi.stubGlobal('fetch',async()=>new Response(JSON.stringify({sandbox:{id:'bx_bridgeoff',state:'ready'}})));
  try{const lease=await plugin.definition.onEnvironmentAcquireLease!(scope);expect(lease.metadata?.runnerGuardianVersion).toBeUndefined();}finally{vi.unstubAllGlobals();}
  const requests:string[]=[],api=createServer((req,res)=>{requests.push(req.url!);res.setHeader('content-type','application/json');res.end(JSON.stringify({ok:true,transport:'file'}));});

@@ -17,7 +17,7 @@ import plugin from "./plugin.js";
 // next arbitrary command through F-04D. Paid-box expiry/failure is unsafe to
 // seed in daily work. Only the Boat transport and time are fake; no live Boat.
 const start = Date.parse("2026-11-17T00:00:00Z");
-const config = { apiKey: "fixture-cap-recovery-key", ttlSeconds: 120, runLeaseRenewCapSeconds: 300,
+const config = { hydrationWaitSeconds: 0, apiKey: "fixture-cap-recovery-key", ttlSeconds: 120, runLeaseRenewCapSeconds: 300,
   reuseLease: true, runnerLifecycleMode: "per_turn" };
 const scope = { driverKey: "boat", companyId: "cap-recovery-company", environmentId: "cap-recovery-env", config };
 const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };

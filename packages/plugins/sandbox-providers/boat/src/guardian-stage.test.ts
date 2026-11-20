@@ -20,7 +20,7 @@ const secret = "CANARY-API-SECRET-NOT-IN-COMMANDS-OR-ASSETS";
 const signedSecret = "CANARY-SIGNED-URL-NOT-IN-COMMANDS";
 const assets = Object.fromEntries(await Promise.all(names.map(async name => [name, await readFile(new URL(`../guest/${name}`, import.meta.url))] as const)));
 const hashes = Object.fromEntries(names.map(name => [name, createHash("sha256").update(assets[name]).digest("hex")]));
-const base = { driverKey: "boat", companyId: "company", environmentId: "environment", config: { apiKey: secret, duplexCarrier: "ssh" } };
+const base = { driverKey: "boat", companyId: "company", environmentId: "environment", config: { hydrationWaitSeconds: 0, apiKey: secret, duplexCarrier: "ssh" } };
 const ok = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
 function mockBoat(options: { staged?: boolean; nodeVersion?: string; fail?: string; state?: string; badReply?: boolean; poisonHash?: boolean; resetOnce?: string } = {}) {
   const commands: string[] = [], uploads: { path: string; bytes: Buffer; headers: Headers }[] = [];
@@ -78,7 +78,7 @@ afterEach(() => vi.unstubAllGlobals());
 describe("guardian staging through Boat lease hooks", () => {
   it("does nothing when duplexCarrier is absent", async () => {
     const boat = mockBoat();
-    const lease = await plugin.definition.onEnvironmentAcquireLease!({ ...base, config: { apiKey: secret } });
+    const lease = await plugin.definition.onEnvironmentAcquireLease!({ ...base, config: { hydrationWaitSeconds: 0, apiKey: secret } });
     expect(lease.metadata?.guardianPreflight).toBeUndefined();
     expect(boat.commands).toEqual([]); expect(boat.uploads).toEqual([]);
   });
@@ -170,7 +170,7 @@ describe("guardian staging through Boat lease hooks", () => {
   });
   it("removes stale usable metadata when the carrier is disabled on resume", async () => {
     const boat = mockBoat();
-    const lease = await plugin.definition.onEnvironmentResumeLease!({ ...base, config: { apiKey: secret }, providerLeaseId: "bx_guardian", leaseMetadata: { guardianPreflight: { usable: true } } });
+    const lease = await plugin.definition.onEnvironmentResumeLease!({ ...base, config: { hydrationWaitSeconds: 0, apiKey: secret }, providerLeaseId: "bx_guardian", leaseMetadata: { guardianPreflight: { usable: true } } });
     expect(lease.metadata?.guardianPreflight).toBeUndefined(); expect(boat.commands).toEqual([]); expect(boat.uploads).toEqual([]);
   });
   it.each(["probe", "preflight"])("F-04D R6 %s ECONNRESET during resume stays transient; next resume recovers", async resetOnce => {

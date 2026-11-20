@@ -13,7 +13,7 @@ import plugin from "./plugin.js";
 //   turn a test red; the cross-scope sequential test below is the one it turns red.
 // Synthetic keys and a fake Boat only; never live Boat.
 let boxes = 0, id = "bx_b0000000";
-const config = { apiKey: "synthetic-boat-key", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
+const config = { hydrationWaitSeconds: 0, apiKey: "synthetic-boat-key", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
 const scope = { driverKey: "boat", companyId: "c", environmentId: "e", config };
 const otherScope = { ...scope, environmentId: "e-other" };
 const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>

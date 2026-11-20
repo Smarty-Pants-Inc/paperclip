@@ -10,7 +10,7 @@ import plugin from "./plugin.js";
 // code stays distinct. This file has its own module instance: the worker-wide
 // pause it sets cannot leak into other test files. Synthetic keys, never live Boat.
 const id = "bx_23456789";
-const config = { apiKey: "synthetic-boat-key", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
+const config = { hydrationWaitSeconds: 0, apiKey: "synthetic-boat-key", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
 const acquire = { driverKey: "boat", companyId: "company", environmentId: "environment", runId: "run", creationOperationId: "attempt", config };
 // server/src/services/environment-provider-unavailable-error.ts:17-23 (acquire, structure only).
 const HOST_TRANSIENT_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);

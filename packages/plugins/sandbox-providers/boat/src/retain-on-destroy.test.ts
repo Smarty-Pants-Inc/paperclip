@@ -4,7 +4,7 @@ import manifest from "./manifest.js";
 
 // Keep: raw-session data safety and provider/core termination trust boundary.
 // Strict HTTP fixtures only; no live Boat calls or persistence claim.
-const config = { apiKey: "boat_test", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
+const config = { hydrationWaitSeconds: 0, apiKey: "boat_test", type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
 const id = "bx_23456789";
 const base = { driverKey: "boat", companyId: "company", environmentId: "environment", providerLeaseId: id, config };
 function response(body: unknown, status = 200) {

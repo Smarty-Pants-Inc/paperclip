@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createServer, type Server } from "node:http";
 import plugin from "./plugin.js";
 const id = "bx_23456789", orgId = "team_lease";
-const scope = { driverKey: "boat", companyId: "company", environmentId: "environment", config: { apiKey: "boat_test" } };
+const scope = { driverKey: "boat", companyId: "company", environmentId: "environment", config: { hydrationWaitSeconds: 0, apiKey: "boat_test" } };
 const inspect = (leaseMetadata: Record<string, unknown> = { boatOrgId: orgId }) => plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: id, leaseMetadata });
 const reply = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
 const org = (id: unknown = orgId, active: unknown = true, type: unknown = "org") => ({ id, active, type });

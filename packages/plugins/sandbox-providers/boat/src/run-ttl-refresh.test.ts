@@ -6,7 +6,7 @@ import plugin from "./plugin.js";
 // including failure/teardown races that are not safe to seed in live daily work.
 const id = "bx_23456789", apiKey = "private_run_ttl_key";
 const scope = { driverKey: "boat", companyId: "run-ttl-company", environmentId: "run-ttl-env" };
-const config = { apiKey, ttlSeconds: 300, reuseLease: true, runnerLifecycleMode: "per_turn" };
+const config = { hydrationWaitSeconds: 0, apiKey, ttlSeconds: 300, reuseLease: true, runnerLifecycleMode: "per_turn" };
 const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
 const reply = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status });
 function boat() {

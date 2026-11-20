@@ -6,7 +6,7 @@ import manifest from "./manifest.js";
 // Keep: F1 money/data-safety failure and the provider/core ownership boundary.
 // Strict HTTP fixtures, not live Boat or a billing/persistence claim.
 const id = "bx_23456789";
-const config = { apiKey: "test-only", retainOnDestroy: true, setupScript: "false" };
+const config = { hydrationWaitSeconds: 0, apiKey: "test-only", retainOnDestroy: true, setupScript: "false" };
 const params = { driverKey: "boat", companyId: "company", environmentId: "environment", runId: "run", creationOperationId: "attempt", config };
 const labels = { owner: "paperclip:company", environment: "environment", run: "run", "paperclip-acquire": "attempt" };
 const response = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });

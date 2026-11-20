@@ -11,7 +11,7 @@ const otherId = "b6b9e7d0-f886-471a-b461-640dd03e8d0f";
 const provider = "plugin:paperclip.boat-sandbox-provider:boat";
 const saved = { name: "runner-base", snapshotId: id, status: "ready", createdAt: "2026-11-12T05:57:00.123Z", sourceSandboxId: "bx_source" };
 const sandbox = { id: "bx_qualification", state: "ready", team: { id: "team_actual" } };
-const config = { apiKey: "fixture-only", provider, snapshot: saved.name };
+const config = { hydrationWaitSeconds: 0, apiKey: "fixture-only", provider, snapshot: saved.name };
 const params: PluginEnvironmentAcquireLeaseParams = { driverKey: "boat", companyId: "company", environmentId: "environment", runId: "probe", resolveSnapshotIdentity: true, config };
 const identity = { provider, requestedRef: saved.name, id, name: saved.name, organizationId: "team_actual", createdAt: saved.createdAt };
 type Call = { path: string; method: string; body: any };
@@ -156,7 +156,7 @@ describe("Boat lease snapshot qualification", () => {
 
   it("leaves snapshot-free creation unchanged and never invents an identity", async () => {
     const calls = fixture();
-    const lease = await plugin.definition.onEnvironmentAcquireLease!({ ...params, config: { apiKey: "fixture-only" } });
+    const lease = await plugin.definition.onEnvironmentAcquireLease!({ ...params, config: { hydrationWaitSeconds: 0, apiKey: "fixture-only" } });
     expect(calls.map(c => c.path)).toEqual(["/sandboxes", "/sandboxes/bx_qualification"]);
     expect(calls[0].body).not.toHaveProperty("from");
     expect(lease.metadata?.provider).toBe("boat");
@@ -165,7 +165,7 @@ describe("Boat lease snapshot qualification", () => {
 
   it("keeps legacy from (including share codes) working without snapshot lookup", async () => {
     const calls = fixture();
-    const lease = await plugin.definition.onEnvironmentAcquireLease!({ ...params, config: { apiKey: "fixture-only", from: "bsh_fixture" } });
+    const lease = await plugin.definition.onEnvironmentAcquireLease!({ ...params, config: { hydrationWaitSeconds: 0, apiKey: "fixture-only", from: "bsh_fixture" } });
     expect(calls.map(c => c.path)).toEqual(["/sandboxes", "/sandboxes/bx_qualification"]);
     expect(calls[0].body.from).toBe("bsh_fixture");
     expect(lease.metadata).not.toHaveProperty("snapshotIdentity");

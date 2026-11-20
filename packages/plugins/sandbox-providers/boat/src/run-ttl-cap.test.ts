@@ -6,7 +6,7 @@ import manifest from "./manifest.js";
 // teardown races cannot be seeded safely on a real paid daily-work box.
 const id = "bx_3456789a";
 const scope = { driverKey: "boat", companyId: "cap-company", environmentId: "cap-env" };
-const config = { apiKey: "fixture-cap-key", ttlSeconds: 300, runnerLifecycleMode: "per_turn" };
+const config = { hydrationWaitSeconds: 0, apiKey: "fixture-cap-key", ttlSeconds: 300, runnerLifecycleMode: "per_turn" };
 const start = Date.parse("2026-11-17T00:00:00Z");
 const reply = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status });
 const deferred = () => {

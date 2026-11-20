@@ -21,7 +21,7 @@ const HOSTILE_ERROR = `${BOAT_REFUSAL}; upload failed: Authorization: Bearer JUD
   + `PUT https://snap.example/obj?X-Amz-Signature=JUDGE_AMZ_SIGNATURE&X-Amz-Credential=JUDGE_AMZ_CREDENTIAL&sig=JUDGE_SIG_TOKEN&_token=JUDGE_SIGNED_URL_TOKEN&token=JUDGE_PLAIN_TOKEN`;
 const SENTINELS = [KEY, "JUDGE_OTHER_BEARER_TOKEN", "JUDGE_AMZ_SIGNATURE", "JUDGE_AMZ_CREDENTIAL", "JUDGE_SIG_TOKEN", "JUDGE_SIGNED_URL_TOKEN", "JUDGE_PLAIN_TOKEN"];
 let boxes = 0, id = "bx_r0000000";
-const config = { apiKey: KEY, type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
+const config = { hydrationWaitSeconds: 0, apiKey: KEY, type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
 const scope = { driverKey: "boat", companyId: "c", environmentId: "e", config };
 const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
@@ -125,7 +125,7 @@ describe("rf-4 F1: every outbound Boat diagnostic is sanitised at one source", (
 });
 
 describe("rf-4 F2: a person's Resume of a RUNNING box whose stop Boat refused cancels that stop", () => {
-  const runnerConfig = { apiKey: KEY, reuseLease: true, ttlSeconds: 1800, runnerLifecycleMode: "warm", runnerIdleTimeoutMs: 600_000 };
+  const runnerConfig = { hydrationWaitSeconds: 0, apiKey: KEY, reuseLease: true, ttlSeconds: 1800, runnerLifecycleMode: "warm", runnerIdleTimeoutMs: 600_000 };
   const runnerScope = { driverKey: "boat", companyId: "c", environmentId: "e", config: runnerConfig };
   /** A Runner box, acquired through the real acquire hook with its workspace sentinel. */
   function runnerBoat() {

@@ -5,7 +5,7 @@ import { PluginEnvironmentRunnerIngressError, environmentResumeErrorData, enviro
 
 // Keep: provider/core trust boundary, retained workspace data safety, and
 // failures (foreign allocation, lost reply, secret-bearing errors) unsafe to seed live.
-const cfg = { apiKey: "boat_test", type: "small", ttlSeconds: 1800, reuseLease: true };
+const cfg = { hydrationWaitSeconds: 0, apiKey: "boat_test", type: "small", ttlSeconds: 1800, reuseLease: true };
 const scope = { driverKey: "boat", companyId: "company", environmentId: "environment", config: cfg, leaseMetadata: { boatOrgId: "team_lease" } };
 const acquire = { ...scope, runId: "run-1", agentId: "agent", executionWorkspaceId: "workspace", adapterType: "paperclip_runner" };
 const path = "/api/runner/v1/connect/run-1";

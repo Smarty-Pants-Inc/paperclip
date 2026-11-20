@@ -6,7 +6,7 @@ import { transientSandboxResumeFailure } from "./test-fixtures/real-resume-predi
 // fault injection through real plugin hooks; no live Boat. Data-safety boundary:
 // F-04D also recovers arbitrary commands after a confirmed not-run refusal.
 // The actual supervision caller is in SERVER, not this plugin (see REPORT).
-const config = { apiKey: "not-live-f04c", type: "small", ttlSeconds: 1800, reuseLease: true, labels: {} };
+const config = { hydrationWaitSeconds: 0, apiKey: "not-live-f04c", type: "small", ttlSeconds: 1800, reuseLease: true, labels: {} };
 const scope = { driverKey: "boat", companyId: "f04c-c", environmentId: "f04c-e", config };
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
 const shapes = [
