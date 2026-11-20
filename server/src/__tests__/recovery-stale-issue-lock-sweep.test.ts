@@ -16,6 +16,8 @@ import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database
 import { chatCompletionDeliveryService } from "../services/chat-completion-delivery.js";
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
+import { PgDialect } from "drizzle-orm/pg-core";
+import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { settleOwnableKind } from "../services/recovery/ownership-invariant-report.js";
 import {
@@ -102,6 +104,26 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
   afterAll(async () => {
     await db?.$client.end({ timeout: 1 });
     await tempDb?.cleanup();
+  });
+
+  it("renders the Stop-pending schema in the ordinary recovery writer guard", async () => {
+    // Keep the sweep's real import order: a module-initialization cycle can
+    // capture undefined here even though the exported schema is defined later.
+    const renderedGuards: string[] = [];
+    const render = PgDialect.prototype.sqlToQuery;
+    const spy = vi.spyOn(PgDialect.prototype, "sqlToQuery").mockImplementation(function (this: PgDialect, query, source) {
+      const rendered = render.call(this, sql`${query}`.inlineParams(), source).sql;
+      if (rendered.includes("->'stopPending'->>'schema'")) renderedGuards.push(rendered);
+      return render.call(this, query, source);
+    });
+    try {
+      await issueRecoveryActionService(db).resolveActiveForIssue({
+        companyId: randomUUID(), sourceIssueId: randomUUID(), status: "resolved", outcome: "restored",
+      });
+    } finally {
+      spy.mockRestore();
+      expect(renderedGuards.join("\n")).toContain("<> 'paperclip.task-stop-pending.v1'");
+    }
   });
 
   async function seed() {

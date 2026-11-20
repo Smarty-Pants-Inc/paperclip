@@ -1,6 +1,7 @@
 import { notifyAttentionRetentionWork } from "./retention-work-notifications.js";
 import { notifyIssueRecovery } from "./issue-recovery-notifications.js";
-import { hasTaskStopPending, STOP_PENDING_SCHEMA, withTaskStopPendingInstruction } from "./recovery/stop-pending.js";
+import { STOP_PENDING_SCHEMA } from "./recovery/stop-pending-schema.js";
+import { hasTaskStopPending, withTaskStopPendingInstruction } from "./recovery/stop-pending.js";
 import { notifyNativeRecoveryNotices } from "./native-recovery-notice-notifications.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-notifications.js";
 import { writeExecutionControl } from "./execution-control-notifications.js";

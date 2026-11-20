@@ -6,8 +6,10 @@ import { notifyIssueRecovery } from "../issue-recovery-notifications.js";
 import { notifyNativeRecoveryNotices } from "../native-recovery-notice-notifications.js";
 import { PROVIDER_POLICY_REFUSAL_CODE } from "../native-runtime/native-provider-failure.js";
 
+import { STOP_PENDING_SCHEMA } from "./stop-pending-schema.js";
+export { STOP_PENDING_SCHEMA } from "./stop-pending-schema.js";
+
 const STOP_PENDING_CODE = "execution_stop_pending";
-export const STOP_PENDING_SCHEMA = "paperclip.task-stop-pending.v1";
 const STOP_PENDING_ACTION = "Stop pending (execution_stop_pending): Paperclip cannot confirm that the previous execution stopped. " +
   "Recovery retained this task's claims and escalated the failed inspection to the board. " +
   "Inspect the bound runs and use the owning agent's Stop/cleanup controls. If its Stop work is parked, inspect its evidence before using the agent's Retry. " +
