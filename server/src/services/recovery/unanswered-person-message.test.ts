@@ -893,7 +893,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
 
   // Keep: rf5 independent waitnote F1 caught a real lifecycle pause cancelling
   // the still-deferred carrying wake, then resume being called another failure.
-  async function deferredMessageBeforePause() {
+  async function deferredMessageBeforePause(opts: { savedWait?: boolean } = {}) {
     const start = Date.now();
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(start);
@@ -901,10 +901,11 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await db.update(agents).set({ status: "idle", lifecycleState: "ready" }).where(eq(agents.id, f.agentId));
     const commentId = await f.message("After Stop, continue my saved work.");
     await db.update(issueComments).set({ createdAt: new Date(start) }).where(eq(issueComments.id, commentId));
-    const payload = { issueId: f.issueId, commentId, executionWait: { reason: "remote_cleanup",
-      message: "Waiting for the previous environment to stop. Your message will start automatically.", recoveryActionId: null } };
+    const payload = opts.savedWait === false ? { issueId: f.issueId, commentId }
+      : { issueId: f.issueId, commentId, executionWait: { reason: "remote_cleanup",
+        message: "Waiting for the previous environment to stop. Your message will start automatically.", recoveryActionId: null } };
     const [wake] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
-      source: "on_demand", reason: "issue_execution_deferred", status: "deferred_issue_execution",
+      source: "on_demand", reason: "issue_execution_deferred", status: opts.savedWait === false ? "queued" : "deferred_issue_execution",
       requestedByActorType: "user", requestedByActorId: f.userId, payload,
       createdAt: new Date(start), updatedAt: new Date(start) }).returning();
     const advance = (minute: number) => vi.setSystemTime(start + minute * 60_000);
@@ -926,7 +927,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
 
   it.each(["paused", "waiting", "none"] as const)(
     "pausewake rf5: pause cancels deferred wake with no run, resume +1/+11 gives the true pause note (standing %s)", async standing => {
-      const f = await deferredMessageBeforePause();
+      // SUPERSEDED by app-lead 17:17Z (C3 94631a90 keeps an executionWait-saved wake through a Pause): fixture re-pointed to a wake the Pause cancels
+      // (an unbound QUEUED carrying wake: without its saved wait a deferred receipt is stale and reads no_run before the Pause).
+      const f = await deferredMessageBeforePause({ savedWait: false });
       if (standing !== "none") {
         await f.sweep(1); await f.sweep(5);
         expect((await f.visible()).map(note => note.body)).toEqual([WAITING]);
@@ -968,6 +971,35 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId))).toHaveLength(1);
       } finally { await worker.stop(); }
     });
+
+  // C3 94631a90 (rf-4 C2), app-lead 17:17Z: a wake already saved under its own executionWait is not the Pause's to
+  // drop. It survives Pause and Resume, the person gets no pause card, and it stays the message's one saved attempt.
+  it("c3 pausekeep: an executionWait-saved wake survives the Pause and Resume; no pause card", async () => {
+    const f = await deferredMessageBeforePause();
+    await f.sweep(1); await f.sweep(5);
+    expect((await f.visible()).map(note => note.body)).toEqual([WAITING]);
+    f.advance(5.1);
+    const lifecycle = createAgentLifecycle(db);
+    const driver = createLifecycleDriver(db, {} as never);
+    const worker = configureAgentLifecycle(db, { ...driver, requiredPluginIds: async () => [], runPlugin: async () => "complete" });
+    try {
+      await lifecycle.pauseAgent(f.agentId); await worker.process(f.agentId);
+      const [kept] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+      expect(kept).toMatchObject({ status: "deferred_issue_execution", runId: null, error: null, payload: f.payload });
+      f.advance(6); await lifecycle.resumeAgent(f.agentId); await worker.process(f.agentId);
+      expect((await db.select().from(agents).where(eq(agents.id, f.agentId)))[0]!.lifecycleState).toBe("ready");
+      for (const minute of [7, 17]) {
+        const notes = await f.sweep(minute);
+        if (process.env.PAUSEWAKE_EVIDENCE_FILE) appendFileSync(process.env.PAUSEWAKE_EVIDENCE_FILE,
+          `${JSON.stringify({ row: "c3-pausekeep", minute, notes })}\n`);
+        expect(JSON.stringify(notes)).not.toContain("was paused before it answered");
+        expect(JSON.stringify(notes)).not.toContain("Send it again");
+      }
+      const [after] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+      expect(after!.status).not.toBe("cancelled");
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId))).toHaveLength(1);
+    } finally { await worker.stop(); }
+  });
 
   // Keep: rf5 F1 regression — terminating a manager cancels the ready report's
   // wake with the shared stop reason, but does not pause that report.
