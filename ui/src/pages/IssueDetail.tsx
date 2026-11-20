@@ -1287,7 +1287,8 @@ type IssueDetailChatTabProps = {
   initialHistoryError?: boolean;
   onRetryInitialHistory?: () => void;
   locallyQueuedCommentRunIds: ReadonlyMap<string, string>;
-  steeringUnavailableReason?: string | null;
+  /** The server's 'could not steer' reason and the queued comment it describes. */
+  steeringUnavailable?: { commentId: string; reason: string } | null;
   interactions: IssueThreadInteraction[];
   documents: IssueDocumentSummary[];
   createdTasks: Issue[];
@@ -1449,7 +1450,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   initialHistoryError = false,
   onRetryInitialHistory,
   locallyQueuedCommentRunIds,
-  steeringUnavailableReason = null,
+  steeringUnavailable = null,
   interactions,
   documents,
   createdTasks,
@@ -2332,6 +2333,16 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       .map((entry, position) => ({ ...entry, position }));
     return entries.length ? { ...effectiveQueuedCommentQueue, entries } : null;
   }, [effectiveQueuedCommentQueue, startingCommentIds]);
+  // The steering-paused line speaks for ITS message only while that message
+  // waits in this bar (the server lists it, or the POST said queued and the
+  // read has not caught up). Answered, gone, or another row: no line.
+  const steeringUnavailableReason =
+    steeringUnavailable &&
+    visibleQueuedCommentQueue?.entries.some(
+      (entry) => entry.comment.id === steeringUnavailable.commentId,
+    )
+      ? steeringUnavailable.reason
+      : null;
   const commentsForThread = useMemo(
     () =>
       [...commentsWithRunMeta, ...(authoritativeQueuedCommentQueue?.entries ?? [])
@@ -3407,7 +3418,14 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   const [locallyQueuedCommentRunIds, setLocallyQueuedCommentRunIds] = useState<
     Map<string, string>
   >(() => new Map());
-  const [steeringUnavailableReason, setSteeringUnavailableReason] = useState<string | null>(null);
+  // The server's 'could not steer' reason for one queued comment. It speaks
+  // for that comment only while the queued-comments GET lists it.
+  const [steeringUnavailable, setSteeringUnavailable] = useState<{
+    issueId: string;
+    commentId: string;
+    reason: string;
+    listed: boolean;
+  } | null>(null);
   const [pendingCommentComposerFocusKey, setPendingCommentComposerFocusKey] =
     useState(0);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -3910,6 +3928,35 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     enabled: false,
   });
   const heldByPersonStop = queueHeldByPersonStop(noticeQueuedCommentQueue);
+  const steeringUnavailableListed = Boolean(
+    steeringUnavailable &&
+      steeringUnavailable.issueId === issueId &&
+      noticeQueuedCommentQueue?.entries.some(
+        (entry) => entry.comment.id === steeringUnavailable.commentId,
+      ),
+  );
+  // The bar draws the line only while this comment is one of its rows (the
+  // server's read, or the POST's 'queued' before that read lists it).
+  const steeringUnavailableForBar = useMemo(
+    () =>
+      steeringUnavailable && steeringUnavailable.issueId === issueId
+        ? { commentId: steeringUnavailable.commentId, reason: steeringUnavailable.reason }
+        : null,
+    [issueId, steeringUnavailable],
+  );
+  useEffect(() => {
+    if (!steeringUnavailable) return;
+    // Another task, or the comment was listed and has left the queue
+    // (answered, sent, discarded): the reason no longer describes anything.
+    if (
+      steeringUnavailable.issueId !== issueId ||
+      (steeringUnavailable.listed && !steeringUnavailableListed)
+    ) {
+      setSteeringUnavailable(null);
+    } else if (!steeringUnavailable.listed && steeringUnavailableListed) {
+      setSteeringUnavailable({ ...steeringUnavailable, listed: true });
+    }
+  }, [issueId, steeringUnavailable, steeringUnavailableListed]);
   // Retained-file recovery reports whether it offers its own control. Keep the
   // task Retry only when the server's execution blocker allows it and this recovery
   // surface does not already own the control.
@@ -5321,8 +5368,15 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       if (context?.workingRunId) {
         // Show exactly what the server answered for this POST.
         const delivery = readCommentDelivery(comment);
-        setSteeringUnavailableReason(
-          delivery.kind === "queued" ? delivery.steeringUnavailableReason : null,
+        setSteeringUnavailable(
+          delivery.kind === "queued" && delivery.steeringUnavailableReason
+            ? {
+                issueId: issueId ?? comment.issueId,
+                commentId: comment.id,
+                reason: delivery.steeringUnavailableReason,
+                listed: false,
+              }
+            : null,
         );
         if (delivery.kind !== "steered" && context.optimisticCommentId) {
           // Not steered: the pending bubble leaves the thread now; the
@@ -8916,7 +8970,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                     void refetchWorkProducts();
                   }}
                   locallyQueuedCommentRunIds={locallyQueuedCommentRunIds}
-                  steeringUnavailableReason={steeringUnavailableReason}
+                  steeringUnavailable={steeringUnavailableForBar}
                   interactions={interactions}
                   documents={issue.documentSummaries ?? []}
                   createdTasks={threadCreatedTasks}

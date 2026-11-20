@@ -592,7 +592,11 @@ export function TaskChatQueuedMessages({
   const stoppedPaused = queue.executionWait?.reason === CHAT_AGENT_PAUSED_REASON &&
     Boolean(queue.queueId) && !queue.targetRunId && entries.length > 0;
 
-  if (entries.length === 0 && !visibleError && !statusMessage && !steeringUnavailableReason) return null;
+  // The steering-paused line describes a message waiting in this bar: with
+  // nothing waiting (answered, or gone from the server's queue) it is gone.
+  const steeringPausedLine = entries.length > 0 ? steeringUnavailableReason : null;
+
+  if (entries.length === 0 && !visibleError && !statusMessage) return null;
 
   return (
     <TaskChatComposerBar
@@ -601,9 +605,9 @@ export function TaskChatQueuedMessages({
     >
       {/* The waiting list holds QUEUED messages only; a steered message is in the thread. */}
       <div data-testid="task-chat-queued-list">
-      {steeringUnavailableReason ? (
+      {steeringPausedLine ? (
         <p role="status" className="px-3 py-1.5 text-xs text-muted-foreground" data-testid="task-chat-steering-unavailable">
-          Steering paused: {steeringUnavailableReason} Will send after this turn.
+          Steering paused: {steeringPausedLine} Will send after this turn.
         </p>
       ) : null}
       <DndContext

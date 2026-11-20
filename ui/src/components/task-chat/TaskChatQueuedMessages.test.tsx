@@ -1038,5 +1038,13 @@ describe("TaskChatQueuedMessages", () => {
       expect(line.textContent).toBe("Steering paused: This runner can't take messages mid-turn. Will send after this turn.");
       expect(container.textContent).toContain("First queued message");
     });
+
+    it.each([390, 1440])("stalesteer: with nothing waiting the reason never draws an empty bar or the line at %ipx", (width) => {
+      window.innerWidth = width;
+      render({ queue: { ...queue, entries: [] }, steeringUnavailableReason: "steering unavailable" });
+      expect(container.querySelector('[data-testid="task-chat-queued-messages"]')).toBeNull();
+      expect(container.querySelector('[data-testid="task-chat-steering-unavailable"]')).toBeNull();
+      expect(container.textContent).not.toContain("Steering paused");
+    });
   });
 });
