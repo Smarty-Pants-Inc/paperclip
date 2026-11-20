@@ -228,9 +228,18 @@ export async function previewNativeQueuedCommentSend(input: {
   if (!queue || queue.payload?.queuedCommentInterrupt != null) return false;
   const commentId = queuedCommentIdsFromWakePayload(queue.payload).at(-1);
   if (!commentId) return false;
-  return Boolean(await checkExplicitNativeContinuation({ ...input, actorType: "user", reason: "issue_commented",
-    commentId, successorRunId: "00000000-0000-0000-0000-000000000000", queuedCommentInterruptId: queue.id, dryRun: true },
-    { queue, requestedAt: new Date().toISOString() }));
+  try {
+    return Boolean(await checkExplicitNativeContinuation({ ...input, actorType: "user", reason: "issue_commented",
+      commentId, successorRunId: "00000000-0000-0000-0000-000000000000", queuedCommentInterruptId: queue.id, dryRun: true },
+      { queue, requestedAt: new Date().toISOString() }));
+  } catch (error) {
+    // Required history is also an admission refusal. Keep the held messages
+    // readable rather than turning that refusal into a broken queue panel.
+    // Database/programming errors must still surface, not masquerade as a hold.
+    if (error instanceof Error && ["continuation_task_ownership_changed", "continuation_source_context_missing",
+      "continuation_user_authorization_missing"].includes(error.message)) return false;
+    throw error;
+  }
 }
 
 async function checkExplicitNativeContinuation(input: ExplicitNativeContinuationInput,

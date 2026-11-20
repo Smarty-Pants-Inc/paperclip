@@ -464,10 +464,10 @@ const CHAT_STOPPED_BY_PERSON_MESSAGE = "Stopped. These messages are waiting. Sen
 // bb-2d-stopwords (RFL 22:22Z): a TASK's waiting messages held by their sender's OWN Stop. The reason is the hold's
 // own, read from the hold (readPersonStopHold: who pressed Stop, and when), never from a stored wait's text. The line
 // names only what works in that hold, and the panel offers exactly that:
-// - held_by_own_stop_send: the stopped run's cleanup is verified (personStopSendCanStart), so the queue's Send
-//   starts the held messages: ONE Send on the line, each row its Delete.
-// - held_by_own_stop: it is not (for example the Stop came while the run's save hung). There the queue's Send is
-//   accepted and starts nothing (the gate keeps the wake, controller_settling), so the panel offers none: each
+// - held_by_own_stop_send: cleanup is verified and this wake passes the admission preview (personStopSendCanStart),
+//   so the queue's Send starts the held messages: ONE Send on the line, each row its Delete.
+// - held_by_own_stop: it cannot (for example cleanup or a linked decision is pending). There the queue's Send is
+//   accepted and starts nothing (the admission gate keeps the wake), so the panel offers none: each
 //   row its Delete, and a new message, which carries the held ones (the wake queue: "An operator stop never
 //   promotes old queued work by itself. The next explicit wake adopts those messages").
 const TASK_HELD_BY_OWN_STOP_REASON = "held_by_own_stop";
