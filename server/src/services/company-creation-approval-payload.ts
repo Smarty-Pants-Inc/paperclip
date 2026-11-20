@@ -44,4 +44,3 @@ export function companyCreationCardPayload(fields: z.infer<typeof createCompanyA
 export function normalizeCompanyName(name: string) {
   return name.normalize("NFKC").trim().replace(/\s+/g, " ").toLocaleLowerCase("en-US");
 }
-
