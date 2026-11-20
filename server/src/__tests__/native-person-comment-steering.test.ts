@@ -1510,6 +1510,27 @@ describe("answered-a6: a run's final items in ONE publication step are posted on
     const second = await run("A6-Mcode2", ["```ts\nsend();\n```", `${block}\nDone.`]);
     try { expect(second.posted.map(c => c.body)).toEqual(["```ts\nsend();\n```", `${block}\nDone.`]); } finally { await second.f.close(); }
   }, 90_000);
+
+  // answered-a7 (rf-5 F1): "show the minimal example", then "show the extended example separately".
+  // Each final is a DIFFERENT whole fenced program; the later never restates the earlier block, so both are posted.
+  const BT = "`".repeat(3);
+  const fenceShapes: Array<[string, string, string]> = [
+    ["tilde", "~~~ts\nsend();\n~~~", "~~~ts\nsend();\naudit();\n~~~"],
+    ["nested", `${BT}\`markdown\n${BT}ts\nsend();\n${BT}\n${BT}\``, `${BT}\`markdown\n${BT}ts\nsend();\naudit();\n${BT}\n${BT}\``],
+    ["backtickInfo", `${BT}python\nprint("""\n${BT}not_a_closer\n""")\n${BT}`, `${BT}python\nprint("""\n${BT}not_a_closer\n""")\nprint('extra')\n${BT}`],
+  ];
+  for (const [label, minimal, extended] of fenceShapes) {
+    it(`A7 fence ${label}: the minimal and the extended program are BOTH posted, whole`, async () => {
+      const { f, posted } = await run(`A7-${label}`, [minimal, extended]);
+      try { expect(posted.map(c => c.body)).toEqual([minimal, extended]); } finally { await f.close(); }
+    }, 60_000);
+  }
+
+  it("A7 ~~~ superset: the later final restates the earlier ~~~ block whole, plus more -> ONE reply", async () => {
+    const block = "~~~ts\nsend();\n~~~";
+    const { f, posted } = await run("A7-tildeSuperset", [block, `${block}\nThen call audit().`]);
+    try { expect(posted.map(c => c.body)).toEqual([`${block}\nThen call audit().`]); } finally { await f.close(); }
+  }, 60_000);
 });
 
 describe("answered-a6: the strict-restatement rule (unit)", () => {
@@ -1524,6 +1545,25 @@ describe("answered-a6: the strict-restatement rule (unit)", () => {
     expect(texts(["__init__", "init\nmore"])).toEqual(["__init__", "init\nmore"]);
     expect(texts(["`a  b`", "a b\nmore"])).toEqual(["`a  b`", "a b\nmore"]);
     expect(texts(["101", "101.5\n1010 rows"])).toEqual(["101", "101.5\n1010 rows"]);
+  });
+
+  it("answered-a7: CommonMark fences are atomic byte-exact units; an unclosed/ambiguous fence never drops an item", async () => {
+    const { restatedEarlierFinalsDropped, fencedCodeSpans } = await import("../services/native-runtime/native-response-items.js");
+    const texts = (xs: string[]) => restatedEarlierFinalsDropped(xs.map(text => ({ text }))).map(i => i.text);
+    const BT = "`".repeat(3);
+    // the three rf-5 shapes: different programs -> both kept
+    expect(texts(["~~~ts\nsend();\n~~~", "~~~ts\nsend();\naudit();\n~~~"])).toHaveLength(2);
+    expect(texts([`${BT}\`md\n${BT}ts\nsend();\n${BT}\n${BT}\``, `${BT}\`md\n${BT}ts\nsend();\naudit();\n${BT}\n${BT}\``])).toHaveLength(2);
+    expect(texts([`${BT}py\nx = """\n${BT}not_a_closer\n"""\n${BT}`, `${BT}py\nx = """\n${BT}not_a_closer\n"""\nprint(1)\n${BT}`])).toHaveLength(2);
+    // a closer must be the same character, at least as long, with only spaces after it
+    expect(fencedCodeSpans("~~~\na\n" + BT + "\nb\n~~~").spans).toEqual([{ start: 0, end: 15 }]);
+    expect(fencedCodeSpans(`${BT}\`\na\n${BT}\nb\n${BT}\`  `)).toEqual({ spans: [{ start: 0, end: 19 }], ambiguous: false });
+    // whole block restated + more -> earlier dropped (strict rule unchanged)
+    expect(texts(["~~~ts\nsend();\n~~~", "~~~ts\nsend();\n~~~\nDone."])).toEqual(["~~~ts\nsend();\n~~~\nDone."]);
+    // never-lose: an unclosed fence (either side) keeps both
+    expect(fencedCodeSpans(`${BT}ts\nsend();`).ambiguous).toBe(true);
+    expect(texts([`${BT}ts\nsend();`, `${BT}ts\nsend();\n${BT}\nDone.`])).toHaveLength(2);
+    expect(texts(["~~~ts\nsend();\n~~~", "~~~ts\nsend();\n~~~\nDone.\n~~~\nopen"])).toHaveLength(2);
   });
 });
 

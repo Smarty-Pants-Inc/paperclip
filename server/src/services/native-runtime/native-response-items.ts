@@ -1,4 +1,5 @@
 import { and, asc, eq, sql } from "drizzle-orm";
+import { fromMarkdown } from "mdast-util-from-markdown";
 import { heartbeatRunEvents, type Db } from "@paperclipai/db";
 import { completedPlanProposalIds, readCompletedAssistantMessageCandidate,
   readTruncatedCompletedAgentMessageItemId, readTruncatedCompletedAssistantMessageCandidate } from "../heartbeat-run-summary.js";
@@ -48,7 +49,48 @@ export async function nativeResponseItems(db: Db, input: { companyId: string; ru
   return kept.length > 1 ? kept : [];
 }
 
-const FENCE = /^\s*```/;
+// answered-a7: fenced code is found by the CommonMark parser the UI's renderer already uses
+// (react-markdown -> mdast-util-from-markdown@2.0.3), not by a hand lexer: ``` and ~~~ fences,
+// any opener length >= 3, a closer of the SAME character at least as long with nothing after it.
+const OPENER = /^ {0,3}(`{3,}|~{3,})/;
+const CLOSER = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
+const FENCE_LIKE = /^\s*(`{3,}|~{3,})/;
+
+type Span = { start: number; end: number };
+type MdNode = { type: string; children?: MdNode[]; position?: { start: { offset?: number }; end: { offset?: number } } };
+
+/** Each fenced code block of `text` as its exact source byte span. `ambiguous` is set when a
+ * fence is unclosed (runs to the end of its container), the parse fails, or a fence-looking line
+ * is left outside every parsed block: such an item is never dropped (never-lose). */
+export function fencedCodeSpans(text: string): { spans: Span[]; ambiguous: boolean } {
+  let tree: MdNode;
+  try { tree = fromMarkdown(text) as MdNode; } catch { return { spans: [], ambiguous: true }; }
+  const spans: Span[] = [];
+  let ambiguous = false;
+  const visit = (node: MdNode) => {
+    if (node.type === "code") {
+      const start = node.position?.start.offset, end = node.position?.end.offset;
+      if (typeof start !== "number" || typeof end !== "number") { ambiguous = true; return; }
+      const source = text.slice(start, end);
+      const opener = OPENER.exec(source);
+      if (!opener) return; // indented code: not a fence, read as lines (as before)
+      spans.push({ start, end });
+      const lines = source.split("\n");
+      const closer = lines.length > 1 ? CLOSER.exec(lines[lines.length - 1]) : null;
+      if (!closer || closer[1][0] !== opener[1][0] || closer[1].length < opener[1].length) ambiguous = true;
+      return;
+    }
+    for (const child of node.children ?? []) visit(child);
+  };
+  visit(tree);
+  spans.sort((a, b) => a.start - b.start);
+  let at = 0;
+  for (const span of [...spans, { start: text.length, end: text.length }]) {
+    if (text.slice(at, span.start).split("\n").some(line => FENCE_LIKE.test(line))) ambiguous = true;
+    at = span.end;
+  }
+  return { spans, ambiguous };
+}
 
 function normalisedProse(segment: string) {
   // Outside code only: paired ** emphasis, paired __ emphasis around non-identifier text, whitespace runs.
@@ -87,29 +129,35 @@ function lineUnits(line: string): string[] {
   return units;
 }
 
-/** A final item's units: each fenced code block (``` ... ```) is ONE unit, byte-exact; every
- * other line is split at sentence ends. */
+/** A final item's units: each fenced code block (CommonMark, ``` or ~~~) is ONE unit, its exact
+ * source bytes; every other line is split at sentence ends. */
 export function finalItemUnits(text: string): Set<string> {
+  return finalItemParse(text).units;
+}
+
+function finalItemParse(text: string): { units: Set<string>; ambiguous: boolean } {
   const units = new Set<string>();
-  const lines = text.split("\n");
-  for (let i = 0; i < lines.length; i++) {
-    if (FENCE.test(lines[i])) {
-      let end = i + 1;
-      while (end < lines.length && !FENCE.test(lines[end])) end++;
-      units.add(`\u0001${lines.slice(i, Math.min(end, lines.length - 1) + 1).join("\n")}`);
-      i = end;
-      continue;
-    }
-    for (const unit of lineUnits(lines[i])) units.add(unit);
+  const { spans, ambiguous } = fencedCodeSpans(text);
+  const prose = (segment: string) => { for (const line of segment.split("\n")) for (const unit of lineUnits(line)) units.add(unit); };
+  let at = 0;
+  for (const span of spans) {
+    prose(text.slice(at, span.start));
+    units.add(`\u0001${text.slice(span.start, span.end)}`);
+    at = span.end;
   }
-  return units;
+  prose(text.slice(at));
+  return { units, ambiguous };
 }
 
 /** Drop an EARLIER item only when a LATER item of the same step holds every one of its units
  * whole and at least one unit more (strict). The last item is never dropped, so every dropped
  * unit stays visible in a posted item. */
 export function restatedEarlierFinalsDropped<T extends { text: string }>(items: T[]): T[] {
-  const units = items.map(item => finalItemUnits(item.text));
-  return items.filter((_, index) => !units.slice(index + 1).some(later =>
+  const parsed = items.map(item => finalItemParse(item.text));
+  const units = parsed.map(item => item.units);
+  // Never-lose: an item whose fences parse ambiguously (unclosed, or a fence-like line outside
+  // every block) is never dropped, and never used to drop an earlier item (both are kept).
+  return items.filter((_, index) => parsed[index].ambiguous || !units.slice(index + 1).some((later, offset) =>
+    !parsed[index + 1 + offset].ambiguous &&
     later.size > units[index].size && [...units[index]].every(unit => later.has(unit))));
 }
