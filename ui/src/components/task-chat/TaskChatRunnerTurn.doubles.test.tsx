@@ -117,6 +117,39 @@ describe.each([390, 1440])("runner lane draws an answer once at %ipx", (width) =
     expect(answers.filter((text) => text.includes("201"))).toHaveLength(2);
   });
 
+  it("W1 answered-a4: a steered answer the final restates after another line is drawn once", () => {
+    render([message("4", "100+1 = 101.", "progress", T0 + 1_000), message("9", "Done. Also, 100+1 = 101.", "final", T0 + 13_000)]);
+    snapshot("W1");
+    expect(count("100+1 = 101.")).toBe(1);
+    expect(count("Done. Also,")).toBe(1);
+  });
+
+  it("W2 control: progress that is only part of a word in the final stays drawn", () => {
+    render([message("4", "101", "progress", T0 + 1_000), message("9", "Processed 1010 rows.", "final", T0 + 13_000)]);
+    snapshot("W2");
+    expect(count("101")).toBe(2);
+    expect(count("Processed 1010 rows.")).toBe(1);
+  });
+
+  it("W3 two steered answers the final restates are each drawn once", () => {
+    // A bare "101." is an empty markdown list item, so the answers are drawn as the model wrote them.
+    render([
+      message("4", "100+1 = 101.", "progress", T0 + 1_000),
+      message("6", "9+10 = 19.", "progress", T0 + 5_000),
+      message("9", "Done. 100+1 = 101. 9+10 = 19.", "final", T0 + 13_000),
+    ]);
+    snapshot("W3");
+    expect(count("101.")).toBe(1);
+    expect(count("19.")).toBe(1);
+  });
+
+  it("W4 control: working text the final does not restate stays drawn", () => {
+    render([message("4", "Let me check that.", "progress", T0 + 1_000), message("9", "Done. Also, 100+1 = 101.", "final", T0 + 13_000)]);
+    snapshot("W4");
+    expect(count("Let me check that.")).toBe(1);
+    expect(count("100+1 = 101.")).toBe(1);
+  });
+
   it("U5 control: a final with no progress is drawn unchanged", () => {
     render([message("9", SLEEP_FINAL, "final", T0 + 13_000)]);
     snapshot("U5");
