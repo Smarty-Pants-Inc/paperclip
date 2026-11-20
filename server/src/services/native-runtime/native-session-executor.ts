@@ -13602,12 +13602,15 @@ async function executePaperclipNativeSessionAttempt(
     const usesPluginTask = input.runnerExecutionTarget?.kind === "remote" && input.runnerExecutionTarget.transport === "sandbox" && !!input.runnerExecutionTarget.runnerTask;
     const prepareRunnerEnvironment = async () => {
       if (input.prepareGitHubEnvironment) {
+        const githubEnvironmentTimingStarted = performance.now();
         const environment = await timeController("github_environment", input.prepareGitHubEnvironment);
+        console.info(`[paperclip-timing] github.environment.prepare ${(performance.now() - githubEnvironmentTimingStarted).toFixed(1)}ms run=${input.execution.binding.runId} lease=${input.runnerExecutionTarget?.kind === "remote" ? input.runnerExecutionTarget.leaseId ?? "" : ""}`);
         executionContext?.assertOpen();
         input = { ...input, runnerEnvironment: { ...input.runnerEnvironment, ...environment } };
       }
       if (needsCoreGitHubAccess(input) && input.execution.schema !== "paperclip.native-execution-input.v6" && input.execution.schema !== "paperclip.native-execution-input.v8") {
         if (!input.execution.workspace.cwd) throw new Error("native_workspace_required");
+        const githubAccessCreateTimingStarted = performance.now();
         githubAccess ??= await timeController("github_access", () => createNativeGitHubAccess({
           scope: input.execution.binding,
           target: input.runnerExecutionTarget,
@@ -13617,7 +13620,10 @@ async function executePaperclipNativeSessionAttempt(
           onLog: input.onLog,
         }));
         executionContext?.assertOpen();
+        console.info(`[paperclip-timing] github.access.create ${(performance.now() - githubAccessCreateTimingStarted).toFixed(1)}ms run=${input.execution.binding.runId} lease=${input.runnerExecutionTarget?.kind === "remote" ? input.runnerExecutionTarget.leaseId ?? "" : ""}`);
+        const githubAccessActivateTimingStarted = performance.now();
         releaseGitHubRun = await githubAccess.activate(input.execution.binding);
+        console.info(`[paperclip-timing] github.access.activate ${(performance.now() - githubAccessActivateTimingStarted).toFixed(1)}ms run=${input.execution.binding.runId} lease=${input.runnerExecutionTarget?.kind === "remote" ? input.runnerExecutionTarget.leaseId ?? "" : ""}`);
         input = { ...input, runnerEnvironment: { ...input.runnerEnvironment, ...githubAccess.env } };
       }
       return input.runnerEnvironment;
@@ -18567,6 +18573,7 @@ async function createRunnerdBackendWithinSessionClaim(
     && input.retainedPluginTaskOwner && !input.remoteWarmRecovery && !input.restartRecovery
     ? pluginTaskOwner = preparePluginTaskOwner().then(prepared => { input.beginRetainedRunAttachment!(); return prepared; })
     : undefined;
+  const environmentJoinTimingStarted = performance.now();
   const [preparedEnvironment, preparedAssignedMcp, preparedPluginTaskOwner] = await Promise.allSettled([
     Promise.resolve().then(() => input.prepareRunnerEnvironment?.() ?? input.runnerEnvironment),
     Promise.resolve().then(() => !nativeReview && !firstPartyOnly && !museRuntime && !addressedParticipant && assignedMcpUrl && assignedMcpToken
@@ -18581,6 +18588,7 @@ async function createRunnerdBackendWithinSessionClaim(
       : undefined),
     earlyPluginTaskOwner,
   ]);
+  console.info(`[paperclip-timing] github.environment.join_all_settled ${(performance.now() - environmentJoinTimingStarted).toFixed(1)}ms run=${input.execution.binding.runId} lease=${remoteTarget?.leaseId ?? ""}`);
   if (preparedEnvironment.status === "rejected") throw preparedEnvironment.reason;
   if (preparedAssignedMcp.status === "rejected") throw preparedAssignedMcp.reason;
   if (preparedPluginTaskOwner.status === "rejected") throw preparedPluginTaskOwner.reason;

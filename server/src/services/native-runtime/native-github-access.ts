@@ -110,13 +110,16 @@ export async function createNativeGitHubAccess(input: {
     }
   })();
   try {
+    const brokerListenTimingStarted = performance.now();
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
       server.listen(0, "127.0.0.1", () => { server.off("error", reject); resolve(); });
     });
+    console.info(`[paperclip-timing] github.broker.listen ${(performance.now() - brokerListenTimingStarted).toFixed(1)}ms run=${location.runId} lease=${input.target?.kind === "remote" ? input.target.leaseId ?? "" : ""}`);
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("GitHub broker did not listen");
     const url = `http://127.0.0.1:${address.port}`;
+    const callbackBridgeTimingStarted = performance.now();
     try {
       bridge = await startBridge({
         ...location,
@@ -139,9 +142,16 @@ export async function createNativeGitHubAccess(input: {
       // GitHub remains optional. Stage anonymous wrappers for this session;
       // the supervisor retries transport setup on the next run.
       ready = false;
+      const brokerCloseTimingStarted = performance.now();
       await new Promise<void>(resolve => server.close(() => resolve()));
+      console.info(`[paperclip-timing] github.broker.fallback_close ${(performance.now() - brokerCloseTimingStarted).toFixed(1)}ms run=${location.runId} lease=${input.target?.kind === "remote" ? input.target.leaseId ?? "" : ""}`);
+      const fallbackLogTimingStarted = performance.now();
       await input.onLog?.("stderr", "[paperclip] GitHub runtime transport unavailable; continuing without managed GitHub access.\n").catch(() => undefined);
+      console.info(`[paperclip-timing] github.bridge.fallback_log ${(performance.now() - fallbackLogTimingStarted).toFixed(1)}ms run=${location.runId} lease=${input.target?.kind === "remote" ? input.target.leaseId ?? "" : ""}`);
+    } finally {
+      console.info(`[paperclip-timing] github.bridge.create ${(performance.now() - callbackBridgeTimingStarted).toFixed(1)}ms run=${location.runId} lease=${input.target?.kind === "remote" ? input.target.leaseId ?? "" : ""}`);
     }
+    const launcherTimingStarted = performance.now();
     const env = await prepareGitHubOperationLaunchers({
       ...location, cwd: input.cwd,
       env: {
@@ -153,6 +163,7 @@ export async function createNativeGitHubAccess(input: {
         PAPERCLIP_GITHUB_BRIDGE_TOKEN: ready ? bridge?.env.PAPERCLIP_API_KEY ?? token : "",
       },
     });
+    console.info(`[paperclip-timing] github.launchers.prepare ${(performance.now() - launcherTimingStarted).toFixed(1)}ms run=${location.runId} lease=${input.target?.kind === "remote" ? input.target.leaseId ?? "" : ""}`);
     return {
       env,
       get ready() { return ready && !stopped && bridge?.readRunDisposition?.().failed !== true; },
@@ -164,7 +175,9 @@ export async function createNativeGitHubAccess(input: {
         // Quarantine requests left by the previous run and resume polling before
         // publishing this run's authority. The broker stays inactive throughout.
         const generation = randomUUID();
+        const bridgeResumeTimingStarted = performance.now();
         await bridge?.resume?.(generation);
+        console.info(`[paperclip-timing] github.bridge.resume ${(performance.now() - bridgeResumeTimingStarted).toFixed(1)}ms run=${binding.runId} lease=${input.target?.kind === "remote" ? input.target.leaseId ?? "" : ""}`);
         const owner = { ...binding };
         active = owner;
         activeGeneration = generation;

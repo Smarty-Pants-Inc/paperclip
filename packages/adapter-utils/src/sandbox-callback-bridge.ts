@@ -406,6 +406,8 @@ async function runShell(
   shellCommand: "bash" | "sh" = "sh",
   stdin?: string,
 ): Promise<RunProcessResult> {
+  const remoteExecTimingStarted = performance.now();
+  try {
   return await runSandboxBridgeControlCommand(runner, {
     command: shellCommand,
     args: shellCommandArgs(script),
@@ -423,6 +425,9 @@ async function runShell(
     // agent command that never returns — a permanent deadlock.
     bypassSession: true,
   });
+  } finally {
+    console.info(`[paperclip-timing] bridge.remote.exec ${(performance.now() - remoteExecTimingStarted).toFixed(1)}ms`);
+  }
 }
 
 function requireSuccessfulResult(action: string, result: RunProcessResult): RunProcessResult {
@@ -681,6 +686,7 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
         : 0;
       const commandWaitMs = Math.min(requestedWaitMs, Math.max(0, timeoutMs - BRIDGE_LIST_WAIT_TIMEOUT_MARGIN_MS));
       const waitChecks = Math.ceil(commandWaitMs / 100);
+      const listTimingStarted = performance.now();
       const result = await runShell(
         input.runner,
         input.remoteCwd,
@@ -719,6 +725,7 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
         timeoutMs,
         shellCommand,
       );
+      console.info(`[paperclip-timing] bridge.queue.list ${(performance.now() - listTimingStarted).toFixed(1)}ms`);
       requireSuccessfulResult(`list ${remotePath}`, result);
       return result.stdout
         .split(/\r?\n/)
@@ -752,22 +759,29 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
       const uploadPath = `${remotePath}.${randomUUID()}.paperclip-upload`;
       const tempPath = `${uploadPath}.b64`;
       const decodedPath = `${uploadPath}.decoded`;
+      const stateUploadTimingStarted = performance.now();
       try {
+        const uploadPrepareTimingStarted = performance.now();
         await runChecked(
           `prepare upload ${remotePath}`,
           `mkdir -p ${shellQuote(remoteDir)} && rm -f ${shellQuote(tempPath)} ${shellQuote(decodedPath)} && : > ${shellQuote(tempPath)}`,
         );
+        console.info(`[paperclip-timing] bridge.state.upload.prepare ${(performance.now() - uploadPrepareTimingStarted).toFixed(1)}ms`);
         const base64Body = toBuffer(Buffer.from(body, "utf8")).toString("base64");
         for (const chunk of base64Chunks(base64Body)) {
+          const uploadChunkTimingStarted = performance.now();
           await runChecked(
             `append upload chunk ${remotePath}`,
             `printf '%s' ${shellQuote(chunk)} >> ${shellQuote(tempPath)}`,
           );
+          console.info(`[paperclip-timing] bridge.state.upload.chunk ${(performance.now() - uploadChunkTimingStarted).toFixed(1)}ms`);
         }
+        const uploadFinalizeTimingStarted = performance.now();
         await runChecked(
           `finalize upload ${remotePath}`,
           `base64 -d < ${shellQuote(tempPath)} > ${shellQuote(decodedPath)} && mv ${shellQuote(decodedPath)} ${shellQuote(remotePath)} && rm -f ${shellQuote(tempPath)}`,
         );
+        console.info(`[paperclip-timing] bridge.state.upload.finalize ${(performance.now() - uploadFinalizeTimingStarted).toFixed(1)}ms`);
       } catch (error) {
         // Abandon only this attempt's intermediates, never the published file
         // or another attempt. A late finalize may fail or finish publishing;
@@ -780,6 +794,8 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
           `rm -f ${shellQuote(tempPath)} ${shellQuote(decodedPath)}`,
         ).catch(() => undefined);
         throw error;
+      } finally {
+        console.info(`[paperclip-timing] bridge.state.upload.total ${(performance.now() - stateUploadTimingStarted).toFixed(1)}ms`);
       }
     },
     writeResponseFile: async (responsePath, body, options = {}) => {
@@ -938,12 +954,16 @@ export async function startSandboxCallbackBridgeWorker(input: {
     directories.logsDir,
   ];
   if (input.client.makeDirs) {
+    const queueMakeDirsTimingStarted = performance.now();
     await input.client.makeDirs(queueDirectories);
+    console.info(`[paperclip-timing] bridge.queue.make_dirs ${(performance.now() - queueMakeDirsTimingStarted).toFixed(1)}ms`);
   } else {
     // Backward-compatible fallback for a queue client that omits the batched
     // makeDirs method. Create each queue directory with a single makeDir.
     for (const directory of queueDirectories) {
+      const queueMakeDirTimingStarted = performance.now();
       await input.client.makeDir(directory);
+      console.info(`[paperclip-timing] bridge.queue.make_dir ${(performance.now() - queueMakeDirTimingStarted).toFixed(1)}ms`);
     }
   }
   const runStatePath = path.posix.join(directories.rootDir, "run-state.json");
@@ -951,6 +971,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
   let runStateManaged = Boolean(input.startPaused);
   let runStateWriteFailureLogged = false;
   const writeRunStateBestEffort = async (remotePath: string, value: string): Promise<void> => {
+    const stateWriteTimingStarted = performance.now();
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
@@ -966,10 +987,13 @@ export async function startSandboxCallbackBridgeWorker(input: {
       }
     } finally {
       if (timer) clearTimeout(timer);
+      console.info(`[paperclip-timing] bridge.state.write_best_effort ${(performance.now() - stateWriteTimingStarted).toFixed(1)}ms`);
     }
   };
   if (input.startPaused) {
+    const pausedStateTimingStarted = performance.now();
     await input.client.writeTextFile(runStatePath, "paused");
+    console.info(`[paperclip-timing] bridge.state.write_paused ${(performance.now() - pausedStateTimingStarted).toFixed(1)}ms`);
   }
 
   let stopping = false;
@@ -1804,17 +1828,27 @@ export async function startSandboxCallbackBridgeWorker(input: {
     },
     resume: async (generation?: string) => {
       if (stopping || !paused) return;
+      const activationTimingStarted = performance.now();
+      const quarantineTimingStarted = performance.now();
       await failPendingRequests("Bridge request belongs to a detached run.", { abandonInFlight: true });
+      console.info(`[paperclip-timing] bridge.activation.quarantine ${(performance.now() - quarantineTimingStarted).toFixed(1)}ms`);
+      const everAttachedTimingStarted = performance.now();
       await writeRunStateBestEffort(everAttachedPath, "attached");
+      console.info(`[paperclip-timing] bridge.activation.write_ever_attached ${(performance.now() - everAttachedTimingStarted).toFixed(1)}ms`);
+      const attachedStateTimingStarted = performance.now();
       await writeRunStateBestEffort(runStatePath, generation ? `attached:${generation}` : "attached");
+      console.info(`[paperclip-timing] bridge.activation.write_attached ${(performance.now() - attachedStateTimingStarted).toFixed(1)}ms`);
       idlePollIntervalMs = pollIntervalMs;
       resetIdleOnNextEmpty = true;
       const pollStarted = new Promise<void>((resolve) => { pollStartedResolve = resolve; });
+      const activationAckTimingStarted = performance.now();
       paused = false;
       resumePolling?.();
       resumePolling = null;
       pausedPromise = null;
       await pollStarted;
+      console.info(`[paperclip-timing] bridge.activation.ack_wait ${(performance.now() - activationAckTimingStarted).toFixed(1)}ms`);
+      console.info(`[paperclip-timing] bridge.activation.total ${(performance.now() - activationTimingStarted).toFixed(1)}ms`);
     },
     stop: async (options = {}) => {
       stopping = true;
@@ -1860,7 +1894,10 @@ export async function syncSandboxCallbackBridgeEntrypoint(input: {
   shellCommand?: "bash" | "sh" | null;
 }): Promise<{ remoteEntrypoint: string; sha256: string; uploaded: boolean }> {
   const remoteEntrypoint = path.posix.join(input.assetRemoteDir, SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT);
+  const entrypointReadTimingStarted = performance.now();
   const entrypointSource = await fs.readFile(input.bridgeAsset.entrypoint, "utf8");
+  console.info(`[paperclip-timing] bridge.entrypoint.read ${(performance.now() - entrypointReadTimingStarted).toFixed(1)}ms`);
+  const entrypointUploadTimingStarted = performance.now();
   const { uploaded, sha256 } = await syncRemoteTextFileWithHashSkip({
     runner: input.runner,
     remoteCwd: input.remoteCwd,
@@ -1874,6 +1911,7 @@ export async function syncSandboxCallbackBridgeEntrypoint(input: {
     shellCommand: input.shellCommand,
   });
 
+  console.info(`[paperclip-timing] bridge.entrypoint.upload ${(performance.now() - entrypointUploadTimingStarted).toFixed(1)}ms`);
   return {
     remoteEntrypoint,
     sha256,
@@ -1903,6 +1941,7 @@ export async function startSandboxCallbackBridgeServer(input: {
   const directories = sandboxCallbackBridgeDirectories(input.queueDir);
   let remoteEntrypoint = path.posix.join(input.assetRemoteDir, SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT);
   if (input.bridgeAsset) {
+    const entrypointSyncTimingStarted = performance.now();
     const assetSync = await syncSandboxCallbackBridgeEntrypoint({
       runner: input.runner,
       remoteCwd: input.remoteCwd,
@@ -1911,6 +1950,7 @@ export async function startSandboxCallbackBridgeServer(input: {
       timeoutMs,
       shellCommand,
     });
+    console.info(`[paperclip-timing] bridge.server.entrypoint_sync ${(performance.now() - entrypointSyncTimingStarted).toFixed(1)}ms`);
     remoteEntrypoint = assetSync.remoteEntrypoint;
   }
   const env = buildSandboxCallbackBridgeEnv({
@@ -1924,6 +1964,7 @@ export async function startSandboxCallbackBridgeServer(input: {
     maxBodyBytes: input.maxBodyBytes,
   });
   const nodeCommand = input.nodeCommand?.trim() || "node";
+  const serverLaunchTimingStarted = performance.now();
   const startResult = await runSandboxBridgeControlCommand(input.runner, {
     command: shellCommand,
     args: shellCommandArgs(
@@ -1944,14 +1985,18 @@ export async function startSandboxCallbackBridgeServer(input: {
     },
     timeoutMs,
   });
+  console.info(`[paperclip-timing] bridge.server.launch ${(performance.now() - serverLaunchTimingStarted).toFixed(1)}ms`);
   requireSuccessfulResult("start sandbox callback bridge", startResult);
 
+  const readinessPollTimingStarted = performance.now();
   const readyResult = await runShell(
     input.runner,
     input.remoteCwd,
     [
       "i=0",
+      "paperclip_timing_ready_iterations=0",
       `while [ \"$i\" -lt 200 ]; do`,
+      "  paperclip_timing_ready_iterations=$((paperclip_timing_ready_iterations + 1))",
       `  if [ -s ${shellQuote(directories.readyFile)} ]; then`,
       `    cat ${shellQuote(directories.readyFile)}`,
       "    exit 0",
@@ -1970,6 +2015,7 @@ export async function startSandboxCallbackBridgeServer(input: {
     timeoutMs,
     shellCommand,
   );
+  console.info(`[paperclip-timing] bridge.server.readiness.poll ${(performance.now() - readinessPollTimingStarted).toFixed(1)}ms`);
   requireSuccessfulResult("wait for sandbox callback bridge readiness", readyResult);
 
   let readyData: { host?: string; port?: number; baseUrl?: string; pid?: number };
