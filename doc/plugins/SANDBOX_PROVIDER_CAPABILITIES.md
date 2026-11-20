@@ -337,7 +337,8 @@ The separately versioned Boat provider first declares the capability in
 but that version does NOT meet the Stop guarantee above (a Stop waits behind an
 in-flight sync and the command can survive it); do not install it with the
 capability on. Use the first Boat version that meets every guarantee in this
-section (the Stop fix, `0.1.17-spare.12c2`, once judged). Its implementation is
+section: `0.1.17-spare.12c3` (Stop cancels at once during a sync, and the sync's
+own temp file is still cleaned up). Its implementation is
 not bundled in this server revision. Always use the
 installed provider's declaration and verified methods, not its name or version
 alone, to decide whether concurrency is effective.
