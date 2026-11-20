@@ -1,18 +1,14 @@
 import { readFileSync } from "node:fs";
 import type { HeartbeatRunEvent } from "@paperclipai/shared";
 import { describe, expect, it } from "vitest";
-import { projectPiRecording } from "../../../../packages/paperclip-runner/test-support/pi-rpc-golden";
 import { nativeRunEventsToTranscript } from "./native-run-events";
+import { transcriptToTaskChatItems } from "../task-chat/transcript-adapter";
+import { persistedPiWire, piStoppedRunEvents } from "./pi-stop-mid-shell.test-support";
 
 const fixture = (name: string) => readFileSync(new URL(`../../../../packages/paperclip-runner/test-fixtures/pi-rpc/${name}`, import.meta.url), "utf8");
 function persisted(name: string): HeartbeatRunEvent[] {
   const wire = fixture(name).trim().split("\n").map(line => JSON.parse(line));
-  return projectPiRecording(wire, name.startsWith("extension-")).map((event, index) => ({
-    id: index + 1, companyId: "controlled-peer", runId: event.runId, agentId: "capture", seq: index + 1,
-    eventType: event.eventType, stream: "system", level: "info", color: null, message: null,
-    payload: { prpEvent: { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceEventId: `pi-${index + 1}`, sourceSeq: index + 1, sourceInstanceId: "pi-capture", sourceKind: "runner", priority: 1, normalizedSessionId: "pi-session", emittedAt: "2026-11-12T06:18:00.000Z", ...event } },
-    createdAt: new Date("2026-11-12T06:18:00.000Z"),
-  }));
+  return persistedPiWire(wire, name.startsWith("extension-"));
 }
 
 describe("real native Pi RPC recordings through the app's native task-chat consumer", () => {
@@ -42,5 +38,35 @@ describe("real native Pi RPC recordings through the app's native task-chat consu
     const base = last.payload!.prpEvent as Record<string, unknown>;
     rows.push({ ...last, id: last.id + 1, seq: last.seq + 1, eventType: "run.terminal", payload: { prpEvent: { ...base, sourceEventId: "governed-driver-terminal", sourceSeq: last.seq + 1, eventType: "run.terminal", payload: { schema: "paperclip.prp.terminal.v1", turnTerminalState: "interrupted", runTerminalState: "cancelled", reportedWorkDisposition: "yielded" } } } });
     expect(nativeRunEventsToTranscript(rows)).toContainEqual(expect.objectContaining({ kind: "run_terminal", turnState: "interrupted", runState: "cancelled", disposition: "yielded" }));
+  });
+});
+
+// catch: stopcard2 VERDICT finding 2 (native Pi partial output uninspectable after Stop).
+describe("a Stop while a native Pi shell step streams", () => {
+  const stoppedTool = (snapshots: string[]) => {
+    const rows = piStoppedRunEvents(snapshots);
+    expect(rows.map(row => row.eventType)).toContain("tool.execution.progressed");
+    expect(rows.map(row => row.eventType)).not.toContain("tool.execution.completed");
+    const transcript = nativeRunEventsToTranscript(rows);
+    const partialAt = transcript.findIndex(entry => entry.kind === "tool_result");
+    // Where it arrived: after its call, before the run's terminal record.
+    if (partialAt >= 0) {
+      expect(partialAt).toBeGreaterThan(transcript.findIndex(entry => entry.kind === "tool_call"));
+      expect(partialAt).toBeLessThan(transcript.findIndex(entry => entry.kind === "run_terminal"));
+    }
+    const items = transcriptToTaskChatItems(transcript, { runId: "pi-capture", agentName: "Pi", running: false });
+    const tools = items.filter(item => item.kind === "tool");
+    expect(tools).toHaveLength(1);
+    return tools[0]!;
+  };
+  it("keeps the output that arrived as the interrupted call's partial result", () => {
+    const tool = stoppedTool(["STEP1-74584f\n", "STEP1-74584f\nSTEP2-74584f\n"]);
+    expect(tool).toMatchObject({ status: "interrupted" });
+    // Pi snapshots are cumulative: the latest one, once, not concatenated.
+    expect(tool.kind === "tool" && tool.detail).toBe("STEP1-74584f\nSTEP2-74584f\n\nInterrupted before the provider reported completion.");
+  });
+  it("control: claims no output only when none arrived", () => {
+    const tool = stoppedTool([]);
+    expect(tool).toMatchObject({ status: "interrupted", detail: "Stopped before output. Interrupted before the provider reported completion." });
   });
 });

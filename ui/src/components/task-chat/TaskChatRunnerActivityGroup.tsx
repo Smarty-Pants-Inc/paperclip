@@ -422,10 +422,19 @@ function ActivityDetailsBody({ item }: { item: Activity }) {
       </p>
     );
   const { output: detail, outputTruncated } = savedOutputForDisplay(item.detail, item.outputTruncated);
-  if (item.diff?.lines?.length)
+  // A diff of only blank context lines draws as an empty box; it must not
+  // hide what the call ran and what it reported.
+  const diffVisible = Boolean(
+    item.diff?.lines?.some((line) => line.kind !== "context" || line.text.trim()),
+  );
+  const stopped = item.status === "interrupted";
+  if (diffVisible && item.diff?.lines)
     return (
       <>
         <TaskChatDiffView lines={item.diff.lines} truncated={item.diff.truncated} runLogHref={item.runLogHref} />
+        {stopped && !outputTruncated && detail ? (
+          <pre className="whitespace-pre-wrap break-words font-mono">{detail}</pre>
+        ) : null}
         {outputTruncated ? <>
           {detail ? <pre className="whitespace-pre-wrap break-words font-mono">{detail}</pre> : null}
           <SavedOutputNotice fullTextKept runLogHref={item.runLogHref} />
@@ -446,7 +455,7 @@ function ActivityDetailsBody({ item }: { item: Activity }) {
       ) : null}
       {outputTruncated ? <SavedOutputNotice fullTextKept runLogHref={item.runLogHref} /> : null}
       {item.decision ? <p>Permission {item.decision}</p> : null}
-      {item.diff ? (
+      {item.diff && (item.diff.path || item.diff.added || item.diff.removed) ? (
         <p className="break-all font-mono">
           {item.diff.path} · +{item.diff.added} −{item.diff.removed}
         </p>
