@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -30,8 +30,13 @@ import {
 import { realizeExecutionWorkspace } from "../services/workspace-runtime.ts";
 import { WORKSPACE_COMPACTION_TRASH_DIR } from "../services/workspace-compaction.ts";
 import { logger } from "../middleware/logger.js";
-import { contentSpill, custodySpill, SPILL_CUSTODY_ROW, spillCustodyFaults } from "../services/object-run-log-spill.fixture.js";
+import { contentSpill, custodyRows, custodySpill, plantHungStore, readAll, recoveredSpills, SPILL_CUSTODY_ROW,
+  spillCustodyFaults } from "../services/object-run-log-spill.fixture.js";
 import { cleanupExecutionWorkspaceArtifacts } from "../services/workspace-runtime.js";
+import { RUN_LOG_SPILL_READ_BACK_BUDGET_MS } from "../services/object-run-log-store.js";
+import { cleanupWorktreeInstanceArtifacts, deriveWorktreeInstanceId, listKeptWorktreeInstances,
+  readWorktreeInstancePointer } from "../services/workspace-instance-cleanup.js";
+import { setTimeout as delay } from "node:timers/promises";
 
 const execFileAsync = promisify(execFile);
 const HOUR_MS = 60 * 60 * 1000;
@@ -341,6 +346,134 @@ describeEmbeddedPostgres("terminal workspace compaction", () => {
     expect(result.cleaned).toBe(mode === "recovered");
     expect(survived).toBe(mode !== "recovered");
   }, 30_000);
+
+  // RFL ruling 11-20 (1): the run-log-shape test is for `*.ndjson` OUTSIDE a spill directory only.
+  it.each([
+    ["elsewhere in the worktree does not block it", "build/export/orders.ndjson", true],
+    ["inside a spill directory keeps the worktree", "build/data/run-logs/.spill/company/agent/run.ndjson", false],
+  ] as const)("whole-worktree removal: another tool's *.ndjson %s", async (_case, file, removed) => {
+    const seeded = await seedWorkspace({ populate: false });
+    const contents = `${JSON.stringify({ id: 1, stream: "orders", chunk: 7 })}\n`.repeat(3);
+    await writeFile(path.join(seeded.worktreePath, file), contents);
+    const [workspace] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    const result = await cleanupExecutionWorkspaceArtifacts({ workspace: workspace!, projectWorkspace: { cwd: seeded.repoRoot, cleanupCommand: null } });
+    expect(result.cleaned).toBe(removed);
+    expect(await exists(seeded.worktreePath)).toBe(!removed);
+    if (!removed) expect(await fs.readFile(path.join(seeded.worktreePath, file), "utf8")).toBe(contents);
+  }, 30_000);
+
+  // The independent observer of the workspace lifecycle lock: its own database
+  // connection, reading Postgres' own lock table. It never takes the lock and
+  // shares nothing with the cleanup under test. Each hold is bounded from both
+  // sides: `seenHeldMs` between two sightings of the lock, `heldAtMostMs`
+  // between the last sighting without it before and the first one after.
+  function observeLifecycleLock(workspaceId: string, onSighting: (heldAtMostMs: number) => void) {
+    const observer = createDb(tempDb!.connectionString);
+    const holds: Array<{ seenHeldMs: number; heldAtMostMs: number }> = [];
+    let stopped = false, lastFree = Date.now(), firstHeld: number | null = null, lastHeld = 0;
+    const watching = (async () => {
+      while (!stopped || firstHeld !== null) {
+        const [row] = await observer.execute(sql`
+          select count(*)::int as held from pg_locks
+          where locktype = 'advisory' and granted
+            and ((classid::bigint << 32) | objid::bigint) = hashtextextended(${`execution_workspace_lifecycle:${workspaceId}`}, 0)`);
+        const at = Date.now();
+        if (Number(row?.held) > 0) {
+          firstHeld ??= at;
+          lastHeld = at;
+          onSighting(at - lastFree);
+        } else {
+          if (firstHeld !== null) holds.push({ seenHeldMs: lastHeld - firstHeld, heldAtMostMs: at - lastFree });
+          firstHeld = null;
+          lastFree = at;
+        }
+        await delay(20);
+      }
+      await observer.$client.end({ timeout: 1 });
+    })();
+    return { async stop() {
+      stopped = true;
+      await watching;
+      return holds.sort((a, b) => b.heldAtMostMs - a.heldAtMostMs);
+    } };
+  }
+
+  // RFL ruling 11-20 (3).
+  // catch: bb-objlog11's limit (11-20): every recovered spill is read back while the cleanup holds the
+  // workspace lifecycle lock, and a store that stops answering costs one journal read deadline (15 s)
+  // PER SPILL: 20 spills held the lock 300 s, and a person's next turn on that workspace waits on that lock.
+  // Keep reason: NEVER-OK trace custody must not cost the person their turn. One guard pass spends at
+  // most one read-back budget; what it could not read back is KEPT for the next pass, never released.
+  // The real scheduled sweep and its real lifecycle lock (embedded Postgres), the real writer, store,
+  // journal, instance cleanup and files. The one planted fault is `store-hung`.
+  it("a hung object store holds the lifecycle lock for one read-back budget; every unread spill is kept, then released once the store answers", async () => {
+    // RFL's bound: one guard pass reads back for 30 s in total. On top of it, the cleanup's
+    // own work under the lock (Git, the database, the filesystem).
+    const BUDGET_MS = 30_000, LOCK_WORK_ALLOWANCE_MS = 5_000;
+    const seeded = await seedWorkspace({ populate: false });
+    const worktreesDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-budget-instances-")));
+    tempDirs.add(worktreesDir);
+    // A seeded worktree instance, as provisioning leaves it: the pointer in the worktree, the root on the row.
+    const instanceId = deriveWorktreeInstanceId(seeded.worktreePath);
+    const instanceRoot = path.join(worktreesDir, "instances", instanceId);
+    await writeFile(path.join(seeded.worktreePath, ".paperclip", ".env"),
+      `PAPERCLIP_HOME=${JSON.stringify(worktreesDir)}\nPAPERCLIP_INSTANCE_ID=${JSON.stringify(instanceId)}\n`);
+    await db.update(executionWorkspaces).set({ metadata: { worktreeInstanceRoot: instanceRoot } })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    const pointer = (await readWorktreeInstancePointer(seeded.worktreePath))!;
+    // 20 spills at the instance's default root, each genuinely recovered: releasable, once read back.
+    const { m, store, spills } = await recoveredSpills(path.join(instanceRoot, "data", "run-logs", ".spill"), 20);
+    expect(spills.map(spill => spill.unrecoveredBytes)).toEqual(Array(20).fill(0));
+    vi.stubEnv("PAPERCLIP_WORKTREES_DIR", worktreesDir);
+    const hung = plantHungStore(m);
+    const warn = vi.spyOn(logger, "warn");
+    // Should the lock outlive its bound, let the store answer so this row ends: it has already failed.
+    const lock = observeLifecycleLock(seeded.executionWorkspaceId, heldAtMostMs => {
+      if (heldAtMostMs > BUDGET_MS + LOCK_WORK_ALLOWANCE_MS) hung.heal();
+    });
+    let sweep, holds;
+    try {
+      // Compaction is off so that this sweep asks about the spills once, under the lock.
+      sweep = await service({ workspaceCompactionDelayMs: null }).sweepTerminalWorkspaces();
+    } finally {
+      holds = await lock.stop();
+      vi.unstubAllEnvs();
+    }
+    const rows = custodyRows(warn);
+    warn.mockRestore();
+    const stillHung = hung.state.hung;
+    hung.heal();
+    console.info("read-back-budget", { sweep, holds: holds.slice(0, 3), unansweredGets: hung.state.unansweredGets,
+      waitedMs: hung.state.lastGiveUpAt - hung.state.firstGetAt, reasons: rows.map(row => row.reason) });
+
+    // The lock, from the observer: held for the budget plus the cleanup's own work, not 20 read deadlines.
+    expect(holds[0]!.heldAtMostMs).toBeLessThanOrEqual(BUDGET_MS + LOCK_WORK_ALLOWANCE_MS);
+    expect(stillHung).toBe(true);
+    // The read-backs, from the store: the pass waited on it no longer than its budget.
+    expect(RUN_LOG_SPILL_READ_BACK_BUDGET_MS).toBe(BUDGET_MS);
+    expect(hung.state.unansweredGets).toBeGreaterThan(0);
+    expect(hung.state.lastGiveUpAt - hung.state.firstGetAt).toBeLessThanOrEqual(BUDGET_MS + 250);
+    // KEPT: all 20, each with a custody row; the ones the budget did not reach say so.
+    expect(rows.map(row => row.spill).sort()).toEqual(spills.map(spill => spill.path).sort());
+    const reasons = rows.map(row => row.reason);
+    expect(reasons.filter(reason => reason === "read_back_budget_exhausted").length).toBeGreaterThanOrEqual(17);
+    expect(reasons.filter(reason => !["read_back_budget_exhausted", "recovered_copy_read_timeout", "recovered_copy_unreadable"].includes(reason))).toEqual([]);
+    for (const spill of spills) {
+      expect((await fs.readFile(spill.path)).equals(spill.bytes)).toBe(true);
+      expect((await fs.readFile(spill.indexPath)).equals(spill.index)).toBe(true);
+    }
+    expect(await listKeptWorktreeInstances(worktreesDir)).toEqual([
+      expect.objectContaining({ instance: instanceId, instanceRoot, keptPaths: 20 })]);
+
+    // The store answers again: the next pass reads all 20 back, proves them and releases the instance.
+    const next = await cleanupWorktreeInstanceArtifacts({ pointer, workspaceId: seeded.executionWorkspaceId,
+      workspacePath: seeded.worktreePath, expectedInstanceId: instanceId, expectedInstanceRoot: instanceRoot, worktreesDir });
+    expect(next.status).toBe("removed");
+    expect(await exists(instanceRoot)).toBe(false);
+    expect(await listKeptWorktreeInstances(worktreesDir)).toEqual([]);
+    // Nothing was lost with the spills: the object log still serves every admitted byte.
+    for (const spill of spills) expect((await readAll(store, spill.logRef)).equals(spill.log)).toBe(true);
+  }, 150_000);
 
   it("compacts a delivered workspace that is still inside the archive cooldown", async () => {
     const seeded = await seedWorkspace();

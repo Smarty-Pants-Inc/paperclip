@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   cleanupWorktreeInstanceArtifacts,
   deriveWorktreeInstanceId,
+  listKeptWorktreeInstances,
   readManagedWorktreeInstanceOwnership,
   readWorktreeInstancePointer,
   stopEmbeddedPostgresIfRunning,
@@ -13,6 +14,7 @@ import type { WorkspaceOperation } from "@paperclipai/shared";
 import type { WorkspaceOperationRecorder } from "../services/workspace-operations.js";
 import { logger } from "../middleware/logger.js";
 import { createObjectRunLogStore, readObjectRunLogSpill } from "../services/object-run-log-store.js";
+import { createDurableRunLogStore } from "../services/run-log-store.js";
 import { contentSpill, custodySpill, event, ids, plantSpillCustodyFault, SPILL_CUSTODY_FAULTS, SPILL_CUSTODY_ROW,
   spillCustodyFaults, spillMemory, type SpillCustodyFault } from "../services/object-run-log-spill.fixture.js";
 
@@ -294,6 +296,96 @@ describe("worktree instance cleanup", () => {
         spill: path.join(await fs.realpath(instanceRoot), path.relative(instanceRoot, spill.path)) }));
     expect(await fs.readFile(spill.path)).toEqual(spill.bytes);
     expect(await fs.readFile(spill.indexPath).catch(() => null)).toEqual(spill.index);
+  });
+
+  // RFL rulings 11-20 (1) and (2).
+  // catch: a kept instance was only a refusal inside one cleanup's result. Nothing listed
+  // the instances being kept, so nobody could count them or tell them from abandoned disk.
+  // Keep reason: NEVER-OK trace custody: what is kept, and why, must stay visible.
+  // The real cleanup over real files; the spill is the real writer's, the local run log the real local store's.
+  async function keptInstance(worktreesDir: string, instanceId: string) {
+    const workspacePath = await makeTempRoot("paperclip-kept-workspace-");
+    const instanceRoot = path.join(await fs.realpath(worktreesDir), "instances", instanceId);
+    await fs.mkdir(instanceRoot, { recursive: true });
+    await writeWorkspaceEnv(workspacePath, worktreesDir, instanceId);
+    const clean = async () => cleanupWorktreeInstanceArtifacts({
+      pointer: (await readWorktreeInstancePointer(workspacePath))!, workspaceId: `workspace-${instanceId}`, workspacePath,
+      expectedInstanceId: instanceId, expectedInstanceRoot: instanceRoot, worktreesDir });
+    return { instanceId, instanceRoot, clean };
+  }
+  it("writes one custody row per kept instance, and the reader lists the kept set with its reasons", async () => {
+    const worktreesDir = await makeTempRoot("paperclip-kept-instances-");
+    // Kept for a spill: bytes object storage never took, at the writer's default root.
+    const spilled = await keptInstance(worktreesDir, "kept-for-a-spill");
+    const spillDir = path.join(spilled.instanceRoot, "data", "run-logs", ".spill");
+    const m = spillMemory();
+    const store = createObjectRunLogStore({ provider: m.provider, keyPrefix: "logs", flushMs: 1000, spillDir,
+      assertWriterAuthority: async () => undefined });
+    const handle = await store.begin({ ...ids, runId: "run" });
+    m.state.down = true;
+    const committed = (await store.enqueue!(handle, event(1, "admitted"))).committed.catch(() => undefined);
+    await store.finalize(handle);
+    await committed;
+    const spill = await readObjectRunLogSpill(spillDir, handle.logRef);
+    // Kept for a LOCAL run log: the local store's own file, with no spill record beside it.
+    const local = await keptInstance(worktreesDir, "kept-for-a-local-run-log");
+    const localStore = createDurableRunLogStore({ basePath: path.join(local.instanceRoot, "data", "run-logs") });
+    const localHandle = await localStore.begin({ ...ids, runId: "run" });
+    await localStore.append(localHandle, { stream: "stdout", chunk: "a local run log", ts: "2026-11-20T00:00:00Z" });
+    await localStore.finalize(localHandle);
+    const localLog = path.join(local.instanceRoot, "data", "run-logs", localHandle.logRef);
+    const localBytes = await fs.readFile(localLog);
+    // Control: an instance that holds no run-log bytes is removed and gets no row.
+    const empty = await keptInstance(worktreesDir, "holds-nothing");
+
+    expect([(await spilled.clean()).status, (await local.clean()).status, (await empty.clean()).status])
+      .toEqual(["refused", "refused", "removed"]);
+
+    const rowsDir = path.join(worktreesDir, "instances", ".run-log-custody");
+    expect((await fs.readdir(rowsDir)).sort()).toEqual(["kept-for-a-local-run-log.json", "kept-for-a-spill.json"]);
+    const rows = [
+      { v: 1, instance: "kept-for-a-local-run-log", instanceRoot: local.instanceRoot, path: localLog, reason: "index_missing",
+        keptPaths: 1, at: expect.any(String) },
+      { v: 1, instance: "kept-for-a-spill", instanceRoot: spilled.instanceRoot, path: spill.path, reason: "unrecovered",
+        keptPaths: 1, at: expect.any(String) },
+    ];
+    expect(await Promise.all(rows.map(async row => JSON.parse(await fs.readFile(path.join(rowsDir, `${row.instance}.json`), "utf8")))))
+      .toEqual(rows);
+    expect(await listKeptWorktreeInstances(worktreesDir)).toEqual(rows);
+    expect((await fs.readFile(localLog)).equals(localBytes)).toBe(true);
+    expect((await fs.readFile(spill.path)).length).toBe(spill.unrecovered.length);
+
+    // A later pass that can prove the spill recovered releases the instance and takes its row.
+    m.state.down = false;
+    await store.recoverSpill!({ ...ids, runId: "run" });
+    expect((await spilled.clean()).status).toBe("removed");
+    expect(await listKeptWorktreeInstances(worktreesDir)).toEqual([rows[0]]);
+  });
+
+  it.each([
+    ["another tool's records, in no run-log shape", `${JSON.stringify({ id: 1, stream: "orders", chunk: 7 })}\n`.repeat(3)],
+    ["bytes that decode as nothing", Buffer.from([0xff, 0xfe, 0x00, 0xc3, 0x28, 0x80, 0x0a])],
+  ])("keeps an instance whose spill directory holds %s", async (_case, contents) => {
+    const worktreesDir = await makeTempRoot("paperclip-kept-instances-");
+    const instance = await keptInstance(worktreesDir, "spill-dir-file");
+    const file = path.join(instance.instanceRoot, "data", "run-logs", ".spill", "company", "agent", "run.ndjson");
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, contents);
+    expect((await instance.clean()).status).toBe("refused");
+    expect(Buffer.from(contents).equals(await fs.readFile(file))).toBe(true);
+    expect(await listKeptWorktreeInstances(worktreesDir)).toEqual([
+      expect.objectContaining({ instance: "spill-dir-file", path: file, reason: "index_missing" })]);
+  });
+
+  it("control: another tool's *.ndjson outside the spill directory does not keep an instance", async () => {
+    const worktreesDir = await makeTempRoot("paperclip-kept-instances-");
+    const instance = await keptInstance(worktreesDir, "other-tool");
+    const file = path.join(instance.instanceRoot, "tools", "export", "orders.ndjson");
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, `${JSON.stringify({ id: 1, stream: "orders", chunk: 7 })}\n`.repeat(3));
+    expect((await instance.clean()).status).toBe("removed");
+    await expect(fs.stat(instance.instanceRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.stat(path.join(worktreesDir, "instances", ".run-log-custody", "other-tool.json"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("preserves a collision-resistant active instance when persisted ownership is absent", async () => {

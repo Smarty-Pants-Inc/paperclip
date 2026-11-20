@@ -4,9 +4,9 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { logger } from "../middleware/logger.js";
-import { candidateHoldsUnrecoveredRunLogSpill, listUnrecoveredObjectRunLogSpills,
-  readObjectRunLogSpill } from "./object-run-log-store.js";
-import { event, ids, newStore, plantSpillCustodyFault, readAll, record, sha, SPILL_CUSTODY_FAULTS, SPILL_CUSTODY_ROW,
+import { candidateHoldsUnrecoveredRunLogSpill, findKeptRunLogSpillContent, listKeptObjectRunLogSpills,
+  listUnrecoveredObjectRunLogSpills, readObjectRunLogSpill } from "./object-run-log-store.js";
+import { custodyRows, event, ids, newStore, plantSpillCustodyFault, readAll, record, sha, SPILL_CUSTODY_FAULTS, SPILL_CUSTODY_ROW,
   spillCustodyFaults, spilledRun, spillMemory } from "./object-run-log-spill.fixture.js";
 
 // catch: rf-7 OBJLOG9 F1 (11-19): an index corrupted to zero bytes, `{}` or `[]`
@@ -107,14 +107,67 @@ describe("a kept spill is released only on positive, read-back proof", () => {
     expect(await decide(spillDir)).toEqual({ listed: [], guarded: false, rows: [] });
   }, 30_000);
 
+  // RFL ruling 11-20 (1). The writer puts nothing in its spill directory but spills
+  // and their records: THERE any non-empty file with no record proving it
+  // recovered is kept, whatever it holds and whether or not it can be read. The
+  // run-log-shape test is only for a `*.ndjson` elsewhere, where other tools write.
+  // `.spill` is the writer's default directory name; both doors are asked: the
+  // listing of the spill directory and the content guard over the tree holding it.
+  const otherTool = Buffer.from(`${JSON.stringify({ id: 1, stream: "orders", chunk: 7 })}\n`.repeat(3));
+  async function inSpillDir(name: string, contents: Buffer) {
+    const tree = await fs.mkdtemp(path.join(os.tmpdir(), "objlog-instance-"));
+    const spillDir = path.join(tree, "data", "run-logs", ".spill"), file = path.join(spillDir, "company", "agent", name);
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, contents);
+    return { tree, spillDir, file };
+  }
+  async function doors(spillDir: string, tree: string) {
+    const warn = vi.spyOn(logger, "warn");
+    const decision = { listed: await listKeptObjectRunLogSpills(spillDir), guarded: await findKeptRunLogSpillContent(tree) };
+    const rows = custodyRows(warn);
+    warn.mockRestore();
+    return { ...decision, rows };
+  }
   it.each([
-    ["an empty data file", ""],
-    ["another tool's *.ndjson, holding no run-log record", `${JSON.stringify({ id: 1, stream: "orders", chunk: 7 })}\n`.repeat(3)],
-  ])("control: %s with no record is not a spill", async (_case, contents) => {
-    const spillDir = await fs.mkdtemp(path.join(os.tmpdir(), "objlog-spill-"));
-    await fs.mkdir(path.join(spillDir, "company", "agent"), { recursive: true });
-    await fs.writeFile(path.join(spillDir, "company", "agent", "run.ndjson"), contents);
-    expect(await decide(spillDir)).toEqual({ listed: [], guarded: false, rows: [] });
+    ["another tool's records, in no run-log shape", "run.ndjson", otherTool, "index_missing"],
+    ["bytes that decode as nothing", "run.ndjson", Buffer.from([0xff, 0xfe, 0x00, 0xc3, 0x28, 0x80, 0x0a]), "index_missing"],
+    ["a non-empty file under a name the writer never uses", "run.ndjson.bak", record("attempt", 1, "a renamed spill"), "spill_dir_file_without_record"],
+  ])("inside the spill directory, %s is kept", async (_case, name, contents, reason) => {
+    const { tree, spillDir, file } = await inSpillDir(name, contents);
+    const logRef = `company/agent/${name.replace(/\.ndjson$/, "")}`;
+    expect(await listUnrecoveredObjectRunLogSpills(spillDir)).toEqual([logRef]);
+    expect(await candidateHoldsUnrecoveredRunLogSpill(tree)).toBe(true);
+    const row = expect.objectContaining({ spill: file, reason });
+    expect(await doors(spillDir, tree)).toEqual({ listed: [{ logRef, path: file, reason }], guarded: { path: file, reason }, rows: [row, row] });
+    expect((await fs.readFile(file)).equals(contents)).toBe(true);
+  });
+
+  it("inside the spill directory, a file that cannot be read stays kept (fail closed)", async () => {
+    const { tree, spillDir, file } = await inSpillDir("run.ndjson", otherTool);
+    await fs.chmod(file, 0);
+    try {
+      await expect(fs.readFile(file)).rejects.toMatchObject({ code: "EACCES" });
+      expect(await listUnrecoveredObjectRunLogSpills(spillDir)).toEqual(["company/agent/run"]);
+      expect(await candidateHoldsUnrecoveredRunLogSpill(tree)).toBe(true);
+    } finally { await fs.chmod(file, 0o600); }
+    expect((await fs.readFile(file)).equals(otherTool)).toBe(true);
+  });
+
+  it("control: outside the spill directory, another tool's *.ndjson is not a spill", async () => {
+    const worktree = await fs.mkdtemp(path.join(os.tmpdir(), "objlog-worktree-"));
+    const file = path.join(worktree, "tools", "export", "orders.ndjson");
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, otherTool);
+    const warn = vi.spyOn(logger, "warn");
+    expect(await candidateHoldsUnrecoveredRunLogSpill(worktree)).toBe(false);
+    expect(custodyRows(warn)).toEqual([]);
+  });
+
+  it("control: an empty file inside the spill directory is not a spill", async () => {
+    const { tree, spillDir } = await inSpillDir("run.ndjson", Buffer.alloc(0));
+    await fs.writeFile(path.join(spillDir, "company", "agent", "left-behind.tmp"), "");
+    expect(await listUnrecoveredObjectRunLogSpills(spillDir)).toEqual([]);
+    expect(await candidateHoldsUnrecoveredRunLogSpill(tree)).toBe(false);
   });
 
   it("run-log bytes with no record are kept even when their first write was torn", async () => {
