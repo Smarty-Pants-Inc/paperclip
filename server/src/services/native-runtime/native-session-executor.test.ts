@@ -4107,8 +4107,10 @@ describe("remote provider pack manifest", () => {
       let stdout = "";
       if (script.includes("paperclip-provider-pack-fingerprint-v1")) {
         memoProbe();
-        stdout = ["/opt/paperclip-runner/provider-pack", "installer-boot", "1000",
-          "1:10:1:4096:0:41ed:1", "1:11:1:1024:0:81a4:1", "a".repeat(64)].join("\n") + "\n";
+        stdout = ["/opt/paperclip-runner/provider-pack", "abcd-1234", "1000",
+          "1:10:1:4096:0:41ed:1", "1:11:1:1024:0:81a4:1", "a".repeat(64),
+          ...(command.args?.[4] ? ["nonce", "123", "2026-09-19T10:00:00.000Z", "runner", "linux:abcd-1234:100"] : []),
+        ].join("\n") + "\n";
       } else if (script.includes("paperclip-provider-pack-immutable-v1")) stdout = "immutable\n";
       else if (command.args?.[0] === "-e") memoFullVerify();
       else if (command.args?.[0] === "--version") stdout = "1.18.34\n";
@@ -4119,8 +4121,9 @@ describe("remote provider pack manifest", () => {
       sandboxLeaseAcquisition: { outcome: "resumed" as const, providerLeaseId: randomUUID() } };
     const memoTraceRecorder = createNativeRunTrace({ runId: randomUUID(), onEvent: memoTrace });
     for (let turn = 0; turn < 2; turn++) await expect(prepareRemoteProviderPackOnTarget({
-      target: memoTarget, runner: memoRunner, configuredProviderPackRoot: root,
+      target: { ...memoTarget, leaseId: randomUUID() }, runner: memoRunner, configuredProviderPackRoot: root,
       manifest: selectedPack.manifest, trace: memoTraceRecorder,
+      runnerIdentityPath: "/runtime/runner-process.identity",
     })).resolves.toMatchObject({ source: "staged" });
     expect(memoFullVerify).toHaveBeenCalledOnce();
     expect(memoProbe).toHaveBeenCalledTimes(3); // cold before/after + one warm probe
@@ -21941,6 +21944,92 @@ describe("runnerd provider runtime wiring", () => {
       expect(await readFile(join(root, "control-plane", "retained.txt"), "utf8")).toBe("Retained controller journal");
       expect(openSession).not.toHaveBeenCalled();
     }
+  });
+
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21267
+  // Real createRunnerdBackend preparation and generated pack verifier; only the
+  // remote transport/privileged metadata and provider process are simulated.
+  it.each(["same", "allocation", "digest", "birth"] as const)("keeps a warm Pi pack across new lease rows, re-verifying only a changed box/pack/runner: %s", async change => {
+    const { nativePiProviderPackFixture } = await import("./native-pi-provider-pack.test-fixture.js");
+    const { packRoot, manifest } = await nativePiProviderPackFixture(join(isolatedStateDirectory, "warm-lease-pi-pack"));
+    for (const [name, version] of Object.entries({ acpx: manifest.payload.pins.acpx,
+      "@agentclientprotocol/claude-agent-acp": manifest.payload.pins.claudeAcp,
+      "@agentclientprotocol/codex-acp": manifest.payload.pins.codexAcp, "opencode-ai": manifest.payload.pins.opencode })) {
+      await mkdir(join(packRoot, "node_modules", name), { recursive: true });
+      await writeFile(join(packRoot, "node_modules", name, "package.json"), JSON.stringify({ version }));
+    }
+    const previous = { ...scopedNativeExecution("warm-lease-pi"),
+      provider: { kind: "pi_rpc", model: "paperclip/faux", profile: QUALIFIED_PI_RPC_PROFILE },
+    } as unknown as NativeExecutionInput;
+    previous.session = { ...previous.session, driverKind: "pi_rpc", lifecyclePolicy: { mode: "warm", idleTimeoutMs: 28_800_000 } };
+    parseNativeExecutionInput(previous);
+    const identity = { runId: previous.binding.runId, normalizedSessionId: previous.session.normalizedSessionId!,
+      runnerInstanceId: "warm-pi-runner", environmentLeaseId: "original-lease", turnId: "previous-turn", itemId: "previous-item" };
+    const root = await initializeScopedRunnerRoot(previous, identity.runnerInstanceId, packRoot);
+    await writeRunnerAuthority(root, identity, "suspended");
+    const projections = vi.spyOn(controllerRecovery, "resolveNativeControllerRecovery").mockResolvedValue({ kind: "no_prior_execution" });
+    onTestFinished(() => projections.mockRestore());
+    let fullVerifications = 0, immutableAudits = 0;
+    let processBirth = "linux:abcd-1234:100";
+    const remoteExecute = vi.fn(async (request: { command: string; args?: string[] }) => {
+      const args = request.args ?? [], script = args[1] ?? "";
+      const result = (stdout = "", exitCode = 0) => ({ exitCode, timedOut: false, signal: null, stderr: "", stdout });
+      if (script.includes("paperclip-provider-pack-fingerprint-v1")) return result([
+        packRoot, "abcd-1234", "1000", "1:10:1:4096:0:41ed:1", "1:11:1:1024:0:81a4:1",
+        createHash("sha256").update(readFileSync(join(packRoot, "provider-pack.json"))).digest("hex"),
+        ...(args[4] ? ["nonce", "123", "2026-09-19T10:00:00.000Z", identity.runnerInstanceId, processBirth] : []),
+      ].join("\n") + "\n");
+      if (script.includes("paperclip-provider-pack-immutable-v1")) { immutableAudits++; return result("immutable\n"); }
+      if (args[0] === "-e") {
+        fullVerifications++;
+        // Execute the actual verifier against the simulated remote pack bytes.
+        return result(execFileSync(process.execPath, [args[0], args[1]!, packRoot, ...args.slice(3)], { encoding: "utf8" }));
+      }
+      if (args[0] === "--build-metadata") return result(JSON.stringify({
+        schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd",
+        packageName: "@paperclipai/paperclip-runner", binaryContractVersion: 2,
+        durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"],
+      }));
+      if (args[0] === "--version") return result(request.command.endsWith("/opencode") ? "1.18.34" : "codex-cli 0.160.0");
+      if (script.includes("base64")) return result(Buffer.from(JSON.stringify({ ...identity, lifecycle: "ready",
+        outbox: [], pendingTerminalDelivery: null })).toString("base64"));
+      if (script.includes("cat --")) return result(`nonce\n123\n2026-09-19T10:00:00.000Z\n${identity.runnerInstanceId}\n${processBirth}\n`);
+      return result();
+    });
+    const syncIn = vi.fn(async () => undefined);
+    const runnerArtifact = join(isolatedStateDirectory, "warm-pi-runnerd");
+    await writeFile(runnerArtifact, "fixture runner artifact");
+    for (const [turn, leaseId] of ["warm-turn-two-lease", "warm-turn-three-lease"].entries()) {
+      if (turn === 1 && change === "birth") processBirth = "linux:abcd-1234:200";
+      if (turn === 1 && change === "digest") {
+        manifest.payload.runnerSourceRevision = "b".repeat(40);
+        manifest.digest = `sha256:${createHash("sha256").update(canonicalProviderPackDigestJson(manifest.payload)).digest("hex")}`;
+        await writeFile(join(packRoot, "provider-pack.json"), JSON.stringify(manifest));
+      }
+      const boxId = turn === 1 && change === "allocation" ? "replacement-pi-box" : "warm-pi-box";
+      const current = { ...previous, binding: { ...previous.binding, runId: leaseId } };
+      const db = leaseDb(current), ordinarySelect = db.select.bind(db);
+      db.select = ((fields?: Record<string, unknown>) => fields?.status === heartbeatRuns.status && fields?.runnerProfileJson === heartbeatRuns.runnerProfileJson
+        ? priorNativeRunDb(previous).select(fields as never) : ordinarySelect(fields as never)) as Db["select"];
+      await createRunnerdBackend({ db, execution: current, runnerInstanceId: identity.runnerInstanceId,
+        runnerIngressAuthorized: true, runnerRemoteProviderPackPath: packRoot, runnerRemoteBinaryPath: runnerArtifact,
+        remoteWarmRecovery: { identity, reuseProcess: true, previousExecution: previous, checkpoint: {} as never,
+          remote: { providerLeaseId: boxId, remoteCwd: "/workspace" }, revalidate: async () => undefined },
+        runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace", environmentId: "warm-pi-env",
+          leaseId, providerKey: "boat", effectiveCapabilities: { runnerWebSocketIngress: true },
+          sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: boxId }, runner: { execute: remoteExecute, syncIn } } as never });
+      state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+      const options = state.createTransport.mock.calls.at(-1)![0] as RunnerTransportOptions & { prepareExternalRunnerState: () => Promise<void> };
+      await options.prepareExternalRunnerState();
+    }
+    expect(manifest.payload.nativeProviders.pi_rpc).toBeDefined();
+    const expectedVerifications = change === "same" ? 1 : 2;
+    expect(fullVerifications).toBe(expectedVerifications);
+    expect(immutableAudits).toBe(expectedVerifications);
+    console.log(JSON.stringify({ evidence: "warm-executor-pack-memo", change, turns: 2, fullVerifications, immutableAudits }));
+    expect(syncIn).not.toHaveBeenCalled();
+    expect(remoteExecute.mock.calls.some(([request]) => request.args?.includes("paperclip-runner-launch")
+      || request.args?.includes("paperclip-runner-claim-unstarted-session"))).toBe(false);
   });
 
   it.each(["verified", "no-proof", "dead", "stale"] as const)("reuses only verified idle warm process during actual remote preparation: %s", async mode => {

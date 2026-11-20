@@ -121,7 +121,7 @@ function compatibleInstallation<T extends ProviderPackIdentity>(
   return structuredClone(actual);
 }
 
-export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({ runner, cwd, packRoot, manifest, installation, provider, requireExactIdentity = false, requireCurrentOpenCodeProxy = false, acceptProvenance = false, memoScope, onMemoHit }: {
+export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({ runner, cwd, packRoot, manifest, installation, provider, requireExactIdentity = false, requireCurrentOpenCodeProxy = false, acceptProvenance = false, memoScope, runnerIdentityPath, onMemoHit }: {
   runner: CommandManagedRuntimeRunner;
   cwd: string;
   packRoot: string;
@@ -132,6 +132,7 @@ export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({
   requireCurrentOpenCodeProxy?: boolean;
   acceptProvenance?: boolean;
   memoScope?: string;
+  runnerIdentityPath?: string;
   onMemoHit?: (startedAtMs: number, endedAtMs: number) => Promise<void>;
 }): Promise<T> {
   const nativePi = manifest.payload.nativeProviders?.pi_rpc;
@@ -146,7 +147,7 @@ export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({
     return compatibleInstallation(installation, manifest, packRoot, provider, requireExactIdentity, requireCurrentOpenCodeProxy);
   }
   if (memoScope) {
-    return verifyWithRemoteProviderPackMemo({ runner, cwd, packRoot, scope: memoScope, onMemoHit,
+    return verifyWithRemoteProviderPackMemo({ runner, cwd, packRoot, scope: memoScope, runnerIdentityPath, onMemoHit,
       expectedIdentity: createHash("sha256").update(canonicalProviderPackJson({ manifest, provider,
         requireExactIdentity, requireCurrentOpenCodeProxy, acceptProvenance })).digest("hex") },
     resolvedRoot => verifyRemoteProviderPack({ runner, cwd, packRoot: resolvedRoot, manifest, provider,

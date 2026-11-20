@@ -16372,6 +16372,7 @@ export async function prepareRemoteProviderPackOnTarget(input: {
   trace?: NativeRunTrace;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => void | Promise<void>;
   acceptProvenanceDifferences?: boolean;
+  runnerIdentityPath?: string;
 }): Promise<{ root: string; manifest: RemoteProviderPackManifest; source: "staged" | "preinstalled" | "uploaded" }> {
   const remoteTarget = input.target, remoteCommandRunner = input.runner;
   const configuredProviderPackRoot = input.configuredProviderPackRoot;
@@ -16384,7 +16385,7 @@ export async function prepareRemoteProviderPackOnTarget(input: {
     verifyRemoteProviderPackIdentity({ runner: remoteCommandRunner,
       cwd: remoteTarget.remoteCwd, packRoot, manifest: expectedProviderPackManifest, provider: input.provider,
       acceptProvenance: acceptProvenance && input.acceptProvenanceDifferences === true,
-      memoScope: remoteProviderPackMemoScope(remoteTarget),
+      memoScope: remoteProviderPackMemoScope(remoteTarget), runnerIdentityPath: input.runnerIdentityPath,
       onMemoHit: async (startedAtMs, endedAtMs) => { await input.trace?.record({
         name: "provider_pack.verify_memo_hit", startedAtMs, endedAtMs,
       }); },
@@ -19261,6 +19262,7 @@ async function createRunnerdBackendWithinSessionClaim(
     await verifyRemoteProviderPackIdentity({ runner: remoteCommandRunner,
       cwd: remoteTarget.remoteCwd, packRoot, manifest: expectedProviderPackManifest, provider: packProvider,
       memoScope: remoteProviderPackMemoScope(remoteTarget),
+      runnerIdentityPath: remoteStateDirectory ? posix.join(remoteStateDirectory, "runner-process.identity") : undefined,
       onMemoHit: async (startedAtMs, endedAtMs) => { await input.trace?.record({
         name: "provider_pack.verify_memo_hit", startedAtMs, endedAtMs,
       }); },
@@ -19364,6 +19366,7 @@ async function createRunnerdBackendWithinSessionClaim(
       const prepared = await prepareRemoteProviderPackOnTarget({
         target: remoteTarget, runner: remoteCommandRunner, configuredProviderPackRoot,
         manifest: expectedProviderPackManifest, provider: packProvider, trace: input.trace, onLog: input.onLog,
+        runnerIdentityPath: remoteStateDirectory ? posix.join(remoteStateDirectory, "runner-process.identity") : undefined,
         signal: sourceSignals.length ? AbortSignal.any(sourceSignals) : undefined,
         acceptProvenanceDifferences: providerPackProvenanceReuseAllowed({ retainProviderPack, explicitProviderPackSelection,
           authoritySelectable: providerPackAuthority !== null }),

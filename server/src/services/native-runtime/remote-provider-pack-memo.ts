@@ -16,13 +16,19 @@ type RemoteTargetIdentity = {
 export function remoteProviderPackMemoScope(target: RemoteTargetIdentity): string | undefined {
   if (target.transport !== "sandbox" || !target.environmentId || !target.leaseId
     || !target.sandboxLeaseAcquisition?.providerLeaseId) return undefined;
-  return JSON.stringify([target.environmentId, target.providerKey ?? null, target.leaseId,
+  // A new controller lease row can name the same still-running allocation.
+  // Keep requiring current lease authority above, but cache immutable bytes by
+  // box identity; the per-use probe below still fences boot/root/manifest and
+  // live Runner birth changes. The expected identity also binds the pack digest.
+  return JSON.stringify([target.environmentId, target.providerKey ?? null,
     target.sandboxLeaseAcquisition.providerLeaseId]);
 }
 
 // One remote RPC, one stat invocation for the resolved root + manifest, and
 // a re-read of the small manifest (not the pack tree). Hashing its exact bytes
 // binds this probe to the manifest that passed the full canonical comparison.
+// Include the existing launch marker and check its Linux process generation:
+// the same allocation and runner instance ID can survive a Runner relaunch.
 const fingerprintScript = `# paperclip-provider-pack-fingerprint-v1
 set -eu
 root=$(/usr/bin/realpath -e -- "$1")
@@ -33,6 +39,27 @@ printf '%s\\n' "$root"
 /usr/bin/stat -L -c '%d:%i:%Y:%s:%u:%f:%Z:%y:%z' -- "$root" "$root/provider-pack.json"
 sum=$(/usr/bin/sha256sum -- "$root/provider-pack.json")
 printf '%s\\n' "\${sum%% *}"
+# Unknown/pre-launch generation never grants a memo receipt.
+test -n "$2"
+{
+  IFS= read -r nonce
+  IFS= read -r pid
+  IFS= read -r started
+  IFS= read -r runner
+  IFS= read -r birth
+  if IFS= read -r extra || test -n "\${extra:-}"; then exit 1; fi
+} < "$2"
+case "$pid" in ''|0|*[!0-9]*) exit 1 ;; esac
+stat=$(/bin/cat "/proc/$pid/stat")
+fields=\${stat##*) }
+set -f
+set -- $fields
+case "$1" in Z|X|x) exit 1 ;; esac
+shift 19
+ticks=$1
+boot=$(/bin/cat /proc/sys/kernel/random/boot_id)
+test "$birth" = "linux:$boot:$ticks"
+printf '%s\\n' "$nonce" "$pid" "$started" "$runner" "$birth"
 `;
 
 // The cheap root stat alone cannot prove that descendants are immutable.
@@ -71,16 +98,20 @@ function protectedStat(line: string, type: number): boolean {
   return (mode & 0o170000) === type && (mode & 0o022) === 0;
 }
 
-async function probePack(runner: CommandManagedRuntimeRunner, cwd: string, packRoot: string): Promise<Probe | null> {
+async function probePack(runner: CommandManagedRuntimeRunner, cwd: string, packRoot: string, runnerIdentityPath?: string): Promise<Probe | null> {
+  if (!runnerIdentityPath) return null;
   try {
-    const result = await runner.execute({ command: "/bin/sh", args: ["-c", fingerprintScript, "sh", packRoot],
+    const result = await runner.execute({ command: "/bin/sh", args: ["-c", fingerprintScript, "sh", packRoot, runnerIdentityPath],
       cwd, bypassSession: true, timeoutMs: 10_000 });
     if (result.exitCode !== 0 || result.timedOut || result.signal) return null;
     const lines = result.stdout.trimEnd().split("\n");
-    if (lines.length !== 6 || !lines[0].startsWith("/") || !/^[a-zA-Z0-9-]{1,128}$/.test(lines[1])
+    if (lines.length !== 11 || !lines[0].startsWith("/") || !/^[a-zA-Z0-9-]{1,128}$/.test(lines[1])
       || !/^\d+$/.test(lines[2]) || Number(lines[2]) === 0
       || !protectedStat(lines[3], 0o040000) || !protectedStat(lines[4], 0o100000)
-      || !/^[a-f0-9]{64}$/.test(lines[5])) return null;
+      || !/^[a-f0-9]{64}$/.test(lines[5]) || !lines[6] || !/^[1-9]\d*$/.test(lines[7])
+      || !Number.isFinite(Date.parse(lines[8])) || !lines[9]
+      || !/^linux:[0-9a-f-]+:[0-9]+$/.test(lines[10])
+      || !lines[10].startsWith(`linux:${lines[1]}:`)) return null;
     return { root: lines[0], fingerprint: result.stdout };
   } catch { return null; } // A failed optimization must fall back to the full verifier.
 }
@@ -90,12 +121,13 @@ export async function verifyWithRemoteProviderPackMemo<T>(input: {
   cwd: string;
   packRoot: string;
   scope?: string;
+  runnerIdentityPath?: string;
   expectedIdentity: string;
   onMemoHit?: (startedAtMs: number, endedAtMs: number) => Promise<void>;
 }, verify: (resolvedRoot: string) => Promise<T>): Promise<T> {
   if (!input.scope) return verify(input.packRoot);
   const startedAtMs = Date.now();
-  const probe = await probePack(input.runner, input.cwd, input.packRoot);
+  const probe = await probePack(input.runner, input.cwd, input.packRoot, input.runnerIdentityPath);
   if (!probe) {
     // A failed read must not leave an older success eligible for the next turn.
     for (const [key, entry] of verifiedPacks) if (entry.scope === input.scope) verifiedPacks.delete(key);
@@ -120,7 +152,7 @@ export async function verifyWithRemoteProviderPackMemo<T>(input: {
   // be retargeted during verification and poison another root's memo entry.
   const verified = await verify(probe.root); // Never cache an in-flight or failed verification.
   if (immutable) {
-    const after = await probePack(input.runner, input.cwd, input.packRoot);
+    const after = await probePack(input.runner, input.cwd, input.packRoot, input.runnerIdentityPath);
     if (after?.fingerprint === probe.fingerprint) {
       verifiedPacks.set(key, { scope: input.scope, fingerprint: probe.fingerprint, value: structuredClone(verified) });
       if (verifiedPacks.size > MAX_VERIFIED_PACKS) verifiedPacks.delete(verifiedPacks.keys().next().value!);

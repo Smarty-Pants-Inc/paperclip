@@ -467,12 +467,12 @@ describe("native Pi remote provider pack verification", () => {
 
 // Keep reason: trust boundary. Real verifier subprocesses read fixture bytes;
 // only root-owned OS metadata is simulated because the test user cannot chown.
-describe("lease-scoped remote provider pack verification memo", () => {
+describe("allocation-scoped remote provider pack verification memo", () => {
   async function memoFixture() {
     const fixture = await nativePiFixture();
     const state = { mode: "41ed", uid: 0, manifestMode: "81a4", manifestUid: 0, remoteUid: 1000,
-      inode: 10, boot: "boot-a", failProbe: false, immutable: true, resolvedRoot: fixture.root,
-      fullCalls: 0, probes: 0, audits: 0 };
+      inode: 10, boot: "abcd-1234", failProbe: false, immutable: true, resolvedRoot: fixture.root,
+      birth: "linux:abcd-1234:100", fullCalls: 0, probes: 0, audits: 0 };
     const execute = vi.fn(async (request: Parameters<CommandManagedRuntimeRunner["execute"]>[0]) => {
       const script = request.args?.[1] ?? "";
       const result = (stdout: string, exitCode = 0) => ({ stdout, stderr: "", exitCode, signal: null,
@@ -481,7 +481,8 @@ describe("lease-scoped remote provider pack verification memo", () => {
         state.probes++;
         if (state.failProbe) return result("", 1);
         return result([state.resolvedRoot, state.boot, String(state.remoteUid), `1:${state.inode}:1:4096:${state.uid}:${state.mode}:1`,
-          `1:11:1:1024:${state.manifestUid}:${state.manifestMode}:1`, sha(readFileSync(join(fixture.root, "provider-pack.json"), "utf8")).slice(7)].join("\n") + "\n");
+          `1:11:1:1024:${state.manifestUid}:${state.manifestMode}:1`, sha(readFileSync(join(fixture.root, "provider-pack.json"), "utf8")).slice(7),
+          ...(request.args?.[4] ? ["nonce", "123", "2026-09-19T10:00:00.000Z", "runner", state.birth] : [])].join("\n") + "\n");
       }
       if (script.includes("paperclip-provider-pack-immutable-v1")) {
         state.audits++;
@@ -492,7 +493,7 @@ describe("lease-scoped remote provider pack verification memo", () => {
     });
     const onMemoHit = vi.fn(async (_startedAt: number, _endedAt: number) => {});
     return { ...fixture, state, execute, onMemoHit,
-      input: { ...fixture.input, runner: { execute }, memoScope: randomUUID(), onMemoHit } };
+      input: { ...fixture.input, runner: { execute }, memoScope: randomUUID(), runnerIdentityPath: "/runtime/runner-process.identity", onMemoHit } };
   }
 
   it("does the first full verify, then only one cheap round trip on the same lease", async () => {
@@ -518,12 +519,34 @@ describe("lease-scoped remote provider pack verification memo", () => {
     } finally { await f.cleanup(); }
   });
 
-  it.each(["lease", "digest", "inode", "boot", "manifest-bytes", "provider"])("fully re-verifies a changed %s", async change => {
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21267
+  it("reuses the protected pack across fresh lease rows on the same warm allocation", async () => {
+    const f = await memoFixture();
+    const target = { transport: "sandbox", environmentId: randomUUID(), providerKey: "boat",
+      leaseId: "first-turn-lease", sandboxLeaseAcquisition: { providerLeaseId: "same-warm-box" } };
+    try {
+      const first = await verifyRemoteProviderPack({ ...f.input, memoScope: remoteProviderPackMemoScope(target) });
+      const second = await verifyRemoteProviderPack({ ...f.input,
+        memoScope: remoteProviderPackMemoScope({ ...target, leaseId: "second-turn-lease" }) });
+      expect(second).toEqual(first);
+      expect(f.state.fullCalls).toBe(2);
+      expect(f.state.audits).toBe(1);
+      expect(f.onMemoHit).toHaveBeenCalledOnce();
+      // A changed box must execute the full verifier even with identical bytes.
+      await verifyRemoteProviderPack({ ...f.input, memoScope: remoteProviderPackMemoScope({ ...target,
+        leaseId: "third-turn-lease", sandboxLeaseAcquisition: { providerLeaseId: "replacement-box" } }) });
+      expect(f.state.fullCalls).toBe(4);
+      expect(f.state.audits).toBe(2);
+    } finally { await f.cleanup(); }
+  });
+
+  it.each(["scope", "digest", "birth", "inode", "boot", "manifest-bytes", "provider"])("fully re-verifies a changed %s", async change => {
     const f = await memoFixture();
     try {
       await verifyRemoteProviderPack(f.input);
       const next = { ...f.input };
-      if (change === "lease") next.memoScope = randomUUID();
+      if (change === "scope") next.memoScope = randomUUID();
+      if (change === "birth") f.state.birth = "linux:abcd-1234:200";
       if (change === "digest") { f.pack.payload.runnerSourceRevision = "b".repeat(40); await f.seal(); }
       if (change === "inode") f.state.inode++;
       if (change === "boot") f.state.boot = "boot-b";
@@ -547,6 +570,20 @@ describe("lease-scoped remote provider pack verification memo", () => {
       if (failure === "failed-probe") f.state.failProbe = true;
       await verifyRemoteProviderPack(f.input);
       await verifyRemoteProviderPack(f.input);
+      expect(f.state.fullCalls).toBe(4);
+      expect(f.onMemoHit).not.toHaveBeenCalled();
+    } finally { await f.cleanup(); }
+  });
+
+  // Keep reason: missing runner generation must never grant a process-lifetime receipt.
+  it.each(["missing-path", "missing-birth", "malformed-birth"])("does not memoize an unknown runner generation: %s", async failure => {
+    const f = await memoFixture();
+    try {
+      const input = failure === "missing-path" ? { ...f.input, runnerIdentityPath: undefined } : f.input;
+      if (failure === "missing-birth") f.state.birth = "";
+      if (failure === "malformed-birth") f.state.birth = "same-runner-id-is-not-a-birth";
+      await verifyRemoteProviderPack(input);
+      await verifyRemoteProviderPack(input);
       expect(f.state.fullCalls).toBe(4);
       expect(f.onMemoHit).not.toHaveBeenCalled();
     } finally { await f.cleanup(); }
@@ -606,7 +643,8 @@ describe("lease-scoped remote provider pack verification memo", () => {
     };
     const onMemoHit = vi.fn(async () => {});
     try {
-      const input = { ...f.input, runner: { execute }, memoScope: randomUUID(), onMemoHit };
+      const input = { ...f.input, runner: { execute }, memoScope: randomUUID(),
+        runnerIdentityPath: join(f.root, "missing-runner-process.identity"), onMemoHit };
       await verifyRemoteProviderPack(input);
       await verifyRemoteProviderPack(input);
       expect(probeMs).toHaveLength(2);
@@ -616,13 +654,66 @@ describe("lease-scoped remote provider pack verification memo", () => {
     } finally { await f.cleanup(); }
   });
 
-  it("requires both the controller lease and physical allocation, scoped to the environment", () => {
+  // Keep reason: process-generation trust boundary; execute the unmodified
+  // shell probe against real /proc data, simulating only privileged pack metadata.
+  it.skipIf(process.platform !== "linux")("checks real Linux birth identity before reusing a protected pack", async () => {
+    const f = await nativePiFixture();
+    const marker = join(f.root, "runner-process.identity");
+    const boot = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    const ticks = (pid: number) => {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      return stat.slice(stat.lastIndexOf(") ") + 2).trim().split(/\s+/)[19];
+    };
+    const writeMarker = (pid: number, generation = ticks(pid)) => writeFile(marker,
+      `nonce\n${pid}\n2026-09-19T10:00:00.000Z\nrunner\nlinux:${boot}:${generation}\n`);
+    let fullVerifications = 0;
+    const execute: CommandManagedRuntimeRunner["execute"] = async request => {
+      if (request.args?.[1]?.includes("paperclip-provider-pack-immutable-v1")) return {
+        stdout: "immutable\n", stderr: "", exitCode: 0, signal: null, timedOut: false, pid: null, startedAt: new Date().toISOString() };
+      if (request.args?.[0] === "-e") fullVerifications++;
+      const result = await f.execute(request);
+      if (request.args?.[1]?.includes("paperclip-provider-pack-fingerprint-v1") && result.exitCode === 0) {
+        const lines = result.stdout.trimEnd().split("\n");
+        // Only ownership/permissions are simulated: real shell, manifest hash,
+        // launch marker and live process start ticks are not rewritten.
+        lines[2] = "1000";
+        lines[3] = "1:10:1:4096:0:41ed:1";
+        lines[4] = "1:11:1:1024:0:81a4:1";
+        return { ...result, stdout: lines.join("\n") + "\n" };
+      }
+      return result;
+    };
+    const onMemoHit = vi.fn(async () => {});
+    const input = { ...f.input, runner: { execute }, memoScope: randomUUID(), runnerIdentityPath: marker, onMemoHit };
+    try {
+      await writeMarker(process.pid);
+      await verifyRemoteProviderPack(input);
+      await verifyRemoteProviderPack(input);
+      expect(fullVerifications).toBe(1);
+      expect(onMemoHit).toHaveBeenCalledOnce();
+      await writeMarker(process.ppid);
+      await verifyRemoteProviderPack(input);
+      expect(fullVerifications).toBe(2);
+      // Well-shaped but false start ticks must not be accepted as a live birth.
+      await writeMarker(process.pid, "0");
+      await verifyRemoteProviderPack(input);
+      await verifyRemoteProviderPack(input);
+      expect(fullVerifications).toBe(4);
+      expect(onMemoHit).toHaveBeenCalledOnce();
+      await rm(marker);
+      await verifyRemoteProviderPack(input);
+      expect(fullVerifications).toBe(5);
+    } finally { await f.cleanup(); }
+  });
+
+  it("requires a current lease but keys the physical allocation, provider and environment", () => {
     const target = { transport: "sandbox", environmentId: "env-a", leaseId: "lease-a",
       sandboxLeaseAcquisition: { providerLeaseId: "allocation-a" } };
     const scope = remoteProviderPackMemoScope(target);
     expect(scope).toBeDefined();
     expect(remoteProviderPackMemoScope({ ...target })).toBe(scope);
-    for (const changed of [{ environmentId: "env-b" }, { leaseId: "lease-b" },
+    expect(remoteProviderPackMemoScope({ ...target, leaseId: "lease-b" })).toBe(scope);
+    for (const changed of [{ environmentId: "env-b" }, { providerKey: "boat" },
       { sandboxLeaseAcquisition: { providerLeaseId: "allocation-b" } }]) {
       expect(remoteProviderPackMemoScope({ ...target, ...changed })).not.toBe(scope);
     }
