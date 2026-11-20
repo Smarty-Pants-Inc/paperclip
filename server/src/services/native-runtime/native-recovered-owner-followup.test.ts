@@ -2071,6 +2071,61 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       : "not retired: restarted_sandbox_runner_generation_not_lost");
   }, 60_000);
 
+  // adopt-h1b journey (H1): Paul's Stop on a box whose Boat stop is blocked
+  // (the Runner's receipt never recorded: recoveryState "blocked", the box kept
+  // as pending_cleanup), then he sends M1 and M2. Real PG and the real executor
+  // admission (createRunnerdBackend); Boat offers M1's run the stopped box
+  // first. Base: M1 refused retained_sandbox_binding, the dead end every next
+  // message repeats. Now M1 leaves the stopped box with the typed
+  // replace-the-sandbox fallback and its fresh box reaches the provider turn
+  // (the run's tool authority) exactly once. M2, sent while M1's run owns the
+  // conversation, waits behind it (one run at a time), is never refused
+  // retained_sandbox_binding and is never answered twice or before M1.
+  it("Stop with Boat's stop blocked, then M1 and M2: M1 answered once on a fresh box, M2 waits behind it, never a repeated refusal", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "codex", lifecycle: "warm" });
+    // As the single-message row above: the wake's admission is built from the
+    // stopped run's checkpoint; the Stop's settled record is what the executor
+    // meets when the run starts.
+    const m1 = await admitFollowUp(prior);
+    // The box came back with the stopped Runner's process generation still
+    // running: nothing proves it gone (rf-11: base refuses only this shape).
+    await recordPriorLeaseOnSameSandbox(prior, m1, "live");
+    await db.update(environmentLeases).set({ status: "pending_cleanup" }).where(eq(environmentLeases.heartbeatRunId, prior.runId));
+    await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "cancelled", resultJson: { cancelledByActorType: "user",
+      cancelledByUserId: "board-user", executionCancellation: { state: "requested", requestedAt: new Date().toISOString() } } })
+      .where(eq(heartbeatRuns.id, prior.runId));
+    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", resultId: null, leaseOwner: null, leaseExpiresAt: null,
+      recoveryState: "blocked", failureCode: "native_continuation_requires_reconciliation" })
+      .where(eq(nativeRunFinalizations.runId, prior.runId));
+    await db.delete(nativeRunResults).where(eq(nativeRunResults.runId, prior.runId));
+    const journal: Array<{ message: string; box: "stopped" | "fresh"; outcome: string; providerTurns: number }> = [];
+    const step = async (message: string, box: "stopped" | "fresh", outcome: Promise<string>) =>
+      journal.push({ message, box, outcome: await outcome, providerTurns: toolDefinitions.mock.calls.length });
+    await step("M1", "stopped", m1.start("resumed", undefined, true));
+    await step("M1", "fresh", m1.start("created"));
+    // M2 arrives while M1's run still owns the conversation; Boat offers the
+    // stopped box again.
+    const m2 = await admitFollowUp(prior, true);
+    m2.remoteExecute.mockImplementation(m1.remoteExecute.getMockImplementation()!);
+    await db.update(environmentLeases).set({ providerLeaseId: m2.providerLeaseId }).where(eq(environmentLeases.heartbeatRunId, prior.runId));
+    await step("M2", "stopped", m2.start("resumed", undefined, true));
+    if (process.env.H1B_JOURNEY_PROBE) await writeFile(process.env.H1B_JOURNEY_PROBE, JSON.stringify(journal, null, 2));
+    // Never the dead end, for either message.
+    expect(journal.filter(entry => entry.outcome.includes("retained_sandbox_binding"))).toEqual([]);
+    // M1: the stopped box is left with the typed fallback, no Runner launched there.
+    expect(journal[0]!.outcome).toBe("The previous run's session on this sandbox could not be retired "
+      + "(runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=restarted_sandbox_owner_unproven).");
+    expect(findNativePredecessorRetirementUnproven(m1.failures[0])!.predecessorRunId).toBe(prior.runId);
+    expect(m1.remoteExecute.mock.calls.some(([request]) => JSON.stringify(request).includes("paperclip-runner-launch"))).toBe(false);
+    // M1 on its fresh box: answered, once.
+    expect(journal[1]).toEqual({ message: "M1", box: "fresh", outcome: ADMITTED, providerTurns: 1 });
+    // M2 waits behind M1's open run: not answered twice, not answered before M1.
+    expect(journal[2]).toEqual({ message: "M2", box: "stopped",
+      outcome: "native_controller_recovery_missing_evidence:newer_progress_barrier", providerTurns: 1 });
+    expect(m2.remoteExecute.mock.calls.some(([request]) => JSON.stringify(request).includes("paperclip-runner-launch"))).toBe(false);
+    expect(toolDefinitions).toHaveBeenCalledTimes(1);
+  }, 120_000);
+
   // RFL F1: Boat may resume the same machine with its programs running. The
   // restarted label alone never retires an owner whose process is still live.
   it("keeps a settled warm owner held on a restarted sandbox while its process generation is still live", async () => {
