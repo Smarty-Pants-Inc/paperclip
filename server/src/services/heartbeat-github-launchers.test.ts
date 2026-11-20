@@ -63,6 +63,25 @@ describe("heartbeat GitHub launcher lifetime", () => {
     expect(cleanupLaunchers).toHaveBeenCalledExactlyOnceWith({ runId: "failed-run", target });
   });
 
+  // Keep reason: remote command failures must abort the real heartbeat staging path.
+  it.each([
+    { native: false, failure: "path" }, { native: false, failure: "batch" },
+    { native: true, failure: "path" }, { native: true, failure: "batch" },
+  ])("fails closed through actual launcher prep (%j), retaining the original error if cleanup fails", async ({ native, failure }) => {
+    const execute = vi.fn<CommandManagedRuntimeRunner["execute"]>(async input => ({
+      exitCode: failure === "batch" && input.command === "sh" && !input.stdin && !input.args?.join(" ").includes("rm -rf --") ? 0 : 42,
+      stdout: "\0/usr/bin:/bin\0", stderr: "fixture remote staging failure", signal: null, timedOut: false,
+      pid: null, startedAt: new Date().toISOString(),
+    }));
+    await expect(prepareHeartbeatGitHubLaunchers({ native, githubConfigured: false, agentId: "agent",
+      runId: "failure-row", target: { ...target, runner: { execute } }, cwd: "/controller", env: {},
+      brokerUrl: "https://paperclip.invalid", createBrokerToken: () => "must-not-travel-to-the-box" }))
+      .rejects.toThrow(failure === "path" ? "Could not resolve remote PATH" : "stage GitHub operation launcher");
+    expect(execute.mock.calls.filter(([input]) => input.args?.join(" ").includes("rm -rf --"))).toHaveLength(native ? 0 : 1);
+    expect(execute).toHaveBeenCalledTimes((failure === "path" ? 1 : 2) + (native ? 0 : 1));
+    expect(JSON.stringify(execute.mock.calls)).not.toContain("must-not-travel-to-the-box");
+  });
+
   it("does not remove shared anonymous wrappers when staging a later run fails", async () => {
     const stagingError = new Error("remote launcher staging failed");
     const cleanupLaunchers = vi.fn(async () => undefined);
