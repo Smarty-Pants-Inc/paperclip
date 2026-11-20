@@ -825,6 +825,11 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
   const startedToolIds = new Set<string>();
   const toolSignatures = new Map<string, string>();
   const completedToolIds = new Set<string>();
+  // Latest output a still-running tool reported (tool.execution.progressed).
+  // Pi's partialResult is a cumulative snapshot, so the latest one is the
+  // whole output so far. It becomes the call's partial result when no
+  // tool.execution.completed follows (a Stop or disconnect).
+  const progressOutputById = new Map<string, { at: number; ts: string; toolName: string; content: string; outputTruncated: boolean }>();
   let accountingIncomplete = false;
   let additionalUsageUnknown = false;
   let usageSummary: {
@@ -1343,8 +1348,21 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
         });
         if (firstEmission) entries.push(...fileChangeDiffEntries(fileChanges, executionId, ts, `/agents/${encodeURIComponent(event.agentId)}/runs/${encodeURIComponent(event.runId)}`));
       }
+      if (event.eventType === "tool.execution.progressed" && !completedToolIds.has(executionId)) {
+        const output = text(payload.output);
+        if (output || payload.outputTruncated === true) {
+          progressOutputById.set(executionId, {
+            at: entries.length,
+            ts,
+            toolName: presentation.name,
+            content: output ?? "",
+            outputTruncated: payload.outputTruncated === true,
+          });
+        }
+      }
       if (event.eventType === "tool.execution.completed" && !completedToolIds.has(executionId)) {
         completedToolIds.add(executionId);
+        progressOutputById.delete(executionId);
         const output = text(payload.output);
         const content = output ?? (nativeToolItem
           ? serializedNativeToolResult(nativeToolItem)
@@ -1512,6 +1530,25 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
         sourceEventId: candidate.sourceEventId,
       };
     }
+  }
+
+  // A call whose output arrived but whose completion never did keeps that
+  // output as a partial (delta) result where it arrived; the adapter marks it
+  // interrupted once the run is terminal instead of claiming no output arrived.
+  const partials = [...progressOutputById]
+    .filter(([executionId]) => !completedToolIds.has(executionId))
+    .sort(([, a], [, b]) => b.at - a.at);
+  for (const [executionId, partial] of partials) {
+    entries.splice(partial.at, 0, {
+      kind: "tool_result",
+      ts: partial.ts,
+      toolUseId: executionId,
+      toolName: partial.toolName,
+      content: partial.content,
+      ...(partial.outputTruncated ? { outputTruncated: true } : {}),
+      isError: false,
+      delta: true,
+    });
   }
 
   if (usageSummary) {
