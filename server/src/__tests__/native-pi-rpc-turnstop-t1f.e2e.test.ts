@@ -22,7 +22,19 @@ import { respondToNativePiHello } from "./helpers/native-pi-hello-model.js";
 // Desired contract: after completed bash tools, real Stop ends the turn,
 // not the resident; new input retains tool history on the same live Pi.
 // This is not a sandbox/remote-target qualification and uses no paid model.
-const allocation = vi.hoisted(() => ({ drivers: undefined as import("../services/environment-runtime.js").EnvironmentRuntimeDriver[] | undefined }));
+const allocation = vi.hoisted(() => ({ drivers: undefined as import("../services/environment-runtime.js").EnvironmentRuntimeDriver[] | undefined,
+  hostIngressPort: undefined as number | undefined }));
+// The simulated allocations share this host's network namespace. Map their
+// guest ingress port to a unique host port, just as a real sandbox isolates
+// its fixed guest port. All authorization/transport planning still runs first.
+vi.mock("@paperclipai/adapter-utils/runner-connectivity", async importOriginal => {
+  const actual = await importOriginal<typeof import("@paperclipai/adapter-utils/runner-connectivity")>();
+  return { ...actual, resolvePaperclipRunnerTransport: async (input: Parameters<typeof actual.resolvePaperclipRunnerTransport>[0]) => {
+    const transport = await actual.resolvePaperclipRunnerTransport(input);
+    return transport.mode === "provider_ingress" && allocation.hostIngressPort
+      ? { ...transport, listenPort: allocation.hostIngressPort } : transport;
+  } };
+});
 vi.mock("../services/environment-runtime.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../services/environment-runtime.js")>();
   return { ...actual, environmentRuntimeService: (db: Parameters<typeof actual.environmentRuntimeService>[0], options: Parameters<typeof actual.environmentRuntimeService>[1]) => actual.environmentRuntimeService(db, { ...options, drivers: allocation.drivers ?? options?.drivers }) };
@@ -161,6 +173,13 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
     throw new Error(`Timed out at ${label}; wakeups=${JSON.stringify(wakeups)}`);
   };
   try {
+    const portProbe = createServer();
+    await new Promise<void>((resolve, reject) => { portProbe.once("error", reject); portProbe.listen(0, "127.0.0.1", resolve); });
+    const portAddress = portProbe.address();
+    if (!portAddress || typeof portAddress === "string") throw new Error("fixture ingress port missing");
+    allocation.hostIngressPort = portAddress.port;
+    await new Promise<void>(resolve => portProbe.close(() => resolve()));
+    stage("simulated allocation ingress port mapping", { guestPort: PAPERCLIP_RUNNER_INGRESS_PORT, hostPort: allocation.hostIngressPort });
     // Exercise the exact cold sandbox admission entry, not a copied verifier.
     // Only the command transport is local: runner.execute launches the real
     // pack-owned Node/OpenCode through the production child-process executor.
@@ -325,7 +344,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       const leaseId = ingressBindings.get(req.url ?? "");
       if (!leaseId || req.headers["x-spike-lease"] !== leaseId) { socket.end("HTTP/1.1 403 Forbidden\r\n\r\n"); return; }
       websocket.handleUpgrade(req, socket, head, front => {
-        const back = new WebSocket(`ws://127.0.0.1:${PAPERCLIP_RUNNER_INGRESS_PORT}${req.url}`, { perMessageDeflate: false });
+        const back = new WebSocket(`ws://127.0.0.1:${allocation.hostIngressPort}${req.url}`, { perMessageDeflate: false });
         const pending: Array<{ data: RawData; binary: boolean }> = [];
         sockets.add(front); sockets.add(back);
         front.on("message", (data, binary) => { if (back.readyState === WebSocket.OPEN) back.send(data, { binary }); else pending.push({ data, binary }); });
@@ -961,7 +980,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
     }
     for (const bundle of bundles) await bundle.transport.close().catch(error => console.error("Owned runner teardown", error));
     await app?.locals.paperclipShutdown?.();
-    allocation.drivers = undefined;
+    allocation.drivers = undefined; allocation.hostIngressPort = undefined;
     for (const socket of sockets) socket.terminate();
     if (preview?.listening) await new Promise<void>(done => preview!.close(() => done()));
     fixtureHttpsAgent?.destroy(); https.globalAgent = previousHttpsAgent; setDefaultCACertificates(previousCertificates);
