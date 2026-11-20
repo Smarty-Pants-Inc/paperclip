@@ -63,7 +63,12 @@ describe.skipIf(!support.supported)("native harness backup obligation selection"
   async function pages(statement: ReturnType<PgDialect["sqlToQuery"]>) {
     const all: unknown[][] = []; let cursor = ["", ""];
     for (;;) {
-      const rows = await db.$client.unsafe(statement.sql, cursor).values();
+      // Preserve non-cursor parameters (including the shared kind predicate).
+      const prefix = statement.params.slice(0, -2).map(value => {
+        if (typeof value !== "string") throw new Error("obligation_probe_non_string_parameter");
+        return value;
+      });
+      const rows = await db.$client.unsafe(statement.sql, [...prefix, ...cursor]).values();
       all.push(...rows);
       if (rows.length < 100) return all;
       cursor = [String(rows.at(-1)![1]), String(rows.at(-1)![2])];
