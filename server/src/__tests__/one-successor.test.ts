@@ -693,9 +693,11 @@ describeEmbeddedPostgres("person-message floor after Stop (RFL 19:05Z)", () => {
   });
 
   it("fp-cr-888: the continuation reader still returns M after unrelated revived work replied", async () => {
+    const start = performance.now();
     const f = await revivedOldWork();
+    const fixtureMs = performance.now() - start;
     const pending = await readContinuationCommentInput(db, { ...f, runId: f.second.id });
-    evidence("fp-cr-888", { m: f.m.id, pending });
+    evidence("fp-cr-888", { m: f.m.id, pending, fixtureMs, readerMs: performance.now() - start - fixtureMs });
     expect(pending).toMatchObject({ wakeCommentIds: [f.m.id], wakeCommentId: f.m.id, commentId: f.m.id });
     expect((await f.wakes()).map(w => w.id), "reading pending input does not auto-send it").toEqual(f.receiptIds);
   });

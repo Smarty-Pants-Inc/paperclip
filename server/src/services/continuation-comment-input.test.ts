@@ -36,7 +36,7 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
       queuedCommentSourceWakeIds: [wakeId], firstTurnQueuedInput: null, commentContinuation: true });
   });
 
-  it("carries the parent's comment ids as-is; a later reply does not erase them", async () => {
+  it("carries the parent's comment ids as-is; FAILED carrier partial reply does not discharge M (Half 1)", async () => {
     const f = await fixture();
     const [other] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, contextSnapshot: { issueId: f.issueId } }).returning();
     await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId,
@@ -52,7 +52,11 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
     expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id })).toMatchObject({ wakeCommentIds: [f.message.id] });
     await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId,
       createdByRunId: f.run.id, body: "COBALT" });
-    // RFL ruling (1), 20:06Z: the parent's OWN published reply answers the comment (carrying it would answer it twice).
+    // RULE-ANSWERED-MEANS-ANSWERED Half 1 wins over the old own-reply oracle:
+    // this carrier is FAILED. Its posted partial cannot discharge M.
+    expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id })).toMatchObject({ wakeCommentIds: [f.message.id] });
+    // The sibling success path still stops a continuation answering twice.
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.run.id));
     expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id })).toEqual({});
   });
 

@@ -1208,7 +1208,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   // Server-local HH:MM: the instance's time zone, not an assumed UTC zone.
   const since = `${String(message.createdAt.getHours()).padStart(2, "0")}:${String(message.createdAt.getMinutes()).padStart(2, "0")}`;
   // A consumed steer or a message left behind while unrelated work continued
-  // needs its own naming card. The later run is not evidence about this input.
+  // needs the started-run remedy. The later run is not evidence about this input.
   const readSteer = run && Object.hasOwn((run.contextSnapshot?.steeredDeliveryEventSeqs ?? {}) as object, message.id);
   const namedTerminal = Boolean(run && TERMINAL.includes(run.status) && (readSteer || (latest && latest.id !== run.id)));
   const quote = message.body.length > 60 ? `${message.body.slice(0, 59)}…` : message.body;
@@ -1220,16 +1220,19 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
         issueId: sql`${issue.id}::uuid`, requestedAt: sql`${agentWakeupRequests.requestedAt}`, payload: sql`${agentWakeupRequests.payload}` }))) : [];
   const namedNoRun = staleReceipts.some(wake => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id))
     ? named("It was not answered because no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.")
-    : UNANSWERED_MESSAGE_NO_RUN_TEXT;
+    : named(UNANSWERED_MESSAGE_NO_RUN_TEXT);
   const body = policyRefused ? PROVIDER_POLICY_REFUSAL_MESSAGE : settingUp ? `${pausedName} is still being set up (since ${since}). Your message is saved and will be answered as soon as it's ready.`
     : paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
     : supervisionUnconfirmed ? REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
-    : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? (namedTerminal ? named(UNANSWERED_MESSAGE_STARTED_NO_REPLY_TEXT)
-      : workingEnded ? UNANSWERED_MESSAGE_STARTED_NO_REPLY_TEXT : UNANSWERED_MESSAGE_NO_REPLY_TEXT)
+    // RFL naming rule: naming is independent of why this input is owed.
+    // Restoring a retired card must name the original M, even when its carrier
+    // is still the latest run and a follow-up was saved during card resolution.
+    : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? named(namedTerminal || workingEnded
+      ? UNANSWERED_MESSAGE_STARTED_NO_REPLY_TEXT : UNANSWERED_MESSAGE_NO_REPLY_TEXT)
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? namedNoRun
-      : held ? HELD_PREDECESSOR_NOTICE : namedTerminal ? named(UNANSWERED_MESSAGE_STARTED_FAILED_TEXT)
-        : workingEnded ? UNANSWERED_MESSAGE_STARTED_FAILED_TEXT : UNANSWERED_MESSAGE_TEXT;
+    : held ? HELD_PREDECESSOR_NOTICE
+    : named(namedTerminal || workingEnded ? UNANSWERED_MESSAGE_STARTED_FAILED_TEXT : UNANSWERED_MESSAGE_TEXT);
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
       title: policyRefused ? "The provider refused this request" : settingUp ? `${pausedName} is still being set up` : paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start" : "Your message wasn't answered",

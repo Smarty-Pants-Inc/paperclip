@@ -1862,6 +1862,12 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
       escalateStrandedRecoveryIssueInPlace: async () => { throw new Error("unexpected automatic recovery"); },
     } })({ companyId: c.companyId, runId, now: new Date(), ...(resumeStrandedQueue ? { resumeStrandedQueue: true } : {}) });
   }
+  // RFL naming rule: the note names the saved message (first words + time),
+  // not the clock of the sweep or the wake receipt. Applies to all 11 literals.
+  function messageName(message: { body: string; createdAt: Date }) {
+    const time = `${String(message.createdAt.getHours()).padStart(2, "0")}:${String(message.createdAt.getMinutes()).padStart(2, "0")}`;
+    return `Your message is saved: "${message.body}" (${time}).`;
+  }
   async function cards(c: Chat, id: string) {
     return db.select().from(issueComments).where(and(eq(issueComments.companyId, c.companyId),
       eq(issueComments.issueId, c.issueId), sql`${issueComments.metadata}->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX + id}`));
@@ -1911,7 +1917,7 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
     expect(immediate.map(rows => rows.length)).toEqual(held.map(() => 1));
     expect(latencyMs).toBeLessThanOrEqual(5000);
     for (const [index, notices] of immediate.entries()) {
-      expect(notices[0].body).toBe(`Your message is saved: "${held[index].body}". It was not answered because no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.`);
+      expect(notices[0].body).toBe(`${messageName(held[index])} It was not answered because no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.`);
       expect(notices[0].createdAt.getTime() - cancelled.finishedAt!.getTime()).toBeLessThanOrEqual(5000);
       expect(await noRunFor(held[index].id)).toEqual([]);
     }
@@ -1940,7 +1946,7 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
     console.log("mc-2 boot immediate", { latencyMs: Date.now() - started, cards: immediate.length });
     expect(immediate).toHaveLength(1);
     expect(Date.now() - started).toBeLessThanOrEqual(5000);
-    expect(immediate[0].body).toContain(`Your message is saved: "${old.body}".`);
+    expect(immediate[0].body).toContain(messageName(old));
     expect(await noRunFor(old.id)).toEqual([]);
     for (const minutes of [3, 10]) expect((await settleUnansweredPersonMessages(db, { companyId: c.companyId,
       issueId: c.issueId, now: new Date(started + minutes * 60_000) })).noticed).toBe(0);
@@ -1965,7 +1971,7 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
     const earlier = await settleUnansweredPersonMessages(db, { companyId: c.companyId, issueId: c.issueId });
     expect(earlier.noticed).toBe(1);
     const [before] = await cards(c, old.id);
-    expect(before.body).toContain(`Your message is saved: "${old.body}".`);
+    expect(before.body).toContain(messageName(old));
     await db.$client.end();
     db = createDb(tempDb.connectionString);
     vi.spyOn(serverInfo, "getServerProcessStartedAt").mockReturnValue(new Date().toISOString());
@@ -1980,7 +1986,10 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
     console.log("mc-4 pre-existing card retained across reconnect/boot/cancel/sweeps", before.id);
   });
 
-  it("mc-5: live custody may still answer the message, so release and sweeps write NO card", async () => {
+  // RFL 10:44Z wins over mc-5's old live-custody no-card oracle:
+  // old CHAT question -> ONE naming note; old bare TASK comment -> ZERO.
+  // This fixture is CHAT. Its existing live carrier can still answer it.
+  it("mc-5: old CHAT age-note priority wins over live custody: ONE naming card, retired by the actual answer", async () => {
     const { c, old, w, r } = await movedChat();
     const live = await run(c, [old.id], ago(30_000), "running");
     await db.update(heartbeatRuns).set({ finishedAt: null }).where(eq(heartbeatRuns.id, live.id));
@@ -1989,14 +1998,22 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
       .toBe("deferred_issue_execution");
     for (const minutes of [0, 3, 10]) await settleUnansweredPersonMessages(db, { companyId: c.companyId,
       issueId: c.issueId, now: new Date(Date.now() + minutes * 60_000) });
-    expect(await cards(c, old.id)).toEqual([]);
+    const [ageNote] = await cards(c, old.id);
+    expect(await cards(c, old.id)).toHaveLength(1);
+    expect(ageNote.body).toContain(messageName(old));
+    expect(ageNote.body).toContain("will not run automatically");
+    expect(ageNote.deletedAt).toBeNull();
+    expect(await noRunFor(old.id)).toEqual([{ id: live.id }]);
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, live.id)))[0].status).toBe("running");
     await reply(c, live.id, "The held request is answered now.");
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, live.id));
     await drain(c, live.id);
     await sweep(c);
-    expect(await cards(c, old.id)).toEqual([]);
-    console.log("mc-5 live custody then real published answer: cards", (await cards(c, old.id)).length);
+    const afterAnswer = await cards(c, old.id);
+    expect(afterAnswer).toHaveLength(1);
+    expect(afterAnswer[0].id).toBe(ageNote.id);
+    expect(afterAnswer[0].deletedAt).not.toBeNull();
+    console.log("mc-5 RFL 10:44Z: old CHAT naming note retired after real published answer", ageNote.id);
   });
 
   it("mc-6: a mixed cancelled wake cards ONLY its never-carried message, not carried/moved-past input", async () => {
@@ -2052,7 +2069,7 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
     console.log("sw-1 sweep cards", notices.length, notices.map(n => n.body));
     expect(notices).toHaveLength(1);
     expect(notices[0].body).toContain("will not run automatically"); // rule line 13 supersedes old retry advice
-    expect(notices[0].body).toContain(`Your message is saved: "${old.body}".`);
+    expect(notices[0].body).toContain(messageName(old));
   });
 
   it("sw-2: OLD was carried by a failed run; cancel with no re-send and NO late card", async () => {
@@ -2324,7 +2341,7 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
         expect(notices).toHaveLength(expectedCards);
         if (!carried) {
           expect(notices[0].body).toContain("no run started for it");
-          expect(notices[0].body).toContain(`Your message is saved: "${old.body}".`);
+          expect(notices[0].body).toContain(messageName(old));
         }
         expect(await noRunFor(old.id)).toHaveLength(carried ? 1 : 0);
       } else {
@@ -2395,7 +2412,7 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
         expect(notices).toHaveLength(expectedCards);
         if (!carried) {
           expect(notices[0].body).toContain("no run started for it");
-          expect(notices[0].body).toContain(`Your message is saved: "${old.body}".`);
+          expect(notices[0].body).toContain(messageName(old));
         }
         expect(await noRunFor(old.id)).toHaveLength(carried ? 1 : 0);
       } else {

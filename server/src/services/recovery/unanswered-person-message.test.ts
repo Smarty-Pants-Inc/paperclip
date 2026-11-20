@@ -153,6 +153,20 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     return { companyId, agentId, issueId, userId, message, run, reply, boardHold, sweep, visible, at, nativeSuccessor };
   }
 
+  // RFL naming rule: first words + time identify the SAME saved message.
+  // Keep the exact old remedy assertion after validating the persisted prefix.
+  async function noticeText(note: typeof issueComments.$inferSelect): Promise<string> {
+    const id = note.metadata?.authorizationReason?.slice("unanswered_message:".length);
+    expect(id).toBeTruthy();
+    const [message] = await db.select().from(issueComments).where(eq(issueComments.id, id!));
+    expect(message).toBeDefined();
+    const time = `${String(message!.createdAt.getHours()).padStart(2, "0")}:${String(message!.createdAt.getMinutes()).padStart(2, "0")}`;
+    const quote = message!.body.length > 60 ? `${message!.body.slice(0, 59)}…` : message!.body;
+    const prefix = `Your message is saved: "${quote}" (${time}). `;
+    expect(note.body.startsWith(prefix)).toBe(true);
+    return note.body.slice(prefix.length);
+  }
+
   const codeOf = (comment: { metadata: unknown }) => {
     const sections = ((comment.metadata as Record<string, unknown>)?.sections ?? []) as Array<{ rows: Array<{ label?: string; value?: string }> }>;
     return sections.flatMap(section => section.rows).find(row => row.label === "Failure code")?.value;
@@ -246,7 +260,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await f.notes()).toHaveLength(2);
     const visible = await f.visible();
     expect(visible).toHaveLength(1);
-    expect(visible[0]!.body).toBe(NOT_ANSWERED);
+    expect(await noticeText(visible[0]!)).toBe(NOT_ANSWERED);
     expect(codeOf(visible[0]!)).toBe("setup_failed");
     expect(visible[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${f.messageId}`);
     expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "noticed_before" });
@@ -312,7 +326,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed", code: "setup_failed" });
     const notes = await f.notes();
     expect(notes).toHaveLength(2);
-    expect(notes.find(note => note.id !== f.commentId)!.body).toBe(NOT_ANSWERED);
+    expect(await noticeText(notes.find(note => note.id !== f.commentId)!)).toBe(NOT_ANSWERED);
     expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "noticed_before" });
     expect(await f.notes()).toHaveLength(2);
   });
@@ -334,7 +348,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed", code: "setup_failed" });
     const notes = await f.visible();
     expect(notes).toHaveLength(1);
-    expect(notes[0]!.body).toBe(NOT_ANSWERED);
+    expect(await noticeText(notes[0]!)).toBe(NOT_ANSWERED);
     expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${messageId}`);
   });
 
@@ -344,7 +358,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   ])("one-note: a non-covering recovery notice cannot silence the message (%j)", async input => {
     const f = await setupFailureWithRetryNotice(input);
     expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed", code: "setup_failed" });
-    expect((await f.visible())[0]!.body).toBe(NOT_ANSWERED);
+    expect(await noticeText((await f.visible())[0]!)).toBe(NOT_ANSWERED);
   });
 
   it("one-note: an older Retry notice does not cover a new message and failed run", async () => {
@@ -377,11 +391,11 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       for (const f of ordinary) {
         const notices = await f.visible();
         expect(notices).toHaveLength(1);
-        expect(notices[0]!.body).toBe(NOT_ANSWERED);
+        expect(await noticeText(notices[0]!)).toBe(NOT_ANSWERED);
       }
       const heldNotices = await held.visible();
       expect(heldNotices).toHaveLength(1);
-      expect(heldNotices[0]!.body).toBe(NOT_ANSWERED);
+      expect(await noticeText(heldNotices[0]!)).toBe(NOT_ANSWERED);
       expect(heldNotices[0]!.presentation).toMatchObject({ title: "Your message wasn't answered" });
       expect(heldNotices[0]!.body).not.toContain("I'm stopping");
     }
@@ -400,7 +414,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await settleUnrecoverableExecutions(db);
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NOT_ANSWERED);
+    expect(await noticeText(notices[0]!)).toBe(NOT_ANSWERED);
     expect(notices[0]!.body).not.toMatch(/native_|runner_|backup_without/);
     expect(codeOf(notices[0]!)).toBe("runner_harness_state_mismatch");
     await f.sweep();
@@ -422,7 +436,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     // follow-Paperclip Cut B R8: an overdue retry can be explained without preempting its recovery owner.
     expect(await f.visible()).toHaveLength(1);
-    expect((await f.visible())[0].body).toBe(NOT_ANSWERED);
+    expect(await noticeText((await f.visible())[0])).toBe(NOT_ANSWERED);
     expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, id)))[0].phase)
       .toBe("retryable_failure");
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(1);
@@ -432,7 +446,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.boardHold("native_session_retry_exhausted", id);
     await settleUnrecoverableExecutions(db);
     expect(await f.visible()).toHaveLength(1);
-    expect((await f.visible())[0].body).toBe(NOT_ANSWERED);
+    expect(await noticeText((await f.visible())[0])).toBe(NOT_ANSWERED);
   });
 
   it("SMA-94 (live C8): adapter_failed 'Native session failed' under an ACTIVE board-owned native_continuation_requires_reconciliation hold -> exactly one notice", async () => {
@@ -442,7 +456,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NOT_ANSWERED);
+    expect(await noticeText(notices[0]!)).toBe(NOT_ANSWERED);
     expect(codeOf(notices[0]!)).toBe("adapter_failed");
     const rows = (notices[0]!.metadata?.sections ?? []).flatMap(section => section.rows) as Array<{ label?: string }>;
     expect(rows.some(row => row.label === "Recovery action")).toBe(true);
@@ -456,7 +470,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NOT_ANSWERED);
+    expect(await noticeText(notices[0]!)).toBe(NOT_ANSWERED);
     expect(notices[0]!.body).not.toContain("runnerd");
     expect(codeOf(notices[0]!)).toBe("native_session_retry_exhausted");
   });
@@ -473,7 +487,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(2);
-    expect(notices.map(notice => notice.body)).toContain(NO_RUN);
+    expect(await noticeText(notices.find(note => note.body.endsWith(NO_RUN))!)).toBe(NO_RUN);
   });
 
   it("SMAA-501 (RFL 20:37Z): a comment coalesced into a remote_cleanup execution wait whose wake FAILED -> exactly one notice, at the failure (no timer)", async () => {
@@ -495,7 +509,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issueId });
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NO_RUN);
+    expect(await noticeText(notices[0]!)).toBe(NO_RUN);
     expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${comment!.id}`);
     expect(JSON.stringify(notices[0])).not.toContain("receipt missing");
   });
@@ -510,7 +524,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issueId });
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NO_RUN);
+    expect(await noticeText(notices[0]!)).toBe(NO_RUN);
     expect(JSON.stringify(notices[0])).not.toContain("completion contract");
   });
 
@@ -520,7 +534,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NO_RUN);
+    expect(await noticeText(notices[0]!)).toBe(NO_RUN);
     expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
     expect(codeOf(notices[0]!)).toBe("no_run");
   });
@@ -531,7 +545,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NO_REPLY);
+    expect(await noticeText(notices[0]!)).toBe(NO_REPLY);
     expect(codeOf(notices[0]!)).toBe("no_reply");
   });
 
@@ -629,7 +643,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       error: "Something exploded at /srv/secret/path with token abc123" });
     await f.sweep();
     const [notice] = await f.visible();
-    expect(notice!.body).toBe(NOT_ANSWERED);
+    expect(await noticeText(notice!)).toBe(NOT_ANSWERED);
     expect(JSON.stringify(notice)).not.toMatch(/exploded|secret|abc123/);
     expect(codeOf(notice!)).toBe("adapter_failed");
     const unknown = await fixture();
@@ -682,7 +696,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId });
     const before = await f.visible();
     expect(before).toHaveLength(1);
-    expect(before[0]!.body).toBe(NOT_ANSWERED);
+    expect(await noticeText(before[0]!)).toBe(NOT_ANSWERED);
     const continuation = kind === "native-status" ? await f.nativeSuccessor(failed)
       : await f.run({ commentId: null, status: "succeeded", retryOfRunId: failed, wakeReason: "issue_continuation_needed" });
     await f.reply(continuation);
@@ -700,7 +714,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NO_RUN);
+    expect(await noticeText(notices[0]!)).toBe(NO_RUN);
   });
 
   it("fabric-v2 (21:40Z): a comment delivered as a run's FIRST-TURN input is carried by that run: no notice while it runs or after it answers; one if it fails", async () => {
@@ -730,7 +744,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         const notices = await f.visible();
         expect(notices).toHaveLength(1);
         expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
-        expect(notices[0]!.body).toBe(NOT_ANSWERED);
+        expect(await noticeText(notices[0]!)).toBe(NOT_ANSWERED);
       }
     }
   });
@@ -897,7 +911,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const notes = await f.visible();
     expect(notes).toHaveLength(1);
     expect(notes[0]!.id).toBe(waiting!.id);
-    expect(notes[0]!.body).toBe(NO_RUN);
+    expect(await noticeText(notes[0]!)).toBe(NO_RUN);
     expect(codeOf(notes[0]!)).toBe("no_run");
     await settleAt(f, PENDING_WAIT_START_BOUND_MS + 60_000);
     expect(await f.visible()).toHaveLength(1);
@@ -916,7 +930,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       await settleAt(f, PENDING_WAIT_BOUND_MS + 1_000);
       const notes = await f.visible();
       expect(notes).toHaveLength(1);
-      expect(notes[0]!.body).toBe(NO_RUN);
+      expect(await noticeText(notes[0]!)).toBe(NO_RUN);
     });
 
   it("waitnote guard: an unrelated deferred wait and a coalesced receipt alone do not silence a failed message", async () => {
@@ -929,14 +943,14 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
           executionWait: { reason: "remote_cleanup", message: "Waiting" } } });
     }
     await f.sweep();
-    expect((await f.visible()).map(note => note.body)).toEqual([NOT_ANSWERED]);
+    expect(await Promise.all((await f.visible()).map(noticeText))).toEqual([NOT_ANSWERED]);
   });
 
   it("waitnote guard: a failed run with no deferred wake still gets its resend notice", async () => {
     const f = await fixture();
     await f.run({ commentId: await f.message(), status: "failed", errorCode: "adapter_failed" });
     await f.sweep();
-    expect((await f.visible()).map(note => note.body)).toEqual([NOT_ANSWERED]);
+    expect(await Promise.all((await f.visible()).map(noticeText))).toEqual([NOT_ANSWERED]);
   });
 
   it("M1.1 (1): a queued wake carrying the issue that never runs -> no notice inside the bound, exactly one after it", async () => {
@@ -1053,7 +1067,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await settleAt(f, AFTER_WAKE_BOUND_MS);
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NO_REPLY);
+    expect(await noticeText(notices[0]!)).toBe(NO_REPLY);
   });
 
   it("M1.1 (6) control: the missing-comment retry posts the reply within the bound -> no notice", async () => {
@@ -1130,7 +1144,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     notices = await f.visible();
     expect(notices).toHaveLength(1);
     expect(notices[0]!.id).toBe(noteId);
-    expect(notices[0]!.body).toBe(NO_RUN);
+    expect(await noticeText(notices[0]!)).toBe(NO_RUN);
     expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
     expect(rowsOf(notices[0]!).some(row => row.label === "Waiting code")).toBe(false);
     await settleAt(f, 12 * 60_000);
@@ -1437,7 +1451,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       const [note] = await f.visible();
       expect((await f.visible()).map(n => n.body)).toEqual([WAITING]);
       await settleAt(f, 11 * 60_000);
-      expect((await f.visible()).map(n => ({ id: n.id, body: n.body }))).toEqual([{ id: note!.id, body: NO_RUN }]);
+      expect(await Promise.all((await f.visible()).map(async n => ({ id: n.id, body: await noticeText(n) })))).toEqual([{ id: note!.id, body: NO_RUN }]);
     });
 
   // pausefix 2 (rf-5 P1, org 10:32Z): after a Resume, the stale paused note
@@ -1513,7 +1527,15 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     if (state === "ready") await db.update(agents).set({ lifecycleState: "ready", status: "idle" }).where(eq(agents.id, f.agentId));
     await db.update(heartbeatRuns).set({ ...end, finishedAt: new Date(Date.now() - 60_000) }).where(eq(heartbeatRuns.id, run));
     await settleAt(f, 2 * 60_000);
-    expect(await one(f)).toEqual([{ id: pausedNote.id, body: text }]);
+    // RFL naming rule: after ready, the terminal unanswered notice names M;
+    // resuming still uses the separate standing lifecycle notice.
+    if (state === "ready") {
+      const notes = await f.visible();
+      expect(notes.map(note => note.id)).toEqual([pausedNote.id]);
+      expect(await noticeText(notes[0]!)).toBe(text);
+    } else {
+      expect(await one(f)).toEqual([{ id: pausedNote.id, body: text }]);
+    }
     expect(JSON.stringify(await f.visible())).not.toMatch(/working on|safe/i);
   });
 
@@ -1986,9 +2008,11 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   });
 
   // catch: round-2 card retirement; RFL's person resolution is NOT an agent answer.
-  it.each(["accept", "reject", "skip", "withdraw"] as const)(
-    "CARD-RETIREMENT: person %s restores the SAME naming note once, through real sweep and card writer", async decision => {
-      for (const [chat, fresh] of [[true, false], [false, false], [true, true], [false, true]]) {
+  // Each real shape has the unchanged 15-second bound, rather than charging
+  // four separate card-service journeys to one test's clock.
+  it.each((["accept", "reject", "skip", "withdraw"] as const).flatMap(decision =>
+    [true, false].flatMap(chat => [false, true].map(fresh => ({ decision, chat, fresh })))))(
+    "CARD-RETIREMENT: person $decision / chat=$chat / fresh=$fresh restores the SAME naming note once, through real sweep and card writer", async ({ decision, chat, fresh }) => {
         const f = await fixture({ chat, status: "in_progress" });
         const messageId = await f.message("Keep this exact obligation visible.", fresh ? 1_000 : -2 * 24 * 60 * 60_000);
         const visibleForMessage = async () => (await f.visible()).filter(note =>
@@ -1999,7 +2023,12 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         await f.sweep();
         const [original] = await f.visible();
         expect(original).toBeDefined();
-        if (!fresh) expect(original?.body).toContain("Keep this exact obligation visible.");
+        // RFL naming rule: every note names M by its first words + saved time,
+        // including fresh input and the same note when a person resolves a card.
+        const [message] = await db.select().from(issueComments).where(eq(issueComments.id, messageId));
+        const time = `${String(message!.createdAt.getHours()).padStart(2, "0")}:${String(message!.createdAt.getMinutes()).padStart(2, "0")}`;
+        const name = `Your message is saved: "${message!.body}" (${time}).`;
+        expect.soft(original?.body).toContain(name);
         const sourceRunId = await f.run({ commentId: messageId, status: "running" });
         const svc = issueThreadInteractionService(db);
         const scope = { id: f.issueId, companyId: f.companyId };
@@ -2030,7 +2059,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
           await f.sweep();
           expect(await visibleForMessage()).toMatchObject([{ id: original!.id,
             metadata: { authorizationReason: `unanswered_message:${messageId}` } }]);
-          if (!fresh) expect((await visibleForMessage())[0]!.body).toContain("Keep this exact obligation visible.");
+          expect.soft((await visibleForMessage())[0]!.body).toContain(name);
         }
         const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
           sql`${issueComments.metadata}->>'authorizationReason' = ${`unanswered_message:${messageId}`}`));
@@ -2039,7 +2068,6 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId))).toHaveLength(1);
         if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `card-retirement-${decision}-${chat}-${fresh}.json`),
           JSON.stringify({ messageId, original, retired, resolved, notes }, null, 2));
-      }
     });
 
   it.each(["wakeCommentId", "commentId", "conversationReplyBoundaryCommentId", "wakeCommentIds", "firstTurnQueuedInput"])(
@@ -2190,6 +2218,6 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       await f.sweep();
       const notices = await f.visible();
       expect(notices).toHaveLength(1);
-      expect(notices[0]!.body).toBe(NO_REPLY);
+      expect(await noticeText(notices[0]!)).toBe(NO_REPLY);
     });
 });
