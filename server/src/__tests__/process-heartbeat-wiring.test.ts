@@ -27,6 +27,8 @@ vi.mock("../services/heartbeat.js", () => ({
         return { cleared: 1, issueIds: [issueId], terminalizedRunIds: [] };
       },
       releaseIssueExecutionAndPromote: async () => { startPromoted("release"); return null; },
+      // cancelRun promotes the cancelled run's deferred successor.
+      cancelRun: async () => { startPromoted("cancel"); return null; },
     };
   },
 }));
@@ -35,6 +37,12 @@ import { heartbeatService } from "../services/heartbeat.js";
 import { clearProcessHeartbeat, registerProcessHeartbeat } from "../services/heartbeat-registry.js";
 import { settleIssueLock } from "../services/recovery/issue-lock-settlement.js";
 import { settleSteeringIngestion } from "../services/native-runtime/steering-ingestion.js";
+import { executeIssuePostCommitActions } from "../services/issues.js";
+import { logger } from "../middleware/logger.js";
+
+const warnSpy = vi.spyOn(logger, "warn");
+const registryMisses = () => warnSpy.mock.calls.filter(([obj]) =>
+  (obj as { event?: string } | undefined)?.event === "process_heartbeat_registry_miss");
 
 const pluginWorkerManager = { isRunning: () => true, call: vi.fn() };
 
@@ -54,7 +62,7 @@ function lockRecord() {
 }
 
 describe("promotion paths use the process's wired heartbeat (plugin sandbox provider)", () => {
-  afterEach(() => { started.length = 0; built.length = 0; });
+  afterEach(() => { started.length = 0; built.length = 0; warnSpy.mockClear(); });
 
   it("(i) settleIssueLock: the promoted wake passes environment setup on the registered process heartbeat", async () => {
     const db = standInDb();
@@ -66,6 +74,7 @@ describe("promotion paths use the process's wired heartbeat (plugin sandbox prov
     expect(built).toEqual([]); // no bare instance at all
     expect(started).toHaveLength(1);
     expect(started[0]).toMatchObject({ via: "settlement", setup: "passed" });
+    expect(registryMisses()).toEqual([]); // hit: no warn
     clearProcessHeartbeat(db);
   });
 
@@ -80,6 +89,7 @@ describe("promotion paths use the process's wired heartbeat (plugin sandbox prov
     console.info("row-iii", JSON.stringify({ started, bareInstancesBuilt: built.length }));
     expect(built).toEqual([]);
     expect(started).toEqual([expect.objectContaining({ via: "release", setup: "passed" })]);
+    expect(registryMisses()).toEqual([]); // hit: no warn
     clearProcessHeartbeat(db);
   });
 
@@ -90,5 +100,37 @@ describe("promotion paths use the process's wired heartbeat (plugin sandbox prov
     expect(outcome.settled).toBe(true);
     expect(built).toEqual([{ wired: false }]);
     expect(started[0]).toMatchObject({ via: "settlement", setup: UNAVAILABLE });
+    expect(registryMisses()).toEqual([]); // nothing registered: no warn
+  });
+
+  it("(v) a call with a DIFFERENT Db object (e.g. a tx handle) warns once per site and keeps the bare fallback", async () => {
+    const dbA = standInDb();
+    const dbB = standInDb(); // e.g. a tx handle or dedicated connection
+    registerProcessHeartbeat(dbA, heartbeatService(dbA as any, { pluginWorkerManager } as any) as any);
+    built.length = 0;
+    try {
+      const first = await settleIssueLock(dbB, lockRecord(), { now: new Date(), proof: {} as any });
+      const second = await settleIssueLock(dbB, lockRecord(), { now: new Date(), proof: {} as any });
+      console.info("row-v", JSON.stringify({ first, second, started, built, warns: registryMisses() }));
+      expect(first.settled && second.settled).toBe(true); // never throws
+      // Not substituted: a root-bound heartbeat would run outside the caller's tx.
+      expect(built).toEqual([{ wired: false }, { wired: false }]);
+      expect(registryMisses()).toHaveLength(1); // once per call site, not per call
+      expect(registryMisses()[0]![0]).toEqual({ event: "process_heartbeat_registry_miss", site: "issue-lock-settlement" });
+    } finally { clearProcessHeartbeat(dbA); }
+  });
+
+  it("(vii) cancelling a live run starts its successor on the registered process heartbeat", async () => {
+    const db = standInDb();
+    registerProcessHeartbeat(db, heartbeatService(db as any, { pluginWorkerManager } as any) as any);
+    built.length = 0;
+    try {
+      await executeIssuePostCommitActions(db, [{ type: "cancel_native_question_run",
+        runId: randomUUID(), issueId: randomUUID(), issueStatus: "done" }]);
+      console.info("row-vii", JSON.stringify({ started, built }));
+      expect(built).toEqual([]);
+      expect(started).toEqual([expect.objectContaining({ via: "cancel", setup: "passed" })]);
+      expect(registryMisses()).toEqual([]);
+    } finally { clearProcessHeartbeat(db); }
   });
 });

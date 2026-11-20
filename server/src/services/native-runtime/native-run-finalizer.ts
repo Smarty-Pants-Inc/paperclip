@@ -1560,7 +1560,7 @@ export async function finalizeNativeRun(input: Parameters<typeof finalizeNativeR
     // (rf-3 row 7). The deferred wake stays saved for the next drain.
     try {
       const { wiredHeartbeatFor } = await import("../heartbeat-registry.js");
-      await (await wiredHeartbeatFor(input.db)).releaseIssueExecutionAndPromote(
+      await (await wiredHeartbeatFor(input.db, "native-run-finalizer")).releaseIssueExecutionAndPromote(
         { id: input.runId, companyId: finalized.companyId }, { resumeStrandedQueue: true });
     } catch (err) {
       logger.warn({ err, runId: input.runId }, "Post-commit release drain failed; the deferred wake stays saved");

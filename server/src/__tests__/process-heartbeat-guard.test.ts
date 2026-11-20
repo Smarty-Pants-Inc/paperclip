@@ -7,18 +7,17 @@ import { describe, expect, it } from "vitest";
 // that can START a run fails environment setup on a plugin sandbox provider
 // ("sandbox plugin workers are unavailable in this server process"). Every
 // non-test server module must reach a run-starting heartbeat through
-// processHeartbeatFor(db) / wiredHeartbeatFor(db). Known callers that only
-// cancel or read are allow-listed by file, with the reason.
+// processHeartbeatFor(db) / wiredHeartbeatFor(db). Cancelling STARTS runs too
+// (cancelRun promotes the deferred successor and starts the agent's next queued
+// run; cancelBudgetScopeWork cancels through cancelRun), so only truly read-only
+// callers are allow-listed, and an allow-listed file that calls a run-starting
+// method fails the guard.
 const SRC = join(dirname(fileURLToPath(import.meta.url)), "..");
-const CANCEL_OR_READ_ONLY: Record<string, string> = {
+const READ_ONLY: Record<string, string> = {
   "services/heartbeat-registry.ts": "the registry's own fallback when nothing is registered (tests)",
-  "services/issues.ts": "heartbeat.cancelRun only",
   "routes/activity.ts": "heartbeat.getRunReadAccess only (read)",
-  "routes/prompt-injection-prevention.ts": "cancelBudgetScopeWork only",
-  "routes/fast-responses.ts": "cancelBudgetScopeWork only",
-  "routes/decision-models.ts": "cancelBudgetScopeWork only",
-  "routes/companies.ts": "cancelBudgetScopeWork only",
 };
+const RUN_STARTING = /\.(cancelRun|cancelBudgetScopeWork|releaseIssueExecutionAndPromote|wakeup|startNextQueuedRunForAgent)\b/;
 
 function sourceFiles(dir: string): string[] {
   return readdirSync(dir).flatMap(name => {
@@ -33,8 +32,15 @@ describe("process heartbeat guard", () => {
     const offenders: string[] = [];
     for (const file of sourceFiles(SRC)) {
       const rel = relative(SRC, file).replaceAll("\\", "/");
-      if (CANCEL_OR_READ_ONLY[rel]) continue;
       const lines = readFileSync(file, "utf8").split("\n");
+      if (READ_ONLY[rel]) {
+        lines.forEach((line, index) => {
+          if (!/^\s*(\/\/|\*)/.test(line) && RUN_STARTING.test(line)) {
+            offenders.push(`${rel}:${index + 1}: allow-listed as read-only but starts runs: ${line.trim()}`);
+          }
+        });
+        continue;
+      }
       lines.forEach((line, index) => {
         if (/^\s*(\/\/|\*)/.test(line)) return;
         if (/heartbeatService\(\s*[\w.$]+(\s+as\s+\w+)?\s*\)/.test(line) && !/processHeartbeatFor\(/.test(line)) {
