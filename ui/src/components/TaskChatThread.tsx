@@ -1791,8 +1791,16 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
     const settledReplyRunIds = new Set<string>();
     const sourceRunByItemId = new Map<string, string>();
     const commentsById = new Map(projectedComments.map(comment => [comment.id, comment]));
+    const boundAttachmentCommentIds = new Set(attachments.map(attachment => attachment.issueCommentId));
+    const visibleResponseCommentIds = new Set<string>();
     for (const { item } of orderedEntries) {
       if (item.kind !== "message" || item.author !== "agent") continue;
+      // Only an assembled response can own the final slot. Raw comments can
+      // instead be held, superseded, session markers, or payload-free bubbles.
+      // File/media-only responses still own their visible attachment payload.
+      if (!item.interstitial && !item.optimistic && (item.text.trim() || boundAttachmentCommentIds.has(item.id))) {
+        visibleResponseCommentIds.add(item.id);
+      }
       const comment = commentsById.get(item.id);
       const runId = comment?.createdByRunId ?? comment?.runId ?? comment?.derivedCreatedByRunId;
       if (runId) sourceRunByItemId.set(item.id, runId);
@@ -1933,14 +1941,14 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
               .reverse()
               .find(
                 (comment) =>
-                  !comment.deletedAt &&
+                  visibleResponseCommentIds.has(comment.id) &&
                   comment.runId === source.id &&
                   !progressCommentIds.has(comment.id),
               )?.id ?? null)
           : decidedCommentId !== null &&
               projectedComments.some(
                 (comment) =>
-                  !comment.deletedAt &&
+                  visibleResponseCommentIds.has(comment.id) &&
                   comment.runId === source.id &&
                   comment.id === decidedCommentId,
               )
@@ -2350,9 +2358,14 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
         };
         const runReasoningDisplay = resolveReasoningDisplay(reasoningPreferences, meta?.agentId, source.adapterType);
         const children = settledRunChildren(runHealth.rest, runReasoningDisplay);
-        // A compaction-only run is fully shown by its divider.
-        if (children.length === 0 && !finalResponse && (!sourceIsPaperclipRunner || compactionMarkers.length > 0)) {
-          if (compactionMarkers.length > 0) settledRunIds.add(source.id);
+        // Protocol-only segments (including answers owned by saved comments)
+        // have no separate identity to show. Health banners are real content;
+        // compaction dividers are already owned by the thread above.
+        if (children.length === 0 && !finalResponse && runHealth.failures.length === 0) {
+          // Native protocol-only turns are fully settled even without a body.
+          // Legacy tails may still own unclassified reply text until its saved
+          // comment arrives; preserve that existing handoff.
+          if (sourceIsPaperclipRunner || compactionMarkers.length > 0) settledRunIds.add(source.id);
           continue;
         }
         settledRunIds.add(source.id);
@@ -2560,6 +2573,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
     };
   }, [
     orderedEntries,
+    attachments,
     coordinatorEnabled,
     conversationWindowStart,
     decisionReceipts.receipts,

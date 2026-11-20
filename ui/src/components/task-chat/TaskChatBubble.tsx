@@ -232,6 +232,13 @@ function TaskChatBubbleContent({
     ...hydratedLinkedRefs.filter((ref) => !isImageAttachment(ref)),
     ...boundAttachmentRefs.filter((ref) => !isImageAttachment(ref)),
   ]);
+  // Decide after extracting/binding payloads: an attachment-only answer or
+  // attached activity must not disappear just because there is no prose.
+  if (!isHuman && !item.streaming && !item.optimistic && !bodyText.trim() &&
+      imageRefs.length === 0 && attachmentRefs.length === 0 &&
+      !item.verificationCaveats?.length && !item.chatMessage && !attachedTurn && !beforeTurn) {
+    return null;
+  }
   const mediaRefs = [...imageRefs, ...attachmentRefs.filter((ref) => isVideoLikeOutput(ref.contentType, ref.name))];
   const galleryItems: GalleryMediaItem[] =
     lightboxSrc !== null && !mediaRefs.some((ref) => ref.url === lightboxSrc)
