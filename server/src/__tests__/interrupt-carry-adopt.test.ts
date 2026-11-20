@@ -48,6 +48,10 @@ import { createPiEventProjector } from "../../../packages/paperclip-runner/src/d
 import { openPiSteeringPeer } from "./helpers/pi-steering-peer.js";
 import { PaperclipControlPlanePort } from "../services/native-runtime/paperclip-control-plane-port.js";
 import type { PrpEvent } from "../vendor/paperclip-runner/index.js";
+import { buildNativeModelEnvelope } from "../vendor/paperclip-runner/index.js";
+import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
+import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
+import { waitForPendingCommentSteers } from "../services/conversation-steering.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -584,6 +588,124 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
     await advanceThreeMinutes(chat);
     expect(await liveWakesNaming(chat, steerId)).toEqual([]);
   });
+
+  // ---- answered-b rows (Org 06:38Z (1)(b), 'ANSWERED MEANS ANSWERED') ----
+  // The production native entry: buildNativeExecutionInput (native-execution-input.ts, the wake rendered with
+  // resumedSession:false and the verified resume fact as sessionHoldsInterruptedTurn), then the runner's own
+  // buildNativeModelEnvelope, JSON-serialized exactly as native-session-runtime.ts session.startTurn submits it.
+  // An Interrupt successor never gets a continuationPrompt (native-continuation.ts: interruptedRunId), so
+  // this task.prompt is the turn the Pi session receives.
+  async function submittedSuccessorTurn(chat: Chat, run: typeof heartbeatRuns.$inferSelect, sameSession: boolean) {
+    const wakePayload = await buildPaperclipWakePayload({ db, companyId: chat.companyId, agentId: chat.agentId,
+      runId: run.id, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>) } });
+    const execution = buildNativeExecutionInput({
+      companyId: chat.companyId, runId: run.id, agentId: chat.agentId,
+      issue: { id: chat.issue.id, identifier: chat.issue.identifier ?? "CS-1", title: "Conversation", description: null, workMode: "standard" },
+      taskPrompt: "", wakePayload, conversationMode: true, resumedSession: sameSession,
+      workspace: { id: randomUUID(), cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
+      normalizedSessionId: sameSession ? "60000000-0000-4000-8000-000000000006" : null,
+      provider: "pi_rpc", model: "paperclip/gateway/model", piRpcThinkingLevel: "high",
+      completionContract: { id: randomUUID(), sha256: `sha256:${"a".repeat(64)}`, schemaVersion: "paperclip.run-result.v1",
+        contract: { revision: "1", objective: "Answer the person", criteria: [{ id: "answer", requirement: "Answer the person" }] } },
+      runtimeContext: nativeRuntimeContextFixture(),
+    });
+    const envelope = sameSession ? buildNativeModelEnvelope(execution, { resumedSession: true }) : buildNativeModelEnvelope(execution);
+    return JSON.stringify(envelope);
+  }
+
+  it("AB-R1 (answered-b red): READ steer + Interrupt + the successor in the SAME Pi session ⇒ the submitted turn omits STEER; the cut run records it read", async () => {
+    const chat = await seedChat();
+    const { steerId, cut, carry } = await steerThenInterrupt(chat, "read");
+    expect((cut.resultJson as any).interruptCarriedReadSteeredCommentIds, "the cut turn's record: Pi read STEER").toEqual([steerId]);
+    const successor = await admitSuccessor(chat, carry);
+    const submitted = await submittedSuccessorTurn(chat, successor, true);
+    expect(count(submitted, STEER), "STEER re-sent into the session that already read it = a second answer").toBe(0);
+    expect(count(submitted, MSG)).toBe(1);
+  });
+
+  it("AB-R2 (control): UNREAD steer + Interrupt + the SAME Pi session ⇒ STEER is in the submitted turn once", async () => {
+    const chat = await seedChat();
+    const { steerId, cut, carry } = await steerThenInterrupt(chat, "unread");
+    expect((cut.resultJson as any).interruptCarriedReadSteeredCommentIds ?? []).not.toContain(steerId);
+    const successor = await admitSuccessor(chat, carry);
+    const submitted = await submittedSuccessorTurn(chat, successor, true);
+    expect(count(submitted, STEER)).toBe(1);
+    expect(count(submitted, MSG)).toBe(1);
+  });
+
+  it("AB-R3 (control): READ steer + Interrupt + a FRESH session (no prior turns) ⇒ STEER is re-delivered once", async () => {
+    const chat = await seedChat();
+    const { carry } = await steerThenInterrupt(chat, "read");
+    const successor = await admitSuccessor(chat, carry);
+    const submitted = await submittedSuccessorTurn(chat, successor, false);
+    expect(count(submitted, STEER), "a fresh session never saw STEER").toBe(1);
+    expect(count(submitted, MSG)).toBe(1);
+  });
+
+  it("AB-R4 (writer): steer through the real route, the production Pi drivers/proxy/ingestion show Pi READ it, then Interrupt ⇒ the cut run records interruptCarriedReadSteeredCommentIds and the same-session successor omits it", async () => {
+    const chat = await seedChat(); await attachSteerable(chat);
+    const root = await mkdtemp(join(tmpdir(), "answered-b-pi-"));
+    const peer = await openPiSteeringPeer(root, chat.runId);
+    const events: PrpEvent[] = [];
+    let port: PaperclipControlPlanePort | undefined;
+    let pumpError: unknown;
+    const pump = (async () => {
+      for await (const event of peer.session.events()) {
+        port ??= new PaperclipControlPlanePort(db, { companyId: chat.companyId, issueId: chat.issue.id,
+          runId: chat.runId, agentId: chat.agentId, sessionId: event.normalizedSessionId,
+          completionContractId: randomUUID(), completionContractSha256: `sha256:${"a".repeat(64)}`,
+          sourceInstanceId: event.sourceInstanceId, controlPlaneSourceInstanceId: event.sourceInstanceId });
+        await port.appendEvent(event);
+        events.push(event);
+      }
+    })().catch(error => { pumpError = error; });
+    try {
+      const { turnId } = await peer.session.startTurn({ message: { role: "user", text: chat.first.body } });
+      await vi.waitFor(() => {
+        if (pumpError) throw pumpError;
+        expect(events.some(event => event.eventType === "tool.execution.started")).toBe(true);
+      });
+      mocks.probe.mockResolvedValue({ disposition: "available", activeTurnId: turnId });
+      mocks.steer.mockImplementation(async (input: { message: string; correlationId: string }) => {
+        await peer.session.steer!({ turnId, message: { role: "user", text: input.message }, correlationId: input.correlationId });
+        return { turnId };
+      });
+      const steered = (await postDefault(chat, STEER).expect(201)).body;
+      expect(steered.steeredIntoRunId).toBe(chat.runId);
+      await waitForPendingCommentSteers();
+      peer.releaseBoundary(false); // Pi reads STEER at the tool boundary, then runs another tool (no text)
+      await vi.waitFor(async () => {
+        if (pumpError) throw pumpError;
+        const comments = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/comments`).expect(200);
+        expect(comments.body.find((comment: any) => comment.id === steered.id)).toMatchObject({ steeringStatus: "delivered" });
+      }, { timeout: 5000 });
+      expect(await answered(steered.id)).toBe(false);
+      mocks.cancel.mockImplementationOnce(async (runId: string) => {
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        await db.update(heartbeatRuns).set({ resultJson: { ...(run!.resultJson ?? {}), nativeCancellation: {
+          schema: "paperclip.native-cancellation.v1", runId, companyId: chat.companyId, issueId: chat.issue.id,
+          scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
+          intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID(),
+        } } }).where(eq(heartbeatRuns.id, runId));
+        return { decision: { stopped: true }, auditId: randomUUID() };
+      });
+      await postDefault(chat, MSG, { deliveryIntent: "interrupt" }).expect(201);
+      const [cut] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+      expect((cut!.resultJson as any).interruptCarriedReadSteeredCommentIds, "the writer: Pi's real read, recorded at the Interrupt").toEqual([steered.id]);
+      const carries = await carryWakes(chat);
+      expect(carries).toHaveLength(1);
+      const successor = await admitSuccessor(chat, carries[0]!);
+      const submitted = await submittedSuccessorTurn(chat, successor, true);
+      expect(count(submitted, STEER), "one answer: the same session already holds STEER").toBe(0);
+      expect(count(submitted, MSG)).toBe(1);
+      if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, "AB-R4-pi-peer.json"), JSON.stringify({
+        fixture: "real routes + production Pi/Codex-facade drivers + proxy + PaperclipControlPlanePort ingestion; Pi RPC peer controlled",
+        steerId: steered.id, cutResult: cut!.resultJson, commands: peer.commands, events, submitted: JSON.parse(submitted) }, null, 2));
+    } finally {
+      await peer.close(); await pump;
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   /** The cut turn's tool calls, as run-event ingestion stores them (validated PRP tool.execution.started /
    * tool.execution.completed). `midFlight`: started, cut before any completed receipt. */
