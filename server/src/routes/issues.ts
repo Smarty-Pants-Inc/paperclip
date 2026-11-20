@@ -62,7 +62,7 @@ import { reconstructNativeWorkspace, unreconciledNativeExportPredicate } from ".
 import { reconstructWorkspaceSchema } from "@paperclipai/shared";
 import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractionResponse, type QueuedInteractionResponse } from "../services/queued-interaction-response.js";
 import { deliverConversationComments, heldConversationComments, isConversation, isConversationReset } from "../services/agent-conversations.js";
-import { withCarriedSteerDisplay as withSteeredCommentDisplay } from "../services/carried-steer.js";
+import { withCarriedSteerDisplay as withSteeredCommentDisplay, unprovenSteerComments } from "../services/carried-steer.js";
 import { trySteerPersonComment } from "../services/conversation-steering.js";
 import { assertOnboardingFirstTaskDependenciesAllowed } from "../services/onboarding-first-task-admission.js";
 import { resolveChatTaskAssignment } from "../services/chat-task-assignment.js";
@@ -18113,9 +18113,17 @@ export function issueRoutes(
       activeRun: await resolveActiveIssueRun(issue, { queueStateOnly: true }),
       actor,
     });
-    // A chat message held by the agent's daily limit has no wake receipt yet:
-    // show it as saved and waiting, with the reason, instead of as sent.
-    const held = await heldConversationComments(db, issue);
+    // Unproven steering custody, like a daily-limit hold, has no wake receipt
+    // yet. Show it read-only without creating a second delivery owner.
+    const unproven = await unprovenSteerComments(db, issue);
+    const limitHeld = await heldConversationComments(db, issue);
+    const held = limitHeld || (unproven.length ? { comments: unproven, hold: {
+      reason: "steering_outcome_unknown", message: "Waiting for delivery to the current work session.",
+    } } : null);
+    if (limitHeld) {
+      const known = new Set(limitHeld.comments.map(comment => comment.id));
+      limitHeld.comments.push(...unproven.filter(comment => !known.has(comment.id)));
+    }
     if (held && (queue.state !== null || queue.entries.length > 0)) {
       // Earlier queued work keeps its controls; held messages join it read-only.
       const queuedIds = new Set(queue.entries.map(entry => entry.comment.id));

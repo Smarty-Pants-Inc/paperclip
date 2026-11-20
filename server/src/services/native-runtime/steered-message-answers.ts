@@ -155,7 +155,7 @@ export async function readSteeredMessageAnswers(db: Db, input: { companyId: stri
     or(
       sql`${heartbeatRunEvents.eventType} in ('turn.completed', 'turn.cancelled', 'turn.failed')`,
       and(eq(heartbeatRunEvents.eventType, "item.completed"), sql`${kind} in ('steering_acknowledgement', 'agentMessage')`),
-      and(eq(heartbeatRunEvents.eventType, "item.started"), sql`${kind} in ('userMessage', 'agentMessage')`),
+      and(eq(heartbeatRunEvents.eventType, "item.started"), sql`${kind} in ('userMessage', 'agentMessage', 'tool_use', 'commandExecution')`),
     ),
   )).orderBy(asc(heartbeatRunEvents.seq));
   // A real Pi can read and answer M before the RPC ACK returns (or after its
@@ -181,6 +181,22 @@ export async function readSteeredMessageAnswers(db: Db, input: { companyId: stri
       itemId: `${ack.turnId}:steer:${id}`, turnId: ack.turnId, reservation: true });
   }
   const evidence = steeredMessageAnswers([...rows.map((row) => ({ ...row, seq: Number(row.seq) })), ...reservations]);
+  // Pending custody is not a Pi acknowledgement. A read may pair that custody
+  // for delivery, but cannot attribute an unrelated final after Pi returned to
+  // tools. Only an immediate text response can discharge a receipt-less steer;
+  // otherwise leave it owed for the existing run-end restoration. Real ACKs
+  // keep the normal answer rule, and delivery proof is retained either way.
+  for (const reservation of reservations) {
+    const id = STEER_ITEM.exec(reservation.itemId ?? "")?.[1];
+    if (!id || !evidence.answered.includes(id)) continue;
+    const read = evidence.deliveredEventSeqs[id];
+    const tool = rows.find(row => Number(row.seq) > read && row.eventType === "item.started"
+      && (row.kind === "tool_use" || row.kind === "commandExecution"));
+    if (!tool) continue;
+    const beforeTool = steeredMessageAnswers([...rows.filter(row => Number(row.seq) < Number(tool.seq))
+      .map(row => ({ ...row, seq: Number(row.seq) })), reservation]);
+    if (!beforeTool.answered.includes(id)) evidence.answered = evidence.answered.filter(answeredId => answeredId !== id);
+  }
   const times = new Map(rows.map(row => [Number(row.seq), row.createdAt.toISOString()]));
   return { ...evidence, deliveredAts: Object.fromEntries(Object.entries(evidence.deliveredEventSeqs)
     .map(([id, seq]) => [id, times.get(seq)]).filter((entry): entry is [string, string] => typeof entry[1] === "string")) };

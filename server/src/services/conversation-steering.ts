@@ -165,7 +165,26 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
       if (!(error instanceof NativeSessionSteeringError) || ![
         "steering_rejected", "steering_stale_turn",
         "steering_unsupported", "steering_temporarily_unavailable",
-      ].includes(error.code)) return;
+      ].includes(error.code)) {
+        // A failed receipt proves neither refusal nor delivery. Preserve custody
+        // for run-end restoration, but publish the uncertainty for both reads.
+        await db.transaction(async tx => {
+          const [current] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)).for("no key update");
+          if (!current) return;
+          const result = object(current.resultJson), acks = object(result.queuedSteeringAcknowledgements);
+          if (object(acks[comment.id]).status !== "pending") return;
+          await tx.update(heartbeatRuns).set({ resultJson: { ...result, queuedSteeringAcknowledgements: {
+            ...acks, [comment.id]: { ...object(acks[comment.id]), steeringUnavailableReason: "steering_outcome_unknown" },
+          } } }).where(eq(heartbeatRuns.id, run.id));
+        });
+        publishLiveEvent({ companyId: issue.companyId, type: "activity.logged", payload: {
+          action: "issue.comment_added", entityType: "issue", entityId: issue.id,
+          actorType: "system", actorId: "conversation-steering", responsibleUserId: comment.authorUserId,
+          details: { commentId: comment.id, source: "steering.receipt_unknown", deliveryOutcome: "queued",
+            steeringUnavailableReason: "steering_outcome_unknown" },
+        } });
+        return;
+      }
       if (!options.onRejected) return; // fail closed: still owed at run end
       if (identity) await rejectSteeredIdentity(db, identity);
       const steeringUnavailableReason = error instanceof NativeSessionSteeringError ? error.code : "steering_error";
@@ -286,12 +305,14 @@ export async function withSteeredCommentDisplay<T extends { id: string; issueId:
       ?? object(run.resultJson?.queuedSteeringAcknowledgements)[comment.id]))
       .find(ack => ack.status === "rejected" && typeof ack.steeringUnavailableReason === "string");
     const deliveredAt = object(run?.contextSnapshot?.steeredDeliveredAts)[comment.id];
+    const unproven = run && ack.steeringUnavailableReason === "steering_outcome_unknown" && typeof seq !== "number"
+      && !ids(run.contextSnapshot?.answeredSteeredCommentIds).includes(comment.id);
     return { ...comment, steeredIntoRunId: run?.id ?? null, steeredAt: typeof ack.acknowledgedAt === "string" ? ack.acknowledgedAt : null,
-      steeringStatus: run ? typeof seq === "number" ? "delivered" : "accepted" : null,
+      steeringStatus: unproven ? null : run ? typeof seq === "number" ? "delivered" : "accepted" : null,
       steeringDeliveryEventSeq: typeof seq === "number" ? seq : null,
       steerDeliveredAt: typeof deliveredAt === "string" ? deliveredAt : null,
-      deliveryOutcome: run ? "steered" : waiting.has(comment.id) ? "queued" : "ordinary",
-      steeringUnavailableReason: !run && waiting.has(comment.id) && intents.get(comment.id) === "steer"
+      deliveryOutcome: unproven ? "queued" : run ? "steered" : waiting.has(comment.id) ? "queued" : "ordinary",
+      steeringUnavailableReason: unproven ? "steering_outcome_unknown" : !run && waiting.has(comment.id) && intents.get(comment.id) === "steer"
         ? typeof refused?.steeringUnavailableReason === "string" ? refused.steeringUnavailableReason : unavailable : null };
   });
 }

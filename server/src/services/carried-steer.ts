@@ -1,5 +1,6 @@
 import { and, asc, desc, eq, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
-import { heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
+import { heartbeatRunEvents, heartbeatRuns, issueComments, type Db } from "@paperclipai/db";
+import { answeredPersonMessageIds } from "./person-message-answer.js";
 import { withSteeredCommentDisplay, type SteeredCommentDisplay } from "./conversation-steering.js";
 
 export { PAPERCLIP_RECEIVED_MID_TASK_LABEL } from "@paperclipai/adapter-utils/server-utils";
@@ -90,6 +91,25 @@ export async function withCarriedSteerDisplay<T extends { id: string; issueId: s
     }
     return { ...comment, carriedIntoRunId: null };
   });
+}
+
+/** Receipt-less custody has no wake yet. Expose its unproven inputs in the
+ * existing deferred queue, read-only; a Pi read or the ONE answer reader removes
+ * them. This projection never creates a second delivery owner. */
+export async function unprovenSteerComments(db: Db, issue: { id: string; companyId: string }) {
+  const runs = await db.select({ context: heartbeatRuns.contextSnapshot, result: heartbeatRuns.resultJson })
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.status, "running"),
+      or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`)));
+  const pending = [...new Set(runs.flatMap(run => ids(run.context?.steeredCommentIds).filter(id =>
+    object(object(run.result?.queuedSteeringAcknowledgements)[id]).steeringUnavailableReason === "steering_outcome_unknown"
+    && typeof object(run.context?.steeredDeliveryEventSeqs)[id] !== "number")))];
+  if (!pending.length) return [];
+  const answered = await answeredPersonMessageIds(db, { companyId: issue.companyId, issueId: issue.id, commentIds: pending });
+  const waiting = pending.filter(id => !answered.has(id));
+  if (!waiting.length) return [];
+  return db.select().from(issueComments).where(and(eq(issueComments.companyId, issue.companyId),
+    eq(issueComments.issueId, issue.id), inArray(issueComments.id, waiting), sql`${issueComments.deletedAt} is null`))
+    .orderBy(asc(issueComments.createdAt), asc(issueComments.id));
 }
 
 export async function carriedSteerCommentIds(db: Pick<Db, "select">, input: {
