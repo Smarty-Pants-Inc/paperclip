@@ -17785,6 +17785,82 @@ describe("native session bounded recovery", () => {
     }
   });
 
+  // adopt-idlecp (gate 2, runs 1f18e65b / 7cde1ebf): a managed-GitHub agent's
+  // per-run GitHub preparation runs before the Pi handle is published. A board
+  // Stop that lands while it is in flight is acknowledged against the handle at
+  // publication (beforeProviderTurn), the executor throws from onSession, the
+  // runtime closes the attached Pi, and retainCancelledSession never runs: the
+  // stopped run carries no nativeRetainedIdleCheckpoint, so the next turn
+  // cannot adopt the kept box. This pins that exact signature.
+  it("board Stop during in-flight GitHub preparation: acknowledged before the provider turn, no retention probe, no idle receipt", async () => {
+    const probe = vi.spyOn(runEventWriter, "appendHeartbeatRunEvent").mockResolvedValue({} as never);
+    const name = "pi-board-stop-github-prep";
+    const current = { ...execution, provider: { kind: "pi_rpc", model: "provider/model" },
+      binding: { ...execution.binding, runId: name, executionWorkspaceId: name },
+      session: { ...execution.session, driverKind: "pi_rpc", normalizedSessionId: randomUUID(),
+        lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } },
+    } as NativeExecutionInputV1;
+    const persistence = cancellationDb({ runId: name, resultJson: { cancelledByActorType: "user", cancelledByUserId: "board" } });
+    // The executor reads the same run row the Stop acknowledges.
+    const live = () => persistence.getResultJson();
+    const runResultJson = new Proxy({} as Record<string, unknown>, {
+      get: (_target, key) => live()[key as string],
+      has: (_target, key) => key in live(),
+      ownKeys: () => Reflect.ownKeys(live()),
+      getOwnPropertyDescriptor: (_target, key) => key in live()
+        ? { enumerable: true, configurable: true, writable: true, value: live()[key as string] } : undefined,
+    });
+    const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+    const close = vi.fn(async () => {});
+    const cancel = vi.fn(() => ({ cleanup: Promise.resolve() }));
+    const session = { close, cancel, snapshot: vi.fn(async () => ({ identity: { ...current.binding,
+      sessionId: current.session.normalizedSessionId }, activeTurnId: null, pendingRuntimeRequests: [] })) };
+    let githubStarted!: () => void, finishGitHub!: () => void;
+    const githubInFlight = new Promise<void>(resolve => { githubStarted = resolve; });
+    const githubDone = new Promise<void>(resolve => { finishGitHub = resolve; });
+    let providerTurnSubmitted = false;
+    let retentionCalled = false;
+    state.execute.mockReset().mockImplementationOnce(async options => {
+      try { await options.onSession(session); } catch (error) {
+        // The sealed runtime's execution finally closes a session whose
+        // onSession publication failed (native-session-runtime.ts:3764).
+        await session.close(); throw error;
+      }
+      providerTurnSubmitted = true;
+      retentionCalled = await options.retainCancelledSession?.({ session, signal: new AbortController().signal,
+        terminalEvent: {} as PrpEvent }) !== undefined;
+      throw new Error("native_finalization_missing: session returned no semantic result");
+    });
+    const running = executePaperclipNativeSession({ db: leaseDb(current, {}, runResultJson, updates), execution: current,
+      runnerInstanceId: name, prepareGitHubEnvironment: async () => { githubStarted(); await githubDone; return { GH_PREPARED: "1" }; },
+    }).catch(error => error);
+    try {
+      await Promise.race([githubInFlight, running.then(error => { throw error; })]);
+      const stopping = cancelNativeSession(name, "Board Stop", { db: persistence.db, scope: "run" });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      finishGitHub();
+      await expect(stopping).resolves.toMatchObject({ dispatched: true });
+      const outcome = await running;
+      if (!(outcome instanceof NativeCancellationPendingRecoveryError)) throw outcome;
+      expect(persistence.getResultJson().nativeCancellation).toMatchObject({ dispatchState: "acknowledged",
+        dispatched: true, beforeProviderTurn: true });
+      expect(providerTurnSubmitted).toBe(false);
+      expect(retentionCalled).toBe(false);
+      // The attached Pi is closed (runtime finally + failed warm release).
+      expect(close).toHaveBeenCalled();
+      expect(updates.some(update => update.table === nativeRunFinalizations
+        && update.values.failureCode === "native_retry_cancelled")).toBe(true);
+      for (let phase = 0; phase < 5; phase++) await new Promise<void>(resolve => setImmediate(resolve));
+      expect(probe.mock.calls.filter(([, event]) => event.eventType === "native.warm_retention.probe"
+        && event.payload?.phase === "retention")).toHaveLength(0);
+      const { inspect } = await import("node:util");
+      expect(updates.some(update => update.table === heartbeatRuns && "runnerProfileJson" in update.values
+        && inspect(update.values.runnerProfileJson, { depth: 8 }).includes("nativeRetainedIdleCheckpoint"))).toBe(false);
+    } finally {
+      finishGitHub(); await running; await closeIdleWarmNativeSessionsForRestart(); probe.mockRestore();
+    }
+  });
+
   // H1 (restart chaos): a budget pause's lifecycle Stop interrupted a Codex
   // turn, which ended without a semantic result. That Stop must stay a
   // cancellation (resume continues it), never an interrupted-run retry the
