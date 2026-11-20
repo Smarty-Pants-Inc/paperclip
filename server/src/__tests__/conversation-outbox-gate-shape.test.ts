@@ -1,11 +1,13 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import { performance } from "node:perf_hooks";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueComments, issues,
 } from "@paperclipai/db";
 import { undeliveredConversationComments } from "../services/agent-conversations.js";
+import { personMessageOwedSql } from "../services/person-message-answer.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -103,5 +105,36 @@ suite("conversation outbox with gate-sized saved run contexts", () => {
       await writeFile(process.env.PAPERCLIP_OUTBOX_BENCHMARK_REPORT, JSON.stringify({ report, query, parameters, plan }, null, 2));
     }
     expect(plan['Execution Time'], "gate-shaped outbox statement must execute below 50 ms").toBeLessThan(50);
+  }, 90_000);
+
+  it("preserves the newer-answer floor, never-carried exception, live custody and reset boundary", async () => {
+    const owed = async () => {
+      const [row] = await db.select({ owed: personMessageOwedSql({
+        id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+        issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}`,
+      }) }).from(issueComments).where(eq(issueComments.id, pendingId));
+      return row!.owed;
+    };
+    expect(await owed()).toBe(true);
+    const newerId = randomUUID();
+    await db.insert(issueComments).values({ id: newerId, companyId, issueId, body: "Later input",
+      authorType: "user", authorUserId: "outbox-owner", createdAt: new Date(Date.now() + 1000) });
+    // A streamed answer to a later input does not erase never-carried input.
+    await db.insert(heartbeatRuns).values({ companyId, agentId, nativeIssueId: issueId, status: "succeeded",
+      contextSnapshot: { issueId, steeredCommentIds: [newerId], answeredSteeredCommentIds: [newerId] } });
+    expect(await owed()).toBe(true);
+    // A historic carrier with no reply is subject to the same move-on floor.
+    await db.insert(heartbeatRuns).values({ companyId, agentId, nativeIssueId: issueId, status: "succeeded",
+      contextSnapshot: { issueId, wakeCommentId: pendingId } });
+    expect(await owed()).toBe(false);
+    const wakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({ id: wakeId, companyId, agentId, source: "on_demand", status: "queued",
+      payload: { issueId, commentId: pendingId } });
+    expect(await owed()).toBe(true);
+    await db.update(agentWakeupRequests).set({ status: "cancelled" }).where(eq(agentWakeupRequests.id, wakeId));
+    expect(await owed()).toBe(false);
+    await db.update(agentWakeupRequests).set({ status: "queued" }).where(eq(agentWakeupRequests.id, wakeId));
+    await db.update(issues).set({ conversationBoundaryCommentId: newerId }).where(eq(issues.id, issueId));
+    expect(await owed()).toBe(false);
   }, 90_000);
 });

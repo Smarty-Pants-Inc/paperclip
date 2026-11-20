@@ -209,13 +209,15 @@ function everCarriedSql(m: PersonMessageSql): SQL {
 
 export function personMessageOwedSql(m: PersonMessageSql): SQL {
   return sql`(not ${answeredPersonMessageSql(m)}
-    and (${liveMessageCustodySql(m)} or not ${everCarriedSql(m)}
-      -- A carrier at/after the move-on turn still owns m (Stop-held README,
-      -- then '9 + 10', then README's carrier); its own failure still cards.
-      -- The person moved past m only when a succeeded replying turn CLAIMED a newer person message (the
-      -- stale rule's evidence, RFL 17:07Z); a turn that only revived work or answered a system wake does not
-      -- (gate 7 888e5d1d, 11-19: '9 + 10' silently unanswered under the start clock).
-      or not ${newerPersonInputAnsweredSql({ companyId: m.companyId, issueId: m.issueId, requestedAt: m.createdAt }, m.id)})
+    -- With no newer answered input, the move-on floor cannot exclude m. Check
+    -- that first: an ordinary OR lets the planner scan/detoast every historical
+    -- carrier before discovering that the cheap newer-message range is empty.
+    -- A carrier at/after the move-on turn still owns m (Stop-held README,
+    -- then '9 + 10', then README's carrier); its own failure still cards.
+    -- Moving on requires an ANSWERED newer person input, never merely a later
+    -- start, a work revival, or an answered system wake (RFL 17:07Z).
+    and (case when not ${newerPersonInputAnsweredSql({ companyId: m.companyId, issueId: m.issueId, requestedAt: m.createdAt }, m.id)}
+      then true else (${liveMessageCustodySql(m)} or not ${everCarriedSql(m)}) end)
     and not exists (select 1 from ${issues} reset_issue
       join ${issueComments} reset_boundary on reset_boundary.id = reset_issue.conversation_boundary_comment_id
         and reset_boundary.company_id = reset_issue.company_id and reset_boundary.issue_id = reset_issue.id
