@@ -13,8 +13,8 @@ JSON-RPC requests/errors without changing protocol bytes delivered to Core or Bo
 
 ## Prerequisites / command
 
-Use Linux with `sudo -n`, `unshare`, `ip`, `sysctl`, `setpriv`, `openssl`, and Node
-24. Build the application dependencies, plugin SDK and paperclip-runner package.
+Use Linux with `sudo -n`, `unshare`, `ip`, `sysctl`, `setpriv`, `openssl`, Python 3,
+and Node 24. Build the application dependencies, plugin SDK and paperclip-runner package.
 Build Boat commit `85a00a62f7d36c3e3b43f08d2fade414d0da3647`
 (`0.1.17-spare.6`) in a separate checkout following its README/package scripts.
 No provider account or real Boat key is used: the saved fixture secret contains
@@ -47,8 +47,13 @@ bash src/__tests__/fixtures/hire-boat-namespace.sh \
 The launcher creates disposable mount, network and PID namespaces, preserves the
 caller's user identity, maps the private Boat preview hostname only inside that
 namespace, and prevents its guest path or hosts-file changes touching the host.
-PID-namespace teardown also removes any orphan guest process. Scratch data stays
-under `TMPDIR`. Optional `PAPERCLIP_HIRE_BOAT_GUEST_ROOT` reuses prepared guest data.
+`hire-boat-init.py` is namespace PID 1 and reaps detached guest processes while
+the test runs. Do not exec Vitest as PID 1: an exited runner becomes a zombie,
+its stderr copier keeps seeing `kill -0` succeed, and the real physical-retirement
+guard correctly refuses the still-existing PID/process group before credential
+handoff can retry against Boat's CLOSED gate. The init changes no retirement
+proof, RPC, timeout, or database state. PID-namespace teardown also removes any
+remaining orphan guest process. Scratch data stays under `TMPDIR`. Optional `PAPERCLIP_HIRE_BOAT_GUEST_ROOT` reuses prepared guest data.
 The provider pack is preinstalled, but the normal runtime verifies its bytes and
 stages the actual runner binary through the real Boat HTTP file protocol.
 

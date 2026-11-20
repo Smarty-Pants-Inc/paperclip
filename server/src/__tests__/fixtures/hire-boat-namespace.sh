@@ -30,5 +30,8 @@ exec sudo -n unshare --mount --net --pid --fork --mount-proc --propagation priva
   case "$home" in /home/*) mount --bind "$work/original-home/${home#/home/}" "$home";; esac
   mount --bind "$work/guest-home" /home/user
   mount --bind "$work/guest-tmp" /tmp
-  exec setpriv --reuid="$uid" --regid="$gid" --init-groups env HOME="$home" PATH="$path" TMPDIR="$tmp" TASK_OUT="$out" PAPERCLIP_HIRE_BOAT_NAMESPACE=1 PAPERCLIP_HIRE_BOAT_PACKAGE="$boat" PAPERCLIP_RUNNER_BINARY="$runner" PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH="$pack" "$@"
-' namespace "$work" "$(id -u)" "$(id -g)" "$HOME" "$PATH" "$TMPDIR" "${TASK_OUT:-}" "$PAPERCLIP_HIRE_BOAT_PACKAGE" "$PAPERCLIP_RUNNER_BINARY" "$PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH" "$@"
+  # A real guest has an init that reaps detached runnerd generations. Vitest
+  # must not be PID 1: zombie runners would falsely keep physical retirement
+  # pending (including the runner process group and its stderr copier).
+  exec python3 "$1" setpriv --reuid="$uid" --regid="$gid" --init-groups env HOME="$home" PATH="$path" TMPDIR="$tmp" TASK_OUT="$out" PAPERCLIP_HIRE_BOAT_NAMESPACE=1 PAPERCLIP_HIRE_BOAT_PACKAGE="$boat" PAPERCLIP_RUNNER_BINARY="$runner" PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH="$pack" "${@:2}"
+' namespace "$work" "$(id -u)" "$(id -g)" "$HOME" "$PATH" "$TMPDIR" "${TASK_OUT:-}" "$PAPERCLIP_HIRE_BOAT_PACKAGE" "$PAPERCLIP_RUNNER_BINARY" "$PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH" "$(cd -- "$(dirname -- "$0")" && pwd)/hire-boat-init.py" "$@"
