@@ -167,7 +167,7 @@ describe("Interrupt successor carrying a new message answers it first (adopt-a2-
     return { built, text: strings.join("\n\n") };
   }
   const ANSWER_FIRST = "The person interrupted your previous turn and sent a new message. Answer their new message first.";
-  const CUT_NOT_RERUN = "A call marked interrupted was cut mid-flight. Do not run it again unless the person asks; if it changed files, check them before redoing any edit.";
+  const CUT_NOT_RERUN = "A call marked interrupted was cut mid-flight. If it was only a wait or sleep, do not run it again unless the person asks.";
   const LIST = /\n## Commands already run in the interrupted turn \(do not run these again\)\n[\s\S]*Do not run them again[.;][\s\S]*\n1\. `bash` \(`echo STEP1 > \/tmp\/step1`\): completed\n {3}result: STEP1-RESULT-wrote-step1\n2\. `bash` \(`sleep 600`\): interrupted/;
 
   for (const [name, previousRun, sameSession] of [
@@ -184,9 +184,36 @@ describe("Interrupt successor carrying a new message answers it first (adopt-a2-
       expect(text.indexOf(ANSWER_FIRST), "said before the list").toBeLessThan(text.indexOf("1. `bash`"));
       // Nothing points the model back at the old request ahead of the new message.
       expect(text).not.toMatch(/continue from the next step|continue from the (conversation|history|existing work)|Continue from the latest user request/i);
-      expect(text).not.toContain("check whether it took effect before you run it again");
+      expect(text.indexOf(ANSWER_FIRST), "answer first, before any re-run check").toBeLessThan(text.indexOf("check whether it took effect"));
     });
   }
+
+  // adopt-a2-order2 (rf-4 T2 bar): the person interrupts a 6-step task after STEP2 while STEP3 (not a wait) is
+  // mid-flight and asks "9 + 10". The answer comes first, but STEP3-6 must still be done: the words must say to
+  // continue from the next unfinished step and must not forbid re-running a cut call that was not a wait.
+  it("6-step task cut at STEP3 (not a wait): new message first, then continue from the next unfinished step", () => {
+    const sixStepWake = { ...interruptWake,
+      interruptedTurnToolCalls: [
+        { name: "bash", target: "echo STEP1 > /tmp/step1", status: "completed", output: "STEP1-done" },
+        { name: "bash", target: "echo STEP2 > /tmp/step2", status: "completed", output: "STEP2-done" },
+        { name: "bash", target: "echo STEP3 > /tmp/step3", status: "interrupted", output: "" },
+      ],
+      executionContinuation: { ...continuation, objective: "Run STEP1 to STEP6 in order" },
+    };
+    for (const previousRun of [null, "prior"] as const) {
+      const { text } = request(sixStepWake, previousRun === "prior" ? prior(successor(sixStepWake, sessionId, false, firstRun)) : null);
+      expect(text).toContain("9 + 10");
+      expect(text, "answer first").toContain("Answer their new message first.");
+      const resume = text.search(/continue[^.\n]* from the next unfinished step/);
+      expect(resume, "says to continue the task from the next unfinished step").toBeGreaterThan(-1);
+      expect(text.indexOf("Answer their new message first."), "answer before continuing").toBeLessThan(resume);
+      expect(text, "STEP3 (not a wait) is not forbidden").not.toMatch(/cut mid-flight\. Do not run it again unless the person asks/);
+      expect(text, "only a wait or sleep is not re-run").toContain("If it was only a wait or sleep, do not run it again unless the person asks.");
+      expect(text, "a cut non-wait call is checked, then run again").toContain("Otherwise check whether it took effect before you run it again.");
+      expect(text).not.toMatch(/continue from the (conversation|history|existing work)/i);
+      expect(text).toMatch(/\n1\. `bash` \(`echo STEP1 > \/tmp\/step1`\): completed[\s\S]*\n2\. `bash` \(`echo STEP2 > \/tmp\/step2`\): completed[\s\S]*\n3\. `bash` \(`echo STEP3 > \/tmp\/step3`\): interrupted/);
+    }
+  });
 
   it("no Interrupt (plain continuation with a new message): none of the Interrupt wording", () => {
     for (const previousRun of [null, prior(successor(plainWake, sessionId, false, firstRun))]) {
@@ -195,6 +222,16 @@ describe("Interrupt successor carrying a new message answers it first (adopt-a2-
       expect(text).not.toContain("Commands already run in the interrupted turn");
       expect(text).not.toContain(ANSWER_FIRST);
       expect(text).not.toContain("cut mid-flight");
+    }
+  });
+
+  it("Interrupt without a new message: the base receipts wording, none of the new-message wording", () => {
+    const { comments: _c, commentIds: _i, latestCommentId: _l, ...noMessageWake } = interruptWake;
+    for (const previousRun of [null, prior(successor(noMessageWake, sessionId, false, firstRun))]) {
+      const { text } = request({ ...noMessageWake, reason: "issue_assigned" }, previousRun);
+      expect(text).toContain("Do not run them again; continue from the next step. A call marked interrupted was cut mid-flight: check whether it took effect before you run it again.");
+      expect(text).not.toContain("new message first");
+      expect(text).not.toContain("next unfinished step");
     }
   });
 });
