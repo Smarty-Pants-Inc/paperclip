@@ -649,6 +649,21 @@ export async function prepareManagedAiRuntime(
   }
 }
 
+/** Whether a probe's cleanup failure carries an unrecoverable native session
+ * close (matched by code across the vendored and source runtime boundaries). */
+function nativeSessionCloseUnrecoverable(error: InstanceType<typeof NativeEnvironmentProbeCleanupError>): boolean {
+  const seen = new Set<unknown>();
+  const visit = (value: unknown, depth: number): boolean => {
+    if (!value || typeof value !== "object" || depth > 4 || seen.has(value)) return false;
+    seen.add(value);
+    const candidate = value as { code?: unknown; cause?: unknown; errors?: unknown };
+    if (candidate.code === "native_session_close_unrecoverable") return true;
+    return visit(candidate.cause, depth + 1)
+      || (Array.isArray(candidate.errors) && candidate.errors.some(item => visit(item, depth + 1)));
+  };
+  return [error.operationError, ...error.cleanupErrors].some(item => visit(item, 0));
+}
+
 export async function withManagedAiProbe<T>(
   db: Db,
   input: Parameters<typeof prepareManagedAiRuntime>[1],
@@ -660,6 +675,30 @@ export async function withManagedAiProbe<T>(
     return await probe(runtime);
   }
   catch (error) {
+    if (error instanceof NativeEnvironmentProbeCleanupError && nativeSessionCloseUnrecoverable(error)) {
+      // An unrecoverable close: the close owner has already torn down its
+      // controller (NativeSessionCloseUnrecoverableError), and the verifier
+      // releases the probe box right after this throw. No native owner is left
+      // to refresh this generation, and its retirement can never be proven, so
+      // fencing the account on it blocks every later hire until a restart.
+      // Finish this runtime's own cleanup now (it saves any refresh the home
+      // holds, then deletes the home) and fail this agent's check for Retry.
+      retained = true;
+      void error.retired.catch(() => undefined);
+      try { await runtime.cleanup(); }
+      catch (cleanupError) {
+        if (runtime.retainedCleanupScope && !(cleanupError instanceof RetiredCredentialRecoveryError)) {
+          retainAiCredentialCleanup({ scope: runtime.retainedCleanupScope, home: runtime.home && path.join(runtime.home, "provider"), cleanup: runtime.cleanup, agentId: input.agentId });
+        }
+      }
+      try {
+        // One alarm per failed probe, naming what it held: the account, its runtime home and the agent.
+        logger.error({ code: "native_probe_cleanup_failed", agentId: input.agentId, runtimeHome: runtime.home,
+          accountKeyHash: runtime.retainedCleanupScope ? retainedAiAccountKeyHash(runtime.retainedCleanupScope.accountKey) : undefined },
+        "Native probe close was unrecoverable; its runtime cleanup finished without retirement proof");
+      } catch { /* Diagnostics must not change the HTTP response. */ }
+      throw unprocessable("The native account test failed and its runtime could not be closed cleanly.", { code: "native_probe_cleanup_failed" });
+    }
     if (error instanceof NativeEnvironmentProbeCleanupError) {
       // Keep the selected credential generation until the native owner has
       // retired and completed its refresh handoff. HTTP need not wait for it.
