@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import type { Db, agents, agentTaskSessions, heartbeatRuns } from "@paperclipai/db";
+import { companyMemberships, type Db, type agents, type agentTaskSessions, type heartbeatRuns } from "@paperclipai/db";
+import { and, asc, eq } from "drizzle-orm";
 import { FAST_RESPONSE_AGENT_GUIDANCE, fastResponseHistoryBody, isValidIanaTimeZone } from "@paperclipai/shared";
 import type { PaperclipTurnContext } from "@paperclipai/adapter-utils/server-utils";
 import { parseObject } from "../../adapters/utils.js";
@@ -230,24 +231,42 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
     issueContext?.chatAssignedAgentId === agent.id
       ? issueContext.chatCommunicationGuidance
       : null;
-  // Use the standing chat owner's saved preferences, never worker text.
+  // Choose the person, not the first available zone. A requester with no saved
+  // zone must not inherit another person's preference. Never use worker text.
   // Recovery retains the admitted choices instead of silently changing its prompt.
-  const conversationOwnerPreference = isConversation(issueContext) && issueContext?.conversationUserId
-    && !input.policy.recovering
-    ? await workspacePreferenceService(db).get(issueContext.conversationUserId)
+  let personUserId: string | null = null;
+  if (!input.policy.recovering && issueContext) {
+    personUserId = isConversation(issueContext)
+      ? issueContext.conversationUserId
+      : issueContext.createdByUserId;
+    if (!personUserId && !isConversation(issueContext)) {
+      const [owner] = await db.select({ userId: companyMemberships.principalId })
+        .from(companyMemberships)
+        .where(and(
+          eq(companyMemberships.companyId, agent.companyId),
+          eq(companyMemberships.principalType, "user"),
+          eq(companyMemberships.status, "active"),
+          eq(companyMemberships.membershipRole, "owner"),
+        ))
+        .orderBy(asc(companyMemberships.createdAt), asc(companyMemberships.id))
+        .limit(1);
+      personUserId = owner?.userId ?? null;
+    }
+  }
+  const personPreference = personUserId
+    ? await workspacePreferenceService(db).get(personUserId)
     : null;
   const coordinatorWorkspace = agent.adapterType === "paperclip_runner" && isConversation(issueContext)
     && issueContext?.conversationUserId
     ? input.policy.recovering
       ? context.paperclipCoordinatorWorkspaceEnabled === true
-      : conversationOwnerPreference?.coordinatorWorkspaceEnabled === true
+      : personPreference?.coordinatorWorkspaceEnabled === true
     : false;
   context.paperclipCoordinatorWorkspaceEnabled = Boolean(coordinatorWorkspace);
   const savedPersonTimeZone = input.policy.recovering
     ? readNonEmptyString(context.paperclipConversationTimeZone)
-    : conversationOwnerPreference?.timeZone ?? null;
-  const personTimeZone = isConversation(issueContext) && issueContext?.conversationUserId
-    && savedPersonTimeZone && isValidIanaTimeZone(savedPersonTimeZone)
+    : personPreference?.timeZone ?? null;
+  const personTimeZone = savedPersonTimeZone && isValidIanaTimeZone(savedPersonTimeZone)
     ? savedPersonTimeZone
     : null;
   if (personTimeZone) context.paperclipConversationTimeZone = personTimeZone;
