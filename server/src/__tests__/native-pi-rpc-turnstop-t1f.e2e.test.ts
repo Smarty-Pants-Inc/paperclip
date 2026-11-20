@@ -413,8 +413,9 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       const { resolveEnvironmentExecutionTarget } = await import("../services/environment-execution-target.js");
       const target = await resolveEnvironmentExecutionTarget({ db: db!, companyId, adapterType: "paperclip_runner", environment,
         leaseId: source!.id, leaseMetadata: source!.metadata, lease: source!, environmentRuntime: environmentRuntimeService(db!) });
-      const { resumeNativeWorkspaceSync, nativeWorkspaceSyncInternals: sync } = await import("../services/native-runtime/native-workspace-sync.js");
+      const { cleanupNativeWorkspaceSync, resumeNativeWorkspaceSync, nativeWorkspaceSyncInternals: sync } = await import("../services/native-runtime/native-workspace-sync.js");
       const completed = await resumeNativeWorkspaceSync({ db: db!, runId, target: target! });
+      if (completed) await cleanupNativeWorkspaceSync(runId);
       const [run] = await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       const reference = sync.readReference(run!.runnerProfileJson?.nativeWorkspaceSync)!;
       const { descriptor } = await sync.readDescriptor({ runId, reference });
@@ -425,7 +426,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       const restored = join(root, `readback-${runId}-${randomUUID()}`);
       const { restoreRemoteWorkspaceArchive } = await import("../services/remote-workspace-snapshot-archive.js");
       await restoreRemoteWorkspaceArchive({ archivePath, targetDir: restored, expectedManifestDigest: snapshot.manifestDigest });
-      return { completed, archivePath, snapshot, preparedAt: descriptor.createdAt, reference,
+      return { completed, archivePath, snapshot, restoredPath: restored, preparedAt: descriptor.createdAt, reference,
         serverFileBase64: (await readFile(join(workspace, "filestop.txt"))).toString("base64"),
         fileBase64: (await readFile(join(restored, "filestop.txt"))).toString("base64") };
     };
@@ -870,20 +871,27 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       const stampPath = join(remoteWorkspace, ".paperclip-runtime", "paperclip-runner", "workspace-sync-v1.json");
       const newerStamp = JSON.parse(await readFile(stampPath, "utf8"));
       expect(newerStamp.finalizedRunId).toBe(current.id);
-      const { resumeNativeWorkspaceSync } = await import("../services/native-runtime/native-workspace-sync.js");
+      const { cleanupNativeWorkspaceSync, resumeNativeWorkspaceSync } = await import("../services/native-runtime/native-workspace-sync.js");
+      // The successor's ordinary executor cleanup has already run. Its actual
+      // newer archive must still exist, not merely its shared remote stamp.
+      const newerReadback = await exportAndReadBack(current.id);
+      expect(await readFile(join(newerReadback.restoredPath, "successor.txt"), "utf8")).toBe("successor file wins\n");
       let completed = false, exportError: string | undefined, readback: Awaited<ReturnType<typeof exportAndReadBack>> | undefined;
       try { readback = await exportAndReadBack(admitted.id); completed = readback.completed; }
       catch (error) { exportError = error instanceof Error ? error.stack : String(error); }
       const lateStamp = JSON.parse(await readFile(stampPath, "utf8"));
       const successorBytes = await readFile(join(remoteWorkspace, "successor.txt"), "utf8");
       const [lateRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, admitted.id));
-      const custody = { completed, exportError, newerStamp, lateStamp, successorBytes, readback, olderExport: lateRun?.runnerProfileJson?.nativeWorkspaceSync };
+      const custody = { completed, exportError, newerStamp, lateStamp, successorBytes, newerReadback, readback, olderExport: lateRun?.runnerProfileJson?.nativeWorkspaceSync };
       await writeFile(join(root, "R1-late-export.json"), JSON.stringify(custody, null, 2));
       stage("R1 late native export after successor snapshot", custody);
       expect(completed, "pending predecessor export completes").toBe(true);
       expect(successorBytes).toBe("successor file wins\n");
       expect(lateStamp, "a late predecessor export cannot overwrite the newer successor stamp").toEqual(newerStamp);
       expect(readback?.fileBase64).toBe(fileBytes.toString("base64"));
+      await cleanupNativeWorkspaceSync(admitted.id);
+      expect(createHash("sha256").update(await readFile(readback!.archivePath)).digest("hex")).toBe(readback!.snapshot.sha256);
+      expect(createHash("sha256").update(await readFile(newerReadback.archivePath)).digest("hex")).toBe(newerReadback.snapshot.sha256);
       expect(Date.parse(readback!.preparedAt)).toBeLessThan(Date.parse(newerStamp.preparedAt));
       // Replaying an already finalized older export must obey the same guard.
       await resumeNativeWorkspaceSync({ db, runId: admitted.id, target: target! });
