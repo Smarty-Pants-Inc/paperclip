@@ -56,12 +56,21 @@ function piDescendant(runnerPid: number): number | null {
   return visit(runnerPid);
 }
 
-it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallback", "finished", "FILESTOP", "FILESTOP-fallback", "FILESTOP-forged-proof", "FILESTOP-restart-hook", "FILESTOP-validation-fails", "FILESTOP-late-export", "FILESTOP-fast-question"] as const)(`warm turnstop T1-F: %s (real Runner/Pi, two prior turns)`, async scenario => {
+it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallback", "finished", "FILESTOP", "FILESTOP-fallback", "FILESTOP-forged-proof", "FILESTOP-restart-hook", "FILESTOP-validation-fails", "FILESTOP-late-export", "FILESTOP-successor-fails", "FILESTOP-restart-process", "FILESTOP-fast-question"] as const)(`warm turnstop T1-F: %s (real Runner/Pi, two prior turns)`, async scenario => {
   const stopTurn = 3;
   const filestop = scenario.startsWith("FILESTOP");
   const forgedProof = scenario === "FILESTOP-forged-proof";
   const restartHook = scenario === "FILESTOP-restart-hook";
   const validationFails = scenario === "FILESTOP-validation-fails";
+  const successorFails = scenario === "FILESTOP-successor-fails";
+  const restartProcess = scenario === "FILESTOP-restart-process";
+  const restartPhase = restartProcess ? process.env.PAPERCLIP_PI_R4_PHASE : undefined;
+  const restartStatePath = process.env.PAPERCLIP_PI_R4_STATE;
+  if (restartProcess && (!restartStatePath || !["1", "2"].includes(restartPhase ?? "")))
+    throw new Error("R4 requires the two-process run-restart.sh orchestrator");
+  const restartState = restartPhase === "2" ? JSON.parse(await readFile(restartStatePath!, "utf8")) : null;
+  let keepPostgresForRestart = false;
+  let failNextExecution = false;
   const fallback = scenario === "R-fallback" || scenario === "FILESTOP-fallback" || forgedProof || restartHook;
   const fileBytes = Buffer.from("Paul's completed write survives Stop.\nFILESTOP utf8: café 🌱\n", "utf8");
   expect(thinking).toBe("xhigh");
@@ -71,7 +80,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
   if (process.platform !== "linux") throw new Error("This real PID proof requires Linux");
   if (!process.env.PAPERCLIP_RUNNER_BINARY || !process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH)
     throw new Error("Set absolute PAPERCLIP_RUNNER_BINARY and PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH to qualified local artifacts");
-  const root = await mkdtemp(join(process.env.PAPERCLIP_PI_E2E_EVIDENCE ?? tmpdir(), "native-pi-turnstop-spike-"));
+  const root: string = restartState?.root ?? await mkdtemp(join(process.env.PAPERCLIP_PI_E2E_EVIDENCE ?? tmpdir(), "native-pi-turnstop-spike-"));
   const stages: Array<{ at: string; stage: string; detail: unknown }> = [];
   const stage = (name: string, detail: unknown = {}) => {
     const row = { at: new Date().toISOString(), stage: name, detail };
@@ -94,6 +103,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
   const boxBootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
   const packVerificationCommands: Array<Record<string, unknown>> = [];
   let stopRetainedPostgres: (() => Promise<void>) | undefined;
+  let retainedPostgresSpec: { pgCtl: string; dataDir: string; args: string[]; port: string } | undefined;
   let helloProbeRequests = 0;
   let warmupCount = 0;
   const warmupRunIds = new Set<string>();
@@ -108,14 +118,15 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
   let db: ReturnType<typeof createDb> | undefined;
   let companyId = "", agentId = "", issueId = "";
   const workspace = join(root, "workspace");
-  await mkdir(workspace);
+  await mkdir(workspace, { recursive: true });
   let remoteWorkspace = join(root, "box-workspace");
-  await mkdir(remoteWorkspace);
+  await mkdir(remoteWorkspace, { recursive: true });
   const agentHome = join(root, "minimal-agent");
-  await mkdir(agentHome);
+  await mkdir(agentHome, { recursive: true });
   await writeFile(join(agentHome, "models.json"), JSON.stringify({ providers: { paperclip: { models: [{ id: "faux", reasoning: true, contextWindow: 128000, maxTokens: 8192, thinkingLevelMap: { xhigh: "xhigh" } }] } } }));
   const adapterEnv = { PI_CODING_AGENT_DIR: agentHome, TMPDIR: process.env.TMPDIR! };
   vi.stubEnv("PAPERCLIP_HOME", join(root, "paperclip-home"));
+  if (restartState) vi.stubEnv("PAPERCLIP_INSTANCE_ID", restartState.instanceId);
   vi.stubEnv("PAPERCLIP_CONFIG", join(root, "config.json"));
   vi.stubEnv("PAPERCLIP_RUNNER_STATE_DIR", join(root, "runner-state"));
   vi.stubEnv("PAPERCLIP_AGENT_JWT_SECRET", randomUUID().repeat(2));
@@ -255,13 +266,13 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
         emit("response.completed", { response }); res.end();
       });
     });
-    await new Promise<void>(resolve => modelServer!.listen(0, "127.0.0.1", resolve));
+    await new Promise<void>(resolve => modelServer!.listen(restartState?.modelPort ?? 0, "127.0.0.1", resolve));
     const modelAddress = modelServer.address();
     if (!modelAddress || typeof modelAddress === "string") throw new Error("No faux model listener");
     const baseUrl = `http://127.0.0.1:${modelAddress.port}/v1`;
     stage("loopback faux model up", { baseUrl, root });
     stage("thinking qualification", { thinking, protocol, prodShapeXhigh: thinking === "xhigh", diagnosticStandIn: thinking !== "xhigh" });
-    temporary = await startEmbeddedPostgresTestDatabase("native-pi-full-server-db-");
+    temporary = restartState ? { connectionString: restartState.connectionString } as NonNullable<typeof temporary> : await startEmbeddedPostgresTestDatabase("native-pi-full-server-db-");
     db = createDb(temporary.connectionString);
     // Preserve this gate's database files: the ordinary helper cleanup removes
     // its temporary tree, forbidden in L3's no-deletions scope. Stop only our
@@ -274,6 +285,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
         if (!args[0]?.endsWith("/postgres") || args[args.indexOf("-p") + 1] !== pgPort) continue;
         const dataDir = args[args.indexOf("-D") + 1]!;
         const pgCtl = args[0].replace(/postgres$/, "pg_ctl");
+        retainedPostgresSpec = { pgCtl, dataDir, args: args.slice(1).filter(Boolean), port: pgPort };
         stopRetainedPostgres = async () => {
           const { closeRegisteredClients } = await import("@paperclipai/db");
           await closeRegisteredClients(temporary!.connectionString);
@@ -289,7 +301,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
     // Simulated allocation ONLY: all lease rows, retention, execution and routes
     // below remain product code. The real Runner/Pi run on this host behind the
     // same authenticated sandbox ingress contract used by the real-Pi fixtures.
-    const environmentId = randomUUID();
+    const environmentId: string = restartState?.environmentId ?? randomUUID();
     const envService = environmentService(db);
     const caps = { nativeSyncIn: false, nativeSyncOut: false, persistentProcessSessions: false,
       incrementalSessionOutput: false, concurrentSyncOperations: false, independentControlCommands: true,
@@ -299,7 +311,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
     let commandCount = 0;
     const staged = join(remoteWorkspace, ".paperclip-runtime", "paperclip-runner");
     await mkdir(staged, { recursive: true });
-    await symlink(process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH!, join(staged, "provider-pack"));
+    if (!existsSync(join(staged, "provider-pack"))) await symlink(process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH!, join(staged, "provider-pack"));
     const key = join(root, "preview.key"), cert = join(root, "preview.crt");
     const openssl = await runChildProcess(`cert-${randomUUID()}`, "openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert,
       "-days", "1", "-subj", "/CN=localhost", "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost"], { cwd: root, env: {}, timeoutSec: 30, graceSec: 1, onLog: async () => {} });
@@ -328,7 +340,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
     const previewAddress = preview.address(); if (!previewAddress || typeof previewAddress === "string") throw new Error("preview missing");
     // Only the provider allocation transport is simulated. Lease selection,
     // including workspace_export_pending, must run in the production driver.
-    const pluginId = randomUUID();
+    const pluginId: string = restartState?.pluginId ?? randomUUID();
     const providerConfig = { provider: "turnstop-loopback", reuseLease: true,
       runnerLifecycleMode: "warm", runnerIdleTimeoutMs: 300000 };
     await db.insert(plugins).values({ id: pluginId, pluginKey: "turnstop.loopback", packageName: "@paperclip/turnstop-loopback",
@@ -337,7 +349,8 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
         description: "Real lease policy with local provider transport", author: "Paperclip", categories: ["automation"],
         capabilities: ["environment.drivers.register"], entrypoints: { worker: "unused.js" },
         environmentDrivers: [{ driverKey: "turnstop-loopback", kind: "sandbox_provider", displayName: "Loopback",
-          supportsReusableLeases: true, configSchema: { type: "object" } }] } } as never);
+          supportsReusableLeases: true, configSchema: { type: "object" } }] } } as never).onConflictDoNothing();
+    if (restartState) await db.update(plugins).set({ status: "installed" }).where(eq(plugins.id, pluginId));
     const { environmentRuntimeService: realEnvironmentRuntimeService } = await vi.importActual<typeof import("../services/environment-runtime.js")>("../services/environment-runtime.js");
     const realAllocation = realEnvironmentRuntimeService(db, { pluginWorkerManager: {
       isRunning: () => true,
@@ -391,15 +404,41 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       retryPendingSandboxTeardown: async ({ lease }) => { stopCalls.push(lease.id); stage("provider stop requested", { leaseId: lease.id }); return { providerLeaseId: lease.providerLeaseId!, state: "stopped" }; },
     }];
     await db.insert(environments).values({ id: environmentId, name: "Turnstop loopback allocation", driver: "sandbox",
-      config: providerConfig });
+      config: providerConfig }).onConflictDoNothing();
 
-    const [{ createApp }, { createStorageService }, { createLocalDiskStorageProvider }, runner, { setupRunnerPrpWebSocketServer }, { subscribeCompanyLiveEvents }] = await Promise.all([
+    const exportAndReadBack = async (runId: string) => {
+      const [source] = await db!.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, runId));
+      const environment = (await db!.select().from(environments).where(eq(environments.id, environmentId)))[0]!;
+      const { environmentRuntimeService } = await import("../services/environment-runtime.js");
+      const { resolveEnvironmentExecutionTarget } = await import("../services/environment-execution-target.js");
+      const target = await resolveEnvironmentExecutionTarget({ db: db!, companyId, adapterType: "paperclip_runner", environment,
+        leaseId: source!.id, leaseMetadata: source!.metadata, lease: source!, environmentRuntime: environmentRuntimeService(db!) });
+      const { resumeNativeWorkspaceSync, nativeWorkspaceSyncInternals: sync } = await import("../services/native-runtime/native-workspace-sync.js");
+      const completed = await resumeNativeWorkspaceSync({ db: db!, runId, target: target! });
+      const [run] = await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      const reference = sync.readReference(run!.runnerProfileJson?.nativeWorkspaceSync)!;
+      const { descriptor } = await sync.readDescriptor({ runId, reference });
+      expect(descriptor.finalSnapshot, "export keeps immutable file custody, not only a finalized descriptor").toBeDefined();
+      const snapshot = descriptor.finalSnapshot!;
+      const archivePath = sync.finalSnapshotPath(runId, snapshot.sha256);
+      expect(createHash("sha256").update(await readFile(archivePath)).digest("hex")).toBe(snapshot.sha256);
+      const restored = join(root, `readback-${runId}-${randomUUID()}`);
+      const { restoreRemoteWorkspaceArchive } = await import("../services/remote-workspace-snapshot-archive.js");
+      await restoreRemoteWorkspaceArchive({ archivePath, targetDir: restored, expectedManifestDigest: snapshot.manifestDigest });
+      return { completed, archivePath, snapshot, preparedAt: descriptor.createdAt, reference,
+        serverFileBase64: (await readFile(join(workspace, "filestop.txt"))).toString("base64"),
+        fileBase64: (await readFile(join(restored, "filestop.txt"))).toString("base64") };
+    };
+    const [{ createApp }, { createStorageService },  { createLocalDiskStorageProvider }, runner, { setupRunnerPrpWebSocketServer }, { subscribeCompanyLiveEvents }] = await Promise.all([
       import("../app.js"), import("../storage/service.js"), import("../storage/local-disk-provider.js"),
       import("../vendor/paperclip-runner/index.js"), import("../realtime/runner-prp-ws.js"), import("../services/live-events.js"),
     ]);
-    if (scenario === "FILESTOP-fallback") {
+    if (scenario === "FILESTOP-fallback" || successorFails) {
       const realExecute = runner.executeNativeSession;
-      vi.spyOn(runner, "executeNativeSession").mockImplementation(options => realExecute({
+      vi.spyOn(runner, "executeNativeSession").mockImplementation(options => {
+        if (failNextExecution) throw new Error("rf5: successor fails before its workspace export");
+        if (successorFails) return realExecute(options);
+        return realExecute({
         ...options,
         // Force only the clean-stop retention qualification off. Interrupt,
         // provider closure, file collection and successor admission stay real.
@@ -407,7 +446,8 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
           stage("FILESTOP qualification forced off; normal retirement fallback");
           return false;
         },
-      }));
+      });
+      });
     }
     const realFactory = runner.createRunnerdCodexTransport;
     // Observation only: every invocation enters the unmodified production
@@ -464,6 +504,41 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       expect(response.status, `${method} ${path}: ${text}`).toBe(expected);
       return JSON.parse(text);
     };
+    if (restartState) {
+      companyId = restartState.companyId; agentId = restartState.agentId; issueId = restartState.issueId;
+      warmupCount = stopTurn - 1;
+      for (const id of restartState.priorRunIds) warmupRunIds.add(id);
+      await db.update(plugins).set({ status: "ready" }).where(eq(plugins.id, pluginId));
+      // The external-model stand-in keeps its saved URL across the server
+      // restart. Reuse the actual existing connection/grant/install unchanged;
+      // creating a new credential here would require new delegation authority.
+      const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, restartState.sourceRunId));
+      const [sourceLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, restartState.sourceLeaseId));
+      const { hasRetainedNativeTurnStop } = await import("../services/native-runtime/native-session-executor.js");
+      expect(process.pid, "the actual server worker process changed").not.toBe(restartState.serverPid);
+      expect(hasRetainedNativeTurnStop(stopped!, sourceLease), "restart loses the process-local proof").toBe(false);
+      const sendAt = Date.now();
+      await api("POST", `/issues/${issueId}/comments`, { body: "T1F_INPUT_1: read filestop.txt" }, 201);
+      const next = await waitFor("R4 successor admitted after real restart", async () =>
+        (await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).find(run => !warmupRunIds.has(run.id)) ?? null);
+      const first = await waitFor("R4 successor first model request", async () => requests[0] ?? null);
+      const [nextLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, next.id));
+      expect(nextLease?.providerLeaseId).not.toBe(sourceLease!.providerLeaseId);
+      expect(first.fileBeforeTools?.exists).toBe(false);
+      const final = await waitFor("R4 restarted question completes", async () =>
+        (await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next.id))).find(run => run.status === "succeeded") ?? null);
+      const { heartbeatService } = await import("../services/heartbeat.js");
+      await heartbeatService(db).waitForRunExecutionDrain(final.id, { timeoutMs: 15_000 });
+      const failures = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).filter(run => ["failed", "timed_out"].includes(run.status));
+      expect(failures).toHaveLength(0);
+      const result = { oldServerPid: restartState.serverPid, serverPid: process.pid, sourceRunId: stopped!.id,
+        sourceLeaseId: sourceLease!.id, sourceBox: sourceLease!.providerLeaseId, successorRunId: final.id,
+        nextLeaseId: nextLease!.id, nextBox: nextLease!.providerLeaseId, status: final.status, failures: failures.length,
+        requestGapMs: first.at - sendAt, fileBeforeTools: first.fileBeforeTools, processLocalProof: false };
+      await writeFile(join(root, "R4-real-process-restart.json"), JSON.stringify(result, null, 2));
+      stage("R4 real server-process restart GREEN", result);
+      return;
+    }
     const company = await api("POST", "/companies", { name: "Local native Pi full-server proof" }, 201);
     companyId = company.id;
     await api("PATCH", `/companies/${companyId}`, { requireBoardApprovalForNewAgents: false });
@@ -620,6 +695,19 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       if (filestop && !fallback) expect(exportPending, "real prepared Stop export must still be pending at successor acquisition").toBe(true);
       if (!fallback) expect(qualified, "spike's exact stopped live owner + lease qualified").toBe(true);
       else expect(qualified, "fallback fixture must not qualify for retained turn-stop").toBe(false);
+      if (restartProcess) {
+        expect(qualified).toBe(true);
+        keepPostgresForRestart = true;
+        await writeFile(restartStatePath!, JSON.stringify({ root, connectionString: temporary!.connectionString,
+          companyId, agentId, issueId, environmentId, pluginId, serverPid: process.pid,
+          sourceRunId: current.id, sourceLeaseId: lease!.id, priorRunIds: [...warmupRunIds, current.id],
+          postgres: retainedPostgresSpec, modelPort: modelAddress.port,
+          instanceId: process.env.PAPERCLIP_INSTANCE_ID }), { mode: 0o600 });
+        await writeFile(join(root, "R4-before-process-exit.json"), JSON.stringify({ serverPid: process.pid,
+          sourceRunId: current.id, sourceLeaseId: lease!.id, qualified, exportPending, originalIdentity }, null, 2));
+        stage("R4 phase 1: Stop qualified; this actual server process will exit before phase 2");
+        return;
+      }
       if (scenario === "FILESTOP") {
         // R3: use the exact qualified real owner, including a shared workspace,
         // while varying only the issue or agent at the production acquire door.
@@ -646,7 +734,24 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       // Stop itself must dispatch nothing. The separate Send is new authority.
       if (!interrupt) expect(requests).toHaveLength(requestCountAtPress);
       const sendAt = interrupt ? pressAt : Date.now();
+      if (successorFails) failNextExecution = true;
       if (!interrupt) successorCommentId = (await api("POST", `/issues/${issueId}/comments`, { body: message }, 201)).id;
+      if (successorFails) {
+        const failed = await waitFor("rf5 successor fails before export", async () =>
+          (await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+            .find(run => run.id !== current.id && !warmupRunIds.has(run.id) && run.status === "failed") ?? null);
+        await heartbeatService(db).waitForRunExecutionDrain(failed.id, { timeoutMs: 15_000 });
+        const beforeExport = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, failed.id)))[0]!;
+        expect(beforeExport.runnerProfileJson?.nativeWorkspaceSync?.state).not.toBe("finalized");
+        failNextExecution = false;
+        const custody = await exportAndReadBack(current.id);
+        await writeFile(join(root, "rf5-successor-fails.json"), JSON.stringify({ failedRunId: failed.id,
+          beforeExport: beforeExport.runnerProfileJson?.nativeWorkspaceSync, custody }, null, 2));
+        expect(custody.completed).toBe(true);
+        expect(custody.fileBase64).toBe(fileBytes.toString("base64"));
+        stage("rf5 stopped files reach server after successor failure", custody);
+        return;
+      }
       // Do not skip a wrong/stale first request while waiting for a later
       // correctly attributed one: the very next provider input is the oracle.
       const first = await waitFor(`successor ${press} FIRST model request`, async () => {
@@ -690,6 +795,8 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
         cancelRouteMs: cancelledAt - pressAt, drainMs: drainedAt - pressAt, sendToRequestMs: first.at - sendAt };
       observations.push(observation);
       stage("BOUNDARY OBSERVATION", observation);
+      await writeFile(join(root, `request-spans-${next.id}.json`), JSON.stringify({ sendAt,
+        events: await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, next.id)) }, null, 2));
       await writeFile(join(root, "observations.json"), JSON.stringify(observations, null, 2));
       expect(commentBoundToSuccessor, "the FIRST successor is bound to the newly authorized comment").toBe(true);
       expect(first.turn, "the FIRST successor input carries the newly authorized message").toBe(press);
@@ -743,6 +850,13 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
         fileSurvived: requests.find(row => row.fileBeforeTools)?.fileBeforeTools?.base64 === fileBytes.toString("base64"),
         readOutput, observations }, null, 2));
     }
+    if (scenario === "FILESTOP-fallback") {
+      const custody = await exportAndReadBack(admitted.id);
+      await writeFile(join(root, "R5-unqualified-export-readback.json"), JSON.stringify(custody, null, 2));
+      expect(custody.completed).toBe(true);
+      expect(custody.fileBase64).toBe(fileBytes.toString("base64"));
+      stage("R5 unqualified Stop export still completes with readback", custody);
+    }
     if (scenario === "FILESTOP-late-export") {
       // R1 uses the same legacy native-sync path as FILESTOP, not the unrelated
       // modern remote-workspace snapshot service. A late completion must not
@@ -757,18 +871,23 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       const newerStamp = JSON.parse(await readFile(stampPath, "utf8"));
       expect(newerStamp.finalizedRunId).toBe(current.id);
       const { resumeNativeWorkspaceSync } = await import("../services/native-runtime/native-workspace-sync.js");
-      let completed = false, exportError: string | undefined;
-      try { completed = await resumeNativeWorkspaceSync({ db, runId: admitted.id, target: target! }); }
-      catch (error) { exportError = error instanceof Error ? error.message : String(error); }
+      let completed = false, exportError: string | undefined, readback: Awaited<ReturnType<typeof exportAndReadBack>> | undefined;
+      try { readback = await exportAndReadBack(admitted.id); completed = readback.completed; }
+      catch (error) { exportError = error instanceof Error ? error.stack : String(error); }
       const lateStamp = JSON.parse(await readFile(stampPath, "utf8"));
       const successorBytes = await readFile(join(remoteWorkspace, "successor.txt"), "utf8");
       const [lateRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, admitted.id));
-      const custody = { completed, exportError, newerStamp, lateStamp, successorBytes, olderExport: lateRun?.runnerProfileJson?.nativeWorkspaceSync };
+      const custody = { completed, exportError, newerStamp, lateStamp, successorBytes, readback, olderExport: lateRun?.runnerProfileJson?.nativeWorkspaceSync };
       await writeFile(join(root, "R1-late-export.json"), JSON.stringify(custody, null, 2));
       stage("R1 late native export after successor snapshot", custody);
       expect(completed, "pending predecessor export completes").toBe(true);
       expect(successorBytes).toBe("successor file wins\n");
       expect(lateStamp, "a late predecessor export cannot overwrite the newer successor stamp").toEqual(newerStamp);
+      expect(readback?.fileBase64).toBe(fileBytes.toString("base64"));
+      expect(Date.parse(readback!.preparedAt)).toBeLessThan(Date.parse(newerStamp.preparedAt));
+      // Replaying an already finalized older export must obey the same guard.
+      await resumeNativeWorkspaceSync({ db, runId: admitted.id, target: target! });
+      expect(JSON.parse(await readFile(stampPath, "utf8"))).toEqual(newerStamp);
     }
     for (const observation of observations) {
       const request = requests.find(value => value.at === observation.requestAt)!;
@@ -840,7 +959,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
     fixtureHttpsAgent?.destroy(); https.globalAgent = previousHttpsAgent; setDefaultCACertificates(previousCertificates);
     if (http) { http.closeAllConnections(); await new Promise<void>(resolve => http!.close(() => resolve())); }
     if (modelServer) { modelServer.closeAllConnections(); await new Promise<void>(resolve => modelServer!.close(() => resolve())); }
-    await stopRetainedPostgres?.();
+    if (!keepPostgresForRestart) await stopRetainedPostgres?.();
     vi.restoreAllMocks(); vi.unstubAllEnvs();
     console.log(`[pi-full-server] evidence retained at ${root}`);
   }
