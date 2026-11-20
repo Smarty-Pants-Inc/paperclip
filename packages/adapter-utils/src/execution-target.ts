@@ -5168,7 +5168,24 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       remoteCwd: target.remoteCwd,
       timeoutMs: bridgeTimeoutMs,
       shellCommand,
+      inlineSmallWrites: input.startPaused === true,
     });
+    const startServer = () => startSandboxCallbackBridgeServer({
+      runner,
+      remoteCwd: target.remoteCwd,
+      assetRemoteDir,
+      queueDir,
+      bridgeToken,
+      bridgeAsset,
+      timeoutMs: bridgeTimeoutMs,
+      maxBodyBytes,
+      shellCommand,
+      startPaused: input.startPaused,
+    });
+    // A paused server cannot service a new run yet. Initialize its queue, write
+    // paused, sync the entrypoint and await readiness in a single admission,
+    // then construct the host worker over that already-initialized queue.
+    if (input.startPaused) server = await startServer();
     // This host-owned worker is not configurable from a sandbox-provider plugin;
     // read the single operator setting here and use its existing option seam.
     const pollIntervalMs = resolveSandboxCallbackBridgePollIntervalMs();
@@ -5186,22 +5203,14 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       getRuntimeParentContext: input.getRuntimeParentContext,
       runtimeSpan: input.runtimeSpan,
       startPaused: input.startPaused,
+      queueInitialized: server !== null,
+      strictActivation: input.startPaused === true,
       // The worker encodes binary bodies only at the queue boundary.
       handleRequest: (request, options) => forwardBridgeRequest({ ...request, bridgeTransport: "queue_v1" }, options?.signal, {
         reservation: options?.reservation,
       }),
     });
-    server = await startSandboxCallbackBridgeServer({
-      runner,
-      remoteCwd: target.remoteCwd,
-      assetRemoteDir,
-      queueDir,
-      bridgeToken,
-      bridgeAsset,
-      timeoutMs: bridgeTimeoutMs,
-      maxBodyBytes,
-      shellCommand,
-    });
+    if (!server) server = await startServer();
   } catch (error) {
     await Promise.allSettled([
       server?.stop(),
