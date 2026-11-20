@@ -5135,7 +5135,8 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
             },
             runLogTail: duplexRunLogTail,
             readRunDisposition: (): DuplexBrokerRunDisposition => dispositionLatch.disposition,
-            pause: async () => { await writeHttp2RunState("paused"); },
+            pause: async () => { await (input.runtimeSpan ?? ((_name, work) => work()))("github.run_release.http2", () =>
+              (input.runtimeSpan ?? ((_name, work) => work()))("github.run_release.state_write", () => writeHttp2RunState("paused"))); },
             resume: async (generation?: string) => {
               await writeHttp2RunState(generation ? `attached:${generation}` : "attached");
             },
@@ -5230,7 +5231,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       PAPERCLIP_BRIDGE_QUEUE_DIR: queueDir,
     },
     runLogTail,
-    pause: async () => { await worker?.pause(); },
+    pause: async () => { await (input.runtimeSpan ?? ((_name, work) => work()))("github.run_release.queue_v1", async () => worker?.pause()); },
     resume: async (generation?: string) => { await worker?.resume(generation); },
     stop: async () => {
       await Promise.allSettled([

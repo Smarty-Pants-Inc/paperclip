@@ -63,7 +63,7 @@ import {
 } from "./sync-operation-schedule.js";
 import type { RuntimeSpanRunner } from "./acpx-engine/startup-timing.js";
 import {
-  recordWorkspaceRestoreDiagnostic, withWorkspaceRestoreDiagnostics, withWorkspaceRestoreStep,
+  recordWorkspaceRestoreDiagnostic, withWorkspaceRestoreDiagnostics, withWorkspaceRestoreStep as diagnoseWorkspaceRestoreStep,
   type WorkspaceRestoreDiagnostic,
 } from "./workspace-restore-diagnostics.js";
 
@@ -1408,6 +1408,16 @@ export async function prepareSandboxManagedRuntime(input: {
   // span, because the teardown runs the restore inside that span.
   const runStepSpan = <T>(name: string, work: () => Promise<T>): Promise<T> =>
     input.runtimeSpan ? input.runtimeSpan(name, work) : work();
+  // The existing failure-step boundary now also times successful restores.
+  // Fixed names only: never include asset keys or workspace paths in these spans.
+  const restorePhases: Partial<Record<Parameters<typeof diagnoseWorkspaceRestoreStep>[0], string>> = {
+    git_export: "workspace.git_export", git_import: "workspace.git_import",
+    workspace_transfer: "workspace.transfer", workspace_extract: "workspace.extract",
+    directory_merge: "workspace.merge", git_integration: "workspace.git_integration",
+    index_reset: "workspace.index_reset", git_ref_cleanup: "workspace.git_ref_cleanup",
+  };
+  const withWorkspaceRestoreStep = <T>(step: Parameters<typeof diagnoseWorkspaceRestoreStep>[0], work: () => Promise<T>) =>
+    diagnoseWorkspaceRestoreStep(step, () => restorePhases[step] ? runStepSpan(restorePhases[step]!, work) : work());
   const reportWorkspaceStatus = (phase: RuntimeStatusPhase, message: string) =>
     runStepSpan("workspace.progress", () => emitRuntimeStatus(input.onRuntimeProgress, phase, message));
 
@@ -2096,6 +2106,7 @@ export async function prepareSandboxManagedRuntime(input: {
                 }),
                 onRuntimeProgress: input.onRuntimeProgress,
                 workspaceRestoreRetryDelaysMs: input.workspaceRestoreRetryDelaysMs,
+                runtimeSpan: input.runtimeSpan,
               });
               await nested.restoreWorkspace(restoreSink);
             }
@@ -2198,7 +2209,7 @@ export async function prepareSandboxManagedRuntime(input: {
                       await input.client.remove(remoteShallowPath).catch(() => undefined);
                     }
                     if (!forceFullBundle) {
-                      remoteWorkspaceStatus = await input.client.readFile(remoteWorkspaceStatusPath)
+                      remoteWorkspaceStatus = await runStepSpan("workspace.git_status_read", () => input.client.readFile(remoteWorkspaceStatusPath))
                         .then((bytes) => toBuffer(bytes).toString("utf8").trim())
                         .catch(() => "dirty");
                       remoteWorkspaceStatus = remoteWorkspaceStatus === "clean" ? "clean" : "dirty";
@@ -2226,10 +2237,10 @@ export async function prepareSandboxManagedRuntime(input: {
                 const extractedDir = path.join(tempDir, "workspace");
                 let sparseSupported = false;
                 if (input.workspaceCheckpoint && nativeSyncOut) {
-                  sparseSupported = await input.client.run(
+                  sparseSupported = await runStepSpan("workspace.probe", () => input.client.run(
                     `node --input-type=module -e ${shellQuote("import {DatabaseSync} from 'node:sqlite'; new DatabaseSync(':memory:').close()")}`,
                     { timeoutMs: 15_000 },
-                  ).then(() => true, () => false);
+                  )).then(() => true, () => false);
                 }
                 if (sparseSupported) {
                   const checkpointBaseline = repositories.length === 0 ? baselineSnapshot! : await selectDirectorySnapshot(baselineSnapshot!, {
@@ -2253,7 +2264,7 @@ export async function prepareSandboxManagedRuntime(input: {
                     try {
                       let captured = false;
                       try {
-                        await input.client.run(["node", remoteHelper, workspaceRemoteDir, remoteManifest, remoteOutput, JSON.stringify(workspaceRestoreExclude)].map(shellQuote).join(" "), { timeoutMs: input.spec.timeoutMs });
+                        await runStepSpan("workspace.capture", () => input.client.run(["node", remoteHelper, workspaceRemoteDir, remoteManifest, remoteOutput, JSON.stringify(workspaceRestoreExclude)].map(shellQuote).join(" "), { timeoutMs: input.spec.timeoutMs }));
                         captured = true;
                       } catch (error) {
                         if (!isCheckpointCaptureCapacityError(error)) throw error;
@@ -2270,7 +2281,7 @@ export async function prepareSandboxManagedRuntime(input: {
                         await withWorkspaceRestoreStep("workspace_transfer", () => input.client.syncOut!(outbound));
                         checkpointSnapshot = readCheckpointSnapshot(path.join(output, "manifest.sqlite"), checkpointBaseline);
                         await fs.rename(path.join(output, "payload"), extractedDir);
-                        const metrics = await validateCheckpointPayload({ baseline: checkpointBaseline, snapshot: checkpointSnapshot, payload: extractedDir });
+                        const metrics = await runStepSpan("workspace.validate", () => validateCheckpointPayload({ baseline: checkpointBaseline, snapshot: checkpointSnapshot!, payload: extractedDir }));
                         await input.onWorkspaceCheckpoint?.(metrics).catch(() => undefined);
                       }
                     } catch (error) {
@@ -2313,14 +2324,14 @@ export async function prepareSandboxManagedRuntime(input: {
                   await workspaceRestore.finish(transferredBytes, transferredBytes);
                 } else if (!checkpointSnapshot) {
                   const remoteWorkspaceTar = path.posix.join(runtimeRootDir, "workspace-download.tar");
-                  await withWorkspaceRestoreStep("workspace_transfer", () => input.client.run(
+                  await withWorkspaceRestoreStep("workspace_transfer", () => runStepSpan("workspace.capture", () => input.client.run(
                     `sh -c ${shellQuote(createRemoteTarballFromDirectoryCommand({
                       remoteDir: workspaceRemoteDir,
                       archivePath: remoteWorkspaceTar,
                       exclude: workspaceRestoreExclude,
                     }))}`,
                     { timeoutMs: input.spec.timeoutMs },
-                  ));
+                  )));
                   const workspaceRestore = makeTransferProgress(
                     restoreSink,
                     "Restoring",
@@ -2341,7 +2352,7 @@ export async function prepareSandboxManagedRuntime(input: {
                     });
                   });
                 }
-                if (!checkpointSnapshot) await confineFullWorkspaceExport(extractedDir);
+                if (!checkpointSnapshot) await runStepSpan("workspace.validate", () => confineFullWorkspaceExport(extractedDir));
                 const gitHeadToIntegrate = importedHead;
                 await withWorkspaceRestoreStep("directory_merge", async () => {
                   const mergeBaseline = repositories.length === 0 ? baselineSnapshot! : await selectDirectorySnapshot(baselineSnapshot!, {

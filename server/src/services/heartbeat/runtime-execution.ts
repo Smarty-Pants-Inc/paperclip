@@ -995,7 +995,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       const tail = identityRedactor.finish(stream);
       if (tail) await appendIdentityRedactedLog(stream, tail);
     }
-    await finishAdapterEvents?.();
+    await (finishAdapterEvents ? measureRunPhase("adapter_events.drain", finishAdapterEvents) : undefined);
     const instructionSave = input.instructions.getInstructionSave();
     if (instructionSave) adapterResult.resultJson = { ...adapterResult.resultJson, instructionSave };
 
@@ -1061,7 +1061,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
             ),
           ), { companyId: run.companyId });
         const workspaceFinalizeStatus = hasWorkspaceRestoreFailure(adapterResult.resultJson) ? "failed" : "succeeded";
-        await recordWorkspaceFinalize(workspaceFinalizeStatus);
+        await measureRunPhase("workspace.finalize_receipt", () => recordWorkspaceFinalize(workspaceFinalizeStatus));
         if (adapterResult.nativeFinalization) {
           adapterResult.nativeFinalization.workspaceFinalizeStatus =
             workspaceFinalizeStatus;
@@ -1072,9 +1072,9 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               workspaceFinalizeStatus,
               preserveProviderAttempt: Boolean(nativeWorkspaceSync || remoteWorkspaceAuthority),
             }));
-            await dispatchPendingNativeStatusWakeups({
+            await measureRunPhase("native_finalize.notices_dispatch", () => dispatchPendingNativeStatusWakeups({
               companyId: run.companyId,
-            });
+            }));
             if (finalized.phase === "committed") {
               await nativeWorkspaceSync?.cleanup();
             }
@@ -1331,11 +1331,11 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
     throw adapterErr;
   } finally {
     try {
-      if (!preserveRunGatewayTokens) await revokeHeartbeatRunGatewayTokens({
+      if (!preserveRunGatewayTokens) await measureRunPhase("runtime.gateway_revoke", () => revokeHeartbeatRunGatewayTokens({
         db,
         companyId: agent.companyId,
         runId: run.id,
-      });
+      }));
     } catch (revokeErr) {
       logger.warn(
         { err: revokeErr, runId: run.id, companyId: agent.companyId },
@@ -1343,7 +1343,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       );
     }
     await nativeInstructionReservation?.release();
-    await withAdapterExecutionPhase(executionPhaseContext, "instruction_cleanup", releaseInstructionCopy);
+    await measureRunPhase("instruction.release", () => withAdapterExecutionPhase(executionPhaseContext, "instruction_cleanup", releaseInstructionCopy));
   }
   return { dispatched: true, adapterResult };
 }

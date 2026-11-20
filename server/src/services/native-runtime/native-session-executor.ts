@@ -97,7 +97,7 @@ import {
   NATIVE_CONTINUITY_STATE_ENTRIES, NATIVE_SESSION_ROOT_HELD_ENTRIES, describeUnexpectedNativeSessionRootEntries,
   isKnownNativeSessionRootEntry,
 } from "./native-session-root-entries.js";
-import { createRunPreparationTiming } from "../execution-preparation-timing.js";
+import { beginEndrunTiming, beginRunPhase, createRunPreparationTiming, measureRunPhase } from "../execution-preparation-timing.js";
 import { CONFIGURED_ENVIRONMENT_KEYS, configuredEnvironment, PROVIDER_CREDENTIAL_ENVIRONMENT_KEYS } from "../../vendor/paperclip-runner/index.js";
 import { parseProviderPerformanceSpans } from "../../vendor/paperclip-runner/index.js";
 import { apiKeyBillingType } from "@paperclipai/adapter-utils/api-billing-type";
@@ -1769,9 +1769,13 @@ async function measureNativeRunnerSpan<T>(
  * OpenTelemetry-only timing left this interval invisible in the span table. */
 function createNativeControllerTiming(runId: string, currentTrace: () => NativeRunTrace | undefined) {
   const time = createRunPreparationTiming(runId, "native.controller");
-  return <T>(phase: Parameters<typeof time>[0], work: () => T | Promise<T>): Promise<T> =>
-    measureNativeControllerStep(phase, () => phase === "span_persistence" ? time(phase, work)
+  return <T>(phase: Parameters<typeof time>[0], work: () => T | Promise<T>): Promise<T> => {
+    const measured = () => measureNativeControllerStep(phase, () => phase === "span_persistence" ? time(phase, work)
       : measureNativeRunnerSpan(currentTrace(), `native.controller.${phase}`, () => time(phase, work), "task.provider_session"));
+    return phase === "warm_release" ? measureRunPhase("warm.release", measured)
+      : phase === "coordinator_release" ? measureRunPhase("coordinator.release", measured)
+      : phase === "github_stop" ? measureRunPhase("github.stop", measured) : measured();
+  };
 }
 
 /**
@@ -11868,13 +11872,14 @@ async function executePaperclipNativeSessionUnnoticed(input: {
     }
     throw error;
   } finally {
+    const endCleanup = beginRunPhase("executor.cleanup");
     try {
       startup.providerPackSourceAbort.abort(new Error("native_execution_startup_completed"));
       for (const lease of diagnosticLeases) lease.retire();
       let startupUnsettled = false;
       if (startup.executionContext) {
         if (startup.executionContext.active) startup.executionContext.abort(new Error("native_execution_startup_completed"));
-        startupUnsettled = !(await startup.executionContext.drain());
+        startupUnsettled = !(await measureRunPhase("executor.cleanup.context_drain", () => startup.executionContext!.drain()));
         startup.executionContext.finish();
       }
       // Join preparation cleanup before release; keep cancellation reachable
@@ -11888,7 +11893,7 @@ async function executePaperclipNativeSessionUnnoticed(input: {
       }
       let stagedCleanupFailed = false;
       try {
-        await cleanupStagedAttachments();
+        await measureRunPhase("executor.cleanup.attachments", cleanupStagedAttachments);
       } catch (cleanupError) {
         stagedCleanupFailed = true;
         // Cleanup is a confidentiality incident, but it occurs after the native
@@ -11920,7 +11925,7 @@ async function executePaperclipNativeSessionUnnoticed(input: {
           if (executionFailure !== undefined || startupUnsettled || stagedCleanupFailed) {
             pendingRelease.closeOnReleaseReason = "warm native session final cleanup failed";
           }
-          await pendingRelease.finishRelease();
+          await measureRunPhase("executor.cleanup.warm_handover", () => pendingRelease.finishRelease!());
         }
       } finally {
         if (ownsPhysicalIngress && physicalIngressKey && executingNativeIngressAllocations.get(physicalIngressKey) === ownerToken) {
@@ -11948,6 +11953,7 @@ async function executePaperclipNativeSessionUnnoticed(input: {
         startup.executionContext!.deadlineAtMs, startup.leaseOwner!, startup.executionContext!.pluginSupported,
         input.runnerExecutionTarget?.kind === "remote" ? input.runnerExecutionTarget.leaseId ?? undefined : undefined);
     } finally {
+      endCleanup();
       // Always hand the settling mark back, even if a cleanup step throws.
       const settledScope = nativeSessionScopeKey(input.execution);
       if (settlingNativeSessionScopes.get(settledScope) === runId) settlingNativeSessionScopes.delete(settledScope);
@@ -13218,6 +13224,7 @@ async function executePaperclipNativeSessionAttempt(
           ].includes(event.eventType) &&
           turnCompletedAtMs === null
         ) {
+          beginEndrunTiming();
           turnCompletedAtMs = milestoneAtMs;
           if (!agentTurnScope) {
             agentTurnScope = trace.start("agent.turn", {
@@ -14369,7 +14376,7 @@ async function executePaperclipNativeSessionAttempt(
     // answers and ACKs, and let the existing wired release owner resume a hold.
     // A settle failure must never lose a completed turn (rf-3 (iii)): the held
     // release stays held and the stale-lock sweep's recovery retries it.
-    await controlPlane.settleEventIngestion().catch(err =>
+    await measureRunPhase("ingestion.settle", () => controlPlane.settleEventIngestion()).catch(err =>
       logger.warn({ err, runId: input.execution.binding.runId }, "steering ingestion settle after a normal end failed; the release stays held for recovery"));
     // Persist provider accounting before any workspace/issue finalization. A
     // detached controller or failed finalizer must not lose a completed turn.
@@ -14384,9 +14391,9 @@ async function executePaperclipNativeSessionAttempt(
     } else nativeAccountingComplete = observedAccountingUsage !== null
       && observedAccountingTurn !== undefined && observedAccountingTurn === native.turnId;
     native = { ...native, usage: observedAccountingUsage };
-    await persistAccountingUsage(native.usage, nativeAccountingComplete);
+    await measureRunPhase("accounting.persist", () => persistAccountingUsage(native.usage, nativeAccountingComplete));
     try {
-      await completeManagedNativeCredentialTurn(managedCredentialSession);
+      await measureRunPhase("credentials.turn_complete", () => completeManagedNativeCredentialTurn(managedCredentialSession));
     } catch {
       // A durable result remains successful if optional credential refresh
       // fails. Retire this owner so it cannot keep stale auth on a warm turn.
@@ -14400,12 +14407,12 @@ async function executePaperclipNativeSessionAttempt(
       // provider's partial inline prompt. The run-scoped reader records a
       // durable complete-page receipt; this fence revalidates that exact
       // current snapshot before any native finalization can become authoritative.
-      await assertCurrentWakeCommentsRead(
+      await measureRunPhase("wake_receipt.validate", () => assertCurrentWakeCommentsRead(
         input.db,
         input.execution.binding,
         expectedCurrentWakeComments,
         native.result,
-      );
+      ));
     }
     await trace.record({
       name: "native.result.finalize",
@@ -15277,7 +15284,7 @@ async function executePaperclipNativeSessionAttempt(
     // release and hand-back, which a follow-up's admission may wait for
     // (`warmSessionReleaseWait`). The outer execution's finally clears it.
     settlingNativeSessionScopes.set(nativeSessionScopeKey(input.execution), input.execution.binding.runId);
-    await releaseGitHubRun?.();
+    await (releaseGitHubRun ? measureRunPhase("github.run_release", releaseGitHubRun) : undefined);
     if (githubAccess && (!warmSessionId || warmNativeSessions.get(warmSessionId)?.githubAccess !== githubAccess)) {
       await timeController("github_stop", () => githubAccess!.stop());
     }
@@ -15438,7 +15445,7 @@ async function executePaperclipNativeSessionAttempt(
     let renewalStopFailed = false;
     try {
       try {
-        await leaseRenewal.stop();
+        await measureRunPhase("renewal.join", () => leaseRenewal.stop());
       } catch (error) {
         renewalStopFailed = true;
         throw error;
@@ -15559,9 +15566,9 @@ async function executePaperclipNativeSessionAttempt(
         native.terminal.runTerminalState === "succeeded" ? "ok" : "failed",
     });
   }
-  await trace.finish(
+  await measureRunPhase("native_trace.finish_drain", () => trace.finish(
     native.terminal.runTerminalState === "succeeded" ? "ok" : "failed",
-  );
+  ));
   return adapterResult;
 }
 

@@ -1,3 +1,4 @@
+import { measureRunPhase } from "./execution-preparation-timing.js";
 import { notifyInstructionCollection } from "./instruction-collection-notifications.js";
 import { instructionCopyRetryAt } from "./instruction-copy-retry.js";
 import { notifyDirectoryCleanup } from "./directory-cleanup-notifications.js";
@@ -870,8 +871,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         const changed = nextHash !== row.baseHash;
         live();
         const { storageWarning, conflicts } = changed
-          ? await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: path.join(captured.directory, "files"), baseline: baseline(row), checkpoint: captured.manifest }, actor(row))
-          : await unchangedCheckpoint(row).then(() => ({
+          ? await measureRunPhase("instruction_checkpoint.canonical_apply", () => store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: path.join(captured!.directory, "files"), baseline: baseline(row), checkpoint: captured!.manifest }, actor(row)))
+          : await measureRunPhase("instruction_checkpoint.canonical_apply", () => unchangedCheckpoint(row)).then(() => ({
             storageWarning: typeof row.receipt?.storageWarning === "string" ? row.receipt.storageWarning : null, conflicts: [],
           }));
         live();

@@ -3,7 +3,7 @@ import { notifyNativeWorkspaceFinalization, releaseNativeWorkspaceFinalization }
 import { notifyNativeStatusReassessment } from "../native-status-reassessment-notifications.js";
 import { notifyQueuedRunDispatch } from "../run-dispatch-notifications.js";
 import { notifyDeferredExecutionWork, notifyDeferredWakesForRun } from "../deferred-execution-notifications.js";
-import { beginRunPhase } from "../execution-preparation-timing.js";
+import { beginRunPhase, measureRunPhase } from "../execution-preparation-timing.js";
 import { logActivity } from "../activity-log.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { nativeSha256 } from "./canonical.js";
@@ -353,7 +353,7 @@ export async function withNativeWorkspaceFinalizationOwnership<T>(
       if (activeRunOwners.get(runKey)?.token === owner.token) activeRunOwners.delete(runKey);
       joinedOwnerTokens.add(owner.token);
       try {
-        await input.db.transaction(async tx => {
+        await measureRunPhase("workspace.owner_release", () => input.db.transaction(async tx => {
           await notifyNativeResultCommit(tx, { companyId: input.companyId, runId: input.runId });
           await notifyNativeWorkspaceFinalization(tx, { companyId: input.companyId, runId: input.runId });
           await notifyNativeStatusReassessment(tx, { companyId: input.companyId, runId: input.runId });
@@ -364,7 +364,7 @@ export async function withNativeWorkspaceFinalizationOwnership<T>(
           await tx.update(heartbeatRuns).set({
             runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb) - ${OWNER_KEY}`,
           }).where(owned);
-        });
+        }));
         joinedOwnerTokens.delete(owner.token);
       } catch {
         // A reconnect in this exact controller boot can use the positive join

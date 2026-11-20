@@ -120,12 +120,31 @@ export type ExecutionPhase =
   | "execution.usage_startup" | "execution.mcp_handoff" | "execution.dispatch_admission" | "execution.budget_reservation"
   | "completion.run" | "completion.output" | "completion.terminal_write" | "completion.cost" | "completion.liveness" | "completion.summary"
   | "response.transaction" | "response.transaction.entry" | "response.transaction.commit" | "response.transaction.rollback" | "response.row_lock" | "response.write"
-  | "response.resolve" | "response.authorize" | "response.add_comment" | "response.activity" | "response.publish";
+  | "response.resolve" | "response.authorize" | "response.add_comment" | "response.activity" | "response.publish"
+  | "endrun" | "ingestion.settle" | "accounting.persist" | "credentials.turn_complete" | "wake_receipt.validate"
+  | "github.run_release" | "github.run_release.authority_fence" | "github.stop" | "github.stop.bridge" | "github.stop.launchers"
+  | "github.run_release.http2" | "github.run_release.queue_v1" | "github.run_release.state_write"
+  | "github.run_release.poll_join" | "github.run_release.pending_receipts" | "github.run_release.inflight_join"
+  | "instruction_checkpoint.stage" | "instruction_checkpoint.capture" | "instruction_checkpoint.download"
+  | "instruction_checkpoint.validate" | "instruction_checkpoint.canonical_apply" | "instruction_checkpoint.scratch_cleanup"
+  | "warm.release" | "coordinator.release" | "renewal.join" | "native_trace.finish_drain"
+  | "executor.cleanup" | "executor.cleanup.attachments" | "executor.cleanup.context_drain" | "executor.cleanup.warm_handover"
+  | "workspace.git_export" | "workspace.git_import" | "workspace.git_status_read" | "workspace.probe"
+  | "workspace.capture" | "workspace.transfer" | "workspace.validate" | "workspace.merge" | "workspace.extract"
+  | "workspace.git_integration" | "workspace.index_reset" | "workspace.git_ref_cleanup"
+  | "adapter_events.drain" | "workspace.remote_stamp_write" | "workspace.finalize_receipt" | "workspace.owner_release"
+  | "native_finalize.claim" | "native_finalize.assessment_read" | "native_finalize.policy" | "native_finalize.status_commit"
+  | "native_finalize.projection" | "native_finalize.notices_dispatch"
+  | "runtime.gateway_revoke" | "instruction.release" | "completion.log_finalize" | "provider_trace.finalize";
 
 // recordRunId: the run whose preparation log receives nested measureRunPhase
 // steps. A traced step opens its own scope, so it carries its preparation
 // ancestor's target; other scopes (execution attempts) never record.
-type RunScope = { runId: string; phase: string; parent?: Context; ended: boolean; details: Map<string, number>; recordRunId?: string };
+type Endrun = { context: Context; span: ReturnType<ReturnType<typeof trace.getTracer>["startSpan"]> };
+// Shared only by scopes in this execution attempt. No process-wide run registry,
+// writes, timers or promises: the existing execution recorder owns this lifetime.
+type AttemptTiming = { parent?: Context; endrun?: Endrun; endrunClosed?: boolean };
+type RunScope = { runId: string; phase: string; parent?: Context; ended: boolean; details: Map<string, number>; recordRunId?: string; attempt: AttemptTiming; endrunAtEntry?: Endrun };
 const ownership = new AsyncLocalStorage<RunScope>();
 const endpointEnabled = () => Boolean(process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim());
 
@@ -151,7 +170,9 @@ export function recordRepositoryObjectCacheDetail(detail: {
 
 export function getRunExecutionTraceContext(runId: string): Context | undefined {
   const owned = ownership.getStore();
-  return endpointEnabled() && owned?.runId === runId && !owned.ended ? owned.parent : undefined;
+  return endpointEnabled() && owned?.runId === runId && !owned.ended
+    ? owned.attempt.endrun && owned.endrunAtEntry !== owned.attempt.endrun ? owned.attempt.endrun.context : owned.parent
+    : undefined;
 }
 
 /** Inspect only the current async scope; unrelated authorization must not consume its detail budget. */
@@ -218,13 +239,17 @@ function measureTraced<T>(runId: string, name: string, work: () => T | Promise<T
       ended: false,
       details: !independent && previous?.runId === runId ? previous.details : new Map<string, number>(),
       recordRunId,
+      attempt: !independent && previous?.runId === runId ? previous.attempt : { parent },
+      endrunAtEntry: !independent && previous?.runId === runId ? previous.attempt.endrun : undefined,
     };
     operation = withDatabaseOperation(name, () => Promise.resolve().then(() =>
       ownership.run(owned, () => runWithRuntimeParent(owned.parent, work))).then(value => {
+        if (name === "task.execution_attempt") closeEndrunTiming(owned.attempt, "abandoned");
         try { span?.end(); } catch {}
         owned.ended = true;
         return value;
       }, error => {
+        if (name === "task.execution_attempt") closeEndrunTiming(owned.attempt, "abandoned");
         try { span?.setStatus({ code: SpanStatusCode.ERROR }); } catch {}
         try { span?.end(); } catch {}
         owned.ended = true;
@@ -236,7 +261,8 @@ function measureTraced<T>(runId: string, name: string, work: () => T | Promise<T
     // No tracer: still scope the run so nested measureRunPhase steps reach the run log.
     const previous = ownership.getStore();
     const owned: RunScope = { runId, phase: name, parent: undefined, ended: false,
-      details: !independent && previous?.runId === runId ? previous.details : new Map<string, number>() };
+      details: !independent && previous?.runId === runId ? previous.details : new Map<string, number>(),
+      attempt: !independent && previous?.runId === runId ? previous.attempt : {} };
     return withDatabaseOperation(name, () => ownership.run(owned, async () => {
       try { return await work(); } finally { owned.ended = true; }
     }));
@@ -266,6 +292,45 @@ export function withRunExecutionTiming<T>(runId: string, work: () => T | Promise
   return measure(runId, "task.execution_attempt", work, true);
 }
 
+/** Terminal observation is the fallback boundary when no earlier reply producer
+ * is identified. It deliberately survives native trace.finish and executor exit. */
+export function beginEndrunTiming(): void {
+  const owned = ownership.getStore();
+  if (!endpointEnabled() || !owned || owned.ended || owned.attempt.endrun || owned.attempt.endrunClosed) return;
+  try {
+    const span = trace.getTracer("paperclip.execution").startSpan("endrun", {
+      attributes: { [EXECUTION_PREPARATION_SPAN_ATTRS.runId]: createHash("sha256").update(owned.runId).digest("hex").slice(0, 12),
+        "endrun.boundary": "turn_terminal" },
+    }, owned.attempt.parent ?? owned.parent ?? ROOT_CONTEXT);
+    span.addEvent("turn.terminal");
+    owned.attempt.endrun = { span, context: trace.setSpan(owned.attempt.parent ?? ROOT_CONTEXT, span) };
+  } catch {}
+}
+
+export function markEndrunFinishedAt(sampledAt: Date): void {
+  try { ownership.getStore()?.attempt.endrun?.span.addEvent("finished_at.sampled", {}, sampledAt); } catch {}
+}
+
+/** Called after the existing terminal CAS resolves, never within its transaction.
+ * A failed/abandoned attempt closes without claiming a terminal commit. */
+export function finishEndrunTiming(committed: boolean, runId?: string): void {
+  const owned = ownership.getStore();
+  if (runId !== undefined && owned?.runId !== runId) return;
+  closeEndrunTiming(owned?.attempt, committed ? "committed" : "cas_miss");
+}
+
+function closeEndrunTiming(attempt: AttemptTiming | undefined, outcome: "committed" | "cas_miss" | "abandoned"): void {
+  const endrun = attempt?.endrun;
+  if (!endrun) return;
+  try {
+    endrun.span.setAttribute("endrun.outcome", outcome);
+    endrun.span.addEvent(outcome === "committed" ? "terminal.db_commit" : outcome === "cas_miss" ? "terminal.cas_miss" : "endrun.abandoned");
+    endrun.span.end();
+  } catch {}
+  attempt!.endrun = undefined;
+  attempt!.endrunClosed = true;
+}
+
 export function withRunWorkspaceFinalizationTiming<T>(runId: string, work: () => T | Promise<T>): Promise<T> {
   return measure(runId, "task.workspace_finalization", work, true);
 }
@@ -293,7 +358,7 @@ export function measureRunPhase<T>(phase: ExecutionPhase, work: () => T | Promis
       // A startup step can be more specific than the owning run phase. Keep that
       // causal parent while the child publishes its own context to plugin workers.
       const value = endpointEnabled()
-        ? await measure(owned.runId, phase, work, false, counts, getActiveStepContext()?.parentContext as Context | undefined, recordedRunId ?? undefined)
+        ? await measure(owned.runId, phase, work, false, counts, owned.attempt.endrun ? undefined : getActiveStepContext()?.parentContext as Context | undefined, recordedRunId ?? undefined)
         : await work();
       outcome = "ok";
       return value;
@@ -312,7 +377,7 @@ export function beginRunPhase(phase: ExecutionPhase): (failed?: boolean) => void
   try {
     const span = trace.getTracer("paperclip.execution").startSpan(phase, {
       attributes: { [EXECUTION_PREPARATION_SPAN_ATTRS.runId]: createHash("sha256").update(owned.runId).digest("hex").slice(0, 12) },
-    }, owned.parent);
+    }, getRunExecutionTraceContext(owned.runId));
     let ended = false;
     return failed => {
       if (ended) return;
@@ -383,8 +448,18 @@ const workspaceSyncPhases: Readonly<Record<string, ExecutionPhase>> = {
   pack: "workspace_sync.pack", "seed.verify": "workspace_sync.seed_verify",
   "stage.workspace": "workspace_sync.stage_workspace", "restore.workspace": "workspace_sync.restore",
   "workspace.restore": "execution.workspace_restore",
+  "workspace.git_export": "workspace.git_export", "workspace.git_import": "workspace.git_import",
+  "workspace.git_status_read": "workspace.git_status_read", "workspace.probe": "workspace.probe",
+  "workspace.capture": "workspace.capture", "workspace.validate": "workspace.validate",
+  "workspace.merge": "workspace.merge", "workspace.extract": "workspace.extract",
+  "workspace.git_integration": "workspace.git_integration", "workspace.index_reset": "workspace.index_reset",
+  "workspace.git_ref_cleanup": "workspace.git_ref_cleanup",
+  "github.run_release.http2": "github.run_release.http2", "github.run_release.queue_v1": "github.run_release.queue_v1",
+  "github.run_release.state_write": "github.run_release.state_write", "github.run_release.poll_join": "github.run_release.poll_join",
+  "github.run_release.pending_receipts": "github.run_release.pending_receipts", "github.run_release.inflight_join": "github.run_release.inflight_join",
 };
 
 export function measureWorkspaceSyncPhase<T>(name: string, work: () => Promise<T>): Promise<T> {
+  if (name === "workspace.transfer" && ownership.getStore()?.attempt.endrun) return measureRunPhase("workspace.transfer", work);
   return Object.prototype.hasOwnProperty.call(workspaceSyncPhases, name) ? measureRunPhase(workspaceSyncPhases[name]!, work) : work();
 }

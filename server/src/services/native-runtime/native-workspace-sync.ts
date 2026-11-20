@@ -878,7 +878,7 @@ async function finalizePreparedRuntime(input: {
       descriptor: input.descriptor,
       hostSha256: finalHostSha256,
     });
-    await writeRemoteStamp({ target: input.target, stamp });
+    await measureRunPhase("workspace.remote_stamp_write", () => writeRemoteStamp({ target: input.target, stamp }));
     const finalizedDescriptor: NativeWorkspaceSyncDescriptor = {
       ...input.descriptor,
       state: "finalized",

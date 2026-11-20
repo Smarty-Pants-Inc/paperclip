@@ -6,6 +6,8 @@ import { type DirectorySnapshot, type SnapshotEntry } from "@paperclipai/adapter
 import { captureAgentFiles, checkpointPath, type AgentFileManifest, type AgentFileCheckpointStats } from "./scripts/agent-file-checkpoint.mjs";
 import { inspectAgentFile, MAX_AGENT_DIRECTORY_BYTES, MAX_AGENT_DIRECTORY_ENTRIES, MAX_AGENT_FILE_BYTES } from "./agent-file-store.js";
 
+import { measureRunPhase } from "./execution-preparation-timing.js";
+
 export type { AgentFileManifest, AgentFileCheckpointStats };
 const quote = (text: string) => `'${text.replaceAll("'", `'"'"'`)}'`;
 export function checkpointSnapshot(manifest: AgentFileManifest): DirectorySnapshot {
@@ -83,7 +85,7 @@ export async function captureAgentFileCheckpoint(input: {
   const remoteDirectory = target ? path.posix.join(input.executionRoot, ".paperclip-runtime", path.basename(directory)) : null;
   let restore: Awaited<ReturnType<typeof prepareAdapterExecutionTargetRuntime>> | undefined;
   let cacheRuntime: Awaited<ReturnType<typeof prepareAdapterExecutionTargetRuntime>> | undefined;
-  const cleanup = async () => {
+  const cleanup = () => measureRunPhase("instruction_checkpoint.scratch_cleanup", async () => {
     try {
       await restore?.cleanupWorkspaceSnapshot?.();
     } finally {
@@ -94,33 +96,33 @@ export async function captureAgentFileCheckpoint(input: {
         if (result.exitCode !== 0 || result.timedOut) throw new Error("Agent checkpoint cleanup failed");
       }
     }
-  };
+  });
   try {
     let stats: AgentFileCheckpointStats;
-    if (!target) ({ stats } = await captureAgentFiles(input.localRoot, input.previous, directory));
+    if (!target) ({ stats } = await measureRunPhase("instruction_checkpoint.capture", () => captureAgentFiles(input.localRoot, input.previous, directory)));
     else {
       const cacheDir = path.join(directory, "cache");
       await fs.mkdir(cacheDir, { recursive: true });
       const cache = JSON.stringify(input.previous);
       await fs.writeFile(path.join(cacheDir, "manifest.json"), cache);
       live();
-      const prepared = cacheRuntime = await prepareAdapterExecutionTargetRuntime({ target, runId: input.runId, adapterKey: `agent-checkpoint-${path.basename(directory)}`,
-        workspaceLocalDir: directory, workspaceRemoteDir: remoteDirectory!, syncWorkspace: false, assets: [{ key: "cache", localDir: cacheDir, followSymlinks: false }] });
+      const prepared = cacheRuntime = await measureRunPhase("instruction_checkpoint.stage", () => prepareAdapterExecutionTargetRuntime({ target, runId: input.runId, adapterKey: `agent-checkpoint-${path.basename(directory)}`,
+        workspaceLocalDir: directory, workspaceRemoteDir: remoteDirectory!, syncWorkspace: false, assets: [{ key: "cache", localDir: cacheDir, followSymlinks: false }] }));
       const script = await fs.readFile(new URL("./scripts/agent-file-checkpoint.mjs", import.meta.url), "utf8");
       const options = { root: input.executionRoot, output: remoteDirectory, cacheFile: path.posix.join(prepared.assetDirs.cache!, "manifest.json"), cacheHash: createHash("sha256").update(cache).digest("hex") };
       live();
-      const result = await runAdapterExecutionTargetShellCommand(input.runId, target, `node --input-type=module -e ${quote(script)} -- --checkpoint ${quote(JSON.stringify(options))}`,
-        { cwd: target.remoteCwd, env: {}, timeoutSec: 120 });
+      const result = await measureRunPhase("instruction_checkpoint.capture", () => runAdapterExecutionTargetShellCommand(input.runId, target, `node --input-type=module -e ${quote(script)} -- --checkpoint ${quote(JSON.stringify(options))}`,
+        { cwd: target.remoteCwd, env: {}, timeoutSec: 120 }));
       if (result.exitCode !== 0 || result.timedOut) throw new Error(`Agent file checkpoint failed: ${result.stderr.trim()}`);
       stats = JSON.parse(result.stdout.trim()) as AgentFileCheckpointStats;
       await fs.rm(cacheDir, { recursive: true, force: true });
       live();
-      restore = await prepareAdapterExecutionTargetRuntime({ target, runId: input.runId, adapterKey: `agent-checkpoint-download-${path.basename(directory)}`, workspaceLocalDir: directory,
-        workspaceRemoteDir: remoteDirectory!, syncWorkspace: true, workspaceInboundMode: "adopt_remote", workspaceBaseline: { exclude: [], entries: new Map() }, workspaceGitSnapshot: null, workspaceRepositories: [], workspaceFileMode: "all" });
+      restore = await measureRunPhase("instruction_checkpoint.download", () => prepareAdapterExecutionTargetRuntime({ target, runId: input.runId, adapterKey: `agent-checkpoint-download-${path.basename(directory)}`, workspaceLocalDir: directory,
+        workspaceRemoteDir: remoteDirectory!, syncWorkspace: true, workspaceInboundMode: "adopt_remote", workspaceBaseline: { exclude: [], entries: new Map() }, workspaceGitSnapshot: null, workspaceRepositories: [], workspaceFileMode: "all" }));
       live();
-      await restore.restoreWorkspace();
+      await measureRunPhase("instruction_checkpoint.download", () => restore!.restoreWorkspace());
       live();
     }
-    return { directory, manifest: await validateAgentFileCheckpoint(directory, input.previous), stats, cleanup };
+    return { directory, manifest: await measureRunPhase("instruction_checkpoint.validate", () => validateAgentFileCheckpoint(directory, input.previous)), stats, cleanup };
   } catch (error) { await cleanup().catch(() => undefined); live(); throw error; }
 }

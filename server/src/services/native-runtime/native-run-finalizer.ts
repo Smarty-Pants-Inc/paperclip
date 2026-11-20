@@ -1632,12 +1632,12 @@ async function finalizeNativeRunAndProject(input: {
     .then((rows) => rows[0] ?? null);
   if (!admittedRun || admittedRun.runtimeMode !== "native")
     throw new Error("native_finalization_run_missing");
-  const claim = await claimCoordinator({
+  const claim = await measureRunPhase("native_finalize.claim", () => claimCoordinator({
     db: input.db,
     runId: input.runId,
     preserveProviderAttempt: input.preserveProviderAttempt,
     onlyWhenDue: input.onlyWhenDue,
-  });
+  }));
   const coordinator = claim.coordinator;
   if (!claim.leaseOwner && coordinator.phase === "committed") {
     if (isNativeRunnerOwnershipHeld(admittedRun)) return coordinator;
@@ -1706,7 +1706,7 @@ async function finalizeNativeRunAndProject(input: {
   const run = await input.db.select().from(heartbeatRuns)
     .where(eq(heartbeatRuns.id, input.runId)).limit(1).then(rows => rows[0] ?? null);
   if (!run || run.runtimeMode !== "native") throw new Error("native_finalization_run_missing");
-  const [resultRow, contractRow] = await Promise.all([
+  const [resultRow, contractRow] = await measureRunPhase("native_finalize.assessment_read", () => Promise.all([
     input.db
       .select()
       .from(nativeRunResults)
@@ -1730,7 +1730,7 @@ async function finalizeNativeRunAndProject(input: {
       )
       .limit(1)
       .then((rows) => rows[0] ?? null),
-  ]);
+  ]));
   if (!resultRow) throw new Error("native_result_missing");
   if (!contractRow) throw new Error("native_completion_contract_missing");
   const envelope = record(resultRow.resultJson);
@@ -1780,6 +1780,8 @@ async function finalizeNativeRunAndProject(input: {
   const allowIncompleteContinuation = record(sourceWake?.payload).continuationIdempotencyKey !== "native-completion-incomplete";
   let supersedesAssessmentId: string | null = coordinator.assessmentId;
   for (let attempt = 0; attempt < 3; attempt += 1) {
+    const endPolicy = beginRunPhase("native_finalize.policy");
+    try {
     // From upstream #21913 (prerequisite of #21959): re-read the run's saved
     // stop on each attempt so a stop that lands during finalization wins.
     const savedStop = attempt === 0 ? run.resultJson : await input.db.select({ resultJson: heartbeatRuns.resultJson })
@@ -2039,6 +2041,7 @@ async function finalizeNativeRunAndProject(input: {
       workspaceFinalizeStatus: input.workspaceFinalizeStatus, hasGovernanceGate: !!governanceGate,
       priorStatus: authoritativeStatus(authoritativeIssue.status), decision: proposedDecision,
     });
+    endPolicy();
     const assessmentRow = await recordNativeWorkAssessment({
       db: input.db,
       companyId: run.companyId,
@@ -2084,7 +2087,7 @@ async function finalizeNativeRunAndProject(input: {
         boardResponseWait !== null &&
         assessment.hasBlockingRemainingWork &&
         ["completion_evidence_incomplete", "prior_status_preserved_no_live_path"].includes(decision.reasonCode ?? "");
-      const committed = await commitNativeStatusDecision({
+      const committed = await measureRunPhase("native_finalize.status_commit", () => commitNativeStatusDecision({
         db: input.db,
         companyId: run.companyId,
         issueId: authoritativeIssue.id,
@@ -2145,7 +2148,7 @@ async function finalizeNativeRunAndProject(input: {
               }
             : undefined,
         failpoint: input.failpoint,
-      });
+      }));
       crashPoint("native.finalize.after_decision_before_projection");
       const now = new Date();
       const finalizationFailed = decision.effects.some(
@@ -2277,7 +2280,7 @@ async function finalizeNativeRunAndProject(input: {
         })
         .where(eq(heartbeatRuns.id, run.id))
         .returning();
-      const projection = await input.db.transaction(async transaction => {
+      const projection = await measureRunPhase("native_finalize.projection", () => input.db.transaction(async transaction => {
         const tx = transaction as unknown as Db;
 
 
@@ -2301,7 +2304,7 @@ async function finalizeNativeRunAndProject(input: {
         const [after] = await projectRun(tx);
         if (after && input.projectRunStatus) await settleNativeTerminalWake(tx, after);
         return after ? { before, after } : null;
-      });
+      }));
       const updatedRun = projection?.after;
       if (
         input.projectRunStatus &&
@@ -2357,6 +2360,7 @@ async function finalizeNativeRunAndProject(input: {
         projectRunStatus: input.projectRunStatus,
       });
     }
+    } finally { endPolicy(); }
   }
   throw new Error("native_finalization_status_race");
 }

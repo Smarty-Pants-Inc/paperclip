@@ -1780,26 +1780,32 @@ export async function startSandboxCallbackBridgeWorker(input: {
       if (stopping || paused) return;
       paused = true;
       runStateManaged = true;
-      await writeRunStateBestEffort(runStatePath, "paused");
+      await (input.runtimeSpan ?? ((_name, work) => work()))("github.run_release.state_write", () => writeRunStateBestEffort(runStatePath, "paused"));
       pausedPromise ??= new Promise<void>((resolve) => { resumePolling = resolve; });
       if (sleepTimer) clearTimeout(sleepTimer);
       sleepTimer = null;
       wakeSleep?.();
       wakeSleep = null;
       if (polling && pollSettledPromise) {
-        await Promise.race([
+        // Construct the original join synchronously: an async tracer must not
+        // defer the timer or re-read a settled poll's mutable promise.
+        const joining = Promise.race([
           pollSettledPromise,
           new Promise<void>((resolve) => setTimeout(resolve, iterationTimeoutMs)),
         ]);
+        await (input.runtimeSpan ?? ((_name, work) => work()))("github.run_release.poll_join", () => joining);
       }
-      await failPendingRequests("Bridge run detached before request could be handled.", { abandonInFlight: true });
+      await (input.runtimeSpan ?? ((_name, work) => work()))("github.run_release.pending_receipts", () => failPendingRequests("Bridge run detached before request could be handled.", { abandonInFlight: true }));
       if (inFlight > 0) {
-        await new Promise<void>((resolve) => {
+        // Preserve waiter registration before any tracer continuation can let
+        // the final in-flight request finish.
+        const joining = new Promise<void>((resolve) => {
           let timer: ReturnType<typeof setTimeout>;
           const finish = () => { clearTimeout(timer); resolve(); };
           inFlightWaiters.push(finish);
           timer = setTimeout(finish, iterationTimeoutMs);
         });
+        await (input.runtimeSpan ?? ((_name, work) => work()))("github.run_release.inflight_join", () => joining);
       }
     },
     resume: async (generation?: string) => {

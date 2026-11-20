@@ -13,7 +13,7 @@ import { nativeTaskSessionPublicationHandled } from "../native-runtime/native-ta
 import { boundOriginalMessage, describeRefusedExactResume, interruptedExactResumeCause } from "../native-runtime/native-exact-resume-failure.js";
 import { settledResponsePublicationSql } from "../native-runtime/native-response-publication-receipt.js";
 import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js";
-import { measureRunPhase } from "../execution-preparation-timing.js";
+import { finishEndrunTiming, markEndrunFinishedAt, measureRunPhase } from "../execution-preparation-timing.js";
 import { PROJECT_ACCESS_DENIED, ProjectAccessDeniedError } from "../project-access-denial.js";
 import { pendingCaseHandoffForRun } from "./case-handoff-lifecycle.js";
 import { createHeartbeatAgentStatus } from "./agent-status.js";
@@ -590,7 +590,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     } | null = null;
     if (handle) {
       await output.settleDeferredLogRecovery?.();
-      logSummary = await measureRunPhase("completion.output", () => runLogStore.finalize(handle));
+      logSummary = await measureRunPhase("completion.output", () => measureRunPhase("completion.log_finalize", () => runLogStore.finalize(handle)));
     }
     const finalLogBytes = logSummary?.bytes;
     if (outputProgressState.pending && typeof finalLogBytes === "number") {
@@ -600,7 +600,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
 
     if (providerTraceCapture) {
       try {
-        await traceStore.finalize(run.id, run.companyId);
+        await measureRunPhase("provider_trace.finalize", () => traceStore.finalize(run.id, run.companyId));
         onProviderTraceFinalized();
       } catch (error) {
         logger.warn(
@@ -725,12 +725,14 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       logSha256: logSummary?.sha256,
       logCompressed: logSummary?.compressed ?? false,
     };
+    markEndrunFinishedAt(finalRunPatch.finishedAt!);
     const persistedRunWrite = await measureRunPhase("completion.terminal_write", () => setRunStatusIfRunning(
       run.id,
       status,
       finalRunPatch,
       { adapterErrorMeta: adapterResult.errorMeta, secretValues: readFailureReportSecrets() },
     ));
+    finishEndrunTiming(persistedRunWrite.updated, run.id);
     let persistedRun: typeof heartbeatRuns.$inferSelect | null =
       persistedRunWrite.run;
     if (!persistedRunWrite.updated) {

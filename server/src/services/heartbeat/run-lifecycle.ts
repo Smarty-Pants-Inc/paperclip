@@ -1,3 +1,4 @@
+import { finishEndrunTiming } from "../execution-preparation-timing.js";
 import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
 import { writeRuntimeRunPointer } from "./runtime-run-pointer.js";
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
@@ -1386,6 +1387,9 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
               throw error;
             });
     });
+    // Close after the terminal transaction, before live/plugin publication.
+    // No telemetry write or wait is added inside the authority transaction.
+    if (updated && isHeartbeatRunTerminalStatus(status)) finishEndrunTiming(true, runId);
 
     if (updated) {
       publishLiveEvent({

@@ -9,6 +9,7 @@ import {
   startAdapterExecutionTargetPaperclipBridge,
 } from "@paperclipai/adapter-utils/execution-target";
 import { githubBrokerEnvironment } from "@paperclipai/adapter-utils/github-launcher";
+import { beginRunPhase, measureRunPhase, measureWorkspaceSyncPhase } from "../execution-preparation-timing.js";
 
 type Binding = { companyId: string; agentId: string; issueId: string; runId: string };
 type LauncherInput = Parameters<typeof prepareGitHubOperationLaunchers>[0];
@@ -100,10 +101,10 @@ export async function createNativeGitHubAccess(input: {
     activeGeneration = null;
     bridge?.markOrderlyCompletion?.();
     server.closeAllConnections();
-    const bridgeStop = await Promise.allSettled([bridge?.stop()]);
+    const bridgeStop = await Promise.allSettled([measureRunPhase("github.stop.bridge", () => bridge?.stop())]);
     const results = await Promise.allSettled([
       new Promise<void>(resolve => server.close(() => resolve())),
-      cleanupGitHubOperationLaunchers(location),
+      measureRunPhase("github.stop.launchers", () => cleanupGitHubOperationLaunchers(location)),
     ]);
     if (bridgeStop.some(result => result.status === "rejected") || results.some(result => result.status === "rejected")) {
       await input.onLog?.("stderr", "[paperclip] GitHub session cleanup incomplete.\n").catch(() => undefined);
@@ -129,6 +130,7 @@ export async function createNativeGitHubAccess(input: {
         enableSandboxDuplexBridge: duplexRequested,
         startPaused: true,
         getRunGeneration: () => activeGeneration ?? undefined,
+        runtimeSpan: measureWorkspaceSyncPhase,
         duplexObservabilityRecorder: adapterExecutionTargetDuplexObservabilityRecorder(input.target),
         onLog: input.onLog,
       });
@@ -170,8 +172,10 @@ export async function createNativeGitHubAccess(input: {
         activeGeneration = generation;
         return async () => {
           if (active === owner) {
+            const endFence = beginRunPhase("github.run_release.authority_fence");
             active = null;
             activeGeneration = null;
+            endFence();
             await bridge?.pause?.();
           }
         };
