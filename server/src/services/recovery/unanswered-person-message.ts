@@ -16,6 +16,7 @@ import type { AnyPgColumn } from "drizzle-orm/pg-core";
 import { issueService } from "../issues.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { logActivity } from "../activity-log.js";
+import { publishLiveEvent } from "../live-events.js";
 import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
 import { isWellFormedExecutionWait, wellFormedExecutionWaitSql } from "../deferred-execution-wait.js";
 import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
@@ -383,17 +384,20 @@ export async function settleUnansweredPersonMessage(
     eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
     or(sql`starts_with(${reasonOf(issueComments.metadata)}, ${UNANSWERED_MESSAGE_REASON_PREFIX})`,
       sql`starts_with(${reasonOf(issueComments.metadata)}, ${RETRYING_MESSAGE_REASON_PREFIX})`))).limit(1);
-  if (liveNotice) await db.transaction(async tx => {
+  const retired = !liveNotice ? [] : await db.transaction(async tx => {
     await tx.select({ id: issues.id }).from(issues)
       .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
-    await tx.execute(sql`update ${issueComments} n set deleted_at = ${now.toISOString()}::timestamptz, updated_at = ${now.toISOString()}::timestamptz
+    return [...await tx.execute<{ id: string }>(sql`update ${issueComments} n set deleted_at = ${now.toISOString()}::timestamptz, updated_at = ${now.toISOString()}::timestamptz
     where n.company_id = ${issue.companyId} and n.issue_id = ${issue.id} and n.author_type = 'system' and n.deleted_at is null
       and (starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
         or starts_with(n.metadata->>'authorizationReason', ${RETRYING_MESSAGE_REASON_PREFIX}))
       and exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
         and m.id::text = substr(n.metadata->>'authorizationReason', strpos(n.metadata->>'authorizationReason', ':') + 1)
-        and ${noticeRetiredSql(rawMessage("m"), sql.raw("m.deleted_at"), sql.raw("n.created_at"))})`);
+        and ${noticeRetiredSql(rawMessage("m"), sql.raw("m.deleted_at"), sql.raw("n.created_at"))})
+    returning n.id`)];
   });
+  // A retired note leaves an open chat at once: its id is re-read there (a deleted note reads as deleted).
+  for (const row of retired) announceNoteToOpenChat(issue, row.id, "retired");
 
   // The AGREED order (adopt-lead + rf-4, 10:09Z), one card per message:
   // (a) cut A's carried steers FIRST: a carried steer whose carrying turn failed or was stopped gets its own ONE
@@ -510,7 +514,27 @@ async function settleOneMessage(db: Db, issue: DecisionIssue, now: Date,
     }, tx);
     return comment?.id ?? null;
   });
+  if (commentId) announceNoteToOpenChat(issue, commentId, decision.upgradeCommentId ? "rewritten" : "added");
   return done(commentId ? { kind: "noticed", code: decision.code, commentId } : { kind: "noticed_before" });
+}
+
+/** The live source of a note this sweep wrote or rewrote. */
+export const UNANSWERED_NOTE_LIVE_SOURCE = "recovery.unanswered_message";
+
+/**
+ * An open chat sees the note at once (noteslive): the note, added, rewritten in place under the same id, or
+ * retired, is announced AFTER its commit on the thread's existing keyed comment hydration channel (ui
+ * LiveUpdatesProvider hydrateVisibleIssueComment re-reads that id; authenticated sockets refetch the thread's
+ * comments on the same action), the way conversation-steering re-announces a saved comment. No audit row: the
+ * sweep's notes never had one.
+ */
+function announceNoteToOpenChat(issue: { id: string; companyId: string }, commentId: string,
+  change: "added" | "rewritten" | "retired") {
+  publishLiveEvent({ companyId: issue.companyId, type: "activity.logged", payload: {
+    issueId: issue.id, action: "issue.comment_added", entityType: "issue", entityId: issue.id,
+    actorType: "system", actorId: "recovery",
+    details: { commentId, source: UNANSWERED_NOTE_LIVE_SOURCE, change },
+  } });
 }
 
 type CarriedSteerNotice = { reason: string; code: string; upgradeCommentId: string | null;
@@ -635,6 +659,7 @@ async function settleCarriedSteerNotices(db: Db, issue: DecisionIssue, now: Date
       return comment?.id ?? null;
     });
     if (commentId) {
+      announceNoteToOpenChat(issue, commentId, candidate.upgradeCommentId ? "rewritten" : "added");
       noticed ??= { kind: "noticed", code: candidate.code, commentId };
       noticedReasons.push(candidate.reason);
     }
