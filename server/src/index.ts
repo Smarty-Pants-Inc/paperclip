@@ -181,6 +181,7 @@ import {
   toolAccessService,
   workspaceOperationService,
 } from "./services/index.js";
+import { registerProcessHeartbeat } from "./services/heartbeat-registry.js";
 import { questionResponseDeliveryService, registerQuestionResponseDeliveryWork } from "./services/question-response-delivery.js";
 import { deliverNativeQuestionResponse } from "./services/native-runtime/native-question-bridge.js";
 import { registerStatusCardEvaluationWork, statusCardEvaluationService } from "./services/status-card-evaluation.js";
@@ -977,6 +978,9 @@ async function startServerWithDatabaseTeardown(
     ? heartbeatService(db as any, { pluginWorkerManager })
     : null;
   const accountingHeartbeat = heartbeat ?? heartbeatService(db as any, { pluginWorkerManager });
+  // Settlement, the native finalizer's drain and steering ingestion promote
+  // runs outside a heartbeat closure; they must use this wired instance.
+  registerProcessHeartbeat(db as any, accountingHeartbeat);
   // A native run whose controller the ownership reconciler proves gone is re-checked here,
   // so a crashed old server's runs end or resume without another server boot.
   if (heartbeat) registerNativeRestartRecheck(runIds => heartbeat.recoverNativeRunsAfterRestart(new Date(), runIds));

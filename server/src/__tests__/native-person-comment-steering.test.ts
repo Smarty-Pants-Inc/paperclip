@@ -38,6 +38,7 @@ import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
 import { PaperclipRunnerToolAuthority } from "../services/native-runtime/paperclip-runner-tool-authority.js";
 import { PaperclipControlPlanePort } from "../services/native-runtime/paperclip-control-plane-port.js";
 import { finalizeNativeRun } from "../services/native-runtime/native-run-finalizer.js";
+import { clearProcessHeartbeat, registerProcessHeartbeat } from "../services/heartbeat-registry.js";
 import { withNativeWorkspaceFinalizationOwnership, NativeWorkspaceFinalizationBusyError } from "../services/native-runtime/native-workspace-finalization-ownership.js";
 import { registerNativeResponsePresentationWork } from "../services/native-runtime/native-response-presentation-work.js";
 import { registerNativeCleanupReleaseWake } from "../services/native-runtime/native-cleanup-release-wake.js";
@@ -605,6 +606,44 @@ describe("native completion promotion (rf3-ibpair)", () => {
       if (process.env.PAPERCLIP_STEER_RED_EVIDENCE) await writeFile(
         join(process.env.PAPERCLIP_STEER_RED_EVIDENCE, `P2-proof-${phase}.json`), JSON.stringify(proof, null, 2));
     } finally { await f.close(); }
+  }, 60_000);
+
+  it("P2-wired: the finalizer's post-commit drain promotes on the registered process heartbeat, not a bare one", async () => {
+    const f = await fixture("P2-wired", true, false);
+    const realHeartbeatService = heartbeatModule.heartbeatService;
+    // The process heartbeat (index.ts registers the one built WITH the plugin
+    // worker manager). Mark it so the drain's instance is observable.
+    const processDrains: string[] = [];
+    const processHeartbeat = realHeartbeatService(db);
+    registerProcessHeartbeat(db, { ...processHeartbeat,
+      releaseIssueExecutionAndPromote: async (...args: Parameters<typeof processHeartbeat.releaseIssueExecutionAndPromote>) => {
+        processDrains.push(args[0].id);
+        return processHeartbeat.releaseIssueExecutionAndPromote(...args);
+      } });
+    const bareDrains: string[] = [];
+    const spy = vi.spyOn(heartbeatModule, "heartbeatService").mockImplementation((...args) => {
+      const service = realHeartbeatService(...args);
+      return { ...service, releaseIssueExecutionAndPromote: async (...releaseArgs: Parameters<typeof service.releaseIssueExecutionAndPromote>) => {
+        bareDrains.push(releaseArgs[0].id);
+        return service.releaseIssueExecutionAndPromote(...releaseArgs);
+      } };
+    });
+    try {
+      const message = await f.post("P2-WIRED: answer on the wired heartbeat", "queue");
+      await waitForPendingCommentSteers();
+      f.owner.deferCommitAtReturn = true;
+      await f.complete();
+      await db.update(nativeRunFinalizations).set({ leaseOwner: null, leaseExpiresAt: null })
+        .where(eq(nativeRunFinalizations.runId, f.runId));
+      await db.update(issues).set({ executionRunId: null, checkoutRunId: null,
+        executionAgentNameKey: null, executionLockedAt: null }).where(eq(issues.id, f.issueId));
+      await finalizeNativeRun({ db, runId: f.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+      await vi.waitFor(async () => { await f.assertAnsweredOnce([message]); }, { timeout: 30_000 });
+      await realHeartbeatService(db).drainActiveRunExecutions();
+      console.info("P2-wired proof", JSON.stringify({ runId: f.runId, processDrains, bareFinalizerDrains: bareDrains.filter(id => id === f.runId) }));
+      expect(processDrains).toContain(f.runId);
+      expect(bareDrains).not.toContain(f.runId);
+    } finally { spy.mockRestore(); clearProcessHeartbeat(db); await f.close(); }
   }, 60_000);
 
   it("P2-double: registry settlement drains before the committed finalizer's drain; ONE successor", async () => {
