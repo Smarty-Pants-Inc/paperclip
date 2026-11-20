@@ -153,6 +153,13 @@ async function mapNotification(state: CodexSessionState, notification: CodexRpcN
   }
 
 async function mapNotificationBody(state: CodexSessionState, notification: CodexRpcNotification): Promise<void> {
+    // The Pi/OpenCode facade names cancellation turn/cancelled; Codex app-server
+    // reports interrupted turns on turn/completed. Route the facade terminal
+    // through the same binding, start-settlement and replay checks, retaining
+    // its cancelled status for mapTerminalTurn (never a successful completion).
+    if (notification.method === "turn/cancelled") {
+      notification = { ...notification, method: "turn/completed" };
+    }
     if (notification.method === "paperclip/runtimeActivityRecorded") {
       const params = notification.params;
       if ((params as Record<PropertyKey, unknown>)[RUNNERD_RUNTIME_ACTIVITY] !== true) return;

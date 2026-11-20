@@ -721,7 +721,12 @@ describe("Codex app-server Codex driver", () => {
     ).toMatchObject({ channel: "summary", text: "**Tracing the retry path**\n\n**Verifying edge cases**" });
   });
 
-  it("orders turn.accepted before a terminal event even when the provider notifies the terminal turn ahead of the turn/start response", async () => {
+  // Keep reason: Stop while STARTING lost the Pi facade cancellation terminal.
+  it.each([
+    ["turn/completed", "failed", "turn.failed"],
+    ["turn/completed", "interrupted", "turn.interrupted"],
+    ["turn/cancelled", "cancelled", "turn.cancelled"],
+  ])("orders turn.accepted before %s (%s) even ahead of the turn/start response", async (method, status, terminalEvent) => {
     const transport = new FakeCodexTransport();
     let resolveTurnStart: (value: Record<string, unknown>) => void = () => {};
     transport.turnStartResponse = new Promise((resolve) => {
@@ -742,13 +747,13 @@ describe("Codex app-server Codex driver", () => {
       threadId: "thread-1",
       turn: { id: "turn-1", status: "inProgress" },
     });
-    transport.push("turn/completed", {
+    transport.push(method, {
       threadId: "thread-1",
       turn: {
         id: "turn-1",
-        status: "failed",
+        status,
         items: [],
-        error: { message: "provider rejected the turn" },
+        ...(status === "failed" ? { error: { message: "provider rejected the turn" } } : {}),
       },
     });
     // A macrotask boundary drains every microtask the notification pump can
@@ -765,13 +770,13 @@ describe("Codex app-server Codex driver", () => {
     const events = await collectUntilTerminal(session.events());
     const eventTypes = events.map((event) => event.eventType);
     expect(eventTypes).toEqual(
-      expect.arrayContaining(["turn.started", "turn.accepted", "turn.failed"]),
+      expect.arrayContaining(["turn.started", "turn.accepted", terminalEvent]),
     );
     expect(eventTypes.indexOf("turn.started")).toBeLessThan(
       eventTypes.indexOf("turn.accepted"),
     );
     expect(eventTypes.indexOf("turn.accepted")).toBeLessThan(
-      eventTypes.indexOf("turn.failed"),
+      eventTypes.indexOf(terminalEvent),
     );
     expect(
       events.some((event) => event.eventType === "session.failed"),
