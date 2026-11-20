@@ -3331,10 +3331,11 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         const refresh = patchLeaseTtl(c, id, orgHeaders, { sendGuard: () => {
           if (renewUntil !== undefined && Date.now() >= renewUntil) throw new Error("Boat RUN renewal cap reached");
         } });
-        // Only the preceding live GET authorizes this read. Settle its failure
-        // immediately, but await/record the PATCH receipt before using or throwing
-        // the proof result. A fast cat timeout must not strand a slow renewal.
-        liveSentinel = sentinel ? verifyWorkspaceSentinel(sentinel, {
+        // The preceding live GET authorizes starting this read, not using it.
+        // Settle its failure immediately; only a successful live PATCH below
+        // can authorize the early proof. Record that receipt before using it.
+        // A cap already reached forbids this PATCH; keep the base's single cat.
+        liveSentinel = sentinel && (renewUntil === undefined || Date.now() < renewUntil) ? verifyWorkspaceSentinel(sentinel, {
           request: (path, init) => request(c, path, init),
           run: (command, timeout) => runCommand(c, id, command, timeout, undefined, undefined, { intent: "idempotent_probe" }),
         }).then(value => ({ status: "fulfilled" as const, value }), reason => ({ status: "rejected" as const, reason })) : undefined;
@@ -3355,6 +3356,17 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         category: ttlRefresh.status === "failed" ? ttlRefresh.category : ttlRefresh.status === "unconfirmed" ? "deadline_mismatch" : null };
       if (ttlRefresh.status === "ok") duplexLogger?.info("Boat warm lease TTL refresh", details);
       else duplexLogger?.warn("Boat warm lease TTL refresh", details);
+      if (liveSentinel && (ttlRefresh.status === "failed" || !["ready", "idle", "running"].includes(sandbox.state)
+          || stopRefusals.has(activityKey(c, id)) || ["failing", "failed"].includes(sandbox.stop?.status))) {
+        // An early match predates the PATCH's observation: it cannot hand out a
+        // now-archived box. Drain/discard even a rejected proof, then run exactly
+        // the base's post-PATCH sentinel path (including its 409 resume recovery).
+        const reason = ttlRefresh.status === "failed" ? "patch-failed"
+          : !["ready", "idle", "running"].includes(sandbox.state) ? "patch-not-live" : "patch-stop-refused";
+        duplexLogger?.info("Boat lease resume path", { providerLeaseId: redactKey(c, id), resumePath: "fallback", reason });
+        await liveSentinel;
+        liveSentinel = undefined;
+      }
     }
     const liveProof = liveSentinel ? await liveSentinel : undefined;
     if (liveProof?.status === "rejected") throw liveProof.reason;

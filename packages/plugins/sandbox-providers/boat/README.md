@@ -85,9 +85,15 @@ On a proof-bearing warm resume, GET still comes first. Only a live
 `ready`/`idle`/`running` observation without a refused/failing stop starts the
 one-shot TTL PATCH and read-only workspace sentinel check together. The PATCH
 receipt is settled and logged before the sentinel result is used, including a
-sentinel timeout that throws to preserve the lease. The live branch logs
-`Boat lease resume path` with `resumePath: "live-parallel"`; lease metadata is
-unchanged. Stopped/archived and refused-stop resumes keep the existing
+sentinel timeout that throws to preserve the lease. The early sentinel counts
+only when the PATCH succeeds for the exact allocation and its own response is
+still `ready`/`idle`/`running` without a refused/failing/failed stop. Otherwise
+its result (even a rejection) is drained and discarded; the existing sequential
+post-PATCH sentinel path runs again, including today's 409 → resume → waitReady
+recovery. There is no second PATCH. The live branch logs `Boat lease resume path`
+with `resumePath: "live-parallel"`; a discarded proof also logs `resumePath:
+"fallback"` and reason `patch-failed`, `patch-not-live`, or `patch-stop-refused`.
+Lease metadata is unchanged. Stopped/archived and refused-stop resumes keep the existing
 resume → waitReady → sentinel sequence; nothing PATCHes before GET. This
 removes serial I/O from the warm path, but is not a live end-to-end latency claim.
 
