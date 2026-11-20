@@ -14361,6 +14361,13 @@ async function executePaperclipNativeSessionAttempt(
     // A detached consumer can resolve successfully after its stream closes.
     // Only the replacement controller may settle the run or certify accounting.
     assertControllerActive();
+    // executeNativeSession has joined its ordered consumer on normal return,
+    // too. Retained sessions keep a session-wide source sequence across
+    // attachRun, whereas the durable contiguous cursor is run-scoped: their
+    // previous run's prefix cannot make this run's cursor reach its terminal.
+    // Close with the exact consumer-stopped proof, preserving retained reads,
+    // answers and ACKs, and let the existing wired release owner resume a hold.
+    await controlPlane.settleEventIngestion();
     // Persist provider accounting before any workspace/issue finalization. A
     // detached controller or failed finalizer must not lose a completed turn.
     // session.usage() may be an attachment baseline, a partial report, or a

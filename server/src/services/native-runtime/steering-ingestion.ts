@@ -1,5 +1,6 @@
 import { and, eq, sql } from "drizzle-orm";
-import { heartbeatRuns, type Db } from "@paperclipai/db";
+import { heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { currentProcessProbe, proveOwnerGone } from "../owner-proof.js";
 
 /** One active-operation readiness bound, not an idle poller. Expiry NEVER releases input. */
 export const STEERING_INGESTION_WAIT_MS = 1_000;
@@ -29,6 +30,8 @@ export async function openSteeringIngestion(db: Db, input: { companyId: string; 
 export async function settleSteeringIngestion(db: Db, input: {
   companyId: string; runId: string; sourceInstanceId: string;
   terminalSourceSeq?: number; highestContiguousSourceSeq?: number; consumerStopped?: true;
+  /** Recovery must prove the persisted consumer's controller gone, never infer it from age or a new boot alone. */
+  recoverStoppedController?: true;
 }) {
   const release = await db.transaction(async tx => {
     const [run] = await tx.select({ result: heartbeatRuns.resultJson, status: heartbeatRuns.status }).from(heartbeatRuns)
@@ -36,14 +39,32 @@ export async function settleSteeringIngestion(db: Db, input: {
     if (!run) return false;
     const result = object(run.result), prior = object(result[STEERING_INGESTION_KEY]);
     if (prior.sourceInstanceId !== input.sourceInstanceId) return false;
+    let consumerStopped = input.consumerStopped === true;
+    if (input.recoverStoppedController) {
+      // A committed successful run cannot resume on this coordinator. Keep its
+      // exact controller stamp locked while proving the old consumer absent.
+      // A different boot alone is NOT proof (replicas may still be consuming).
+      if (run.status !== "succeeded" || prior.state !== "open" || result.steeringIngestionReleaseHeld !== true) return false;
+      const [owner] = await tx.select().from(nativeRunFinalizations).where(and(
+        eq(nativeRunFinalizations.companyId, input.companyId), eq(nativeRunFinalizations.runId, input.runId),
+      )).for("update");
+      if (!owner || owner.phase !== "committed") return false;
+      const proof = await proveOwnerGone({ kind: "local", scope: "steering-ingestion", generation: null,
+        host: null, processSpace: owner.controllerHostHash, bootId: owner.controllerBootId,
+        pid: owner.controllerPid, processStartedAt: owner.controllerProcessStartedAt?.toISOString() ?? null,
+        touchedAt: owner.updatedAt.toISOString(), requireRecordedProcessSpace: true,
+      }, currentProcessProbe());
+      if (proof.verdict !== "gone") return false;
+      consumerStopped = true;
+    }
     const terminal = input.terminalSourceSeq ?? prior.terminalSourceSeq;
     const contiguous = Math.max(Number(prior.highestContiguousSourceSeq ?? 0), input.highestContiguousSourceSeq ?? 0);
     const terminalIngested = typeof terminal === "number" && contiguous >= terminal;
     // Stop can retain a terminal after cancellation discarded part of its source
     // suffix. Once the ordered consumer is stopped/joined, those gaps cannot
     // deliver more read/text facts. Its closure proof wins over a cursor that
-    // can never become contiguous; natural completion still requires that cursor.
-    const settled = terminalIngested || input.consumerStopped === true;
+    // can never become contiguous; a terminal receipt alone still needs that cursor.
+    const settled = terminalIngested || consumerStopped;
     await tx.update(heartbeatRuns).set({ resultJson: { ...result, [STEERING_INGESTION_KEY]: {
       ...prior, terminalSourceSeq: terminal ?? null, highestContiguousSourceSeq: contiguous,
       state: terminalIngested ? "terminal_ingested" : settled ? "consumer_stopped" : "open",
