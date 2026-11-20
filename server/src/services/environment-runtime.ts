@@ -33,7 +33,8 @@ import { dueRunLeaseReleaseCondition, pendingRunLeaseReleaseCondition } from "./
 import { flushDeferredEnvironmentCleanup, registerDeferredEnvironmentCleanup, writeEnvironmentCleanup } from "./environment-cleanup-notifications.js";
 import { executeEnvironmentTask, pluginEnvironmentSupportsTasks, settleDispatchedEnvironmentTask } from "./environment-task-runtime.js";
 import { allowLegacyShutdownWorkspaceCleanup, legacyShutdownWorkspaceResourceProtected } from "./legacy-shutdown-workspace-settlement.js";
-import { nativeWorkspaceExportPendingForLease, nativeWorkspaceExportPendingForResource } from "./native-runtime/native-workspace-finalization-state.js";
+import { boxHasUnexportedPreparedWork, nativeWorkspaceExportPendingForLease, nativeWorkspaceExportPendingForResource } from "./native-runtime/native-workspace-finalization-state.js";
+import { nativeWorkspaceReleaseAllowedCondition } from "./native-runtime/native-workspace-release-guard.js";
 import { hasNativeHarnessBackupMissing } from "./native-runtime/native-harness-backup-missing.js";
 import { nativeCustodyKeptRecovery, nativeLeaseChainCustodyStamp, nativeLeaseCustodyMissing } from "./native-runtime/native-lease-custody.js";
 import { abandonedWorkspaceFilesHeldOnLease, abandonedWorkspaceFilesParked, parkAbandonedWorkspaceFilesLease } from "./remote-workspace-abandoned-files-hold.js";
@@ -4129,8 +4130,43 @@ function createPluginEnvironmentDriver(
       : taskStopped ? { providerLeaseId: lease.providerLeaseId, state: "stopped" } : undefined;
   }
 
+  /** Stop and KEEP a box whose files were never exported: no provider release
+   * or destroy. A provider stop (files retained by contract) when the worker
+   * offers one; otherwise only the runner task is settled and the box stays. */
+  async function stopAndKeepUnexportedPluginBox(input: EnvironmentDriverReleaseInput, runIds: string[],
+    executionStopObserved: boolean) {
+    const lease = input.lease;
+    const scope = and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, lease.companyId));
+    const settled = await settleDispatchedEnvironmentTask(db, workerManager, lease, { executionStopObserved });
+    const { plugin, driverKey, driverConfig } = await resolvePluginDriverForRelease(input);
+    const environmentId = input.environment?.id ?? readString(lease.metadata?.environmentId);
+    const receipt = environmentId && workerManager.getWorker(plugin.id)?.supportedMethods.includes("environmentStopLease")
+      ? await workerManager.call(plugin.id, "environmentStopLease", {
+        driverKey, companyId: lease.companyId, environmentId, issueId: lease.issueId,
+        config: driverConfig, providerLeaseId: lease.providerLeaseId, leaseMetadata: lease.metadata ?? undefined,
+      }) : undefined;
+    logger.warn({ leaseId: lease.id, providerLeaseId: lease.providerLeaseId, runIds },
+      "box kept, not released: it holds unexported prepared workspace work");
+    await db.update(environmentLeases).set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({
+      pluginLeaseCleanupMethod: "stop", unexportedWorkKept: { runIds, providerLeaseId: lease.providerLeaseId, at: new Date().toISOString() },
+    })}::jsonb` }).where(scope);
+    const stopped = remoteTerminationReceipt(lease, receipt) ? receipt
+      : settled !== false ? { providerLeaseId: lease.providerLeaseId, state: "stopped" } : undefined;
+    return await environmentsSvc.releaseLease(lease.id, input.status, {
+      cleanupStatus: "success",
+      remoteExecutionTermination: remoteTerminationReceipt(lease, stopped),
+    });
+  }
+
   async function releasePluginRunLease(input: EnvironmentDriverReleaseInput, executionStopObserved = false) {
     const scope = and(eq(environmentLeases.id, input.lease.id), eq(environmentLeases.companyId, input.lease.companyId));
+    // Never-OK: a release may erase the box; never release one that holds the
+    // only copy of a cut run's files (a 'prepared' reference with no final sha).
+    if (input.lease.providerLeaseId) {
+      const unexported = await boxHasUnexportedPreparedWork(db, {
+        companyId: input.lease.companyId, providerLeaseId: input.lease.providerLeaseId });
+      if (unexported.held) return await stopAndKeepUnexportedPluginBox(input, unexported.runIds, executionStopObserved);
+    }
     await db.update(environmentLeases).set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || '{"pluginLeaseCleanupMethod":"release"}'::jsonb` }).where(scope);
     let receipt: Awaited<ReturnType<typeof cleanupPluginRunLease>>;
     try {
@@ -4861,6 +4897,16 @@ export function environmentRuntimeService(
       for (let leaseRow of leaseRows) {
         try {
           let providerResourceDisposition = desiredProviderResourceDisposition;
+          // Export precedes ANY release, including a non-destructive physical
+          // Stop. Do not stop the source out from under its file-only worker.
+          if (providerResourceDisposition !== "keep_running") {
+            const [ready] = await db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+              eq(environmentLeases.id, leaseRow.id), nativeWorkspaceReleaseAllowedCondition()));
+            if (!ready) {
+              await environmentsSvc.releaseLease(leaseRow.id, status);
+              continue;
+            }
+          }
           if (providerResourceDisposition !== "stop_and_retain" && providerResourceDisposition !== "keep_running"
             && !hasStopOnlyCleanup(leaseRow) && await nativeWorkspaceExportPendingForLease(db, leaseRow)) continue;
           if (!(await allowLegacyShutdownWorkspaceCleanup(db, leaseRow, new Date(), {

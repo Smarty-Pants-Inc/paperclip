@@ -104,6 +104,10 @@ export async function nativeWorkspaceExportPendingForLease(db: Db, lease: Worksp
   return await held();
 }
 
+// Physical release and lease-table retirement use this identical box-wide
+// predicate. The verified exporter clears it by finalizing the reference.
+export { boxHasUnexportedPreparedWork } from "./native-workspace-release-guard.js";
+
 export async function nativeWorkspaceExportPendingForResource(db: Db, lease: WorkspaceSourceLease, resumingRunId: string | null) {
   if (!lease.provider || !lease.providerLeaseId || lease.provider === "local") return false;
   const sources = await db.select({ lease: { id: environmentLeases.id, companyId: environmentLeases.companyId,

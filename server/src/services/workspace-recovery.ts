@@ -19,7 +19,7 @@ import { conflict } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import type { EnvironmentRuntimeService } from "./environment-runtime.js";
 import { resolveEnvironmentExecutionTarget } from "./environment-execution-target.js";
-import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
+import { hasRemoteTerminationReceipt, remoteLeaseExecutionStopped } from "./remote-execution-termination.js";
 import { confirmSandboxRecoveryRestart, hasStopOnlyCleanup, prepareHistoricalSandboxStopVerification, prepareSandboxStopAndRetain, prepareStoppedSandboxForRecovery, restoreSandboxStopAfterFailedRestart, settleAbsentSandbox, settleStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
 import { requestSandboxAbsenceProof } from "./sandbox-absence-proof.js";
 import { persistActivity, publishActivity } from "./activity-log.js";
@@ -68,7 +68,7 @@ async function recheckStoppedWorkspaceRecovery(db: Db, source: StopEvidenceSourc
     if (!coordinator || coordinator.leaseOwner || !["terminal_failure", "applied"].includes(coordinator.phase)) return 0;
     const leases = await tx.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, source.companyId),
       eq(environmentLeases.heartbeatRunId, source.runId)));
-    if (!leases.length || leases.some(lease => !lease.provider || lease.provider === "local" || !hasRemoteTerminationReceipt(lease))) return 0;
+    if (!leases.length || leases.some(lease => !lease.provider || lease.provider === "local" || !remoteLeaseExecutionStopped(lease))) return 0;
     const intent = run.resultJson!.nativeCancellation as Record<string, unknown>;
     const fingerprint = createHash("sha256").update(JSON.stringify({ companyId: source.companyId, issueId: source.issueId,
       runId: source.runId, intentAuditId: intent.intentAuditId, acknowledgementAuditId: intent.acknowledgementAuditId,
@@ -270,7 +270,7 @@ export async function recoverRetainedWorkspace(input: Source & { db: Db; environ
       let sourceUnavailable = false;
       for (const source of inspected.sources) {
         const { lease, environment, remoteCwd } = source;
-        if (hasRemoteTerminationReceipt(lease)
+        if (remoteLeaseExecutionStopped(lease)
           && (lease.metadata?.remoteExecutionTermination as Record<string, unknown> | undefined)?.state === "destroyed") {
           sourceUnavailable = true;
           continue;
@@ -297,7 +297,7 @@ export async function recoverRetainedWorkspace(input: Source & { db: Db; environ
           }
         }
         let stoppedLease = lease;
-        if (!hasRemoteTerminationReceipt(stoppedLease)) {
+        if (!remoteLeaseExecutionStopped(stoppedLease)) {
           const pending = await db.transaction(async tx => {
             const [fresh] = await tx.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, input.companyId),
               eq(environmentLeases.id, lease.id))).for("update");
@@ -320,7 +320,7 @@ export async function recoverRetainedWorkspace(input: Source & { db: Db; environ
             .then(receipt => settleStopOnlyCleanup(db, pending, { attemptId: ownership.token, receipt }),
               async () => await restoreSandboxStopAfterFailedRestart(db, pending, { attemptId: ownership.token })
                 ?? await settleStopOnlyCleanup(db, pending, { attemptId: ownership.token }));
-          if (!settled || !hasRemoteTerminationReceipt(settled))
+          if (!settled || !remoteLeaseExecutionStopped(settled))
             throw new SystemRecoveryFailure("agent_stop_unconfirmed", "recheck_evidence");
           // The provider confirmed the sandbox is gone: its files cannot be read.
           if ((settled.metadata?.remoteExecutionTermination as Record<string, unknown> | undefined)?.state === "destroyed") {
@@ -338,7 +338,7 @@ export async function recoverRetainedWorkspace(input: Source & { db: Db; environ
         let cleanupLease = await db.transaction(async tx => {
           const [fresh] = await tx.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, input.companyId),
             eq(environmentLeases.id, lease.id))).for("update");
-          if (!fresh || !hasRemoteTerminationReceipt(fresh) || fresh.providerLeaseId !== lease.providerLeaseId)
+          if (!fresh || !remoteLeaseExecutionStopped(fresh) || fresh.providerLeaseId !== lease.providerLeaseId)
             throw new SystemRecoveryFailure("agent_stop_unconfirmed", "recheck_evidence");
           const pending = await prepareStoppedSandboxForRecovery(tx as unknown as Db, fresh);
           if (!pending) throw workspaceSourceBindingFailure("recovery_stop_intent_invalid");

@@ -572,4 +572,274 @@ import { readRemoteWorkspaceAuthority } from "@paperclipai/shared";
       expect(worker.nextWakeAt()).toBeNull();
     } finally { await worker.stop(); }
   });
+  // Never-OK guard: a terminal run's only written files cannot be released
+  // before the real copyback/read-back. This uses real PostgreSQL and shell
+  // transport; no provider turn, cloud sandbox or deployed recovery is claimed.
+  async function terminalCopyFixture(status: string, provider = "fake") {
+    const fs = await import("node:fs/promises");
+    const path = await import("node:path");
+    const root = await fs.mkdtemp(path.join(process.env.TMPDIR!, "terminal-copy-"));
+    vi.stubEnv("PAPERCLIP_HOME", path.join(root, "home"));
+    const f = await seed();
+    const host = path.join(root, "host"), box = path.join(root, "box");
+    await fs.mkdir(host); await fs.mkdir(box);
+    await fs.writeFile(path.join(host, "baseline.txt"), "saved baseline\n");
+    const { runChildProcess } = await import("@paperclipai/adapter-utils/server-utils");
+    const { environmentRuntimeService, classifyEnvironmentCapabilities } = await import("../environment-runtime.js");
+    const { environmentService } = await import("../environments.js");
+    const { resolveEnvironmentExecutionTarget } = await import("../environment-execution-target.js");
+    const { prepareNativeWorkspaceSync } = await import("./native-workspace-sync.js");
+    await db.update(environments).set({ config: { provider, reuseLease: true } })
+      .where(eq(environments.id, (await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId)))[0].environmentId!));
+    await db.update(executionWorkspaces).set({ cwd: host, providerRef: host, metadata: {} }).where(eq(executionWorkspaces.id, f.workspaceId));
+    await db.update(heartbeatRuns).set({ status: "running", runnerProfileJson: {}, resultJson: null }).where(eq(heartbeatRuns.id, f.runId));
+    const [source] = await db.update(environmentLeases).set({ status: "active", leasePolicy: "reuse_by_environment", provider,
+      metadata: { driver: "sandbox", remoteCwd: box, agentId: f.agentId, sandboxLeaseAcquisition: { outcome: "created", providerLeaseId: f.reference.providerLeaseId } } })
+      .where(eq(environmentLeases.id, f.leaseId)).returning();
+    let failCopy = false;
+    const stops: string[] = [];
+    const runtime = environmentRuntimeService(db, { drivers: [{ driver: "sandbox",
+      resolveCapabilities: async () => classifyEnvironmentCapabilities({}),
+      acquireRunLease: async () => (await environmentService(db).getLeaseById(f.leaseId))!,
+      releaseRunLease: async input => environmentService(db).releaseLease(input.lease.id, input.status),
+      resumeRunLease: async input => input.lease,
+      retryPendingSandboxTeardown: async ({ lease }) => {
+        stops.push(lease.providerLeaseId!);
+        return { providerLeaseId: lease.providerLeaseId!, state: "stopped" as const };
+      },
+      execute: async input => {
+        if (failCopy) throw new Error("deliberately unavailable local copy transport");
+        return runChildProcess(`terminal-copy-${randomUUID()}`, input.command, input.args ?? [], {
+          cwd: input.cwd ?? box, env: input.env ?? {}, stdin: input.stdin, timeoutSec: 20, graceSec: 1, onLog: async () => {},
+        });
+      },
+    }] });
+    const service = environmentService(db), lease = (await service.getLeaseById(f.leaseId))!;
+    const environment = (await service.getById(lease.environmentId!))!;
+    const target = (await resolveEnvironmentExecutionTarget({ db, companyId: f.companyId, adapterType: "paperclip_runner",
+      environment, lease, leaseId: lease.id, leaseMetadata: lease.metadata, environmentRuntime: runtime }))!;
+    const prepared = (await prepareNativeWorkspaceSync({ db, runId: f.runId, companyId: f.companyId, workspaceId: f.workspaceId,
+      workspaceLocalDir: host, target, lease, resourceDisposition: "keep_running" }))!;
+    const bytes = `actual-shell-written-${randomUUID()}\n`;
+    const wrote = await runChildProcess(`terminal-write-${randomUUID()}`, "bash", ["-c", "printf '%s' \"$1\" > \"$2\"", "bash", bytes, path.join(box, "written.txt")], {
+      cwd: box, env: {}, timeoutSec: 5, graceSec: 1, onLog: async () => {},
+    });
+    expect(wrote.exitCode).toBe(0);
+    await db.update(heartbeatRuns).set({ status, finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(environmentLeases).set({ status: "retained", cleanupStatus: null }).where(eq(environmentLeases.id, f.leaseId));
+    return { ...f, root, host, box, bytes, runtime, prepared, target, service, fs, path, stops, fail: (value: boolean) => { failCopy = value; },
+      close: async () => { await prepared.cleanup(); await fs.rm(root, { recursive: true, force: true }); vi.unstubAllEnvs(); } };
+  }
+
+  it("leaves committed accepted exports with their existing finalization owner", async () => {
+    const f = await terminalCopyFixture("succeeded");
+    try {
+      await acceptResult(f);
+      await db.update(nativeRunFinalizations).set({ phase: "committed" }).where(eq(nativeRunFinalizations.runId, f.runId));
+      const { exportTerminalNativeWorkspace } = await import("./native-terminal-workspace-export.js");
+      expect(await exportTerminalNativeWorkspace({ db, companyId: f.companyId, runId: f.runId, environmentRuntime: f.runtime })).toBe("pending");
+      await expect(f.fs.readFile(f.path.join(f.host, "written.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { await f.close(); }
+  }, 120_000);
+
+  it.each(["released", "expired", "failed"] as const)("reclaims an ended %s source before registered export", async status => {
+    const f = await terminalCopyFixture("failed");
+    await db.update(environmentLeases).set({ status, releasedAt: new Date(), cleanupStatus: "success" })
+      .where(eq(environmentLeases.id, f.leaseId));
+    const execute = f.runtime.execute.bind(f.runtime);
+    const copy = vi.spyOn(f.runtime, "execute").mockImplementation(async input => {
+      expect(await f.service.getLeaseById(f.leaseId)).toMatchObject({ status: "retained", releasedAt: null });
+      return execute(input);
+    });
+    const worker = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => { throw error; } });
+    try {
+      await registerCancelledWorkspacePreservationWork(db, worker, () => true, async () => true,
+        { environmentRuntime: f.runtime }).ready;
+      expect(await f.fs.readFile(f.path.join(f.host, "written.txt"), "utf8")).toBe(f.bytes);
+      expect(copy).toHaveBeenCalled();
+      expect(await f.service.releaseLease(f.leaseId, "released")).toMatchObject({ status: "released" });
+    } finally { await worker.stop(); copy.mockRestore(); await f.close(); }
+  }, 120_000);
+
+  it.each(["failed", "cancelled", "timed_out", "interrupted", "succeeded"])("exports terminal %s files through the registered worker and reads them on a later box", async status => {
+    const f = await terminalCopyFixture(status);
+    const errors: unknown[] = [];
+    const worker = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => errors.push(error) });
+    try {
+      if (status === "failed") {
+        const [old] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+        const reference = { ...(old.runnerProfileJson!.nativeWorkspaceSync as Record<string, unknown>) };
+        delete reference.preparedAt; // previous release's persisted shape
+        await db.update(heartbeatRuns).set({ runnerProfileJson: { ...old.runnerProfileJson, nativeWorkspaceSync: reference } })
+          .where(eq(heartbeatRuns.id, f.runId));
+      }
+      await registerCancelledWorkspacePreservationWork(db, worker, () => true, async () => true,
+        { environmentRuntime: f.runtime }).ready;
+      expect(await f.fs.readFile(f.path.join(f.host, "written.txt"), "utf8")).toBe(f.bytes);
+      const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      expect(saved.status).toBe(status);
+      expect(saved.runnerProfileJson?.nativeWorkspaceSync).toMatchObject({ state: "finalized", finalHostSha256: expect.stringMatching(/^[0-9a-f]{64}$/) });
+      expect(errors).toEqual([]);
+      // A distinct cold box receives the saved host tree through the same real
+      // preparation path (not by copying a test's expected bytes).
+      const runId = randomUUID(), leaseId = randomUUID(), nextBox = f.path.join(f.root, "later-box");
+      await f.fs.mkdir(nextBox);
+      await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId, issueId: f.issueId,
+        nativeIssueId: f.issueId, runtimeMode: "native", status: "running" });
+      const [source] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
+      await db.insert(environmentLeases).values({ ...source, id: leaseId, heartbeatRunId: runId, providerLeaseId: `new-${randomUUID()}`,
+        status: "active", metadata: { ...source.metadata, remoteCwd: nextBox, sandboxLeaseAcquisition: { outcome: "created" } } });
+      const lease = (await f.service.getLeaseById(leaseId))!;
+      const { prepareNativeWorkspaceSync } = await import("./native-workspace-sync.js");
+      const { resolveEnvironmentExecutionTarget } = await import("../environment-execution-target.js");
+      const target = (await resolveEnvironmentExecutionTarget({ db, companyId: f.companyId, adapterType: "paperclip_runner",
+        environment: (await f.service.getById(lease.environmentId!))!, lease, leaseId, leaseMetadata: lease.metadata,
+        environmentRuntime: f.runtime }))!;
+      if (status === "failed") {
+        // A finalized old-release descriptor was normally deleted at cleanup.
+        await f.prepared.cleanup();
+        const [old] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+        const reference = { ...(old.runnerProfileJson!.nativeWorkspaceSync as Record<string, unknown>) };
+        delete reference.preparedAt;
+        await db.update(heartbeatRuns).set({ updatedAt: new Date(), runnerProfileJson: { ...old.runnerProfileJson, nativeWorkspaceSync: reference } })
+          .where(eq(heartbeatRuns.id, f.runId));
+      }
+      const next = await prepareNativeWorkspaceSync({ db, runId, companyId: f.companyId, workspaceId: f.workspaceId,
+        workspaceLocalDir: f.host, target, lease });
+      expect(await f.fs.readFile(f.path.join(nextBox, "written.txt"), "utf8")).toBe(f.bytes);
+      if (status === "failed") await next?.restoreWorkspace();
+      await next?.cleanup();
+      expect(await f.service.releaseLease(f.leaseId, "released")).toMatchObject({ status: "released" });
+    } finally { await worker.stop(); await f.close(); }
+  }, 120_000);
+
+  it.each(["released", "expired", "failed", "bulk", "runtime", "stop-only", "export-resume", "restart-restore", "historical-inspection", "absence"]) ("refuses %s release while a terminal native descriptor is prepared", async path => {
+    const f = await terminalCopyFixture("failed", path === "absence" ? "daytona" : "fake");
+    try {
+      if (path === "released") {
+        const { workspaceOperations } = await import("@paperclipai/db");
+        await db.insert(workspaceOperations).values({ companyId: f.companyId, heartbeatRunId: f.runId,
+          phase: "workspace_recovery_snapshot", status: "succeeded", metadata: {
+            schema: "paperclip.workspace-recovery-snapshot.v1", leaseId: f.leaseId, providerLeaseId: f.prepared.reference.providerLeaseId,
+            archive: { sha256: "a".repeat(64), byteSize: 1, objectKey: "not-a-bound-readback" },
+            manifest: { sha256: "b".repeat(64), byteSize: 1, objectKey: "not-a-bound-manifest" },
+          } });
+      }
+      let readBack = false;
+      const attemptRelease = async () => {
+      if (path === "bulk") {
+        await db.update(environmentLeases).set({ status: "active" }).where(eq(environmentLeases.id, f.leaseId));
+        await f.service.releaseLeasesForRun(f.runId);
+      } else if (path === "runtime") {
+        await db.update(environmentLeases).set({ status: "active" }).where(eq(environmentLeases.id, f.leaseId));
+        await f.runtime.releaseRunLeases(f.runId, "released", undefined, "stop_and_retain");
+      } else if (path === "stop-only") {
+        await db.update(environmentLeases).set({ status: "active" }).where(eq(environmentLeases.id, f.leaseId));
+        const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
+        // Built-in stop dispatch is not mocked as custody: its positive receipt
+        // alone must still fail the file-release predicate.
+        const pending = (await prepareSandboxStopAndRetain(db, lease))!;
+        await settleStopOnlyCleanup(db, pending, { attemptId: String(pending.metadata!.pendingCleanupAttemptId),
+          receipt: { state: "stopped", providerLeaseId: lease.providerLeaseId } });
+      } else if (path === "export-resume") {
+        const pluginId = randomUUID(), attemptId = randomUUID();
+        const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
+        const [pending] = await db.update(environmentLeases).set({ status: "pending_cleanup", metadata: { ...lease.metadata, pluginId,
+          pendingCleanupAttemptId: attemptId, nativeWorkspaceExportResume: { schema: "paperclip.workspace-export-resume.v2",
+            requestId: attemptId, resultId: randomUUID(), companyId: f.companyId, runId: f.runId, leaseId: lease.id,
+            provider: lease.provider, providerLeaseId: lease.providerLeaseId, pluginId } } })
+          .where(eq(environmentLeases.id, lease.id)).returning();
+        const { settleNativeWorkspaceExportResume } = await import("./native-workspace-export-resume.js");
+        await settleNativeWorkspaceExportResume(db, pending, { attemptId,
+          receipt: { state: "stopped", providerLeaseId: pending.providerLeaseId } });
+      } else if (path === "restart-restore") {
+        const { remoteTerminationReceipt } = await import("../remote-execution-termination.js");
+        const { restoreSandboxStopAfterFailedRestart } = await import("../sandbox-stop-and-retain.js");
+        const [lease] = await db.update(environmentLeases).set({ status: "active" }).where(eq(environmentLeases.id, f.leaseId)).returning();
+        const pending = (await prepareSandboxStopAndRetain(db, lease))!;
+        const [suspended] = await db.update(environmentLeases).set({ metadata: { ...pending.metadata,
+          sandboxStopAndRetain: { ...(pending.metadata!.sandboxStopAndRetain as Record<string, unknown>), priorStop: {
+            remoteExecutionTermination: remoteTerminationReceipt(pending, { state: "stopped", providerLeaseId: pending.providerLeaseId }) } } } })
+          .where(eq(environmentLeases.id, f.leaseId)).returning();
+        await restoreSandboxStopAfterFailedRestart(db, suspended, { attemptId: String(pending.metadata!.pendingCleanupAttemptId) });
+      } else if (path === "historical-inspection") {
+        const [lease] = await db.update(environmentLeases).set({ status: "released", cleanupStatus: "failed" })
+          .where(eq(environmentLeases.id, f.leaseId)).returning();
+        await settleStopOnlyCleanup(db, lease, { attemptId: randomUUID(), receiptSource: "provider_inspection",
+          receipt: { state: "stopped", providerLeaseId: lease.providerLeaseId } });
+      } else if (path === "absence") {
+        const { withNativeWorkspaceFinalizationOwnership } = await import("./native-workspace-finalization-ownership.js");
+        const { settleAbsentSandbox } = await import("../sandbox-stop-and-retain.js");
+        await withNativeWorkspaceFinalizationOwnership({ db, companyId: f.companyId, runId: f.runId }, async owner => {
+          const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
+          expect(await settleAbsentSandbox(db, lease, { receipt: "verified-at-caller-boundary", proof: {
+            v: 1, iss: "paperclip-cloud", aud: "paperclip-sandbox-absence/v1", sub: "local-proof-row", absent: true,
+            iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 30, ownerToken: owner.token,
+            companyId: f.companyId, issueId: f.issueId, runId: f.runId, leaseId: lease.id,
+            provider: "daytona", providerLeaseId: lease.providerLeaseId!,
+          } })).toBe(readBack);
+        });
+      } else await f.service.releaseLease(f.leaseId, path as "released" | "expired" | "failed", { cleanupStatus: "success" });
+      };
+      await attemptRelease();
+      expect(await f.service.getLeaseById(f.leaseId)).toMatchObject({ status: "retained", releasedAt: null });
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      expect(run.runnerProfileJson?.nativeWorkspaceSync).toMatchObject({ state: "prepared", finalHostSha256: null });
+      expect(f.stops).toEqual([]);
+      const { exportTerminalNativeWorkspace } = await import("./native-terminal-workspace-export.js");
+      expect(await exportTerminalNativeWorkspace({ db, companyId: f.companyId, runId: f.runId, environmentRuntime: f.runtime })).toBe("settled");
+      expect(await f.fs.readFile(f.path.join(f.host, "written.txt"), "utf8")).toBe(f.bytes);
+      readBack = true;
+      await attemptRelease();
+      if (path === "runtime") expect(f.stops).toEqual([f.prepared.reference.providerLeaseId]);
+      expect(await f.service.getLeaseById(f.leaseId)).toMatchObject({ status: ["expired", "failed"].includes(path) ? path : "released" });
+      expect(await f.service.releaseLease(f.leaseId, "released")).toMatchObject({ status: "released" });
+    } finally { await f.close(); }
+  }, 120_000);
+
+  it("keeps the source through a failed export and retries with one warning", async () => {
+    const f = await terminalCopyFixture("failed");
+    const { exportTerminalNativeWorkspace } = await import("./native-terminal-workspace-export.js");
+    const { logger } = await import("../../middleware/logger.js");
+    const warning = vi.spyOn(logger, "warn");
+    const input = { db, companyId: f.companyId, runId: f.runId, environmentRuntime: f.runtime };
+    try {
+      f.fail(true);
+      expect(await exportTerminalNativeWorkspace(input)).toBe("pending");
+      expect(await exportTerminalNativeWorkspace(input)).toBe("pending");
+      expect(await f.service.getLeaseById(f.leaseId)).toMatchObject({ status: "retained", releasedAt: null });
+      expect(await f.fs.readFile(f.path.join(f.box, "written.txt"), "utf8")).toBe(f.bytes);
+      expect(warning.mock.calls.filter(call => String(call[1]).includes("Terminal native workspace export failed"))).toHaveLength(1);
+      f.fail(false);
+      expect(await exportTerminalNativeWorkspace(input)).toBe("settled");
+      expect(await f.fs.readFile(f.path.join(f.host, "written.txt"), "utf8")).toBe(f.bytes);
+    } finally { await f.close(); }
+  }, 120_000);
+
+  it("does not export a live adopted allocation or overwrite a newer server snapshot", async () => {
+    const f = await terminalCopyFixture("cancelled");
+    const { exportTerminalNativeWorkspace } = await import("./native-terminal-workspace-export.js");
+    const input = { db, companyId: f.companyId, runId: f.runId, environmentRuntime: f.runtime };
+    const successor = randomUUID();
+    try {
+      await db.insert(heartbeatRuns).values({ id: successor, companyId: f.companyId, agentId: f.agentId,
+        issueId: f.issueId, nativeIssueId: f.issueId, runtimeMode: "native", status: "running" });
+      const [source] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
+      await db.insert(environmentLeases).values({ ...source, id: randomUUID(), heartbeatRunId: successor, status: "active" });
+      expect(await exportTerminalNativeWorkspace(input)).toBe("pending");
+      await expect(f.fs.readFile(f.path.join(f.host, "written.txt"), "utf8")).rejects.toHaveProperty("code", "ENOENT");
+      await db.update(heartbeatRuns).set({ status: "succeeded", runnerProfileJson: { nativeWorkspaceSync: {
+        ...f.prepared.reference, state: "finalized", finalHostSha256: "a".repeat(64), preparedAt: new Date(Date.now() + 60000).toISOString(),
+      } } }).where(eq(heartbeatRuns.id, successor));
+      await f.fs.writeFile(f.path.join(f.host, "written.txt"), "newer successor snapshot\n");
+      const outcome = await exportTerminalNativeWorkspace(input);
+      expect(await f.fs.readFile(f.path.join(f.host, "written.txt"), "utf8")).toBe("newer successor snapshot\n");
+      expect(outcome).toBe("pending");
+      const { workspaceOperations } = await import("@paperclipai/db");
+      const operations = await db.select().from(workspaceOperations).where(eq(workspaceOperations.heartbeatRunId, f.runId));
+      expect(operations.at(-1)?.stderrExcerpt).toContain("native_workspace_sync_snapshot_superseded");
+      expect(await f.service.getLeaseById(f.leaseId)).toMatchObject({ status: "retained" });
+    } finally { await f.close(); }
+  }, 120_000);
+
 });
