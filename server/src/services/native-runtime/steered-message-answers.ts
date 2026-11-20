@@ -21,6 +21,8 @@ export interface SteerAnswerEvent {
 interface TextItem {
   start?: number;
   completedAt?: number;
+  /** Progress text (Pi: text before a tool call; Codex: commentary): posted only as a steer's answer. */
+  progress?: boolean;
 }
 
 const STEER_ITEM = /:steer:(.+)$/;
@@ -29,7 +31,8 @@ const TURN_END = new Set(["turn.completed", "turn.cancelled", "turn.failed"]);
 /**
  * The answered rule for steered person messages (never-OK, live on PV2 s3).
  * A steered message B is ANSWERED by its run only when the run log shows an assistant
- * FINAL text item (kind agentMessage, channel final; never commentary, reasoning or a tool) with a real item.started
+ * text item (kind agentMessage, channel final, or the progress text it wrote before its next tool; never reasoning or
+ * a tool) with a real item.started
  * after B's delivery userMessage and before that turn's end, whose same item then
  * COMPLETED (item.completed) with non-empty text in that window. Tool calls do not
  * close the window: every later model request in the Pi session contains B in its
@@ -54,6 +57,8 @@ const TURN_END = new Set(["turn.completed", "turn.cancelled", "turn.failed"]);
 export function steeredMessageAnswers(events: Iterable<SteerAnswerEvent>): {
   acknowledged: string[]; delivered: string[]; answered: string[];
   deliveredEventSeqs: Record<string, number>;
+  /** Progress text items that are a delivered steer's FIRST text: the answer the person must see (posted before the final). */
+  answerItemIds: string[];
 } {
   const list = [...events].sort((a, b) => a.seq - b.seq);
   const acknowledged: string[] = [];
@@ -92,23 +97,32 @@ export function steeredMessageAnswers(events: Iterable<SteerAnswerEvent>): {
       const item = textItems.get(event.itemId) ?? {};
       textItems.set(event.itemId, item);
       if (event.eventType === "item.started") item.start ??= event.seq;
-      else if (event.hasText && event.channel === "final" && event.providerPhase !== "commentary"
-        && item.start !== undefined) item.completedAt = event.seq;
+      else if (event.hasText && item.start !== undefined && (event.channel === "progress"
+        || (event.channel === "final" && event.providerPhase !== "commentary"))) {
+        item.completedAt = event.seq;
+        item.progress = event.channel === "progress";
+      }
     } else if (TURN_END.has(event.eventType)) {
       boundaries.push({ seq: event.seq, eventType: event.eventType });
     }
   }
+  // A steer's answer is the FIRST completed text the model wrote after reading it, in that turn. A
+  // progress answer ("101", then the next tool) is posted as its own reply (native-response-items.ts);
+  // whether the steer counts as answered is then decided by the posted reply (person-message-answer.ts).
+  const answerItemIds = new Set<string>();
   const answered = acknowledged.filter((id) => {
     const at = deliveredAt.get(id);
     if (at === undefined) return false;
     const terminal = boundaries.find(({ seq }) => seq > at);
     if (terminal && terminal.eventType !== "turn.completed") return false;
     const end = terminal?.seq ?? Number.POSITIVE_INFINITY;
-    return [...textItems.values()].some((item) => item.start !== undefined && item.start > at && item.start < end
-      && item.completedAt !== undefined && item.completedAt < end);
+    const answer = [...textItems.entries()].filter(([, item]) => item.start !== undefined && item.start > at && item.start < end
+      && item.completedAt !== undefined && item.completedAt < end).sort(([, a], [, b]) => a.start! - b.start!)[0];
+    if (answer?.[1].progress) answerItemIds.add(answer[0]);
+    return answer !== undefined;
   });
   return { acknowledged, delivered: acknowledged.filter((id) => deliveredAt.has(id)), answered,
-    deliveredEventSeqs: Object.fromEntries(deliveredAt) };
+    deliveredEventSeqs: Object.fromEntries(deliveredAt), answerItemIds: [...answerItemIds] };
 }
 
 const kind = sql<string | null>`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'kind'`;
