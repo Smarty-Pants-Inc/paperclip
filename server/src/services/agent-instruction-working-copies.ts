@@ -5,7 +5,7 @@ import { notifyInstructionCommit, type InstructionCommitScope } from "./instruct
 import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 import type { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";
 import { registerScopedDeadlineWork } from "./scoped-deadline-work.js";
-import { AGENT_FILES_SAVE_PENDING_INSTRUCTION, AgentDirectoryOperationBusyError, agentDirectoryWorkingCopyService, agentFileSaveHeld, isAgentDirectoryCopy, trackAgentFileCheckpoint } from "./agent-directory-working-copies.js";
+import { AGENT_FILES_SAVE_PENDING_INSTRUCTION, AgentDirectoryOperationBusyError, INSTRUCTION_STOP_UNCONFIRMED_MESSAGE, agentDirectoryWorkingCopyService, agentFileSaveHeld, isAgentDirectoryCopy, trackAgentFileCheckpoint } from "./agent-directory-working-copies.js";
 import { createHash } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
@@ -448,7 +448,7 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
   }
   function awaitingStop(row: Copy, waitingSince: Date): Partial<typeof copies.$inferInsert> {
     return { ...(row.state === "prepared" ? { state: "pending_collection", errorCode: "INSTRUCTION_STOP_UNCONFIRMED",
-      errorMessage: "The provider's stop has not been confirmed. Instruction collection is pending; no save is claimed." } : {}),
+      errorMessage: INSTRUCTION_STOP_UNCONFIRMED_MESSAGE } : {}),
       nextAttemptAt: instructionCopyRetryAt(waitingSince) };
   }
   async function collectRecovered(row: Copy, evidence: Exclude<StopEvidence, null>, retryAt: Date): Promise<Copy | null | undefined> {

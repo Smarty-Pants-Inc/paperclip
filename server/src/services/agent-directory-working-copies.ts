@@ -49,6 +49,8 @@ export function agentFileSaveHeld(row: Pick<Copy, "state" | "receipt"> | null | 
 }
 /** Hold code for retained note-delivery aside copies that could not be surfaced. */
 export const AGENT_FILES_ASIDE_UNSURFACED = "AGENT_FILES_ASIDE_UNSURFACED";
+/** The stopped-collection sweep's no-evidence marker: it claims no stop, save or discard. */
+export const INSTRUCTION_STOP_UNCONFIRMED_MESSAGE = "The provider's stop has not been confirmed. Instruction collection is pending; no save is claimed.";
 /** The one operator instruction for a held stopped copy, keyed on the hold's
  * own code (receipt.savePending.code), not on the row's last error. */
 export function agentFileHoldInstruction(row: Pick<Copy, "receipt" | "executionRoot" | "location"> | null | undefined): string {
@@ -837,6 +839,13 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     return holdUnsaved(row, AGENT_FILES_ASIDE_UNSURFACED, "Retained note-delivery aside copies could not be surfaced",
       (row.receipt?.storageWarning as string | null | undefined) ?? null, undefined, "pending_collection");
   }
+  function displacedOnlyByStopUnconfirmed(read: Copy, current: Copy) {
+    return read.state === "prepared" && current.state === "pending_collection"
+      && current.errorCode === "INSTRUCTION_STOP_UNCONFIRMED" && current.errorMessage === INSTRUCTION_STOP_UNCONFIRMED_MESSAGE
+      && read.processStoppedAt === null && current.processStoppedAt === null && current.attempts === read.attempts
+      && current.baseHash === read.baseHash && current.candidateHash === read.candidateHash && current.localRoot === read.localRoot
+      && current.location === read.location && JSON.stringify(current.receipt) === JSON.stringify(read.receipt);
+  }
   async function checkpoint(row: Copy, target?: AdapterExecutionTarget | null, stopped = false, signal?: AbortSignal): Promise<Copy> {
     // AF-ABORT: an aborted stopped collection starts no further remote command
     // and writes nothing (no save, no hold): the deadline owner writes the hold.
@@ -875,14 +884,21 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
             storageWarning: typeof row.receipt?.storageWarning === "string" ? row.receipt.storageWarning : null, conflicts: [],
           }));
         live();
-        row = await patch(row, { state: stopped ? (changed ? "saved" : "unchanged") : "warm_saved", baseHash: nextHash,
+        const verified = { state: stopped ? (changed ? "saved" : "unchanged") : "warm_saved", baseHash: nextHash,
           candidateHash: nextHash, errorCode: null, errorMessage: null, attempts: 0, nextAttemptAt: null,
           ...(stopped ? { processStoppedAt: new Date() } : {}),
           // A verified save ends any earlier failed save's hold. This warm
           // path and collectStopped's cold path both strip it.
           receipt: { ...withoutSaveHold(row.receipt), baseline: serializeDirectorySnapshot(snapshot), checkpointManifest: captured.manifest,
             checkpointState: changed ? "saved" : "unchanged", checkpointStats: captured.stats, storageWarning, conflicts,
-            pendingConflicts: [...pendingConflicts(row), ...conflicts] } });
+            pendingConflicts: [...pendingConflicts(row), ...conflicts] } } satisfies Partial<typeof copies.$inferInsert>;
+        const written = await patch(row, verified);
+        // The stopped-collection sweep (woken by the cancelled run) writes its
+        // no-evidence marker without this lock. Landing mid-capture it is the
+        // only change, and it records no stop, save or discard: the serial
+        // order sweep-then-checkpoint already ends in this verified save.
+        // Any other concurrent write still wins (no false checkpoint).
+        row = displacedOnlyByStopUnconfirmed(row, written) ? await patch(written, verified) : written;
         if (aside && !unsurfaced) {
           live();
           const remaining = await notesAsideRetried(row, aside, "clean");
