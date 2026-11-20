@@ -1,5 +1,5 @@
 import { and, desc, eq, gt, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
-import { answeredPersonMessageSql, deferredWakeIsStaleSql, failedCarrierRunSql, personMessageOwedSql } from "../person-message-answer.js";
+import { answeredPersonMessageSql, deferredWakeIsStaleSql, failedCarrierRunSql, personMessageOwedSql, personMessageWithinSendWindowSql } from "../person-message-answer.js";
 import {
   activityLog,
   agentWakeupRequests,
@@ -254,6 +254,7 @@ const rawMessage = (alias: string) => ({ id: sql.raw(`${alias}.id`), companyId: 
  */
 function inScopeSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }, since: string): SQL {
   return sql`(${m.createdAt} > ${since}::timestamptz
+    or not (${personMessageWithinSendWindowSql(m.createdAt)})
     or exists (select 1 from ${heartbeatRuns} r where r.company_id = ${m.companyId} and r.native_issue_id = ${m.issueId}
       and coalesce(r.finished_at, r.updated_at) > ${since}::timestamptz
       and (r.context_snapshot->>'wakeCommentId' = ${m.id}::text or r.context_snapshot->>'commentId' = ${m.id}::text
@@ -443,21 +444,21 @@ async function owedOlderMessageIds(db: Db, issue: DecisionIssue, newestId: strin
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     sql`${issueComments.id} <> ${newestId}`, unansweredPersonMessageCommentCondition(),
     skipReasons.length > 0 ? notInArray(sql`${UNANSWERED_MESSAGE_REASON_PREFIX} || ${issueComments.id}::text`, skipReasons) : undefined,
-    sql`not exists (select 1 from ${heartbeatRuns} r where r.company_id = ${issueComments.companyId}
+    sql`(not (${personMessageWithinSendWindowSql(sql`${issueComments.createdAt}`)}) or not exists (select 1 from ${heartbeatRuns} r where r.company_id = ${issueComments.companyId}
       and (r.context_snapshot->>'wakeCommentId' = ${issueComments.id}::text or r.context_snapshot->>'commentId' = ${issueComments.id}::text
         or r.context_snapshot->>'conversationReplyBoundaryCommentId' = ${issueComments.id}::text
         or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? ${issueComments.id}::text
         or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${issueComments.id}::text)
-      and not ${failedCarrierRunSql("r", { id: sql`${issueComments.id}` })})`,
+      and not ${failedCarrierRunSql("r", { id: sql`${issueComments.id}` })}))`,
     // One card per failed carrier's batch (interrupt-lostdouble L1/L1b): a failed run that carried m AND a LATER
     // message still owed is told by that later message's card (the newest's, or its own older pick), never twice.
-    sql`not exists (select 1 from ${heartbeatRuns} fb where fb.company_id = ${issueComments.companyId}
+    sql`(not (${personMessageWithinSendWindowSql(sql`${issueComments.createdAt}`)}) or not exists (select 1 from ${heartbeatRuns} fb where fb.company_id = ${issueComments.companyId}
       and ${failedCarrierRunSql("fb", { id: sql`${issueComments.id}` })}
       and exists (select 1 from ${issueComments} later where later.company_id = ${issueComments.companyId}
         and later.issue_id = ${issueComments.issueId} and later.author_type = 'user' and later.deleted_at is null
         and later.created_at > ${issueComments.createdAt}
         and ${failedCarrierRunSql("fb", { id: sql.raw("later.id") })}
-        and not ${answeredPersonMessageSql(rawMessage("later"))}))`,
+        and not ${answeredPersonMessageSql(rawMessage("later"))})))`,
     eq(issueComments.authorType, "user")))
     .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(OWED_OLDER_MESSAGES_PER_SWEEP);
   return rows.map(row => row.id);
@@ -546,6 +547,9 @@ async function decideCarriedSteerNotices(q: Db, issue: DecisionIssue, now: Date)
     .filter((id) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id));
   if (ids.length === 0) return none;
   const messages = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt }).from(issueComments).where(and(
+    // Expired input is handled by decideMessage's naming-only decision, never
+    // this legacy carried-steer text or its retry/pending exceptions.
+    personMessageWithinSendWindowSql(sql`${issueComments.createdAt}`, sql`${now.toISOString()}::timestamptz`),
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id), inArray(issueComments.id, ids),
     eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt),
     // neworg-floor-custody (rf-4 C1): the same ONE floor as the outbox and decideMessage; a restored steer
@@ -694,7 +698,8 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   const agentId = issue.assigneeAgentId;
 
   const [message] = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt,
-    body: issueComments.body, authorUserId: issueComments.authorUserId }).from(issueComments).where(and(
+    body: issueComments.body, authorUserId: issueComments.authorUserId,
+    sendable: personMessageWithinSendWindowSql(sql`${issueComments.createdAt}`, sql`${now.toISOString()}::timestamptz`).mapWith(Boolean) }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt),
     // The message this decision is for: a named owed message, else the newest.
@@ -720,6 +725,20 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   // A standing WAITING note is still an open obligation: it must stay true.
   if (noticed && !noticed.waiting) return { kind: "noticed_before" };
   const upgrading = noticed?.waiting ? noticed.id : null;
+  // Half 2 wins over every pending wake/finalizer/setup wait. Age never marks
+  // input answered: its existing fenced writer owns one truthful naming note.
+  if (!message.sendable) {
+    const quote = message.body.length > 60 ? `${message.body.slice(0, 59)}…` : message.body;
+    const notice = buildStrandedRecoveryEscalationNotice({
+      seed: { title: "Your message wasn't answered", tone: "warning",
+        body: `Your message is saved: "${quote}". It was not answered. It is at least 24 hours old, so it will not run automatically. Send a new message to try again.`,
+        nextAction: "Send a new message to try again." },
+      recoveryActionId: null, recoveryOwner: null, recoveryResponsibility: "user",
+      sourceRun: null, failureCode: "unanswered_message_too_old",
+    });
+    return { kind: "notice", reason, code: "unanswered_message_too_old", notice,
+      ...(upgrading ? { upgradeCommentId: upgrading } : {}) };
+  }
   const standingWaitingCode = noticed?.waiting ? noticed.waitingCode ?? UNANSWERED_MESSAGE_WAITING_CODE : null;
 
   // The run this message started (the latest run that carries it), if any.

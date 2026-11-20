@@ -1,6 +1,8 @@
 import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { agentWakeupRequests, heartbeatRunEvents, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
+import { expiredPersonMessageIds } from "../person-message-answer.js";
+import { settleUnansweredPersonMessage } from "../recovery/unanswered-person-message.js";
 import type { NativeRestartRecoveryClaim } from "../native-runtime/native-restart-recovery.js";
 import { isUserCommentContinuationReason } from "../explicit-native-continuation.js";
 import { requestTaskRetry } from "../task-retry.js";
@@ -172,6 +174,13 @@ export async function requestInterruptedNativeTurnRetry(db: Db, runId: string): 
   const context = run.contextSnapshot ?? {};
   const issueId = run.nativeIssueId ?? run.issueId ?? (typeof context.issueId === "string" ? context.issueId : null);
   if (!issueId || !run.wakeupRequestId) return { requested: false, reason: "source_missing" };
+  const expired = await expiredPersonMessageIds(db, { companyId: run.companyId, issueId, contextSnapshot: context });
+  if (expired.length) {
+    for (const messageId of expired) await settleUnansweredPersonMessage(db, {
+      companyId: run.companyId, issueId, settleMessageId: messageId,
+    });
+    return { requested: false, reason: "message_expired" };
+  }
   const [lastTurn] = await db.select({ eventType: heartbeatRunEvents.eventType, payload: heartbeatRunEvents.payload })
     .from(heartbeatRunEvents).where(and(
       eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id),

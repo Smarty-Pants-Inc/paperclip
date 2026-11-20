@@ -1,4 +1,6 @@
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
+import { expiredPersonMessageIds } from "../person-message-answer.js";
+import { settleUnansweredPersonMessage } from "../recovery/unanswered-person-message.js";
 import { readPersonStopHold } from "../acknowledged-native-stop.js";
 import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
 import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
@@ -2810,6 +2812,18 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
     let agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
+    // Half 2: all admissions, including boot retries and the A2 escape, use the
+    // persisted person's message clock before creating a wake or a run.
+    if (issueId) {
+      const expired = await expiredPersonMessageIds(db, { companyId: agent.companyId, issueId,
+        contextSnapshot: enrichedContextSnapshot });
+      if (expired.length) {
+        for (const messageId of expired) await settleUnansweredPersonMessage(db, {
+          companyId: agent.companyId, issueId, settleMessageId: messageId,
+        });
+        return null;
+      }
+    }
     const withManagedWakeWrite = async <T>(work: (writer: Db) => Promise<T>): Promise<T> => {
       if (!opts.managementActor) return work(db);
       return db.transaction(async tx => {

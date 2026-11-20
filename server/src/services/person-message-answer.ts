@@ -1,5 +1,5 @@
 import { and, eq, inArray, sql, type SQL } from "drizzle-orm";
-import { activityLog, agentWakeupRequests, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues, type Db } from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, nativeRunResults, type Db } from "@paperclipai/db";
 import { freshContinuationSourceChainSql } from "./fresh-continuation-chain.js";
 import { wellFormedExecutionWaitSql } from "./deferred-execution-wait.js";
 
@@ -10,6 +10,56 @@ export const COMPANY_IMPORTED_ACTION = "company.imported";
 
 type PersonMessageSql = { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL };
 type DeferredWakeSql = { companyId: SQL; agentId: SQL; issueId: SQL; requestedAt: SQL; payload: SQL };
+
+/** RULE-ANSWERED-MEANS-ANSWERED-1119 Half 2: admission age, never an answered/owed definition. */
+export const PERSON_MESSAGE_SEND_WINDOW_MS = 24 * 60 * 60_000;
+export function personMessageWithinSendWindowSql(createdAt: SQL, now: SQL = sql`now()`): SQL {
+  return sql`${createdAt} > ${now} - ${PERSON_MESSAGE_SEND_WINDOW_MS} * interval '1 millisecond'`;
+}
+
+/** Persisted ids at every automatic send boundary, including legacy carry keys.
+ * The server clock, not a wake's requestedAt or a client's timestamp, decides. */
+export async function expiredPersonMessageIds(db: Pick<Db, "select">,
+  input: { companyId: string; issueId: string; contextSnapshot: unknown }, now?: Date): Promise<string[]> {
+  const context = (input.contextSnapshot ?? {}) as Record<string, unknown>;
+  const first = (context.firstTurnQueuedInput ?? {}) as Record<string, unknown>;
+  const ids = [...new Set([context.commentId, context.wakeCommentId, context.conversationReplyBoundaryCommentId,
+    ...[context.wakeCommentIds, context.steeredCommentIds, context.carriedSteeredCommentIds, first.commentIds]
+      .flatMap(value => Array.isArray(value) ? value : [])]
+    .filter((id): id is string => typeof id === "string" && UUID.test(id)))];
+  if (!ids.length) {
+    // An automatic successor can name its source without copying input keys.
+    // Read the existing durable continuation chain rather than losing the age
+    // fence when a retry seed is sparse. A fresh person's own input wins above.
+    const sourceIds = [context.retryOfRunId, context.previousRunId].filter((id): id is string => typeof id === "string" && UUID.test(id));
+    if (!sourceIds.length) return [];
+    const sources = await db.select({ context: heartbeatRuns.contextSnapshot, result: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, input.companyId),
+      sql`(${sql.join(sourceIds.map(runId => sql`${heartbeatRuns.id} in (${freshContinuationSourceChainSql({
+        companyId: input.companyId, issueId: input.issueId, runId,
+      })} select id from source_chain)`), sql` or `)})`,
+      sql`(${heartbeatRuns.nativeIssueId} = ${input.issueId}::uuid or ${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId})`,
+    ));
+    // The shared chain reader bounds ancestry at a new person's independent
+    // input and terminates cycles; do not invent a second lineage definition.
+    const sourceMessageIds = sources.flatMap(source => {
+      const c = source.context ?? {}, f = (c.firstTurnQueuedInput ?? {}) as Record<string, unknown>;
+      const r = source.result ?? {};
+      return [c.commentId, c.wakeCommentId, c.conversationReplyBoundaryCommentId,
+        ...[c.wakeCommentIds, c.steeredCommentIds, c.carriedSteeredCommentIds, f.commentIds,
+          r.restoredSteeredCommentIds, r.stopRestoredSteeredCommentIds, r.interruptCarriedSteeredCommentIds]
+          .flatMap(v => Array.isArray(v) ? v : [])];
+    }).filter((id): id is string => typeof id === "string" && UUID.test(id));
+    ids.push(...new Set(sourceMessageIds));
+    if (!ids.length) return [];
+  }
+  const rows = await db.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
+    eq(issueComments.authorType, "user"), sql`${issueComments.deletedAt} is null`, inArray(issueComments.id, ids),
+    sql`not (${personMessageWithinSendWindowSql(sql`${issueComments.createdAt}`, now ? sql`${now.toISOString()}::timestamptz` : sql`now()`)})`,
+  ));
+  return rows.map(row => row.id);
+}
 
 /** RFL 17:07Z: a deferred receipt ages only when a succeeded replying turn
  * actually claimed a newer PERSON input. Starting later is not evidence: a
@@ -36,6 +86,22 @@ export function newerPersonInputAnsweredSql(w: Pick<DeferredWakeSql, "companyId"
  * Older saved execution waits can name the Stop's own board recovery hold.
  * Neither an Interrupt nor a generic execution wait grants this exception. */
 export function deferredWakeIsStaleSql(w: DeferredWakeSql): SQL {
+  // Age retires SEND custody, not the person's obligation. Use persisted PERSON
+  // input, never requestedAt/updatedAt; a touched receipt cannot rejuvenate it.
+  // A mixed queue keeps its fresh input, which promotion filters independently.
+  const heldPerson = (alias: string) => {
+    const p = sql.identifier(alias);
+    return sql`${p}.company_id = ${w.companyId} and ${p}.issue_id = ${w.issueId}
+      and ${p}.author_type = 'user' and ${p}.deleted_at is null
+      and (${p}.id::text = ${w.payload}->>'commentId'
+        or ${p}.id::text = ${w.payload}->'_paperclipWakeContext'->>'commentId'
+        or ${p}.id::text = ${w.payload}->'_paperclipWakeContext'->>'wakeCommentId'
+        or coalesce(${w.payload}->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? ${p}.id::text)`;
+  };
+  const expiredPersonInput = sql`(exists (select 1 from ${issueComments} old_input where ${heldPerson("old_input")}
+      and not (${personMessageWithinSendWindowSql(sql`old_input.created_at`)}))
+    and not exists (select 1 from ${issueComments} fresh_input where ${heldPerson("fresh_input")}
+      and ${personMessageWithinSendWindowSql(sql`fresh_input.created_at`)}))`;
   const personStopHold = sql`(${w.payload}->'queuedCommentInterrupt' is null and exists (
     select 1 from ${heartbeatRuns} stopped
     where stopped.company_id = ${w.companyId} and stopped.agent_id = ${w.agentId}
@@ -48,7 +114,7 @@ export function deferredWakeIsStaleSql(w: DeferredWakeSql): SQL {
             and stop_hold.id::text = ${w.payload}->'executionWait'->>'recoveryActionId'
             and stop_hold.cause = 'native_continuation_requires_reconciliation'
             and stop_hold.evidence->>'runId' = stopped.id::text))))`;
-  return sql`(not ${personStopHold} and ${newerPersonInputAnsweredSql(w)})`;
+  return sql`(${expiredPersonInput} or (not ${personStopHold} and ${newerPersonInputAnsweredSql(w)}))`;
 }
 
 function carriesCommentSql(alias: string, commentId: SQL, requireSteeredText: boolean): SQL {
@@ -61,7 +127,8 @@ function carriesCommentSql(alias: string, commentId: SQL, requireSteeredText: bo
     and (${context}->>'wakeCommentId' = ${commentId}::text or ${context}->>'commentId' = ${commentId}::text
     or ${context}->>'conversationReplyBoundaryCommentId' = ${commentId}::text
     or coalesce(${context}->'wakeCommentIds', '[]'::jsonb) ? ${commentId}::text
-    or coalesce(${context}->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${commentId}::text))`;
+    or coalesce(${context}->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${commentId}::text
+    or coalesce(${context}->'steeredCommentIds', '[]'::jsonb) ? ${commentId}::text))`;
 }
 
 /** A reply/card can belong to a later run without copying the original input
@@ -81,7 +148,17 @@ function chainCarriesCommentSql(alias: string, commentId: SQL, m: PersonMessageS
 // delivery; cancelled cards need evidence of a human skip/withdraw/cancel reply.
 const PERSON_MESSAGE_ANSWER_CARD_STATUSES = ["pending", "answered", "accepted", "rejected"] as const;
 
-/** A person message is answered by a published agent reply attributed to it or to a later person input,
+/** The accepted result's own published reply (D3): identity, hash and finalization agree. */
+const ACCEPTED_RESULT_PUBLISHED_SQL = sql`(r.result_json#>>'{presentationDecision,commentId}' = a.id::text
+  and exists (select 1 from ${nativeRunResults} accepted
+    where accepted.run_id = r.id and accepted.company_id = r.company_id and accepted.issue_id = a.issue_id
+      and accepted.schema_status = 'accepted'
+      and coalesce(r.result_json#>>'{nativeCommittedChatResponse,resultId}', accepted.id::text) = accepted.id::text
+      and coalesce(r.result_json#>>'{nativeCommittedChatResponse,canonicalSha256}', accepted.canonical_sha256) = accepted.canonical_sha256
+      and not exists (select 1 from ${nativeRunFinalizations} committed where committed.run_id = r.id
+        and committed.company_id = r.company_id and committed.result_id is not null and committed.result_id <> accepted.id)))`;
+
+/** A person message is answered by a published non-progress reply from a succeeded run (or its accepted result published),
  * an open or resolved interaction card on its run chain, or imported history. Answering the card is new input;
  * it never makes the original message unanswered again. Shared by recovery input selection (continuation-comment-input.ts) and the
  * unanswered-person-message notice, so the carry and the notice never disagree on a message.
@@ -102,19 +179,24 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
   // REACHED the agent: m was in some run's input (any carried key, including
   // wakeCommentIds and context.commentId) of a run that STARTED (started_at, set
   // at claim; a run cancelled before start never reached the model). A STEERED m counts as reached only
-  // when its text went into a model request (requireSteeredText = true: it is in
-  // answeredSteeredCommentIds); Pi's read alone is not enough (RFL). A message
+  // when its matching text segment went into a model request (the persisted
+  // answeredSteeredCommentIds projection). This is carry/segment evidence,
+  // never an answer without the posted-reply/status/progress gates below. A message
   // held and never carried stays owed (carried next, or a true card). Imported
   // history is answered by its own arm below, never by this one.
-  return sql`(exists (select 1 from ${heartbeatRuns} streamed
-      where streamed.company_id = ${m.companyId}
-        and (streamed.native_issue_id = ${m.issueId} or streamed.context_snapshot->>'issueId' = ${m.issueId}::text)
-        and coalesce(streamed.context_snapshot->'steeredCommentIds', '[]'::jsonb) ? ${m.id}::text
-        and coalesce(streamed.context_snapshot->'answeredSteeredCommentIds', '[]'::jsonb) ? ${m.id}::text)
-    or exists (select 1 from ${issueComments} a
+  // Half 1: a run-log acknowledgement is not a posted answer. All prose, including
+  // steers, goes through this ONE published-reply arm and its success/progress gates.
+  return sql`(exists (select 1 from ${issueComments} a
     join ${heartbeatRuns} r on r.id = a.created_by_run_id and r.company_id = a.company_id
     where a.company_id = ${m.companyId} and a.issue_id = ${m.issueId} and a.author_type = 'agent' and a.deleted_at is null
       and a.created_at > ${m.createdAt}
+      and (r.status = 'succeeded' or ${ACCEPTED_RESULT_PUBLISHED_SQL})
+      and a.created_at >= coalesce(r.started_at, r.created_at)
+      and (not coalesce(r.context_snapshot->'steeredCommentIds', '[]'::jsonb) ? ${m.id}::text
+        or a.created_at >= coalesce((r.context_snapshot->'steeredDeliveredAts'->>${m.id}::text)::timestamptz, ${m.createdAt}))
+      and not exists (select 1 from jsonb_each(case when jsonb_typeof(r.result_json->'semanticToolReceipts') = 'object'
+          then r.result_json->'semanticToolReceipts' else '{}'::jsonb end) receipt
+        where receipt.value->>'operationId' = 'report_progress' and receipt.value->'result'->>'commentId' = a.id::text)
       and exists (select 1 from ${issueComments} b
         where b.company_id = a.company_id and b.issue_id = a.issue_id and b.author_type = 'user'
           and (b.id = ${m.id} or (b.created_at > ${m.createdAt}

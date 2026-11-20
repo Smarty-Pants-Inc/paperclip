@@ -2002,6 +2002,25 @@ export function heartbeatService(
     await markInstanceHasHeartbeatRuns();
     if (run.status !== "queued" && run.status !== "running") return;
 
+    // Boot replacement and retry paths can enter with an already-running row,
+    // bypassing queued admission. Reattaching an EXISTING provider is not a new
+    // start; every other execution entry must keep the same person-input age fence.
+    const reattaching = runOptions.nativeRestartRecovery?.kind === "reattach_existing_runner"
+      || runOptions.nativeRestartRecovery?.kind === "reattach_remote_runner";
+    const sendIssueId = run.nativeIssueId ?? (typeof run.contextSnapshot?.issueId === "string" ? run.contextSnapshot.issueId : null);
+    if (!reattaching && sendIssueId) {
+      const { expiredPersonMessageIds } = await import("./person-message-answer.js");
+      if ((await expiredPersonMessageIds(db, { companyId: run.companyId, issueId: sendIssueId,
+        contextSnapshot: run.contextSnapshot })).length) {
+        const expired = await runDispatch.cancelStaleQueuedRun({ runId: run.id, companyId: run.companyId,
+          expectedStatus: run.status });
+        if (expired.outcome === "cancelled") applyRunDispatchPostCommitEffects(expired.postCommitEffects);
+        // A concurrent owner/status change is not permission to execute the
+        // stale row we read. This attempt never enters a provider either way.
+        return;
+      }
+    }
+
     if (run.status === "queued") {
       const claimed = await claimQueuedRun(run);
       if (!claimed) {

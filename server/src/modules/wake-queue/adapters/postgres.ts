@@ -6,7 +6,7 @@ import { settleUnansweredPersonMessage } from "../../../services/recovery/unansw
 import { insertIssueComment } from "../../../services/issue-comment-writes.js";
 import { lockAgentForRunAdmission } from "../../../services/heartbeat-run-admission-lock.js";
 import { pendingContinuationCommentInput } from "../../../services/continuation-comment-input.js";
-import { deferredWakeIsStaleSql, newerPersonInputAnsweredSql, personMessageOwedSql } from "../../../services/person-message-answer.js";
+import { deferredWakeIsStaleSql, newerPersonInputAnsweredSql, personMessageOwedSql, personMessageWithinSendWindowSql, expiredPersonMessageIds } from "../../../services/person-message-answer.js";
 import { notifyStrandedAgentStatus } from "../../../services/live-run-recovery-notifications.js";
 import { notifyDeferredExecutionWork } from "../../../services/deferred-execution-notifications.js";
 import { notifyQueuedRunDispatch, notifyRunDispatch } from "../../../services/run-dispatch-notifications.js";
@@ -24,8 +24,8 @@ import { instanceSettingsService } from "../../../services/instance-settings.js"
 import { currentConversationCommentCondition, isConversationReset } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker, hasPendingRunCleanup } from "../../../services/execution-blocker.js";
 import { nativeManualAdmissionHoldsExecution } from "../../../services/native-runtime/native-runner-ownership.js";
-import { readSteeredMessageAnswers } from "../../../services/native-runtime/steered-message-answers.js";
 import { answeredPersonMessageSql } from "../../../services/person-message-answer.js";
+import { readSteeredMessageAnswers } from "../../../services/native-runtime/steered-message-answers.js";
 import { and, asc, desc, eq, inArray, isNotNull, isNull, notInArray, or, sql } from "drizzle-orm";
 import { readReleaseRun, type ReleaseRun } from "./release-run-read.js";
 import { steeringIngestionPending, waitForSteeringIngestion } from "../../../services/native-runtime/steering-ingestion.js";
@@ -448,13 +448,19 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       const rows = queryableCommentIds.length === 0 ? [] : await tx
         .select({ id: issueComments.id, deletedAt: issueComments.deletedAt, createdByRunId: issueComments.createdByRunId,
           authorType: issueComments.authorType, owedAtBoot: personMessageOwedSql(message),
+          sendable: personMessageWithinSendWindowSql(sql`${issueComments.createdAt}`),
           owed: conversationMovedOn ? sql<boolean>`(${issueComments.authorType} is distinct from 'user' or
             (${personMessageOwedSql(message)} and not ${newerPersonInputAnsweredSql({ companyId: message.companyId,
               issueId: message.issueId, requestedAt: message.createdAt })}))` : sql<boolean>`true` })
         .from(issueComments)
         .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, queryableCommentIds), currentConversationCommentCondition()));
       const personRows = rows.filter(row => row.authorType === "user" && !row.deletedAt);
-      const owedPersonAtBoot = personRows.some(row => row.owedAtBoot);
+      const expired = personRows.filter(row => !row.sendable);
+      for (const message of expired) await settleUnansweredPersonMessage(tx, {
+        companyId, issueId, settleMessageId: message.id,
+      });
+      const owedPersonAtBoot = personRows.some(row => row.sendable && row.owedAtBoot);
+      if (expired.length > 0 && expired.length === personRows.length) conversationMovedOn = true;
       if (beforeBoot && personRows.length > 0 && !owedPersonAtBoot) conversationMovedOn = true;
       const targetsFinishingRunAgent = wakeAgentId === finishingRunAgentId;
       const liveAndUnauthored = queryableCommentIds.filter((commentId) => {
@@ -462,7 +468,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         // The floor retires already-carried input. A never-carried OLD stays
         // owed for its ONE sweep card, not for replay by a stale receipt. Fresh
         // messages coalesced into an old receipt may still be owed delivery.
-        return Boolean(row && row.owed && !row.deletedAt &&
+        return Boolean(row && row.owed && !row.deletedAt && (row.authorType !== "user" || row.sendable) &&
           (!beforeBoot || row.authorType !== "user" || row.owedAtBoot) &&
           (!targetsFinishingRunAgent || row.createdByRunId !== finishingRunId));
       });
@@ -1040,23 +1046,15 @@ function isPersonStoppedChatRun(run: ReleaseRun, issue: IssueRow): boolean {
 }
 
 /**
- * EVERY run end (success, failure, cancel, a person's Stop; never-OK, live on PV2 s3):
- * a message the provider acknowledged as steered into this run is answered by
- * the run ONLY under the answered rule (steered-message-answers.ts): an
- * assistant text item after its delivery userMessage and before the next tool
- * call or the turn's end. Unread (Stop's clear_queue drops it, or the turn
- * ended first), read with a tool call next and no text, or acknowledged where
- * the run log never recorded it: NOT answered. Each such steer goes back to
- * the queue at its place (the head of the wake it was steered from, or that
- * wake reopened when the steer emptied it), in order, and the run no longer
- * carries it (wakeCommentIds/steeredCommentIds), so the continuation carry and
- * the answered check never count it for this run. The next turn delivers it
- * once; on a person's Stop it waits under the stopped line. A steer a live
- * successor already carries, or a waiting wake already holds, is not queued a
- * second time. The answered steers are recorded (answeredSteeredCommentIds):
- * person-message-answer.ts counts a steered id for its run only when listed.
- * The release's terminal-ingestion fence precedes this decision; elapsed time
- * never substitutes for a read fact. Interrupt adopts under the same run lock.
+ * EVERY terminal run end: materialize ordered native read/segment evidence,
+ * then let ONLY answeredPersonMessageSql discharge a PERSON steer. Native
+ * text or an RPC acknowledgement alone is never an answer: the run must have
+ * published the qualifying reply. Unanswered input is restored in sent order
+ * to ONE existing/new deferred carrier; a live successor or waiting wake keeps
+ * its custody instead of receiving a duplicate. Expired PERSON input is named
+ * by the existing fenced writer, never restored for another automatic run.
+ * The terminal-ingestion fence and Interrupt's shared run lock are unchanged;
+ * elapsed time never substitutes for a read or a posted-answer fact.
  */
 const TERMINAL_RUN_STATUSES = ["succeeded", "failed", "cancelled", "timed_out", "interrupted"];
 async function restoreUnansweredSteersAtRunEnd(tx: Db, run: ReleaseRun, issue: IssueRow, now: Date): Promise<void> {
@@ -1069,8 +1067,22 @@ async function restoreUnansweredSteersAtRunEnd(tx: Db, run: ReleaseRun, issue: I
   if ((readNonEmptyString(context.issueId) ?? current.nativeIssueId) !== issue.id) return;
   const result = parseObject(current.resultJson);
   const strings = (value: unknown) => Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : [];
-  const accounted = new Set([...strings(result.stopRestoredSteeredCommentIds), ...strings(result.restoredSteeredCommentIds),
-    ...strings(result.interruptCarriedSteeredCommentIds), ...strings(context.answeredSteeredCommentIds),
+  // Terminal fixtures and recovered logs may not have materialized the ordered
+  // ingestion suffix yet. Refresh its INPUT evidence before the shared SQL
+  // reads it; never let this evidence itself discharge a person's message.
+  const evidence = await readSteeredMessageAnswers(tx, { companyId: run.companyId, runId: run.id });
+  const projectedSteers = strings(context.steeredCommentIds);
+  context.answeredSteeredCommentIds = evidence.answered.filter(id => projectedSteers.includes(id));
+  context.steeredDeliveryEventSeqs = Object.fromEntries(Object.entries(evidence.deliveredEventSeqs).filter(([id]) => projectedSteers.includes(id)));
+  context.steeredDeliveredAts = Object.fromEntries(Object.entries(evidence.deliveredAts).filter(([id]) => projectedSteers.includes(id)));
+  await tx.update(heartbeatRuns).set({ contextSnapshot: context }).where(and(
+    eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id)));
+  const expired = await expiredPersonMessageIds(tx, { companyId: run.companyId, issueId: issue.id, contextSnapshot: context }, now);
+  for (const messageId of expired) await settleUnansweredPersonMessage(tx, {
+    companyId: run.companyId, issueId: issue.id, settleMessageId: messageId, now,
+  });
+  const accounted = new Set([...expired, ...strings(result.stopRestoredSteeredCommentIds), ...strings(result.restoredSteeredCommentIds),
+    ...strings(result.interruptCarriedSteeredCommentIds),
     // The ONE answered predicate can already discharge M while its RPC ACK is
     // still in flight. Never restore that answered input on receipt state alone.
     ...(await tx.select({ id: issueComments.id }).from(issueComments).where(and(
@@ -1096,9 +1108,9 @@ async function restoreUnansweredSteersAtRunEnd(tx: Db, run: ReleaseRun, issue: I
     ...strings(context.steeredCommentIds).filter((id) => !acks.some((entry) => entry.id === id)).map((id) => ({ id, queueId: null }))]
     .filter(({ id }) => !accounted.has(id));
   if (steered.length === 0) return;
-  const answeredIds = new Set((await readSteeredMessageAnswers(tx, { companyId: run.companyId, runId: run.id })).answered);
-  const answered = steered.filter(({ id }) => answeredIds.has(id)).map(({ id }) => id);
-  const open = steered.filter(({ id }) => !answeredIds.has(id));
+  // Streamed-text evidence is delivery evidence, not a second answered
+  // definition. The ONE SQL predicate above already excluded posted answers.
+  const open = steered;
   const uuids = open.map(({ id }) => id).filter(isUuidLike);
   // A person's message is never dropped on a guess; a deleted one is not sent again.
   const live = new Set(uuids.length ? (await tx.select({ id: issueComments.id }).from(issueComments).where(and(
@@ -1162,11 +1174,10 @@ async function restoreUnansweredSteersAtRunEnd(tx: Db, run: ReleaseRun, issue: I
     }
     restored.push(...ids);
   }
-  if (restored.length === 0 && answered.length === 0) return;
+  if (restored.length === 0) return;
   const without = (value: unknown) => Array.isArray(value) ? value.filter((id) => !restored.includes(id as string)) : value;
   await tx.update(heartbeatRuns).set({
-    contextSnapshot: { ...context, wakeCommentIds: without(context.wakeCommentIds), steeredCommentIds: without(context.steeredCommentIds),
-      answeredSteeredCommentIds: [...strings(context.answeredSteeredCommentIds), ...answered] },
+    contextSnapshot: { ...context, wakeCommentIds: without(context.wakeCommentIds), steeredCommentIds: without(context.steeredCommentIds) },
     resultJson: { ...result, restoredSteeredCommentIds: [...strings(result.restoredSteeredCommentIds), ...restored] },
     updatedAt: now,
   }).where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id)));

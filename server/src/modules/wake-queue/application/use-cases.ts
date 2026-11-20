@@ -240,9 +240,8 @@ async function runReleaseDrain(
       Boolean(readNonEmptyString(candidate.deferredContextSeed.interactionId)) &&
       ["accepted", "answered", "rejected"].includes(String(candidate.deferredContextSeed.interactionStatus)) &&
       Boolean(readNonEmptyString(candidate.deferredContextSeed.source)?.startsWith("chat:"));
-    if (
-      !candidate.authorizedFailedChatRetry
-    ) {
+    {
+      // Retry authorization never authorizes replay of expired person input.
       liveness = await ports.transaction.getQueuedCommentLiveness({
         companyId: run.companyId,
         wakeId: candidate.id,
@@ -251,7 +250,7 @@ async function runReleaseDrain(
         finishingRunId: run.id,
         finishingRunAgentId: run.agentId,
         queuedCommentIds: candidate.queuedCommentIds,
-        ...(retainDeliveredCommentBindings ? { retainDeliveredCommentBindings: true } : {}),
+        ...(retainDeliveredCommentBindings || candidate.authorizedFailedChatRetry ? { retainDeliveredCommentBindings: true } : {}),
       });
     }
     if (liveness.heldBeforeBoot) {

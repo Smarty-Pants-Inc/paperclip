@@ -1,4 +1,6 @@
 import { notifyExecutionRunWork } from "../../../services/execution-control-notifications.js";
+import { expiredPersonMessageIds } from "../../../services/person-message-answer.js";
+import { settleUnansweredPersonMessage } from "../../../services/recovery/unanswered-person-message.js";
 import { notifyDeferredExecutionWork, notifyDeferredWakesForIssue } from "../../../services/deferred-execution-notifications.js";
 import { hasRequiredWorkspaceRecovery } from "../../../services/workspace-restore-recovery-state.js";
 import { readNativeWorkspaceSyncReference } from "../../../services/native-runtime/native-workspace-sync.js";
@@ -1108,6 +1110,8 @@ export function createPostgresRunDispatchAdapter(
 
   async function deferUnstartedUserComment(tx: Db, run: HeartbeatRun, issueId: string, now: Date) {
     if (!run.wakeupRequestId || !await isPreDispatchExecutionWaitVerified(tx, run)) return null;
+    if ((await expiredPersonMessageIds(tx, { companyId: run.companyId, issueId,
+      contextSnapshot: run.contextSnapshot }, now)).length) return null;
     const wait = parseObject(run.resultJson?.executionWait);
     const [preservation] = await tx.select().from(issueRecoveryActions).where(and(
       eq(issueRecoveryActions.companyId, run.companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
@@ -1330,8 +1334,21 @@ export function createPostgresRunDispatchAdapter(
 
   async function decideCurrentRunStaleness(tx: Db, run: HeartbeatRun, now: Date, publications?: ActivityPublication[]) {
     const contextSnapshot = parseObject(run.contextSnapshot);
-    const issueId = readNonEmptyString(contextSnapshot.issueId);
+    const issueId = readNonEmptyString(contextSnapshot.issueId) ?? run.nativeIssueId;
     if (!issueId) return { issueId: null, facts: null, executionBlocker: null, decision: { stale: false as const } };
+    // Last automatic start fence: queued promotion and scheduled same-run
+    // retry cannot evade admission's person-message age check.
+    const expired = await expiredPersonMessageIds(tx, { companyId: run.companyId, issueId, contextSnapshot }, now);
+    if (expired.length) {
+      for (const messageId of expired) await settleUnansweredPersonMessage(tx, {
+        companyId: run.companyId, issueId, settleMessageId: messageId, now,
+      });
+      return { issueId, facts: null, executionBlocker: null, decision: { stale: true as const,
+        errorCode: "execution_reconciliation_required" as const,
+        reason: "This saved message is at least 24 hours old. Send a new message to try again.",
+        details: { issueId, expiredPersonMessageIds: expired },
+      } };
+    }
     if (typeof contextSnapshot.workspaceReconstructionActionId === "string") {
       try {
         await validateReconstructedWorkspaceDispatch(tx, run);
