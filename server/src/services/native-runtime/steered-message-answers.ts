@@ -1,5 +1,10 @@
-import { and, asc, eq, isNotNull, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
 import { heartbeatRunEvents, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
+
+/** answered-b3: the settled native_run_finalizations phases, exactly the set the schema's own
+ * accepted-result lease index excludes (packages/db/src/schema/native_run_finalizations.ts:79,
+ * migration 0445): committed, terminal_failure and the compatibility phase applied. */
+export const SETTLED_FINALIZATION_PHASES = ["committed", "terminal_failure", "applied"] as const;
 
 /** answered-b2: each carried READ steer is bound to the Pi session that read it (the cut run's native session).
  * The successor omits it only when it resumes THAT session from THIS run (native-execution-input.ts); with no
@@ -142,11 +147,12 @@ export async function recordSteeredMessageEvidence(db: Db, input: { companyId: s
     if (!steered.length && !carried.some(id => !recordedRead.includes(id))) return;
     const evidence = await readSteeredMessageAnswers(tx as unknown as Db, input);
     const lateRead = carried.filter(id => !recordedRead.includes(id) && evidence.delivered.includes(id));
-    // answered-b2 fence: under this run lock, a FINALIZED cut run (native_run_finalizations committed) is never
-    // rewritten; its late read stays unrecorded, so the successor re-delivers the steer (base behaviour).
+    // answered-b2/b3 fence: under this run lock, a SETTLED cut run (native_run_finalizations phase committed,
+    // terminal_failure or applied) is never rewritten; its late read stays unrecorded, so the successor
+    // re-delivers the steer (base behaviour).
     const [finalized] = lateRead.length ? await tx.select({ phase: nativeRunFinalizations.phase }).from(nativeRunFinalizations)
       .where(and(eq(nativeRunFinalizations.companyId, input.companyId), eq(nativeRunFinalizations.runId, input.runId),
-        eq(nativeRunFinalizations.phase, "committed"))).limit(1) : [];
+        inArray(nativeRunFinalizations.phase, [...SETTLED_FINALIZATION_PHASES]))).limit(1) : [];
     if (lateRead.length && !finalized) await tx.update(heartbeatRuns).set({ resultJson: { ...result,
       interruptCarriedReadSteeredCommentIds: [...recordedRead, ...lateRead], ...carriedReadSessions(result, lateRead, run?.sessionId) } })
       .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId)));

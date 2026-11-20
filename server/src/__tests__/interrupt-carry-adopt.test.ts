@@ -42,7 +42,7 @@ import { settleUnansweredPersonMessage, UNANSWERED_MESSAGE_REASON_PREFIX } from 
 import { getServerAdapter, registerServerAdapter, runningProcesses } from "../adapters/index.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat/run-preparation.js";
 import { renderFirstTurnQueuedInput } from "../services/native-runtime/first-turn-queued-input.js";
-import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
+import { renderPaperclipWakePrompt, selectPaperclipPromptSections } from "@paperclipai/adapter-utils/server-utils";
 import { waitForPendingRunFailureReports } from "../services/run-failure-report.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { createPiEventProjector } from "../../../packages/paperclip-runner/src/drivers/pi/pi-event-projector.js";
@@ -496,10 +496,12 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
   }
 
   /** The successor's prompt, as the adapter renders it for a resumed (same) or a fresh Pi session. */
-  async function successorPrompt(chat: Chat, run: typeof heartbeatRuns.$inferSelect, resumedSession: boolean) {
+  // answered-b3: `readInSessionBinding` = the verified resumed session + cut run (the native path's fact).
+  async function successorPrompt(chat: Chat, run: typeof heartbeatRuns.$inferSelect, resumedSession: boolean,
+    readInSessionBinding?: { sessionId: string; runId: string }) {
     const payload = await buildPaperclipWakePayload({ db, companyId: chat.companyId, agentId: chat.agentId,
       runId: run.id, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>) } });
-    return renderPaperclipWakePrompt(payload, { resumedSession });
+    return renderPaperclipWakePrompt(payload, { resumedSession, readInSessionBinding });
   }
 
   /** +3 min: the stranded sweep's conversation outbox twice, then the unanswered sweep; nothing may wake on id again. */
@@ -567,7 +569,7 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
     const chat = await seedChat();
     const { steerId, cut, carry } = await steerThenInterrupt(chat, "read");
     const successor = await admitSuccessor(chat, carry);
-    const prompt = await successorPrompt(chat, successor, true);
+    const prompt = await successorPrompt(chat, successor, true, { sessionId: chat.sessionId, runId: chat.runId });
     expect(prompt, "a read steer re-injected into the session that read it (a double)").not.toContain(STEER);
     expect((cut.resultJson as any).interruptCarriedReadSteeredCommentIds).toEqual([steerId]);
     expect(prompt).toContain(MSG);
@@ -838,6 +840,66 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
     expect((open!.resultJson as any).interruptCarriedReadSteeredCommentIds).toEqual([steerId]);
     expect((open!.resultJson as any).interruptCarriedReadSessionIds).toEqual({ [steerId]: chat.sessionId });
   });
+
+  // ---- answered-b3 rows (rf-4 FAIL 0ad444a8: shared renderer omitted without custody; fence was committed-only) ----
+  it("B3-1 (rf-4 F1-residual red): a direct/legacy adapter (codex-local execute.ts shape) resumes with resumedSession=true and a readInSession steer but NO verified binding ⇒ its shared prompt carries STEER once", async () => {
+    const chat = await seedChat();
+    const { steerId, carry } = await steerThenInterrupt(chat, "read");
+    const successor = await admitSuccessor(chat, carry);
+    const wake = await buildPaperclipWakePayload({ db, companyId: chat.companyId, agentId: chat.agentId,
+      runId: successor.id, contextSnapshot: { ...(successor.contextSnapshot as Record<string, unknown>) } });
+    // The at-risk shape: the raw wake keeps A's binding metadata (filtering is the consumer's job).
+    expect((wake as any).comments.find((c: any) => c.id === steerId))
+      .toMatchObject({ readInSession: true, readInSessionId: chat.sessionId, readInSessionRunId: chat.runId });
+    // Exactly what codex-local/src/server/execute.ts:1195 calls (resumedSession: Boolean(resumeSessionId)).
+    const { wakePrompt } = selectPaperclipPromptSections({ ...(successor.contextSnapshot as Record<string, unknown>),
+      paperclipWake: wake, conversationMode: true }, { resumedSession: true, includeCommunicationGuidance: false });
+    expect(count(wakePrompt, STEER), "no verified session/run binding ⇒ the owed steer must reach the model").toBe(1);
+    expect(count(wakePrompt, MSG)).toBe(1);
+    expect(await answered(steerId), "still owed").toBe(false);
+    if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, "B3-1-direct-adapter.json"), JSON.stringify({
+      steerId, sessionA: chat.sessionId, cutRunId: chat.runId, wakeComment: (wake as any).comments.find((c: any) => c.id === steerId),
+      steerCopies: count(wakePrompt, STEER), wakePrompt }, null, 2));
+  });
+
+  it("B3-2 (kept): the native path verified the SAME session from the cut run ⇒ 0 copies; the shared renderer omits only with that binding", async () => {
+    const chat = await seedChat();
+    const { steerId, carry } = await steerThenInterrupt(chat, "read");
+    const successor = await admitSuccessor(chat, carry);
+    const submitted = await submittedSuccessorTurn(chat, successor, true);
+    expect(count(submitted, STEER), "native verified same session: no second copy").toBe(0);
+    expect(count(submitted, MSG)).toBe(1);
+    const wake = await buildPaperclipWakePayload({ db, companyId: chat.companyId, agentId: chat.agentId,
+      runId: successor.id, contextSnapshot: { ...(successor.contextSnapshot as Record<string, unknown>) } });
+    const copies = (binding?: { sessionId: string; runId: string }) =>
+      count(renderPaperclipWakePrompt(wake, { resumedSession: true, readInSessionBinding: binding }), STEER);
+    expect(copies({ sessionId: chat.sessionId, runId: chat.runId })).toBe(0);
+    expect(copies({ sessionId: randomUUID(), runId: chat.runId }), "other session").toBe(1);
+    expect(copies({ sessionId: chat.sessionId, runId: randomUUID() }), "other source run").toBe(1);
+    expect(copies(), "no binding").toBe(1);
+    expect(await answered(steerId)).toBe(false);
+  });
+
+  for (const [row, phase] of [["B3-3", "terminal_failure"], ["B3-4", "applied"]] as const) {
+    it(`${row} (rf-4 F2 red): the cut run's native_run_finalizations phase is '${phase}' (settled); Pi's late read arrives ⇒ the late writer writes NOTHING`, async () => {
+      const chat = await seedChat();
+      const { steerId } = await steerThenInterrupt(chat, "unread");
+      await db.update(heartbeatRuns).set({ nativeIssueId: chat.issue.id, finishedAt: new Date() }).where(eq(heartbeatRuns.id, chat.runId));
+      await db.insert(nativeRunFinalizations).values({ companyId: chat.companyId, issueId: chat.issue.id, runId: chat.runId, phase });
+      await runLog(chat, [{ eventType: "item.started", kind: "userMessage", itemId: "turn-1:steered" }]);
+      const [before] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+      await recordSteeredMessageEvidence(db, { companyId: chat.companyId, runId: chat.runId });
+      const [after] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+      if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `${row}-${phase}-writer.json`), JSON.stringify({
+        steerId, phase, before: before!.resultJson, after: after!.resultJson }, null, 2));
+      expect(after!.resultJson, `a ${phase} run is never rewritten`).toEqual(before!.resultJson);
+      // Control: an unsettled phase (observed) still records the late read; the fence is the only difference.
+      await db.update(nativeRunFinalizations).set({ phase: "observed" }).where(eq(nativeRunFinalizations.runId, chat.runId));
+      await recordSteeredMessageEvidence(db, { companyId: chat.companyId, runId: chat.runId });
+      const [open] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+      expect((open!.resultJson as any).interruptCarriedReadSteeredCommentIds).toEqual([steerId]);
+    });
+  }
 
   /** The cut turn's tool calls, as run-event ingestion stores them (validated PRP tool.execution.started /
    * tool.execution.completed). `midFlight`: started, cut before any completed receipt. */
