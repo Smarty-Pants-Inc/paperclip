@@ -1556,9 +1556,15 @@ export async function finalizeNativeRun(input: Parameters<typeof finalizeNativeR
     // the SAME guarded drain after commit, including committed replay. Its
     // terminal/cleanup guards keep a live owner held; its issue lock makes a
     // concurrent settlement drain idempotent. Keep heartbeat loading lazy.
-    const { heartbeatService } = await import("../heartbeat.js");
-    await heartbeatService(input.db).releaseIssueExecutionAndPromote(
-      { id: input.runId, companyId: finalized.companyId }, { resumeStrandedQueue: true });
+    // A drain failure never turns a committed finalization into a thrown error
+    // (rf-3 row 7). The deferred wake stays saved for the next drain.
+    try {
+      const { heartbeatService } = await import("../heartbeat.js");
+      await heartbeatService(input.db).releaseIssueExecutionAndPromote(
+        { id: input.runId, companyId: finalized.companyId }, { resumeStrandedQueue: true });
+    } catch (err) {
+      logger.warn({ err, runId: input.runId }, "Post-commit release drain failed; the deferred wake stays saved");
+    }
   }
   return finalized;
 }
