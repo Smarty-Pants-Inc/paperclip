@@ -908,6 +908,6 @@ export const paperclipRunnerUIAdapter: UIAdapterModule = {
   },
   ConfigFields: CodexLocalConfigFields,
   buildAdapterConfig: buildPaperclipRunnerConfig,
-  // Native runner (pi_rpc) reasoning reads inline in the turn with no click.
-  transcriptPresentation: { liveReasoningView: "inline" },
+  // T3-style live preview and settled work fold; saved agent Inline still wins.
+  transcriptPresentation: { liveReasoningView: "fold" },
 };

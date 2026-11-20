@@ -3,7 +3,9 @@ import { AgentQueueWait } from "@/components/AgentQueueWait";
 import { agentQueueWaitOf } from "@/lib/agent-queue-wait";
 import { WAITING_TO_START_LABEL, useWaitingToStart } from "./useWaitingToStart";
 import { McpAppTurnViews, mcpAppRunRefreshKey } from "@/components/mcp-app/McpAppTurnViews";
-import { useRef, type ReactNode } from "react";
+import { useContext, useRef, useState, type ReactNode } from "react";
+import { TaskChatExpansionState } from "./expansion-state";
+import { ChevronRight } from "lucide-react";
 import type { ExecutionProjection } from "@paperclipai/shared";
 import { useSecondTick } from "@/hooks/useSecondTick";
 import { cn } from "@/lib/utils";
@@ -27,6 +29,7 @@ import { TaskChatShimmerScope, useTaskChatShimmer } from "./TaskChatShimmer";
 import {
   buildTurnTimelineRows,
   isTerminalRunStatus,
+  isPersistentRunnerWorkItem,
   isYieldedWaitStub,
   omitProgressRepeatedByResponse,
   paperclipRunnerFinalResponse,
@@ -239,6 +242,15 @@ export function TaskChatRunnerTurn({
 }) {
   const { failures: mcpStartupFailures, rest: turnItems } = partitionRunHealthItems(items);
   const terminal = isTerminalRunStatus(status);
+  const [workOpen, setWorkOpen] = useState(false);
+  const sharedExpansion = useContext(TaskChatExpansionState);
+  const localExpansion = useRef(new Map<string, boolean>());
+  const workRun = useRef(runId);
+  if (workRun.current !== runId) {
+    workRun.current = runId;
+    localExpansion.current.clear();
+    if (workOpen) setWorkOpen(false);
+  }
   const waitingToStart = useRunnerWaitingToStart({ runId, status, execution, startedAtMs });
   const waitingLabel = runnerWaitingLabel({ runId, status, execution, preparationLabel, startedAtMs }, waitingToStart);
   const yielded = turnItems.some(
@@ -335,7 +347,15 @@ export function TaskChatRunnerTurn({
     reasoningDisplay,
   ));
 
+  const foldWork = status === "succeeded" && !yielded && !awaitingContinuation && reasoningDisplay !== "inline" &&
+    !turnItems.some((item) => item.kind === "message" && item.streaming) &&
+    timelineRows.some((row) => !isPersistentRunnerWorkItem(row));
+  const visibleTimelineRows = foldWork && !workOpen
+    ? timelineRows.filter(isPersistentRunnerWorkItem)
+    : timelineRows;
+
   return (
+    <TaskChatExpansionState.Provider value={sharedExpansion ?? localExpansion.current}>
     <TaskChatShimmerScope items={items}><div
       className="flex min-w-0 flex-col"
       data-testid="task-chat-runner-turn"
@@ -343,7 +363,15 @@ export function TaskChatRunnerTurn({
     >
       {showHeader ? <TaskChatRunnerHeader runId={runId} agentName={agentName} agentIcon={agentIcon} agent={agent}
         status={status} execution={execution} preparationLabel={preparationLabel} startedAtMs={startedAtMs}
-        finishedAtMs={finishedAtMs} continuedAfterSteering={continuedAfterSteering} /> : null}
+        finishedAtMs={finishedAtMs} continuedAfterSteering={continuedAfterSteering}
+        statusContent={foldWork ? (
+          <button type="button" data-testid="task-chat-work-toggle" aria-expanded={workOpen}
+            onClick={() => setWorkOpen((value) => !value)}
+            className="flex min-h-8 min-w-0 items-center gap-2 rounded-sm text-left hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+            <RunnerTurnStatus status={status} startedAtMs={startedAtMs} finishedAtMs={finishedAtMs} continuedAfterSteering={continuedAfterSteering} />
+            <ChevronRight className={cn("size-3.5 shrink-0", workOpen && "rotate-90")} aria-hidden />
+          </button>
+        ) : undefined} /> : null}
       <TaskChatRunHealthBanner failures={mcpStartupFailures} />
       {activityUnavailable ? (
         <div
@@ -354,12 +382,12 @@ export function TaskChatRunnerTurn({
           Live runner activity is temporarily unavailable. Retrying…
         </div>
       ) : null}
-      {timelineRows.length > 0 ? (
+      {visibleTimelineRows.length > 0 ? (
         <div
           className="flex min-w-0 flex-col gap-2 py-1"
           data-testid="task-chat-turn-timeline"
         >
-          {timelineRows.map((row) => (
+          {visibleTimelineRows.map((row) => (
             <div
               className="min-w-0"
               key={`${runId ?? "run"}:${row.id}`}
@@ -388,7 +416,7 @@ export function TaskChatRunnerTurn({
                   onRuntimeRequestDecision={onRuntimeRequestDecision}
                 />
               ) : row.kind === "thinking" ? (
-                <TaskChatThinking item={row} inline />
+                <TaskChatThinking item={row} inline={reasoningDisplay === "inline"} />
               ) : null}
             </div>
           ))}
@@ -426,5 +454,6 @@ export function TaskChatRunnerTurn({
       {!final && currentActivityItems.length === 0 && !(status === "queued" && runId && (waitingLabel || agentQueueWaitFor({ status, execution })))
         ? <RunnerCurrentActivityTail status={status} waitingLabel={waitingLabel} /> : null}
     </div></TaskChatShimmerScope>
+    </TaskChatExpansionState.Provider>
   );
 }

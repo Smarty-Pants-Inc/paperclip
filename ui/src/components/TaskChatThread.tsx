@@ -2449,9 +2449,10 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
               agentIcon: meta?.agentId
               ? agentMap?.get(meta.agentId)?.icon
               : undefined,
-            // Inline reasoning must not be hidden inside the legacy turn's
-            // outer Activity disclosure after it settles or is reloaded.
+            // Runner identity stays in place; default settled work/reasoning
+            // folds together, with the reply outside. Saved inline opts out.
             standaloneHeader: sourceIsPaperclipRunner || runReasoningDisplay === "inline",
+            foldActivity: sourceIsPaperclipRunner && !failed && !sourceYielded && runReasoningDisplay !== "inline",
             continuedAfterSteering: sourceIsPaperclipRunner && segmentIndex > 0,
             animateFold: liveSeenRef.current.has(source.id),
             items: children,
@@ -2552,6 +2553,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
                 : undefined,
               standaloneHeader:
                 isNativePaperclipRunnerRun(liveRun) || liveRunReasoningDisplay === "inline",
+              foldActivity: isNativePaperclipRunnerRun(liveRun) && liveRunReasoningDisplay !== "inline",
               continuedAfterSteering:
                 isNativePaperclipRunnerRun(liveRun) && segmentIndex > 0,
               items: children,
@@ -3831,7 +3833,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
                               {tailRunId || optimisticRunnerStartup ? (
                                 <div data-testid="task-chat-live-transcript">
                                   <TaskChatShimmerScope items={tailItems}>
-                                  <TaskChatRunnerHeader
+                                  {!(tailRunSource?.adapterType === "paperclip_runner" && tailStatus === "succeeded") ? <TaskChatRunnerHeader
                                     runId={tailRunId}
                                     agentName={visibleTailAgentName}
                                     agentIcon={visibleTailAgentIcon}
@@ -3846,11 +3848,11 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
                                       <TaskChatLiveRunPill status={tailStatus} execution={liveRun?.id === tailRunId ? liveRun.execution : null}
                                         startedAtMs={tailStartedAtMs} finishedAtMs={tailFinishedAtMs} toolSummary={tailToolSummary} />
                                     ) : undefined}
-                                  />
+                                  /> : null}
                                   {tailRunSource?.adapterType === "paperclip_runner" ||
                                   optimisticRunnerStartup ? (
                                     <TaskChatRunnerTurn
-                                      showHeader={false}
+                                      showHeader={tailStatus === "succeeded"}
                                       reasoningDisplay={tailReasoningDisplay}
                                       runId={tailRunId}
                                       execution={
