@@ -1124,7 +1124,7 @@ describe("agent directory collection aborted after the canonical commit boundary
     return { fault, remove: () => spy.mockRestore() };
   }
 
-  it.each(["feedback", "customer-success inspection"] as const)("R16 the rollback restore itself fails (rf-3's failed-restore plant: PostgreSQL rejects the durable head, then the undo rename fails with EIO): the real %s reader returns the saved files or 'not available', never the failed save's bytes", async reader => {
+  it.each(["feedback", "customer-success inspection", "database-less instructions service"] as const)("R16 the rollback restore itself fails (rf-3's failed-restore plant: PostgreSQL rejects the durable head, then the undo rename fails with EIO): the real %s reader returns the saved files or 'not available', never the failed save's bytes", async reader => {
     // The saved (durable) files before the run. `0-first.txt` sorts before the
     // entry file, so the entry file is the second undo rename: the planted one.
     const saved: Record<string, string> = { [entryFile]: "# Policy\n", "0-first.txt": "saved first file\n", "edit-me.txt": "pre-existing edited file\n",
@@ -1181,6 +1181,18 @@ describe("agent directory collection aborted after the canonical commit boundary
       returned = { entry: instructions?.entryBody ?? null, edit: null,
         listing: instructions?.files ? instructions.files.map(file => [file.path, file.size] as const).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0) : null,
         unavailable: instructions ? null : notes.find(item => /agent_instructions_unavailable/.test(item)) ?? "instructions omitted without a reason", raw: { instructions, notes } };
+    } else if (reader === "database-less instructions service") {
+      // READER: the instructions service built WITHOUT a database (as feedback built it
+      // at 17202674). It cannot lock or restore, so its truthful answer is a refusal.
+      const { agentInstructionsService } = await import("../services/agent-instructions.js");
+      const [owner] = await db.select().from(agents).where(eq(agents.id, agentId));
+      const outcome = <T>(work: Promise<T>) => work.then(value => ({ value, refused: null as string | null }),
+        (error: { message?: string; details?: { code?: string } }) => ({ value: null as T | null, refused: `${error?.details?.code ?? "error"}: ${error?.message}` }));
+      const bundle = await outcome(agentInstructionsService().getBundle(owner!));
+      const entry = await outcome(agentInstructionsService().readFile(owner!, entryFile)), edit = await outcome(agentInstructionsService().readFile(owner!, "edit-me.txt"));
+      returned = { entry: entry.value?.content ?? null, edit: edit.value?.content ?? null,
+        listing: bundle.value ? bundle.value.files.map(file => [file.path, file.size] as const) : null,
+        unavailable: bundle.refused ?? entry.refused ?? edit.refused, raw: { bundle: bundle.refused, entry: entry.refused, edit: edit.refused } };
     } else {
       // READER: the real support inspection of the agent's instruction files.
       const { readCustomerSuccessResource } = await import("../services/customer-success-inspection.js");
@@ -1191,7 +1203,7 @@ describe("agent directory collection aborted after the canonical commit boundary
       returned = { entry: text(entry), edit: text(edit), listing: null, unavailable: entry.available && edit.available ? null : String(entry.reason ?? edit.reason), raw: { entry, edit } };
     }
     const after = { marker: await readMarker(), ...await canonical(note), entry: await onDisk(entryFile), edit: await onDisk("edit-me.txt") };
-    await evidence(`r16-failed-restore-${reader === "feedback" ? "feedback" : "inspection"}-reader.json`, { reader, plant: { persistRejectedBy: "PostgreSQL trigger on agent_file_roots", restore: restoreFault.fault, fault: { ...fault, abortedAt: undefined } },
+    await evidence(`r16-failed-restore-${reader === "feedback" ? "feedback" : reader === "customer-success inspection" ? "inspection" : "database-less"}-reader.json`, { reader, plant: { persistRejectedBy: "PostgreSQL trigger on agent_file_roots", restore: restoreFault.fault, fault: { ...fault, abortedAt: undefined } },
       failure: { error: failure.error ? String(failure.error) : null, row: briefRow(failure.row) }, saved: { entry: saved[entryFile], edit: saved["edit-me.txt"], listing: savedListing }, neverSaved, before, faulted, returned, after });
     // The fixture really is the double fault: a failed save whose restore failed, marked unverified.
     expect.soft(fault, "fixture: one apply whose REAL persist failed after the tree merge").toMatchObject({ applies: 1, appliesSettled: 1, realPersistCalls: 1, treeMergedAtPersist: true });
@@ -1202,10 +1214,12 @@ describe("agent directory collection aborted after the canonical commit boundary
     expect.soft(faulted.generation, "fixture: nothing of the failed save was committed").toBe(before.generation);
     expect.soft({ entry: faulted.entry, edit: faulted.edit }, "fixture: the files on disk hold the failed save's never-saved bytes").toEqual(neverSaved);
     // The outcome: what the real reader returned.
-    expect.soft(returned.entry, "the reader never returns the failed save's never-saved entry bytes").not.toContain("NEVER SAVED");
+    expect.soft(returned.entry ?? "", "the reader never returns the failed save's never-saved entry bytes").not.toContain("NEVER SAVED");
     expect.soft(returned.edit ?? "", "the reader never returns the failed save's never-saved file bytes").not.toBe(neverSaved.edit);
+    if (reader === "database-less instructions service") expect.soft(returned.unavailable, "without a database the files cannot be restored: the reader must refuse").not.toBeNull();
     if (returned.unavailable !== null) {
       expect.soft(returned.unavailable, "a reader that cannot restore says the files are not available while they are verified").toMatch(/verif|agent_instructions_unavailable/);
+      expect.soft({ entry: returned.entry, edit: returned.edit, listing: returned.listing }, "and returns nothing of the tree").toEqual({ entry: null, edit: null, listing: null });
     } else {
       expect.soft(returned.entry?.trimEnd(), "the saved entry file, restored from the durable head").toBe(saved[entryFile]!.trimEnd());
       if (reader === "feedback") expect.soft(returned.listing, "the saved file listing (paths and sizes), not the failed save's").toEqual(savedListing);
