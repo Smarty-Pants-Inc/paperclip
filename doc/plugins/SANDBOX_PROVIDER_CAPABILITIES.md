@@ -244,13 +244,79 @@ unknown state.
   object on a valid, identified plugin is a different state; the host defers to
   verified discovery for that case.
 
-## Concurrency capabilities are not part of the contract
+## Concurrent sync operations need an explicit opt-in
 
-Earlier drafts listed two concurrency keys, `concurrentSyncAndExec` and
-`concurrentSyncOperations`. The runtime never exposed a scheduling choice that
-read either key, so a declaration had no effect. The host removed both keys. The
-strict capability validator now rejects them as unknown keys. The host can
-reintroduce a concurrency capability when a runtime path enforces it.
+Declare `sandboxCapabilities.concurrentSyncOperations: true` only when the
+provider can safely run native file transfers concurrently, including transfers
+in both directions at once. This is a behavioral guarantee, not something the
+host can infer from method discovery. An omitted key or `false` denies the
+capability. The host requires **both** `environmentSyncIn` and
+`environmentSyncOut` in the live worker's verified methods; one direction alone
+is insufficient. The declaration cannot override missing methods, static driver
+restrictions, or per-run narrowing. See the
+[provider contract](../../packages/shared/src/types/plugin.ts#L166-L175) and
+[capability resolver](../../server/src/services/environment-runtime.ts#L155-L225).
+
+When the effective capability is `true`, the host carries it to the native sync
+client as `allowConcurrentSyncOperations`. This enables:
+
+- **Concurrent inbound and outbound sync work.** The workspace coordinator uses
+  the permission for both its inbound uploads and outbound restores, with at most
+  four operations active per scheduler invocation. It waits for all started
+  operations to settle before crossing the startup or restore barrier and reports
+  required failures in stable input order. This does not overlap startup with
+  copyback or remove either barrier. See the
+  [scheduler and limit](../../packages/adapter-utils/src/sync-operation-schedule.ts#L1-L79),
+  [inbound barrier](../../packages/adapter-utils/src/sandbox-managed-runtime.ts#L1960-L1987),
+  and [outbound barrier](../../packages/adapter-utils/src/sandbox-managed-runtime.ts#L2380-L2401).
+- **Parallel launch-asset staging.** For sandbox transport, launch-state
+  materialization and runtime-context staging may overlap. Selected Codex skills
+  are prepared first, and the CA bundle is staged afterward. Both parallel
+  branches settle before a failure is raised. See
+  [launch-asset staging](../../server/src/services/native-runtime/remote-launch-assets.ts#L188-L204).
+- **Eligible runner/harness preparation overlap.** Runner preparation can overlap
+  discovery and verification of preinstalled Codex when there is no explicit
+  Codex binary or npm installation request. See
+  [runner preparation](../../server/src/services/native-runtime/native-session-executor.ts#L18256-L18264).
+
+Without the opt-in, the native sync path and these capability-gated preparation
+paths remain serial. The generic base64-over-exec sync fallback is different: it
+already permits concurrency independently of a provider declaration. See
+[permission propagation](../../server/src/services/environment-execution-target.ts#L522-L527)
+and [native versus fallback selection](../../packages/adapter-utils/src/command-managed-runtime.ts#L517-L540).
+
+GitHub preparation also overlaps eligible native runnerd setup, but at this
+revision it is **not gated** by `concurrentSyncOperations`. The native executor
+selects that path for managed GitHub access on remote Codex/OpenCode runnerd runs,
+with no explicit backend and excluding execution schemas v6/v8. GitHub environment
+preparation can then overlap assigned-MCP preparation; failures are awaited and
+GitHub access is activated before the prepared environment is handed on. Heartbeat
+preparation defers configured native GitHub access to the session supervisor. The
+capability does not bypass GitHub activation or authorize arbitrary command
+batching. See [heartbeat deferral](../../server/src/services/heartbeat-github-launchers.ts#L24-L29),
+[native GitHub preparation](../../server/src/services/native-runtime/native-session-executor.ts#L11617-L11641),
+and [preparation barrier](../../server/src/services/native-runtime/native-session-executor.ts#L15444-L15460).
+
+Before opting in, a provider must isolate per-call scratch state in both sync
+directions: use distinct host temporary directories, remote archive/list names,
+and publication staging paths. Concurrent operations must have disjoint
+publication destinations; this capability does not make same-target replacement
+transactional. Lease release, stop, destroy, and worker shutdown must drain active
+sync calls, including their cleanup, before tearing down their resources. Fence
+new work during teardown and fail closed if the drain cannot be confirmed; a
+timeout is not successful teardown. The coordinator's settle-all barrier does not
+replace these provider-side guarantees. See the
+[Daytona declaration and guarantees](../../packages/plugins/sandbox-providers/daytona/src/manifest.ts#L48-L65)
+and [Boat sync lifecycle contract](../../packages/plugins/sandbox-providers/boat/README.md#L3-L22).
+
+The bundled Daytona provider declares this capability (added in 0.1.4). Boat
+also declares it from `0.1.17-spare.12c1` (unreleased at this revision); older Boat
+manifests do not gain it from method discovery alone. See
+[Daytona version history](../../packages/plugins/sandbox-providers/daytona/src/manifest.ts#L13-L18)
+and [Boat manifest](../../packages/plugins/sandbox-providers/boat/src/manifest.ts#L3-L38).
+`concurrentSyncAndExec` remains unsupported: it is not an alias or an additional
+permission, and the [strict validator](../../packages/shared/src/validators/plugin.ts#L158-L172)
+rejects it as an unknown key.
 
 ### Preserving an unexported workspace
 
