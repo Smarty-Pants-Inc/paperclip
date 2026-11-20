@@ -4,8 +4,27 @@ import type { TaskChatItem, TaskChatMarkerItem, TaskChatMessageItem } from "./ta
 const LEGACY_RECOVERY_STATEMENT = /^Paperclip (?:automatically )?retried (?:dispatch|continuation|this issue's run)\b[^\r\n]*\bit still has no live execution path\b/i;
 const RECOVERY_TITLES = new Set(["task could not continue", "no live execution path"]);
 
+const OWED_MESSAGE_PREFIX = "unanswered_message:";
+
+/** The person message an "unanswered message" card is owed for (one card per message). */
+export function owedMessageId(
+  item: Pick<TaskChatMessageItem, "author" | "metadata">,
+): string | null {
+  if (item.author !== "system") return null;
+  const reason = item.metadata?.authorizationReason;
+  if (typeof reason !== "string" || !reason.startsWith(OWED_MESSAGE_PREFIX)) return null;
+  return reason.slice(OWED_MESSAGE_PREFIX.length).trim() || null;
+}
+
+/** Pending-state key of one Retry: the failed run, narrowed to one owed message when the card names it. */
+export function retryFailedRunKey(runId: string, messageId?: string | null): string {
+  return messageId ? `${runId}:${messageId}` : runId;
+}
+
 export function isNoLiveExecutionPathNotice(item: TaskChatMessageItem): boolean {
   if (item.author !== "system") return false;
+  // An owed-message card is a recovery surface: its Retry re-sends its message.
+  if (owedMessageId(item)) return true;
   const text = item.text.trim();
   const recoveryStatement = TASK_RECOVERY_STATEMENT.test(text) || LEGACY_RECOVERY_STATEMENT.test(text);
   if (item.presentation) {
@@ -63,7 +82,18 @@ export function compactAdjacentErrors(items: readonly TaskChatItem[]): {
       );
       // Preserve the retry target separately from the surviving error's text.
       // The renderer still applies the parent's permission and pending state.
-      if (marker) retryMarkers.set(latest.id, marker);
+      // One card per owed message: every owed card of the group survives (in
+      // order) with its own Retry target; only the run marker collapses.
+      const owed = items.slice(start, end).filter(
+        (item) => item.kind === "message" && owedMessageId(item) !== null,
+      );
+      const survivors = owed.length > 0
+        ? (owed.includes(latest) ? owed : [...owed, latest])
+        : [latest];
+      if (marker) for (const survivor of survivors) retryMarkers.set(survivor.id, marker);
+      result.push(...survivors);
+      start = end;
+      continue;
     }
     result.push(...(mixed ? [latest] : items.slice(start, end)));
     start = end;

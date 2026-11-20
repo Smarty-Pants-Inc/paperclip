@@ -622,7 +622,9 @@ interface IssueChatThreadProps {
   onTryAgainNoLiveExecutionPath?: () => Promise<void> | void;
   tryAgainNoLiveExecutionPathPending?: boolean;
   /** Starts a fresh on-demand run for the selected failed run. */
-  onRetryFailedRun?: (runId: string) => Promise<void> | void;
+  /** `messageId`: the owed-message card whose Retry was pressed (re-send that message only). */
+  onRetryFailedRun?: (runId: string, messageId?: string) => Promise<void> | void;
+  /** Pending Retry key: `retryFailedRunKey(runId, messageId)`. */
   retryFailedRunId?: string | null;
   companyId?: string | null;
   projectId?: string | null;

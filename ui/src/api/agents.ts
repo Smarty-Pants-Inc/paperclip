@@ -309,6 +309,12 @@ export const agentsApi = {
     id: string,
     failedRunId: string,
     companyId: string,
+    /**
+     * The owed message whose card was pressed. With it the server re-sends
+     * that message only; without it (run-level Retry, older cards) it keeps
+     * re-sending everything the failed run carried.
+     */
+    messageId?: string | null,
   ) => {
     const result = await api.post<
       AgentWakeupResponse | ChatFailedRunRetryResponse
@@ -317,6 +323,7 @@ export const agentsApi = {
       triggerDetail: "manual",
       reason: "retry_failed_run",
       failedRunId,
+      ...(messageId ? { messageId } : {}),
     });
     if ("id" in result) {
       // Exact retries are idempotent: a repeated click can return a successor

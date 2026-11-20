@@ -30,7 +30,9 @@ import { TaskMessageScroller, type ScrollingHistory } from "./TaskMessageScrolle
 import { TaskChatProtocolCard } from "./TaskChatProtocolCard";
 import { TaskChatProtocolActivityRow } from "./TaskChatProtocolActivityRow";
 import { TaskChatPlanPreviewCard } from "./TaskChatPlanPreviewCard";
-import { compactAdjacentErrors, isRetryableFailureMarker } from "./adjacent-errors";
+import {
+  compactAdjacentErrors, isRetryableFailureMarker, owedMessageId, retryFailedRunKey,
+} from "./adjacent-errors";
 import { CoordinatorChatTaskHandoff } from "@/components/coordinator/CoordinatorChatTaskHandoffs";
 import { CoordinatorChatDecisionReceipt } from "@/components/coordinator/CoordinatorChatDecisionReceipts";
 import { CoordinatorChatPendingQuestion } from "@/components/coordinator/CoordinatorChatPendingQuestions";
@@ -74,7 +76,9 @@ interface TaskChatThreadViewProps {
   /** Requeues a blocked task from its no-live-execution-path failure surfaces. */
   onTryAgainNoLiveExecutionPath?: () => Promise<void> | void;
   tryAgainNoLiveExecutionPathPending?: boolean;
-  onRetryFailedRun?: (runId: string) => Promise<void> | void;
+  /** `messageId` is set when an owed-message card's Retry was pressed: re-send that message only. */
+  onRetryFailedRun?: (runId: string, messageId?: string) => Promise<void> | void;
+  /** Pending Retry key: `retryFailedRunKey(runId, messageId)`. */
   retryFailedRunId?: string | null;
   /** Content appended inside the transcript scroller after the settled thread. */
   tail?: ReactNode;
@@ -108,7 +112,7 @@ function renderItem(
   onTryAgainNoLiveExecutionPath?: () => Promise<void> | void,
   tryAgainNoLiveExecutionPathPending = false,
   retryableMarkerId?: string,
-  onRetryFailedRun?: (runId: string) => Promise<void> | void,
+  onRetryFailedRun?: (runId: string, messageId?: string) => Promise<void> | void,
   retryFailedRunId?: string | null,
   attachments: IssueAttachment[] = [],
   onOpenSkill?: (skillId: string, name: string) => void,
@@ -361,19 +365,30 @@ export function TaskChatThreadView({
             },
           )?.id
       : undefined;
+  // Every owed-message card of the latest retryable failed run gets its own
+  // Retry (one card per owed message), not only the last surviving row.
+  const retryableRunId = retryableMarkerId ? retryMarkers.get(retryableMarkerId)?.runId : undefined;
   // Streaming tail and header updates must not rebuild settled markdown/tool trees.
   const history = useMemo(() => {
     const renderVisibleItem = (item: TaskChatItem) => {
-      const marker = item.id === retryableMarkerId ? retryMarkers.get(item.id) : undefined;
+      const owedId = item.kind === "message" ? owedMessageId(item) : null;
+      const itemMarker = retryMarkers.get(item.id);
+      const marker = item.id === retryableMarkerId
+        || (owedId && retryableRunId && itemMarker?.runId === retryableRunId)
+        ? itemMarker
+        : undefined;
       const runId = marker?.retryable !== false ? marker?.runId : undefined;
-      const runRetry = !onTryAgainNoLiveExecutionPath && onRetryFailedRun && runId
-        ? () => onRetryFailedRun(runId)
+      const messageId = owedId ?? undefined;
+      const runRetry = (messageId || !onTryAgainNoLiveExecutionPath) && onRetryFailedRun && runId
+        ? () => (messageId ? onRetryFailedRun(runId, messageId) : onRetryFailedRun(runId))
         : undefined;
       return renderItem(
         item, onApprovalDecision, renderInteraction, renderBrief, renderMessageActions,
         renderQueuedAction, onRuntimeRequestDecision, "classic",
         runRetry ?? onTryAgainNoLiveExecutionPath,
-        runRetry ? retryFailedRunId === runId : tryAgainNoLiveExecutionPathPending,
+        runRetry && runId
+          ? retryFailedRunId === retryFailedRunKey(runId, messageId)
+          : tryAgainNoLiveExecutionPathPending,
         retryableMarkerId, onRetryFailedRun, retryFailedRunId, attachments, onOpenSkill, onOpenBrowser,
       );
     };
@@ -428,7 +443,7 @@ export function TaskChatThreadView({
       </>
     );
   }, [
-    visibleItems, retryMarkers, streamlined, onApprovalDecision, onRuntimeRequestDecision,
+    visibleItems, retryMarkers, retryableRunId, streamlined, onApprovalDecision, onRuntimeRequestDecision,
     renderInteraction, renderBrief, renderMessageActions, renderQueuedAction,
     onTryAgainNoLiveExecutionPath, tryAgainNoLiveExecutionPathPending,
     retryableMarkerId, onRetryFailedRun, retryFailedRunId, attachments, onOpenSkill, onOpenBrowser,

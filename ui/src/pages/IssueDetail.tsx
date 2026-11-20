@@ -5,6 +5,7 @@ import { useIssueIdBatches } from "@/hooks/useIssueIdBatches";
 import { TaskChatLoadingShell } from "@/components/task-chat/TaskChatLoadingShell";
 import { useConversationHistoryPages, type ConversationHistoryPage } from "@/hooks/useConversationHistoryPages";
 import { taskChatHashAnchor } from "@/components/task-chat/scroll-navigation";
+import { retryFailedRunKey } from "@/components/task-chat/adjacent-errors";
 import { AgentChatReadProvider } from "@/hooks/useAgentChatRead";
 import { useCoordinatorWorkspaceEnabled } from "@/hooks/useCoordinatorWorkspaceEnabled";
 import { TaskDecisionRecord } from "@/components/TaskDecisionRecord";
@@ -1711,13 +1712,15 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     recordIssueDetailReadiness({ activity: !activityPending, "linked-runs": !linkedRunsPending, runtime: runtimeSelectionKnown });
   }, [issueId, issueQueryRef, activityPending, linkedRunsPending, runtimeSelectionKnown]);
   const retryFailedRun = useMutation({
-    mutationFn: async (runId: string) => {
+    mutationFn: async ({ runId, messageId }: { runId: string; messageId?: string }) => {
       const failedRun = resolvedLinkedRuns.find((run) => run.runId === runId);
       if (!failedRun) throw new Error("Failed run is no longer available.");
+      // An owed-message card's Retry re-sends that message only.
       return agentsApi.retryFailedRun(
         failedRun.agentId,
         failedRun.runId,
         companyId,
+        messageId,
       );
     },
     onSuccess: (result) => {
@@ -1740,7 +1743,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         queryKey: queryKeys.issues.activeRun(issueQueryRef),
       });
     },
-    onError: (error, runId) => {
+    onError: (error, { runId }) => {
       const failedRun = resolvedLinkedRuns.find((run) => run.runId === runId);
       pushToast(modelStillUnavailableToast(error, failedRun ? agentMap.get(failedRun.agentId) : undefined) ?? {
         title: "Run retry failed",
@@ -2791,11 +2794,13 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             feedbackDataSharingPreference={feedbackDataSharingPreference}
             feedbackTermsUrl={feedbackTermsUrl}
             linkedRuns={timelineRuns}
-            onRetryFailedRun={(runId) =>
-              retryFailedRun.mutateAsync(runId).then(() => undefined)
+            onRetryFailedRun={(runId, messageId) =>
+              retryFailedRun.mutateAsync({ runId, messageId }).then(() => undefined)
             }
             retryFailedRunId={
-              retryFailedRun.isPending ? retryFailedRun.variables : null
+              retryFailedRun.isPending && retryFailedRun.variables
+                ? retryFailedRunKey(retryFailedRun.variables.runId, retryFailedRun.variables.messageId)
+                : null
             }
             timelineEvents={timelineEvents}
             workModeChanges={workModeChanges}
