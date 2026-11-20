@@ -2358,9 +2358,10 @@ function renderPaperclipWakePromptBody(
     // (the authoritative, uncapped brief) so the description is not delivered
     // twice in one prompt.
     suppressIssueDescription?: boolean;
-    // Wording only (c1-prime): the native request is rendered whole (resumedSession false), but the
-    // server verified the SAME provider session continues, so it already holds the interrupted turn.
-    // It switches the 'fresh session' sentences to true ones; it never removes a receipts list item.
+    // c1-prime: the native request is rendered whole (resumedSession false), but the server verified
+    // the SAME provider session continues, so it already holds the interrupted turn. It switches the
+    // 'fresh session' sentences to true ones and omits a steer that turn already read (readInSession);
+    // it never removes a receipts list item.
     sessionHoldsInterruptedTurn?: boolean;
   } = {},
 ): string {
@@ -2369,8 +2370,9 @@ function renderPaperclipWakePromptBody(
   const wakePayload = normalizePaperclipWakePayload(value);
   if (!wakePayload) return "";
   // A steer Pi already read in the cut turn is in this same session: not injected again (one answer).
-  // A fresh session never saw it, so it is injected as carried input.
-  const normalized = resumedSession && wakePayload.comments.some((comment) => comment.readInSession)
+  // A fresh session never saw it, so it is injected as carried input. The native request is rendered
+  // whole (resumedSession false), so its same-session fact is sessionHoldsInterruptedTurn (answered-b).
+  const normalized = (resumedSession || sessionHoldsInterruptedTurn) && wakePayload.comments.some((comment) => comment.readInSession)
     ? { ...wakePayload, comments: wakePayload.comments.filter((comment) => !comment.readInSession) }
     : wakePayload;
   const externalChatTurn = isNormalizedPaperclipExternalChatTurn(normalized);
