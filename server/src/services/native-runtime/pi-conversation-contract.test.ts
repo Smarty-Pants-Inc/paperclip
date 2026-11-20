@@ -232,7 +232,10 @@ describe("Interrupt successor carrying a new message answers it first (adopt-a2-
     expect.soft(text).toMatch(/New comments in order:\n1\. comment [^\n]+ by user paul\n9 \+ 10(?:\n|$)/);
     expect.soft(text, "Stop carries the same saved receipts as Interrupt")
       .toMatch(/## Commands already run in the interrupted turn \(do not run these again\)[\s\S]*\n1\. `bash` \(`echo STEP1`\): completed\n {3}result: STEP1\n2\. `bash` \(`sleep 600`\): interrupted: it may or may not have taken effect/);
-    expect.soft(text, "a Stop never instructs the successor to continue").not.toMatch(/\bcontinue\b/i);
+    // Narrowed on purpose (rf-4 / RFL, 11-20): the generic wake header 'Use this wake to continue the task…'
+    // (server-utils renderPaperclipWakePromptBody) is on every wake and is not the Stop instruction. This row
+    // guards the Stop instruction itself; real-model take (d) guards behaviour. Do not widen back to /continue/.
+    expect.soft(text, "a Stop never instructs the successor to continue").not.toContain("continue the task from the next unfinished step");
     expect.soft(text).not.toContain("Then continue");
     expect.soft(text).not.toContain(ANSWER_FIRST);
   });
