@@ -994,6 +994,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
 
   let stopping = false;
   let paused = input.startPaused ?? false;
+  let activeGeneration: string | undefined;
   let polling = false;
   let resumePolling: (() => void) | null = null;
   let pausedPromise: Promise<void> | null = null;
@@ -1229,6 +1230,20 @@ export async function startSandboxCallbackBridgeWorker(input: {
         return;
       }
       const denialReason = await authorizeRequest(request);
+      // Quarantine is best effort per file: a failed read or exhausted recovery
+      // writes can leave an old request behind. Fence every route at the final
+      // host-operation admission, after asynchronous authorization and before the
+      // synchronous claim, so it cannot run under a later turn's identity.
+      if (request.bridgeGeneration !== activeGeneration) {
+        await finalize({
+          id: request.id,
+          status: 503,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ error: "Bridge request belongs to a detached run." }),
+          completedAt: new Date().toISOString(),
+        });
+        return;
+      }
       if (denialReason) {
         await finalize({
           id: request.id,
@@ -1847,6 +1862,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
       idlePollIntervalMs = pollIntervalMs;
       resetIdleOnNextEmpty = true;
       const pollStarted = new Promise<void>((resolve) => { pollStartedResolve = resolve; });
+      activeGeneration = generation;
       paused = false;
       resumePolling?.();
       resumePolling = null;
