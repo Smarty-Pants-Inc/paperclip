@@ -33,6 +33,7 @@ import * as nativeExecutor from "../services/native-runtime/native-session-execu
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import * as heartbeatModule from "../services/heartbeat.js";
+import * as issueReferenceModule from "../services/issue-references.js";
 import { waitForPendingCommentSteers } from "../services/conversation-steering.js";
 import { readUnreadSteeredMessages } from "../services/native-runtime/unread-steered-messages.js";
 import { readPersonStopHold } from "../services/acknowledged-native-stop.js";
@@ -43,7 +44,7 @@ import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
 import { PaperclipRunnerToolAuthority } from "../services/native-runtime/paperclip-runner-tool-authority.js";
 import { PaperclipControlPlanePort } from "../services/native-runtime/paperclip-control-plane-port.js";
 import { finalizeNativeRun } from "../services/native-runtime/native-run-finalizer.js";
-import { clearProcessHeartbeat, registerProcessHeartbeat } from "../services/heartbeat-registry.js";
+import { clearProcessHeartbeat, registerProcessHeartbeat, processHeartbeatFor } from "../services/heartbeat-registry.js";
 import { withNativeWorkspaceFinalizationOwnership, NativeWorkspaceFinalizationBusyError } from "../services/native-runtime/native-workspace-finalization-ownership.js";
 import { registerNativeResponsePresentationWork } from "../services/native-runtime/native-response-presentation-work.js";
 import { registerNativeCleanupReleaseWake } from "../services/native-runtime/native-cleanup-release-wake.js";
@@ -81,6 +82,7 @@ class RecordingPiPeer {
     return release;
   }
   onPrompt?: (message: string) => void;
+  facade?: PiFacadeTransport;
   facadeCalls: Array<{ method: string; params: Record<string, unknown> }> = [];
   sessionFile?: string;
   model = { provider: "paperclip", id: "neutral/vendor-model-not-in-bundled-catalog" };
@@ -218,6 +220,11 @@ let root: string;
 type Outcome = { result?: Awaited<ReturnType<typeof executePaperclipNativeSession>>; error?: string };
 const scheduled = new Map<string, { bodies: string[]; peers: RecordingPiPeer[]; executions: Promise<unknown>[];
   first: RecordingPiPeer; outcomes: Map<string, Outcome>; contendAtFinalization?: boolean; deferCommitAtReturn?: boolean;
+  holdSuccessors?: boolean;
+  finishTasks?: boolean;
+  taskError?: string;
+  successorStartGate?: Promise<void>;
+  deferAllCommits?: boolean;
   deferredPhase?: "observed" | "applied" }>();
 const realExecute = executePaperclipNativeSession;
 function backendFor(execution: Parameters<typeof realExecute>[0]["execution"], runnerInstanceId: string, peer: RecordingPiPeer) {
@@ -237,7 +244,7 @@ function backendFor(execution: Parameters<typeof realExecute>[0]["execution"], r
     } });
   const backend = createRunnerdNativeSessionBackend(execution, { runnerInstanceId, transportFactory: () => {
     const facade = new PiFacadeTransport(driver, execution.binding.runId, execution.session.normalizedSessionId!);
-    peer.facadeCalls = facade.calls; return facade;
+    peer.facade = facade; peer.facadeCalls = facade.calls; return facade;
   } });
   if (peer.preAttached) {
     const open = backend.openSession.bind(backend);
@@ -259,6 +266,27 @@ function backendFor(execution: Parameters<typeof realExecute>[0]["execution"], r
   }
   return backend;
 }
+// A task, unlike Agent Chat, explicitly reports completion. The scripted Pi
+// peer submits that report at the EXISTING facade server-request boundary;
+// contract validation, completion feedback and native finalization stay real.
+async function finishTask(peer: RecordingPiPeer, runId: string) {
+  const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+  const [contract] = await db.select().from(completionContracts).where(eq(completionContracts.id, run.completionContractId!));
+  const body = contract.contractJson as { revision: string; criteria: Array<{ id: string }> };
+  const facade = peer.facade!;
+  const read = await facade.request("thread/read", { threadId: "controlled-native-pi", includeTurns: true });
+  const thread = read.thread as { id: string; turns: Array<{ id: string }> };
+  const evidence = `scripted-pi:${runId}`;
+  const report = { ...CONTROL_PLANE_CONFORMANCE_RESULT, summary: peer.replies.join("\n"),
+    completionClaim: { contractRevision: String(body.revision), objectiveSatisfied: true,
+      criteria: body.criteria.map(c => ({ criterionId: c.id, status: "satisfied", evidenceRefs: [evidence] })), remainingWork: [] },
+    evidence: [{ ref: evidence }], verification: [] };
+  const response = await facade.invoke({ id: `finish:${runId}`, method: "item/tool/call", params: {
+    threadId: thread.id, turnId: thread.turns.at(-1)!.id, callId: `finish:${runId}`, tool: "paperclip_finish", arguments: report,
+  } });
+  expect(response, JSON.stringify(response)).toMatchObject({ success: true });
+}
+
 beforeAll(async () => {
   root = await mkdtemp(join(tmpdir(), "steer-default-red-"));
   if (process.env.PAPERCLIP_STEER_RED_EVIDENCE) await mkdir(process.env.PAPERCLIP_STEER_RED_EVIDENCE, { recursive: true });
@@ -278,15 +306,19 @@ beforeAll(async () => {
     const first = owner.peers.length === 0;
     const peer = first ? owner.first : new RecordingPiPeer(); owner.peers.push(peer);
     if (!first) peer.onPrompt = message => setImmediate(() => {
+      if (owner.holdSuccessors) return;
       const envelope = JSON.parse(message);
       const prompt = String(envelope.task?.prompt ?? message);
       peer.boundary();
       const inputs = owner.bodies.filter(body => prompt.includes(body));
       if (inputs.length) peer.answer(inputs);
-      peer.finish();
+      if (owner.finishTasks) void finishTask(peer, input.execution.binding.runId)
+        .catch(error => { owner.taskError = String(error); }).finally(() => peer.finish());
+      else peer.finish();
     });
-    const execution = realExecute({ ...input, useRunnerd: false, backend: backendFor(input.execution, input.runnerInstanceId, peer) }).then(async result => {
-      if (owner.deferCommitAtReturn && first) {
+    const start = () => realExecute({ ...input, useRunnerd: false, backend: backendFor(input.execution, input.runnerInstanceId, peer) });
+    const execution = (!first && owner.successorStartGate ? owner.successorStartGate.then(start) : start()).then(async result => {
+      if (owner.deferCommitAtReturn && (first || owner.deferAllCommits)) {
         await db.update(nativeRunFinalizations).set({ phase: owner.deferredPhase ?? "observed", leaseOwner: "native-row-reconciler",
           leaseExpiresAt: new Date(Date.now() + 60_000) }).where(eq(nativeRunFinalizations.runId, input.execution.binding.runId));
       }
@@ -326,7 +358,7 @@ async function fixture(label: string, conversation = true, skipIssueComment = tr
   await db.insert(issueComments).values({ id: initial, companyId, issueId, authorType: "user", authorUserId: userId, body: "Do the original two-step work." });
   const peer = new RecordingPiPeer();
   peer.preAttached = preAttached;
-  const owner = { contendAtFinalization: false, deferCommitAtReturn: false, deferredPhase: "observed" as "observed" | "applied", bodies: [] as string[], peers: [] as RecordingPiPeer[], executions: [] as Promise<unknown>[], first: peer, outcomes: new Map<string, Outcome>() };
+  const owner: NonNullable<ReturnType<typeof scheduled.get>> = { contendAtFinalization: false, deferCommitAtReturn: false, deferredPhase: "observed" as "observed" | "applied", bodies: [] as string[], peers: [] as RecordingPiPeer[], executions: [] as Promise<unknown>[], first: peer, outcomes: new Map<string, Outcome>() };
   scheduled.set(companyId, owner);
   let coordinator: ReturnType<typeof createDeliveryWorkCoordinator> | undefined;
   let work: ReturnType<ReturnType<typeof heartbeatService>["registerDeferredReceiptWork"]> | undefined;
@@ -442,6 +474,384 @@ async function fixture(label: string, conversation = true, skipIssueComment = tr
     },
   };
 }
+
+it.each([true, false])("MERGE age floor: a 25h message keeps one note, not folded (aged wake=%s)", async ageWake => {
+  const f = await fixture(`mergeagefloor${ageWake}`);
+  const hb = await wiredHeartbeatFor(db, "test:merge-age-floor");
+  try {
+    f.owner.deferCommitAtReturn = true;
+    const old = await f.post("AGED waiting request", "queue");
+    const agedAt = new Date(Date.now() - 25 * 60 * 60_000);
+    await db.update(issueComments).set({ createdAt: agedAt, updatedAt: agedAt }).where(eq(issueComments.id, old.id));
+    const [pending] = (await f.wakes()).filter(w => w.status === "deferred_issue_execution");
+    if (ageWake) await db.update(agentWakeupRequests).set({ requestedAt: agedAt, createdAt: agedAt, updatedAt: agedAt })
+      .where(eq(agentWakeupRequests.id, pending.id));
+    const [note] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorType: "system", body: `Your message is saved: "${old.body}". It was not answered because no run started for it.`,
+      metadata: { version: 1, sections: [], authorizationReason: `unanswered_message:${old.id}` } }).returning();
+    f.peer.boundary(); f.peer.answer(["Original work done"]); await f.complete();
+    await db.update(nativeRunFinalizations).set({ phase: "committed", leaseOwner: null, leaseExpiresAt: null })
+      .where(eq(nativeRunFinalizations.runId, f.runId));
+    await db.update(issues).set({ executionRunId: null, checkoutRunId: null, executionAgentNameKey: null, executionLockedAt: null })
+      .where(eq(issues.id, f.issueId));
+    const newest = await f.post("Fresh question after the aged request");
+    await hb.drainActiveRunExecutions();
+    const successors = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).filter(r => r.id !== f.runId);
+    const notes = (await f.comments()).filter(c => c.metadata?.authorizationReason === `unanswered_message:${old.id}`);
+    console.log("MERGE age evidence", { source: f.runId, oldId: old.id, newestId: newest.id,
+      successors: successors.map(r => ({ id: r.id, commentIds: r.contextSnapshot?.wakeCommentIds })),
+      notes: notes.map(n => n.id), originalNote: note.id });
+    expect(successors).toHaveLength(1);
+    expect(successors[0].contextSnapshot?.wakeCommentIds).toEqual([newest.id]);
+    expect(successors[0].contextSnapshot?.wakeCommentIds).not.toContain(old.id);
+    expect(f.owner.peers.slice(1).flatMap(p => p.replies).filter(reply => reply === `ANSWER:${old.body}`)).toEqual([]);
+    expect(notes.map(n => n.id)).toEqual([note.id]);
+  } finally { await f.close(); }
+}, 90_000);
+
+it.each(["stop", "system", "agent"] as const)("MERGE safety: %s deferred input stays out of a new person run", async kind => {
+  const f = await fixture(`mergehold${kind}`);
+  const hb = await wiredHeartbeatFor(db, "test:merge-held");
+  try {
+    const held = await f.post(`Held ${kind} input`, "queue");
+    f.owner.deferCommitAtReturn = true;
+    f.peer.boundary(); f.peer.answer(["Original work done"]); await f.complete();
+    await db.update(nativeRunFinalizations).set({ phase: "committed", leaseOwner: null, leaseExpiresAt: null })
+      .where(eq(nativeRunFinalizations.runId, f.runId));
+    await db.update(issues).set({ executionRunId: null, checkoutRunId: null, executionAgentNameKey: null, executionLockedAt: null })
+      .where(eq(issues.id, f.issueId));
+    const [saved] = (await f.wakes()).filter(w => w.status === "deferred_issue_execution");
+    if (kind === "stop") {
+      // Persist the acknowledged Stop receipt shape used by the queue's own
+      // Postgres fixtures. This row tests admission of an ALREADY held queue,
+      // not the separate native cancellation transport.
+      await db.update(heartbeatRuns).set({ status: "cancelled", resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
+        cancelledByActorType: "user", cancelledByUserId: f.userId,
+        nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId: f.runId, companyId: f.companyId,
+          issueId: f.issueId, scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged",
+          dispatched: true, intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID() },
+      })}::jsonb` }).where(eq(heartbeatRuns.id, f.runId));
+      await db.update(agentWakeupRequests).set({ payload: { ...saved.payload, personStopHold: { runId: f.runId } } })
+        .where(eq(agentWakeupRequests.id, saved.id));
+      expect(await readPersonStopHold(db, { companyId: f.companyId, issueId: f.issueId, agentId: f.agentId, messageId: held.id }))
+        .toMatchObject({ stoppedRunId: f.runId });
+    } else {
+      await db.update(agentWakeupRequests).set({ source: "automation", requestedByActorType: kind,
+        requestedByActorId: kind === "agent" ? f.agentId : null }).where(eq(agentWakeupRequests.id, saved.id));
+    }
+    const [pending] = (await f.wakes()).filter(w => w.status === "deferred_issue_execution");
+    expect(pending).toBeDefined();
+    if (kind === "stop") expect(pending.payload?.personStopHold).toBeDefined();
+    f.owner.holdSuccessors = true;
+    const newest = await f.post(`New person question after ${kind}`);
+    await vi.waitFor(() => expect(f.owner.peers).toHaveLength(2), { timeout: 15_000 });
+    const [successor] = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).filter(r => r.id !== f.runId);
+    expect(successor.contextSnapshot?.wakeCommentIds).toEqual([newest.id]);
+    const kept = (await f.wakes()).find(w => w.id === pending.id)!;
+    expect(kept).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    expect(JSON.stringify(kept.payload)).toContain(held.id);
+    const nextPeer = f.owner.peers[1];
+    await vi.waitFor(() => expect(nextPeer.requests.some(r => r.type === "prompt")).toBe(true), { timeout: 15_000 });
+    // The admission assertion above is the Stop boundary under test. Existing
+    // release policy may subsequently resume its queue after the typed turn;
+    // let that separate successor finish rather than holding its scripted peer.
+    f.owner.holdSuccessors = false;
+    nextPeer.boundary(); nextPeer.answer([newest.body]); nextPeer.finish();
+    await hb.drainActiveRunExecutions();
+    console.log("MERGE safety evidence", { kind, source: f.runId, successor: successor.id, heldWake: kept.id,
+      heldCommentId: held.id, heldStatusAtAdmission: kept.status, heldRunIdAtAdmission: kept.runId,
+      successorCommentIds: successor.contextSnapshot?.wakeCommentIds });
+  } finally {
+    // A failed assertion must not leave the scripted successor streaming.
+    f.owner.holdSuccessors = false;
+    for (const peer of f.owner.peers.slice(1)) { peer.boundary(); peer.finish(); }
+    await f.close();
+  }
+}, 90_000);
+
+// The comment transaction commits before wake admission. Delay only that
+// boundary (not custody/claim/drain) to reproduce an outbox wake lagging end.
+async function laggedPersonFixture(label: string) {
+  let lag = false, admitted!: () => void;
+  const gate = new Promise<void>(resolve => { admitted = resolve; });
+  // This route-owned callback runs AFTER the comment commits and BEFORE
+  // either outbox path (including append-without-wakeup). The native end
+  // path does not share this callback, so the lag cannot hold its drain.
+  const realReferences = issueReferenceModule.issueReferenceService;
+  const spy = vi.spyOn(issueReferenceModule, "issueReferenceService").mockImplementation((...args) => {
+    const service = realReferences(...args);
+    return { ...service, syncComment: async (...syncArgs: Parameters<typeof service.syncComment>) => {
+      if (lag) await gate;
+      return service.syncComment(...syncArgs);
+    } };
+  });
+  try {
+    const f = await fixture(label);
+    return { ...f, lag() { lag = true; }, admit() { lag = false; admitted(); } };
+  } finally { spy.mockRestore(); }
+}
+async function waitForPersistedEnd(runId: string) {
+  let finishedAt!: Date;
+  await vi.waitFor(async () => {
+    const [run] = await db.select({ finishedAt: heartbeatRuns.finishedAt }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run.finishedAt).not.toBeNull(); finishedAt = run.finishedAt!;
+  }, { timeout: 15_000, interval: 5 });
+  return finishedAt;
+}
+async function waitUntil(at: number) {
+  const delay = at - Date.now();
+  if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
+}
+async function clearMissedDrain(f: Awaited<ReturnType<typeof fixture>>, clearIssue = true) {
+  await db.update(nativeRunFinalizations).set({ leaseOwner: null, leaseExpiresAt: null })
+    .where(eq(nativeRunFinalizations.runId, f.runId));
+  // Complete the REAL accepted-result/status/presentation transaction while
+  // dropping only its post-commit release hint (the missed-handoff fault this
+  // fixture models). A bare phase='committed' fabricated no decision row and
+  // lost CHAIN's first reply. Running the hint here instead races a real
+  // successor ahead of the late comment, defeating the intended missed-drain
+  // starting state. Admission and the later drain are never stubbed.
+  const previous = processHeartbeatFor(db, "test:missed-drain");
+  const heartbeat = previous ?? heartbeatService(db);
+  const dropped: string[] = [];
+  registerProcessHeartbeat(db, { ...heartbeat, releaseIssueExecutionAndPromote: async (...args) => {
+    if (args[0].id === f.runId) { dropped.push(f.runId); return; }
+    return heartbeat.releaseIssueExecutionAndPromote(...args);
+  } });
+  try {
+    await finalizeNativeRun({ db, runId: f.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+  } finally {
+    if (previous) registerProcessHeartbeat(db, previous); else clearProcessHeartbeat(db);
+  }
+  console.info("MERGE missed post-commit handoff", { runId: f.runId, dropped });
+  if (clearIssue) await db.update(issues).set({ executionRunId: null, checkoutRunId: null, executionAgentNameKey: null, executionLockedAt: null })
+    .where(eq(issues.id, f.issueId));
+}
+
+// ROW 0 / LATE3: two saved messages behind WORK, then one late message,
+// measured against its PERSISTED finishedAt. Only the post-comment callback is
+// delayed: routes, outbox, admission, claim, drain and Pi ingestion stay real.
+it.each([100, 400, 800].flatMap(gap => [500, 2000].map(lag => ({ gap, lag }))))
+("LATE3 row0: +$gap ms after saved end, $lag ms comment-to-wake lag; three answers once", async ({ gap, lag }) => {
+  const f = await laggedPersonFixture(`late3gap${gap}lag${lag}`);
+  const hb = await wiredHeartbeatFor(db, "test:late3");
+  try {
+    // Judge rf-3: no lock/phase edits, held finalizer, or missed-drain shortcut.
+    // The real native completion and release race the late committed comment.
+    const messages = [await f.post("LATE3 waiting one", "queue"), await f.post("LATE3 waiting two", "queue")];
+    f.peer.boundary(); f.peer.answer(["WORK finished"]); f.peer.finish();
+    const finishedAt = await waitForPersistedEnd(f.runId);
+    await waitUntil(finishedAt.getTime() + gap);
+    f.lag(); const newest = f.post("LATE3 late person message");
+    let commentAt!: Date;
+    await vi.waitFor(async () => {
+      const row = (await f.comments()).find(c => c.body === "LATE3 late person message");
+      expect(row).toBeDefined(); commentAt = row!.createdAt;
+    }, { interval: 5, timeout: 15_000 });
+    await waitUntil(commentAt.getTime() + lag); f.admit(); messages.push(await newest);
+    await f.running; await hb.waitForRunExecutionDrain(f.runId, { timeoutMs: 15_000 });
+    await hb.drainActiveRunExecutions();
+    await f.assertAnsweredOnce(messages);
+    await hb.sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId });
+    await hb.drainActiveRunExecutions(); await f.assertAnsweredOnce(messages);
+    expect((await f.wakes()).filter(w => w.error === "The conversation moved on")).toEqual([]);
+    expect((await f.comments()).filter(c => c.authorType === "system" && /not run|wasn't answered|was not answered/i.test(c.body))).toEqual([]);
+    console.info("LATE3 row0 timing", { gap, lag, finishedAt, commentAt,
+      actualOffsetMs: commentAt.getTime() - finishedAt.getTime(),
+      wakes: (await f.wakes()).map(w => ({ id: w.id, status: w.status, runId: w.runId, requestedAt: w.requestedAt })) });
+  } finally { f.admit(); await f.close(); }
+}, 90_000);
+
+it("MERGE row11: release promotion races late admission; the deferred wake owns exactly ONE run", async () => {
+  const f = await fixture("mergerow11");
+  const hb = await wiredHeartbeatFor(db, "test:merge-row11");
+  try {
+    f.owner.deferCommitAtReturn = true;
+    const waiting = await f.post("ROW11 deferred person input", "queue");
+    const [receipt] = (await f.wakes()).filter(w => w.status === "deferred_issue_execution");
+    f.peer.boundary(); f.peer.answer(["WORK finished"]); await f.complete();
+    await clearMissedDrain(f, false);
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    f.owner.holdSuccessors = true;
+    const [, late] = await Promise.all([
+      hb.releaseIssueExecutionAndPromote(source, { suppressImmediateRecovery: true, resumeStrandedQueue: true }),
+      f.post("ROW11 late person input"),
+    ]);
+    await vi.waitFor(() => expect(f.owner.peers.length).toBeGreaterThan(1), { timeout: 15_000 });
+    const next = f.owner.peers[1];
+    await vi.waitFor(() => expect(next.requests.some(r => r.type === "prompt")).toBe(true), { timeout: 15_000 });
+    const prompt = String(next.requests.find(r => r.type === "prompt")!.input?.message);
+    f.owner.holdSuccessors = false;
+    next.boundary(); next.answer([waiting.body, late.body].filter(body => prompt.includes(body))); next.finish();
+    await hb.drainActiveRunExecutions();
+    await f.assertAnsweredOnce([waiting, late]);
+    const carriers = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+      .filter(r => (r.contextSnapshot?.wakeCommentIds as string[] | undefined)?.includes(waiting.id));
+    expect(carriers).toHaveLength(1);
+    const saved = (await f.wakes()).find(w => w.id === receipt.id)!;
+    expect(saved.runId).toBe(carriers[0].id);
+    expect(["completed", "coalesced"]).toContain(saved.status);
+    console.info("MERGE row11 receipt", { wakeId: saved.id, status: saved.status, runId: saved.runId,
+      carriers: carriers.map(r => ({ id: r.id, status: r.status })) });
+  } finally {
+    f.owner.holdSuccessors = false;
+    for (const peer of f.owner.peers.slice(1)) { peer.boundary(); peer.finish(); }
+    await f.close();
+  }
+}, 90_000);
+
+it("MERGE extra b: late comment reopens a done task without losing either person input", async () => {
+  const f = await fixture("mergereopened", false, false);
+  const hb = await wiredHeartbeatFor(db, "test:merge-reopened");
+  try {
+    f.owner.deferCommitAtReturn = true; f.owner.finishTasks = true;
+    const waiting = await f.post("REOPEN waiting person input", "queue");
+    f.peer.boundary(); f.peer.answer(["WORK finished"]); await finishTask(f.peer, f.runId);
+    await f.complete(); await clearMissedDrain(f);
+    await db.update(issues).set({ status: "done", completedAt: new Date() }).where(eq(issues.id, f.issueId));
+    const late = await f.post("REOPEN late question on the done task");
+    // This missed-handoff fixture, unlike a live server's dispatcher, owns no
+    // background queued-run pump. Join the REAL dispatcher before its active
+    // execution drain; a queued row is not yet an active execution to join.
+    await hb.resumeQueuedRunsForAgent(f.companyId, f.agentId);
+    await hb.drainActiveRunExecutions();
+    expect(f.owner.taskError).toBeUndefined();
+    await f.assertAnsweredOnce([waiting, late]);
+    const wake = (await f.wakes()).find(w => JSON.stringify(w.payload).includes(late.id))!;
+    expect(wake.reason).toBe("issue_reopened_via_comment");
+    const runs = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+      .filter(r => r.id !== f.runId);
+    console.info("MERGE extra b reopened", { lateId: late.id, reason: wake.reason, wakeStatus: wake.status, runId: wake.runId,
+      runs: runs.map(r => ({ id: r.id, status: r.status, commentIds: r.contextSnapshot?.wakeCommentIds })) });
+    expect((await f.wakes()).filter(w => w.error === "The conversation moved on")).toEqual([]);
+  } finally { await f.close(); }
+}, 90_000);
+
+it.each([-2000, -500, 100, 2000])("MERGE admission: comment at %i ms around persisted end carries all waiting person messages", async gap => {
+  const f = await laggedPersonFixture(`mergegap${gap < 0 ? "before" : "after"}${Math.abs(gap)}`);
+  const hb = await wiredHeartbeatFor(db, "test:merge-gap");
+  try {
+    f.owner.deferCommitAtReturn = true;
+    const messages = [];
+    for (let i = 1; i <= 3; i++) messages.push(await f.post(`MERGE ${gap} waiting ${i}`, "queue"));
+    f.peer.boundary(); f.peer.answer(["Original work done"]);
+    let newest: ReturnType<typeof f.post> | undefined;
+    let committedAt: Date | undefined;
+    f.lag();
+    if (gap < 0) {
+      newest = f.post(`MERGE ${gap} newest`, "queue");
+      await vi.waitFor(async () => {
+        const row = (await f.comments()).find(c => c.body === `MERGE ${gap} newest`);
+        expect(row).toBeDefined(); committedAt = row!.createdAt;
+      }, { interval: 5 });
+      await waitUntil(committedAt!.getTime() - gap);
+    }
+    f.peer.finish();
+    const endedAt = await waitForPersistedEnd(f.runId);
+    if (gap >= 0) {
+      await waitUntil(endedAt.getTime() + gap);
+      newest = f.post(`MERGE ${gap} newest`);
+    }
+    // Wait on the saved comment, not its HTTP response: wake admission is
+    // deliberately gated while finalization finishes and clears its custody.
+    await vi.waitFor(async () => expect((await f.comments()).some(c => c.body === `MERGE ${gap} newest`)).toBe(true), { timeout: 15_000 });
+    await f.running;
+    await hb.waitForRunExecutionDrain(f.runId, { timeoutMs: 15_000 });
+    await clearMissedDrain(f);
+    f.admit();
+    messages.push(await newest!);
+    await hb.drainActiveRunExecutions();
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
+    const successors = runs.filter(r => r.id !== f.runId);
+    const persistedNewest = (await f.comments()).find(c => c.id === messages.at(-1)!.id)!;
+    const actualGap = persistedNewest.createdAt.getTime() - endedAt.getTime();
+    console.log("MERGE gap evidence", { gap, actualGap, endedAt, commentAt: persistedNewest.createdAt,
+      source: f.runId, successors: successors.map(r => ({ id: r.id, context: r.contextSnapshot })),
+      // Negative rows intentionally have comment commit < end < wake admission.
+      wakeLagMs: (await f.wakes()).filter(w => JSON.stringify(w.payload).includes(persistedNewest.id))
+        .map(w => w.requestedAt.getTime() - persistedNewest.createdAt.getTime()),
+      wakes: (await f.wakes()).map(w => ({ id: w.id, status: w.status, runId: w.runId, error: w.error })) });
+    expect(successors).toHaveLength(1);
+    expect(successors[0].contextSnapshot?.wakeCommentIds).toEqual(messages.map(m => m.id));
+    await f.assertAnsweredOnce(messages);
+    await hb.sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId });
+    await hb.drainActiveRunExecutions();
+    await f.assertAnsweredOnce(messages);
+    expect((await f.wakes()).filter(w => w.error === "The conversation moved on")).toHaveLength(0);
+    expect((await f.comments()).filter(c => c.authorType === "system" && /not run|wasn't answered|was not answered/i.test(c.body))).toHaveLength(0);
+  } finally { f.admit(); await f.close(); }
+}, 90_000);
+
+it("MERGE chain: input behind a starting follow-up is carried by the next late person's run", async () => {
+  const f = await fixture("mergechain");
+  const hb = await wiredHeartbeatFor(db, "test:merge-chain");
+  let start!: () => void;
+  try {
+    f.owner.deferCommitAtReturn = true; f.owner.deferAllCommits = true;
+    const earlier = await f.post("CHAIN earlier input", "queue");
+    f.peer.boundary(); f.peer.answer(["Original work done"]); await f.complete();
+    await clearMissedDrain(f);
+    f.owner.successorStartGate = new Promise<void>(resolve => { start = resolve; });
+    const firstLate = await f.post("CHAIN first late message");
+    await vi.waitFor(() => expect(f.owner.peers).toHaveLength(2), { timeout: 15_000 });
+    const followup = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+      .find(r => r.id !== f.runId)!;
+    expect(f.owner.peers[1].requests.filter(r => r.type === "prompt")).toEqual([]);
+    const waiting = await f.post("CHAIN 104 behind starting follow-up", "queue");
+    expect((await f.wakes()).some(w => w.status === "deferred_issue_execution" && JSON.stringify(w.payload).includes(waiting.id))).toBe(true);
+    start(); f.owner.successorStartGate = undefined;
+    await hb.drainActiveRunExecutions();
+    await waitForPersistedEnd(followup.id);
+    await clearMissedDrain({ ...f, runId: followup.id });
+    f.owner.deferAllCommits = false; // the final answering successor commits normally
+    const newest = await f.post("CHAIN 999 after follow-up end");
+    await hb.drainActiveRunExecutions();
+    const runs = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).filter(r => r.id !== f.runId);
+    expect(runs).toHaveLength(2);
+    expect(runs.find(r => r.id !== followup.id)!.contextSnapshot?.wakeCommentIds).toEqual([waiting.id, newest.id]);
+    await f.assertAnsweredOnce([earlier, firstLate, waiting, newest]);
+    expect((await f.comments()).filter(c => c.authorType === "system")).toEqual([]);
+  } finally { start?.(); f.owner.successorStartGate = undefined; await f.close(); }
+}, 90_000);
+
+// org 11:02Z: 'at a run's release a deferred PERSON wake is folded into the issue's next run (or promoted first) and is never cancelled because a later message was carried; the moved on cancel stays for SYSTEM / agent wakes'.
+// A natural release may already promote the first two before the late third
+// message commits. Two ORDERED answering successors are correct, not a loss.
+it("MERGE tail: last reply precedes persisted end by seven seconds; tail input is answered once", async () => {
+  const f = await fixture("mergetail");
+  const hb = await wiredHeartbeatFor(db, "test:merge-tail");
+  try {
+    const messages = [await f.post("TAIL queued before last reply", "queue")];
+    f.peer.boundary(); f.peer.answer(["Original work done"]);
+    let replyAt!: Date;
+    await vi.waitFor(async () => {
+      // Native streaming publishes the saved final-answer event before the
+      // materialized issue comment is written during finalization.
+      const reply = (await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.runId)))
+        .find(e => e.eventType === "item.completed" && JSON.stringify(e.payload).includes("ANSWER:Original work done"));
+      expect(reply).toBeDefined(); replyAt = reply!.createdAt;
+    }, { timeout: 15_000 });
+    await waitUntil(replyAt.getTime() + 2000);
+    messages.push(await f.post("TAIL during seven-second finalization", "queue"));
+    await waitUntil(replyAt.getTime() + 7000);
+    f.peer.finish(); const finishedAt = await waitForPersistedEnd(f.runId);
+    await waitUntil(finishedAt.getTime() + 100);
+    messages.push(await f.post("TAIL just after persisted end"));
+    await f.running; await hb.waitForRunExecutionDrain(f.runId, { timeoutMs: 15_000 });
+    await hb.drainActiveRunExecutions();
+    const runs = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+      .filter(r => r.id !== f.runId).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+    expect(runs.length).toBeGreaterThanOrEqual(1); expect(runs.length).toBeLessThanOrEqual(2);
+    expect(runs.flatMap(r => r.contextSnapshot?.wakeCommentIds as string[] ?? [])).toEqual(messages.map(m => m.id));
+    await f.assertAnsweredOnce(messages);
+    const answers = (await f.comments()).filter(c => c.authorType === "agent" && c.createdByRunId !== f.runId)
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+      .flatMap(c => c.body.split("\n").filter(line => line.startsWith("ANSWER:TAIL")));
+    expect(answers).toEqual(messages.map(m => `ANSWER:${m.body}`));
+    expect((await f.comments()).filter(c => c.authorType === "system")).toEqual([]);
+    console.info("MERGE tail timing", { replyAt, finishedAt, tailMs: finishedAt.getTime() - replyAt.getTime() });
+  } finally { await f.close(); }
+}, 90_000);
 
 it.each([500, 8])("BOUND native: coalesce %i ms before end gets one real answering turn", async gap => {
   const f = await fixture(`personbound${gap}`);
@@ -1046,7 +1456,9 @@ describe("person comment default steering eligibility and asynchronous receipt",
       for (const message of steered) expect(acks[message.id].status).toBe("acknowledged");
       const last = await f.post("INGEST-LAST-SECOND", "queue");
       expect((await f.wakes()).filter(w => w.status === "deferred_issue_execution")).toHaveLength(1);
+      console.info("INGEST before complete", { label });
       await f.complete();
+      console.info("INGEST after complete", { label });
       oldSuccess?.mockRestore();
       if (restart) {
         const [held] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
@@ -1075,8 +1487,11 @@ describe("person comment default steering eligibility and asynchronous receipt",
         // after the fix these duplicate the success callback. Neither may
         // create another successor or restore any answered steering input.
         expect(port).toBeDefined();
+        console.info("INGEST before concurrent settle", { label });
         await Promise.all(Array.from({ length: 8 }, () => port!.settleEventIngestion()));
+        console.info("INGEST after concurrent settle", { label });
         await heartbeatService(db).drainActiveRunExecutions();
+        console.info("INGEST after concurrent drain", { label });
       }
       const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
       const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));

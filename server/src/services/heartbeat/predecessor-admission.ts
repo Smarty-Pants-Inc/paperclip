@@ -19,9 +19,13 @@ export async function fenceUnverifiedPredecessorsAtAdmission(db: Db, candidate: 
   if (!issueId) return candidate;
   return db.transaction(async transaction => {
     const tx = transaction as unknown as Db;
-    await lockAgentForRunWrite(tx, candidate.companyId, candidate.agentId);
+    // Match wake admission/release: issue -> agent -> run. Taking the agent's
+    // SHARE lock first deadlocks with a late comment holding this issue while
+    // it takes admission's agent UPDATE lock; the successor then loses input
+    // as a setup_failed run instead of ever asking the provider to answer it.
     const [issue] = await tx.select().from(issues).where(and(eq(issues.companyId, candidate.companyId),
       eq(issues.id, issueId))).for("update");
+    await lockAgentForRunWrite(tx, candidate.companyId, candidate.agentId);
     const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, candidate.companyId),
       eq(heartbeatRuns.agentId, candidate.agentId), eq(heartbeatRuns.id, candidate.id))).for("update");
     if (!issue || !run || run.status !== "running" || agentRunWritesRevoked(run)) {

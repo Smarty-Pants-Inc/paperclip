@@ -258,6 +258,8 @@ async function runReleaseDrain(
       preservedWakeIds.push(candidate.id);
       continue;
     }
+    // The adapter exempts only recent owed person messages. Do not bypass
+    // this rule by actor alone: historical receipts keep their no-run path.
     if (liveness.conversationMovedOn && (candidate.requestedByActorType === "system" || liveness.liveNonSelfCommentIds.length === 0)) {
       await ports.transaction.cancelDeferredWake({ companyId: run.companyId, wakeId: candidate.id,
         agentId: candidate.agentId, reason: "The conversation moved on", now: input.now });

@@ -482,8 +482,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
   // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21272
   // A3: exercise the real comment POST and ordinary wake admission/release.
   it.each((["generic", "disconnect", "refusal", "probe", "unexpected-disposition", "newer-first", "newer-first-never-carried", "stale-turn"] as const)
-    .map(variant => ({ variant, outcome: variant.startsWith("newer-first")
-      ? "a newer answered person input prevents re-send" : "the ordinary successor answers once" })))
+    .map(variant => ({ variant, outcome: "the ordinary successor answers once" })))
   ("A3: $variant steer failure returns 201 and $outcome", async ({ variant }) => {
     const chat = await seedChat(); await attachSteerable(chat);
     const { NativeSessionSteeringError } = await import("../services/native-runtime/native-session-executor.js");
@@ -537,10 +536,13 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     const carriers = await carriersOf(chat, messageId);
     expect(carriers.wakes.length + carriers.runs.length).toBe(1);
     if (variant.startsWith("newer-first")) {
-      // RFL 17:07Z: an answered newer PERSON input makes the deferred receipt
-      // stale: no re-send. A DEFINITELY REJECTED reservation never carried M;
-      // its producer must leave M eligible for ONE truthful card under the
-      // unchanged person-message-answer.ts:181-218 floor, just like probe failure.
+      // The newer-first-never-carried shape is THIS lost-message case: probe
+      // failed before delivery, so answering N never answered M. Keep the
+      // real newer answered turn and require the ordinary successor to answer
+      // M once below, rather than accepting a moved-on cancellation/card.
+      // org 11:02Z: "a deferred PERSON wake is folded into the issue's next run
+      // and never cancelled because a later message was carried; moved on stays
+      // for system / agent wakes". The answer predicate itself is unchanged.
       const newer = await issueService(db).addComment(chat.issue.id, "N, answered first", { userId: owner });
       const [newerRun] = await db.insert(heartbeatRuns).values({ companyId: chat.companyId, agentId: chat.agentId,
         status: "succeeded", startedAt: new Date(), finishedAt: new Date(),
@@ -585,26 +587,18 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
             now: new Date(Date.now() + 600_000) }));
           await joinOwnedWork();
         }
-        expect(seen).toEqual([]);
-        expect(await answered(messageId)).toBe(false); // moved past is not an answer
-        const remaining = await carriersOf(chat, messageId);
-        expect(remaining.wakes).toHaveLength(0);
-        expect(remaining.runs).toHaveLength(0);
         const wakes = await db.select().from(agentWakeupRequests).where(and(
           eq(agentWakeupRequests.companyId, chat.companyId),
           eq(agentWakeupRequests.idempotencyKey, `conversation-comment:${messageId}`)));
         expect(wakes).toHaveLength(1);
-        expect(wakes[0]).toMatchObject({ status: "cancelled", runId: null, error: "The conversation moved on" });
+        expect(wakes[0]!.status).not.toBe("cancelled");
+        expect(wakes[0]!.error).not.toBe("The conversation moved on");
         const notices = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id),
           sql`${issueComments.metadata}->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX + messageId}`));
-        expect(notices).toHaveLength(1);
-        if (notices.length) expect(notices[0]!.body).toContain(`A3 ordinary ${variant}`);
-        const replies = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id),
-          eq(issueComments.body, `ANSWER:${messageId}`)));
-        expect(replies).toHaveLength(0);
+        expect(notices).toHaveLength(0);
         if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `A3-${variant}-floor.json`),
           JSON.stringify({ messageId, answered: await answered(messageId), owed: await owed(messageId), outcomes, notices }, null, 2));
-        return;
+        // Continue through the common, person-visible ANSWER:M once assertion.
       }
       await vi.waitFor(async () => {
         const replies = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id),
@@ -615,6 +609,13 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       await releaseRun(chat); await deliverConversationComments(db, chat.issue, heartbeatService(db).wakeup); await joinOwnedWork();
       expect(seen.flat()).toEqual([messageId]);
       expect(await answered(messageId)).toBe(true);
+      if (variant === "newer-first-never-carried") {
+        const notices = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id),
+          sql`${issueComments.metadata}->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX + messageId}`));
+        expect(notices, "never-carried M gets its answer, not a loss card").toEqual([]);
+        expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, chat.companyId)))
+          .filter(w => w.error === "The conversation moved on" && JSON.stringify(w.payload).includes(messageId))).toEqual([]);
+      }
       const remaining = await carriersOf(chat, messageId);
       expect(remaining.wakes).toHaveLength(0);
       expect(remaining.runs).toHaveLength(1);
@@ -1496,8 +1497,10 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
   // read (Pi's userMessage receipt) stays with the stopped turn: no double answer.
   // The answered rule: read is not answered. Only text after the read, before the next tool or the end, answers it.
   it.each(["unread", "read-no-reply", "read-answered"] as const)("after a person's Stop, a steered message the model had not read waits again and one Send delivers it once (%s)", async (variant) => {
-    const chat = await seedChat();
-    const [b, c] = await send(chat, ["B, steered", "C, waiting"]);
+    const startedAt = Date.now();
+    const mark = (stage: string) => console.info("Stop row timing", { variant, stage, elapsedMs: Date.now() - startedAt });
+    const chat = await seedChat(); mark("seeded");
+    const [b, c] = await send(chat, ["B, steered", "C, waiting"]); mark("saved");
     const [wake] = await deferredWakes(chat);
     mocks.steer.mockResolvedValueOnce({ turnId: "turn-1" });
     expect((await steer(chat, b!.id, wake!.id)).status).toBe(200);
@@ -1510,7 +1513,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       ...(variant === "read-answered" ? [{ eventType: "item.started", kind: "agentMessage", itemId: "turn-1:reply", text: "" },
         { eventType: "item.completed", kind: "agentMessage", itemId: "turn-1:reply", text: "B: yes" }] : []),
     ]);
-    await personStop(chat);
+    mark("before Stop"); await personStop(chat); mark("after Stop");
     const expected = variant === "read-answered" ? [c!.id] : [b!.id, c!.id];
     const queue = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200);
     expect(queue.body.entries.map((entry: any) => entry.comment.id)).toEqual(expected);
@@ -1520,12 +1523,12 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       .toEqual(variant === "read-answered" ? [chat.first.id, b!.id] : [chat.first.id]);
     // The shared predicate now recognizes durable streamed text immediately;
     // neither an acknowledgement nor a userMessage alone is an answer.
-    expect(await answered(b!.id)).toBe(variant === "read-answered");
+    expect(await answered(b!.id)).toBe(variant === "read-answered"); mark("held, not answered");
 
     // The owner's Send: one turn with the waiting messages, each once, in order.
     const sent = await request(app(chat.companyId)).post(`/api/issues/${chat.issue.id}/queued-comments/interrupt`)
       .send({ queueId: queue.body.queueId, revision: queue.body.revision, targetRunId: null });
-    expect(sent.status, JSON.stringify(sent.body)).toBe(200);
+    expect(sent.status, JSON.stringify(sent.body)).toBe(200); mark("Send admitted");
     const successors = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, chat.companyId),
       sql`${heartbeatRuns.id} <> ${chat.runId}`));
     expect(successors).toHaveLength(1);
@@ -1544,8 +1547,9 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       expect(["queued", "running"]).not.toContain(run!.status);
       expect(agent!.status).not.toBe("running");
     }, { timeout: 20_000, interval: 100 });
+    mark("successor terminal");
     // rf5 F1: the successor's owned post-commit work (its execution, wakes and failure report) is joined too.
-    await joinOwnedWork();
+    await joinOwnedWork(); mark("owned work joined");
   });
 
   // S10 C2: A, /new, B behind a person's Stop. One Send runs A, then /new, then
