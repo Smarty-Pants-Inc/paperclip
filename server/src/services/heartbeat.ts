@@ -1334,6 +1334,16 @@ export function heartbeatService(
   });
 
   const heartbeatQueue = createHeartbeatQueue(db, {
+    startCommentResume: async input => {
+      const settings = await instanceSettings.get();
+      // A forced placement must never wake the old default environment.
+      if (settings.general.executionMode === "kubernetes") return;
+      const managedOnly = (await instanceSettings.getExperimental()).enableManagedSandboxOnly === true;
+      const environmentId = managedOnly
+        ? (await environmentsSvc.findManagedSandboxEnvironment(input.companyId))?.id ?? null
+        : input.environmentId ?? settings.defaultEnvironmentId ?? null;
+      await environmentRuntime.speculateCommentResume?.({ ...input, environmentId });
+    },
     canStartNewExternalBotWork: async agent => {
       if (agent.adapterType !== "paperclip_runner" || agent.adapterConfig.provider !== "grok_bot") return true;
       const aiConnection = aiRuntimeConnectionBindingSchema.safeParse(agent.runtimeConfig?.aiConnection);

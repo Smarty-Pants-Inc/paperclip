@@ -245,6 +245,7 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
     "resolveSessionBeforeForWakeup" | "hasResolvablePriorSessionWorkspaceForWake">,
   Pick<HeartbeatRecoveryDependencies, "setRunStatusFromLive"> {
   sweepPendingCleanupLeases: ReturnType<typeof createHeartbeatRecovery>["sweepPendingCleanupLeases"];
+  startCommentResume?: (input: import("../speculative-sandbox-resume.js").CommentResumeInput) => Promise<void>;
   options: Pick<HeartbeatServiceOptions, "beforeChatControlRecoveryCheck">;
   issuesSvc: Pick<ReturnType<typeof issueService>, "getDependencyReadiness" | "listDependencyReadiness" | "updateForCompany">;
   treeControlSvc: Pick<ReturnType<typeof issueTreeControlService>, "getActivePauseHoldGate">;
@@ -5215,6 +5216,24 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 .returning().then(rows => rows[0])
             : await tx.insert(agentWakeupRequests).values(wakeupValues).returning().then(rows => rows[0]);
           if (!wakeupRequest) return { kind: "deferred" as const };
+          const admissionResponsibleUserId = await resolveQueuedResponsibleUserId();
+
+          // This is the first point at comment ingress past ALL existing
+          // eligibility/Stop/coalescing decisions. Resume in parallel with the
+          // remaining admission, never on a rejected or steer-only comment.
+          // A rollback leaves the runtime's separately committed money bound.
+          if (dependencies.startCommentResume && reason === "issue_commented" && wakeCommentId
+            && opts.requestedByActorType === "user" && agent.adapterType === "paperclip_runner"
+            && issue.assigneeAgentId === agentId && !isAgentAwaitingSetup(agent)
+            && enrichedContextSnapshot.forceFreshSession !== true) {
+            const speculative = dependencies.startCommentResume({ companyId: agent.companyId, agentId,
+              issueId: issue.id, commentId: wakeCommentId, environmentId: agent.defaultEnvironmentId,
+              adapterType: agent.adapterType, adapterConfig: agent.adapterConfig }).catch(() => {
+                logger.warn({ agentId, issueId: issue.id, commentId: wakeCommentId }, "Comment resume unavailable; ordinary admission remains authoritative");
+              });
+            activeWakeupPromises.add(speculative);
+            void speculative.finally(() => activeWakeupPromises.delete(speculative));
+          }
 
           // A handoff changes the executor, not the owner of saved user input.
           // Validate its exact stopped source while the issue row is locked;
@@ -5301,7 +5320,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               invocationSource: source,
               triggerDetail,
               status: "queued",
-              responsibleUserId: await resolveQueuedResponsibleUserId(),
+              responsibleUserId: admissionResponsibleUserId,
               wakeupRequestId: wakeupRequest.id,
               retryOfRunId: failedChatRetry
                 ? durableRequest!.failedRunRetry!.failedRunId

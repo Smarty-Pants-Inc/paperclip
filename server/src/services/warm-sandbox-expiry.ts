@@ -3,6 +3,7 @@ import { and, asc, eq, sql } from "drizzle-orm";
 import { environmentLeases, type Db } from "@paperclipai/db";
 import { REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY } from "./reusable-sandbox-kept-marker.js";
 import { prepareSupersededWarmSandboxStop } from "./sandbox-stop-and-retain.js";
+import { readSpeculativeResume, SPECULATIVE_RESUME_KEY } from "./speculative-sandbox-resume.js";
 
 /**
  * Warm sandbox expiry.
@@ -54,8 +55,11 @@ export function warmWindowEndsAtSql() {
   const window = sql`least(coalesce(
     ${positiveWindowSql(sql`${environmentLeases.metadata}->${WARM_SANDBOX_IDLE_TIMEOUT_KEY}`)},
     ${PAPERCLIP_RUNNER_IDLE_TIMEOUT_MAX_MS}), ${PAPERCLIP_RUNNER_IDLE_TIMEOUT_MAX_MS})`;
+  // A speculative resume is not an eight-hour warm hold. Its separately
+  // committed deadline uses this SAME cleanup scheduler, including after boot.
+  const speculativeEnd = positiveWindowSql(sql`${environmentLeases.metadata}->${SPECULATIVE_RESUME_KEY}->'expiresAt'`);
   return sql`least((extract(epoch from ${environmentLeases.lastUsedAt}) * 1000 + ${window} + ${WARM_SANDBOX_IDLE_CLOSE_MARGIN_MS}),
-    extract(epoch from ${environmentLeases.expiresAt}) * 1000)`;
+    extract(epoch from ${environmentLeases.expiresAt}) * 1000, ${speculativeEnd})`;
 }
 
 /**
@@ -87,10 +91,15 @@ export function warmSandboxExpiryCandidateCondition() {
     sql`not exists (select 1 from environment_leases other where other.id <> ${environmentLeases.id}
       and other.provider = ${environmentLeases.provider} and other.provider_lease_id = ${environmentLeases.providerLeaseId}
       and other.status in ('active', 'retained', 'pending_cleanup'))`,
-    sql`not exists (select 1 from heartbeat_runs other where other.company_id = ${environmentLeases.companyId}
-      and other.id <> ${environmentLeases.heartbeatRunId} and other.status = 'running'
-      and ${environmentLeases.issueId} is not null
-      and (other.issue_id = ${environmentLeases.issueId} or other.native_issue_id = ${environmentLeases.issueId}))`,
+    // A run still in preparation has not claimed the speculation. It must not
+    // turn its 30s money bound into the ordinary multi-hour warm window. The
+    // original resume site claims under the same lease-row lock/CAS before I/O.
+    sql`((${environmentLeases.metadata}->${SPECULATIVE_RESUME_KEY}->>'schema' = 'paperclip.speculative-comment-resume.v1'
+      and not (${environmentLeases.metadata}->${SPECULATIVE_RESUME_KEY} ? 'claimedBy'))
+      or not exists (select 1 from heartbeat_runs other where other.company_id = ${environmentLeases.companyId}
+        and other.id <> ${environmentLeases.heartbeatRunId} and other.status = 'running'
+        and ${environmentLeases.issueId} is not null
+        and (other.issue_id = ${environmentLeases.issueId} or other.native_issue_id = ${environmentLeases.issueId})))`,
   );
 }
 
@@ -115,8 +124,11 @@ export async function stopWarmSandboxesPastWindow(db: Db, now = new Date()): Pro
   for (const { lease, endsAt } of due) {
     // The stop intent is a compare-and-swap on the exact retained row, so a run
     // that reacquired the sandbox since this read keeps it.
+    const speculative = readSpeculativeResume(lease.metadata);
     const prepared = await prepareSupersededWarmSandboxStop(db, lease, {
       [WARM_WINDOW_EXPIRED_KEY]: true, warmWindowEndedAt: new Date(Number(endsAt)).toISOString(),
+      ...(speculative ? { speculativeResumeUnclaimed: !speculative.claimedBy,
+        speculativeResumeReservationId: speculative.id } : {}),
     });
     if (prepared) stopping++;
   }
