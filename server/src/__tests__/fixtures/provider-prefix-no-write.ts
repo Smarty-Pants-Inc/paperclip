@@ -112,7 +112,7 @@ try {
     visibleFamilies: providerPrefixKeys.filter(([, key]) => JSON.stringify(inspection).includes(key)).map(([family]) => family) });
   noKey(inspection, "server trace inspection");
   noKey(await traces.revealFrame(runId, companyId, 1), "server exact frame reveal");
-  const decoded = frames.filter(row => row.kind === "frame").map(row => Buffer.from(row.rawBase64, "base64").toString("utf8"));
+  const decoded = frames.filter(row => row.kind === "frame").map(row => Buffer.from(row.rawBase64 as string, "base64").toString("utf8"));
   assert.equal(decoded.length, providerPrefixKeys.length);
   noKey(decoded, "decoded trace frames");
   await save("trace-decoded.json", decoded);
