@@ -140,6 +140,8 @@ import {
   type SandboxOrphanCleanupSpool,
 } from "./sandbox-orphan-cleanup-spool.js";
 import { logger } from "../middleware/logger.js";
+import { resumeWithSpeculation, startSpeculativeResume, type CommentResumeInput } from "./speculative-sandbox-resume.js";
+import { resolveRunnerEnvironmentForRun, resolveRunnerReconnectGraceMsForRun, resolveWarmRunnerIdleTimeoutMsForRun } from "./runner-environment-lifecycle.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
 
 // The constant error kind for the durable orphan-cleanup-write-failed log. The
@@ -725,6 +727,7 @@ export interface EnvironmentRuntimeDriver {
   acquireRunLease(input: EnvironmentDriverAcquireInput): Promise<EnvironmentLease>;
   releaseRunLease(input: EnvironmentDriverReleaseInput): Promise<EnvironmentLease | null>;
   resumeRunLease?(input: EnvironmentDriverResumeInput): Promise<PluginEnvironmentLease | EnvironmentLease | null>;
+  speculateCommentResume?(input: CommentResumeInput & { environment: Environment }): Promise<void>;
   destroyRunLease?(input: EnvironmentDriverLeaseInput): Promise<EnvironmentLease | null>;
   realizeWorkspace?(input: EnvironmentDriverRealizeWorkspaceInput): Promise<PluginEnvironmentRealizeWorkspaceResult>;
   execute?(input: EnvironmentDriverExecuteInput): Promise<PluginEnvironmentExecuteResult>;
@@ -2078,6 +2081,82 @@ function createSandboxEnvironmentDriver(
   const sandboxDriver: EnvironmentRuntimeDriver = {
     driver: "sandbox",
 
+    async speculateCommentResume(input) {
+      // Only exact, already-stopped Boat allocations. No create, replacement,
+      // recovery source, legacy fingerprint, or cross-task workspace guess.
+      if (!pluginWorkerManager || input.adapterType !== "paperclip_runner") return;
+      let parsed = parseEnvironmentDriverConfig(input.environment);
+      if (parsed.driver !== "sandbox" || parsed.config.provider !== "boat") return;
+      const provider = await resolveSandboxProviderPlugin({ provider: parsed.config.provider });
+      if (provider.state !== "running") return;
+      const { plugin, driver } = provider.resolved;
+      const methods = new Set(pluginWorkerManager.getWorker(plugin.id)?.supportedMethods ?? []);
+      if (!resolveDeclaredSandboxCapabilities(driver).reusableLeases || !capabilityIsVerified("reusableLeases", methods)
+        || !methods.has("environmentStopLease")) return;
+      // Use the existing run-scoped lifecycle resolver, not a second default.
+      input = { ...input, environment: resolveRunnerEnvironmentForRun(input.environment, input.adapterType,
+        input.adapterConfig, undefined, undefined, { reusableLeaseSupported: true }) };
+      parsed = parseEnvironmentDriverConfig(input.environment);
+      if (parsed.driver !== "sandbox" || !parsed.config.reuseLease) return;
+      const config = sandboxConfigForLeaseMetadata(parsed.config);
+      const candidates = (await environmentsSvc.listLeases(input.environment.id)).filter(lease =>
+        lease.companyId === input.companyId && lease.issueId === input.issueId && ["released", "retained"].includes(lease.status)
+        && lease.leasePolicy === "reuse_by_environment" && lease.metadata?.agentId === input.agentId
+        && lease.metadata?.pluginId === plugin.id && lease.provider === "boat" && !!lease.providerLeaseId
+        && !reusableSandboxKeptAfterReplacement(lease) && !hasStopOnlyCleanup(lease)
+        && (lease.status === "retained" || hasBoundRemoteStopReceipt(lease)
+          && (lease.metadata?.remoteExecutionTermination as { state?: string })?.state === "stopped")
+        && !lease.metadata?.reusableLeaseSuccessor && !lease.metadata?.reusableSandboxLeaseSuperseded
+        && lease.metadata?.pendingCleanupInFlight !== true
+        && !readReplaceBeforeReuseMarker(lease.metadata));
+      // Ambiguity is a miss, not permission to wake several paid allocations.
+      if (candidates.length !== 1) return;
+      const lease = candidates[0]!;
+      // A provider may auto-suspend a retained warm lease without writing a
+      // stop receipt here. Qualify that actual suspended case, never guess from
+      // an idle DB label or wake a known-running warm runner.
+      if (lease.status === "retained") {
+        if (!methods.has("environmentInspectLease")) return;
+        const observed = await sandboxDriver.inspectLeaseResource?.({ environment: input.environment, lease });
+        if (observed?.providerLeaseId !== lease.providerLeaseId || observed.state !== "stopped") return;
+      }
+      if (await nativeWorkspaceExportPendingForResource(db, lease, null)
+        || await legacyShutdownWorkspaceResourceProtected(db, lease)) return;
+      const fingerprints = await buildReusableSandboxLeaseFingerprints({ db, ...input,
+        executionWorkspaceId: lease.executionWorkspaceId, provider: "boat", providerConfig: config,
+        providerPlugin: { id: plugin.id, pluginKey: plugin.pluginKey, packageName: plugin.packageName, version: plugin.version } });
+      if (!reusableSandboxLeaseScopeMatches({ ...input, lease, executionWorkspaceId: lease.executionWorkspaceId,
+        environmentId: input.environment.id, provider: "boat", config, leaseFingerprint: fingerprints.leaseFingerprint })
+        || !findReusableSandboxLeaseId({ config: parsed.config, leases: [lease] })) return;
+      const warmRunnerIdleTimeoutMs = resolveWarmRunnerIdleTimeoutMsForRun(input.environment, input.adapterType,
+        input.adapterConfig, undefined, { reusableLeaseSupported: true });
+      const runnerReconnectGraceMs = resolveRunnerReconnectGraceMsForRun(input.environment, input.adapterType);
+      const resolved = await resolveEnvironmentDriverConfigForRuntime(db, input.companyId, input.environment,
+        { issueId: input.issueId, heartbeatRunId: null, applyCustomImageTemplate: false });
+      if (resolved.driver !== "sandbox") return;
+      const runtimeConfig = { ...stripSandboxProviderEnvelope(resolved.config),
+        ...(warmRunnerIdleTimeoutMs === undefined ? {} : { warmRunnerIdleTimeoutMs }),
+        ...(runnerReconnectGraceMs === undefined ? {} : { runnerReconnectGraceMs }),
+      };
+      await startSpeculativeResume(db, { lease: lease as typeof environmentLeases.$inferSelect,
+        configDigest: createHash("sha256").update(stableStringify(runtimeConfig)).digest("hex"),
+        commentId: input.commentId, rpcTimeoutMs: resolvePluginSandboxRpcTimeoutMs(runtimeConfig) ?? 60_000,
+        resume: async timeoutMs => {
+          // Recheck the live worker, as the authoritative path does. Never use
+          // a previous worker's advertised method set after a restart.
+          if (!pluginWorkerVerifiesLifecycleMethod(plugin.id, "environmentResumeLease")
+            || !pluginWorkerVerifiesLifecycleMethod(plugin.id, "environmentStopLease")) throw new Error("speculative_resume_worker_unavailable");
+          const reply = await pluginWorkerManager.call(plugin.id, "environmentResumeLease", {
+            driverKey: "boat", companyId: input.companyId, environmentId: input.environment.id,
+            issueId: input.issueId, config: runtimeConfig, providerLeaseId: lease.providerLeaseId!,
+            leaseMetadata: lease.metadata ?? undefined,
+          }, timeoutMs);
+          return { providerLeaseId: reply.providerLeaseId, expiresAt: reply.expiresAt,
+            metadata: stripSecretRefValuesFromPluginLeaseMetadata({ metadata: reply.metadata,
+            schema: driver.configSchema as Record<string, unknown> | null | undefined }) };
+        } });
+    },
+
     async acquireRunLease(input) {
       const configuredEnvironment = input.configuredEnvironment ?? input.environment;
       // A warm run may change retention, but must not replace the boot binding
@@ -2360,7 +2439,11 @@ function createSandboxEnvironmentDriver(
             let resumed: PluginEnvironmentLease;
             while (true) {
               try {
-                resumed = await pluginWorkerManager.call(
+                resumed = await resumeWithSpeculation(db, {
+                  companyId: input.companyId, leaseId: reusableLease.id, runId: input.heartbeatRunId!,
+                  enabled: parsed.config.provider === "boat",
+                  configDigest: createHash("sha256").update(stableStringify(resumeConfig)).digest("hex"),
+                  resume: () => pluginWorkerManager.call(
                   pluginProvider.resolved.plugin.id,
                   "environmentResumeLease",
                   {
@@ -2369,14 +2452,14 @@ function createSandboxEnvironmentDriver(
                     environmentId: input.environment.id,
                     issueId: input.issueId,
                     config: resumeConfig,
-                    providerLeaseId: reusableLease.providerLeaseId,
+                    providerLeaseId: reusableLease.providerLeaseId!,
                     leaseMetadata: reusableLease.metadata ?? undefined,
                   },
                   Math.min(
                     configuredResumeTimeoutMs,
                     Math.max(1, resumeDeadline - Date.now()),
                   ),
-                );
+                ) });
                 break;
               } catch (error) {
                 if (!transientSandboxResumeFailure(error)) throw error;
@@ -5326,6 +5409,13 @@ export function environmentRuntimeService(
         else failed += 1;
       }
       return { destroyed, failed, skippedLiveRun };
+    },
+
+    async speculateCommentResume(input: CommentResumeInput): Promise<void> {
+      if (!input.environmentId) return;
+      const environment = await environmentsSvc.getById(input.environmentId);
+      if (!environment || environment.status !== "active") return;
+      await getDriver(environment.driver)?.speculateCommentResume?.({ ...input, environment });
     },
 
     async resumeRunLease(input: EnvironmentDriverResumeInput): Promise<PluginEnvironmentLease | EnvironmentLease | null> {

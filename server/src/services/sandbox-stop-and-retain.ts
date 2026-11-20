@@ -3,6 +3,7 @@ import { writeEnvironmentCleanup } from "./environment-cleanup-notifications.js"
 import { notifyInstructionCopyStopEvidence } from "./instruction-collection-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { randomUUID } from "node:crypto";
+import { logger } from "../middleware/logger.js";
 import { isDeepStrictEqual } from "node:util";
 import { and, eq, getTableColumns, isNull, sql, type SQL } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, type Db } from "@paperclipai/db";
@@ -412,6 +413,7 @@ export async function settleStopOnlyCleanup(db: Db, lease: Lease, options: { att
     : gone ? sql`- 'sandboxStopAndRetain' - 'sandboxStopAndRetainReceipt'` : sql``;
   const recordedIntent = lease.metadata?.[SANDBOX_STOP_AND_RETAIN_KEY] as Record<string, unknown> | undefined;
   const endedEvidence = recordedIntent?.endedLeaseEvidence;
+  const countUnclaimed = stopped && recordedIntent?.speculativeResumeUnclaimed === true;
   const original = endedLeaseFromEvidence(endedEvidence, lease);
   // A malformed snapshot cannot fall through to ordinary release and erase it.
   if (endedEvidence !== undefined && !original) return null;
@@ -453,6 +455,8 @@ export async function settleStopOnlyCleanup(db: Db, lease: Lease, options: { att
           confirmedAt: receipt.confirmedAt,
         } } : {}),
         ...legacyOrphan,
+        ...(countUnclaimed ? { speculativeResumeUnclaimedSuspensions:
+          (Number(lease.metadata?.speculativeResumeUnclaimedSuspensions) || 0) + 1 } : {}),
         pendingCleanupInFlight: false, pendingCleanupLeaseExpiresAtMs: 0,
       })}::jsonb`,
     }).where(and(stopOnlyAttempt(lease, options.attemptId), sql`not exists (
@@ -460,6 +464,9 @@ export async function settleStopOnlyCleanup(db: Db, lease: Lease, options: { att
         and peer.provider = ${lease.provider} and peer.provider_lease_id = ${lease.providerLeaseId}
         and peer.status in ('active', 'retained', 'pending_cleanup'))`)).returning();
   }, { companyId: lease.companyId, runId: lease.heartbeatRunId ?? undefined });
+  if (updated && countUnclaimed) logger.info({ event: "sandbox.speculative_resume.unclaimed_suspended", count: 1,
+    companyId: lease.companyId, leaseId: lease.id, reservationId: recordedIntent?.speculativeResumeReservationId },
+    "Unclaimed speculative sandbox resume suspended and retained");
   return updated ?? null;
 }
 
