@@ -1,3 +1,6 @@
+import { setTimeout as realDelay } from "node:timers/promises";
+import { writeDeferredExecutionWait } from "../services/deferred-execution-wait.js";
+import { deferredPersonWakeQuietAtSql } from "../services/deferred-person-wake-clock.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { createHeartbeatQueue, type HeartbeatQueueDependencies } from "../services/heartbeat/queue.js";
 import { registerDeferredReceiptWork } from "../services/heartbeat/deferred-receipt-work.js";
@@ -1562,6 +1565,130 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       }), recovery: { escalateStrandedAssignedIssue: async () => {},
         escalateStrandedRecoveryIssueInPlace: async () => {} } });
     }
+    it("PAUSEDLOOP: an old person's saved wake waits quietly for five minutes, then resumes once", async () => {
+      const c = await chat();
+      const m = await message(c, "Saved question from November 18", ago(2 * day));
+      const w = await deferred(c, m.id, ago(13_000));
+      await db.update(agentWakeupRequests).set({ reason: "deferred_restore_recovery", payload: {
+        ...w.payload, _paperclipWakeContext: { ...(w.payload!._paperclipWakeContext as object),
+          wakeReason: "deferred_restore_recovery" },
+        executionWait: { reason: "agent.not_invokable", message: "Your message is saved.", trigger: "pause_lifted" },
+      } }).where(eq(agentWakeupRequests.id, w.id));
+      const r = await run(c, [], ago(hour));
+      await db.insert(nativeRunFinalizations).values({ companyId: c.companyId, issueId: c.issueId,
+        runId: r.id, phase: "committed" });
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, c.agentId));
+      const before = await wake(w.id);
+      const cardBefore = await taskInterruptionPresentation(db, await issue(c));
+      const attempts: string[] = [];
+      const recovery = recoveryService(db, { enqueueWakeup: c.heartbeat.wakeup,
+        releaseTerminalExecutionOwner: async (source, options) => {
+          attempts.push(new Date().toISOString());
+          await c.heartbeat.releaseIssueExecutionAndPromote(source, { suppressImmediateRecovery: true,
+            ...(options?.personWakeBound ? { resumeStrandedQueue: true, personWakeBound: true } : {}) });
+        },
+      });
+      const start = Date.now();
+      // Invoke the periodic worker's production sweep with real guarded release
+      // and Postgres admission. Only Date is controlled; Postgres I/O stays real.
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        for (let tick = 1; tick <= 20; tick++) {
+          vi.setSystemTime(start + tick * 15_000);
+          await recovery.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId });
+        }
+        const held = await wake(w.id);
+        const runs = await queuedRuns(w.id);
+        const cardAfter = await taskInterruptionPresentation(db, await issue(c));
+        process.stdout.write(`PAUSEDLOOP evidence ${JSON.stringify({ simulatedMs: 300_000,
+          attempts: attempts.length, times: attempts, admitted: runs.map(x => x.id),
+          before, held, cardBefore, cardAfter, notes: await systemNotes(c) })}\n`);
+        expect(held).toEqual(before);
+        expect(runs).toHaveLength(0);
+        expect(cardAfter).toEqual(cardBefore);
+        expect(await systemNotes(c)).toHaveLength(0);
+        expect(attempts).toHaveLength(0);
+        await db.update(agents).set({ status: "idle" }).where(eq(agents.id, c.agentId));
+        await recovery.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId });
+        const resumed = await queuedRuns(w.id);
+        expect(resumed).toHaveLength(1);
+        expect(resumed[0].contextSnapshot?.wakeCommentIds).toContain(m.id);
+        await recovery.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId });
+        await c.heartbeat.releaseIssueExecutionAndPromote(r, { suppressImmediateRecovery: true, resumeStrandedQueue: true });
+        expect(await queuedRuns(w.id)).toHaveLength(1);
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+          .where(eq(heartbeatRuns.id, resumed[0].id));
+        await reply(c, { ...resumed[0], finishedAt: new Date() }, "Here is the answer to your saved question.");
+        process.stdout.write(`PAUSEDLOOP resume ${JSON.stringify({ wakeId: w.id,
+          oldSourceId: r.id, resumedRunId: resumed[0].id, commentId: m.id,
+          answer: "Here is the answer to your saved question.", wake: await wake(w.id) })}\n`);
+      } finally { vi.useRealTimers(); }
+    });
+
+    it("PAUSEDLOOP worker: five minutes of the actual deadline worker never releases a paused wake", async () => {
+      const { c, w } = await boundFixture();
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, c.agentId));
+      const before = await wake(w.id);
+      let attempts = 0, passes = 0;
+      const errors: unknown[] = [];
+      const recovery = recoveryService(db, { enqueueWakeup: c.heartbeat.wakeup,
+        releaseTerminalExecutionOwner: async (source, options) => {
+          attempts++;
+          await c.heartbeat.releaseIssueExecutionAndPromote(source, { suppressImmediateRecovery: true,
+            ...(options?.personWakeBound ? { resumeStrandedQueue: true, personWakeBound: true } : {}) });
+        },
+      });
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"], shouldAdvanceTime: true });
+      const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: e => errors.push(e) });
+      const worker = registerIssueRecoveryWork(db, coordinator, {
+        schedulingSuppressed: async () => false,
+        locks: async scope => { await recovery.sweepStaleIssueLocks(scope); passes++; },
+        stranded: async () => {}, orphanBlockers: async () => {}, recoveryActions: async () => {},
+        dependencies: async () => ({ enqueueFailed: 0 }), watchdogs: async () => ({ incomplete: 0 }),
+      }, () => true);
+      try {
+        await worker.ready;
+        for (let tick = 0; tick < 20; tick++) {
+          await vi.advanceTimersByTimeAsync(15_000);
+          // Let real Postgres finish before advancing the next timer deadline.
+          for (let settle = 0; settle < 5; settle++) {
+            await realDelay(10);
+            await vi.advanceTimersByTimeAsync(0);
+          }
+        }
+        process.stdout.write(`PAUSEDLOOP worker ${JSON.stringify({ simulatedMs: 300_000, attempts, passes, errors,
+          before, held: await wake(w.id), runs: (await queuedRuns(w.id)).map(r => r.id) })}\n`);
+        expect(errors).toEqual([]);
+        // No bound deadline is re-armed for an event-owned pause.
+        expect(passes).toBe(1);
+        expect(attempts).toBe(0);
+        expect(await wake(w.id)).toEqual(before);
+        expect(await queuedRuns(w.id)).toHaveLength(0);
+      } finally { await worker.stop(); await coordinator.stop(); vi.useRealTimers(); }
+    });
+
+    it.each([true, false])("PAUSEDLOOP clock: a not-invokable re-save preserves quiet time (coalesced=%s)", async coalesced => {
+      const { c, w } = await boundFixture();
+      if (!coalesced) {
+        const { _paperclipLastCoalescedAt: _marker, ...payload } = (await wake(w.id)).payload!;
+        await db.update(agentWakeupRequests).set({ payload }).where(eq(agentWakeupRequests.id, w.id));
+      }
+      const quietAt = async () => (await db.select({ quietAt: deferredPersonWakeQuietAtSql })
+        .from(agentWakeupRequests).where(eq(agentWakeupRequests.id, w.id)))[0].quietAt;
+      const before = await wake(w.id), clock = await quietAt();
+      for (let pass = 0; pass < 3; pass++) await writeDeferredExecutionWait(db,
+        { companyId: c.companyId, requestId: w.id },
+        { reason: "agent.not_invokable", message: "Your message is saved.", trigger: "pause_lifted" });
+      const after = await wake(w.id);
+      expect(after.updatedAt.getTime()).toBeGreaterThan(before.updatedAt.getTime());
+      expect(await quietAt()).toEqual(clock);
+      expect(after.requestedAt).toEqual(before.requestedAt);
+      expect(after.payload?._paperclipLastCoalescedAt).toEqual(before.payload?._paperclipLastCoalescedAt);
+      expect(await queuedRuns(w.id)).toHaveLength(0);
+      process.stdout.write(`PAUSEDLOOP clock ${JSON.stringify({ coalesced, wakeId: w.id, quietAt: clock,
+        quietAfter: await quietAt(), beforeUpdatedAt: before.updatedAt, afterUpdatedAt: after.updatedAt })}\n`);
+    });
+
     it.each([500, 8, 5_000, 9_600])("BOUND: last coalesce %i ms before normal end drains every message once", async gap => {
       const { c, w, r, messages } = await boundFixture(gap);
       await c.heartbeat.sweepStaleIssueLocks({ companyId: c.companyId, issueId: c.issueId });

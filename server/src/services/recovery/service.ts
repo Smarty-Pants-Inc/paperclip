@@ -7240,6 +7240,11 @@ export function recoveryService(
           sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
         )).where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
           eq(agentWakeupRequests.source, "on_demand"), eq(agentWakeupRequests.requestedByActorType, "user"),
+          // A pause is an event-owned hold, not a quiet-time retry. Use the
+          // same eligibility gate as the deferred receipt pause-lift path.
+          sql`exists (select 1 from agents pause_agent where pause_agent.id = ${agentWakeupRequests.agentId}
+            and pause_agent.company_id = ${agentWakeupRequests.companyId}
+            and pause_agent.status not in ('paused', 'terminated', 'pending_approval'))`,
           // Historical input belongs to the existing boot notice path, not
           // this live-handoff bound. A fresh coalesce makes a receipt current.
           gte(agentWakeupRequests.updatedAt, new Date(Date.parse(getServerProcessStartedAt()) - UNANSWERED_MESSAGE_LOOKBACK_MS)),
