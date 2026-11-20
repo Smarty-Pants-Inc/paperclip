@@ -12145,6 +12145,8 @@ describe("warm native session evidence copy", () => {
       void copy.admitted.then(() => evidenceAdmissionMs.push(performance.now() - started));
       return copy;
     });
+    const targetOverrides: Record<string, unknown> = {};
+    const runOptions: { runnerRemoteBinaryPath?: string; runnerRemoteCodexPath?: string } = {};
     const runTurn = async () => {
       const runId = randomUUID(), leaseId = randomUUID();
       if (prior) {
@@ -12166,7 +12168,7 @@ describe("warm native session evidence copy", () => {
       await prepareNativeHeartbeatRun({ db, run: run!, issue: issue!, environmentLeaseId: leaseId });
       const [contract] = await db.select().from(tables.completionContracts).where(eq(tables.completionContracts.issueId, issueId));
       const target = { kind: "remote" as const, transport: "sandbox" as const, providerKey: "daytona", environmentId, leaseId, remoteCwd,
-        runner: commandRunner, sandboxLeaseAcquisition: { outcome: prior ? "resumed" as const : "created" as const, providerLeaseId: "same-warm-box" } };
+        runner: commandRunner, sandboxLeaseAcquisition: { outcome: prior ? "resumed" as const : "created" as const, providerLeaseId: "same-warm-box" }, ...targetOverrides };
       const current: NativeExecutionInputV3 = { ...execution, schema: "paperclip.native-execution-input.v3",
         executionMode: "default", planningContext: null, runtimeContext: nativeRuntimeContextFixture(),
         completionContract: { id: contract!.id, sha256: contract!.canonicalSha256, schemaVersion: "paperclip.completion-contract.v1",
@@ -12177,7 +12179,7 @@ describe("warm native session evidence copy", () => {
       const started = performance.now();
       // The paperclip_runner adapter path (heartbeat runtime-execution.ts useRunnerd).
       const result = await executePaperclipNativeSession({ db, execution: current, runnerInstanceId: environmentId, runnerExecutionTarget: target,
-        useRunnerd: true, runnerIngressAuthorized: true });
+        useRunnerd: true, runnerIngressAuthorized: true, ...runOptions });
       turnMs.push(performance.now() - started);
       const [saved] = await db.select().from(tables.heartbeatRuns).where(eq(tables.heartbeatRuns.id, runId));
       await db.update(tables.heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(),
@@ -12239,8 +12241,137 @@ describe("warm native session evidence copy", () => {
       await rm(home, { recursive: true, force: true }).catch(() => undefined);
     };
     return { db, tables, companyId, issueId, environmentId, session, runTurn, evidenceRows, waitFor, openEvidence, boxInventory, boxTree,
-      leaseMetadata, storageFaults, evidenceGate, commands, turnMs, evidenceAdmissionMs, cleanup, realStorage, codexHome, logger, commandRunner };
+      leaseMetadata, storageFaults, evidenceGate, commands, turnMs, evidenceAdmissionMs, cleanup, realStorage, codexHome, logger, commandRunner,
+      currentTurn, targetOverrides, runOptions };
   }
+
+  it("released owner joins evidence before detach", async () => {
+    const f = await warmEvidenceFixture("released-detach");
+    const evidence = await import("./native-session-evidence.js");
+    const retention = await import("./sandbox-runner-retention.js");
+    const owners = vi.spyOn(retention, "createSandboxRunnerRetention");
+    let openCopy!: () => void, enterCopy!: () => void, enterJoin!: () => void, enterDetach!: () => void;
+    const copyEntered = new Promise<void>(resolve => { enterCopy = resolve; });
+    const joinEntered = new Promise<void>(resolve => { enterJoin = resolve; });
+    const detachEntered = new Promise<void>(resolve => { enterDetach = resolve; });
+    let copySettled = false;
+    const detachObservations: Array<{ copySettled: boolean; inFlight: number }> = [];
+    const detach = vi.fn(async () => {
+      detachObservations.push({ copySettled, inFlight: evidence.nativeSessionEvidenceCopies.size });
+      enterDetach();
+    });
+    // Same provider-boundary fixture as the sandbox release/resume integration:
+    // an explicitly guardian-capable allocation with authorized WSS ingress.
+    const release = vi.fn(async () => {
+      const current = f.currentTurn.execution!;
+      const source = { runnerInstanceId: f.environmentId, environmentLeaseId: current.binding.executionWorkspaceId!,
+        runId: current.binding.runId, normalizedSessionId: f.environmentId, turnId: "warm-turn-1", itemId: "warm-item-1" };
+      const owner = owners.mock.results.at(-1)!.value;
+      expect(owner.driver, "the real qualified sandbox owner must offer a release/resume pair").toBeDefined();
+      await owner.driver!.release(source);
+      return source;
+    });
+    Object.assign(f.session, { release, detachControllerForRestart: detach });
+    // The existing released-owner fixture checkpoints before onSession, so
+    // finishRelease can persist its verified source in the real warm journal.
+    const execute = state.execute.getMockImplementation()!;
+    state.execute.mockImplementation(async options => {
+      const current = f.currentTurn.execution!;
+      await options.onCheckpoint?.({ backendKind: "runner", driverKind: current.session.driverKind, sessionId: "driver-session",
+        identity: { ...current.binding, sessionId: f.environmentId }, providerSessionId: f.environmentId,
+        activeTurnId: null, pendingRuntimeRequests: [] });
+      return execute(options);
+    });
+    const guardianFrames: string[] = [];
+    Object.assign(f.commandRunner, { openDuplexChannel: vi.fn(async () => {
+      let receive: (chunk: Buffer) => void = () => undefined;
+      return { onData: (callback: typeof receive) => { receive = callback; }, onExit: () => undefined,
+        write: (wire: Buffer) => {
+          const frame = JSON.parse(wire.toString());
+          guardianFrames.push(frame.op);
+          const reply = frame.op === "qualify" ? { ...frame, status: "qualified", guardianVersion: 1, privateHostControlVersion: 1 }
+            : frame.op === "observe" ? { ...frame, status: "observed", lastControllerCommandSeq: 0, ackedSourceSeq: 0 }
+            : { ...frame, status: "parked" };
+          receive(Buffer.from(`${JSON.stringify(reply)}\n`));
+        }, close: async () => undefined };
+    }) });
+    const releaseLease = vi.fn(async () => undefined);
+    Object.assign(f.targetOverrides, { runnerGuardian: { version: 1 },
+      effectiveCapabilities: { runnerWebSocketIngress: true, reusableLeases: true, duplexCommandStream: true },
+      getRunnerIngressEndpoint: async () => ({ kind: "authenticated_websocket", websocketUrl: "wss://sandbox.invalid/runner",
+        secretHeaders: [], generation: "fixture", refresh: vi.fn(), close: vi.fn(async () => undefined) }),
+      runnerLeaseLifecycle: { releaseLease, resumeLease: async () => "resumed" } });
+    // Executable provider artifact, staged and verified by real Core preparation;
+    // only daemon/model I/O is simulated (as in the existing transport fixtures).
+    const artifact = join(dirname(f.codexHome), "provider-fixture");
+    await mkdir(dirname(artifact), { recursive: true });
+    const metadata = { schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd",
+      packageName: "@paperclipai/paperclip-runner", binaryContractVersion: 2,
+      durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"] };
+    await writeFile(artifact, `#!/bin/sh\ncase "$1" in\n--build-metadata) echo '${JSON.stringify(metadata)}';;\n--version) echo 'codex-cli 0.160.0';;\n*) exit 1;;\nesac\n`, { mode: 0o700 });
+    Object.assign(f.runOptions, { runnerRemoteBinaryPath: artifact, runnerRemoteCodexPath: artifact });
+    const originalJoin = evidence.joinNativeSessionEvidenceCopies;
+    const joinSpy = vi.spyOn(evidence, "joinNativeSessionEvidenceCopies").mockImplementation(async owner => {
+      if (owner) enterJoin();
+      await originalJoin(owner);
+    });
+    let stopping: ReturnType<typeof closeIdleWarmNativeSessionsForRestart> | undefined;
+    let turning: ReturnType<typeof f.runTurn> | undefined;
+    try {
+      f.evidenceGate.stalled = new Promise<void>(resolve => { openCopy = resolve; });
+      f.evidenceGate.reached = enterCopy;
+      turning = f.runTurn();
+      const first = await Promise.race([turning, joinEntered.then(() => {
+        throw new Error("fixture entered source teardown before succeeded warm hand-back");
+      })]);
+      await copyEntered;
+      expect(first.result.exitCode).toBe(0);
+      expect(release).toHaveBeenCalledOnce();
+      expect(releaseLease).toHaveBeenCalledOnce();
+      expect(guardianFrames).toEqual(["qualify", "observe", "park"]);
+      expect(owners.mock.results.at(-1)!.value.released).toBe(true);
+      expect(readNativeSessionIdleWork(), "turn-end identity proof published the released owner").toBe("none");
+      expect(evidence.nativeSessionEvidenceCopies.size).toBe(1);
+      const copy = [...evidence.nativeSessionEvidenceCopies.values()][0]!;
+      void copy.then(() => { copySettled = true; });
+      const source = executorModule.readNativeSessionEvidenceSource(f.session as never)!;
+      expect(source).toMatchObject({ environmentId: f.environmentId, environmentLeaseId: first.leaseId,
+        providerLeaseId: "same-warm-box", normalizedSessionId: f.environmentId });
+      expect((await f.leaseMetadata(first.leaseId))?.nativeSessionEvidencePending).toMatchObject({ runId: first.runId });
+      stopping = closeIdleWarmNativeSessionsForRestart();
+      // No timing sleep: the held native copy forces either join or premature
+      // detach to be the next observable boundary, including under the mutant.
+      const boundary = await Promise.race([joinEntered.then(() => "join"), detachEntered.then(() => "detach"), stopping.then(() => "returned")]);
+      if (boundary === "join") {
+        expect(joinSpy).toHaveBeenCalledWith({ companyId: f.companyId, source });
+        expect(detach).not.toHaveBeenCalled();
+        expect(copySettled).toBe(false);
+      }
+      f.evidenceGate.stalled = null; openCopy();
+      const stopped = await stopping;
+      expect(detach.mock.calls.length, "qualified release-pair branch must actually detach").toBeGreaterThan(0);
+      console.log(JSON.stringify({ warmReleasedDetach: { boundary, detachObservations, guardianFrames,
+        companyId: f.companyId, box: source.providerLeaseId, sessionId: source.normalizedSessionId, runId: first.runId } }));
+      expect(detachObservations, "released owner must join its company/box/session evidence BEFORE detach").toEqual([{ copySettled: true, inFlight: 0 }]);
+      expect(stopped).toMatchObject({ closed: 1, busy: 0, failed: 0 });
+      expect(f.session.close).not.toHaveBeenCalled();
+      const [row] = await f.evidenceRows(first.runId, "current");
+      expect(row, "joined copy publishes its complete receipt, never loses the evidence").toBeDefined();
+      expect((await f.leaseMetadata(first.leaseId))?.nativeSessionEvidencePending).toBeUndefined();
+      const opened = await f.openEvidence(row!);
+      try {
+        expect(opened.objectSha256).toBe(opened.ref.sha256);
+        expect(opened.manifest).toMatchObject({ kind: EVIDENCE_KIND, companyId: f.companyId, runId: first.runId,
+          providerLeaseId: source.providerLeaseId, normalizedSessionId: source.normalizedSessionId });
+        expect(await readFile(join(opened.root, "codex-home/sessions/rollout.jsonl"), "utf8")).toContain("turn-1 history");
+      } finally { await rm(dirname(opened.root), { recursive: true, force: true }); }
+    } finally {
+      f.evidenceGate.stalled = null; openCopy?.();
+      await turning?.catch(() => undefined); await stopping;
+      await evidence.joinNativeSessionEvidenceCopies();
+      joinSpy.mockRestore(); owners.mockRestore(); await f.cleanup();
+    }
+  }, 120_000);
 
   it("RF7 readback failure never publishes a complete receipt", async () => {
     const f = await warmEvidenceFixture("rf7-readback");
