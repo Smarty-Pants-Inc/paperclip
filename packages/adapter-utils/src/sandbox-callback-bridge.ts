@@ -886,8 +886,8 @@ export async function startSandboxCallbackBridgeWorker(input: {
   /** The paused server setup already created the queue and wrote paused.
    * Only its owning factory may skip these awaited initialization writes. */
   queueInitialized?: boolean;
-  /** Do not publish native GitHub authority after a failed attachment write. */
-  strictActivation?: boolean;
+  /** Refuse native activation unless the old queue was listed successfully. */
+  requireActivationQuarantine?: boolean;
   // Per-iteration timeout for one poll-loop client call (the `listJsonFiles`
   // poll and one `processRequestFile`). On timeout the loop `catch` runs
   // `failPendingRequests`. Defaults to DEFAULT_BRIDGE_ITERATION_TIMEOUT_MS.
@@ -973,22 +973,19 @@ export async function startSandboxCallbackBridgeWorker(input: {
   const everAttachedPath = `${runStatePath}.ever-attached`;
   let runStateManaged = Boolean(input.startPaused);
   let runStateWriteFailureLogged = false;
-  const writeRunStateBestEffort = async (remotePath: string, value: string): Promise<void> => {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([
-        input.client.writeTextFile(remotePath, value),
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error("run-state write timed out")), 5_000);
-        }),
-      ]);
-    } catch (error) {
-      if (!runStateWriteFailureLogged) {
-        runStateWriteFailureLogged = true;
-        console.warn(`[paperclip] sandbox callback bridge could not update run state: ${error instanceof Error ? error.message : String(error)}`);
+  const writeRunStateBestEffort = async (remotePath: string, value: string, attempts = 1): Promise<void> => {
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        await withTimeout(input.client.writeTextFile(remotePath, value), 5_000, "Sandbox callback bridge run-state write");
+        return;
+      } catch {
+        if (attempt === attempts && !runStateWriteFailureLogged) {
+          runStateWriteFailureLogged = true;
+          // Provider errors can echo command values. Do not log them or the
+          // marker contents; these writes remain best effort after one retry.
+          console.warn("[paperclip] sandbox callback bridge could not update run state; continuing.");
+        }
       }
-    } finally {
-      if (timer) clearTimeout(timer);
     }
   };
   if (input.startPaused && !input.queueInitialized) {
@@ -1432,7 +1429,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
   // wins over the drain 503, exactly like the earlier stop behavior.
   const failPendingRequests = async (
     message: string,
-    options: { abandonInFlight?: boolean } = {},
+    options: { abandonInFlight?: boolean; requireListing?: boolean } = {},
   ) => {
     if (options.abandonInFlight) {
       // Abort every in-flight handler first, then arm its 504 backstop. The loop
@@ -1456,11 +1453,22 @@ export async function startSandboxCallbackBridgeWorker(input: {
     // channel is unresponsive, a client call hangs with no reject. The timeout
     // keeps this recovery path fail-fast, so it never re-hangs on the same dead
     // channel that triggered the recovery.
-    const fileNames = await withTimeout(
-      input.client.listJsonFiles(directories.requestsDir),
-      iterationTimeoutMs,
-      "Sandbox callback bridge list pending requests",
-    ).catch(() => [] as string[]);
+    let fileNames: string[] = [];
+    const listAttempts = options.requireListing ? 2 : 1;
+    for (let attempt = 1; attempt <= listAttempts; attempt += 1) {
+      try {
+        fileNames = await withTimeout(
+          input.client.listJsonFiles(directories.requestsDir),
+          options.requireListing ? 5_000 : iterationTimeoutMs,
+          "Sandbox callback bridge list pending requests",
+        );
+        break;
+      } catch (error) {
+        // Recovery remains best effort, but activation must not treat an
+        // unknown old queue as empty. Leave the worker paused on refusal.
+        if (options.requireListing && attempt === listAttempts) throw error;
+      }
+    }
     for (const fileName of fileNames) {
       const guard = inFlightRequestGuards.get(fileName);
       if (guard && guard.claim === "handler" && (options.abandonInFlight || guard.controller.signal.aborted)) {
@@ -1827,15 +1835,15 @@ export async function startSandboxCallbackBridgeWorker(input: {
     },
     resume: async (generation?: string) => {
       if (stopping || !paused) return;
-      await failPendingRequests("Bridge request belongs to a detached run.", { abandonInFlight: true });
-      // Authority must not become active unless both durable markers landed.
-      // Keep the ever-attached fence first: the server consults it even after
-      // run-state disappears. A failed write leaves the host worker paused.
-      const writeAttachment = input.strictActivation
-        ? input.client.writeTextFile.bind(input.client)
-        : writeRunStateBestEffort;
-      await writeAttachment(everAttachedPath, "attached");
-      await writeAttachment(runStatePath, generation ? `attached:${generation}` : "attached");
+      await failPendingRequests("Bridge request belongs to a detached run.", {
+        abandonInFlight: true, requireListing: input.requireActivationQuarantine,
+      });
+      // Keep the ever-attached fence first. These advisory markers retain the
+      // base's five-second bound and best-effort outcome, with one bounded
+      // retry for activation. The host broker still owns credential authority.
+      const attachmentAttempts = input.requireActivationQuarantine ? 2 : 1;
+      await writeRunStateBestEffort(everAttachedPath, "attached", attachmentAttempts);
+      await writeRunStateBestEffort(runStatePath, generation ? `attached:${generation}` : "attached", attachmentAttempts);
       idlePollIntervalMs = pollIntervalMs;
       resetIdleOnNextEmpty = true;
       const pollStarted = new Promise<void>((resolve) => { pollStartedResolve = resolve; });

@@ -9,6 +9,8 @@ import {
   startAdapterExecutionTargetPaperclipBridge,
 } from "@paperclipai/adapter-utils/execution-target";
 import { githubBrokerEnvironment } from "@paperclipai/adapter-utils/github-launcher";
+import { NativeGitHubSetupError } from "./native-github-setup-failure.js";
+export { NativeGitHubSetupError } from "./native-github-setup-failure.js";
 
 type Binding = { companyId: string; agentId: string; issueId: string; runId: string };
 type LauncherInput = Parameters<typeof prepareGitHubOperationLaunchers>[0];
@@ -164,7 +166,13 @@ export async function createNativeGitHubAccess(input: {
         // Quarantine requests left by the previous run and resume polling before
         // publishing this run's authority. The broker stays inactive throughout.
         const generation = randomUUID();
-        await bridge?.resume?.(generation);
+        try {
+          await bridge?.resume?.(generation);
+        } catch {
+          // Keep authority unpublished and the transport available for Retry.
+          // Never copy provider command/error values into the run's reason.
+          throw new NativeGitHubSetupError();
+        }
         const owner = { ...binding };
         active = owner;
         activeGeneration = generation;
