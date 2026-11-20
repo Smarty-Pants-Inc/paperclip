@@ -35,6 +35,7 @@ import {
 } from "../services/agent-conversations.js";
 import { answeredPersonMessageSql, personMessageOwedSql } from "../services/person-message-answer.js";
 import { commentCarriedSql, commentIdsCarriedElsewhere } from "../services/interrupt-carry-custody.js";
+import { logger } from "../middleware/logger.js";
 import { waitForPendingCommentSteers } from "../services/conversation-steering.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import { createWakeQueue } from "../modules/wake-queue/index.js";
@@ -452,6 +453,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
   });
 
   it.each(["starting", "saving-files", "non-Pi", "stale-turn"] as const)("S-c/S-c2: %s uses the ordinary next-message path once", async variant => {
+    const info = vi.spyOn(logger, "info");
     const chat = await seedChat(); await attachSteerable(chat);
     if (variant === "starting" || variant === "saving-files") mocks.probe.mockResolvedValue({ disposition: "temporarily_unavailable", activeTurnId: null });
     if (variant === "non-Pi") await db.update(agents).set({ adapterType: "process" }).where(eq(agents.id, chat.agentId));
@@ -462,6 +464,16 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     const response = await postDefault(chat, `Fallback ${variant}`).expect(201);
     await waitForPendingCommentSteers();
     await deliverConversationComments(db, chat.issue, heartbeatService(db).wakeup);
+    const traces = info.mock.calls.filter(([fields, message]) => message === "Person send steering fallback" &&
+      (fields as Record<string, unknown>).commentId === response.body.id);
+    expect(traces).toHaveLength(1);
+    expect(traces[0][0]).toEqual({ commentId: response.body.id, issueId: chat.issue.id,
+      runId: variant === "non-Pi" ? null : chat.runId,
+      reason: variant === "non-Pi" ? "unsupported_adapter" : variant === "stale-turn" ? "stale_turn" : "steering_temporarily_unavailable",
+      wakeId: null, wakeStatus: "unknown" });
+    expect(JSON.stringify(traces)).not.toContain(`Fallback ${variant}`);
+    expect(Object.keys(traces[0][0] as object).sort()).toEqual(["commentId", "issueId", "reason", "runId", "wakeId", "wakeStatus"]);
+    info.mockRestore();
     const carriers = await carriersOf(chat, response.body.id);
     expect(carriers.wakes.length + carriers.runs.length).toBe(1);
     expect(await answered(response.body.id)).toBe(false);
