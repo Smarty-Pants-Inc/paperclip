@@ -14,6 +14,8 @@ export class B6RealPiPeer {
   held?: () => void; released = false; finishing = false; initialTool = false;
   bodies: string[] = [];
   beforeBoundary?: () => Promise<void>;
+  admissionGate?: Promise<void>;
+  admissionEntered?: () => void;
   releasing?: Promise<void>;
   closeGate?: Promise<void>;
   closing?: () => void;
@@ -72,6 +74,10 @@ export class B6RealPiPeer {
     }
     try {
       const response = await this.transport!.request(type, input, options);
+      if (type === "get_available_models" && this.admissionGate) {
+        this.admissionEntered?.();
+        await this.admissionGate;
+      }
       this.requestSettlements.push({ type, at: Date.now() });
       return response;
     } catch (error) {

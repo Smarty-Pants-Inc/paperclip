@@ -225,7 +225,6 @@ const scheduled = new Map<string, { bodies: string[]; peers: RecordingPiPeer[]; 
   first: RecordingPiPeer; outcomes: Map<string, Outcome>; contendAtFinalization?: boolean; deferCommitAtReturn?: boolean;
   deferredPhase?: "observed" | "applied"; attachGate?: Promise<void> }>();
 const realExecute = executePaperclipNativeSession;
-const nativeEventAppends = new Map<string, Array<{ eventType: string; emittedAt?: string; enteredAt: number; settledAt?: number }>>();
 function backendFor(execution: Parameters<typeof realExecute>[0]["execution"], runnerInstanceId: string, peer: RecordingPiPeer) {
   const workspace = execution.workspace.cwd;
   if (!workspace) throw new Error("native steering fixture requires a workspace cwd");
@@ -276,16 +275,9 @@ beforeAll(async () => {
   vi.stubEnv("PAPERCLIP_AGENT_JWT_SECRET", randomUUID().repeat(2));
   database = await startEmbeddedPostgresTestDatabase("steer-default-red-db-"); db = createDb(database.connectionString);
   await instanceSettingsService(db).updateExperimental({ enableAgentChat: true, enableNativeRunner: true });
-  // Diagnostic only: distinguish provider admission from an in-flight durable append.
-  const append = PaperclipControlPlanePort.prototype.appendEvent;
-  vi.spyOn(PaperclipControlPlanePort.prototype, "appendEvent").mockImplementation(async function (this: PaperclipControlPlanePort, value, options) {
-    const event = value as { runId: string; eventType: string; emittedAt?: string };
-    const observation = { eventType: event.eventType, emittedAt: event.emittedAt, enteredAt: Date.now(), settledAt: undefined as number | undefined };
-    const observations = nativeEventAppends.get(event.runId) ?? [];
-    observations.push(observation); nativeEventAppends.set(event.runId, observations);
-    try { return await append.call(this, value, options); }
-    finally { observation.settledAt = Date.now(); }
-  });
+  // Do not install a second appendEvent spy here: the INGEST rows wrap that
+  // method themselves. Vitest reuses a spy, so capturing it and replacing its
+  // implementation would recurse before the fresh session can start.
   // Forward the scheduler's exact native input into the SAME product executor,
   // replacing only its provider backend at the documented test seam. No wake,
   // run admission, completion, answer or Stop outcome is mocked.
@@ -335,7 +327,7 @@ beforeAll(async () => {
 }, 60_000);
 afterAll(async () => { vi.restoreAllMocks(); await db?.$client.end(); await database?.cleanup(); vi.unstubAllEnvs(); });
 
-async function fixture(label: string, conversation = true, skipIssueComment: boolean | string[] = true, preAttached = false) {
+async function fixture(label: string, conversation = true, skipIssueComment: boolean | string[] = true, preAttached = false, stopDuringStarting = false) {
   const earlyBodies = Array.isArray(skipIssueComment) ? skipIssueComment : [];
   if (Array.isArray(skipIssueComment)) skipIssueComment = true;
   const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), userId = randomUUID();
@@ -356,6 +348,14 @@ async function fixture(label: string, conversation = true, skipIssueComment: boo
     ? await (async () => { const actual = new B6RealPiPeer(); actual.initialTool = earlyBodies.length === 0; await actual.start(); return actual as unknown as RecordingPiPeer; })()
     : new RecordingPiPeer();
   peer.preAttached = preAttached;
+  let releaseAdmission = () => {};
+  let admissionEntered: Promise<void> | undefined;
+  let stopElapsedMs: number | undefined;
+  if (stopDuringStarting) {
+    if (!(peer instanceof B6RealPiPeer)) throw new Error("STARTING Stop requires B6_REAL_PI=1");
+    admissionEntered = new Promise<void>(resolve => { peer.admissionEntered = resolve; });
+    peer.admissionGate = new Promise<void>(resolve => { releaseAdmission = resolve; });
+  }
   const owner = { contendAtFinalization: false, deferCommitAtReturn: false, deferredPhase: "observed" as "observed" | "applied", bodies: [] as string[], peers: [] as RecordingPiPeer[], executions: [] as Promise<unknown>[], first: peer, outcomes: new Map<string, Outcome>() };
   let attach!: () => void;
   if (earlyBodies.length) Object.assign(owner, { attachGate: new Promise<void>(resolve => { attach = resolve; }) });
@@ -398,7 +398,28 @@ async function fixture(label: string, conversation = true, skipIssueComment: boo
       early.push(receipt.body); owner.bodies.push(body);
     }
     attach?.();
-    await vi.waitFor(async () => {
+    if (stopDuringStarting) {
+      await admissionEntered;
+      const [starting] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(starting.status).toBe("running");
+      // STARTING is the unpublished native handle, not the finalizer's
+      // nativePhase (which can already be "observed" during provider setup).
+      expect(await getNativeSessionSteeringState(runId)).toMatchObject({ disposition: "temporarily_unavailable" });
+      expect(peer.requests.some(command => command.type === "prompt")).toBe(false);
+      const stopAt = Date.now();
+      const stopping = request(app).post(`/api/heartbeat-runs/${runId}/cancel`).send({}).then(response => response);
+      try {
+        await vi.waitFor(async () => {
+          const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+          expect(run.resultJson?.nativeCancellation).toMatchObject({ scope: "run", dispatchState: "pending" });
+        }, { timeout: 5000 });
+      } finally { releaseAdmission(); }
+      const stopped = await stopping;
+      expect(stopped.status, JSON.stringify(stopped.body)).toBe(200);
+      await heartbeat.waitForRunExecutionDrain(runId, { timeoutMs: Math.max(1, 15_000 - (Date.now() - stopAt)) });
+      stopElapsedMs = Date.now() - stopAt;
+      expect(stopElapsedMs).toBeLessThan(15_000);
+    } else await vi.waitFor(async () => {
       const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       if (["failed", "cancelled", "timed_out"].includes(run.status)) throw new Error(`native fixture failed: ${run.errorCode}: ${run.error}`);
       expect(await getNativeSessionSteeringState(runId)).toMatchObject({ disposition: "available" });
@@ -419,7 +440,6 @@ async function fixture(label: string, conversation = true, skipIssueComment: boo
       error: error instanceof Error ? { message: error.message, stack: error.stack } : String(error),
       companyId, issueId, runId, commands: peer.requests, outcomes: [...owner.outcomes],
       requestSettlements: peer instanceof B6RealPiPeer ? peer.requestSettlements : undefined,
-      nativeEventAppends: nativeEventAppends.get(runId),
       databaseActivity: await db.execute(sql`select clock_timestamp() as sampled_at, pid, state,
         query_start, xact_start, clock_timestamp() - query_start as query_age, wait_event_type, wait_event,
         pg_blocking_pids(pid) as blocking_pids, left(query, 400) as query
@@ -429,6 +449,7 @@ async function fixture(label: string, conversation = true, skipIssueComment: boo
       events: await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId)),
     }, null, 2));
     let cleanupError: unknown;
+    releaseAdmission();
     peer.boundary(); peer.finish();
     try { await heartbeat.waitForRunExecutionDrain(runId, { timeoutMs: 15_000 }); }
     catch (failure) { cleanupError = failure; }
@@ -450,7 +471,7 @@ async function fixture(label: string, conversation = true, skipIssueComment: boo
     const view = (await request(app).get(`/api/issues/${issueId}/queued-comments`).expect(200)).body;
     queues.push(view); return view;
   };
-  return { companyId, agentId, issueId, runId, userId, initial, peer, app, running, post, commands, comments, wakes, queue, owner, early,
+  return { companyId, agentId, issueId, runId, userId, initial, peer, app, running, post, commands, comments, wakes, queue, owner, early, stopElapsedMs,
     async startDelivery(completions = false) {
       coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => workerErrors.push(error) });
       if (completions) {
@@ -521,10 +542,9 @@ async function fixture(label: string, conversation = true, skipIssueComment: boo
       for (const scheduledPeer of owner.peers) await scheduledPeer.close();
       scheduled.delete(companyId);
       if (process.env.PAPERCLIP_STEER_RED_EVIDENCE) await writeFile(join(process.env.PAPERCLIP_STEER_RED_EVIDENCE, `${label}.json`), JSON.stringify({
-        companyId, agentId, issueId, runId, commands: peer.requests, previousRunEvents: peer.previousRunEvents,
+        companyId, agentId, issueId, runId, stopElapsedMs, commands: peer.requests, previousRunEvents: peer.previousRunEvents,
         consumed: peer.consumed, replies: peer.replies, outcome: owner.outcomes.get(runId),
         requestSettlements: peer instanceof B6RealPiPeer ? peer.requestSettlements : undefined,
-        nativeEventAppends: nativeEventAppends.get(runId),
         realPi: peer instanceof B6RealPiPeer ? { command: peer.command, version: "1.5.2", modelRequests: peer.modelRequests } : null,
         successorPeers: owner.peers.slice(1).map(peer => ({ commands: peer.requests, facadeCalls: peer.facadeCalls, consumed: peer.consumed, replies: peer.replies,
           realPi: peer instanceof B6RealPiPeer ? { command: peer.command, version: "1.5.2", modelRequests: peer.modelRequests } : null })), workerErrors,
@@ -1220,6 +1240,23 @@ describe("person comment default steering eligibility and asynchronous receipt",
 
   // B6: same captured timing shape; real POST/PG/scheduler/native executor,
   // controlled Pi peer (not a real model/provider qualification).
+  it.runIf(process.env.B6_REAL_PI === "1")("B6P2 STARTING plus Stop drains within 15 seconds and Stop holds unread input", async () => {
+    const f = await fixture("B6P2-starting-stop", true, ["B6P2-UNREAD"], false, true);
+    try {
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      expect(run.status).toBe("cancelled");
+      expect(f.stopElapsedMs).toBeLessThan(15_000);
+      expect(f.commands("prompt")).toEqual([]);
+      expect(await readPersonStopHold(db, { companyId: f.companyId, issueId: f.issueId,
+        agentId: f.agentId, messageId: f.early[0].id })).toMatchObject({ stoppedRunId: f.runId });
+      const queued = await f.queue();
+      expect(queued.executionWait).toMatchObject({ reason: "stopped_by_person" });
+      expect(queued.entries.map((entry: any) => entry.comment.id)).toContain(f.early[0].id);
+      expect(f.owner.peers).toHaveLength(1);
+      expect(f.peer.consumed).toEqual([]);
+    } finally { await f.close(); }
+  }, 45_000);
+
   it("B6 STARTING M1 then rapid M2/M3 all enter the same run in order, no extra run", async () => {
     const f = await fixture("B6-starting", true, ["B6-M1"]);
     try {
