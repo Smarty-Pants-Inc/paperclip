@@ -425,7 +425,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         companyId: sql`${agentWakeupRequests.companyId}`, agentId: sql`${agentWakeupRequests.agentId}`,
         issueId: sql`${issueId}::uuid`, requestedAt: sql`${agentWakeupRequests.requestedAt}`, payload: sql`${agentWakeupRequests.payload}`,
       }), requestedAt: agentWakeupRequests.requestedAt,
-        payload: agentWakeupRequests.payload, reason: agentWakeupRequests.reason,
+        payload: agentWakeupRequests.payload, reason: agentWakeupRequests.reason, source: agentWakeupRequests.source,
         requestedByActorType: agentWakeupRequests.requestedByActorType,
       }).from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId),
         eq(agentWakeupRequests.id, wakeId), eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS))) : [];
@@ -435,6 +435,12 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       const completion = (context.wakeReason ?? wake?.reason) === CHAT_COMPLETION_WAKE_REASON;
       // A pre-boot completion is historical news, never a late agent turn.
       // Both restart reconstruction and stale-lock release use this same gate.
+      // Later answered input cannot discharge an older, still waiting person
+      // receipt. Automatic/completion updates retain their stale-work policy.
+      const personInput = wake?.source === "on_demand" && wake.requestedByActorType === "user" &&
+        ["issue_commented", "issue_reopened_via_comment"].includes(String(context.wakeReason ?? wake?.reason)) &&
+        !completion && !payload.chatCompletionDeliveryIds && !context.chatCompletionDeliveryIds;
+      const recentSince = new Date(Date.now() - UNANSWERED_MESSAGE_LOOKBACK_MS);
       let conversationMovedOn = Boolean(wake?.stale || (beforeBoot && completion));
       const message = { id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
         issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` };
@@ -448,22 +454,31 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         .filter((commentId) => isUuidLike(commentId));
       const rows = queryableCommentIds.length === 0 ? [] : await tx
         .select({ id: issueComments.id, deletedAt: issueComments.deletedAt, createdByRunId: issueComments.createdByRunId,
-          authorType: issueComments.authorType, owedAtBoot: personMessageOwedSql(message),
-          owed: conversationMovedOn ? sql<boolean>`(${issueComments.authorType} is distinct from 'user' or
-            (${personMessageOwedSql(message)} and not ${newerPersonInputAnsweredSql({ companyId: message.companyId,
-              issueId: message.issueId, requestedAt: message.createdAt })}))` : sql<boolean>`true` })
+          authorType: issueComments.authorType, createdAt: issueComments.createdAt, owedAtBoot: personMessageOwedSql(message),
+          newerAnswered: conversationMovedOn ? newerPersonInputAnsweredSql({ companyId: message.companyId,
+            issueId: message.issueId, requestedAt: message.createdAt }) : sql<boolean>`false` })
         .from(issueComments)
         .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, queryableCommentIds), currentConversationCommentCondition()));
+      // Read THE owed predicate once per message. Repeating its correlated
+      // custody/answer graph in a CASE and again for boot liveness made an
+      // ordinary release plan that graph several times (including on Stop).
+      const wasMovedOn = conversationMovedOn;
+      const owed = (row: typeof rows[number]) => personInput && row.createdAt > recentSince
+        ? row.owedAtBoot
+        : !wasMovedOn || row.authorType !== "user" || (row.owedAtBoot && !row.newerAnswered);
       const personRows = rows.filter(row => row.authorType === "user" && !row.deletedAt);
       const owedPersonAtBoot = personRows.some(row => row.owedAtBoot);
-      if (beforeBoot && personRows.length > 0 && !owedPersonAtBoot) conversationMovedOn = true;
+      // The release exception is per-message and recent only. Older input
+      // keeps the stale receipt / one-note path; it must not become a new turn.
+      if (personInput && personRows.some(row => row.createdAt > recentSince && owed(row))) conversationMovedOn = false;
+      else if (beforeBoot && personRows.length > 0 && !owedPersonAtBoot) conversationMovedOn = true;
       const targetsFinishingRunAgent = wakeAgentId === finishingRunAgentId;
       const liveAndUnauthored = queryableCommentIds.filter((commentId) => {
         const row = rows.find((candidate) => candidate.id === commentId);
         // The floor retires already-carried input. A never-carried OLD stays
         // owed for its ONE sweep card, not for replay by a stale receipt. Fresh
         // messages coalesced into an old receipt may still be owed delivery.
-        return Boolean(row && row.owed && !row.deletedAt &&
+        return Boolean(row && owed(row) && !row.deletedAt &&
           (!beforeBoot || row.authorType !== "user" || row.owedAtBoot) &&
           (!targetsFinishingRunAgent || row.createdByRunId !== finishingRunId));
       });

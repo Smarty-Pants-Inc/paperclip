@@ -352,13 +352,30 @@ function wakeCarriesIssue(payload: unknown, issueId: string): boolean {
   return value.issueId === issueId || nested.issueId === issueId || value.taskId === issueId;
 }
 
-/** A stale deferred receipt cannot postpone its never-carried message's true
- * card. Queued receipts keep their existing waiting semantics. */
-function nonStaleWakeCondition(issueId: string): SQL {
-  return sql`(${agentWakeupRequests.status} not in ('deferred', 'deferred_issue_execution') or not ${deferredWakeIsStaleSql({
-    companyId: sql`${agentWakeupRequests.companyId}`, agentId: sql`${agentWakeupRequests.agentId}`,
-    issueId: sql`${issueId}::uuid`, requestedAt: sql`${agentWakeupRequests.requestedAt}`, payload: sql`${agentWakeupRequests.payload}`,
-  })})`;
+/** Match release's recent PERSON exception, not a new answer definition.
+ * decideMessage has already checked THE owed predicate for this message.
+ * Its own recent person receipt will still be folded/promoted at release even
+ * when a later input was answered, so a no-run card here would be premature.
+ * Historical and system/agent receipts keep the existing stale-card policy. */
+function nonStaleWakeCondition(issueId: string, messages: readonly { id: string; createdAt: Date }[]): SQL {
+  const payload = sql`${agentWakeupRequests.payload}`;
+  const context = sql`${payload}->'_paperclipWakeContext'`;
+  const recentIds = messages.filter(message => message.createdAt.getTime() > Date.now() - UNANSWERED_MESSAGE_LOOKBACK_MS).map(message => message.id);
+  const ids = sql.join(recentIds.map(id => sql`${id}`), sql`, `);
+  const recentPersonCustody = recentIds.length > 0
+    ? sql`(${agentWakeupRequests.source} = 'on_demand' and ${agentWakeupRequests.requestedByActorType} = 'user'
+      and coalesce(${context}->>'wakeReason', ${agentWakeupRequests.reason}) in ('issue_commented', 'issue_reopened_via_comment')
+      and coalesce(${payload}->'chatCompletionDeliveryIds', 'null'::jsonb) = 'null'::jsonb
+      and coalesce(${context}->'chatCompletionDeliveryIds', 'null'::jsonb) = 'null'::jsonb
+      and (${payload}->>'issueId' = ${issueId} or ${context}->>'issueId' = ${issueId} or ${payload}->>'taskId' = ${issueId})
+      and (${payload}->>'commentId' in (${ids}) or ${context}->>'wakeCommentId' in (${ids})
+        or coalesce(${context}->'wakeCommentIds', '[]'::jsonb) ?| array[${ids}]::text[]))`
+    : sql`false`;
+  return sql`(${agentWakeupRequests.status} not in ('deferred', 'deferred_issue_execution')
+    or ${recentPersonCustody} or not ${deferredWakeIsStaleSql({
+      companyId: sql`${agentWakeupRequests.companyId}`, agentId: sql`${agentWakeupRequests.agentId}`,
+      issueId: sql`${issueId}::uuid`, requestedAt: sql`${agentWakeupRequests.requestedAt}`, payload,
+    })})`;
 }
 
 /** One task, or one named message whose wake just settled. Idempotent. */
@@ -608,7 +625,7 @@ async function decideCarriedSteerNotices(q: Db, issue: DecisionIssue, now: Date)
   const wakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
     inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
-    nonStaleWakeCondition(issue.id),
+    nonStaleWakeCondition(issue.id, messages),
     // A wake already promoted into a run is that run's: the run's own end decides.
     isNull(agentWakeupRequests.runId)));
   const notices: CarriedSteerNotice[] = [];
@@ -1020,7 +1037,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
       createdAt: agentWakeupRequests.createdAt })
       .from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
-        nonStaleWakeCondition(issue.id),
+        nonStaleWakeCondition(issue.id, [message]),
         or(inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
           and(eq(agentWakeupRequests.status, "deferred"), wellFormedExecutionWaitSql(agentWakeupRequests.payload)))));
     // Admission has saved a real further attempt for THIS message, not a
