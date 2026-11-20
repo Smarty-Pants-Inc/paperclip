@@ -3436,6 +3436,33 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     expect(JSON.stringify(queue.body.executionWait ?? null)).not.toMatch(/will start|starting|starts (soon|shortly|next)|about to start/i);
   });
 
+  // Independent rf6 control: ordinary pending task approval must not be advertised as Send-startable.
+  // Same named planted ack/release as author route row, plus explicitly planted pending approval.
+  it("RF6 JUDGE pending approval: cleanup alone must not advertise a Send which cannot admit a run", async () => {
+    const f = await seedStoppableTurn("task");
+    const held = await postMessage(f, "Hold this until I decide");
+    await vi.waitFor(async () => {
+      const saved = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      expect(saved.some(w => w.status === "deferred_issue_execution" && JSON.stringify(w.payload).includes(held))).toBe(true);
+    }, { timeout: 10_000, interval: 50 });
+    await stopByRoute(f, "queue-owner");
+    const approvalId = randomUUID();
+    await db.execute(sql`INSERT INTO approvals (id, company_id, type, status, payload) VALUES (${approvalId}, ${f.companyId}, 'hire_agent', 'pending', '{}'::jsonb)`);
+    await db.execute(sql`INSERT INTO issue_approvals (company_id, issue_id, approval_id, linked_by_user_id) VALUES (${f.companyId}, ${f.issueId}, ${approvalId}, 'queue-owner')`);
+    const before = (await request(f.client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200)).body;
+    const sent = await request(f.client).post(`/api/issues/${f.issueId}/queued-comments/interrupt`)
+      .send({ queueId: before.queueId, revision: before.revision, targetRunId: null });
+    for (let pass = 0; pass < 6; pass++) { await heartbeatService(db).resumeQueuedRuns(); await new Promise(r => setTimeout(r, 100)); }
+    const after = (await request(f.client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200)).body;
+    const successors = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+      .filter(r => r.contextSnapshot?.issueId === f.issueId && r.id !== f.runId);
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    process.stdout.write(`RF6-APPROVAL ${JSON.stringify({before, sendStatus:sent.status, sent:sent.body, after, successors, wakes})}\n`);
+    expect(successors).toEqual([]);
+    expect(JSON.stringify(wakes)).toContain("decision_pending");
+    expect(before.executionWait?.reason, JSON.stringify(before)).not.toBe("held_by_own_stop_send");
+  });
+
   // bb-2d-stopwords (RFL 22:22Z): where the queue's Send works, the Stop line names it and the panel offers it; where
   // it does not, the line names none.
   // REAL: the held messages (POST /api/issues/:id/comments), the Stop (POST /api/heartbeat-runs/:runId/cancel, as the
@@ -3472,6 +3499,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     const afterDelete = await read();
     expect(ids(afterDelete), JSON.stringify(afterDelete)).toEqual([held[0]]);
     said.afterDelete = afterDelete.executionWait ?? null;
+    process.stdout.write(`RF6-SEND-SINGULAR-GET ${JSON.stringify(afterDelete)}\n`);
     expect(await runsOf()).toEqual([]);
     // SEND (the line's button): exactly ONE run, carrying what is left.
     const sent = await request(f.client).post(`/api/issues/${f.issueId}/queued-comments/interrupt`)
