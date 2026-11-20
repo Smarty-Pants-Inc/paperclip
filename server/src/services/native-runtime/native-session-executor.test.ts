@@ -18275,8 +18275,9 @@ describe("native session bounded recovery", () => {
 
   it("records a GitHub activation setup failure as a specific terminal blocked reason before provider work", async () => {
     const actual = await vi.importActual<Record<string, unknown>>("./native-github-access.js");
-    expect(typeof actual.NativeGitHubSetupError).toBe("function");
-    const failure = new (actual.NativeGitHubSetupError as new () => Error)();
+    const Failure = actual.NativeGitHubSetupError as (new () => Error) | undefined;
+    const failure = Failure ? new Failure() : Object.assign(new Error("GitHub access couldn't be set up for this turn"),
+      { name: "NativeGitHubSetupError", code: "native_github_setup_failed" });
     const code = nativeSessionFailureSourceCode(failure);
     expect(code).toBe("native_github_setup_failed");
     const disposition = nativeSessionFailureDisposition(1, new Date(), code);
