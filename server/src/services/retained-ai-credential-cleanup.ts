@@ -99,11 +99,17 @@ export function retainAiCredentialCleanup(input: {
   });
 }
 
-export async function reconcileRetainedAiCleanup(scope: RetainedAiCleanupScope): Promise<void> {
+/** With `agentId`, only that agent's own retained probe entries (and entries no
+ * agent owns) are attempted: one agent's unfinished probe cleanup gates its own
+ * next probe, never another agent's hire on the same account. */
+export async function reconcileRetainedAiCleanup(scope: RetainedAiCleanupScope, options?: { agentId?: string }): Promise<void> {
   await Promise.resolve();
   const scopeKey = key(scope);
   if (cleaningScope(scope)) return;
-  for (const entry of [...(retained.get(scopeKey) ?? [])]) await attempt(entry);
+  for (const entry of [...(retained.get(scopeKey) ?? [])]) {
+    if (options?.agentId !== undefined && entry.agentId !== undefined && entry.agentId !== options.agentId) continue;
+    await attempt(entry);
+  }
 }
 
 export function bindRetainedAiCredentialHome(home: string, scope: RetainedAiCleanupScope): () => void {
