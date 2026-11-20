@@ -79,6 +79,7 @@ import { CHAT_CONVERSATION_ID_KEY, extractWakeCommentIds, readWakeChatConversati
 import { deferredWakeHoldsNoOtherConversation, otherConversationCommentIds, splitOtherConversationMessages } from "./chat-conversation-batch.js";
 import { hasInteractionContinuationWakeContext } from "../domain/context.js";
 import { decidePreDrain, type PreDrainFacts } from "../domain/policy.js";
+import { QUEUED_MESSAGES_DELIVERED_REASON } from "../domain/policy.js"; // logging only (release_not_promoted)
 import {
   EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
   isConfigurationIncompleteFailedRun,
@@ -1644,12 +1645,36 @@ export function createWakeAdmissionWriter(): WakeAdmissionWriter {
   };
 }
 
+// Logging only (neworg-trace-reason): the deferred head's fate during one release drain.
+// Each cancel reason below is a fixed code string from use-cases.ts, never person text.
+const NOT_PROMOTED_CANCEL_REASONS: Record<string, string> = {
+  "The conversation moved on": "conversation_moved_on",
+  [QUEUED_MESSAGES_DELIVERED_REASON]: "answered",
+  "Queued messages were discarded before promotion": "stale",
+  "Deferred wake contained only comments authored by the finishing run": "self_authored",
+  "Delegation closing note refers to completed child work": "delegation_note_done",
+  "Deferred task messages now belong to the current assignee": "reassigned",
+  "Deferred wake suppressed by active subtree pause hold": "pause_hold",
+};
+type ReleaseHeadTrace = { drained: boolean; recoveryOnly: boolean; fate: string | null; heldBeforeBoot: boolean };
+function releaseNotPromotedLine(trace: { reason: string; issueId: string | null; runId: string; outcome: string;
+  deferredHeadWakeId: string | null }, head: ReleaseHeadTrace, now: unknown) {
+  const reason = !head.drained ? trace.reason
+    : head.recoveryOnly ? "recovery_only"
+    : !trace.deferredHeadWakeId ? "no_head"
+    : head.fate ?? (head.heldBeforeBoot ? "held_before_boot" : "head_preserved");
+  return { event: "issue_execution_release_not_promoted", reason, outcome: trace.outcome, issueId: trace.issueId,
+    runId: trace.runId, headWakeId: trace.deferredHeadWakeId, headStatus: trace.deferredHeadWakeId ? DEFERRED_WAKE_STATUS : null,
+    headCoalescedCount: null, releaseTxStartedAt: now instanceof Date && !Number.isNaN(now.getTime()) ? now.toISOString() : null };
+}
+
 export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAdapterDeps): IssueLockWriter {
   return {
     async withIssueExecutionLock(input, fn): Promise<ReleaseTransactionResult & { run: RunSnapshot }> {
       // Never wait while holding the issue/run locks needed by ordered ingestion.
       await waitForSteeringIngestion(db, input);
-      const trace = { caller: "wake_queue.release_drain", runId: input.runId, issueId: null as string | null,
+      const head: ReleaseHeadTrace = { drained: false, recoveryOnly: false, fate: null, heldBeforeBoot: false }; // logging only
+      const trace = { event: "issue_execution_release_drain", caller: "wake_queue.release_drain", runId: input.runId, issueId: null as string | null,
         companyId: input.companyId, outcome: "error", reason: "error", deferredHeadWakeId: null as string | null,
         promotedWakeId: null as string | null };
       const decision = <T extends ReleaseTransactionResult & { run: RunSnapshot }>(reason: string, result: T): T => {
@@ -1948,6 +1973,13 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           trace.deferredHeadWakeId ??= candidate?.id ?? null;
           return candidate;
         };
+        // Logging only: observe (never change) what this drain did to the head wake.
+        const { getQueuedCommentLiveness, cancelDeferredWake, failDeferredWake, claimDeferredWakeForPromotion } = transaction;
+        transaction.getQueuedCommentLiveness = async args => { const r = await getQueuedCommentLiveness(args); if (args.wakeId === trace.deferredHeadWakeId) head.heldBeforeBoot = r.heldBeforeBoot === true; return r; };
+        transaction.cancelDeferredWake = async args => { const r = await cancelDeferredWake(args); if (args.wakeId === trace.deferredHeadWakeId) head.fate ??= NOT_PROMOTED_CANCEL_REASONS[args.reason] ?? "cancelled_other"; return r; };
+        transaction.failDeferredWake = async args => { const r = await failDeferredWake(args); if (args.wakeId === trace.deferredHeadWakeId) head.fate ??= "agent_not_invokable"; return r; };
+        transaction.claimDeferredWakeForPromotion = async args => { const r = await claimDeferredWakeForPromotion(args); if (args.wakeId === trace.deferredHeadWakeId && !r) head.fate ??= "promote_cas_zero_rows"; return r; };
+        head.drained = true; head.recoveryOnly = locked.recoveryOnly === true; // logging only
         const result = await fn(locked, { host, transaction });
         // Explicit retry admission requires the exact source's task claim.
         // Preserve it only when the existing queue-first recovery policy
@@ -1963,7 +1995,8 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         }
         return decision(result.outcome.kind, { ...result, run: runSnapshot });
       }).finally(() => {
-        logger.info(trace, "Issue execution release decision");
+        logger.info(trace, "Issue execution release decision (wake queue)");
+        if (trace.outcome !== "promoted") logger.info(releaseNotPromotedLine(trace, head, input.now), "Issue execution release not promoted");
       });
     },
   };

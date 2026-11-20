@@ -60,11 +60,13 @@ describe.skipIf(!runControlPostgresSupport.supported)("execution release reads",
     const deps = callbacks(database);
     const info = vi.spyOn(logger, "info");
     await createHeartbeatRunControl(database, deps).releaseIssueExecutionAndPromote(run);
-    const releases = info.mock.calls.filter(([fields, message]) => message === "Issue execution release decision" &&
+    const releases = info.mock.calls.filter(([fields, message]) => message === "Issue execution release (heartbeat)" &&
       (fields as Record<string, unknown>).caller === "heartbeat.release");
     expect(releases).toHaveLength(1);
-    expect(releases[0][0]).toEqual({ caller: "heartbeat.release", runId: run.id, issueId: null,
-      companyId: company.id, outcome: "released", deferredHeadWakeId: null, promotedWakeId: null });
+    expect(releases[0][0]).toEqual({ event: "issue_execution_release_heartbeat", caller: "heartbeat.release", runId: run.id, issueId: null,
+      companyId: company.id, outcome: "released", promotedWakeId: null });
+    // rf-3 fix 3: no second line shares this message; the wake-queue line has its own.
+    expect(info.mock.calls.filter(([, message]) => message === "Issue execution release (heartbeat)")).toHaveLength(1);
     expect(JSON.stringify(releases)).not.toContain(payload);
     info.mockRestore();
     expect(deps.wakeQueue.releaseIssueExecution).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({

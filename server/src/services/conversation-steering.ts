@@ -22,6 +22,15 @@ export type PersonCommentSteeringOptions = {
 };
 
 export type PersonCommentFallbackTrace = { reason: string; runId: string | null };
+/** Logging only: the durable receipt a steer->queue fallback admitted (its id, never content). Never throws. */
+async function fallbackQueuedWakeId(db: Db, companyId: string, agentId: string, commentId: string): Promise<string | null> {
+  try {
+    const rows = await db.execute(sql`select id from agent_wakeup_requests where company_id = ${companyId}::uuid
+      and agent_id = ${agentId}::uuid and idempotency_key = ${`conversation-comment:${commentId}`} order by created_at desc limit 1`);
+    const id = (rows as unknown as Array<{ id?: unknown }>)[0]?.id;
+    return typeof id === "string" ? id : null;
+  } catch { return null; }
+}
 export function logPersonCommentFallback(comment: Pick<SteerablePersonComment, "id" | "issueId">,
   trace: PersonCommentFallbackTrace, wakeId: string | null = null, wakeStatus = "unknown") {
   logger.info({ commentId: comment.id, issueId: comment.issueId, runId: trace.runId,
@@ -114,7 +123,7 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
   } catch (error) {
     // Probe failure precedes custody; ordinary admission still owns the comment.
     logSteeringFailure(error);
-    return fallback("unknown", run.id);
+    return fallback("steering_probe_failed", run.id);
   }
   if (state?.disposition !== "available" || !state.activeTurnId) return fallback("steering_temporarily_unavailable", run.id); // includes provider-ended / saving-files
   const prepared = await db.transaction(async tx => {
@@ -180,7 +189,8 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
       if (error instanceof NativeSessionSteeringError && error.code === "steering_timeout") return;
       if (!(error instanceof NativeSessionSteeringError)) logSteeringFailure(error);
       if (!options.onRejected) {
-        logPersonCommentFallback(comment, { runId: run.id, reason: "unknown" }, null, "deferred_to_release");
+        logPersonCommentFallback(comment, { runId: run.id,
+          reason: error instanceof NativeSessionSteeringError ? error.code : "steering_error" }, null, "deferred_to_release");
         return; // fail closed: still owed at run end
       }
       if (identity) await rejectSteeredIdentity(db, identity);
@@ -229,11 +239,8 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
           return true;
         });
       });
-      logPersonCommentFallback(comment, { runId: run.id,
-        reason: error instanceof NativeSessionSteeringError
-          ? ({ steering_stale_turn: "stale_turn", steering_rejected: "rejected",
-              steering_temporarily_unavailable: "steering_temporarily_unavailable" } as Record<string, string>)[error.code] ?? "unknown"
-          : "unknown" });
+      logPersonCommentFallback(comment, { runId: run.id, reason: steeringUnavailableReason },
+        queued ? await fallbackQueuedWakeId(db, issue.companyId, agentId, comment.id) : null, queued ? "queued" : "not_admitted");
       if (queued) {
         // Reannounce this saved comment through the thread's existing keyed
         // comment hydration channel, AFTER ordinary admission and cleanup commit.
