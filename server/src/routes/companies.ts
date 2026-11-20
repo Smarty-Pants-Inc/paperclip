@@ -66,6 +66,7 @@ import {
   logActivity,
   workTimelineService,
 } from "../services/index.js";
+import { processHeartbeatFor } from "../services/heartbeat-registry.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import type { StorageService } from "../storage/types.js";
@@ -281,7 +282,7 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
   const importTransferSpoolRoot =
     options?.importTransferSpoolRoot ?? resolveDefaultImportTransferSpoolRoot();
   const svc = companyService(db, {
-    cancelWorkForScope: (scope) => heartbeatService(db).cancelBudgetScopeWork(scope),
+    cancelWorkForScope: (scope) => (processHeartbeatFor(db, "companies-budget") ?? heartbeatService(db)).cancelBudgetScopeWork(scope),
   });
   const agents = agentService(db);
   const portability = companyPortabilityService(db, storage);

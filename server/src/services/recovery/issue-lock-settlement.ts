@@ -22,7 +22,7 @@ export async function settleIssueLock(db: Db, record: InProgressRecord,
   // queue, permanently losing the only terminal-owner handoff. The process's
   // registered heartbeat carries the plugin worker manager a promoted run needs.
   const { wiredHeartbeatFor } = await import("../heartbeat-registry.js");
-  const result = await (await wiredHeartbeatFor(db)).sweepStaleIssueLocks({ companyId: record.companyId, issueId: record.issueId });
+  const result = await (await wiredHeartbeatFor(db, "issue-lock-settlement")).sweepStaleIssueLocks({ companyId: record.companyId, issueId: record.issueId });
   return result.issueIds.includes(record.issueId)
     ? { settled: true, reason: "stale_lock_cleared" }
     : { settled: false, reason: "lock_still_needed" };

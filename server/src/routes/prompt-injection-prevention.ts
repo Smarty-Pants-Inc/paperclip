@@ -9,11 +9,12 @@ import { validate } from "../middleware/validate.js";
 import { promptInjectionPreventionService } from "../services/prompt-injection-prevention.js";
 import { aiConnectionService } from "../services/ai-connections.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { processHeartbeatFor } from "../services/heartbeat-registry.js";
 import { listOpenRouterModels } from "../services/openrouter-models.js";
 
 export function promptInjectionPreventionRoutes(db: Db) {
   const router = Router();
-  const service = promptInjectionPreventionService(db, { budgetHooks: { cancelWorkForScope: heartbeatService(db).cancelBudgetScopeWork } });
+  const service = promptInjectionPreventionService(db, { budgetHooks: { cancelWorkForScope: (scope) => (processHeartbeatFor(db, "prompt-injection-budget") ?? heartbeatService(db)).cancelBudgetScopeWork(scope) } });
   router.get("/companies/:companyId/prompt-injection-prevention", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId); assertBoard(req);

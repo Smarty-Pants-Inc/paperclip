@@ -7,11 +7,12 @@ import { forbidden } from "../errors.js";
 import { validate } from "../middleware/validate.js";
 import { decisionModelService, settingsDecisionTest } from "../services/decision-models.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { processHeartbeatFor } from "../services/heartbeat-registry.js";
 import { parseCostDateRange, parseCostLimit } from "./costs.js";
 
 export function decisionModelRoutes(db: Db) {
   const router = Router();
-  const service = decisionModelService(db, { budgetHooks: { cancelWorkForScope: heartbeatService(db).cancelBudgetScopeWork } });
+  const service = decisionModelService(db, { budgetHooks: { cancelWorkForScope: (scope) => (processHeartbeatFor(db, "decision-models-budget") ?? heartbeatService(db)).cancelBudgetScopeWork(scope) } });
   router.get("/companies/:companyId/decision-model", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId); assertBoard(req);
