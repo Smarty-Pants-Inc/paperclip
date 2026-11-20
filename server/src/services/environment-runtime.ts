@@ -4098,6 +4098,39 @@ function createPluginEnvironmentDriver(
       : taskStopped ? { providerLeaseId: lease.providerLeaseId, state: "stopped" } : undefined;
   }
 
+  /** A stop-only cleanup (stop-and-retain or workspace export resume) is a STOP:
+   * never environmentReleaseLease/Destroy. A provider stop when the worker offers
+   * one; otherwise only the runner task is settled and the box stays. A box
+   * holding unexported prepared work is recorded as kept, as the release guard does. */
+  async function stopOnlyPluginRunLease(input: { environment: Environment | null; lease: EnvironmentLease }) {
+    const settled = await settleDispatchedEnvironmentTask(db, workerManager, input.lease, { executionStopObserved: false });
+    const scope = and(eq(environmentLeases.id, input.lease.id), eq(environmentLeases.companyId, input.lease.companyId));
+    const [current] = await db.select().from(environmentLeases).where(scope);
+    if (!current || current.providerLeaseId !== input.lease.providerLeaseId) throw new Error("Plugin lease cleanup ownership changed");
+    const lease = toEnvironmentLeaseSnapshot(current);
+    const { plugin, driverKey, driverConfig } = await resolvePluginDriverForRelease({ ...input, lease });
+    const environmentId = input.environment?.id ?? readString(lease.metadata?.environmentId);
+    if (lease.providerLeaseId) {
+      const unexported = await boxHasUnexportedPreparedWork(db, { companyId: lease.companyId, providerLeaseId: lease.providerLeaseId });
+      if (unexported.held) {
+        logger.warn({ leaseId: lease.id, providerLeaseId: lease.providerLeaseId, runIds: unexported.runIds },
+          "box kept, not released: stop-only cleanup on a box holding unexported prepared workspace work");
+        await db.update(environmentLeases).set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({
+          unexportedWorkKept: { runIds: unexported.runIds, providerLeaseId: lease.providerLeaseId, at: new Date().toISOString() },
+        })}::jsonb` }).where(scope);
+      }
+    }
+    const receipt = environmentId && workerManager.getWorker(plugin.id)?.supportedMethods.includes("environmentStopLease")
+      ? await workerManager.call(plugin.id, "environmentStopLease", {
+        driverKey, companyId: lease.companyId, environmentId, issueId: lease.issueId,
+        config: driverConfig, providerLeaseId: lease.providerLeaseId, leaseMetadata: lease.metadata ?? undefined,
+      }) : undefined;
+    const taskStopped = settled !== false ||
+      (lease.metadata?.runnerTaskLease === true && lease.metadata?.runnerTaskDispatched !== true && !lease.metadata?.runnerTaskStartup && !lease.metadata?.runnerTaskStartupCleanup);
+    return remoteTerminationReceipt(lease, receipt) ? receipt
+      : taskStopped ? { providerLeaseId: lease.providerLeaseId, state: "stopped" } : undefined;
+  }
+
   /** Stop and KEEP a box whose files were never exported: no provider release
    * or destroy. A provider stop (files retained by contract) when the worker
    * offers one; otherwise only the runner task is settled and the box stays. */
@@ -4362,7 +4395,8 @@ function createPluginEnvironmentDriver(
       } catch { return false; }
     },
 
-    retryPendingSandboxTeardown: input => cleanupPluginRunLease(input, false, !hasStopOnlyCleanup(input.lease)),
+    retryPendingSandboxTeardown: input => hasStopOnlyCleanup(input.lease)
+      ? stopOnlyPluginRunLease(input) : cleanupPluginRunLease(input, false, true),
 
     async realizeWorkspace(input) {
       const { plugin, pluginKey, driverKey, driverConfig } = await resolvePluginDriverForRelease({

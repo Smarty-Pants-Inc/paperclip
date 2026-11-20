@@ -148,4 +148,43 @@ const support=external ? {supported:true} : await getEmbeddedPostgresTestSupport
   await f.acquire();
   expectKept(f,await oldRow(f.first.lease.id),box,[otherRun]);
  });
+ // The plugin driver's stop-only retry (retryPendingSandboxTeardown) is a STOP:
+ // it must never call environmentReleaseLease, held box or not.
+ async function stopOnlyRetry(f:Awaited<ReturnType<typeof fixture>>,stopOnly=true){
+  const box=f.first.lease.providerLeaseId!;
+  if(stopOnly) await db.update(environmentLeases).set({metadata:sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({sandboxStopAndRetain:{
+   schema:"paperclip.sandbox-stop-and-retain.v1",companyId:f.companyId,runId:f.firstRunId,leaseId:f.first.lease.id,provider:f.first.lease.provider,
+   providerLeaseId:box,requestId:randomUUID(),pluginId:f.first.lease.metadata?.pluginId}})}::jsonb`}).where(eq(environmentLeases.id,f.first.lease.id));
+  const lease=(await environmentService(db).getLeaseById(f.first.lease.id))!;
+  const before=f.calls.length;
+  const receipt=await f.runtime().retryPendingSandboxTeardown({environment:null,lease});
+  return {box,receipt,calls:f.calls.slice(before)};
+ }
+ it("(f) a stop-only retry on a box holding a prepared cut run STOPS and keeps it (no release)",async()=>{
+  const f=await fixture();const box=f.first.lease.providerLeaseId!;
+  await cutRun(f.firstRunId,reference(f.first.lease.id,box));
+  const r=await stopOnlyRetry(f);
+  expect(r.calls).not.toContain("environmentReleaseLease");
+  expect(r.calls).not.toContain("environmentDestroyLease");
+  expect(r.calls).toContain("environmentStopLease");
+  expect(r.receipt).toMatchObject({providerLeaseId:box,state:"stopped"});
+  expect((await oldRow(f.first.lease.id)).metadata).toMatchObject({unexportedWorkKept:{runIds:[f.firstRunId],providerLeaseId:box}});
+ });
+ it("(g) a stop-only retry with NO prepared run still stops, never releases",async()=>{
+  const f=await fixture();const box=f.first.lease.providerLeaseId!;
+  await cutRun(f.firstRunId,reference(f.first.lease.id,box,true));
+  const r=await stopOnlyRetry(f);
+  expect(r.calls).not.toContain("environmentReleaseLease");
+  expect(r.calls).not.toContain("environmentDestroyLease");
+  expect(r.calls).toContain("environmentStopLease");
+  expect(r.receipt).toMatchObject({providerLeaseId:box,state:"stopped"});
+  expect((await oldRow(f.first.lease.id)).metadata?.unexportedWorkKept).toBeUndefined();
+ });
+ it("(h) control: a real release-intent retry with a FINALIZED reference releases as today",async()=>{
+  const f=await fixture();const box=f.first.lease.providerLeaseId!;
+  await cutRun(f.firstRunId,reference(f.first.lease.id,box,true));
+  const r=await stopOnlyRetry(f,false);
+  expect(r.calls).toContain("environmentReleaseLease");
+  expect(r.calls).not.toContain("environmentStopLease");
+ });
 });
