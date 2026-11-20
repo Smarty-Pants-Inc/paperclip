@@ -302,9 +302,10 @@ function waitingReason(facts: AssignedWorkFacts, now: Date): WaitingReason | nul
   if (issue.awaitingFirstMessage) return "awaiting_first_message";
   if (facts.awaitingPerson) return "awaiting_person";
   if (issue.status === "blocked") {
-    // A carried source block is an intentional wait, not an unknown local
-    // failure to repair. Once local execution exists, its normal owner applies.
-    if (issue.originKind === "company_import" && !facts.latestRun) return "assignee_declared_block";
+    // A task blocked before it ever ran here (an imported source block or an
+    // old never-run task) is an intentional wait to report, not an interrupted
+    // run to restart unasked. Once local execution exists, its normal owner applies.
+    if (!facts.latestRun) return "assignee_declared_block";
     if (facts.blockedBy === "user") return "user_stop";
     const owner = issue.unblockOwner;
     const declaredForSomeoneElse = owner !== null

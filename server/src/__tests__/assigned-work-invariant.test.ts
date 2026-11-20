@@ -851,5 +851,32 @@ describePostgres("assigned-work invariant sweep", () => {
     expect(suspects.ms).toBeLessThan(1_000);
     expect(one.ms).toBeLessThan(1_000);
   }, 240_000);
+
+  it("a new todo task assigned to a healthy agent is still repaired as an assignment and queued", async () => {
+    const f = await seedCompany();
+    const issueId = await f.issue({ status: "todo" });
+    const queue = wakeQueue();
+    const recovery = recoveryService(db, { enqueueWakeup: queue.enqueueWakeup, scheduleRecoveryRetry: async () => null });
+    expect(await recovery.assignedWork.checkIssue({ companyId: f.companyId, issueId }))
+      .toMatchObject({ outcome: "repaired", verdict: { kind: "violation", reason: "no_pending_path" } });
+    expect(queue.calls).toEqual([{ agentId: f.agentId, issueId, source: "issue.assigned_work_invariant" }]);
+    expect(queue.enqueueWakeup.mock.calls[0][1]).toMatchObject({ reason: "issue_assigned" });
+    expect(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
+      eq(agentWakeupRequests.reason, "issue_assigned"), eq(agentWakeupRequests.status, "queued")))).toHaveLength(1);
+  }, 60_000);
+
+  it("a blocked task that has run before (failed run, no hold) is still restored and continued once", async () => {
+    const f = await seedCompany();
+    const issueId = await f.issue({ status: "blocked", blockedTransitionAt: new Date(Date.now() - 2 * HOUR) });
+    const failed = await f.run(issueId, { status: "failed", errorCode: "adapter_failed", livenessState: "failed" });
+    const queue = wakeQueue();
+    const recovery = recoveryService(db, { enqueueWakeup: queue.enqueueWakeup, scheduleRecoveryRetry: async () => null });
+    expect(await recovery.assignedWork.checkIssue({ companyId: f.companyId, issueId }))
+      .toMatchObject({ outcome: "repaired", verdict: { kind: "violation", reason: "unknown_block", stale: false } });
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0].status).toBe("todo");
+    expect(queue.calls).toEqual([{ agentId: f.agentId, issueId, source: "issue.assigned_work_invariant" }]);
+    expect(queue.enqueueWakeup.mock.calls[0][1]).toMatchObject({ reason: "issue_continuation_needed",
+      contextSnapshot: { previousRunId: failed.id } });
+  }, 60_000);
 });
 
