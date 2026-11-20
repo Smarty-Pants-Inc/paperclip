@@ -259,7 +259,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
   const { providerTraceCapture, nativeRunnerPreparationSpans, attestedQuestionResponseAtMs, attemptStartedAtMs, environmentAcquireStartedAtMs, environmentRealizeEndedAtMs } = input.trace;
   const { executionControl, executionPhaseContext, dispatchResolvedInteractionContinuationWithAtomicGate } = input.control;
   const dispatchWithTiming: HeartbeatRuntimeExecutionInput["control"]["dispatchResolvedInteractionContinuationWithAtomicGate"] = async dispatch => {
-    if (await preparedRunInteractionDeliveryDenied(db, run)) {
+    if (await measureRunPhase("execution.interaction_delivery", () => preparedRunInteractionDeliveryDenied(db, run))) {
       await input.services.cancelRunInternal(run.id, "Queued agent input is no longer permitted.", {
         errorCode: INTERACTION_DELIVERY_DENIED, suppressImmediateRecovery: true,
       });
@@ -590,15 +590,15 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       const completedGoalControl =
         sessionGoalControl !== null &&
         taskKey !== null &&
-        (await isRunnerGoalActionCompleted(
+        (await measureRunPhase("execution.goal_completion", () => isRunnerGoalActionCompleted(
           db,
           {
             companyId: agent.companyId,
             agentId: agent.id,
             issueId: taskKey,
           },
-          sessionGoalControl.requestId,
-        ));
+          sessionGoalControl!.requestId,
+        )));
       if (completedGoalControl) sessionGoalControl = null;
       // Goal checkpoints already publish their task session. Goal-less turns
       // need the same durable pointer before cleanup can delay host completion.
@@ -647,7 +647,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
         }),
       );
       const stopCleanup = runOptions.nativeRestartRecovery?.kind === "reattach_remote_runner"
-        && await readClaimedNativeStopRecovery(db, run, runOptions.nativeLeaseOwner);
+        && await measureRunPhase("execution.stop_recovery", () => readClaimedNativeStopRecovery(db, run, runOptions.nativeLeaseOwner));
       const guardedDispatch =
         await dispatchWithTiming(
           (markDispatchStarted) => {

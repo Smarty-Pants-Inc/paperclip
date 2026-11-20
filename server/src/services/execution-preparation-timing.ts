@@ -40,6 +40,13 @@ type PreparationPhase = "environment_selection" | "execution_configuration" | "s
   | "github_stop" | "coordinator_release" | "instruction_checkpoint"
   | "instruction_changes" | "warm_release" | "instruction_collection"
   | "attachment_staging" | "warm_restore" | "span_persistence" | "state_migration"
+  | "warm_close_wait" | "checkpoint_restore" | "staged_restart" | "target_lease_read"
+  | "startup_reuse" | "controller_identity" | "controller_process"
+  | "coordinator_read" | "binding_read" | "resume_admission" | "coordinator_write" | "run_write"
+  | "lease_acquired_callback" | "harness_restore" | "warm_owner_wait" | "warm_owner_events" | "warm_owner_recovery"
+  | "warm_projections" | "suspended_checkpoint" | "restart_replacement" | "runner_binding"
+  | "portable_description" | "portable_source" | "portable_resume" | "released_owner_detach"
+  | "plugin_checkpoint" | "failed_attachment_read" | "generation_loss" | "stop_recovery_run" | "stop_recovery_check"
   | "accounting_history" | "usage_delivery" | "instruction_rehydrate" | "review_binding";
 
 export type ExecutionPhase =
@@ -118,6 +125,7 @@ export type ExecutionPhase =
   | "execution.usage" | "execution.native_finalize"
   | "execution.plugin_dispatch" | "execution.plugin_prepare" | "execution.plugin_project_auth" | "execution.plugin_submit" | "execution.plugin_connection"
   | "execution.usage_startup" | "execution.mcp_handoff" | "execution.dispatch_admission" | "execution.budget_reservation"
+  | "execution.interaction_delivery" | "execution.goal_completion" | "execution.stop_recovery"
   | "completion.run" | "completion.output" | "completion.terminal_write" | "completion.cost" | "completion.liveness" | "completion.summary"
   | "response.transaction" | "response.transaction.entry" | "response.transaction.commit" | "response.transaction.rollback" | "response.row_lock" | "response.write"
   | "response.resolve" | "response.authorize" | "response.add_comment" | "response.activity" | "response.publish";
