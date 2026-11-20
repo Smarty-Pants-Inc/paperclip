@@ -1,4 +1,5 @@
 import { getServerProcessStartedAt } from "../server-info.js";
+import { getExecutionBlocker } from "./execution-blocker.js";
 import { insertIssueComment } from "./issue-comment-writes.js";
 import { notifyDeliveryWork, DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 import { notifyNativeResponsePresentation } from "./native-response-presentation-notifications.js";
@@ -89,7 +90,7 @@ export async function recordChatCompletion(tx: Connection, before: Issue, after:
  * to run. The caller holds the task lock; the source lock serializes the one
  * note across workers/restarts. A new execution hold gets its own receipt. */
 export async function reportChatHandoffExecutionHold(tx: Connection, task: Pick<Issue, "id" | "companyId" | "identifier" | "statusVersion">,
-  input: { runId: string; recoveryActionId: string | null }) {
+  input: { runId: string; recoveryActionId: string | null; body?: string }) {
   const [handoff] = await tx.select().from(handoffs).where(and(eq(handoffs.taskId, task.id), eq(handoffs.companyId, task.companyId)));
   if (!handoff) return;
   const [source] = await tx.select().from(issues).where(and(eq(issues.id, handoff.conversationId), eq(issues.companyId, task.companyId))).for("update");
@@ -99,7 +100,7 @@ export async function reportChatHandoffExecutionHold(tx: Connection, task: Pick<
     eq(issueComments.companyId, task.companyId), eq(issueComments.issueId, source.id), eq(issueComments.authorType, "system"),
     sql`${issueComments.metadata}->>'authorizationReason' = ${reason}`)).limit(1);
   const note = existing ?? (await insertIssueComment(tx, { companyId: task.companyId, issueId: source.id, authorType: "system",
-    body: `[${task.identifier ?? "Delegated task"}](/issues/${task.identifier ?? task.id}) has stopped: its agent can't continue it until the problem with its last run is sorted out. Open the task to see what's needed.`,
+    body: input.body ?? `[${task.identifier ?? "Delegated task"}](/issues/${task.identifier ?? task.id}) has stopped: its agent can't continue it until the problem with its last run is sorted out. Open the task to see what's needed.`,
     metadata: { version: 1, sections: [], authorizationReason: reason } }))[0];
   // The factual note satisfies this unchanged blocked report. Do not leave an
   // older pending delivery to wake the chat or narrate the same failure again.
@@ -443,6 +444,16 @@ export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentI
       if (!(await instanceSettingsService(db).getExperimental()).enableAgentChat) return;
       const [agent] = await db.select().from(agents).where(and(eq(agents.id, row.handoff.agentId), eq(agents.companyId, claimed.companyId)));
       if (!agent || ["paused", "terminated"].includes(agent.status)) return;
+      if (row.task.status === "blocked" && await db.transaction(async tx => {
+        const [task] = await tx.select().from(issues).where(and(eq(issues.id, row.task.id),
+          eq(issues.companyId, claimed.companyId))).for("update");
+        if (task?.status !== "blocked") return false;
+        const blocker = await getExecutionBlocker(tx as unknown as Db, task.companyId, row.handoff.conversationId);
+        if (!blocker?.runId) return false;
+        await reportChatHandoffExecutionHold(tx, task, { runId: blocker.runId, recoveryActionId: blocker.recoveryActionId,
+          body: `Blocked, not finished: [${task.identifier ?? "Delegated task"}](/issues/${task.identifier ?? task.id}). Open the task to see what's needed.` });
+        return true;
+      })) return;
       // The same boot boundary as deferred admission: an old outbox row is
       // historical news even if no deferred head survived. Never create a wake.
       if (claimed.createdAt < new Date(getServerProcessStartedAt()) && !claimed.targetRunId) {

@@ -1,12 +1,14 @@
 import { randomUUID } from "node:crypto";
+import { writeFileSync } from "node:fs";
 import { and, asc, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { activityLog, agents, agentWakeupRequests, authUsers, chatCompletionDeliveries as deliveries,
-  companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issues } from "@paperclipai/db";
+  companies, companyMemberships, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issues } from "@paperclipai/db";
 import { recoveryPostgresSupport as support, startRecoveryPostgres } from "./helpers/recovery-postgres.js";
 import { createHeartbeatQueueTestDependencies } from "./helpers/heartbeat-queue.js";
 import { createHeartbeatQueue } from "../services/heartbeat/queue.js";
 import { assignedWorkSweep } from "../services/recovery/assigned-work-sweep.js";
+import { recoveryService } from "../services/recovery/service.js";
 import { issueService } from "../services/issues.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
@@ -93,6 +95,75 @@ import { chatCompletionDeliveryService, prepareChatCompletionTurn, recordAccepte
     };
     return { companyId, agentId, workerId, sourceId, task, taskRunId, sourceRunId, worker, continuation, queue, deps, rows, notes, snapshot };
   }
+
+  it.each(["guarded", "active_hold", "parent_hold_only"])("GAT497READ gate-2 30-minute row: %s", async shape => {
+    const f = await seed();
+    await db.insert(companyMemberships).values({ companyId: f.companyId, principalId: "operator", principalType: "user", status: "active", membershipRole: "owner" });
+    const [action] = await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, f.companyId), eq(issueRecoveryActions.sourceIssueId, f.task.id)));
+    if (shape !== "guarded") {
+      const { freshContinuation: _fresh, continuationDelivery: _delivery, ...evidence } = action.evidence;
+      await db.update(issueRecoveryActions).set({ evidence, ...(shape === "active_hold" ? { status: "active" } : {}) }).where(eq(issueRecoveryActions.id, action.id));
+    }
+    if (shape === "parent_hold_only") {
+      await db.delete(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+      await db.update(issues).set({ unblockDescriptor: { owner: "board", action: "Inspect the task's stopped work before continuing." } }).where(eq(issues.id, f.task.id));
+    }
+    // Gate 2's completion targets a blocked parent whose two-day-old native
+    // recovery ended blocked. A child's own hold is a separate authority.
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, f.sourceId));
+    await db.update(issueRecoveryActions).set({ cause: "native_continuation_requires_reconciliation", outcome: "blocked",
+      resolvedAt: new Date(Date.now() - 2 * 86400_000) }).where(and(eq(issueRecoveryActions.companyId, f.companyId), eq(issueRecoveryActions.sourceIssueId, f.sourceId)));
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.task.id));
+    // Gate 2 had historical version 454; seed its prior counter, then let the
+    // real status writer/SQL trigger create version 454 and its outbox receipt.
+    await db.update(issues).set({ statusVersion: 453 }).where(eq(issues.id, f.task.id));
+    await issueService(db).update(f.task.id, { status: "blocked" });
+    const origins: Array<Record<string, unknown>> = [];
+    let origin = "unknown";
+    const wake = async (agentId: string, opts: Parameters<typeof f.queue.trackWakeup>[1]) => {
+      origins.push({ origin, minute: (Date.now() - start) / 60_000, agentId, opts });
+      return f.queue.trackWakeup(agentId, opts);
+    };
+    const recovery = recoveryService(db, { enqueueWakeup: wake });
+    const delivery = chatCompletionDeliveryService(db, { wakeup: wake });
+    const start = Date.now() + 1_000;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const checkpoints = [];
+    for (let second = 0; second <= 1800; second += 30) {
+      vi.setSystemTime(start + second * 1000);
+      const scope = { companyId: f.companyId, issueId: f.task.id };
+      origin = "recovery.active_actions"; await recovery.reconcileActiveRecoveryActions({ companyId: f.companyId });
+      origin = "recovery.stranded"; await recovery.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+      origin = "recovery.dependencies"; await recovery.reconcileResolvedDependencyWakeBackstop(scope);
+      origin = "recovery.stale_locks"; await recovery.sweepStaleIssueLocks(scope);
+      origin = "assigned_work";
+      for (const issueId of [f.task.id, f.sourceId]) await recovery.assignedWork.checkIssue({ companyId: f.companyId, issueId });
+      origin = "chat_completion"; await delivery.sweepPending({ companyId: f.companyId, taskId: f.task.id });
+      if (second % 600 === 0) checkpoints.push({ minute: second / 60, ...await f.snapshot() });
+    }
+    recovery.assignedWork.flushPassLog();
+    const final = await f.snapshot();
+    // An exhausted delivery is not a writer: even direct delivery calls and a
+    // worker restart at minute 31 must not create another receipt or note.
+    vi.setSystemTime(start + 31 * 60_000);
+    const restartedDelivery = chatCompletionDeliveryService(db, { wakeup: wake });
+    for (const outbox of await f.rows()) await restartedDelivery.deliver(outbox.id);
+    await restartedDelivery.sweepPending({ companyId: f.companyId, taskId: f.task.id });
+    expect(await f.snapshot()).toEqual(final);
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    const skipped = wakes.filter(w => w.status === "skipped" && w.reason === "execution_reconciliation_required");
+    const byWriter = Object.fromEntries([...new Set(skipped.map(w => w.requestedByActorId ?? w.payload?.mutation ?? w.source))].map(writer => [writer, skipped.filter(w => (w.requestedByActorId ?? w.payload?.mutation ?? w.source) === writer).length]));
+    const result = { shape, revision: process.env.GAT497_REVISION ?? "5d03a5af", companyId: f.companyId, chatId: f.sourceId, taskId: f.task.id, checkpoints, final, skipped: skipped.length, byWriter, origins, receipts: wakes,
+      tasks: await db.select().from(issues).where(eq(issues.companyId, f.companyId)),
+      recoveryActions: await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId)) };
+    if (process.env.TASK_OUT) writeFileSync(`${process.env.TASK_OUT}/${process.env.GAT497_PHASE ?? "red"}-${shape}.json`, JSON.stringify(result, null, 2));
+    console.log("GAT497READ_ROW " + JSON.stringify(result));
+    expect.soft(final.notes).toHaveLength(1);
+    if (shape !== "guarded") expect.soft(final.notes[0]?.body).toBe(`Blocked, not finished: [${f.task.identifier}](/issues/${f.task.identifier}). Open the task to see what's needed.`);
+    expect.soft(final.admittedRuns).toBe(0);
+    expect.soft(result.tasks.find(task => task.id === f.task.id)).toMatchObject({ status: "blocked", statusVersion: 454 });
+    expect.soft(skipped).toHaveLength(0);
+  }, 120_000);
 
   it("one refusal and one true note, then quiet for three 15-minute periods", async () => {
     const f = await seed();
