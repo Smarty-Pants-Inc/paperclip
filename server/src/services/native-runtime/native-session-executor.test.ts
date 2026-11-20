@@ -17797,7 +17797,14 @@ describe("native session bounded recovery", () => {
           leaseId: null, retained, reason, elapsedMs: expect.any(Number) }),
       }));
       if (!["not-warm", "not-user-stop"].includes(mode)) {
-        expect(close).toHaveBeenCalledTimes(["clean", "warm-checkpoint", "probe-write-failed", "probe-held", "probe-twice"].includes(mode) ? 0 : 1);
+        // Expiry revokes the iterator immediately; the ordinary finally then
+        // joins the same idempotent close. Both calls are required, not a warm
+        // retention or a second physical teardown.
+        expect(close).toHaveBeenCalledTimes(mode === "cleanup-timeout" ? 2
+          : ["clean", "warm-checkpoint", "probe-write-failed", "probe-held", "probe-twice"].includes(mode) ? 0 : 1);
+        if (mode === "cleanup-timeout") expect(close).toHaveBeenNthCalledWith(1, {
+          reason: "native stop acknowledgement deadline expired",
+        });
         expect(updates.some(update => update.table === heartbeatRuns && update.values.status === "failed")).toBe(false);
       }
       expect(probe.mock.calls.filter(([, event]) => event.eventType === "native.warm_retention.probe"
