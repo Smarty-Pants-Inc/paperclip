@@ -2,6 +2,8 @@ import { wiredHeartbeatFor } from "../services/heartbeat-registry.js";
 import { nativeWorkspaceFinalizationWork } from "../services/native-runtime/native-workspace-finalization-work.js";
 import { recordNativeWorkspaceFinalizationFailure } from "../services/native-runtime/native-workspace-finalizer.js";
 import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { currentProcessSpaceHash } from "../services/controller-process-identity.js";
 import { existsSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -56,6 +58,8 @@ import { CONTROL_PLANE_CONFORMANCE_RESULT, CONTROL_PLANE_CONFORMANCE_TERMINAL } 
 // The comment route, wake admission, Pi driver, native executor, event persistence,
 // answer publication and queue/Stop readers remain production code.
 class RecordingPiPeer {
+  preAttached = false;
+  previousRunEvents: unknown[] = [];
   clock = Date.now();
   tick() { return ++this.clock; }
   closed = false;
@@ -231,10 +235,29 @@ function backendFor(execution: Parameters<typeof realExecute>[0]["execution"], r
         version: 3, timestamp: new Date().toISOString(), cwd: workspace }) + "\n", { mode: 0o600 });
       return peer as unknown as PiRpcTransport;
     } });
-  return createRunnerdNativeSessionBackend(execution, { runnerInstanceId, transportFactory: () => {
+  const backend = createRunnerdNativeSessionBackend(execution, { runnerInstanceId, transportFactory: () => {
     const facade = new PiFacadeTransport(driver, execution.binding.runId, execution.session.normalizedSessionId!);
     peer.facadeCalls = facade.calls; return facade;
   } });
+  if (peer.preAttached) {
+    const open = backend.openSession.bind(backend);
+    backend.openSession = async input => {
+      // A real retained facade has already emitted its startup source prefix
+      // for the previous run. Drain that prefix, then use its REAL attachRun;
+      // do not synthesize events, source sequences, cursors, or ingestion state.
+      const session = await open({ ...input, identity: { ...input.identity, runId: randomUUID() } });
+      const prior = await session.snapshot();
+      const events = session.events()[Symbol.asyncIterator]();
+      for (let n = 0; n < Number(prior.cursor); n++) {
+        const next = await events.next();
+        if (next.done) throw new Error("retained fixture lost startup prefix");
+        peer.previousRunEvents.push(next.value);
+      }
+      await session.attachRun!({ identity: input.identity });
+      return session;
+    };
+  }
+  return backend;
 }
 beforeAll(async () => {
   root = await mkdtemp(join(tmpdir(), "steer-default-red-"));
@@ -286,7 +309,7 @@ beforeAll(async () => {
 }, 60_000);
 afterAll(async () => { vi.restoreAllMocks(); await db?.$client.end(); await database?.cleanup(); vi.unstubAllEnvs(); });
 
-async function fixture(label: string, conversation = true, skipIssueComment = true) {
+async function fixture(label: string, conversation = true, skipIssueComment = true, preAttached = false) {
   const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), userId = randomUUID();
   const workspace = join(root, label); await mkdir(workspace);
   await writeFile(join(workspace, "AGENTS.md"), "Answer each incoming person message exactly once.\n");
@@ -302,6 +325,7 @@ async function fixture(label: string, conversation = true, skipIssueComment = tr
   const initial = randomUUID();
   await db.insert(issueComments).values({ id: initial, companyId, issueId, authorType: "user", authorUserId: userId, body: "Do the original two-step work." });
   const peer = new RecordingPiPeer();
+  peer.preAttached = preAttached;
   const owner = { contendAtFinalization: false, deferCommitAtReturn: false, deferredPhase: "observed" as "observed" | "applied", bodies: [] as string[], peers: [] as RecordingPiPeer[], executions: [] as Promise<unknown>[], first: peer, outcomes: new Map<string, Outcome>() };
   scheduled.set(companyId, owner);
   let coordinator: ReturnType<typeof createDeliveryWorkCoordinator> | undefined;
@@ -403,7 +427,8 @@ async function fixture(label: string, conversation = true, skipIssueComment = tr
       for (const scheduledPeer of owner.peers) await scheduledPeer.close();
       scheduled.delete(companyId);
       if (process.env.PAPERCLIP_STEER_RED_EVIDENCE) await writeFile(join(process.env.PAPERCLIP_STEER_RED_EVIDENCE, `${label}.json`), JSON.stringify({
-        companyId, agentId, issueId, runId, commands: peer.requests, consumed: peer.consumed, replies: peer.replies, outcome: owner.outcomes.get(runId),
+        companyId, agentId, issueId, runId, commands: peer.requests, previousRunEvents: peer.previousRunEvents,
+        consumed: peer.consumed, replies: peer.replies, outcome: owner.outcomes.get(runId),
         successorPeers: owner.peers.slice(1).map(peer => ({ commands: peer.requests, facadeCalls: peer.facadeCalls, consumed: peer.consumed, replies: peer.replies })), workerErrors,
         queues, issue: (await db.select().from(issues).where(eq(issues.id, issueId)))[0],
         finalizations: await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.companyId, companyId)),
@@ -977,6 +1002,106 @@ describe("native completion promotion (rf3-ibpair)", () => {
 // B3's explicitly commissioned native integration rows; controlled Pi peer,
 // real attachment, scheduler, comment POST, drivers and durable event ingestion.
 describe("person comment default steering eligibility and asynchronous receipt", () => {
+  // The finished native consumer, not elapsed time or another Send, owns this
+  // closure proof. Three in-turn reads/answers must survive the release drain.
+  it.each([
+    { label: "fresh", retained: false, concurrent: false },
+    { label: "retained", retained: true, concurrent: false },
+    { label: "concurrent", retained: true, concurrent: true },
+    { label: "previous-boot", retained: true, concurrent: false },
+    { label: "live-boot", retained: true, concurrent: false },
+    { label: "unknown-boot", retained: true, concurrent: false },
+  ])("INGEST: successful three-steer turn releases its last-second deferred person exactly once ($label)", async ({ label, retained, concurrent }) => {
+    let port: PaperclipControlPlanePort | undefined;
+    const append = PaperclipControlPlanePort.prototype.appendEvent;
+    const observe = vi.spyOn(PaperclipControlPlanePort.prototype, "appendEvent").mockImplementation(function (this: PaperclipControlPlanePort, ...args) {
+      port ??= this;
+      return append.apply(this, args);
+    });
+    const restart = ["previous-boot", "live-boot", "unknown-boot"].includes(label);
+    // Recreate exactly the old successful return: no joined-consumer callback.
+    // All stream, run, lock and wake rows are still written by production code.
+    const oldSuccess = restart ? vi.spyOn(PaperclipControlPlanePort.prototype, "settleEventIngestion").mockResolvedValueOnce(undefined) : undefined;
+    const f = await fixture(`ingest-success-${label}`, true, false, retained).catch(error => {
+      oldSuccess?.mockRestore(); observe.mockRestore(); throw error;
+    });
+    try {
+      const steered = [];
+      for (let n = 1; n <= 3; n++) steered.push(await f.post(`INGEST-STEER-${n}`));
+      await waitForPendingCommentSteers();
+      expect(f.commands("steer")).toHaveLength(3);
+      f.peer.boundary();
+      await vi.waitFor(async () => {
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+        expect(run.contextSnapshot?.answeredSteeredCommentIds).toEqual(steered.map(m => m.id));
+      }, { timeout: 15_000 });
+      const before = (await f.comments()).filter(c => steered.some(m => m.id === c.id));
+      expect(before.every(c => c.steerDeliveredAt !== null)).toBe(true);
+      const [beforeRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      const acks = beforeRun.resultJson?.queuedSteeringAcknowledgements as Record<string, { status: string }>;
+      for (const message of steered) expect(acks[message.id].status).toBe("acknowledged");
+      const last = await f.post("INGEST-LAST-SECOND", "queue");
+      expect((await f.wakes()).filter(w => w.status === "deferred_issue_execution")).toHaveLength(1);
+      await f.complete();
+      oldSuccess?.mockRestore();
+      if (restart) {
+        const [held] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+        expect(held.resultJson?.steeringIngestionReleaseHeld).toBe(true);
+        expect(held.resultJson?.nativeSteeringIngestion).toMatchObject({ state: "open", highestContiguousSourceSeq: 0 });
+        if (label !== "live-boot") {
+          const prior = spawnSync(process.execPath, ["-e", ""], { timeout: 5000 });
+          expect(prior.status).toBe(0);
+          await db.update(nativeRunFinalizations).set({ controllerBootId: randomUUID(), controllerPid: prior.pid,
+            controllerHostHash: label === "unknown-boot" ? "another-pid-space" : currentProcessSpaceHash(),
+            controllerProcessStartedAt: null }).where(eq(nativeRunFinalizations.runId, f.runId));
+        }
+        await heartbeatService(db).sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId });
+        if (label !== "previous-boot") {
+          const [stillHeld] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+          expect(stillHeld.executionRunId, "a live or unprovable consumer cannot be bypassed").toBe(f.runId);
+          expect(f.owner.peers).toHaveLength(1);
+          // End this negative row through the true joined consumer, not age.
+          await port!.settleEventIngestion();
+        }
+        await heartbeatService(db).drainActiveRunExecutions();
+      }
+      if (concurrent) {
+        // The actual ingestion owner receives concurrent stopped/joined
+        // notifications. At base this explicitly resumes the held release;
+        // after the fix these duplicate the success callback. Neither may
+        // create another successor or restore any answered steering input.
+        expect(port).toBeDefined();
+        await Promise.all(Array.from({ length: 8 }, () => port!.settleEventIngestion()));
+        await heartbeatService(db).drainActiveRunExecutions();
+      }
+      const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+      console.info("INGEST finished row", JSON.stringify({ runId: f.runId, status: ended.status,
+        ingestion: ended.resultJson?.nativeSteeringIngestion, held: ended.resultJson?.steeringIngestionReleaseHeld,
+        executionRunId: issue.executionRunId, checkoutRunId: issue.checkoutRunId,
+        steeredCommentIds: ended.contextSnapshot?.steeredCommentIds, wakes: await f.wakes() }));
+      expect(ended.status).toBe("succeeded");
+      const ingestion = ended.resultJson?.nativeSteeringIngestion as Record<string, unknown>;
+      expect(ingestion.terminalSourceSeq).toEqual(expect.any(Number));
+      expect(ingestion.highestContiguousSourceSeq).toBe(retained ? 0 : ingestion.terminalSourceSeq);
+      expect(issue.executionRunId, "finished successful run must not retain issue custody").not.toBe(f.runId);
+      expect(issue.checkoutRunId).not.toBe(f.runId);
+      await vi.waitFor(async () => { await f.assertAnsweredOnce([...steered, last]); }, { timeout: 15_000 });
+      expect(ended.resultJson?.queuedSteeringAcknowledgements).toEqual(acks);
+      expect(ended.contextSnapshot?.answeredSteeredCommentIds).toEqual(steered.map(m => m.id));
+      expect(ended.contextSnapshot?.steeredDeliveredAts).toEqual(beforeRun.contextSnapshot?.steeredDeliveredAts);
+      expect(f.owner.peers).toHaveLength(2);
+      const prompts = f.owner.peers.slice(1).flatMap(p => p.requests.filter(r => r.type === "prompt"));
+      expect(prompts).toHaveLength(1);
+      expect(String(prompts[0].input?.message)).toContain(last.body);
+      for (const message of steered) {
+        expect(f.peer.replies.filter(reply => reply === `ANSWER:${message.body}`)).toHaveLength(1);
+        expect(String(prompts[0].input?.message)).not.toContain(message.body);
+      }
+      const after = (await f.comments()).filter(c => steered.some(m => m.id === c.id));
+      expect(after.map(c => [c.id, c.steerDeliveredAt])).toEqual(before.map(c => [c.id, c.steerDeliveredAt]));
+    } finally { oldSuccess?.mockRestore(); observe.mockRestore(); await f.close(); }
+  }, 60_000);
   it("S-task: a person comment on a TASK enters its attached Pi turn, without a wake or a restart", async () => {
     const f = await fixture("B-task", false);
     try {
