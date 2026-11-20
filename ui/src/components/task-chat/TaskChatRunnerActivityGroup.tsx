@@ -33,6 +33,7 @@ import {
 import { TaskChatUsageReadout } from "./TaskChatUsageReadout";
 import { TaskChatReasoningSummary } from "./TaskChatReasoningSummary";
 import { latestReasoningHeadline } from "./reasoning-summary";
+import { REASONING_COLLAPSED_PREVIEW_LINES, reasoningPreviewText } from "./reasoning-preview";
 import { toolActivityPresentation, type ToolIcon } from "./tool-taxonomy";
 import { useTaskChatShimmer } from "./TaskChatShimmer";
 import { TaskChatDiffCounts, TaskChatDiffView } from "./TaskChatDiffView";
@@ -609,6 +610,13 @@ export function TaskChatRunnerActivityGroup({
     (activity) => presentation(activity, false) !== null,
   );
   const latest = activities.at(-1);
+  // Like T3's work-live row, preview the latest thought even if a tool has
+  // since become current. Expanding removes the preview and mounts history.
+  const thought = activities.findLast((activity) => activity.kind === "thinking");
+  const thoughtPreview = item.active && !expanded && REASONING_COLLAPSED_PREVIEW_LINES > 0 && thought?.kind === "thinking"
+    ? reasoningPreviewText(thought.lines.join("\n"))
+    : "";
+  const reasoningOnly = activities.every((activity) => activity.kind === "thinking");
   const summary = completedActivitySummary(activities);
   const SummaryIcon = summary.icon;
   const countLabel = `${activities.length} ${activities.length === 1 ? "activity" : "activities"}`;
@@ -641,13 +649,24 @@ export function TaskChatRunnerActivityGroup({
         <div className="min-w-0">
           <button
             type="button"
-            className="flex min-h-8 w-full min-w-0 items-center gap-2 rounded-sm text-left text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            className={cn("flex min-h-8 w-full min-w-0 gap-2 rounded-sm text-left text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring", thoughtPreview ? "flex-col items-start" : "items-center")}
             data-testid="task-chat-activity-phase-toggle"
             onClick={() => setExpanded(!expanded)}
             aria-expanded={expanded}
             aria-controls={expanded ? historyId : undefined}
             aria-label={`${expanded ? "Collapse" : "Expand"} ${item.active ? countLabel : `${summary.fullLabel.toLowerCase()} (${countLabel})`}`}
           >
+            {thoughtPreview ? (
+              <span className="flex w-full min-w-0 items-start gap-2 text-xs">
+                <span className="flex size-5 shrink-0 items-center justify-center"><Brain className="size-3.5" aria-hidden /></span>
+                <span
+                  className="min-w-0 flex-1 overflow-hidden break-words"
+                  data-testid="task-chat-reasoning-preview"
+                  style={{ display: "-webkit-box", WebkitBoxOrient: "vertical", WebkitLineClamp: REASONING_COLLAPSED_PREVIEW_LINES }}
+                >{thoughtPreview}</span>
+              </span>
+            ) : null}
+            <span className="flex w-full min-w-0 items-center gap-2">
             {!item.active ? (
               <span
                 className="flex h-8 min-w-0 flex-1 items-center gap-2 text-xs"
@@ -668,7 +687,7 @@ export function TaskChatRunnerActivityGroup({
                 <span>{countLabel}</span>
               </span>
             ) : (
-              <RollingActivity item={latest} active={item.active} />
+              <RollingActivity item={latest.kind === "thinking" && thoughtPreview ? { ...latest, lines: [] } : latest} active={item.active} />
             )}
             <span className="flex shrink-0 items-center gap-1 text-xs">
               {!item.active && (editTotals.added > 0 || editTotals.removed > 0) ? (
@@ -684,8 +703,15 @@ export function TaskChatRunnerActivityGroup({
                 aria-hidden="true"
               />
             </span>
+            </span>
           </button>
-          {expanded ? (
+          {expanded && reasoningOnly ? (
+            <div id={historyId} className="min-w-0 max-w-full overflow-hidden" data-testid="task-chat-runner-activity-detail">
+              {activities.map((activity) => activity.kind === "thinking"
+                ? <TaskChatReasoningSummary key={activity.id} text={activity.lines.join("\n")} streaming={item.active && Boolean(activity.streaming)} />
+                : null)}
+            </div>
+          ) : expanded ? (
             <ol
               id={historyId}
               className="flex min-w-0 flex-col gap-1"

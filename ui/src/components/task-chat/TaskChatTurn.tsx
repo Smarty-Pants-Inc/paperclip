@@ -1,4 +1,5 @@
 import { groupImageResources } from "./image-resources";
+import { isPersistentRunnerWorkItem } from "./transcript-adapter";
 import { useContext, useState, type ReactNode } from "react";
 import { TaskChatRevealActivity } from "./expansion-state";
 import { cn } from "@/lib/utils";
@@ -80,6 +81,17 @@ export function TaskChatTurn({
 }: TaskChatTurnProps) {
   const streamlined = useStreamlinedTaskChatPresentation();
   const parentRow = !item.settled && item.liveStatus != null;
+  const reveal = useContext(TaskChatRevealActivity);
+  const [runnerWorkOpen, setRunnerWorkOpen] = useState(reveal);
+  const [runnerRevealed, setRunnerRevealed] = useState(reveal);
+  if (reveal && !runnerRevealed) {
+    setRunnerRevealed(true);
+    setRunnerWorkOpen(true);
+  }
+  const foldRunnerWork = Boolean(item.settled && item.foldActivity && item.items.some((child) => !isPersistentRunnerWorkItem(child)));
+  const runnerItems = item.standaloneHeader ? groupImageResources(item.items).filter((child) =>
+    !foldRunnerWork || runnerWorkOpen || isPersistentRunnerWorkItem(child),
+  ) : [];
   // The new Paperclip Runner task surface owns one durable chronological
   // timeline. The Worked/Stopped row is its stable header, so it stays directly
   // below the preceding human bubble and above commentary, activity phases,
@@ -91,7 +103,7 @@ export function TaskChatTurn({
         data-testid="task-chat-turn"
         data-settled={item.settled ? "true" : "false"}
       >
-        {item.agentName || !item.historical ? <div
+        {item.agentName || !item.historical || foldRunnerWork ? <div
           className="flex min-h-8 w-full min-w-0 items-center gap-2 pb-1 pt-1.5 text-sm text-muted-foreground"
           data-testid="task-chat-turn-summary"
           data-turn-position="identity"
@@ -102,7 +114,23 @@ export function TaskChatTurn({
               agentIcon={item.agentIcon} agent={item.agent}
             />
           ) : null}
-          {!item.historical ? <span className="min-w-0 truncate">
+          {foldRunnerWork ? (
+            <button
+              type="button"
+              className="flex min-h-8 min-w-0 items-center gap-2 rounded-sm text-left hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              data-testid="task-chat-work-toggle"
+              aria-expanded={runnerWorkOpen}
+              onClick={() => setRunnerWorkOpen((value) => !value)}
+            >
+              <span className="min-w-0 truncate">
+                {item.continuedAfterSteering ? "Continued after steering · " : ""}
+                {item.historical ? "Activity" : item.summary.durationLabel
+                  ? `${item.summary.failed ? "Stopped" : "Worked"} for ${item.summary.durationLabel}`
+                  : item.summary.failed ? "Stopped" : "Worked"}
+              </span>
+              <ChevronRight className={cn("size-3.5 shrink-0", runnerWorkOpen && "rotate-90")} aria-hidden />
+            </button>
+          ) : !item.historical ? <span className="min-w-0 truncate">
             {item.continuedAfterSteering ? "Continued after steering · " : ""}
             {item.summary.durationLabel
               ? `${item.summary.failed ? "Stopped" : "Worked"} for ${item.summary.durationLabel}`
@@ -112,12 +140,12 @@ export function TaskChatTurn({
           </span> : null}
         </div> : null}
         <TaskChatRunHealthBanner failures={item.mcpStartupFailures ?? []} />
-        {item.items.length > 0 ? (
+        {runnerItems.length > 0 ? (
           <div
             className="flex min-w-0 flex-col gap-2 py-1"
             data-testid="task-chat-turn-timeline"
           >
-            {groupImageResources(item.items).map((child) => (
+            {runnerItems.map((child) => (
               <div
                 className="min-w-0"
                 key={child.id}
@@ -160,7 +188,6 @@ export function TaskChatTurn({
   // Parent-row live turns and settled turns start as their one-line header;
   // only the headerless legacy live turn starts expanded, or a settled turn
   // whose compacted output the reader just revealed ("More run output").
-  const reveal = useContext(TaskChatRevealActivity);
   const [open, setOpen] = useState(
     () => (!item.settled && item.liveStatus == null) || reveal,
   );
