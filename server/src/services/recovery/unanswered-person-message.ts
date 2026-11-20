@@ -64,6 +64,14 @@ export const UNANSWERED_MESSAGE_NO_RUN_GRACE_MS = 120_000;
 /** A native same-run retry that is this late is not going to start by itself. */
 const OVERDUE_NATIVE_RETRY_MS = 5 * 60_000;
 
+/** MarkdownBody renders this ISO-labelled token in the reader's local time.
+ * Other Markdown/plain-text clients retain the unambiguous UTC ISO label.
+ * Contract: doc/markdown-local-times.md. Never use the server's wall clock. */
+function savedMessageTime(at: Date): string {
+  const iso = at.toISOString();
+  return `[${iso}](#paperclip-time=${iso})`;
+}
+
 export const UNANSWERED_MESSAGE_NO_REPLY_CODE = "no_reply";
 export const UNANSWERED_MESSAGE_NO_RUN_CODE = "no_run";
 export const UNANSWERED_MESSAGE_UNCLASSIFIED_CODE = "unclassified_failure";
@@ -791,7 +799,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   if (!message.sendable) {
     if (!message.hasAutomaticPath) return { kind: "out_of_scope" };
     const quote = message.body.length > 60 ? `${message.body.slice(0, 59)}…` : message.body;
-    const savedAt = `${String(message.createdAt.getHours()).padStart(2, "0")}:${String(message.createdAt.getMinutes()).padStart(2, "0")}`;
+    const savedAt = savedMessageTime(message.createdAt);
     const notice = buildStrandedRecoveryEscalationNotice({
       seed: { title: "Your message wasn't answered", tone: "warning",
         body: `Your message is saved: "${quote}" (${savedAt}). It was not answered. It is at least 24 hours old, so it will not run automatically. Send a new message to try again.`,
@@ -1205,8 +1213,8 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   const boundReached = Boolean(!paused && !waiting && run && TERMINAL.includes(run.status) && run.status !== "succeeded"
     && (await freshContinuationChain(q as Db, { companyId: issue.companyId, issueId: issue.id, runId: run.id })).attempts
       >= FRESH_CONTINUATION_BOUND);
-  // Server-local HH:MM: the instance's time zone, not an assumed UTC zone.
-  const since = `${String(message.createdAt.getHours()).padStart(2, "0")}:${String(message.createdAt.getMinutes()).padStart(2, "0")}`;
+  // Both the naming prefix and setup's since-time identify the saved instant.
+  const since = savedMessageTime(message.createdAt);
   // A consumed steer or a message left behind while unrelated work continued
   // needs the started-run remedy. The later run is not evidence about this input.
   const readSteer = run && Object.hasOwn((run.contextSnapshot?.steeredDeliveryEventSeqs ?? {}) as object, message.id);

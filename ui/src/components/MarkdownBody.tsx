@@ -877,6 +877,19 @@ function MarkdownBodyImpl({
       </code>
     ),
     a: ({ node: _node, href: rawHref, style: linkStyle, children: linkChildren, ...anchorProps }) => {
+      // ISO-labelled Markdown links are the plain-text fallback for local times
+      // (doc/markdown-local-times.md). Strict canonical UTC instants only: no
+      // raw HTML, URL scheme exemption, or date parsing of arbitrary link text.
+      const timestamp = rawHref?.startsWith("#paperclip-time=")
+        ? rawHref.slice("#paperclip-time=".length) : "";
+      if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(timestamp)) {
+        const date = new Date(timestamp);
+        if (Number.isFinite(date.getTime()) && date.toISOString() === timestamp) {
+          return <time dateTime={timestamp} title={date.toLocaleString(undefined, { dateStyle: "full", timeStyle: "long" })}>
+            {new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(date)}
+          </time>;
+        }
+      }
       const href = companyPathFromProtocolRelativeHref(rawHref, knownPrefixes);
       const workspaceFileRef = parseWorkspaceFileHref(href);
       if (workspaceFileRef) {

@@ -154,18 +154,77 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   }
 
   // RFL naming rule: first words + time identify the SAME saved message.
-  // Keep the exact old remedy assertion after validating the persisted prefix.
+  // Repointed for review-fleet-5 AMMA5: server HH:mm was wrong for the reader;
+  // retain the first words and remedy checks, but require the saved ISO token.
   async function noticeText(note: typeof issueComments.$inferSelect): Promise<string> {
     const id = note.metadata?.authorizationReason?.slice("unanswered_message:".length);
     expect(id).toBeTruthy();
     const [message] = await db.select().from(issueComments).where(eq(issueComments.id, id!));
     expect(message).toBeDefined();
-    const time = `${String(message!.createdAt.getHours()).padStart(2, "0")}:${String(message!.createdAt.getMinutes()).padStart(2, "0")}`;
+    const iso = message!.createdAt.toISOString();
+    const time = `[${iso}](#paperclip-time=${iso})`;
     const quote = message!.body.length > 60 ? `${message!.body.slice(0, 59)}…` : message!.body;
     const prefix = `Your message is saved: "${quote}" (${time}). `;
     expect(note.body.startsWith(prefix)).toBe(true);
     return note.body.slice(prefix.length);
   }
+
+  // catch: review-fleet-5 FINDING on 3da56cd6, AMMA5: the UTC server
+  // named Paul's 8:04 AM ET message as bare 13:04 (including setup's since).
+  it.each(["failed", "too-old", "setup"] as const)(
+    "AMMA5 persists the exact 13:04Z instant, not the server clock (%s)", async kind => {
+      const saved = new Date("2026-11-20T13:04:00.000Z");
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date(saved.getTime() + (kind === "too-old" ? 25 * 3_600_000 : 16 * 60_000)));
+      try {
+        const f = await fixture();
+        const messageId = await f.message("Please keep my exact message.");
+        await db.update(issueComments).set({ createdAt: saved }).where(eq(issueComments.id, messageId));
+        if (kind === "setup") {
+          await db.update(agents).set({ status: "paused", lifecycleState: "preparing", pauseReason: "setup",
+            lifecycleHolds: [], lifecycleError: null }).where(eq(agents.id, f.agentId));
+        } else if (kind === "too-old") {
+          await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+            source: "on_demand", reason: "issue_commented", status: "cancelled",
+            idempotencyKey: `conversation-comment:${messageId}`, payload: { issueId: f.issueId, commentId: messageId } });
+        } else {
+          await f.run({ commentId: messageId, status: "failed", errorCode: "adapter_failed" });
+        }
+        await f.sweep();
+        const [original] = await f.visible();
+        expect(original).toBeDefined();
+        // Real card creation/resolution retires and restores failed/old notes.
+        // Setup has no run/card yet: exercise its production sweep directly.
+        let restored = original;
+        let cardId: string | null = null;
+        if (kind !== "setup") {
+        const runId = await f.run({ commentId: messageId, status: "running" });
+        const svc = issueThreadInteractionService(db);
+        const scope = { id: f.issueId, companyId: f.companyId };
+        const card = await svc.create(scope, { kind: "request_confirmation", sourceRunId: runId,
+          continuationPolicy: "none", payload: { version: 1, prompt: "Proceed?", rejectRequiresReason: true } },
+          { agentId: f.agentId, runId });
+        await db.update(issueThreadInteractions).set({ createdAt: f.at() })
+          .where(eq(issueThreadInteractions.id, card.id));
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: f.at() }).where(eq(heartbeatRuns.id, runId));
+        await f.sweep();
+        expect(await f.visible()).toHaveLength(0);
+        await svc.rejectInteraction(scope, card.id, { reason: "Still need my answer." }, { userId: f.userId });
+        await f.sweep();
+        [restored] = await f.visible();
+        cardId = card.id;
+        expect(restored?.id).toBe(original!.id);
+        }
+        if (process.env.AMMA5_NOTE_EVIDENCE_DIR) await writeFile(
+          join(process.env.AMMA5_NOTE_EVIDENCE_DIR, `amma5-${kind}.json`),
+          JSON.stringify({ kind, savedAt: saved.toISOString(), original, restored, cardId }, null, 2));
+        expect(restored!.body).toContain(`[${saved.toISOString()}](#paperclip-time=${saved.toISOString()})`);
+        expect(restored!.body).not.toMatch(/\((?:since )?13:04\)/);
+        expect(restored!.body).toContain(kind === "setup" ? "Managed Pi is still being set up" : 'Your message is saved: "Please keep my exact message."');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
 
   const codeOf = (comment: { metadata: unknown }) => {
     const sections = ((comment.metadata as Record<string, unknown>)?.sections ?? []) as Array<{ rows: Array<{ label?: string; value?: string }> }>;
@@ -1245,8 +1304,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       await f.sweep();
       const [note] = await f.visible();
       expect(await f.visible()).toHaveLength(1);
-      const hhmm = `${String(start.getHours()).padStart(2, "0")}:${String(start.getMinutes()).padStart(2, "0")}`;
-      expect(note!.body).toBe(`Managed Pi is still being set up (since ${hhmm}). Your message is saved and will be answered as soon as it's ready.`);
+      // review-fleet-5 AMMA5: setup's since-time is reader-local too.
+      const iso = start.toISOString();
+      expect(note!.body).toBe(`Managed Pi is still being set up (since [${iso}](#paperclip-time=${iso})). Your message is saved and will be answered as soon as it's ready.`);
       expect(note!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
       expect(rowsOf(note!).some(row => row.label === "Failure code")).toBe(false);
       expect(JSON.stringify(note)).not.toMatch(/paused|resume|send.*again/i);
@@ -2026,7 +2086,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         // RFL naming rule: every note names M by its first words + saved time,
         // including fresh input and the same note when a person resolves a card.
         const [message] = await db.select().from(issueComments).where(eq(issueComments.id, messageId));
-        const time = `${String(message!.createdAt.getHours()).padStart(2, "0")}:${String(message!.createdAt.getMinutes()).padStart(2, "0")}`;
+        // review-fleet-5 AMMA5: repoint time only; preserve naming + retirement.
+        const iso = message!.createdAt.toISOString();
+        const time = `[${iso}](#paperclip-time=${iso})`;
         const name = `Your message is saved: "${message!.body}" (${time}).`;
         expect.soft(original?.body).toContain(name);
         const sourceRunId = await f.run({ commentId: messageId, status: "running" });

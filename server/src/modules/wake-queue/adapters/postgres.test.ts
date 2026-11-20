@@ -1865,7 +1865,10 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
   // RFL naming rule: the note names the saved message (first words + time),
   // not the clock of the sweep or the wake receipt. Applies to all 11 literals.
   function messageName(message: { body: string; createdAt: Date }) {
-    const time = `${String(message.createdAt.getHours()).padStart(2, "0")}:${String(message.createdAt.getMinutes()).padStart(2, "0")}`;
+    // Repointed for review-fleet-5 AMMA5: keep the first words and all
+    // custody/age assertions; only the server-local HH:mm literal changes.
+    const iso = message.createdAt.toISOString();
+    const time = `[${iso}](#paperclip-time=${iso})`;
     return `Your message is saved: "${message.body}" (${time}).`;
   }
   async function cards(c: Chat, id: string) {
