@@ -221,6 +221,103 @@ describe.skipIf(!support.supported)("company import safety pause recovery (M12 S
     } finally { await heartbeat.drainActiveRunExecutions(); }
   });
 
+  // c3-live: the two MIXED pause orders, each with Paul's message posted LIVE
+  // through the real comment route (not a DB insert, not imported history).
+  // (a) import-then-manual: the import safety pause, then the person's Pause
+  //     (POST /agents/:id/pause). (b) manual-then-import: the person's Pause,
+  //     then the import safety pause (the same lifecycle operation the import
+  //     caller uses, company-portability.ts pauseAgent(existingAgentId, "import")).
+  // Each: ONE true paused note, no run while paused, real Resume -> P runs once.
+  it.each(["import-then-manual", "manual-then-import"] as const)("a LIVE person message to an agent paused %s gets ONE true paused note; Resume runs it once (c3-live)", async order => {
+    const f = await imported(false);
+    await db.execute(sql`update activity_log set created_at = now() - interval '8 minutes'
+      where action = 'issue.imported' and entity_type = 'issue' and entity_id = ${f.issue.id}`);
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = { type: "board", source: "local_implicit", userId: "m12-board", isInstanceAdmin: true };
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as Parameters<typeof issueRoutes>[1]));
+    app.use("/api", agentRoutes(db, {}));
+    app.use(errorHandler);
+    const lifecycleWorker = () => configureAgentLifecycle(db, { requiredPluginIds: async () => [],
+      runPlugin: async () => "complete", runHost: async () => "complete" });
+    if (order === "manual-then-import") {
+      // Release the first import pause so the person's Pause comes first.
+      const worker = lifecycleWorker();
+      try {
+        await worker.process(f.agentId);
+        await createAgentLifecycle(db).resumeAgent(f.agentId);
+        await worker.process(f.agentId);
+      } finally { await worker.stop(); }
+    }
+    const manual = await request(app).post(`/api/agents/${f.agentId}/pause`).send({});
+    expect(manual.status, JSON.stringify(manual.body)).toBe(200);
+    if (order === "manual-then-import") await createAgentLifecycle(db).pauseAgent(f.agentId, "import");
+    // The lifecycle worker settles the pause, as it does in the running server.
+    const settle = lifecycleWorker();
+    try {
+      for (let i = 0; i < 5 && (await db.select().from(agents).where(eq(agents.id, f.agentId)))[0]!.lifecycleState !== "paused"; i++)
+        await settle.process(f.agentId);
+    } finally { await settle.stop(); }
+    const [agent] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+    expect(agent).toMatchObject({ status: "paused", lifecycleState: "paused" });
+    expect([...agent!.lifecycleHolds].sort()).toEqual(["import", "manual"]);
+    const posted = await request(app).post(`/api/issues/${f.issue.id}/comments`).send({ body: "Paul here, live: please pick the orchard count back up." });
+    expect(posted.status, JSON.stringify(posted.body)).toBe(201);
+    const agentRuns = () => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
+    const heartbeat = heartbeatService(db, { runStartHandover: { isYielding: () => true, refreshIfStale: async () => {} } });
+    try {
+      for (let i = 0; i < 3; i++) {
+        await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issue.id });
+        await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issue.id,
+          now: new Date(Date.now() + (30 + i * 10) * 60_000) });
+      }
+      const swept = await notes(f.issue.id);
+      const deferred = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, f.agentId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution")));
+      const [held] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+      console.log(JSON.stringify({ check: "c3-live", order, holds: held!.lifecycleHolds, pauseReason: held!.pauseReason, lifecycleState: held!.lifecycleState,
+        notes: swept.map(n => n.body), deferred: deferred.length, runs: (await agentRuns()).length }));
+      // ONE note, about THIS live message, and it is true: the wake is saved,
+      // so it says the message will run on Resume, and who can resume.
+      expect(swept).toHaveLength(1);
+      expect((swept[0]!.metadata as Record<string, unknown> | null)?.authorizationReason).toBe(`unanswered_message:${posted.body.id}`);
+      expect(swept[0]!.body).toBe("Import Coder is paused. Your message is saved, and it will run when Import Coder is resumed. "
+        + "A board user or Import Coder's manager can resume Import Coder.");
+      expect(deferred).toHaveLength(1);
+      expect(await agentRuns(), "no run while paused").toHaveLength(0);
+      // The person's real Resume (POST /agents/:id/resume) lifts both holds.
+      const resumed = await request(app).post(`/api/agents/${f.agentId}/resume`).send({});
+      expect(resumed.status, JSON.stringify(resumed.body)).toBe(200);
+      const worker = lifecycleWorker();
+      try {
+        for (let i = 0; i < 5 && (await db.select().from(agents).where(eq(agents.id, f.agentId)))[0]!.lifecycleState !== "ready"; i++)
+          await worker.process(f.agentId);
+      } finally { await worker.stop(); }
+      const [ready] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+      expect(ready).toMatchObject({ status: "idle", pauseReason: null, lifecycleHolds: [] });
+      for (let i = 0; i < 3; i++) await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issue.id });
+      const releaser = heartbeatService(db);
+      for (let i = 0; i < 2; i++) { await releaser.resumeQueuedRuns(); await releaser.drainActiveRunExecutions(); }
+      const runs = await agentRuns();
+      const carriesP = runs.filter(run => {
+        const c = (run.contextSnapshot ?? {}) as Record<string, unknown>;
+        return c.commentId === posted.body.id || c.wakeCommentId === posted.body.id
+          || (Array.isArray(c.wakeCommentIds) && c.wakeCommentIds.includes(posted.body.id));
+      });
+      console.log(JSON.stringify({ check: "c3-live-release", order, runs: runs.map(r => ({ id: r.id, status: r.status, ctx: r.contextSnapshot })) }));
+      // P runs once (the process adapter posts no answer, so a disposition retry is not a second delivery).
+      const delivered = carriesP.filter(run => !((run.contextSnapshot ?? {}) as Record<string, unknown>).retryOfRunId);
+      expect(delivered).toHaveLength(1);
+      expect(delivered[0]!.contextSnapshot).toMatchObject({ wakeReason: "issue_commented" });
+      expect(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, f.agentId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution")))).toHaveLength(0);
+      expect(await notes(f.issue.id), "still ONE note after Resume").toHaveLength(1);
+    } finally { await heartbeat.drainActiveRunExecutions(); }
+  });
+
   it("an armed monitor survives import-pause recovery and its timer admits a run after resume", async () => {
     const f = await imported(true);
     // The portability format deliberately imports monitor metadata unarmed.
