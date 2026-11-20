@@ -10618,6 +10618,7 @@ export class NativeSessionSteeringError extends Error {
       | "steering_temporarily_unavailable"
       | "steering_stale_turn"
       | "steering_timeout"
+      | "steering_outcome_unknown"
       | "steering_rejected",
     message: string,
   ) {
@@ -10835,22 +10836,12 @@ export async function steerNativeSession(input: {
     return acknowledged;
   } catch (error) {
     if (error instanceof NativeSessionSteeringError) throw error;
-    const message = error instanceof Error ? error.message : String(error);
-    if (/stale|terminal|active turn/i.test(message)) {
-      throw new NativeSessionSteeringError(
-        "steering_stale_turn",
-        "The target turn is no longer active.",
-      );
-    }
-    if (/unsupported|unavailable|capability/i.test(message)) {
-      throw new NativeSessionSteeringError(
-        "steering_unsupported",
-        "This provider does not support same-turn steering.",
-      );
-    }
+    // A failed receipt does not prove that Pi refused the input. It may already
+    // have read and answered it. Only explicit steering error codes establish a
+    // refusal; neither a transport exception nor words in its message do.
     throw new NativeSessionSteeringError(
-      "steering_rejected",
-      "The provider rejected the steering message.",
+      "steering_outcome_unknown",
+      "The provider's steering outcome is unknown.",
     );
   } finally {
     if (timeout) clearTimeout(timeout);

@@ -31,7 +31,7 @@ export async function waitForPendingCommentSteers(): Promise<void> {
 function logSteeringFailure(error: unknown) {
   const errorClass = error instanceof TypeError ? "TypeError" : error instanceof RangeError ? "RangeError"
     : error instanceof Error ? "Error" : "NonError";
-  logger.warn({ errorClass }, "Conversation steering failed; using ordinary delivery");
+  logger.warn({ errorClass }, "Conversation steering failed");
 }
 
 const object = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
@@ -157,10 +157,15 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
         } } }).where(eq(heartbeatRuns.id, run.id));
       });
     } catch (error) {
-      // Only a timeout is uncertain: the carrying run retains custody until
-      // the shared answered predicate can reconcile read/answer evidence.
-      if (error instanceof NativeSessionSteeringError && error.code === "steering_timeout") return;
       if (!(error instanceof NativeSessionSteeringError)) logSteeringFailure(error);
+      // Only a definite refusal releases custody. A timeout, transport failure,
+      // malformed receipt or unexpected exception leaves the reservation pending:
+      // native read/answer events reconcile it, or run-end restoration delivers
+      // the unread input once. Never invite a resend on a failed receipt alone.
+      if (!(error instanceof NativeSessionSteeringError) || ![
+        "steering_rejected", "steering_stale_turn",
+        "steering_unsupported", "steering_temporarily_unavailable",
+      ].includes(error.code)) return;
       if (!options.onRejected) return; // fail closed: still owed at run end
       if (identity) await rejectSteeredIdentity(db, identity);
       const steeringUnavailableReason = error instanceof NativeSessionSteeringError ? error.code : "steering_error";
