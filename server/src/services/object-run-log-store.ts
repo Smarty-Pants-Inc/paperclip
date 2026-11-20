@@ -1037,7 +1037,7 @@ export function createObjectRunLogStore(options: ObjectRunLogStoreOptions): RunL
     // Do not infer missing bytes from a null final size or an open head (a
     // close/digest failure can leave every byte stored).
     const paths = spillPaths(options.spillDir, logRef);
-    const custody = await runLogSpillCustody(paths.indexPath);
+    const custody = await runLogSpillCustodyPass(() => runLogSpillCustody(paths.indexPath, true));
     const unknown = custody.state === "kept" && custody.reason !== "unrecovered";
     // Only an ordinary, validated unrecovered index may use the range proof
     // below. A corrupt/unreadable index is not an empty, complete-looking log.
