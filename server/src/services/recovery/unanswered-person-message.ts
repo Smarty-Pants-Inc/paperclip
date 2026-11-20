@@ -1261,19 +1261,25 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
 
 
 /** Resume (paused -> resuming) is an event: every open task of this agent whose
- * person's message carries a standing '<agent> is paused' note is handed to the
- * stranded sweep's per-issue entry (settleUnansweredPersonMessagesForTask) at
- * commit, so the SAME note is upgraded now, not at the 5-min recheck. Called
- * in the lifecycle transaction (services/agent-lifecycle.ts recordStatus). */
+ * person's message carries a standing '<agent> is paused' note, OR that has a
+ * person's message still owed (the sweep's own candidate condition,
+ * unansweredPersonMessageCondition: a message sent while paused that the
+ * paged sweep has not reached yet has no note), is handed to the stranded
+ * sweep's per-issue entry (settleUnansweredPersonMessagesForTask) at commit.
+ * Called in the lifecycle transaction (services/agent-lifecycle.ts
+ * recordStatus); for a ready-to-run message the entry queues its run then
+ * (deliverConversationComments), which starts at ready. */
 export async function notifyPausedNoteResume(tx: Db, scope: { companyId: string; agentId: string }): Promise<void> {
   const pausedRow = JSON.stringify([{ rows: [{ label: WAITING_ROW_LABEL, value: UNANSWERED_MESSAGE_AGENT_PAUSED_CODE }] }]);
-  const rows = await tx.selectDistinct({ id: issues.id }).from(issues)
-    .innerJoin(issueComments, and(eq(issueComments.companyId, issues.companyId), eq(issueComments.issueId, issues.id)))
-    .where(and(eq(issues.companyId, scope.companyId), eq(issues.assigneeAgentId, scope.agentId), isNull(issues.hiddenAt),
+  const rows = await tx.select({ id: issues.id }).from(issues)
+    .where(and(eq(issues.companyId, scope.companyId), isNull(issues.hiddenAt),
+      or(eq(issues.assigneeAgentId, scope.agentId), eq(issues.conversationAgentId, scope.agentId)),
       inArray(issues.status, ["todo", "in_progress", "in_review", "blocked"]),
-      eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
-      sql`starts_with(${reasonOf(issueComments.metadata)}, ${UNANSWERED_MESSAGE_REASON_PREFIX})`,
-      sql`coalesce(${issueComments.metadata}->'sections' @> ${pausedRow}::jsonb, false)`)).limit(200);
+      or(sql`exists (select 1 from ${issueComments} paused_note where paused_note.company_id = ${issues.companyId}
+          and paused_note.issue_id = ${issues.id} and paused_note.author_type = 'system' and paused_note.deleted_at is null
+          and starts_with(paused_note.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
+          and coalesce(paused_note.metadata->'sections' @> ${pausedRow}::jsonb, false))`,
+        unansweredPersonMessageCondition(issues.id, issues.companyId)))).limit(200);
   for (const row of rows) {
     await notifyDeliveryWork(tx, DELIVERY_QUEUES.strandedAssignments, JSON.stringify({ companyId: scope.companyId, issueId: row.id }));
   }
