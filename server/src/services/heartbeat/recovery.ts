@@ -2039,6 +2039,14 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
 
       try {
         if (lease.metadata?.workspaceRecoveryCleanup !== undefined && !recoveredCleanup && !hasStopOnlyCleanup(lease)) {
+          const cleanup = lease.metadata.workspaceRecoveryCleanup as { stopReceipt?: unknown } | null;
+          await writeEnvironmentCleanup(db, tx => tx.update(environmentLeases).set({
+            metadata: sql`${pendingCleanupMetadataObjectSql()} || ${JSON.stringify({
+              pendingCleanupHoldReason: cleanup?.stopReceipt == null ? "stop_receipt_missing" : "stop_receipt_invalid",
+            })}::jsonb`,
+          }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.status, "pending_cleanup"),
+            sql`${environmentLeases.metadata}->>'pendingCleanupAttemptId' = ${claimed}`)),
+          { companyId: lease.companyId, leaseId: lease.id });
           throw new Error("Recovery cleanup requires its bound stop receipt.");
         }
         if (opts?.explicitRetry) await logActivity(db, {
