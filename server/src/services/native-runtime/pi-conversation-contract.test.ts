@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { PAPERCLIP_PERSON_STOPPED_PREVIOUS_TURN_NOTE } from "@paperclipai/adapter-utils/server-utils";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { buildNativeModelEnvelope } from "../../vendor/paperclip-runner/index.js";
 import { buildNativeExecutionWithCheckpoint, nativeToolContractFingerprintForTarget, rebindNativeSessionCheckpoint } from "./native-session-resume.js";
@@ -134,7 +135,8 @@ describe("Interrupt successor carrying a new message answers it first (adopt-a2-
   const interruptWake = {
     reason: "issue_commented",
     issue: { id: issueId, identifier: null, title: "Daily conversation", status: "in_progress", priority: "medium" },
-    personStoppedPreviousTurn: true,
+    // adopt-a2-order3: an Interrupt never carries personStoppedPreviousTurn (server-owned, Stop only:
+    // readPersonStoppedPreviousTurn never matches an Interrupt). The Stop row below sets it.
     interruptedTurnToolCalls: [
       { name: "bash", target: "echo STEP1 > /tmp/step1", status: "completed", output: "STEP1-RESULT-wrote-step1" },
       { name: "bash", target: "sleep 600", status: "interrupted", output: "" },
@@ -144,7 +146,7 @@ describe("Interrupt successor carrying a new message answers it first (adopt-a2-
     executionContinuation: continuation,
   };
   // No Interrupt: a plain continuation with a new message (must render as at base).
-  const { personStoppedPreviousTurn: _p, interruptedTurnToolCalls: _t, ...plainWake } = interruptWake;
+  const { interruptedTurnToolCalls: _t, ...plainWake } = interruptWake;
   function successor(wakePayload: Record<string, unknown>, id: string, resumedSession: boolean, runId = nextRun) {
     return buildNativeExecutionInput({ companyId, agentId, runId,
       issue: { id: issueId, identifier: null, title: "Daily conversation", description: null, workMode: "standard" },
@@ -222,6 +224,25 @@ describe("Interrupt successor carrying a new message answers it first (adopt-a2-
       expect(text).not.toContain("Commands already run in the interrupted turn");
       expect(text).not.toContain(ANSWER_FIRST);
       expect(text).not.toContain("cut mid-flight");
+    }
+  });
+
+  // adopt-a2-order3: a person's STOP (server-owned personStoppedPreviousTurn) with receipts and a new message.
+  // The new message is answered; the stopped work is NOT resumed or redone unless asked: none of the
+  // Interrupt's 'then continue' wording may leak into a Stop successor. Receipts list still stays (C1).
+  it("Stop successor with receipts and a new message: answer it, do not resume the stopped work (no 'continue')", () => {
+    const stopWake = { ...interruptWake, personStoppedPreviousTurn: true };
+    const STOP_SENTENCE = "The person stopped your previous turn and sent a new message. Answer their new message. Do not resume or redo the stopped work unless they ask; the completed calls below must not be run again.";
+    for (const previousRun of [null, "prior"] as const) {
+      const { text } = request(stopWake, previousRun === "prior" ? prior(successor(stopWake, sessionId, false, firstRun)) : null);
+      expect(text).toContain("9 + 10");
+      expect(text, "the Stop note is kept, once").toContain(PAPERCLIP_PERSON_STOPPED_PREVIOUS_TURN_NOTE);
+      expect(text.split(PAPERCLIP_PERSON_STOPPED_PREVIOUS_TURN_NOTE)).toHaveLength(2);
+      expect(text, "the receipts list is never removed (C1)").toMatch(LIST);
+      expect(text, "the Stop sentence").toContain(STOP_SENTENCE);
+      expect(text, "no Interrupt text leaks into a Stop").not.toContain("continue the task from the next unfinished step");
+      expect(text, "no Interrupt text leaks into a Stop").not.toContain("Then continue");
+      expect(text, "no Interrupt text leaks into a Stop").not.toMatch(/next unfinished step|continue from the next step|The person interrupted your previous turn|Answer their new message first|before you run it again/i);
     }
   });
 
