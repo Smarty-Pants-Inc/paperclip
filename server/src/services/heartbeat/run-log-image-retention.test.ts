@@ -20,7 +20,7 @@ import { createHeartbeatRunOutput } from "./run-output.js";
 // Keep reason: never-OK trace custody. A legacy CLI image has no required raw
 // source outside its run log. Exercise the real writer, stores and PostgreSQL.
 // No provider/model or uploaded-attachment path is involved at this boundary.
-const smallPng = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7X8AAAAASUVORK5CYII=", "base64");
+const smallPng = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=", "base64");
 function imageBytes(metadataBytes: number) {
   if (!metadataBytes) return smallPng;
   const payload = Buffer.from(`Comment\0${"image trace metadata ".repeat(Math.ceil(metadataBytes / 21))}`.slice(0, metadataBytes));
@@ -137,7 +137,7 @@ describe("legacy CLI image custody at the persisted run-log boundary", () => {
     const f = await fixture(), bytes = imageBytes(2048), sourceInstanceId = randomUUID();
     const event = { schema: "paperclip.prp.event.v1" as const, schemaVersion: 1 as const,
       runId: f.run.id, sourceInstanceId, sourceEventId: `${sourceInstanceId}:1`, sourceSeq: 1,
-      sourceKind: "runner" as const, normalizedSessionId: randomUUID(), eventType: "item.delta",
+      sourceKind: "runner" as const, normalizedSessionId: randomUUID(), eventType: "item.delta" as const,
       priority: 2 as const, emittedAt: new Date().toISOString(),
       payload: { image: { type: "image", source: { type: "base64", data: bytes.toString("base64") } } } };
     const receipt = await appendHeartbeatRunEvent(db, { companyId: f.run.companyId, runId: f.run.id,
