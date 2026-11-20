@@ -475,10 +475,10 @@ const TASK_HELD_BY_OWN_STOP_SEND_REASON = "held_by_own_stop_send";
 function taskHeldByOwnStopMessage(count: number, send: boolean): string {
   if (send) return count === 1
     ? "Not sent, because you pressed Stop. Send it now, or delete it."
-    : "Not sent, because you pressed Stop. Send them now, or delete any.";
+    : "Not sent, because you pressed Stop. Send them now, or delete any of them.";
   return count === 1
-    ? "Not sent, because you pressed Stop. Delete it, or send a new message: this one goes with it."
-    : "Not sent, because you pressed Stop. Delete any, or send a new message: these go with it.";
+    ? "Not sent, because you pressed Stop. It will go with your next message, or you can delete it."
+    : "Not sent, because you pressed Stop. They will go with your next message, or you can delete any of them.";
 }
 /** A paused chat agent: the Send route's own code and words (its 409), so the
  * held bar says it is paused and offers no Send that would be refused. */
