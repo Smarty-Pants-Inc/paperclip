@@ -119,6 +119,40 @@ describe("customer-owned GitHub App protocol", () => {
     expect(() => parseGitHubAppConfig({ ...base, version })).toThrow();
   });
 
+  it("accepts only the standalone wildcard as installation-wide repository scope", () => {
+    expect(parseGitHubAppConfig({ ...base, repositories: "*" }).repositories).toBe("*");
+  });
+
+  it.each(["*,owner/repo", "owner/repo,*", "*\nowner/repo", "*,", "*,*", "all"])("rejects mixed or non-exact wildcard scope %s", repositories => {
+    expect(() => parseGitHubAppConfig({ ...base, repositories })).toThrow();
+  });
+
+  it("mints installation-wide tokens without a repositories field and paginates beyond 500 repositories", async () => {
+    const overrides: Record<string, unknown> = {};
+    for (let page = 1; page <= 7; page++) {
+      overrides[`/installation/repositories?per_page=100&page=${page}`] = {
+        repositories: page === 7 ? [] : Array.from({ length: 100 }, (_, index) => ({
+          id: (page - 1) * 100 + index + 1, full_name: `owner/repo${(page - 1) * 100 + index}`,
+        })),
+      };
+    }
+    const { client, fetcher } = fixture(overrides);
+    const result = await client.acquire("scope", parseGitHubAppConfig({ ...base, repositories: "*" }), privateKey);
+    expect(result.github.repositoryCount).toBe(600);
+    expect(result.github.repositories?.at(-1)?.fullName).toBe("owner/repo599");
+    const mint = fetcher.mock.calls.find(([url]) => String(url).endsWith("/access_tokens"))!;
+    expect(JSON.parse(mint[1]!.body as string)).toEqual({ permissions: config.permissions });
+  });
+
+  it("keeps GitHub's selected installation selection truthful in wildcard mode", async () => {
+    const { client } = fixture({ "/app/installations/456": {
+      id: 456, app_id: 123, repository_selection: "selected", account: { login: "owner" }, permissions: config.permissions,
+    } });
+    const result = await client.acquire("scope", parseGitHubAppConfig({ ...base, repositories: "*" }), privateKey);
+    expect(result.github.repositorySelection).toBe("selected");
+    expect(result.github.repositoryCount).toBe(1);
+  });
+
   it("normalizes repository scope without widening it", () => {
     expect(parseGitHubAppConfig({ ...base, repositories: "Owner/Repo,owner/repo\nowner/second" }).repositories).toEqual(["owner/repo", "owner/second"]);
   });
