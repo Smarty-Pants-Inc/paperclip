@@ -1,4 +1,4 @@
-import type { QueryClient } from "@tanstack/react-query";
+import type { Query, QueryClient } from "@tanstack/react-query";
 import type { InstanceExperimentalSettings, Issue, IssueComment } from "@paperclipai/shared";
 import { issuesApi } from "@/api/issues";
 import { getIssueRecentCommentsQueryOptions } from "./issue-comment-window-query";
@@ -187,6 +187,15 @@ export function getIssueDetailQueryOptions(
     queryKey: queryKeys.issues.detail(issueRef),
     queryFn: ({ signal }: { signal?: AbortSignal }) => fetchIssueDetail(queryClient, issueRef, { signal }),
     placeholderData: getCachedIssueDetail(queryClient, issueRef, options?.placeholderIssue ?? undefined),
+    // Cancellation can commit after the final run/comment event. Reconcile a
+    // visible board card even when that event was missed; stop once it clears.
+    // React Query suspends this interval while the browser is in the background.
+    refetchInterval: (query: Query<Issue>) => {
+      const action = query.state.data?.activeRecoveryAction;
+      return action?.ownerType === "board" && ["active", "escalated"].includes(action.status)
+        ? 10_000
+        : false;
+    },
   };
 }
 
