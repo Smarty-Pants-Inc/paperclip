@@ -3241,12 +3241,29 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
     (runs.find((run) => run.id === workingObservedRunId)?.status === "succeeded" &&
       comments.some((comment) => !comment.deletedAt && comment.authorType === "agent" &&
         (comment.createdByRunId ?? comment.runId) === workingObservedRunId))));
+  // With no live tail, a bare 'working' projection is not startup authority
+  // after a saved reply. Its observed run can be old, absent, or not joined to
+  // history yet (gate 7 stopq). New intent/recovery and local submissions still
+  // owe feedback; a real successor owns its live tail independently of this arm.
+  const hasAnsweredReply = useMemo(() => {
+    const statusByRunId = new Map(runs.map(run => [run.id, run.status]));
+    return comments.some(comment => {
+      const runId = comment.createdByRunId ?? comment.runId ?? comment.derivedCreatedByRunId;
+      if (!runId || comment.deletedAt || comment.clientStatus || comment.authorType !== "agent" ||
+        !comment.body.trim() || comment.body === LEGACY_WITHHELD_RUN_COMMENT) return false;
+      if (presentedReplyRunIds.has(runId)) return true;
+      const status = statusByRunId.get(runId);
+      return (status === undefined || status === "succeeded") &&
+        !semanticProgressCommentIds(linkedRunMetaById.get(runId)?.resultJson).has(comment.id);
+    });
+  }, [comments, runs, presentedReplyRunIds, linkedRunMetaById]);
   const optimisticRunnerStartup =
     hasAgentAssignee &&
     !startupBlocked &&
     !tailRunId &&
     (props.retryPreparing ||
-      (props.interruption?.state === "working" && !interruptionRunAnswered &&
+      (props.interruption?.state === "working" &&
+        (!(interruptionRunAnswered || hasAnsweredReply) || props.interruption.intentId || props.interruption.recoveryStep) &&
         !(personStoppedRunId && props.interruption.observedRunId === personStoppedRunId)) ||
       runnerSubmissionPending ||
       commentItems.some(
