@@ -21,7 +21,7 @@ import { beforeAll, afterAll, describe, it, expect, vi } from "vitest";
 import {
   applyPendingMigrations, approvals, issueApprovals, issueThreadInteractions, chatConversations, chatEndpoints, toolApplications, toolConnections,
   agentWakeupRequests, agents, companies, createDb, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions,
-  issues, nativeRunFinalizations, nativeRunResults, completionContracts, environmentLeases, environments, issueRelations, issueTreeHolds, issueTreeHoldMembers, workspaceOperations, type Db,
+  issues, nativeRunFinalizations, nativeRunResults, completionContracts, environmentLeases, environments, executionWorkspaces, issueRelations, issueTreeHolds, issueTreeHoldMembers, workspaceOperations, type Db,
 } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase, getEmbeddedPostgresTestSupport } from "../__tests__/helpers/embedded-postgres.js";
 import { resolveExternalTestDatabaseUrl } from "../__tests__/helpers/external-test-database.js";
@@ -95,6 +95,71 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
       onBlocked: reason => blocked.push(reason) });
     return { result, blocked, reads };
   }
+  it.each(["valid", "system_stop", "other_person", "missing_exit", "destroyed", "wrong_box", "other_owner", "files_not_retained", "cleanup", "controller", "workspace_writer", "approval"])(
+    "A2 person Stop crosses the repair hold only with all four proofs (%s)", async gate => {
+      const f = await seed(), leaseId = randomUUID(), workspaceId = randomUUID(), pluginId = randomUUID(), queueId = randomUUID();
+      await db.insert(agentWakeupRequests).values({ id: queueId, companyId: f.companyId, agentId: f.agentId,
+        source: "on_demand", reason: "issue_commented", status: "deferred_issue_execution", requestedByActorType: "user", requestedByActorId: "board",
+        payload: { issueId: f.issueId, commentId: f.commentId, _paperclipWakeContext: { wakeCommentIds: [f.commentId] } } });
+      const stoppedAt = "2026-09-11T10:00:00.000Z", acquiredAt = new Date("2026-09-11T09:00:00Z");
+      const providerLeaseId = `retained-${leaseId}`;
+      await db.insert(executionWorkspaces).values({ id: workspaceId, companyId: f.companyId, sourceIssueId: f.issueId,
+        mode: "isolated_workspace", strategyType: "project_primary", name: "Retained person's work", providerType: "remote" });
+      const recovery = { schema: "paperclip.workspace-restore-recovery.v1", runId: f.sourceRunId, leaseIds: [leaseId] };
+      await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "user_cancelled", nativeSessionId: randomUUID(), resultJson: {
+        workspaceRestoreFailure: "restore_failed", workspaceRestoreRecovery: recovery,
+        cancelledByActorType: gate === "system_stop" ? "system" : "user", cancelledByUserId: gate === "other_person" ? "someone-else" : "board",
+        cancellation: { recordedAt: stoppedAt, initiator: { type: gate === "system_stop" ? "system" : "user", id: "board" } },
+        nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId: f.sourceRunId,
+          companyId: f.companyId, issueId: f.issueId, scope: "run", reasonCode: "cancellation_run_only", intentId: randomUUID(), intentAuditId: randomUUID(),
+          dispatchState: "acknowledged", dispatched: true, acknowledgementAuditId: randomUUID(), acknowledgedAt: stoppedAt },
+      } }).where(eq(heartbeatRuns.id, f.sourceRunId));
+      const identity = { companyId: f.companyId, runId: f.sourceRunId, leaseId, provider: "a2-fixture", providerLeaseId };
+      const receipt = { ...identity, schema: "paperclip.sandbox-stop-and-retain-receipt.v1", method: "environmentStopLease", pluginId,
+        requestId: randomUUID(), confirmedAt: stoppedAt };
+      const metadata: Record<string, unknown> = { pluginId, sandboxProviderPlugin: true,
+        remoteExecutionTermination: { ...identity, schema: "paperclip.remote-termination.v1", state: gate === "destroyed" ? "destroyed" : "stopped", confirmedAt: stoppedAt },
+        ...(gate === "files_not_retained" ? {} : { workspaceRestoreRecovery: recovery }),
+        ...(gate === "missing_exit" ? {} : { sandboxStopAndRetainReceipt: { ...receipt, ...(gate === "wrong_box" ? { providerLeaseId: "another-box" } : {}) } }),
+      };
+      await db.insert(environmentLeases).values({ id: leaseId, companyId: f.companyId, issueId: f.issueId,
+        heartbeatRunId: f.sourceRunId, executionWorkspaceId: workspaceId, provider: identity.provider, providerLeaseId,
+        status: "released", leasePolicy: gate === "files_not_retained" ? "ephemeral" : "retain_on_failure",
+        acquiredAt, releasedAt: new Date(stoppedAt), cleanupStatus: gate === "cleanup" ? "failed" : "success", metadata });
+      await db.update(issueRecoveryActions).set({ evidence: { runId: f.sourceRunId, systemRecovery: createSystemRecovery(f.sourceRunId),
+        workspaceRestoreFailure: "restore_failed", automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } } }).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+      if (gate === "controller") await db.update(nativeRunFinalizations).set({ leaseOwner: "another-worker", leaseExpiresAt: new Date(Date.now() + 60_000) })
+        .where(eq(nativeRunFinalizations.runId, f.sourceRunId));
+      if (gate === "other_owner") await db.insert(environmentLeases).values({ companyId: f.companyId, issueId: f.issueId,
+        provider: identity.provider, providerLeaseId, status: "active", leasePolicy: "ephemeral" });
+      if (gate === "workspace_writer") await db.insert(workspaceOperations).values({ companyId: f.companyId,
+        executionWorkspaceId: workspaceId, status: "running", phase: "publish", createdAt: new Date(), updatedAt: new Date() });
+      if (gate === "approval") {
+        const [approval] = await db.insert(approvals).values({ companyId: f.companyId, type: "hire_agent", status: "pending", payload: {} }).returning();
+        await db.insert(issueApprovals).values({ companyId: f.companyId, issueId: f.issueId, approvalId: approval.id });
+      }
+      const sourceBefore = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId)))[0];
+      const leaseBefore = (await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId)))[0];
+      const blocked: string[] = [];
+      const continuationInput = { ...f, queuedCommentRequestId: queueId, onBlocked: (reason: string) => blocked.push(reason) };
+      const result = await admit(continuationInput);
+      if (gate === "valid") {
+        expect(result, blocked.join(", ")).toMatchObject({ previousRunId: f.sourceRunId, commentId: f.commentId,
+          readiness: { mode: "fresh_isolated_workspace", sourceRunId: f.sourceRunId, retryIntentId: queueId, retainedSourceIds: [leaseId] } });
+        const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+        expect(actions.find(action => action.evidence.systemRecovery)?.evidence).toMatchObject({ systemRecovery: { freshAttemptRunId: f.successorRunId } });
+        expect(actions).toContainEqual(expect.objectContaining({ evidence: expect.objectContaining({
+          continuationRunId: f.successorRunId,
+          freshContinuation: expect.objectContaining({ schema: "paperclip.fresh-continuation.v1", sourceRunId: f.sourceRunId }),
+        }) }));
+      } else expect(result).toBeNull();
+      expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId)))[0], "admission never releases or edits the retained custody").toEqual(leaseBefore);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId)))[0], "source receipts are retained; only the fresh-thread fence may be added")
+        .toEqual(gate === "valid" ? { ...sourceBefore, resultJson: { ...sourceBefore!.resultJson,
+          freshContinuationSupersededAt: expect.any(String) } } : sourceBefore);
+    },
+  );
+
   it("never calls a pre-failure message pre-Stop without the one person-Stop hold reader", async () => {
     const f = await seed();
     await db.update(heartbeatRuns).set({ startedAt: new Date("2026-09-11T09:58:00Z") })
