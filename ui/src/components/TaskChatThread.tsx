@@ -3228,42 +3228,47 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
   // A 'working' body that only says its observed run is still running (no
   // input waits on it, no recovery step) is not a turn starting once the
   // server says that run is finished: its reply is presented, its terminal
-  // event is in its transcript, it is listed succeeded with its reply, or the
+  // event is in its transcript, or the
   // live-runs list dropped it after having it (gate 4 t1; B' gate 3 at 390;
   // s-steer8, where the issue runs list read 'running' ~8 s more). A reply
   // alone is not that fact: a run that posted a mid-run comment and is still
   // producing keeps its row (RFL on 4d84f57a). A person's input still shows.
   const workingObservedRunId = props.interruption?.state === "working" && !props.interruption.intentId
     && !props.interruption.recoveryStep ? props.interruption.observedRunId : null;
-  const interruptionRunAnswered = Boolean(workingObservedRunId && (presentedReplyRunIds.has(workingObservedRunId) ||
+  const observedRunSettled = Boolean(workingObservedRunId && (presentedReplyRunIds.has(workingObservedRunId) ||
     (transcriptByRun.get(workingObservedRunId) ?? []).some((entry) => entry.kind === "run_terminal") ||
-    droppedLiveRunIds.has(workingObservedRunId) ||
-    (runs.find((run) => run.id === workingObservedRunId)?.status === "succeeded" &&
-      comments.some((comment) => !comment.deletedAt && comment.authorType === "agent" &&
-        (comment.createdByRunId ?? comment.runId) === workingObservedRunId))));
-  // With no live tail, a bare 'working' projection is not startup authority
-  // after a saved reply. Its observed run can be old, absent, or not joined to
-  // history yet (gate 7 stopq). New intent/recovery and local submissions still
-  // owe feedback; a real successor owns its live tail independently of this arm.
-  const hasAnsweredReply = useMemo(() => {
+    droppedLiveRunIds.has(workingObservedRunId)));
+  // A known observed run owns its own startup responsibility: a different
+  // run's answer cannot cancel it, even when live/active polls have no tail.
+  // Release bare 'working' only after that run ends with a visible saved or
+  // settled transcript reply. With no known observed run, retain the visible-
+  // reply fallback; explicit intent/recovery and local submissions still win.
+  const interruptionRunAnswered = useMemo(() => {
+    // Keep FINAL5e's own-run completion evidence ahead of a stale running poll.
+    if (observedRunSettled) return true;
     const statusByRunId = new Map(runs.map(run => [run.id, run.status]));
+    const observedRunId = props.interruption?.observedRunId;
+    const observedStatus = observedRunId ? statusByRunId.get(observedRunId) : undefined;
+    if (observedStatus !== undefined && !isTerminalRunStatus(observedStatus)) return false;
+    const replyInScope = (runId: string) => observedStatus === undefined || runId === observedRunId;
+    if ([...settledReplyRunIds].some(replyInScope)) return true;
     return comments.some(comment => {
       const runId = comment.createdByRunId ?? comment.runId ?? comment.derivedCreatedByRunId;
-      if (!runId || comment.deletedAt || comment.clientStatus || comment.authorType !== "agent" ||
+      if (!runId || !replyInScope(runId) || comment.deletedAt || comment.clientStatus || comment.authorType !== "agent" ||
         !comment.body.trim() || comment.body === LEGACY_WITHHELD_RUN_COMMENT) return false;
       if (presentedReplyRunIds.has(runId)) return true;
       const status = statusByRunId.get(runId);
       return (status === undefined || status === "succeeded") &&
         !semanticProgressCommentIds(linkedRunMetaById.get(runId)?.resultJson).has(comment.id);
     });
-  }, [comments, runs, presentedReplyRunIds, linkedRunMetaById]);
+  }, [observedRunSettled, props.interruption?.observedRunId, comments, runs, presentedReplyRunIds, settledReplyRunIds, linkedRunMetaById]);
   const optimisticRunnerStartup =
     hasAgentAssignee &&
     !startupBlocked &&
     !tailRunId &&
     (props.retryPreparing ||
       (props.interruption?.state === "working" &&
-        (!(interruptionRunAnswered || hasAnsweredReply) || props.interruption.intentId || props.interruption.recoveryStep) &&
+        (!interruptionRunAnswered || props.interruption.intentId || props.interruption.recoveryStep) &&
         !(personStoppedRunId && props.interruption.observedRunId === personStoppedRunId)) ||
       runnerSubmissionPending ||
       commentItems.some(
