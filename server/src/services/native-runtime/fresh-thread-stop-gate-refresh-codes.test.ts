@@ -6,7 +6,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { truncateTablesWithDeadlockRetry } from "../../__tests__/helpers/truncate-with-deadlock-retry.js";
 import { ensureFreshContinuation, resetBacklogContinuationPacingForTests } from "../fresh-continuation-fallback.js";
 import { heartbeatService } from "../heartbeat.js";
-import { isInstructionRefreshPrepareCode, RUNNER_PREPARE_REFUSAL_CODES, NativeRunnerRefreshRequiredError } from "../../vendor/paperclip-runner/index.js";
+import { isInstructionRefreshPrepareCode, RUNNER_PREPARE_REFUSAL_CODES, NativeRunnerRefreshRequiredError, parseNativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
 import { freshThreadRefusalCode } from "./runner-reconciliation-refusal.js";
 import { FRESH_THREAD_STARTED_NOTE, freshThreadStartedNote } from "./fresh-thread-stop-gate.js";
 import { PI_CONVERSATION_KEY, selectPiConversation } from "./pi-conversation-record.js";
@@ -39,6 +39,34 @@ suite("fresh thread wording follows Runner instruction-refresh codes", () => {
     const [action] = await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId, kind: "active_run_watchdog", status: "active", ownerType: "board", returnOwnerAgentId: agentId, cause: "native_continuation_requires_reconciliation", fingerprint: `native-continuation:${runId}`, nextAction: "Reconcile previous execution", maxAttempts: 3, createdAt: finishedAt, evidence: { runId, originalFailureCode: "native_runner_refresh_required", nativeFailureBlock: { runId, statusVersion: 4 } } }).returning();
     return { issueId, runId, actionId: action.id };
   }
+
+  it("names a model edit from persisted launch inputs even when the prepare code is provider_config_changed", async () => {
+    const f = await seed();
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const previousId = randomUUID();
+    const input = (runId: string, model: string) => parseNativeExecutionInput({
+      schema: "paperclip.native-execution-input.v1", provider: { kind: "codex", model },
+      binding: { companyId, agentId, issueId: f.issueId, runId, executionWorkspaceId: randomUUID() },
+      task: { identifier: "FTR-1", title: "Refresh", description: null, prompt: "Answer", workMode: "standard" },
+      workspace: { cwd: "/tmp/fresh-thread-refresh", repoUrl: null, repoRef: null, branchName: null },
+      session: { normalizedSessionId: source.nativeSessionId, driverKind: "codex_app_server", protocolVersion: 1,
+        lifecyclePolicy: { mode: "warm", idleTimeoutMs: 300_000 } },
+      completionContract: { id: "contract", sha256: "sha", schemaVersion: "paperclip.completion-contract.v1",
+        contract: { revision: "1", objective: "Answer", criteria: [{ id: "answer", requirement: "Answer the person" }] } },
+      interactionResponses: [], credentialBindings: [],
+    });
+    const profile = (runId: string, model: string) => ({ nativeExecutionInput: input(runId, model) }) as typeof source.runnerProfileJson;
+    await db.insert(heartbeatRuns).values({ id: previousId, companyId, agentId, issueId: f.issueId,
+      nativeIssueId: f.issueId, runtimeMode: "native", invocationSource: "assignment", status: "succeeded",
+      nativeSessionId: source.nativeSessionId, createdAt: new Date(source.createdAt.getTime() - 1000),
+      runnerProfileJson: profile(previousId, "before") });
+    const [changed] = await db.update(heartbeatRuns).set({ runnerProfileJson: profile(f.runId, "after"),
+      resultJson: { nativeFreshContinuationRefusal: { code: "native_runner_refresh_required", prepareRefusalCode: "provider_config_changed" } },
+    }).where(eq(heartbeatRuns.id, f.runId)).returning();
+    const note = await freshThreadStartedNote(db, changed);
+    expect(note).toMatch(/your model change is in effect/i);
+    expect(note).not.toMatch(/skill change/i);
+  });
 
   // follow-Paperclip Cut B R2: recording is silent; actual selection owns one started note and one linked thread, including replay.
   it.each(RUNNER_PREPARE_REFUSAL_CODES)("%s writes its refresh wording once at actual session selection, not settlement", async prepareCode => {
@@ -76,7 +104,10 @@ suite("fresh thread wording follows Runner instruction-refresh codes", () => {
     expect(notes[0]).toMatchObject({ body: await freshThreadStartedNote(db, source),
       metadata: { authorizationReason: `fresh_provider_thread:${continued.recoveryActionId}` } });
     if (isInstructionRefreshPrepareCode(prepareCode)) {
-      expect(notes[0].body).toMatch(/your skill change is in effect/i);
+      // This historical row has no launch inputs. A generic refresh receipt
+      // cannot identify a skill edit (or a model edit).
+      expect(notes[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
+      expect(notes[0].body).not.toMatch(/your (skill|model) change/i);
     } else {
       expect(notes[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
     }

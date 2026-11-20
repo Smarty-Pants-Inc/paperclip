@@ -139,6 +139,27 @@ describe("deriveRecoveryCardState", () => {
 });
 
 describe("IssueRecoveryActionCard", () => {
+  it("uses the exact source run's automatic retry instead of asking for a human decision", () => {
+    const action = buildAction({ kind: "active_run_watchdog", ownerType: "board", wakePolicy: null, evidence: { runId: "failed-run" } });
+    const scheduledRetry = { runId: "retry-run", status: "scheduled_retry" as const, agentId: "agent", agentName: null,
+      retryOfRunId: "failed-run", scheduledRetryAt: "2099-01-01T00:00:00Z", scheduledRetryAttempt: 1, scheduledRetryReason: "transient" };
+    expect(deriveRecoveryCardState(action, { scheduledRetry })).toBe("in_progress");
+    const node = render(<IssueRecoveryActionCard action={action} scheduledRetry={scheduledRetry} />);
+    expect(node.textContent).not.toContain("needs a human decision");
+    expect(node.textContent).not.toContain("until an explicit decision");
+    expect(node.textContent).toContain("automatically");
+    expect(deriveRecoveryCardState(action, { scheduledRetry: { ...scheduledRetry, retryOfRunId: "another-run" } })).toBe("needed");
+    expect(deriveRecoveryCardState(action, { scheduledRetry: { ...scheduledRetry, status: "cancelled" } })).toBe("needed");
+  });
+
+  it("does not ask for a human decision while a board-owned recovery has a scheduled automatic resume", () => {
+    const action = buildAction({ kind: "active_run_watchdog", cause: "native_finalization_invalid", ownerType: "board",
+      wakePolicy: { kind: "resume_native_run", runId: "native-run", notBefore: "2099-01-01T00:00:00Z" } });
+    expect(deriveRecoveryCardState(action)).toBe("in_progress");
+    const node = render(<IssueRecoveryActionCard action={action} />);
+    expect(node.textContent).not.toContain("needs a human decision");
+    expect(node.textContent).toContain("scheduled another attempt");
+  });
   it.each(["running", "scheduled", "missed"] as const)("describes native %s finalization without claiming another agent turn", (state) => {
     const node = render(<IssueRecoveryActionCard action={buildAction({
       kind: "active_run_watchdog", cause: "native_finalization_invalid",

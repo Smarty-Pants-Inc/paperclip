@@ -178,10 +178,11 @@ describe("deriveRecoveryDisplayState", () => {
       }, { now })).toBe("in_progress");
     });
 
-    it("keeps exhausted retries and board-owned failures actionable", () => {
+    it("keeps exhausted retries actionable, but does not ask the board to perform an already scheduled automatic retry", () => {
       const wakePolicy = { ...action.wakePolicy, notBefore: "2026-09-27T02:01:00.000Z" };
       expect(deriveRecoveryDisplayState({ ...action, wakePolicy, attemptCount: 3 }, { now })).toBe("needed");
-      expect(deriveRecoveryDisplayState({ ...action, wakePolicy, ownerType: "board" }, { now })).toBe("needed");
+      expect(deriveRecoveryDisplayState({ ...action, wakePolicy, ownerType: "board" }, { now })).toBe("in_progress");
+      expect(deriveRecoveryDisplayState({ ...action, wakePolicy: null, ownerType: "board" }, { now })).toBe("needed");
     });
   });
 

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { agentTaskSessions, heartbeatRuns, issueComments, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import type { NativeExecutionInput, PrpEvent } from "../../vendor/paperclip-runner/index.js";
@@ -239,9 +240,43 @@ export async function materializePiSessionRecoveryNotice(input: {
     : "Pi saved-history recovery owner alarm: saved history unavailable; native session restarted fresh");
 }
 
+/** Compare admitted launch inputs, not the generic refresh refusal. Working-copy
+ * paths belong to a run, so compare instruction/skill content identities instead. */
+export type LaunchProfileChange = "model" | "skills" | "instructions" | "thinking level" | "runtime configuration";
+export function launchProfileChanges(previous: NativeExecutionInput, current: NativeExecutionInput): LaunchProfileChange[] {
+  if (previous.binding.companyId !== current.binding.companyId || previous.binding.agentId !== current.binding.agentId
+    || previous.binding.issueId !== current.binding.issueId) return [];
+  const changes: LaunchProfileChange[] = [];
+  const { model: oldModel, piRpcThinkingLevel: oldThinking, ...oldProvider } = record(previous.provider);
+  const { model: newModel, piRpcThinkingLevel: newThinking, ...newProvider } = record(current.provider);
+  if (oldModel !== newModel) changes.push("model");
+  if (oldThinking !== newThinking) changes.push("thinking level");
+  const oldContext = record(record(previous).runtimeContext), newContext = record(record(current).runtimeContext);
+  const instructions = (context: Record<string, unknown>) => {
+    const value = record(context.instructions);
+    return { digest: record(value.bundle).digest, entryPath: value.entryPath };
+  };
+  const skills = (context: Record<string, unknown>) => (Array.isArray(context.skills) ? context.skills : []).map(value => {
+    const skill = record(value);
+    return { key: skill.key, runtimeName: skill.runtimeName, versionId: skill.versionId, digest: record(skill.bundle).digest };
+  }).sort((a, b) => String(a.key).localeCompare(String(b.key)));
+  if (!isDeepStrictEqual(skills(oldContext), skills(newContext))) changes.push("skills");
+  if (!isDeepStrictEqual(instructions(oldContext), instructions(newContext))) changes.push("instructions");
+  if (!isDeepStrictEqual(oldProvider, newProvider) || !isDeepStrictEqual(previous.session.lifecyclePolicy, current.session.lifecyclePolicy)
+    || record(previous).homeMode !== record(current).homeMode || record(previous).executionMode !== record(current).executionMode
+    || !isDeepStrictEqual(oldContext.prompt, newContext.prompt) || !isDeepStrictEqual(oldContext.mcp, newContext.mcp)) {
+    changes.push("runtime configuration");
+  }
+  return changes;
+}
+
+export function launchProfileChangeLabel(changes: readonly LaunchProfileChange[] = []): string {
+  return changes.length ? changes.join(" and ") : "runtime configuration";
+}
+
 /** J3-22 member (a): the person-visible line of a refused restore continued in a fresh thread. A
  * continuation, never a failure: the run goes on and answers. */
-export function restoreUnavailableContinuationNoticeBody(reason: string): string {
+export function restoreUnavailableContinuationNoticeBody(reason: string, changes: readonly LaunchProfileChange[] = []): string {
   // Path-neutral and true on both opens: only a fresh OPEN sends the saved-
   // history handoff (NSR session === null); a fresh thread taken while
   // recovering the saved session gets this run's message only (the real-runner
@@ -249,7 +284,7 @@ export function restoreUnavailableContinuationNoticeBody(reason: string): string
   // F20: a changed launch profile is taken on the OPEN path only, where the
   // fresh session gets the saved-history handoff.
   if (reason === "launch_profile_changed") {
-    return "Continuing in a fresh thread: the agent's runtime configuration changed, so the earlier provider thread "
+    return `Continuing in a fresh thread: the agent's ${launchProfileChangeLabel(changes)} changed, so the earlier provider thread `
       + "could not be continued; this reply continues the same conversation in a fresh provider thread from its saved history. "
       + `Earlier actions with unknown outcomes are not confirmed or replayed. (${reason})`;
   }
@@ -265,6 +300,7 @@ export function restoreUnavailableContinuationNoticeBody(reason: string): string
  */
 export async function writeRestoreUnavailableContinuationNotice(db: Db, input: {
   companyId: string; issueId: string; agentId: string; runId: string; code: string; reason: string;
+  changes?: readonly LaunchProfileChange[];
 }): Promise<boolean> {
   const authorizationReason = `restore_unavailable_fresh_thread:${input.reason}:${input.runId}`;
   return db.transaction(async tx => {
@@ -276,7 +312,7 @@ export async function writeRestoreUnavailableContinuationNotice(db: Db, input: {
       eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
       sql`${issueComments.metadata}->>'authorizationReason' = ${authorizationReason}`)).limit(1);
     if (existing) return false;
-    await issueService(db).addComment(input.issueId, restoreUnavailableContinuationNoticeBody(input.reason), {}, { authorType: "system",
+    await issueService(db).addComment(input.issueId, restoreUnavailableContinuationNoticeBody(input.reason, input.changes), {}, { authorType: "system",
       presentation: { kind: "system_notice", tone: "info", density: "compact", detailsDefaultOpen: false },
       metadata: { version: 1, authorizationReason,
         sections: [{ rows: [{ type: "run_link", runId: input.runId, agentId: input.agentId, title: "Continued in a fresh thread" }] }] } }, tx);

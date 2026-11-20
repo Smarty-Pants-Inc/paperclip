@@ -370,7 +370,8 @@ import { parseStrictIsoInstant } from "./strict-iso-instant.js";
 import { readNativeRunWakeRequestedAtMs } from "./native-run-wake-anchor.js";
 import { noteNativeRunnerEvidence } from "./native-runner-evidence-signal.js";
 import { HELD_CONVERSATION_NOTICE_REASON_PREFIX, materializePiSessionRecoveryNotice, piSessionRecovery,
-  readUnsupersededHeldConversationNotice, writeRestoreUnavailableContinuationNotice } from "./pi-session-recovery-notice.js";
+  readUnsupersededHeldConversationNotice, writeRestoreUnavailableContinuationNotice, launchProfileChanges,
+  type LaunchProfileChange } from "./pi-session-recovery-notice.js";
 import { resolvePredecessorRunnerLease } from "./predecessor-runner-lease.js";
 import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
 import { registerLiveRunnerGoalController } from "../runner-goal-control-broker.js";
@@ -18650,6 +18651,27 @@ async function createRunnerdBackendWithinSessionClaim(
     throw error;
   }
   const { root, durableIdentity, durableBinding } = durableState ??= readDurableState();
+  // New-turn launch selection has already retired an incompatible warm owner.
+  // Read the actual admitted predecessor, not the agent's now-edited settings
+  // or a generic Runner refusal, to describe that boundary truthfully.
+  let profileChanges: LaunchProfileChange[] = [];
+  if (input.execution.provider.kind === "pi_rpc" && !input.restartRecovery && !input.remoteWarmRecovery) {
+    const { companyId, agentId, issueId, runId } = input.execution.binding;
+    const priorOwnerRunId = durableIdentityMatchesSession(durableIdentity, input.execution) && durableIdentity.runId !== runId
+      ? durableIdentity.runId : null;
+    const [previous] = await input.db.select({ profile: heartbeatRuns.runnerProfileJson }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.nativeIssueId, issueId),
+      // A cancelled preparation has not necessarily applied its profile. Prefer
+      // the durable owner; absent one, use only a completed predecessor.
+      priorOwnerRunId ? eq(heartbeatRuns.id, priorOwnerRunId) : and(
+        sql`${heartbeatRuns.createdAt} < (select created_at from ${heartbeatRuns} where id = ${runId})`,
+        eq(heartbeatRuns.status, "succeeded")),
+    )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+    if (previous?.profile?.nativeExecutionInput) {
+      try { profileChanges = launchProfileChanges(parseNativeExecutionInput(previous.profile.nativeExecutionInput), input.execution); }
+      catch { /* An unparseable historical input cannot establish what changed. */ }
+    }
+  }
   const stagedRecovery = input.restartRecovery?.kind === "reattach_remote_runner"
     ? await verifyStagedAttachmentRestart(input) : null;
   const retainedSystemInstructions = input.restartRecovery?.kind === "reattach_remote_runner"
@@ -20707,19 +20729,23 @@ async function createRunnerdBackendWithinSessionClaim(
       const state = await readRemoteRunnerProviderState({ runner: remoteCommandRunner,
         stateDirectory: remoteStateDirectory, execution: input.execution });
       const goal = state.goal && typeof state.goal === "object" ? state.goal as Record<string, unknown> : null;
+      const bridge = record(state.toolBridge);
       return (state.activeProviderTurnId ?? null) === null && (state.piDeferredTerminal ?? null) === null
-        && state.ambiguousTurnStartPending !== true && goal?.status !== "active" && goal?.workingNow !== true;
+        && (state.startupAttempt ?? null) === null && state.ambiguousTurnStartPending !== true
+        && Object.keys(record(bridge.pending)).length === 0
+        && (!Array.isArray(state.descendantThreadIds) || state.descendantThreadIds.length === 0)
+        && goal?.status !== "active" && goal?.workingNow !== true;
     } catch { return false; }
   };
   const takeRestoreUnavailableFreshThread = async (failure: unknown, previous?: PersistedNativeSession,
-    path: "open" | "recover" = "recover"): Promise<boolean> => {
+    path: "open" | "recover" = "recover", admittedLaunchChange = false): Promise<boolean> => {
     // F20 (gate-6 dress): on the OPEN path only, the runner's launch-profile
     // refusal of the box's legacy state is taken the same way. An open means
     // no checkpoint of this run (NSR session === null), so the fresh session
     // gets NSR's saved-history handoff. The recover path keeps it: NSR's
     // in-run replacement owns that refusal there.
-    const launchProfile = path === "open" && restoreUnavailableOnNewBoxCode(failure) === null
-      && freshThreadRefusalCode(failure) === LAUNCH_PROFILE_MISMATCH_CODE;
+    const launchProfile = path === "open" && (admittedLaunchChange || restoreUnavailableOnNewBoxCode(failure) === null
+      && freshThreadRefusalCode(failure) === LAUNCH_PROFILE_MISMATCH_CODE);
     const code = launchProfile ? LAUNCH_PROFILE_MISMATCH_CODE : restoreUnavailableOnNewBoxCode(failure);
     if (code === null || restoreUnavailableFreshThread || remoteTarget?.transport !== "sandbox"
       || !remoteCommandRunner || !sandboxLeaseAcquisition?.providerLeaseId
@@ -20762,7 +20788,7 @@ async function createRunnerdBackendWithinSessionClaim(
         + `new sandbox (${code}); this run continues the conversation in a fresh provider thread (${reason}).\n`);
     const { companyId, issueId, agentId, runId } = input.execution.binding;
     await writeRestoreUnavailableContinuationNotice(input.db, { companyId, issueId, agentId, runId, code,
-      reason }).catch(async (error: unknown) => {
+      reason, changes: profileChanges }).catch(async (error: unknown) => {
       await input.onLog?.("stderr", `[paperclip-runner] continuation note not written: ${
         redactSensitiveText(error instanceof Error ? error.message : String(error)).slice(0, 256)}\n`);
     });
@@ -20959,6 +20985,13 @@ async function createRunnerdBackendWithinSessionClaim(
     await prepareRemoteRunner(mode);
     if (sandboxRetention && guardianQualification) await sandboxRetention.qualify(guardianQualification);
   };
+  // Retirement of the warm process is not enough: its durable provider state
+  // still describes the old model/instructions. Archive that settled state
+  // before preparation, so neither run.prepare nor pack preparation repeats.
+  // Never rotate an adopted/live recovery owner.
+  if (profileChanges.length && !adoptedProcess && !input.remoteWarmRecovery && !input.restartRecovery) {
+    await takeRestoreUnavailableFreshThread(undefined, undefined, "open", true);
+  }
   if (requiresRemoteProviderPack || sandboxRetention && !sandboxRetention.released) {
     await prepareNativeRemoteRunner({ target, runnerIngressAuthorized: input.runnerIngressAuthorized === true,
       runnerPublicUrl: input.runnerPublicUrl, runnerCaBundlePath: input.runnerCaBundlePath,
@@ -21526,10 +21559,14 @@ async function createRunnerdBackendWithinSessionClaim(
           // request or goal of the old thread can ride on this open.
           if (!await takeRestoreUnavailableFreshThread(error, undefined, "open")) throw error;
           session = await backend.openSession(sessionInput);
-          await recordRestoreUnavailableFreshThread();
         }
+        if (restoreUnavailableFreshThread) await recordRestoreUnavailableFreshThread();
         const managed = wrapManagedSession(session);
         await recordAdmittedProviderPack(managed, sessionInput.identity, Boolean(adoptedProcess));
+        if (profileChanges.length && !restoreUnavailableFreshThread) {
+          await writeRestoreUnavailableContinuationNotice(input.db, { ...input.execution.binding,
+            code: LAUNCH_PROFILE_CHANGED_REASON, reason: LAUNCH_PROFILE_CHANGED_REASON, changes: profileChanges });
+        }
         return managed;
       } catch (error) { cursorCloudRuntime?.unregister(); throw error; }
     },

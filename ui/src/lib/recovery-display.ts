@@ -66,6 +66,20 @@ export type RecoveryDisplayInput = Pick<
     >
   >;
 
+/** A retry only describes this recovery when its parent is the recorded source.
+ * An unrelated queued turn, an exhausted retry, or a missed deadline is not
+ * evidence that the system will resolve this action. */
+export function hasAutomaticRecoveryRetry(action: RecoveryDisplayInput, context?: RecoveryLivenessContext): boolean {
+  if (action.kind !== "active_run_watchdog" || ["resolved", "cancelled"].includes(action.status)) return false;
+  const retry = context?.scheduledRetry;
+  const evidence = action.evidence as Record<string, unknown> | null | undefined;
+  const sourceRunId = evidence?.runId ?? evidence?.sourceRunId ?? evidence?.latestRunId;
+  if (!retry?.runId || !retry.retryOfRunId || retry.retryOfRunId !== sourceRunId || retry.retryExhaustedReason) return false;
+  if (retry.status === "queued" || retry.status === "running") return true;
+  const due = retry.scheduledRetryAt == null ? NaN : new Date(retry.scheduledRetryAt).getTime();
+  return retry.status === "scheduled_retry" && Number.isFinite(due) && due + 30_000 >= (context?.now ?? Date.now());
+}
+
 export function deriveRecoveryDisplayState(
   action: RecoveryDisplayInput,
   context?: RecoveryLivenessContext,
@@ -89,6 +103,8 @@ export function deriveRecoveryDisplayState(
   // native run is already making progress. Actual activity wins over that
   // historical repair state, but a merely scheduled board retry does not.
   if (lineage?.lane === "native_run" && lineage.liveRunId) return "in_progress";
+  if (hasAutomaticRecoveryRetry(action, context)
+    || (lineage?.lane !== "board" && lineage?.hasDurablePath)) return "in_progress";
   if (action.status === "escalated") return "escalated";
   if (action.kind === "active_run_watchdog") {
     // Native finalization shares the watchdog kind, but resumes a failed
