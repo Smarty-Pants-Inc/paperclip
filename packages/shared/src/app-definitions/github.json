@@ -213,11 +213,11 @@
         },
         {
           "key": "repositories",
-          "placeholder": "acme/backend, acme/frontend",
+          "placeholder": "* or acme/backend, acme/frontend",
           "label": "Repositories",
           "type": "textarea",
           "required": true,
-          "helperMd": "Enter owner/repository names separated by commas. Each repository must be included in this App installation."
+          "helperMd": "Enter * alone for every repository this installation grants, or owner/repository names separated by commas to restrict access. With All repositories selected in GitHub, * also includes repositories added later. GitHub's installation selection and the chosen permissions still apply; do not mix * with names."
         },
         {
           "key": "permissionProfile",

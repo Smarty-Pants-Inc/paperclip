@@ -13,7 +13,7 @@ export type GitHubAppConfig = {
   version: 1;
   appId: string;
   installationId: string;
-  repositories: string[];
+  repositories: "*" | string[];
   permissions: Record<string, "read" | "write" | "admin">;
 };
 const profiles = {
@@ -77,8 +77,10 @@ export function parseGitHubAppConfig(value: unknown): GitHubAppConfig {
   const v = value as Record<string, unknown> | null;
   if (!v || (v.version !== undefined && v.version !== "1" && v.version !== 1) || !/^(?:[1-9]\d*|Iv[0-9][A-Za-z0-9.]{1,97})$/.test(String(v.appId ?? "")) || !/^[1-9]\d*$/.test(String(v.installationId ?? ""))
     || typeof v.repositories !== "string" || (v.permissionProfile !== "custom" && !Object.hasOwn(profiles, String(v.permissionProfile)))) githubAppFailure("configuration");
-  const repositories = [...new Set(v.repositories.split(/[,\n]/).map(s => s.trim().toLowerCase()).filter(Boolean))].sort();
-  if (!repositories.length || repositories.length > 500 || repositories.some(r => !/^[a-z0-9][a-z0-9-]*\/[a-z0-9_.-]+$/.test(r))) githubAppFailure("configuration");
+  const repositories = v.repositories === "*" ? "*"
+    : [...new Set(v.repositories.split(/[,\n]/).map(s => s.trim().toLowerCase()).filter(Boolean))].sort();
+  if (repositories !== "*" && (!repositories.length || repositories.length > 500
+    || repositories.some(r => !/^[a-z0-9][a-z0-9-]*\/[a-z0-9_.-]+$/.test(r)))) githubAppFailure("configuration");
   return { version: 1, appId: String(v.appId), installationId: String(v.installationId), repositories,
     permissions: v.permissionProfile === "custom" ? parseCustomPermissions(v.customPermissions) : { ...profiles[v.permissionProfile as keyof typeof profiles] } };
 }
@@ -101,6 +103,7 @@ const installationSchema = z.object({
   app_id: providerId,
   suspended_at: z.string().nullable().optional(),
   account: z.object({ login: z.string().min(1) }),
+  repository_selection: z.enum(["all", "selected"]).optional(),
   permissions: z.record(z.string(), z.string()),
 });
 const tokenSchema = z.object({ token: z.string().min(1), expires_at: z.string() });
@@ -136,33 +139,36 @@ export function createGitHubAppClient(fetcher: typeof fetch = fetch, clock = Dat
     if (String(installation.id) !== config.installationId || installation.app_id !== app.id
       || installation.suspended_at) githubAppFailure("installation");
     const owner = installation.account.login.toLowerCase();
-    if (config.repositories.some(repo => repo.split("/")[0] !== owner)) githubAppFailure("repositories");
+    if (config.repositories !== "*" && config.repositories.some(repo => repo.split("/")[0] !== owner)) githubAppFailure("repositories");
     for (const [name, level] of Object.entries(config.permissions)) {
       const allowed = installation.permissions?.[name];
       if (!Object.hasOwn(permissionLevels, allowed ?? "")
         || permissionLevels[allowed as keyof typeof permissionLevels] < permissionLevels[level]) githubAppFailure("permissions");
     }
+    // Omit repositories to inherit the installation's current and future repository access.
     const minted = await request(`/app/installations/${config.installationId}/access_tokens`, jwt, "token", tokenSchema, {
-      repositories: config.repositories.map(repo => repo.split("/")[1]), permissions: config.permissions,
+      ...(config.repositories === "*" ? {} : { repositories: config.repositories.map(repo => repo.split("/")[1]) }),
+      permissions: config.permissions,
     });
     const expiresAt = Date.parse(minted.expires_at);
     if (!minted.token.trim() || !Number.isFinite(expiresAt) || expiresAt <= clock() + 60_000) githubAppFailure("token");
     const bot = await request(`/users/${encodeURIComponent(`${app.slug}[bot]`)}`, minted.token, "bot_identity", botSchema);
     if (bot.login !== `${app.slug}[bot]`) githubAppFailure("bot_identity");
     const repositories: NonNullable<NonNullable<Metadata>["repositories"]> = [];
-    for (let page = 1; page <= 6; page++) {
+    for (let page = 1; ; page++) {
       const data = await request(`/installation/repositories?per_page=100&page=${page}`, minted.token, "repositories", repositoriesSchema);
       for (const repo of data.repositories) {
-        if (!config.repositories.includes(repo.full_name.toLowerCase())) githubAppFailure("repositories");
+        if (config.repositories !== "*" && !config.repositories.includes(repo.full_name.toLowerCase())) githubAppFailure("repositories");
         repositories.push({ id: String(repo.id), fullName: repo.full_name, installationId: config.installationId, private: repo.private === true });
       }
       if (data.repositories.length < 100) break;
-      if (page === 6) githubAppFailure("repositories");
+      if (config.repositories !== "*" && page === 6) githubAppFailure("repositories");
     }
-    if (new Set(repositories.map(r => r.fullName.toLowerCase())).size !== config.repositories.length) githubAppFailure("repositories");
+    if (config.repositories !== "*" && new Set(repositories.map(r => r.fullName.toLowerCase())).size !== config.repositories.length) githubAppFailure("repositories");
     return { token: minted.token, expiresAt, github: {
       userId: String(bot.id), login: bot.login, appSlug: app.slug,
-      installationCount: 1, repositoryCount: repositories.length, repositorySelection: "selected",
+      installationCount: 1, repositoryCount: repositories.length,
+      repositorySelection: config.repositories === "*" ? installation.repository_selection ?? "selected" : "selected",
       installationIds: [config.installationId], installationOwnerLogins: [installation.account.login], repositories,
       managementUrl: `https://github.com/settings/installations/${config.installationId}`,
       lastAccessRefreshAt: new Date(clock()).toISOString(),
