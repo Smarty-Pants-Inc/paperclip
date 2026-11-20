@@ -346,7 +346,9 @@ describe("native workspace sync durable metadata", () => {
     };
     const execute = vi
       .fn()
-      .mockResolvedValueOnce({ timedOut: false, exitCode: 1, stdout: "" })
+      // Ordered publication reads with `if test -f; then cat; fi`: an absent
+      // stamp is a successful empty read, followed by the repair write.
+      .mockResolvedValueOnce({ timedOut: false, exitCode: 0, stdout: "" })
       .mockResolvedValueOnce({ timedOut: false, exitCode: 0, stdout: "" });
 
     await expect(
