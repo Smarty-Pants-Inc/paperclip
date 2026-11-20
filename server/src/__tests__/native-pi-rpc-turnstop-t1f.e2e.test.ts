@@ -12,7 +12,7 @@ import { getCACertificates, setDefaultCACertificates } from "node:tls";
 import WebSocket, { WebSocketServer, type RawData } from "ws";
 import { PAPERCLIP_RUNNER_INGRESS_PORT, type RunnerIngressEndpoint } from "@paperclipai/adapter-utils/runner-connectivity";
 import { environmentService } from "../services/environments.js";
-import { agents, authUsers, createDb, heartbeatRuns, heartbeatRunEvents, issueComments, agentWakeupRequests, environments, environmentLeases, issues, workspaceOperations, nativeRunFinalizations } from "@paperclipai/db";
+import { agents, authUsers, createDb, heartbeatRuns, heartbeatRunEvents, issueComments, agentWakeupRequests, environments, environmentLeases, issues, workspaceOperations, nativeRunFinalizations, plugins } from "@paperclipai/db";
 import { expect, it, vi } from "vitest";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { respondToNativePiHello } from "./helpers/native-pi-hello-model.js";
@@ -56,10 +56,13 @@ function piDescendant(runnerPid: number): number | null {
   return visit(runnerPid);
 }
 
-it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallback", "finished", "FILESTOP", "FILESTOP-fallback"] as const)(`warm turnstop T1-F: %s (real Runner/Pi, two prior turns)`, async scenario => {
+it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallback", "finished", "FILESTOP", "FILESTOP-fallback", "FILESTOP-forged-proof", "FILESTOP-restart-hook", "FILESTOP-validation-fails", "FILESTOP-late-export", "FILESTOP-fast-question"] as const)(`warm turnstop T1-F: %s (real Runner/Pi, two prior turns)`, async scenario => {
   const stopTurn = 3;
-  const filestop = scenario === "FILESTOP" || scenario === "FILESTOP-fallback";
-  const fallback = scenario === "R-fallback" || scenario === "FILESTOP-fallback";
+  const filestop = scenario.startsWith("FILESTOP");
+  const forgedProof = scenario === "FILESTOP-forged-proof";
+  const restartHook = scenario === "FILESTOP-restart-hook";
+  const validationFails = scenario === "FILESTOP-validation-fails";
+  const fallback = scenario === "R-fallback" || scenario === "FILESTOP-fallback" || forgedProof || restartHook;
   const fileBytes = Buffer.from("Paul's completed write survives Stop.\nFILESTOP utf8: café 🌱\n", "utf8");
   expect(thinking).toBe("xhigh");
   expect(protocol).toBe("responses");
@@ -106,7 +109,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
   let companyId = "", agentId = "", issueId = "";
   const workspace = join(root, "workspace");
   await mkdir(workspace);
-  const remoteWorkspace = join(root, "box-workspace");
+  let remoteWorkspace = join(root, "box-workspace");
   await mkdir(remoteWorkspace);
   const agentHome = join(root, "minimal-agent");
   await mkdir(agentHome);
@@ -224,7 +227,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
         const command = filestop && step === 1
           ? `printf '%s' '${fileBytes.toString("base64")}' | base64 -d > filestop.txt; printf 'STEP1\\n' >> '${stepsPath}'; printf '${fact}_STEP1\\n'`
           : filestop && step === 2
-            ? `cat filestop.txt; printf 'STEP2\\n' >> '${stepsPath}'; printf '${fact}_STEP2\\n'`
+            ? `cat filestop.txt; ${scenario === "FILESTOP-late-export" ? "printf 'successor file wins\\n' > successor.txt; " : ""}printf 'STEP2\\n' >> '${stepsPath}'; printf '${fact}_STEP2\\n'`
             : `printf 'STEP${step}\\n' >> '${stepsPath}'; printf '${fact}_STEP${step}\\n'`;
         const input = { command };
         const call = { id: `fc-${randomUUID()}`, type: "function_call", status: "completed", call_id: `call-${randomUUID()}`, name: "bash", arguments: JSON.stringify(input) };
@@ -323,20 +326,45 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
     });
     await new Promise<void>(done => preview!.listen(0, "127.0.0.1", done));
     const previewAddress = preview.address(); if (!previewAddress || typeof previewAddress === "string") throw new Error("preview missing");
+    // Only the provider allocation transport is simulated. Lease selection,
+    // including workspace_export_pending, must run in the production driver.
+    const pluginId = randomUUID();
+    const providerConfig = { provider: "turnstop-loopback", reuseLease: true,
+      runnerLifecycleMode: "warm", runnerIdleTimeoutMs: 300000 };
+    await db.insert(plugins).values({ id: pluginId, pluginKey: "turnstop.loopback", packageName: "@paperclip/turnstop-loopback",
+      version: "1.0.0", apiVersion: 1, categories: ["automation"], status: "installed", installOrder: 10000,
+      manifestJson: { id: "turnstop.loopback", apiVersion: 1, version: "1.0.0", displayName: "Loopback allocation",
+        description: "Real lease policy with local provider transport", author: "Paperclip", categories: ["automation"],
+        capabilities: ["environment.drivers.register"], entrypoints: { worker: "unused.js" },
+        environmentDrivers: [{ driverKey: "turnstop-loopback", kind: "sandbox_provider", displayName: "Loopback",
+          supportsReusableLeases: true, configSchema: { type: "object" } }] } } as never);
+    const { environmentRuntimeService: realEnvironmentRuntimeService } = await vi.importActual<typeof import("../services/environment-runtime.js")>("../services/environment-runtime.js");
+    const realAllocation = realEnvironmentRuntimeService(db, { pluginWorkerManager: {
+      isRunning: () => true,
+      getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease"] }),
+      call: async (_pluginId: string, method: string, params: any) => {
+        if (method === "environmentAcquireLease") {
+          box = `spike-box-${randomUUID()}`;
+          remoteWorkspace = join(root, box); await mkdir(remoteWorkspace);
+          const runtime = join(remoteWorkspace, ".paperclip-runtime", "paperclip-runner");
+          await mkdir(runtime, { recursive: true });
+          await symlink(process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH!, join(runtime, "provider-pack"));
+          return { providerLeaseId: box, metadata: { ...providerConfig, remoteCwd: remoteWorkspace } };
+        }
+        if (method === "environmentResumeLease") {
+          remoteWorkspace = params.leaseMetadata.remoteCwd;
+          return { providerLeaseId: params.providerLeaseId, metadata: { ...providerConfig, remoteCwd: remoteWorkspace } };
+        }
+        throw new Error(`Unexpected allocation RPC ${method}`);
+      },
+    } as never });
     allocation.drivers = [{ driver: "sandbox",
       acquireRunLease: async input => {
-        const candidates = await db!.select().from(environmentLeases).where(eq(environmentLeases.environmentId, environmentId));
-        const prior = candidates.find(row => row.issueId === input.issueId && row.metadata?.agentId === input.agentId && row.status === "retained");
-        if (!prior) box = `spike-box-${randomUUID()}`;
-        const lease = await envService.acquireLease({ companyId: input.companyId, environmentId,
-          heartbeatRunId: input.heartbeatRunId, executionWorkspaceId: input.executionWorkspaceId, issueId: input.issueId,
-          provider: "boat", providerLeaseId: prior?.providerLeaseId ?? box, leasePolicy: "reuse_by_environment",
-          ...(prior ? { replacesReusableLeaseId: prior.id } : {}), metadata: { remoteCwd: remoteWorkspace, agentId: input.agentId,
-            // Match the real sandbox driver's same-allocation metadata carry
-            // (environment-runtime.ts); dropping this stamp forces host_current.
-            ...(prior?.metadata?.nativeWorkspaceSync ? { nativeWorkspaceSync: prior.metadata.nativeWorkspaceSync } : {}),
-            sandboxLeaseAcquisition: { outcome: prior ? "resumed" : "created", providerLeaseId: box } } });
-        stage("allocation", { leaseId: lease.id, box: lease.providerLeaseId, runId: input.heartbeatRunId, warm: !!prior });
+        const result = await realAllocation.acquireRunLease({ ...input,
+          persistedExecutionWorkspace: input.executionWorkspaceId ? { id: input.executionWorkspaceId, mode: input.executionWorkspaceMode! } : null });
+        const lease = result.lease;
+        stage("allocation (production reusable filter)", { leaseId: lease.id, box: lease.providerLeaseId,
+          runId: input.heartbeatRunId, acquisition: lease.metadata?.sandboxLeaseAcquisition });
         return lease;
       },
       releaseRunLease: async input => envService.releaseLease(input.lease.id, input.status),
@@ -363,7 +391,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       retryPendingSandboxTeardown: async ({ lease }) => { stopCalls.push(lease.id); stage("provider stop requested", { leaseId: lease.id }); return { providerLeaseId: lease.providerLeaseId!, state: "stopped" }; },
     }];
     await db.insert(environments).values({ id: environmentId, name: "Turnstop loopback allocation", driver: "sandbox",
-      config: { provider: "boat", reuseLease: true, remoteCwd: workspace, runnerLifecycleMode: "warm", runnerIdleTimeoutMs: 300000 } });
+      config: providerConfig });
 
     const [{ createApp }, { createStorageService }, { createLocalDiskStorageProvider }, runner, { setupRunnerPrpWebSocketServer }, { subscribeCompanyLiveEvents }] = await Promise.all([
       import("../app.js"), import("../storage/service.js"), import("../storage/local-disk-provider.js"),
@@ -476,6 +504,9 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
     expect(patched.adapterConfig).toMatchObject({ provider: "pi_rpc", lifecycleMode: "warm", piRpcThinkingLevel: thinking, model: "paperclip/faux" });
     expect(patched.lifecycleState).toBe("ready");
     stage("PATCH 200", { agentId, lifecycleState: patched.lifecycleState, adapterConfig: patched.adapterConfig });
+    // The fixture worker is the provider boundary; do not ask the app loader
+    // to launch a nonexistent packaged worker during startup.
+    await db.update(plugins).set({ status: "ready" }).where(eq(plugins.id, pluginId));
     await db.update(agents).set({ defaultEnvironmentId: environmentId }).where(eq(agents.id, agentId));
     const issue = await api("POST", `/companies/${companyId}/issues`, { title: "Six steps through native Pi", description: "Execute STEP1 through STEP6 once each. After Interrupt continue from the completed tool results, never redo completed steps. Stop revokes this work; answer only the newly authorized question after Stop.", status: "todo", assigneeAgentId: agentId }, 201);
     issueId = issue.id;
@@ -560,19 +591,83 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       expect(stopped?.status).toBe("cancelled");
       const { hasRetainedNativeTurnStop } = await import("../services/native-runtime/native-session-executor.js");
       const [stoppedLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease!.id));
-      const qualified = hasRetainedNativeTurnStop(stopped!, stoppedLease);
+      let qualified = hasRetainedNativeTurnStop(stopped!, stoppedLease);
+      if (forgedProof) {
+        expect(qualified).toBe(true);
+        const receipt = stopped!.runnerProfileJson!.nativeRetainedIdleCheckpoint as Record<string, unknown>;
+        const profile = { ...stopped!.runnerProfileJson, nativeRetainedIdleCheckpoint: { ...receipt, generation: Number(receipt.generation) + 1 } };
+        await db.update(heartbeatRuns).set({ runnerProfileJson: profile }).where(eq(heartbeatRuns.id, stopped!.id));
+        const [forged] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, stopped!.id));
+        qualified = hasRetainedNativeTurnStop(forged!, stoppedLease);
+        stage("R2 durable clean-stop receipt without exact live-generation proof", { qualified, receiptPresent: true });
+      }
+      if (restartHook) {
+        expect(qualified).toBe(true);
+        const { closeIdleWarmNativeSessionsForRestart } = await import("../services/native-runtime/native-session-executor.js");
+        const restarted = await closeIdleWarmNativeSessionsForRestart();
+        qualified = hasRetainedNativeTurnStop(stopped!, stoppedLease);
+        stage("R4 restart lifecycle hook (not a server-process restart)", { restarted, qualified });
+        expect(restarted.failed).toBe(0);
+        expect(qualified).toBe(false);
+      }
+      if (validationFails) {
+        await writeFile(join(remoteWorkspace, ".paperclip-runtime", "paperclip-runner", "workspace-sync-v1.json"), "{}\n");
+        stage("R6 corrupt remote warm stamp after qualified Stop", { qualified });
+      }
+      const { nativeWorkspaceExportPendingForResource } = await import("../services/native-runtime/native-workspace-finalization-state.js");
+      const exportPending = await nativeWorkspaceExportPendingForResource(db, stoppedLease!, null);
+      stage("Stop export obligation (production predicate)", { qualified, exportPending, reference: stopped?.runnerProfileJson?.nativeWorkspaceSync });
+      if (filestop && !fallback) expect(exportPending, "real prepared Stop export must still be pending at successor acquisition").toBe(true);
       if (!fallback) expect(qualified, "spike's exact stopped live owner + lease qualified").toBe(true);
       else expect(qualified, "fallback fixture must not qualify for retained turn-stop").toBe(false);
+      if (scenario === "FILESTOP") {
+        // R3: use the exact qualified real owner, including a shared workspace,
+        // while varying only the issue or agent at the production acquire door.
+        const sourceCwd = remoteWorkspace;
+        const otherAgentId = randomUUID(), otherIssueId = randomUUID();
+        await db.insert(agents).values({ id: otherAgentId, companyId, name: "Scope control", adapterType: "paperclip_runner" });
+        await db.insert(issues).values({ id: otherIssueId, companyId, title: "Other issue scope", assigneeAgentId: agentId });
+        const environment = (await db.select().from(environments).where(eq(environments.id, environmentId)))[0]!;
+        for (const scope of [{ agentId, issueId: otherIssueId }, { agentId: otherAgentId, issueId }]) {
+          const probeRunId = randomUUID();
+          await db.insert(heartbeatRuns).values({ id: probeRunId, companyId, ...scope, status: "running" });
+          warmupRunIds.add(probeRunId);
+          const probe = await realAllocation.acquireRunLease({ companyId, environment, ...scope,
+            adapterType: "paperclip_runner", heartbeatRunId: probeRunId,
+            persistedExecutionWorkspace: stoppedLease!.executionWorkspaceId ? { id: stoppedLease!.executionWorkspaceId, mode: "shared_workspace" } : null });
+          stage("R3 scope acquisition", { ...scope, sourceLeaseId: stoppedLease!.id, sourceBox: stoppedLease!.providerLeaseId,
+            leaseId: probe.lease.id, box: probe.lease.providerLeaseId });
+          expect(probe.lease.providerLeaseId, "a different agent or issue cannot take the retained allocation").not.toBe(stoppedLease!.providerLeaseId);
+          await envService.releaseLease(probe.lease.id, "expired");
+          await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, probeRunId));
+          remoteWorkspace = sourceCwd;
+        }
+      }
       // Stop itself must dispatch nothing. The separate Send is new authority.
       if (!interrupt) expect(requests).toHaveLength(requestCountAtPress);
       const sendAt = interrupt ? pressAt : Date.now();
       if (!interrupt) successorCommentId = (await api("POST", `/issues/${issueId}/comments`, { body: message }, 201)).id;
       // Do not skip a wrong/stale first request while waiting for a later
       // correctly attributed one: the very next provider input is the oracle.
-      const first = await waitFor(`successor ${press} FIRST model request`, async () => requests[requestCountAtPress] ?? null);
+      const first = await waitFor(`successor ${press} FIRST model request`, async () => {
+        if (forgedProof) {
+          const successor = (await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+            .find(run => !warmupRunIds.has(run.id) && run.id !== current.id);
+          const [selected] = successor ? await db!.select().from(environmentLeases)
+            .where(eq(environmentLeases.heartbeatRunId, successor.id)) : [];
+          if (selected?.providerLeaseId === lease!.providerLeaseId) {
+            const decision = { qualified, hintPresent: true, sourceLeaseId: lease!.id,
+              sourceBox: lease!.providerLeaseId, selectedLeaseId: selected.id, selectedBox: selected.providerLeaseId };
+            await writeFile(join(root, "R2-gate-decision.json"), JSON.stringify(decision, null, 2));
+            stage("R2 wrong adoption at the production acquisition boundary", decision);
+            expect(selected.providerLeaseId, "R2 durable hint without live-owner proof cannot adopt").not.toBe(lease!.providerLeaseId);
+          }
+        }
+        return requests[requestCountAtPress] ?? null;
+      });
       const next = await waitFor(`successor ${press} admitted`, async () => (await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
         .find(run => !warmupRunIds.has(run.id) && run.id !== current.id && !observations.some(row => row.predecessorRunId === run.id)) ?? null);
-      const live = bundles.map(bundle => bundle.transport.processInfo?.()?.pid).filter((value): value is number => !!value)
+      const live = bundles.toReversed().map(bundle => bundle.transport.processInfo?.()?.pid).filter((value): value is number => !!value)
         .map(runnerPid => ({ runnerPid, piPid: piDescendant(runnerPid) })).find(value => value.piPid !== null)!;
       const actualIdentity = live && { ...live, runnerBirth: procBirth(live.runnerPid), piBirth: procBirth(live.piPid!), boxBootId, nativeSessionId: next.nativeSessionId };
       const [nextLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, next.id));
@@ -588,6 +683,7 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       const observation = { press, predecessorRunId: current.id, successorRunId: next.id, qualified,
         forceFreshSession: next.contextSnapshot?.forceFreshSession === true, originalIdentity, actualIdentity,
         successorCommentId: successorCommentId!, commentBoundToSuccessor,
+        beforeLeaseId: lease!.id, nextLeaseId: nextLease?.id,
         beforeBoxId: lease!.providerLeaseId, nextBoxId: nextLease?.providerLeaseId,
         expectedSteps, actualFirstTurn: first.turn, actualFirstInputSteps: first.completed, pressAt, cancelledAt, drainedAt, sendAt,
         requestAt: first.at, firstTokenWrittenAt: first.firstTokenWrittenAt,
@@ -598,8 +694,11 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       expect(commentBoundToSuccessor, "the FIRST successor is bound to the newly authorized comment").toBe(true);
       expect(first.turn, "the FIRST successor input carries the newly authorized message").toBe(press);
       if (fallback) {
-        if (scenario === "FILESTOP-fallback") {
-          stage("FILESTOP FALLBACK OBSERVATION ONLY", { qualified, fileBeforeTools: first.fileBeforeTools,
+        if (scenario === "FILESTOP-fallback" || forgedProof || restartHook) {
+          expect(nextLease?.providerLeaseId, "unqualified Stop requires a different physical allocation").not.toBe(lease!.providerLeaseId);
+          expect(live.piPid, "unqualified Stop cannot reuse the old Pi").not.toBe(pid.piPid);
+          expect(first.fileBeforeTools?.exists, "fresh box makes no stopped-file promise").toBe(false);
+          stage("FILESTOP FALLBACK",  { qualified, fileBeforeTools: first.fileBeforeTools,
             fileSurvived: first.fileBeforeTools?.base64 === fileBytes.toString("base64"),
             firstInputRetainsWrite: first.completed.includes(1), originalIdentity, actualIdentity });
         }
@@ -620,8 +719,8 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
         expect(nextLease?.providerLeaseId, "the same physical allocation, not merely a new durable lease").toBe(lease!.providerLeaseId);
         expect(stopCalls).toEqual([]);
         if (filestop) {
-          expect(first.fileBeforeTools?.exists, "file exists on the box BEFORE successor's first tool").toBe(true);
-          expect(first.fileBeforeTools?.base64, "completed write survives Stop byte-for-byte before any successor tool").toBe(fileBytes.toString("base64"));
+          expect(first.fileBeforeTools?.exists, validationFails ? "R6 failed stamp validation restores host seed, losing stopped files" : "file exists on the box BEFORE successor's first tool").toBe(!validationFails);
+          if (!validationFails) expect(first.fileBeforeTools?.base64, "completed write survives Stop byte-for-byte before any successor tool").toBe(fileBytes.toString("base64"));
         }
       }
       current = next;
@@ -638,11 +737,38 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
     if (filestop) {
       const readResult = requests.find(row => row.turn === 1 && row.completed.includes(2));
       const readOutput = readResult?.input.find(item => item.type === "function_call_output" && JSON.stringify(item.output).includes(`${fact}_STEP2`));
-      if (!fallback) expect(readOutput?.output, "authorized successor really read the completed file").toContain(fileBytes.toString("utf8"));
+      if (!fallback && !validationFails) expect(readOutput?.output, "authorized successor really read the completed file").toContain(fileBytes.toString("utf8"));
       await writeFile(join(root, "filestop-result.json"), JSON.stringify({ scenario, qualified: observations[0]?.qualified,
         expectedBase64: fileBytes.toString("base64"), fileBeforeTools: requests.find(row => row.fileBeforeTools)?.fileBeforeTools,
         fileSurvived: requests.find(row => row.fileBeforeTools)?.fileBeforeTools?.base64 === fileBytes.toString("base64"),
         readOutput, observations }, null, 2));
+    }
+    if (scenario === "FILESTOP-late-export") {
+      // R1 uses the same legacy native-sync path as FILESTOP, not the unrelated
+      // modern remote-workspace snapshot service. A late completion must not
+      // replace the successor's published stamp.
+      const [source] = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, admitted.id));
+      const environment = (await db.select().from(environments).where(eq(environments.id, environmentId)))[0]!;
+      const { environmentRuntimeService } = await import("../services/environment-runtime.js");
+      const { resolveEnvironmentExecutionTarget } = await import("../services/environment-execution-target.js");
+      const target = await resolveEnvironmentExecutionTarget({ db, companyId, adapterType: "paperclip_runner", environment,
+        leaseId: source!.id, leaseMetadata: source!.metadata, lease: source!, environmentRuntime: environmentRuntimeService(db) });
+      const stampPath = join(remoteWorkspace, ".paperclip-runtime", "paperclip-runner", "workspace-sync-v1.json");
+      const newerStamp = JSON.parse(await readFile(stampPath, "utf8"));
+      expect(newerStamp.finalizedRunId).toBe(current.id);
+      const { resumeNativeWorkspaceSync } = await import("../services/native-runtime/native-workspace-sync.js");
+      let completed = false, exportError: string | undefined;
+      try { completed = await resumeNativeWorkspaceSync({ db, runId: admitted.id, target: target! }); }
+      catch (error) { exportError = error instanceof Error ? error.message : String(error); }
+      const lateStamp = JSON.parse(await readFile(stampPath, "utf8"));
+      const successorBytes = await readFile(join(remoteWorkspace, "successor.txt"), "utf8");
+      const [lateRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, admitted.id));
+      const custody = { completed, exportError, newerStamp, lateStamp, successorBytes, olderExport: lateRun?.runnerProfileJson?.nativeWorkspaceSync };
+      await writeFile(join(root, "R1-late-export.json"), JSON.stringify(custody, null, 2));
+      stage("R1 late native export after successor snapshot", custody);
+      expect(completed, "pending predecessor export completes").toBe(true);
+      expect(successorBytes).toBe("successor file wins\n");
+      expect(lateStamp, "a late predecessor export cannot overwrite the newer successor stamp").toEqual(newerStamp);
     }
     for (const observation of observations) {
       const request = requests.find(value => value.at === observation.requestAt)!;
@@ -652,9 +778,23 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       const firstDeliveredMs = request.deliveredAt! - Number(observation.sendAt);
       Object.assign(observation, { firstTokenWrittenAt: request.firstTokenWrittenAt, deliveredAt: request.deliveredAt,
         modelTtftMs, firstDeliveredMs, overheadMs: firstDeliveredMs - modelTtftMs });
-      stage("PERFORMANCE REPORT ONLY: sub-second bar is out of I-B scope", observation);
+      stage("Timing evidence (R7 under-2s gate is FILESTOP-fast-question)", observation);
     }
     await writeFile(join(root, "observations.json"), JSON.stringify(observations, null, 2));
+    if (scenario === "FILESTOP-fast-question") {
+      const observation = observations[0]!;
+      const answers = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+        .filter(row => row.authorAgentId === agentId && row.body.includes("T1F_SIX_STEPS_DONE_1"));
+      const acceptance = { ...observation, answerCount: answers.length,
+        gapUnder2s: Number(observation.sendToRequestMs) < 2000,
+        sameDatabaseLeaseId: observation.beforeLeaseId === observation.nextLeaseId,
+        sameProviderLeaseId: observation.beforeBoxId === observation.nextBoxId };
+      await writeFile(join(root, "R7-fast-question.json"), JSON.stringify(acceptance, null, 2));
+      stage("R7 literal acceptance", acceptance);
+      expect(answers).toHaveLength(1);
+      expect(observation.sendToRequestMs, "R7 send-to-provider-turn gap is under 2 seconds").toBeLessThan(2000);
+      expect(observation.nextLeaseId, "R7 literal same database lease id").toBe(observation.beforeLeaseId);
+    }
     stage("GREEN", { scenario, actualSteps, reply: reply.body, publicationObservedAt, observations,
       timingScope: "loopback HTTP, actual provider request/first-token write, durable comment publication; no browser/render or inference-latency claim" });
   } catch (error) {
@@ -680,6 +820,17 @@ it.skipIf(!enabled).each(["R-redo", "R-double", "R-stop", "R-late-ack", "R-fallb
       for (const run of await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))) {
         await heartbeat.waitForRunExecutionDrain(run.id, { timeoutMs: 15_000 }).catch(error => console.error("Owned run drain", error));
       }
+    }
+    if (db && companyId) {
+      const { closeWarmNativeSessionsForEnvironment } = await import("../services/native-runtime/native-session-executor.js");
+      const ownedLeases = await db.select().from(environmentLeases).where(eq(environmentLeases.companyId, companyId));
+      const cleanup = [];
+      for (const environmentId of new Set(ownedLeases.map(row => row.environmentId))) {
+        cleanup.push(await closeWarmNativeSessionsForEnvironment({ environmentId,
+          reason: "owned FILESTOP fixture teardown", forceStopUnsettled: true, db })
+          .catch(error => ({ error: String(error) })));
+      }
+      await writeFile(join(root, "cleanup-warm-owners.json"), JSON.stringify(cleanup, null, 2));
     }
     for (const bundle of bundles) await bundle.transport.close().catch(error => console.error("Owned runner teardown", error));
     await app?.locals.paperclipShutdown?.();
