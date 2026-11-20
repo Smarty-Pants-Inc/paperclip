@@ -1,3 +1,4 @@
+import { deferredPersonWakeQuietAtSql } from "../../../services/deferred-person-wake-clock.js";
 import { UNANSWERED_MESSAGE_LOOKBACK_MS } from "../../../services/recovery/unanswered-person-message.js";
 import { DEFERRED_PERSON_WAKE_BOUND_MS } from "../domain/policy.js";
 import { getServerProcessStartedAt } from "../../../server-info.js";
@@ -289,7 +290,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
               personWakeDueAt ? eq(agentWakeupRequests.source, "on_demand") : undefined,
               personWakeDueAt ? eq(agentWakeupRequests.requestedByActorType, "user") : undefined,
               personWakeDueAt ? sql`${agentWakeupRequests.updatedAt} >= ${new Date(Date.parse(getServerProcessStartedAt()) - UNANSWERED_MESSAGE_LOOKBACK_MS).toISOString()}::timestamptz` : undefined,
-              personWakeDueAt ? sql`${agentWakeupRequests.updatedAt} <= ${new Date(personWakeDueAt.getTime() - DEFERRED_PERSON_WAKE_BOUND_MS).toISOString()}::timestamptz` : undefined,
+              personWakeDueAt ? sql`${deferredPersonWakeQuietAtSql} <= ${new Date(personWakeDueAt.getTime() - DEFERRED_PERSON_WAKE_BOUND_MS).toISOString()}::timestamptz` : undefined,
               locallyExcludedWakeIds.length ? notInArray(agentWakeupRequests.id, locallyExcludedWakeIds) : undefined,
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
               interruptQueueId ? eq(agentWakeupRequests.id, interruptQueueId) : undefined,
@@ -1577,16 +1578,20 @@ export function createWakeAdmissionWriter(): WakeAdmissionWriter {
           requestedAt: prior.requestedAt, finishedAt: new Date(), runId: prior.runId,
         });
       }
+      const coalescedAt = new Date();
       const rows = await tx
         .update(agentWakeupRequests)
         .set({
-          payload: input.mergedPayload,
+          payload: { ...input.mergedPayload,
+            ...(prior.source === "on_demand" && (prior.requestedByActorType === "user" || input.manualUserWakeActorId)
+              ? { _paperclipLastCoalescedAt: coalescedAt.toISOString() } : {}),
+          },
           coalescedCount: input.nextCoalescedCount,
           ...(input.manualUserWakeActorId ? {
             requestedByActorType: "user",
             requestedByActorId: input.manualUserWakeActorId,
           } : {}),
-          updatedAt: new Date(),
+          updatedAt: coalescedAt,
         })
         .where(
           and(

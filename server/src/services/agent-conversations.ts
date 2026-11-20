@@ -737,7 +737,8 @@ async function appendConversationQueueComment(db: Db, comment: typeof issueComme
     if (rows.length !== ids.length || rows.some(row => isConversationReset(row.body))) return false;
     await notifyDeferredExecutionWork(tx, { companyId: issue.companyId, requestId: tail.id });
     await tx.update(agentWakeupRequests).set({
-      payload: withQueuedCommentIdsInWakePayload(tail.payload, [...ids, comment.id]),
+      payload: withQueuedCommentIdsInWakePayload({ ...tail.payload,
+        _paperclipLastCoalescedAt: new Date().toISOString() }, [...ids, comment.id]),
       coalescedCount: (tail.coalescedCount ?? 0) + 1, updatedAt: new Date(),
     }).where(eq(agentWakeupRequests.id, tail.id));
     await tx.insert(agentWakeupRequests).values({

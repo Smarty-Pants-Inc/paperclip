@@ -4897,7 +4897,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 wake.requestedByActorType === (opts.requestedByActorType ?? null) &&
                 wake.requestedByActorId === (opts.requestedByActorId ?? null));
               if (pending) await tx.update(agentWakeupRequests).set({
-                payload: withQueuedCommentIdsInWakePayload(pending.payload,
+                payload: withQueuedCommentIdsInWakePayload({ ...pending.payload,
+                  _paperclipLastCoalescedAt: new Date().toISOString() },
                   [...new Set([...queuedCommentIdsFromWakePayload(pending.payload), wakeCommentId!])]),
                 coalescedCount: pending.coalescedCount + 1, updatedAt: new Date(),
               }).where(and(eq(agentWakeupRequests.id, pending.id), eq(agentWakeupRequests.companyId, agent.companyId),
