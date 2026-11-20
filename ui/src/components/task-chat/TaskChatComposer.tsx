@@ -1498,6 +1498,7 @@ export function TaskChatComposer({
               ref={editorRef}
               value={body}
               onChange={changeBody}
+              verbatimText
               placeholder={
                 disabled
                   ? (disabledReason ?? "Composer disabled")
