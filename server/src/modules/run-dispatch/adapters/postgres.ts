@@ -1,4 +1,6 @@
 import { notifyExecutionRunWork } from "../../../services/execution-control-notifications.js";
+import { expiredPersonMessageIds } from "../../../services/person-message-answer.js";
+import { settleUnansweredPersonMessage, publishUnansweredNoteAnnouncement, type UnansweredNoteAnnouncement } from "../../../services/recovery/unanswered-person-message.js";
 import { notifyDeferredExecutionWork, notifyDeferredWakesForIssue } from "../../../services/deferred-execution-notifications.js";
 import { hasRequiredWorkspaceRecovery } from "../../../services/workspace-restore-recovery-state.js";
 import { readNativeWorkspaceSyncReference } from "../../../services/native-runtime/native-workspace-sync.js";
@@ -244,7 +246,7 @@ export function createPostgresRunDispatchAdapter(
   async function withRunOwnershipLocks<T>(
     input: { runId: string; companyId: string; recoveryLeaseOwner?: string; enforceContinuationOwnership?: boolean },
     onMissing: () => T,
-    operation: (tx: Db, run: HeartbeatRun, publications: ActivityPublication[]) => Promise<T>,
+    operation: (tx: Db, run: HeartbeatRun, publications: ActivityPublication[], notes: UnansweredNoteAnnouncement[]) => Promise<T>,
     mode: "accounting" | "ownership",
     isolation: "snapshot" | "read committed" = "snapshot",
   ): Promise<T> {
@@ -266,7 +268,10 @@ export function createPostgresRunDispatchAdapter(
       const hintedIssueId = input.enforceContinuationOwnership === false ? null
         : readNonEmptyString(parseObject(hint.contextSnapshot).issueId);
 
+      const notes: UnansweredNoteAnnouncement[] = [];
       const locked = async (typedTx: Db, publications: ActivityPublication[]) => {
+        // Accounting can retry a proven rollback; discard its unreadable notes.
+        notes.length = 0;
         if (mode === "accounting") {
           await lockBudgetAdmissionControls(typedTx, input.companyId, hint.projectId);
           await typedTx.select({ id: agents.id }).from(agents)
@@ -299,13 +304,16 @@ export function createPostgresRunDispatchAdapter(
         const lockedIssueId = input.enforceContinuationOwnership === false ? null
           : readNonEmptyString(parseObject(run.contextSnapshot).issueId);
         if (lockedIssueId !== hintedIssueId) return { kind: "retry" as const };
-        return { kind: "value" as const, value: await operation(typedTx, run, publications) };
+        return { kind: "value" as const, value: await operation(typedTx, run, publications, notes) };
       };
       const result: { kind: "missing" | "retry" } | { kind: "value"; value: T } = mode === "accounting"
         ? await withOperationAccountingTransaction(db, input.companyId, locked,
           isolation === "read committed" ? { isolationLevel: "read committed" } : {})
         : await db.transaction(tx => locked(tx as unknown as Db, []));
 
+      // The naming writer shares these locks; announce only after their
+      // transaction commits, never from an aborted dispatch attempt.
+      for (const note of notes) publishUnansweredNoteAnnouncement(note);
       if (result.kind === "missing") return onMissing();
       if (result.kind === "value") return result.value;
     }
@@ -326,7 +334,7 @@ export function createPostgresRunDispatchAdapter(
   function withIssueThenRunLocks<T>(
     input: { runId: string; companyId: string; recoveryLeaseOwner?: string; enforceContinuationOwnership?: boolean },
     onMissing: () => T,
-    operation: (tx: Db, run: HeartbeatRun, publications: ActivityPublication[]) => Promise<T>,
+    operation: (tx: Db, run: HeartbeatRun, publications: ActivityPublication[], notes: UnansweredNoteAnnouncement[]) => Promise<T>,
     isolation: "snapshot" | "read committed" = "snapshot",
   ) {
     return withRunOwnershipLocks(input, onMissing, operation, "accounting", isolation);
@@ -1108,6 +1116,8 @@ export function createPostgresRunDispatchAdapter(
 
   async function deferUnstartedUserComment(tx: Db, run: HeartbeatRun, issueId: string, now: Date) {
     if (!run.wakeupRequestId || !await isPreDispatchExecutionWaitVerified(tx, run)) return null;
+    if ((await expiredPersonMessageIds(tx, { companyId: run.companyId, issueId,
+      contextSnapshot: run.contextSnapshot }, now)).length) return null;
     const wait = parseObject(run.resultJson?.executionWait);
     const [preservation] = await tx.select().from(issueRecoveryActions).where(and(
       eq(issueRecoveryActions.companyId, run.companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
@@ -1328,10 +1338,24 @@ export function createPostgresRunDispatchAdapter(
       };
   }
 
-  async function decideCurrentRunStaleness(tx: Db, run: HeartbeatRun, now: Date, publications?: ActivityPublication[]) {
+  async function decideCurrentRunStaleness(tx: Db, run: HeartbeatRun, now: Date,
+    publications: ActivityPublication[], notes: UnansweredNoteAnnouncement[]) {
     const contextSnapshot = parseObject(run.contextSnapshot);
-    const issueId = readNonEmptyString(contextSnapshot.issueId);
+    const issueId = readNonEmptyString(contextSnapshot.issueId) ?? run.nativeIssueId;
     if (!issueId) return { issueId: null, facts: null, executionBlocker: null, decision: { stale: false as const } };
+    // Last automatic start fence: queued promotion and scheduled same-run
+    // retry cannot evade admission's person-message age check.
+    const expired = await expiredPersonMessageIds(tx, { companyId: run.companyId, issueId, contextSnapshot }, now);
+    if (expired.length) {
+      for (const messageId of expired) await settleUnansweredPersonMessage(tx, {
+        companyId: run.companyId, issueId, settleMessageId: messageId, now, announcements: notes,
+      });
+      return { issueId, facts: null, executionBlocker: null, decision: { stale: true as const,
+        errorCode: "execution_reconciliation_required" as const,
+        reason: "This saved message is at least 24 hours old. Send a new message to try again.",
+        details: { issueId, expiredPersonMessageIds: expired },
+      } };
+    }
     if (typeof contextSnapshot.workspaceReconstructionActionId === "string") {
       try {
         await validateReconstructedWorkspaceDispatch(tx, run);
@@ -1454,9 +1478,9 @@ export function createPostgresRunDispatchAdapter(
   async function cancelStaleQueuedRun(
     input: CancelStaleQueuedRunInput,
   ): Promise<CancelStaleQueuedRunOutcome> {
-    const cancelLockedRun = async (tx: Db, run: HeartbeatRun, publications: ActivityPublication[]) => {
+    const cancelLockedRun = async (tx: Db, run: HeartbeatRun, publications: ActivityPublication[], notes: UnansweredNoteAnnouncement[]) => {
       if (run.status !== input.expectedStatus) return { outcome: "lost_race" as const };
-      const { issueId, facts, decision, executionBlocker } = await decideCurrentRunStaleness(tx, run, input.now, publications);
+      const { issueId, facts, decision, executionBlocker } = await decideCurrentRunStaleness(tx, run, input.now, publications, notes);
       if (!decision.stale || !issueId) {
         if (input.expectedStatus === "queued" && facts?.isInteractionWake) {
           // Preserve the authority accepted under the issue/run locks. Later
@@ -1495,7 +1519,7 @@ export function createPostgresRunDispatchAdapter(
   async function dispatchResolvedInteractionIfCurrent<T>(
     input: DispatchResolvedInteractionInput<T>,
   ): Promise<DispatchResolvedInteractionOutcome<T>> {
-    const dispatchLockedRun = async (tx: Db, run: HeartbeatRun, publications: ActivityPublication[]) => {
+    const dispatchLockedRun = async (tx: Db, run: HeartbeatRun, publications: ActivityPublication[], notes: UnansweredNoteAnnouncement[]) => {
       const stopRecovery = await readClaimedNativeStopRecovery(tx, run, input.recoveryLeaseOwner);
       if (run.status !== input.expectedStatus || ((run.resultJson?.cancellation || run.resultJson?.startupCancellation) && !stopRecovery)) {
         return { dispatched: false as const, cancellation: { outcome: "lost_race" as const } };
@@ -1506,6 +1530,7 @@ export function createPostgresRunDispatchAdapter(
           run,
           input.now,
           publications,
+          notes,
         );
         const decision =
           !initialDecision.stale && issueId

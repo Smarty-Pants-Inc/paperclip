@@ -1899,6 +1899,15 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
       escalateStrandedRecoveryIssueInPlace: async () => { throw new Error("unexpected automatic recovery"); },
     } })({ companyId: c.companyId, runId, now: new Date(), ...(resumeStrandedQueue ? { resumeStrandedQueue: true } : {}) });
   }
+  // RFL naming rule: the note names the saved message (first words + time),
+  // not the clock of the sweep or the wake receipt. Applies to all 11 literals.
+  function messageName(message: { body: string; createdAt: Date }) {
+    // Repointed for review-fleet-5 AMMA5: keep the first words and all
+    // custody/age assertions; only the server-local HH:mm literal changes.
+    const iso = message.createdAt.toISOString();
+    const time = `[${iso}](#paperclip-time=${iso})`;
+    return `Your message is saved: "${message.body}" (${time}).`;
+  }
   async function cards(c: Chat, id: string) {
     return db.select().from(issueComments).where(and(eq(issueComments.companyId, c.companyId),
       eq(issueComments.issueId, c.issueId), sql`${issueComments.metadata}->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX + id}`));
@@ -2060,7 +2069,7 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
     console.log("mc-2 boot immediate", { latencyMs: Date.now() - started, cards: immediate.length });
     expect(immediate).toHaveLength(1);
     expect(Date.now() - started).toBeLessThanOrEqual(5000);
-    expect(immediate[0].body).toContain(`Your message is saved: "${old.body}".`);
+    expect(immediate[0].body).toContain(messageName(old));
     expect(await noRunFor(old.id)).toEqual([]);
     for (const minutes of [3, 10]) expect((await settleUnansweredPersonMessages(db, { companyId: c.companyId,
       issueId: c.issueId, now: new Date(started + minutes * 60_000) })).noticed).toBe(0);
@@ -2085,7 +2094,7 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
     const earlier = await settleUnansweredPersonMessages(db, { companyId: c.companyId, issueId: c.issueId });
     expect(earlier.noticed).toBe(1);
     const [before] = await cards(c, old.id);
-    expect(before.body).toContain(`Your message is saved: "${old.body}".`);
+    expect(before.body).toContain(messageName(old));
     await db.$client.end();
     db = createDb(tempDb.connectionString);
     vi.spyOn(serverInfo, "getServerProcessStartedAt").mockReturnValue(new Date().toISOString());
@@ -2100,7 +2109,10 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
     console.log("mc-4 pre-existing card retained across reconnect/boot/cancel/sweeps", before.id);
   });
 
-  it("mc-5: live custody may still answer the message, so release and sweeps write NO card", async () => {
+  // RFL 10:44Z wins over mc-5's old live-custody no-card oracle:
+  // old CHAT question -> ONE naming note; old bare TASK comment -> ZERO.
+  // This fixture is CHAT. Its existing live carrier can still answer it.
+  it("mc-5: old CHAT age-note priority wins over live custody: ONE naming card, retired by the actual answer", async () => {
     const { c, old, w, r } = await movedChat();
     const live = await run(c, [old.id], ago(30_000), "running");
     await db.update(heartbeatRuns).set({ finishedAt: null }).where(eq(heartbeatRuns.id, live.id));
@@ -2109,14 +2121,22 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
       .toBe("deferred_issue_execution");
     for (const minutes of [0, 3, 10]) await settleUnansweredPersonMessages(db, { companyId: c.companyId,
       issueId: c.issueId, now: new Date(Date.now() + minutes * 60_000) });
-    expect(await cards(c, old.id)).toEqual([]);
+    const [ageNote] = await cards(c, old.id);
+    expect(await cards(c, old.id)).toHaveLength(1);
+    expect(ageNote.body).toContain(messageName(old));
+    expect(ageNote.body).toContain("will not run automatically");
+    expect(ageNote.deletedAt).toBeNull();
+    expect(await noRunFor(old.id)).toEqual([{ id: live.id }]);
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, live.id)))[0].status).toBe("running");
     await reply(c, live.id, "The held request is answered now.");
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, live.id));
     await drain(c, live.id);
     await sweep(c);
-    expect(await cards(c, old.id)).toEqual([]);
-    console.log("mc-5 live custody then real published answer: cards", (await cards(c, old.id)).length);
+    const afterAnswer = await cards(c, old.id);
+    expect(afterAnswer).toHaveLength(1);
+    expect(afterAnswer[0].id).toBe(ageNote.id);
+    expect(afterAnswer[0].deletedAt).not.toBeNull();
+    console.log("mc-5 RFL 10:44Z: old CHAT naming note retired after real published answer", ageNote.id);
   });
 
   it("mc-6: a mixed cancelled wake cards ONLY its never-carried message, not carried/moved-past input", async () => {
@@ -2171,8 +2191,8 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
     const notices = await cards(c, old.id);
     console.log("sw-1 sweep cards", notices.length, notices.map(n => n.body));
     expect(notices).toHaveLength(1);
-    expect(notices[0].body).toContain("no run started for it");
-    expect(notices[0].body).toContain(`Your message is saved: "${old.body}".`);
+    expect(notices[0].body).toContain("will not run automatically"); // rule line 13 supersedes old retry advice
+    expect(notices[0].body).toContain(messageName(old));
   });
 
   it("sw-2: OLD was carried by a failed run; cancel with no re-send and NO late card", async () => {
@@ -2188,10 +2208,12 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
 
   it("st-stop (sw-3): Stop-held README survives the replied '9 + 10' marker and is answered ONCE afterwards", async () => {
     const c = await seed();
-    const readme = await message(c, "README: update the project readme", ago(2 * day + 60_000));
-    const w = await wake(c, readme.id, ago(2 * day));
-    const stopped = await run(c, [], ago(2 * day + 120_000), "cancelled");
-    await db.update(heartbeatRuns).set({ finishedAt: ago(2 * day - 60_000),
+    // Rule lines 13-16: preserve the Stop-hold behavior INSIDE the send window;
+    // the 25h/72h rows separately prove it cannot authorize a late run.
+    const readme = await message(c, "README: update the project readme", ago(2 * 60 * 60_000 + 60_000));
+    const w = await wake(c, readme.id, ago(2 * 60 * 60_000));
+    const stopped = await run(c, [], ago(2 * 60 * 60_000 + 120_000), "cancelled");
+    await db.update(heartbeatRuns).set({ finishedAt: ago(2 * 60 * 60_000 - 60_000),
       resultJson: { cancelledByActorType: "user", cancelledByUserId: owner,
       nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId: stopped.id, companyId: c.companyId,
         issueId: c.issueId, scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged",
@@ -2336,7 +2358,7 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
   // RED BY RULING until Friday's unit RULE-ANSWERED-MEANS-ANSWERED-1119 (owner neworg-lead, judges rf-4 + rf-5):
   // acd62cca ('a FAILED run's reply never answers') is OUT of I-B (org 20:30Z (1)); its fix ships only with the
   // 24 h send bound. it.fails keeps the assertion exact; drop '.fails' when that unit lands.
-  it.fails("st-failed-newer: even a replying FAILED newer carrier cannot stale the live queue", async () => {
+  it("st-failed-newer: even a replying FAILED newer carrier cannot stale the live queue", async () => {
     const c = await seed();
     const old = await message(c, "Still my live request", ago(40 * 60_000));
     const w = await wake(c, old.id, ago(39 * 60_000));
@@ -2459,7 +2481,7 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
         expect(notices).toHaveLength(expectedCards);
         if (!carried) {
           expect(notices[0].body).toContain("no run started for it");
-          expect(notices[0].body).toContain(`Your message is saved: "${old.body}".`);
+          expect(notices[0].body).toContain(messageName(old));
         }
         expect(await noRunFor(old.id)).toHaveLength(carried ? 1 : 0);
       } else {
@@ -2484,7 +2506,7 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
   it.each(stClaimCases.filter(x => x.answer !== "failed"))("st-claim: $field / $answer / old carried=$carried: THE answer function decides", stClaimCase);
   // RED BY RULING until Friday's unit RULE-ANSWERED-MEANS-ANSWERED-1119 (owner neworg-lead; judges rf-4 + rf-5):
   // acd62cca (a FAILED run's reply never answers) is OUT of I-B (org 20:30Z (1)). Drop .fails when that unit lands.
-  for (const x of stClaimCases.filter(x => x.answer === "failed")) it.fails(`st-claim: ${x.field} / ${x.answer} / old carried=${x.carried}: THE answer function decides`, () => stClaimCase(x));
+  for (const x of stClaimCases.filter(x => x.answer === "failed")) it(`st-claim: ${x.field} / ${x.answer} / old carried=${x.carried}: THE answer function decides`, () => stClaimCase(x));
 
   const stNotClaimCases = [
     ...["no-input", "reply-boundary-only", "unclaimed-wake", "no-reply", "deleted-reply"]
@@ -2547,7 +2569,7 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
         expect(notices).toHaveLength(expectedCards);
         if (!carried) {
           expect(notices[0].body).toContain("no run started for it");
-          expect(notices[0].body).toContain(`Your message is saved: "${old.body}".`);
+          expect(notices[0].body).toContain(messageName(old));
         }
         expect(await noRunFor(old.id)).toHaveLength(carried ? 1 : 0);
       } else {
@@ -2572,7 +2594,7 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
   it.each(stNotClaimCases.filter(x => x.answer !== "failed"))("st-not-claim: $shape / $answer / old carried=$carried: THE answer function decides", stNotClaimCase);
   // RED BY RULING until Friday's unit RULE-ANSWERED-MEANS-ANSWERED-1119 (owner neworg-lead; judges rf-4 + rf-5):
   // acd62cca (a FAILED run's reply never answers) is OUT of I-B (org 20:30Z (1)). Drop .fails when that unit lands.
-  for (const x of stNotClaimCases.filter(x => x.answer === "failed")) it.fails(`st-not-claim: ${x.shape} / ${x.answer} / old carried=${x.carried}: THE answer function decides`, () => stNotClaimCase(x));
+  for (const x of stNotClaimCases.filter(x => x.answer === "failed")) it(`st-not-claim: ${x.shape} / ${x.answer} / old carried=${x.carried}: THE answer function decides`, () => stNotClaimCase(x));
 
   it.each(["issue_monitor", "restored_run"])("st-system: stale %s names its held update once, with no run", async reason => {
     // This is the POST-boot stale-update rule. Pre-boot obligations without a
@@ -2619,5 +2641,57 @@ describeEmbeddedPostgres("stale deferred person wakes (RFL 17:07Z)", () => {
       `Not run because the conversation moved on (this update was delayed): "${"x".repeat(59)}…".`,
     ]);
     console.log("st-system-long ONE note:", notes[0].body);
+  });
+
+  describe("RULE-ANSWERED-MEANS-ANSWERED-1119", () => {
+    it.each([
+      ["77a521c3", "system", "system"], ["1fcbf2a9", "agent", "agent"],
+      ["7db5a940", "system", "agent"], ["cfdc1dfc", "agent", "system"],
+    ] as const)("INSTALL no person: held %s requested %s / comment %s gets zero naming notes", async (label, requestedByActorType, authorType) => {
+      vi.spyOn(serverInfo, "getServerProcessStartedAt").mockReturnValue(new Date().toISOString());
+      const c = await seed();
+      const [held] = await db.insert(issueComments).values({ companyId: c.companyId, issueId: c.issueId,
+        authorType, ...(authorType === "agent" ? { authorAgentId: c.agentId } : {}), body: `${label} saved system work`, createdAt: ago(3 * day) }).returning();
+      const w = await wake(c, held.id, ago(3 * day));
+      await db.update(agentWakeupRequests).set({ requestedByActorType, requestedByActorId: requestedByActorType === "agent" ? c.agentId : null })
+        .where(eq(agentWakeupRequests.id, w.id));
+      const finalizer = await run(c, [], ago(10 * 60_000));
+      await db.insert(nativeRunFinalizations).values({ companyId: c.companyId, issueId: c.issueId, runId: finalizer.id, phase: "committed" });
+      for (let boot = 0; boot < 3; boot++) { await drain(c, finalizer.id, true); await sweep(c); }
+      const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, c.issueId), eq(issueComments.authorType, "system"),
+        sql`${issueComments.metadata}->>'authorizationReason' like ${UNANSWERED_MESSAGE_REASON_PREFIX + "%"}`));
+      console.log("AMMA-INSTALL-NONPERSON", JSON.stringify({ label, requestedByActorType, authorType, notes: notes.length, runs: await noRunFor(held.id) }));
+      expect(notes).toEqual([]);
+      expect(await noRunFor(held.id)).toEqual([]);
+    });
+    // Rule Half 2 lines 13-17: a saved owed person wake cannot become a late run,
+    // including at boot when no newer person input has ever been answered.
+    it.each([23, 25, 72])("HALF 2 boot drain/promotion: %sh owed person wake", async hours => {
+      vi.spyOn(serverInfo, "getServerProcessStartedAt").mockReturnValue(new Date().toISOString());
+      const c = await seed();
+      const old = await message(c, `Saved ${hours}-hour-old README request`, ago(hours * 60 * 60_000));
+      const w = await wake(c, old.id, ago(hours * 60 * 60_000 - 1000));
+      const finalizer = await run(c, [], ago(10 * 60_000));
+      await reply(c, finalizer.id, "An unrelated system turn finished.");
+      await db.insert(nativeRunFinalizations).values({ companyId: c.companyId, issueId: c.issueId,
+        runId: finalizer.id, phase: "committed" });
+      const outcomes = [];
+      for (let boot = 0; boot < 3; boot++) {
+        outcomes.push(await drain(c, finalizer.id, true));
+        await sweep(c);
+      }
+      const outcome = outcomes.at(-1)!;
+      const created = await noRunFor(old.id), notes = await cards(c, old.id);
+      const evidence = { hours, messageId: old.id, wakeId: w.id, outcome: outcome.outcome.kind,
+        created, cards: notes.map(n => ({ id: n.id, body: n.body })) };
+      console.log("AMMA-HALF2-BOOT", JSON.stringify(evidence));
+      expect.soft(created, hours > 24 ? "no old message starts a run" : "23h follows the live floor")
+        .toHaveLength(hours > 24 ? 0 : 1);
+      expect.soft(notes.length, "at most ONE naming note after two sweeps").toBeLessThanOrEqual(1);
+      if (hours > 24) {
+        expect.soft(notes, "owed history is named, not silently discarded").toHaveLength(1);
+        if (notes[0]) expect.soft(notes[0].body).toContain(old.body);
+      }
+    });
   });
 });

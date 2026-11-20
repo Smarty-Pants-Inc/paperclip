@@ -1,6 +1,9 @@
 import { getServerProcessStartedAt } from "../../server-info.js";
 import { settleSteeringIngestion, steeringIngestionPending } from "../native-runtime/steering-ingestion.js";
-import { UNANSWERED_MESSAGE_LOOKBACK_MS } from "./unanswered-person-message.js";
+import { settleUnansweredPersonMessage, UNANSWERED_MESSAGE_LOOKBACK_MS } from "./unanswered-person-message.js";
+import { personMessageWithinSendWindowSql } from "../person-message-answer.js";
+import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
+import { isUuidLike } from "@paperclipai/shared";
 import { deferredPersonWakeQuietAtSql } from "../deferred-person-wake-clock.js";
 import { DEFERRED_PERSON_WAKE_BOUND_MS } from "../../modules/wake-queue/domain/policy.js";
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
@@ -6914,6 +6917,32 @@ export function recoveryService(
   // still claims to be live but can no longer reach a terminal status on its
   // own, so a stuck "running" run can no longer block the sweep. Idempotent and
   // safe: clears at most one row's worth of lock columns per candidate.
+  // Recovery is not fresh person intent. Receipt touches/coalesces must not
+  // refresh the age of the actual waiting input across a restart.
+  async function settleHistoricalPersonWake(companyId: string, issueId: string, wakeId?: string) {
+    const wakes = await db.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      eq(agentWakeupRequests.source, "on_demand"), eq(agentWakeupRequests.requestedByActorType, "user"),
+      sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+      wakeId ? eq(agentWakeupRequests.id, wakeId) : undefined));
+    const ids = [...new Set(wakes.flatMap(wake => queuedCommentIdsFromWakePayload(wake.payload)).filter(isUuidLike))];
+    if (!ids.length) return false;
+    const now = new Date();
+    const messages = await db.select({ id: issueComments.id,
+      sendable: personMessageWithinSendWindowSql(sql`${issueComments.createdAt}`, sql`${now.toISOString()}::timestamptz`).mapWith(Boolean),
+    }).from(issueComments).where(and(
+      eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
+      eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt), inArray(issueComments.id, ids)))
+      .orderBy(desc(issueComments.createdAt), desc(issueComments.id));
+    if (!messages.length || messages.some(message => message.sendable)) return false;
+    // The sweep's own per-message writer owns the naming text, issue fence and
+    // unanswered_message:<id> idempotency key, just as moved-on settlement does.
+    for (const message of messages) await settleUnansweredPersonMessage(db, {
+      companyId, issueId, settleMessageId: message.id, now,
+    });
+    return true;
+  }
+
   async function sweepStaleIssueLocks(opts?: { companyId?: string; issueId?: string; onDeferredDeadline?: (at: number) => void }) {
     const result = {
       cleared: 0,
@@ -7044,6 +7073,11 @@ export function recoveryService(
       // rf-3 (ii): only a SUCCEEDED run's open fence is held here; failed / timed-out /
       // interrupted runs keep base's clear (their own owner-release path closes ingestion).
       if (row.status === "succeeded" && steeringIngestionPending(row.resultJson) && typeof ingestion?.sourceInstanceId === "string") {
+        const issueId = boundRunIssueId(row);
+        if (issueId && await settleHistoricalPersonWake(row.companyId, issueId)) {
+          pendingIngestionRunIds.add(row.id);
+          continue;
+        }
         await settleSteeringIngestion(db, { companyId: row.companyId, runId: row.id,
           sourceInstanceId: ingestion.sourceInstanceId, recoverStoppedController: true });
         const [current] = await db.select({ result: heartbeatRuns.resultJson }).from(heartbeatRuns)
@@ -7233,7 +7267,7 @@ export function recoveryService(
     // The adapter rechecks quiet time, actor, finalization and successor under
     // the issue lock shared by Send and end-of-run release.
     if (deps.releaseTerminalExecutionOwner) {
-      const personWakes = await db.select({ companyId: agentWakeupRequests.companyId,
+      const personWakes = await db.select({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId,
         agentId: agentWakeupRequests.agentId, issueId: issues.id, quietAt: deferredPersonWakeQuietAtSql })
         .from(agentWakeupRequests).innerJoin(issues, and(
           eq(issues.companyId, agentWakeupRequests.companyId),
@@ -7246,6 +7280,7 @@ export function recoveryService(
           opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
           opts?.issueId ? eq(issues.id, opts.issueId) : undefined));
       for (const wake of personWakes) {
+        if (await settleHistoricalPersonWake(wake.companyId, wake.issueId, wake.id)) continue;
         const dueAt = wake.quietAt.getTime() + DEFERRED_PERSON_WAKE_BOUND_MS;
         if (dueAt > Date.now()) { opts?.onDeferredDeadline?.(dueAt); continue; }
         const [live] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(

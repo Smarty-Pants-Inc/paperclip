@@ -4,6 +4,7 @@ import { acceptSteeredIdentity, reconcileSteeredIdentity, rejectSteeredIdentity,
 import { nativeRunHasStopRequest } from "./native-runtime/native-run-stop-request.js";
 import { logger } from "../middleware/logger.js";
 import { publishLiveEvent } from "./live-events.js";
+import { expiredPersonMessageIds } from "./person-message-answer.js";
 
 /** Existing outbox lock; shared with task-comment admission and run-end adoption. */
 export const personCommentDeliveryLockKey = (issueId: string): string => `conversation-delivery:${issueId}`;
@@ -55,6 +56,13 @@ async function deliveryIntent(db: Db, comment: SteerablePersonComment) {
  */
 export async function trySteerPersonComment(db: Db, comment: SteerablePersonComment, options: PersonCommentSteeringOptions = {}): Promise<boolean> {
   if (!comment.authorUserId || comment.authorAgentId || comment.deletedAt || comment.body.trim() === "/new") return false;
+  const expired = await expiredPersonMessageIds(db, { companyId: comment.companyId, issueId: comment.issueId,
+    contextSnapshot: { commentId: comment.id } });
+  if (expired.length) {
+    const { settleUnansweredPersonMessage } = await import("./recovery/unanswered-person-message.js");
+    await settleUnansweredPersonMessage(db, { companyId: comment.companyId, issueId: comment.issueId, settleMessageId: comment.id });
+    return true; // handled, not permission to fall back to an ordinary run
+  }
   if (!options.lockHeld) return db.transaction(async tx => {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${personCommentDeliveryLockKey(comment.issueId)}, 0))`);
     return trySteerPersonComment(db, comment, { ...options, lockHeld: true });

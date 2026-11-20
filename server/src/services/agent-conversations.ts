@@ -34,7 +34,8 @@ import { createHeartbeatTimerPolicy, parseHeartbeatPolicy } from "./heartbeat/ti
 import { isAgentAwaitingSetup } from "../modules/agent-lifecycle/index.js";
 import { HttpError } from "../errors.js";
 import { commentCarriedSql } from "./interrupt-carry-custody.js";
-import { personMessageOwedSql } from "./person-message-answer.js";
+import { personMessageOwedSql, personMessageWithinSendWindowSql } from "./person-message-answer.js";
+import { settleUnansweredPersonMessage, UNANSWERED_MESSAGE_REASON_PREFIX } from "./recovery/unanswered-person-message.js";
 
 export type ConversationIdentity = {
   conversationAgentId?: string | null;
@@ -604,6 +605,7 @@ export async function undeliveredConversationComments(
         sql`${issueComments.authorUserId} is not null`,
         isNull(issueComments.authorAgentId),
         eq(issueComments.origin, "comment"),
+        personMessageWithinSendWindowSql(sql`${issueComments.createdAt}`),
         sql`${issueComments.clientRequestId} is not null`,
         sql`not exists (select 1 from ${agentWakeupRequests} where ${agentWakeupRequests.companyId} = ${companyId}
       and ${agentWakeupRequests.idempotencyKey} = 'conversation-comment:' || ${issueComments.id}::text)`,
@@ -772,6 +774,24 @@ export async function deliverConversationComments(
   options: { onDeferredDeadline?: (at: number) => void } = {},
 ) {
   if (!issue.conversationAgentId) return;
+  // A stricter answer rule can reopen history. Settle it by the same keyed,
+  // fenced writer as the sweeps, never by putting it into the send outbox.
+  const expired = await db.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+    eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt),
+    sql`not (${personMessageWithinSendWindowSql(sql`${issueComments.createdAt}`)})`,
+    // Do not let the first page of already-noticed history starve later owed
+    // messages. Waiting-note upgrades remain the sweep's existing keyed work.
+    sql`not exists (select 1 from ${issueComments} named_notice
+      where named_notice.company_id = ${issueComments.companyId} and named_notice.issue_id = ${issueComments.issueId}
+        and named_notice.author_type = 'system'
+        and named_notice.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || ${issueComments.id}::text)`,
+    personMessageOwedSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+      issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }),
+  )).orderBy(issueComments.createdAt, issueComments.id).limit(100);
+  for (const message of expired) await settleUnansweredPersonMessage(db, {
+    companyId: issue.companyId, issueId: issue.id, settleMessageId: message.id,
+  });
   const canDeliver = async (connection: Db): Promise<{ invokable: true } | { invokable: false; reason: string }> => {
     const [agent] = await connection.select().from(agents).where(and(
       eq(agents.id, issue.conversationAgentId!), eq(agents.companyId, issue.companyId),

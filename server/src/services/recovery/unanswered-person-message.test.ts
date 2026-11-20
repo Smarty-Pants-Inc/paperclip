@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { appendFileSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import {
   activityLog,
   agentWakeupRequests,
@@ -103,8 +105,13 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       return row!.id;
     };
     const reply = async (runId: string) => {
+      const [carrier] = await db.select({ startedAt: heartbeatRuns.startedAt, createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      // Rule line 6: the reply must follow the ACTUAL claim, not this fixture's
+      // older synthetic clock when a queued run is claimed using Date.now().
+      const createdAt = new Date(Math.max(at().getTime(), ((carrier?.startedAt ?? carrier?.createdAt)?.getTime() ?? 0) + 1));
+      clock = createdAt.getTime();
       await db.insert(issueComments).values({ companyId, issueId, body: "Here is my answer.", authorType: "agent", authorAgentId: agentId,
-        createdByRunId: runId, createdAt: at() });
+        createdByRunId: runId, createdAt });
     };
     const boardHold = async (cause: string, runId: string, kind = "active_run_watchdog") => {
       const [row] = await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId, kind, status: "active",
@@ -155,6 +162,79 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     };
     return { companyId, agentId, issueId, userId, message, run, reply, boardHold, sweep, visible, at, nativeSuccessor };
   }
+
+  // RFL naming rule: first words + time identify the SAME saved message.
+  // Repointed for review-fleet-5 AMMA5: server HH:mm was wrong for the reader;
+  // retain the first words and remedy checks, but require the saved ISO token.
+  async function noticeText(note: typeof issueComments.$inferSelect): Promise<string> {
+    const id = note.metadata?.authorizationReason?.slice("unanswered_message:".length);
+    expect(id).toBeTruthy();
+    const [message] = await db.select().from(issueComments).where(eq(issueComments.id, id!));
+    expect(message).toBeDefined();
+    const iso = message!.createdAt.toISOString();
+    const time = `[${iso}](#paperclip-time=${iso})`;
+    const quote = message!.body.length > 60 ? `${message!.body.slice(0, 59)}…` : message!.body;
+    const prefix = `Your message is saved: "${quote}" (${time}). `;
+    expect(note.body.startsWith(prefix)).toBe(true);
+    return note.body.slice(prefix.length);
+  }
+
+  // catch: review-fleet-5 FINDING on 3da56cd6, AMMA5: the UTC server
+  // named Paul's 8:04 AM ET message as bare 13:04 (including setup's since).
+  it.each(["failed", "too-old", "setup"] as const)(
+    "AMMA5 persists the exact 13:04Z instant, not the server clock (%s)", async kind => {
+      const saved = new Date("2026-11-20T13:04:00.000Z");
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date(saved.getTime() + (kind === "too-old" ? 25 * 3_600_000 : 16 * 60_000)));
+      try {
+        const f = await fixture();
+        const messageId = await f.message("Please keep my exact message.");
+        await db.update(issueComments).set({ createdAt: saved }).where(eq(issueComments.id, messageId));
+        if (kind === "setup") {
+          await db.update(agents).set({ status: "paused", lifecycleState: "preparing", pauseReason: "setup",
+            lifecycleHolds: [], lifecycleError: null }).where(eq(agents.id, f.agentId));
+        } else if (kind === "too-old") {
+          await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+            source: "on_demand", reason: "issue_commented", status: "cancelled",
+            idempotencyKey: `conversation-comment:${messageId}`, payload: { issueId: f.issueId, commentId: messageId } });
+        } else {
+          await f.run({ commentId: messageId, status: "failed", errorCode: "adapter_failed" });
+        }
+        await f.sweep();
+        const [original] = await f.visible();
+        expect(original).toBeDefined();
+        // Real card creation/resolution retires and restores failed/old notes.
+        // Setup has no run/card yet: exercise its production sweep directly.
+        let restored = original;
+        let cardId: string | null = null;
+        if (kind !== "setup") {
+        const runId = await f.run({ commentId: messageId, status: "running" });
+        const svc = issueThreadInteractionService(db);
+        const scope = { id: f.issueId, companyId: f.companyId };
+        const card = await svc.create(scope, { kind: "request_confirmation", sourceRunId: runId,
+          continuationPolicy: "none", payload: { version: 1, prompt: "Proceed?", rejectRequiresReason: true } },
+          { agentId: f.agentId, runId });
+        await db.update(issueThreadInteractions).set({ createdAt: f.at() })
+          .where(eq(issueThreadInteractions.id, card.id));
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: f.at() }).where(eq(heartbeatRuns.id, runId));
+        await f.sweep();
+        expect(await f.visible()).toHaveLength(0);
+        await svc.rejectInteraction(scope, card.id, { reason: "Still need my answer." }, { userId: f.userId });
+        await f.sweep();
+        [restored] = await f.visible();
+        cardId = card.id;
+        expect(restored?.id).toBe(original!.id);
+        }
+        if (process.env.AMMA5_NOTE_EVIDENCE_DIR) await writeFile(
+          join(process.env.AMMA5_NOTE_EVIDENCE_DIR, `amma5-${kind}.json`),
+          JSON.stringify({ kind, savedAt: saved.toISOString(), original, restored, cardId }, null, 2));
+        expect(restored!.body).toContain(`[${saved.toISOString()}](#paperclip-time=${saved.toISOString()})`);
+        expect(restored!.body).not.toMatch(/\((?:since )?13:04\)/);
+        expect(restored!.body).toContain(kind === "setup" ? "Managed Pi is still being set up" : 'Your message is saved: "Please keep my exact message."');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
 
   const codeOf = (comment: { metadata: unknown }) => {
     const sections = ((comment.metadata as Record<string, unknown>)?.sections ?? []) as Array<{ rows: Array<{ label?: string; value?: string }> }>;
@@ -249,7 +329,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await f.notes()).toHaveLength(2);
     const visible = await f.visible();
     expect(visible).toHaveLength(1);
-    expect(visible[0]!.body).toBe(NOT_ANSWERED);
+    expect(await noticeText(visible[0]!)).toBe(NOT_ANSWERED);
     expect(codeOf(visible[0]!)).toBe("setup_failed");
     expect(visible[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${f.messageId}`);
     expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "noticed_before" });
@@ -315,7 +395,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed", code: "setup_failed" });
     const notes = await f.notes();
     expect(notes).toHaveLength(2);
-    expect(notes.find(note => note.id !== f.commentId)!.body).toBe(NOT_ANSWERED);
+    expect(await noticeText(notes.find(note => note.id !== f.commentId)!)).toBe(NOT_ANSWERED);
     expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "noticed_before" });
     expect(await f.notes()).toHaveLength(2);
   });
@@ -337,7 +417,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed", code: "setup_failed" });
     const notes = await f.visible();
     expect(notes).toHaveLength(1);
-    expect(notes[0]!.body).toBe(NOT_ANSWERED);
+    expect(await noticeText(notes[0]!)).toBe(NOT_ANSWERED);
     expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${messageId}`);
   });
 
@@ -347,7 +427,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   ])("one-note: a non-covering recovery notice cannot silence the message (%j)", async input => {
     const f = await setupFailureWithRetryNotice(input);
     expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed", code: "setup_failed" });
-    expect((await f.visible())[0]!.body).toBe(NOT_ANSWERED);
+    expect(await noticeText((await f.visible())[0]!)).toBe(NOT_ANSWERED);
   });
 
   it("one-note: an older Retry notice does not cover a new message and failed run", async () => {
@@ -380,11 +460,11 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       for (const f of ordinary) {
         const notices = await f.visible();
         expect(notices).toHaveLength(1);
-        expect(notices[0]!.body).toBe(NOT_ANSWERED);
+        expect(await noticeText(notices[0]!)).toBe(NOT_ANSWERED);
       }
       const heldNotices = await held.visible();
       expect(heldNotices).toHaveLength(1);
-      expect(heldNotices[0]!.body).toBe(NOT_ANSWERED);
+      expect(await noticeText(heldNotices[0]!)).toBe(NOT_ANSWERED);
       expect(heldNotices[0]!.presentation).toMatchObject({ title: "Your message wasn't answered" });
       expect(heldNotices[0]!.body).not.toContain("I'm stopping");
     }
@@ -403,7 +483,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await settleUnrecoverableExecutions(db);
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NOT_ANSWERED);
+    expect(await noticeText(notices[0]!)).toBe(NOT_ANSWERED);
     expect(notices[0]!.body).not.toMatch(/native_|runner_|backup_without/);
     expect(codeOf(notices[0]!)).toBe("runner_harness_state_mismatch");
     await f.sweep();
@@ -425,7 +505,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     // follow-Paperclip Cut B R8: an overdue retry can be explained without preempting its recovery owner.
     expect(await f.visible()).toHaveLength(1);
-    expect((await f.visible())[0].body).toBe(NOT_ANSWERED);
+    expect(await noticeText((await f.visible())[0])).toBe(NOT_ANSWERED);
     expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, id)))[0].phase)
       .toBe("retryable_failure");
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(1);
@@ -435,7 +515,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.boardHold("native_session_retry_exhausted", id);
     await settleUnrecoverableExecutions(db);
     expect(await f.visible()).toHaveLength(1);
-    expect((await f.visible())[0].body).toBe(NOT_ANSWERED);
+    expect(await noticeText((await f.visible())[0])).toBe(NOT_ANSWERED);
   });
 
   it("SMA-94 (live C8): adapter_failed 'Native session failed' under an ACTIVE board-owned native_continuation_requires_reconciliation hold -> exactly one notice", async () => {
@@ -445,7 +525,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NOT_ANSWERED);
+    expect(await noticeText(notices[0]!)).toBe(NOT_ANSWERED);
     expect(codeOf(notices[0]!)).toBe("adapter_failed");
     const rows = (notices[0]!.metadata?.sections ?? []).flatMap(section => section.rows) as Array<{ label?: string }>;
     expect(rows.some(row => row.label === "Recovery action")).toBe(true);
@@ -459,7 +539,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NOT_ANSWERED);
+    expect(await noticeText(notices[0]!)).toBe(NOT_ANSWERED);
     expect(notices[0]!.body).not.toContain("runnerd");
     expect(codeOf(notices[0]!)).toBe("native_session_retry_exhausted");
   });
@@ -476,7 +556,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(2);
-    expect(notices.map(notice => notice.body)).toContain(NO_RUN);
+    expect(await noticeText(notices.find(note => note.body.endsWith(NO_RUN))!)).toBe(NO_RUN);
   });
 
   it("SMAA-501 (RFL 20:37Z): a comment coalesced into a remote_cleanup execution wait whose wake FAILED -> exactly one notice, at the failure (no timer)", async () => {
@@ -498,7 +578,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issueId });
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NO_RUN);
+    expect(await noticeText(notices[0]!)).toBe(NO_RUN);
     expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${comment!.id}`);
     expect(JSON.stringify(notices[0])).not.toContain("receipt missing");
   });
@@ -513,7 +593,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issueId });
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NO_RUN);
+    expect(await noticeText(notices[0]!)).toBe(NO_RUN);
     expect(JSON.stringify(notices[0])).not.toContain("completion contract");
   });
 
@@ -523,7 +603,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NO_RUN);
+    expect(await noticeText(notices[0]!)).toBe(NO_RUN);
     expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
     expect(codeOf(notices[0]!)).toBe("no_run");
   });
@@ -534,7 +614,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NO_REPLY);
+    expect(await noticeText(notices[0]!)).toBe(NO_REPLY);
     expect(codeOf(notices[0]!)).toBe("no_reply");
   });
 
@@ -632,7 +712,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       error: "Something exploded at /srv/secret/path with token abc123" });
     await f.sweep();
     const [notice] = await f.visible();
-    expect(notice!.body).toBe(NOT_ANSWERED);
+    expect(await noticeText(notice!)).toBe(NOT_ANSWERED);
     expect(JSON.stringify(notice)).not.toMatch(/exploded|secret|abc123/);
     expect(codeOf(notice!)).toBe("adapter_failed");
     const unknown = await fixture();
@@ -685,7 +765,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId });
     const before = await f.visible();
     expect(before).toHaveLength(1);
-    expect(before[0]!.body).toBe(NOT_ANSWERED);
+    expect(await noticeText(before[0]!)).toBe(NOT_ANSWERED);
     const continuation = kind === "native-status" ? await f.nativeSuccessor(failed)
       : await f.run({ commentId: null, status: "succeeded", retryOfRunId: failed, wakeReason: "issue_continuation_needed" });
     await f.reply(continuation);
@@ -703,7 +783,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NO_RUN);
+    expect(await noticeText(notices[0]!)).toBe(NO_RUN);
   });
 
   it("fabric-v2 (21:40Z): a comment delivered as a run's FIRST-TURN input is carried by that run: no notice while it runs or after it answers; one if it fails", async () => {
@@ -733,7 +813,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         const notices = await f.visible();
         expect(notices).toHaveLength(1);
         expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
-        expect(notices[0]!.body).toBe(NOT_ANSWERED);
+        expect(await noticeText(notices[0]!)).toBe(NOT_ANSWERED);
       }
     }
   });
@@ -1130,7 +1210,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const notes = await f.visible();
     expect(notes).toHaveLength(1);
     expect(notes[0]!.id).toBe(waiting!.id);
-    expect(notes[0]!.body).toBe(NO_RUN);
+    expect(await noticeText(notes[0]!)).toBe(NO_RUN);
     expect(codeOf(notes[0]!)).toBe("no_run");
     await settleAt(f, PENDING_WAIT_START_BOUND_MS + 60_000);
     expect(await f.visible()).toHaveLength(1);
@@ -1149,7 +1229,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       await settleAt(f, PENDING_WAIT_BOUND_MS + 1_000);
       const notes = await f.visible();
       expect(notes).toHaveLength(1);
-      expect(notes[0]!.body).toBe(NO_RUN);
+      expect(await noticeText(notes[0]!)).toBe(NO_RUN);
     });
 
   it("waitnote guard: an unrelated deferred wait and a coalesced receipt alone do not silence a failed message", async () => {
@@ -1162,14 +1242,14 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
           executionWait: { reason: "remote_cleanup", message: "Waiting" } } });
     }
     await f.sweep();
-    expect((await f.visible()).map(note => note.body)).toEqual([NOT_ANSWERED]);
+    expect(await Promise.all((await f.visible()).map(noticeText))).toEqual([NOT_ANSWERED]);
   });
 
   it("waitnote guard: a failed run with no deferred wake still gets its resend notice", async () => {
     const f = await fixture();
     await f.run({ commentId: await f.message(), status: "failed", errorCode: "adapter_failed" });
     await f.sweep();
-    expect((await f.visible()).map(note => note.body)).toEqual([NOT_ANSWERED]);
+    expect(await Promise.all((await f.visible()).map(noticeText))).toEqual([NOT_ANSWERED]);
   });
 
   it("M1.1 (1): a queued wake carrying the issue that never runs -> no notice inside the bound, exactly one after it", async () => {
@@ -1286,7 +1366,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await settleAt(f, AFTER_WAKE_BOUND_MS);
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NO_REPLY);
+    expect(await noticeText(notices[0]!)).toBe(NO_REPLY);
   });
 
   it("M1.1 (6) control: the missing-comment retry posts the reply within the bound -> no notice", async () => {
@@ -1363,7 +1443,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     notices = await f.visible();
     expect(notices).toHaveLength(1);
     expect(notices[0]!.id).toBe(noteId);
-    expect(notices[0]!.body).toBe(NO_RUN);
+    expect(await noticeText(notices[0]!)).toBe(NO_RUN);
     expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
     expect(rowsOf(notices[0]!).some(row => row.label === "Waiting code")).toBe(false);
     await settleAt(f, 12 * 60_000);
@@ -1464,8 +1544,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       await f.sweep();
       const [note] = await f.visible();
       expect(await f.visible()).toHaveLength(1);
-      const hhmm = `${String(start.getHours()).padStart(2, "0")}:${String(start.getMinutes()).padStart(2, "0")}`;
-      expect(note!.body).toBe(`Managed Pi is still being set up (since ${hhmm}). Your message is saved and will be answered as soon as it's ready.`);
+      // review-fleet-5 AMMA5: setup's since-time is reader-local too.
+      const iso = start.toISOString();
+      expect(note!.body).toBe(`Managed Pi is still being set up (since [${iso}](#paperclip-time=${iso})). Your message is saved and will be answered as soon as it's ready.`);
       expect(note!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
       expect(rowsOf(note!).some(row => row.label === "Failure code")).toBe(false);
       expect(JSON.stringify(note)).not.toMatch(/paused|resume|send.*again/i);
@@ -1670,7 +1751,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       const [note] = await f.visible();
       expect((await f.visible()).map(n => n.body)).toEqual([WAITING]);
       await settleAt(f, 11 * 60_000);
-      expect((await f.visible()).map(n => ({ id: n.id, body: n.body }))).toEqual([{ id: note!.id, body: NO_RUN }]);
+      expect(await Promise.all((await f.visible()).map(async n => ({ id: n.id, body: await noticeText(n) })))).toEqual([{ id: note!.id, body: NO_RUN }]);
     });
 
   // pausefix 2 (rf-5 P1, org 10:32Z): after a Resume, the stale paused note
@@ -1746,7 +1827,15 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     if (state === "ready") await db.update(agents).set({ lifecycleState: "ready", status: "idle" }).where(eq(agents.id, f.agentId));
     await db.update(heartbeatRuns).set({ ...end, finishedAt: new Date(Date.now() - 60_000) }).where(eq(heartbeatRuns.id, run));
     await settleAt(f, 2 * 60_000);
-    expect(await one(f)).toEqual([{ id: pausedNote.id, body: text }]);
+    // RFL naming rule: after ready, the terminal unanswered notice names M;
+    // resuming still uses the separate standing lifecycle notice.
+    if (state === "ready") {
+      const notes = await f.visible();
+      expect(notes.map(note => note.id)).toEqual([pausedNote.id]);
+      expect(await noticeText(notes[0]!)).toBe(text);
+    } else {
+      expect(await one(f)).toEqual([{ id: pausedNote.id, body: text }]);
+    }
     expect(JSON.stringify(await f.visible())).not.toMatch(/working on|safe/i);
   });
 
@@ -1958,9 +2047,10 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
 
   it("no false notice: blocked on a question card to the person (the agent's answer is the card) -> quiet", async () => {
     const f = await fixture({ status: "blocked" });
-    const asked = await f.run({ commentId: await f.message("Which region?"), status: "succeeded" });
+    const messageId = await f.message("Which region?");
+    const asked = await f.run({ commentId: messageId, status: "succeeded" });
     await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, kind: "ask_user_questions",
-      status: "pending", createdByAgentId: f.agentId, sourceRunId: asked, addresseeUserId: f.userId,
+      status: "pending", createdByAgentId: f.agentId, sourceRunId: asked, originCommentIds: [messageId], addresseeUserId: f.userId,
       payload: { version: 1, questions: [{ id: "region", prompt: "Which region?", selectionMode: "single",
         options: [{ id: "eu", label: "EU" }, { id: "us", label: "US" }] }] } as never, createdAt: f.at() });
     await f.sweep();
@@ -1972,14 +2062,14 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   it.each([
     ["carrying", "context"], ["continuation", "context"], ["carrying", "delivery"], ["continuation", "delivery"],
   ] as const)(
-    "PV2b chain: message -> %s card -> answer-resume (%s) fails -> successor final never gets a resend notice", async (cardSource, answerLink) => {
+    "PV2b chain: message -> %s card -> person answer-resume (%s) fails -> successor final supersedes ONE notice", async (cardSource, answerLink) => {
       const f = await fixture({ status: "in_review" });
       const messageId = await f.message("Build Sol; ask me for the name first.");
       const carryingRunId = await f.run({ commentId: messageId, status: "succeeded" });
       const sourceRunId = cardSource === "carrying" ? carryingRunId
         : await f.run({ status: "succeeded", retryOfRunId: carryingRunId });
       const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
-        kind: "ask_user_questions", status: "pending", sourceRunId, createdByAgentId: f.agentId,
+        kind: "ask_user_questions", status: "pending", sourceRunId, createdByAgentId: f.agentId, originCommentIds: [messageId],
         addresseeUserId: f.userId, continuationPolicy: "wake_assignee", createdAt: f.at(),
         payload: { version: 1, questions: [{ id: "name", prompt: "What is the product called?", required: true,
           selectionMode: "single", options: [{ id: "sol", label: "Sol" }] }] } }).returning();
@@ -1997,13 +2087,17 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         await db.update(issueQuestionResponseDeliveries).set({ targetRunId: resume, status: "fallback_queued",
           deliveryMode: "wake_fallback" }).where(eq(issueQuestionResponseDeliveries.interactionId, card!.id));
       }
-      expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
+      // RFL by-purpose: the person's card answer is new input, not a posted
+      // agent reply. Until the successor publishes, the original stays owed.
+      expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed" });
       const successor = await f.nativeSuccessor(resume);
       await f.reply(successor);
       expect(await freshContinuationDescendsFrom(db, { companyId: f.companyId, issueId: f.issueId,
         runId: successor, ancestorRunId: carryingRunId, includeAnswerLineage: true })).toBe(true);
       await f.sweep();
-      expect(await noticesEver()).toHaveLength(0);
+      expect(await noticesEver()).toHaveLength(1);
+      expect(await f.visible()).toHaveLength(0);
+      expect((await noticesEver())[0]!.deletedAt).not.toBeNull();
       expect(await readContinuationCommentInput(db, { ...f, runId: carryingRunId })).toEqual({});
       // A previously published notice is superseded too, not merely hidden
       // by the decision to avoid writing another one.
@@ -2289,14 +2383,15 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     }
   });
 
-  // Keep: recorded PV2 gate-1 catch (11:27Z): answering the run's question
-  // removed its pending-card exemption before response delivery could wake it.
-  it.each([true, false])("PV2 card-answer: no resend notice before, during or after one answer delivery (chat=%s)", async chat => {
+  // RFL by-purpose supersedes the pending-card exemption after a PERSON
+  // answers it. Preserve delivery idempotency; only the agent's posted reply
+  // answers the original message and supersedes its one notice.
+  it.each([true, false])("PV2 card-answer: person answer stays owed until the agent posts; one note, one delivery (chat=%s)", async chat => {
     const f = await fixture({ chat, status: "in_review" });
     const messageId = await f.message("Build the landing page.");
     const sourceRunId = await f.run({ commentId: messageId, status: "running" });
     const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
-      kind: "ask_user_questions", status: "pending", sourceRunId, createdByAgentId: f.agentId,
+      kind: "ask_user_questions", status: "pending", sourceRunId, createdByAgentId: f.agentId, originCommentIds: [messageId],
       addresseeUserId: f.userId, continuationPolicy: "wake_assignee", createdAt: f.at(),
       payload: { version: 1, questions: [{ id: "name", prompt: "What is the product called?", required: true,
         selectionMode: "single", options: [{ id: "sol", label: "Sol" }] }] } }).returning();
@@ -2309,11 +2404,12 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const answered = await issueThreadInteractionService(db).answerQuestions({ id: f.issueId, companyId: f.companyId }, card!.id,
       { answers: [{ questionId: "name", optionIds: ["sol"] }] }, { userId: f.userId });
     expect(answered.status).toBe("answered");
-    // The exact live race: the card answer committed, but no delivery wake exists yet.
-    expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
+    // RFL by-purpose: a person's answer is not an agent's published reply.
+    // The fenced card stands until the answer-resume publishes its own reply.
+    expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed" });
     await f.sweep();
-    expect(await noticesEver()).toHaveLength(0);
-    expect(await readContinuationCommentInput(db, { ...f, runId: sourceRunId })).toEqual({});
+    expect(await noticesEver()).toHaveLength(1);
+    expect(await readContinuationCommentInput(db, { ...f, runId: sourceRunId })).toMatchObject({ wakeCommentIds: [messageId] });
 
     // Only provider dispatch is replaced: the real answer transaction, delivery
     // claim/idempotency, durable wake, sweep and reply attribution all use PostgreSQL.
@@ -2338,25 +2434,26 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await db.select().from(issueQuestionResponseDeliveries).where(eq(issueQuestionResponseDeliveries.interactionId, card!.id)))
       .toHaveLength(1);
     await f.sweep();
-    expect(await noticesEver()).toHaveLength(0);
+    expect(await noticesEver()).toHaveLength(1);
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: f.at() }).where(eq(heartbeatRuns.id, first!.targetRunId!));
     await db.update(agentWakeupRequests).set({ status: "completed" }).where(eq(agentWakeupRequests.id, wakes[0]!.id));
     await f.reply(first!.targetRunId!);
     await f.sweep();
-    expect(await noticesEver()).toHaveLength(0);
+    expect(await noticesEver()).toHaveLength(1);
+    expect(await f.visible()).toHaveLength(0);
+    expect((await noticesEver())[0]!.deletedAt).not.toBeNull();
     expect(await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "agent"))))
       .toHaveLength(1);
   });
 
-  // Keep: rf5 H4 F1 caught confirmation acceptance changing pending -> accepted,
-  // which made the original input look unanswered again. Use the production
-  // creation and resolution services, not a hand-written terminal status.
+  // RFL by-purpose: a person's confirmation is not the agent's answer. Use
+  // production creation and resolution and retain the ONE notice with no reply.
   it.each([
     { chat: true, decision: "accept" }, { chat: false, decision: "accept" },
     { chat: true, decision: "reject" }, { chat: false, decision: "reject" },
     { chat: true, decision: "skip" }, { chat: false, decision: "skip" },
     { chat: true, decision: "withdraw" }, { chat: false, decision: "withdraw" },
-  ] as const)("H4 confirmation reply: $decision leaves no notice or carry (chat=$chat)", async ({ chat, decision }) => {
+  ] as const)("H4 confirmation reply: $decision is person input, ONE notice until an agent reply (chat=$chat)", async ({ chat, decision }) => {
     const f = await fixture({ chat, status: "in_progress" });
     const messageId = await f.message("Apply the proposed change.");
     const sourceRunId = await f.run({ commentId: messageId, status: "running" });
@@ -2372,15 +2469,18 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: f.at() }).where(eq(heartbeatRuns.id, sourceRunId));
     const noticesEver = () => db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
       sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`));
-    const assertQuiet = async () => {
+    const assertState = async (personAnswered = false) => {
       await f.sweep();
-      expect(await noticesEver(), "no notice, including soft-deleted notices").toHaveLength(0);
-      expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
-      expect(await readContinuationCommentInput(db, { ...f, runId: sourceRunId })).toEqual({});
+      const notices = await noticesEver();
+      expect(notices).toHaveLength(personAnswered ? 1 : 0);
+      expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: personAnswered ? "noticed_before" : "answered" });
+      const pending = await readContinuationCommentInput(db, { ...f, runId: sourceRunId });
+      if (personAnswered) expect(pending).toMatchObject({ wakeCommentIds: [messageId] });
+      else expect(pending).toEqual({});
       expect(await db.select({ id: issueComments.id }).from(issueComments).where(and(
         eq(issueComments.id, messageId), unansweredPersonMessageCommentCondition()))).toHaveLength(0);
     };
-    await assertQuiet();
+    await assertState();
     const actor = { userId: f.userId };
     const reason = { reason: "Keep the current behavior." };
     const resolved = decision === "accept"
@@ -2390,35 +2490,111 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       : await svc.withdrawInteraction(scope, card.id, reason, actor);
     const expectedStatus = { accept: "accepted", reject: "rejected", skip: "cancelled", withdraw: "cancelled" };
     expect(resolved).toMatchObject({ status: expectedStatus[decision], resolvedByUserId: f.userId });
-    await assertQuiet();
-    // Cross the 10-minute no-reply grace as well as ordinary settlement, then
-    // sweep twice. No provider reply or continuation wake can mask this bug.
+    await assertState(true);
+    // No agent reply appeared: keep the SAME one notice across later sweeps.
     await db.update(heartbeatRuns).set({ finishedAt: new Date(Date.now() - 11 * 60_000) }).where(eq(heartbeatRuns.id, sourceRunId));
-    await assertQuiet();
-    await assertQuiet();
+    await assertState(true);
+    await assertState(true);
     expect(await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
       eq(issueComments.authorType, "agent")))).toHaveLength(0);
   });
 
+  // catch: round-2 card retirement; RFL's person resolution is NOT an agent answer.
+  // Each real shape has the unchanged 15-second bound, rather than charging
+  // four separate card-service journeys to one test's clock.
+  it.each((["accept", "reject", "skip", "withdraw"] as const).flatMap(decision =>
+    [true, false].flatMap(chat => [false, true].map(fresh => ({ decision, chat, fresh })))))(
+    "CARD-RETIREMENT: person $decision / chat=$chat / fresh=$fresh restores the SAME naming note once, through real sweep and card writer", async ({ decision, chat, fresh }) => {
+        const f = await fixture({ chat, status: "in_progress" });
+        const messageId = await f.message("Keep this exact obligation visible.", fresh ? 1_000 : -2 * 24 * 60 * 60_000);
+        const visibleForMessage = async () => (await f.visible()).filter(note =>
+          note.metadata?.authorizationReason === `unanswered_message:${messageId}`);
+        await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+          source: "on_demand", reason: "issue_commented", status: "cancelled",
+          idempotencyKey: `conversation-comment:${messageId}`, payload: { issueId: f.issueId, commentId: messageId } });
+        await f.sweep();
+        const [original] = await f.visible();
+        expect(original).toBeDefined();
+        // RFL naming rule: every note names M by its first words + saved time,
+        // including fresh input and the same note when a person resolves a card.
+        const [message] = await db.select().from(issueComments).where(eq(issueComments.id, messageId));
+        // review-fleet-5 AMMA5: repoint time only; preserve naming + retirement.
+        const iso = message!.createdAt.toISOString();
+        const time = `[${iso}](#paperclip-time=${iso})`;
+        const name = `Your message is saved: "${message!.body}" (${time}).`;
+        expect.soft(original?.body).toContain(name);
+        const sourceRunId = await f.run({ commentId: messageId, status: "running" });
+        const svc = issueThreadInteractionService(db);
+        const scope = { id: f.issueId, companyId: f.companyId };
+        const card = await svc.create(scope, { kind: "request_confirmation", sourceRunId,
+          continuationPolicy: "none", payload: { version: 1, prompt: "Proceed?", rejectRequiresReason: true } },
+          { agentId: f.agentId, runId: sourceRunId });
+        await db.update(issueThreadInteractions).set({ createdAt: f.at() }).where(eq(issueThreadInteractions.id, card.id));
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: f.at() }).where(eq(heartbeatRuns.id, sourceRunId));
+        await f.sweep();
+        expect(await f.visible()).toHaveLength(0); // pending card temporarily answers M
+        const [retired] = await db.select().from(issueComments).where(eq(issueComments.id, original!.id));
+        expect(retired!.deletedAt).not.toBeNull();
+        if (!chat) {
+          // Upgrade case: 01619 retired existing notes without the new marker.
+          await db.update(issueComments).set({ metadata: sql`${issueComments.metadata} - 'unansweredNoticeRetired'` })
+            .where(eq(issueComments.id, original!.id));
+        }
+        if (fresh) await f.message("My follow-up while I resolve the card.");
+        const actor = { userId: f.userId }, reason = { reason: "Keep the obligation." };
+        const resolved = decision === "accept"
+          ? (await svc.acceptInteraction({ ...scope, projectId: null, goalId: null }, card.id, {}, actor)).interaction
+          : decision === "reject" ? await svc.rejectInteraction(scope, card.id, reason, actor)
+          : decision === "skip" ? await svc.skipInteraction(scope, card.id, reason, actor)
+          : await svc.withdrawInteraction(scope, card.id, reason, actor);
+        expect(resolved.resolvedByUserId).toBe(f.userId);
+        await Promise.all([f.sweep(), f.sweep()]); // two workers must restore the same id, not append
+        for (let pass = 0; pass < 3; pass++) {
+          await f.sweep();
+          expect(await visibleForMessage()).toMatchObject([{ id: original!.id,
+            metadata: { authorizationReason: `unanswered_message:${messageId}` } }]);
+          expect.soft((await visibleForMessage())[0]!.body).toContain(name);
+        }
+        const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+          sql`${issueComments.metadata}->>'authorizationReason' = ${`unanswered_message:${messageId}`}`));
+        expect(notes).toHaveLength(1);
+        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(1);
+        expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId))).toHaveLength(1);
+        if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `card-retirement-${decision}-${chat}-${fresh}.json`),
+          JSON.stringify({ messageId, original, retired, resolved, notes }, null, 2));
+    });
+
   it.each(["wakeCommentId", "commentId", "conversationReplyBoundaryCommentId", "wakeCommentIds", "firstTurnQueuedInput"])(
-    "PV2 card-answer: open and answered cards answer only their own carried input through %s", async key => {
+    "PV2 card-answer: only pending addressed agent cards answer carried input through %s", async key => {
       const f = await fixture();
       const earlier = await f.message("Still waiting in the queue.");
       const messageId = await f.message("The steered input.");
       const runId = await f.run({ status: "succeeded" });
       const contextSnapshot = { issueId: f.issueId, steeredCommentIds: [messageId],
+        steeredDeliveredAts: { [messageId]: f.at().toISOString() },
         [key]: key === "wakeCommentIds" ? [messageId] : key === "firstTurnQueuedInput" ? { commentIds: [messageId] } : messageId };
       await db.update(heartbeatRuns).set({ contextSnapshot }).where(eq(heartbeatRuns.id, runId));
       for (const kind of ["ask_user_questions", "request_confirmation"] as const) {
         const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
-          kind, status: "pending", sourceRunId: runId, createdByAgentId: f.agentId, createdAt: f.at(),
+          kind, status: "pending", sourceRunId: runId, createdByAgentId: f.agentId, originCommentIds: [messageId], createdAt: f.at(),
           payload: kind === "ask_user_questions" ? { version: 1, questions: [] } : { version: 1, prompt: "Proceed?" } }).returning();
         for (const status of kind === "ask_user_questions" ? ["pending", "answered"] : ["pending", "accepted", "rejected"]) {
-          await db.update(issueThreadInteractions).set({ status }).where(eq(issueThreadInteractions.id, card!.id));
-          expect(await settleUnansweredPersonMessage(db, f), `${kind}/${status}`).toEqual({ kind: "answered" });
-          expect(await readContinuationCommentInput(db, { ...f, runId })).toEqual({});
+          // RFL: this is the PERSON resolving the card, not an agent reply.
+          await db.update(issueThreadInteractions).set({ status,
+            resolvedByUserId: status === "pending" ? null : f.userId }).where(eq(issueThreadInteractions.id, card!.id));
+          const outcome = await settleUnansweredPersonMessage(db, f);
+          expect(outcome.kind, `${kind}/${status}`).toBe(status === "pending" ? "answered"
+            : status === "answered" || status === "accepted" ? "noticed" : "noticed_before");
+          const input = await readContinuationCommentInput(db, { ...f, runId });
+          if (status === "pending") expect(input).toEqual({});
+          else {
+            expect(input).toMatchObject({ wakeCommentIds: [messageId] });
+            expect((await f.visible()).filter(note => note.metadata?.authorizationReason === `unanswered_message:${messageId}`),
+              "the same message's final note must be visible again after the person answers the card").toHaveLength(1);
+          }
           const pending = await pendingContinuationCommentInput(db, { ...f, contextSnapshot: { wakeCommentIds: [earlier] } });
-          expect(pending.wakeCommentIds, "a card for the steered input must not consume earlier queued messages").toEqual([earlier]);
+          expect(pending.wakeCommentIds, "a card never consumes the earlier input explicitly passed to this reader")
+            .toEqual([earlier]);
           const candidates = await db.select({ id: issueComments.id }).from(issueComments).where(and(
             eq(issueComments.id, messageId), unansweredPersonMessageCommentCondition()));
           expect(candidates, `${kind}/${status}: discovery and settlement agree`).toHaveLength(0);
@@ -2520,7 +2696,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NO_REPLY);
+    expect(notices[0]!.body).toContain('Your message is saved: "Please continue." (');
+    expect(notices[0]!.body).toContain(STARTED_NO_REPLY);
+    expect(notices[0]!.body).not.toContain("Sending it again is safe");
     expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${message}`);
   });
 
@@ -2534,6 +2712,6 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       await f.sweep();
       const notices = await f.visible();
       expect(notices).toHaveLength(1);
-      expect(notices[0]!.body).toBe(NO_REPLY);
+      expect(await noticeText(notices[0]!)).toBe(NO_REPLY);
     });
 });

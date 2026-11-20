@@ -1,5 +1,7 @@
 // @vitest-environment jsdom
 
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -50,6 +52,49 @@ describe("TaskChatSystemNotice (PAP-443)", () => {
       ),
     );
   }
+
+  // catch: review-fleet-5 FINDING on 3da56cd6 (AMMA5). Acceptance runs
+  // feed the real Postgres/card-service notes into this real comment renderer.
+  // Separate processes set TZ + LANG, like readers with different browser defaults;
+  // no formatter/timezone mocks. Ordinary UI-only runs use the documented token.
+  it.each(["failed", "too-old", "setup"] as const)(
+    "AMMA5 displays the saved message time in the reader's zone (%s)", kind => {
+      const iso = "2026-11-20T13:04:00.000Z";
+      const token = `[${iso}](#paperclip-time=${iso})`;
+      const evidenceDir = process.env.AMMA5_NOTE_EVIDENCE_DIR;
+      const saved = evidenceDir
+        ? JSON.parse(readFileSync(join(evidenceDir, `amma5-${kind}.json`), "utf8")).restored
+        : { body: kind === "setup" ? `Managed Pi is still being set up (since ${token}). Your message is saved.`
+          : `Your message is saved: "Please keep my exact message." (${token}). It was not answered.` };
+      renderNotice({ text: saved.body, presentation: saved.presentation ?? {
+        kind: "system_notice", title: "Your message is saved", tone: "warning", detailsDefaultOpen: true,
+      } });
+      if (toggleButton().getAttribute("aria-expanded") === "false") flushSync(() => toggleButton().click());
+      const expected = process.env.AMMA5_READER === "ET" ? "8:04 AM"
+        : process.env.AMMA5_READER === "Berlin" ? "14:04"
+        : new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date(iso));
+      const actual = container.querySelector("time[datetime]");
+      if (process.env.AMMA5_DISPLAY_EVIDENCE_DIR) writeFileSync(
+        join(process.env.AMMA5_DISPLAY_EVIDENCE_DIR, `display-${process.env.AMMA5_READER}-${kind}.json`),
+        JSON.stringify({ kind, reader: process.env.AMMA5_READER, defaults: new Intl.DateTimeFormat().resolvedOptions(),
+          storedBody: saved.body, expected, actual: actual?.textContent ?? null, html: container.innerHTML }, null, 2));
+      expect(actual?.getAttribute("datetime")).toBe(iso);
+      expect(actual?.textContent).toBe(expected);
+      expect(actual?.getAttribute("title")).toBeTruthy();
+      expect(container.textContent).toContain(kind === "setup" ? "Managed Pi is still being set up" : 'Your message is saved: "Please keep my exact message."');
+      expect(container.querySelector('a[href^="#paperclip-time="]')).toBeNull();
+    });
+
+  it("AMMA5 leaves invalid time tokens and code literal, without enabling raw HTML", () => {
+    const invalid = "[bad](#paperclip-time=2026-02-30T13:04:00.000Z)";
+    const token = "[2026-11-20T13:04:00.000Z](#paperclip-time=2026-11-20T13:04:00.000Z)";
+    renderNotice({ text: `${invalid} and \`${token}\`\n\n<script>alert(1)</script>`,
+      presentation: { kind: "system_notice", title: "Saved message", tone: "warning", detailsDefaultOpen: true } });
+    expect(container.querySelector("time[datetime]")).toBeNull();
+    expect(container.querySelector("code")?.textContent).toBe(token);
+    expect(container.textContent).toContain("bad");
+    expect(container.querySelector("script")).toBeNull();
+  });
 
   function toggleButton() {
     return container.querySelector<HTMLButtonElement>(

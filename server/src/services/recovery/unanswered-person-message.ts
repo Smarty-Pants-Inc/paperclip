@@ -1,5 +1,5 @@
 import { and, desc, eq, gt, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
-import { answeredPersonMessageSql, deferredWakeIsStaleSql, failedCarrierRunSql, personMessageOwedSql } from "../person-message-answer.js";
+import { answeredPersonMessageSql, deferredWakeIsStaleSql, failedCarrierRunSql, personMessageOwedSql, personMessageWithinSendWindowSql } from "../person-message-answer.js";
 import {
   activityLog,
   agentWakeupRequests,
@@ -8,6 +8,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
+  issueThreadInteractions,
   issues,
   nativeRunFinalizations,
   type Db,
@@ -22,7 +23,6 @@ import { isWellFormedExecutionWait, wellFormedExecutionWaitSql } from "../deferr
 import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
 import { PROVIDER_POLICY_REFUSAL_CODE, PROVIDER_POLICY_REFUSAL_MESSAGE } from "../native-runtime/native-provider-failure.js";
 import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-session-recovery-notice.js";
-import { conversationTurnAnswered } from "../native-runtime/native-governance.js";
 import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { noticeMetadataReferencesRecoveryAction } from "./successful-run-handoff.js";
 import { keyValueRow } from "./notice-format.js";
@@ -65,6 +65,14 @@ export const UNANSWERED_MESSAGE_SETTLE_MS = 15_000;
 export const UNANSWERED_MESSAGE_NO_RUN_GRACE_MS = 120_000;
 /** A native same-run retry that is this late is not going to start by itself. */
 const OVERDUE_NATIVE_RETRY_MS = 5 * 60_000;
+
+/** MarkdownBody renders this ISO-labelled token in the reader's local time.
+ * Other Markdown/plain-text clients retain the unambiguous UTC ISO label.
+ * Contract: doc/markdown-local-times.md. Never use the server's wall clock. */
+function savedMessageTime(at: Date): string {
+  const iso = at.toISOString();
+  return `[${iso}](#paperclip-time=${iso})`;
+}
 
 export const UNANSWERED_MESSAGE_NO_REPLY_CODE = "no_reply";
 export const UNANSWERED_MESSAGE_NO_RUN_CODE = "no_run";
@@ -220,6 +228,26 @@ export function unansweredMessageCode(run: { status: string; error: string | nul
 
 const reasonOf = (column: AnyPgColumn) => sql<string>`${column}->>'authorizationReason'`;
 
+// Only the sweep's own retirement is reversible, never a person's deletion.
+// A resolved card is new person input, not a posted agent reply. Reuse the
+// message's original note/key once that temporary answer stops answering it.
+function restorableNoticeSql(alias: string): SQL {
+  const n = sql.identifier(alias);
+  return sql`(${n}.author_type = 'system' and ${n}.deleted_at is not null
+    and ${n}.deleted_by_type is null
+    and (${n}.metadata->>'unansweredNoticeRetired' = 'true'
+      -- The preceding release retired these notes without a marker or actor.
+      -- An actor-attributed deletion is never undone, including old notes.
+      or not (${n}.metadata ? 'unansweredNoticeRetired'))
+    and exists (select 1 from ${issueThreadInteractions} resolved_card
+      where resolved_card.company_id = ${n}.company_id and resolved_card.issue_id = ${n}.issue_id
+        and resolved_card.resolved_by_user_id is not null and resolved_card.status <> 'pending'
+        and resolved_card.created_by_agent_id is not null and resolved_card.created_by_user_id is null
+        and resolved_card.created_at <= ${n}.deleted_at
+        and coalesce(resolved_card.origin_comment_ids, '[]'::jsonb)
+          ? substr(${n}.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})))`;
+}
+
 /**
  * SQL: an agent answer ATTRIBUTED to message m, the Paperclip way: a reply
  * written by a run on the chain carrying m or a later person input. Fresh
@@ -257,8 +285,34 @@ const rawMessage = (alias: string) => ({ id: sql.raw(`${alias}.id`), companyId: 
  * or a wake for it changed. An obligation that is still open never ages out
  * silently because the message itself is old.
  */
+function oldMessageHasAutomaticPathSql(m: { id: SQL; companyId: SQL; issueId: SQL }): SQL {
+  // Chats have the boot outbox. Old task discussion is not an outbox: only
+  // a saved wake, held execution or active recovery can reopen that input.
+  return sql`(exists (select 1 from ${issues} task where task.id = ${m.issueId}
+      and task.company_id = ${m.companyId} and task.conversation_agent_id is not null)
+    or exists (select 1 from ${agentWakeupRequests} wake where wake.company_id = ${m.companyId}
+      and wake.status <> 'completed'
+      and (wake.idempotency_key = 'conversation-comment:' || ${m.id}::text
+        or wake.payload->>'commentId' = ${m.id}::text
+        or wake.payload->'_paperclipWakeContext'->>'wakeCommentId' = ${m.id}::text
+        or coalesce(wake.payload->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text))
+    or exists (select 1 from ${heartbeatRuns} held where held.company_id = ${m.companyId}
+      and (held.native_issue_id = ${m.issueId} or held.context_snapshot->>'issueId' = ${m.issueId}::text)
+      and (held.context_snapshot->>'wakeCommentId' = ${m.id}::text
+        or coalesce(held.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text
+        or coalesce(held.context_snapshot->'steeredCommentIds', '[]'::jsonb) ? ${m.id}::text)
+      and (held.status in ('queued', 'running', 'scheduled_retry')
+        or exists (select 1 from ${nativeRunFinalizations} finalizer where finalizer.run_id = held.id
+          and finalizer.company_id = held.company_id
+          and finalizer.phase in ('result_persisted', 'ready_for_assessment', 'arbitrating', 'workspace_pending', 'retryable_failure'))
+        or exists (select 1 from ${issueRecoveryActions} recovery where recovery.company_id = held.company_id
+          and recovery.source_issue_id = ${m.issueId} and recovery.status in ('active', 'escalated')
+          and recovery.evidence->>'runId' = held.id::text))))`;
+}
 function inScopeSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }, since: string): SQL {
-  return sql`(${m.createdAt} > ${since}::timestamptz
+  return sql`((${personMessageWithinSendWindowSql(m.createdAt)} or ${oldMessageHasAutomaticPathSql(m)}) and (
+    ${m.createdAt} > ${since}::timestamptz
+    or not (${personMessageWithinSendWindowSql(m.createdAt)})
     or exists (select 1 from ${heartbeatRuns} r where r.company_id = ${m.companyId} and r.native_issue_id = ${m.issueId}
       and coalesce(r.finished_at, r.updated_at) > ${since}::timestamptz
       and (r.context_snapshot->>'wakeCommentId' = ${m.id}::text or r.context_snapshot->>'commentId' = ${m.id}::text
@@ -268,7 +322,7 @@ function inScopeSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }
     or exists (select 1 from ${agentWakeupRequests} w where w.company_id = ${m.companyId} and w.updated_at > ${since}::timestamptz
       and (w.payload->>'commentId' = ${m.id}::text
         or w.payload->'_paperclipWakeContext'->>'wakeCommentId' = ${m.id}::text
-        or coalesce(w.payload->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text)))`;
+        or coalesce(w.payload->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text))))`;
 }
 
 /**
@@ -285,7 +339,8 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
         and ${personMessageOwedSql(rawMessage("m"))}
         and not exists (select 1 from ${issueComments} n where n.company_id = m.company_id and n.issue_id = m.issue_id
           and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || m.id::text
-          and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)))
+          and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)
+          and not ${restorableNoticeSql("n")}))
     or exists (select 1 from ${issueComments} n
       join ${issueComments} m on m.company_id = n.company_id and m.issue_id = n.issue_id
         and m.id::text = substr(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
@@ -311,7 +366,8 @@ export function unansweredPersonMessageCommentCondition(): SQL {
       and not exists (select 1 from ${issueComments} n where n.company_id = ${issueComments.companyId}
         and n.issue_id = ${issueComments.issueId}
         and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || ${issueComments.id}::text
-        and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)))
+        and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)
+        and not ${restorableNoticeSql("n")}))
     or (${issueComments.authorType} = 'system' and ${issueComments.deletedAt} is null
       and starts_with(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
       and exists (select 1 from ${issueComments} m
@@ -334,6 +390,10 @@ function runCarriesMessage(contextSnapshot: unknown, messageId: string): boolean
   const ids = [
     ...(Array.isArray(context.wakeCommentIds) ? context.wakeCommentIds : []),
     ...(Array.isArray(firstTurn.commentIds) ? firstTurn.commentIds : []),
+    // A reserved/ACKed steer is not model input. The event-boundary projector
+    // records these sequence numbers only after the matching userMessage read.
+    ...Object.entries((context.steeredDeliveryEventSeqs ?? {}) as Record<string, unknown>)
+      .filter(([, seq]) => typeof seq === "number" && Number.isFinite(seq) && seq > 0).map(([id]) => id),
     context.wakeCommentId, context.commentId, context.conversationReplyBoundaryCommentId,
   ];
   return ids.includes(messageId);
@@ -422,7 +482,8 @@ export async function settleUnansweredPersonMessage(
   const retired = !liveNotice ? [] : await db.transaction(async tx => {
     await tx.select({ id: issues.id }).from(issues)
       .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
-    return [...await tx.execute<{ id: string }>(sql`update ${issueComments} n set deleted_at = ${now.toISOString()}::timestamptz, updated_at = ${now.toISOString()}::timestamptz
+    return [...await tx.execute<{ id: string }>(sql`update ${issueComments} n set deleted_at = ${now.toISOString()}::timestamptz, updated_at = ${now.toISOString()}::timestamptz,
+      metadata = coalesce(n.metadata, '{}'::jsonb) || '{"unansweredNoticeRetired":true}'::jsonb
     where n.company_id = ${issue.companyId} and n.issue_id = ${issue.id} and n.author_type = 'system' and n.deleted_at is null
       and (starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
         or starts_with(n.metadata->>'authorizationReason', ${RETRYING_MESSAGE_REASON_PREFIX}))
@@ -475,25 +536,31 @@ export const OWED_OLDER_MESSAGES_PER_SWEEP = 20;
  * succeeded, stopped, or a failed run that replied) keeps today's newest-only reading.
  * `skipReasons`: the notice keys this pass's carried-steer step (a) just noticed; those messages are skipped. */
 async function owedOlderMessageIds(db: Db, issue: DecisionIssue, newestId: string, skipReasons: string[]): Promise<string[]> {
+  // The carry/batch limits below govern NEW notes. They must not suppress an
+  // existing note after a person's card resolution makes its message owed again.
+  const restoring = sql`exists (select 1 from ${issueComments} n
+    where n.company_id = ${issueComments.companyId} and n.issue_id = ${issueComments.issueId}
+      and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || ${issueComments.id}::text
+      and ${restorableNoticeSql("n")})`;
   const rows = await db.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     sql`${issueComments.id} <> ${newestId}`, unansweredPersonMessageCommentCondition(),
     skipReasons.length > 0 ? notInArray(sql`${UNANSWERED_MESSAGE_REASON_PREFIX} || ${issueComments.id}::text`, skipReasons) : undefined,
-    sql`not exists (select 1 from ${heartbeatRuns} r where r.company_id = ${issueComments.companyId}
+    sql`(${restoring} or not (${personMessageWithinSendWindowSql(sql`${issueComments.createdAt}`)}) or not exists (select 1 from ${heartbeatRuns} r where r.company_id = ${issueComments.companyId}
       and (r.context_snapshot->>'wakeCommentId' = ${issueComments.id}::text or r.context_snapshot->>'commentId' = ${issueComments.id}::text
         or r.context_snapshot->>'conversationReplyBoundaryCommentId' = ${issueComments.id}::text
         or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? ${issueComments.id}::text
         or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${issueComments.id}::text)
-      and not ${failedCarrierRunSql("r", { id: sql`${issueComments.id}` })})`,
+      and not ${failedCarrierRunSql("r", { id: sql`${issueComments.id}` })}))`,
     // One card per failed carrier's batch (interrupt-lostdouble L1/L1b): a failed run that carried m AND a LATER
     // message still owed is told by that later message's card (the newest's, or its own older pick), never twice.
-    sql`not exists (select 1 from ${heartbeatRuns} fb where fb.company_id = ${issueComments.companyId}
+    sql`(${restoring} or not (${personMessageWithinSendWindowSql(sql`${issueComments.createdAt}`)}) or not exists (select 1 from ${heartbeatRuns} fb where fb.company_id = ${issueComments.companyId}
       and ${failedCarrierRunSql("fb", { id: sql`${issueComments.id}` })}
       and exists (select 1 from ${issueComments} later where later.company_id = ${issueComments.companyId}
         and later.issue_id = ${issueComments.issueId} and later.author_type = 'user' and later.deleted_at is null
         and later.created_at > ${issueComments.createdAt}
         and ${failedCarrierRunSql("fb", { id: sql.raw("later.id") })}
-        and not ${answeredPersonMessageSql(rawMessage("later"))}))`,
+        and not ${answeredPersonMessageSql(rawMessage("later"))})))`,
     eq(issueComments.authorType, "user")))
     .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(OWED_OLDER_MESSAGES_PER_SWEEP);
   return rows.map(row => row.id);
@@ -537,9 +604,9 @@ async function settleOneMessage(db: Db, issue: DecisionIssue, now: Date,
     if (fenced.upgradeCommentId) {
       // The SAME note (same key) becomes the failure text: still one note.
       const [updated] = await tx.update(issueComments).set({ body: fenced.notice.body, presentation: fenced.notice.presentation,
-        metadata: { ...fenced.notice.metadata, authorizationReason: fenced.reason }, updatedAt: now })
+        metadata: { ...fenced.notice.metadata, authorizationReason: fenced.reason }, updatedAt: now, deletedAt: null })
         .where(and(eq(issueComments.id, fenced.upgradeCommentId), eq(issueComments.companyId, issue.companyId),
-          isNull(issueComments.deletedAt))).returning({ id: issueComments.id });
+          or(isNull(issueComments.deletedAt), restorableNoticeSql("issue_comments")))).returning({ id: issueComments.id });
       return updated?.id ?? null;
     }
     const comment = await issueService(tx as unknown as Db).addComment(issue.id, fenced.notice.body, {}, {
@@ -608,6 +675,9 @@ async function decideCarriedSteerNotices(q: Db, issue: DecisionIssue, now: Date)
     .filter((id) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id));
   if (ids.length === 0) return none;
   const messages = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt }).from(issueComments).where(and(
+    // Expired input is handled by decideMessage's naming-only decision, never
+    // this legacy carried-steer text or its retry/pending exceptions.
+    personMessageWithinSendWindowSql(sql`${issueComments.createdAt}`, sql`${now.toISOString()}::timestamptz`),
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id), inArray(issueComments.id, ids),
     eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt),
     // neworg-floor-custody (rf-4 C1): the same ONE floor as the outbox and decideMessage; a restored steer
@@ -758,7 +828,10 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   const agentId = issue.assigneeAgentId;
 
   const [message] = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt,
-    body: issueComments.body, authorUserId: issueComments.authorUserId }).from(issueComments).where(and(
+    body: issueComments.body, authorUserId: issueComments.authorUserId,
+    hasAutomaticPath: oldMessageHasAutomaticPathSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+      issueId: sql`${issueComments.issueId}` }).mapWith(Boolean),
+    sendable: personMessageWithinSendWindowSql(sql`${issueComments.createdAt}`, sql`${now.toISOString()}::timestamptz`).mapWith(Boolean) }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt),
     // The message this decision is for: a named owed message, else the newest.
@@ -775,6 +848,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   if (answer) return { kind: "answered" };
   const reason = `${UNANSWERED_MESSAGE_REASON_PREFIX}${message.id}`;
   const [noticed] = await q.select({ id: issueComments.id,
+    restorable: restorableNoticeSql("issue_comments").mapWith(Boolean),
     waiting: sql<boolean>`coalesce(${issueComments.metadata}->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)`,
     waitingCode: sql<string | null>`(select r->>'value' from jsonb_array_elements(coalesce(${issueComments.metadata}->'sections', '[]'::jsonb)) sec,
       jsonb_array_elements(coalesce(sec->'rows', '[]'::jsonb)) r where r->>'label' = ${WAITING_ROW_LABEL} limit 1)` })
@@ -782,8 +856,24 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     sql`${reasonOf(issueComments.metadata)} = ${reason}`)).limit(1);
   // A standing WAITING note is still an open obligation: it must stay true.
-  if (noticed && !noticed.waiting) return { kind: "noticed_before" };
-  const upgrading = noticed?.waiting ? noticed.id : null;
+  if (noticed && !noticed.waiting && !noticed.restorable) return { kind: "noticed_before" };
+  const upgrading = noticed?.waiting || noticed?.restorable ? noticed.id : null;
+  // Half 2 wins over every pending wake/finalizer/setup wait. Age never marks
+  // input answered: its existing fenced writer owns one truthful naming note.
+  if (!message.sendable) {
+    if (!message.hasAutomaticPath) return { kind: "out_of_scope" };
+    const quote = message.body.length > 60 ? `${message.body.slice(0, 59)}…` : message.body;
+    const savedAt = savedMessageTime(message.createdAt);
+    const notice = buildStrandedRecoveryEscalationNotice({
+      seed: { title: "Your message wasn't answered", tone: "warning",
+        body: `Your message is saved: "${quote}" (${savedAt}). It was not answered. It is at least 24 hours old, so it will not run automatically. Send a new message to try again.`,
+        nextAction: "Send a new message to try again." },
+      recoveryActionId: null, recoveryOwner: null, recoveryResponsibility: "user",
+      sourceRun: null, failureCode: "unanswered_message_too_old",
+    });
+    return { kind: "notice", reason, code: "unanswered_message_too_old", notice,
+      ...(upgrading ? { upgradeCommentId: upgrading } : {}) };
+  }
   const standingWaitingCode = noticed?.waiting ? noticed.waitingCode ?? UNANSWERED_MESSAGE_WAITING_CODE : null;
 
   // The run this message started (the latest run that carries it), if any.
@@ -800,14 +890,8 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   // run (a timer, or the continuation that replaced a cancelled deferred wake
   // with no comment ids) is not: the message's own wake path decides.
   const messageRun = runs.find(candidate => runCarriesMessage(candidate.contextSnapshot, message.id)) ?? null;
-  // Paperclip's per-turn response rule (doc/execution-semantics.md:2649-2658,
-  // native-governance.ts conversationTurnAnswered): only a pending question or
-  // confirmation card that the message's OWN run created stands in for its
-  // reply. A card from an earlier turn or one the board addressed to someone
-  // else, and any approval, can hold the task but do not answer the message.
-  if (messageRun && !(await conversationTurnAnswered({ db: q, companyId: issue.companyId, issueId: issue.id, runId: messageRun.id }))) {
-    return { kind: "answered" };
-  }
+  // Interaction cards are answered evidence only through the shared
+  // predicate above: the run's status gate cannot answer a different input.
 
   // A failed fresh continuation that descends from the message's run is the
   // run the person's message ended on: the automatic lineage, typed or not,
@@ -1203,8 +1287,6 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   const pauseStopped = code === PAUSE_STOPPED_CODE;
   const pausedName = agentRow?.name?.trim() || "This agent";
   const waiting = WAITING_KIND_CODES.has(code);
-  // A standing working note whose run ended without answering: the run
-  // STARTED, so the SAME note gets RFL's started-run text (never 'safe').
   const workingEnded = Boolean(standingWaitingCode === UNANSWERED_MESSAGE_WORKING_CODE && !waiting
     && run && TERMINAL.includes(run.status));
   // The ONE bound: the message's automatic lineage used its K=2 fresh
@@ -1212,26 +1294,35 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
   const boundReached = Boolean(!paused && !waiting && run && TERMINAL.includes(run.status) && run.status !== "succeeded"
     && (await freshContinuationChain(q as Db, { companyId: issue.companyId, issueId: issue.id, runId: run.id })).attempts
       >= FRESH_CONTINUATION_BOUND);
-  // Server-local HH:MM: the instance's time zone, not an assumed UTC zone.
-  const since = `${String(message.createdAt.getHours()).padStart(2, "0")}:${String(message.createdAt.getMinutes()).padStart(2, "0")}`;
-  // A never-claimed stale receipt gets its existing ONE no-run card, but
-  // names the saved message. Ordinary no-run notices keep their wording.
+  // Both the naming prefix and setup's since-time identify the saved instant.
+  const since = savedMessageTime(message.createdAt);
+  // A consumed steer or a message left behind while unrelated work continued
+  // needs the started-run remedy. The later run is not evidence about this input.
+  const readSteer = run && Object.hasOwn((run.contextSnapshot?.steeredDeliveryEventSeqs ?? {}) as object, message.id);
+  const namedTerminal = Boolean(run && TERMINAL.includes(run.status) && (readSteer || (latest && latest.id !== run.id)));
+  const quote = message.body.length > 60 ? `${message.body.slice(0, 59)}…` : message.body;
+  const named = (text: string) => `Your message is saved: "${quote}" (${since}). ${text}`;
   const staleReceipts = code === UNANSWERED_MESSAGE_NO_RUN_CODE ? await q.select({ payload: agentWakeupRequests.payload })
     .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, issue.companyId),
       inArray(agentWakeupRequests.status, ["deferred", "deferred_issue_execution", "cancelled"]),
       deferredWakeIsStaleSql({ companyId: sql`${agentWakeupRequests.companyId}`, agentId: sql`${agentWakeupRequests.agentId}`,
         issueId: sql`${issue.id}::uuid`, requestedAt: sql`${agentWakeupRequests.requestedAt}`, payload: sql`${agentWakeupRequests.payload}` }))) : [];
   const namedNoRun = staleReceipts.some(wake => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id))
-    ? `Your message is saved: "${message.body}". It was not answered because no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.`
-    : UNANSWERED_MESSAGE_NO_RUN_TEXT;
+    ? named("It was not answered because no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.")
+    : named(UNANSWERED_MESSAGE_NO_RUN_TEXT);
   const body = policyRefused ? PROVIDER_POLICY_REFUSAL_MESSAGE : settingUp ? `${pausedName} is still being set up (since ${since}). Your message is saved and will be answered as soon as it's ready.`
     : paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
     : pauseStopped ? `${pausedName} was paused before it answered your message. Send it again to continue.`
     : supervisionUnconfirmed ? REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
-    : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? (workingEnded ? UNANSWERED_MESSAGE_STARTED_NO_REPLY_TEXT : UNANSWERED_MESSAGE_NO_REPLY_TEXT)
+    // RFL naming rule: naming is independent of why this input is owed.
+    // Restoring a retired card must name the original M, even when its carrier
+    // is still the latest run and a follow-up was saved during card resolution.
+    : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? named(namedTerminal || workingEnded
+      ? UNANSWERED_MESSAGE_STARTED_NO_REPLY_TEXT : UNANSWERED_MESSAGE_NO_REPLY_TEXT)
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? namedNoRun
-      : held ? HELD_PREDECESSOR_NOTICE : workingEnded ? UNANSWERED_MESSAGE_STARTED_FAILED_TEXT : UNANSWERED_MESSAGE_TEXT;
+    : held ? HELD_PREDECESSOR_NOTICE
+    : named(namedTerminal || workingEnded ? UNANSWERED_MESSAGE_STARTED_FAILED_TEXT : UNANSWERED_MESSAGE_TEXT);
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
       title: policyRefused ? "The provider refused this request" : settingUp ? `${pausedName} is still being set up` : paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start"
@@ -1245,7 +1336,7 @@ async function decideMessage(q: Db, issue: DecisionIssue, now: Date,
         : pauseStopped ? "Send it again to continue."
         : supervisionUnconfirmed ? "Retry or send a new message to continue through fenced recovery."
         : held || boundReached ? "Send a new message to try again."
-        : workingEnded ? UNANSWERED_MESSAGE_STARTED_NEXT_ACTION : "Send the message again; if it fails again, assign this agent a new task.",
+        : namedTerminal || workingEnded ? UNANSWERED_MESSAGE_STARTED_NEXT_ACTION : "Send the message again; if it fails again, assign this agent a new task.",
     },
     recoveryActionId: boardHold?.id ?? null,
     recoveryOwner: null,
