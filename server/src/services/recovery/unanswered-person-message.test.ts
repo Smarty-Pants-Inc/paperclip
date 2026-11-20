@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import {
   activityLog,
   agentWakeupRequests,
@@ -1983,6 +1985,63 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       eq(issueComments.authorType, "agent")))).toHaveLength(0);
   });
 
+  // catch: round-2 card retirement; RFL's person resolution is NOT an agent answer.
+  it.each(["accept", "reject", "skip", "withdraw"] as const)(
+    "CARD-RETIREMENT: person %s restores the SAME naming note once, through real sweep and card writer", async decision => {
+      for (const [chat, fresh] of [[true, false], [false, false], [true, true], [false, true]]) {
+        const f = await fixture({ chat, status: "in_progress" });
+        const messageId = await f.message("Keep this exact obligation visible.", fresh ? 1_000 : -2 * 24 * 60 * 60_000);
+        const visibleForMessage = async () => (await f.visible()).filter(note =>
+          note.metadata?.authorizationReason === `unanswered_message:${messageId}`);
+        await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+          source: "on_demand", reason: "issue_commented", status: "cancelled",
+          idempotencyKey: `conversation-comment:${messageId}`, payload: { issueId: f.issueId, commentId: messageId } });
+        await f.sweep();
+        const [original] = await f.visible();
+        expect(original).toBeDefined();
+        if (!fresh) expect(original?.body).toContain("Keep this exact obligation visible.");
+        const sourceRunId = await f.run({ commentId: messageId, status: "running" });
+        const svc = issueThreadInteractionService(db);
+        const scope = { id: f.issueId, companyId: f.companyId };
+        const card = await svc.create(scope, { kind: "request_confirmation", sourceRunId,
+          continuationPolicy: "none", payload: { version: 1, prompt: "Proceed?", rejectRequiresReason: true } },
+          { agentId: f.agentId, runId: sourceRunId });
+        await db.update(issueThreadInteractions).set({ createdAt: f.at() }).where(eq(issueThreadInteractions.id, card.id));
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: f.at() }).where(eq(heartbeatRuns.id, sourceRunId));
+        await f.sweep();
+        expect(await f.visible()).toHaveLength(0); // pending card temporarily answers M
+        const [retired] = await db.select().from(issueComments).where(eq(issueComments.id, original!.id));
+        expect(retired!.deletedAt).not.toBeNull();
+        if (!chat) {
+          // Upgrade case: 01619 retired existing notes without the new marker.
+          await db.update(issueComments).set({ metadata: sql`${issueComments.metadata} - 'unansweredNoticeRetired'` })
+            .where(eq(issueComments.id, original!.id));
+        }
+        if (fresh) await f.message("My follow-up while I resolve the card.");
+        const actor = { userId: f.userId }, reason = { reason: "Keep the obligation." };
+        const resolved = decision === "accept"
+          ? (await svc.acceptInteraction({ ...scope, projectId: null, goalId: null }, card.id, {}, actor)).interaction
+          : decision === "reject" ? await svc.rejectInteraction(scope, card.id, reason, actor)
+          : decision === "skip" ? await svc.skipInteraction(scope, card.id, reason, actor)
+          : await svc.withdrawInteraction(scope, card.id, reason, actor);
+        expect(resolved.resolvedByUserId).toBe(f.userId);
+        await Promise.all([f.sweep(), f.sweep()]); // two workers must restore the same id, not append
+        for (let pass = 0; pass < 3; pass++) {
+          await f.sweep();
+          expect(await visibleForMessage()).toMatchObject([{ id: original!.id,
+            metadata: { authorizationReason: `unanswered_message:${messageId}` } }]);
+          if (!fresh) expect((await visibleForMessage())[0]!.body).toContain("Keep this exact obligation visible.");
+        }
+        const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+          sql`${issueComments.metadata}->>'authorizationReason' = ${`unanswered_message:${messageId}`}`));
+        expect(notes).toHaveLength(1);
+        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(1);
+        expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId))).toHaveLength(1);
+        if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `card-retirement-${decision}-${chat}-${fresh}.json`),
+          JSON.stringify({ messageId, original, retired, resolved, notes }, null, 2));
+      }
+    });
+
   it.each(["wakeCommentId", "commentId", "conversationReplyBoundaryCommentId", "wakeCommentIds", "firstTurnQueuedInput"])(
     "PV2 card-answer: only pending addressed agent cards answer carried input through %s", async key => {
       const f = await fixture();
@@ -1998,10 +2057,12 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
           kind, status: "pending", sourceRunId: runId, createdByAgentId: f.agentId, originCommentIds: [messageId], createdAt: f.at(),
           payload: kind === "ask_user_questions" ? { version: 1, questions: [] } : { version: 1, prompt: "Proceed?" } }).returning();
         for (const status of kind === "ask_user_questions" ? ["pending", "answered"] : ["pending", "accepted", "rejected"]) {
-          await db.update(issueThreadInteractions).set({ status }).where(eq(issueThreadInteractions.id, card!.id));
+          // RFL: this is the PERSON resolving the card, not an agent reply.
+          await db.update(issueThreadInteractions).set({ status,
+            resolvedByUserId: status === "pending" ? null : f.userId }).where(eq(issueThreadInteractions.id, card!.id));
           const outcome = await settleUnansweredPersonMessage(db, f);
           expect(outcome.kind, `${kind}/${status}`).toBe(status === "pending" ? "answered"
-            : kind === "ask_user_questions" && status === "answered" ? "noticed" : "noticed_before");
+            : status === "answered" || status === "accepted" ? "noticed" : "noticed_before");
           const input = await readContinuationCommentInput(db, { ...f, runId });
           if (status === "pending") expect(input).toEqual({});
           else {

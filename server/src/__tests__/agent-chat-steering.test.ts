@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { inspect } from "node:util";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -563,7 +564,10 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
         seen.push(context.wakeCommentIds ?? [context.wakeCommentId ?? context.commentId]);
         await issueService(db).addComment(chat.issue.id, `ANSWER:${messageId}`, { agentId: chat.agentId, runId });
         res.end("ok");
-      } catch (error) { res.statusCode = 500; res.end(String(error)); }
+      } catch (error) {
+        if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `A3-${variant}-reply-error.txt`), inspect(error, { depth: 8 }));
+        res.statusCode = 500; res.end(String(error));
+      }
     });
     responder.listen(0, "127.0.0.1"); await once(responder, "listening");
     const port = (responder.address() as { port: number }).port;
@@ -607,11 +611,21 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
           JSON.stringify({ messageId, answered: await answered(messageId), owed: await owed(messageId), outcomes, notices }, null, 2));
         return;
       }
-      await vi.waitFor(async () => {
-        const replies = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id),
-          eq(issueComments.body, `ANSWER:${messageId}`)));
-        expect(replies).toHaveLength(1);
-      }, { timeout: 15_000 });
+      try {
+        await vi.waitFor(async () => {
+          const replies = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id),
+            eq(issueComments.body, `ANSWER:${messageId}`)));
+          expect(replies).toHaveLength(1);
+        }, { timeout: 15_000 });
+      } catch (error) {
+        if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `A3-${variant}-timeout.json`), JSON.stringify({
+          seen, runs: await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, chat.companyId)),
+          wakes: await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, chat.companyId)),
+          activity: await db.execute(sql`select pid, state, wait_event_type, wait_event, clock_timestamp()-query_start as elapsed,
+            pg_blocking_pids(pid) as blockers, query from pg_stat_activity where backend_type = 'client backend'`),
+        }, null, 2));
+        throw error;
+      }
       await joinOwnedWork();
       await releaseRun(chat); await deliverConversationComments(db, chat.issue, heartbeatService(db).wakeup); await joinOwnedWork();
       expect(seen.flat()).toEqual([messageId]);

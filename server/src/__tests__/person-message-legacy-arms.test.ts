@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto";
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import { agents, companies, createDb, heartbeatRuns, issueComments, issueThreadInteractions, issues } from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRuns, issueComments, issueThreadInteractions, issues, agentWakeupRequests } from "@paperclipai/db";
 import { answeredPersonMessageIds } from "../services/person-message-answer.js";
-import { settleUnansweredPersonMessage } from "../services/recovery/unanswered-person-message.js";
+import { settleUnansweredPersonMessage, settleUnansweredPersonMessages } from "../services/recovery/unanswered-person-message.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("RFL by-purpose legacy arms", () => {
@@ -45,16 +47,40 @@ const support = await getEmbeddedPostgresTestSupport();
     if (posted) await db.insert(issueComments).values({ companyId: f.company.id, issueId: f.issue.id, authorType: "agent", authorAgentId: f.agent.id, origin: "import", body: "The imported README reply", createdAt: f.at(4) });
     expect(await f.answered()).toEqual(posted ? [f.m.id] : []);
   });
-  it("bare old TASK: 34 owed comments on 25 issues get zero notes and zero runs", async () => {
+  // RFL 11-20: old bare TASK discussion is not an outbox; keep base discovery's zero.
+  it("bare old TASK: real sweep, 34 comments on 25 issues get zero notes and zero runs", async () => {
     let notes = 0, runs = 0;
+    const outcomes: unknown[] = [];
     for (let n = 0; n < 25; n++) {
       const f = await fixture(true);
       if (n < 9) await db.insert(issueComments).values({ companyId: f.company.id, issueId: f.issue.id, authorType: "user", authorUserId: "paul", body: "Another old task message", createdAt: f.at(2) });
-      await settleUnansweredPersonMessage(db, { companyId: f.company.id, issueId: f.issue.id });
+      outcomes.push(await settleUnansweredPersonMessages(db, { companyId: f.company.id, issueId: f.issue.id }));
+      outcomes.push(await settleUnansweredPersonMessages(db, { companyId: f.company.id, issueId: f.issue.id }));
       notes += (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).filter(c => c.authorType === "system").length;
       runs += (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.company.id))).length;
     }
     console.log("AMMA-BARE-OLD-TASKS", JSON.stringify({ comments: 34, issues: 25, notes, runs }));
     expect(notes).toBe(0); expect(runs).toBe(0);
+    if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, "old-bare-task-sweep.json"),
+      JSON.stringify({ comments: 34, issues: 25, notes, runs, outcomes }, null, 2));
+  });
+  // RFL 11-20 Half 2: CHAT is an outbox; old unanswered input gets ONE naming note, never a run.
+  it("old unanswered CHAT: real sweep twice restores one naming note, zero sends", async () => {
+    const f = await fixture(true);
+    await db.update(issues).set({ conversationAgentId: f.agent.id, conversationUserId: "paul", conversationState: "active" })
+      .where(eq(issues.id, f.issue.id));
+    const outcomes = [];
+    for (let pass = 0; pass < 2; pass++) outcomes.push(await settleUnansweredPersonMessages(db,
+      { companyId: f.company.id, issueId: f.issue.id }));
+    const notes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id)))
+      .filter(c => c.authorType === "system" && !c.deletedAt);
+    expect(notes).toHaveLength(1);
+    expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${f.m.id}`);
+    expect(notes[0]!.body).toContain("Please read the README");
+    expect(notes[0]!.body).toContain("at least 24 hours old");
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.company.id))).toHaveLength(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.company.id))).toHaveLength(0);
+    if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, "old-unanswered-chat-sweep.json"),
+      JSON.stringify({ comment: f.m, notes, outcomes, runs: 0, wakes: 0 }, null, 2));
   });
 });
