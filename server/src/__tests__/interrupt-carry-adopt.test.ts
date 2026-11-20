@@ -21,6 +21,7 @@ import {
   issueComments,
   issueRecoveryActions,
   issues,
+  nativeRunFinalizations,
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
@@ -170,8 +171,10 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
       conversationState: "waiting",
     });
     const first = await issueService(db).addComment(issue.id, "First message", { userId: owner });
+    // The live native turn's Pi session (session A): the read evidence of an Interrupt is bound to it (answered-b2).
+    const sessionId = randomUUID();
     const [inserted] = await db.insert(heartbeatRuns).values({
-      companyId, agentId, status: "running", runtimeMode: "native",
+      companyId, agentId, status: "running", runtimeMode: "native", nativeSessionId: sessionId,
       startedAt: new Date(),
       contextSnapshot: { issueId: issue.id, taskKey: issue.id, wakeCommentId: first.id, commentId: first.id },
     }).returning();
@@ -179,7 +182,7 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
     await db.update(issues).set({ executionRunId: inserted!.id, executionLockedAt: new Date() })
       .where(eq(issues.id, issue.id));
     runningProcesses.set(inserted!.id, { child: {} as never, graceSec: 0, processGroupId: null });
-    return { companyId, agentId, issue, first, runId: inserted!.id };
+    return { companyId, agentId, issue, first, runId: inserted!.id, sessionId };
   }
 
   type Chat = Awaited<ReturnType<typeof seedChat>>;
@@ -595,15 +598,22 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
   // buildNativeModelEnvelope, JSON-serialized exactly as native-session-runtime.ts session.startTurn submits it.
   // An Interrupt successor never gets a continuationPrompt (native-continuation.ts: interruptedRunId), so
   // this task.prompt is the turn the Pi session receives.
-  async function submittedSuccessorTurn(chat: Chat, run: typeof heartbeatRuns.$inferSelect, sameSession: boolean) {
+  // answered-b2: `true` = the successor resumes the cut turn's own session (chat.sessionId) from the cut run, as
+  // runtime-selection passes it (normalizedSessionId + previousTurn.runId = the resumed checkpoint's run);
+  // an object = it resumes ANOTHER session/run; `false` = a fresh session.
+  async function submittedSuccessorTurn(chat: Chat, run: typeof heartbeatRuns.$inferSelect,
+    resume: boolean | { sessionId: string; fromRunId: string }) {
+    const sameSession = resume !== false;
+    const resumed = resume === true ? { sessionId: chat.sessionId, fromRunId: chat.runId } : resume || null;
     const wakePayload = await buildPaperclipWakePayload({ db, companyId: chat.companyId, agentId: chat.agentId,
       runId: run.id, contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>) } });
     const execution = buildNativeExecutionInput({
       companyId: chat.companyId, runId: run.id, agentId: chat.agentId,
       issue: { id: chat.issue.id, identifier: chat.issue.identifier ?? "CS-1", title: "Conversation", description: null, workMode: "standard" },
       taskPrompt: "", wakePayload, conversationMode: true, resumedSession: sameSession,
+      previousTurn: resumed ? { runId: resumed.fromRunId, task: { title: "Conversation", description: null } } : null,
       workspace: { id: randomUUID(), cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
-      normalizedSessionId: sameSession ? "60000000-0000-4000-8000-000000000006" : null,
+      normalizedSessionId: resumed ? resumed.sessionId : null,
       provider: "pi_rpc", model: "paperclip/gateway/model", piRpcThinkingLevel: "high",
       completionContract: { id: randomUUID(), sha256: `sha256:${"a".repeat(64)}`, schemaVersion: "paperclip.run-result.v1",
         contract: { revision: "1", objective: "Answer the person", criteria: [{ id: "answer", requirement: "Answer the person" }] } },
@@ -766,6 +776,68 @@ describeEmbeddedPostgres("Interrupt carry OWNS every unanswered steer (adopt-car
       await rm(root, { recursive: true, force: true });
     }
   }, 30_000);
+
+  // ---- answered-b2 rows (rf-4 FAIL d0237082: F1 cross-session omission, F2 late write after finalization) ----
+  it("AB2-X1 (rf-4 F1 red): STEER READ in session A + Interrupt; the successor resumes a DIFFERENT session B ⇒ STEER is in B's submitted turn once and is still owed", async () => {
+    const chat = await seedChat();
+    const { steerId, cut, carry } = await steerThenInterrupt(chat, "read");
+    expect((cut.resultJson as any).interruptCarriedReadSteeredCommentIds, "read in session A").toEqual([steerId]);
+    // Session B: another resumable session of this agent + issue (a thread reset between the read and the Interrupt).
+    const [b] = await db.insert(heartbeatRuns).values({ companyId: chat.companyId, agentId: chat.agentId, status: "succeeded",
+      runtimeMode: "native", nativeSessionId: randomUUID(), startedAt: new Date(), finishedAt: new Date(),
+      contextSnapshot: { issueId: chat.issue.id, taskKey: chat.issue.id } }).returning();
+    const successor = await admitSuccessor(chat, carry);
+    const submitted = await submittedSuccessorTurn(chat, successor, { sessionId: b!.nativeSessionId!, fromRunId: b!.id });
+    expect(count(submitted, STEER), "session B never saw STEER: it must reach the model").toBe(1);
+    expect(count(submitted, MSG)).toBe(1);
+    expect(await answered(steerId), "carried != answered: still owed").toBe(false);
+    expect((cut.resultJson as any).interruptCarriedReadSessionIds, "the read is bound to session A").toEqual({ [steerId]: chat.sessionId });
+    // Same session id but resumed from another run of it (not the cut run): custody unproved ⇒ delivered.
+    expect(count(await submittedSuccessorTurn(chat, successor, { sessionId: chat.sessionId, fromRunId: b!.id }), STEER)).toBe(1);
+    if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, "AB2-X1-cross-session.json"), JSON.stringify({
+      steerId, sessionA: chat.sessionId, sessionB: b!.nativeSessionId, cutResult: cut.resultJson,
+      submittedB: JSON.parse(submitted) }, null, 2));
+  });
+
+  it("AB2-X2: STEER READ in session A + Interrupt; the successor starts a FRESH thread (new session id, no resume) ⇒ delivered once", async () => {
+    const chat = await seedChat();
+    const { steerId, carry } = await steerThenInterrupt(chat, "read");
+    const successor = await admitSuccessor(chat, carry);
+    const submitted = await submittedSuccessorTurn(chat, successor, false);
+    expect(count(submitted, STEER), "a fresh thread never saw STEER").toBe(1);
+    expect(count(submitted, MSG)).toBe(1);
+    expect(await answered(steerId)).toBe(false);
+  });
+
+  it("AB2-X3 (no custody recorded): the cut run had no native session id at the press ⇒ the read is unbound and the same-session successor gets STEER once", async () => {
+    const chat = await seedChat();
+    await db.update(heartbeatRuns).set({ nativeSessionId: null }).where(eq(heartbeatRuns.id, chat.runId));
+    const { steerId, cut, carry } = await steerThenInterrupt(chat, "read");
+    expect((cut.resultJson as any).interruptCarriedReadSteeredCommentIds).toEqual([steerId]);
+    expect((cut.resultJson as any).interruptCarriedReadSessionIds).toBeUndefined();
+    const successor = await admitSuccessor(chat, carry);
+    expect(count(await submittedSuccessorTurn(chat, successor, true), STEER), "custody unproved ⇒ re-delivered").toBe(1);
+  });
+
+  it("AB2-F2 (rf-4 F2 red): the cut run's native_run_finalizations phase is 'committed'; Pi's late read arrives ⇒ the late writer writes NOTHING (before finalization it records the read, bound to session A)", async () => {
+    const chat = await seedChat();
+    const { steerId } = await steerThenInterrupt(chat, "unread");
+    await db.update(heartbeatRuns).set({ nativeIssueId: chat.issue.id, finishedAt: new Date() }).where(eq(heartbeatRuns.id, chat.runId));
+    await db.insert(nativeRunFinalizations).values({ companyId: chat.companyId, issueId: chat.issue.id, runId: chat.runId, phase: "committed" });
+    await runLog(chat, [{ eventType: "item.started", kind: "userMessage", itemId: "turn-1:steered" }]);
+    const [before] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+    await recordSteeredMessageEvidence(db, { companyId: chat.companyId, runId: chat.runId });
+    const [after] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+    if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, "AB2-F2-finalized-writer.json"), JSON.stringify({
+      steerId, before: before!.resultJson, after: after!.resultJson }, null, 2));
+    expect(after!.resultJson, "a finalized run is never rewritten").toEqual(before!.resultJson);
+    // Control: the same late read before finalization is recorded (the fence is the only difference).
+    await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, chat.runId));
+    await recordSteeredMessageEvidence(db, { companyId: chat.companyId, runId: chat.runId });
+    const [open] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+    expect((open!.resultJson as any).interruptCarriedReadSteeredCommentIds).toEqual([steerId]);
+    expect((open!.resultJson as any).interruptCarriedReadSessionIds).toEqual({ [steerId]: chat.sessionId });
+  });
 
   /** The cut turn's tool calls, as run-event ingestion stores them (validated PRP tool.execution.started /
    * tool.execution.completed). `midFlight`: started, cut before any completed receipt. */

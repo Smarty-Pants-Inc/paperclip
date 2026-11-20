@@ -144,6 +144,20 @@ export interface BuildNativeExecutionInput {
   };
   runtimeContext: NativeRuntimeContextSnapshot;
 }
+/** answered-b2: a steer read in an interrupted turn (readInSession) is omitted only from the session that read it:
+ * the successor RESUMES that recorded session id (normalizedSessionId) from that same cut run (previousTurn.runId).
+ * Any other session, a fresh thread, a failed restore, or no recorded custody: the steer is delivered (base). */
+function readInResumedSessionOnly(wakePayload: unknown, input: BuildNativeExecutionInput): unknown {
+  const wake = wakePayload && typeof wakePayload === "object" && !Array.isArray(wakePayload) ? wakePayload as Record<string, unknown> : null;
+  if (!wake || !Array.isArray(wake.comments) || !wake.comments.some(comment => (comment as Record<string, unknown> | null)?.readInSession)) return wakePayload;
+  const resumedFromRunId = input.resumedSession === true ? input.previousTurn?.runId ?? null : null;
+  return { ...wake, comments: wake.comments.map(comment => {
+    const { readInSession, readInSessionId, readInSessionRunId, ...rest } = comment as Record<string, unknown>;
+    return readInSession && resumedFromRunId && input.normalizedSessionId && readInSessionId === input.normalizedSessionId
+      && readInSessionRunId === resumedFromRunId ? comment : rest;
+  }) };
+}
+
 export function buildNativeExecutionInput(input: BuildNativeExecutionInput & { provider: "muse"; museBinding: MuseBindingSnapshot }): NativeExecutionInputV8;
 export function buildNativeExecutionInput(input: BuildNativeExecutionInput & { provider: "openai_dot" | "grok_bot"; dotBinding: DotBindingSnapshot }): NativeExecutionInputV6;
 export function buildNativeExecutionInput(input: BuildNativeExecutionInput & { provider?: Exclude<BuildNativeExecutionInput["provider"], "openai_dot" | "grok_bot" | "muse"> }): NativeExecutionInputV5 | NativeExecutionInputV7 | NativeExecutionInputV9 | NativeExecutionInputV10;
@@ -209,7 +223,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
           },
         }
       : input.wakePayload;
-  const bootstrapWakePayload = caseWakeWithInstructionReference(wakePayload, input.caseContext);
+  const bootstrapWakePayload = caseWakeWithInstructionReference(readInResumedSessionOnly(wakePayload, input), input.caseContext);
   // Build the full bootstrap through the same owner as legacy adapters.
   // Verified native resume selection stays at the existing session boundary.
   const caseMarkdown = caseExecutionMarkdown(input.caseContext ?? null);
@@ -274,7 +288,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
     } : {}),
     ...(input.resumedSession && input.previousTurn && !input.conversationMode ? {
       continuationPrompt: [input.agentFileConflictNotice, buildNativeContinuationPrompt({
-        wakePayload: input.wakePayload,
+        wakePayload: readInResumedSessionOnly(input.wakePayload, input),
         previousRunId: input.previousTurn.runId,
         previousIssue: input.previousTurn.task,
         previousGitHubReviewConfigurationKeys: input.previousTurn.githubReviewConfigurationKeys,
