@@ -1,5 +1,5 @@
-import { adoptAgentFiles, inspectAgentFile, fileHash, agentFilePath, MAX_AGENT_FILE_BYTES } from "./agent-file-store.js";
-import { invalidateAgentFileProjection, persistDurableAgentFiles, restoreDurableAgentFiles } from "./agent-file-durability.js";
+import { adoptAgentFiles, inspectAgentFile, fileHash, agentFilePath, AgentFilesUnverifiedError, MAX_AGENT_FILE_BYTES } from "./agent-file-store.js";
+import { agentFileProjectionUnverified, invalidateAgentFileProjection, persistDurableAgentFiles, restoreDurableAgentFiles } from "./agent-file-durability.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
@@ -910,10 +910,22 @@ export function agentInstructionsService(db?: Db) {
     });
   }
 
+  // Without a database this service can neither take the row lock nor restore
+  // the projection from its durable head. It must still never serve a managed
+  // tree that is marked unverified (a failed save whose rollback also failed):
+  // it answers "not available while the files are verified" instead.
+  async function assertReadableWithoutDatabase(agent: AgentLike) {
+    if (agentInstructionsBundleMode(agent) === "external") return;
+    if (await agentFileProjectionUnverified(resolveManagedInstructionsRoot(agent))) throw new AgentFilesUnverifiedError();
+  }
+
   // Public managed reads and configuration changes share the same row lock as
   // editor/runtime writes. Internal helpers operate on the already-loaded tree.
   async function withProjection<T>(agent: AgentLike, write: boolean, operation: (current: AgentLike, connection?: Pick<Db, "select">) => Promise<T>, managedDestination = false) {
-    if (!db) return operation(agent);
+    if (!db) {
+      if (!write) await assertReadableWithoutDatabase(agent);
+      return operation(agent);
+    }
     return db.transaction(async tx => {
       const [current] = await tx.select().from(agents).where(and(eq(agents.id, agent.id), eq(agents.companyId, agent.companyId))).for("update");
       if (!current) throw notFound("Agent not found");
@@ -929,7 +941,10 @@ export function agentInstructionsService(db?: Db) {
 
   return {
     getManagedEntryFingerprint,
-    getFileDates: (agent: AgentLike, relativePath: string, hash?: string) => getFileDates(agent, relativePath, hash, db),
+    getFileDates: async (agent: AgentLike, relativePath: string, hash?: string) => {
+      if (!db) await assertReadableWithoutDatabase(agent);
+      return getFileDates(agent, relativePath, hash, db);
+    },
     getBundleLocation: (agent: AgentLike) => withProjection(agent, false, getBundleLocation),
     getBundle: (agent: AgentLike) => withProjection(agent, false, getBundle),
     readFile: (agent: AgentLike, relativePath: string) => withProjection(agent, false, (current, connection) => readFile(current, relativePath, connection)),

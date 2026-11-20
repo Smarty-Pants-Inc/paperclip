@@ -74,6 +74,26 @@ export async function agentFileProjectionCurrent(db: Db, owner: { companyId: str
   return generation === head.generation && await fs.stat(root).then(info => info.isDirectory(), () => false);
 }
 
+/**
+ * For a reader WITHOUT a database, which can neither compare the projection
+ * with its durable head nor restore it: is this projection unverified, as far
+ * as the disk alone can tell? With durable agent files on (or a durable
+ * adoption recorded beside the tree) a verified projection carries its
+ * generation marker; `invalidateAgentFileProjection` removes the marker before
+ * every write, and a failed save whose rollback also fails leaves it removed.
+ * An existing tree without the marker may hold bytes that were never saved.
+ */
+export async function agentFileProjectionUnverified(root: string): Promise<boolean> {
+  const exists = (filename: string) => fs.stat(filename).then(() => true, (error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  });
+  // No durable authority: the local directory is the only copy and has no marker.
+  if (!durableAgentFilesEnabled() && !await exists(adoptionReceipt(root))) return false;
+  if (await exists(marker(root))) return false;
+  return fs.stat(root).then(info => info.isDirectory(), () => false);
+}
+
 /** Under the agent row lock. A durable head remains authoritative even after
  * the opt-in is removed; silently falling back would lose acknowledged writes. */
 export async function restoreDurableAgentFiles(tx: Tx, owner: Owner, root: string): Promise<boolean> {

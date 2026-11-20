@@ -128,6 +128,45 @@ export async function adoptAgentFiles(tx: Tx, agent: Agent): Promise<string> {
   return root;
 }
 
+/** The truthful answer of a reader that cannot serve an agent's files because
+ * the on-disk projection is unverified and could not be restored. */
+export class AgentFilesUnverifiedError extends HttpError {
+  constructor(readonly reason?: unknown) {
+    super(503, "Agent files are not available while they are being verified", { code: "AGENT_FILES_UNVERIFIED" });
+  }
+}
+
+/**
+ * The projection guard for a READER of an agent's managed files on disk that
+ * is not a save (rf-3 3b(iv), smarty-dev#20787). The on-disk tree is only a
+ * projection of the durable head. A save that fails after its tree merge is
+ * rolled back; when that rollback itself fails, the tree keeps bytes that
+ * were never saved and its generation marker stays removed. So, exactly like
+ * `locked` and every other reader: take the agent row lock, restore the
+ * projection from the durable head unless it is marked at that head's
+ * generation, and only then `read`, still under the lock (no save can be
+ * merging meanwhile). Unlike `adoptAgentFiles` it never imports a legacy
+ * directory: with no durable authority the local directory is the only copy
+ * and is read as it is, with no write. A projection that cannot be restored
+ * is refused (`AgentFilesUnverifiedError`), never served.
+ */
+export async function readVerifiedAgentFiles<T>(db: Db, owner: { companyId: string; id: string },
+  read: (root: string, agent: Agent) => Promise<T>): Promise<T> {
+  return fileStorageDb(db).transaction(async tx => {
+    const [agent] = await tx.select().from(agents).where(and(eq(agents.companyId, owner.companyId), eq(agents.id, owner.id))).for("update");
+    if (!agent) throw notFound("Agent not found");
+    if (agentInstructionsBundleMode(agent) === "external") throw unprocessable("External instructions are not managed agent files");
+    const root = resolveManagedInstructionsRoot(agent);
+    try {
+      await restoreDurableAgentFiles(tx, agent, root);
+    } catch (error) {
+      logger.warn({ err: error, companyId: agent.companyId, agentId: agent.id }, "agent files could not be verified for a reader");
+      throw new AgentFilesUnverifiedError(error);
+    }
+    return read(root, agent);
+  });
+}
+
 async function openAgentFile(root: string, relative: string) {
   const filename = await assertInstructionPathSafe(root, relative);
   const handle = await fs.open(filename, constants.O_RDONLY | constants.O_NOFOLLOW).catch((error: NodeJS.ErrnoException) => {

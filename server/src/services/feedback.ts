@@ -112,7 +112,6 @@ type ResolvedFeedbackTarget = FeedbackTargetRecord & {
 };
 
 const feedbackExportColumns = getTableColumns(feedbackExports);
-const instructionsSvc = agentInstructionsService();
 
 type FeedbackTraceShareClient = {
   uploadTraceBundle(bundle: FeedbackTraceBundle, signal?: AbortSignal): Promise<{ objectKey: string }>;
@@ -1240,6 +1239,13 @@ async function buildAgentContext(
       : null,
   };
 
+  // The agent's files on disk are a projection of its saved (durable) files.
+  // Read them through the projection guard of the database-backed service
+  // (agent row lock, restore from the durable head first): after a failed
+  // save whose rollback also failed, the raw tree holds bytes that were never
+  // saved. When the guard cannot verify the files, say so instead.
+  const instructionsSvc = agentInstructionsService(db as Db);
+  let instructionsUnavailable = false;
   const instructionsBundle = externalInstructions
     ? null
     : await instructionsSvc.getBundle({
@@ -1247,7 +1253,14 @@ async function buildAgentContext(
       companyId: agent.companyId,
       name: agent.name,
       adapterConfig: agent.adapterConfig,
-    }).catch(() => null);
+    }).catch(() => {
+      instructionsUnavailable = true;
+      return null;
+    });
+  if (instructionsUnavailable) {
+    state.notes.add("agent_instructions_unavailable_while_agent_files_are_verified");
+    state.omittedFields.add("bundle.agentContext.instructions");
+  }
 
   let entryDigest: string | null = null;
   let entryBody: string | null = null;

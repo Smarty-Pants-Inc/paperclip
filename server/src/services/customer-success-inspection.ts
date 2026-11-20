@@ -17,8 +17,9 @@ import {
   assertWorkspaceFilePathAllowed,
   workspaceFileResourceService,
 } from "./workspace-file-resources.js";
-import { deriveBundleState } from "./agent-instructions.js";
+import { agentInstructionsBundleMode, deriveBundleState } from "./agent-instructions.js";
 import { readInstructionBytes } from "./agent-instruction-files.js";
+import { AgentFilesUnverifiedError, readVerifiedAgentFiles } from "./agent-file-store.js";
 import { skillPackageStore } from "./skill-package-store.js";
 import { getRunLogStore, isRunLogStoreType } from "./run-log-store.js";
 import { createRemoteWorkspaceFiles } from "./remote-workspace-files.js";
@@ -275,13 +276,28 @@ export async function readCustomerSuccessResource(
       }
       if (q.operation === "instructions.file") {
         const agent = await ownRow(tx, schema.agents, q.companyId!, q.resourceId!);
-        const state = deriveBundleState(
-          agent as unknown as Parameters<typeof deriveBundleState>[0],
-        );
+        const bundle = agent as unknown as Parameters<typeof deriveBundleState>[0];
+        const state = deriveBundleState(bundle);
         if (!state.rootPath) return unavailable("instructions_not_configured");
         const relative = q.path ?? state.entryFile;
         assertWorkspaceFilePathAllowed(relative);
-        const bytes = await readInstructionBytes(state.rootPath, relative);
+        let bytes: Buffer | null;
+        if (agentInstructionsBundleMode(bundle) === "external") {
+          bytes = await readInstructionBytes(state.rootPath, relative);
+        } else {
+          // Managed files on disk are a projection of the durable head, and this
+          // transaction is read-only: it can neither lock the agent nor restore.
+          // Read through the projection guard on its own short transaction (row
+          // lock, restore from the durable head first). After a failed save whose
+          // rollback also failed, the raw tree holds bytes that were never saved.
+          try {
+            bytes = await readVerifiedAgentFiles(db, { companyId: q.companyId!, id: q.resourceId! },
+              root => readInstructionBytes(root, relative));
+          } catch (error) {
+            if (!(error instanceof AgentFilesUnverifiedError)) throw error;
+            return unavailable("instructions_unavailable_while_agent_files_are_verified");
+          }
+        }
         return bytes
           ? binary(bytes, bytes.length, 0, "text/plain; charset=utf-8")
           : unavailable("instructions_file_missing");
