@@ -45,7 +45,9 @@ function timeout(value: number | null | undefined) {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.trunc(value) : 30_000;
 }
 
-function program(input: RemoteTextFileSyncFile) {
+/** Compose the existing locked, hash-checked atomic upload with adjacent setup.
+ * Callers must run the script fail-fast with base64Body on stdin. */
+export function buildRemoteTextFileSyncProgram(input: RemoteTextFileSyncFile) {
   const remotePartial = `${input.remotePath}.partial`;
   const remoteUploadPath = `${input.remotePath}.paperclip-upload.b64`;
   const base64Body = Buffer.from(input.body, "utf8").toString("base64");
@@ -102,7 +104,7 @@ function program(input: RemoteTextFileSyncFile) {
 }
 
 export async function syncRemoteTextFile(input: RemoteTextFileSyncInput, execution: RemoteTextSyncExecution) {
-  const prepared = program(input);
+  const prepared = buildRemoteTextFileSyncProgram(input);
   const result = await execution.runShell(input.runner, input.remoteCwd, prepared.script, timeout(input.timeoutMs),
     preferredShellForSandbox(input.shellCommand), prepared.base64Body);
   execution.check(input.action, result);
@@ -117,7 +119,7 @@ export async function syncRemoteTextFile(input: RemoteTextFileSyncInput, executi
 export async function syncRemoteTextFiles(input: RemoteTextFileBatchInput, execution: RemoteTextSyncExecution) {
   if (input.files.length === 0 || input.files.length > 16) throw new Error("Remote text sync requires 1 to 16 files");
   const shell = preferredShellForSandbox(input.shellCommand);
-  const programs = input.files.map(program);
+  const programs = input.files.map(buildRemoteTextFileSyncProgram);
   const script = ["set -eu", ...programs.map((file, index) => {
     const delimiter = `PAPERCLIP_TEXT_${index}_${randomUUID().replaceAll("-", "")}`;
     return `${shellQuote(shell)} -c ${shellQuote(file.script)} <<'${delimiter}'\n${file.base64Body}\n${delimiter}`;

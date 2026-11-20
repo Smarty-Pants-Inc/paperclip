@@ -1,5 +1,5 @@
 import { buildRemotePidLockAcquireScript, buildRemotePidLockCleanupScript } from "./remote-pid-lock.js";
-import { syncRemoteTextFile, syncRemoteTextFiles, type RemoteTextFileSyncInput, type RemoteTextFileBatchInput } from "./remote-text-file-sync.js";
+import { buildRemoteTextFileSyncProgram, syncRemoteTextFile, syncRemoteTextFiles, type RemoteTextFileSyncInput, type RemoteTextFileBatchInput } from "./remote-text-file-sync.js";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { promises as fs } from "node:fs";
 import http2 from "node:http2";
@@ -656,6 +656,8 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
   remoteCwd: string;
   timeoutMs?: number | null;
   shellCommand?: "bash" | "sh" | null;
+  /** Native GitHub control state can fit within one command admission. */
+  inlineSmallWrites?: boolean;
 }): SandboxCallbackBridgeQueueClient {
   const timeoutMs = normalizeTimeoutMs(input.timeoutMs, DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS);
   const shellCommand = preferredShellForSandbox(input.shellCommand);
@@ -752,12 +754,24 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
       const uploadPath = `${remotePath}.${randomUUID()}.paperclip-upload`;
       const tempPath = `${uploadPath}.b64`;
       const decodedPath = `${uploadPath}.decoded`;
+      const base64Body = toBuffer(Buffer.from(body, "utf8")).toString("base64");
+      if (input.inlineSmallWrites && base64Body.length <= REMOTE_WRITE_BASE64_CHUNK_SIZE) {
+        // Small control state fits one admission. Keep a unique unpublished
+        // temporary and the same atomic rename; never expose a partial file.
+        await runChecked(`write ${remotePath}`, [
+          "set -eu",
+          `mkdir -p ${shellQuote(remoteDir)}`,
+          `trap ${shellQuote(`rm -f ${shellQuote(decodedPath)}`)} EXIT`,
+          `printf '%s' ${shellQuote(base64Body)} | base64 -d > ${shellQuote(decodedPath)}`,
+          `mv ${shellQuote(decodedPath)} ${shellQuote(remotePath)}`,
+        ].join("\n"));
+        return;
+      }
       try {
         await runChecked(
           `prepare upload ${remotePath}`,
           `mkdir -p ${shellQuote(remoteDir)} && rm -f ${shellQuote(tempPath)} ${shellQuote(decodedPath)} && : > ${shellQuote(tempPath)}`,
         );
-        const base64Body = toBuffer(Buffer.from(body, "utf8")).toString("base64");
         for (const chunk of base64Chunks(base64Body)) {
           await runChecked(
             `append upload chunk ${remotePath}`,
@@ -866,6 +880,11 @@ export async function startSandboxCallbackBridgeWorker(input: {
   idleBackoffMaxMs?: number | null;
   /** Begin without polling until a native run is bound. */
   startPaused?: boolean;
+  /** The paused server setup already created the queue and wrote paused.
+   * Only its owning factory may skip these awaited initialization writes. */
+  queueInitialized?: boolean;
+  /** Do not publish native GitHub authority after a failed attachment write. */
+  strictActivation?: boolean;
   // Per-iteration timeout for one poll-loop client call (the `listJsonFiles`
   // poll and one `processRequestFile`). On timeout the loop `catch` runs
   // `failPendingRequests`. Defaults to DEFAULT_BRIDGE_ITERATION_TIMEOUT_MS.
@@ -937,13 +956,14 @@ export async function startSandboxCallbackBridgeWorker(input: {
     directories.responsesDir,
     directories.logsDir,
   ];
-  if (input.client.makeDirs) {
-    await input.client.makeDirs(queueDirectories);
-  } else {
-    // Backward-compatible fallback for a queue client that omits the batched
-    // makeDirs method. Create each queue directory with a single makeDir.
-    for (const directory of queueDirectories) {
-      await input.client.makeDir(directory);
+  if (!input.queueInitialized) {
+    if (input.client.makeDirs) {
+      await input.client.makeDirs(queueDirectories);
+    } else {
+      // Backward-compatible fallback for clients without batched makeDirs.
+      for (const directory of queueDirectories) {
+        await input.client.makeDir(directory);
+      }
     }
   }
   const runStatePath = path.posix.join(directories.rootDir, "run-state.json");
@@ -968,7 +988,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
       if (timer) clearTimeout(timer);
     }
   };
-  if (input.startPaused) {
+  if (input.startPaused && !input.queueInitialized) {
     await input.client.writeTextFile(runStatePath, "paused");
   }
 
@@ -1805,8 +1825,14 @@ export async function startSandboxCallbackBridgeWorker(input: {
     resume: async (generation?: string) => {
       if (stopping || !paused) return;
       await failPendingRequests("Bridge request belongs to a detached run.", { abandonInFlight: true });
-      await writeRunStateBestEffort(everAttachedPath, "attached");
-      await writeRunStateBestEffort(runStatePath, generation ? `attached:${generation}` : "attached");
+      // Authority must not become active unless both durable markers landed.
+      // Keep the ever-attached fence first: the server consults it even after
+      // run-state disappears. A failed write leaves the host worker paused.
+      const writeAttachment = input.strictActivation
+        ? input.client.writeTextFile.bind(input.client)
+        : writeRunStateBestEffort;
+      await writeAttachment(everAttachedPath, "attached");
+      await writeAttachment(runStatePath, generation ? `attached:${generation}` : "attached");
       idlePollIntervalMs = pollIntervalMs;
       resetIdleOnNextEmpty = true;
       const pollStarted = new Promise<void>((resolve) => { pollStartedResolve = resolve; });
@@ -1897,12 +1923,14 @@ export async function startSandboxCallbackBridgeServer(input: {
   shellCommand?: "bash" | "sh" | null;
   maxQueueDepth?: number | null;
   maxBodyBytes?: number | null;
+  /** Initialize the paused queue, sync, launch and await readiness in one exec. */
+  startPaused?: boolean;
 }): Promise<StartedSandboxCallbackBridgeServer> {
   const timeoutMs = normalizeTimeoutMs(input.timeoutMs, DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS);
   const shellCommand = preferredShellForSandbox(input.shellCommand);
   const directories = sandboxCallbackBridgeDirectories(input.queueDir);
   let remoteEntrypoint = path.posix.join(input.assetRemoteDir, SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT);
-  if (input.bridgeAsset) {
+  if (input.bridgeAsset && !input.startPaused) {
     const assetSync = await syncSandboxCallbackBridgeEntrypoint({
       runner: input.runner,
       remoteCwd: input.remoteCwd,
@@ -1924,32 +1952,15 @@ export async function startSandboxCallbackBridgeServer(input: {
     maxBodyBytes: input.maxBodyBytes,
   });
   const nodeCommand = input.nodeCommand?.trim() || "node";
-  const startResult = await runSandboxBridgeControlCommand(input.runner, {
-    command: shellCommand,
-    args: shellCommandArgs(
-      [
-        `mkdir -p ${shellQuote(directories.requestsDir)} ${shellQuote(directories.responsesDir)} ${shellQuote(directories.logsDir)}`,
-        `rm -f ${shellQuote(directories.readyFile)} ${shellQuote(directories.pidFile)}`,
-        `nohup ${shellQuote(nodeCommand)} ${shellQuote(remoteEntrypoint)} ` +
-          `>> ${shellQuote(directories.logFile)} 2>&1 < /dev/null &`,
-        "pid=$!",
-        `printf '%s\\n' \"$pid\" > ${shellQuote(directories.pidFile)}`,
-        "printf '{\"pid\":%s}\\n' \"$pid\"",
-      ].join("\n"),
-    ),
-    cwd: input.remoteCwd,
-    env: {
-      [SANDBOX_EXEC_CHANNEL_ENV]: SANDBOX_EXEC_CHANNEL_BRIDGE,
-      ...env,
-    },
-    timeoutMs,
-  });
-  requireSuccessfulResult("start sandbox callback bridge", startResult);
-
-  const readyResult = await runShell(
-    input.runner,
-    input.remoteCwd,
-    [
+  const startScript = [
+    `mkdir -p ${shellQuote(directories.requestsDir)} ${shellQuote(directories.responsesDir)} ${shellQuote(directories.logsDir)}`,
+    `rm -f ${shellQuote(directories.readyFile)} ${shellQuote(directories.pidFile)}`,
+    `nohup ${shellQuote(nodeCommand)} ${shellQuote(remoteEntrypoint)} ` +
+      `>> ${shellQuote(directories.logFile)} 2>&1 < /dev/null &`,
+    "pid=$!",
+    `printf '%s\\n' \"$pid\" > ${shellQuote(directories.pidFile)}`,
+  ];
+  const readyScript = [
       "i=0",
       `while [ \"$i\" -lt 200 ]; do`,
       `  if [ -s ${shellQuote(directories.readyFile)} ]; then`,
@@ -1966,10 +1977,48 @@ export async function startSandboxCallbackBridgeServer(input: {
       `echo "Timed out waiting for bridge readiness." >&2`,
       `if [ -s ${shellQuote(directories.logFile)} ]; then cat ${shellQuote(directories.logFile)} >&2; fi`,
       "exit 1",
-    ].join("\n"),
-    timeoutMs,
-    shellCommand,
-  );
+    ].join("\n");
+  let readyResult: RunProcessResult;
+  if (input.startPaused) {
+    const runStatePath = path.posix.join(directories.rootDir, "run-state.json");
+    const tempStatePath = `${runStatePath}.${randomUUID()}.paperclip-upload.decoded`;
+    const script = [
+      "set -eu",
+      `mkdir -p ${shellQuote(directories.requestsDir)} ${shellQuote(directories.responsesDir)} ${shellQuote(directories.logsDir)}`,
+      `trap ${shellQuote(`rm -f ${shellQuote(tempStatePath)}`)} EXIT`,
+      `printf '%s' paused > ${shellQuote(tempStatePath)}`,
+      `mv ${shellQuote(tempStatePath)} ${shellQuote(runStatePath)}`,
+    ];
+    if (input.bridgeAsset) {
+      const prepared = buildRemoteTextFileSyncProgram({
+        remoteDir: input.assetRemoteDir, remotePath: remoteEntrypoint,
+        body: await fs.readFile(input.bridgeAsset.entrypoint, "utf8"),
+        label: "Sandbox callback bridge entrypoint", action: "sync sandbox callback bridge entrypoint",
+        lockDir: path.posix.join(input.assetRemoteDir, ".paperclip-bridge-upload.lock"),
+      });
+      const delimiter = `PAPERCLIP_BRIDGE_${randomUUID().replaceAll("-", "")}`;
+      // Reuse exactly the hash verification, PID lock and atomic rename of the
+      // standalone sync. A subshell owns its lock trap and upload result stdout.
+      script.push(`${shellQuote(shellCommand)} -c ${shellQuote(prepared.script)} <<'${delimiter}' > /dev/null\n${prepared.base64Body}\n${delimiter}`);
+    }
+    script.push(...startScript, readyScript);
+    readyResult = await runSandboxBridgeControlCommand(input.runner, {
+      command: shellCommand, args: shellCommandArgs(`exec ${shellCommand} -s`),
+      stdin: script.join("\n"), cwd: input.remoteCwd,
+      env: { [SANDBOX_EXEC_CHANNEL_ENV]: SANDBOX_EXEC_CHANNEL_BRIDGE, ...env },
+      timeoutMs, bypassSession: true,
+    });
+  } else {
+    const startResult = await runSandboxBridgeControlCommand(input.runner, {
+      command: shellCommand,
+      args: shellCommandArgs([...startScript, "printf '{\"pid\":%s}\\n' \"$pid\""].join("\n")),
+      cwd: input.remoteCwd,
+      env: { [SANDBOX_EXEC_CHANNEL_ENV]: SANDBOX_EXEC_CHANNEL_BRIDGE, ...env },
+      timeoutMs,
+    });
+    requireSuccessfulResult("start sandbox callback bridge", startResult);
+    readyResult = await runShell(input.runner, input.remoteCwd, readyScript, timeoutMs, shellCommand);
+  }
   requireSuccessfulResult("wait for sandbox callback bridge readiness", readyResult);
 
   let readyData: { host?: string; port?: number; baseUrl?: string; pid?: number };
