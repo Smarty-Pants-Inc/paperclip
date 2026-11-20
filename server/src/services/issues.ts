@@ -69,7 +69,7 @@ import {
 import { Buffer } from "node:buffer";
 import { isDeepStrictEqual } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { nativeResponseItems } from "./native-runtime/native-response-items.js";
+import { nativeResponseItems, unitsPostedByRun, withoutPostedUnits } from "./native-runtime/native-response-items.js";
 import { readPositiveIntegerEnvironment } from "../cap-environment.js";
 import { isExplicitContinuationRetryClaim } from "./explicit-continuation-retry-claim.js";
 import { nativeManualAdmissionHoldsExecution } from "./native-runtime/native-runner-ownership.js";
@@ -13851,17 +13851,31 @@ export function issueService(db: Db) {
         const [nativeRun] = await dbOrTx.select({ runtimeMode: heartbeatRuns.runtimeMode }).from(heartbeatRuns)
           .where(and(eq(heartbeatRuns.id, actor.runId), eq(heartbeatRuns.companyId, issue.companyId)));
         if (nativeRun?.runtimeMode === "native" && !options.completionReplyItemId) {
+          // answered-a5: THIS is the publication step: one completion reply call posts the run's
+          // selected final and the earlier final items of its turn, now, never held for later.
           const items = await nativeResponseItems(dbOrTx, { companyId: issue.companyId, runId: actor.runId, text: body });
-          if (items.length > 1) {
+          // Arm (2): units this run already posted in an earlier step are left out; same run only.
+          const posted = await unitsPostedByRun(dbOrTx, { companyId: issue.companyId, issueId, runId: actor.runId, agentId: actor.agentId });
+          const fresh = (items.length > 1 ? items : [{ itemId: null, text: body }])
+            .map(item => ({ ...item, text: withoutPostedUnits(item.text, posted.units) })).filter(item => item.text);
+          if (fresh.length === 0 && posted.lastReplyId) {
+            // Nothing new is left: no second reply. The run's earlier reply is its answer.
+            const [existing] = await dbOrTx.select().from(issueComments).where(eq(issueComments.id, posted.lastReplyId));
+            await acknowledgeChatCompletionReply(dbOrTx, actor.runId, existing.id);
+            return redactIssueComment(existing, currentUserRedactionOptions.enabled);
+          }
+          if (items.length > 1 && fresh.length > 0) {
             let reply: IssueComment | undefined;
             // UI chronology is millisecond timestamps, then UUID. Distinct
             // timestamps preserve item order even for very fast inserts.
             const firstCreatedAt = options.createdAt ? new Date(options.createdAt).getTime() : Date.now();
-            for (const [index, item] of items.entries()) reply = await addComment(issueId, item.text, actor,
-              { ...options, completionReplyItemId: item.itemId,
+            for (const [index, item] of fresh.entries()) reply = await addComment(issueId, item.text, actor,
+              { ...options, completionReplyItemId: item.itemId!,
                 createdAt: new Date(firstCreatedAt + index) }, dbOrTx);
             return reply!;
           }
+          if (posted.units.size > 0 && fresh.length === 1 && fresh[0].text !== body.trim())
+            return addComment(issueId, fresh[0].text, actor, options, dbOrTx);
         }
         if (options.completionReplyItemId) {
           const [existing] = await dbOrTx.select().from(issueComments).where(and(
