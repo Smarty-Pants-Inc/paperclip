@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { writeFile } from "node:fs/promises";
 import { context, trace } from "@opentelemetry/api";
 import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import { InMemorySpanExporter, SimpleSpanProcessor, TracerProvider } from "@opentelemetry/sdk-trace";
@@ -104,6 +105,12 @@ describe.skipIf(!support.supported)("heartbeat preparation gap spans", () => {
       expect(attempts).toHaveLength(1);
       const attemptTrace = attempts[0]!.spanContext().traceId;
       const spans = exporter.getFinishedSpans().filter(span => span.spanContext().traceId === attemptTrace);
+      if (process.env.PAPERCLIP_S1_SPAN_EVIDENCE) {
+        await writeFile(process.env.PAPERCLIP_S1_SPAN_EVIDENCE, JSON.stringify(spans.map(span => ({
+          name: span.name, startMs: span.startTime[0] * 1000 + span.startTime[1] / 1e6,
+          durationMs: span.duration[0] * 1000 + span.duration[1] / 1e6,
+        })), null, 2));
+      }
       const names = new Set(spans.map(span => span.name));
       const preparation = [
         "heartbeat.prepare.chat_retry_admission",
@@ -121,6 +128,16 @@ describe.skipIf(!support.supported)("heartbeat preparation gap spans", () => {
         "native.controller.warm_restore",
         "native.controller.span_persistence",
         "native.controller.state_migration",
+        "native.controller.warm_close_wait",
+        "native.controller.startup_reuse",
+        "native.controller.controller_identity",
+        "native.controller.controller_process",
+        "native.controller.coordinator_read",
+        "native.controller.binding_read",
+        "native.controller.resume_admission",
+        "native.controller.coordinator_write",
+        "native.controller.run_write",
+        "native.controller.lease_acquired_callback",
       ];
       for (const name of [...preparation, ...controller]) expect(names, name).toContain(name);
       for (const span of spans.filter(span => preparation.includes(span.name))) {

@@ -484,6 +484,18 @@ async function runLeaseChangeScenario(resumedFrom: "idle" | "archived" | "stoppe
           && record(event.payload).span === "native.controller.warm_owner_identity_check");
         expect(spans, "the current run's managed preparation must not suppress the identity check").toHaveLength(1);
         expect(record(spans[0]!.payload).outcome).toBe(resumedFrom === "connected" ? "ok" : "failed");
+        // The run log (without an OTLP collector) must retain the waits that
+        // precede the identity check, including those before trace creation.
+        const performance = managedEvents.filter(event => event.eventType === "run.performance.span").map(event => record(event.payload));
+        const identityStartedAt = Number(record(spans[0]!.payload).wallStartedAtMs);
+        for (const name of ["warm_close_wait", "attachment_staging", "warm_restore", "harness_restore",
+          "startup_reuse", "state_migration", "controller_identity", "controller_process",
+          "coordinator_read", "binding_read", "resume_admission", "coordinator_write", "run_write", "lease_acquired_callback"]) {
+          const measured = performance.find(span => span.span === `native.controller.${name}`);
+          expect(measured, name).toBeDefined();
+          expect(Number(measured!.durationMs), name).toBeGreaterThanOrEqual(0);
+          expect(Number(measured!.wallStartedAtMs) + Number(measured!.durationMs), name).toBeLessThanOrEqual(identityStartedAt);
+        }
         const probes = commands.slice(beforeCommands).filter(command => (record(command).args as string[] | undefined)?.[2] === "paperclip-runner-generation-marker");
         // DECLARED EXPECTED FAILURE (RFL, L2xI1): the lost-owner path reads the
         // generation marker twice per attempt (pre-reuse block + backend caller).
