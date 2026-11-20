@@ -39,6 +39,21 @@ export async function runExecutionsHaveStopped(db: Db, companyId: string, runIds
     and(eq(environmentLeases.companyId, companyId), inArray(environmentLeases.heartbeatRunId, ids))!, ids.length, false)) === null;
 }
 
+/** spgrace: true only when the normal release tail is the SOLE thing missing
+ * for these runs: a lease still held for its ordinary end-of-run release, or a
+ * cancelled remote run's provider stop confirmation (termination receipt) not
+ * yet written; every other check (release deferrals, failed cleanup,
+ * controller/finalizer owners, live local processes, local Stop proof) passes
+ * for EVERY run. Read-only; never Stop proof. The caller bounds the wait. */
+export async function runExecutionsAwaitOnlyReleaseTail(db: Db, companyId: string, runIds: string[]) {
+  const ids = [...new Set(runIds)];
+  if (!ids.length) return false;
+  return (await executionStopBlocker(db, and(eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.id, ids))!,
+    and(eq(environmentLeases.companyId, companyId), inArray(environmentLeases.heartbeatRunId, ids))!, ids.length, false,
+    false, true)) === RELEASE_TAIL_PENDING;
+}
+
+const RELEASE_TAIL_PENDING = "execution_release_tail_pending";
 type Run = typeof heartbeatRuns.$inferSelect;
 type Lease = typeof environmentLeases.$inferSelect;
 type Coordinator = typeof nativeRunFinalizations.$inferSelect;
@@ -87,7 +102,8 @@ function keptWarmTurnHandoff(run: Run, runLeases: Lease[],
 }
 
 async function executionStopBlocker(db: Db, condition: SQL, leaseCondition: SQL,
-  expectedRunCount?: number, settleCoordinators = true, skipRemoteProviderProof = false): Promise<string | null> {
+  expectedRunCount?: number, settleCoordinators = true, skipRemoteProviderProof = false,
+  releaseTailOnly = false): Promise<string | null> {
   const runs = await db.select().from(heartbeatRuns).where(condition);
   // A missing or cross-company binding cannot establish execution Stop.
   if (expectedRunCount !== undefined && runs.length !== expectedRunCount) return "run_binding_unproven";
@@ -104,8 +120,15 @@ async function executionStopBlocker(db: Db, condition: SQL, leaseCondition: SQL,
     coordinatorRows.find(row => row.runId === run.id))
     || keptWarmTurnHandoff(run, allLeases.filter(lease => lease.heartbeatRunId === run.id), handOff)).map(run => run.id));
   const leases = allLeases.filter(lease => !lease.heartbeatRunId || !handedOff.has(lease.heartbeatRunId));
-  const proofLeases = leases.filter(lease => !skipRemoteProviderProof || !lease.provider || lease.provider === "local");
-  const deferred = proofLeases.find(lease => lease.status === "active" && readLeaseReleaseDeferral(lease.metadata));
+  // releaseTailOnly: a lease still held for its ordinary release is recorded as
+  // the release tail and judged after every other blocker; failed cleanup or a
+  // release deferral still blocks here exactly as before.
+  const held = (lease: Lease) => (!lease.releasedAt && !(lease.status === "retained" && lease.cleanupStatus === "success"))
+    || lease.status === "pending_cleanup";
+  let releaseTail = releaseTailOnly && leases.some(held);
+  const proofLeases = leases.filter(lease => (!skipRemoteProviderProof || !lease.provider || lease.provider === "local")
+    && (!releaseTailOnly || lease.cleanupStatus === "failed"));
+  const deferred = (releaseTailOnly ? leases : proofLeases).find(lease => lease.status === "active" && readLeaseReleaseDeferral(lease.metadata));
   if (deferred) return `environment_lease_release_deferred:${readLeaseReleaseDeferral(deferred.metadata)!.reason}`;
   if (proofLeases.some(lease => (!lease.releasedAt && !(lease.status === "retained" && lease.cleanupStatus === "success")) || lease.status === "pending_cleanup" || lease.cleanupStatus === "failed")) return "environment_lease_unreleased";
   const coordinators = await db.select().from(nativeRunFinalizations)
@@ -130,7 +153,10 @@ async function executionStopBlocker(db: Db, condition: SQL, leaseCondition: SQL,
     if (handedOff.has(run.id)) continue;
     const runLeases = leases.filter(lease => lease.heartbeatRunId === run.id);
     if (runLeases.some(lease => lease.provider && lease.provider !== "local")) {
-      if (run.status === "cancelled" && !skipRemoteProviderProof && !runLeases.every(hasRemoteTerminationReceipt)) return "remote_stop_unconfirmed";
+      if (run.status === "cancelled" && !skipRemoteProviderProof && !runLeases.every(hasRemoteTerminationReceipt)) {
+        if (!releaseTailOnly) return "remote_stop_unconfirmed";
+        releaseTail = true;
+      }
       continue;
     }
     let processAlive = Boolean(run.processPid && !absent(run.processPid));
@@ -152,6 +178,7 @@ async function executionStopBlocker(db: Db, condition: SQL, leaseCondition: SQL,
         !(run.executionStage === "settled" && !await runUsedConversationAdapter(db, run)) &&
         !await isCancelledNativeStartup(db, run, coordinators.find(row => row.runId === run.id))) return "legacy_stop_unproven";
   }
+  if (releaseTail) return RELEASE_TAIL_PENDING;
   // Task/run-lock callers only read proof. They must never wait for a
   // coordinator write while a native owner waits for their run lock.
   if (!settleCoordinators) return null;

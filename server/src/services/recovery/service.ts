@@ -7135,8 +7135,10 @@ export function recoveryService(
           if (lockedRuns.some(run => run.status === "succeeded" && steeringIngestionPending(run.result))) return null;
           if (!await runExecutionsHaveStopped(tx as unknown as Db, issue.companyId, ownerRunIds)) {
             if (await onlyUnreleasedLeasesWithinBoundBlockStop(tx as unknown as Db, locked, ownerRunIds, opts?.onDeferredDeadline)) return null;
-            await recordTaskStopPending(tx as unknown as Db, { companyId: issue.companyId, issueId: issue.id,
+            const pending = await recordTaskStopPending(tx as unknown as Db, { companyId: issue.companyId, issueId: issue.id,
               runIds: ownerRunIds, source: "recovery.sweep_stale_issue_locks" }, publications);
+            // A person's Stop still inside its confirmation window: inspect again at the bound.
+            if (pending) opts?.onDeferredDeadline?.(pending.reinspectAt);
             return null;
           }
         }

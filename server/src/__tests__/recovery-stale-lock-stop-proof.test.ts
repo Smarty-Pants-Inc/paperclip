@@ -14,6 +14,11 @@ import { nativeUserStopRecoveryHeld } from "../services/native-runtime/native-us
 // Keep reason: #20807 RFL F1's independent PostgreSQL reproduction caught a
 // data-safety failure: the ordinary sweep released a still-executing owner's
 // claims immediately after guarded stranded-assignment recovery retained them.
+// These rows judge Stop proof itself, so their owners finished before the
+// normal release-tail bounds (stop-pending.ts STOP_CONFIRMATION_GRACE_MS /
+// END_OF_RUN_RELEASE_GRACE_MS); inside them a card is deferred, which
+// recovery-stop-pending-grace.test.ts covers.
+const pastReleaseTail = () => new Date(Date.now() - 90_000);
 describe("stale-lock sweep requires execution Stop proof", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: Db;
@@ -32,7 +37,7 @@ describe("stale-lock sweep requires execution Stop proof", () => {
       status: "paused", pauseReason: "budget", lifecycleState: "pausing", lifecycleHolds: ["budget"],
       lifecycleRequiredPluginIds: [], lifecycleOperation: { id: randomUUID(), attempts: 1, hostComplete: false, completedPluginIds: [] } });
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", status: "cancelled",
-      runtimeMode: "legacy", executionStage: "dispatching", startedAt: new Date(Date.now() - 60_000), finishedAt: new Date(),
+      runtimeMode: "legacy", executionStage: "dispatching", startedAt: new Date(Date.now() - 180_000), finishedAt: pastReleaseTail(),
       contextSnapshot: { issueId }, runnerProfileJson: { adapterDispatch: { adapterType: "http" } }, resultJson: {},
       controllerLeaseExpiresAt: new Date(Date.now() + 600_000), processPid: process.pid });
     await db.insert(issues).values({ id: issueId, companyId, title: "Unconfirmed stopped task", status: "in_progress",
@@ -101,7 +106,7 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     const f = await warmFixture(), checkoutRunId = randomUUID();
     await db.insert(heartbeatRuns).values({ id: checkoutRunId, companyId: f.companyId, agentId: f.agentId,
       invocationSource: "on_demand", status: "failed", errorCode: "adapter_failed", runtimeMode: "legacy",
-      startedAt: new Date(Date.now() - 60_000), finishedAt: new Date(),
+      startedAt: new Date(Date.now() - 180_000), finishedAt: pastReleaseTail(),
       controllerLeaseExpiresAt: controller ? new Date(Date.now() + 60_000) : null });
     await db.update(issues).set({ checkoutRunId }).where(eq(issues.id, f.issueId));
     await inspect(f, "sweep");
@@ -148,7 +153,7 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     await db.update(heartbeatRuns).set({ status: "running", finishedAt: null }).where(eq(heartbeatRuns.id, f.runId));
     // The same durable fence used by the real correlated Board Stop path.
     await claimCancellationRequest(db, f.runId, f.companyId, randomUUID(), "board-user");
-    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: pastReleaseTail() }).where(eq(heartbeatRuns.id, f.runId));
     const before = await task(f.issueId);
     await inspect(f, path);
     expect(await task(f.issueId)).toEqual(before);
@@ -351,7 +356,7 @@ describe("stale-lock sweep requires execution Stop proof", () => {
       await db.update(heartbeatRuns).set({ status: "running", finishedAt: null }).where(eq(heartbeatRuns.id, f.runId));
       await claimCancellationRequest(db, f.runId, f.companyId, randomUUID(), "board-user");
     }
-    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: pastReleaseTail() }).where(eq(heartbeatRuns.id, f.runId));
     await db.update(environmentLeases).set({ expiresAt: new Date(Date.now() - 301_000) }).where(eq(environmentLeases.id, f.lease.id));
     await inspect(f, "sweep");
     expect(await stopActions(f.issueId)).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
@@ -504,7 +509,7 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     await acknowledgeStop(f.runId);
     await db.insert(heartbeatRuns).values({ id: executionRunId, companyId: f.companyId, agentId: f.agentId,
       invocationSource: "on_demand", status: "cancelled", runtimeMode: "legacy", executionStage: "dispatching",
-      startedAt: new Date(Date.now() - 60_000), finishedAt: new Date(), processPid: process.pid, contextSnapshot: { issueId: f.issueId } });
+      startedAt: new Date(Date.now() - 180_000), finishedAt: pastReleaseTail(), processPid: process.pid, contextSnapshot: { issueId: f.issueId } });
     await db.update(issues).set({ executionRunId }).where(eq(issues.id, f.issueId));
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
     expect((await recovery.sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId })).cleared).toBe(0);
