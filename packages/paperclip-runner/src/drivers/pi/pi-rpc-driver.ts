@@ -155,23 +155,29 @@ export class PiRpcDriver implements HarnessDriver {
 
   async #open(input: OpenHarnessSessionInput, recovery?: { snapshot: PersistedHarnessSession; sessionFile: string }): Promise<HarnessSession> {
     const spans: ProviderPerformanceSpan[] = [];
+    let session: PiRpcHarnessSession | undefined;
+    const observe: PiOpenObserve = span => {
+      // stderr and stdout are independent streams: a startup observation may
+      // arrive after get_state/open. Preserve it through the same event sink.
+      if (session) {
+        try { session.recordOpenTimings([span], input.runId); } catch { /* log-only */ }
+      } else spans.push(span);
+      try { console.error(`pi.open ${span.name.slice("runner.pi.open.".length)} ${span.endedAtMs - span.startedAtMs}ms`); } catch { /* log-only */ }
+    };
     const measure: PiOpenMeasure = async (name, work) => {
       const startedAtMs = Date.now();
       let outcome: ProviderPerformanceSpan["outcome"] = "failed";
       try { const result = await work(); outcome = "ok"; return result; }
       finally {
         const endedAtMs = Math.max(startedAtMs, Date.now());
-        spans.push({ name, startedAtMs, endedAtMs, outcome });
-        // Content-free fallback also survives failures before a session/event
-        // queue exists. Never let a diagnostic replace the startup result.
-        try { console.error(`pi.open ${name.slice("runner.pi.open.".length)} ${endedAtMs - startedAtMs}ms`); } catch { /* log-only */ }
+        observe({ name, startedAtMs, endedAtMs, outcome });
       }
     };
-    let session: PiRpcHarnessSession | undefined;
     try {
-      session = await measure("runner.pi.open.total", () => this.#openMeasured(input, measure, recovery));
+      session = await measure("runner.pi.open.total", () => this.#openMeasured(input, measure, observe, recovery));
       return session;
     } finally {
+      try { console.error(`pi.open timing ${spans.map(span => `${span.name.slice("runner.pi.open.".length)}=${span.endedAtMs - span.startedAtMs}ms`).join(" ")}`); } catch { /* log-only */ }
       if (session) {
         try { session.recordOpenTimings(spans, input.runId); } catch { /* log-only */ }
       } else {
@@ -185,7 +191,7 @@ export class PiRpcDriver implements HarnessDriver {
     }
   }
 
-  async #openMeasured(input: OpenHarnessSessionInput, measure: PiOpenMeasure,
+  async #openMeasured(input: OpenHarnessSessionInput, measure: PiOpenMeasure, observe: PiOpenObserve,
     recovery?: { snapshot: PersistedHarnessSession; sessionFile: string }): Promise<PiRpcHarnessSession> {
     const { cwd, directory } = await measure("runner.pi.open.workspace", async () => {
       if (input.signal?.aborted) throw input.signal.reason ?? new Error("Pi RPC session startup aborted");
@@ -319,6 +325,8 @@ export class PiRpcDriver implements HarnessDriver {
         environment.PAPERCLIP_AI_PROVIDER_KEY = provider.key;
       }
     }
+    let piSpawnAtMs: number | undefined, firstGetStateEndedAtMs: number | undefined;
+    const observedExtensionPhases = new Set<ProviderPerformancePhase>();
     const transportOptions: PiRpcTransportOptions = {
       command: this.#options.command ?? "pi",
       args,
@@ -327,6 +335,21 @@ export class PiRpcDriver implements HarnessDriver {
       commandFd: this.#options.commandFd,
       commandLifecycle: this.#options.commandLifecycle,
       fatalSessionStartExtensionPaths,
+      onOpenPerformanceSpan: span => {
+        // Late stderr from this startup is valid; a later reload/new-session is
+        // not. Never relabel it to the run that originally opened this process.
+        if (piSpawnAtMs === undefined || span.startedAtMs < piSpawnAtMs
+          || (firstGetStateEndedAtMs !== undefined && span.endedAtMs > firstGetStateEndedAtMs)
+          || observedExtensionPhases.has(span.name)) return;
+        observedExtensionPhases.add(span.name);
+        if (span.name === "runner.pi.open.extension_factory") {
+          // An observed boundary, NOT a claim that factory/module import alone
+          // consumed this time: includes Node/CLI startup and resource discovery.
+          observe({ name: "runner.pi.open.pre_extension_factory", startedAtMs: piSpawnAtMs,
+            endedAtMs: span.startedAtMs, outcome: "ok" });
+        }
+        observe(span);
+      },
       shutdownTimeoutMs: this.#options.shutdownTimeoutMs,
       killTimeoutMs: this.#options.killTimeoutMs,
     };
@@ -334,7 +357,15 @@ export class PiRpcDriver implements HarnessDriver {
     try {
       let port!: PiRpcAdmissionPort;
       const ready = await measure("runner.pi.open.pi_spawn_to_get_state", async () => {
-        transport = this.#options.transportFactory?.(transportOptions) ?? new PiRpcTransport(transportOptions);
+        const spawnedAtMs = piSpawnAtMs = Date.now();
+        let spawned = false;
+        try {
+          transport = this.#options.transportFactory?.(transportOptions) ?? new PiRpcTransport(transportOptions);
+          spawned = true;
+        } finally {
+          observe({ name: "runner.pi.open.pi_spawn", startedAtMs: spawnedAtMs,
+            endedAtMs: Math.max(spawnedAtMs, Date.now()), outcome: spawned ? "ok" : "failed" });
+        }
         // --session loads an existing file too: no saved selection bypasses live
         // admission. The broker/models.json bootstrap above remains first.
         port = piAdmissionPort(transport, this.#options.startupTimeoutMs);
@@ -344,8 +375,18 @@ export class PiRpcDriver implements HarnessDriver {
         // under its own bound; every later admission RPC keeps the short bound.
         const startupTimeoutMs = this.#options.processStartupTimeoutMs ?? PI_PROCESS_STARTUP_TIMEOUT_MS;
         // The transport's own per-request deadline (30 s) must not cut the wait short.
-        return record(await withAbort(withTimeout(transport.request("get_state", {}, { timeoutMs: startupTimeoutMs }),
-          startupTimeoutMs, "Pi RPC startup timed out"), input.signal).then(response => response.data));
+        const getStateAtMs = Date.now();
+        let ready = false;
+        try {
+          const state = record(await withAbort(withTimeout(transport.request("get_state", {}, { timeoutMs: startupTimeoutMs }),
+            startupTimeoutMs, "Pi RPC startup timed out"), input.signal).then(response => response.data));
+          ready = true;
+          return state;
+        } finally {
+          firstGetStateEndedAtMs = Math.max(getStateAtMs, Date.now());
+          observe({ name: "runner.pi.open.get_state", startedAtMs: getStateAtMs,
+            endedAtMs: firstGetStateEndedAtMs, outcome: ready ? "ok" : "failed" });
+        }
       });
       if (recovery) {
         // Check native readback before model/config mutation, not just the argv.
@@ -434,6 +475,7 @@ export class PiRpcDriver implements HarnessDriver {
 
 type PiOpenPhase = Extract<ProviderPerformancePhase, `runner.pi.open.${string}`>;
 type PiOpenMeasure = <T>(name: PiOpenPhase, work: () => Promise<T>) => Promise<T>;
+type PiOpenObserve = (span: ProviderPerformanceSpan) => void;
 
 interface PiRunContext {
   baseInstructions: string;

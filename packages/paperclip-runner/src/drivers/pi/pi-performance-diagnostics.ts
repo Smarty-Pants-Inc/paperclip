@@ -43,6 +43,39 @@ export function installPiPerformanceDiagnostics(pi: PiPerformanceApi): void {
   });
 }
 
+/** Startup precedes RPC's session subscription (and factory execution precedes
+ * appendEntry initialization). Use the existing stderr diagnostic fallback until
+ * the transport can hand these same closed spans to recordOpenTimings. No RPC,
+ * session entry, provider data, or awaited diagnostic work is added. */
+export const PI_OPEN_PERFORMANCE_PREFIX = "pi.open.span ";
+type PiExtensionOpenPhase = Extract<ProviderPerformanceSpan["name"], `runner.pi.open.extension_${string}`>;
+
+export function startPiExtensionOpenSpan(name: PiExtensionOpenPhase): (outcome?: ProviderPerformanceSpan["outcome"]) => void {
+  const startedAtMs = Date.now();
+  return (outcome = "ok") => {
+    try {
+      console.error(PI_OPEN_PERFORMANCE_PREFIX + JSON.stringify({ code: PROVIDER_PERFORMANCE_DIAGNOSTIC,
+        spans: [{ name, startedAtMs, endedAtMs: Math.max(startedAtMs, Date.now()), outcome }] }));
+    } catch { /* Measurement must never replace startup's result. */ }
+  };
+}
+
+export function measurePiExtensionOpen<T>(name: PiExtensionOpenPhase, work: () => T): T {
+  const finish = startPiExtensionOpenSpan(name);
+  let outcome: ProviderPerformanceSpan["outcome"] = "failed";
+  try { const result = work(); outcome = "ok"; return result; }
+  finally { finish(outcome); }
+}
+
+/** Strict, bounded startup-only projection; never forward arbitrary stderr. */
+export function piExtensionOpenPerformanceSpans(line: string, observedAtMs: number): ProviderPerformanceSpan[] {
+  if (line.length > 1024 || !line.startsWith(PI_OPEN_PERFORMANCE_PREFIX)) return [];
+  try {
+    return parseProviderPerformanceSpans(JSON.parse(line.slice(PI_OPEN_PERFORMANCE_PREFIX.length)), observedAtMs)
+      .filter(span => span.name.startsWith("runner.pi.open.extension_")).slice(0, 1);
+  } catch { return []; }
+}
+
 const record = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 

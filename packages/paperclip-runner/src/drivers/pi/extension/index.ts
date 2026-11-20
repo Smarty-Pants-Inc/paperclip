@@ -8,7 +8,7 @@ import { createSubagentLifecycle, registerSubagentBridge, type SubagentEventBus 
 import { installSubagentSeam, installUnboundChildParent } from "./subagents/seam.js";
 import { piManagedModelRegistration } from "../pi-managed-model.js";
 import { isPiThinkingLevelAtMost } from "../pi-native-config.js";
-import { installPiPerformanceDiagnostics } from "../pi-performance-diagnostics.js";
+import { installPiPerformanceDiagnostics, measurePiExtensionOpen, startPiExtensionOpenSpan } from "../pi-performance-diagnostics.js";
 import { PI_TOOL_LIMIT_ENTRY, piToolLimitMessage } from "../pi-tool-limit-diagnostics.js";
 import {
   PI_BIND_ERROR, PI_BIND_MAX_FRAME_BYTES, PI_BIND_TIMEOUT_MS, PI_DYNAMIC_TOOL_LIMIT_BY_API, RunAuthority, bindContent, digest, dispatchPiToolCall,
@@ -334,42 +334,49 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
     } finally { commandBusy = false; }
   }
   async function start(context: PiBindContext) {
-    if (closed || ctx) throw new Error(PI_BIND_ERROR);
-    ctx = context; sessionId = options.initial.sessionId;
-    if (!sessionId) throw new Error(PI_BIND_ERROR);
-    const directory = dirname(options.socketPath);
-    const info = await lstat(directory);
-    if (!info.isDirectory() || info.isSymbolicLink() || (info.mode & 0o777) !== 0o700
-      || (typeof process.getuid === "function" && info.uid !== process.getuid()) || await realpath(directory) !== resolve(directory)) throw new Error(PI_BIND_ERROR);
-    const version = fenceVersion;
-    await admitHome(config);
-    if (closed || version !== fenceVersion) throw new Error(PI_BIND_ERROR);
-    updateTools(config); authority.bind(config);
-    if (options.initial.turnId) prepared = authority.beginTurn({ epoch: config.epoch, runId: config.runId, turnId: options.initial.turnId });
-    active = publicState;
-    offUnboundParent = installUnboundChildParent({ capture: () => authority.capture(), accept: origin => !closed && authority.accept(origin) });
-    server = createServer(socket => {
-      socket.on("error", () => undefined);
-      if (sockets.size >= 8 || closed) { socket.destroy(); return; }
-      sockets.add(socket); socket.once("close", () => sockets.delete(socket));
-      let buffer = Buffer.alloc(0), handled = false;
-      const timer = setTimeout(() => socket.destroy(), timeoutMs);
-      socket.once("close", () => clearTimeout(timer));
-      socket.on("data", (chunk: Buffer) => {
-        if (handled) { socket.destroy(); return; }
-        if (buffer.length + chunk.length > PI_BIND_MAX_FRAME_BYTES) { handled = true; socket.end(`${JSON.stringify({ error: PI_BIND_ERROR })}\n`); return; }
-        buffer = Buffer.concat([buffer, chunk]); const newline = buffer.indexOf(10); if (newline < 0) return;
-        handled = true; clearTimeout(timer);
-        let request: unknown;
-        try { if (newline !== buffer.length - 1) throw new Error(); request = JSON.parse(buffer.subarray(0, newline).toString("utf8")); }
-        catch { socket.end(`${JSON.stringify({ error: PI_BIND_ERROR })}\n`); return; }
-        void dispatch(request).then(response => socket.end(`${JSON.stringify(response)}\n`), () => socket.end(`${JSON.stringify({ error: PI_BIND_ERROR })}\n`));
+    let finish = startPiExtensionOpenSpan("runner.pi.open.extension_directory");
+    try {
+      if (closed || ctx) throw new Error(PI_BIND_ERROR);
+      ctx = context; sessionId = options.initial.sessionId;
+      if (!sessionId) throw new Error(PI_BIND_ERROR);
+      const directory = dirname(options.socketPath);
+      const info = await lstat(directory);
+      if (!info.isDirectory() || info.isSymbolicLink() || (info.mode & 0o777) !== 0o700
+        || (typeof process.getuid === "function" && info.uid !== process.getuid()) || await realpath(directory) !== resolve(directory)) throw new Error(PI_BIND_ERROR);
+      const version = fenceVersion;
+      finish(); finish = startPiExtensionOpenSpan("runner.pi.open.extension_home_admission");
+      await admitHome(config);
+      if (closed || version !== fenceVersion) throw new Error(PI_BIND_ERROR);
+      finish(); finish = startPiExtensionOpenSpan("runner.pi.open.extension_tools");
+      updateTools(config); authority.bind(config);
+      if (options.initial.turnId) prepared = authority.beginTurn({ epoch: config.epoch, runId: config.runId, turnId: options.initial.turnId });
+      active = publicState;
+      offUnboundParent = installUnboundChildParent({ capture: () => authority.capture(), accept: origin => !closed && authority.accept(origin) });
+      finish(); finish = startPiExtensionOpenSpan("runner.pi.open.extension_socket_listen");
+      server = createServer(socket => {
+        socket.on("error", () => undefined);
+        if (sockets.size >= 8 || closed) { socket.destroy(); return; }
+        sockets.add(socket); socket.once("close", () => sockets.delete(socket));
+        let buffer = Buffer.alloc(0), handled = false;
+        const timer = setTimeout(() => socket.destroy(), timeoutMs);
+        socket.once("close", () => clearTimeout(timer));
+        socket.on("data", (chunk: Buffer) => {
+          if (handled) { socket.destroy(); return; }
+          if (buffer.length + chunk.length > PI_BIND_MAX_FRAME_BYTES) { handled = true; socket.end(`${JSON.stringify({ error: PI_BIND_ERROR })}\n`); return; }
+          buffer = Buffer.concat([buffer, chunk]); const newline = buffer.indexOf(10); if (newline < 0) return;
+          handled = true; clearTimeout(timer);
+          let request: unknown;
+          try { if (newline !== buffer.length - 1) throw new Error(); request = JSON.parse(buffer.subarray(0, newline).toString("utf8")); }
+          catch { socket.end(`${JSON.stringify({ error: PI_BIND_ERROR })}\n`); return; }
+          void dispatch(request).then(response => socket.end(`${JSON.stringify(response)}\n`), () => socket.end(`${JSON.stringify({ error: PI_BIND_ERROR })}\n`));
+        });
       });
-    });
-    server.on("error", () => { failed = true; fence(); });
-    await new Promise<void>((resolveListen, reject) => { server!.once("error", reject); server!.listen(options.socketPath, () => { server!.removeListener("error", reject); resolveListen(); }); });
-    socketInode = (await lstat(options.socketPath)).ino;
-    await chmod(options.socketPath, 0o600);
+      server.on("error", () => { failed = true; fence(); });
+      await new Promise<void>((resolveListen, reject) => { server!.once("error", reject); server!.listen(options.socketPath, () => { server!.removeListener("error", reject); resolveListen(); }); });
+      socketInode = (await lstat(options.socketPath)).ino;
+      await chmod(options.socketPath, 0o600);
+    } catch (error) { finish("failed"); throw error; }
+    finish();
   }
   async function close() {
     if (closing) return closing;
@@ -387,8 +394,11 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
     return closing;
   }
   pi.on("session_start", async (_event, context) => {
+    const finish = startPiExtensionOpenSpan("runner.pi.open.extension_session_start");
+    let outcome: "ok" | "failed" = "failed";
     starting = start(context);
-    try { await starting; } catch { failed = true; await close(); throw new Error(PI_BIND_ERROR); }
+    try { await starting; outcome = "ok"; } catch { failed = true; await close(); throw new Error(PI_BIND_ERROR); }
+    finally { finish(outcome); }
   });
   pi.on("session_shutdown", close);
   pi.on("input", (event, context) => {
@@ -489,6 +499,8 @@ export function installPiSubagentComposition(
   }
   pi.on("agent_settled", () => { for (const finish of [...settled]) finish(); });
   pi.on("session_start", (_event, context) => {
+    const finish = startPiExtensionOpenSpan("runner.pi.open.extension_subagents_start");
+    let outcome: "ok" | "failed" = "failed";
     try {
       if (disposed || lifecycle) throw new Error("Pi subagent lifecycle already started");
       // Recheck at registration too: files may change after the factory loaded.
@@ -512,7 +524,9 @@ export function installPiSubagentComposition(
         } finally { settled.delete(finish); signal.removeEventListener("abort", canceled); }
       } });
       bridge = registerSubagentBridge({ sessionId, childBridgePath });
+      outcome = "ok";
     } catch (error) { dispose(); context.abort(); throw error; }
+    finally { finish(outcome); }
   });
   pi.on("session_shutdown", dispose); // also emitted for Pi extension reload
   return { dispose };
@@ -603,27 +617,29 @@ export function installPiCurrentTime(pi: PiBindApi, now: () => Date = () => new 
 }
 
 export default function paperclipPiBindExtension(pi: PiBindApi): void {
-  installPiPerformanceDiagnostics(pi);
-  installPiCurrentTime(pi);
-  const socketPath = process.env.PAPERCLIP_PI_BIND_SOCKET;
-  const initial = readPiBindInitial(process.env);
-  if (!socketPath && initial === undefined) {
-    // Native/custom providers still load the host prompt refresher independently
-    // of broker routing. This does not grant managed callback/broker authority.
-    const path = process.env.PAPERCLIP_PI_INSTRUCTIONS_FILE;
-    const boundary = process.env.PAPERCLIP_PI_INSTRUCTIONS_BOUNDARY;
-    if (!path || !boundary) throw new Error(PI_BIND_ERROR);
-    installPiSubagentComposition(pi);
-    pi.on("before_agent_start", event => {
-      const segment = readFileSync(path, "utf8");
-      const start = `<!-- ${boundary}:start -->\n`, end = `\n<!-- ${boundary}:end -->`;
-      if (!segment.startsWith(start) || !segment.endsWith(end)) throw new Error(PI_BIND_ERROR);
-      return { systemPrompt: replacePiHostInstructions(event.systemPrompt, segment.slice(start.length, -end.length), boundary) };
-    });
-    return;
-  }
-  if (!socketPath || !initial) throw new Error(PI_BIND_ERROR);
-  const composition = installPiSubagentComposition(pi);
-  try { installPiBindExtension(pi, { socketPath, initial }); }
-  catch (error) { composition.dispose(); throw error; }
+  return measurePiExtensionOpen("runner.pi.open.extension_factory", () => {
+    installPiPerformanceDiagnostics(pi);
+    installPiCurrentTime(pi);
+    const socketPath = process.env.PAPERCLIP_PI_BIND_SOCKET;
+    const initial = measurePiExtensionOpen("runner.pi.open.extension_initial_read", () => readPiBindInitial(process.env));
+    if (!socketPath && initial === undefined) {
+      // Native/custom providers still load the host prompt refresher independently
+      // of broker routing. This does not grant managed callback/broker authority.
+      const path = process.env.PAPERCLIP_PI_INSTRUCTIONS_FILE;
+      const boundary = process.env.PAPERCLIP_PI_INSTRUCTIONS_BOUNDARY;
+      if (!path || !boundary) throw new Error(PI_BIND_ERROR);
+      measurePiExtensionOpen("runner.pi.open.extension_composition", () => installPiSubagentComposition(pi));
+      pi.on("before_agent_start", event => {
+        const segment = readFileSync(path, "utf8");
+        const start = `<!-- ${boundary}:start -->\n`, end = `\n<!-- ${boundary}:end -->`;
+        if (!segment.startsWith(start) || !segment.endsWith(end)) throw new Error(PI_BIND_ERROR);
+        return { systemPrompt: replacePiHostInstructions(event.systemPrompt, segment.slice(start.length, -end.length), boundary) };
+      });
+      return;
+    }
+    if (!socketPath || !initial) throw new Error(PI_BIND_ERROR);
+    const composition = measurePiExtensionOpen("runner.pi.open.extension_composition", () => installPiSubagentComposition(pi));
+    try { installPiBindExtension(pi, { socketPath, initial }); }
+    catch (error) { composition.dispose(); throw error; }
+  });
 }

@@ -1,6 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
 import { redactProviderDiagnostic } from "../diagnostic-redaction.js";
+import type { ProviderPerformanceSpan } from "../../contracts/provider-performance.js";
+import { piExtensionOpenPerformanceSpans } from "./pi-performance-diagnostics.js";
 
 export type PiRpcRecord = Record<string, unknown>;
 
@@ -20,6 +22,8 @@ export interface PiRpcTransportOptions {
   commandLifecycle?: { beforeSpawn(): void; afterSpawn(): void; afterExit(): void };
   /** Canonical owned host/child paths already resolved and verified by the driver. */
   fatalSessionStartExtensionPaths?: readonly string[];
+  /** Content-free startup observations, delivered synchronously without RPC work. */
+  onOpenPerformanceSpan?: (span: ProviderPerformanceSpan) => void;
   maxRecordBytes?: number;
   /** Client-side ACK deadline; expiration never proves command rejection. */
   requestTimeoutMs?: number;
@@ -213,10 +217,28 @@ export class PiRpcTransport {
     this.#child.stdout.on("end", () => {
       if (this.#buffer.length > 0) this.#fail(new Error("Pi RPC stdout ended with an unterminated JSONL record"));
     });
+    let timingLine = "", timingLineOverflow = false, timingCount = 0;
     this.#child.stderr.on("data", (chunk: Buffer | string) => {
-      const stderr = this.#stderr + chunk.toString();
+      const text = chunk.toString();
+      const stderr = this.#stderr + text;
       this.#stderrTruncated ||= stderr.length > 8192;
       this.#stderr = stderr.slice(-8192);
+      if (!options.onOpenPerformanceSpan || timingCount >= 32) return;
+      // stderr chunks need not align with lines. Ignore an entire oversized line,
+      // rather than treating its suffix as a fresh, possibly forged diagnostic.
+      for (const part of text.split(/(?<=\n)/u)) {
+        if (!timingLineOverflow) {
+          if (timingLine.length + part.length > 1024) timingLineOverflow = true;
+          else timingLine += part;
+        }
+        if (!part.endsWith("\n")) continue;
+        if (!timingLineOverflow) for (const span of piExtensionOpenPerformanceSpans(timingLine.trimEnd(), Date.now())) {
+          if (timingCount++ >= 32) break;
+          try { options.onOpenPerformanceSpan(span); } catch { /* log-only */ }
+          if (timingCount >= 32) return;
+        }
+        timingLine = ""; timingLineOverflow = false;
+      }
     });
   }
 

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { writeFile } from "node:fs/promises";
 
 import type { AdapterRuntimeEvent } from "../../adapters/index.js";
+import { parseProviderPerformanceSpans } from "../../vendor/paperclip-runner/index.js";
 import { getActiveStepContext } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import { measureRunnerOperation } from "./runner-operation-timing.js";
 import type { StartupTraceContextHandle } from "../../instrumentation.js";
@@ -71,6 +72,26 @@ function createRecordingTraceContext(): {
 }
 
 describe("native runner performance trace", () => {
+  it("records every admitted Pi open sub-span as a content-free run.performance.span", async () => {
+    const events: AdapterRuntimeEvent[] = [];
+    const trace = createNativeRunTrace({ runId: "pi-open-timing", startedAtMs: 1000, onEvent: async event => { events.push(event); } });
+    const execute = trace.start("native.session.execute", { startedAtMs: 1000 });
+    const names = ["pi_spawn", "get_state", "pre_extension_factory", "extension_factory", "extension_initial_read", "extension_composition",
+      "extension_subagents_start", "extension_session_start", "extension_directory", "extension_home_admission", "extension_tools", "extension_socket_listen"]
+      .map(step => `runner.pi.open.${step}`);
+    const spans = parseProviderPerformanceSpans({ code: "provider_performance_spans", spans: names.map(name => ({ name,
+      startedAtMs: 1100, endedAtMs: 1110, outcome: "ok", instructions: "PRIVATE", apiKey: "PRIVATE" })) }, 1200);
+    expect(spans.map(span => span.name)).toEqual(names);
+    await recordNativeProviderPerformanceSpans(trace, spans);
+    await trace.end(execute, { endedAtMs: 1200 }); await trace.finish("ok");
+    const rows = events.filter(event => names.includes(String(event.payload?.span)));
+    expect(rows.map(event => event.payload?.span)).toEqual(names);
+    for (const event of rows) expect(event).toMatchObject({ eventType: "run.performance.span", stream: "system", payload: {
+      schema: "paperclip.run-performance-span.v1", parentSpan: "native.session.execute", startOffsetMs: 100, durationMs: 10, outcome: "ok",
+    } });
+    expect(JSON.stringify(rows)).not.toContain("PRIVATE");
+    if (process.env.PI_OPEN_SERVER_SPAN_EVIDENCE) await writeFile(process.env.PI_OPEN_SERVER_SPAN_EVIDENCE, JSON.stringify(rows, null, 2) + "\n");
+  });
   it("persists Pi RPC spans and retained transport attach for the current run without OTLP", async () => {
     const events = new Map<string, AdapterRuntimeEvent[]>();
     const traces = ["old-run", "warm-run"].map(runId => createNativeRunTrace({ runId,

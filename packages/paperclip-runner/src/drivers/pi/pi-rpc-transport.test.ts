@@ -65,6 +65,34 @@ async function queuedRecords(child: PiRpcTransport): Promise<PiRpcRecord[]> {
 }
 
 describe("PiRpcTransport large tool output and lagging consumers", () => {
+  // The startup entry subscription does not yet exist in real Pi. Exercise actual
+  // stderr pipes (fragmentation, noise, projection, caps) without changing RPCs.
+  it.each([false, true])("forwards bounded startup timings from stderr without affecting RPC (observer throws=%s)", async observerThrows => {
+    const spans: unknown[] = [];
+    const child = emittingTransport(`
+      const at = Date.now();
+      function timing(name, extra = {}) { return 'pi.open.span ' + JSON.stringify({ code: 'provider_performance_spans',
+        spans: [{ name, startedAtMs: at - 10, endedAtMs: at, outcome: 'ok', ...extra }] }) + '\\n'; }
+      const line = timing('runner.pi.open.extension_factory', { apiKey: 'PRIVATE', instructions: 'PRIVATE' });
+      process.stderr.write(line.slice(0, 17));
+      await new Promise(resolve => setImmediate(resolve));
+      process.stderr.write(line.slice(17));
+      process.stderr.write('PRIVATE ordinary stderr\\n');
+      process.stderr.write('x'.repeat(2048) + timing('runner.pi.open.extension_tools'));
+      process.stderr.write(timing('provider.model.stream'));
+      process.stderr.write('pi.open.span {bad}\\n');
+      for (let i = 0; i < 40; i++) process.stderr.write(timing('runner.pi.open.extension_tools'));
+    `, { onOpenPerformanceSpan: span => { spans.push(span); if (observerThrows) throw new Error("diagnostic failure"); } });
+    try {
+      const response = await child.request("get_state");
+      expect(response).toMatchObject({ type: "response", command: "get_state", success: true });
+      await child.close();
+      expect(spans).toHaveLength(32);
+      expect(spans[0]).toMatchObject({ name: "runner.pi.open.extension_factory", outcome: "ok" });
+      expect(spans.slice(1).every(span => (span as { name: string }).name === "runner.pi.open.extension_tools")).toBe(true);
+      expect(JSON.stringify(spans)).not.toContain("PRIVATE");
+    } finally { await child.close(); }
+  });
   it("retains an oversized control input for bounded projection before a safe same-ID update", async () => {
     const child = emittingTransport(`${updateScript}
       await emit({ ...update("same", "first"), args: { input: "x".repeat(300000) } });
