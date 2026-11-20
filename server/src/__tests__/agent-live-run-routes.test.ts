@@ -940,6 +940,52 @@ describe("agent live run routes", () => {
     expect(row).toMatchObject({ logBytes: r.admitted.length, logSha256: createHash("sha256").update(r.admitted).digest("hex") });
   }, 60_000);
 
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20787#issuecomment-7002475364 (rf-7 F3)
+  // Keep reason: NEVER-OK trace custody. A corrupt kept index must not make the GET look complete.
+  it.each(["empty", "object", "array", "absent", "unreadable"] as const)("reports UNKNOWN spill custody in the log GET while the index is %s", async fault => {
+    const { spilledRun, newStore } = await vi.importActual<typeof import("../services/object-run-log-spill.fixture.js")>("../services/object-run-log-spill.fixture.js");
+    const { readObjectRunLogSpill, candidateHoldsUnrecoveredRunLogSpill } = await vi.importActual<typeof import("../services/object-run-log-store.js")>("../services/object-run-log-store.js");
+    const fs = await import("node:fs/promises");
+    const runId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const r = await spilledRun(runId);
+    const spill = await readObjectRunLogSpill(r.spillDir, r.logRef);
+    const originalIndex = await fs.readFile(spill.indexPath), originalBytes = await fs.readFile(spill.path);
+    const store = newStore(r.m, r.spillDir), handle = { store: "s3_segments" as const, logRef: r.logRef };
+    mockHeartbeatService.getRunLogAccess.mockResolvedValue({ id: runId, companyId: "company-1", scopeKind: "company", issueId: null, logStore: handle.store, logRef: handle.logRef });
+    mockHeartbeatService.readLog.mockImplementation(async () => ({ runId, ...handle, ...await store.read(handle) }));
+    const app = await createApp();
+    const get = () => requestApp(app, url => request(url).get(`/api/heartbeat-runs/${runId}/log`));
+    const indexState = () => fs.readFile(spill.indexPath).then(b => b.toString("hex"), (e: NodeJS.ErrnoException) => e.code);
+    try {
+      if (fault === "absent") await fs.unlink(spill.indexPath);
+      else if (fault === "unreadable") {
+        await fs.chmod(spill.indexPath, 0);
+        expect(await indexState(), "effective filesystem denial, not a simulated read").toBe("EACCES");
+      } else await fs.writeFile(spill.indexPath, fault === "empty" ? "" : fault === "object" ? "{}\n" : "[]\n");
+      const planted = await indexState();
+      // The corruption stays present through both GETs and the consumer's custody inspection.
+      for (let stage = 0; stage < 2; stage++) {
+        const res = await get();
+        expect(await indexState()).toBe(planted);
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect(res.body.incomplete?.bytes).toBe(originalBytes.length);
+        expect(res.body.incomplete.causes).toContainEqual(expect.objectContaining({ reason: "spill_custody_unknown" }));
+        expect((await fs.readFile(spill.path)).equals(originalBytes)).toBe(true);
+        if (!stage) expect(await candidateHoldsUnrecoveredRunLogSpill(r.spillDir)).toBe(true);
+      }
+    } finally {
+      if (fault === "unreadable") await fs.chmod(spill.indexPath, 0o600);
+      await fs.writeFile(spill.indexPath, originalIndex);
+    }
+    r.m.state.down = false;
+    await store.recoverSpill!({ companyId: "company", agentId: "agent", runId });
+    const recovered = await get();
+    expect(recovered.status, JSON.stringify(recovered.body)).toBe(200);
+    expect(recovered.body.content).toBe(r.admitted.toString());
+    expect(recovered.body).not.toHaveProperty("incomplete");
+    expect((await fs.readFile(spill.path)).equals(originalBytes)).toBe(true);
+  }, 60_000);
+
   it("does not read an object run log for another company", async () => {
     const res = await requestApp(await createApp({}, {
       type: "board", userId: "board-user", companyIds: ["company-2"], source: "session", isInstanceAdmin: false,
