@@ -3,6 +3,7 @@ import { activityLog, agents, agentWakeupRequests, heartbeatRuns, issueComments,
 import { acceptSteeredIdentity, reconcileSteeredIdentity, rejectSteeredIdentity, reserveSteeredIdentity, storedSteeringAcknowledgement } from "./run-identity.js";
 import { nativeRunHasStopRequest } from "./native-runtime/native-run-stop-request.js";
 import { logger } from "../middleware/logger.js";
+import { measureCommentIngress } from "./comment-ingress-timing.js";
 import { publishLiveEvent } from "./live-events.js";
 
 /** Existing outbox lock; shared with task-comment admission and run-end adoption. */
@@ -40,10 +41,10 @@ const ids = (value: unknown): string[] => Array.isArray(value) ? value.filter((i
 /** A saved comment is the outbox. Its existing activity receipt keeps an explicit
  * Queue/Interrupt durable across a server crash, without manufacturing a wake. */
 async function deliveryIntent(db: Db, comment: SteerablePersonComment) {
-  const [receipt] = await db.select({ details: activityLog.details }).from(activityLog).where(and(
+  const [receipt] = await measureCommentIngress("comment.ingress.steer.intent", () => db.select({ details: activityLog.details }).from(activityLog).where(and(
     eq(activityLog.companyId, comment.companyId), eq(activityLog.entityId, comment.issueId),
     eq(activityLog.action, "issue.comment_added"), sql`${activityLog.details}->>'commentId' = ${comment.id}`,
-  )).orderBy(desc(activityLog.createdAt)).limit(1);
+  )).orderBy(desc(activityLog.createdAt)).limit(1));
   return receipt?.details?.deliveryIntent;
 }
 
@@ -60,36 +61,36 @@ export async function trySteerPersonComment(db: Db, comment: SteerablePersonComm
     return trySteerPersonComment(db, comment, { ...options, lockHeld: true });
   });
   // POST retries retain their original custody even if its run has now ended.
-  const [carrying] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+  const [carrying] = await measureCommentIngress("comment.ingress.steer.carrying_run", () => db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, comment.companyId),
     sql`(${heartbeatRuns.nativeIssueId} = ${comment.issueId}::uuid or ${heartbeatRuns.contextSnapshot}->>'issueId' = ${comment.issueId})`,
     sql`coalesce(${heartbeatRuns.contextSnapshot}->'steeredCommentIds', '[]'::jsonb) ? ${comment.id}`,
-  )).limit(1);
+  )).limit(1));
   if (carrying) return true;
-  const intent = options.deliveryIntent ?? await deliveryIntent(db, comment);
+  const intent = options.deliveryIntent ?? await measureCommentIngress("comment.ingress.steer.delivery_intent", () => deliveryIntent(db, comment));
   if (intent === "queue" || intent === "interrupt") return false;
-  const [issue] = await db.select().from(issues).where(and(eq(issues.id, comment.issueId), eq(issues.companyId, comment.companyId)));
+  const [issue] = await measureCommentIngress("comment.ingress.steer.issue", () => db.select().from(issues).where(and(eq(issues.id, comment.issueId), eq(issues.companyId, comment.companyId))));
   if (!issue || ["done", "cancelled"].includes(issue.status)) return false;
   // Chat stays owner-only. Task comments have already passed the ordinary
   // comment route's access/pause checks; they target the current task assignee.
   if (issue.conversationAgentId && issue.conversationUserId !== comment.authorUserId) return false;
   const agentId = issue.conversationAgentId ?? issue.assigneeAgentId;
   if (!agentId) return false;
-  const [agent] = await db.select({ adapterType: agents.adapterType, adapterConfig: agents.adapterConfig }).from(agents)
-    .where(and(eq(agents.id, agentId), eq(agents.companyId, issue.companyId)));
+  const [agent] = await measureCommentIngress("comment.ingress.steer.agent", () => db.select({ adapterType: agents.adapterType, adapterConfig: agents.adapterConfig }).from(agents)
+    .where(and(eq(agents.id, agentId), eq(agents.companyId, issue.companyId))));
   if (agent?.adapterType !== "paperclip_runner" || object(agent.adapterConfig).provider !== "pi_rpc") return false;
   // An explicit queued message (especially /new or a fresh-session response)
   // is an ordering boundary. Default Send never jumps across it.
-  const waiting = await db.execute(sql`select 1 from agent_wakeup_requests w
+  const waiting = await measureCommentIngress("comment.ingress.steer.waiting_wake", () => db.execute(sql`select 1 from agent_wakeup_requests w
     where w.company_id = ${issue.companyId}::uuid and w.agent_id = ${agentId}::uuid
       and w.status in ('queued', 'deferred_issue_execution') and w.payload->>'issueId' = ${issue.id}
-      and w.run_id is null limit 1`);
+      and w.run_id is null limit 1`));
   if (waiting.length) return false;
-  const [run] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, issue.companyId),
+  const [run] = await measureCommentIngress("comment.ingress.steer.active_run", () => db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, issue.companyId),
     eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.runtimeMode, "native"), eq(heartbeatRuns.status, "running"),
     sql`(${heartbeatRuns.nativeIssueId} = ${issue.id}::uuid or ${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id})`,
     issue.executionRunId ? eq(heartbeatRuns.id, issue.executionRunId) : undefined,
-  )).orderBy(desc(heartbeatRuns.createdAt)).limit(1);
+  )).orderBy(desc(heartbeatRuns.createdAt)).limit(1));
   if (!run || nativeRunHasStopRequest(run.resultJson) || (issue.conversationAgentId && run.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration)) return false;
   // Lazy import keeps the existing conversation/runtime dependency cycle inert.
   const { getNativeSessionSteeringState, steerNativeSession, NativeSessionSteeringError } = await import("./native-runtime/native-session-executor.js");

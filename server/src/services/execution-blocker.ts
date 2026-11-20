@@ -1,5 +1,6 @@
 import { isPreDispatchReviewWait, neverStartedDispatchCancellationPredicate } from "./pre-dispatch-review-wait.js";
 import { canonicalExecutionUuid } from "./execution-identity.js";
+import { measureCommentIngress } from "./comment-ingress-timing.js";
 import { preDispatchExecutionWaitRecoveryActionPredicate } from "./pre-dispatch-execution-wait.js";
 import { legacyShutdownBeforeDispatchCondition } from "./legacy-shutdown-before-dispatch.js";
 import { and, desc, eq, gt, inArray, not, or, sql, type SQL } from "drizzle-orm";
@@ -364,21 +365,21 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
   /** The native run being dispatched; its own scheduled resume does not block it. */
   resumingNativeRunId?: string | null;
 }): Promise<ExecutionBlocker | null> {
-  const [conversation] = await db.select({ agentId: issues.conversationAgentId,
+  const [conversation] = await measureCommentIngress("comment.ingress.blocker.conversation", () => db.select({ agentId: issues.conversationAgentId,
     boundaryId: issues.conversationBoundaryCommentId, status: issues.status,
     assigneeAgentId: issues.assigneeAgentId, statusVersion: issues.statusVersion,
     executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId }).from(issues).where(and(
     eq(issues.companyId, companyId), eq(issues.id, issueId),
-  )).limit(1);
+  )).limit(1));
   // Resetting model context cannot repair or recover a workspace. This hold
   // survives conversation boundaries until the existing repair/reconciliation path clears it.
-  const [restoreHold] = await db.select().from(issueRecoveryActions).where(and(
+  const [restoreHold] = await measureCommentIngress("comment.ingress.blocker.restore_hold", () => db.select().from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, companyId),
     eq(issueRecoveryActions.sourceIssueId, issueId),
     executionBlockerPredicate(),
     not(restoreHoldReleasedForCurrentOwnerPredicate()),
     restoreHoldPredicate(),
-  )).orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
+  )).orderBy(desc(issueRecoveryActions.updatedAt)).limit(1));
   // A persisted user /new is an ordered context command, not a retry of uncertain work.
   // The normal issue execution lock still serializes it behind any active turn.
   if (!restoreHold && conversation?.agentId && options?.conversationResetCommentId) {
@@ -394,16 +395,16 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
       eq(issueComments.id, conversation.boundaryId),
     )).limit(1) : [];
 
-  const ownership = await getConversationOwnershipBlocker(db, companyId, issueId);
+  const ownership = await measureCommentIngress("comment.ingress.blocker.ownership", () => getConversationOwnershipBlocker(db, companyId, issueId));
   if (ownership) return { ...ownership, recoveryActionId: null };
-  const [action] = restoreHold ? [restoreHold] : await db.select().from(issueRecoveryActions).where(and(
+  const [action] = restoreHold ? [restoreHold] : await measureCommentIngress("comment.ingress.blocker.action", () => db.select().from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, companyId),
     eq(issueRecoveryActions.sourceIssueId, issueId),
     executionBlockerPredicate(),
     not(restoreHoldReleasedForCurrentOwnerPredicate()),
     boundary ? or(gt(issueRecoveryActions.createdAt, boundary.createdAt), nativeExecutionRecoveryActionPredicate()) : undefined,
     options?.resumingNativeRunId ? not(ownNativeResumePredicate(options.resumingNativeRunId)) : undefined,
-  )).orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id)).limit(1);
+  )).orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id)).limit(1));
   if (!action) return null;
   const parsedRunId = z.string().guid().safeParse(action.evidence.runId ?? action.evidence.sourceRunId);
   const runId = parsedRunId.success ? parsedRunId.data : null;

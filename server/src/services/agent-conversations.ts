@@ -1,5 +1,6 @@
 import { isContextCompactionRun } from "./context-compaction.js";
 import { personCommentDeliveryLockKey, trySteerConversationComment } from "./conversation-steering.js";
+import { measureCommentIngress } from "./comment-ingress-timing.js";
 import { queuedCommentIdsFromWakePayload, withQueuedCommentIdsInWakePayload } from "./issue-queued-comment-queue.js";
 import { notifyDeferredExecutionWork } from "./deferred-execution-notifications.js";
 import { nativeRunHasStopRequest } from "./native-runtime/native-run-stop-request.js";
@@ -773,39 +774,39 @@ export async function deliverConversationComments(
 ) {
   if (!issue.conversationAgentId) return;
   const canDeliver = async (connection: Db): Promise<{ invokable: true } | { invokable: false; reason: string }> => {
-    const [agent] = await connection.select().from(agents).where(and(
+    const [agent] = await measureCommentIngress("comment.ingress.outbox.agent", () => connection.select().from(agents).where(and(
       eq(agents.id, issue.conversationAgentId!), eq(agents.companyId, issue.companyId),
-    ));
+    )));
     // Match queue admission: setup may retain accepted work, but a pause or
     // invalid reporting chain must leave the durable comment outbox untouched.
-    const invokability = await evaluateAgentInvokabilityFromDb(connection,
-      agent && isAgentAwaitingSetup(agent) ? { ...agent, status: "idle" } : agent);
+    const invokability = await measureCommentIngress("comment.ingress.outbox.invokability", () => evaluateAgentInvokabilityFromDb(connection,
+      agent && isAgentAwaitingSetup(agent) ? { ...agent, status: "idle" } : agent));
     if (!invokability.invokable || !agent) return invokability;
     // A reached daily limit is a temporary hold, not a reason to consume the
     // message: admission would record it as a terminal skip.
-    const hold = await conversationDeliveryHold(connection, agent);
+    const hold = await measureCommentIngress("comment.ingress.outbox.daily_cap", () => conversationDeliveryHold(connection, agent));
     if (!hold) return invokability;
     options.onDeferredDeadline?.(hold.retryAt);
     return { invokable: false, reason: hold.reason };
   };
   for (;;) {
-    const delivered = await db.transaction(async (tx) => {
+    const delivered = await measureCommentIngress("comment.ingress.outbox.transaction", () => db.transaction(async (tx) => {
       // Contenders release their connection while waiting so concurrent sends
       // cannot exhaust the pool needed by normal wake admission.
-      const locks = await tx.execute(
+      const locks = await measureCommentIngress("comment.ingress.outbox.delivery_lock", () => tx.execute(
         sql`select pg_try_advisory_xact_lock(hashtextextended(${personCommentDeliveryLockKey(issue.id)}, 0)) as acquired`,
-      );
+      ));
       if (!locks[0]?.acquired) return "retry" as const;
-      for (const comment of await undeliveredConversationComments(
+      for (const comment of await measureCommentIngress("comment.ingress.outbox.owed_comments", () => undeliveredConversationComments(
         tx as unknown as Db,
         issue.companyId,
         issue.id,
-      )) {
-        if (!(await canDeliver(tx as unknown as Db)).invokable) return "deferred" as const;
-        await resumeConversationForReset(db, comment);
+      ))) {
+        if (!(await measureCommentIngress("comment.ingress.outbox.can_deliver", () => canDeliver(tx as unknown as Db))).invokable) return "deferred" as const;
+        await measureCommentIngress("comment.ingress.outbox.reset", () => resumeConversationForReset(db, comment));
         const queueComment = async () => {
-          if (await appendConversationQueueComment(db, comment)) return;
-          return enqueue(issue.conversationAgentId!, {
+          if (await measureCommentIngress("comment.ingress.outbox.append", () => appendConversationQueueComment(db, comment))) return;
+          return measureCommentIngress("comment.ingress.outbox.enqueue", () => enqueue(issue.conversationAgentId!, {
             source: "on_demand",
             triggerDetail: "manual",
             reason: "issue_commented",
@@ -821,11 +822,11 @@ export async function deliverConversationComments(
               wakeCommentIds: [comment.id],
               source: "issue.comment",
             },
-          });
+          }));
         };
-        if (await trySteerConversationComment(db, comment, { lockHeld: true, onRejected: queueComment })) continue;
+        if (await measureCommentIngress("comment.ingress.outbox.steer", () => trySteerConversationComment(db, comment, { lockHeld: true, onRejected: queueComment }))) continue;
         try {
-          await queueComment();
+          await measureCommentIngress("comment.ingress.outbox.queue", () => queueComment());
         } catch (error) {
           // Admission remains authoritative if eligibility changes after our
           // read. Only defer the matching invokability conflict; other failures
@@ -839,9 +840,9 @@ export async function deliverConversationComments(
         }
       }
       return "delivered" as const;
-    });
+    }));
     if (delivered !== "retry") return delivered;
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await measureCommentIngress("comment.ingress.outbox.contention_retry", () => new Promise((resolve) => setTimeout(resolve, 10)));
   }
 }
 

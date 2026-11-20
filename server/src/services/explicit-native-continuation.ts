@@ -1,4 +1,5 @@
 import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-notifications.js";
+import { measureCommentIngress } from "./comment-ingress-timing.js";
 import { agentDirectoryPreparationWaitPredicate, isAgentDirectoryPreparationWait } from "./pre-dispatch-execution-evidence.js";
 import { assertDurableChatWakeupRequest, assertDurableChatWakeupReceipt, type DurableChatWakeupRequest } from "./durable-chat-wakeup.js";
 import { notifyExecutionRunWork } from "./execution-control-notifications.js";
@@ -220,9 +221,9 @@ export async function admitExplicitNativeContinuation(input: {
     decisionResponse.comment.authorUserId === actorId && !decisionResponse.toolActionOutcome ? decisionResponse : null;
   if (!retry && !input.taskRetryRequestId && !input.queuedCommentInterruptId && !decided && (!commentId || !z.string().guid().safeParse(commentId).success ||
       !isUserCommentContinuationReason(input.reason))) return null;
-  const [task] = await db.select().from(issues).where(and(
+  const [task] = await measureCommentIngress("comment.ingress.continuation.task", () => db.select().from(issues).where(and(
     eq(issues.companyId, companyId), eq(issues.id, issueId),
-  ));
+  )));
   if (!task || task.assigneeAgentId !== agentId || task.status === "cancelled"
     || task.status === "done" && !input.queuedCommentInterruptId) return null;
   const [retryWake] = input.taskRetryRequestId ? await db.select().from(agentWakeupRequests).where(and(
@@ -279,14 +280,14 @@ export async function admitExplicitNativeContinuation(input: {
     if (undelivered.at(-1) !== commentId) return null;
     partiallyDeliveredQueue = undelivered.length !== ids.length;
   }
-  const [comment] = retry || taskRetry || response ? [] : await db.select().from(issueComments).where(and(
+  const [comment] = retry || taskRetry || response ? [] : await measureCommentIngress("comment.ingress.continuation.comment", () => db.select().from(issueComments).where(and(
     eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
     eq(issueComments.id, commentId!), eq(issueComments.authorType, "user"),
     queuedInterrupt ? undefined : eq(issueComments.authorUserId, actorId), isNull(issueComments.createdByRunId),
     isNull(issueComments.deletedAt),
-  ));
+  )));
   if (!retry && !taskRetry && !response && !comment?.body.trim()) return null;
-  const [agent] = await db.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.id, agentId)));
+  const [agent] = await measureCommentIngress("comment.ingress.continuation.agent", () => db.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.id, agentId))));
   if (!agent || (!isConversationAdapter(agent.adapterType) && agent.adapterType !== "paperclip_runner")) return null;
   const agentIsNative = isNativeAdmissionAdapter(agent.adapterType);
   const interruptIntent = interruptQueue?.payload?.queuedCommentInterrupt as Record<string, unknown> | undefined;
@@ -300,13 +301,13 @@ export async function admitExplicitNativeContinuation(input: {
     { stoppedAt: new Date(0), actorId, key: QUEUED_SEND_AFTER_STOP_KEY }) : null;
   const authorizedAt = nativeQueuedSend ? interruptRequestedAt! : savedSend ? new Date(savedSend.requestedAt)
     : response?.comment.createdAt ?? comment?.createdAt ?? retryWake?.requestedAt ?? new Date();
-  if (!input.dryRun) await preserveTaskRemoteWorkspaceWriter(db, companyId, issueId);
-  blocker = await getExecutionBlocker(db, companyId, issueId);
-  const [boundary] = await db.select({ createdAt: issueComments.createdAt }).from(issues).innerJoin(issueComments, and(
+  if (!input.dryRun) await measureCommentIngress("comment.ingress.continuation.preserve_writer", () => preserveTaskRemoteWorkspaceWriter(db, companyId, issueId));
+  blocker = await measureCommentIngress("comment.ingress.continuation.blocker", () => getExecutionBlocker(db, companyId, issueId));
+  const [boundary] = await measureCommentIngress("comment.ingress.continuation.boundary", () => db.select({ createdAt: issueComments.createdAt }).from(issues).innerJoin(issueComments, and(
     eq(issueComments.companyId, issues.companyId), eq(issueComments.issueId, issues.id),
     eq(issueComments.id, issues.conversationBoundaryCommentId),
-  )).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId), sql`${issues.conversationAgentId} is not null`)).limit(1);
-  const actions = await db.select().from(issueRecoveryActions).where(and(
+  )).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId), sql`${issues.conversationAgentId} is not null`)).limit(1));
+  const actions = await measureCommentIngress("comment.ingress.continuation.actions", () => db.select().from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
     boundary ? or(gt(issueRecoveryActions.createdAt, boundary.createdAt), nativeExecutionRecoveryActionPredicate(),
       blocker?.recoveryActionId ? eq(issueRecoveryActions.id, blocker.recoveryActionId) : undefined) : undefined,
@@ -324,7 +325,7 @@ export async function admitExplicitNativeContinuation(input: {
           and completed.runtime_mode = 'native' and completed.status = 'succeeded' and finalized.phase = 'committed'
           and result.schema_status = 'accepted' and result.result_json#>>'{terminal,runTerminalState}' = 'succeeded')`,
     )),
-  )).for("update");
+  )).for("update"));
   const sourceChecks: Array<{ id?: string; cause: string; evidence: Record<string, unknown> }> =
     actions.map(action => ({ id: action.id, cause: action.cause, evidence: action.evidence }));
   if (nativeQueuedSend) {
@@ -397,8 +398,8 @@ export async function admitExplicitNativeContinuation(input: {
   }
   if (!sourceChecks.length && !nativeQueuedSend) return null;
   if (blocker && blocker.recoveryActionId === null) return null;
-  if (await hasPendingContinuationDecision(db, { companyId, issueId, actorId,
-    taskRetrySourceRunId: taskRetry?.sourceRunId ?? null }))
+  if (await measureCommentIngress("comment.ingress.continuation.pending_decision", () => hasPendingContinuationDecision(db, { companyId, issueId, actorId,
+    taskRetrySourceRunId: taskRetry?.sourceRunId ?? null })))
     return blocked("decision_pending", "A pending approval or question must be resolved before this message can start.");
   if (!sourceChecks.length) return null;
 

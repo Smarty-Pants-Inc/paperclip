@@ -36,6 +36,7 @@ import { readNativeMonitorSource } from "./native-runtime/native-monitor-deliver
 import { readNativeContinuationSource } from "./native-runtime/native-continuation-delivery.js";
 import { assertNoCaseHandoffMutation, cancelCaseHandoffsForIssue, completeTerminalCaseHandoffsForIssue } from "./heartbeat/case-handoff-lifecycle.js";
 import { measureRunPhase } from "./execution-preparation-timing.js";
+import { measureCommentIngress } from "./comment-ingress-timing.js";
 import { automaticReadRecoveryCleanupCondition, directHumanCommentCondition, humanCreatedIssueCondition, pendingUserRequestCondition, pendingUserRequestRowCondition, touchedByUserCondition, userParticipationActivityCondition } from "./issue-participation.js";
 import { resolveProjectDefaultWorkspaceId } from "./project-default-workspace.js";
 import { type AuthorizationActor, executionWorkspaceReadSqlCondition, projectReadSqlCondition } from "./authorization.js";
@@ -14303,19 +14304,19 @@ export function issueService(db: Db) {
       }
 
       if (issue.conversationAgentId && actor.userId) {
-        await dbOrTx.update(issues).set({ conversationState: "active" }).where(eq(issues.id, issueId));
+        await measureCommentIngress("comment.ingress.save.conversation_state", () => dbOrTx.update(issues).set({ conversationState: "active" }).where(eq(issues.id, issueId)));
       }
       if (options?.mirrorToSlack && actor.userId && authorType === "user") {
         await mirrorSlackBoardComment(dbOrTx, comment, { attachmentIds: options.attachmentIds });
       }
       if (authorType === "user" || actor.userId) {
-        await resumeSlackConversation(dbOrTx, issue.companyId, issueId);
+        await measureCommentIngress("comment.ingress.save.resume_slack", () => resumeSlackConversation(dbOrTx, issue.companyId, issueId));
       }
       // Update issue's updatedAt so comment activity is reflected in recency sorting
-      await dbOrTx
+      await measureCommentIngress("comment.ingress.save.recency", () => dbOrTx
         .update(issues)
         .set({ updatedAt: new Date() })
-        .where(eq(issues.id, issueId));
+        .where(eq(issues.id, issueId)));
 
       // Only an explicitly authored comment from the run causally woken by an
       // inbound chat message is automatically publishable. Presentation,
@@ -14416,14 +14417,14 @@ export function issueService(db: Db) {
         !createdByRunId
       ) {
         const { issueThreadInteractionService } =
-          await import("./issue-thread-interactions.js");
-        const expiredInteractions = await issueThreadInteractionService(
+          await measureCommentIngress("comment.ingress.save.interactions_import", () => import("./issue-thread-interactions.js"));
+        const expiredInteractions = await measureCommentIngress("comment.ingress.save.expire_confirmations", () => issueThreadInteractionService(
           dbOrTx,
         ).expireRequestConfirmationsSupersededByComment(
           { id: issueId, companyId: issue.companyId },
           comment,
           { agentId: actor.agentId, userId: actor.userId },
-        );
+        ));
         for (const interaction of expiredInteractions) {
           await logActivity(dbOrTx, {
             companyId: issue.companyId,

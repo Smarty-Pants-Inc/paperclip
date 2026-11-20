@@ -36,6 +36,7 @@ export function isNativeRunRootHistoricalSpan(name: string): boolean {
   return (
     name === "heartbeat.queue" ||
     name === "comment.to_run_created" ||
+    name === "comment.to_run_inserted" ||
     name === "question_response.to_run_created"
   );
 }
@@ -178,7 +179,7 @@ export function nativeRunPreparationStarts(
   // them in task.prepare would charge previous attempts and recovery delays
   // to every resumed attempt, even if its actual startup took milliseconds.
   const preparationStartedAtMs = spans
-    .filter((span) => !isNativeRunRootHistoricalSpan(span.name))
+    .filter((span) => !isNativeRunRootHistoricalSpan(span.name) && !span.name.startsWith("comment.ingress."))
     .reduce((earliest, span) => Math.min(earliest, span.startedAtMs), nowMs);
   return { runStartedAtMs, preparationStartedAtMs };
 }

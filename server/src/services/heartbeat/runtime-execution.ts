@@ -16,6 +16,7 @@ import { writeExecutionControl } from "../execution-control-notifications.js";
 import { inspectPluginWorkspaceForFinalization } from "../native-runtime/native-plugin-workspace-finalization.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { drainRunPreparationPhases, measureRunPhase } from "../execution-preparation-timing.js";
+import { drainCommentIngressTimings } from "../comment-ingress-timing.js";
 import { parseNativeSessionGoalControl } from "./scheduling.js";
 import { isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
 import {
@@ -630,6 +631,10 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       });
       if (wakeIngressSpan)
         nativeRunnerPreparationSpans.unshift(wakeIngressSpan);
+      nativeRunnerPreparationSpans.push(...drainCommentIngressTimings(wakeComments.flatMap(comment => {
+        const id = parseObject(comment).id;
+        return typeof id === "string" ? [id] : [];
+      })));
       // Named preparation phases (workspace, configuration, runner staging)
       // that ran before dispatch, as run-log spans under task.prepare.
       nativeRunnerPreparationSpans.push(...drainRunPreparationPhases(run.id).map(phase => ({

@@ -101,6 +101,7 @@ import {
 import { agentService } from "../agents.js";
 import { normalizeLegacyRunnerProvider } from "@paperclipai/adapter-utils";
 import { randomUUID } from "node:crypto";
+import { markCommentIngressRunInserted, measureCommentIngress } from "../comment-ingress-timing.js";
 import {
   and,
   asc,
@@ -2763,13 +2764,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         !opts.queuedCommentInterruptId && !opts.queuedCommentRequestId && !opts.taskRetryRequestId && !executionWaitRequestId) {
       const ids = [...new Set([...(Array.isArray(enrichedContextSnapshot.wakeCommentIds) ? enrichedContextSnapshot.wakeCommentIds : []),
         wakeCommentId].filter((id): id is string => typeof id === "string" && id.length > 0))];
-      const [issueRow] = ids.length ? await db.select({ companyId: issues.companyId }).from(issues)
-        .where(eq(issues.id, issueId)) : [];
-      const [sameKey] = issueRow && opts.idempotencyKey ? await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
-        .where(and(eq(agentWakeupRequests.companyId, issueRow.companyId), eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey)))
-        .limit(1) : [];
-      const carried = issueRow && !sameKey ? await commentIdsCarriedElsewhere(db, { companyId: issueRow.companyId, issueId,
-        commentIds: ids, idempotencyKey: opts.idempotencyKey }) : new Set<string>();
+      const [issueRow] = ids.length ? await measureCommentIngress("comment.ingress.queue.custody_issue", () => db.select({ companyId: issues.companyId }).from(issues)
+        .where(eq(issues.id, issueId!))) : [];
+      const [sameKey] = issueRow && opts.idempotencyKey ? await measureCommentIngress("comment.ingress.queue.same_key", () => db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.companyId, issueRow.companyId), eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey!)))
+        .limit(1)) : [];
+      const carried = issueRow && !sameKey ? await measureCommentIngress("comment.ingress.queue.carried_elsewhere", () => commentIdsCarriedElsewhere(db, { companyId: issueRow.companyId, issueId: issueId!,
+        commentIds: ids, idempotencyKey: opts.idempotencyKey })) : new Set<string>();
       if (ids.length && ids.every(id => carried.has(id))) {
         const now = new Date();
         await db.insert(agentWakeupRequests).values({ companyId: issueRow!.companyId, agentId, source, triggerDetail, reason,
@@ -2808,7 +2809,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     }
 
 
-    let agent = await getAgent(agentId);
+    let agent = await measureCommentIngress("comment.ingress.queue.agent", () => getAgent(agentId));
     if (!agent) throw notFound("Agent not found");
     const withManagedWakeWrite = async <T>(work: (writer: Db) => Promise<T>): Promise<T> => {
       if (!opts.managementActor) return work(db);
@@ -2817,20 +2818,20 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         return work(tx as unknown as Db);
       });
     };
-    if (issueId && await hasAutomaticInteractionDeliveryHold(db, {
-      companyId: agent.companyId, issueId, agentId, payload, context: enrichedContextSnapshot,
+    if (issueId && await measureCommentIngress("comment.ingress.queue.interaction_hold", () => hasAutomaticInteractionDeliveryHold(db, {
+      companyId: agent.companyId, issueId: issueId!, agentId, payload, context: enrichedContextSnapshot,
       actorType: opts.requestedByActorType, actorId: opts.requestedByActorId,
-    })) return null;
+    }))) return null;
     if (issueId) {
-      const [pending] = await db.select().from(caseHandoffs).where(and(eq(caseHandoffs.companyId, agent.companyId), eq(caseHandoffs.issueId, issueId),
-        inArray(caseHandoffs.state, ["awaiting_release", "pending_dispatch"]))).limit(1);
+      const [pending] = await measureCommentIngress("comment.ingress.queue.case_handoff", () => db.select().from(caseHandoffs).where(and(eq(caseHandoffs.companyId, agent.companyId), eq(caseHandoffs.issueId, issueId!),
+        inArray(caseHandoffs.state, ["awaiting_release", "pending_dispatch"]))).limit(1));
       if (pending && opts.durableCaseHandoffRequest?.handoffId !== pending.id) return null;
     }
     // Mentions only annotate comments. Ignore legacy callers before creating
     // a run or deferred request; assignment and review have their own wakes.
     if (reason === "issue_comment_mentioned" || enrichedContextSnapshot.wakeReason === "issue_comment_mentioned") return null;
     if (issueId) {
-      const conversation = await getIssueExecutionContext(agent.companyId, issueId);
+      const conversation = await measureCommentIngress("comment.ingress.queue.conversation", () => getIssueExecutionContext(agent.companyId, issueId!));
       if (taskRetryActorId && conversation) await assertTaskRetryConversationAllowed(db, conversation, taskRetryActorId);
       if (reason === "issue_children_completed" && conversation?.originKind === "onboarding_first_task") enrichedContextSnapshot.onboardingCompletion = true;
       if (isConversation(conversation)) {
@@ -2839,7 +2840,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         }
         if (isConversationExecutionWake(conversation, reason ?? readNonEmptyString(enrichedContextSnapshot.wakeReason))) return null;
         if (agent.id !== conversation!.conversationAgentId) return null;
-        if (!(await instanceSettings.getExperimental()).enableAgentChat) return null;
+        if (!(await measureCommentIngress("comment.ingress.queue.chat_setting", () => instanceSettings.getExperimental())).enableAgentChat) return null;
         if (isWaitingConversation(conversation) && !hasIndependentConversationWakeCause()) return null;
       }
     }
@@ -3201,7 +3202,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       return new PersistedExecutionWaitRefusal(message, details);
     };
 
-    const schedulingSuppression = await getSchedulingSuppression();
+    const schedulingSuppression = await measureCommentIngress("comment.ingress.queue.scheduling", () => getSchedulingSuppression());
     // A task drain holds ADMISSION, not the request. The drain is a
     // process-local pre-restart hold, so a wake that arrives while it is
     // active still names real work that must run once the process comes
@@ -3226,11 +3227,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         ? null
         : await getWorktreeExecutionCutoff();
 
-    const company = await db
+    const company = await measureCommentIngress("comment.ingress.queue.company", () => db
       .select({ status: companies.status })
       .from(companies)
       .where(eq(companies.id, agent.companyId))
-      .then((rows) => rows[0] ?? null);
+      .then((rows) => rows[0] ?? null));
 
     if (!company || company.status !== "active") {
       if (caseRequest) return null;
@@ -3247,11 +3248,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       return null;
     }
 
-    const explicitResumeSession = await resolveExplicitResumeSessionOverride(
+    const explicitResumeSession = await measureCommentIngress("comment.ingress.queue.explicit_session", () => resolveExplicitResumeSessionOverride(
       agent,
       payload,
       taskKey,
-    );
+    ));
     if (explicitResumeSession) {
       enrichedContextSnapshot.resumeFromRunId =
         explicitResumeSession.resumeFromRunId;
@@ -3292,7 +3293,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     if (genericTimerWake && !supportsUnscopedTimerHeartbeat(agent)) return null;
     const sessionBefore =
       explicitResumeSession?.sessionDisplayId ??
-      (await resolveSessionBeforeForWakeup(agent, effectiveTaskKey));
+      (await measureCommentIngress("comment.ingress.queue.session_before", () => resolveSessionBeforeForWakeup(agent, effectiveTaskKey)));
     let hasResolvablePriorSessionWorkspace: boolean | null = null;
     const resolveHasResolvablePriorSessionWorkspace = async () => {
       if (hasResolvablePriorSessionWorkspace !== null)
@@ -3326,7 +3327,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             eq(issues.identifier, issueId.toUpperCase()),
           )
         : eq(issues.identifier, issueId.toUpperCase());
-      const resolvedIssue = await db
+      const resolvedIssue = await measureCommentIngress("comment.ingress.queue.project_lookup", () => db
         .select({
           id: issues.id,
           projectId: issues.projectId,
@@ -3334,7 +3335,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         })
         .from(issues)
         .where(and(eq(issues.companyId, agent.companyId), idMatch))
-        .then((rows) => rows[0] ?? null);
+        .then((rows) => rows[0] ?? null));
       if (resolvedIssue) {
         if (
           worktreeExecutionCutoff &&
@@ -3367,7 +3368,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       enrichedContextSnapshot.projectId = projectId;
     }
     const isolatedWorkspacesEnabled = issueId
-      ? (await instanceSettings.getExperimental()).enableIsolatedWorkspaces
+      ? (await measureCommentIngress("comment.ingress.queue.settings", () => instanceSettings.getExperimental())).enableIsolatedWorkspaces
       : false;
     let operatorResponsibleUserId: string | null = opts.manualUserWake ? opts.requestedByActorId! : null;
     let queuedResponsibleUserIdPromise: Promise<string> | null = null;
@@ -3375,14 +3376,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       if (operatorResponsibleUserId) return Promise.resolve(operatorResponsibleUserId);
       queuedResponsibleUserIdPromise ??= (async () => {
         const queuedIssueContext = issueId
-          ? await getIssueExecutionContext(agent.companyId, issueId)
+          ? await measureCommentIngress("comment.ingress.queue.responsible_issue", () => getIssueExecutionContext(agent.companyId, issueId!))
           : null;
-        const queuedRoutineEnvContext = await getRoutineEnvForExecutionIssue(
+        const queuedRoutineEnvContext = await measureCommentIngress("comment.ingress.queue.responsible_routine", () => getRoutineEnvForExecutionIssue(
           agent.companyId,
           queuedIssueContext,
-        );
+        ));
         const queuedResponsibleUserId =
-          await resolveResponsibleUserIdForRunSeed({
+          await measureCommentIngress("comment.ingress.queue.responsible_user", () => resolveResponsibleUserIdForRunSeed({
             companyId: agent.companyId,
             contextSnapshot: enrichedContextSnapshot,
             issueContext: queuedIssueContext,
@@ -3391,7 +3392,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             requestedByActorId: opts.requestedByActorId ?? null,
             source,
             triggerDetail,
-          });
+          }));
         if (!queuedResponsibleUserId) {
           throw new HttpError(
             422,
@@ -3414,14 +3415,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       return queuedResponsibleUserIdPromise;
     };
 
-    const budgetBlock = await budgets.getInvocationBlock(
+    const budgetBlock = await measureCommentIngress("comment.ingress.queue.budget", () => budgets.getInvocationBlock(
       agent.companyId,
       agentId,
       {
         issueId,
         projectId,
       },
-    );
+    ));
     if (budgetBlock) {
       // A budget block that is not a reached hard stop is an explicit pause.
       if ((await canSaveDeferredMessage()) && !(await isBoardOwnedBudgetBlock(db, agent.companyId, budgetBlock)))
@@ -3437,7 +3438,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     }
 
     // Setup delays execution, but must not discard work accepted by a caller.
-    const invokability = await getAgentInvokability(isAgentAwaitingSetup(agent) ? { ...agent, status: "idle" } : agent);
+    const invokability = await measureCommentIngress("comment.ingress.queue.invokability", () => getAgentInvokability(isAgentAwaitingSetup(agent) ? { ...agent, status: "idle" } : agent));
     if (!invokability.invokable) {
       if (caseRequest) return null;
       // Only a pause defers through the release drain (wake-queue policy); a
@@ -3483,10 +3484,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     }
 
     if (issueId) {
-      const activePauseHold = await treeControlSvc.getActivePauseHoldGate(
+      const activePauseHold = await measureCommentIngress("comment.ingress.queue.pause_hold", () => treeControlSvc.getActivePauseHoldGate(
         agent.companyId,
-        issueId,
-      );
+        issueId!,
+      ));
       if (activePauseHold) {
         const treeHoldInteractionWake =
           await isVerifiedIssueTreeControlInteractionWake(db, {
@@ -3558,7 +3559,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const contextBeforeAdmission = { ...enrichedContextSnapshot };
       const payloadBeforeAdmission = payload;
       const operatorBeforeAdmission = operatorResponsibleUserId;
-      const outcome = await retryUnlessTransactionBound(db, async attempt => {
+      const outcome = await measureCommentIngress("comment.ingress.queue.admission", () => retryUnlessTransactionBound(db, async attempt => {
         if (attempt > 1) {
           cancelledRunsToEmit.length = 0;
           issueActivityPublications.length = 0;
@@ -3571,11 +3572,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         }
         return db
         .transaction(withDurableChatAdmission(durableRequest, async (tx) => {
-          await lockAgentLifecycleAuthority(tx as unknown as Db, opts.managementActor, agent);
-          await tx.execute(
+          await measureCommentIngress("comment.ingress.queue.lifecycle_authority", () => lockAgentLifecycleAuthority(tx as unknown as Db, opts.managementActor, agent));
+          await measureCommentIngress("comment.ingress.queue.issue_lock", () => tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
-          );
-          await lockAgentForRunAdmission(tx, { companyId: agent.companyId, agentId });
+          ));
+          await measureCommentIngress("comment.ingress.queue.agent_lock", () => lockAgentForRunAdmission(tx, { companyId: agent.companyId, agentId }));
 
           if (executionWaitRequestId) {
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(
@@ -3755,9 +3756,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             }
           }
 
-          const durableReceipt = await existingDurableReceipt(
+          const durableReceipt = await measureCommentIngress("comment.ingress.queue.durable_receipt", () => existingDurableReceipt(
             tx as unknown as Db,
-          );
+          ));
           if (durableReceipt)
             return { kind: "durable" as const, receipt: durableReceipt };
           if (caseRequest) {
@@ -3768,7 +3769,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             if (!handoff || handoff.appliedIssueStatusVersion !== caseRequest.expectedIssueStatusVersion)
               throw conflict("Case handoff delivery was superseded");
           }
-          const failedChatRetry = await authorizeFailedChatRunRetryWake(
+          const failedChatRetry = await measureCommentIngress("comment.ingress.queue.failed_chat_retry", () => authorizeFailedChatRunRetryWake(
             db,
             tx as unknown as Db,
             {
@@ -3779,7 +3780,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               issueId,
               contextSnapshot: enrichedContextSnapshot,
             },
-          );
+          ));
           if (
             failedChatRetry !== Boolean(durableRequest?.failedRunRetry) ||
             (failedChatRetry &&
@@ -3832,7 +3833,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 );
               }
             }
-            const [held] = await tx
+            const [held] = await measureCommentIngress("comment.ingress.queue.unadmitted_chat", () => tx
               .select({ id: issues.id })
               .from(issues)
               .where(
@@ -3842,7 +3843,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   unadmittedChatWakeupCondition(issues.id, issues.companyId),
                 ),
               )
-              .limit(1);
+              .limit(1));
             if (held) {
               throw conflict(
                 "This task has external chat input that has not been admitted. Check the connection's Activity; let pending input finish, or restore access and send a new authorized message before starting the task.",
@@ -3851,7 +3852,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             }
           }
 
-          const issue = await tx
+          const issue = await measureCommentIngress("comment.ingress.queue.issue", () => tx
             .select({
               id: issues.id,
               companyId: issues.companyId,
@@ -3883,7 +3884,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 eq(issues.companyId, agent.companyId),
               ),
             )
-            .then((rows) => rows[0] ?? null);
+            .then((rows) => rows[0] ?? null));
 
           if (!issue) {
             if (caseRequest) throw conflict("Case handoff task no longer exists");
@@ -4213,19 +4214,19 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           };
           const explicitContinuationRunId = randomUUID();
           const [resetComment] = isConversation(issue) && opts.requestedByActorType === "user" && opts.requestedByActorId && wakeCommentId
-            ? await tx.select({ body: issueComments.body }).from(issueComments).where(and(
+            ? await measureCommentIngress("comment.ingress.queue.reset_comment", () => tx.select({ body: issueComments.body }).from(issueComments).where(and(
                 eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
-                eq(issueComments.id, wakeCommentId), eq(issueComments.authorUserId, opts.requestedByActorId),
+                eq(issueComments.id, wakeCommentId!), eq(issueComments.authorUserId, opts.requestedByActorId!),
                 eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt), isNull(issueComments.createdByRunId),
-              )).limit(1)
+              )).limit(1))
             : [];
           const verifiedConversationReset = Boolean(resetComment && isConversationReset(resetComment.body));
           if (wakeCommentId && opts.requestedByActorType === "user")
-            await preserveTaskRemoteWorkspaceWriter(tx as unknown as Db, issue.companyId, issue.id);
-          const executionBlocker = await getExecutionBlocker(
+            await measureCommentIngress("comment.ingress.queue.preserve_writer", () => preserveTaskRemoteWorkspaceWriter(tx as unknown as Db, issue.companyId, issue.id));
+          const executionBlocker = await measureCommentIngress("comment.ingress.queue.execution_blocker", () => getExecutionBlocker(
             tx as unknown as Db, issue.companyId, issue.id,
             { conversationResetCommentId: verifiedConversationReset ? wakeCommentId : null },
-          );
+          ));
           // Prove eligibility without retiring the hold. Later gates can still
           // decline this wake; hold retirement and successor creation stay atomic.
           // A bound chat request has already rechecked its current principal
@@ -4257,7 +4258,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             return { kind: "skipped" as const };
           }
           const continuationToDeliver = !systemWake && !executionReconciliationWake && !executionBlocker
-            ? await undeliveredContinuation(tx as unknown as Db, { companyId: issue.companyId, issueId: issue.id }) : null;
+            ? await measureCommentIngress("comment.ingress.queue.undelivered_continuation", () => undeliveredContinuation(tx as unknown as Db, { companyId: issue.companyId, issueId: issue.id })) : null;
           if (continuationToDeliver)
             Object.assign(enrichedContextSnapshot, undeliveredContinuationContext(continuationToDeliver, enrichedContextSnapshot));
           if ((executionBlocker || opts.queuedCommentInterruptId) && !ownsReconstructionContinuation && !(await admitExplicitNativeContinuation({
@@ -4544,7 +4545,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
           const excludedResponseRunIds: string[] = [];
           while (!activeExecutionRun) {
-            const legacyRun = await tx
+            const legacyRun = await measureCommentIngress("comment.ingress.queue.legacy_active_run", () => tx
               .select()
               .from(heartbeatRuns)
               .where(
@@ -4562,7 +4563,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 asc(heartbeatRuns.createdAt),
               )
               .limit(1)
-              .then((rows) => rows[0] ?? null);
+              .then((rows) => rows[0] ?? null));
 
             if (!legacyRun) break;
             const executionCandidate = await classifyAddressedInteractionExecutionCandidate(tx as unknown as Db, {
@@ -4621,9 +4622,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             if (pending) throw new ContextCompactionError("already_pending", "The agent is already compacting its context.");
           }
 
-          const dependencyReadiness = await issuesSvc
+          const dependencyReadiness = await measureCommentIngress("comment.ingress.queue.dependencies", () => issuesSvc
             .listDependencyReadiness(issue.companyId, [issue.id], tx)
-            .then((rows) => rows.get(issue.id) ?? null);
+            .then((rows) => rows.get(issue.id) ?? null));
 
           // Blocked descendants should stay idle until the final blocker resolves.
           // Human comment/mention wakes are the exception: they may run in a
@@ -5107,12 +5108,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             }
           }
 
-          const dailyCapBlock = await getHeartbeatDailyCapBlock(
+          const dailyCapBlock = await measureCommentIngress("comment.ingress.queue.daily_cap", () => getHeartbeatDailyCapBlock(
             agent,
             policy,
             {},
             tx,
-          );
+          ));
           if (dailyCapBlock) {
             if (caseRequest) waitForCaseAdmission(dailyCapBlock.reason, "Case handoff is waiting for the agent's daily limit to clear");
             if (executionWaitRequestId && executionBlocker) {
@@ -5157,7 +5158,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             return { kind: "skipped" as const };
           }
 
-          const explicitContinuation = await admitExplicitNativeContinuation({
+          const explicitContinuation = await measureCommentIngress("comment.ingress.queue.explicit_continuation", () => admitExplicitNativeContinuation({
             db: tx as unknown as Db, companyId: issue.companyId, issueId: issue.id,
             agentId, actorType: taskRetryActorId ? "user" : opts.requestedByActorType, actorId: taskRetryActorId ?? opts.requestedByActorId,
             reason: taskRetryActorId ? "task_retry" : durableRequest && !failedChatRetry ? "issue_commented" : reason,
@@ -5168,7 +5169,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             ...(durableRequest?.resumeDeferred && !failedChatRetry ? { durableChatRequest: durableRequest } : {}),
             interactionPayload: payload,
             onBlocked: (reason, message) => { continuationBlocked = true; continuationWait = { reason, message }; },
-          });
+          }));
           if (!explicitContinuation && (executionBlocker || (continuationBlocked && !verifiedConversationReset)) && !ownsReconstructionContinuation)
             return deferBlockedExecution(continuationHold());
           if (explicitContinuation) {
@@ -5214,7 +5215,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 eq(agentWakeupRequests.companyId, agent.companyId),
                 eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId)))
                 .returning().then(rows => rows[0])
-            : await tx.insert(agentWakeupRequests).values(wakeupValues).returning().then(rows => rows[0]);
+            : await measureCommentIngress("comment.ingress.queue.wake_insert", () => tx.insert(agentWakeupRequests).values(wakeupValues).returning().then(rows => rows[0]));
           if (!wakeupRequest) return { kind: "deferred" as const };
 
           // A handoff changes the executor, not the owner of saved user input.
@@ -5290,8 +5291,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             adoptedCommentIds = await undeliveredLegacyUserCommentIds(tx as unknown as Db,
               agent.companyId, issueId, agentId, adoptedCommentIds);
           }
-          await notifyChatRunMilestones(tx, { companyId: agent.companyId, issueId: issueId ?? undefined });
-          const newRun = await tx
+          await measureCommentIngress("comment.ingress.queue.milestones", () => notifyChatRunMilestones(tx, { companyId: agent.companyId, issueId: issueId ?? undefined }));
+          const newRun = await measureCommentIngress("comment.ingress.queue.run_insert", async () => tx
             .insert(heartbeatRuns)
             .values({
               ...(explicitContinuation ? { id: explicitContinuationRunId } : {}),
@@ -5302,7 +5303,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               invocationSource: source,
               triggerDetail,
               status: "queued",
-              responsibleUserId: await resolveQueuedResponsibleUserId(),
+              responsibleUserId: await measureCommentIngress("comment.ingress.queue.resolve_responsible", () => resolveQueuedResponsibleUserId()),
               wakeupRequestId: wakeupRequest.id,
               retryOfRunId: failedChatRetry
                 ? durableRequest!.failedRunRetry!.failedRunId
@@ -5325,7 +5326,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               } : {}),
             })
             .returning()
-            .then((rows) => rows[0]);
+            .then((rows) => rows[0]));
+          markCommentIngressRunInserted(wakeCommentId ?? null);
 
           if (ownsReconstructionContinuation) {
             await tx.update(issueRecoveryActions).set({ evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
@@ -5388,7 +5390,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             return { kind: "deferred" as const };
           throw error;
         });
-      });
+      }));
 
       // The admission has committed. What follows is dispatch of saved rows.
       if (outcome.kind !== "deferred" && outcome.kind !== "skipped") admission?.saved();

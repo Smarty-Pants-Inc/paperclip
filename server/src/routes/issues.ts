@@ -82,6 +82,7 @@ import {
   rejectSteeredIdentity,
 } from "../services/run-identity.js";
 import { createHash, randomUUID } from "node:crypto";
+import { bindCommentIngressTiming, measureCommentIngress, withCommentIngressTiming } from "../services/comment-ingress-timing.js";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
@@ -20352,6 +20353,7 @@ export function issueRoutes(
       );
       if (!issue) return;
       if (issue.conversationAgentId && req.actor.type === "board") {
+        return withCommentIngressTiming(async () => {
         if (!(await instanceSettings.getExperimental()).enableAgentChat) throw notFound("Agent Chat is disabled");
         if (!req.actor.userId) throw forbidden("Board user access required");
         if (req.actor.userId !== issue.conversationUserId) throw forbidden("Only the conversation owner can send messages or start a new session");
@@ -20362,7 +20364,7 @@ export function issueRoutes(
         const userId = req.actor.userId;
         const publications: ActivityPublication[] = [];
         let newComment = false;
-        const comment = await db.transaction(async (tx) => {
+        const comment = await measureCommentIngress("comment.ingress.route.save", () => db.transaction(async (tx) => {
           await tx.select({ id: issueRows.id }).from(issueRows).where(and(
             eq(issueRows.id, issue.id), eq(issueRows.companyId, issue.companyId),
           )).for("update");
@@ -20374,17 +20376,18 @@ export function issueRoutes(
             clientRequestId: req.body.clientRequestId, authorType: "user", attachmentIds: req.body.attachmentIds,
           }, tx);
           newComment = !existing;
-          if (!existing) await logActivity(tx as unknown as Db, {
+          if (!existing) await measureCommentIngress("comment.ingress.save.audit", () => logActivity(tx as unknown as Db, {
             companyId: issue.companyId, actorType: actor.actorType, actorId: actor.actorId,
             action: "issue.comment_added", entityType: "issue", entityId: issue.id,
             details: { commentId: saved.id, identifier: issue.identifier,
               deliveryIntent: req.body.deliveryIntent ?? (req.body.interrupt ? "interrupt" : "steer") },
-          }, publications);
+          }, publications));
           return saved;
-        });
+        }));
+        bindCommentIngressTiming(comment);
         for (const publication of publications) publishActivity(publication);
-        await issueReferencesSvc.syncComment(comment.id);
-        await deliverConversationComments(db, issue, heartbeat.wakeup);
+        await measureCommentIngress("comment.ingress.route.references", () => issueReferencesSvc.syncComment(comment.id));
+        await measureCommentIngress("comment.ingress.route.outbox", () => deliverConversationComments(db, issue, heartbeat.wakeup));
         if (newComment && (req.body.deliveryIntent === "interrupt" || (!req.body.deliveryIntent && req.body.interrupt))) {
           const current = await svc.getById(issue.id) ?? issue;
           const queue = await buildQueuedCommentQueue({ executor: db, issue: current,
@@ -20404,6 +20407,7 @@ export function issueRoutes(
         }));
         res.status(201).json(displayComment ?? comment);
         return;
+        });
       }
       if (req.actor.type === "agent" && req.body.onBehalfOfUserId != null) {
         await auditAgentIssueCommentAttributionSpoof({

@@ -10630,7 +10630,15 @@ describe("native resumed preparation timing", () => {
       try {
         await executePaperclipNativeSession({
           db: leaseDb(), execution, runnerInstanceId: "runner",
-          preparationSpans: ingress === "native_dispatch" ? [] : [{ name: ingress, startedAtMs, endedAtMs: startedAtMs + 100 }],
+          preparationSpans: ingress === "native_dispatch" ? [] : [
+            { name: ingress, startedAtMs, endedAtMs: startedAtMs + 100 },
+            ...(ingress === "comment.to_run_created" ? [
+              { name: "comment.ingress.queue.transaction", parentName: ingress,
+                startedAtMs: startedAtMs + 10, endedAtMs: startedAtMs + 90 },
+              { name: "comment.ingress.queue.run_insert", parentName: "comment.ingress.queue.transaction",
+                startedAtMs: startedAtMs + 20, endedAtMs: startedAtMs + 30 },
+            ] : []),
+          ],
           onEvent: async (event) => { events.push(event); },
         });
       } finally { clock.mockRestore(); }
@@ -10644,6 +10652,10 @@ describe("native resumed preparation timing", () => {
         .toMatchObject({ parentSpan: "agent.turn", eventKind: "agentMessage" });
       expect(JSON.stringify(ttft)).not.toContain("first text");
       expect(JSON.stringify(ttft)).not.toContain("later text");
+      if (ingress === "comment.to_run_created") {
+        expect(events.find((event) => event.payload?.span === "comment.ingress.queue.run_insert")?.payload)
+          .toMatchObject({ parentSpan: "comment.ingress.queue.transaction", startOffsetMs: 20, durationMs: 10 });
+      }
     },
   );
 

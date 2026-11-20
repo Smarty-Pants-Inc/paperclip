@@ -12242,7 +12242,9 @@ async function executePaperclipNativeSessionAttempt(
       const rootMilestone = isNativeRunRootHistoricalSpan(span.name);
       await trace.record({
         ...span,
-        parentName: rootMilestone
+        parentName: span.name.startsWith("comment.ingress.")
+          ? span.parentName ?? "comment.to_run_inserted"
+          : rootMilestone
           ? "task.provider_session"
           : environmentSpans.includes(span)
             ? "environment.startup"
