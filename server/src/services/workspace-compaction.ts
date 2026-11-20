@@ -276,7 +276,11 @@ export async function deleteWorkspaceCompactionTrash(trashDir: string) {
 
 // Deletes trash directories that a crash or restart left behind. A trash entry
 // younger than `olderThanMs` may belong to a compaction in progress, so it stays.
-export async function purgeStaleWorkspaceCompactionTrash(worktreeParentDir: string, olderThanMs: number) {
+export function purgeStaleWorkspaceCompactionTrash(worktreeParentDir: string, olderThanMs: number): Promise<void> {
+  // One purge is one guard pass, not a fresh read-back budget for every stale entry.
+  return runLogSpillCustodyPass(() => purgeStaleWorkspaceCompactionTrashInPass(worktreeParentDir, olderThanMs));
+}
+async function purgeStaleWorkspaceCompactionTrashInPass(worktreeParentDir: string, olderThanMs: number) {
   const trashRoot = path.join(worktreeParentDir, WORKSPACE_COMPACTION_TRASH_DIR);
   const entries = await fs.readdir(trashRoot, { withFileTypes: true }).catch(() => []);
   const cutoff = Date.now() - olderThanMs;

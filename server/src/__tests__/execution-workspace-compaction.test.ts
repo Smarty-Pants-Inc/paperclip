@@ -30,7 +30,7 @@ import {
 import { realizeExecutionWorkspace } from "../services/workspace-runtime.ts";
 import { WORKSPACE_COMPACTION_TRASH_DIR } from "../services/workspace-compaction.ts";
 import { logger } from "../middleware/logger.js";
-import { contentSpill, custodyRows, custodySpill, plantHungStore, readAll, recoveredSpills, SPILL_CUSTODY_ROW,
+import { contentSpill, custodyRows, custodySpill, plantHungStore, readAll, recoveredSpills, sha, SPILL_CUSTODY_ROW,
   spillCustodyFaults } from "../services/object-run-log-spill.fixture.js";
 import { cleanupExecutionWorkspaceArtifacts } from "../services/workspace-runtime.js";
 import { RUN_LOG_SPILL_READ_BACK_BUDGET_MS } from "../services/object-run-log-store.js";
@@ -502,6 +502,62 @@ describeEmbeddedPostgres("terminal workspace compaction", () => {
     expect(await svc.sweepTerminalWorkspaces()).toMatchObject({ compacted: 1 });
     await expectRegenerablePresent(seeded.worktreePath, false);
   }, 30_000);
+
+  // catch: rf-7 OBJLOG16 F4 (11-20): each stale entry restarted the 10 s budget.
+  // Keep reason: NEVER-OK trace custody must bound the whole purge without deleting unread spills.
+  // Exercise both real sweep callers, real writer/recovery/files, with only the provider hung.
+  it.each(["immediate", "deferred"] as const)("one %s trash purge shares its read-back budget across stale entries", async mode => {
+    vi.stubEnv("RUN_LOG_SPILL_READ_BACK_BUDGET_MS", undefined);
+    const seeded = await seedWorkspace({ populate: false });
+    const svc = service({ workspaceReaperCooldownDays: 7 });
+    const trashRoot = path.join(path.dirname(seeded.worktreePath), WORKSPACE_COMPACTION_TRASH_DIR);
+    const groups = [];
+    for (let n = 0; n < 2; n++) {
+      const entry = path.join(trashRoot, `interrupted-${n}`);
+      const group = await recoveredSpills(path.join(entry, "0", ".spill"), 10);
+      expect(group.spills.map(spill => spill.unrecoveredBytes)).toEqual(Array(10).fill(0));
+      const old = new Date(Date.now() - 2 * HOUR_MS);
+      await fs.utimes(entry, old, old);
+      groups.push({ ...group, entry });
+    }
+    // The deferred caller drains the queue from the startup sweep, before visiting candidates.
+    if (mode === "deferred") await svc.sweepTerminalWorkspaces(50, undefined, { compact: false });
+    const hung = groups.map(group => plantHungStore(group.m));
+    const warn = vi.spyOn(logger, "warn");
+    try {
+      const started = Date.now();
+      await svc.sweepTerminalWorkspaces();
+      const finished = Date.now();
+      const proof = [];
+      for (const spill of groups.flatMap(group => group.spills)) {
+        const bytes = await fs.readFile(spill.path), index = await fs.readFile(spill.indexPath);
+        proof.push({ path: spill.path, beforeSha: sha(spill.bytes), afterSha: sha(bytes),
+          beforeIndexSha: sha(spill.index), afterIndexSha: sha(index) });
+        expect(bytes).toEqual(spill.bytes);
+        expect(index).toEqual(spill.index);
+      }
+      const rows = custodyRows(warn);
+      console.info("stale-trash-purge-caller-budget", { mode, operationMs: finished - started,
+        firstGetToFinishMs: finished - Math.min(...hung.map(store => store.state.firstGetAt).filter(Boolean)),
+        rows, proof });
+      expect(proof).toHaveLength(20);
+      expect(finished - started).toBeLessThanOrEqual(15_000);
+      // Each content guard stops at its first kept spill; the second entry is kept without a fresh wait.
+      expect(rows).toHaveLength(2);
+      expect(rows.filter(row => row.reason === "read_back_budget_exhausted")).toHaveLength(1);
+      for (const store of hung) store.heal();
+      // A new purge, after healing, can prove and remove both recovered entries normally.
+      await service({ workspaceReaperCooldownDays: 7 }).sweepTerminalWorkspaces();
+      for (const group of groups) {
+        expect(await exists(group.entry)).toBe(false);
+        for (const spill of group.spills) expect(await readAll(group.store, spill.logRef)).toEqual(spill.log);
+      }
+    } finally {
+      for (const store of hung) store.heal();
+      warn.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  }, 90_000);
 
   it("leaves leftover trash for a later sweep when a sweep skips compaction", async () => {
     const seeded = await seedWorkspace({ populate: false });

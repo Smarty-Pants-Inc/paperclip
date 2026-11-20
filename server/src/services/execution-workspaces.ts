@@ -2481,7 +2481,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       signal?.throwIfAborted();
       deferredCompactionTrashParents.delete(parentDir);
       compactionTrashPurgedAt.set(parentDir, now().getTime());
-      await purgeStaleWorkspaceCompactionTrash(parentDir, WORKSPACE_COMPACTION_TRASH_STALE_MS).catch((error) => {
+      await runLogSpillCustodyPass(() =>
+        purgeStaleWorkspaceCompactionTrash(parentDir, WORKSPACE_COMPACTION_TRASH_STALE_MS),
+      ).catch((error) => {
         logger.warn({ err: error, parentDir }, "failed to purge stale workspace compaction trash");
       });
     }
@@ -2496,7 +2498,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     if (lastPurgedAt !== undefined && nowMs - lastPurgedAt < WORKSPACE_COMPACTION_TRASH_PURGE_INTERVAL_MS) return;
     if (compactionTrashPurgedAt.size >= 1024) compactionTrashPurgedAt.delete(compactionTrashPurgedAt.keys().next().value!);
     compactionTrashPurgedAt.set(parentDir, nowMs);
-    await purgeStaleWorkspaceCompactionTrash(parentDir, WORKSPACE_COMPACTION_TRASH_STALE_MS).catch((error) => {
+    await runLogSpillCustodyPass(() =>
+      purgeStaleWorkspaceCompactionTrash(parentDir, WORKSPACE_COMPACTION_TRASH_STALE_MS),
+    ).catch((error) => {
       logger.warn({ err: error, parentDir }, "failed to purge stale workspace compaction trash");
     });
   }
