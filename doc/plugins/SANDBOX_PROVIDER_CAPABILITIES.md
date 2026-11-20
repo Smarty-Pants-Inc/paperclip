@@ -331,9 +331,14 @@ blanket permission for arbitrary sync/exec overlap or conflicting writes.
 Daytona declares the capability (since 0.1.4)
 ([packages/plugins/sandbox-providers/daytona/src/manifest.ts:13](https://github.com/Smarty-Pants-Inc/paperclip/blob/088401bf237a55a61cbf9fd3dad63ba666b6276b/packages/plugins/sandbox-providers/daytona/src/manifest.ts#L13),
 [packages/plugins/sandbox-providers/daytona/src/manifest.ts:65](https://github.com/Smarty-Pants-Inc/paperclip/blob/088401bf237a55a61cbf9fd3dad63ba666b6276b/packages/plugins/sandbox-providers/daytona/src/manifest.ts#L65)).
-The separately versioned Boat provider opts in from `0.1.17-spare.12c1`
-([provider opt-in commit](https://github.com/Smarty-Pants-Inc/paperclip/commit/bcc3767e405d4527603430fee3ec378ea317de6b));
-its implementation is not bundled in this server revision. Always use the
+The separately versioned Boat provider first declares the capability in
+`0.1.17-spare.12c1`
+([provider opt-in commit](https://github.com/Smarty-Pants-Inc/paperclip/commit/bcc3767e405d4527603430fee3ec378ea317de6b)),
+but that version does NOT meet the Stop guarantee above (a Stop waits behind an
+in-flight sync and the command can survive it); do not install it with the
+capability on. Use the first Boat version that meets every guarantee in this
+section (the Stop fix, `0.1.17-spare.12c2`, once judged). Its implementation is
+not bundled in this server revision. Always use the
 installed provider's declaration and verified methods, not its name or version
 alone, to decide whether concurrency is effective.
 
