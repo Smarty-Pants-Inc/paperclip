@@ -99,7 +99,7 @@ export async function reportChatHandoffExecutionHold(tx: Connection, task: Pick<
     eq(issueComments.companyId, task.companyId), eq(issueComments.issueId, source.id), eq(issueComments.authorType, "system"),
     sql`${issueComments.metadata}->>'authorizationReason' = ${reason}`)).limit(1);
   const note = existing ?? (await insertIssueComment(tx, { companyId: task.companyId, issueId: source.id, authorType: "system",
-    body: `[${task.identifier ?? "Delegated task"}](/issues/${task.identifier ?? task.id}) is stuck: its agent can't continue it while recovery of its previous execution is unresolved. See the task for recovery details.`,
+    body: `[${task.identifier ?? "Delegated task"}](/issues/${task.identifier ?? task.id}) has stopped: its agent can't continue it until the problem with its last run is sorted out. Open the task to see what's needed.`,
     metadata: { version: 1, sections: [], authorizationReason: reason } }))[0];
   // The factual note satisfies this unchanged blocked report. Do not leave an
   // older pending delivery to wake the chat or narrate the same failure again.
