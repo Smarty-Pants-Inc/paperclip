@@ -5168,7 +5168,13 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       remoteCwd: target.remoteCwd,
       timeoutMs: bridgeTimeoutMs,
       shellCommand,
-      inlineSmallWrites: input.startPaused === true,
+      // Only activation attachments opt in. Pause/stop and unrelated queue
+      // writes keep their original upload path outside the named setup spans.
+      inlineSmallWrites: input.startPaused === true
+        ? (remotePath, body) =>
+          (remotePath === runStatePath && (body === "attached" || body.startsWith("attached:"))) ||
+          (remotePath === `${runStatePath}.ever-attached` && body === "attached")
+        : false,
     });
     const startServer = () => startSandboxCallbackBridgeServer({
       runner,
