@@ -199,3 +199,64 @@ export async function custodySpill(workspacePath: string, candidate: string, fau
   const spill = await contentSpill(workspacePath, candidate, "drift", SPILL_CUSTODY_FAULTS[fault].recovered);
   return { ...spill, ...await plantSpillCustodyFault(spill, fault) };
 }
+
+// Guard-pass rows (RFL rulings 11-20). `count` settled runs of ONE store at
+// `spillDir`, each spilled by the real writer while storage refused its bytes
+// and then genuinely recovered: every record names its bytes recovered and the
+// object log holds them. One store only, so one journal reads each copy back.
+export async function recoveredSpills(spillDir: string, count: number) {
+  const m = spillMemory(), store = newStore(m, spillDir);
+  const runs = Array.from({ length: count }, (_, n) => ({ ...ids, runId: `recovered-${String(n).padStart(2, "0")}` }));
+  const warning = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
+  try {
+    const handles = await Promise.all(runs.map(run => store.begin(run)));
+    await Promise.all(handles.map(handle => store.append(handle, event(1, "stored before the outage"))));
+    m.state.down = true;
+    const refused = await Promise.all(handles.map(async (handle, n) =>
+      (await store.enqueue!(handle, event(2, `refused ${n}: for a while the spill was the only copy`))).committed.catch(() => undefined)));
+    await Promise.all(handles.map(handle => store.finalize(handle)));
+    await Promise.all(refused);
+    m.state.down = false;
+    for (const run of runs) await store.recoverSpill!(run);
+    const spills = await Promise.all(handles.map(async handle => {
+      const spill = await readObjectRunLogSpill(spillDir, handle.logRef);
+      return { logRef: handle.logRef, path: spill.path, indexPath: spill.indexPath, unrecoveredBytes: spill.unrecovered.length,
+        bytes: await fs.readFile(spill.path), index: await fs.readFile(spill.indexPath), log: await readAll(store, handle.logRef) };
+    }));
+    return { m, store, spills };
+  } finally { warning.mockRestore(); }
+}
+/**
+ * PLANTED store fault "store-hung": from now on no GET of this object store
+ * answers. Each ends only when its caller gives up: at the journal's own read
+ * deadline (15 s), or when the guard pass's read-back budget ends. `heal`
+ * makes the store answer again, the GETs still waiting included.
+ */
+export function plantHungStore(m: ReturnType<typeof spillMemory>) {
+  const getObject = m.provider.getObject, waiting = new Set<() => void>();
+  // The store's own clock: when the first GET went unanswered, and when a caller last gave up on one.
+  const state = { hung: true, unansweredGets: 0, firstGetAt: 0, lastGiveUpAt: 0 };
+  m.provider.getObject = async input => {
+    if (state.hung) {
+      state.unansweredGets++;
+      state.firstGetAt ||= Date.now();
+      await new Promise<void>((resolve, reject) => {
+        waiting.add(resolve);
+        input.signal?.addEventListener("abort", () => {
+          waiting.delete(resolve);
+          state.lastGiveUpAt = Date.now();
+          reject(input.signal!.reason);
+        }, { once: true });
+      });
+    }
+    return getObject(input);
+  };
+  return { state, heal: () => {
+    state.hung = false;
+    for (const answer of waiting) answer();
+    waiting.clear();
+  } };
+}
+/** The custody rows a guard pass logged: one per spill it kept without proof. */
+export const custodyRows = (warn: { mock: { calls: unknown[][] } }) => warn.mock.calls
+  .filter(call => call[1] === SPILL_CUSTODY_ROW).map(call => call[0] as { spill: string; reason: string } & Record<string, unknown>);
