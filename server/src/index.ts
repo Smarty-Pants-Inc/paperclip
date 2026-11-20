@@ -104,6 +104,7 @@ import { reconcileAbandonedExecutionControl } from "./services/execution-control
 import { acknowledgeNativeStartupCleanup } from "./services/native-runtime/native-startup-cleanup.js";
 import { fenceOrphanedNativeStateStaging, sweepNativeStateStaging } from "./services/native-runtime/native-state-staging.js";
 import { registerNativeSessionEvidenceWork } from "./services/native-runtime/native-session-evidence-work.js";
+import { joinNativeSessionEvidenceCopies } from "./services/native-runtime/native-session-evidence.js";
 import { executionControlSchedule, registerExecutionControlWork } from "./services/execution-control-work.js";
 import { connectionIntentDeliveryService } from "./services/connection-intent-delivery.js";
 import { existsSync, readFileSync, rmSync } from "node:fs";
@@ -2401,6 +2402,10 @@ async function startServerWithDatabaseTeardown(
     await runtimeResponseDelivery?.stop();
     await deploymentHints?.stop();
     await deliveryWork.stop();
+    // Turn-started copies are deliberately not delivery worker promises. Their
+    // producers have drained above; join their reads/uploads/retries before the
+    // source services and database close, just as deliveryWork.stop joins sweeps.
+    await joinNativeSessionEvidenceCopies();
     await managedEnvironmentRecovery.stop();
 
     // Whatever the drain did not finalize (timed-out runs, the hot-restart

@@ -5,7 +5,7 @@ import { nativeReconciliationError, freshThreadRefusalCode, isFreshThreadRefusal
 import { currentControllerProcess } from "../controller-process-identity.js";
 import { probePiSessionResumeFile, restorePiSessionResumeFile } from "./pi-session-file-repair.js";
 import { readRemoteCheckpointManifest, verifyLocalCheckpointManifest } from "./remote-checkpoint-manifest.js";
-import { scheduleNativeSessionEvidenceCopy, type NativeSessionEvidenceSource } from "./native-session-evidence.js";
+import { joinNativeSessionEvidenceCopies, scheduleNativeSessionEvidenceCopy, type NativeSessionEvidenceSource } from "./native-session-evidence.js";
 import { resumableNativeHarnessBackupRow } from "./native-harness-backup-kind.js";
 import { clearProviderIdentityBreak, noteProviderIdentityBreak, recordedProviderIdentityTransitionIsAllowed, type ProviderIdentityLineageScope } from "./provider-identity-lineage.js";
 import { settleReattachRun } from "../heartbeat/run-admission.js";
@@ -886,6 +886,8 @@ async function closeWarmNativeSession(entry: WarmNativeSession, reason: string, 
   // Revoke before awaiting process retirement/checkpoint IO.
   const stopping = entry.githubAccess?.stop();
   try {
+    const evidenceSource = nativeSessionEvidenceSources.get(entry.session);
+    if (evidenceSource) await joinNativeSessionEvidenceCopies({ companyId: entry.companyId, source: evidenceSource });
     try { await entry.session.close({ reason }); }
     catch (error) {
       // A new conversation does not consume the old checkpoint, so the old
@@ -1038,6 +1040,8 @@ async function forgetUnretiredOwnerOnOtherSandbox(scope: string, entry: WarmNati
 
 async function detachReleasedWarmNativeSession(entry: WarmNativeSession) {
   entry.controllerDetachedForRestart = true;
+  const evidenceSource = nativeSessionEvidenceSources.get(entry.session);
+  if (evidenceSource) await joinNativeSessionEvidenceCopies({ companyId: entry.companyId, source: evidenceSource });
   if (!entry.session.detachControllerForRestart) throw new Error("native_session_released_detach_unavailable");
   await entry.session.detachControllerForRestart();
   await entry.githubAccess?.stop();

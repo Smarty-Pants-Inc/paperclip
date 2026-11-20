@@ -51,6 +51,26 @@ export const nativeSessionEvidenceStorage: { override: StorageService | null } =
 /** Only durable admission is joined by the turn; the copy stays unawaited. */
 export type NativeSessionEvidenceCopy = Promise<NativeSessionEvidenceOutcome> & { admitted: Promise<boolean> };
 export const nativeSessionEvidenceCopies = new Map<string, NativeSessionEvidenceCopy>();
+const nativeSessionEvidenceCopySources = new Map<string, NativeSessionEvidenceSource>();
+
+/** Lifecycle owners join copies before retiring their source or closing the DB.
+ * The turn still joins only admission. Do not race this join against a timer:
+ * the runner API has no cancellation signal, so an in-flight read must settle. */
+export async function joinNativeSessionEvidenceCopies(owner?: { companyId: string; source: NativeSessionEvidenceSource }): Promise<void> {
+  for (;;) {
+    const copies = [...nativeSessionEvidenceCopies].filter(([key]) => {
+      if (!owner) return true;
+      const source = nativeSessionEvidenceCopySources.get(key);
+      // Successive turns and startup reconstruction have different source
+      // objects/lease rows, but still read the same company's warm session.
+      return key.startsWith(`${owner.companyId}:`) && source !== undefined
+        && source.providerLeaseId === owner.source.providerLeaseId && source.normalizedSessionId === owner.source.normalizedSessionId
+        && source.sessionScopeDigest === owner.source.sessionScopeDigest;
+    }).map(([, copy]) => copy);
+    if (!copies.length) return;
+    await Promise.all(copies);
+  }
+}
 
 export type NativeSessionEvidenceOutcome =
   | { status: "complete"; attempts: number; scopeDigest: string; sourceSha256: string; bytes: number; fileCount: number }
@@ -175,9 +195,15 @@ async function captureAndPersist(request: NativeSessionEvidenceRequest, storage:
     const scopeDigest = nativeSessionEvidenceScopeDigest(request.source.sessionScopeDigest, request.runId);
     // The existing persister reads the uploaded object back and checks its
     // hash before it marks the row current; a failure leaves no current row.
-    await persistNativeHarnessBackup({ db: request.db, storage, scopeDigest, root,
-      owner: { kind: "session_evidence", companyId: request.companyId, issueId: request.issueId, runId: request.runId },
-      signal: AbortSignal.timeout(nativeSessionEvidenceRetry.deadlineMs) });
+    const deadline = new AbortController();
+    const timer = setTimeout(() => deadline.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError")),
+      nativeSessionEvidenceRetry.deadlineMs);
+    timer.unref?.();
+    try {
+      await persistNativeHarnessBackup({ db: request.db, storage, scopeDigest, root,
+        owner: { kind: "session_evidence", companyId: request.companyId, issueId: request.issueId, runId: request.runId },
+        signal: deadline.signal });
+    } finally { clearTimeout(timer); }
     return { scopeDigest, sourceSha256, bytes: directories.reduce((total, entry) => total + entry.before.bytes, 0),
       fileCount: directories.reduce((total, entry) => total + entry.before.fileCount, 0) };
   } finally { await rm(root, { recursive: true, force: true }); }
@@ -255,7 +281,8 @@ export function scheduleNativeSessionEvidenceCopy(request: NativeSessionEvidence
     if (!ok) return { status: "pending" as const, attempts: 0, reason: "marker_write_failed" };
     await new Promise<void>(resolve => setImmediate(resolve));
     return runEvidenceCopy(request, marker);
-  }).finally(() => { nativeSessionEvidenceCopies.delete(key); }), { admitted });
+  }).finally(() => { nativeSessionEvidenceCopies.delete(key); nativeSessionEvidenceCopySources.delete(key); }), { admitted });
+  nativeSessionEvidenceCopySources.set(key, request.source);
   nativeSessionEvidenceCopies.set(key, copy);
   return copy;
 }

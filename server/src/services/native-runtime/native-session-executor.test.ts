@@ -12082,12 +12082,14 @@ describe("warm native session evidence copy", () => {
     // The remote command runner fixture: real shell commands on a local "box".
     const commands: string[] = [];
     const evidenceGate = { stalled: null as null | Promise<void>, reached: null as null | (() => void) };
+    let releaseEvidenceReadForCleanup!: () => void;
+    const evidenceReadCleanup = new Promise<void>(resolve => { releaseEvidenceReadForCleanup = resolve; });
     const commandRunner: import("@paperclipai/adapter-utils/command-managed-runtime").CommandManagedRuntimeRunner = { execute: async input => {
       const command = `${input.command} ${(input.args ?? []).join(" ")}`;
       commands.push(command);
       if (evidenceGate.stalled && command.includes("tar ") && command.includes("-czf -")) {
         evidenceGate.reached?.();
-        await evidenceGate.stalled;
+        await Promise.race([evidenceGate.stalled, evidenceReadCleanup]);
       }
       const env = { PATH: process.env.PATH, ...input.env }, args = [...(input.args ?? [])];
       if (input.stdin != null && (args[0] === "-c" || args[0] === "-lc")) {
@@ -12224,8 +12226,11 @@ describe("warm native session evidence copy", () => {
     };
     const boxTree = async () => (await executeCommand("sh", ["-c", `cd '${remoteCwd}' && find . | LC_ALL=C sort`])).stdout;
     const cleanup = async () => {
-      // Let any copy still in flight settle before stopping its database.
-      await new Promise(resolveDelay => setTimeout(resolveDelay, 200));
+      // Release controlled transport holds even when an assertion failed, then
+      // join actual copies/retries rather than guessing with a 200ms sleep.
+      releaseEvidenceReadForCleanup();
+      const evidence = await import("./native-session-evidence.js");
+      await evidence.joinNativeSessionEvidenceCopies();
       await closeWarmNativeSessionsForEnvironment({ environmentId, reason: "test cleanup" }).catch(() => undefined);
       storageSpy.mockRestore();
       admissionSpy.mockRestore();
@@ -12498,6 +12503,50 @@ describe("warm native session evidence copy", () => {
       await coordinator?.stop();
       evidence.nativeSessionEvidenceRetry.delayMs = originalDelay;
       alarms.mockRestore();
+      await f.cleanup();
+    }
+  }, 120_000);
+
+  it("joins a warm session's evidence read before closing its source and clears its persistence deadline", async () => {
+    const f = await warmEvidenceFixture("stop-source");
+    const evidence = await import("./native-session-evidence.js");
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    const cleared = vi.spyOn(globalThis, "clearTimeout");
+    let release!: () => void, joining!: () => void;
+    const joinReached = new Promise<void>(resolve => { joining = resolve; });
+    const originalJoin = evidence.joinNativeSessionEvidenceCopies;
+    const joinSpy = vi.spyOn(evidence, "joinNativeSessionEvidenceCopies").mockImplementation(async source => {
+      if (source) joining();
+      await originalJoin(source);
+    });
+    let stopping: Promise<unknown> | undefined;
+    try {
+      f.evidenceGate.stalled = new Promise<void>(resolve => { release = resolve; });
+      const reached = new Promise<void>(resolve => { f.evidenceGate.reached = resolve; });
+      await f.runTurn();
+      await reached;
+      // A later turn has a new source object/lease row. Closing the shared
+      // session must join both copies, not just the newest object's promise.
+      await f.runTurn();
+      expect(evidence.nativeSessionEvidenceCopies.size).toBe(2);
+      stopping = closeWarmNativeSessionsForEnvironment({ environmentId: f.environmentId, reason: "test source stop" });
+      const reachedJoin = await Promise.race([joinReached.then(() => true), stopping.then(() => false)]);
+      if (reachedJoin) {
+        expect(f.session.close).not.toHaveBeenCalled();
+        f.evidenceGate.stalled = null; release();
+      }
+      await stopping;
+      expect(evidence.nativeSessionEvidenceCopies.size, "closed session has no background evidence read or retry").toBe(0);
+      expect(f.session.close).toHaveBeenCalled();
+      const deadlines = timers.mock.calls.flatMap((args, index) => args[1] === evidence.nativeSessionEvidenceRetry.deadlineMs
+        ? [timers.mock.results[index]?.value] : []);
+      expect(deadlines.length).toBeGreaterThan(0);
+      for (const deadline of deadlines) expect(cleared.mock.calls.some(([timer]) => timer === deadline), "owned deadline cleared").toBe(true);
+    } finally {
+      f.evidenceGate.stalled = null; release?.();
+      await Promise.all([...evidence.nativeSessionEvidenceCopies.values()]);
+      await stopping;
+      joinSpy.mockRestore(); timers.mockRestore(); cleared.mockRestore();
       await f.cleanup();
     }
   }, 120_000);
