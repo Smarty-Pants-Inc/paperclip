@@ -218,7 +218,7 @@ export function usesNativeUsageDelivery(input: {
   runnerd: boolean; remote: boolean; provider?: NativeExecutionInput["provider"] | null;
 }) {
   return input.runnerd && input.remote && input.provider !== undefined && input.provider !== null
-    && ["codex", "opencode", "acpx", "claude_managed", "aws_agentcore"].includes(input.provider.kind);
+    && ["codex", "opencode", "pi_rpc", "acpx", "claude_managed", "aws_agentcore"].includes(input.provider.kind);
 }
 
 export function isNativeUsageAccountingEvent(event: Pick<PrpEvent, "eventType">) {
