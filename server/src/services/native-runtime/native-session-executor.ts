@@ -8063,6 +8063,7 @@ function runnerProviderStateFilename(execution: NativeExecutionInput): string {
       return "dot-provider-state.json";
     case "cursor_cloud":
     case "codex":
+    case "pi_rpc":
     case "opencode":
       return "codex-provider-state.json";
     case "acpx":
@@ -8164,12 +8165,15 @@ export function providerSessionIdentityFromDurableProviderState(input: {
     }
     case "cursor_cloud":
     case "codex":
+    case "pi_rpc":
     case "opencode": {
       const config = record(state.config);
       const expectedDriver =
         input.execution.provider.kind === "cursor_cloud" ? "cursor_cloud_api" : input.execution.provider.kind === "codex"
           ? "codex_app_server"
-          : "opencode_server";
+          : input.execution.provider.kind === "pi_rpc"
+            ? "pi_rpc"
+            : "opencode_server";
       if (
         state.schema !== CODEX_PROVIDER_STATE_SCHEMA ||
         !["prepared", "session_open", "provider_exited"].includes(
@@ -8235,6 +8239,7 @@ export function remoteProviderStateNeverOpened(execution: NativeExecutionInput, 
         && (state.activeTurnId ?? null) === null && (state.providerExitUnconfirmed ?? false) === false;
     case "cursor_cloud":
     case "codex":
+    case "pi_rpc":
     case "opencode":
       return state.schema === CODEX_PROVIDER_STATE_SCHEMA && (state.threadId ?? null) === null
         && (state.providerSessionId ?? null) === null && (state.activeProviderTurnId ?? null) === null
