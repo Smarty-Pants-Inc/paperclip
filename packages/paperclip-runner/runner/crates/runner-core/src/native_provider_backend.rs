@@ -326,7 +326,7 @@ impl NativeProviderCommandExecutor {
                 &self.config,
                 ExternalProviderCodec::Grok,
             )),
-            "codex" | "opencode" | "cursor_cloud" => SelectedExecutor::LocalFacade(
+            "codex" | "opencode" | "pi_rpc" | "cursor_cloud" => SelectedExecutor::LocalFacade(
                 CodexCommandExecutor::with_runner_config(&self.state_dir, &self.config),
             ),
             "acpx" => SelectedExecutor::Acpx(AcpxCommandExecutor::with_runner_config(
