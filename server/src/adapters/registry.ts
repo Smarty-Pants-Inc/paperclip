@@ -404,7 +404,7 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
       timedOut: false,
       errorMessage: message,
       errorCode: "paperclip_runner_coordinator_required",
-      provider: ctx.config.provider === "opencode"
+      provider: ctx.config.provider === "pi_rpc" ? "pi_rpc" : ctx.config.provider === "opencode"
         ? "opencode"
         : ctx.config.provider === "claude_managed"
           ? "anthropic"
@@ -438,6 +438,23 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
           message: profileError.message,
         }],
       };
+    }
+    if (profile.provider === "pi_rpc") {
+      const failure = (code: string, message: string): AdapterEnvironmentTestResult => ({
+        adapterType: "paperclip_runner", status: "fail", testedAt: new Date().toISOString(),
+        checks: [{ code: `pi_rpc_hello_probe_${code}`, level: "error", message }],
+      });
+      const target = context.executionTarget;
+      if (target?.kind !== "remote" || target.transport !== "sandbox" || target.runnerTask || !target.runner)
+        return failure("unavailable", "Pi RPC Test requires the selected sandbox command runner; no local, ACPX or OpenCode fallback is used.");
+      const configured = context.config.env;
+      const environment = configured && typeof configured === "object" && !Array.isArray(configured)
+        ? configured as Record<string, unknown> : {};
+      if (typeof environment.PAPERCLIP_AI_PROVIDER_URL !== "string" || !environment.PAPERCLIP_AI_PROVIDER_URL
+        || typeof environment.PAPERCLIP_AI_PROVIDER_KEY !== "string" || !environment.PAPERCLIP_AI_PROVIDER_KEY)
+        return failure("auth_required", "Select the managed AI connection before testing Pi RPC.");
+      const { testNativeRunnerAuthentication } = await import("../services/native-runtime/setup-readiness.js");
+      return testNativeRunnerAuthentication(context, "pi_rpc", profile.model);
     }
     if (profile.provider !== "cursor_cloud" && context.executionTarget?.kind === "remote" && context.executionTarget.transport === "sandbox" && context.executionTarget.runnerTask) {
       // Managed connections probe through testManagedEnvironment. This path has
@@ -634,6 +651,7 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
   getRuntimeCommandSpec: (config) => config.provider === "claude_managed"
     || config.provider === "aws_agentcore"
     || config.provider === "acpx"
+    || config.provider === "pi_rpc"
     || config.provider === "cursor_cloud"
     ? { command: "paperclip-runnerd", detectCommand: null, installCommand: null }
     : config.provider === "opencode"
@@ -644,7 +662,7 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
         )
       : buildNpmRuntimeCommandSpec(config, "codex", "@openai/codex@0.170.0"),
   agentConfigurationDoc:
-    "# Paperclip Runner\n\nAdapter: paperclip_runner\n\nRuns Codex, OpenCode, Claude Managed, AWS AgentCore, or ACPX Claude/Grok Build/Cursor/Pi through the Rust Paperclip runner and authenticated PRP transport. Pi accepts an explicit provider/model ID and uses the company credentials bound to the agent environment. GitHub Copilot requires a saved GitHub token and an explicitly selected available model. Managed providers use company-scoped qualified profiles, explicit retention acknowledgement, and spend limits. A board operator creates each Claude Managed (Anthropic managed agent) profile through POST /api/companies/{companyId}/managed-agent-profiles; agent credentials cannot create, qualify or list one.\n",
+    "# Paperclip Runner\n\nAdapter: paperclip_runner\n\nRuns Codex, OpenCode, native Pi RPC, Claude Managed, AWS AgentCore, or ACPX Claude/Grok Build/Cursor/Pi through the Rust Paperclip runner and authenticated PRP transport. Pi accepts an explicit provider/model ID and uses the company credentials bound to the agent environment. GitHub Copilot requires a saved GitHub token and an explicitly selected available model. Managed providers use company-scoped qualified profiles, explicit retention acknowledgement, and spend limits. A board operator creates each Claude Managed (Anthropic managed agent) profile through POST /api/companies/{companyId}/managed-agent-profiles; agent credentials cannot create, qualify or list one.\n",
   getConfigSchema: () => ({
     fields: [
       {
@@ -655,6 +673,7 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
         options: [
           { value: "codex", label: "Codex" },
           { value: "opencode", label: `OpenCode ${QUALIFIED_OPENCODE_RUNNER_VERSION}` },
+          { value: "pi_rpc", label: "Pi RPC" },
           { value: "claude_managed", label: "Claude Managed" },
           { value: "aws_agentcore", label: "AWS AgentCore" },
           { value: "acpx", label: "ACP agents" },
@@ -701,6 +720,11 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
         meta: { visibleWhen: { key: "provider", value: "opencode" } },
       },
       {
+        key: "piRpcThinkingLevel", label: "Pi thinking level", type: "select" as const,
+        options: ["off", "minimal", "low", "medium", "high", "xhigh", "max"].map(value => ({ value, label: value })),
+        meta: { visibleWhen: { key: "provider", value: "pi_rpc" } },
+      },
+      {
         key: "acpxSessionMode",
         label: "Cursor mode",
         type: "select" as const,
@@ -730,8 +754,8 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
         type: "text" as const,
         default: "",
         placeholder: DEFAULT_OPENCODE_RUNNER_MODEL,
-        hint: "OpenCode uses provider/model form. ACPX Claude accepts Claude model IDs, including custom IDs.",
-        meta: { visibleWhen: { key: "provider", value: "opencode" } },
+        hint: "OpenCode and Pi RPC use explicit provider/model form. ACPX Claude accepts Claude model IDs, including custom IDs.",
+        meta: { visibleWhen: { key: "provider", values: ["opencode", "pi_rpc"] } },
       },
       {
         key: "managedProfileId",
