@@ -69,6 +69,13 @@ export function managedProviderRouting(
     });
     env.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
     config.model = aiRoutingModel(route, harness, model);
+  } else if (harness === "pi_rpc") {
+    env.PAPERCLIP_AI_PROVIDER_URL = baseUrl;
+    env.PAPERCLIP_AI_PROVIDER_KEY = credential;
+    env.PAPERCLIP_AI_PROVIDER_PROTOCOL = route.protocol;
+    env.PAPERCLIP_AI_PROVIDER_AUTH = route.auth;
+    if (openrouter) env.PAPERCLIP_AI_PROVIDER_HEADERS = JSON.stringify(OPENROUTER_ATTRIBUTION_HEADERS);
+    config.model = aiRoutingModel(route, harness, model);
   } else if (harness === "hermes_local") {
     env.OPENAI_BASE_URL = baseUrl;
     env.OPENAI_API_KEY = credential;
