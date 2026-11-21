@@ -5,11 +5,13 @@ import { execFileSync, spawnSync } from "node:child_process";
 import {
   chmodSync,
   copyFileSync,
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -265,6 +267,50 @@ try {
     }
   }
 
+  // Our external package materializes npm latest and the approved resource closure
+  // together. Keep the stock pack intact; pi_rpc never uses ACPX's pinned Pi.
+  const piInput = process.env.PAPERCLIP_RUNNER_PI_INPUT_DIR?.trim();
+  let pi_rpc;
+  let piArtifacts = {};
+  if (piInput) {
+    const input = realpathSync(resolve(piInput));
+    const piProxy = "dist/cli/pi-app-server-proxy.cjs";
+    const piPackageRoot = "pi-runtime/node_modules/@earendil-works/pi-coding-agent";
+    const copyTree = (name) => {
+      const source = join(input, name);
+      const root = realpathSync(source);
+      const check = (directory) => {
+        for (const entry of readdirSync(directory, { withFileTypes: true })) {
+          const path = join(directory, entry.name);
+          if (entry.isDirectory()) check(path);
+          else if (entry.isSymbolicLink()) {
+            const target = realpathSync(path);
+            if (readlinkSync(path).startsWith("/") || !target.startsWith(root + "/")) {
+              throw new Error(`Pi input ${name} has an external resource link`);
+            }
+          } else if (!entry.isFile()) throw new Error(`Pi input ${name} has an unsupported entry`);
+        }
+      };
+      check(source);
+      cpSync(source, join(temporaryRoot, name), { recursive: true, verbatimSymlinks: true });
+      return { path: name, sha256: sha256Tree(join(temporaryRoot, name)) };
+    };
+    const runtime = copyTree("pi-runtime");
+    const resources = copyTree("pi-resources");
+    const installed = JSON.parse(readFileSync(join(temporaryRoot, piPackageRoot, "package.json"), "utf8"));
+    if (installed.name !== "@earendil-works/pi-coding-agent" || typeof installed.version !== "string"
+      || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(installed.version)) throw new Error("Pi input has no resolved npm release");
+    const entry = typeof installed.bin === "string" ? installed.bin : installed.bin?.pi;
+    if (typeof entry !== "string" || !entry || entry.startsWith("/") || entry.includes("\\")
+      || entry.split("/").includes("..") || entry.includes("\0")) throw new Error("Pi package bin.pi must name an installed relative CLI entry");
+    const piExecutable = relative(temporaryRoot, resolve(temporaryRoot, piPackageRoot, entry));
+    const entryPath = realpathSync(join(temporaryRoot, piExecutable));
+    if (!entryPath.startsWith(realpathSync(join(temporaryRoot, piPackageRoot)) + "/")) throw new Error("Pi CLI entry escapes its package tree");
+    copyFileSync(join(input, piProxy), join(temporaryRoot, piProxy));
+    piArtifacts = { piProxy: { path: piProxy, sha256: sha256File(join(temporaryRoot, piProxy)) },
+      piExecutable: { path: piExecutable, sha256: sha256File(join(temporaryRoot, piExecutable)) } };
+    pi_rpc = { version: installed.version, runtime, resources };
+  }
   const opencodeProxySha = sha256File(join(temporaryRoot, opencodeProxyPath));
   const acpxSidecarSha = sha256File(join(temporaryRoot, acpxSidecarPath));
   const distDigest = sha256Tree(join(temporaryRoot, "dist"));
@@ -327,7 +373,10 @@ try {
         profiles.profiles.codex.commandDigest,
     },
     ...providerPackManifestFields(candidateProviders, candidates),
+    // pi_rpc keeps stock controller localeCompare (verification.ts:8) and in-box ASCII sort (:148) identical.
+    ...(pi_rpc ? { pi_rpc } : {}),
     artifacts: {
+      ...piArtifacts,
       grokLauncher: {
         path: "dist/providers/grok/launcher.cjs",
         sha256: sha256File(join(temporaryRoot, "dist/providers/grok/launcher.cjs")),
