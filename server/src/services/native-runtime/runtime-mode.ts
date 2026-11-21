@@ -35,6 +35,7 @@ export type NativeRuntimeResolution =
         backend:
           | "codex_app_server"
           | "opencode_server"
+          | "pi_rpc"
           | "claude_managed_agents_api"
           | "aws_agentcore_harness_api"
           | "acpx_runtime"
@@ -221,6 +222,7 @@ export function resolveHeartbeatNativeRuntimeMode(input: {
       const driverKind = input.persisted.driverKind;
       const backend = driverKind === "opencode_server"
         ? "opencode_server"
+        : driverKind === "pi_rpc" ? "pi_rpc"
         : driverKind === "claude_managed_agents_api"
           ? "claude_managed_agents_api"
           : driverKind === "aws_agentcore_harness_api"
