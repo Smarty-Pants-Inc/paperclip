@@ -52,7 +52,7 @@ import { notifyCancelledWorkspacePreservation } from "../cancelled-workspace-pre
 import { notifyInstructionCollection } from "../instruction-collection-notifications.js";
 import { providerPackWorkspaceId, recordAdmittedRemoteProviderPack, resolveRemoteProviderPackAuthority } from "./remote-provider-pack-authority.js";
 import { nativeProviderPackAdmissionFailureCode, prepareNativeProviderPackAdmission, rememberAdmittedNativeProviderPack, rememberRecoveredNativeProviderPack, recordNativeProviderPackAdmission, type NativeProviderPackAdmissionSource } from "./native-provider-pack-admission.js";
-import { type ProviderPackInstallation, providerPackIncompatible, verifyRemoteProviderPack as verifyRemoteProviderPackIdentity } from "./remote-provider-pack-verification.js";
+import { type ProviderPackIdentity, type ProviderPackInstallation, providerPackIncompatible, verifyRemoteProviderPack as verifyRemoteProviderPackIdentity } from "./remote-provider-pack-verification.js";
 import { writeEnvironmentCleanup } from "../environment-cleanup-notifications.js";
 import { NATIVE_SESSION_EXECUTION_LEASE_TTL_MS, lockNativeExecutionLeaseForReacquire, nativeExecutionLeaseHeldCondition, releaseUnstartedNativeExecutionClaim, startNativeSessionExecutionLeaseRenewal, type NativeExecutionLeaseRenewal } from "./native-execution-lease.js";
 export { renewNativeSessionExecutionLease } from "./native-execution-lease.js";
@@ -1491,6 +1491,7 @@ export function resolveNativeProviderEnvironment(
     return buildNativeProviderEnvironment({}, host);
   }
   if (provider.kind === "cursor_cloud") return {};
+  if (provider.kind === "pi_rpc") return buildNativeProviderEnvironment({}, host);
   return host;
 }
 
@@ -2547,6 +2548,7 @@ function nativeProviderSessionScope(execution: NativeExecutionInput) {
         profile: execution.provider.profile,
       };
     case "codex":
+    case "pi_rpc":
     case "opencode":
       // These local providers have no separate persisted profile id. Company,
       // agent, and workspace bind their credential/session context; mutable
@@ -8038,7 +8040,7 @@ export function resolveNativeHarnessPersistenceProfile(
     providerKind: execution.provider.kind,
     driverKind: execution.session.driverKind,
     directories: [
-      { name: "runner", location: "runner", excludeEntries: [] },
+      { name: "runner", location: "runner", excludeEntries: execution.provider.kind === "pi_rpc" ? ["pi-launches"] : [] },
       ...(providerDirectory ? [providerDirectory] : []),
     ],
   };
@@ -11085,6 +11087,7 @@ async function executePaperclipNativeSessionAttempt(
     input.execution.provider.kind !== "cursor_cloud" &&
     input.execution.provider.kind !== "codex" &&
     input.execution.provider.kind !== "opencode" &&
+    input.execution.provider.kind !== "pi_rpc" &&
     input.execution.provider.kind !== "claude_managed" &&
     input.execution.provider.kind !== "aws_agentcore" &&
     input.execution.provider.kind !== "acpx" &&
@@ -11783,7 +11786,7 @@ async function executePaperclipNativeSessionAttempt(
   };
   // OpenCode and ACPX report their current turn; Codex reports a cumulative run delta.
   // Rebuild per-turn state from the durable event log when a controller resumes.
-  const turnAccounting = ["opencode", "acpx"].includes(input.execution.provider.kind) ? createNativeTurnAccounting(input.execution.provider) : null;
+  const turnAccounting = ["opencode", "pi_rpc", "acpx"].includes(input.execution.provider.kind) ? createNativeTurnAccounting(input.execution.provider) : null;
   if (turnAccounting || cursorCloudAccounting) {
     const history = await input.db.select({ payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents).where(and(
       eq(heartbeatRunEvents.companyId, input.execution.binding.companyId), eq(heartbeatRunEvents.runId, input.execution.binding.runId),
@@ -14414,7 +14417,8 @@ type RemoteProviderPackManifest = {
   schema: typeof REMOTE_PROVIDER_PACK_SCHEMA;
   digest: string;
   payload: {
-    compatibility?: { opencode: number; acpx: number };
+    compatibility?: { opencode: number; acpx: number; pi_rpc?: number };
+    piRpc?: ProviderPackIdentity["payload"]["piRpc"];
     pins: typeof REMOTE_PROVIDER_PACK_PINS;
     target: { platform: string; architecture: string };
     runnerSourceRevision: string;
@@ -14436,6 +14440,8 @@ type RemoteProviderPackManifest = {
       opencodeCommand: { path: string; sha256: string };
       opencodeExecutable: { path: string; sha256: string };
       opencodeProxy: { path: string; sha256: string };
+      piProxy?: { path: string; sha256: string };
+      piExecutable?: { path: string; sha256: string };
       acpxSidecar: { path: string; sha256: string };
     };
   };
@@ -14616,6 +14622,10 @@ function* providerPackIdentityChecks(
       payload.artifacts?.acpxSidecar,
       REMOTE_PROVIDER_PACK_ARTIFACT_PATHS.acpxSidecar,
     ],
+    ...(payload.piRpc ? [
+      ["Pi proxy", payload.artifacts?.piProxy, "dist/cli/pi-app-server-proxy.cjs"],
+      ["Pi CLI", payload.artifacts?.piExecutable, "pi-runtime/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"],
+    ] as const : []),
   ] as const;
   for (const [label, artifact, expectedPath] of artifactEntries) {
     const artifactPath = providerPackRelativePath(
@@ -14628,12 +14638,23 @@ function* providerPackIdentityChecks(
       );
     }
     if (
-      !/^sha256:[a-f0-9]{64}$/.test(artifact?.sha256 ?? "") ||
+      !artifact || !/^sha256:[a-f0-9]{64}$/.test(artifact.sha256) ||
       (verifyControllerFiles && (yield { kind: "file", path: resolve(packRoot, artifactPath) }) !== artifact.sha256)
     ) {
       throw new Error(
         `runner_remote_provider_artifact_incompatible: ${label} digest mismatch`,
       );
+    }
+  }
+  if (payload.piRpc) {
+    if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(payload.piRpc.version)) {
+      throw providerPackIncompatible("pi_version", "Pi pack must record its resolved npm version");
+    }
+    for (const [tree, expectedPath] of [[payload.piRpc.runtime, "pi-runtime"], [payload.piRpc.resources, "pi-resources"]] as const) {
+      if (tree?.path !== expectedPath || !/^sha256:[a-f0-9]{64}$/.test(tree.sha256)
+        || (verifyControllerFiles && (yield { kind: "tree", path: resolve(packRoot, expectedPath) }) !== tree.sha256)) {
+        throw providerPackIncompatible("pi_tree", "Pi dependency/resource tree identity is invalid");
+      }
     }
   }
   if (verifyControllerFiles && (yield { kind: "tree", path: resolve(packRoot, "dist") }) !== payload.distDigest) {
@@ -17192,7 +17213,7 @@ async function createRunnerdBackendWithinSessionClaim(
     : null;
   const requiresRemoteProviderPack =
     remoteTarget !== null &&
-    (input.execution.provider.kind === "opencode" ||
+    (input.execution.provider.kind === "opencode" || input.execution.provider.kind === "pi_rpc" ||
       input.execution.provider.kind === "acpx");
   const artifactStorage = remoteTarget?.transport === "sandbox" && input.controllerPersistence
     && input.execution.provider.kind === "opencode" ? durableNativeHarnessStorage() : null;
@@ -17273,7 +17294,7 @@ async function createRunnerdBackendWithinSessionClaim(
   // state even when no daemon survived. Its launch profile binds the admitted
   // artifact bytes and paths just as a live reattachment does.
   const reattachProviderPack = input.restartRecovery?.kind === "reattach_remote_runner" || input.remoteWarmRecovery !== undefined;
-  let retainProviderPack = reattachProviderPack || input.execution.provider.kind === "opencode" && durableBinding !== null;
+  let retainProviderPack = reattachProviderPack || ["opencode", "pi_rpc"].includes(input.execution.provider.kind) && durableBinding !== null;
   if (requiresRemoteProviderPack && !retainProviderPack) resolveCurrentProviderPackManifest();
   // The transport hashes runnerBinary on the controller before an external
   // launcher starts runnerd. Keep that artifact identity in the controller's
@@ -17445,8 +17466,8 @@ async function createRunnerdBackendWithinSessionClaim(
         const manifest = await measureNativeRunnerSpan(input.trace, "provider_pack.compatibility", () => verifyRemoteProviderPackIdentity({
           runner: remoteCommandRunner, cwd: remoteTarget.remoteCwd, packRoot: installation.root,
           manifest: expected, installation,
-          provider: input.execution.provider as { kind: "opencode" } | { kind: "acpx"; agent: string },
-          requireExactIdentity: retainProviderPack || explicitProviderPackSelection,
+          provider: input.execution.provider as { kind: "opencode" | "pi_rpc" } | { kind: "acpx"; agent: string },
+          requireExactIdentity: retainProviderPack || explicitProviderPackSelection || input.execution.provider.kind === "pi_rpc",
           requireCurrentOpenCodeProxy: !retainProviderPack
             && runnerEnvironment?.PAPERCLIP_OPENCODE_PERFORMANCE_DIAGNOSTICS === "1",
         }), { attributes: { target: installation.root === stagedRemoteProviderPackRoot ? "workspace" : "image" } });
@@ -18839,7 +18860,7 @@ async function createRunnerdBackendWithinSessionClaim(
         ...accountingTransportOptions,
         onCredentialsUpdated: credentialUpdates?.onCredentialsUpdated,
         provider:
-          input.execution.provider.kind === "cursor_cloud" ? "cursor_cloud" : input.execution.provider.kind === "codex"
+          input.execution.provider.kind === "pi_rpc" ? "pi_rpc" : input.execution.provider.kind === "cursor_cloud" ? "cursor_cloud" : input.execution.provider.kind === "codex"
             ? "codex"
             : input.execution.provider.kind === "opencode"
               ? "opencode"
@@ -18884,6 +18905,8 @@ async function createRunnerdBackendWithinSessionClaim(
                   ),
             }
           : {}),
+        ...(input.execution.provider.kind === "pi_rpc" ? { piRpcThinkingLevel: input.execution.provider.piRpcThinkingLevel,
+          piRuntimeDirectory: remoteStateDirectory ?? root } : {}),
         ...(nativeProviderStartedTurns(input.execution.provider) ? { providerStartedTurns: true } : {}),
         ...(input.execution.provider.kind === "cursor_cloud" ? { cursorCloud: input.execution.provider.cursorCloud } : {}),
         ...(input.execution.provider.kind === "opencode"
@@ -18952,6 +18975,13 @@ async function createRunnerdBackendWithinSessionClaim(
                   .sha256,
             }
           : {}),
+        ...(input.execution.provider.kind === "pi_rpc" && expectedProviderPackManifest?.payload.piRpc && activeRemoteProviderPackRoot ? {
+          piCommand: posix.join(activeRemoteProviderPackRoot, expectedProviderPackManifest.payload.artifacts.piExecutable!.path),
+          piCommandSha256: expectedProviderPackManifest.payload.artifacts.piExecutable!.sha256,
+          piProxyPath: posix.join(activeRemoteProviderPackRoot, expectedProviderPackManifest.payload.artifacts.piProxy!.path),
+          piProxySha256: expectedProviderPackManifest.payload.artifacts.piProxy!.sha256,
+          piResourcesDirectory: posix.join(activeRemoteProviderPackRoot, expectedProviderPackManifest.payload.piRpc.resources.path),
+        } : {}),
         ...(openCodeLaunchArtifacts ? {
           providerNodeCommand: openCodeLaunchArtifacts.paths.nodeCommand,
           providerNodeCommandSha256: expectedProviderPackManifest!.payload.artifacts.nodeCommand.sha256,
