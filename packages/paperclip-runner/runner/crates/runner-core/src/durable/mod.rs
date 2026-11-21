@@ -227,6 +227,9 @@ pub struct OpenCodeLaunchProfile {
     pub executable: QualifiedLaunchArtifact,
 }
 
+// Pi binds the same Node/proxy/provider-entry artifacts; its identity is checked at launch.
+pub type PiLaunchProfile = OpenCodeLaunchProfile;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CursorCloudLaunchProfile {
     pub command: QualifiedLaunchArtifact,
@@ -248,6 +251,7 @@ pub struct DurableRunnerConfig {
     pub runner_digest: String,
     pub acpx_launch_profile: Option<AcpxLaunchProfile>,
     pub opencode_launch_profile: Option<OpenCodeLaunchProfile>,
+    pub pi_launch_profile: Option<PiLaunchProfile>,
     pub cursor_cloud_launch_profile: Option<CursorCloudLaunchProfile>,
     pub max_outbox_bytes: usize,
     pub p0_reserve_bytes: usize,
@@ -380,7 +384,12 @@ impl DurableRunnerConfig {
                 ));
             }
         }
-        if let Some(profile) = self.opencode_launch_profile.as_ref() {
+        for (name, profile) in self
+            .opencode_launch_profile
+            .iter()
+            .map(|profile| ("OpenCode", profile))
+            .chain(self.pi_launch_profile.iter().map(|profile| ("Pi", profile)))
+        {
             let artifacts = [&profile.command, &profile.proxy_script, &profile.executable];
             if artifacts.iter().any(|artifact| {
                 !artifact.path.is_absolute()
@@ -394,9 +403,9 @@ impl DurableRunnerConfig {
                 || profile.command.path == profile.executable.path
                 || profile.proxy_script.path == profile.executable.path
             {
-                return Err(DurableRunnerError::invalid(
-                    "OpenCode runner launch profile is malformed",
-                ));
+                return Err(DurableRunnerError::invalid(format!(
+                    "{name} runner launch profile is malformed"
+                )));
             }
         }
         if let Some(profile) = self.cursor_cloud_launch_profile.as_ref() {
@@ -441,6 +450,7 @@ mod tests {
             runner_digest: "sha256:digest".to_owned(),
             acpx_launch_profile: None,
             opencode_launch_profile: None,
+            pi_launch_profile: None,
             cursor_cloud_launch_profile: None,
             max_outbox_bytes: 1024 * 1024,
             p0_reserve_bytes: 64 * 1024,
