@@ -891,6 +891,7 @@ fn durable_config(directory: &Path) -> DurableRunnerConfig {
         runner_digest: format!("sha256:{}", "a".repeat(64)),
         acpx_launch_profile: None,
         opencode_launch_profile: None,
+        pi_launch_profile: None,
         cursor_cloud_launch_profile: None,
         max_outbox_bytes: 16 * 1024 * 1024,
         p0_reserve_bytes: 1024 * 1024,
