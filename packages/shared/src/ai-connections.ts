@@ -151,7 +151,7 @@ export function isAiConnectionCompatible(
     && ["openrouter", "openai", "anthropic", "google"].includes(requirement.provider)
     && typeof model === "string" && model.startsWith(`${requirement.provider}/`);
   if ("mode" in requirement && requirement.mode !== "responsible_user" && requirement.method === "api_key")
-    return ["claude_local", "codex_local", "opencode_local", "hermes_local", "gemini_local", "grok_local", "copilot_runtime"].includes(adapterType);
+    return ["claude_local", "codex_local", "opencode_local", "pi_rpc", "hermes_local", "gemini_local", "grok_local", "copilot_runtime"].includes(adapterType);
   const methods = AI_CONNECTION_CAPABILITIES[requirement.provider].methods;
   const candidates = "mode" in requirement && requirement.mode === "responsible_user"
     ? Object.values(methods)
