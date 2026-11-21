@@ -93,6 +93,7 @@ export function aiRoutingHarness(
         claude: "claude_local",
         codex: "codex_local",
         opencode: "opencode_local",
+        pi_rpc: "pi_rpc",
         grok: "grok_local",
         pi: "pi_local",
       } as Record<string, string>
@@ -109,12 +110,13 @@ export function isAiRoutingCompatible(
       "claude_local",
       "codex_local",
       "opencode_local",
+      "pi_rpc",
       "pi_local",
       "hermes_local",
     ].includes(harness);
-  if (route.protocol === "responses") return harness === "codex_local";
-  if (route.protocol === "messages") return harness === "claude_local";
-  return ["opencode_local", "hermes_local"].includes(harness);
+  if (route.protocol === "responses") return harness === "codex_local" || harness === "pi_rpc";
+  if (route.protocol === "messages") return harness === "claude_local" || harness === "pi_rpc";
+  return ["opencode_local", "pi_rpc", "hermes_local"].includes(harness);
 }
 export function aiRoutingBaseUrl(
   route: AiProviderRouting,
@@ -130,7 +132,7 @@ export function aiRoutingModel(
   harness: string,
   model: string,
 ): string {
-  if (!model || (harness !== "opencode_local" && !(harness === "pi_local" && route.kind === "openrouter"))) return model;
+  if (!model || (harness !== "opencode_local" && harness !== "pi_rpc" && !(harness === "pi_local" && route.kind === "openrouter"))) return model;
   const prefix = route.kind === "openrouter" ? "openrouter" : "paperclip";
   return model.startsWith(`${prefix}/`) ? model : `${prefix}/${model}`;
 }
