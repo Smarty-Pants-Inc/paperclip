@@ -1742,7 +1742,7 @@ export interface CapabilityRunnerdProcessEvidence {
 export interface CapabilityRunnerdCodexTransportOptions extends RunnerExecutionDriver {
   observability?: import("../drivers/agent-observability.js").ProviderObservabilityLaunch;
   homeMode?: "isolated" | "preconfigured";
-  provider?: "cursor_cloud" | "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
+  provider?: "cursor_cloud" | "codex" | "opencode" | "pi_rpc" | "claude_managed" | "aws_agentcore" | "acpx";
   observeCredentials?: boolean;
   onCredentialsUpdated?: (event: PrpEvent) => Promise<void>;
   onAccountingEvent?: (event: PrpEvent) => Promise<void>;
@@ -1763,6 +1763,7 @@ export interface CapabilityRunnerdCodexTransportOptions extends RunnerExecutionD
   acpxCandidateAdmission?: AcpxCandidateAdmission;
   acpxPermissionMode?: NativeAcpxPermissionMode;
   acpxMode?: string;
+  piRpcThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   piThinkingLevel?: "off" | "low" | "high" | "max";
   claudeEffort?: "low" | "medium" | "high" | "xhigh" | "max";
   grokEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
