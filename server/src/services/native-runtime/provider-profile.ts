@@ -64,6 +64,7 @@ export type PaperclipRunnerProviderProfile =
       backend: "opencode_server";
       model: string;
     }
+  | { provider: "pi_rpc"; backend: "pi_rpc"; model: string }
   | {
       provider: "claude_managed";
       backend: "claude_managed_agents_api";
@@ -103,6 +104,7 @@ export type PaperclipRunnerNativeProviderInput =
       model: string;
       opencodePermissionMode: "allow" | "ask" | "deny";
     }
+  | { provider: "pi_rpc"; model: string; homeMode: "isolated"; piRpcThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" }
   | {
       provider: "claude_managed";
       model: string;
@@ -246,7 +248,7 @@ export function validatePaperclipRunnerGrokConfig(config: Record<string, unknown
 
 /** A task may change a Runner model (and supported effort), but not provider identity. */
 export function projectPaperclipRunnerTaskConfig(
-  backend: "codex_app_server" | "opencode_server" | "acpx_runtime" | "cursor_cloud_api",
+  backend: "codex_app_server" | "opencode_server" | "pi_rpc" | "acpx_runtime" | "cursor_cloud_api",
   agentConfig: unknown,
   taskOverrides: unknown,
   managedModel?: string,
@@ -269,6 +271,7 @@ export function projectPaperclipRunnerTaskConfig(
   }
   if (model !== null) config.model = model;
   if (effortKey !== undefined) config[grok ? "reasoningEffort" : "modelReasoningEffort"] = task[effortKey];
+  if (backend === "pi_rpc" && "piRpcThinkingLevel" in task) config.piRpcThinkingLevel = task.piRpcThinkingLevel;
   return config;
 }
 
@@ -510,6 +513,9 @@ export function resolvePaperclipRunnerProviderProfile(
   try { resolvePaperclipRunnerPiThinkingLevel(candidate, config.acpxAgent, config.piThinkingLevel); } catch (error) {
     throw new PaperclipRunnerProviderProfileError("paperclip_runner_pi_thinking_invalid", error instanceof Error ? error.message : "Invalid Pi thinking level");
   }
+  if (config.piRpcThinkingLevel !== undefined && (candidate !== "pi_rpc" || typeof config.piRpcThinkingLevel !== "string" || !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(config.piRpcThinkingLevel))) {
+    throw new PaperclipRunnerProviderProfileError("paperclip_runner_pi_rpc_thinking_invalid", "piRpcThinkingLevel requires pi_rpc and must be off, minimal, low, medium, high, xhigh, or max.");
+  }
   const model = optionalString(config.model);
   if (candidate === "codex") {
     return {
@@ -531,6 +537,16 @@ export function resolvePaperclipRunnerProviderProfile(
       backend: "opencode_server",
       model,
     };
+  }
+
+  if (candidate === "pi_rpc") {
+    if (!model || !model.includes("/") || model.endsWith("/")) {
+      throw new PaperclipRunnerProviderProfileError("paperclip_runner_pi_rpc_model_invalid", "Paperclip Runner Pi requires an explicit provider/model.");
+    }
+    if (config.homeMode === "preconfigured" || ["opencodePermissionMode", "acpxPermissionMode", "codexPermissionMode"].some(key => config[key] !== undefined)) {
+      throw new PaperclipRunnerProviderProfileError("paperclip_runner_pi_rpc_policy_invalid", "Pi requires a fresh isolated resource home and does not support per-tool permission modes.");
+    }
+    return { provider: "pi_rpc", backend: "pi_rpc", model };
   }
 
   if (candidate === "claude_managed") {
@@ -771,6 +787,10 @@ export function resolvePaperclipRunnerNativeProviderInput(input: {
         config.opencodePermissionMode,
       ) as "allow" | "ask" | "deny",
     };
+  }
+  if (profile.provider === "pi_rpc") {
+    return { provider: "pi_rpc", model: profile.model, homeMode: "isolated",
+      ...(config.piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel: config.piRpcThinkingLevel as Extract<PaperclipRunnerNativeProviderInput, { provider: "pi_rpc" }>["piRpcThinkingLevel"] }) };
   }
   if (profile.provider === "acpx") {
     return {
