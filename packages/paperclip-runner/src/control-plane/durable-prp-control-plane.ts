@@ -4922,6 +4922,12 @@ const runnerExplicitProviderEnvironmentKeys = [
   "AWS_CONTAINER_CREDENTIALS_FULL_URI",
   "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
   "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+  "PAPERCLIP_AI_PROVIDER_PROTOCOL",
+  "PAPERCLIP_AI_PROVIDER_AUTH",
+  "PAPERCLIP_AI_PROVIDER_HEADERS",
+  "PAPERCLIP_PI_RUNTIME_DIR",
+  "PAPERCLIP_PI_RESOURCES_DIR",
+  "PAPERCLIP_PI_THINKING_LEVEL",
   "PAPERCLIP_OPENCODE_PERMISSION_MODE",
   "PAPERCLIP_OPENCODE_RUNTIME_DIR",
   "PAPERCLIP_OPENCODE_PERFORMANCE_DIAGNOSTICS",
@@ -5028,6 +5034,10 @@ export function spawnRunner(options: {
   cursorCloudLaunchProfile?: {
     command: string; commandSha256: string; proxyScript: string; proxyScriptSha256: string;
   };
+  piLaunchProfile?: {
+    command: string; commandSha256: string; proxyScript: string; proxyScriptSha256: string;
+    executable: string; executableSha256: string;
+  };
   opencodeLaunchProfile?: {
     command: string;
     commandSha256: string;
@@ -5125,6 +5135,14 @@ export function spawnRunner(options: {
       "--cursor-cloud-proxy-script", options.cursorCloudLaunchProfile.proxyScript,
       "--cursor-cloud-proxy-script-sha256", options.cursorCloudLaunchProfile.proxyScriptSha256,
     ] : []),
+    ...(options.piLaunchProfile ? [
+      "--pi-proxy-command", options.piLaunchProfile.command,
+      "--pi-proxy-command-sha256", options.piLaunchProfile.commandSha256,
+      "--pi-proxy-script", options.piLaunchProfile.proxyScript,
+      "--pi-proxy-script-sha256", options.piLaunchProfile.proxyScriptSha256,
+      "--pi-executable", options.piLaunchProfile.executable,
+      "--pi-executable-sha256", options.piLaunchProfile.executableSha256,
+    ] : []),
     ...(options.opencodeLaunchProfile
       ? [
           "--opencode-proxy-command",
@@ -5197,7 +5215,7 @@ export function spawnRunner(options: {
           maxOutboxBytes: options.maxOutboxBytes, p0ReserveBytes: options.p0ReserveBytes,
           maxRuntimeMs, maxLifetimeMs: lifetimeDeadline === undefined ? options.maxLifetimeMs : maxRuntimeMs,
           reconnectGraceMs: options.reconnectGraceMs, lifecyclePolicy: options.lifecyclePolicy,
-          acpxLaunchProfile: options.acpxLaunchProfile, opencodeLaunchProfile: options.opencodeLaunchProfile, cursorCloudLaunchProfile: options.cursorCloudLaunchProfile,
+          acpxLaunchProfile: options.acpxLaunchProfile, opencodeLaunchProfile: options.opencodeLaunchProfile, piLaunchProfile: options.piLaunchProfile, cursorCloudLaunchProfile: options.cursorCloudLaunchProfile,
           diagnosticsDirectory: options.diagnosticsDirectory,
         },
       }),
