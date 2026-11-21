@@ -38,6 +38,7 @@ export const PAPERCLIP_RUNNER_ADAPTER_CONFIG_SESSION_INPUTS = {
   acpxSessionMode: kept("Cursor session mode."),
   codexPermissionMode: kept("Codex approval policy, when Codex is the provider; dropped for another provider."),
   opencodePermissionMode: kept("OpenCode tool permissions, when OpenCode is the provider; dropped for another provider."),
+  piRpcThinkingLevel: kept("Pi thinking level; only valid when Pi is the provider (the provider profile refuses it otherwise)."),
   acpxPermissionMode: kept("ACP tool permissions, when ACPX is the provider; dropped for another provider."),
   search: kept("Codex web search, when Codex is the provider; dropped for another provider."),
   lifecycleMode: kept(`${NATIVE_LIFECYCLE} An explicit switch to warm also deliberately starts a new session.`),
