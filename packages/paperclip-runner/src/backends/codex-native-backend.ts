@@ -65,6 +65,7 @@ function transportDriverIdentity(input: NativeExecutionInput): {
     | "cursor_cloud_api"
     | "codex_app_server"
     | "opencode_server"
+    | "pi_rpc"
     | "claude_managed_agents_api"
     | "aws_agentcore_harness_api"
     | "acpx_runtime";
@@ -85,6 +86,12 @@ function transportDriverIdentity(input: NativeExecutionInput): {
         kind: "opencode_server",
         displayName: "OpenCode server",
         version: "1.18.34",
+      };
+    case "pi_rpc":
+      return {
+        kind: "pi_rpc",
+        displayName: "Pi RPC",
+        version: "pi-rpc-v1",
       };
     case "claude_managed":
       return {
