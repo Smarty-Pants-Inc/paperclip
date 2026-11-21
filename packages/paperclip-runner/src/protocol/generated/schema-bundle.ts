@@ -1246,6 +1246,7 @@ export const providerDescriptorSchema = {
       "enum": [
         "codex",
         "opencode",
+        "pi_rpc",
         "claude_managed",
         "aws_agentcore",
         "acpx",
@@ -1259,6 +1260,7 @@ export const providerDescriptorSchema = {
       "enum": [
         "codex_app_server",
         "opencode_server",
+        "pi_rpc",
         "claude_managed_agents_api",
         "aws_agentcore_harness_api",
         "acpx_runtime",
@@ -1458,6 +1460,19 @@ export const providerDescriptorSchema = {
     },
     {
       "oneOf": [
+        {
+          "properties": {
+            "provider": {
+              "const": "pi_rpc"
+            },
+            "driver": {
+              "const": "pi_rpc"
+            },
+            "executionKind": {
+              "const": "local_process"
+            }
+          }
+        },
         {
           "properties": {
             "provider": {
