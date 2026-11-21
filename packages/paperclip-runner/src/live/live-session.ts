@@ -133,8 +133,9 @@ export interface CapabilityLiveSessionConfigSnapshot {
   /** Exact model requested by the caller; omitted only for legacy interactive sessions. */
   requestedModel?: string;
   /** Safe harness identity used by server-side projections and eval metadata. */
-  provider?: "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
-  driver?: "codex_app_server" | "opencode_server" | "claude_managed_agents_api" | "aws_agentcore_harness_api" | "acpx_runtime";
+  provider?: "codex" | "opencode" | "pi_rpc" | "claude_managed" | "aws_agentcore" | "acpx";
+  driver?: "codex_app_server" | "opencode_server" | "pi_rpc" | "claude_managed_agents_api" | "aws_agentcore_harness_api" | "acpx_runtime";
+  piRpcThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   providerVersion?: string | null;
   acpxAgent?: QualifiedAcpxAgent;
   piThinkingLevel?: "off" | "low" | "high" | "max";
@@ -326,7 +327,8 @@ export interface CapabilityLiveSessionSnapshot {
 export interface CreateCapabilityLiveSessionInput {
   seed?: CapabilityFixtureSeed | CapabilityFixtureState;
   workingDirectory?: string;
-  provider?: "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
+  provider?: "codex" | "opencode" | "pi_rpc" | "claude_managed" | "aws_agentcore" | "acpx";
+  piRpcThinkingLevel?: CapabilityLiveSessionConfigSnapshot["piRpcThinkingLevel"];
   acpxAgent?: QualifiedAcpxAgent;
   piThinkingLevel?: "off" | "low" | "high" | "max";
   requestedModel?: string;
@@ -624,6 +626,7 @@ export function assertCapabilityLiveSessionSnapshot(
     persistedProvider !== undefined &&
     persistedProvider !== "codex" &&
     persistedProvider !== "opencode" &&
+    persistedProvider !== "pi_rpc" &&
     persistedProvider !== "claude_managed"
     && persistedProvider !== "aws_agentcore"
     && persistedProvider !== "acpx"
@@ -633,6 +636,7 @@ export function assertCapabilityLiveSessionSnapshot(
   const provider = persistedProvider ?? "codex";
   const expectedDriver = provider === "opencode"
     ? "opencode_server"
+    : provider === "pi_rpc" ? "pi_rpc"
     : provider === "claude_managed" ? "claude_managed_agents_api"
     : provider === "aws_agentcore" ? "aws_agentcore_harness_api"
     : provider === "acpx" ? "acpx_runtime" : "codex_app_server";
@@ -654,6 +658,7 @@ export function assertCapabilityLiveSessionSnapshot(
     throw new Error(`capability_live_checkpoint_corrupt: missing ${provider === "opencode" ? "OpenCode" : provider === "claude_managed" ? "Claude Agent" : provider === "aws_agentcore" ? "AWS AgentCore" : "ACPX"} model`);
   }
   resolvePiThinkingLevel(provider === "acpx" ? String(config.acpxAgent) : "", config.piThinkingLevel);
+  validatePiRpcConfig(provider, config.requestedModel, config.piRpcThinkingLevel);
   if (provider === "acpx") {
     const agent = config.acpxAgent;
     if (agent !== "pi" && agent !== "claude" && agent !== "codex" && agent !== "grok" && agent !== "cursor" && agent !== "copilot") {
@@ -888,6 +893,11 @@ function terminalStatus(value: unknown): CapabilityLiveTurnResult["status"] {
     : "completed";
 }
 
+function validatePiRpcConfig(provider: unknown, model: unknown, value: unknown): void {
+  if (provider === "pi_rpc" && (typeof model !== "string" || !model.trim() || !model.includes("/") || model.endsWith("/"))) throw new Error("Pi requires an explicit provider/model");
+  if (value !== undefined && (provider !== "pi_rpc" || typeof value !== "string" || !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value))) throw new Error("piRpcThinkingLevel requires pi_rpc and a native Pi thinking level");
+}
+
 function pendingInteractions(port: CapabilityMockControlPlaneAdapter): CapabilityFixtureInteraction[] {
   return port.snapshot().interactions.filter((interaction) => interaction.status === "pending");
 }
@@ -908,6 +918,7 @@ export class CapabilityLiveSessionService {
 
   async create(input: CreateCapabilityLiveSessionInput = {}): Promise<CapabilityLiveSession> {
     resolvePiThinkingLevel(input.provider === "acpx" ? input.acpxAgent ?? "codex" : "", input.piThinkingLevel);
+    validatePiRpcConfig(input.provider, input.requestedModel, input.piRpcThinkingLevel);
     if (this.#transportOptions.acpxCandidateAdmission) {
       parseAcpxCandidateAdmission(this.#transportOptions.acpxCandidateAdmission, { companyId: input.companyId ?? "", agent: input.acpxAgent ?? "", model: input.requestedModel ?? "" });
     }
@@ -971,6 +982,7 @@ export class CapabilityLiveSessionService {
         provider: input.provider ?? "codex",
         driver: input.provider === "opencode"
           ? "opencode_server"
+          : input.provider === "pi_rpc" ? "pi_rpc"
           : input.provider === "claude_managed"
             ? "claude_managed_agents_api"
             : input.provider === "aws_agentcore"
@@ -983,6 +995,7 @@ export class CapabilityLiveSessionService {
             : input.provider === "aws_agentcore"
               ? input.agentCoreProfile!.qualificationRevision
           : input.provider === "acpx" ? acpxProfile!.acpxVersion : null,
+        ...(input.piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel: input.piRpcThinkingLevel }),
         ...(acpxProfile === null ? {} : {
           acpxAgent: acpxProfile.agent,
           ...(acpxProfile.agent === "pi" ? { piThinkingLevel: resolvePiThinkingLevel("pi", input.piThinkingLevel) } : {}),
@@ -2386,6 +2399,7 @@ export class CapabilityLiveSession {
     const transportBundle = this.#transportFactory({
       ...this.#transportOptions,
       provider,
+      ...(provider === "pi_rpc" ? { piRpcThinkingLevel: this.#config.piRpcThinkingLevel } : {}),
       ...(provider === "opencode"
         ? {
             // Capability-live sessions expose only governed semantic tools and
