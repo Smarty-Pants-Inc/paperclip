@@ -261,6 +261,7 @@ mod tests {
             runner_digest: "sha256:digest".into(),
             acpx_launch_profile: None,
             opencode_launch_profile: None,
+            pi_launch_profile: None,
             cursor_cloud_launch_profile: None,
             max_outbox_bytes: 1024 * 1024,
             p0_reserve_bytes: 64 * 1024,
