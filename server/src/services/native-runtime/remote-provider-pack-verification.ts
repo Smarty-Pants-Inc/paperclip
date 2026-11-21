@@ -14,7 +14,8 @@ export type ProviderPackIdentity = {
   schema: string;
   digest: string;
   payload: {
-    compatibility?: { opencode: number; acpx: number };
+    compatibility?: { opencode: number; acpx: number; pi_rpc?: number };
+    piRpc?: { version: string; runtime: { path: string; sha256: string }; resources: { path: string; sha256: string } };
     contractDigest?: string;
     acpxProfileDigests?: Record<string, string>;
     providers?: Record<string, unknown>;
@@ -45,7 +46,7 @@ async function withProviderPackCheck<T>(step: "pack" | "opencode", verify: () =>
 }
 
 export type ProviderPackInstallation = { root: string; manifest: unknown; immutable: boolean };
-export type PackProvider = { kind: "opencode" } | { kind: "acpx"; agent: string };
+export type PackProvider = { kind: "opencode" | "pi_rpc" } | { kind: "acpx"; agent: string };
 
 /** Admission of a build-qualified, OS-protected installation. Source revisions,
  * dependency pins and unrelated provider changes are provenance, not an interface.
@@ -85,6 +86,11 @@ function compatibleInstallation<T extends ProviderPackIdentity>(
       throw providerPackIncompatible(`artifact:${name}`, "installed provider pack artifact identity is invalid");
     }
   }
+  if (provider.kind === "pi_rpc" && (!payload.piRpc
+    || canonicalProviderPackJson(payload.piRpc) !== canonicalProviderPackJson(expected.payload.piRpc)
+    || ["piProxy", "piExecutable"].some(name => payload.artifacts[name]?.sha256 !== expected.payload.artifacts[name]?.sha256))) {
+    throw providerPackIncompatible("pi_identity", "installed Pi runtime or resources differ from the selected pack");
+  }
   if (provider.kind === "opencode" && requireCurrentOpenCodeProxy
     && payload.artifacts.opencodeProxy?.sha256 !== expected.payload.artifacts.opencodeProxy?.sha256) {
     throw providerPackIncompatible("opencode_proxy", "installed proxy does not match the requested OpenCode diagnostics");
@@ -120,6 +126,9 @@ export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({
     if (!provider) throw new Error("runner_remote_provider_artifact_incompatible: provider interface is required");
     return compatibleInstallation(installation, manifest, packRoot, provider, requireExactIdentity, requireCurrentOpenCodeProxy);
   }
+  if (provider?.kind === "pi_rpc" && !manifest.payload.piRpc) {
+    throw providerPackIncompatible("pi_missing", "selected pack has no Pi runtime");
+  }
   const expected = Buffer.from(
     canonicalProviderPackJson(manifest),
     "utf8",
@@ -148,6 +157,7 @@ export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({
     "const tree=(treeRoot)=>{try{return walk(treeRoot)}catch{return 'unreadable'}}",
     "for(const name of ['nodeCommand','productionLock','opencodeCommand','opencodeExecutable','opencodeProxy','acpxSidecar','grokLauncher']){const artifact=manifest.payload.artifacts[name];if(hash(artifact.path)!==artifact.sha256)fail('artifact_digest:'+name,name+' digest mismatch')}",
     "if(tree(path.join(root,'dist'))!==manifest.payload.distDigest)fail('dist_digest','dist tree digest mismatch')",
+    "if(manifest.payload.piRpc){const pi=manifest.payload.piRpc;for(const [name,p] of [['runtime','pi-runtime'],['resources','pi-resources']]){const a=pi[name];if(a?.path!==p||!/^sha256:[a-f0-9]{64}$/.test(a.sha256)||tree(path.join(root,p))!==a.sha256)fail('pi_tree:'+name,'Pi tree digest mismatch')}for(const [name,p] of [['piProxy','dist/cli/pi-app-server-proxy.cjs'],['piExecutable','pi-runtime/node_modules/@earendil-works/pi-coding-agent/dist/cli.js']]){const a=manifest.payload.artifacts[name];if(a?.path!==p||hash(p)!==a.sha256)fail('pi_artifact:'+name,'Pi artifact digest mismatch')}let version;try{version=JSON.parse(fs.readFileSync(path.join(root,'pi-runtime/node_modules/@earendil-works/pi-coding-agent/package.json'),'utf8')).version}catch{}if(typeof pi.version!=='string'||!pi.version||version!==pi.version)fail('pi_version','Pi version mismatch')}",
     "for(const candidate of Object.values({...manifest.payload.providers,...manifest.payload.candidateProviders})){if(tree(path.join(root,candidate.path))!==candidate.sha256)fail('candidate_digest','candidate asset tree digest mismatch')}",
     "const version=process.versions.node.split('.').map(Number)",
     "const minimum=manifest.payload.pins.nodeMinimum.split('.').map(Number)",
