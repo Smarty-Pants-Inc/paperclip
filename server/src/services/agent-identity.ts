@@ -84,8 +84,8 @@ export function supportsManagedAgentIdentity(
   if (adapterType === "paperclip_runner") {
     // API-hosted providers have no process environment under our control.
     return persistedDriver
-      ? ["codex", "codex_app_server", "opencode_server", "acpx_runtime"].includes(persistedDriver)
-      : [undefined, "codex", "opencode", "acpx"].includes(config?.provider as string | undefined);
+      ? ["codex", "codex_app_server", "opencode_server", "pi_rpc", "acpx_runtime"].includes(persistedDriver)
+      : [undefined, "codex", "opencode", "pi_rpc", "acpx"].includes(config?.provider as string | undefined);
   }
   return new Set([
     "process", "claude_local", "codex_local", "cursor_cloud",
