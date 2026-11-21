@@ -404,7 +404,7 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
       timedOut: false,
       errorMessage: message,
       errorCode: "paperclip_runner_coordinator_required",
-      provider: ctx.config.provider === "opencode"
+      provider: ctx.config.provider === "pi_rpc" ? "pi_rpc" : ctx.config.provider === "opencode"
         ? "opencode"
         : ctx.config.provider === "claude_managed"
           ? "anthropic"
@@ -438,6 +438,80 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
           message: profileError.message,
         }],
       };
+    }
+    if (profile.provider === "pi_rpc") {
+      const failure = (code: string, message: string): AdapterEnvironmentTestResult => ({
+        adapterType: "paperclip_runner", status: "fail", testedAt: new Date().toISOString(),
+        checks: [{ code: `pi_rpc_hello_probe_${code}`, level: "error", message }],
+      });
+      const target = context.executionTarget;
+      if (target?.kind !== "remote" || target.transport !== "sandbox" || target.runnerTask || !target.runner)
+        return failure("unavailable", "Pi RPC Test requires the selected sandbox command runner; no local, ACPX or OpenCode fallback is used.");
+      const configured = context.config.env;
+      const environment = configured && typeof configured === "object" && !Array.isArray(configured)
+        ? configured as Record<string, unknown> : {};
+      if (typeof environment.PAPERCLIP_AI_PROVIDER_URL !== "string" || !environment.PAPERCLIP_AI_PROVIDER_URL
+        || typeof environment.PAPERCLIP_AI_PROVIDER_KEY !== "string" || !environment.PAPERCLIP_AI_PROVIDER_KEY)
+        return failure("auth_required", "Select the managed AI connection before testing Pi RPC.");
+      try {
+        // Same installer as native execution/Kimi Test: verified staged or
+        // preinstalled pack first, upload only as stock's final fallback.
+        const { prepareRemoteProviderPackOnTarget, resolveRemoteProviderPackSource } = await import("../services/native-runtime/native-session-executor.js");
+        const { posix } = await import("node:path");
+        const selected = resolveRemoteProviderPackSource(process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH);
+        const payload = selected.manifest.payload as typeof selected.manifest.payload & { piRpc?: { version: string }; artifacts: { piExecutable?: { path: string; sha256: string } } };
+        if (payload.target.platform !== "linux" || payload.target.architecture !== "x64" || !payload.piRpc?.version || !payload.artifacts.piExecutable)
+          return failure("unavailable", "The selected provider pack does not admit Pi RPC for this sandbox.");
+        const prepared = await prepareRemoteProviderPackOnTarget({ target, runner: target.runner,
+          configuredProviderPackRoot: selected.configuredRoot, manifest: selected.manifest });
+        const root = prepared.root;
+        const nodePath = payload.artifacts.nodeCommand.path;
+        if (posix.isAbsolute(nodePath) || nodePath.split("/").includes("..") || nodePath.includes("\0"))
+          return failure("unavailable", "The selected provider pack has an invalid Node path.");
+        const env: Record<string, string> = {
+          PAPERCLIP_PI_PACK_ROOT: root, PAPERCLIP_PI_PACK_DIGEST: prepared.manifest.digest,
+          PAPERCLIP_PI_MODEL: profile.model,
+          PAPERCLIP_PI_RESOURCES_DIR: posix.join(root, "pi-resources"),
+          PAPERCLIP_PI_RUNTIME_DIR: posix.join(target.remoteCwd, ".paperclip-runtime", "paperclip-runner", "runner"),
+          ...(typeof context.config.piRpcThinkingLevel === "string" ? { PAPERCLIP_PI_THINKING_LEVEL: context.config.piRpcThinkingLevel } : {}),
+        };
+        for (const key of ["PAPERCLIP_AI_PROVIDER_URL", "PAPERCLIP_AI_PROVIDER_KEY", "PAPERCLIP_AI_PROVIDER_PROTOCOL", "PAPERCLIP_AI_PROVIDER_AUTH", "PAPERCLIP_AI_PROVIDER_HEADERS"])
+          if (typeof environment[key] === "string") env[key] = environment[key];
+        // No shell-profile/ambient auth or command override reaches the probe.
+        // distDigest admits P; stock's Node and Pi artifact identities bind R.
+        const command = `exec /usr/bin/env -i PATH=/usr/bin:/bin ${Object.keys(env).map(key => `${key}="$${key}"`).join(" ")} ${shellQuote(posix.join(root, nodePath))} ${shellQuote(posix.join(root, "dist/cli/pi-probe.cjs"))}`;
+        let probe: Awaited<ReturnType<typeof runAdapterExecutionTargetShellCommand>>;
+        try {
+          probe = await runAdapterExecutionTargetShellCommand(`pi-rpc-hello-${crypto.randomUUID()}`, target, command,
+            { cwd: target.remoteCwd, env, timeoutSec: 60, graceSec: 3 });
+        } catch {
+          // Transport loss is not retirement. Preserve stock's managed-probe
+          // cleanup ownership rather than returning an apparently clean fail.
+          const error = new Error("Pi probe transport lost; sandbox probe retirement remains unconfirmed.");
+          const retired = Promise.reject<void>(error); void retired.catch(() => {});
+          throw new NativeEnvironmentProbeCleanupError(retired, error, [error]);
+        }
+        if (probe.timedOut || probe.signal || probe.exitCode === null || probe.exitCode === 2) {
+          const error = new Error("Pi probe shutdown is unconfirmed; retain sandbox cleanup ownership. This shell probe has no runnerd lineage coverage.");
+          const retired = Promise.reject<void>(error); void retired.catch(() => {});
+          throw new NativeEnvironmentProbeCleanupError(retired, error, [error]);
+        }
+        if (probe.exitCode !== 0 || Buffer.byteLength(probe.stdout) > 64 * 1024)
+          return failure("failed", "Pi did not produce an exact settled hello with clean shutdown; the Test did not pass.");
+        const result: unknown = JSON.parse(probe.stdout.trim());
+        const answer = result && typeof result === "object" ? result as Record<string, unknown> : {};
+        if (answer.ok !== true || answer.answer !== "READY" || answer.piVersion !== payload.piRpc.version
+          || answer.packDigest !== prepared.manifest.digest || typeof answer.elapsedMs !== "number"
+          || !Number.isFinite(answer.elapsedMs) || answer.elapsedMs < 0 || answer.elapsedMs > 60_000)
+          return failure("unexpected_output", "Pi returned an invalid hello or release/cleanup result; the Test did not pass.");
+        return { adapterType: "paperclip_runner", status: "pass", testedAt: new Date().toISOString(), checks: [{
+          code: "pi_rpc_hello_probe_passed", level: "info",
+          message: `Pi ${answer.piVersion}; pack ${answer.packDigest}; model ${profile.model}; resources ${env.PAPERCLIP_PI_RESOURCES_DIR}. Exact READY, agent_settled and clean EOF shutdown; model tools disabled. No runnerd tool-retirement claim.`,
+        }] };
+      } catch (error) {
+        if (error instanceof NativeEnvironmentProbeCleanupError) throw error;
+        return failure("failed", "The selected Pi pack, resources or hello could not be verified in this sandbox. No fallback was attempted.");
+      }
     }
     if (profile.provider !== "cursor_cloud" && context.executionTarget?.kind === "remote" && context.executionTarget.transport === "sandbox" && context.executionTarget.runnerTask) {
       // Managed connections probe through testManagedEnvironment. This path has
@@ -634,6 +708,7 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
   getRuntimeCommandSpec: (config) => config.provider === "claude_managed"
     || config.provider === "aws_agentcore"
     || config.provider === "acpx"
+    || config.provider === "pi_rpc"
     || config.provider === "cursor_cloud"
     ? { command: "paperclip-runnerd", detectCommand: null, installCommand: null }
     : config.provider === "opencode"
@@ -644,7 +719,7 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
         )
       : buildNpmRuntimeCommandSpec(config, "codex", "@openai/codex@0.170.0"),
   agentConfigurationDoc:
-    "# Paperclip Runner\n\nAdapter: paperclip_runner\n\nRuns Codex, OpenCode, Claude Managed, AWS AgentCore, or ACPX Claude/Grok Build/Cursor/Pi through the Rust Paperclip runner and authenticated PRP transport. Pi accepts an explicit provider/model ID and uses the company credentials bound to the agent environment. GitHub Copilot requires a saved GitHub token and an explicitly selected available model. Managed providers use company-scoped qualified profiles, explicit retention acknowledgement, and spend limits. A board operator creates each Claude Managed (Anthropic managed agent) profile through POST /api/companies/{companyId}/managed-agent-profiles; agent credentials cannot create, qualify or list one.\n",
+    "# Paperclip Runner\n\nAdapter: paperclip_runner\n\nRuns Codex, OpenCode, native Pi RPC, Claude Managed, AWS AgentCore, or ACPX Claude/Grok Build/Cursor/Pi through the Rust Paperclip runner and authenticated PRP transport. Pi accepts an explicit provider/model ID and uses the company credentials bound to the agent environment. GitHub Copilot requires a saved GitHub token and an explicitly selected available model. Managed providers use company-scoped qualified profiles, explicit retention acknowledgement, and spend limits. A board operator creates each Claude Managed (Anthropic managed agent) profile through POST /api/companies/{companyId}/managed-agent-profiles; agent credentials cannot create, qualify or list one.\n",
   getConfigSchema: () => ({
     fields: [
       {
@@ -655,6 +730,7 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
         options: [
           { value: "codex", label: "Codex" },
           { value: "opencode", label: `OpenCode ${QUALIFIED_OPENCODE_RUNNER_VERSION}` },
+          { value: "pi_rpc", label: "Pi RPC" },
           { value: "claude_managed", label: "Claude Managed" },
           { value: "aws_agentcore", label: "AWS AgentCore" },
           { value: "acpx", label: "ACP agents" },
@@ -701,6 +777,11 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
         meta: { visibleWhen: { key: "provider", value: "opencode" } },
       },
       {
+        key: "piRpcThinkingLevel", label: "Pi thinking level", type: "select" as const,
+        options: ["off", "minimal", "low", "medium", "high", "xhigh", "max"].map(value => ({ value, label: value })),
+        meta: { visibleWhen: { key: "provider", value: "pi_rpc" } },
+      },
+      {
         key: "acpxSessionMode",
         label: "Cursor mode",
         type: "select" as const,
@@ -730,8 +811,8 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
         type: "text" as const,
         default: "",
         placeholder: DEFAULT_OPENCODE_RUNNER_MODEL,
-        hint: "OpenCode uses provider/model form. ACPX Claude accepts Claude model IDs, including custom IDs.",
-        meta: { visibleWhen: { key: "provider", value: "opencode" } },
+        hint: "OpenCode and Pi RPC use explicit provider/model form. ACPX Claude accepts Claude model IDs, including custom IDs.",
+        meta: { visibleWhen: { key: "provider", values: ["opencode", "pi_rpc"] } },
       },
       {
         key: "managedProfileId",
