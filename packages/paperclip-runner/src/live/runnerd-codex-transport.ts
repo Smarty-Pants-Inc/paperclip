@@ -1827,6 +1827,12 @@ export interface CapabilityRunnerdCodexTransportOptions extends RunnerExecutionD
   /** SHA-256 verified by the provider-pack authority before runner startup. */
   opencodeProxySha256?: string;
   opencodeRuntimeDirectory?: string;
+  piCommand?: string;
+  piCommandSha256?: string;
+  piProxyPath?: string;
+  piProxySha256?: string;
+  piRuntimeDirectory?: string;
+  piResourcesDirectory?: string;
   environment?: NodeJS.ProcessEnv;
   /** Provider system instructions supplied by a native execution caller. */
   baseInstructions?: string;
@@ -3834,6 +3840,17 @@ function opencodeRunnerLaunchProfile(
   };
 }
 
+function piRunnerLaunchProfile(options: CapabilityRunnerdCodexTransportOptions) {
+  const paths = [options.providerNodeCommand, options.piProxyPath, options.piCommand];
+  const digests = [options.providerNodeCommandSha256, options.piProxySha256, options.piCommandSha256];
+  if (paths.some(path => !path?.startsWith("/") || path.startsWith("/Users/") || path.includes("\0"))
+    || digests.some(digest => !/^sha256:[a-f0-9]{64}$/.test(digest ?? ""))) {
+    throw new Error("runner_remote_provider_artifact_incompatible: Pi requires its pack's absolute Node, proxy, CLI and three verified digests");
+  }
+  return { command: paths[0]!, commandSha256: digests[0]!, proxyScript: paths[1]!,
+    proxyScriptSha256: digests[1]!, executable: paths[2]!, executableSha256: digests[2]! };
+}
+
 function resolveRunnerOpenCodeExecutable(options: RunnerdCodexTransportOptions): string {
   if (options.opencodeCommand !== undefined) return options.opencodeCommand;
   if (options.runnerFilesystemRoot) {
@@ -3937,6 +3954,12 @@ function createCapabilityRunnerdProviderEnvironmentBase(input: {
       selected[name] = env[name];
     }
     return selected;
+  }
+  if (input.provider === "pi_rpc") {
+    return { ...createSanitizedPiRunnerEnvironment(input.options.environment), ...commonIdentity,
+      PAPERCLIP_PI_RUNTIME_DIR: input.options.piRuntimeDirectory ?? input.options.stateDirectory,
+      PAPERCLIP_PI_RESOURCES_DIR: input.options.piResourcesDirectory,
+      ...(input.options.piRpcThinkingLevel === undefined ? {} : { PAPERCLIP_PI_THINKING_LEVEL: input.options.piRpcThinkingLevel }) };
   }
   if (input.provider === "opencode") {
     return {
@@ -4066,6 +4089,19 @@ function createSanitizedOpenCodeRunnerEnvironment(
           /^LC_[A-Z0-9_]{1,32}$/.test(key)),
     ),
   ) };
+}
+
+function createSanitizedPiRunnerEnvironment(source: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv {
+  const candidate = { ...process.env, ...source };
+  return { ...configuredEnvironment(source), ...githubCredentialEnvironment(source ?? {}),
+    ...Object.fromEntries(Object.entries(candidate).filter(([key, value]) => typeof value === "string"
+      && !key.startsWith("PAPERCLIP_") && key !== "OPENROUTER_API_KEY"
+      && (OPEN_CODE_RUNNER_ENVIRONMENT_KEYS.has(key) || /^LC_[A-Z0-9_]{1,32}$/.test(key)))),
+    ...Object.fromEntries(["PAPERCLIP_AI_PROVIDER_URL", "PAPERCLIP_AI_PROVIDER_KEY",
+      "PAPERCLIP_AI_PROVIDER_PROTOCOL", "PAPERCLIP_AI_PROVIDER_AUTH", "PAPERCLIP_AI_PROVIDER_HEADERS",
+      "PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY"]
+      .flatMap(key => source?.[key] === undefined ? [] : [[key, source[key]]])),
+  };
 }
 
 export function resolveSourceCodexHome(
@@ -4477,6 +4513,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
               options.environment,
               options.acpxAgent ?? "codex",
             ).env
+          : options.provider === "pi_rpc" ? createSanitizedPiRunnerEnvironment(options.environment)
           : options.provider === "opencode"
             ? createSanitizedOpenCodeRunnerEnvironment(options.environment)
             : options.provider === "claude_managed"
@@ -6325,7 +6362,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           authorizedTools: this.#authorizedTools,
           ...(completionContract.revision && Array.isArray(completionContract.criterionIds) ? { completionContract } : {}),
           provider: prepared.provider },
-        runnerAcpxLaunchProfile: undefined, runnerOpenCodeLaunchProfile: undefined,
+        runnerAcpxLaunchProfile: undefined, runnerOpenCodeLaunchProfile: undefined, runnerPiLaunchProfile: undefined,
         environment: {},
       };
     }
@@ -6414,6 +6451,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             identity,
           )
         : undefined;
+    const runnerPiLaunchProfile = provider === "pi_rpc" ? piRunnerLaunchProfile(this.options) : undefined;
     const runnerOpenCodeLaunchProfile =
       provider === "opencode"
         ? opencodeRunnerLaunchProfile(
@@ -6486,10 +6524,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       ), {
         options: this.options, root: this.#root, cwd: String(params.cwd ?? tmpdir()),
         codexHome, providerNodeCommand, codexCommand: effectiveCodexCommand,
-        opencodeProxyPath, acpxSidecarPath, cursorCloudProxyPath,
+        opencodeProxyPath, piProxyPath: this.options.piProxyPath, acpxSidecarPath, cursorCloudProxyPath,
       }),
     };
-    return { runAttachTemplate, runnerAcpxLaunchProfile, runnerOpenCodeLaunchProfile, runnerCursorCloudLaunchProfile,
+    return { runAttachTemplate, runnerAcpxLaunchProfile, runnerOpenCodeLaunchProfile, runnerPiLaunchProfile, runnerCursorCloudLaunchProfile,
       environment: withRunnerdProviderTrace(
         createCapabilityRunnerdProviderEnvironment({
           provider,
@@ -6702,6 +6740,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       runnerDigest: runnerArtifact.digest,
       acpxLaunchProfile: prepared.runnerAcpxLaunchProfile,
       opencodeLaunchProfile: prepared.runnerOpenCodeLaunchProfile,
+      piLaunchProfile: prepared.runnerPiLaunchProfile,
       cursorCloudLaunchProfile: prepared.runnerCursorCloudLaunchProfile,
       environment: prepared.environment,
       diagnosticsDirectory: resolve(this.#root, "diagnostics"),
@@ -7168,6 +7207,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             opencodeExecutable!,
           )
         : undefined;
+    const runnerPiLaunchProfile = provider === "pi_rpc" && preparesProviderLaunch
+      ? piRunnerLaunchProfile(this.options) : undefined;
     const authorityRunId = this.#authorityRunId;
     this.#captureRetainedSourceIdentity();
     const core = new DurablePrpControlPlane({
@@ -7570,6 +7611,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           runnerDigest: runnerArtifact.digest,
           acpxLaunchProfile: runnerAcpxLaunchProfile,
           opencodeLaunchProfile: runnerOpenCodeLaunchProfile,
+          piLaunchProfile: runnerPiLaunchProfile,
           cursorCloudLaunchProfile: runnerCursorCloudLaunchProfile,
           environment: this.options.prepareLaunch ? {} : withRunnerdProviderTrace(
             createCapabilityRunnerdProviderEnvironment({
