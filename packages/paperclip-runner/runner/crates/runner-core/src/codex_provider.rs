@@ -12,7 +12,9 @@ use sha2::{Digest, Sha256};
 
 #[cfg(test)]
 use crate::durable::QualifiedLaunchArtifact;
-use crate::durable::{redact_text, CursorCloudLaunchProfile, OpenCodeLaunchProfile};
+use crate::durable::{
+    redact_text, CursorCloudLaunchProfile, OpenCodeLaunchProfile, PiLaunchProfile,
+};
 use crate::local_runner::LocalRunnerError;
 use crate::process_supervisor::{
     is_node_interpreter, BoundedLogBuffer, ProcessExitFact, ProcessOutput, SupervisedProcess,
@@ -101,6 +103,23 @@ const OPENCODE_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
     "PAPERCLIP_OPENCODE_PERMISSION_MODE",
     "PAPERCLIP_OPENCODE_RUNTIME_DIR",
     "PAPERCLIP_OPENCODE_PERFORMANCE_DIAGNOSTICS",
+    "PAPERCLIP_RUNNER_INSTANCE_ID",
+    "PAPERCLIP_RUN_ID",
+    "PAPERCLIP_NORMALIZED_SESSION_ID",
+    "PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH",
+];
+const PI_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
+    "PAPERCLIP_PI_RUNTIME_DIR",
+    "PAPERCLIP_PI_RESOURCES_DIR",
+    "PAPERCLIP_PI_THINKING_LEVEL",
+    "PAPERCLIP_AI_PROVIDER_URL",
+    "PAPERCLIP_AI_PROVIDER_KEY",
+    "PAPERCLIP_AI_PROVIDER_PROTOCOL",
+    "PAPERCLIP_AI_PROVIDER_AUTH",
+    "PAPERCLIP_AI_PROVIDER_HEADERS",
+    "PAPERCLIP_AGENT_KEY_ID",
+    "PAPERCLIP_AGENT_PUBLIC_KEY",
+    "PAPERCLIP_AGENT_PRIVATE_KEY",
     "PAPERCLIP_RUNNER_INSTANCE_ID",
     "PAPERCLIP_RUN_ID",
     "PAPERCLIP_NORMALIZED_SESSION_ID",
@@ -587,10 +606,11 @@ impl CodexProviderConfig {
             (self.provider.as_str(), self.driver.as_str()),
             ("codex", "codex_app_server")
                 | ("opencode", "opencode_server")
+                | ("pi_rpc", "pi_rpc")
                 | ("cursor_cloud", "cursor_cloud_api")
         ) {
             return Err(LocalRunnerError::invalid(
-                "runner facade provider/driver pair must be codex/codex_app_server, opencode/opencode_server, or cursor_cloud/cursor_cloud_api",
+                "runner facade provider/driver pair must be codex/codex_app_server, opencode/opencode_server, pi_rpc/pi_rpc, or cursor_cloud/cursor_cloud_api",
             ));
         }
         if self.provider_version.trim().is_empty() || self.provider_version.len() > 120 {
@@ -602,6 +622,20 @@ impl CodexProviderConfig {
             return Err(LocalRunnerError::invalid(format!(
                 "OpenCode providerVersion must equal the qualified {QUALIFIED_OPENCODE_VERSION} release",
             )));
+        }
+        if self.provider == "pi_rpc"
+            && (self.provider_version != "pi-rpc-v1"
+                || self.read_only
+                || self.model.as_deref().is_none_or(|model| {
+                    model.chars().any(char::is_control)
+                        || model.split_once('/').is_none_or(|(provider, id)| {
+                            provider.trim().is_empty() || id.trim().is_empty()
+                        })
+                }))
+        {
+            return Err(LocalRunnerError::invalid(
+                "Pi RPC requires pi-rpc-v1, an explicit provider/model and sandbox-owned permissions",
+            ));
         }
         if self.provider == "cursor_cloud"
             && (self.provider_version != CURSOR_CLOUD_PROXY_VERSION
@@ -875,6 +909,7 @@ pub struct CodexProvider {
     #[cfg(test)]
     pub(crate) interpretation_observer: Option<Box<dyn FnMut(&[String]) + Send>>,
     opencode_launch_profile: Option<OpenCodeLaunchProfile>,
+    pi_launch_profile: Option<PiLaunchProfile>,
     cursor_cloud_launch_profile: Option<CursorCloudLaunchProfile>,
     provider_termination_receipt: Option<Value>,
     completion_contract: Option<ProviderCompletionContract>,
@@ -1085,6 +1120,7 @@ impl CodexProvider {
             resume_thread_id,
             process_generation,
             opencode_launch_profile,
+            None,
             cursor_cloud_launch_profile,
             completion_contract,
             &mut |_| Ok(()),
@@ -1097,6 +1133,7 @@ impl CodexProvider {
         resume_thread_id: Option<&str>,
         process_generation: u64,
         opencode_launch_profile: Option<&OpenCodeLaunchProfile>,
+        pi_launch_profile: Option<&PiLaunchProfile>,
         cursor_cloud_launch_profile: Option<&CursorCloudLaunchProfile>,
         completion_contract: Option<(&str, &[String])>,
         observe: &mut dyn FnMut(ProviderStartupObservation) -> Result<(), LocalRunnerError>,
@@ -1146,6 +1183,7 @@ impl CodexProvider {
         ];
         let provider_environment_keys = match config.provider.as_str() {
             "opencode" => OPENCODE_PROVIDER_ENVIRONMENT_KEYS,
+            "pi_rpc" => PI_PROVIDER_ENVIRONMENT_KEYS,
             "cursor_cloud" => CURSOR_CLOUD_PROVIDER_ENVIRONMENT_KEYS,
             _ => CODEX_PROVIDER_ENVIRONMENT_KEYS,
         };
@@ -1192,6 +1230,10 @@ impl CodexProvider {
                 launch_args.splice(position..position, extra);
             }
         }
+        // Pi's checked startup (including thinking policy) gets 25s, below
+        // the outer 30s request bound, not OpenCode's 10s health deadline.
+        let startup_deadline = (config.provider == "pi_rpc")
+            .then(|| std::time::Instant::now() + Duration::from_secs(25));
         let spawn = (|| {
             if config.provider == "cursor_cloud" {
                 let profile = cursor_cloud_launch_profile.ok_or_else(|| {
@@ -1208,6 +1250,28 @@ impl CodexProvider {
                     ));
                 }
                 let launch = verified_cursor_cloud_launch(profile)?;
+                observe(ProviderStartupObservation::SpawnStarting)?;
+                SupervisedProcess::spawn_verified_with_environment_keys(
+                    &launch,
+                    Duration::from_secs(2),
+                    CODEX_APP_SERVER_MAX_FRAME_BYTES,
+                    &environment_keys,
+                )
+            } else if config.provider == "pi_rpc" {
+                let profile = pi_launch_profile.ok_or_else(|| {
+                    LocalRunnerError::invalid(
+                        "Pi runner startup omitted its qualified launch profile",
+                    )
+                })?;
+                let proxy_script = profile.proxy_script.path.to_string_lossy();
+                if config.command != profile.command.path
+                    || config.args.as_slice() != [proxy_script.as_ref()]
+                {
+                    return Err(LocalRunnerError::invalid(
+                        "Pi launch does not match the runner-owned qualified profile",
+                    ));
+                }
+                let launch = verified_pi_launch(profile)?;
                 observe(ProviderStartupObservation::SpawnStarting)?;
                 SupervisedProcess::spawn_verified_with_environment_keys(
                     &launch,
@@ -1319,6 +1383,7 @@ impl CodexProvider {
             #[cfg(test)]
             interpretation_observer: None,
             opencode_launch_profile: opencode_launch_profile.cloned(),
+            pi_launch_profile: pi_launch_profile.cloned(),
             cursor_cloud_launch_profile: cursor_cloud_launch_profile.cloned(),
             provider_termination_receipt: None,
             completion_contract: completion_contract.map(|(revision, criterion_ids)| {
@@ -1334,20 +1399,23 @@ impl CodexProvider {
         };
         let mut stage = ProviderStartupStage::Initialize;
         let initialized_result = (|| -> Result<(), LocalRunnerError> {
-            let initialized = provider.request(
-                "initialize",
-                json!({
-                    "clientInfo": {
-                        "name": "paperclip-runnerd",
-                        "title": "Paperclip Runner",
-                        "version": "1",
-                    },
-                    "capabilities": {
-                        "experimentalApi": true,
-                        "requestAttestation": false,
-                    },
-                }),
-            )?;
+            let initialized = provider
+                .request_classified_until(
+                    "initialize",
+                    json!({
+                        "clientInfo": {
+                            "name": "paperclip-runnerd",
+                            "title": "Paperclip Runner",
+                            "version": "1",
+                        },
+                        "capabilities": {
+                            "experimentalApi": true,
+                            "requestAttestation": false,
+                        },
+                    }),
+                    startup_deadline,
+                )
+                .map_err(ProviderRequestError::into_inner)?;
             provider.send_frame(&json!({"method": "initialized"}))?;
 
             let mut params = json!({
@@ -1382,7 +1450,10 @@ impl CodexProvider {
             } else {
                 params_object.insert("permissions".to_owned(), json!(provider.permission_profile));
             }
-            if matches!(config.provider.as_str(), "opencode" | "cursor_cloud") {
+            if matches!(
+                config.provider.as_str(),
+                "opencode" | "pi_rpc" | "cursor_cloud"
+            ) {
                 if let Some(mode) = &config.conversation_mode {
                     params_object.insert("conversationMode".to_owned(), json!(mode));
                 }
@@ -1410,7 +1481,9 @@ impl CodexProvider {
                 "thread/start"
             };
             stage = ProviderStartupStage::ThreadOpen;
-            let opened = provider.request(method, params)?;
+            let opened = provider
+                .request_classified_until(method, params, startup_deadline)
+                .map_err(ProviderRequestError::into_inner)?;
             provider.thread_id = opened
                 .pointer("/thread/id")
                 .or_else(|| opened.get("threadId"))
@@ -1898,6 +1971,7 @@ impl CodexProvider {
             Some(&thread_id),
             next_generation,
             self.opencode_launch_profile.as_ref(),
+            self.pi_launch_profile.as_ref(),
             self.cursor_cloud_launch_profile.as_ref(),
             completion_contract.as_ref().map(|contract| {
                 (
@@ -2161,7 +2235,7 @@ impl CodexProvider {
             .expect("Codex turn parameters are an object");
         // The retained proxy's launch environment belongs to its first run.
         // Only runnerd's rotated authority supplies the current run identity.
-        if self.config.provider == "opencode" {
+        if matches!(self.config.provider.as_str(), "opencode" | "pi_rpc") {
             for (key, value) in
                 opencode_turn_identity_params(run_id, self.completion_contract.as_ref())
             {
@@ -4183,6 +4257,37 @@ fn verified_opencode_launch(
     Ok(VerifiedProcessLaunch::new(command, args))
 }
 
+fn verified_pi_launch(
+    profile: &PiLaunchProfile,
+) -> Result<VerifiedProcessLaunch, LocalRunnerError> {
+    if !is_node_interpreter(&profile.command.path) || !profile.executable.path.is_absolute() {
+        return Err(LocalRunnerError::invalid(
+            "Pi requires the pack's Node and absolute installed CLI entry",
+        ));
+    }
+    let command = verify_launch_artifact(&profile.command, "Pi proxy Node")
+        .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
+    let proxy = verify_launch_artifact(&profile.proxy_script, "Pi proxy bundle")
+        .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
+    let executable = verify_launch_artifact(&profile.executable, "Pi CLI entry")
+        .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
+    // The descriptor authenticates the CLI bytes; its installed canonical path
+    // preserves relative ESM imports. Pack admission binds the complete tree.
+    let entry = fs::canonicalize(&profile.executable.path)
+        .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
+    Ok(VerifiedProcessLaunch::new(
+        command,
+        vec![
+            VerifiedProcessArgument::CommonJsArtifact(proxy),
+            VerifiedProcessArgument::Literal("--paperclip-trusted-pi-executable".to_owned()),
+            VerifiedProcessArgument::Artifact(executable),
+            VerifiedProcessArgument::Literal("--paperclip-pi-cli-entry".to_owned()),
+            VerifiedProcessArgument::Literal(entry.to_string_lossy().into_owned()),
+        ],
+    )
+    .with_inherited_runtime_executable())
+}
+
 fn verified_cursor_cloud_launch(
     profile: &CursorCloudLaunchProfile,
 ) -> Result<VerifiedProcessLaunch, LocalRunnerError> {
@@ -6034,6 +6139,7 @@ done
             [],
             None,
             1,
+            None,
             None,
             None,
             None,
