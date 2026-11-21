@@ -2023,6 +2023,7 @@ pub struct CodexCommandExecutor {
     restore_checked: bool,
     restore_error: Option<DurableRunnerError>,
     opencode_launch_profile: Option<OpenCodeLaunchProfile>,
+    pi_launch_profile: Option<crate::durable::PiLaunchProfile>,
     cursor_cloud_launch_profile: Option<CursorCloudLaunchProfile>,
     startup_command: Option<ProviderStartupCommand>,
     startup_evidence_error: Option<DurableRunnerError>,
@@ -2044,6 +2045,7 @@ impl CodexCommandExecutor {
             restore_checked: false,
             restore_error: None,
             opencode_launch_profile: None,
+            pi_launch_profile: None,
             cursor_cloud_launch_profile: None,
             startup_command: None,
             startup_evidence_error: None,
@@ -2060,6 +2062,7 @@ impl CodexCommandExecutor {
         let mut executor = Self::new(state_dir);
         executor.event_identity = Some(ProviderEventIdentity::from_config(config));
         executor.opencode_launch_profile = config.opencode_launch_profile.clone();
+        executor.pi_launch_profile = config.pi_launch_profile.clone();
         executor.cursor_cloud_launch_profile = config.cursor_cloud_launch_profile.clone();
         executor
     }
@@ -2345,6 +2348,7 @@ impl CodexCommandExecutor {
             .clone()
             .ok_or_else(|| DurableRunnerError::invalid("provider startup state missing"))?;
         let profile = self.opencode_launch_profile.clone();
+        let pi_profile = self.pi_launch_profile.clone();
         let cursor_cloud_profile = self.cursor_cloud_launch_profile.clone();
         if state.config.provider == "codex" {
             let args = &mut state.config.args;
@@ -2363,6 +2367,7 @@ impl CodexCommandExecutor {
             state.thread_id.as_deref(),
             generation,
             profile.as_ref(),
+            pi_profile.as_ref(),
             cursor_cloud_profile.as_ref(),
             state.completion_contract.as_ref().map(|contract| {
                 (
