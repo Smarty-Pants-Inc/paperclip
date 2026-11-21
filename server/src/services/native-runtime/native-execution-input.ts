@@ -96,7 +96,7 @@ export interface BuildNativeExecutionInput {
     branchName: string | null;
   };
   normalizedSessionId: string | null;
-  provider?: "cursor_cloud" | "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx" | "openai_dot" | "grok_bot" | "muse";
+  provider?: "cursor_cloud" | "codex" | "opencode" | "pi_rpc" | "claude_managed" | "aws_agentcore" | "acpx" | "openai_dot" | "grok_bot" | "muse";
   museBinding?: MuseBindingSnapshot;
   dotBinding?: DotBindingSnapshot;
   acpxAgent?: NativeAcpxAgent;
@@ -105,6 +105,7 @@ export interface BuildNativeExecutionInput {
   codexReasoningEffort?: string;
   codexWebSearch?: "disabled";
   opencodePermissionMode?: NativeOpenCodePermissionMode;
+  piRpcThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   acpxPermissionMode?: NativeAcpxPermissionMode;
   acpxSessionMode?: "agent" | "plan" | "ask";
   piThinkingLevel?: "off" | "low" | "high" | "max";
@@ -312,6 +313,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
       normalizedSessionId: input.normalizedSessionId,
       driverKind: input.provider === "cursor_cloud" ? "cursor_cloud_api" : input.provider === "opencode"
         ? "opencode_server"
+        : input.provider === "pi_rpc" ? "pi_rpc"
         : input.provider === "claude_managed"
           ? "claude_managed_agents_api"
           : input.provider === "aws_agentcore"
@@ -361,6 +363,9 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
             commandDigest: acpxProfile!.commandDigest,
           },
         }
+      : input.provider === "pi_rpc"
+        ? { kind: "pi_rpc", model: input.model,
+            ...(input.piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel: input.piRpcThinkingLevel }) }
       : input.provider === "opencode"
         ? {
             kind: "opencode",
