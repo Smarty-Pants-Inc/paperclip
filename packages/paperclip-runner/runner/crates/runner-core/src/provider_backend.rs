@@ -497,6 +497,7 @@ fn local_process_definitely_gone(_id: u32, _group: bool) -> bool {
 fn facade_provider_name(provider: &str) -> &'static str {
     match provider {
         "opencode" => "OpenCode",
+        "pi_rpc" => "Pi",
         "cursor_cloud" => "Cursor Cloud",
         _ => "Codex",
     }
@@ -506,7 +507,10 @@ fn validate_proxy_run_result(
     state: &CodexProviderState,
     params: &Value,
 ) -> Result<(Value, String, String), DurableRunnerError> {
-    if !matches!(state.config.provider.as_str(), "opencode" | "cursor_cloud") {
+    if !matches!(
+        state.config.provider.as_str(),
+        "opencode" | "pi_rpc" | "cursor_cloud"
+    ) {
         return Err(DurableRunnerError::invalid(
             "paperclip/runResult is reserved for verified provider proxies",
         ));
@@ -1283,6 +1287,8 @@ struct CodexProviderState {
     config: CodexProviderConfig,
     #[serde(default)]
     opencode_launch_profile_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pi_launch_profile_digest: Option<String>,
     /// SHA-256 of the qualified OpenCode executable: the upstream release that
     /// owns the saved conversation. The launch-profile digest also covers the
     /// controller's Node command and proxy bundle, which a rebuild or deploy
@@ -1415,6 +1421,7 @@ impl CodexProviderState {
             lifecycle: "prepared".to_owned(),
             config,
             opencode_launch_profile_digest: None,
+            pi_launch_profile_digest: None,
             opencode_release_digest: None,
             cursor_cloud_launch_profile_digest: None,
             provider_termination_receipt: None,
@@ -1722,7 +1729,7 @@ impl CodexProviderState {
                     !matches!(disposition, "done" | "blocked" | "needs_review" | "yielded")
                         || !matches!(
                             self.config.provider.as_str(),
-                            "codex" | "opencode" | "cursor_cloud"
+                            "codex" | "opencode" | "pi_rpc" | "cursor_cloud"
                         )
                 })
             || (matches!(
@@ -2023,6 +2030,7 @@ pub struct CodexCommandExecutor {
     restore_checked: bool,
     restore_error: Option<DurableRunnerError>,
     opencode_launch_profile: Option<OpenCodeLaunchProfile>,
+    pi_launch_profile: Option<crate::durable::PiLaunchProfile>,
     cursor_cloud_launch_profile: Option<CursorCloudLaunchProfile>,
     startup_command: Option<ProviderStartupCommand>,
     startup_evidence_error: Option<DurableRunnerError>,
@@ -2044,6 +2052,7 @@ impl CodexCommandExecutor {
             restore_checked: false,
             restore_error: None,
             opencode_launch_profile: None,
+            pi_launch_profile: None,
             cursor_cloud_launch_profile: None,
             startup_command: None,
             startup_evidence_error: None,
@@ -2060,6 +2069,7 @@ impl CodexCommandExecutor {
         let mut executor = Self::new(state_dir);
         executor.event_identity = Some(ProviderEventIdentity::from_config(config));
         executor.opencode_launch_profile = config.opencode_launch_profile.clone();
+        executor.pi_launch_profile = config.pi_launch_profile.clone();
         executor.cursor_cloud_launch_profile = config.cursor_cloud_launch_profile.clone();
         executor
     }
@@ -2118,6 +2128,37 @@ impl CodexCommandExecutor {
         }
         let mut digest = Sha256::new();
         digest.update(b"paperclip.runner.opencode-launch-profile.v1\0");
+        for artifact in [&profile.command, &profile.proxy_script, &profile.executable] {
+            digest.update(artifact.path.to_string_lossy().as_bytes());
+            digest.update(b"\0");
+            digest.update(artifact.sha256.as_bytes());
+            digest.update(b"\0");
+        }
+        Ok(Some(format!("sha256:{:x}", digest.finalize())))
+    }
+
+    fn bind_pi_launch_profile(
+        &self,
+        config: &CodexProviderConfig,
+    ) -> Result<Option<String>, DurableRunnerError> {
+        if config.provider != "pi_rpc" {
+            return Ok(None);
+        }
+        let profile = self.pi_launch_profile.as_ref().ok_or_else(|| {
+            DurableRunnerError::invalid("Pi runner startup omitted its qualified launch profile")
+                .with_classification(PROVIDER_STATE_INCOMPATIBLE)
+        })?;
+        let proxy_script = profile.proxy_script.path.to_string_lossy();
+        if config.command != profile.command.path
+            || config.args.as_slice() != [proxy_script.as_ref()]
+        {
+            return Err(DurableRunnerError::invalid(
+                "Pi run.prepare launch does not match the runner-owned qualified profile",
+            )
+            .with_classification(PROVIDER_STATE_INCOMPATIBLE));
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"paperclip.runner.pi-launch-profile.v1\0");
         for artifact in [&profile.command, &profile.proxy_script, &profile.executable] {
             digest.update(artifact.path.to_string_lossy().as_bytes());
             digest.update(b"\0");
@@ -2345,6 +2386,7 @@ impl CodexCommandExecutor {
             .clone()
             .ok_or_else(|| DurableRunnerError::invalid("provider startup state missing"))?;
         let profile = self.opencode_launch_profile.clone();
+        let pi_profile = self.pi_launch_profile.clone();
         let cursor_cloud_profile = self.cursor_cloud_launch_profile.clone();
         if state.config.provider == "codex" {
             let args = &mut state.config.args;
@@ -2363,6 +2405,7 @@ impl CodexCommandExecutor {
             state.thread_id.as_deref(),
             generation,
             profile.as_ref(),
+            pi_profile.as_ref(),
             cursor_cloud_profile.as_ref(),
             state.completion_contract.as_ref().map(|contract| {
                 (
@@ -2586,6 +2629,12 @@ impl CodexCommandExecutor {
         if state.opencode_launch_profile_digest != expected_launch_profile_digest {
             return Err(DurableRunnerError::invalid(
                 "OpenCode runner launch profile changed across durable recovery",
+            )
+            .with_classification(PROVIDER_STATE_INCOMPATIBLE));
+        }
+        if state.pi_launch_profile_digest != self.bind_pi_launch_profile(&state.config)? {
+            return Err(DurableRunnerError::invalid(
+                "Pi runner launch profile changed across durable recovery",
             )
             .with_classification(PROVIDER_STATE_INCOMPATIBLE));
         }
@@ -3240,6 +3289,7 @@ impl CodexCommandExecutor {
         let provider_name = config.provider.clone();
         let driver = config.driver.clone();
         let opencode_launch_profile_digest = self.bind_opencode_launch_profile(&config)?;
+        let pi_launch_profile_digest = self.bind_pi_launch_profile(&config)?;
         let cursor_cloud_launch_profile_digest = self.bind_cursor_cloud_launch_profile(&config)?;
         let completion_contract = completion_contract(payload)?;
         let tool_set = authorized_tool_set(payload)?;
@@ -3253,6 +3303,12 @@ impl CodexCommandExecutor {
                 return Err(DurableRunnerError::invalid(
                     "OpenCode runner launch profile changed across the durable run",
                 ));
+            }
+            if state.pi_launch_profile_digest != pi_launch_profile_digest {
+                return Err(DurableRunnerError::invalid(
+                    "Pi runner launch profile changed across the durable run",
+                )
+                .with_classification(PROVIDER_STATE_INCOMPATIBLE));
             }
             if state.cursor_cloud_launch_profile_digest != cursor_cloud_launch_profile_digest {
                 return Err(DurableRunnerError::invalid(
@@ -3288,6 +3344,7 @@ impl CodexCommandExecutor {
             })?;
             let mut state = CodexProviderState::new(config, completion_contract, tool_bridge);
             state.opencode_launch_profile_digest = opencode_launch_profile_digest;
+            state.pi_launch_profile_digest = pi_launch_profile_digest;
             state.opencode_release_digest = self.opencode_release_digest(&state.config);
             state.cursor_cloud_launch_profile_digest = cursor_cloud_launch_profile_digest;
             self.state = Some(state);
@@ -5874,7 +5931,7 @@ impl CodexCommandExecutor {
                                 "prompt": prompt,
                                 "input": question_set,
                                 "origin": {
-                                    "adapter": match state.config.provider.as_str() { "opencode" => "opencode-server", "cursor_cloud" => "cursor-cloud-api", _ => "codex-app-server" },
+                                    "adapter": match state.config.provider.as_str() { "opencode" => "opencode-server", "pi_rpc" => "pi-rpc", "cursor_cloud" => "cursor-cloud-api", _ => "codex-app-server" },
                                     "provider": state.config.provider,
                                     "method": "item/tool/requestUserInput",
                                 },
@@ -6286,6 +6343,7 @@ mod tests {
     fn restart_lost_turns_continue_only_for_locally_restored_providers() {
         assert!(super::restart_lost_turn_is_continuable("codex"));
         assert!(super::restart_lost_turn_is_continuable("opencode"));
+        assert!(!super::restart_lost_turn_is_continuable("pi_rpc"));
         assert!(!super::restart_lost_turn_is_continuable("cursor_cloud"));
     }
 
@@ -7308,6 +7366,11 @@ done
         assert_eq!(terminal[0].event_type, "run.terminal");
         assert_eq!(terminal[0].payload["reportedWorkDisposition"], "done");
         assert!(state.validate().is_ok());
+        state.config.provider = "pi_rpc".to_owned();
+        state.config.driver = "pi_rpc".to_owned();
+        state.config.provider_version = "pi-rpc-v1".to_owned();
+        assert!(validate_proxy_run_result(&state, &params).is_ok());
+        assert!(state.validate().is_ok());
     }
 
     fn cursor_cloud_result_state() -> CodexProviderState {
@@ -7455,6 +7518,19 @@ done
         assert!(rebound.pending_events.is_empty());
         assert!(rebound.queued_events.is_empty());
         assert!(!rebound.active_terminal_tool_rejected);
+
+        let mut pi = rebound.clone();
+        pi.config.provider = "pi_rpc".to_owned();
+        pi.config.driver = "pi_rpc".to_owned();
+        pi.config.provider_version = "pi-rpc-v1".to_owned();
+        pi.config.model = Some("provider/model".to_owned());
+        writer.persist_state(&pi).unwrap();
+        let saved = fs::read(writer.state_path()).unwrap();
+        let error = CodexCommandExecutor::new(&directory)
+            .load_state_without_provider()
+            .unwrap_err();
+        assert_eq!(error.classification(), Some(PROVIDER_STATE_INCOMPATIBLE));
+        assert_eq!(fs::read(writer.state_path()).unwrap(), saved);
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -8392,6 +8468,7 @@ done
                 conversation_mode: None,
             },
             opencode_launch_profile_digest: None,
+            pi_launch_profile_digest: None,
             opencode_release_digest: None,
             cursor_cloud_launch_profile_digest: None,
             provider_termination_receipt: None,
