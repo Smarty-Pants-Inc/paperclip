@@ -794,6 +794,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         || nativeRuntimeResolution.profile.backend === "codex_app_server"
         || (nativeRuntimeResolution.profile.backend === "acpx_runtime" && ["claude_local", "grok_local"].includes(agentHarnessType(agent.adapterType, parseObject(agent.adapterConfig))))
         || nativeRuntimeResolution.profile.backend === "opencode_server"
+        || nativeRuntimeResolution.profile.backend === "pi_rpc"
         || (nativeRuntimeResolution.profile.backend === "acpx_runtime"
           && parseObject(agent.adapterConfig).acpxAgent === "copilot")
         ? projectPaperclipRunnerTaskConfig(
