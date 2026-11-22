@@ -842,7 +842,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
               agentKeyId: agentIdentity?.keyId,
               companyId: agent.companyId,
               runId: run.id,
-              issue: nativeReviewRequest ? { ...issueRef, title: `Review: ${issueRef.title}`, description: nativeReviewRequest } : issueRef,
+              issue: { ...(nativeReviewRequest ? { ...issueRef, title: `Review: ${issueRef.title}`, description: nativeReviewRequest } : issueRef), conversationAgentId: issueContext?.conversationAgentId },
               taskPrompt: [
                 nativeReviewRequest ?? readNonEmptyString(
                   selectPaperclipTaskMarkdown(context, {
