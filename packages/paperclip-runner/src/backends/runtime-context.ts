@@ -1,3 +1,5 @@
+import { isNativePiConversation } from "../contracts/native-execution.js";
+import { PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION } from "../contracts/runtime-context-prompts.js";
 import { explicitTaskSkillNames } from "../contracts/runtime-context.js";
 import { readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
@@ -45,7 +47,7 @@ export function nativeSystemInstructions(input: NativeExecutionInput): string {
 export function nativeTaskConstraints(input: NativeExecutionInput): string[] {
   // Keep the discovery/ordering rule in each turn. The completion tools own
   // reporting, rejection feedback, approval handling and final-response details.
-  const finalResponseConstraint =
+  const finalResponseConstraint = isNativePiConversation(input) ? PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION :
     "Obtain one accepted result from paperclip_finish or paperclip_block before writing the complete user-facing final response. Follow that tool's reporting and final-response instructions. If blocked, explain why work cannot continue, name the owner and give the unblock action.";
   const answeredQuestions = Array.isArray(input.interactionResponses)
     ? input.interactionResponses.flatMap((response, responseIndex) => {

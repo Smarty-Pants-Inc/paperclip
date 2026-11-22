@@ -230,7 +230,9 @@ export class CodexAppServerDriver implements HarnessDriver {
           text(tool.name) === "read_chat_attachment",
       );
     }
-    return [...supplied, ...codexSemanticToolSpecs()];
+    return [...supplied, ...codexSemanticToolSpecs().map(tool => this.#options.conversationReply
+      ? { ...tool, description: "Optional for this conversation: an ordinary reply needs only a final message. " + tool.description }
+      : tool)];
   }
 
   #baseInstructions(): string {
@@ -349,7 +351,7 @@ export class CodexAppServerDriver implements HarnessDriver {
                 },
               }),
           dynamicTools: this.#providerDynamicTools(),
-          ...(this.#prepared() ? { conversationMode: "prepared" } : {}),
+          ...(this.#prepared() ? { conversationMode: this.#options.conversationReply ? "conversation" : "prepared" } : {}),
           experimentalRawEvents: false,
           persistExtendedHistory: false,
         }),
@@ -833,7 +835,7 @@ export class CodexAppServerDriver implements HarnessDriver {
       approvalPolicy: this.#options.approvalPolicy ?? "never",
       ...(this.#options.model ? { model: this.#options.model } : {}),
       dynamicTools: this.#providerDynamicTools(),
-      ...(this.#prepared() ? { conversationMode: "prepared" } : {}),
+      ...(this.#prepared() ? { conversationMode: this.#options.conversationReply ? "conversation" : "prepared" } : {}),
       persistExtendedHistory: false,
     };
   }
