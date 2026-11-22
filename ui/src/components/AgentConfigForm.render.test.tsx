@@ -8,6 +8,7 @@ import { getEnvironmentCapabilities } from "@paperclipai/shared";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ToastProvider } from "../context/ToastContext";
 import { AgentConfigForm } from "./AgentConfigForm";
+import { aiConnectionsApi } from "../api/ai-connections";
 import { isBlockedFromReplay } from "@/lib/analytics/replay-recording.test-utils";
 import { ApiError } from "../api/client";
 import { CodexLocalConfigFields } from "../adapters/codex-local/config-fields";
@@ -190,7 +191,27 @@ async function clickByText(container: HTMLElement, label: string) {
   await flushReact();
 }
 
-describe("AgentConfigForm session replay masking", () => {
+async function clickElement(element: Element | null | undefined) {
+  await act(async () => { element?.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  await flushReact();
+}
+
+async function renderForm(environments: Environment[], agentOverrides: Partial<Agent> = {}) {
+  mockEnvironmentsApi.list.mockResolvedValue(environments);
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  const root = createRoot(container);
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+  await act(async () => {
+    root.render(<QueryClientProvider client={queryClient}><ToastProvider><TooltipProvider>
+      <AgentConfigForm mode="edit" agent={makeAgent(agentOverrides)} onSave={vi.fn()} hidePromptTemplate showAdapterTypeField={false} />
+    </TooltipProvider></ToastProvider></QueryClientProvider>);
+  });
+  await flushReact();
+  return { container, root };
+}
+
+describe("AgentConfigForm session replay masking and routed catalogs", () => {
   let roots: Root[] = [];
 
   beforeEach(() => {
@@ -234,6 +255,46 @@ describe("AgentConfigForm session replay masking", () => {
     roots = [];
     document.body.innerHTML = "";
     vi.clearAllMocks();
+  });
+
+  it.each(["opencode", "pi_rpc"])("loads %s models from the routed gateway connection without an unknown adapter request", async provider => {
+    const binding = { provider: "openai", method: "api_key", mode: "responsible_user" } as const;
+    let resolveAccounts!: (value: Awaited<ReturnType<typeof aiConnectionsApi.list>>) => void;
+    const accounts = vi.spyOn(aiConnectionsApi, "list").mockReturnValue(new Promise(resolve => { resolveAccounts = resolve; }));
+    try {
+      const result = await renderForm([], {
+        adapterType: "paperclip_runner", adapterConfig: { provider, model: "paperclip/gpt-6.1-sol" }, runtimeConfig: { aiConnection: binding },
+      });
+      roots.push(result.root);
+      await clickElement(result.container.querySelector('[aria-label="Model"]'));
+      const pendingRequests = [...mockAgentsApi.adapterModels.mock.calls];
+      const pendingRefresh = [...document.querySelectorAll("button")].some(button => button.textContent === "Refresh models");
+      await act(async () => resolveAccounts({ currentUserId: "you", canManageConnections: true, connections: [{
+        id: "gateway-account", grantId: "gateway-grant", companyId: "company-1", provider: "openai", method: "api_key", name: "Routed gateway",
+        ownership: "personal", ownerUserId: "you", isDefault: true, status: "connected",
+        routing: { kind: "gateway", protocol: provider === "opencode" ? "chat" : "responses", auth: "bearer", baseUrl: "https://gateway.example.com/v1", models: [{ id: "gpt-6.1-sol", label: "Gateway Sol" }] },
+      }] }));
+      await flushReact();
+      expect([...document.querySelectorAll('[role="option"]')].some(option => option.textContent?.includes("Gateway Sol"))).toBe(true);
+      expect(pendingRefresh).toBe(provider === "opencode");
+      if (provider === "pi_rpc") {
+        expect(pendingRequests).toEqual([]);
+        expect(mockAgentsApi.adapterModels).not.toHaveBeenCalled();
+      } else {
+        expect(pendingRequests.length).toBeGreaterThan(0);
+        expect(pendingRequests.every(call => call[1] === "opencode_local")).toBe(true);
+      }
+      expect([...document.querySelectorAll("button")].some(button => button.textContent === "Refresh models")).toBe(false);
+    } finally { accounts.mockRestore(); }
+  });
+
+  it("does not offer an adapter catalog or refresh for Pi RPC without a connection", async () => {
+    const result = await renderForm([], { adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: "paperclip/gpt-6.1-sol" } });
+    roots.push(result.root);
+    await clickElement(result.container.querySelector('[aria-label="Model"]'));
+    expect(mockAgentsApi.adapterModels).not.toHaveBeenCalled();
+    expect([...document.querySelectorAll("button")].some(button => button.textContent === "Refresh models")).toBe(false);
+    expect(result.container.querySelector('[aria-label="Model"]')?.textContent).toContain("paperclip/gpt-6.1-sol");
   });
 
   it("blocks the displayed login code from session replay", async () => {
