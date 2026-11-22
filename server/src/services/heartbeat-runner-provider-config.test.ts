@@ -128,6 +128,38 @@ describe("Paperclip Runner native provider configuration", () => {
     })).toThrow("reasoning effort is not supported");
   });
 
+  it.each([
+    { opencodePermissionMode: "allow", acpxPermissionMode: "approve-all" },
+    {},
+    { opencodePermissionMode: "ask", acpxPermissionMode: "approve-reads" },
+    { opencodePermissionMode: "deny", acpxPermissionMode: "deny-all" },
+  ])("ignores other harness permission keys for Pi: %j", permissions => {
+    const adapterConfig = { model: "paperclip/gpt-6.1-sol", timeoutSec: 0, graceSec: 15,
+      provider: "pi_rpc", codexPermissionMode: "never", ...permissions };
+    expect(resolvePaperclipRunnerNativeProviderInput({ backend: "pi_rpc", adapterConfig }))
+      .toEqual({ provider: "pi_rpc", model: adapterConfig.model, homeMode: "isolated", piRpcThinkingLevel: "low" });
+    expect(() => resolvePaperclipRunnerNativeProviderInput({ backend: "pi_rpc", adapterConfig: { ...adapterConfig, homeMode: "preconfigured" } }))
+      .toThrow(expect.objectContaining({ code: "paperclip_runner_pi_rpc_policy_invalid", message: expect.stringContaining("homeMode=preconfigured") }));
+  });
+
+  // catch: (Pi R5)
+  it.each(["modelReasoningEffort", "reasoningEffort", "effort"])("maps Pi generic %s and forwards the exact selection for driver admission", key => {
+    const base = { provider: "pi_rpc", model: "openai/gpt-6.1-sol", [key]: "high" };
+    const resolve = (adapterConfig: Record<string, unknown>) => resolvePaperclipRunnerNativeProviderInput({ backend: "pi_rpc", adapterConfig });
+    expect(resolve(base)).toMatchObject({ piRpcThinkingLevel: "high" });
+    for (const [effort, level] of [["auto", "low"], ["none", "off"], ["off", "off"]]) expect(resolve({ ...base, [key]: effort })).toMatchObject({ piRpcThinkingLevel: level });
+    expect(resolve({ ...base, piRpcThinkingLevel: "auto" })).toMatchObject({ piRpcThinkingLevel: "auto" });
+    expect(resolve({ ...base, piRpcThinkingLevel: "off", [key]: "ultra" })).toMatchObject({ piRpcThinkingLevel: "off" });
+    expect(resolve({ ...base, [key]: "ultra" })).toMatchObject({ piRpcThinkingLevel: "ultra" });
+    expect(resolve(projectPaperclipRunnerTaskConfig("pi_rpc", base, { [key]: "low" }))).toMatchObject({ piRpcThinkingLevel: "low" });
+    expect(resolve(projectPaperclipRunnerTaskConfig("pi_rpc", { ...base, piRpcThinkingLevel: "max" }, { [key]: "low" }))).toMatchObject({ piRpcThinkingLevel: "max" });
+    expect(resolve(projectPaperclipRunnerTaskConfig("pi_rpc", base, { model: "openai/other" }))).toMatchObject({ piRpcThinkingLevel: "low" });
+  });
+  it("records the documented low Pi default when no effort is configured", () => {
+    // doc/runner-internals.md:168: native default uses low thinking.
+    expect(resolvePaperclipRunnerNativeProviderInput({ backend: "pi_rpc", adapterConfig: { provider: "pi_rpc", model: "openai/gpt-6.1-sol" } })).toMatchObject({ piRpcThinkingLevel: "low" });
+  });
+
   it("uses only task model and effort overrides without changing the Runner provider", () => {
     const base = { provider: "codex", model: "gpt-6-astra", modelReasoningEffort: "ultra", codexPermissionMode: "never" };
     const projected = projectPaperclipRunnerTaskConfig("codex_app_server", base, {
