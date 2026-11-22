@@ -56,6 +56,7 @@ export function agentHarnessType(adapterType: string, config: Record<string, unk
   if (adapterType !== "paperclip_runner") return adapterType;
   if (config.provider === undefined || config.provider === "codex") return "codex_local";
   if (config.provider === "opencode") return "opencode_local";
+  if (config.provider === "pi_rpc") return "pi_local";
   if (config.provider === "acpx") {
     const agent = config.acpxAgent ?? "claude";
     return ({ codex: "codex_local", claude: "claude_local", grok: "grok_local", cursor: "cursor", pi: "pi_local", kimi: "kimi_local", antigravity: "antigravity_runtime" } as Record<string, string>)[String(agent)] ?? `acpx:${String(agent)}`;
