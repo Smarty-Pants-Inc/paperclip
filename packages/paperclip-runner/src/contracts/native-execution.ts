@@ -1,3 +1,4 @@
+import { PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION } from "./runtime-context-prompts.js";
 import { parseNativeCursorCloudConfig, type NativeCursorCloudConfig } from "./cursor-cloud.js";
 import { resolveGrokDisableWebSearch } from "../drivers/acpx/grok-web-search.js";
 import { resolveGrokEffort } from "../drivers/acpx/grok-effort.js";
@@ -124,7 +125,7 @@ export type NativeProviderConfig =
   | { kind: "cursor_cloud"; model: string; cursorCloud: NativeCursorCloudConfig }
   | { kind: "codex"; model: string | null; approvalPolicy?: NativeCodexApprovalPolicy }
   | { kind: "opencode"; model: string; permissionMode?: NativeOpenCodePermissionMode }
-  | { kind: "pi_rpc"; model: string; piRpcThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" }
+  | { kind: "pi_rpc"; model: string; conversationMode?: true; piRpcThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" }
   | {
       kind: "claude_managed";
       model: string;
@@ -290,6 +291,10 @@ export interface NativeExecutionInputV8 extends Omit<NativeExecutionInputV6, "sc
 }
 
 export type NativeExecutionInput = NativeExecutionInputV1 | NativeExecutionInputV2 | NativeExecutionInputV3 | NativeExecutionInputV4 | NativeExecutionInputV5 | NativeExecutionInputV6 | NativeExecutionInputV7 | NativeExecutionInputV8 | NativeExecutionInputV9 | NativeExecutionInputV10;
+
+export function isNativePiConversation(input: Pick<NativeExecutionInput, "provider">): boolean {
+  return input.provider.kind === "pi_rpc" && input.provider.conversationMode === true;
+}
 
 /** The only task data that may enter provider-visible model input. */
 export interface NativeModelEnvelopeV1 {
@@ -598,7 +603,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
       : provider.kind === "codex" && isV4
         ? ["kind", "model", "approvalPolicy", ...(isV5 ? ["reasoningEffort", "webSearch"] : [])]
         : provider.kind === "pi_rpc"
-          ? ["kind", "model", "piRpcThinkingLevel"]
+          ? ["kind", "model", "piRpcThinkingLevel", "conversationMode"]
         : provider.kind === "opencode" && isV4
           ? ["kind", "model", "permissionMode"]
           : ["kind", "model"],
@@ -801,7 +806,9 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
       },
     };
   } else if (provider.kind === "pi_rpc") {
+    if (provider.conversationMode !== undefined && provider.conversationMode !== true) throw new NativeExecutionInputError("input.provider.conversationMode must be true when present");
     parsedProvider = { kind: "pi_rpc", model: providerModel!,
+      ...(provider.conversationMode === true ? { conversationMode: true as const } : {}),
       ...(provider.piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel: provider.piRpcThinkingLevel as Extract<NativeProviderConfig, { kind: "pi_rpc" }>["piRpcThinkingLevel"] }) };
   } else if (provider.kind === "opencode") {
     if (isV4 && provider.permissionMode !== "allow" && provider.permissionMode !== "ask" && provider.permissionMode !== "deny") {
@@ -1008,7 +1015,7 @@ export function buildNativeModelEnvelope(input: NativeExecutionInput, options?: 
       completion: {
         revision: input.completionContract.contract.revision,
         criterionIds: input.completionContract.contract.criteria.map((criterion) => criterion.id),
-        instruction: "Before ending this turn, obtain one accepted paperclip_finish or paperclip_block result. Earlier reports belong to earlier turns; a final message alone does not complete this turn.",
+        instruction: isNativePiConversation(input) ? PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION : "Before ending this turn, obtain one accepted paperclip_finish or paperclip_block result. Earlier reports belong to earlier turns; a final message alone does not complete this turn.",
       },
     };
   }
