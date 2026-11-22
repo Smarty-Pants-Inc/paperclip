@@ -2848,6 +2848,30 @@ describe("native provider usage normalization", () => {
       .toEqual({ provider: "anthropic", biller: "anthropic", billingType: "metered_api" });
   });
 
+  // catch: (Pi R13; money guard)
+  it.each([
+    ["openai/gpt-6.1-sol", { OPENAI_API_KEY: "fixture" }, "openai", "openai", "metered_api"],
+    ["anthropic/claude-test", { ANTHROPIC_API_KEY: "fixture" }, "anthropic", "anthropic", "metered_api"],
+    ["paperclip/gpt-6.1-sol", { PAPERCLIP_AI_PROVIDER_PROTOCOL: "responses", PAPERCLIP_AI_PROVIDER_KEY: "fixture", PAPERCLIP_AI_PROVIDER_URL: "https://gateway.example/v1" }, "openai", "unknown", "metered_api"],
+    ["paperclip/gpt-6.1-sol", { PAPERCLIP_AI_PROVIDER_PROTOCOL: "responses", PAPERCLIP_AI_PROVIDER_KEY: "fixture", PAPERCLIP_AI_PROVIDER_URL: "https://api.openai.com/v1" }, "openai", "openai", "metered_api"],
+    ["openai/gpt-6.1-sol", {}, "openai", "openai", "unknown"],
+    ["paperclip/custom", {}, "unknown", "unknown", "unknown"],
+  ] as const)("derives Pi billing for %s from its route or built-in provider", (model, env, provider, biller, billingType) => {
+    expect(resolveNativeBilling({ kind: "pi_rpc", model }, env)).toEqual({ provider, biller, billingType });
+  });
+  it("preserves authoritative Pi connection identity", () => {
+    const identity = { provider: "anthropic", biller: "anthropic", billingType: "metered_api" as const };
+    expect(resolveNativeBilling({ kind: "pi_rpc", model: "paperclip/claude-test" }, {}, identity)).toEqual(identity);
+  });
+  it("keeps Pi namespaced models and unknown gateways outside direct OpenAI rate-card pricing", async () => {
+    const { priceCodexReceipt } = await import("../codex-pricing.js");
+    const receipt = { ...resolveNativeBilling({ kind: "pi_rpc", model: "openai/gpt-6.1-sol" }, { OPENAI_API_KEY: "fixture" }),
+      model: "openai/gpt-6.1-sol", complete: true, usageBasis: "per_run" as const, usage: { inputTokens: 1000, cachedInputTokens: 100, outputTokens: 100 } };
+    expect(priceCodexReceipt(receipt).costUsdExact).toBeUndefined();
+    expect(priceCodexReceipt({ ...receipt, model: "gpt-6.1-sol" }).costUsdExact).toBe("0.003010000");
+    expect(priceCodexReceipt({ ...receipt, model: "gpt-6.1-sol", biller: "unknown" }).costUsdExact).toBeUndefined();
+  });
+
   it("prefers the adjusted turn price to cumulative session prices", () => {
     expect(nativeUsageCostUsd({ providerCostUsd: 10, runDelta: { inputTokens: 10, providerCostUsd: 2, cacheAdjustedCostUsd: 1 } })).toBe(1);
   });
