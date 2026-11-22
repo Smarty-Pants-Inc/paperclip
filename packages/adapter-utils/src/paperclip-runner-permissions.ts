@@ -1,5 +1,5 @@
 export type PaperclipRunnerProvider =
-  "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx" | "openai_dot" | "grok_bot" | "muse" | "cursor_cloud";
+  "codex" | "opencode" | "pi_rpc" | "claude_managed" | "aws_agentcore" | "acpx" | "openai_dot" | "grok_bot" | "muse" | "cursor_cloud";
 
 export type CodexPermissionMode = "never" | "on-request" | "untrusted";
 export type OpenCodePermissionMode = "allow" | "ask" | "deny";
@@ -89,6 +89,12 @@ export const PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES = {
       },
     ],
   },
+  pi_rpc: {
+    configurable: false,
+    defaultMode: "provider-managed",
+    options: [],
+    description: "Pi runs non-interactively inside the assigned Paperclip OS boundary; per-tool Ask and Deny are unavailable.",
+  },
   claude_managed: {
     configurable: false,
     defaultMode: "provider-managed",
@@ -149,6 +155,7 @@ export function isPaperclipRunnerProvider(
   return (
     value === "codex" ||
     value === "opencode" ||
+    value === "pi_rpc" ||
     value === "claude_managed" ||
     value === "aws_agentcore" ||
     value === "acpx" || value === "openai_dot" || value === "grok_bot" || value === "muse" || value === "cursor_cloud"
@@ -215,6 +222,9 @@ export function paperclipRunnerTransitionConfig(
   previousModel: unknown,
   providerOverride?: unknown,
 ): Record<string, unknown> {
+  if (providerOverride === "pi_rpc") {
+    return { provider: "pi_rpc", model: typeof previousModel === "string" ? previousModel.trim() : "" };
+  }
   if (previousAdapterType === "cursor_cloud" && (providerOverride === undefined || providerOverride === "cursor_cloud")) {
     return { provider: "cursor_cloud", model: typeof previousModel === "string" ? previousModel.trim() : "", lifecycleMode: "per_turn" };
   }
