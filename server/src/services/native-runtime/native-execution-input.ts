@@ -31,6 +31,7 @@ import type {
 } from "../../vendor/paperclip-runner/index.js";
 import {
   parseNativeExecutionInput,
+  canonicalNativeRuntimeContextDigest, PAPERCLIP_EXECUTION_FINISH_INSTRUCTION, PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION,
   resolveQualifiedAcpxProfile,
 } from "../../vendor/paperclip-runner/index.js";
 import {
@@ -55,6 +56,7 @@ export interface BuildNativeExecutionInput {
     title: string;
     description: string | null;
     workMode: string;
+    conversationAgentId?: string | null;
   };
   taskPrompt: string;
   initialCommunicationGuidance?: string | null;
@@ -258,6 +260,13 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
       ? readCaseProjectionMarker(previousExecution) : null;
   const workflowCase = input.caseContext && previousCaseProjection
     ? projectCaseContinuation(input.caseContext, previousCaseProjection) : null;
+  const piConversation = input.provider === "pi_rpc" && input.conversationMode === true && input.issue.conversationAgentId === input.agentId;
+  const runtimeContext = piConversation ? structuredClone(input.runtimeContext) : input.runtimeContext;
+  if (piConversation) {
+    runtimeContext.prompt.text = runtimeContext.prompt.text.replace(PAPERCLIP_EXECUTION_FINISH_INSTRUCTION, PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION);
+    runtimeContext.prompt.digest = createHash("sha256").update(runtimeContext.prompt.text).digest("hex");
+    runtimeContext.aggregateDigest = canonicalNativeRuntimeContextDigest(runtimeContext);
+  }
   const prepared = {
     schema: input.grokEffort !== undefined || input.grokDisableWebSearch !== undefined ? "paperclip.native-execution-input.v10"
       : input.claudeEffort !== undefined ? "paperclip.native-execution-input.v9"
@@ -364,7 +373,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
           },
         }
       : input.provider === "pi_rpc"
-        ? { kind: "pi_rpc", model: input.model,
+        ? { kind: "pi_rpc", model: input.model, ...(piConversation ? { conversationMode: true } : {}),
             ...(input.piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel: input.piRpcThinkingLevel }) }
       : input.provider === "opencode"
         ? {
@@ -392,7 +401,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
     } } : {}),
     interactionResponses: input.interactionResponses ?? [],
     credentialBindings: [],
-    runtimeContext: input.runtimeContext,
+    runtimeContext,
   };
   return parseNativeExecutionInput(input.provider === "muse" ? { ...prepared,
     schema: "paperclip.native-execution-input.v8", provider: { kind: "muse", model: null, binding: input.museBinding, bridgeRevision: "muse-v1" },
