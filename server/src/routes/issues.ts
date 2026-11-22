@@ -17670,7 +17670,7 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!issue) return;
-      if (issue.conversationAgentId) throw conflict("Conversation messages are processed in order at turn boundaries");
+      if (issue.conversationAgentId && process.env.PAPERCLIP_AGENT_CHAT_STEERING !== "true") throw conflict("Conversation messages are processed in order at turn boundaries");
       const decision = await decideIssueAccess(req, issue, "issue:comment");
       if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
       const actor = getActorInfo(req);
