@@ -952,6 +952,13 @@ fn terminal_events(
             },
         ];
     }
+    if state.config.provider == "pi_rpc"
+        && event_type == "turn.completed"
+        && state.config.conversation_mode.as_deref() == Some("conversation")
+        && state.active_provider_result_fingerprint.is_none()
+    {
+        return Vec::new(); // Core resolves the bound final reply as a conversation yield.
+    }
     // Once the correlated semantic-tool result has been accepted, Paperclip's
     // bounded controller finalizer may interrupt the provider after the result
     // proposal. That provider terminal closes the exact turn; it does not
