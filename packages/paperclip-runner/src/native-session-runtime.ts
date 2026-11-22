@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION } from "./contracts/runtime-context-prompts.js";
 import { nativeSystemInstructions } from "./backends/runtime-context.js";
 
 import type {
@@ -13,6 +14,7 @@ import type {
 import { readProviderFailure } from "./contracts/provider-failure.generated.js";
 import {
   buildNativeModelEnvelope,
+  isNativePiConversation,
   parseNativeExecutionInput,
 } from "./contracts/native-execution.js";
 import type {
@@ -3004,7 +3006,7 @@ export async function executeNativeSession(
           "Reconcile any unfinished tool or command before proceeding: check the workspace for the outputs or artifacts it should have produced. If the expected output is present, use it. If the expected output is missing, re-run the command.",
           "Do not repeat completed work. Before you repeat an action with external effects, such as a push, a message or a deployment, check whether it already took effect. If you cannot determine that, report the specific blocker.",
           "Finish in this turn. Nothing resumes this conversation after the turn ends, so do not end it to wait for a background command or a notification; wait for or check that work first.",
-          "Then invoke exactly one paperclip_finish or paperclip_block with the accurate disposition.",
+          isNativePiConversation(input) ? PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION : "Then invoke exactly one paperclip_finish or paperclip_block with the accurate disposition.",
           ...(attachmentPrompt ? ["", attachmentPrompt] : []),
         ].join("\n"),
         ...(steeredMessages.length > 0 ? { steeredMessages: steeredMessages.map(message => message.text) } : {}),
@@ -3071,7 +3073,7 @@ export async function executeNativeSession(
       return continuationSetup;
     };
     const requestContinuationDisposition = async (event: PrpEvent, signal: AbortSignal) => {
-      if (continuationDispositionRequested || event.eventType !== "turn.completed") return false;
+      if (isNativePiConversation(input) || continuationDispositionRequested || event.eventType !== "turn.completed") return false;
       await continuationSetup?.catch(() => undefined);
       signal.throwIfAborted();
       if (borrowedContinuationTurnId === null || event.turnId !== borrowedContinuationTurnId) return false;
@@ -3384,7 +3386,7 @@ export async function executeNativeSession(
             if (handoff) modelEnvelope.task.prompt = `${handoff}\n\n${modelEnvelope.task.prompt}`;
           }
           const dispositionOnlyRecovery = Boolean(
-            recovered &&
+            !isNativePiConversation(input) && recovered &&
             !recoveredSnapshot.semanticResult &&
             (persistedSession?.terminalTurns?.length ?? 0) > 0 &&
             !recoveredActiveTurnId,
