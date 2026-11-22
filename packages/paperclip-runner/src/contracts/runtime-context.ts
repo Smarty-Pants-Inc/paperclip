@@ -7,7 +7,7 @@ import {
 } from "./runtime-context-prompts.js";
 import { GENERATED_RUNTIME_CONTEXT_FIELDS } from "./generated-runtime-context-contract.js";
 
-export { PAPERCLIP_EXECUTION_PROMPT, PAPERCLIP_EXECUTION_PROMPT_REVISION } from "./runtime-context-prompts.js";
+export { PAPERCLIP_EXECUTION_PROMPT, PAPERCLIP_EXECUTION_PROMPT_REVISION, PAPERCLIP_EXECUTION_FINISH_INSTRUCTION, PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION } from "./runtime-context-prompts.js";
 
 export const NATIVE_RUNTIME_ASSET_SCHEMA = "paperclip.runtime-asset.v1" as const;
 

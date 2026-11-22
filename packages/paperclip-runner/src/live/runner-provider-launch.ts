@@ -23,7 +23,7 @@ export interface RunnerProviderLaunchRequirements {
   model: string | null;
   approvalPolicy: "never" | "on-request" | "untrusted";
   readOnly: boolean;
-  preparedConversation: boolean;
+  preparedConversation: boolean | "conversation";
   includeCollaborationModeInstructions: boolean;
   settings: Pick<CapabilityRunnerdCodexTransportOptions,
     "acpxAgent" | "acpxMode" | "acpxPermissionMode" | "acpxPermissionModePinned" |
@@ -69,7 +69,7 @@ export function runnerProviderLaunchRequirements(
     approvalPolicy: params.approvalPolicy === "on-request" || params.approvalPolicy === "untrusted"
       ? params.approvalPolicy : "never",
     readOnly: params.permissions === "paperclip-runner-workspace-read-only",
-    preparedConversation: params.conversationMode === "prepared",
+    preparedConversation: options.provider === "pi_rpc" && params.conversationMode === "conversation" ? "conversation" : params.conversationMode === "prepared",
     includeCollaborationModeInstructions: (params.config as Record<string, unknown> | undefined)?.include_collaboration_mode_instructions !== false,
   };
   // PRP hashes strict JSON; absent settings must not remain undefined properties.
@@ -259,7 +259,7 @@ export function createRunnerProviderLaunch(
     return { kind: "pi_rpc", provider: "pi_rpc", driver: "pi_rpc", providerVersion: "pi-rpc-v1",
       command: input.piProxyPath ?? "", args: [], cwd: input.cwd,
       model: requirements.model, approvalPolicy: "never", instructions: baseInstructions,
-      conversationMode: requirements.preparedConversation ? "prepared" : "task", runtimeContext };
+      conversationMode: requirements.preparedConversation === "conversation" ? "conversation" : requirements.preparedConversation ? "prepared" : "task", runtimeContext };
   }
   const acpxAgent = provider === "acpx" ? settings.acpxAgent ?? "codex" : null;
   const requestedModel = requirements.model ?? "";
