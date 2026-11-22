@@ -303,7 +303,7 @@ export async function testNativeRunnerAuthentication(context: AdapterEnvironment
     const authentication = /(?:invalid (?:api[- ]?key|auth(?:entication)? token)|authentication (?:failed|required)|unauthenticated|unauthorized|not authenticated|please (?:log|sign) in|not logged in|\b(?:401|403)\b)/i.test(message);
     const rejectedModel = provider === "codex" ? CODEX_CHATGPT_MODEL_REJECTION_RE.exec(message)?.[1] : undefined;
     const retirementHint = rejectedModel ? codexChatGptRetirementHint(rejectedModel) : null;
-    return { adapterType: "paperclip_runner", status: "fail", testedAt: new Date().toISOString(), checks: [{ code: `${provider}_hello_probe_${authentication ? "auth_required" : failure?.category === "model_unavailable" ? "model_unavailable" : /timed out/i.test(message) ? (provider === "pi_rpc" ? "timed_out" : "timeout") : "failed"}`, level: "error", message,
+    return { adapterType: "paperclip_runner", status: "fail", testedAt: new Date().toISOString(), checks: [{ code: `${provider}_hello_probe_${authentication ? "auth_required" : failure?.category === "model_unavailable" ? "model_unavailable" : /timed out/i.test(message) ? "timed_out" : "failed"}`, level: "error", message,
       hint: retirementHint ?? "Check the selected account, model access, and native runtime prerequisites, then retry." },
       ...(authentication && provider === "codex" ? [{ code: ADAPTER_AUTH_MISSING_CHECK_CODE, level: "error" as const,
         message: "The selected Codex account needs authentication.",
