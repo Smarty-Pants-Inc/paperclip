@@ -7,6 +7,10 @@ import * as localCredentialFile from "../local-ai-credential-file.js";
 import * as codexCredentials from "@paperclipai/adapter-codex-local/server";
 const { prepareIsolatedCodexHome } = await import(new URL("../../../../packages/paperclip-runner/src/drivers/runtime-context-materializer.ts", import.meta.url).href);
 const { execute, nativeProbe, selectedRunner, selectedRemoteRunner, sshExecute, sshRunner, nativeArtifacts, remoteLauncher, registerPrp, ingressConnect } = vi.hoisted(() => ({ execute: vi.fn(), nativeProbe: vi.fn(), selectedRunner: vi.fn(), selectedRemoteRunner: vi.fn(), sshExecute: vi.fn(), sshRunner: vi.fn(), nativeArtifacts: vi.fn(), remoteLauncher: vi.fn(), registerPrp: vi.fn(), ingressConnect: vi.fn() }));
+const piPack = vi.hoisted(() => ({ payload: { pi_rpc: { version: "1.6.0", resources: { path: "resources" } }, artifacts: {
+  nodeCommand: { path: "node", sha256: "node" }, piExecutable: { path: "pi", sha256: "pi" }, piProxy: { path: "proxy", sha256: "proxy" },
+} } }));
+vi.mock("./remote-provider-pack-verification.js", () => ({ verifyRemoteProviderPack: vi.fn(async () => piPack) }));
 const nativeProbeRuntimeDirectories = vi.hoisted(() => [] as string[]);
 vi.mock("node:fs/promises", async original => {
   const filesystem = await original<typeof import("node:fs/promises")>();
@@ -22,7 +26,8 @@ vi.mock("../../realtime/runner-prp-ws.js", () => ({ registerRunnerPrpAuthority: 
 vi.mock("../../realtime/runner-prp-outbound.js", () => ({ connectRunnerPrpIngress: ingressConnect }));
 vi.mock("./native-codex-runner.js", () => ({ resolvePaperclipRunnerBinary: selectedRunner, resolveRemotePaperclipRunnerBinary: selectedRemoteRunner }));
 vi.mock("../../vendor/paperclip-runner/index.js", async original => ({ ...await original<typeof import("../../vendor/paperclip-runner/index.js")>(), probeNativeRunnerEnvironment: nativeProbe }));
-vi.mock("./native-session-executor.js", async original => ({ ...await original<typeof import("./native-session-executor.js")>(), createRemoteNativeArtifactPreparation: nativeArtifacts, createRemoteRunnerProcessLauncher: remoteLauncher }));
+vi.mock("./native-session-executor.js", async original => ({ ...await original<typeof import("./native-session-executor.js")>(), createRemoteNativeArtifactPreparation: nativeArtifacts, createRemoteRunnerProcessLauncher: remoteLauncher,
+  resolveRemoteProviderPackSource: () => ({ manifest: piPack }), prepareRemoteProviderPackOnTarget: async () => ({ root: "/fixture/pack" }) }));
 import { testNativeRunnerAuthentication } from "./setup-readiness.js";
 const context = {
   companyId: "company", adapterType: "paperclip_runner", config: { externallySandboxed: false, env: { PAPERCLIP_RUNNER_EXTERNAL_SANDBOX: "false" } },
@@ -445,7 +450,7 @@ describe("Codex selected native account verification", () => {
     } finally { await rm(home, { recursive: true, force: true }); }
   });
   it.each([
-    ["authentication failed: bound-account", "auth_required"], ["Native provider hello probe timed out.", "timeout"],
+    ["authentication failed: bound-account", "auth_required"], ["Native provider hello probe timed out.", "timed_out"],
     ["Model is unavailable", "failed"], ["native executable is missing", "failed"], ["native provider returned no response", "failed"],
   ])("fails closed and redacts native failures (%s)", async (message, code) => {
     nativeProbe.mockRejectedValue(new Error(message));
@@ -456,6 +461,24 @@ describe("Codex selected native account verification", () => {
     expect(JSON.stringify(result)).not.toContain("bound-account");
     expect(nativeProbe).toHaveBeenCalledOnce();
     expect(execute).not.toHaveBeenCalled();
+  });
+  it.each([
+    ["model_unavailable", "pi_startup_refused: pi_model_not_in_catalog: fixture/missing", "model_unavailable"],
+    ["unknown", "pi_startup_refused: pi_mcp_bridge_unavailable", "failed"],
+    ["unknown", "pi_startup_refused: selected-secret", "failed"],
+    ["timeout", "pi_startup_refused: startup timed out", "timed_out"],
+    ["unknown", "x".repeat(2100), "failed"],
+  ])("surfaces the retained Pi session.open refusal safely (%s, %s)", async (category, message, suffix) => {
+    const error = new Error("Provider request failed");
+    Object.defineProperty(error, "runnerCommandResult", { value: { command: { method: "session.open" }, status: "failed", result: { providerFailure: {
+      schema: "paperclip.provider-failure.v1", provider: "pi_rpc", phase: "startup", category, message, retryability: "unknown",
+    } } } });
+    nativeProbe.mockImplementation(async input => { await input.onCleanupConfirmed(); throw error; });
+    const result = await testNativeRunnerAuthentication({ ...context, config: { provider: "pi_rpc", model: "fixture/model", env: { PAPERCLIP_AI_PROVIDER_KEY: "selected-secret" } } }, "pi_rpc", "fixture/model");
+    expect(nativeProbe, JSON.stringify(result)).toHaveBeenCalledOnce();
+    expect(result.status).toBe("fail");
+    expect(result.checks[0]).toMatchObject({ code: `pi_rpc_hello_probe_${suffix}`, message: message.replaceAll("selected-secret", "[REDACTED]").slice(0, 2000) });
+    expect(JSON.stringify(result)).not.toContain("selected-secret");
   });
   it("names the ChatGPT retirement when the backend rejects a retired model", async () => {
     nativeProbe.mockRejectedValue(new Error(JSON.stringify({ type: "error", status: 400,
