@@ -439,6 +439,23 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
         }],
       };
     }
+    if (profile.provider === "pi_rpc") {
+      const failure = (code: string, message: string): AdapterEnvironmentTestResult => ({
+        adapterType: "paperclip_runner", status: "fail", testedAt: new Date().toISOString(),
+        checks: [{ code: `pi_rpc_hello_probe_${code}`, level: "error", message }],
+      });
+      const target = context.executionTarget;
+      if (target?.kind !== "remote" || target.transport !== "sandbox" || target.runnerTask || !target.runner)
+        return failure("unavailable", "Pi RPC Test requires the selected sandbox command runner; no local, ACPX or OpenCode fallback is used.");
+      const configured = context.config.env;
+      const environment = configured && typeof configured === "object" && !Array.isArray(configured)
+        ? configured as Record<string, unknown> : {};
+      if (typeof environment.PAPERCLIP_AI_PROVIDER_URL !== "string" || !environment.PAPERCLIP_AI_PROVIDER_URL
+        || typeof environment.PAPERCLIP_AI_PROVIDER_KEY !== "string" || !environment.PAPERCLIP_AI_PROVIDER_KEY)
+        return failure("auth_required", "Select the managed AI connection before testing Pi RPC.");
+      const { testNativeRunnerAuthentication } = await import("../services/native-runtime/setup-readiness.js");
+      return testNativeRunnerAuthentication(context, "pi_rpc", profile.model);
+    }
     if (profile.provider !== "cursor_cloud" && context.executionTarget?.kind === "remote" && context.executionTarget.transport === "sandbox" && context.executionTarget.runnerTask) {
       // Managed connections probe through testManagedEnvironment. This path has
       // none, which a plugin Runner-task environment never runs.
