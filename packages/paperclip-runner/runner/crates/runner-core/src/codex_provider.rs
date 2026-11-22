@@ -4106,7 +4106,13 @@ impl CodexProvider {
                             redact_text(&error.to_string())
                         ))
                         .with_provider_failure(
-                            if self.config.provider == "codex"
+                            if self.config.provider == "pi_rpc"
+                                && matches!(method, "initialize" | "thread/start" | "thread/resume")
+                            {
+                                crate::provider_failure::validated_provider_failure(
+                                    error.pointer("/data/providerFailure").cloned(),
+                                )
+                            } else if self.config.provider == "codex"
                                 && matches!(method, "initialize" | "thread/start" | "thread/resume")
                             {
                                 crate::provider_failure::codex_startup_failure(error)
