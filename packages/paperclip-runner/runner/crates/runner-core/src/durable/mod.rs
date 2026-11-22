@@ -15,6 +15,7 @@ pub use runner::{
     run_durable_runner, run_durable_runner_with_host_control, CommandExecution, CommandExecutor,
     PolledEvent, TerminalDeliveryReconciliation,
 };
+pub(crate) use state::replace_file_from_temporary;
 pub(crate) use state::{
     create_private_temporary_file, open_private_regular_file, redact_sensitive_text_values,
     redact_text, sanitize_value, validate_semantic_tool_input, verify_private_directory,

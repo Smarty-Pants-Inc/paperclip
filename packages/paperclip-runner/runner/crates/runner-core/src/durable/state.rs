@@ -1227,7 +1227,7 @@ impl DurableStateStore {
                     DurableRunnerError::invalid(format!("failed to commit durable state: {error}"))
                 })?;
             drop(file);
-            fs::rename(&temporary, &self.path).map_err(|error| {
+            replace_file_from_temporary(&temporary, &self.path).map_err(|error| {
                 DurableRunnerError::invalid(format!(
                     "failed to atomically replace durable state: {error}"
                 ))
@@ -1569,6 +1569,24 @@ const fn no_follow_flag() -> i32 {
 ))]
 const fn no_follow_flag() -> i32 {
     0
+}
+
+// survives EXDEV on lazily restored mounts; NOT crash-safe during the fallback copy
+// (a crash mid-copy leaves a state file load rejects; the synced temp is kept only until the copy is synced)
+pub(crate) fn replace_file_from_temporary(temporary: &Path, path: &Path) -> io::Result<()> {
+    match fs::rename(temporary, path) {
+        Err(error) if error.raw_os_error() == Some(18) => {
+            let bytes = fs::read(temporary)?;
+            let mut options = OpenOptions::new();
+            #[cfg(unix)]
+            options.mode(0o600).custom_flags(no_follow_flag());
+            let mut file = options.write(true).create(true).truncate(true).open(path)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            fs::remove_file(temporary)
+        }
+        result => result,
+    }
 }
 
 pub(crate) fn create_private_temporary_file(
