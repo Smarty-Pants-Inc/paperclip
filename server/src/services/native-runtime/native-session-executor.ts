@@ -52,7 +52,7 @@ import { notifyCancelledWorkspacePreservation } from "../cancelled-workspace-pre
 import { notifyInstructionCollection } from "../instruction-collection-notifications.js";
 import { providerPackWorkspaceId, recordAdmittedRemoteProviderPack, resolveRemoteProviderPackAuthority } from "./remote-provider-pack-authority.js";
 import { nativeProviderPackAdmissionFailureCode, prepareNativeProviderPackAdmission, rememberAdmittedNativeProviderPack, rememberRecoveredNativeProviderPack, recordNativeProviderPackAdmission, type NativeProviderPackAdmissionSource } from "./native-provider-pack-admission.js";
-import { type ProviderPackInstallation, providerPackIncompatible, verifyRemoteProviderPack as verifyRemoteProviderPackIdentity } from "./remote-provider-pack-verification.js";
+import { type ProviderPackIdentity, type ProviderPackInstallation, providerPackIncompatible, verifyRemoteProviderPack as verifyRemoteProviderPackIdentity } from "./remote-provider-pack-verification.js";
 import { writeEnvironmentCleanup } from "../environment-cleanup-notifications.js";
 import { NATIVE_SESSION_EXECUTION_LEASE_TTL_MS, lockNativeExecutionLeaseForReacquire, nativeExecutionLeaseHeldCondition, releaseUnstartedNativeExecutionClaim, startNativeSessionExecutionLeaseRenewal, type NativeExecutionLeaseRenewal } from "./native-execution-lease.js";
 export { renewNativeSessionExecutionLease } from "./native-execution-lease.js";
@@ -1491,6 +1491,7 @@ export function resolveNativeProviderEnvironment(
     return buildNativeProviderEnvironment({}, host);
   }
   if (provider.kind === "cursor_cloud") return {};
+  if (provider.kind === "pi_rpc") return buildNativeProviderEnvironment({}, host);
   return host;
 }
 
@@ -2547,6 +2548,7 @@ function nativeProviderSessionScope(execution: NativeExecutionInput) {
         profile: execution.provider.profile,
       };
     case "codex":
+    case "pi_rpc":
     case "opencode":
       // These local providers have no separate persisted profile id. Company,
       // agent, and workspace bind their credential/session context; mutable
@@ -11085,6 +11087,7 @@ async function executePaperclipNativeSessionAttempt(
     input.execution.provider.kind !== "cursor_cloud" &&
     input.execution.provider.kind !== "codex" &&
     input.execution.provider.kind !== "opencode" &&
+    input.execution.provider.kind !== "pi_rpc" &&
     input.execution.provider.kind !== "claude_managed" &&
     input.execution.provider.kind !== "aws_agentcore" &&
     input.execution.provider.kind !== "acpx" &&
@@ -11783,7 +11786,7 @@ async function executePaperclipNativeSessionAttempt(
   };
   // OpenCode and ACPX report their current turn; Codex reports a cumulative run delta.
   // Rebuild per-turn state from the durable event log when a controller resumes.
-  const turnAccounting = ["opencode", "acpx"].includes(input.execution.provider.kind) ? createNativeTurnAccounting(input.execution.provider) : null;
+  const turnAccounting = ["opencode", "pi_rpc", "acpx"].includes(input.execution.provider.kind) ? createNativeTurnAccounting(input.execution.provider) : null;
   if (turnAccounting || cursorCloudAccounting) {
     const history = await input.db.select({ payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents).where(and(
       eq(heartbeatRunEvents.companyId, input.execution.binding.companyId), eq(heartbeatRunEvents.runId, input.execution.binding.runId),
@@ -14322,6 +14325,17 @@ export function resolveNativeBilling(provider: NativeExecutionInput["provider"],
     if (env.CLAUDE_CODE_USE_BEDROCK === "1") return { provider: "anthropic", biller: "aws_bedrock", billingType: "metered_api" };
     return { provider: "anthropic", biller: "anthropic", billingType: env.ANTHROPIC_API_KEY ? "metered_api" : env.CLAUDE_CODE_OAUTH_TOKEN ? "subscription_included" : "unknown" };
   }
+  if (provider.kind === "pi_rpc") {
+    const parts = (provider.model ?? "").split("/");
+    const namespace = parts.length > 1 && parts[0] !== "paperclip" ? parts[0] : "unknown";
+    const biller = namespace !== "unknown" ? namespace : env.PAPERCLIP_AI_PROVIDER_PROTOCOL === "responses" ? "openai" : "unknown";
+    const modelProvider = biller === "openrouter" && parts.length > 2 ? parts[1] : biller;
+    const billingType = env.PAPERCLIP_AI_PROVIDER_KEY?.trim() ? "metered_api" : apiKeyBillingType(biller, env);
+    // A Responses-compatible gateway identifies the provider, not its prices.
+    const effectiveBiller = biller === "openai" && billingType === "metered_api"
+      ? inferOpenAiCompatibleBiller({ ...env, ...(env.PAPERCLIP_AI_PROVIDER_URL ? { OPENAI_BASE_URL: env.PAPERCLIP_AI_PROVIDER_URL } : {}) }, "openai") ?? "unknown" : biller;
+    return { provider: modelProvider, biller: effectiveBiller, billingType };
+  }
   if (provider.kind === "opencode" || (provider.kind === "acpx" && provider.agent === "pi")) {
     const parts = (provider.model ?? "").split("/");
     const biller = parts.length > 1 ? parts[0] : provider.kind === "acpx" ? nativeUsageBiller(provider) : "unknown";
@@ -14414,7 +14428,8 @@ type RemoteProviderPackManifest = {
   schema: typeof REMOTE_PROVIDER_PACK_SCHEMA;
   digest: string;
   payload: {
-    compatibility?: { opencode: number; acpx: number };
+    compatibility?: { opencode: number; acpx: number; pi_rpc?: number };
+    pi_rpc?: ProviderPackIdentity["payload"]["pi_rpc"];
     pins: typeof REMOTE_PROVIDER_PACK_PINS;
     target: { platform: string; architecture: string };
     runnerSourceRevision: string;
@@ -14436,6 +14451,8 @@ type RemoteProviderPackManifest = {
       opencodeCommand: { path: string; sha256: string };
       opencodeExecutable: { path: string; sha256: string };
       opencodeProxy: { path: string; sha256: string };
+      piProxy?: { path: string; sha256: string };
+      piExecutable?: { path: string; sha256: string };
       acpxSidecar: { path: string; sha256: string };
     };
   };
@@ -17192,7 +17209,7 @@ async function createRunnerdBackendWithinSessionClaim(
     : null;
   const requiresRemoteProviderPack =
     remoteTarget !== null &&
-    (input.execution.provider.kind === "opencode" ||
+    (input.execution.provider.kind === "opencode" || input.execution.provider.kind === "pi_rpc" ||
       input.execution.provider.kind === "acpx");
   const artifactStorage = remoteTarget?.transport === "sandbox" && input.controllerPersistence
     && input.execution.provider.kind === "opencode" ? durableNativeHarnessStorage() : null;
@@ -17273,7 +17290,7 @@ async function createRunnerdBackendWithinSessionClaim(
   // state even when no daemon survived. Its launch profile binds the admitted
   // artifact bytes and paths just as a live reattachment does.
   const reattachProviderPack = input.restartRecovery?.kind === "reattach_remote_runner" || input.remoteWarmRecovery !== undefined;
-  let retainProviderPack = reattachProviderPack || input.execution.provider.kind === "opencode" && durableBinding !== null;
+  let retainProviderPack = reattachProviderPack || ["opencode", "pi_rpc"].includes(input.execution.provider.kind) && durableBinding !== null;
   if (requiresRemoteProviderPack && !retainProviderPack) resolveCurrentProviderPackManifest();
   // The transport hashes runnerBinary on the controller before an external
   // launcher starts runnerd. Keep that artifact identity in the controller's
@@ -17445,7 +17462,7 @@ async function createRunnerdBackendWithinSessionClaim(
         const manifest = await measureNativeRunnerSpan(input.trace, "provider_pack.compatibility", () => verifyRemoteProviderPackIdentity({
           runner: remoteCommandRunner, cwd: remoteTarget.remoteCwd, packRoot: installation.root,
           manifest: expected, installation,
-          provider: input.execution.provider as { kind: "opencode" } | { kind: "acpx"; agent: string },
+          provider: input.execution.provider as { kind: "opencode" | "pi_rpc" } | { kind: "acpx"; agent: string },
           requireExactIdentity: retainProviderPack || explicitProviderPackSelection,
           requireCurrentOpenCodeProxy: !retainProviderPack
             && runnerEnvironment?.PAPERCLIP_OPENCODE_PERFORMANCE_DIAGNOSTICS === "1",
@@ -18839,7 +18856,7 @@ async function createRunnerdBackendWithinSessionClaim(
         ...accountingTransportOptions,
         onCredentialsUpdated: credentialUpdates?.onCredentialsUpdated,
         provider:
-          input.execution.provider.kind === "cursor_cloud" ? "cursor_cloud" : input.execution.provider.kind === "codex"
+          input.execution.provider.kind === "pi_rpc" ? "pi_rpc" : input.execution.provider.kind === "cursor_cloud" ? "cursor_cloud" : input.execution.provider.kind === "codex"
             ? "codex"
             : input.execution.provider.kind === "opencode"
               ? "opencode"
@@ -18884,6 +18901,8 @@ async function createRunnerdBackendWithinSessionClaim(
                   ),
             }
           : {}),
+        ...(input.execution.provider.kind === "pi_rpc" ? { piRpcThinkingLevel: input.execution.provider.piRpcThinkingLevel,
+          piRuntimeDirectory: remoteStateDirectory ?? root } : {}),
         ...(nativeProviderStartedTurns(input.execution.provider) ? { providerStartedTurns: true } : {}),
         ...(input.execution.provider.kind === "cursor_cloud" ? { cursorCloud: input.execution.provider.cursorCloud } : {}),
         ...(input.execution.provider.kind === "opencode"
@@ -18952,6 +18971,10 @@ async function createRunnerdBackendWithinSessionClaim(
                   .sha256,
             }
           : {}),
+        ...(input.execution.provider.kind === "pi_rpc" && expectedProviderPackManifest?.payload.pi_rpc && activeRemoteProviderPackRoot ? {
+          piProxyPath: posix.join(activeRemoteProviderPackRoot, "dist/cli/pi-rpc-command.sh"),
+          piResourcesDirectory: posix.join(activeRemoteProviderPackRoot, expectedProviderPackManifest.payload.pi_rpc.resources.path),
+        } : {}),
         ...(openCodeLaunchArtifacts ? {
           providerNodeCommand: openCodeLaunchArtifacts.paths.nodeCommand,
           providerNodeCommandSha256: expectedProviderPackManifest!.payload.artifacts.nodeCommand.sha256,
