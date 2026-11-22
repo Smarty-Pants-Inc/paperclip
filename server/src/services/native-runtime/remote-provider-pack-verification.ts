@@ -14,7 +14,8 @@ export type ProviderPackIdentity = {
   schema: string;
   digest: string;
   payload: {
-    compatibility?: { opencode: number; acpx: number };
+    compatibility?: { opencode: number; acpx: number; pi_rpc?: number };
+    pi_rpc?: { version: string; runtime: { path: string; sha256: string }; resources: { path: string; sha256: string } };
     contractDigest?: string;
     acpxProfileDigests?: Record<string, string>;
     providers?: Record<string, unknown>;
@@ -45,7 +46,7 @@ async function withProviderPackCheck<T>(step: "pack" | "opencode", verify: () =>
 }
 
 export type ProviderPackInstallation = { root: string; manifest: unknown; immutable: boolean };
-export type PackProvider = { kind: "opencode" } | { kind: "acpx"; agent: string };
+export type PackProvider = { kind: "opencode" | "pi_rpc" } | { kind: "acpx"; agent: string };
 
 /** Admission of a build-qualified, OS-protected installation. Source revisions,
  * dependency pins and unrelated provider changes are provenance, not an interface.
