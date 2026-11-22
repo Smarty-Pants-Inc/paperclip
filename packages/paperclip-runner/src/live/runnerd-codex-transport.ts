@@ -58,6 +58,7 @@ import type {
   CodexTransportProcessInfo,
 } from "../drivers/codex/app-server-transport.js";
 import { createSanitizedCodexEnvironment } from "../drivers/codex/app-server-transport.js";
+import { CODEX_SKILLLESS_PERMISSION_PROFILE, CODEX_PLANNING_PERMISSION_PROFILE } from "../drivers/codex/codex-security-config.js";
 import {
   CodexAppServerDriver,
   codexSemanticToolSpecs,
@@ -1828,6 +1829,9 @@ export interface CapabilityRunnerdCodexTransportOptions extends RunnerExecutionD
   /** SHA-256 verified by the provider-pack authority before runner startup. */
   opencodeProxySha256?: string;
   opencodeRuntimeDirectory?: string;
+  piProxyPath?: string;
+  piRuntimeDirectory?: string;
+  piResourcesDirectory?: string;
   environment?: NodeJS.ProcessEnv;
   /** Provider system instructions supplied by a native execution caller. */
   baseInstructions?: string;
@@ -3949,6 +3953,12 @@ function createCapabilityRunnerdProviderEnvironmentBase(input: {
     }
     return selected;
   }
+  if (input.provider === "pi_rpc") {
+    return { ...createSanitizedPiRunnerEnvironment(input.options.environment), ...commonIdentity,
+      PAPERCLIP_PI_RUNTIME_DIR: input.options.piRuntimeDirectory ?? input.options.stateDirectory,
+      PAPERCLIP_PI_RESOURCES_DIR: input.options.piResourcesDirectory,
+      ...(input.options.piRpcThinkingLevel === undefined ? {} : { PAPERCLIP_PI_THINKING_LEVEL: input.options.piRpcThinkingLevel }) };
+  }
   if (input.provider === "opencode") {
     return {
       ...createSanitizedOpenCodeRunnerEnvironment(input.options.environment),
@@ -4077,6 +4087,19 @@ function createSanitizedOpenCodeRunnerEnvironment(
           /^LC_[A-Z0-9_]{1,32}$/.test(key)),
     ),
   ) };
+}
+
+function createSanitizedPiRunnerEnvironment(source: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv {
+  const candidate = { ...process.env, ...source };
+  return { ...configuredEnvironment(source), ...githubCredentialEnvironment(source ?? {}),
+    ...Object.fromEntries(Object.entries(candidate).filter(([key, value]) => typeof value === "string"
+      && !key.startsWith("PAPERCLIP_") && key !== "OPENROUTER_API_KEY"
+      && (OPEN_CODE_RUNNER_ENVIRONMENT_KEYS.has(key) || /^LC_[A-Z0-9_]{1,32}$/.test(key)))),
+    ...Object.fromEntries(["PAPERCLIP_AI_PROVIDER_URL", "PAPERCLIP_AI_PROVIDER_KEY",
+      "PAPERCLIP_AI_PROVIDER_PROTOCOL", "PAPERCLIP_AI_PROVIDER_AUTH", "PAPERCLIP_AI_PROVIDER_HEADERS",
+      "PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY"]
+      .flatMap(key => source?.[key] === undefined ? [] : [[key, source[key]]])),
+  };
 }
 
 export function resolveSourceCodexHome(
@@ -4494,6 +4517,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
               options.environment,
               options.acpxAgent ?? "codex",
             ).env
+          : options.provider === "pi_rpc" ? createSanitizedPiRunnerEnvironment(options.environment)
           : options.provider === "opencode"
             ? createSanitizedOpenCodeRunnerEnvironment(options.environment)
             : options.provider === "claude_managed"
@@ -6503,7 +6527,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       ), {
         options: this.options, root: this.#root, cwd: String(params.cwd ?? tmpdir()),
         codexHome, providerNodeCommand, codexCommand: effectiveCodexCommand,
-        opencodeProxyPath, acpxSidecarPath, cursorCloudProxyPath,
+        opencodeProxyPath, piProxyPath: this.options.piProxyPath, acpxSidecarPath, cursorCloudProxyPath,
       }),
     };
     return { runAttachTemplate, runnerAcpxLaunchProfile, runnerOpenCodeLaunchProfile, runnerCursorCloudLaunchProfile,
@@ -6849,6 +6873,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       this.options.provider === undefined ||
       this.options.provider === "codex" ||
       this.options.provider === "opencode" ||
+      this.options.provider === "pi_rpc" ||
       this.options.provider === "acpx";
     const localStateOwner =
       this.options.readRunnerState === undefined &&
@@ -9664,7 +9689,7 @@ function retainNativeProbeCleanup(cleanup: (retry: boolean) => Promise<void>) {
 
 export async function probeNativeRunnerEnvironment(options: {
   runtimeDirectory: string;
-  provider: "codex" | "opencode" | "acpx";
+  provider: "codex" | "opencode" | "acpx" | "pi_rpc";
   model: string | null;
   reasoningEffort?: string;
   /** Verify native session identity/model and cleanup without a billable turn. */
@@ -9678,7 +9703,7 @@ export async function probeNativeRunnerEnvironment(options: {
   onCodexCredentialRefresh?: (filename: string) => Promise<void>;
   onCleanupConfirmed?: () => Promise<void>;
 }): Promise<{
-  provider: "codex" | "opencode" | "acpx";
+  provider: "codex" | "opencode" | "acpx" | "pi_rpc";
   providerDriver: string;
   effectiveModel: string;
   helloProbePassed: boolean;
@@ -9710,11 +9735,11 @@ export async function probeNativeRunnerEnvironment(options: {
   };
   let registrationCleanupConfirmed = true;
   const cleanupBudget = probeCleanupBudget(options.cleanupTimeoutMs);
-  const sourceCodexHome = ownsPreparation || preconfiguredHome ? undefined : options.transportOptions?.sourceCodexHome ?? resolveSourceCodexHome(environment);
+  const sourceCodexHome = options.provider === "pi_rpc" || ownsPreparation || preconfiguredHome ? undefined : options.transportOptions?.sourceCodexHome ?? resolveSourceCodexHome(environment);
   delete environment.PAPERCLIP_RUNNER_EXTERNAL_SANDBOX;
   if (!ownsPreparation && !preconfiguredHome) {
     environment.HOME = resolve(remoteFilesystemRoot ?? options.runtimeDirectory, "probe-home");
-    environment.CODEX_HOME = resolve(remoteFilesystemRoot ?? options.runtimeDirectory, "codex-home");
+    if (options.provider !== "pi_rpc") environment.CODEX_HOME = resolve(remoteFilesystemRoot ?? options.runtimeDirectory, "codex-home");
   }
   // A prepared launch reports its own directory; Core does not assign one.
   if (!ownsPreparation) environment.PAPERCLIP_WORKSPACE_CWD = workingDirectory;
@@ -9765,7 +9790,8 @@ export async function probeNativeRunnerEnvironment(options: {
     ...(options.model ? { model: options.model } : {}),
     ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
     conversationMode: "direct",
-    requestedCollaborationMode: "plan",
+    // Pi's existing launch contract requires sandbox-owned, not read-only, permissions.
+    requestedCollaborationMode: options.provider === "pi_rpc" ? "default" : "plan",
     approvalPolicy: "never",
     includeCollaborationModeInstructions: false,
     dynamicTools: [],
@@ -9791,15 +9817,16 @@ export async function probeNativeRunnerEnvironment(options: {
       workingDirectory, signal: controller.signal });
     controller.signal.throwIfAborted();
     const ids = session.ids();
-    const expectedDriver = { codex: "codex_app_server", opencode: "opencode_server", acpx: "acpx_runtime" }[options.provider];
+    const expectedDriver = { codex: "codex_app_server", opencode: "opencode_server", acpx: "acpx_runtime", pi_rpc: "pi_rpc" }[options.provider];
     if (!ids.driverSessionId || !ids.providerSessionId || bundle.evidence().providerDriver !== expectedDriver) {
       throw new Error(`The native environment probe returned no matching provider identity (${bundle.evidence().providerDriver ?? "missing driver"}).`);
     }
     const events = session.events()[Symbol.asyncIterator]();
     const first = await events.next();
     const context = record(first.value?.payload.context);
-    if (first.value?.eventType !== "session.started" || !context.model || record(record(context.sandbox).permissionProfile).id !== "paperclip-runner-workspace-read-only") {
-      throw new Error("The native environment probe returned no observed model or read-only runtime identity.");
+    const expectedPermission = options.provider === "pi_rpc" ? CODEX_SKILLLESS_PERMISSION_PROFILE : CODEX_PLANNING_PERMISSION_PROFILE;
+    if (first.value?.eventType !== "session.started" || !context.model || record(record(context.sandbox).permissionProfile).id !== expectedPermission) {
+      throw new Error("The native environment probe returned no observed model or matching runtime permission identity.");
     }
     {
       effectiveModel = typeof context.model === "string" && context.model.trim() && context.model !== "unknown" ? context.model : undefined;
@@ -10030,7 +10057,7 @@ export function resolveRunnerdCodexSkillInputs(
  */
 export function coldAdmissionTimeoutMs(provider: string | undefined, agent: string | undefined, coldProcess: boolean): number {
   if (!coldProcess) return 30_000;
-  return (provider === "acpx" && (agent === "pi" || agent === "claude")) || provider === "opencode" ? 60_000 : 30_000;
+  return (provider === "acpx" && (agent === "pi" || agent === "claude")) || provider === "opencode" || provider === "pi_rpc" ? 60_000 : 30_000;
 }
 
 export interface RunnerCommandFailure extends Error {
