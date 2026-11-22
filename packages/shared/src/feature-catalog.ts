@@ -433,6 +433,14 @@ export const INSTANCE_FEATURE_CATALOG: Record<InstanceFeatureKey, FeatureCatalog
     cloudDefault: false,
     selfHostedDefault: false,
   },
+  enableQueuedMessageSteerCountdown: {
+    title: "Steer countdown",
+    description:
+      "Wait five seconds, with Edit and Cancel, before a message sent while the agent works is steered into it. Off: it is steered at once.",
+    tier: "preference",
+    cloudDefault: false,
+    selfHostedDefault: false,
+  },
   enableFirstTaskPlanProposal: {
     title: "First task: propose with a plan document",
     description:
