@@ -233,6 +233,7 @@ import {
   type IssueChatRunFinalizationAction,
 } from "../components/IssueChatThread";
 import { TaskChatThread } from "../components/TaskChatThread";
+import { QUEUED_MESSAGE_AUTO_STEER_DELAY_MS } from "../components/task-chat/queued-message-auto-steer";
 import { hasVisibleRunAnswer } from "@/lib/run-answer-visibility";
 import type { TaskChatIssueBrief } from "../components/task-chat/TaskChatDescriptionBubble";
 import { useClassicTaskInterfaceEnabled } from "../hooks/useClassicTaskInterfaceEnabled";
@@ -1222,6 +1223,7 @@ function InboxMobileToolbar({
 }
 
 type IssueDetailChatTabProps = {
+  queuedMessageAutoSteerDelayMs?: number | null;
   executionBlocked?: boolean;
   interruption?: Issue["interruption"];
   retryPreparing?: boolean;
@@ -1390,6 +1392,7 @@ type IssueDetailChatTabProps = {
 const DesignSandboxTaskThread = lazy(() => import("../components/design-sandbox/DesignSandboxTaskThread"));
 
 const IssueDetailChatTab = memo(function IssueDetailChatTab({
+  queuedMessageAutoSteerDelayMs,
   executionBlocked,
   interruption,
   retryPreparing,
@@ -2670,6 +2673,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         >
           <EmailThreadProvider companyId={companyId} issueId={issueId}>
           <ThreadComponent
+            queuedMessageAutoSteerDelayMs={queuedMessageAutoSteerDelayMs}
             {...(!classicTaskInterfaceEnabled ? {
               compactHistory: !historyExpanded,
               onExpandHistory: conversationMode ? undefined : onExpandHistory,
@@ -8665,6 +8669,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                     void queryClient.invalidateQueries({ queryKey: queryKeys.issues.runs(issueId!) });
                   }} />
                 <IssueDetailChatTab
+                  queuedMessageAutoSteerDelayMs={instanceExperimentalSettings?.enableQueuedMessageSteerCountdown === true ? QUEUED_MESSAGE_AUTO_STEER_DELAY_MS : 0}
                   executionBlocked={Boolean(issue.executionBlocker)}
                   interruption={issue.interruption}
                   retryPreparing={taskRetry.optimistic}
