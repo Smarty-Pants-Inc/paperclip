@@ -497,6 +497,7 @@ fn local_process_definitely_gone(_id: u32, _group: bool) -> bool {
 fn facade_provider_name(provider: &str) -> &'static str {
     match provider {
         "opencode" => "OpenCode",
+        "pi_rpc" => "Pi",
         "cursor_cloud" => "Cursor Cloud",
         _ => "Codex",
     }
@@ -506,7 +507,10 @@ fn validate_proxy_run_result(
     state: &CodexProviderState,
     params: &Value,
 ) -> Result<(Value, String, String), DurableRunnerError> {
-    if !matches!(state.config.provider.as_str(), "opencode" | "cursor_cloud") {
+    if !matches!(
+        state.config.provider.as_str(),
+        "opencode" | "pi_rpc" | "cursor_cloud"
+    ) {
         return Err(DurableRunnerError::invalid(
             "paperclip/runResult is reserved for verified provider proxies",
         ));
@@ -1722,7 +1726,7 @@ impl CodexProviderState {
                     !matches!(disposition, "done" | "blocked" | "needs_review" | "yielded")
                         || !matches!(
                             self.config.provider.as_str(),
-                            "codex" | "opencode" | "cursor_cloud"
+                            "codex" | "opencode" | "pi_rpc" | "cursor_cloud"
                         )
                 })
             || (matches!(
@@ -5874,7 +5878,7 @@ impl CodexCommandExecutor {
                                 "prompt": prompt,
                                 "input": question_set,
                                 "origin": {
-                                    "adapter": match state.config.provider.as_str() { "opencode" => "opencode-server", "cursor_cloud" => "cursor-cloud-api", _ => "codex-app-server" },
+                                    "adapter": match state.config.provider.as_str() { "opencode" => "opencode-server", "pi_rpc" => "pi-rpc", "cursor_cloud" => "cursor-cloud-api", _ => "codex-app-server" },
                                     "provider": state.config.provider,
                                     "method": "item/tool/requestUserInput",
                                 },
@@ -7307,6 +7311,11 @@ done
         assert_eq!(terminal.len(), 1);
         assert_eq!(terminal[0].event_type, "run.terminal");
         assert_eq!(terminal[0].payload["reportedWorkDisposition"], "done");
+        assert!(state.validate().is_ok());
+        state.config.provider = "pi_rpc".to_owned();
+        state.config.driver = "pi_rpc".to_owned();
+        state.config.provider_version = "pi-rpc-v1".to_owned();
+        assert!(validate_proxy_run_result(&state, &params).is_ok());
         assert!(state.validate().is_ok());
     }
 
