@@ -27,7 +27,7 @@ export interface RunnerProviderLaunchRequirements {
   includeCollaborationModeInstructions: boolean;
   settings: Pick<CapabilityRunnerdCodexTransportOptions,
     "acpxAgent" | "acpxMode" | "acpxPermissionMode" | "acpxPermissionModePinned" |
-    "piThinkingLevel" | "claudeEffort" | "grokEffort" | "grokDisableWebSearch" | "managedProfile" | "agentCoreProfile" | "opencodePermissionMode" | "disableCodexWebSearch" | "disableCodexProjectInstructions">;
+    "piThinkingLevel" | "piRpcThinkingLevel" | "claudeEffort" | "grokEffort" | "grokDisableWebSearch" | "managedProfile" | "agentCoreProfile" | "opencodePermissionMode" | "disableCodexWebSearch" | "disableCodexProjectInstructions">;
   instructions: string;
   runtimeContext: NativeRuntimeContextSnapshot | null;
 }
@@ -60,7 +60,7 @@ export function runnerProviderLaunchRequirements(
       acpxAgent: options.acpxAgent, acpxMode: options.acpxMode,
       acpxPermissionMode: options.acpxPermissionMode,
       acpxPermissionModePinned: options.acpxPermissionModePinned,
-      piThinkingLevel: options.piThinkingLevel, claudeEffort: options.claudeEffort, grokEffort: options.grokEffort, grokDisableWebSearch: options.grokDisableWebSearch,
+      piThinkingLevel: options.piThinkingLevel, piRpcThinkingLevel: options.piRpcThinkingLevel, claudeEffort: options.claudeEffort, grokEffort: options.grokEffort, grokDisableWebSearch: options.grokDisableWebSearch,
       managedProfile: options.managedProfile, agentCoreProfile: options.agentCoreProfile,
       opencodePermissionMode: options.opencodePermissionMode,
       ...(options.disableCodexWebSearch === true ? { disableCodexWebSearch: true } : {}),
@@ -232,6 +232,7 @@ export interface RunnerProviderLaunchEnvironment {
   providerNodeCommand: string;
   codexCommand?: string;
   opencodeProxyPath: string;
+  piProxyPath?: string;
   acpxSidecarPath: string;
   cursorCloudProxyPath?: string;
 }
@@ -250,6 +251,15 @@ export function createRunnerProviderLaunch(
       command: input.providerNodeCommand, args: [input.cursorCloudProxyPath], cwd: input.cwd,
       model: requirements.model, instructions: baseInstructions, approvalPolicy: "never",
       conversationMode: requirements.preparedConversation ? "prepared" : "task" };
+  }
+  if (provider === "pi_rpc") {
+    if (requirements.readOnly || requirements.approvalPolicy !== "never" || !requirements.model?.includes("/")) {
+      throw new Error("pi_rpc requires an explicit provider/model and sandbox-owned permissions");
+    }
+    return { kind: "pi_rpc", provider: "pi_rpc", driver: "pi_rpc", providerVersion: "pi-rpc-v1",
+      command: input.piProxyPath ?? "", args: [], cwd: input.cwd,
+      model: requirements.model, approvalPolicy: "never", instructions: baseInstructions,
+      conversationMode: requirements.preparedConversation ? "prepared" : "task", runtimeContext };
   }
   const acpxAgent = provider === "acpx" ? settings.acpxAgent ?? "codex" : null;
   const requestedModel = requirements.model ?? "";
