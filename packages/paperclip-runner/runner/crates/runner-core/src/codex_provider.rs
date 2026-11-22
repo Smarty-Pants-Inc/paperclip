@@ -106,6 +106,23 @@ const OPENCODE_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
     "PAPERCLIP_NORMALIZED_SESSION_ID",
     "PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH",
 ];
+const PI_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
+    "PAPERCLIP_PI_RUNTIME_DIR",
+    "PAPERCLIP_PI_RESOURCES_DIR",
+    "PAPERCLIP_PI_THINKING_LEVEL",
+    "PAPERCLIP_AI_PROVIDER_URL",
+    "PAPERCLIP_AI_PROVIDER_KEY",
+    "PAPERCLIP_AI_PROVIDER_PROTOCOL",
+    "PAPERCLIP_AI_PROVIDER_AUTH",
+    "PAPERCLIP_AI_PROVIDER_HEADERS",
+    "PAPERCLIP_AGENT_KEY_ID",
+    "PAPERCLIP_AGENT_PUBLIC_KEY",
+    "PAPERCLIP_AGENT_PRIVATE_KEY",
+    "PAPERCLIP_RUNNER_INSTANCE_ID",
+    "PAPERCLIP_RUN_ID",
+    "PAPERCLIP_NORMALIZED_SESSION_ID",
+    "PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH",
+];
 const CURSOR_CLOUD_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
     "CURSOR_API_KEY",
     "PAPERCLIP_CURSOR_CLOUD_CONFIG_PATH",
@@ -587,10 +604,11 @@ impl CodexProviderConfig {
             (self.provider.as_str(), self.driver.as_str()),
             ("codex", "codex_app_server")
                 | ("opencode", "opencode_server")
+                | ("pi_rpc", "pi_rpc")
                 | ("cursor_cloud", "cursor_cloud_api")
         ) {
             return Err(LocalRunnerError::invalid(
-                "runner facade provider/driver pair must be codex/codex_app_server, opencode/opencode_server, or cursor_cloud/cursor_cloud_api",
+                "runner facade provider/driver pair must be codex/codex_app_server, opencode/opencode_server, pi_rpc/pi_rpc, or cursor_cloud/cursor_cloud_api",
             ));
         }
         if self.provider_version.trim().is_empty() || self.provider_version.len() > 120 {
@@ -602,6 +620,14 @@ impl CodexProviderConfig {
             return Err(LocalRunnerError::invalid(format!(
                 "OpenCode providerVersion must equal the qualified {QUALIFIED_OPENCODE_VERSION} release",
             )));
+        }
+        if self.provider == "pi_rpc"
+            && (self.provider_version != "pi-rpc-v1"
+                || self.read_only)
+        {
+            return Err(LocalRunnerError::invalid(
+                "Pi RPC requires pi-rpc-v1, an explicit provider/model and sandbox-owned permissions",
+            ));
         }
         if self.provider == "cursor_cloud"
             && (self.provider_version != CURSOR_CLOUD_PROXY_VERSION
@@ -1146,6 +1172,7 @@ impl CodexProvider {
         ];
         let provider_environment_keys = match config.provider.as_str() {
             "opencode" => OPENCODE_PROVIDER_ENVIRONMENT_KEYS,
+            "pi_rpc" => PI_PROVIDER_ENVIRONMENT_KEYS,
             "cursor_cloud" => CURSOR_CLOUD_PROVIDER_ENVIRONMENT_KEYS,
             _ => CODEX_PROVIDER_ENVIRONMENT_KEYS,
         };
@@ -1192,6 +1219,10 @@ impl CodexProvider {
                 launch_args.splice(position..position, extra);
             }
         }
+        // Pi's checked startup (including thinking policy) gets 25s, below
+        // the outer 30s request bound, not OpenCode's 10s health deadline.
+        let startup_deadline = (config.provider == "pi_rpc")
+            .then(|| std::time::Instant::now() + Duration::from_secs(25));
         let spawn = (|| {
             if config.provider == "cursor_cloud" {
                 let profile = cursor_cloud_launch_profile.ok_or_else(|| {
@@ -1257,6 +1288,16 @@ impl CodexProvider {
                     child_exit: None,
                     no_reply: false,
                 });
+                if config.provider == "pi_rpc" {
+                    let failure = crate::provider_failure::codex_startup_failure(
+                        &json!({ "message": error.to_string() }),
+                    )
+                    .map(|mut failure| {
+                        failure["provider"] = json!("pi_rpc");
+                        failure
+                    });
+                    return Err(error.with_provider_failure(failure));
+                }
                 return Err(error);
             }
         };
@@ -1334,20 +1375,23 @@ impl CodexProvider {
         };
         let mut stage = ProviderStartupStage::Initialize;
         let initialized_result = (|| -> Result<(), LocalRunnerError> {
-            let initialized = provider.request(
-                "initialize",
-                json!({
-                    "clientInfo": {
-                        "name": "paperclip-runnerd",
-                        "title": "Paperclip Runner",
-                        "version": "1",
-                    },
-                    "capabilities": {
-                        "experimentalApi": true,
-                        "requestAttestation": false,
-                    },
-                }),
-            )?;
+            let initialized = provider
+                .request_classified_until(
+                    "initialize",
+                    json!({
+                        "clientInfo": {
+                            "name": "paperclip-runnerd",
+                            "title": "Paperclip Runner",
+                            "version": "1",
+                        },
+                        "capabilities": {
+                            "experimentalApi": true,
+                            "requestAttestation": false,
+                        },
+                    }),
+                    startup_deadline,
+                )
+                .map_err(ProviderRequestError::into_inner)?;
             provider.send_frame(&json!({"method": "initialized"}))?;
 
             let mut params = json!({
@@ -1382,7 +1426,10 @@ impl CodexProvider {
             } else {
                 params_object.insert("permissions".to_owned(), json!(provider.permission_profile));
             }
-            if matches!(config.provider.as_str(), "opencode" | "cursor_cloud") {
+            if matches!(
+                config.provider.as_str(),
+                "opencode" | "pi_rpc" | "cursor_cloud"
+            ) {
                 if let Some(mode) = &config.conversation_mode {
                     params_object.insert("conversationMode".to_owned(), json!(mode));
                 }
@@ -1410,7 +1457,9 @@ impl CodexProvider {
                 "thread/start"
             };
             stage = ProviderStartupStage::ThreadOpen;
-            let opened = provider.request(method, params)?;
+            let opened = provider
+                .request_classified_until(method, params, startup_deadline)
+                .map_err(ProviderRequestError::into_inner)?;
             provider.thread_id = opened
                 .pointer("/thread/id")
                 .or_else(|| opened.get("threadId"))
@@ -2161,7 +2210,7 @@ impl CodexProvider {
             .expect("Codex turn parameters are an object");
         // The retained proxy's launch environment belongs to its first run.
         // Only runnerd's rotated authority supplies the current run identity.
-        if self.config.provider == "opencode" {
+        if matches!(self.config.provider.as_str(), "opencode" | "pi_rpc") {
             for (key, value) in
                 opencode_turn_identity_params(run_id, self.completion_contract.as_ref())
             {
