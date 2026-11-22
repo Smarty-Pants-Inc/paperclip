@@ -595,7 +595,9 @@ impl CodexProviderConfig {
         if !matches!(
             self.conversation_mode.as_deref(),
             None | Some("task" | "prepared")
-        ) {
+        ) && !(self.provider == "pi_rpc"
+            && self.conversation_mode.as_deref() == Some("conversation"))
+        {
             return Err(LocalRunnerError::invalid(
                 "unsupported provider context mode",
             ));
