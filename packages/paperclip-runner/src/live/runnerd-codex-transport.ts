@@ -8747,6 +8747,22 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           : canonicalMethod
             ? expandRunnerdCanonicalNotifications(canonicalMethod, eventPayload, event.eventType)
             : [];
+      // Stock can hang live after an accepted finish: kill runnerd before the
+      // provider terminal, then restore (stock Codex gate-7 H2 8bcd040b; offline
+      // finish/restart kit). History already recognizes the recovery pair;
+      // project it here too, only for this run/session's bound provider turn.
+      if (event.eventType === "run.terminal" && this.#threadId && this.#turnId &&
+          recoveryIdentityMatches(event.envelope, core.store.state.identity)) {
+        const turnEvents = events.filter(candidate => candidate.sourceSeq <= event.sourceSeq &&
+          recoveryIdentityMatches(candidate.envelope, core.store.state.identity));
+        const terminal = runnerdRecoveredTurnTerminal(turnEvents, this.#turnId);
+        const prior = runnerdRecoveredTurnTerminal(
+          turnEvents.filter(candidate => candidate.sourceSeq < event.sourceSeq), this.#turnId);
+        if (terminal && !prior) notifications.push({ method: "turn/completed", params: {
+          threadId: this.#threadId, turnId: this.#turnId,
+          turn: { id: this.#turnId, ...terminal, items: [] },
+        } });
+      }
       for (const payload of notifications) {
         const method = payload.method;
         if (typeof method !== "string") continue;
