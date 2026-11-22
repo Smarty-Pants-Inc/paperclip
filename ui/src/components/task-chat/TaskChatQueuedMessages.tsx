@@ -391,7 +391,7 @@ export function TaskChatQueuedMessages({
     const due = autoSteerEntries.find(entry => {
       const deadline = autoSteerDeadlines.get(entry.comment.id);
       // The deadlines memo does not see these refs change; check them here.
-      return deadline !== undefined && deadline <= now
+      return deadline !== undefined && (autoSteerDelayMs === 0 || deadline <= now)
         && !attemptedAutoSteer.current.has(queuedMessageAutoSteerKey(entry))
         && !optimisticDeliveryIds.current.has(entry.comment.id);
     });
