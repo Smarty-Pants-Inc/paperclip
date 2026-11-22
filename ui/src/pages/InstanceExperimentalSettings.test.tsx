@@ -121,6 +121,7 @@ function defaultExperimentalSettings(): InstanceExperimentalSettingsPayload {
     enablePaperclipDeveloperMode: false,
     enableSimplifiedEnglishInteractions: false,
     enableFirstTaskPlanProposal: false,
+    enableQueuedMessageSteerCountdown: false,
     enableSmokeLab: false,
     autoRestartDevServerWhenIdle: false,
     enableWorkspaceBranchReconcileForward: true,
