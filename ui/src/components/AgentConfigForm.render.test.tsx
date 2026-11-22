@@ -1352,6 +1352,46 @@ describe("AgentConfigForm environment selector", () => {
     }
   });
 
+  it.each(["opencode", "pi_rpc"])("loads %s models from the routed gateway connection without an unknown adapter request", async provider => {
+    const binding = { provider: "openai", method: "api_key", mode: "responsible_user" } as const;
+    let resolveAccounts!: (value: Awaited<ReturnType<typeof aiConnectionsApi.list>>) => void;
+    const accounts = vi.spyOn(aiConnectionsApi, "list").mockReturnValue(new Promise(resolve => { resolveAccounts = resolve; }));
+    try {
+      const result = await renderForm([], {
+        adapterType: "paperclip_runner", adapterConfig: { provider, model: "paperclip/gpt-6.1-sol" }, runtimeConfig: { aiConnection: binding },
+      });
+      roots.push(result.root);
+      await clickElement(result.container.querySelector('[aria-label="Model"]'));
+      const pendingRequests = [...mockAgentsApi.adapterModels.mock.calls];
+      const pendingRefresh = [...document.querySelectorAll("button")].some(button => button.textContent === "Refresh models");
+      await act(async () => resolveAccounts({ currentUserId: "you", canManageConnections: true, connections: [{
+        id: "gateway-account", grantId: "gateway-grant", companyId: "company-1", provider: "openai", method: "api_key", name: "Routed gateway",
+        ownership: "personal", ownerUserId: "you", isDefault: true, status: "connected",
+        routing: { kind: "gateway", protocol: provider === "opencode" ? "chat" : "responses", auth: "bearer", baseUrl: "https://gateway.example.com/v1", models: [{ id: "gpt-6.1-sol", label: "Gateway Sol" }] },
+      }] }));
+      await flushReact();
+      expect([...document.querySelectorAll('[role="option"]')].some(option => option.textContent?.includes("Gateway Sol"))).toBe(true);
+      expect(pendingRefresh).toBe(provider === "opencode");
+      if (provider === "pi_rpc") {
+        expect(pendingRequests).toEqual([]);
+        expect(mockAgentsApi.adapterModels).not.toHaveBeenCalled();
+      } else {
+        expect(pendingRequests.length).toBeGreaterThan(0);
+        expect(pendingRequests.every(call => call[1] === "opencode_local")).toBe(true);
+      }
+      expect([...document.querySelectorAll("button")].some(button => button.textContent === "Refresh models")).toBe(false);
+    } finally { accounts.mockRestore(); }
+  });
+
+  it("does not offer an adapter catalog or refresh for Pi RPC without a connection", async () => {
+    const result = await renderForm([], { adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: "paperclip/gpt-6.1-sol" } });
+    roots.push(result.root);
+    await clickElement(result.container.querySelector('[aria-label="Model"]'));
+    expect(mockAgentsApi.adapterModels).not.toHaveBeenCalled();
+    expect([...document.querySelectorAll("button")].some(button => button.textContent === "Refresh models")).toBe(false);
+    expect(result.container.querySelector('[aria-label="Model"]')?.textContent).toContain("paperclip/gpt-6.1-sol");
+  });
+
   it.each(["grok_local", "paperclip_runner"])("saves Grok 4.7 reasoning effort using the runtime key on %s", async adapterType => {
     const result = await renderForm([], { adapterType, adapterConfig: { ...(adapterType === "paperclip_runner" ? { provider: "acpx", acpxAgent: "grok" } : {}), model: "grok-4.7", reasoningEffort: "high" } });
     roots.push(result.root);
