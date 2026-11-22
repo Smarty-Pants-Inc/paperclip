@@ -1,5 +1,6 @@
 import { agentWakeupRequests, agents, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import type { IssueQueuedCommentQueue } from "@paperclipai/shared";
+import { isConversationReset } from "../../../services/agent-conversations.js";
 import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { assertQueuedCommentInteractionDelivery, recheckQueuedCommentInteractionDelivery } from "../../../services/agent-interaction-delivery.js";
 import { deliverSteeredMessage, steeringDeliveryIsUncertain } from "../../../services/queued-comment-steering.js";
@@ -214,7 +215,8 @@ export async function readBoardQueuedComments(input: {
     queuedCommentCount: comments.length,
   });
   const steeringDisposition: IssueQueuedCommentQueue["steeringDisposition"] =
-    input.issue.conversationAgentId ? "unsupported" : steering.kind !== "probe"
+    input.issue.conversationAgentId && (process.env.PAPERCLIP_AGENT_CHAT_STEERING !== "true" || comments.some(({ body }) => isConversationReset(body)))
+      ? "unsupported" : steering.kind !== "probe"
       ? steering.kind
       : input.steeringDisposition
         ?? (await getNativeSessionSteeringState(steering.steeringRunId)
