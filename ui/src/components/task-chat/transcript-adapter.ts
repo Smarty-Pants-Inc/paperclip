@@ -2331,7 +2331,7 @@ function transcriptSpanMs(
  */
 export function buildTurnSummary(
   entries: readonly TranscriptEntry[],
-  opts: { durationMs?: number; failed?: boolean } = {},
+  opts: { durationMs?: number; failed?: boolean; personStopped?: boolean } = {},
 ): TaskChatTurnItem["summary"] {
   const toolIds = new Set<string>();
   let added = 0;
@@ -2364,6 +2364,7 @@ export function buildTurnSummary(
     removed,
     tokensLabel: formatTokensLabel(tokens),
     failed: opts.failed || undefined,
+    personStopped: opts.personStopped || undefined,
   };
 }
 
@@ -2372,6 +2373,7 @@ export interface TurnSummaryPart {
   entries: readonly TranscriptEntry[];
   durationMs?: number;
   failed?: boolean;
+  personStopped?: boolean;
 }
 
 /**
@@ -2395,7 +2397,7 @@ export function buildMergedTurnSummary(
   }
   // durationMs: 0 suppresses the concatenated-span fallback (which would count
   // the gap between runs); the summed label is applied over it below.
-  const counts = buildTurnSummary(all, { durationMs: 0, failed });
+  const counts = buildTurnSummary(all, { durationMs: 0, failed, personStopped: parts.some(part => part.personStopped) });
   return {
     ...counts,
     durationLabel:
@@ -2530,6 +2532,7 @@ export function coalesceSettledTurns(
           summary: meta.chainId ? {
             ...buildMergedTurnSummary(parts),
             failed: latest.summary.failed,
+            personStopped: latest.summary.personStopped,
             durationLabel: latest.summary.durationLabel,
           } : buildMergedTurnSummary(parts),
         };
