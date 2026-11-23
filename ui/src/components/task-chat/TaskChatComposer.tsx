@@ -895,10 +895,9 @@ export function TaskChatComposer({
   // clear its error state, so both hold submission until resolved or removed.
   const showStop =
     !queuedEdit &&
-    !submitting &&
     body.trim().length === 0 &&
-    attachments.length === 0 &&
-    Boolean(onStop || stopControl.stopping);
+    draftAttachments.length === 0 &&
+    Boolean(onStop);
   const uploadPending = attachments.some((item) => item.status === "uploading");
   const uploadFailed = attachments.some((item) => item.status === "error");
   const takeoverVisible = Boolean(takeover && !pause);
@@ -1711,7 +1710,7 @@ export function TaskChatComposer({
               }
               data-slot="icon-button"
             >
-              {submitting || (showStop && stopControl.stopping) ? (
+              {(showStop ? stopControl.stopping : submitting) ? (
                 <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
               ) : showStop ? (
                 <Square className="h-4 w-4 fill-current" aria-hidden />
