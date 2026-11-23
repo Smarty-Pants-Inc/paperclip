@@ -46,6 +46,8 @@ export interface ExecutionContinuationEnvelope {
   /** Only valid when resuming the provider session associated with this run. */
   resumeDelta?: {
     baseRunId: string;
+    /** Human wake requests stopped before any agent-authored answer. */
+    stoppedMessageIds?: string[];
     messages: ExecutionContinuationEnvelope["messages"];
   };
   recoveryOutcomes?: Array<{ recoveryActionId: string; decision: unknown }>;

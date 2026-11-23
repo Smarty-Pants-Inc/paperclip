@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { and, asc, desc, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   agentWakeupRequests,
@@ -13,7 +13,8 @@ import {
 import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { sanitizeQuarantinedCommentForHigherTrust } from "./source-trust.js";
 import { hasConversationContinuationPolicy } from "./conversation-continuation.js";
-import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
+import { queuedCommentIdsFromRunContext, queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
+import { recordedUserStop, userStopBoundaryAt } from "./run-cancellation.js";
 import { queuedInteractionId } from "./queued-interaction-response.js";
 import { childReviewOutcomes } from "./native-runtime/child-review-outcomes.js";
 import { isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
@@ -370,7 +371,7 @@ export async function buildExecutionContinuation(input: {
   const previousRun = input.previousContextRunId
     ? (
         await db
-          .select({ context: heartbeatRuns.contextSnapshot })
+          .select({ context: heartbeatRuns.contextSnapshot, createdAt: heartbeatRuns.createdAt })
           .from(heartbeatRuns)
           .where(
             and(
@@ -386,10 +387,41 @@ export async function buildExecutionContinuation(input: {
   const deliveredMessages = Array.isArray(priorEnvelope.messages)
     ? priorEnvelope.messages.map(object)
     : null;
+  const stoppedMessageIds = new Set<string>();
+  if (deliveredMessages && previousRun) {
+    const stoppedRuns = await db.select({ context: heartbeatRuns.contextSnapshot,
+      status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson, finishedAt: heartbeatRuns.finishedAt })
+      .from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, input.agentId),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        eq(heartbeatRuns.status, "cancelled"), gt(heartbeatRuns.createdAt, previousRun.createdAt),
+      ));
+    for (const run of stoppedRuns) {
+      if (!recordedUserStop(run)) continue;
+      const boundary = userStopBoundaryAt(run);
+      if (!boundary) continue;
+      const context = object(run.context);
+      const wake = object(context.paperclipWake);
+      // Preparation may be stopped before paperclipWake is built; canonical wake IDs still name the request.
+      const wakeIds = new Set([
+        ...(Array.isArray(wake.commentIds) ? wake.commentIds : []),
+        ...queuedCommentIdsFromRunContext(context), context.wakeCommentId, context.commentId,
+      ]);
+      for (const comment of rows) {
+        if (comment.authorUserId && !comment.authorAgentId && !comment.createdByRunId &&
+          wakeIds.has(comment.id) && comment.createdAt <= boundary &&
+          !rows.some(answer => (answer.authorAgentId || answer.createdByRunId) &&
+            answer.createdAt >= comment.createdAt && answer.createdAt <= boundary)) {
+          stoppedMessageIds.add(comment.id);
+        }
+      }
+    }
+  }
   const resumeDelta =
     deliveredMessages && input.previousContextRunId
       ? {
           baseRunId: input.previousContextRunId,
+          ...(stoppedMessageIds.size ? { stoppedMessageIds: [...stoppedMessageIds] } : {}),
           messages: messages.filter(
             (message) =>
               originCommentIds.includes(message.id) ||
