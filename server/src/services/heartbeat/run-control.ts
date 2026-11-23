@@ -1322,11 +1322,13 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     const supersedesCaseHandoff = options.resultJson?.cancelledByActorType === "user" || options.errorCode === "issue_reassigned";
     let cancellationClaimed = false;
     let caseHandoffRetryClaimed = false;
+    let completionWon = false;
     if (handoffIssueId && supersedesCaseHandoff && options.resultJson?.caseHandoffYieldStop !== true) {
       const publications: ActivityPublication[] = [];
       let taskRowLocked = false;
       const applySupersession = () => db.transaction(async tx => {
         taskRowLocked = false;
+        completionWon = false;
         // As in legacy terminalization, wait at most 1s for the task row so a
         // board Stop never queues behind a slow task writer. Later locks keep
         // the transaction's previous timeout.
@@ -1341,6 +1343,18 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           eq(heartbeatRuns.companyId, run!.companyId))).for("update");
         if (!current || (options.expectedStatus && current.status !== options.expectedStatus)) return false;
         run = current;
+        // Result publication/event append takes this run lock too. A finished
+        // provider has no Stop to dispatch; leave its existing finalizer alone.
+        if (options.resultJson?.cancelledByActorType === "user" &&
+            current.runtimeMode === "native" && ["running", "succeeded"].includes(current.status)) {
+          const [terminal] = await tx.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+            eq(heartbeatRunEvents.companyId, current.companyId), eq(heartbeatRunEvents.runId, runId),
+            eq(heartbeatRunEvents.eventType, "run.terminal"), isNotNull(heartbeatRunEvents.sourceEventId),
+            sql`${heartbeatRunEvents.payload}#>>'{prpEvent,sourceKind}' = 'control_plane'`,
+            sql`${heartbeatRunEvents.payload}#>>'{prpEvent,payload,runTerminalState}' = 'succeeded'`,
+          )).limit(1);
+          if (current.status === "succeeded" || current.resultJson?.prpRunTerminalState === "succeeded" || terminal) { completionWon = true; return true; }
+        }
         if (options.cancellationRequestId) {
           run = await claimCancellationRequest(tx as unknown as Db, runId, run!.companyId, options.cancellationRequestId,
             options.cancellationRequestedByUserId ?? null);
@@ -1421,6 +1435,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       }
       publications.forEach(publishActivity);
       if (!supersessionApplied) return null;
+      if (completionWon) return run;
     }
     if (options.cancellationRequestId && !cancellationClaimed) {
       run = await claimCancellationRequest(db, runId, run.companyId, options.cancellationRequestId, options.cancellationRequestedByUserId ?? null);
