@@ -143,17 +143,16 @@ interface RunnerHeaderProps {
 
 function runnerWaitingLabel({ runId, status, execution, preparationLabel }: RunnerHeaderProps, waitingToStart = false) {
   if (status === "stopping") return "Stopping…";
-  if (execution && ["reconnecting", "retry_scheduled"].includes(execution.phase)) return execution.label;
   if (isTerminalRunStatus(status)) return null;
-  if (preparationLabel) return preparationLabel;
+  if (preparationLabel) return preparationLabel === "Starting…" && waitingToStart ? WAITING_TO_START_LABEL : preparationLabel;
   if (execution && execution.phase !== "working") return execution.label;
   if (status === "queued" && execution?.cause) return execution.label;
   return waitingToStart ? WAITING_TO_START_LABEL : status === "queued" ? "Starting…" : null;
 }
 
 /** A run's queued turn with no named hold, past the startup grace period. */
-function useRunnerWaitingToStart({ runId, status, execution, startedAtMs }: Pick<RunnerHeaderProps, "runId" | "status" | "execution" | "startedAtMs">) {
-  return useWaitingToStart(status === "queued" && !!runId && !execution?.cause, startedAtMs);
+function useRunnerWaitingToStart({ runId, status, execution, preparationLabel, startedAtMs }: RunnerHeaderProps) {
+  return useWaitingToStart(preparationLabel === "Starting…" || (status === "queued" && !!runId && !execution?.cause), startedAtMs);
 }
 
 function agentQueueWaitFor({ status, execution }: Pick<RunnerHeaderProps, "status" | "execution">) {
@@ -350,7 +349,7 @@ export function TaskChatRunnerTurn({
           />
         </div>
       ) : null}
-      {!final && currentActivityItems.length === 0 && !(status === "queued" && (waitingLabel || agentQueueWaitFor({ status, execution })))
+      {!final && currentActivityItems.length === 0 && !waitingLabel && !agentQueueWaitFor({ status, execution })
         ? <RunnerCurrentActivityTail status={status} waitingLabel={waitingLabel} /> : null}
     </div></ToolCallProgressRunProvider></TaskChatShimmerScope>
   );
