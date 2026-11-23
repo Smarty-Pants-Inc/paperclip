@@ -61,6 +61,7 @@ export function ExecutionBlockerNotice({ presentation, blocker, canRetry, onRetr
         className="flex items-center gap-3 rounded-lg bg-destructive/10 p-4 text-sm text-foreground">
         <AlertCircle className="size-5 shrink-0 text-destructive" aria-hidden="true" />
         <span className="min-w-0 flex-1">{blocker.nextAction}</span>
+        {canRetry && <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}
       </div>
     </div>
   );
