@@ -57,6 +57,7 @@ import { ProviderToolIconsProvider } from "@/components/ProviderToolIcon";
 import { McpAppTurnViews, mcpAppRunRefreshKey } from "@/components/mcp-app/McpAppTurnViews";
 import { ToolCallProgressProvider } from "@/components/task-chat/tool-call-progress";
 import { TaskChatRunnerHeader, TaskChatRunnerTurn } from "@/components/task-chat/TaskChatRunnerTurn";
+import { isConversationRecovery } from "./ExecutionBlockerNotice";
 import { partitionRunHealthItems } from "@/components/task-chat/TaskChatRunHealthBanner";
 import {
   TaskChatTurnStatusIsland,
@@ -2565,6 +2566,18 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // the live-run record can hold its first value for the whole run.
   const liveExecution = (liveRun ? linkedRunMetaById.get(liveRun.id)?.execution : undefined) ?? liveRun?.execution ?? null;
   const tailEnded = tailEntries.some((entry) => entry.kind === "run_terminal") || liveExecution?.phase === "finishing";
+  const recoveryOwnsStatus = !isUserStop(observedRunId) && isConversationRecovery(props.interruption,
+    terminalStatuses.get(observedRunId) ?? linkedRunMetaById.get(observedRunId)?.status);
+  const tailBeforeTurn = !!liveRun && !tailEnded && !isTerminalRunStatus(liveRun.status) &&
+    (!liveExecution || ["working", "reconnecting"].includes(liveExecution.phase) || (liveExecution.phase === "queued" && !liveExecution.cause)) &&
+    !tailEntries.some(entry => ["assistant", "thinking", "tool_call", "tool_result", "result"].includes(entry.kind) ||
+      (entry.kind === "system" && entry.text === "Turn started"));
+  const tailResuming = Boolean(liveExecution?.predecessorRunId ||
+    tailEntries.some(entry => entry.kind === "system" && entry.text.startsWith("Paperclip session resumed")));
+  const tailPreparationLabel = tailBeforeTurn
+    ? tailResuming ? "Resuming your conversation…" : "Starting…" : undefined;
+  const tailExecution = tailResuming && !tailBeforeTurn && liveExecution?.phase === "reconnecting"
+    ? null : liveExecution;
   const tailPlanItem =
     tailRunId === planDocumentSourceRunId ? planTurnItem : null;
   // A fresh array is produced on every render. Track every presentation field
@@ -3009,7 +3022,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       : runnerSubmissionPending || (queuedCommentIds.has(latestUserComment.id) && !!queuedMessageQueue?.executionWait));
   const requestExecution = requestRun?.id === liveRun?.id ? liveExecution : linkedRunMetaById.get(requestRun?.id ?? "")?.execution;
   const requestWait = latestUserComment && queuedCommentIds.has(latestUserComment.id) ? queuedMessageQueue?.executionWait : null;
-  const requestLabel = requestWait?.message ?? (requestStatus === "queued" ? requestExecution?.label : undefined) ?? "Starting…";
+  const requestLabel = recoveryOwnsStatus ? "Resuming your conversation…"
+    : requestWait?.message ?? (requestStatus === "queued" && requestExecution?.phase !== "reconnecting" ? requestExecution?.label : undefined) ?? "Starting…";
   // While the task offers Retry nothing is on its way by itself: words, no working sign.
   const requestWorking = !(props.interruption?.state === "failed" && props.interruption.canRetry) &&
     (HELD_BY_RECOVERY_REASONS.has(requestWait?.reason ?? requestExecution?.cause ?? "") ||
@@ -3568,7 +3582,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                           optimisticRunnerStartup || requestPending ||
                           bottomBlockerLinks ? (
                             <>
-                              {tailRunId || optimisticRunnerStartup ? (
+                              {!recoveryOwnsStatus && (tailRunId || optimisticRunnerStartup) ? (
                                 <div key={tailRunId ? requestCommentByRun.get(tailRunId) ?? tailRunId : latestUserComment?.id} data-testid="task-chat-live-transcript">
                                   <TaskChatShimmerScope items={tailItems}>
                                   <TaskChatRunnerHeader
@@ -3578,27 +3592,27 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                     agent={tailAgent ?? (tailAgentId ? { id: tailAgentId } : undefined)}
                                     status={optimisticRunnerStartup ? "queued" : tailStatus}
                                     working={optimisticRunnerStartup ? requestWorking : undefined}
-                                    execution={!optimisticRunnerStartup && !tailHasFinalResponse && !tailFinalStreaming && !tailTerminal && liveRun?.id === tailRunId ? liveExecution : null}
-                                    preparationLabel={optimisticRunnerStartup ? requestLabel : liveRun && tailHasFinalResponse && (liveExecution?.phase === "finishing" || tailEntries.some((entry) => entry.kind === "run_terminal" && entry.runState === "succeeded")) ? "Answer ready · Saving…" : undefined}
+                                    execution={!optimisticRunnerStartup && !tailHasFinalResponse && !tailFinalStreaming && !tailTerminal && liveRun?.id === tailRunId ? tailExecution : null}
+                                    preparationLabel={tailPreparationLabel ?? (optimisticRunnerStartup ? requestLabel : liveRun && tailHasFinalResponse && (liveExecution?.phase === "finishing" || tailEntries.some((entry) => entry.kind === "run_terminal" && entry.runState === "succeeded")) ? "Answer ready · Saving…" : undefined)}
                                     startedAtMs={tailStartedAtMs}
                                     finishedAtMs={tailFinishedAtMs}
                                     continuedAfterSteering={paperclipRunnerTail && tailTimelineAnchors.length > 0}
-                                    statusContent={tailRunSource?.adapterType !== "paperclip_runner" && !optimisticRunnerStartup ? (
-                                      <TaskChatLiveRunPill status={tailStatus} execution={!tailHasFinalResponse && !tailFinalStreaming && !tailTerminal && liveRun?.id === tailRunId ? liveExecution : null}
+                                    statusContent={tailRunSource?.adapterType !== "paperclip_runner" && !optimisticRunnerStartup && !tailPreparationLabel ? (
+                                      <TaskChatLiveRunPill status={tailStatus} execution={!tailHasFinalResponse && !tailFinalStreaming && !tailTerminal && liveRun?.id === tailRunId ? tailExecution : null}
                                         startedAtMs={tailStartedAtMs} finishedAtMs={tailFinishedAtMs} toolSummary={tailToolSummary} />
                                     ) : undefined}
                                   />
                                   {tailRunSource?.adapterType === "paperclip_runner" ||
-                                  optimisticRunnerStartup ? (
+                                  optimisticRunnerStartup || tailBeforeTurn ? (
                                     <TaskChatRunnerTurn
                                       showHeader={false}
-                                      preparationLabel={optimisticRunnerStartup ? requestLabel : undefined}
+                                      preparationLabel={tailPreparationLabel ?? (optimisticRunnerStartup ? requestLabel : undefined)}
                                       runId={tailRunId}
                                       execution={
                                         // While the answer itself streams the reply is Working, whatever the label poll says.
                                         // Once the run's own end is in, the server is saving it: its unleased 'Confirming execution' is not a reconnect.
                                         !tailHasFinalResponse && !tailFinalStreaming && !tailTerminal && liveRun?.id === tailRunId
-                                          ? liveExecution
+                                          ? tailExecution
                                           : null
                                       }
                                       agentName={visibleTailAgentName}
@@ -3653,7 +3667,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                   </TaskChatShimmerScope>
                                 </div>
                               ) : null}
-                              {requestPending && !optimisticRunnerStartup ? <div key={latestUserComment?.id} data-testid="task-chat-live-transcript">
+                              {requestPending && !optimisticRunnerStartup && !recoveryOwnsStatus ? <div key={latestUserComment?.id} data-testid="task-chat-live-transcript">
                                 <TaskChatShimmerScope items={[]}><TaskChatRunnerHeader status="queued" startedAtMs={null}
                                   agentName={tailAgent?.name} agent={tailAgent} working={requestWorking} preparationLabel={requestLabel} /></TaskChatShimmerScope>
                               </div> : null}
