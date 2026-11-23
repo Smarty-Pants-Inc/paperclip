@@ -1037,7 +1037,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     // After a reload the run list's summary carries no cancellation source, only the Stop
     // receipt (executionCancellation) and the error code a person's Stop leaves ('cancelled').
     return stoppedRunIds.current.has(id) || (cancellation?.source === "operator" && cancellation.initiator?.type === "user") ||
-      (meta?.errorCode === "cancelled" && Boolean(meta?.resultJson?.executionCancellation));
+      (meta?.errorCode === "cancelled" && Boolean(meta?.resultJson?.executionCancellation)) ||
+      // A person's Stop of a Pi turn ends the run normally; the server marks it (resultJson.personStop).
+      Boolean(meta?.resultJson?.personStop);
   }, [linkedRunMetaById]);
   const openedAt = useMemo(() => Date.now(), [issueId]);
   const scrollNavigation = useTaskChatScrollNavigation();
@@ -2053,7 +2055,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             startedAtMs > 0 && finishedAtMs > 0
               ? Math.max(0, finishedAtMs - startedAtMs)
               : undefined;
-          const failed = source.status !== "succeeded";
+          const failed = source.status !== "succeeded" || isUserStop(source.id);
           const turnId = `${source.id}:turn`;
           turnMergeMetaById.set(turnId, {
             chainId: runChainIdsById.get(source.id)?.[0] ?? source.id,
@@ -2140,7 +2142,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           },
         });
       }
-      const failed = source.status !== "succeeded";
+      const failed = source.status !== "succeeded" || isUserStop(source.id);
       const startSlotRaw = meta?.startedAt ?? meta?.createdAt;
       const startSlotMs = startSlotRaw
         ? toMs(startSlotRaw)
@@ -2719,8 +2721,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   if (tailFinalResponse && !tailFinalStreaming) tailFinalRef.current.item = tailFinalResponse;
   const tailHasFinalResponse = Boolean(tailFinalRef.current.item) && !tailFinalStreaming;
   const tailTerminal = tailEntries.findLast((entry) => entry.kind === "run_terminal");
-  const tailStatus = isTerminalRunStatus(tailRunStatus) ? tailRunStatus :
+  const tailEndStatus = isTerminalRunStatus(tailRunStatus) ? tailRunStatus :
     tailTerminal?.runState ?? (tailHasFinalResponse ? "succeeded" : tailRunStatus);
+  const tailStatus = tailEndStatus === "succeeded" && isUserStop(tailRunId ?? "") ? "cancelled" : tailEndStatus;
   const tailFinishedAtMs = tailRunFinishedAtMs ?? (tailTerminal ? toMs(tailTerminal.ts) : tailFinalRef.current.item?.atMs ?? null);
   const tailTurnStatus = useMemo(
     () =>
