@@ -3307,7 +3307,7 @@ export class PaperclipRunnerToolAuthority {
     // Match identity activation and queue mutations before locking the run.
     await tx.select({ id: issues.id }).from(issues).where(and(
       eq(issues.id, this.binding.issueId), eq(issues.companyId, this.binding.companyId),
-    )).for("update");
+    )).for("no key update");
     // Authorization for writes is intentionally re-read only after the
     // transaction starts. Locking the run and issue in the same statement
     // closes the gap between the discovery-time check and the mutation: a
@@ -3328,7 +3328,7 @@ export class PaperclipRunnerToolAuthority {
         eq(issues.executionRunId, this.binding.runId),
         eq(agents.companyId, this.binding.companyId),
       ))
-      .for("update")
+      .for("no key update")
       .limit(1);
     if (
       !context
