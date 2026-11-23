@@ -1,3 +1,4 @@
+import { isGitHubAppConnection } from "../../github-app-credentials.js";
 import { assertSupportedConnection } from "../connections/setup-policy.js";
 import { isAwsMcpConnection } from "../../connectors/aws/mcp-credentials.js";
 import { usesClientCredentials } from "../oauth/client-credentials.js";
@@ -684,7 +685,7 @@ export function createToolCatalogDiscovery(db: Db, { now, audit, secrets, creden
         throw error;
       }
     }
-    if (connection.transport === "mcp_remote")
+    if (connection.transport === "mcp_remote" || isGitHubAppConnection(connection))
       return remoteTools(connection, credentialHeaders, actor, undefined, unavailableServices, listOptions);
     if (connection.transport !== "local_stdio") {
       throw unsupportedToolConnectionTransport();

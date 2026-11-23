@@ -62,6 +62,7 @@ import { executeSpekoVoiceTool, spekoToolsForSession } from "./voice/speko-agent
 import { captureRunIdentity } from "./run-identity.js";
 import { emitConnectionInvoked } from "./connector-telemetry.js";
 import { resolveManagedGitHubIdentitySelection } from "./git-credentials.js";
+import { GITHUB_APP_MCP_URL, isGitHubAppConnection, resolveGitHubAppCredential } from "./github-app-credentials.js";
 import { extractRemoteMcpPending } from "./remote-mcp-pending.js";
 import {
   backgroundPollDelayMs,
@@ -1826,6 +1827,7 @@ export function createToolGatewayService(
         inArray(toolConnections.healthStatus, ["ok", "healthy"]),
         eq(toolConnections.credentialPolicy, "per_user"),
         eq(toolConnections.transport, "plugin"),
+        sql`${toolConnections.config}->>'sourceTemplateKey' = 'github' AND ${toolConnections.config}->>'connectionMethodKey' = 'app-installation'`,
       ),
       eq(toolApplications.companyId, companyId),
       inArray(toolApplications.type, ["mcp_http", "mcp_stdio", "rest_api", "paperclip_plugin"]),
@@ -1952,10 +1954,11 @@ export function createToolGatewayService(
           pluginApps.isAvailable(connectionSourceSlug(connection)) &&
           (!featureSettings || isConnectorFeatureEnabled(getAppDefinitionForApplicationKey(application.applicationKey), featureSettings)) &&
           !isRetiredComposioConnection(connection) &&
+          !(isGitHubAppConnection(connection) && catalogEntry.toolName === "get_me") &&
           !(nativeProviderCatalogFor(connection) && !nativeProviderCatalogFor(connection)!.isCurrentEntry(catalogEntry)) &&
           !(restConnectorFor(connection) && !restConnectorFor(connection)!.isCurrent(catalogEntry)) &&
           !(isRailwayEndpoint(connection.config.url) && (isRailwayToolBlocked(catalogEntry.toolName) || (normalizeRailwayToolName(catalogEntry.toolName).startsWith(RAILWAY_TOOL_PREFIX) && connection.config.railwayApiStatus !== "available"))) &&
-          (((isBrowserUseConnection(connection) || nativeProviderCatalogFor(connection) || restConnectorFor(connection)) && application.type === "rest_api") ||
+          (((isGitHubAppConnection(connection) || isBrowserUseConnection(connection) || nativeProviderCatalogFor(connection) || restConnectorFor(connection)) && application.type === "rest_api") ||
           (connection.transport === "mcp_remote" &&
             application.type === "mcp_http") ||
           (connection.transport === "local_stdio" &&
@@ -1985,7 +1988,7 @@ export function createToolGatewayService(
       ({ catalogEntry, connection, application }) => {
         const toolSlug = slugSegment(catalogEntry.toolName, CONNECTED_TOOL_SLUG_FALLBACK);
         return `${connectionToolNamespace({
-          connectionId: connection.id, transport: connection.transport, connectionName: connection.name,
+          connectionId: connection.id, transport: isGitHubAppConnection(connection) ? "mcp_remote" : connection.transport, connectionName: connection.name,
           config: connection.config, applicationKey: application.applicationKey, applicationName: application.name,
         })}:${toolSlug}`;
       },
@@ -2002,7 +2005,7 @@ export function createToolGatewayService(
       ({ catalogEntry, connection, application }, index) => {
         if (
           connection.transport !== "mcp_remote" &&
-          connection.transport !== "local_stdio" && connection.transport !== "plugin" && !isBrowserUseConnection(connection) && !nativeProviderCatalogFor(connection) && !restConnectorFor(connection)
+          connection.transport !== "local_stdio" && connection.transport !== "plugin" && !isGitHubAppConnection(connection) && !isBrowserUseConnection(connection) && !nativeProviderCatalogFor(connection) && !restConnectorFor(connection)
         ) {
           throw new Error(
             `Non-MCP connection ${connection.id} cannot be exposed through the MCP gateway`,
@@ -2033,7 +2036,7 @@ export function createToolGatewayService(
           applicationDisplayName: application.name,
           connectionId: connection.id,
           catalogEntryId: catalogEntry.id,
-          transport: connection.transport as ConnectedMcpGatewayMetadata["transport"],
+          transport: (isGitHubAppConnection(connection) ? "mcp_remote" : connection.transport) as ConnectedMcpGatewayMetadata["transport"],
           gatewayToolName,
           upstreamToolName: catalogEntry.toolName,
           catalogName: catalogEntry.name,
@@ -2062,7 +2065,7 @@ export function createToolGatewayService(
           parametersSchema: inputSchema,
           pluginId: `mcp:${applicationKey ?? application.id}`,
           providerType:
-            connection.transport === "plugin" ? "paperclip_plugin_connection" : connection.transport === "rest_api" ? "provider_rest" : connection.transport === "local_stdio"
+            connection.transport === "plugin" ? "paperclip_plugin_connection" : connection.transport === "rest_api" && !isGitHubAppConnection(connection) ? "provider_rest" : connection.transport === "local_stdio"
               ? "mcp_local_stdio"
               : "mcp_remote_http",
           risk,
@@ -3998,6 +4001,7 @@ export function createToolGatewayService(
     connection: typeof toolConnections.$inferSelect,
     grant: typeof connectionGrants.$inferSelect,
   ): Promise<string> {
+    if (isGitHubAppConnection(connection)) return GITHUB_APP_MCP_URL;
     const publicEndpoint = remoteEndpoint(connection.config ?? {});
     const ref = (connection.credentialRefs ?? []).find(
       (candidate) => candidate.placement === "url",
@@ -4633,7 +4637,7 @@ export function createToolGatewayService(
     try {
       const captured = githubOperationCredentials.get(session);
       const headers =
-        !resolveOptions.forceRefresh && captured?.grant.id === grant.id
+        !resolveOptions.forceRefresh && !isGitHubAppConnection(connection) && captured?.grant.id === grant.id
           ? captured.headers
           : await resolveCredentialHeadersUnrecorded(
               session,
@@ -4648,7 +4652,7 @@ export function createToolGatewayService(
             github: {
               status: "available",
               login: grant.providerTenant?.github?.login,
-              source: grant.kind === "agent" ? "dedicated" : "personal",
+              source: grant.kind === "user" ? "personal" : "dedicated",
               connectionId: connection.id,
               grantId: grant.id,
               authenticationMode: "managed",
@@ -4669,7 +4673,7 @@ export function createToolGatewayService(
             github: {
               status: "unavailable",
               reason: "GitHub authorization is unavailable",
-              source: grant.kind === "agent" ? "dedicated" : "personal",
+              source: grant.kind === "user" ? "personal" : "dedicated",
             },
           })
           .where(
@@ -4688,6 +4692,15 @@ export function createToolGatewayService(
     grant: typeof connectionGrants.$inferSelect,
     resolveOptions: { forceRefresh?: boolean } = {},
   ): Promise<Record<string, string>> {
+    if (isGitHubAppConnection(connection)) {
+      const credential = await resolveGitHubAppCredential(db, connection, grant, {
+        forceRefresh: resolveOptions.forceRefresh, agentId: session.agentId,
+      });
+      const current = await resolveConnectionGrant(session, connection, false);
+      if (current.id !== grant.id) throw new ToolGatewayHttpError(409,
+        "GitHub identity changed; retry through the managed tool", "github_identity_unavailable");
+      return { Authorization: `Bearer ${credential.token}` };
+    }
     if (connection.credentialSource === "vercel_connect") {
       if (!connection.externalCredential || !vercelConnect) {
         throw new ToolGatewayHttpError(
@@ -5265,7 +5278,7 @@ export function createToolGatewayService(
         connection.transportConfig?.sourceTemplateKey === "github")
     ) {
       const captured = githubOperationCredentials.get(session);
-      const selected = captured
+      const selected = captured && !isGitHubAppConnection(connection)
         ? { grant: captured.grant, error: undefined }
         : await resolveManagedGitHubIdentitySelection(db, session.companyId, {
             agentId: session.agentId,
@@ -5608,7 +5621,7 @@ export function createToolGatewayService(
       )
       .limit(1);
     const connection = connected?.connection;
-    if (!connection || (connection.transport !== "mcp_remote" && !isBrowserUseConnection(connection) && !nativeProviderCatalogFor(connection) && !restConnectorFor(connection))) {
+    if (!connection || (connection.transport !== "mcp_remote" && !isGitHubAppConnection(connection) && !isBrowserUseConnection(connection) && !nativeProviderCatalogFor(connection) && !restConnectorFor(connection))) {
       throw new ToolGatewayHttpError(
         404,
         `Tool "${tool.name}" not found`,
@@ -6410,7 +6423,7 @@ export function createToolGatewayService(
       .where(and(eq(toolApplications.id, input.connection.applicationId), eq(toolApplications.companyId, input.session.companyId))).limit(1);
     if (!application) throw new ToolGatewayHttpError(404, "MCP connection not found", "connection_not_found");
     await assertApplicationFeatureAvailable(application.applicationKey);
-    if (input.connection.transport === "mcp_remote") {
+    if (input.connection.transport === "mcp_remote" || isGitHubAppConnection(input.connection)) {
       return callRemoteConnectionProtocol({
         ...input,
         params: input.params ?? {},

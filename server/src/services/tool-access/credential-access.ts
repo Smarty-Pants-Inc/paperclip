@@ -1,4 +1,5 @@
 import { connectionActorUserId } from "./actor.js";
+import { GITHUB_APP_MCP_URL, getGitHubAppGrant, isGitHubAppConnection, resolveGitHubAppCredential } from "../github-app-credentials.js";
 import { AwsMcpCredentialError, isAwsMcpConnection, resolveAwsMcpAuthorization, sharedAwsMcpCredentialMinter, type AwsMcpClients } from "../connectors/aws/mcp-credentials.js";
 import { workloadIdentityService } from "../workload-identity.js";
 import type { ActorInfo } from "./types.js";
@@ -183,6 +184,14 @@ export function createConnectionCredentialAccess(db: Db, { secrets, audit, verce
     actor?: ActorInfo,
     options: { forceRefresh?: boolean } = {},
   ): Promise<Record<string, string>> {
+    if (isGitHubAppConnection(connection)) {
+      const grant = connection.credentialPolicy === "shared" ? await getGitHubAppGrant(db, connection) : await vaultGrantForConnection(connection, actor);
+      if (!grant) throw unprocessable("The GitHub App authorization is unavailable");
+      const credential = await resolveGitHubAppCredential(db, connection, grant, {
+        forceRefresh: options.forceRefresh, agentId: actor?.actorType === "agent" ? actor.actorId : null,
+      });
+      return { Authorization: `Bearer ${credential.token}` };
+    }
     if (connection.credentialSource === "vercel_connect") {
       const grant = await vercelGrantForConnection(connection, actor);
       return resolveVercelCredentialHeaders(connection, grant, options);
@@ -327,6 +336,7 @@ export function createConnectionCredentialAccess(db: Db, { secrets, audit, verce
     connection: typeof toolConnections.$inferSelect,
     actor?: ActorInfo,
   ): Promise<string> {
+    if (isGitHubAppConnection(connection)) return GITHUB_APP_MCP_URL;
     const publicEndpoint = remoteEndpoint(connection.config);
     const ref = connection.credentialRefs.find(
       (candidate) => candidate.placement === "url",
