@@ -2239,7 +2239,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
               ) &&
               deliveredCommentRunIds.get(entry.comment.id) !==
                 authoritativeQueuedCommentQueue.targetRunId,
-          ),
+          ).sort((a, b) => a.position - b.position ||
+            new Date(a.comment.createdAt).getTime() - new Date(b.comment.createdAt).getTime()),
         }
       : null;
     const pendingComments = commentsWithRunMeta.flatMap((comment) => {
@@ -2264,7 +2265,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       // later message. A request still in flight keeps its original target.
       if (targetRunId && !liveRunIds.has(targetRunId) && !comment.id.startsWith("optimistic-")) return [];
       return targetRunId ? [{ comment, targetRunId }] : [];
-    });
+    }).sort((a, b) => new Date(a.comment.createdAt).getTime() - new Date(b.comment.createdAt).getTime());
     const fallbackProtocol =
       liveRuntimeRun?.adapterType === "paperclip_runner" ||
       (!liveRuntimeRun && assigneeUsesPaperclipRunner)
