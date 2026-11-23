@@ -2125,7 +2125,14 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           // still explains that run's answer, so take it before the filter.
           mcpStartupFailures: partitionRunHealthItems(parsed).failures,
           timelineItems: sourceIsPaperclipRunner
-            ? paperclipRunnerTimelineItems(visibleActivity)
+            // Every authored message was visible live, not just the last final.
+            // Treat it as timeline prose; the run-wide response dedupe below
+            // removes the final copy owned by the completion comment/response.
+            ? paperclipRunnerTimelineItems(visibleActivity.map((item) =>
+                item.kind === "message"
+                  ? { ...item, channel: "progress" as const, interstitial: true }
+                  : item,
+              ))
             : visibleActivity,
         };
       });
