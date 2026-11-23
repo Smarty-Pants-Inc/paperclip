@@ -2348,7 +2348,7 @@ export async function commitNativeStatusDecision(input: {
       // no chat presentation authorization is supplied: this is Board-only.
       await issueService(tx as unknown as Db).addComment(
         input.issueId,
-        boardResponseWait.summary,
+        boardResponseWait.replyText,
         { agentId: boardResponseWait.source.agentId, runId: input.runId },
         undefined,
         tx,
