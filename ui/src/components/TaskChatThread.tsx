@@ -701,6 +701,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     [issueId, queryClient],
   );
 
+  const attemptedAutoSteer = useRef(new Set<string>());
   const queuedMessageQueue =
     queuedCommentQueue && queuedCommentQueue.entries.length > 0
       ? queuedCommentQueue
@@ -1290,6 +1291,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const steeringAnchorsByRun = useMemo(() => {
     const map = new Map<string, number[]>();
     for (const comment of comments) {
+      if (queuedCommentIds.has(comment.id)) continue;
       const anchorMs = toMs(comment.createdAt);
       // A message sent after the run's turn ended can't be a steer (the agent refused it), even
       // while the run is still saving: it is its own request, not a split of the finished reply.
@@ -1305,7 +1307,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     }
     for (const anchors of map.values()) anchors.sort((a, b) => a - b);
     return map;
-  }, [comments, runs, linkedRunMetaById, transcriptByRun]);
+  }, [comments, runs, linkedRunMetaById, transcriptByRun, queuedCommentIds]);
 
   // A native-runner Plan is part of the turn that wrote its current revision.
   // Legacy adapters do not expose the semantic write_document boundary needed
@@ -3744,7 +3746,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                           queue={queuedMessageQueue ?? emptyQueuedCommentQueue}
                           onEdit={beginQueuedEdit}
                           editingCommentId={queuedEdit?.commentId ?? null}
-                          autoSteerDelayMs={queuedMessageAutoSteerDelayMs}
+                          autoSteerDelayMs={stopPending ? null : queuedMessageAutoSteerDelayMs}
+                          attemptedAutoSteerKeys={attemptedAutoSteer.current}
                           onReorder={async (orderedCommentIds, revision) => {
                             if (!onReorderQueuedComments)
                               throw new Error("Queue reordering is unavailable.");
