@@ -62,6 +62,7 @@ import { executeSpekoVoiceTool, spekoToolsForSession } from "./voice/speko-agent
 import { captureRunIdentity } from "./run-identity.js";
 import { emitConnectionInvoked } from "./connector-telemetry.js";
 import { resolveManagedGitHubIdentitySelection } from "./git-credentials.js";
+import { isGitHubAppConnection, resolveGitHubAppCredential } from "./github-app-credentials.js";
 import { extractRemoteMcpPending } from "./remote-mcp-pending.js";
 import {
   backgroundPollDelayMs,
@@ -1952,6 +1953,7 @@ export function createToolGatewayService(
           pluginApps.isAvailable(connectionSourceSlug(connection)) &&
           (!featureSettings || isConnectorFeatureEnabled(getAppDefinitionForApplicationKey(application.applicationKey), featureSettings)) &&
           !isRetiredComposioConnection(connection) &&
+          !(isGitHubAppConnection(connection) && catalogEntry.toolName === "get_me") &&
           !(nativeProviderCatalogFor(connection) && !nativeProviderCatalogFor(connection)!.isCurrentEntry(catalogEntry)) &&
           !(restConnectorFor(connection) && !restConnectorFor(connection)!.isCurrent(catalogEntry)) &&
           !(isRailwayEndpoint(connection.config.url) && (isRailwayToolBlocked(catalogEntry.toolName) || (normalizeRailwayToolName(catalogEntry.toolName).startsWith(RAILWAY_TOOL_PREFIX) && connection.config.railwayApiStatus !== "available"))) &&
@@ -4798,6 +4800,9 @@ export function createToolGatewayService(
     }
     if (isAwsMcpConnection(connection)) {
       return resolveAwsMcpHeaders(session, connection, grant, resolveOptions);
+    }
+    if (isGitHubAppConnection(connection)) {
+      return { Authorization: `Bearer ${(await resolveGitHubAppCredential(db, connection, grant, resolveOptions)).token}` };
     }
     const oauth = asRecord(asRecord(connection.config)?.oauth);
     if (
