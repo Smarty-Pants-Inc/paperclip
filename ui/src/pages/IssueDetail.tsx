@@ -4903,7 +4903,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   const stopResponse = useMutation({
     mutationFn: async (runId: string) => {
       const stoppedRun = await heartbeatsApi.cancel(runId);
-      await waitForStoppedRuns([runId], { initialRuns: [stoppedRun] });
+      // A Pi Stop before the agent has started waits up to 60 s on the server (0234): wait past it.
+      await waitForStoppedRuns([runId], { initialRuns: [stoppedRun], timeoutMs: 70_000 });
     },
     onSettled: () => Promise.all([
       queryClient.invalidateQueries({ queryKey: queryKeys.issues.detail(issueId!) }),
