@@ -2517,16 +2517,16 @@ impl CodexProvider {
         )
     }
 
-    pub fn interrupt_turn(&mut self) -> Result<Value, LocalRunnerError> {
+    pub fn interrupt_turn(&mut self, reason: Option<&str>) -> Result<Value, LocalRunnerError> {
         let turn_id = self
             .active_provider_turn_id
             .clone()
             .ok_or_else(|| LocalRunnerError::invalid("Codex has no active provider turn"))?;
         self.cancel_pending_requests()?;
-        self.request(
-            "turn/interrupt",
-            json!({"threadId": self.thread_id, "turnId": turn_id}),
-        )
+        let mut params = json!({"threadId": self.thread_id, "turnId": turn_id});
+        // Seam 0241: our Pi proxy needs the reason to tell a person's Stop from a cancel; Codex's app-server never sees it.
+        if let (Some(reason), "pi_rpc") = (reason, self.config.provider.as_str()) { params["reason"] = json!(reason); }
+        self.request("turn/interrupt", params)
     }
 
     pub(crate) fn cursor_cloud_terminal_delivery(
