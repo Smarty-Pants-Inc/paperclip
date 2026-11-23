@@ -29,6 +29,7 @@ import type {
   IssueQueuedCommentQueue,
 } from "@paperclipai/shared";
 import { cn } from "@/lib/utils";
+import { ApiError } from "@/api/client";
 import { MarkdownBody } from "@/components/MarkdownBody";
 import { extractImageRefs, stripStandaloneImageEmbeds } from "./task-chat-attachments";
 import { TaskChatComposerBar } from "./TaskChatComposerBar";
@@ -96,6 +97,7 @@ export interface TaskChatQueuedMessagesProps {
   editingCommentId?: string | null;
   /** Steer eligible queued messages automatically after this delay; null keeps every message queued. */
   autoSteerDelayMs?: number | null;
+  attemptedAutoSteerKeys?: Set<string>;
 }
 
 function SortableQueuedMessage({
@@ -304,13 +306,14 @@ export function TaskChatQueuedMessages({
   onDiscard,
   editingCommentId = null,
   autoSteerDelayMs = null,
+  attemptedAutoSteerKeys,
 }: TaskChatQueuedMessagesProps) {
   const [entries, setEntries] = useState(queue.entries);
   // Automatic steering: Cancel keeps a message queued for this view; each
   // message revision gets at most one automatic attempt, so a failure falls
   // back to the ordinary queue instead of retrying in a loop.
   const [cancelledAutoSteer, setCancelledAutoSteer] = useState<ReadonlySet<string>>(() => new Set());
-  const attemptedAutoSteer = useRef(new Set<string>());
+  const attemptedAutoSteer = useRef(attemptedAutoSteerKeys ?? new Set<string>());
   // Recomputes the deadlines after an attempt; the set itself is a ref.
   const [autoSteerAttempts, setAutoSteerAttempts] = useState(0);
   // First time this view offered each message revision for automatic steering.
@@ -407,7 +410,7 @@ export function TaskChatQueuedMessages({
     if (!due) return;
     attemptedAutoSteer.current.add(queuedMessageAutoSteerKey(due));
     setAutoSteerAttempts((count) => count + 1);
-    void runRowAction(due.comment.id, "steer");
+    void runRowAction(due.comment.id, "steer", true);
   });
 
   async function handleDragEnd(event: DragEndEvent) {
@@ -454,6 +457,7 @@ export function TaskChatQueuedMessages({
   async function runRowAction(
     commentId: string,
     action: Exclude<QueueAction, null>,
+    automatic = false,
   ) {
     if (
       pending ||
@@ -517,6 +521,7 @@ export function TaskChatQueuedMessages({
         ));
       }
       setAnnouncement("");
+      if (automatic && error instanceof ApiError && error.status === 409) return;
       const code = queueActionErrorCode(error);
       setVisibleError(
         code === "queued_comment_already_dispatching"
