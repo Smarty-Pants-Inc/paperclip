@@ -527,6 +527,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     stopScope,
     issueWorkMode = "standard",
     onWorkModeChange,
+    composerRef,
     composerAccessory,
     footer,
     showComposer = true,
@@ -3655,6 +3656,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                       ) : null}
                       <div className="relative z-10">
                         <TaskChatComposer
+                          composerRef={composerRef}
                           onAdd={handleThreadAdd}
                           confirmedSubmissionIds={new Set(comments.filter((comment) =>
                             comment.authorUserId === currentUserId && comment.clientRequestId &&
