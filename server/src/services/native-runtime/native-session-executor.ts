@@ -54,6 +54,7 @@ import { providerPackWorkspaceId, recordAdmittedRemoteProviderPack, resolveRemot
 import { nativeProviderPackAdmissionFailureCode, prepareNativeProviderPackAdmission, rememberAdmittedNativeProviderPack, rememberRecoveredNativeProviderPack, recordNativeProviderPackAdmission, type NativeProviderPackAdmissionSource } from "./native-provider-pack-admission.js";
 import { type ProviderPackIdentity, type ProviderPackInstallation, providerPackIncompatible, verifyRemoteProviderPack as verifyRemoteProviderPackIdentity } from "./remote-provider-pack-verification.js";
 import { writeEnvironmentCleanup } from "../environment-cleanup-notifications.js";
+import { retiredReusableLeasePredecessors } from "../environment-lease-handoff.js";
 import { NATIVE_SESSION_EXECUTION_LEASE_TTL_MS, lockNativeExecutionLeaseForReacquire, nativeExecutionLeaseHeldCondition, releaseUnstartedNativeExecutionClaim, startNativeSessionExecutionLeaseRenewal, type NativeExecutionLeaseRenewal } from "./native-execution-lease.js";
 export { renewNativeSessionExecutionLease } from "./native-execution-lease.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
@@ -17904,18 +17905,28 @@ async function createRunnerdBackendWithinSessionClaim(
       completedAt: backup.manifest.completedAt,
     });
     const leaseId = remoteTarget.leaseId;
-    const updated = await writeEnvironmentCleanup(input.db, tx => tx
-      .update(environmentLeases)
+    const updated = await writeEnvironmentCleanup(input.db, async tx => {
+      const history = remoteTarget.environmentId ? await tx.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, input.execution.binding.companyId),
+        eq(environmentLeases.environmentId, remoteTarget.environmentId), eq(environmentLeases.providerLeaseId, leaseRow.providerLeaseId!))).orderBy(environmentLeases.id).for("no key update") : [];
+      const tips = history.filter(row => !Object.hasOwn(row.metadata ?? {}, "reusableLeaseSuccessor"));
+      let tip = tips.length === 1 ? tips[0] : null;
+      const chain = tip && retiredReusableLeasePredecessors(tip, history.filter(row => row.id !== tip!.id));
+      const [run] = tip?.heartbeatRunId ? await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, tip.heartbeatRunId)) : [];
+      if (!tip || !chain || ![tip, ...chain].some(row => row.id === leaseId) || tip.metadata?.agentId !== input.execution.binding.agentId || !run || run.companyId !== tip.companyId || run.nativeSessionId !== backup.manifest.normalizedSessionId || run.runnerInstanceId !== backup.manifest.runnerInstanceId) {
+        logger.warn({ leaseId, tips: tips.length }, "harness backup tip unproven; stamping captured lease");
+        tip = history.find(row => row.id === leaseId) ?? null;
+      }
+      return tx.update(environmentLeases)
       .set({
         metadata: {
-          ...(leaseRow.metadata ?? {}),
+          ...(tip?.metadata ?? leaseRow.metadata ?? {}),
           nativeHarnessBackup: stamp,
         },
         updatedAt: new Date(),
       })
-      .where(eq(environmentLeases.id, leaseId))
+      .where(eq(environmentLeases.id, tip?.id ?? leaseId))
       .returning({ id: environmentLeases.id })
-      .then((rows) => rows[0] ?? null), { companyId: leaseRow.companyId, runId: leaseRow.heartbeatRunId ?? undefined, leaseId });
+      .then((rows) => rows[0] ?? null); }, { companyId: leaseRow.companyId, runId: leaseRow.heartbeatRunId ?? undefined, leaseId });
     if (!updated) throw new Error("runner_harness_backup_lease_missing");
   };
 
