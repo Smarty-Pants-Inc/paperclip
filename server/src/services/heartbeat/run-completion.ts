@@ -43,7 +43,7 @@ import { isConversation, settleConversationTurn } from "../agent-conversations.j
 import { legacyExecutionNeedsReconciliationWithEvidence } from "../legacy-execution-recovery.js";
 import { isWorkspaceGitScanError } from "../workspace-git-operation-scheduler.js";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
-import { heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, nativeRunResults } from "@paperclipai/db";
+import { heartbeatRunEvents, heartbeatRuns, issueComments, issues, nativeRunFinalizations, nativeRunResults } from "@paperclipai/db";
 import { HttpError } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { normalizeResponsibleUserDenialCode } from "../responsible-user-denial-run-outcomes.js";
@@ -903,6 +903,14 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         });
         let presentationDecision: RunPresentationDecision =
           resolved.decision;
+        // A same-run progress note that already says exactly the final answer is that answer: don't post it twice.
+        const sameRunAnswer = issueId && presentationDecision.commentAction === "create" && resolved.text
+          ? (await db.select({ id: issueComments.id }).from(issueComments).where(and(eq(issueComments.companyId, livenessRun.companyId),
+              eq(issueComments.issueId, issueId), eq(issueComments.createdByRunId, livenessRun.id),
+              sql`btrim(${issueComments.body}) = ${resolved.text.trim()}`)).limit(1))[0] ?? null
+          : null;
+        if (sameRunAnswer) presentationDecision = { ...presentationDecision, commentAction: "reuse", commentId: sameRunAnswer.id,
+          reasonCodes: [...presentationDecision.reasonCodes, "same_run_comment_is_final_answer"] };
 
         if (
           issueId &&
