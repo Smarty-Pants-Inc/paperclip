@@ -721,6 +721,12 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         } else await recordInterruptedPreparationContinuation(db, run, "deferred");
       }
     }
+    // A later run that owns the issue drains its deferred comments itself when it releases.
+    // Re-enqueueing a plain comment now would add a second copy beside the original.
+    const [owner] = await db.select({ status: heartbeatRuns.status }).from(issues)
+      .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, issues.executionRunId))
+      .where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId)));
+    const ownerLive = Boolean(owner && !isHeartbeatRunTerminalStatus(owner.status));
     for (const wake of pending) {
       if (wake.idempotencyKey?.startsWith("chat-inbound:")) {
         await resumeDeferredChatWake(db, { companyId: run.companyId, agentId: run.agentId,
@@ -778,6 +784,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           continue;
         }
       }
+      if (ownerLive) break;
       // Re-enter ordinary admission with the original user's authority. It
       // atomically adopts the deferred comments and still applies every gate.
       await enqueueWakeup(run.agentId, { source: wake.source as WakeupOptions["source"], triggerDetail: (wake.triggerDetail ?? undefined) as WakeupOptions["triggerDetail"],
