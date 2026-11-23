@@ -553,6 +553,83 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
   const releaseLiveNativeFinalization = nativeRuntimeResolution.kind === "native"
     ? reserveLiveNativeFinalization(db, { companyId: run.companyId, runId: run.id, issueId: issueRef?.id })
     : undefined;
+  // A returned result can include a failed restore. Keep the workspace
+  // barrier closed until required files have been restored.
+  // If recording the barrier itself fails, propagate as a run failure
+  // rather than silently leaving dependents stranded behind a missing
+  // finalize row.
+  const completeWorkspace = async (adapterResult: AdapterExecutionResult | null, ownership?: NativeWorkspaceFinalizationOwnership) => {
+    try {
+      if (remoteWorkspaceAuthority && persistedExecutionWorkspace) {
+        if (!ownership || !executionTarget) throw new Error("remote_workspace_ownership_required");
+        const current = await executionWorkspacesSvc.getStoredById(agent.companyId, persistedExecutionWorkspace.id);
+        const authority = readRemoteWorkspaceAuthority(current?.metadata);
+        const lease = authority?.location
+          ? await environmentService(db).getLeaseById(authority.location.leaseId) : null;
+        if (!current || !lease || lease.companyId !== run.companyId || lease.heartbeatRunId !== run.id) {
+          throw new Error("workspace_sync_out_unrecoverable");
+        }
+        await recordWorkspaceFinalize("succeeded", { owningService: "native_workspace_finalizer", storage: "remote" },
+          async () => { await saveRemoteWorkspace({ db, workspace: current, runId: run.id, lease,
+            target: executionTarget, assertOwned: ownership.assertHeld }); });
+      }
+      if (nativeWorkspaceSync) {
+        const exported = await db.select({ id: workspaceOperations.id }).from(workspaceOperations).where(and(
+          eq(workspaceOperations.companyId, run.companyId),
+          eq(workspaceOperations.heartbeatRunId, run.id),
+          eq(workspaceOperations.phase, "workspace_finalize"),
+          eq(workspaceOperations.status, "succeeded"),
+        )).limit(1);
+        if (exported.length) adapterFinalizeOutcome = "succeeded";
+        else await recordWorkspaceFinalize(hasWorkspaceRestoreFailure(adapterResult?.resultJson) ? "failed" : "succeeded", undefined,
+          async () => { await measureRunPhase("execution.workspace_finalize", () => restoreNativeWorkspaceBestEffort({
+            db, runId: run.id, assertOwnership: ownership?.assertHeld,
+            restore: () => nativeWorkspaceSync!.restoreWorkspace(ownership?.assertHeld),
+          })); });
+      }
+      await ownership?.assertHeld();
+      await writeExecutionControl(db, DELIVERY_QUEUES.executionFinalization, tx => tx
+        .update(heartbeatRuns)
+        .set({ executionControlDeadlineAt: new Date(Date.now() + 60_000) })
+        .where(
+          and(
+            eq(heartbeatRuns.id, run.id),
+            eq(heartbeatRuns.status, "running"),
+          ),
+        ), { companyId: run.companyId, runId: run.id });
+      const workspaceFinalizeStatus = hasWorkspaceRestoreFailure(adapterResult?.resultJson) ? "failed" : "succeeded";
+      await recordWorkspaceFinalize(workspaceFinalizeStatus);
+      if (adapterResult?.nativeFinalization) {
+        adapterResult.nativeFinalization.workspaceFinalizeStatus =
+          workspaceFinalizeStatus;
+        try {
+          const finalized = await measureRunPhase("execution.native_finalize", () => finalizeNativeRun({
+            db,
+            runId: run.id,
+            workspaceFinalizeStatus,
+            preserveProviderAttempt: Boolean(nativeWorkspaceSync || remoteWorkspaceAuthority),
+          }));
+          await dispatchPendingNativeStatusWakeups({
+            companyId: run.companyId,
+          });
+          if (finalized.phase === "committed") {
+            await nativeWorkspaceSync?.cleanup();
+          }
+        } catch (finalizeErr) {
+          logger.warn(
+            { err: finalizeErr, runId: run.id },
+            "native result persisted but finalization did not apply; the reconciliation loop will retry",
+          );
+        }
+      }
+    } catch (error) {
+      if (ownership) {
+        await ownership.assertHeld();
+        await recordWorkspaceFinalize("failed");
+      }
+      throw error;
+    }
+  };
   try {
     if (nativeRuntimeResolution.kind === "native") {
       if (!nativeExecution || !nativeRunnerInstanceId)
@@ -1018,95 +1095,40 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       }).where(and(eq(heartbeatRuns.id, run.id), isNull(heartbeatRuns.costAccountedAt)));
     }
     adapterResult = applyWorkspaceRestoreFailure(adapterResult);
-    // A returned result can include a failed restore. Keep the workspace
-    // barrier closed until required files have been restored.
-    // If recording the barrier itself fails, propagate as a run failure
-    // rather than silently leaving dependents stranded behind a missing
-    // finalize row.
-    const completeWorkspace = async (ownership?: NativeWorkspaceFinalizationOwnership) => {
-      try {
-        if (remoteWorkspaceAuthority && persistedExecutionWorkspace) {
-          if (!ownership || !executionTarget) throw new Error("remote_workspace_ownership_required");
-          const current = await executionWorkspacesSvc.getStoredById(agent.companyId, persistedExecutionWorkspace.id);
-          const authority = readRemoteWorkspaceAuthority(current?.metadata);
-          const lease = authority?.location
-            ? await environmentService(db).getLeaseById(authority.location.leaseId) : null;
-          if (!current || !lease || lease.companyId !== run.companyId || lease.heartbeatRunId !== run.id) {
-            throw new Error("workspace_sync_out_unrecoverable");
-          }
-          await recordWorkspaceFinalize("succeeded", { owningService: "native_workspace_finalizer", storage: "remote" },
-            async () => { await saveRemoteWorkspace({ db, workspace: current, runId: run.id, lease,
-              target: executionTarget, assertOwned: ownership.assertHeld }); });
-        }
-        if (nativeWorkspaceSync) {
-          const exported = await db.select({ id: workspaceOperations.id }).from(workspaceOperations).where(and(
-            eq(workspaceOperations.companyId, run.companyId),
-            eq(workspaceOperations.heartbeatRunId, run.id),
-            eq(workspaceOperations.phase, "workspace_finalize"),
-            eq(workspaceOperations.status, "succeeded"),
-          )).limit(1);
-          if (exported.length) adapterFinalizeOutcome = "succeeded";
-          else await recordWorkspaceFinalize(hasWorkspaceRestoreFailure(adapterResult.resultJson) ? "failed" : "succeeded", undefined,
-            async () => { await measureRunPhase("execution.workspace_finalize", () => restoreNativeWorkspaceBestEffort({
-              db, runId: run.id, assertOwnership: ownership?.assertHeld,
-              restore: () => nativeWorkspaceSync!.restoreWorkspace(ownership?.assertHeld),
-            })); });
-        }
-        await ownership?.assertHeld();
-        await writeExecutionControl(db, DELIVERY_QUEUES.executionFinalization, tx => tx
-          .update(heartbeatRuns)
-          .set({ executionControlDeadlineAt: new Date(Date.now() + 60_000) })
-          .where(
-            and(
-              eq(heartbeatRuns.id, run.id),
-              eq(heartbeatRuns.status, "running"),
-            ),
-          ), { companyId: run.companyId, runId: run.id });
-        const workspaceFinalizeStatus = hasWorkspaceRestoreFailure(adapterResult.resultJson) ? "failed" : "succeeded";
-        await recordWorkspaceFinalize(workspaceFinalizeStatus);
-        if (adapterResult.nativeFinalization) {
-          adapterResult.nativeFinalization.workspaceFinalizeStatus =
-            workspaceFinalizeStatus;
-          try {
-            const finalized = await measureRunPhase("execution.native_finalize", () => finalizeNativeRun({
-              db,
-              runId: run.id,
-              workspaceFinalizeStatus,
-              preserveProviderAttempt: Boolean(nativeWorkspaceSync || remoteWorkspaceAuthority),
-            }));
-            await dispatchPendingNativeStatusWakeups({
-              companyId: run.companyId,
-            });
-            if (finalized.phase === "committed") {
-              await nativeWorkspaceSync?.cleanup();
-            }
-          } catch (finalizeErr) {
-            logger.warn(
-              { err: finalizeErr, runId: run.id },
-              "native result persisted but finalization did not apply; the reconciliation loop will retry",
-            );
-          }
-        }
-      } catch (error) {
-        if (ownership) {
-          await ownership.assertHeld();
-          await recordWorkspaceFinalize("failed");
-        }
-        throw error;
-      }
-    };
     if (nativeWorkspaceSync || remoteWorkspaceAuthority) {
       const owned = await measureRunPhase("execution.workspace_ownership", () => withNativeWorkspaceFinalizationOwnership({
         db, companyId: run.companyId, runId: run.id, liveHeartbeat: true,
         ...(remoteWorkspaceAuthority && nativeRuntimeResolution.kind !== "native" && persistedExecutionWorkspace
           ? { remoteWorkspaceId: persistedExecutionWorkspace.id } : {}),
-      }, completeWorkspace));
+      }, ownership => completeWorkspace(adapterResult, ownership)));
       if (!owned.acquired) throw new NativeWorkspaceFinalizationBusyError();
     } else {
-      await completeWorkspace();
+      await completeWorkspace(adapterResult);
     }
   } catch (adapterErr) {
     if (adapterErr instanceof NativeCancellationPendingRecoveryError) {
+      if (adapterErr.personStopRetired && (nativeWorkspaceSync || remoteWorkspaceAuthority)) {
+        input.effects.onProviderResourceDisposition("stop_and_retain");
+        const save = (async () => {
+          const owned = await withNativeWorkspaceFinalizationOwnership({
+            db, companyId: run.companyId, runId: run.id, liveHeartbeat: true,
+          }, ownership => completeWorkspace(null, ownership));
+          if (!owned.acquired) throw new NativeWorkspaceFinalizationBusyError();
+          const [saved] = await db.select({ id: workspaceOperations.id }).from(workspaceOperations).where(and(
+            eq(workspaceOperations.companyId, run.companyId), eq(workspaceOperations.heartbeatRunId, run.id),
+            eq(workspaceOperations.phase, "workspace_finalize"), eq(workspaceOperations.status, "succeeded"),
+          )).limit(1);
+          if (!saved) throw new Error("native_stop_workspace_save_unconfirmed");
+        })();
+        // Bounded: past 10 s the save keeps its ownership and finishes on its own; this Stop keeps today's recovery.
+        let bound: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([save, new Promise<never>((_, reject) => {
+          bound = setTimeout(() => reject(new Error("native_stop_workspace_save_bounded")), 10_000);
+        })]).catch(error => {
+          logger.warn({ err: error, runId: run.id }, "Stopped workspace save unconfirmed; keeping cancellation recovery");
+        }).finally(() => clearTimeout(bound));
+        save.catch(() => undefined);
+      }
       // Durable cancellation is settled by the outer recovery handler;
       // it does not imply a failed workspace or a persisted run result.
       throw adapterErr;
