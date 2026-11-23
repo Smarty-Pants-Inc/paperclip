@@ -447,6 +447,8 @@ export function projectExecution(
   if (
     (run.status === "running" &&
       (run.executionControlDeadlineAt || coordinator?.controlDeadlineAt)) ||
+    // A committed result whose run row is not terminal yet is finishing, not unconfirmed.
+    (run.status === "running" && ["committed", "applied"].includes(coordinator?.phase ?? "")) ||
     [
       "result_persisted",
       "ready_for_assessment",
