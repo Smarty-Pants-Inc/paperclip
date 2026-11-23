@@ -1198,10 +1198,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const steeringAnchorsByRun = useMemo(() => {
     const map = new Map<string, number[]>();
     for (const comment of comments) {
-      const runId = comment.steeredIntoRunId;
-      if (comment.deletedAt || !runId || !comment.conversationAnchorAt)
-        continue;
-      const anchorMs = toMs(comment.conversationAnchorAt);
+      const anchorMs = toMs(comment.createdAt);
+      const runId = comment.authorType === "user" ? runs.find(run =>
+        toMs(run.createdAt) < anchorMs && (!isTerminalRunStatus(run.status) ||
+          anchorMs <= toMs(linkedRunMetaById.get(run.id)?.finishedAt)))?.id : null;
+      if (comment.deletedAt || !runId) continue;
       if (!Number.isFinite(anchorMs)) continue;
       const anchors = map.get(runId) ?? [];
       if (!anchors.includes(anchorMs)) anchors.push(anchorMs);
@@ -1209,7 +1210,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     }
     for (const anchors of map.values()) anchors.sort((a, b) => a - b);
     return map;
-  }, [comments]);
+  }, [comments, runs, linkedRunMetaById]);
 
   // A native-runner Plan is part of the turn that wrote its current revision.
   // Legacy adapters do not expose the semantic write_document boundary needed
@@ -1311,7 +1312,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       (comment) => !comment.deletedAt,
     );
     visibleComments.forEach((comment, index) => {
-      if (queuedCommentIds.has(comment.id)) return;
       // The live/settling runner lane already renders this run's final answer.
       // Keep a just-persisted duplicate out of the backbone until the complete
       // canonical bubble + Worked header can replace that lane atomically.
@@ -1328,14 +1328,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       const item = commentItems[index];
       if (!item) return;
       entries.push({
-        // A held/queued input belongs where the runner actually consumes it,
-        // not where the user first submitted it while another turn was live.
-        ms: comment.conversationAnchorAt
+        // Delivery changes status, never a human message's submission slot.
+        ms: comment.authorType !== "user" && comment.conversationAnchorAt
           ? toMs(comment.conversationAnchorAt)
           : toMs(comment.createdAt),
         order:
-          1 + Math.min(comment.conversationAnchorSequence ?? 0, 999) / 1000,
-        id: item.id,
+          1 + Math.min(comment.authorType === "user" ? 0 : comment.conversationAnchorSequence ?? 0, 999) / 1000,
+        id: comment.clientId ?? item.id,
         item,
       });
     });
