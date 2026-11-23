@@ -168,6 +168,7 @@ const retryWaitMessages: Record<string, string> = {
   process_identity_missing: "Retry is waiting for Paperclip to verify that the previous execution stopped. Your message is saved.",
   process_running: "Retry is waiting for the previous execution to stop. Your message is saved.",
   execution_active: "Retry is waiting for the current run to finish. Your message is saved.",
+  execution_owner_active: "Retry is waiting for the previous execution to finish cleanup. Your message is saved.",
   decision_pending: "Retry is waiting for a pending approval or question to be resolved. Your message is saved.",
   "budget.blocked": "Retry is waiting for the budget to allow new work. Check Costs for unrecorded or unpriced usage.",
   // Admission records an unpriced-usage refusal as budget.blocked; the
