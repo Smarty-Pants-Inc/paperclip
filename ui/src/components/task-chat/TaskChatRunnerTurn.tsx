@@ -118,7 +118,8 @@ function RunnerTurnStatus({
 
 function RunnerCurrentActivityTail({ status, waitingLabel }: { status: string; waitingLabel?: string | null }) {
   const shimmer = useTaskChatShimmer("working");
-  if (isTerminalRunStatus(status)) return null;
+  // A recovering run keeps its working sign under the recovery words.
+  if (isTerminalRunStatus(status) && !waitingLabel) return null;
   return <div className="mt-2 flex min-h-8 min-w-0 items-center gap-2 px-1 py-1 text-xs text-muted-foreground" data-testid="task-chat-current-activity" data-turn-position="tail">
     <span className={cn(!waitingLabel && shimmer && "shimmer-text shimmer-text-muted")} aria-live="polite" data-testid="task-chat-current-activity-label">{waitingLabel ?? "Thinking"}</span>
   </div>;

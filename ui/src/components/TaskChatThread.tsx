@@ -2595,14 +2595,15 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     interruption: props.interruption,
     onRefresh: props.onRefreshLatestComments,
   });
+  // A recovering chain is drawn from its linked run, whose name may be empty.
   const tailAgentName =
-    liveRun?.agentName ?? linkedRunMetaById.get(tailRunId ?? "")?.agentName;
+    liveRun?.agentName || linkedRunMetaById.get(tailRunId ?? "")?.agentName || undefined;
   const tailAgentId =
     liveRun?.agentId ??
     linkedRunMetaById.get(tailRunId ?? "")?.agentId ??
     submissionAgentId ?? issueAssigneeAgentId;
   const tailAgent = tailAgentId ? agentMap?.get(tailAgentId) : undefined;
-  const visibleTailAgentName = tailAgentName ?? tailAgent?.name ?? null;
+  const visibleTailAgentName = tailAgentName || tailAgent?.name || null;
   const visibleTailAgentIcon = tailAgent?.icon ?? null;
   const tailItems = useMemo(
     () => {
