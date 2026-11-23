@@ -730,8 +730,8 @@ export interface RunnerProcessHandle {
   processGroupId?: number | null;
   startedAt?: string;
   isExitConfirmed?(): boolean;
-  /** Relaunches the same immutable process specification with a fresh ticket. */
-  restart?: ((ticket: string) => RunnerProcessHandle) | null;
+  /** Relaunches the same process specification with a fresh ticket and current authority. */
+  restart?: ((ticket: string, identity?: DurableRecoveryIdentity, connection?: RunnerProcessConnection) => RunnerProcessHandle) | null;
 }
 
 export type RunnerProcessConnection =
@@ -5183,12 +5183,12 @@ export function spawnRunner(options: {
     ...handle,
     // Remote owners publish this identity after dispatch; keep it live through the wrapper.
     get startedAt() { return handle.startedAt; },
-    restart: (ticket) => {
+    restart: (ticket, identity, connection) => {
       if (handle.isExitConfirmed?.() === false) {
         throw new Error("runner_process_termination_unconfirmed");
       }
       if (lifetimeDeadline !== undefined && lifetimeDeadline <= Date.now()) throw new Error("runner_process_lifetime_expired");
-      return spawnRunner({ ...options, ticket, refreshBootstrapTicket: undefined,
+      return spawnRunner({ ...options, ...(identity ? { identity, environment: { ...options.environment, PAPERCLIP_RUN_ID: identity.runId } } : {}), ...(connection ? { connection } : {}), ticket, refreshBootstrapTicket: undefined,
         ...(lifetimeDeadline === undefined ? {} : { maxLifetimeMs: lifetimeDeadline - Date.now() }) });
     },
   });
