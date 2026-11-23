@@ -73,7 +73,7 @@ import { readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
-import { activityLog, agents as agentsTable, chatConversations, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
+import { activityLog, agents as agentsTable, chatConversations, companies, heartbeatRuns, issues as issuesTable, nativeRunFinalizations, projects as projectsTable } from "@paperclipai/db";
 import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
 import { sha256Digest } from "../services/feedback-redaction.js";
 import {
@@ -210,6 +210,7 @@ import {
   type NativeRuntimeRequestResolver,
 } from "../services/native-runtime/runtime-request-resolution-authority.js";
 import {
+  interruptNativeTurn,
   NativeRuntimeRequestResolutionError,
   resolveNativeRuntimeRequest,
 } from "../services/native-runtime/native-session-executor.js";
@@ -7424,6 +7425,29 @@ export function agentRoutes(
     if (!existing) return;
     if (!(await assertRunReadAllowed(req, res, existing))) return;
     const requestId = cancellationRequestId(req.body?.cancellationRequestId);
+    // A person's Stop on a live Pi turn ends that turn only (seam 0233). The run then
+    // finishes through the ordinary door and keeps its session, runner and machine.
+    const provider = asRecord(asRecord(asRecord(existing.runnerProfileJson)?.nativeExecutionInput)?.provider);
+    if (existing.status === "running" && existing.runtimeMode === "native" && provider?.kind === "pi_rpc") {
+      // The mark is set before the interrupt (the driver can end the turn at once) and removed unless it landed.
+      const mark = (on: boolean) => db.update(heartbeatRuns).set({ resultJson: on
+        ? sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
+          personStop: { requestedAt: new Date().toISOString(), userId: req.actor.userId ?? null } })}::jsonb`
+        : sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) - 'personStop'` })
+        .where(on ? and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")) : eq(heartbeatRuns.id, runId));
+      await mark(true);
+      const outcome = await interruptNativeTurn({ runId, reason: "person_stop" }).catch(() => null);
+      // Attached with no live turn and a result already accepted: the run is finishing, so Stop is a no-op.
+      const [finishing] = outcome === "no_turn" ? await db.select({ resultId: nativeRunFinalizations.resultId })
+        .from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId)).limit(1) : [];
+      const landed = outcome !== null && outcome !== "no_turn";
+      if (!landed) await mark(false);
+      if (landed || finishing?.resultId) {
+        const stopped = (await heartbeat.getRun(runId)) ?? existing;
+        res.json(await runRedactions.redactForRun(stopped.companyId, stopped.id, stopped, getActorInfo(req).actorId));
+        return;
+      }
+    }
     // Stamp the cancellation as operator-initiated (this route is board-only).
     // Recovery reads this to stand down instead of classifying the cancelled
     // run as agent stranding and re-waking the agent the operator just stopped.

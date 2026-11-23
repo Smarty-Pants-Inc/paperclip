@@ -9964,6 +9964,26 @@ export async function steerNativeSession(input: {
   }
 }
 
+/** A person's Stop ends the live turn only: the stock turn interrupt, never cancel (seam 0233). */
+export async function interruptNativeTurn(input: { runId: string; reason: string; timeoutMs?: number }): Promise<{ turnId: string } | "no_turn" | null> {
+  const active = activeNativeSessions.get(input.runId);
+  if (!active || active.cancelRequested || !active.session.interrupt) return null;
+  const turnId = (await active.session.snapshot()).activeTurnId ?? null;
+  if (!turnId) return "no_turn";
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+  try {
+    await Promise.race([
+      active.session.interrupt({ turnId, reason: input.reason }),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error("native_turn_interrupt_timeout")), input.timeoutMs ?? 10_000);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+  return { turnId };
+}
+
 const nativeCancellationsInFlight = new Map<string, Promise<unknown>>();
 
 export function cancelNativeSession(
@@ -12853,8 +12873,12 @@ async function executePaperclipNativeSessionAttempt(
                   eq(issues.companyId, input.execution.binding.companyId),
                 ))
                 .limit(1);
+              // A person's Stop (seam 0233) owes no task result: its short final reply ends the turn.
+              const [stopRun] = await input.db.select({ resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns)
+                .where(eq(heartbeatRuns.id, input.execution.binding.runId)).limit(1);
               return nativeConversationReplyResult({
-                conversation: conversation?.agentId === input.execution.binding.agentId,
+                conversation: conversation?.agentId === input.execution.binding.agentId
+                  || record(record(stopRun?.resultJson).personStop).requestedAt !== undefined,
                 terminalEvent,
                 replyEvent: completedConversationReply,
                 completionContract: input.execution.completionContract.contract,
