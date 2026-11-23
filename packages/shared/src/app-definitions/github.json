@@ -80,6 +80,28 @@
         "organization",
         "repository"
       ]
+    },
+    {
+      "key": "app-installation",
+      "label": "Custom GitHub App",
+      "purpose": "tool",
+      "transport": "mcp_remote",
+      "defaults": {
+        "serverUrl": "https://api.githubcopilot.com/mcp/"
+      },
+      "auth": "api_key",
+      "credentialExchange": "github_app_installation",
+      "ownershipModes": [
+        "customer"
+      ],
+      "grantKinds": [
+        "user",
+        "organization",
+        "agent"
+      ],
+      "whenToUse": "Use an existing GitHub App installation for tools and Git.",
+      "guidanceMd": "Uses the installation configuration and vaulted App private key.",
+      "riskTier": "S3"
     }
   ]
 }
