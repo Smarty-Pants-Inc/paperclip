@@ -3550,13 +3550,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                     agent={tailAgent ?? (tailAgentId ? { id: tailAgentId } : undefined)}
                                     status={optimisticRunnerStartup ? "queued" : tailStatus}
                                     working={optimisticRunnerStartup ? requestWorking : undefined}
-                                    execution={!optimisticRunnerStartup && !tailHasFinalResponse && !tailFinalStreaming && liveRun?.id === tailRunId ? liveExecution : null}
+                                    execution={!optimisticRunnerStartup && !tailHasFinalResponse && !tailFinalStreaming && !tailTerminal && liveRun?.id === tailRunId ? liveExecution : null}
                                     preparationLabel={optimisticRunnerStartup ? requestLabel : liveRun && tailHasFinalResponse && (liveExecution?.phase === "finishing" || tailEntries.some((entry) => entry.kind === "run_terminal" && entry.runState === "succeeded")) ? "Answer ready · Saving…" : undefined}
                                     startedAtMs={tailStartedAtMs}
                                     finishedAtMs={tailFinishedAtMs}
                                     continuedAfterSteering={paperclipRunnerTail && tailTimelineAnchors.length > 0}
                                     statusContent={tailRunSource?.adapterType !== "paperclip_runner" && !optimisticRunnerStartup ? (
-                                      <TaskChatLiveRunPill status={tailStatus} execution={!tailHasFinalResponse && !tailFinalStreaming && liveRun?.id === tailRunId ? liveExecution : null}
+                                      <TaskChatLiveRunPill status={tailStatus} execution={!tailHasFinalResponse && !tailFinalStreaming && !tailTerminal && liveRun?.id === tailRunId ? liveExecution : null}
                                         startedAtMs={tailStartedAtMs} finishedAtMs={tailFinishedAtMs} toolSummary={tailToolSummary} />
                                     ) : undefined}
                                   />
@@ -3568,7 +3568,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                       runId={tailRunId}
                                       execution={
                                         // While the answer itself streams the reply is Working, whatever the label poll says.
-                                        !tailHasFinalResponse && !tailFinalStreaming && liveRun?.id === tailRunId
+                                        // Once the run's own end is in, the server is saving it: its unleased 'Confirming execution' is not a reconnect.
+                                        !tailHasFinalResponse && !tailFinalStreaming && !tailTerminal && liveRun?.id === tailRunId
                                           ? liveExecution
                                           : null
                                       }
