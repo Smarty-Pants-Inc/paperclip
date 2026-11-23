@@ -3246,6 +3246,10 @@ function createSandboxEnvironmentDriver(
     let cleanupStatus: "success" | "failed" = "success";
     let termination: ReturnType<typeof remoteTerminationReceipt>;
     const metadata = input.lease.metadata ?? {};
+    let checkpointTimer: ReturnType<typeof setTimeout> | undefined;
+    if (input.failureReason === "lease_fingerprint_mismatch" && input.lease.providerLeaseId) await Promise.race([(await import("./native-runtime/native-session-executor.js"))
+      .closeWarmNativeSessionsForEnvironment({ environmentId: input.environment.id, providerLeaseId: input.lease.providerLeaseId, reason: input.failureReason })
+      .catch(error => logger.warn({ err: error, leaseId: input.lease.id }, "obsolete warm session checkpoint failed; continuing lease destruction")), new Promise<void>(resolve => { checkpointTimer = setTimeout(() => { logger.warn({ leaseId: input.lease.id }, "obsolete warm session checkpoint timed out; continuing lease destruction"); resolve(); }, 10_000); })]).finally(() => clearTimeout(checkpointTimer));
 
     try {
       if (metadata.sandboxProviderPlugin) {
@@ -3297,6 +3301,9 @@ function createSandboxEnvironmentDriver(
       }
     } catch {
       cleanupStatus = "failed";
+    }
+    if (cleanupStatus === "success" && input.failureReason === "lease_fingerprint_mismatch") {
+      await (await import("./native-runtime/native-session-executor.js")).forgetDestroyedWarmNativeSessions(input.lease);
     }
     // Only a destroy the provider confirmed reaches this gap.
     if (cleanupStatus === "success") crashPoint("environment.teardown.after_destroy_before_lease");
