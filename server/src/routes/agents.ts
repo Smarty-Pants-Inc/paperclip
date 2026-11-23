@@ -7380,7 +7380,7 @@ export function agentRoutes(
       },
     });
 
-    if (run) {
+    if (run && (run.status === "cancelled" || run.resultJson?.executionCancellation)) {
       await logActivity(db, {
         companyId: run.companyId,
         actorType: "user",
