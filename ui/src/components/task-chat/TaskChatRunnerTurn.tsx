@@ -28,6 +28,7 @@ import {
   buildTurnTimelineRows,
   isTerminalRunStatus,
   omitProgressRepeatedByResponse,
+  paperclipRunnerAcceptedResponseWake,
   paperclipRunnerFinalResponse,
   paperclipRunnerTimelineItems,
 } from "./transcript-adapter";
@@ -223,9 +224,12 @@ export function TaskChatRunnerTurn({
       item.surface === "run_result" &&
       item.disposition === "yielded",
   );
-  const observedFinal = paperclipRunnerFinalResponse(turnItems, awaitingContinuation
-    ? { allowFallback: false, yielded: true, waitSummary }
-    : { allowFallback: terminal && allowSummaryFallback });
+  const acceptedWake = paperclipRunnerAcceptedResponseWake(turnItems, runId ?? undefined);
+  const observedFinal = paperclipRunnerFinalResponse(turnItems, {
+    runId: runId ?? undefined,
+    allowFallback: Boolean(acceptedWake) || (!awaitingContinuation && terminal && allowSummaryFallback),
+    yielded: awaitingContinuation, waitSummary: awaitingContinuation ? waitSummary : null,
+  });
   const observedProviderText = Boolean(
     observedFinal &&
     turnItems.some(
@@ -248,7 +252,7 @@ export function TaskChatRunnerTurn({
   // A provider final can arrive before the accepted yielded result. Clear any
   // replay latch once the control plane establishes that this turn is waiting
   // for continuation; only an authored (non-wait) final is re-latched below.
-  if (yielded || awaitingContinuation) finalRef.current = { runId };
+  if (!acceptedWake && (yielded || awaitingContinuation)) finalRef.current = { runId };
   if (
     observedFinal &&
     (!finalRef.current.item ||
