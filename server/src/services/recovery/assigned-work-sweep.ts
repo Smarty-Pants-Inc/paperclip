@@ -15,9 +15,11 @@ import {
   issueThreadInteractions,
   issues,
   nativeRunFinalizations,
+  statusDecisions,
   type Db,
 } from "@paperclipai/db";
 import { logger } from "../../middleware/logger.js";
+import { hasCommittedNativeBoardResponseWait } from "../native-runtime/native-board-response-wait.js";
 import { logActivity, publishActivity, type ActivityPublication } from "../activity-log.js";
 import { evaluateAgentInvokability } from "../agent-invokability.js";
 import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";
@@ -390,6 +392,19 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
     const childCounts = counts(childRows.map(row => ({ issueId: row.parentId, count: row.count })));
     const onboardingIds = new Set(onboardingRows.map(row => row.id));
     const latestByIssue = new Map(rowsOf<RunRow>(latestRuns).map(row => [row.issueId, row]));
+    const succeededRunIds = rowsOf<RunRow>(latestRuns).filter(run => run.status === "succeeded").map(run => run.id);
+    // Batch only the cheap candidate check; the exact receipt helper remains authoritative.
+    const boardWaitRunIds = new Set((succeededRunIds.length ? await database.select({ runId: nativeRunFinalizations.runId })
+      .from(nativeRunFinalizations).innerJoin(statusDecisions, and(
+        eq(statusDecisions.id, nativeRunFinalizations.decisionId),
+        eq(statusDecisions.assessmentId, nativeRunFinalizations.assessmentId),
+        eq(statusDecisions.companyId, nativeRunFinalizations.companyId),
+        eq(statusDecisions.issueId, nativeRunFinalizations.issueId),
+        eq(statusDecisions.runId, nativeRunFinalizations.runId),
+        eq(statusDecisions.applicationState, "applied"),
+        inArray(statusDecisions.reasonCode, ["board_response_waiting", "board_response_wait_superseded"])))
+      .where(and(eq(nativeRunFinalizations.companyId, companyId), inArray(nativeRunFinalizations.runId, succeededRunIds),
+        eq(nativeRunFinalizations.phase, "committed"))) : []).map(row => row.runId));
     const blockActivityByIssue = new Map(rowsOf<{ issueId: string; actorType: string; actorId: string; agentId: string | null; details: unknown }>(blockActivity)
       .map(row => [row.issueId, row]));
 
@@ -435,6 +450,10 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
         activeRuns: ownedRuns,
         latestRun: latest ? {
           id: latest.id, status: latest.status, errorCode: latest.errorCode, finishedAt: latestFinishedAt,
+          boardResponseWaiting: boardWaitRunIds.has(latest.id) && issue.status === "in_progress" && latest.status === "succeeded"
+            && latest.agentId === issue.assigneeAgentId && await hasCommittedNativeBoardResponseWait(database, {
+              companyId, issueId: issue.id, runId: latest.id, agentId: latest.agentId,
+            }),
           settlingUntil: latest.runtimeMode === "legacy" && latest.controllerBootId && leaseUntil
             && !NON_TERMINAL_RUN_STATUSES.includes(latest.status) ? leaseUntil : null,
           operatorStopped: latest.agentId === issue.assigneeAgentId && (
