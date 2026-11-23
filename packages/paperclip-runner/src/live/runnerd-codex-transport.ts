@@ -4345,6 +4345,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     ((settlement: "settled" | "unsettled") => Promise<void> | void) | null =
     null;
   #controlPlaneRelease: ((reason?: "detach") => Promise<void> | void) | null = null;
+  #restartConnection: RunnerProcessConnection | undefined;
   /** Quiesce hooks of the registered routes that have not been released yet. */
   readonly #controlPlaneQuiesces = new Set<() => void>();
   #nextTraceDebugSequence = 1;
@@ -5339,6 +5340,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
 
       activationStarted = true;
       core.rotateRunIdentity(desired, runAttachTemplate);
+      this.#restartConnection = connection;
       if (core.store.state.stagedRunAttachment && this.options.readRunnerState
         && (registration?.connection?.mode === "listen" || registration?.connection?.mode === "external")) {
         const deadline = Math.min(Date.now() + (this.options.runnerReconnectGraceMs ?? 5_000), this.#sourceAttachmentDeadline ?? Infinity);
@@ -9450,7 +9452,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           const ticket = this.#core.issueBootstrapTicket(RUNNER_BOOTSTRAP_TICKET_TTL_MS);
           await this.#core.flushCheckpoint();
           if (this.#closed || this.#failure !== null) return;
-          recoveredHandle = restart(ticket);
+          recoveredHandle = restart(ticket, this.#core.store.state.identity, this.#restartConnection);
         } catch (error) {
           lastDetail = error instanceof Error ? error.message : String(error);
           attempt += 1;
