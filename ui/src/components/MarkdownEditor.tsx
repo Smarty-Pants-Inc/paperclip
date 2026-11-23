@@ -618,6 +618,11 @@ function slashCommandMarkdown(option: SlashCommandOption): string {
   return `[/${option.slug}](${option.href})`;
 }
 
+function isExactActionCommand(option: AutocompleteOption, text: string): boolean {
+  return option.kind === "action" && !option.disabled
+    && text.trim().toLowerCase() === `/${option.command.trim().toLowerCase()}`;
+}
+
 function autocompleteMarkdown(option: AutocompleteOption): string {
   const token = option.kind === "skill" || option.kind === "routine" || option.kind === "action"
     ? slashCommandMarkdown(option)
@@ -793,6 +798,8 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
     [actionCommands, sharedSlashCommands],
   );
   const containerRef = useRef<HTMLDivElement>(null);
+  const onSubmitRef = useRef(onSubmit);
+  onSubmitRef.current = onSubmit;
   const ref = useRef<MDXEditorMethods>(null);
   const fallbackTextareaRef = useRef<HTMLTextAreaElement>(null);
   const valueRef = useRef(editorValue);
@@ -1275,6 +1282,10 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
       mentionStateRef.current = null;
       skillEnterArmedRef.current = false;
       setMentionState(null);
+      if (isExactActionCommand(option, toStoredMarkdown(next))) {
+        // Let the parent render the inserted command before submitting it.
+        requestAnimationFrame(() => onSubmitRef.current?.());
+      }
       return true;
     },
     [decorateProjectMentions, onChange],
@@ -1517,10 +1528,12 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
           }
         }
 
-        // Leave an unselected slash menu's Enter with the editor.
+        const exactActionMatch = mentionStateRef.current?.trigger === "skill"
+          && filteredMentions.some((option) => isExactActionCommand(option, `/${mentionStateRef.current?.query.trim()}`));
+        // Leave unselected slash menus with the editor unless an exact action is ready to send.
         if (
           onSubmit && isSubmitShortcut(e)
-          && !(mentionActive && filteredMentions.length > 0)
+          && !(mentionActive && filteredMentions.length > 0 && !exactActionMatch)
           && e.target instanceof HTMLElement
           && e.target.closest('[contenteditable="true"]')
         ) {
