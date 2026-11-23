@@ -71,7 +71,9 @@ export async function hasCommittedNativeResponseWakeWait(
   if (!wait?.runStartedAt) return false;
   // Seam 0240: a message this run already received (a steer it acknowledged) is not a newer, unanswered one.
   const received = Object.keys(((wait.runResult as Record<string, unknown> | null)?.queuedSteeringAcknowledgements ?? {}) as object)
-    .filter(id => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id));
+    // Seam 0247: a message a person's Stop returned to his box is not unanswered either, even before a browser restores it.
+    .concat(((wait.runResult as { personStop?: { returned?: unknown } } | null)?.personStop?.returned as string[] | undefined) ?? [])
+    .filter(id => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(id)));
   const [unanswered] = await db
     .select({ id: issueComments.id })
     .from(issueComments)
