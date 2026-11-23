@@ -9967,7 +9967,7 @@ export async function steerNativeSession(input: {
 /** A person's Stop ends the live turn only: the stock turn interrupt, never cancel (seam 0233). */
 export async function interruptNativeTurn(input: { runId: string; reason: string; timeoutMs?: number }): Promise<{ turnId: string } | "no_turn" | null> {
   const active = activeNativeSessions.get(input.runId);
-  if (!active || active.cancelRequested || !active.session.interrupt) return null;
+  if (!active || active.cancelRequested || !active.session.interrupt) return active ? null : "no_turn";
   const turnId = (await active.session.snapshot()).activeTurnId ?? null;
   if (!turnId) return "no_turn";
   let timeout: ReturnType<typeof setTimeout> | null = null;
