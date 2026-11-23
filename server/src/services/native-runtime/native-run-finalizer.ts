@@ -68,6 +68,7 @@ import { classifyNativeEvidence } from "./evidence-classifier.js";
 import type { PrpIgnoredAttentionRequest, PrpTerminalState } from "@paperclipai/paperclip-runner";
 import {
   arbitrateNativeStatus,
+  NATIVE_RESPONSE_WAKE_WAITING_REASON,
   NATIVE_STATUS_ARBITER_POLICY_VERSION,
   supersedeHandedOffDecision,
   supersedeStaleOwnerCompletion,
@@ -1868,6 +1869,10 @@ export async function finalizeNativeRun(input: {
             : effect.kind === "record_finalization_error" ? { ...effect, nextAction: error.message } : effect) };
       }
     }
+    // A person's Stop (seam 0236) never completes or closes the task: the turn ended, the task waits for the person.
+    if (record(run.resultJson?.personStop).requestedAt !== undefined && ["done", "in_review"].includes(proposedDecision.statusAction))
+      proposedDecision = { ...proposedDecision, statusAction: "in_progress", toStatus: "in_progress",
+        reasonCode: NATIVE_RESPONSE_WAKE_WAITING_REASON, unblockDescriptor: null, effects: [{ kind: "release_checkout" }] };
     proposedDecision = gateDoneOnConfiguredReview(proposedDecision, reviewStage, run.agentId);
     const decision = conversationNativeDecision({
       conversation: isConversation(authoritativeIssue), terminalState,
