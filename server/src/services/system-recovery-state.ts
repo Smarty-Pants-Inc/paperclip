@@ -109,7 +109,7 @@ export function reserveSystemRecoveryAttempt(state: SystemRecoveryState, now = D
 /** The caller persists this timestamp. A restart must not recalculate jitter. */
 export function failSystemRecovery(
   state: SystemRecoveryState, failure: SystemRecoveryFailure,
-  options: { now?: number; retryAfterAt?: number; evidenceFingerprint?: string; cause?: RecoveryFailureCause } = {},
+  options: { now?: number; retryAfterAt?: number; immediate?: boolean; evidenceFingerprint?: string; cause?: RecoveryFailureCause } = {},
 ): SystemRecoveryState {
   const now = options.now ?? Date.now();
   const firstFailureAt = state.firstFailureAt ?? now;
@@ -117,7 +117,7 @@ export function failSystemRecovery(
   const retryNumber = state.retriesUsed + 1;
   const entropy = createHash("sha256").update(`${state.generationId}:${retryNumber}`).digest().readUInt32BE(0) / 0xffffffff;
   const delay = infrastructureRetryDelayMs(retryNumber, entropy);
-  const nextAttemptAt = Math.max(now + delay, options.retryAfterAt ?? 0);
+  const nextAttemptAt = options.immediate ? now : Math.max(now + delay, options.retryAfterAt ?? 0);
   const retryable = ["retry_transient", "recheck_evidence"].includes(failure.retryClass);
   const retry = retryable && retryNumber <= SYSTEM_RECOVERY_MAX_RETRIES && nextAttemptAt < deadlineAt;
   const sourceVerification = workspaceSourceVerificationFailureSchema.safeParse(failure.sourceVerification);
