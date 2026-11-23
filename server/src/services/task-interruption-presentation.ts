@@ -63,6 +63,8 @@ type ProjectionRun = Pick<typeof heartbeatRuns.$inferSelect,
   Partial<Pick<typeof heartbeatRuns.$inferSelect, "agentId" | "error" | "companyId" | "nativeIssueId" | "runtimeMode" | "startedAt"
     | "scheduledRetryReason" | "createdAt" | "finishedAt" | "processPid" | "processGroupId">> & {
   environmentProviderWaitName?: string | null;
+  /** The person's Stop request, only while certified no-work preparation is still pending. */
+  pendingPreparationStopAt?: string | null;
   /** Due time of the native coordinator's own same-run resume, if one is pending. */
   nativeResumeAt?: Date | null;
   /** When the native coordinator saved this run's terminal failure, if it did. */
@@ -292,6 +294,12 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
   // Retry preparation failures authoritative; this does not change admission.
   if (!action && !retryWait?.preparationStatus && isQueuedDependencyWait(run)) return base;
   if (!wait && !action && isAcknowledgedLegacyUserStop(run)) return base;
+  const preparationStopAt = Date.parse(run.pendingPreparationStopAt ?? "");
+  // Cleanup is not agent work; a Stop without settlement must not hide failure forever.
+  if (!action && !retryWait?.preparationStatus && run.status === "cancelled" && run.runtimeMode === "legacy"
+      && now >= preparationStopAt && now - preparationStopAt < 5 * 60_000)
+    return { ...base, state: "working", retryWait: { reason: "preparation_stop_cleanup",
+      message: "Cleaning up after your Stop…" } };
   // Intentional Stop is not an unsuccessful attempt. This is presentation only;
   // physical containment and pending cleanup keep their execution-side gates.
   if (!wait && run.runtimeMode === "native" && run.companyId === issue.companyId && run.nativeIssueId === issue.id
@@ -533,6 +541,13 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       setupFailureRunId: sql<string>`case when ${heartbeatRuns.resultJson}->'setupCommandFailure' is null
         and ${heartbeatRuns.status} = 'scheduled_retry' and ${heartbeatRuns.retryOfRunId} is not null
         then ${heartbeatRuns.retryOfRunId} else ${heartbeatRuns.id} end`,
+      pendingPreparationStopAt: sql<string | null>`case when ${heartbeatRuns.resultJson}#>>'{executionRecovery,kind}' = 'bootstrap'
+        and ${heartbeatRuns.resultJson}#>'{executionRecovery,providerWorkStarted}' = 'false'::jsonb
+        and ${heartbeatRuns.resultJson}#>'{executionRecovery,preparationPending}' = 'true'::jsonb
+        and ${heartbeatRuns.resultJson}#>>'{executionRecovery,preparationSettledAt}' is null
+        and ${heartbeatRuns.resultJson}#>>'{cancellation,source}' = 'operator' and ${heartbeatRuns.resultJson}#>'{cancellation,expected}' = 'true'::jsonb
+        and ${heartbeatRuns.resultJson}#>>'{cancellation,initiator,type}' = 'user' and ${heartbeatRuns.resultJson}#>>'{executionCancellation,state}' = 'requested'
+        then ${boundedJsonString(sql`${heartbeatRuns.resultJson}#>'{executionCancellation,requestedAt}'`, 64)} end`,
       resultJson: sql<Record<string, unknown>>`${runStopPresentationJson(heartbeatRuns.resultJson)} || jsonb_build_object('configurationIncomplete', ${heartbeatRuns.resultJson}->'configurationIncomplete',
         'stopReason', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'stopReason'`, 80)},
         'timeoutSource', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'timeoutSource'`, 80)},
