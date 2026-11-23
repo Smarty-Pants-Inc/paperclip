@@ -1,6 +1,6 @@
 import { describeError } from "../api/errors";
 import type { ExecutionBlocker, IssueRelationIssueSummary, TaskInterruptionPresentation } from "@paperclipai/shared";
-import { AlertCircle } from "lucide-react";
+import { AlertCircle, LoaderCircle } from "lucide-react";
 import { Link } from "@/lib/router";
 import { createIssueDetailPath } from "../lib/issueDetailBreadcrumb";
 import { Button } from "./ui/button";
@@ -16,6 +16,15 @@ const recoveryStepText: Record<NonNullable<TaskInterruptionPresentation["recover
   saving_previous_files: "Saving files from the previous attempt",
   finishing_recovery: "Finishing recovery of saved work",
 };
+
+/** Ordinary working/resolved projections are not recovery ownership. */
+export function isConversationRecovery(presentation: TaskInterruptionPresentation | null | undefined, observedStatus?: string) {
+  return presentation?.responsibility === "system" && ["working", "retry_scheduled", "failed"].includes(presentation.state)
+    && observedStatus !== "person_stopped" && !presentation.projectAccess && !presentation.setupFailure && !presentation.workspaceFailure
+    && presentation.retryWait?.reason !== "dependency_blocked" && presentation.retryAction !== "move_forward"
+    && (presentation.state !== "working" || Boolean(presentation.recoveryStep)
+      || ["failed", "cancelled", "timed_out", "interrupted", "scheduled_retry"].includes(observedStatus ?? ""));
+}
 
 /** A budget hard stop holds saved work. Only a task that already ran has an
  * attempt to report; a task refused before its first run just waits. */
@@ -35,8 +44,9 @@ const blockerAction: Record<string, string> = {
 };
 
 /** One ordinary interruption surface. Technical records remain in diagnostics. */
-export function ExecutionBlockerNotice({ presentation, blocker, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, companyId, agentName, projectName, blockers }: {
+export function ExecutionBlockerNotice({ presentation, observedStatus, blocker, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, companyId, agentName, projectName, blockers }: {
   presentation: TaskInterruptionPresentation | null | undefined;
+  observedStatus?: string;
   blocker?: ExecutionBlocker | null;
   companyId?: string;
   blockers?: IssueRelationIssueSummary[];
@@ -50,9 +60,19 @@ export function ExecutionBlockerNotice({ presentation, blocker, canRetry, onRetr
   agentName?: string;
   projectName?: string;
 }) {
+  const recovery = isConversationRecovery(presentation,
+    observedStatus ?? (blocker?.workspaceRepairRequired ? "failed" : undefined));
   if (presentation?.projectAccess && !optimistic && !takingLonger) return <TaskProjectAccessNotice
     access={presentation.projectAccess} issueId={issueId} agentName={agentName} projectName={projectName}
     canRetry={canRetry && presentation.canRetry} onRetry={onRetry} error={error} className={className} />;
+  if (recovery && presentation) return <div role="status" aria-label="Task status"
+    className={cn("flex items-center gap-3 text-sm text-muted-foreground", className)}>
+    {(optimistic || presentation.state !== "failed") && <LoaderCircle className="size-4 shrink-0 motion-safe:animate-spin" aria-hidden="true" />}
+    <span className="min-w-0 flex-1">{!optimistic && presentation.state === "failed"
+      ? "Couldn't resume this conversation. Your message is saved." : "Resuming your conversation…"}</span>
+    {!optimistic && presentation.state === "failed" && canRetry && presentation.canRetry &&
+      <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}
+  </div>;
   if (error && !optimistic && !takingLonger) return <div role="alert" className={cn("flex items-center justify-between gap-2 text-sm text-destructive", className)}><span>{describeError(error).body}</span>{canRetry && <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}</div>;
   if (takingLonger) return <div role="status" className={cn("flex items-center justify-between gap-2 text-sm text-muted-foreground", className)}><span>Taking longer than usual…</span>{canRetry && <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}</div>;
   if (blocker?.workspaceRepairRequired) return (
