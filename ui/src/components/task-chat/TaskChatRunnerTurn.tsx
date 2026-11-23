@@ -79,6 +79,7 @@ function RunnerTurnStatus({
   continuedAfterSteering = false,
   waitingLabel,
   working = false,
+  personStopped = false,
 }: {
   status: string;
   startedAtMs: number | null;
@@ -86,6 +87,7 @@ function RunnerTurnStatus({
   continuedAfterSteering?: boolean;
   waitingLabel?: string | null;
   working?: boolean;
+  personStopped?: boolean;
 }) {
   const shimmer = useTaskChatShimmer("working");
   const terminal = isTerminalRunStatus(status);
@@ -100,7 +102,7 @@ function RunnerTurnStatus({
   const elapsed = formatCompactDuration(elapsedMs);
 
   const failed = terminalStatusFailed(status);
-  const label = waitingLabel ?? (terminal ? (failed ? "Stopped" : "Worked") : "Working");
+  const label = waitingLabel ?? (terminal ? (personStopped ? "Stopped" : failed ? "Couldn't finish" : "Worked") : "Working");
   const suffix = waitingLabel ? "" : terminal
     ? elapsed ? ` ${failed ? "after" : "for"} ${elapsed}` : ""
     : elapsed ? `${waitingLabel ? " · " : " for "}${elapsed}` : "";
@@ -128,6 +130,7 @@ function RunnerCurrentActivityTail({ status, waitingLabel }: { status: string; w
 }
 
 interface RunnerHeaderProps {
+  personStopped?: boolean;
   runId?: string | null;
   agentName?: string | null;
   agentIcon?: string | null;
@@ -165,7 +168,7 @@ export function TaskChatRunnerHeader({ statusContent, ...props }: RunnerHeaderPr
   return <div className="flex min-h-8 min-w-0 items-center gap-2 pb-1 pt-2" data-testid="task-chat-runner-identity-row">
     {props.agentName ? <TaskChatAgentIdentity agentName={props.agentName} agentIcon={props.agentIcon} agent={props.agent} /> : null}
     {statusContent ?? (agentQueueWaitFor(props) ? <AgentQueueWait queue={agentQueueWaitFor(props)!} /> : null) ?? <RunnerTurnStatus status={props.status} startedAtMs={props.startedAtMs} finishedAtMs={props.finishedAtMs}
-      continuedAfterSteering={props.continuedAfterSteering} waitingLabel={runnerWaitingLabel(props, waitingToStart)} working={props.working === true} />}
+      continuedAfterSteering={props.continuedAfterSteering} waitingLabel={runnerWaitingLabel(props, waitingToStart)} working={props.working === true} personStopped={props.personStopped} />}
   </div>;
 }
 
