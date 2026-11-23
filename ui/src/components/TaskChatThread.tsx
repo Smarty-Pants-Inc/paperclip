@@ -1260,9 +1260,12 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     const map = new Map<string, number[]>();
     for (const comment of comments) {
       const anchorMs = toMs(comment.createdAt);
+      // A message sent after the run's turn ended can't be a steer (the agent refused it), even
+      // while the run is still saving: it is its own request, not a split of the finished reply.
       const runId = comment.authorType === "user" ? runs.find(run =>
         toMs(run.createdAt) < anchorMs && (!isTerminalRunStatus(run.status) ||
-          anchorMs <= toMs(linkedRunMetaById.get(run.id)?.finishedAt)))?.id : null;
+          anchorMs <= toMs(linkedRunMetaById.get(run.id)?.finishedAt)) &&
+        !((terminalAt => terminalAt && toMs(terminalAt) < anchorMs)(transcriptByRun.get(run.id)?.findLast((entry) => entry.kind === "run_terminal")?.ts)))?.id : null;
       if (comment.deletedAt || !runId) continue;
       if (!Number.isFinite(anchorMs)) continue;
       const anchors = map.get(runId) ?? [];
@@ -1271,7 +1274,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     }
     for (const anchors of map.values()) anchors.sort((a, b) => a - b);
     return map;
-  }, [comments, runs, linkedRunMetaById]);
+  }, [comments, runs, linkedRunMetaById, transcriptByRun]);
 
   // A native-runner Plan is part of the turn that wrote its current revision.
   // Legacy adapters do not expose the semantic write_document boundary needed
