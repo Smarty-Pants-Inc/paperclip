@@ -1634,7 +1634,7 @@ export function paperclipRunnerFinalResponse(
     allowFallback?: boolean;
     /** Run metadata established a yielded wait even if the transcript lacks its result. */
     yielded?: boolean;
-    /** The yielded result's wait summary, when known outside the transcript. */
+    /** Legacy run summary; equality alone does not establish a wait stub. */
     waitSummary?: string | null;
   },
 ): TaskChatMessageItem | undefined {
@@ -1668,11 +1668,10 @@ export function paperclipRunnerFinalResponse(
     // It streamed into view while the turn was live; dropping it on settle
     // makes the conversation flash and lose that reply. Wait stubs are
     // skipped, not terminal: a provider may echo one after its reply.
-    const waitSummaries = [
-      options?.waitSummary,
-      // An accepted response wake's summary is the reply itself, not a wait.
-      ...yieldedResults.filter((result) => !result.acceptedResponseWake).map((result) => result.summary),
-    ];
+    // A yielded summary may copy the reply; only actual request prompts identify card echoes.
+    const waitSummaries = parsed.flatMap((item) =>
+      item.kind === "protocol" && item.surface === "runtime_request" ? [item.prompt] : [],
+    );
     for (let index = parsed.length - 1; index >= 0; index -= 1) {
       const item = parsed[index];
       if (item.kind !== "message" || item.channel !== "final") continue;
