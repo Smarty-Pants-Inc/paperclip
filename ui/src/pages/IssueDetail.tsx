@@ -3379,6 +3379,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   const commentComposerRef = useRef<IssueChatComposerHandle | null>(null);
   const cancelledQueuedOptimisticCommentIdsRef = useRef(new Set<string>());
   const commentRenderKeys = useRef(new Map<string, string>());
+  const commentSubmissionTimes = useRef(new Map<string, Date>());
   const resolvedIssueDetailState = useMemo(
     () =>
       readIssueDetailLocationState(issueId, location.state, location.search),
@@ -4340,7 +4341,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         if ("clientId" in comment && comment.clientId)
           commentRenderKeys.current.set(comment.id, comment.clientId);
         const clientId = commentRenderKeys.current.get(comment.id);
-        return clientId ? { ...comment, clientId } : comment;
+        return clientId ? { ...comment, clientId, createdAt: commentSubmissionTimes.current.get(clientId) ?? comment.createdAt } : comment;
       }),
     [comments, optimisticComments],
   );
@@ -5203,6 +5204,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         : null;
 
       if (optimisticComment) {
+        commentSubmissionTimes.current.set(optimisticComment.clientId, optimisticComment.createdAt);
         setOptimisticComments((current) => [...current, optimisticComment]);
       }
       if (previousIssue) {
@@ -5630,6 +5632,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         : null;
 
       if (optimisticComment) {
+        commentSubmissionTimes.current.set(optimisticComment.clientId, optimisticComment.createdAt);
         setOptimisticComments((current) => [...current, optimisticComment]);
       }
       if (previousIssue) {
