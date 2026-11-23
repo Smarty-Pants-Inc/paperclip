@@ -501,6 +501,10 @@ function durableInputLabel(
  * to the tool history. Turns without a reply bubble keep the standalone
  * folded row. flag-OFF remains byte-for-byte IssueChatThread.
  */
+// Server holds that settle by themselves (stock: run-control execution_recovery;
+// explicit-native-continuation controller_settling / execution_settling).
+const HELD_BY_RECOVERY_REASONS = new Set(["execution_recovery", "controller_settling", "execution_settling"]);
+
 export function TaskChatThread(props: TaskChatThreadProps) {
   const coordinatorEnabled = useCoordinatorPresentation();
   const { status: connectionStatus } = useConnectivity();
@@ -2933,11 +2937,15 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     (body: string, clientRequestId: string) => handleThreadAdd(body, undefined, undefined, undefined, clientRequestId),
     [handleThreadAdd],
   );
+  // A person's message the server holds behind a Stop's recovery is still on
+  // its way: draw the working sign with the server's own words, not a blank.
+  const heldByRecovery = Boolean(queuedMessageQueue?.entries.length) &&
+    HELD_BY_RECOVERY_REASONS.has(queuedMessageQueue?.executionWait?.reason ?? "");
   const optimisticRunnerStartup =
     hasAgentAssignee &&
     !startupBlocked &&
     !tailRunId &&
-    (props.retryPreparing || (!isTerminalIssueStatus(issueStatus) && ((props.interruption?.state === "working" && !observedRunEnded) || props.interruption?.state === "retry_scheduled")) || runnerSubmissionPending ||
+    (props.retryPreparing || (!isTerminalIssueStatus(issueStatus) && ((props.interruption?.state === "working" && !observedRunEnded) || props.interruption?.state === "retry_scheduled")) || heldByRecovery || runnerSubmissionPending ||
       commentItems.some(
         (item) =>
           item.kind === "message" &&
@@ -3493,7 +3501,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                     agent={tailAgent ?? (tailAgentId ? { id: tailAgentId } : undefined)}
                                     status={optimisticRunnerStartup ? (stoppingReply ? "stopping" : "queued") : tailStatus}
                                     execution={!tailHasFinalResponse && liveRun?.id === tailRunId ? liveExecution : null}
-                                    preparationLabel={liveRun && heldPaperclipRunnerFinalText && (liveExecution?.phase === "finishing" || tailEntries.some((entry) => entry.kind === "run_terminal" && entry.runState === "succeeded")) ? "Answer ready · Saving…" : optimisticRunnerStartup && submissionTakingLonger ? "Taking longer than usual…" : undefined}
+                                    preparationLabel={liveRun && heldPaperclipRunnerFinalText && (liveExecution?.phase === "finishing" || tailEntries.some((entry) => entry.kind === "run_terminal" && entry.runState === "succeeded")) ? "Answer ready · Saving…" : optimisticRunnerStartup && heldByRecovery ? queuedMessageQueue?.executionWait?.message ?? undefined : optimisticRunnerStartup && submissionTakingLonger ? "Taking longer than usual…" : undefined}
                                     startedAtMs={tailStartedAtMs}
                                     finishedAtMs={tailFinishedAtMs}
                                     continuedAfterSteering={paperclipRunnerTail && tailTimelineAnchors.length > 0}
