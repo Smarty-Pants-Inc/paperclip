@@ -417,6 +417,8 @@ function resolvedWithoutUserFacingResponse(value: unknown): boolean {
 }
 
 export type TaskChatThreadProps = ComponentProps<typeof IssueChatThread> & {
+  /** A person's Stop hands back the messages the agent hadn't taken (resultJson.personStop.returned). */
+  onRestoreStoppedMessages?: (commentIds: readonly string[]) => Promise<boolean>;
   conversationMode?: boolean;
   creationActivity?: ActivityEvent[];
   createdTasks?: Issue[];
@@ -593,6 +595,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     onResumeAssignee,
     resumeAssigneePending = false,
     onOpenSkill,
+    onRestoreStoppedMessages,
   } = props;
   const {
     data: planDocument,
@@ -1041,6 +1044,18 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       // A person's Stop of a Pi turn ends the run normally; the server marks it (resultJson.personStop).
       Boolean(meta?.resultJson?.personStop);
   }, [linkedRunMetaById]);
+  // Pi's Stop (Esc): the messages it hadn't taken go back into the stopping person's input box, once.
+  // Keyed on state (his returned messages still exist), so a reload or another of his devices restores too.
+  const restoredStopRunIds = useRef(new Set<string>());
+  useEffect(() => {
+    for (const [runId, meta] of linkedRunMetaById) {
+      const stop = meta.resultJson?.personStop as { userId?: unknown; returned?: unknown } | undefined;
+      const returned = Array.isArray(stop?.returned) ? stop.returned.filter((id): id is string => typeof id === "string" && comments.some((comment) => comment.id === id && !comment.deletedAt && comment.authorUserId === currentUserId)) : [];
+      if (!onRestoreStoppedMessages || !currentUserId || stop?.userId !== currentUserId || returned.length === 0 || restoredStopRunIds.current.has(runId)) continue;
+      restoredStopRunIds.current.add(runId);
+      void onRestoreStoppedMessages(returned).then((done) => { if (!done) restoredStopRunIds.current.delete(runId); });
+    }
+  }, [linkedRunMetaById, comments, currentUserId, onRestoreStoppedMessages]);
   const openedAt = useMemo(() => Date.now(), [issueId]);
   const scrollNavigation = useTaskChatScrollNavigation();
   const requestedTranscripts = useRef({ issueId, ids: new Set<string>() });
