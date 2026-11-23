@@ -1670,7 +1670,8 @@ export function paperclipRunnerFinalResponse(
     // skipped, not terminal: a provider may echo one after its reply.
     const waitSummaries = [
       options?.waitSummary,
-      ...yieldedResults.map((result) => result.summary),
+      // An accepted response wake's summary is the reply itself, not a wait.
+      ...yieldedResults.filter((result) => !result.acceptedResponseWake).map((result) => result.summary),
     ];
     for (let index = parsed.length - 1; index >= 0; index -= 1) {
       const item = parsed[index];
