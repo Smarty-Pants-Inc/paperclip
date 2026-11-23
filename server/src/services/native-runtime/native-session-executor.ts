@@ -387,6 +387,7 @@ import {
 type ActiveNativeSession = {
   session: NativeSession;
   cancelRequested: boolean;
+  providerRetired?: boolean;
   admissionAbort?: AbortController;
   cancellationSettled?: Promise<void>;
   restartDetach?: Promise<void>;
@@ -400,7 +401,7 @@ class NativeResultPendingFinalizationError extends Error {
 }
 
 export class NativeCancellationPendingRecoveryError extends Error {
-  constructor() {
+  constructor(readonly personStopRetired = false) {
     super("native_cancellation_pending_recovery");
     this.name = "NativeCancellationPendingRecoveryError";
   }
@@ -10350,7 +10351,7 @@ async function performNativeCancellation(
             let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
             const settled = await Promise.race([
               cleanup.then(
-                () => true,
+                () => "retired" as const,
                 () => true,
               ),
               new Promise<false>((resolve) => {
@@ -10361,6 +10362,7 @@ async function performNativeCancellation(
               }),
             ]);
             if (cleanupTimer) clearTimeout(cleanupTimer);
+            if (settled === "retired") active.providerRetired = true;
             if (!settled) {
               cancellationAbort.abort(
                 new Error("native session cancellation cleanup timed out"),
@@ -13347,7 +13349,9 @@ async function executePaperclipNativeSessionAttempt(
             if (warmSessionId !== null && lifecyclePolicy.mode === "warm") {
               await timeController("warm_release", () => releaseWarmNativeSession(warmSessionId, warmSessionOwnerToken, lifecyclePolicy.idleTimeoutMs, true));
             }
-            error = new NativeCancellationPendingRecoveryError();
+            error = new NativeCancellationPendingRecoveryError(
+              !stoppedBeforeFirstTurn && hasAcknowledgedNativeStopIntent(stoppedRun) && activeAtFailure?.providerRetired === true,
+            );
           }
         }
       }
