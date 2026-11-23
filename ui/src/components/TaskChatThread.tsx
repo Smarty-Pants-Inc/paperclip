@@ -2996,8 +2996,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const requestExecution = requestRun?.id === liveRun?.id ? liveExecution : linkedRunMetaById.get(requestRun?.id ?? "")?.execution;
   const requestWait = latestUserComment && queuedCommentIds.has(latestUserComment.id) ? queuedMessageQueue?.executionWait : null;
   const requestLabel = requestWait?.message ?? (requestStatus === "queued" ? requestExecution?.label : undefined) ?? "Starting…";
-  const requestWorking = HELD_BY_RECOVERY_REASONS.has(requestWait?.reason ?? requestExecution?.cause ?? "") ||
-    (!requestWait && !requestExecution?.cause && (!requestRun || requestStatus === "queued"));
+  // While the task offers Retry nothing is on its way by itself: words, no working sign.
+  const requestWorking = !(props.interruption?.state === "failed" && props.interruption.canRetry) &&
+    (HELD_BY_RECOVERY_REASONS.has(requestWait?.reason ?? requestExecution?.cause ?? "") ||
+    (!requestWait && !requestExecution?.cause && (!requestRun || requestStatus === "queued")));
   // A person's message the server holds behind a Stop's recovery is still on
   // its way: draw the working sign with the server's own words, not a blank.
   const optimisticRunnerStartup =
