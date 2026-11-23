@@ -7875,7 +7875,8 @@ async function restoreWarmRunnerdController(input: {
   await restoreDurableHarnessForExecution(input.db, input.execution, root);
   const identity = readRunnerdDurableIdentity(root);
   const reference = identity ?? readRunnerdDurableIdentity(root, true);
-  if (!idleWarmNativeSessionOwnerRunId(input) && (!reference || !existsSync(nativeSessionCheckpointPath(input.execution)))) {
+  // With no retained owner, the server's canonical checkpoint decides first: a supervisor file can name an older run.
+  if (!idleWarmNativeSessionOwnerRunId(input)) {
     if (await restoreNativeControllerProjections(input.db, input.execution, root)) {
       await restoreRemoteSuspendedRunnerCheckpoint(input, root);
       return;
