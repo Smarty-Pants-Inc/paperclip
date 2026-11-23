@@ -2285,6 +2285,18 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       }
     }
 
+    // The single reply owner must stay after its human submission anchors,
+    // even when coalescing folds its post-steer answer into the first segment.
+    const chainAnchors = new Map<string, number>();
+    for (const [runId, anchors] of steeringAnchorsByRun) {
+      const chainId = runChainIdsById.get(runId)?.[0] ?? runId;
+      chainAnchors.set(chainId, Math.max(chainAnchors.get(chainId) ?? 0, ...anchors));
+    }
+    for (const settled of settledTurns) {
+      if (!settled.turn.standaloneHeader) continue;
+      const chainId = runChainIdsById.get(settled.sourceRunId)?.[0] ?? settled.sourceRunId;
+      settled.startMs = Math.max(settled.startMs, chainAnchors.get(chainId) ?? 0);
+    }
     settledTurns.sort((a, b) =>
       a.startMs < b.startMs ? -1 : a.startMs > b.startMs ? 1 : 0,
     );
@@ -2535,7 +2547,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const settlingFinishedAt = settlingRun
     ? linkedRunMetaById.get(settlingRun.id)?.finishedAt
     : undefined;
-  const tailStatus = terminalStatuses.get(tailRunId ?? "") ?? (stoppingReply ? "stopping" : liveRun
+  const tailRunStatus = terminalStatuses.get(tailRunId ?? "") ?? (stoppingReply ? "stopping" : liveRun
     ? liveRun.status
     : isTerminalIssueStatus(issueStatus) ? (issueStatus === "cancelled" ? "cancelled" : "succeeded")
     : (runs.find((run) => run.id === settlingRun?.id)?.status ?? "succeeded"));
@@ -2544,7 +2556,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       ? ((liveRun.startedAt ? toMs(liveRun.startedAt) : null) ??
         toMs(liveRun.createdAt))
       : (settlingRun?.startedAtMs ?? null));
-  const tailFinishedAtMs = liveRun
+  const tailRunFinishedAtMs = liveRun
     ? liveRun.finishedAt
       ? toMs(liveRun.finishedAt)
       : null
@@ -2623,6 +2635,28 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       tailPlanContentKey,
     ],
   );
+  // Final-response presentation and its header/tail settle in the same render.
+  const tailFinalResponse = paperclipRunnerTail ? paperclipRunnerFinalResponse(tailItems, {
+    runId: tailRunId ?? undefined,
+    allowFallback: Boolean(paperclipRunnerAcceptedResponseWake(tailItems, tailRunId ?? undefined)) ||
+      (!paperclipRunnerTailAwaitingContinuation && isTerminalRunStatus(tailRunStatus) &&
+        (terminalHydratedRunIds.has(tailRunId ?? "") || tailEntries.some((entry) => entry.kind === "run_terminal"))),
+    yielded: paperclipRunnerTailAwaitingContinuation,
+    waitSummary: acceptedSemanticResultSummary(tailRunId ? linkedRunMetaById.get(tailRunId)?.resultJson : null),
+  }) : undefined;
+  // Match the runner turn's replay latch, including its yielded-wait reset.
+  const tailFinalRef = useRef<{ runId: string | null; item?: TaskChatMessageItem }>({ runId: null });
+  if (tailFinalRef.current.runId !== tailRunId || (
+    !paperclipRunnerAcceptedResponseWake(tailItems, tailRunId ?? undefined) &&
+    (paperclipRunnerTailAwaitingContinuation || tailItems.some((item) =>
+      item.kind === "protocol" && item.surface === "run_result" && item.disposition === "yielded"))
+  )) tailFinalRef.current = { runId: tailRunId };
+  if (tailFinalResponse) tailFinalRef.current.item = tailFinalResponse;
+  const tailHasFinalResponse = Boolean(tailFinalRef.current.item);
+  const tailTerminal = tailEntries.findLast((entry) => entry.kind === "run_terminal");
+  const tailStatus = isTerminalRunStatus(tailRunStatus) ? tailRunStatus :
+    tailTerminal?.runState ?? (tailHasFinalResponse ? "succeeded" : tailRunStatus);
+  const tailFinishedAtMs = tailRunFinishedAtMs ?? (tailTerminal ? toMs(tailTerminal.ts) : tailFinalRef.current.item?.atMs ?? null);
   const tailTurnStatus = useMemo(
     () =>
       isTerminalRunStatus(tailStatus)
@@ -3440,7 +3474,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                     agentIcon={visibleTailAgentIcon}
                                     agent={tailAgent ?? (tailAgentId ? { id: tailAgentId } : undefined)}
                                     status={optimisticRunnerStartup ? (stoppingReply ? "stopping" : "queued") : tailStatus}
-                                    execution={liveRun?.id === tailRunId ? liveRun.execution : null}
+                                    execution={!tailHasFinalResponse && liveRun?.id === tailRunId ? liveRun.execution : null}
                                     preparationLabel={liveRun && heldPaperclipRunnerFinalText && (liveRun.execution?.phase === "finishing" || tailEntries.some((entry) => entry.kind === "run_terminal" && entry.runState === "succeeded")) ? "Answer ready · Saving…" : optimisticRunnerStartup && submissionTakingLonger ? "Taking longer than usual…" : undefined}
                                     startedAtMs={tailStartedAtMs}
                                     finishedAtMs={tailFinishedAtMs}
@@ -3456,7 +3490,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                       showHeader={false}
                                       runId={tailRunId}
                                       execution={
-                                        liveRun?.id === tailRunId
+                                        !tailHasFinalResponse && liveRun?.id === tailRunId
                                           ? liveRun.execution
                                           : null
                                       }
