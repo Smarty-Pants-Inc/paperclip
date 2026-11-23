@@ -1750,6 +1750,16 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     if (resolvedActiveRun) ids.add(resolvedActiveRun.id);
     return ids;
   }, [resolvedActiveRun, resolvedLiveRuns]);
+  // The live-run records keep their first execution projection between status
+  // events; the run history the page polls every second while live has the
+  // current one. The thread's status reads the run, so give it the fresh one.
+  const polledExecutionByRunId = useMemo(() => new Map(resolvedLinkedRuns.flatMap((run) =>
+    run.execution ? [[run.runId, run.execution] as const] : [])), [resolvedLinkedRuns]);
+  const freshLiveRuns = useMemo(() => resolvedLiveRuns.map((run) =>
+    polledExecutionByRunId.has(run.id) ? { ...run, execution: polledExecutionByRunId.get(run.id) } : run),
+  [resolvedLiveRuns, polledExecutionByRunId]);
+  const freshActiveRun = resolvedActiveRun && polledExecutionByRunId.has(resolvedActiveRun.id)
+    ? { ...resolvedActiveRun, execution: polledExecutionByRunId.get(resolvedActiveRun.id) } : resolvedActiveRun;
   const timelineRuns = useMemo(() => {
     const historicalRuns =
       liveRunIds.size === 0
@@ -2756,8 +2766,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             }
             timelineEvents={timelineEvents}
             workModeChanges={workModeChanges}
-            liveRuns={resolvedLiveRuns}
-            activeRun={resolvedActiveRun}
+            liveRuns={freshLiveRuns}
+            activeRun={freshActiveRun}
             issueId={issueId}
             blockedBy={blockedBy ?? []}
             liveIssueIds={liveIssueIds}
