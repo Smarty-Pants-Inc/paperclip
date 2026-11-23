@@ -1021,6 +1021,7 @@ export function TaskChatComposer({
     }
     setBody("");
     setSendingAttachmentIds(new Set(submittedAttachments.map(item => item.id)));
+    setActionError(null);
     setSubmitting(true);
     let attemptId: string | null = null;
     let request: ComposerSendRequest | null = null;
@@ -1104,6 +1105,8 @@ export function TaskChatComposer({
       setRunSettings(null);
     } catch (error) {
       if (mountedTaskKey.current !== draftKey) return;
+      if (!queuedEdit && classifySendFailure(error) === "rejected")
+        setActionError(describeError(error, { action: "send this message" }).body);
       const nextDraft = bodyRef.current;
       // Not delivered, or not known to be: keep it and resend with the same
       // ID when the connection allows. The server dedupes by that ID.
