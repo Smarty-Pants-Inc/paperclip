@@ -554,6 +554,7 @@ type PaperclipWakeExecutionStage = {
 };
 
 export const PAPERCLIP_EARLIER_READ_COMMENT_NOTE = "An earlier turn already read this comment and may have applied it. Check the current task state first, and do not repeat work that is already done.";
+export const PAPERCLIP_STOPPED_BEFORE_ANSWER_COMMENT_NOTE = "The person pressed Stop on this request before you answered it. Do not act on it unless they ask for it again.";
 
 type PaperclipWakeComment = {
   id: string | null;
