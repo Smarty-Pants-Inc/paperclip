@@ -46,6 +46,7 @@ export const WAITING_REASONS = [
   "conversation",
   "awaiting_first_message",
   "board_confirmation",
+  "board_response",
 ] as const;
 export type WaitingReason = (typeof WAITING_REASONS)[number];
 
@@ -154,6 +155,7 @@ export type AssignedWorkFacts = {
     /** Another server still holds this run's controller lease to settle it. */
     settlingUntil: Date | null;
     operatorStopped: boolean;
+    boardResponseWaiting?: boolean;
   } | null;
   pendingWakes: number;
   nativeRecoveryPending: boolean;
@@ -346,6 +348,7 @@ function waitingReason(facts: AssignedWorkFacts, now: Date): WaitingReason | nul
       return "provider_limit";
     }
   }
+  if (facts.latestRun?.boardResponseWaiting) return "board_response";
   if (issue.isConversation) return "conversation";
   if (issue.awaitingFirstMessage) return "awaiting_first_message";
   if (issue.status === "blocked") {
