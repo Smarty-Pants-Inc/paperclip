@@ -127,7 +127,8 @@ function SortableQueuedMessage({
   const body = queuedMessageLabel(entry);
   const images = extractImageRefs(body).filter(image =>
     /^\/api\/(?:attachments|assets)\/[^/?#\\]+\/content(?:\?[^#\\]*)?$/.test(image.url));
-  const label = stripStandaloneImageEmbeds(body);
+  const preview = stripStandaloneImageEmbeds(body).replace(/\s+/g, " ").trim();
+  const label = preview.length > 100 ? `${preview.slice(0, 100)}…` : preview;
   const sortable = useSortable({
     id: entry.comment.id,
     disabled: queueMutationDisabled || immutableResponse,
