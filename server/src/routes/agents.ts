@@ -13,6 +13,7 @@ import { completeSetupTokenAiConnection } from "../services/setup-token-ai-conne
 import { connectionManagementService, continuingConnectionManagement } from "../services/connection-management.js";
 import { connectionManagementGuard, connectionRequestContext, connectionRequestUserId, aiLoginUserAction } from "./connection-management-authz.js";
 import { cancellationRequestId } from "../services/native-runtime/native-cancellation-request.js";
+import { claimedAdapterType } from "../services/conversation-continuation.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE } from "../services/native-runtime/completed-turn-cleanup.js";
 import { agentHarnessType, isEnvironmentDriverSupportedForAdapter, normalizeClaudeRunnerOptions, type AgentConfigurationWarning, type AgentRunnerChoice } from "@paperclipai/shared";
 import { resolveNewAgentRunnerForCompany } from "../services/agent-runner-selection.js";
@@ -73,7 +74,7 @@ import { readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
-import { activityLog, agents as agentsTable, chatConversations, companies, heartbeatRuns, issues as issuesTable, nativeRunFinalizations, projects as projectsTable } from "@paperclipai/db";
+import { activityLog, agents as agentsTable, chatConversations, companies, heartbeatRunEvents, heartbeatRuns, issues as issuesTable, nativeRunFinalizations, projects as projectsTable } from "@paperclipai/db";
 import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
 import { sha256Digest } from "../services/feedback-redaction.js";
 import {
@@ -210,6 +211,7 @@ import {
   type NativeRuntimeRequestResolver,
 } from "../services/native-runtime/runtime-request-resolution-authority.js";
 import {
+  getNativeSessionSteeringState,
   interruptNativeTurn,
   NativeRuntimeRequestResolutionError,
   resolveNativeRuntimeRequest,
@@ -7425,29 +7427,52 @@ export function agentRoutes(
     if (!existing) return;
     if (!(await assertRunReadAllowed(req, res, existing))) return;
     const requestId = cancellationRequestId(req.body?.cancellationRequestId);
+    const PERSON_STOP_TURN_WAIT_MS = 60_000, stopDeadline = Date.now() + PERSON_STOP_TURN_WAIT_MS;
     // A person's Stop on a live Pi turn ends that turn only (seam 0233). The run then
     // finishes through the ordinary door and keeps its session, runner and machine.
     const provider = asRecord(asRecord(asRecord(existing.runnerProfileJson)?.nativeExecutionInput)?.provider);
-    if (existing.status === "running" && existing.runtimeMode === "native" && provider?.kind === "pi_rpc") {
+    const preparing = existing.status === "running" && existing.runtimeMode === "legacy" && !existing.runtimeModeResolvedAt && existing.executionStage === "preparing" && claimedAdapterType(existing) === "paperclip_runner" && asRecord(existing.runnerProfileJson)?.nativeExecutionInput == null;
+    const agent = preparing ? await svc.getById(existing.agentId) : null;
+    if ((existing.status === "running" && existing.runtimeMode === "native" && provider?.kind === "pi_rpc") || (preparing && agent?.adapterType === "paperclip_runner" && agent.adapterConfig?.provider === "pi_rpc")) {
       // The mark is set before the interrupt (the driver can end the turn at once) and removed unless it landed.
       const mark = (on: boolean) => db.update(heartbeatRuns).set({ resultJson: on
         ? sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
           personStop: { requestedAt: new Date().toISOString(), userId: req.actor.userId ?? null } })}::jsonb`
         : sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) - 'personStop'` })
         .where(on ? and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")) : eq(heartbeatRuns.id, runId));
-      await mark(true);
-      const outcome = await interruptNativeTurn({ runId, reason: "person_stop" }).catch(() => null);
+      if (!preparing) await mark(true);
+      const outcome = preparing ? "no_turn" : await interruptNativeTurn({ runId, reason: "person_stop" }).catch(() => null);
       // Attached with no live turn and a result already accepted: the run is finishing, so Stop is a no-op.
       const [finishing] = outcome === "no_turn" ? await db.select({ resultId: nativeRunFinalizations.resultId })
         .from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId)).limit(1) : [];
       const landed = outcome !== null && outcome !== "no_turn";
       if (!landed) await mark(false);
-      if (landed || finishing?.resultId) {
+      const hasTurn = async () => (await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, runId), inArray(heartbeatRunEvents.eventType, ["turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted"]))).limit(1)).length > 0;
+      if (outcome === "no_turn" && !finishing?.resultId && !await hasTurn()) {
+        res.status(202).json(await runRedactions.redactForRun(existing.companyId, runId, existing, getActorInfo(req).actorId));
+        void (async () => { for (;;) {
+            const current = await heartbeat.getRun(runId); if (current?.status !== "running") return;
+            if (current.runtimeMode === "native" && asRecord(asRecord(asRecord(current.runnerProfileJson)?.nativeExecutionInput)?.provider)?.kind !== "pi_rpc") { await cancelStoppedRun(); return; }
+            const state = await getNativeSessionSteeringState(runId);
+            if (state.activeTurnId) { await mark(true);
+              const sent = await interruptNativeTurn({ runId, reason: "person_stop", timeoutMs: Math.max(1, stopDeadline - Date.now()) }).catch(() => null);
+              if (sent && sent !== "no_turn") return;
+              await mark(false);
+            }
+            if (await hasTurn()) return;
+            if (Date.now() >= stopDeadline) { await cancelStoppedRun(); return; }
+            await new Promise(resolve => setTimeout(resolve, Math.min(250, stopDeadline - Date.now())));
+        } })().catch(error => logger.warn({ error, runId }, "person Stop turn wait failed"));
+        return;
+      }
+      if (landed || finishing?.resultId || outcome === "no_turn") {
         const stopped = (await heartbeat.getRun(runId)) ?? existing;
         res.json(await runRedactions.redactForRun(stopped.companyId, stopped.id, stopped, getActorInfo(req).actorId));
         return;
       }
     }
+    await cancelStoppedRun();
+    async function cancelStoppedRun() { if (!existing) return;
     // Stamp the cancellation as operator-initiated (this route is board-only).
     // Recovery reads this to stand down instead of classifying the cancelled
     // run as agent stranding and re-waking the agent the operator just stopped.
@@ -7476,8 +7501,9 @@ export function agentRoutes(
       }
     }
 
-    res.json(run ? await runRedactions.redactForRun(run.companyId, run.id, run,
+    if (!res.headersSent) res.json(run ? await runRedactions.redactForRun(run.companyId, run.id, run,
       getActorInfo(req).actorId) : null);
+    }
   });
 
   router.post(
