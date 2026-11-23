@@ -1755,6 +1755,10 @@ function invalidateActivityQueries(
         if (action === "issue.comment_added" || action === "issue.conversation_session_started" || visibleConversation) {
           queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments(ref), ...(visibleConversation ? undefined : invalidationOptions) });
         }
+        // A server hold on a message (or its release) reaches the open page now, not on a reload.
+        if (action === "issue.comment_added" || action?.startsWith("issue.execution_") || action?.startsWith("issue.queued_comment")) {
+          queryClient.invalidateQueries({ queryKey: queryKeys.issues.queuedComments(ref) });
+        }
         if (action?.startsWith("issue.attachment_") || action?.startsWith("issue.work_product_")) {
           // These cards are durable API objects, not streamed text. Refresh the
           // visible task too, including attachments bound to an existing comment.
