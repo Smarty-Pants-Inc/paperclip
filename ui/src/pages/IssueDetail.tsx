@@ -1345,6 +1345,7 @@ type IssueDetailChatTabProps = {
   onDeleteComment?: (commentId: string) => Promise<void> | void;
   onPauseWorkRun?: (runId: string, feedback?: "composer") => Promise<void>;
   onStopResponse?: (runId: string) => Promise<void>;
+  onRestoreStoppedMessages?: (commentIds: readonly string[]) => Promise<boolean>;
   stopResponsePending?: boolean;
   pauseWorkPending?: boolean;
   pauseWorkScope?: "leaf" | "subtree";
@@ -1481,6 +1482,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   onDeleteComment,
   onPauseWorkRun,
   onStopResponse,
+  onRestoreStoppedMessages,
   stopResponsePending,
   pauseWorkPending,
   pauseWorkScope,
@@ -2738,6 +2740,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
               if (activeRunQueryEnabled) void refetchActiveRun();
             }}
             composerRef={composerRef}
+            onRestoreStoppedMessages={onRestoreStoppedMessages}
             composerAccessory={<><WorkspaceRetryControl />{composerAccessory}</>}
             threadHeader={
               !classicTaskInterfaceEnabled &&
@@ -5836,6 +5839,18 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     },
   });
 
+  // The text goes back into the input box FIRST (a failure can only duplicate it, never lose it), then
+  // the person's own delete takes it out of the thread and every hand-over (deleted comments are never handed on).
+  const restoreStoppedMessages = useCallback(async (commentIds: readonly string[]) => {
+    if (!commentComposerRef.current) return false; // no box to take the text: restore nothing, delete nothing, try again later
+    for (const id of commentIds) {
+      const comment = threadComments.find((candidate) => candidate.id === id && !candidate.deletedAt);
+      if (!comment) continue;
+      commentComposerRef.current?.restoreDraft(comment.body);
+      await issuesApi.deleteComment(issueId!, id).then(upsertCommentInCache).catch(() => undefined);
+    }
+    return true;
+  }, [threadComments, issueId, upsertCommentInCache]);
   const deleteComment = useMutation({
     mutationFn: async ({ commentId }: { commentId: string }) =>
       issuesApi.deleteComment(issueId!, commentId),
@@ -8896,6 +8911,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                       .mutateAsync({ commentId })
                       .then(() => undefined)
                   }
+                  onRestoreStoppedMessages={restoreStoppedMessages}
                   onStopResponse={canManageTreeControl
                     ? (runId) => stopResponse.mutateAsync(runId)
                     : undefined}
