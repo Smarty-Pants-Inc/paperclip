@@ -5,6 +5,7 @@ import { agentsApi } from "@/api/agents";
 import { authApi } from "@/api/auth";
 import { QueryErrorState, useQueryView } from "@/components/QueryView";
 import { useCompany } from "@/context/CompanyContext";
+import { useDialogActions } from "@/context/DialogContext";
 import { useAgentChatEnabled } from "@/hooks/useAgentChatEnabled";
 import { recordAgentChatVisit } from "@/lib/recent-agent-chats";
 import { queryKeys } from "@/lib/queryKeys";
@@ -42,6 +43,11 @@ export function AgentChat() {
       && !rosterAgent && isUuidLike(agentRef),
   });
   const agent = rosterAgent ?? (historyAgent.data?.companyId === selectedCompanyId ? historyAgent.data : undefined);
+  const { setNewIssueAssigneeAgentId } = useDialogActions();
+  useEffect(() => {
+    setNewIssueAssigneeAgentId(enabled ? agent?.id : undefined);
+    return () => setNewIssueAssigneeAgentId(undefined);
+  }, [enabled, agent?.id, setNewIssueAssigneeAgentId]);
   const chatKey = queryKeys.agentChats.detail(selectedCompanyId, userId, agent?.id);
   const chat = useQuery({
     queryKey: chatKey,
