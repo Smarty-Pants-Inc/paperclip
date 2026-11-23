@@ -723,6 +723,12 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         } else await recordInterruptedPreparationContinuation(db, run, "deferred");
       }
     }
+    // A later run that owns the issue drains these deferred messages itself when it
+    // releases. Re-enqueueing them now would add a second copy beside the original.
+    const [owner] = await db.select({ status: heartbeatRuns.status }).from(issues)
+      .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, issues.executionRunId))
+      .where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId)));
+    if (owner && !isHeartbeatRunTerminalStatus(owner.status)) return;
     for (const wake of pending) {
       if (wake.idempotencyKey?.startsWith("chat-inbound:")) {
         await resumeDeferredChatWake(db, { companyId: run.companyId, agentId: run.agentId,
