@@ -36,6 +36,7 @@ import {
 } from "../native-runtime/native-cancellation-request.js";
 import {
   canContinueCancelledRun,
+  isAcknowledgedLegacyUserStop,
   readRunCancellation,
   requestedRunCancellation,
   userStopBoundaryAt,
@@ -675,7 +676,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         )) : [];
     const cancelledPreparation = run.runtimeMode === "legacy" &&
       await isCancelledNativeStartup(db, run, preparationCoordinator);
-    if (run.runtimeMode !== "native" && !cancelledPreparation && !interruptedPreparation &&
+    const settledLegacyStop = isAcknowledgedLegacyUserStop(run);
+    if (run.runtimeMode !== "native" && !cancelledPreparation && !interruptedPreparation && !settledLegacyStop &&
         parseObject(run.resultJson?.startupCancellation).beforeNativeSelection !== true &&
         !(await remoteExecutionHasStopped(db, run.companyId, run.id)) &&
         !(await recordedLocalExecutionStopped(db, run))) return;
@@ -695,7 +697,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     if (stoppedNativeExecution) await observeStoppedWorkspaceRecovery(db, { companyId: run.companyId, issueId, runId: run.id });
     const stoppedNativeContinuation = stoppedNativeExecution && !(await getExecutionBlocker(db, run.companyId, issueId));
     const legacyContinuation = run.runtimeMode === "legacy" &&
-      hasConversationContinuationPolicy((await getRunExecutionWait(run.companyId, run.id))?.resultJson) &&
+      (settledLegacyStop || hasConversationContinuationPolicy((await getRunExecutionWait(run.companyId, run.id))?.resultJson)) &&
       !(await getExecutionBlocker(db, run.companyId, issueId));
     if (run.runtimeMode !== "native" && run.runtimeMode !== "legacy") return;
     const pending = await db.select().from(agentWakeupRequests).where(and(

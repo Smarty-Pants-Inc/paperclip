@@ -1,7 +1,7 @@
-import { and, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { heartbeatRuns, type Db } from "@paperclipai/db";
 import { isInterruptedNativePreparation } from "./cancelled-native-startup.js";
-import { LEGACY_RECOVERY_CAUSE, settleInterruptedNativeBootstrap } from "./legacy-execution-recovery.js";
+import { LEGACY_RECOVERY_CAUSE, cancelledLegacyPreparationPendingCondition, settleCancelledLegacyPreparation, settleInterruptedNativeBootstrap } from "./legacy-execution-recovery.js";
 import { logger } from "../middleware/logger.js";
 import type { OwnerProof } from "./owner-proof.js";
 import type { InProgressRecord, SettleOutcome } from "./recovery/ownership-registry.js";
@@ -18,7 +18,8 @@ import { abandonedPreparedRemoteWorkspaceExists } from "./remote-workspace-aband
  * released with a confirmed stop, the existing proof decides, and a run with
  * no provider execution is settled and replayed in its own uncharged lane.
  *
- * Only holds the system recorded itself are listed: an operator decision (an
+ * Certified cancellations share this owner-gone lane, without replaying Stop.
+ * Interrupted runs list only system-recorded holds: an operator decision (an
  * owner-gone attestation, an explicit user continuation, an assigned owner) is
  * never reopened. A workspace-restore hold (restore failure or recovery
  * evidence) belongs to restore recovery, unless the workspace already retired
@@ -27,7 +28,8 @@ import { abandonedPreparedRemoteWorkspaceExists } from "./remote-workspace-aband
  * cleaning up is not listed yet; the next pass lists it once the lease settles.
  */
 export function heldInterruptedPreparationWhere() {
-  return and(inArray(heartbeatRuns.status, ["interrupted", "failed"]), eq(heartbeatRuns.runtimeMode, "legacy"),
+  return and(or(cancelledLegacyPreparationPendingCondition(), and(
+    inArray(heartbeatRuns.status, ["interrupted", "failed"]), eq(heartbeatRuns.runtimeMode, "legacy"),
     isNull(heartbeatRuns.runtimeModeResolvedAt), eq(heartbeatRuns.executionStage, "preparing"),
     sql`exists (select 1 from issue_recovery_actions hold where hold.company_id = ${heartbeatRuns.companyId}
       and hold.cause = ${LEGACY_RECOVERY_CAUSE} and hold.fingerprint = 'legacy-execution:' || ${heartbeatRuns.id}::text
@@ -37,7 +39,7 @@ export function heldInterruptedPreparationWhere() {
       and hold.evidence->'automaticRecovery'->>'replay' = 'blocked'
       and not ${humanGateEvidencePredicate(sql`hold.evidence`)}
       and (not (hold.evidence ?| array['workspaceRestoreFailure', 'workspaceRestoreRecovery'])
-        or ${abandonedPreparedRemoteWorkspaceExists()}))`,
+        or ${abandonedPreparedRemoteWorkspaceExists()}))`)),
     sql`not exists (select 1 from environment_leases lease where lease.company_id = ${heartbeatRuns.companyId}
       and lease.heartbeat_run_id = ${heartbeatRuns.id}
       and (lease.released_at is null or lease.status = 'pending_cleanup' or lease.cleanup_status = 'failed'))`);
@@ -69,14 +71,16 @@ export async function settleHeldInterruptedPreparation(db: Db, record: InProgres
   const [run] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, record.recordId),
     eq(heartbeatRuns.companyId, record.companyId), heldInterruptedPreparationWhere()));
   if (!run) return { settled: false, reason: "no_longer_a_held_preparation" };
-  if (!await isInterruptedNativePreparation(db, run)) {
+  if (run.status !== "cancelled" && !await isInterruptedNativePreparation(db, run)) {
     return { settled: false, reason: "provider_work_not_disproved", watch: false };
   }
   // Settling without the resume path would leave the task with no successor;
   // keep the hold for a process that runs the heartbeat service.
   if (!heldPreparationResumer) return { settled: false, reason: "resume_path_unavailable" };
   let resolved = 0;
-  await settleInterruptedNativeBootstrap(db, { run, providerDispatchStarted: false, proof: context.proof.reason,
+  if (run.status === "cancelled") {
+    if (await settleCancelledLegacyPreparation(db, { run, providerDispatchStarted: false })) resolved = 1;
+  } else await settleInterruptedNativeBootstrap(db, { run, providerDispatchStarted: false, proof: context.proof.reason,
     onHoldsResolved: count => { resolved = count; } });
   if (resolved === 0) return { settled: false, reason: "hold_changed_since_proof" };
   // Only the call that resolved the hold starts the replay, so it starts once.

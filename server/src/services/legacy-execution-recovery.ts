@@ -22,6 +22,7 @@ import { and, desc, eq, getTableColumns, inArray, isNull, or, sql, type SQL } fr
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { executionStartedEventPredicate, isPreDispatchResourceWait } from "./pre-dispatch-execution-evidence.js";
 import { readRunCancellation } from "./run-cancellation.js";
+import { legacyControllerOwnerStamp } from "./legacy-controller-lease.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
@@ -96,6 +97,9 @@ export function legacyExecutionNeedsReconciliation(
   // provider action happened, so there is nothing to reconcile. Its
   // continuation is bounded by the server-restart lane, not the failure count.
   if (isReplacedPreparation({ ...run, controllerBootId: run.controllerBootId ?? null })) return false;
+  if (run.status === "cancelled" && readRunCancellation(run.resultJson)?.expected === true &&
+      evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false &&
+      (evidence.preparationPending === true || typeof evidence.preparationSettledAt === "string")) return false;
   if (executionFailureRetryCount(run) >= 2) return true;
   return !(
     evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false
@@ -260,6 +264,9 @@ export async function terminalizeLegacyExecution(input: {
         sql`${heartbeatRuns.resultJson} is distinct from ${JSON.stringify(retainedResult)}::jsonb`)).returning();
       if (retained) updated = retained;
     }
+    if (!input.recordRestoreFailureOnly && updated.status === "cancelled")
+      updated = await settleCancelledLegacyPreparation(tx as unknown as Db, { run: updated,
+        providerDispatchStarted: false, certifyOnly: true }) ?? updated;
     const needsRecovery = input.recordRestoreFailureOnly
       ? retainedLeaseIds.length > 0 || hasRequiredWorkspaceRecovery(updated.resultJson)
       : !input.reconcileIfNeeded || await legacyExecutionNeedsReconciliationWithEvidence(tx as unknown as Db, updated);
@@ -465,7 +472,18 @@ export async function recordInterruptedPreparationContinuation(db: Db, run: Pick
   });
 }
 
+/** A no-dispatch certificate is not proof that allocation and cleanup finished. */
+export function cancelledLegacyPreparationPendingCondition() {
+  return sql`(${heartbeatRuns.runtimeMode} = 'legacy' and ${heartbeatRuns.status} = 'cancelled'
+    and ${heartbeatRuns.resultJson}#>'{executionRecovery,preparationPending}' = 'true'::jsonb
+    and ${heartbeatRuns.resultJson}#>>'{executionRecovery,kind}' = 'bootstrap'
+    and ${heartbeatRuns.resultJson}#>'{executionRecovery,providerWorkStarted}' = 'false'::jsonb
+    and ${heartbeatRuns.resultJson}#>'{cancellation,expected}' = 'true'::jsonb
+    and ${heartbeatRuns.resultJson}#>>'{executionRecovery,preparationSettledAt}' is null)`;
+}
+
 /**
+ * With certifyOnly, Stop records no-dispatch proof, not cleanup acknowledgement.
  * The executor that owned a cancelled legacy run proves that its gated
  * dispatch never entered the adapter. Such a Stop (for example a subtree pause
  * during workspace preparation) left no provider actions to reconcile, so the
@@ -473,25 +491,26 @@ export async function recordInterruptedPreparationContinuation(db: Db, run: Pick
  * retained execution reference must agree; otherwise the hold stays in force.
  */
 export async function settleCancelledLegacyPreparation(
-  db: Db, input: { run: Run; providerDispatchStarted: boolean },
+  db: Db, input: { run: Run; providerDispatchStarted: boolean; certifyOnly?: boolean },
 ): Promise<Run | null> {
   if (input.providerDispatchStarted || input.run.runtimeMode !== "legacy" || input.run.status !== "cancelled") return null;
   const issueId = input.run.issueId ?? input.run.contextSnapshot?.issueId;
   if (typeof issueId !== "string") return null;
   return db.transaction(async tx => {
     const [task] = await tx.select().from(issues)
-      .where(and(eq(issues.id, issueId), eq(issues.companyId, input.run.companyId))).for("update");
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, input.run.companyId))).for("no key update");
     // The dispatch gate writes this marker under the same run lock before
     // calling the adapter. A prior owner's local flag cannot disprove handoff.
     const [run] = await tx.select().from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.id, input.run.id), eq(heartbeatRuns.companyId, input.run.companyId),
-        sql`${heartbeatRuns.usageJson}#>'{budgetDispatch,handedOffAt}' is null`)).for("update");
+        sql`${heartbeatRuns.usageJson}#>'{budgetDispatch,handedOffAt}' is null`)).for("no key update");
     const recovery = run?.resultJson?.executionRecovery as Record<string, unknown> | undefined;
-    // Only a requested Stop qualifies, and only while it is still classified as
-    // an unknown outcome: existing wait or bootstrap receipts already decide it.
+    const certified = recovery?.kind === "bootstrap" && recovery.providerWorkStarted === false &&
+      recovery.preparationPending === true && !recovery.preparationSettledAt;
     if (!task || !run || run.runtimeMode !== "legacy" || run.status !== "cancelled" || !run.finishedAt
-        || readRunCancellation(run.resultJson)?.expected !== true || recovery !== undefined
-        || !legacyExecutionNeedsReconciliation(run)
+        || readRunCancellation(run.resultJson)?.expected !== true
+        || (recovery !== undefined || !legacyExecutionNeedsReconciliation(run)) && !certified
+        || input.certifyOnly && (run.executionStage !== "preparing" || !legacyControllerOwnerStamp(run) || run.runtimeModeResolvedAt)
         || run.processPid || run.processGroupId || run.processStartedAt || run.sessionIdAfter
         || run.nativeIssueId || run.nativeSessionId
         || hasWorkspaceRestoreFailure(run.resultJson) || hasRequiredWorkspaceRecovery(run.resultJson)
@@ -503,21 +522,23 @@ export async function settleCancelledLegacyPreparation(
     const [execution] = await tx.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
       eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id), executionStartedEventPredicate(),
     )).limit(1);
-    if (native || execution || leases.some(lease => lease.provider === "local"
+    if (native || execution || !input.certifyOnly && leases.some(lease => lease.provider === "local"
       ? !lease.releasedAt || lease.status === "pending_cleanup" || lease.cleanupStatus === "failed"
       : !hasRemoteTerminationReceipt(lease))) return null;
     const now = new Date();
     const cancellation = readRunCancellation(run.resultJson);
     const operatorStop = cancellation?.source === "operator" && cancellation.initiator.type === "user";
     const [settled] = await tx.update(heartbeatRuns).set({ resultJson: { ...run.resultJson,
-      executionRecovery: { kind: "bootstrap", providerWorkStarted: false, preparationSettledAt: now.toISOString() },
+      executionRecovery: { kind: "bootstrap", providerWorkStarted: false,
+        ...(input.certifyOnly ? { preparationPending: true } : { preparationSettledAt: now.toISOString() }) },
       // The preparation owner has unwound and every execution reference agrees.
       // Confirm the user's Stop; system cancellations keep their delivery path.
-      ...(operatorStop ? { executionCancellation: {
+      ...(operatorStop && !input.certifyOnly ? { executionCancellation: {
         ...(run.resultJson?.executionCancellation as Record<string, unknown> | undefined),
         state: "acknowledged", proof: "preparation_settled", acknowledgedAt: now.toISOString(),
       } } : {}),
     }, updatedAt: now }).where(eq(heartbeatRuns.id, run.id)).returning();
+    if (input.certifyOnly) return settled;
     // The automatic disposition may already have closed the incident with
     // replay blocked, and moved the task to blocked. Correct both verdicts.
     const holds = await tx.select().from(issueRecoveryActions).where(and(

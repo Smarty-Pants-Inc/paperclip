@@ -2,6 +2,7 @@ import { isPreDispatchReviewWait, neverStartedDispatchCancellationPredicate } fr
 import { canonicalExecutionUuid } from "./execution-identity.js";
 import { preDispatchExecutionWaitRecoveryActionPredicate } from "./pre-dispatch-execution-wait.js";
 import { legacyShutdownBeforeDispatchCondition } from "./legacy-shutdown-before-dispatch.js";
+import { cancelledLegacyPreparationPendingCondition } from "./legacy-execution-recovery.js";
 import { and, desc, eq, gt, inArray, not, or, sql, type SQL } from "drizzle-orm";
 import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
 import { z } from "zod";
@@ -329,6 +330,12 @@ const blockerIssueFields = {
 };
 
 export async function getExecutionOwnershipBlocker(db: Db, companyId: string, issueId: string): Promise<ExecutionBlocker | null> {
+  const [preparation] = await db.select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, companyId), cancelledLegacyPreparationPendingCondition(),
+    or(eq(heartbeatRuns.issueId, issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`),
+  )).limit(1);
+  if (preparation) return { recoveryActionId: null, runId: preparation.id, agentId: preparation.agentId,
+    cause: "execution_owner_active", nextAction: "The stopped preparation is still releasing its environment. Wait for cleanup before continuing this task." };
   const ownership = await getConversationOwnershipBlocker(db, companyId, issueId);
   return ownership ? { ...ownership, recoveryActionId: null } : null;
 }
