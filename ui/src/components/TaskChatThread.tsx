@@ -2503,6 +2503,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     : [];
   const tailEntries = tailRunId ? (transcriptByRun.get(tailRunId) ?? []) : [];
   // A reply that has ended (its terminal event is in) is finishing, not stoppable.
+  // The interruption projection can still say "working" for a run whose end the page
+  // already has (its status event or its terminal entry); that run is not starting again.
+  const observedRunId = props.interruption?.observedRunId ?? "";
+  const observedRunEnded = terminalStatuses.has(observedRunId) ||
+    (transcriptByRun.get(observedRunId) ?? []).some((entry) => entry.kind === "run_terminal");
   const tailEnded = tailEntries.some((entry) => entry.kind === "run_terminal") || liveRun?.execution?.phase === "finishing";
   const tailPlanItem =
     tailRunId === planDocumentSourceRunId ? planTurnItem : null;
@@ -2929,7 +2934,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     hasAgentAssignee &&
     !startupBlocked &&
     !tailRunId &&
-    (props.retryPreparing || (!isTerminalIssueStatus(issueStatus) && ((props.interruption?.state === "working" && !terminalStatuses.has(props.interruption.observedRunId ?? "")) || props.interruption?.state === "retry_scheduled")) || runnerSubmissionPending ||
+    (props.retryPreparing || (!isTerminalIssueStatus(issueStatus) && ((props.interruption?.state === "working" && !observedRunEnded) || props.interruption?.state === "retry_scheduled")) || runnerSubmissionPending ||
       commentItems.some(
         (item) =>
           item.kind === "message" &&
