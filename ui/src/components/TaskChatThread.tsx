@@ -1056,7 +1056,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     const deferred = new Set<string>();
     if (!compactTranscriptDeferral) return deferred;
     for (const run of runs) if (slowSettledTranscriptRunIds.has(run.id)) deferred.add(run.id);
+    // The newest finished reply is what the person just saw: a reload keeps its words (moment 10).
+    const newestSucceededRunId = runs.filter(run => run.status === "succeeded" && run.createdAt)
+      .sort((a, b) => toMs(a.createdAt) - toMs(b.createdAt)).at(-1)?.id;
     for (const run of runs) {
+      if (run.id === newestSucceededRunId) continue;
       if (requestedTranscripts.current.ids.has(run.id) || run.status !== "succeeded" ||
         !run.createdAt || toMs(run.createdAt) > openedAt) continue;
       const meta = linkedRunMetaById.get(run.id);
