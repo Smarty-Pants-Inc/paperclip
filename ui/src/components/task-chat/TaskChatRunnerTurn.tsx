@@ -78,13 +78,16 @@ function RunnerTurnStatus({
   finishedAtMs,
   continuedAfterSteering = false,
   waitingLabel,
+  working = false,
 }: {
   status: string;
   startedAtMs: number | null;
   finishedAtMs?: number | null;
   continuedAfterSteering?: boolean;
   waitingLabel?: string | null;
+  working?: boolean;
 }) {
+  const shimmer = useTaskChatShimmer("working");
   const terminal = isTerminalRunStatus(status);
   useSecondTick(!terminal && startedAtMs != null);
   const elapsedMs =
@@ -104,7 +107,7 @@ function RunnerTurnStatus({
 
   return (
     <span
-      className="min-w-0 truncate text-sm font-normal text-muted-foreground"
+      className={cn("min-w-0 truncate text-sm font-normal", working && shimmer ? "shimmer-text shimmer-text-muted" : "text-muted-foreground")}
       data-testid="task-chat-turn-status-header"
       data-turn-position="identity"
       aria-live="polite"
@@ -132,6 +135,7 @@ interface RunnerHeaderProps {
   status: string;
   execution?: ExecutionProjection | null;
   preparationLabel?: string;
+  working?: boolean;
   startedAtMs: number | null;
   finishedAtMs?: number | null;
   continuedAfterSteering?: boolean;
@@ -162,7 +166,7 @@ export function TaskChatRunnerHeader({ statusContent, ...props }: RunnerHeaderPr
   return <div className="flex min-h-8 min-w-0 items-center gap-2 pb-1 pt-2" data-testid="task-chat-runner-identity-row">
     {props.agentName ? <TaskChatAgentIdentity agentName={props.agentName} agentIcon={props.agentIcon} agent={props.agent} /> : null}
     {statusContent ?? (agentQueueWaitFor(props) ? <AgentQueueWait queue={agentQueueWaitFor(props)!} /> : null) ?? <RunnerTurnStatus status={props.status} startedAtMs={props.startedAtMs} finishedAtMs={props.finishedAtMs}
-      continuedAfterSteering={props.continuedAfterSteering} waitingLabel={runnerWaitingLabel(props, waitingToStart)} />}
+      continuedAfterSteering={props.continuedAfterSteering} waitingLabel={runnerWaitingLabel(props, waitingToStart)} working={props.working === true} />}
   </div>;
 }
 
