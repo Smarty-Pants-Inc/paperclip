@@ -33,6 +33,7 @@ import { clearLegacyChatMessageRequests } from "@/lib/chat-message-request";
 import { agentChatDraft } from "@/lib/agent-chat-draft";
 import { trackRecentProject } from "@/lib/recent-projects";
 import { ExecutionBlockerNotice } from "../components/ExecutionBlockerNotice";
+import { WorkspaceReconstructionRecovery } from "../components/WorkspaceReconstructionRecovery";
 import type { TaskComposerPause } from "../components/task-chat/TaskChatPausedTakeover";
 import { TaskDetailTasksPanel } from "@/components/task-detail/TaskDetailTasksPanel";
 import { IssueCreatedFromNote } from "@/components/task-detail/IssueCreatedFromNote";
@@ -8363,10 +8364,18 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
           )}
           {resolvedDetailTab === "chat" && (
             <ExecutionBlockerNotice className={shellSectionClass} presentation={issue.interruption} blockers={issue.blockedBy}
+              blocker={retainedRecoveryOwnsRetry ? null : issue.executionBlocker}
               issueId={issue.id} companyId={issue.companyId} agentName={agentMap.get(issue.assigneeAgentId ?? "")?.name} projectName={issue.project?.name}
               canRetry={canResolveBoardRecoveryAction && !(issue.executionBlocker?.workspaceRepairRequired
                 && isRetainedWorkspaceExportCause(issue.executionBlocker.cause) && retainedRecoveryOwnsRetry)} onRetry={taskRetry.retry}
               optimistic={taskRetry.optimistic} takingLonger={taskRetry.takingLonger} error={taskRetry.error} />
+          )}
+          {resolvedDetailTab === "chat" && issue.executionBlocker?.canReconstructWorkspace && (
+            <div className={shellSectionClass}>
+              <WorkspaceReconstructionRecovery key={`${issue.id}:${issue.executionBlocker.recoveryActionId}`}
+                issueId={issue.id} blocker={issue.executionBlocker} canManage={canManageBoardRuntime}
+                onRecorded={() => { invalidateIssueDetail(); invalidateIssueCollections(); }} />
+            </div>
           )}
 
           {issue.status === "in_review" && issue.externalConversationState === "waiting" && (
