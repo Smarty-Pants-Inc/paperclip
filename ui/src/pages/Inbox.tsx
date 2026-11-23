@@ -20,7 +20,6 @@ import { ApiError } from "../api/client";
 import { dashboardApi } from "../api/dashboard";
 import { executionWorkspacesApi } from "../api/execution-workspaces";
 import { issuesApi } from "../api/issues";
-import { useSecondTick } from "../hooks/useSecondTick";
 import { taskRetryNotStartedReason } from "../hooks/useTaskRetry";
 import { agentsApi } from "../api/agents";
 import { heartbeatsApi } from "../api/heartbeats";
@@ -407,12 +406,10 @@ export function FailedRunInboxRow({
   const issueId = readIssueIdFromRun(run);
   const issue = issueId ? issueById.get(issueId) ?? null : null;
   const interruption = issue?.interruption;
-  useSecondTick(interruption?.state === "retry_scheduled");
-  const retrySeconds = Math.max(0, Math.ceil((Date.parse(interruption?.nextRetryAt ?? "") - Date.now()) / 1000));
   const displayError = isRetrying ? "Thinking"
     : interruption?.retryWait ? interruption.retryWait.message
     : interruption?.state === "working" ? "Thinking"
-    : interruption?.state === "retry_scheduled" ? `Trying again in ${retrySeconds}s…`
+    : interruption?.state === "retry_scheduled" ? "Trying again…"
       : interruption?.state === "failed" ? "Couldn’t finish this attempt. Your message is saved."
         : interruption?.state === "waiting_for_user" ? ({
           approval: "Approval required", question: "Respond to the pending question", reconnect: "Reconnect account", assign_agent: "Assign an agent", choose_model: "Choose a supported model",
