@@ -2867,7 +2867,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     hasAgentAssignee &&
     !startupBlocked &&
     !tailRunId &&
-    (props.retryPreparing || (!isTerminalIssueStatus(issueStatus) && props.interruption?.state === "working") || runnerSubmissionPending ||
+    (props.retryPreparing || (!isTerminalIssueStatus(issueStatus) && (props.interruption?.state === "working" || props.interruption?.state === "retry_scheduled")) || runnerSubmissionPending ||
       commentItems.some(
         (item) =>
           item.kind === "message" &&
