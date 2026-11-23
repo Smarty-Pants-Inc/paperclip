@@ -4358,7 +4358,7 @@ impl CodexCommandExecutor {
         // Record cause and pending identities before touching the provider.
         self.persist_state(&next_state)?;
         self.state = Some(next_state);
-        self.ensure_provider()?.interrupt_turn().map_err(|error| {
+        self.ensure_provider()?.interrupt_turn(Some(reason)).map_err(|error| {
             DurableRunnerError::invalid(format!("Codex turn interrupt failed: {error}"))
         })?;
         Ok(CommandExecution::result(json!({
