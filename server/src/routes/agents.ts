@@ -74,8 +74,10 @@ import { readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
-import { activityLog, agents as agentsTable, chatConversations, companies, heartbeatRunEvents, heartbeatRuns, issues as issuesTable, nativeRunFinalizations, projects as projectsTable } from "@paperclipai/db";
-import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
+import { activityLog, agentWakeupRequests, agents as agentsTable, chatConversations, companies, heartbeatRunEvents, heartbeatRuns, issueComments, issues as issuesTable, nativeRunFinalizations, projects as projectsTable } from "@paperclipai/db";
+import { queuedCommentIdsFromWakePayload, withQueuedCommentIdsInWakePayload } from "../lib/queued-comment-context.js";
+import { readFirstTurnQueuedInputReceipt } from "../services/native-runtime/first-turn-queued-input.js";
+import { and, desc, eq, inArray, isNull, not, sql } from "drizzle-orm";
 import { sha256Digest } from "../services/feedback-redaction.js";
 import {
   agentSkillSyncSchema,
@@ -7427,7 +7429,7 @@ export function agentRoutes(
     if (!existing) return;
     if (!(await assertRunReadAllowed(req, res, existing))) return;
     const requestId = cancellationRequestId(req.body?.cancellationRequestId);
-    const PERSON_STOP_TURN_WAIT_MS = 60_000, stopDeadline = Date.now() + PERSON_STOP_TURN_WAIT_MS;
+    const PERSON_STOP_TURN_WAIT_MS = 60_000, stopDeadline = Date.now() + PERSON_STOP_TURN_WAIT_MS, pressedAt = new Date().toISOString();
     // A person's Stop on a live Pi turn ends that turn only (seam 0233). The run then
     // finishes through the ordinary door and keeps its session, runner and machine.
     const provider = asRecord(asRecord(asRecord(existing.runnerProfileJson)?.nativeExecutionInput)?.provider);
@@ -7440,13 +7442,32 @@ export function agentRoutes(
           personStop: { requestedAt: new Date().toISOString(), userId: req.actor.userId ?? null } })}::jsonb`
         : sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) - 'personStop'` })
         .where(on ? and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")) : eq(heartbeatRuns.id, runId));
+      // Seam 0247: his messages still QUEUED behind this run (never delivered) go back to him with the Stop, beside 0237's.
+      const returnQueued = async () => { const issueId = existing.nativeIssueId ?? asRecord(existing.contextSnapshot)?.issueId;
+        if (typeof issueId !== "string" || !req.actor.userId) return;
+        await db.transaction(async (tx) => { const wakes = await tx.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, existing.companyId),
+          eq(agentWakeupRequests.agentId, existing.agentId), inArray(agentWakeupRequests.status, ["deferred_issue_execution", "queued"]),
+          isNull(agentWakeupRequests.runId), sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`)).for("update", { skipLocked: true });
+          // A message this run already received (an acknowledged steer) stays in the thread (product rule). One sent after the press is a new message, not returned.
+          const [run] = await tx.select({ result: heartbeatRuns.resultJson, context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+          const received = Object.keys(asRecord(asRecord(run?.result)?.queuedSteeringAcknowledgements) ?? {}) // stock's first-turn receipt: sealed into its first prompt
+            .concat(readFirstTurnQueuedInputReceipt({ id: runId, contextSnapshot: run?.context })?.commentIds ?? []);
+          const ids = wakes.flatMap(wake => queuedCommentIdsFromWakePayload(wake.payload)).filter(id => !received.includes(id)), mine = ids.length ? (await tx.select({ id: issueComments.id }).from(issueComments)
+            .where(and(inArray(issueComments.id, ids), eq(issueComments.authorUserId, req.actor.userId!), isNull(issueComments.deletedAt),
+              sql`${issueComments.createdAt} <= ${pressedAt}::timestamptz`))).map(row => row.id) : [];
+          if (!mine.length) return;
+          for (const wake of wakes) { if (!queuedCommentIdsFromWakePayload(wake.payload).some(id => mine.includes(id))) continue;
+            const left = queuedCommentIdsFromWakePayload(wake.payload).filter(id => !mine.includes(id)), now = new Date();
+            await tx.update(agentWakeupRequests).set(left.length ? { payload: withQueuedCommentIdsInWakePayload(wake.payload, left), updatedAt: now }
+              : { status: "cancelled", finishedAt: now, updatedAt: now }).where(eq(agentWakeupRequests.id, wake.id)); }
+          await tx.update(heartbeatRuns).set({ resultJson: sql`jsonb_set(${heartbeatRuns.resultJson}, '{personStop,returned}', coalesce(${heartbeatRuns.resultJson}->'personStop'->'returned', '[]'::jsonb) || ${JSON.stringify(mine)}::jsonb)` }).where(eq(heartbeatRuns.id, runId)); }); };
       if (!preparing) await mark(true);
       const outcome = preparing ? "no_turn" : await interruptNativeTurn({ runId, reason: "person_stop" }).catch(() => null);
       // Attached with no live turn and a result already accepted: the run is finishing, so Stop is a no-op.
       const [finishing] = outcome === "no_turn" ? await db.select({ resultId: nativeRunFinalizations.resultId })
         .from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId)).limit(1) : [];
       const landed = outcome !== null && outcome !== "no_turn";
-      if (!landed) await mark(false);
+      if (!landed) await mark(false); else await returnQueued().catch(error => logger.warn({ error, runId }, "person Stop could not return queued messages"));
       const hasTurn = async () => (await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, runId), inArray(heartbeatRunEvents.eventType, ["turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted"]))).limit(1)).length > 0;
       if (outcome === "no_turn" && !finishing?.resultId && !await hasTurn()) {
         res.status(202).json(await runRedactions.redactForRun(existing.companyId, runId, existing, getActorInfo(req).actorId));
@@ -7456,7 +7477,7 @@ export function agentRoutes(
             const state = await getNativeSessionSteeringState(runId);
             if (state.activeTurnId) { await mark(true);
               const sent = await interruptNativeTurn({ runId, reason: "person_stop", timeoutMs: Math.max(1, stopDeadline - Date.now()) }).catch(() => null);
-              if (sent && sent !== "no_turn") return;
+              if (sent && sent !== "no_turn") { await returnQueued().catch(() => undefined); return; }
               await mark(false);
             }
             if (await hasTurn()) return;
