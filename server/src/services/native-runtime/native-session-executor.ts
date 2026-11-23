@@ -387,6 +387,7 @@ import {
 type ActiveNativeSession = {
   session: NativeSession;
   cancelRequested: boolean;
+  providerStopped?: Promise<boolean>;
   admissionAbort?: AbortController;
   cancellationSettled?: Promise<void>;
   restartDetach?: Promise<void>;
@@ -400,7 +401,7 @@ class NativeResultPendingFinalizationError extends Error {
 }
 
 export class NativeCancellationPendingRecoveryError extends Error {
-  constructor() {
+  constructor(readonly personStopProviderStopped?: Promise<boolean>) {
     super("native_cancellation_pending_recovery");
     this.name = "NativeCancellationPendingRecoveryError";
   }
@@ -10347,6 +10348,9 @@ async function performNativeCancellation(
               reason,
               signal: cancellationAbort.signal,
             }).cleanup;
+            // Acknowledged, or lost to the turn's own committed terminal: either way the turn took the Stop.
+            active.providerStopped = cleanup.then(() => true,
+              (error: unknown) => (error as { code?: unknown } | null)?.code === "already_terminal");
             let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
             const settled = await Promise.race([
               cleanup.then(
@@ -12259,6 +12263,8 @@ async function executePaperclipNativeSessionAttempt(
     `native-warm-session:${input.execution.binding.runId}`,
   );
   let existingWarmSession: NativeSession | undefined;
+  // This attempt's published session record. Closing deletes the map entry before failure handling reads it.
+  let publishedActive: ActiveNativeSession | undefined;
   let reusingReleasedRunner = false;
   let relaunchReleased: { owner?: ReturnType<typeof createPluginRunnerTaskOwner>; source: DurableRecoveryIdentity;
     runner: { version: string; digest: string }; published?: true } | undefined;
@@ -13025,6 +13031,7 @@ async function executePaperclipNativeSessionAttempt(
               if (session) {
                 const active: ActiveNativeSession = { session, cancelRequested: false, admissionAbort: new AbortController() };
                 activeNativeSessions.set(input.execution.binding.runId, active);
+                publishedActive = active;
                 const startup = nativeSessionStartups.get(input.execution.binding.runId);
                 const stopBeforeProviderTurn = startup?.stopRequested === true && startup.sessionPublished !== true
                   && startup.providerWorkMayPrecede !== true;
@@ -13347,7 +13354,9 @@ async function executePaperclipNativeSessionAttempt(
             if (warmSessionId !== null && lifecyclePolicy.mode === "warm") {
               await timeController("warm_release", () => releaseWarmNativeSession(warmSessionId, warmSessionOwnerToken, lifecyclePolicy.idleTimeoutMs, true));
             }
-            error = new NativeCancellationPendingRecoveryError();
+            error = new NativeCancellationPendingRecoveryError(
+              !stoppedBeforeFirstTurn && hasAcknowledgedNativeStopIntent(stoppedRun) ? publishedActive?.providerStopped : undefined,
+            );
           }
         }
       }
