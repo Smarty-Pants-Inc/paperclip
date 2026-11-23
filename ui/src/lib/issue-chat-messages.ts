@@ -47,6 +47,7 @@ export interface IssueChatComment extends IssueComment {
 }
 
 export interface IssueChatLinkedRun {
+  retryOfRunId?: string | null;
   execution?: ExecutionProjection | null;
   runId: string;
   runtimeMode?: "legacy" | "native";
