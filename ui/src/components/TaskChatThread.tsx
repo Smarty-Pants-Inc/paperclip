@@ -504,6 +504,9 @@ function durableInputLabel(
 // Server holds that settle by themselves after a Stop: run-control's execution_recovery and
 // explicit-native-continuation's blocked() waits whose words say the message starts automatically
 // or Paperclip is finishing / verifying on its own (not the ones that need the person).
+// A person's Stop for a Pi agent is the '/stop' control sent through the steer route; our driver
+// aborts the turn and ends it the ordinary way. It is a control, never drawn as a message.
+const isStopControl = (comment: { body?: string | null; authorAgentId?: string | null }) => !comment.authorAgentId && comment.body?.trim().toLowerCase() === "/stop";
 const HELD_BY_RECOVERY_REASONS = new Set([
   "execution_recovery", "controller_settling", "execution_settling", "process_running", "process_identity_missing",
   "cleanup_pending", "local_cleanup", "remote_cleanup", "finalizing_saved_result", "execution_owner_active",
@@ -518,7 +521,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     initialHistoryPending = false,
     initialHistoryError = false,
     onRetryInitialHistory,
-    comments,
+    comments: allComments,
     interactions: storedInteractions,
     documents = [],
     workProducts = [],
@@ -594,6 +597,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     resumeAssigneePending = false,
     onOpenSkill,
   } = props;
+  const comments = useMemo(() => allComments.filter((comment) => !isStopControl(comment)), [allComments]);
+  const stopControlAtMs = useMemo(() => allComments.filter(isStopControl).map((comment) => toMs(comment.createdAt)), [allComments]);
   const {
     data: planDocument,
     isLoading: planLoading,
@@ -704,10 +709,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     [issueId, queryClient],
   );
 
-  const queuedMessageQueue =
-    queuedCommentQueue && queuedCommentQueue.entries.length > 0
-      ? queuedCommentQueue
-      : null;
+  const queuedMessageQueue = useMemo(() => {
+    const entries = queuedCommentQueue?.entries.filter((entry) => !isStopControl(entry.comment)) ?? [];
+    return queuedCommentQueue && entries.length > 0 ? { ...queuedCommentQueue, entries } : null;
+  }, [queuedCommentQueue]);
   const emptyQueuedCommentQueue = useMemo<IssueQueuedCommentQueue>(
     () => ({
       issueId: issueId ?? "",
@@ -1037,8 +1042,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     // After a reload the run list's summary carries no cancellation source, only the Stop
     // receipt (executionCancellation) and the error code a person's Stop leaves ('cancelled').
     return stoppedRunIds.current.has(id) || (cancellation?.source === "operator" && cancellation.initiator?.type === "user") ||
-      (meta?.errorCode === "cancelled" && Boolean(meta?.resultJson?.executionCancellation));
-  }, [linkedRunMetaById]);
+      (meta?.errorCode === "cancelled" && Boolean(meta?.resultJson?.executionCancellation)) ||
+      Boolean(meta && (meta.startedAt ?? meta.createdAt) && stopControlAtMs.some((at) => at >= toMs(meta.startedAt ?? meta.createdAt) && (!meta.finishedAt || at <= toMs(meta.finishedAt))));
+  }, [linkedRunMetaById, stopControlAtMs]);
   const openedAt = useMemo(() => Date.now(), [issueId]);
   const scrollNavigation = useTaskChatScrollNavigation();
   const requestedTranscripts = useRef({ issueId, ids: new Set<string>() });
@@ -2050,7 +2056,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             startedAtMs > 0 && finishedAtMs > 0
               ? Math.max(0, finishedAtMs - startedAtMs)
               : undefined;
-          const failed = source.status !== "succeeded";
+          const failed = source.status !== "succeeded" || isUserStop(source.id);
           const turnId = `${source.id}:turn`;
           turnMergeMetaById.set(turnId, {
             chainId: runChainIdsById.get(source.id)?.[0] ?? source.id,
@@ -2137,7 +2143,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           },
         });
       }
-      const failed = source.status !== "succeeded";
+      const failed = source.status !== "succeeded" || isUserStop(source.id);
       const startSlotRaw = meta?.startedAt ?? meta?.createdAt;
       const startSlotMs = startSlotRaw
         ? toMs(startSlotRaw)
@@ -2716,8 +2722,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   if (tailFinalResponse && !tailFinalStreaming) tailFinalRef.current.item = tailFinalResponse;
   const tailHasFinalResponse = Boolean(tailFinalRef.current.item) && !tailFinalStreaming;
   const tailTerminal = tailEntries.findLast((entry) => entry.kind === "run_terminal");
-  const tailStatus = isTerminalRunStatus(tailRunStatus) ? tailRunStatus :
+  const tailEndStatus = isTerminalRunStatus(tailRunStatus) ? tailRunStatus :
     tailTerminal?.runState ?? (tailHasFinalResponse ? "succeeded" : tailRunStatus);
+  const tailStatus = tailEndStatus === "succeeded" && isUserStop(tailRunId ?? "") ? "cancelled" : tailEndStatus;
   const tailFinishedAtMs = tailRunFinishedAtMs ?? (tailTerminal ? toMs(tailTerminal.ts) : tailFinalRef.current.item?.atMs ?? null);
   const tailTurnStatus = useMemo(
     () =>
@@ -3741,7 +3748,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                             comment.authorUserId === currentUserId && comment.clientRequestId &&
                             !("clientStatus" in comment && comment.clientStatus)
                           ).map((comment) => comment.clientRequestId!))}
-                          onStop={liveRun && !tailEnded && !tailHasFinalResponse && onCancelRun ? () => { stoppedRunIds.current.add(liveRun.id); return onCancelRun(); } : undefined}
+                          onStop={liveRun && !tailEnded && !tailHasFinalResponse && onCancelRun ? () => { stoppedRunIds.current.add(liveRun.id);
+                            return tailAgent?.adapterType === "paperclip_runner" && tailAgent.adapterConfig?.provider === "pi" ? onAdd("/stop") : onCancelRun(); } : undefined}
                           confirmedStoppedRunIds={confirmedStoppedRunIds}
                           stopPending={stoppingReply}
                           stopScope={stopScope}
