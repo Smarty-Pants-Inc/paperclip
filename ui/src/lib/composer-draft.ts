@@ -17,6 +17,12 @@ function draftStorage(draftKey: string): Storage {
   return draftKey.startsWith("paperclip:agent-chat-draft:") ? sessionStorage : localStorage;
 }
 
+// A restored message (a Pi Stop hands back what the agent hadn't taken) must outlive a tab-scoped chat draft.
+const restoredKey = (draftKey: string) => `${draftKey}:restored:v1`;
+export function saveRestoredDraft(draftKey: string, value: string) {
+  try { if (draftStorage(draftKey) !== localStorage) localStorage.setItem(restoredKey(draftKey), value); } catch { /* storage unavailable */ }
+}
+
 export function loadDraft(draftKey: string): string {
   return loadDraftIfAvailable(draftKey) ?? "";
 }
@@ -24,7 +30,7 @@ export function loadDraft(draftKey: string): string {
 /** Distinguish an empty stored draft from unavailable browser storage. */
 export function loadDraftIfAvailable(draftKey: string): string | null {
   try {
-    return draftStorage(draftKey).getItem(draftKey) ?? "";
+    return draftStorage(draftKey).getItem(draftKey) ?? localStorage.getItem(restoredKey(draftKey)) ?? "";
   } catch {
     return null;
   }
@@ -72,8 +78,10 @@ export function saveDraft(draftKey: string, value: string, attemptId?: string) {
     if (!mayWriteDraft(draftKey, attemptId)) return;
     if (value.trim()) {
       draftStorage(draftKey).setItem(draftKey, value);
+      if (localStorage.getItem(restoredKey(draftKey)) !== null) localStorage.setItem(restoredKey(draftKey), value);
     } else {
       draftStorage(draftKey).removeItem(draftKey);
+      localStorage.removeItem(restoredKey(draftKey));
     }
     syncDraftRecoveryMarker(draftKey);
   } catch {
@@ -87,6 +95,7 @@ export function clearDraft(draftKey: string, attemptId?: string) {
     draftStorage(draftKey).removeItem(draftKey);
     draftStorage(draftKey).removeItem(`${draftKey}:attachments:v1`);
     draftStorage(draftKey).removeItem(`${draftKey}:submission:v1`);
+    localStorage.removeItem(restoredKey(draftKey));
     syncDraftRecoveryMarker(draftKey);
   } catch {
     // Ignore browser storage failures.
