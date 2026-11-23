@@ -320,6 +320,8 @@ export function TaskChatQueuedMessages({
   const [reordering, setReordering] = useState(false);
   const [announcement, setAnnouncement] = useState("");
   const [visibleError, setVisibleError] = useState<string | null>(null);
+  // "Message is still queued" stops being true once the queue is empty: drop the stale error.
+  useEffect(() => { if (visibleError && entries.length === 0) setVisibleError(null); }, [visibleError, entries.length]);
   const [deferredStatus, setDeferredStatus] = useState<{ queueId: string | null; message: string } | null>(null);
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
