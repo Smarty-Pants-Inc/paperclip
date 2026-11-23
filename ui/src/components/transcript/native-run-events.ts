@@ -6,6 +6,9 @@ import { isRunLogOnlyProviderEvent } from "./run-log-only-events";
 import { workspaceChangeEntry } from "@/adapters/paperclip-runner";
 import { createUnifiedDiffClassifier } from "@/components/task-chat/diff-lines";
 
+// The server stores long item text cut at a bound with this marker (heartbeat-run-summary.ts).
+const STORED_TEXT_BOUND_MARKER = "…[truncated]";
+
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -898,6 +901,9 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
     }
   >();
   const completedAgentMessageIds = new Set<string>();
+  // A completed message stored cut at the server's text bound ('…[truncated]') is
+  // shorter than its own streamed deltas: keep the deltas' full text instead.
+  const streamedAgentMessageIds = new Set<string>();
   const completedReasoningIds = new Set<string>();
   const completionItemIdentityById = new Map<string, ItemIdentity>();
   const nativeToolItemsById = new Map<string, NativeToolItemDetails>();
@@ -959,9 +965,11 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
       completionItemIdentityById.get(itemId),
     );
     if (identity.kind) completionItemIdentityById.set(itemId, identity);
+    if (event.eventType === "item.delta" && isAssistantItemKind(identity.kind) && itemId) streamedAgentMessageIds.add(itemId);
     if (event.eventType !== "item.completed") continue;
     const kind = identity.kind;
-    if (isAssistantItemKind(kind) && itemId && normalizedItemText(payload)) {
+    if (isAssistantItemKind(kind) && itemId && normalizedItemText(payload)
+      && !(streamedAgentMessageIds.has(itemId) && normalizedItemText(payload)!.trimEnd().endsWith(STORED_TEXT_BOUND_MARKER))) {
       completedAgentMessageIds.add(itemId);
     }
     if (kind === "reasoning" && itemId && normalizedItemText(payload)) {
@@ -1057,6 +1065,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
       const raw = normalizedItemText(payload) ?? "";
       const value = itemId && proposedMessageIds.has(itemId) ? withoutProposedPlanBlock(raw) : raw;
       if (!value) continue;
+      if (itemId && !completedAgentMessageIds.has(itemId) && streamedAgentMessageIds.has(itemId)) continue;
       const channel = itemIdentity.assistantChannel;
       entries.push({ kind: "assistant", ts, text: value, channel, ...(itemId ? { itemId } : {}) });
       continue;
