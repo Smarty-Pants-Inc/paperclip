@@ -93,7 +93,7 @@ function definiteNonTransientStatus(error: unknown): boolean {
 const DATABASE_CONNECTION_CODES = new Set(["CONNECTION_CLOSED", "CONNECTION_ENDED", "CONNECTION_DESTROYED", "CONNECT_TIMEOUT"]);
 const TRANSIENT_SQLSTATES = new Set(["57P01", "57P02", "57P03", "57014", "55P03", "40001", "40P01"]);
 
-function transientDatabaseFailure(error: unknown): boolean {
+export function transientDatabaseFailure(error: unknown): boolean {
   for (let cause = error, depth = 0; cause && depth < 5; cause = own(cause, "cause"), depth++) {
     const code = own(cause, "code");
     if (typeof code !== "string") continue;
