@@ -1,4 +1,4 @@
-import { isPaperclipExternalChatContractTurn, normalizePaperclipWakePayload, PAPERCLIP_EARLIER_READ_COMMENT_NOTE } from "@paperclipai/adapter-utils/server-utils";
+import { isPaperclipExternalChatContractTurn, normalizePaperclipWakePayload, PAPERCLIP_EARLIER_READ_COMMENT_NOTE, PAPERCLIP_STOPPED_BEFORE_ANSWER_COMMENT_NOTE } from "@paperclipai/adapter-utils/server-utils";
 import type { CaseExecutionContext, projectCaseContinuation } from "../case-context.js";
 import { caseInstructionAlreadyRepresented } from "../case-context.js";
 
@@ -91,6 +91,8 @@ export function buildNativeContinuationPrompt(input: {
   const earlierRead = wake.comments.filter((comment) => comment.readByEarlierTurn && comment.id
     && events.messages.some((message) => message.id === comment.id)).map((comment) => comment.id!);
   if (earlierRead.length > 0) Object.assign(events, { readByEarlierTurn: { messageIds: earlierRead, note: PAPERCLIP_EARLIER_READ_COMMENT_NOTE } });
+  const stoppedBeforeAnswer = events.messages.filter((message) => delta.stoppedMessageIds?.includes(message.id)).map((message) => message.id);
+  if (stoppedBeforeAnswer.length > 0) Object.assign(events, { stoppedBeforeAnswer: { messageIds: stoppedBeforeAnswer, note: PAPERCLIP_STOPPED_BEFORE_ANSWER_COMMENT_NOTE } });
   if (!events.messages.length && !humanResponses.length && !wake.childIssueSummaries.length && !Object.keys(taskChanges).length && !input.workflowCase) return null;
   return JSON.stringify(events);
 }
