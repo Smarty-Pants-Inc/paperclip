@@ -7,6 +7,7 @@ import { redactCurrentUserText, type CurrentUserRedactionOptions } from "../../l
 import type { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
 import { touchHeartbeatRunRuntimeStatus } from "../heartbeat-run-runtime-status.js";
 import { publishLiveEvent } from "../live-events.js";
+import { logger } from "../../middleware/logger.js";
 import { isRunLogStoreType, type RunLogHandle, type RunLogStore } from "../run-log-store.js";
 import { appendExcerpt, canonicalNativeRunLogRedactionForms, compactRunLogChunk, redactCanonicalNativeRunLogChunk } from "./run-log.js";
 import { createNativeRunLogExporter, nativeRunLogPrefixCursor } from "../native-runtime/native-run-log-export.js";
@@ -152,9 +153,10 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
       .where(eq(heartbeatRuns.id, runId));
 
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
-    const reportRecordingFailure = async () => {
+    const reportRecordingFailure = async (err?: unknown) => {
       if (recordingFailureReported) return;
       recordingFailureReported = true;
+      logger.warn({ err, runId }, "Run log persistence is incomplete: a run log write failed");
       await appendRunEvent(currentRun, {
         eventType: "lifecycle",
         stream: "system",
