@@ -8,7 +8,8 @@ export function isRunLogOnlyProviderEvent(
   // Rate-limit snapshots feed the agent's usage-limit property, not the transcript.
   if (isProviderRateLimitNotice(eventType, payload)) return true;
   if (eventType === "harness.diagnostic") {
-    return payload.code === "codex_unrelated_information";
+    // A Pi Stop's returned-message receipt is read from the run's result (personStop.returned), not drawn.
+    return payload.code === "codex_unrelated_information" || payload.code === "pi_stop_returned_input";
   }
   // Older runners dropped the classification when converting this diagnostic
   // into a notice. Match its complete notice shape so real warnings stay visible.
