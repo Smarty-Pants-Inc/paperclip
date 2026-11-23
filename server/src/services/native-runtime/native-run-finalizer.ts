@@ -1877,7 +1877,8 @@ export async function finalizeNativeRun(input: {
       .map(entry => record(entry).commentId).filter((id): id is string => typeof id === "string" && id.length > 0);
     if (returnedIds.length) await input.db.update(heartbeatRuns).set({ resultJson: sql`jsonb_set(coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb), '{personStop,returned}', ${JSON.stringify(returnedIds)}::jsonb)` }).where(eq(heartbeatRuns.id, run.id));
     // A person's Stop (seam 0236) never completes or closes the task: the turn ended, the task waits for the person.
-    if (record(run.resultJson?.personStop).requestedAt !== undefined && ["done", "in_review"].includes(proposedDecision.statusAction))
+    if (record(run.resultJson?.personStop).requestedAt !== undefined && authoritativeIssue.status === "in_progress"
+      && ["done", "in_review"].includes(proposedDecision.statusAction))
       proposedDecision = { ...proposedDecision, statusAction: "in_progress", toStatus: "in_progress",
         reasonCode: NATIVE_RESPONSE_WAKE_WAITING_REASON, unblockDescriptor: null, effects: [{ kind: "release_checkout" }] };
     proposedDecision = gateDoneOnConfiguredReview(proposedDecision, reviewStage, run.agentId);
