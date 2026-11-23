@@ -188,7 +188,7 @@ function SortableQueuedMessage({
         </div> : null}
       </div>
 
-      {autoSteerSecondsLeft !== null ? (
+      {queue.executionWait ? <span className="px-1 text-xs text-muted-foreground">Held</span> : autoSteerSecondsLeft !== null ? (
         <span className="flex shrink-0 items-center gap-1" data-testid={`task-chat-queued-auto-steer-${entry.comment.id}`}>
           <span className="px-1 text-xs text-muted-foreground tabular-nums">
             Sending in {autoSteerSecondsLeft}s
@@ -358,7 +358,7 @@ export function TaskChatQueuedMessages({
   );
   const autoSteerDeadlines = useMemo(() => {
     const deadlines = new Map<string, number>();
-    if (autoSteerDelayMs === null) return deadlines;
+    if (autoSteerDelayMs === null || queue.executionWait) return deadlines;
     for (const entry of autoSteerEntries) {
       if (queuedMessageAutoSteerEligible({ queue, entry, cancelledIds: cancelledAutoSteer,
         attemptedKeys: attemptedAutoSteer.current, editingCommentId })) {
@@ -450,6 +450,7 @@ export function TaskChatQueuedMessages({
     if (
       pending ||
       reordering ||
+      (latestQueue.current.executionWait && action !== "discard") ||
       (!queue.queueId && action !== "interrupt" && action !== "discard")
     ) {
       return;
@@ -525,12 +526,8 @@ export function TaskChatQueuedMessages({
     }
   }
 
-  // A chat message held in the outbox (for example by the agent's daily
-  // limit) has no receipt or run whose task status could explain the wait,
-  // so the queue says why it waits. Receipt-backed waits keep the task status.
-  const statusMessage = deferredStatus?.message
-    ?? (queue.state === "deferred" && !queue.queueId && !queue.targetRunId && entries.length > 0
-      ? queue.executionWait?.message ?? null : null);
+  // Explain a server hold once for the whole strip, including receipt-backed waits.
+  const statusMessage = queue.executionWait?.message ?? deferredStatus?.message ?? null;
 
   if (entries.length === 0 && !visibleError && !statusMessage) return null;
 
