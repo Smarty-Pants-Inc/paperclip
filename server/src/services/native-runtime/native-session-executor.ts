@@ -949,6 +949,19 @@ const pluginTaskSessionOwners = new WeakMap<NativeSession, ReturnType<typeof cre
 // not inspect or quarantine that owner's state until the save has finished.
 const closingWarmNativeSessions = new Map<string, Promise<void>>();
 
+export async function forgetDestroyedWarmNativeSessions(lease: { companyId: string; environmentId: string | null; providerLeaseId: string | null }) {
+  for (const [scope, entry] of warmNativeSessions) {
+    if (!lease.providerLeaseId || entry.companyId !== lease.companyId || entry.environmentId !== lease.environmentId || entry.providerLeaseId !== lease.providerLeaseId) continue;
+    if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
+    entry.idleTimer = null;
+    let detachTimer: ReturnType<typeof setTimeout> | undefined;
+    try { await Promise.race([(async () => { await closingWarmNativeSessions.get(scope)?.catch(() => undefined); await entry.githubAccess?.stop(); await detachReleasedWarmNativeSession(entry); })().catch(error => logger.warn({ err: error, runId: entry.runId }, "destroyed warm session local detach failed")),
+      new Promise<void>(resolve => { detachTimer = setTimeout(() => { logger.warn({ runId: entry.runId }, "destroyed warm session local detach timed out; forgetting owner"); resolve(); }, 10_000); })]).finally(() => clearTimeout(detachTimer)); }
+    catch (error) { logger.warn({ err: error, runId: entry.runId }, "destroyed warm session local detach failed"); }
+    forgetWarmNativeSession(scope, entry);
+  }
+}
+
 export function readNativeSessionIdleWork(): IdleLocalWork {
   return closingWarmNativeSessions.size !== 0 || [...warmNativeSessions.values()].some(entry =>
     entry.busy || entry.preparingRunId || entry.instructionPreparationRunId || entry.closeOnReleaseReason || !entry.released)
@@ -1125,6 +1138,7 @@ export async function reserveWarmNativeInstructionDirectory(input: {
  */
 export async function closeWarmNativeSessionsForEnvironment(input: {
   environmentId: string;
+  providerLeaseId?: string;
   reason: string;
   forceStopUnsettled?: boolean;
   db?: Db;
@@ -1281,6 +1295,7 @@ export async function prepareIdleWarmNativeSessionsForSleep(input: {
 
 async function closeIdleWarmNativeSessions(input: {
   environmentId?: string;
+  providerLeaseId?: string;
   reason: string;
   closeBusyOnRelease?: boolean;
   detachReleased?: boolean;
@@ -1355,6 +1370,7 @@ async function closeIdleWarmNativeSessions(input: {
   const agentQueues = new Map<string, [string, WarmNativeSession][]>();
   for (const [sessionId, entry] of [...warmNativeSessions]) {
     if (input.environmentId !== undefined && entry.environmentId !== input.environmentId) continue;
+    if (input.providerLeaseId !== undefined && entry.providerLeaseId !== input.providerLeaseId) continue;
     const agentKey = `${entry.companyId}:${entry.agentId}`;
     const queue = agentQueues.get(agentKey);
     if (queue) queue.push([sessionId, entry]); else agentQueues.set(agentKey, [[sessionId, entry]]);
