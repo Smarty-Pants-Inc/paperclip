@@ -522,20 +522,29 @@ export async function admitExplicitNativeContinuation(input: {
     if (queuedRequest && !queuedInterrupt && run.status === "cancelled" && !unusedAdmission &&
         !canContinueCancelledRun(run) && !(run.runtimeMode === "native" && authorizedAt > stoppedAt) &&
         !(cancelledStartup && authorizedAt > run.finishedAt!)) return null;
-    if (retry && run.status === "cancelled" && !canContinueCancelledRun(run) && !cancelledStartup)
+    const cancelledConversationTurn = run.runtimeMode === "native" && run.status === "cancelled"
+      && task.conversationAgentId === agentId && task.conversationUserId === actorId
+      && (retry && input.failedRunId === run.id || taskRetry?.sourceRunId === run.id
+        || !queuedInterrupt && Boolean(comment && comment.authorUserId === actorId && authorizedAt > stoppedAt))
+      && coordinator?.phase === "committed" && Boolean(coordinator.resultId)
+      && !coordinator.leaseOwner && !coordinator.failureDetail?.successorRunId
+      && (!coordinator.leaseExpiresAt || coordinator.leaseExpiresAt <= new Date())
+      && (!run.controllerLeaseExpiresAt || run.controllerLeaseExpiresAt <= new Date());
+    if (retry && run.status === "cancelled" && !canContinueCancelledRun(run) && !cancelledStartup && !cancelledConversationTurn)
       return blocked("cancelled_by_operator", "Inspect the stopped run and send a new message to continue.");
     if (cancelledStartup) cancelledStartupIds.add(run.id);
     if (run.runtimeMode !== "native" && !unusedAdmission && !legacyUserTurn && !cancelledStartup) return refused("previous_execution_unverified", PREVIOUS_EXECUTION_UNVERIFIED);
     // A provider failure can finish the normal result/assessment commit path.
-    // Its accepted failed result is immutable history, not a live controller.
+    // Its accepted failed or owner-continued cancelled result is immutable history, not a live controller.
     // Only a new user turn may pass this gate; the process/lease stop proofs
     // below remain mandatory and no previous action is automatically replayed.
-    const [committedFailure] = coordinator?.phase === "committed" && coordinator.resultId && run.status === "failed"
+    const [committedTerminal] = coordinator?.phase === "committed" && coordinator.resultId
+      && (run.status === "failed" || cancelledConversationTurn)
       ? await db.select({ id: nativeRunResults.id }).from(nativeRunResults).where(and(
           eq(nativeRunResults.companyId, companyId), eq(nativeRunResults.issueId, issueId),
           eq(nativeRunResults.runId, run.id), eq(nativeRunResults.id, coordinator.resultId),
           eq(nativeRunResults.schemaStatus, "accepted"),
-          sql`${nativeRunResults.resultJson}->'terminal'->>'runTerminalState' = 'failed'`,
+          sql`${nativeRunResults.resultJson}->'terminal'->>'runTerminalState' = ${run.status}`,
         )).limit(1)
       : [];
     // A terminal failure may retain a result accepted before checkpoint or
@@ -554,7 +563,7 @@ export async function admitExplicitNativeContinuation(input: {
     const preservedFailure = migratedSource?.issueId === issueId
       && migratedSource.unresolvedFinalization?.phase === coordinator?.phase;
     if (!cancelledStartup && coordinator && (
-        (coordinator.phase !== "terminal_failure" && !committedFailure && !preservedFailure) || coordinator.leaseOwner ||
+        (coordinator.phase !== "terminal_failure" && !committedTerminal && !preservedFailure) || coordinator.leaseOwner ||
         coordinator.failureDetail?.successorRunId)) return blocked("controller_settling",
           run.status === "cancelled" && !coordinator.leaseOwner
             ? "The cancelled run still needs verified cleanup. Your message is saved. Inspect the run and its environment for details."
