@@ -776,6 +776,12 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           onBlocked: (reason, message) => { wait = { reason, message }; },
         });
         if (!admitted) {
+          if (wait.reason === "execution_recovery") {
+            const blocker = await getExecutionBlocker(db, run.companyId, issueId);
+            if (blocker && !blocker.recoveryActionId && blocker.cause) {
+              wait = { reason: blocker.cause, message: blocker.nextAction };
+            }
+          }
           await writeDeferredExecutionWait(db, { companyId: run.companyId, requestId: wake.id }, wait);
           continue;
         }
