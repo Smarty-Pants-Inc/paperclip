@@ -4891,8 +4891,17 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   });
   const stopResponse = useMutation({
     mutationFn: async (runId: string) => {
+      const beforeStop = await issuesApi.getQueuedComments(issueId!);
       const stoppedRun = await heartbeatsApi.cancel(runId);
       await waitForStoppedRuns([runId], { initialRuns: [stoppedRun] });
+      const queue = await issuesApi.getQueuedComments(issueId!);
+      const firstTurnIds = new Set([
+        ...(beforeStop.firstTurnCommentIds ?? []), ...(queue.firstTurnCommentIds ?? []),
+      ]);
+      for (const entry of [...queue.entries].sort((a, b) => a.position - b.position)) {
+        if (entry.source || !entry.canDiscard || firstTurnIds.has(entry.comment.id)) continue;
+        await cancelQueuedComment.mutateAsync({ commentId: entry.comment.id });
+      }
     },
     onSettled: () => Promise.all([
       queryClient.invalidateQueries({ queryKey: queryKeys.issues.detail(issueId!) }),
