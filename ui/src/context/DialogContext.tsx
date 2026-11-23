@@ -34,6 +34,7 @@ interface DialogContextValue {
   newIssueOpen: boolean;
   newIssueDefaults: NewIssueDefaults;
   openNewIssue: (defaults?: NewIssueDefaults) => void;
+  setNewIssueAssigneeAgentId: (agentId: string | undefined) => void;
   closeNewIssue: () => void;
   newProjectOpen: boolean;
   openNewProject: () => void;
@@ -77,6 +78,7 @@ const DialogActionsContext = createContext<DialogActionsValue | null>(null);
 export function DialogProvider({ children }: { children: ReactNode }) {
   const [newIssueOpen, setNewIssueOpen] = useState(false);
   const [newIssueDefaults, setNewIssueDefaults] = useState<NewIssueDefaults>({});
+  const [newIssueAssigneeAgentId, setNewIssueAssigneeAgentId] = useState<string>();
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [newGoalOpen, setNewGoalOpen] = useState(false);
   const [newGoalDefaults, setNewGoalDefaults] = useState<NewGoalDefaults>({});
@@ -85,10 +87,10 @@ export function DialogProvider({ children }: { children: ReactNode }) {
   const [onboardingOptions, setOnboardingOptions] = useState<OnboardingOptions>({});
   const [onboardingRouteDismissed, setOnboardingRouteDismissed] = useState(false);
 
-  const openNewIssue = useCallback((defaults: NewIssueDefaults = {}) => {
-    setNewIssueDefaults(defaults);
+  const openNewIssue = useCallback((defaults?: NewIssueDefaults) => {
+    setNewIssueDefaults(defaults ?? (newIssueAssigneeAgentId ? { assigneeAgentId: newIssueAssigneeAgentId } : {}));
     setNewIssueOpen(true);
-  }, []);
+  }, [newIssueAssigneeAgentId]);
 
   const closeNewIssue = useCallback(() => {
     setNewIssueOpen(false);
@@ -159,6 +161,7 @@ export function DialogProvider({ children }: { children: ReactNode }) {
   const actionsValue = useMemo<DialogActionsValue>(
     () => ({
       openNewIssue,
+      setNewIssueAssigneeAgentId,
       closeNewIssue,
       openNewProject,
       closeNewProject,
