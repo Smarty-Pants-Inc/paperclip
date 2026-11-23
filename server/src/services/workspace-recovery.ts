@@ -11,6 +11,7 @@ import { writeEnvironmentCleanup } from "./environment-cleanup-notifications.js"
 import { resumePreservedResultFinalization } from "./preserved-result-finalization.js";
 import { reclaimInactiveNativeProviderCache } from "./native-runtime/retained-provider-cache.js";
 import { REMOTE_WORKSPACE_SANDBOX_DISK_FULL, sandboxProviderFailureLabel } from "./remote-workspace-transport.js";
+import { transientDatabaseFailure } from "./environment-provider-unavailable-error.js";
 import { and, asc, eq, gt, inArray, ne, notInArray, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, environmentLeases, executionWorkspaces, heartbeatRuns, issues, issueRecoveryActions, nativeRunFinalizations, workspaceOperations, type Db } from "@paperclipai/db";
 import { remoteWorkspaceRunReferenceSchema, type Environment, type EnvironmentLease } from "@paperclipai/shared";
@@ -505,8 +506,11 @@ export async function recoverRetainedWorkspace(input: Source & { db: Db; environ
       // A classified failure already names its subsystem.
       const generic = !(error instanceof SystemRecoveryFailure) && failure.retryClass === "retry_transient"
         && (failure.code === "provider_unavailable" || failure.code === "export_interrupted");
-      const cause = diskFull ? { ...SANDBOX_DISK_FULL_RECOVERY_CAUSE } : generic ? sandboxProviderFailureLabel(error) : undefined;
+      const databaseTransient = generic && transientDatabaseFailure(error);
+      const cause = databaseTransient ? { label: "database_transient", code: null, status: null }
+        : diskFull ? { ...SANDBOX_DISK_FULL_RECOVERY_CAUSE } : generic ? sandboxProviderFailureLabel(error) : undefined;
       const failed = failSystemRecovery(current!, failure, {
+        immediate: databaseTransient && current!.retriesUsed === 0,
         ...(typeof retryAfterAt === "number" && Number.isFinite(retryAfterAt) ? { retryAfterAt } : {}),
         ...(cause ? { cause } : {}),
       });
