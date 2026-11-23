@@ -2457,6 +2457,9 @@ export function prependIssueBrief(
 
 /** Per-turn identity + raw summary inputs for coalescing (keyed by turn item id). */
 export interface SettledTurnMergeMeta {
+  /** Explicit request lineage; independent of agent identity and adjacency. */
+  chainId?: string;
+  chainOrder?: number;
   /** Stable agent identity (agentId); empty/unknown turns never merge. */
   agentKey: string;
   /** Display name, used to keep another agent's bubble from bridging a merge. */
@@ -2495,34 +2498,45 @@ export function coalesceSettledTurns(
   const mergedMeta = new Map<string, SettledTurnMergeMeta>();
   const metaFor = (id: string) => mergedMeta.get(id) ?? metaById.get(id);
   let heldIdx = -1; // index in `out` of the last mergeable settled turn
+  const chainSlots = new Map<string, number>();
   for (const item of items) {
     if (item.kind === "turn" && item.settled) {
       const meta = metaFor(item.id);
+      if (meta?.chainId) heldIdx = chainSlots.get(meta.chainId) ?? -1;
       const held = heldIdx >= 0 ? (out[heldIdx] as TaskChatTurnItem) : null;
       const heldMeta = held ? metaFor(held.id) : undefined;
       if (
         held &&
         meta &&
         heldMeta &&
-        Boolean(item.historical) === Boolean(held.historical) &&
-        meta.agentKey &&
-        meta.agentKey === heldMeta.agentKey
+        (meta.chainId ? meta.chainId === heldMeta.chainId :
+          !heldMeta.chainId && Boolean(item.historical) === Boolean(held.historical) &&
+          meta.agentKey && meta.agentKey === heldMeta.agentKey)
       ) {
-        out.splice(heldIdx, 1);
+        if (!meta.chainId) out.splice(heldIdx, 1);
         const parts = [...heldMeta.parts, ...meta.parts];
+        const latest = (meta.chainOrder ?? 0) >= (heldMeta.chainOrder ?? 0) ? item : held;
         const mcpStartupFailures = mergeMcpStartupFailures(held.mcpStartupFailures, item.mcpStartupFailures);
-        out.push({
+        const merged: TaskChatTurnItem = {
           ...held,
-          items: [...held.items, ...item.items],
+          historical: latest.historical,
+          items: [...held.items, ...(meta.chainId && held.finalResponse ? [held.finalResponse] : []), ...item.items],
           ...(mcpStartupFailures ? { mcpStartupFailures } : {}),
-          finalResponse: item.finalResponse ?? held.finalResponse,
+          finalResponse: meta.chainId ? item.finalResponse : item.finalResponse ?? held.finalResponse,
           animateFold: held.animateFold || item.animateFold || undefined,
-          summary: buildMergedTurnSummary(parts),
-        });
-        mergedMeta.set(held.id, { ...heldMeta, parts });
+          summary: meta.chainId ? {
+            ...buildMergedTurnSummary(parts),
+            failed: latest.summary.failed,
+            durationLabel: latest.summary.durationLabel,
+          } : buildMergedTurnSummary(parts),
+        };
+        if (meta.chainId) out[heldIdx] = merged;
+        else out.push(merged);
+        mergedMeta.set(held.id, { ...(latest === item ? meta : heldMeta), parts });
       } else {
         out.push(item);
       }
+      if (meta?.chainId && !chainSlots.has(meta.chainId)) chainSlots.set(meta.chainId, out.length - 1);
       heldIdx = meta?.agentKey ? out.length - 1 : -1;
       continue;
     }
@@ -2567,6 +2581,7 @@ export function attachSettledTurns(
     if (
       item.kind === "turn" &&
       item.settled &&
+      !metaById.get(item.id)?.chainId &&
       prev?.kind === "message" &&
       prev.author === "agent" &&
       prev.origin !== "fast_response" &&
