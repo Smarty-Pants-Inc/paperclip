@@ -1,10 +1,11 @@
 import { activeIssueInteractionCondition } from "../issue-question-context.js";
-import { and, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import {
   agentWakeupRequests,
   approvals,
   completionContracts,
   heartbeatRuns,
+  heartbeatRunEvents,
   issueApprovals,
   issueComments,
   issues,
@@ -16,6 +17,9 @@ import {
 } from "@paperclipai/db";
 import { nativeSha256 } from "./canonical.js";
 import { isConversation } from "../agent-conversations.js";
+import { completedPlanProposalIds, readCompletedAssistantMessageCandidate, selectHeartbeatRunFinalAgentMessage } from "../heartbeat-run-summary.js";
+
+const flat = (text: string) => text.replace(/\s+/g, " ").trim();
 
 type Binding = {
   companyId: string;
@@ -176,7 +180,7 @@ export async function readNativeBoardResponseWaitSource(
   db: Db,
   binding: Binding,
   locked = false,
-): Promise<{ source: NativeBoardResponseWaitSource; summary: string } | null> {
+): Promise<{ source: NativeBoardResponseWaitSource; summary: string; replyText: string } | null> {
   const runQuery = db
     .select()
     .from(heartbeatRuns)
@@ -355,6 +359,31 @@ export async function readNativeBoardResponseWaitSource(
     !result.summary.trim()
   )
     return null;
+  // Presentation only: completed prose never changes the receipt or its authority.
+  const rows = accepted.result.turnId ? await db.select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload })
+    .from(heartbeatRunEvents).where(and(
+      eq(heartbeatRunEvents.companyId, binding.companyId),
+      eq(heartbeatRunEvents.runId, binding.runId),
+      eq(heartbeatRunEvents.agentId, binding.agentId),
+      eq(heartbeatRunEvents.eventType, "item.completed"),
+      sql`${heartbeatRunEvents.payload}->'prpEvent'->>'runId' = ${binding.runId}`,
+      sql`${heartbeatRunEvents.payload}->'prpEvent'->>'normalizedSessionId' = ${run.nativeSessionId}`,
+      sql`${heartbeatRunEvents.payload}->'prpEvent'->>'turnId' = ${accepted.result.turnId}`,
+      sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,kind}' = 'agentMessage'`,
+      sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,channel}' = 'final'`,
+    )).orderBy(desc(heartbeatRunEvents.seq)).limit(200) : [];
+  const proposedItemIds = completedPlanProposalIds(await db.select({ payload: heartbeatRunEvents.payload })
+    .from(heartbeatRunEvents).where(and(
+      eq(heartbeatRunEvents.companyId, binding.companyId),
+      eq(heartbeatRunEvents.runId, binding.runId),
+      eq(heartbeatRunEvents.eventType, "plan.proposed"),
+    )).limit(200));
+  const finalAgentMessage = selectHeartbeatRunFinalAgentMessage({
+    candidates: rows.flatMap(row => {
+      const candidate = readCompletedAssistantMessageCandidate({ seq: row.seq, prpEvent: record(row.payload).prpEvent, proposedItemIds });
+      return candidate && !candidate.bounded ? [candidate] : [];
+    }),
+  });
   return {
     source: {
       schema: "paperclip.native_board_response_wait.v1",
@@ -376,6 +405,9 @@ export async function readNativeBoardResponseWaitSource(
       contractSha256: accepted.contract.canonicalSha256,
     },
     summary: result.summary.trim(),
+    // The final carries the answer; a question asked only in the summary must not be lost.
+    replyText: !finalAgentMessage ? result.summary.trim() : flat(finalAgentMessage.text).includes(flat(result.summary))
+      ? finalAgentMessage.text : `${result.summary.trim()}\n\n${finalAgentMessage.text}`,
   };
 }
 
