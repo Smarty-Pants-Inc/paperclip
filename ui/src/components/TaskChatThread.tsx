@@ -8,6 +8,7 @@ import { imagePreparationReceiptIds } from "./task-chat/image-resources";
 import type { ScrollingHistory } from "@/components/task-chat/TaskMessageScroller";
 import { TaskChatShimmerScope } from "@/components/task-chat/TaskChatShimmer";
 import { useRunnerSubmission } from "@/hooks/useRunnerSubmission";
+import { useCompanyLiveEvent } from "@/context/LiveUpdatesProvider";
 import { TaskChatLoadingShell } from "@/components/task-chat/TaskChatLoadingShell";
 import {
   ISSUE_DETAIL_CONTENT_PAINT_MARK,
@@ -1120,18 +1121,26 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     nativeTranscriptErrorsByRun,
   ]);
 
+  const [terminalStatuses, setTerminalStatuses] = useState(new Map<string, string>());
+  useCompanyLiveEvent((event) => {
+    const { runId, status } = event.payload;
+    if (event.companyId === companyId && event.type === "heartbeat.run.status" &&
+      typeof runId === "string" && typeof status === "string" && isTerminalRunStatus(status) && runs.some((run) => run.id === runId))
+      setTerminalStatuses((current) => new Map(current).set(runId, status));
+  });
+  const stoppingReply = stopPending;
   // The single in-flight run whose turn we stream live (non-terminal).
   const liveRun = useMemo(() => {
     if (isTerminalIssueStatus(issueStatus)) return null;
     const isCurrentLive = (r: { id: string; status: string }) => isLiveIssueRun(r, issueStatus) &&
-      !isTerminalRunStatus(linkedRunMetaById.get(r.id)?.status ?? "");
+      !isTerminalRunStatus(terminalStatuses.get(r.id) ?? linkedRunMetaById.get(r.id)?.status ?? "");
     if (activeRun && isCurrentLive(activeRun)) return activeRun;
     const live = (liveRuns ?? []).find(isCurrentLive);
     if (live) return live;
-    const recovering = linkedRuns?.find((r) => !statusRelevance.isHistoricalRun(r.runId) && ["reconnecting", "retry_scheduled"].includes(r.execution?.phase ?? "") &&
+    const recovering = linkedRuns?.find((r) => !["succeeded", "cancelled"].includes(terminalStatuses.get(r.runId) ?? "") && !statusRelevance.isHistoricalRun(r.runId) && ["reconnecting", "retry_scheduled"].includes(r.execution?.phase ?? "") &&
       ![...runChainIdsById.values()].some((ids) => ids.at(-1) !== r.runId && ids.includes(r.runId)));
     return recovering ? { ...recovering, id: recovering.runId, agentName: recovering.agentName ?? "", adapterType: recovering.adapterType ?? "", currentStatusMessage: null } : null;
-  }, [activeRun, issueStatus, liveRuns, linkedRuns, linkedRunMetaById, runChainIdsById, statusRelevance]);
+  }, [activeRun, issueStatus, liveRuns, linkedRuns, linkedRunMetaById, runChainIdsById, statusRelevance, terminalStatuses]);
 
   // The live runner turn remains the sole owner of its response until the
   // canonical comment and settled activity are both ready. This state is
@@ -2451,7 +2460,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     }
     return [body, tail];
   }, [items, coordinatorEnabled, tailRunId, runChainIdsById]);
-  const tailStreaming = Boolean(liveRun) && !stopPending;
+  const tailStreaming = Boolean(liveRun) && !stoppingReply;
   const tailRunSource = tailRunId
     ? runs.find((run) => run.id === tailRunId)
     : undefined;
@@ -2481,6 +2490,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       : (legacyTimelineAnchorsByRun.get(tailRunId) ?? [])
     : [];
   const tailEntries = tailRunId ? (transcriptByRun.get(tailRunId) ?? []) : [];
+  // A reply that has ended (its terminal event is in) is finishing, not stoppable.
+  const tailEnded = tailEntries.some((entry) => entry.kind === "run_terminal") || liveRun?.execution?.phase === "finishing";
   const tailPlanItem =
     tailRunId === planDocumentSourceRunId ? planTurnItem : null;
   // A fresh array is produced on every render. Track every presentation field
@@ -2534,10 +2545,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const settlingFinishedAt = settlingRun
     ? linkedRunMetaById.get(settlingRun.id)?.finishedAt
     : undefined;
-  const tailStatus = stopPending ? "stopping" : liveRun
+  const tailStatus = terminalStatuses.get(tailRunId ?? "") ?? (stoppingReply ? "stopping" : liveRun
     ? liveRun.status
     : isTerminalIssueStatus(issueStatus) ? (issueStatus === "cancelled" ? "cancelled" : "succeeded")
-    : (runs.find((run) => run.id === settlingRun?.id)?.status ?? "succeeded");
+    : (runs.find((run) => run.id === settlingRun?.id)?.status ?? "succeeded"));
   const tailStartedAtMs =
     (liveRun
       ? ((liveRun.startedAt ? toMs(liveRun.startedAt) : null) ??
@@ -2884,7 +2895,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     hasAgentAssignee &&
     !startupBlocked &&
     !tailRunId &&
-    (props.retryPreparing || (!isTerminalIssueStatus(issueStatus) && (props.interruption?.state === "working" || props.interruption?.state === "retry_scheduled")) || runnerSubmissionPending ||
+    (props.retryPreparing || (!isTerminalIssueStatus(issueStatus) && ((props.interruption?.state === "working" && !terminalStatuses.has(props.interruption.observedRunId ?? "")) || props.interruption?.state === "retry_scheduled")) || runnerSubmissionPending ||
       commentItems.some(
         (item) =>
           item.kind === "message" &&
@@ -3438,9 +3449,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                     agentName={visibleTailAgentName}
                                     agentIcon={visibleTailAgentIcon}
                                     agent={tailAgent ?? (tailAgentId ? { id: tailAgentId } : undefined)}
-                                    status={optimisticRunnerStartup ? "queued" : tailStatus}
+                                    status={optimisticRunnerStartup ? (stoppingReply ? "stopping" : "queued") : tailStatus}
                                     execution={liveRun?.id === tailRunId ? liveRun.execution : null}
-                                    preparationLabel={optimisticRunnerStartup && submissionTakingLonger ? "Taking longer than usual…" : undefined}
+                                    preparationLabel={liveRun && heldPaperclipRunnerFinalText && (liveRun.execution?.phase === "finishing" || tailEntries.some((entry) => entry.kind === "run_terminal" && entry.runState === "succeeded")) ? "Answer ready · Saving…" : optimisticRunnerStartup && submissionTakingLonger ? "Taking longer than usual…" : undefined}
                                     startedAtMs={tailStartedAtMs}
                                     finishedAtMs={tailFinishedAtMs}
                                     continuedAfterSteering={paperclipRunnerTail && tailTimelineAnchors.length > 0}
@@ -3468,7 +3479,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                         tailEntries.some((entry) => entry.kind === "run_terminal")}
                                       status={
                                         optimisticRunnerStartup
-                                          ? "queued"
+                                          ? (stoppingReply ? "stopping" : "queued")
                                           : tailStatus
                                       }
                                       startedAtMs={tailStartedAtMs}
@@ -3610,9 +3621,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                             comment.authorUserId === currentUserId && comment.clientRequestId &&
                             !("clientStatus" in comment && comment.clientStatus)
                           ).map((comment) => comment.clientRequestId!))}
-                          onStop={liveRun ? onCancelRun : undefined}
+                          onStop={liveRun && !tailEnded ? onCancelRun : undefined}
                           confirmedStoppedRunIds={confirmedStoppedRunIds}
-                          stopPending={stopPending}
+                          stopPending={stoppingReply}
                           stopScope={stopScope}
                           workMode={issueWorkMode}
                           onWorkModeChange={onWorkModeChange}
