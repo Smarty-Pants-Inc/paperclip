@@ -48,7 +48,7 @@ export function turnSummaryMetrics(
 /** "✓ Worked · 38s · 3 tools · +34 −3 · 12.3k tokens" (parts omitted when unknown). */
 export function turnSummaryText(summary: TaskChatTurnItem["summary"]): string {
   const metrics = turnSummaryMetrics(summary);
-  const label = summary.failed ? "Stopped" : "Worked";
+  const label = summary.personStopped ? "Stopped" : summary.failed ? "Couldn't finish" : "Worked";
   return metrics ? `${label} · ${metrics}` : label;
 }
 
@@ -78,6 +78,7 @@ export function TaskChatTurn({
   leading,
 }: TaskChatTurnProps) {
   const streamlined = useStreamlinedTaskChatPresentation();
+  const settledLabel = item.summary.personStopped ? "Stopped" : item.summary.failed ? "Couldn't finish" : "Worked";
   const parentRow = !item.settled && item.liveStatus != null;
   // The new Paperclip Runner task surface owns one durable chronological
   // timeline. The Worked/Stopped row is its stable header, so it stays directly
@@ -104,10 +105,8 @@ export function TaskChatTurn({
           {!item.historical ? <span className="min-w-0 truncate">
             {item.continuedAfterSteering ? "Continued after steering · " : ""}
             {item.summary.durationLabel
-              ? `${item.summary.failed ? "Stopped" : "Worked"} for ${item.summary.durationLabel}`
-              : item.summary.failed
-                ? "Stopped"
-                : "Worked"}
+              ? `${settledLabel} ${item.summary.failed ? "after" : "for"} ${item.summary.durationLabel}`
+              : settledLabel}
           </span> : null}
         </div> : null}
         <TaskChatRunHealthBanner failures={item.mcpStartupFailures ?? []} />
@@ -210,10 +209,8 @@ export function TaskChatTurn({
       ) : null}
       <span>
         {item.historical ? "Activity" : item.standaloneHeader && item.summary.durationLabel
-          ? `${item.summary.failed ? "Stopped" : "Worked"} for ${item.summary.durationLabel}`
-          : item.summary.failed
-            ? "Stopped"
-            : "Worked"}
+          ? `${settledLabel} ${item.summary.failed ? "after" : "for"} ${item.summary.durationLabel}`
+          : settledLabel}
       </span>
       {!item.standaloneHeader && turnSummaryMetrics(item.summary) ? (
         // Time/tools/tokens is demoted, not deleted (PAP-502): it stays in the
