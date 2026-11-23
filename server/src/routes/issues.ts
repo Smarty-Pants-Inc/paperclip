@@ -17673,6 +17673,10 @@ export function issueRoutes(
       if (issue.conversationAgentId && process.env.PAPERCLIP_AGENT_CHAT_STEERING !== "true") throw conflict("Conversation messages are processed in order at turn boundaries");
       const decision = await decideIssueAccess(req, issue, "issue:comment");
       if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+      // Seam 0251: a run a person is stopping takes no new steer (the 0233 mark is set before its interrupt).
+      // The message stays queued and its own wake answers it after the Stop.
+      const [stopping] = await db.select({ result: heartbeatRuns.resultJson }).from(heartbeatRuns).where(eq(heartbeatRuns.id, req.body.targetRunId)).limit(1);
+      if ((stopping?.result as { personStop?: unknown } | null)?.personStop) throw conflict("This run is being stopped; the message is answered after it stops");
       const actor = getActorInfo(req);
       const { queue, turnId, duplicate } = await runQueuedCommentMutation(() =>
         queuedCommentQueue.steerQueuedComment({
