@@ -1388,7 +1388,9 @@ export function omitProgressRepeatedByResponseAcrossSegments(
       if (
         item.kind === "message" &&
         item.interstitial &&
-        item.channel === "progress" &&
+        // Unclassified streamed prose (a delta with no start, Pi) is the
+        // response's own stream when its text equals the response.
+        item.channel !== "final" &&
         item.text.trim() === normalizedResponse
       ) {
         redundantSegmentIndex = segmentIndex;
@@ -1426,7 +1428,7 @@ function omitProgressComposingResponse(
     const items = segments[segmentIndex]!;
     for (let index = items.length - 1; index >= 0; index -= 1) {
       const item = items[index]!;
-      const text = item.kind === "message" && item.interstitial && item.channel === "progress" ? item.text.trim() : "";
+      const text = item.kind === "message" && item.interstitial && item.channel !== "final" ? item.text.trim() : "";
       if (!text) continue;
       composed = composed ? `${text}\n\n${composed}` : text;
       if (composed.length > normalizedResponse.length) break walk;
