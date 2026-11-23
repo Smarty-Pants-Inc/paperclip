@@ -5801,14 +5801,16 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         return next;
       });
       await removeCommentFromCache(comment.id);
+      // Never lose the person's words: with no box to take them, show them.
+      const restored = Boolean(commentComposerRef.current);
       restoreQueuedCommentDraft(comment.body);
       invalidateIssueDetail();
       invalidateIssueThreadLazily();
       invalidateIssueCollections();
       pushToast({
         title: "Queued comment canceled",
-        body: "The queued message was restored to the composer.",
-        tone: "success",
+        body: restored ? "The queued message was restored to the composer." : `Your message (copy it): ${comment.body}`,
+        tone: restored ? "success" : "error",
       });
     },
     onError: (err) => {
@@ -5851,6 +5853,11 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
 
   const handleCancelQueuedComment = useCallback(
     (commentId: string) => {
+      // The text goes back into the input box; with no box to take it, keep it queued.
+      if (!commentComposerRef.current) {
+        pushToast({ title: "Message kept", body: "Open the message box to take it back; it is still queued.", tone: "error" });
+        return;
+      }
       if (commentId.startsWith("optimistic-")) {
         cancelledQueuedOptimisticCommentIdsRef.current.add(commentId);
         let cancelledCommentBody: string | null = null;

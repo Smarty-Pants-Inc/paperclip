@@ -2,14 +2,17 @@ import { createUuid } from "@/lib/uuid";
 import { useCurrentAccountGuard } from "@/hooks/useAccountBoundMutation";
 import { ComposerFileDropTarget } from "./ComposerFileDropTarget";
 import { AgentAvatar } from "../AgentAvatar";
+import type { IssueChatComposerHandle } from "@/components/IssueChatThread";
 import {
   useEffect,
   useId,
+  useImperativeHandle,
   useRef,
   useState,
   type ChangeEvent,
   type ClipboardEvent as ReactClipboardEvent,
   type ReactNode,
+  type Ref,
 } from "react";
 import { cn } from "@/lib/utils";
 import { taskChatComposerSurfaceClasses } from "./composer-surface";
@@ -108,6 +111,7 @@ export interface TaskChatComposerTakeover {
 }
 
 interface TaskChatComposerProps {
+  composerRef?: Ref<IssueChatComposerHandle>;
   onAdd?: (
     body: string,
     reopen?: boolean,
@@ -330,6 +334,7 @@ function escapeMarkdownLabel(name: string): string {
 }
 
 export function TaskChatComposer({
+  composerRef,
   onAdd,
   creation,
   confirmedSubmissionIds,
@@ -479,6 +484,14 @@ export function TaskChatComposer({
       requestOwner: pending.requestOwner,
     });
   }
+  useImperativeHandle(composerRef, () => ({
+    focus: () => editorRef.current?.focus(),
+    restoreDraft: (submittedBody: string) => {
+      if (!submittedBody) return;
+      changeBody(bodyRef.current ? `${bodyRef.current}\n\n${submittedBody}` : submittedBody);
+      requestAnimationFrame(() => editorRef.current?.focus());
+    },
+  }));
   const draftTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const queuedEditRef = useRef(queuedEdit);
   queuedEditRef.current = queuedEdit;
