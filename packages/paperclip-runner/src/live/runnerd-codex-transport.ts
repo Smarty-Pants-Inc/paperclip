@@ -9450,7 +9450,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           const ticket = this.#core.issueBootstrapTicket(RUNNER_BOOTSTRAP_TICKET_TTL_MS);
           await this.#core.flushCheckpoint();
           if (this.#closed || this.#failure !== null) return;
-          recoveredHandle = restart(ticket);
+          recoveredHandle = restart(ticket, this.#core.store.state.identity);
         } catch (error) {
           lastDetail = error instanceof Error ? error.message : String(error);
           attempt += 1;
