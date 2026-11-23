@@ -1890,6 +1890,13 @@ export async function finalizeNativeRun(input: {
             : effect.kind === "record_finalization_error" ? { ...effect, nextAction: error.message } : effect) };
       }
     }
+    // Seam 0237: the comment ids our Pi driver handed back at a person's Stop ride the run's personStop mark (the page restores them).
+    const [returned] = record(run.resultJson?.personStop).requestedAt === undefined ? [] : await input.db.select({ payload: heartbeatRunEvents.payload })
+      .from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, run.id), eq(heartbeatRunEvents.eventType, "harness.diagnostic"),
+        sql`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'code' = 'pi_stop_returned_input'`)).limit(1);
+    const returnedIds = [record(record(returned?.payload).prpEvent).payload].flatMap(p => Array.isArray(record(p).returned) ? record(p).returned as unknown[] : [])
+      .map(entry => record(entry).commentId).filter((id): id is string => typeof id === "string" && id.length > 0);
+    if (returnedIds.length) await input.db.update(heartbeatRuns).set({ resultJson: sql`jsonb_set(coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb), '{personStop,returned}', ${JSON.stringify(returnedIds)}::jsonb)` }).where(eq(heartbeatRuns.id, run.id));
     // A person's Stop (seam 0236) never completes or closes the task: the turn ended, the task waits for the person.
     if (record(run.resultJson?.personStop).requestedAt !== undefined && ["done", "in_review"].includes(proposedDecision.statusAction))
       proposedDecision = { ...proposedDecision, statusAction: "in_progress", toStatus: "in_progress",
