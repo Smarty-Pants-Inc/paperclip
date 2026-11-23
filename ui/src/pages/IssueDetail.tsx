@@ -5846,6 +5846,11 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
 
   const handleCancelQueuedComment = useCallback(
     (commentId: string) => {
+      // The text goes back into the input box; with no box to take it, keep it queued.
+      if (!commentComposerRef.current) {
+        pushToast({ title: "Message kept", body: "Open the message box to take it back; it is still queued.", tone: "error" });
+        return;
+      }
       if (commentId.startsWith("optimistic-")) {
         cancelledQueuedOptimisticCommentIdsRef.current.add(commentId);
         let cancelledCommentBody: string | null = null;
