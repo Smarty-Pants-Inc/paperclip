@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { and, eq, gt, inArray, ne, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, ne, notInArray, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
 import { retiredReusableLeasePredecessors } from "../environment-lease-handoff.js";
 import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js";
@@ -68,7 +68,13 @@ export async function retiredSourceAuthorizesNativeBackupRestore(db: Db, input: 
   if (tips.length !== 1) return false;
   const lease = tips[0]!;
   if (!retiredReusableLeasePredecessors(lease, source.filter(row => row.id !== lease.id))) return false;
-  const termination = lease.metadata?.remoteExecutionTermination as { state?: unknown } | undefined;
+  const termination = lease.metadata?.remoteExecutionTermination as { state?: unknown; confirmedAt?: unknown } | undefined;
+  const obsoleteStopped = lease.status === "expired" && ["lease_fingerprint_mismatch", "lease_expired"].includes(lease.failureReason ?? "")
+    && termination?.state === "stopped" && typeof termination.confirmedAt === "string" && Number.isFinite(Date.parse(termination.confirmedAt))
+    && hasRemoteTerminationReceipt(lease) && !(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.nativeSessionId, input.normalizedSessionId), ne(heartbeatRuns.id, input.currentRunId),
+      notInArray(heartbeatRuns.status, ["succeeded", "failed", "cancelled", "timed_out", "interrupted"]),
+    )).limit(1)).length;
   const destroyed = ["expired", "failed"].includes(lease.status) && hasRemoteTerminationReceipt(lease)
     && termination?.state === "destroyed";
   const stamp = readNativeHarnessBackupStamp(lease.metadata?.nativeHarnessBackup, lease.providerLeaseId!);
@@ -76,7 +82,7 @@ export async function retiredSourceAuthorizesNativeBackupRestore(db: Db, input: 
     || stamp.normalizedSessionId !== input.normalizedSessionId
     || stamp.runnerInstanceId !== input.manifest.runnerInstanceId) return false;
   // A released lease can still be selected for resume; only a retired one is final.
-  const idleSource = !destroyed && !await settledRestoreHoldRetiresSource(db, lease);
+  const idleSource = !destroyed && !obsoleteStopped && !await settledRestoreHoldRetiresSource(db, lease);
   if (idleSource && !await idleWarmSourceRetiresBackup(db, lease, input.currentRunId)) return false;
   // Provider work recorded after the checkpoint means the destroyed sandbox
   // held newer state than this backup. Restoring would silently rewind it.
