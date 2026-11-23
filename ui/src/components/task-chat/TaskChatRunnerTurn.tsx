@@ -97,8 +97,8 @@ function RunnerTurnStatus({
   const elapsed = formatCompactDuration(elapsedMs);
 
   const failed = terminalStatusFailed(status);
-  const label = terminal ? (failed ? "Stopped" : "Worked") : waitingLabel ?? "Working";
-  const suffix = terminal
+  const label = waitingLabel ?? (terminal ? (failed ? "Stopped" : "Worked") : "Working");
+  const suffix = waitingLabel ? "" : terminal
     ? elapsed ? ` ${failed ? "after" : "for"} ${elapsed}` : ""
     : elapsed ? `${waitingLabel ? " · " : " for "}${elapsed}` : "";
 
@@ -138,8 +138,10 @@ interface RunnerHeaderProps {
 }
 
 function runnerWaitingLabel({ runId, status, execution, preparationLabel }: RunnerHeaderProps, waitingToStart = false) {
+  if (status === "stopping") return "Stopping…";
+  if (execution && ["reconnecting", "retry_scheduled"].includes(execution.phase)) return execution.label;
   if (isTerminalRunStatus(status)) return null;
-  if (execution?.phase === "waiting_for_provider") return execution.label;
+  if (execution && execution.phase !== "working") return execution.label;
   if (!runId && preparationLabel) return preparationLabel;
   if (status === "queued" && execution?.cause) return execution.label;
   return waitingToStart ? WAITING_TO_START_LABEL : null;
@@ -255,7 +257,7 @@ export function TaskChatRunnerTurn({
   if (!acceptedWake && (yielded || awaitingContinuation)) finalRef.current = { runId };
   if (
     observedFinal &&
-    (!finalRef.current.item ||
+    (!finalRef.current.item || observedFinal.id !== finalRef.current.item.id ||
       (observedProviderText && !finalRef.current.providerText) ||
       (observedProviderText === Boolean(finalRef.current.providerText) &&
         observedFinal.text.length >= finalRef.current.item.text.length))
@@ -264,7 +266,9 @@ export function TaskChatRunnerTurn({
     finalRef.current.providerText = observedProviderText;
   }
   const final = finalRef.current.item;
-  const timelineItems = paperclipRunnerTimelineItems(turnItems);
+  const timelineItems = paperclipRunnerTimelineItems(turnItems.map((item) =>
+    item.kind === "message" && item.id !== final?.id ? { ...item, interstitial: true } : item,
+  ));
   const currentActivityItems = currentActivityStatusItems(timelineItems);
   const timelineRows = groupImageResources(buildTurnTimelineRows(
     omitProgressRepeatedByResponse(timelineItems, final?.text),
