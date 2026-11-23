@@ -2180,9 +2180,17 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           rest: partitionRunHealthItems(timelineItemsBySegment[segmentIndex] ?? []).rest,
         };
         const children = settledRunChildren(runHealth.rest);
-        // A compaction-only run is fully shown by its divider.
-        if (children.length === 0 && !finalResponse && (!sourceIsPaperclipRunner || compactionMarkers.length > 0)) {
-          if (compactionMarkers.length > 0) settledRunIds.add(source.id);
+        // Hide only empty post-steer acknowledgements, never a terminal failure header.
+        if (
+          children.length === 0 &&
+          !finalResponse &&
+          (!sourceIsPaperclipRunner || (
+            segmentIndex > 0 &&
+            runHealth.failures.length === 0 &&
+            (segmentIndex !== lastPopulatedSegmentIndex || source.status === "succeeded")
+          ))
+        ) {
+          if (sourceIsPaperclipRunner || compactionMarkers.length > 0) settledRunIds.add(source.id);
           continue;
         }
         settledRunIds.add(source.id);
@@ -3507,7 +3515,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                       agentIcon={visibleTailAgentIcon}
                                       agent={tailAgent ?? (tailAgentId ? { id: tailAgentId } : undefined)}
                                       items={tailItems}
-                                      preparationLabel={optimisticRunnerStartup && submissionTakingLonger ? "Taking longer than usual…" : undefined}
                                       allowSummaryFallback={!paperclipRunnerTail ||
                                         terminalHydratedRunIds.has(tailRunId ?? "") ||
                                         tailEntries.some((entry) => entry.kind === "run_terminal")}
