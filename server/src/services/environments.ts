@@ -1671,7 +1671,7 @@ export function environmentService(db: Db) {
                   );
                 }
                 const handoff = createReusableLeaseHandoff(retired[0]!, { ...values, id: replacementLeaseId! });
-                values.metadata = { ...values.metadata, reusableLeasePredecessor: handoff };
+                values.metadata = { ...values.metadata, nativeHarnessBackup: retired[0]!.metadata?.nativeHarnessBackup, reusableLeasePredecessor: handoff };
                 await tx.update(environmentLeases).set({ metadata: {
                   ...retired[0]!.metadata, reusableLeaseSuccessor: handoff,
                 } }).where(eq(environmentLeases.id, retired[0]!.id));
