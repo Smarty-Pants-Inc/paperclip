@@ -1,4 +1,5 @@
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
+import { retryTransientRunWrite } from "./heartbeat/run-lifecycle.js";
 import { currentControllerProcessStamp, type ControllerProcess } from "./controller-process-identity.js";
 import { workspaceAllocationFiles } from "./remote-workspace-allocation.js";
 import { readNativeWorkspaceMigration } from "./native-runtime/native-workspace-migration.js";
@@ -823,7 +824,7 @@ export async function saveRemoteWorkspace(input: {
   const invocationId = randomUUID();
   const owner = { [invocationId]: currentControllerProcessStamp() };
   liveSaveInvocationIds.add(invocationId);
-  const reserved = await input.db.transaction(async tx => {
+  const reserved = await retryTransientRunWrite(() => input.db.transaction(async tx => {
     const issueId = await lockWorkspaceRunParents(tx, input.workspace.companyId, input.runId);
     const workspace = await currentWorkspace(tx, input.workspace.companyId, input.workspace.id);
     const current = readRemoteWorkspaceAuthority(workspace.metadata);
@@ -884,7 +885,7 @@ export async function saveRemoteWorkspace(input: {
         exportCleanup: { ...current.location, state: "pending" } },
     }).returning();
     return { kind: "registered" as const, operation: created! };
-  }).catch(error => { liveSaveInvocationIds.delete(invocationId); throw error; });
+  })).catch(error => { liveSaveInvocationIds.delete(invocationId); throw error; });
   if (reserved.kind === "unchanged") { liveSaveInvocationIds.delete(invocationId); return reserved.saved; }
   const { operation } = reserved;
   let captured: Awaited<ReturnType<typeof captureRemoteWorkspaceArchive>> | null = null;
