@@ -950,6 +950,19 @@ const pluginTaskSessionOwners = new WeakMap<NativeSession, ReturnType<typeof cre
 // not inspect or quarantine that owner's state until the save has finished.
 const closingWarmNativeSessions = new Map<string, Promise<void>>();
 
+export function liveWarmNativeSessionForLease(lease: typeof environmentLeases.$inferSelect, agentId: string): string | null {
+  for (const [scope, entry] of warmNativeSessions) {
+    const workspace = JSON.parse(entry.ownerScope).workspace;
+    if (lease.providerLeaseId && entry.providerLeaseId === lease.providerLeaseId && entry.companyId === lease.companyId
+      && entry.agentId === agentId && entry.environmentId === lease.environmentId && entry.issueId === lease.issueId
+      && (lease.executionWorkspaceId === null ? workspace.kind !== "managed" : workspace.executionWorkspaceId === lease.executionWorkspaceId)
+      && !entry.busy && !entry.released && !entry.preparingRunId && !entry.instructionPreparationRunId
+      && !entry.closeOnReleaseReason && !entry.controllerDetachedForRestart && !entry.retirementUnproven
+      && !closingWarmNativeSessions.has(scope) && !settlingNativeSessionScopes.has(scope)) return entry.normalizedSessionId;
+  }
+  return null;
+}
+
 export async function forgetDestroyedWarmNativeSessions(lease: { companyId: string; environmentId: string | null; providerLeaseId: string | null }) {
   for (const [scope, entry] of warmNativeSessions) {
     if (!lease.providerLeaseId || entry.companyId !== lease.companyId || entry.environmentId !== lease.environmentId || entry.providerLeaseId !== lease.providerLeaseId) continue;

@@ -282,6 +282,8 @@ export {
 } from "./environment-driver-traits.js";
 import { ENVIRONMENT_DRIVER_CAPABILITY_SUPPORT } from "./environment-driver-traits.js";
 import { warmSandboxWindowMetadata } from "./warm-sandbox-expiry.js";
+import { readRunCancellation } from "./run-cancellation.js";
+import { claimedAdapterType } from "./conversation-continuation.js";
 
 /**
  * The one general capability classifier. It resolves each of the eight effective
@@ -4196,8 +4198,40 @@ export function environmentRuntimeService(
       // error through `onLeaseReleaseError` for its log path. Keep the order
       // serial.
       const released: EnvironmentRuntimeLeaseRecord[] = [];
+      const requestedDisposition = providerResourceDisposition;
       for (let leaseRow of leaseRows) {
         try {
+          const [owner] = requestedDisposition === undefined && leaseRow.metadata?.driver === "sandbox"
+            && leaseRow.leasePolicy === "reuse_by_environment"
+            && isRecord(leaseRow.metadata?.sandboxLeaseAcquisition) && leaseRow.metadata.sandboxLeaseAcquisition.outcome === "resumed"
+            ? await db.select().from(heartbeatRuns).where(and(
+                eq(heartbeatRuns.id, heartbeatRunId), eq(heartbeatRuns.companyId, leaseRow.companyId),
+              )).limit(1) : [];
+          const stop = readRunCancellation(owner?.resultJson), scope = leaseRow.metadata?.reusableSandboxLease;
+          const preparationStop = owner?.status === "cancelled" && owner.runtimeMode === "legacy"
+            && !owner.runtimeModeResolvedAt && owner.executionStage === "preparing" && claimedAdapterType(owner) === "paperclip_runner"
+            && stop?.source === "operator" && stop.expected && stop.initiator.type === "user"
+            && isRecord(owner.resultJson?.startupCancellation) && owner.resultJson.startupCancellation.beforeNativeSelection === true
+            && !owner.processPid && !owner.processGroupId && !owner.processStartedAt && !owner.sessionIdAfter
+            && !owner.nativeIssueId && !owner.nativeSessionId && !owner.runnerInstanceId && !owner.externalRunId
+            && owner.runnerProfileJson?.nativeExecutionInput == null
+            && isRecord(scope) && scope.adapterType === "paperclip_runner" && scope.companyId === leaseRow.companyId
+            && scope.environmentId === leaseRow.environmentId && scope.executionWorkspaceId === leaseRow.executionWorkspaceId
+            && scope.agentId === owner.agentId && scope.provider === leaseRow.provider
+            && (leaseRow.executionWorkspaceId !== null || scope.projectlessIssueId === leaseRow.issueId)
+            && typeof leaseRow.metadata?.warmSandboxIdleTimeoutMs === "number" && leaseRow.metadata.warmSandboxIdleTimeoutMs > 0
+            && (!leaseRow.expiresAt || leaseRow.expiresAt > new Date());
+          const liveOwner = preparationStop ? (await import("./native-runtime/native-session-executor.js")).liveWarmNativeSessionForLease(leaseRow, owner.agentId) : null;
+          const providerResourceDisposition = liveOwner ? "keep_running" : requestedDisposition;
+          if (liveOwner) {
+            const [bound] = await db.update(environmentLeases).set({ metadata: sql`${environmentLeases.metadata} || ${JSON.stringify({ preparationWarmHandBack: {
+              companyId: leaseRow.companyId, runId: heartbeatRunId, leaseId: leaseRow.id, provider: leaseRow.provider,
+              providerLeaseId: leaseRow.providerLeaseId, ownerSessionId: liveOwner, provenAt: new Date().toISOString(),
+            } })}::jsonb` }).where(and(eq(environmentLeases.id, leaseRow.id), eq(environmentLeases.companyId, leaseRow.companyId),
+              eq(environmentLeases.heartbeatRunId, heartbeatRunId), eq(environmentLeases.status, "active"))).returning();
+            if (!bound) continue;
+            leaseRow = bound;
+          }
           if (providerResourceDisposition !== "stop_and_retain" && providerResourceDisposition !== "keep_running"
             && !hasStopOnlyCleanup(leaseRow) && await nativeWorkspaceExportPendingForLease(db, leaseRow)) continue;
           if (!(await allowLegacyShutdownWorkspaceCleanup(db, leaseRow, new Date(), {

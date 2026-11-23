@@ -522,9 +522,15 @@ export async function settleCancelledLegacyPreparation(
     const [execution] = await tx.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
       eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id), executionStartedEventPredicate(),
     )).limit(1);
-    if (native || execution || !input.certifyOnly && leases.some(lease => lease.provider === "local"
-      ? !lease.releasedAt || lease.status === "pending_cleanup" || lease.cleanupStatus === "failed"
-      : !hasRemoteTerminationReceipt(lease))) return null;
+    if (native || execution || !input.certifyOnly && leases.some(lease => {
+      const proof = lease.metadata?.preparationWarmHandBack as Record<string, unknown> | undefined;
+      return lease.provider === "local" ? !lease.releasedAt || lease.status === "pending_cleanup" || lease.cleanupStatus === "failed"
+        : !hasRemoteTerminationReceipt(lease) && !(lease.status === "retained" && lease.cleanupStatus === "success"
+          && proof?.companyId === run.companyId && proof.runId === run.id && proof.leaseId === lease.id
+          && proof.provider === lease.provider && proof.providerLeaseId === lease.providerLeaseId
+          && typeof proof.ownerSessionId === "string" && proof.ownerSessionId.length > 0
+          && typeof proof.provenAt === "string" && Number.isFinite(Date.parse(proof.provenAt)));
+    })) return null;
     const now = new Date();
     const cancellation = readRunCancellation(run.resultJson);
     const operatorStop = cancellation?.source === "operator" && cancellation.initiator.type === "user";
