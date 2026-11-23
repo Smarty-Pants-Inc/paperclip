@@ -115,7 +115,7 @@ type ProjectionState = {
   cleanupSettling?: boolean;
   /** The fresh-continuation fallback is continuing this run's task (recorded,
    * not yet started) or will check it again at `nextCheckAt`. */
-  freshContinuation?: { state: "continuing"; pendingSince?: number } | { state: "scheduled"; nextCheckAt: number };
+  freshContinuation?: { state: "continuing"; pendingSince?: number } | { state: "scheduled"; nextCheckAt: number; backoff?: boolean };
   automaticDispositionAt?: number;
   waitingContinuation?: { queuedAt: number; personRequested: boolean };
   recoveryHandedToPerson?: boolean;
@@ -319,7 +319,8 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
       return { ...base, state: "working", canRetry: true, retryAction: "move_forward" };
     return { ...base, state: "working", canRetry: false };
   }
-  if (input.freshContinuation?.state === "scheduled" && input.freshContinuation.nextCheckAt > now)
+  // A backoff is only a later look, not a retry: fall through to the ordinary failed state and its Retry.
+  if (input.freshContinuation?.state === "scheduled" && input.freshContinuation.nextCheckAt > now && !input.freshContinuation.backoff)
     return { ...base, state: "retry_scheduled", nextRetryAt: new Date(input.freshContinuation.nextCheckAt).toISOString(), canRetry: false };
   if (input.automaticDispositionAt !== undefined && ["failed", "timed_out", "interrupted", "cancelled"].includes(run.status)
       && now - Math.max(input.automaticDispositionAt, run.finishedAt?.getTime() ?? 0) < AUTOMATIC_DISPOSITION_GRACE_MS)
@@ -697,11 +698,12 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
         && row.schema === pendingSchema && row.reconciledRunId === runId).map(row => Date.parse(row.recordedAt ?? "")));
       return Number.isFinite(pendingSince) ? { state: "continuing", pendingSince } : { state: "continuing" };
     }
-    const scheduled = rows.filter(row => ["exact_recovery_pending", "backoff"].includes(row.checkKind ?? "") && row.nextCheckAt)
-      .map(row => Number(row.nextCheckAt)).sort((a, b) => a - b)[0];
+    const [next] = rows.filter(row => ["exact_recovery_pending", "backoff"].includes(row.checkKind ?? "") && row.nextCheckAt)
+      .sort((a, b) => Number(a.nextCheckAt) - Number(b.nextCheckAt));
+    const scheduled = next ? Number(next.nextCheckAt) : undefined;
     if (awaitingSystemContinuation.has(`${issueId}:${runId}`) && retryWaitMap.get(issueId)?.sourceRunId !== runId)
       return { state: "continuing" };
-    return scheduled ? { state: "scheduled", nextCheckAt: scheduled } : undefined;
+    return scheduled ? { state: "scheduled", nextCheckAt: scheduled, ...(next?.checkKind === "backoff" && !rows.some(row => row.checkKind === "exact_recovery_pending" && row.nextCheckAt) ? { backoff: true } : {}) } : undefined;
   };
   const dispositionRows = runIds.length ? await db.select({ issueId: issueRecoveryActions.sourceIssueId,
     runId: sql<string>`${issueRecoveryActions.evidence}->>'runId'`, updatedAt: issueRecoveryActions.updatedAt })
