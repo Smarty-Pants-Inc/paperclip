@@ -57,9 +57,9 @@ type StopEvidenceSource = Omit<Source, "actionId"> & { actionId?: string };
 async function recheckStoppedWorkspaceRecovery(db: Db, source: StopEvidenceSource, observe: boolean) {
   return db.transaction(async tx => {
     const [issue] = await tx.select({ id: issues.id }).from(issues).where(and(
-      eq(issues.id, source.issueId), eq(issues.companyId, source.companyId))).for("update");
+      eq(issues.id, source.issueId), eq(issues.companyId, source.companyId))).for("no key update");
     const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, source.runId),
-      eq(heartbeatRuns.companyId, source.companyId))).for("update");
+      eq(heartbeatRuns.companyId, source.companyId))).for("no key update");
     if (!issue || !run || run.runtimeMode !== "native" || run.nativeIssueId !== issue.id ||
         !isAcknowledgedNativeStop(run) || adapterExecutionControls.has(run.id)) return 0;
     const cancellation = run.resultJson?.executionCancellation as { state?: unknown; proof?: unknown; acknowledgedAt?: unknown } | undefined;
@@ -165,8 +165,8 @@ export async function wakeCopybackOwnerRecheck(db: Db, input: {
 /** Admission records intent only. No request handler runs physical recovery. */
 export async function requestWorkspaceRecovery(input: Source & { db: Db; idempotencyKey: string; actorId: string }) {
   return input.db.transaction(async tx => {
-    const [issue] = await tx.select().from(issues).where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId))).for("update");
-    const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId))).for("update");
+    const [issue] = await tx.select().from(issues).where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId))).for("no key update");
+    const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId))).for("no key update");
     const [action] = await tx.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.id, input.actionId),
       eq(issueRecoveryActions.companyId, input.companyId), eq(issueRecoveryActions.sourceIssueId, input.issueId))).for("update");
     if (!issue || !run || !action || action.evidence.runId !== run.id
