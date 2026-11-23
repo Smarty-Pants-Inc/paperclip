@@ -1369,6 +1369,17 @@ export function omitProgressRepeatedByResponse(
  * one removal per segment. Preserve all intentional earlier repetitions and
  * remove only the final progress item matching the durable response.
  */
+// The server stores long item text cut at a bound, ending in this marker
+// (heartbeat-run-summary.ts RUN_EVENT_TEXT_BOUND_MARKER). A cut copy whose kept
+// text the response already carries is that response's earlier copy.
+const RUN_EVENT_TEXT_BOUND_MARKER = "…[truncated]";
+function truncatedCopyOf(text: string, normalizedResponse: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed.endsWith(RUN_EVENT_TEXT_BOUND_MARKER)) return false;
+  const kept = trimmed.slice(0, -RUN_EVENT_TEXT_BOUND_MARKER.length).trim();
+  return kept.length > 0 && normalizedResponse.includes(kept);
+}
+
 export function omitProgressRepeatedByResponseAcrossSegments(
   segments: readonly (readonly TaskChatItem[])[],
   responseText: string | null | undefined,
@@ -1391,7 +1402,7 @@ export function omitProgressRepeatedByResponseAcrossSegments(
         // Unclassified streamed prose (a delta with no start, Pi) is the
         // response's own stream when its text equals the response.
         item.channel !== "final" &&
-        item.text.trim() === normalizedResponse
+        (item.text.trim() === normalizedResponse || truncatedCopyOf(item.text, normalizedResponse))
       ) {
         redundantSegmentIndex = segmentIndex;
         redundantIndex = index;
