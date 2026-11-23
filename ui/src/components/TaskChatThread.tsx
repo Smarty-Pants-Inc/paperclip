@@ -3083,6 +3083,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       const runId = item.queueTargetRunId;
       if (composerPause || item.optimistic !== "queued" || !runId || !onInterruptQueued)
         return null;
+      // Agent Chat: Interrupt while the agent starts cancels the start; the tray says it sends when the agent starts.
+      if (conversationMode && queuedMessageQueue?.steeringDisposition === "temporarily_unavailable") return null;
 
       const isInterrupting = interruptingQueuedRunId === runId;
       return (
@@ -3097,7 +3099,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         </Button>
       );
     },
-    [composerPause, interruptingQueuedRunId, onInterruptQueued],
+    [composerPause, interruptingQueuedRunId, onInterruptQueued, conversationMode, queuedMessageQueue?.steeringDisposition],
   );
 
   const reopenToolReview = useCallback((interactionId: string) => {
@@ -3712,6 +3714,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                     >
                       {!composerPause ? (
                         <TaskChatQueuedMessages
+                          conversationMode={conversationMode}
                           key={issueId}
                           queue={queuedMessageQueue ?? emptyQueuedCommentQueue}
                           onEdit={beginQueuedEdit}
