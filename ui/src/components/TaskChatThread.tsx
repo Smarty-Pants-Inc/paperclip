@@ -2509,7 +2509,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const observedRunId = props.interruption?.observedRunId ?? "";
   const observedRunEnded = terminalStatuses.has(observedRunId) ||
     (transcriptByRun.get(observedRunId) ?? []).some((entry) => entry.kind === "run_terminal");
-  const tailEnded = tailEntries.some((entry) => entry.kind === "run_terminal") || liveRun?.execution?.phase === "finishing";
+  // The run list the page polls carries the freshest execution projection;
+  // the live-run record can hold its first value for the whole run.
+  const liveExecution = (liveRun ? linkedRunMetaById.get(liveRun.id)?.execution : undefined) ?? liveRun?.execution ?? null;
+  const tailEnded = tailEntries.some((entry) => entry.kind === "run_terminal") || liveExecution?.phase === "finishing";
   const tailPlanItem =
     tailRunId === planDocumentSourceRunId ? planTurnItem : null;
   // A fresh array is produced on every render. Track every presentation field
@@ -3490,13 +3493,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                     agentIcon={visibleTailAgentIcon}
                                     agent={tailAgent ?? (tailAgentId ? { id: tailAgentId } : undefined)}
                                     status={optimisticRunnerStartup ? (stoppingReply ? "stopping" : "queued") : tailStatus}
-                                    execution={!tailHasFinalResponse && liveRun?.id === tailRunId ? liveRun.execution : null}
-                                    preparationLabel={liveRun && heldPaperclipRunnerFinalText && (liveRun.execution?.phase === "finishing" || tailEntries.some((entry) => entry.kind === "run_terminal" && entry.runState === "succeeded")) ? "Answer ready · Saving…" : optimisticRunnerStartup && submissionTakingLonger ? "Taking longer than usual…" : undefined}
+                                    execution={!tailHasFinalResponse && liveRun?.id === tailRunId ? liveExecution : null}
+                                    preparationLabel={liveRun && heldPaperclipRunnerFinalText && (liveExecution?.phase === "finishing" || tailEntries.some((entry) => entry.kind === "run_terminal" && entry.runState === "succeeded")) ? "Answer ready · Saving…" : optimisticRunnerStartup && submissionTakingLonger ? "Taking longer than usual…" : undefined}
                                     startedAtMs={tailStartedAtMs}
                                     finishedAtMs={tailFinishedAtMs}
                                     continuedAfterSteering={paperclipRunnerTail && tailTimelineAnchors.length > 0}
                                     statusContent={tailRunSource?.adapterType !== "paperclip_runner" && !optimisticRunnerStartup ? (
-                                      <TaskChatLiveRunPill status={tailStatus} execution={liveRun?.id === tailRunId ? liveRun.execution : null}
+                                      <TaskChatLiveRunPill status={tailStatus} execution={!tailHasFinalResponse && liveRun?.id === tailRunId ? liveExecution : null}
                                         startedAtMs={tailStartedAtMs} finishedAtMs={tailFinishedAtMs} toolSummary={tailToolSummary} />
                                     ) : undefined}
                                   />
@@ -3507,7 +3510,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                       runId={tailRunId}
                                       execution={
                                         !tailHasFinalResponse && liveRun?.id === tailRunId
-                                          ? liveRun.execution
+                                          ? liveExecution
                                           : null
                                       }
                                       agentName={visibleTailAgentName}
