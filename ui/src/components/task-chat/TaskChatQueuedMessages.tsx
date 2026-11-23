@@ -85,6 +85,7 @@ function queueActionErrorCode(error: unknown): string | null {
 }
 
 export interface TaskChatQueuedMessagesProps {
+  conversationMode?: boolean;
   queue: IssueQueuedCommentQueue;
   onEdit: (commentId: string) => void;
   onReorder: (orderedCommentIds: string[], revision: string) => Promise<void>;
@@ -98,6 +99,7 @@ export interface TaskChatQueuedMessagesProps {
 }
 
 function SortableQueuedMessage({
+  conversationMode,
   entry,
   queue,
   busy,
@@ -110,6 +112,7 @@ function SortableQueuedMessage({
   onDiscard,
   onCancelAutoSteer,
 }: {
+  conversationMode?: boolean;
   entry: IssueQueuedCommentEntry;
   queue: IssueQueuedCommentQueue;
   busy: boolean;
@@ -188,7 +191,9 @@ function SortableQueuedMessage({
         </div> : null}
       </div>
 
-      {queue.executionWait ? <span className="px-1 text-xs text-muted-foreground">Held</span> : autoSteerSecondsLeft !== null ? (
+      {queue.executionWait ? <span className="px-1 text-xs text-muted-foreground">Held</span> : conversationMode && queue.steeringDisposition === "temporarily_unavailable" ? (
+        <span className="px-1 text-xs text-muted-foreground">Sends when the agent starts</span>
+      ) : autoSteerSecondsLeft !== null ? (
         <span className="flex shrink-0 items-center gap-1" data-testid={`task-chat-queued-auto-steer-${entry.comment.id}`}>
           <span className="px-1 text-xs text-muted-foreground tabular-nums">
             Sending in {autoSteerSecondsLeft}s
@@ -290,6 +295,7 @@ function SortableQueuedMessage({
 
 /** Compact production queue shown immediately above the default task composer. */
 export function TaskChatQueuedMessages({
+  conversationMode,
   queue,
   onEdit,
   onReorder,
@@ -558,6 +564,7 @@ export function TaskChatQueuedMessages({
             );
             return (
               <SortableQueuedMessage
+                conversationMode={conversationMode}
                 key={entry.comment.id}
                 entry={entry}
                 queue={queue}
