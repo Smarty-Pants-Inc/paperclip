@@ -7571,7 +7571,7 @@ fn pending_runtime_request_count_limit_rejects_the_overflowing_request() {
         .start_turn("Bound pending runtime requests by count.", &config.cwd)
         .expect("start held provider turn");
     provider
-        .interrupt_turn()
+        .interrupt_turn(None)
         .expect("request the runtime-request flood");
 
     let deadline = event_deadline();
