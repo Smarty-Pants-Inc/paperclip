@@ -85,6 +85,8 @@ import {
   settledCompactionMarkers,
   settledRunChildren,
   splitTranscriptAtAnchors,
+  stoppedTranscriptSegmentIndex,
+  type TranscriptPersonStop,
   runnerAnswerStartMs,
   transcriptToTaskChatItems,
   runtimeRequestSegmentContext,
@@ -1011,18 +1013,23 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     }
     return byRun;
   }, [linkedRuns, liveRuns, activeRun]);
-  const stoppedRunIds = useRef(new Set<string>());
+  const stoppedRunIds = useRef(new Map<string, string>());
+  const personStopForRun = useCallback((id: string): TranscriptPersonStop | undefined =>
+    (linkedRunMetaById.get(id)?.resultJson?.personStop as TranscriptPersonStop | undefined) ??
+      (stoppedRunIds.current.has(id) ? { requestedAt: stoppedRunIds.current.get(id) } : undefined),
+  [linkedRunMetaById]);
   const isUserStop = useCallback((id: string) => {
     const meta = linkedRunMetaById.get(id);
     const cancellation = meta?.resultJson?.cancellation as { source?: string; initiator?: { type?: string } } | undefined;
-    const stop = meta?.resultJson?.personStop as { resumedAt?: string } | undefined;
+    const stop = personStopForRun(id);
+    if (stop?.resumedAt) return false;
     // After a reload the run list's summary carries no cancellation source, only the Stop
     // receipt (executionCancellation) and the error code a person's Stop leaves ('cancelled').
     return (stoppedRunIds.current.has(id) && !stop?.resumedAt) || (cancellation?.source === "operator" && cancellation.initiator?.type === "user") ||
       (meta?.errorCode === "cancelled" && Boolean(meta?.resultJson?.executionCancellation)) ||
       // The held turn, not the open run, stopped. Its next accepted message releases the mark.
       Boolean(stop && !stop.resumedAt);
-  }, [linkedRunMetaById]);
+  }, [linkedRunMetaById, personStopForRun]);
   // Retries of one request join runs; session continuity across new messages does not.
   const runChainIdsById = useMemo(() => {
     const predecessors = new Map<string, string | null | undefined>();
@@ -1247,17 +1254,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     return new Set(runs.filter(run => covered.has(run.id) && !isUserStop(run.id) &&
       ["failed", "cancelled", "timed_out", "interrupted"].includes(terminalStatuses.get(run.id) ?? run.status)).map(run => run.id));
   }, [runChainIdsById, props.interruption, runs, isUserStop, terminalStatuses]);
-  const liveStop = (liveRun ? linkedRunMetaById.get(liveRun.id)?.resultJson?.personStop : null) as
-    { requestedAt?: string; settledAt?: string; resumedAt?: string } | null;
-  const liveStopConfirmed = !!liveRun && !!liveStop?.requestedAt && isHeldTurnStopConfirmed({
-    id: liveRun.id, companyId: companyId ?? "", status: linkedRunMetaById.get(liveRun.id)?.status ?? liveRun.status,
-    runtimeMode: linkedRunMetaById.get(liveRun.id)?.runtimeMode ?? liveRun.runtimeMode,
-    resultJson: linkedRunMetaById.get(liveRun.id)?.resultJson ?? null,
-  }, liveStop.requestedAt);
-  const stoppedHeldReply = liveStopConfirmed && !liveStop?.resumedAt;
-  const stoppingReply = !!liveRun && !isTerminalRunStatus(linkedRunMetaById.get(liveRun.id)?.status ?? liveRun.status) &&
-    (stopPending || Boolean(liveStop?.requestedAt && !liveStopConfirmed && !liveStop.resumedAt));
-
   // The live runner turn remains the sole owner of its response until the
   // canonical comment and settled activity are both ready. This state is
   // established in a layout effect so the live lane never disappears for a
@@ -2417,15 +2413,18 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           allowFallback: sourceAllowSummaryFallback,
         });
       };
+      const personStop = personStopForRun(source.id);
+      const stoppedSegmentIndex = stoppedTranscriptSegmentIndex(segments, personStop, isUserStop(source.id));
       for (const [segmentIndex, projected] of projectedSegments.entries()) {
         const { segment, parsed } = projected;
-        const personStopped = isUserStop(source.id) && segmentIndex === segments.length - 1;
-        const failed = segmentIndex === segments.length - 1 && ((!openSegments && source.status !== "succeeded") || personStopped);
+        const personStopped = segmentIndex === stoppedSegmentIndex;
+        const stoppedSegmentSettled = personStopped && (Boolean(personStop?.settledAt) || !openSegments);
+        const failed = personStopped || (segmentIndex === segments.length - 1 && !openSegments && source.status !== "succeeded");
         const stableRunnerSegment = sourceIsPaperclipRunner;
         if (segment.entries.length === 0 && !stableRunnerSegment) continue;
         const finalResponse = settledSegmentFinalResponse(segmentIndex, parsed);
         const finalEntry = segment.entries.findLast(entry => entry.kind === "assistant" && entry.channel === "final");
-        const segmentStreaming = openSegments && segmentIndex === segments.length - 1 &&
+        const segmentStreaming = !stoppedSegmentSettled && openSegments && segmentIndex === segments.length - 1 &&
           (!finalResponse || (finalEntry?.kind === "assistant" && finalEntry.delta === true) ||
             hasTranscriptWorkAfter(segment.entries, finalResponse.atMs));
         const runHealth = {
@@ -2454,7 +2453,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         const answerComplete = finalResponse && !segmentStreaming && !(finalEntry?.kind === "assistant" && finalEntry.delta);
         if (segmentStreaming) liveSegmentClock.current.ends.delete(segmentKey);
         if (answerComplete && liveSegmentClock.current.liveKey === segmentKey && !liveSegmentClock.current.ends.has(segmentKey)) liveSegmentClock.current.ends.set(segmentKey, Math.max(finalResponse.atMs ?? 0, Date.now()));
-        const segmentFinishedMs = liveSegmentClock.current.ends.get(segmentKey) ?? (segmented && answerComplete ? finalResponse.atMs : undefined) ?? (Number.isFinite(segment.endMs)
+        const segmentFinishedMs = (personStopped && personStop?.settledAt ? toMs(personStop.settledAt) : undefined) ?? liveSegmentClock.current.ends.get(segmentKey) ?? (segmented && answerComplete ? finalResponse.atMs : undefined) ?? (Number.isFinite(segment.endMs)
           ? segment.endMs
           : finished);
         const answerStartMs = sourceIsPaperclipRunner ? runnerAnswerStartMs(segments, segmentIndex) : segment.startMs;
@@ -2471,7 +2470,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           items: finalResponse && !paperclipRunnerFinalResponse(parsed, yieldedOptions)
             ? [...parsed, { ...finalResponse, channel: "final", interstitial: false }]
             : parsed,
-          status: segmentStreaming ? source.status : failed ? source.status : "succeeded",
+          status: stoppedSegmentSettled ? "cancelled" : segmentStreaming ? source.status : failed ? source.status : "succeeded",
           startedAtMs: answerStartMs,
           finishedAtMs: Number.isFinite(segmentFinishedMs) ? segmentFinishedMs : null,
           continuedAfterSteering,
@@ -2636,6 +2635,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     orderedEntries,
     coveredAttemptIds,
     isUserStop,
+    personStopForRun,
     coordinatorEnabled,
     conversationWindowStart,
     decisionReceipts.receipts,
@@ -2758,7 +2758,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     }
     return [body, tail];
   }, [items, coordinatorEnabled, tailRunId, runChainIdsById, liveRun, runnerSegmentsById]);
-  const tailStreaming = Boolean(liveRun) && !stoppingReply && !stoppedHeldReply;
   const tailRunSource = tailRunId
     ? runs.find((run) => run.id === tailRunId)
     : undefined;
@@ -2791,6 +2790,18 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     toMs(linkedRunMetaById.get(tailRunId ?? "")?.startedAt ?? liveRun?.startedAt ?? tailRunSource?.createdAt), tailTimelineAnchors,
     continuousReplyPlacements.get(tailRunId ?? "")?.byItem);
   const tailSegment = tailSegments[tailSegments.length - 1]!;
+  const tailPersonStopped = stoppedTranscriptSegmentIndex(tailSegments, personStopForRun(tailRunId ?? ""),
+    isUserStop(tailRunId ?? "")) === tailSegments.length - 1;
+  const liveStop = liveRun ? personStopForRun(liveRun.id) : undefined;
+  const liveStopConfirmed = !!liveRun && !!liveStop?.requestedAt && isHeldTurnStopConfirmed({
+    id: liveRun.id, companyId: companyId ?? "", status: linkedRunMetaById.get(liveRun.id)?.status ?? liveRun.status,
+    runtimeMode: linkedRunMetaById.get(liveRun.id)?.runtimeMode ?? liveRun.runtimeMode,
+    resultJson: linkedRunMetaById.get(liveRun.id)?.resultJson ?? null,
+  }, liveStop.requestedAt);
+  const stoppedHeldReply = liveStopConfirmed && !liveStop?.resumedAt && tailPersonStopped;
+  const stoppingReply = !!liveRun && !isTerminalRunStatus(linkedRunMetaById.get(liveRun.id)?.status ?? liveRun.status) &&
+    (stopPending || Boolean(tailPersonStopped && liveStop?.requestedAt && !liveStopConfirmed && !liveStop.resumedAt));
+  const tailStreaming = Boolean(liveRun) && !stoppingReply && !stoppedHeldReply;
   const tailSegmentSettled = paperclipRunnerTail && threadItems.some(item =>
     item.kind === "turn" && item.id === `${tailRunId}:turn:${tailSegments.length - 1}`);
   const tailEntries = paperclipRunnerTail ? tailSegment.entries : (tailRunId ? (transcriptByRun.get(tailRunId) ?? []) : []);
@@ -3009,7 +3020,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const tailTerminal = tailEntries.findLast((entry) => entry.kind === "run_terminal");
   const tailEndStatus = isTerminalRunStatus(tailRunStatus) ? tailRunStatus :
     tailTerminal?.runState ?? (tailHasFinalResponse ? "succeeded" : tailRunStatus);
-  const tailStatus = stoppedHeldReply || (tailEndStatus === "succeeded" && isUserStop(tailRunId ?? "")) ? "cancelled" : tailEndStatus;
+  const tailStatus = stoppedHeldReply || (tailEndStatus === "succeeded" && tailPersonStopped) ? "cancelled" : tailEndStatus;
   const tailFinishedAtMs = (tailHasFinalResponse ? tailFinalRef.current.item?.atMs : undefined) ?? tailRunFinishedAtMs ??
     (tailTerminal ? toMs(tailTerminal.ts) : stoppedHeldReply ? toMs(liveStop?.settledAt) : null);
   const tailTurnStatus = useMemo(
@@ -3918,7 +3929,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                     agentIcon={visibleTailAgentIcon}
                                     agent={tailAgent ?? (tailAgentId ? { id: tailAgentId } : undefined)}
                                     status={optimisticRunnerStartup ? "queued" : tailStatus}
-                                    personStopped={isUserStop(tailRunId ?? "")}
+                                    personStopped={tailPersonStopped}
                                     working={optimisticRunnerStartup ? requestWorking : undefined}
                                     execution={!optimisticRunnerStartup && !tailHasFinalResponse && !tailFinalStreaming && !tailTerminal && liveRun?.id === tailRunId ? tailExecution : null}
                                     preparationLabel={tailProgressLabel ?? tailPreparationLabel ?? (optimisticRunnerStartup ? requestLabel : liveRun && tailHasFinalResponse && (liveExecution?.phase === "finishing" || tailEntries.some((entry) => entry.kind === "run_terminal" && entry.runState === "succeeded")) ? "Answer ready · Saving…" : undefined)}
@@ -4105,7 +4116,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                           ).map((comment) => comment.clientRequestId!))}
                           onStop={liveRun && !tailEnded && !tailHasFinalResponse && !stoppedHeldReply && onCancelRun ? async () => {
                             const id = liveRun.id;
-                            stoppedRunIds.current.add(id);
+                            stoppedRunIds.current.set(id, new Date().toISOString());
                             try { await onCancelRun(); } catch (error) {
                               stoppedRunIds.current.delete(id);
                               throw error;

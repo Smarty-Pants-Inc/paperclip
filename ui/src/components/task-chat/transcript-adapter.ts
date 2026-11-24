@@ -65,6 +65,34 @@ export interface TranscriptTimeSegment {
   entries: TranscriptEntry[];
 }
 
+export interface TranscriptPersonStop {
+  requestedAt?: string;
+  settledAt?: string;
+  resumedAt?: string;
+  answerItemId?: string;
+}
+
+/** Stop labels belong to an answer, not every later turn of its held run. */
+export function stoppedTranscriptSegmentIndex(
+  segments: readonly TranscriptTimeSegment[],
+  stop: TranscriptPersonStop | undefined,
+  userStopped: boolean,
+): number {
+  const last = segments.length - 1;
+  const requestedAt = Date.parse(stop?.requestedAt ?? "");
+  if (!Number.isFinite(requestedAt)) return userStopped ? last : -1;
+  const answerSegment = stop?.answerItemId ? segments.findIndex(segment => segment.entries.some(entry =>
+    entry.kind === "assistant" && entry.itemId === stop.answerItemId)) : -1;
+  const index = answerSegment >= 0 ? answerSegment :
+    segments.findIndex(segment => segment.startMs <= requestedAt && requestedAt < segment.endMs);
+  // An anchor after Stop preserves its old segment even after resume. Without
+  // that boundary, a resumed receipt or a later answer must not inherit Stop.
+  const stoppedAt = Date.parse(stop?.settledAt ?? stop?.requestedAt ?? "");
+  if (segments[index]?.entries.some(entry => entry.kind === "assistant" && entry.channel === "final" &&
+    (!stop?.answerItemId || entry.itemId !== stop.answerItemId) && Date.parse(entry.ts) > stoppedAt)) return -1;
+  return index === last && answerSegment < 0 && stop?.resumedAt ? -1 : index;
+}
+
 /**
  * Split one provider run at durable in-turn input timestamps. Each boundary
  * belongs to the segment after it. Boundaries are acknowledged input slots;
