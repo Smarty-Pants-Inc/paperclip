@@ -12959,6 +12959,7 @@ async function executePaperclipNativeSessionAttempt(
               });
             },
             existingSession: existingWarmSession,
+            dynamicTools: runnerdBackend?.dynamicTools,
             persistedSession: persistedWarmSession,
             keepSessionOpen: warmSessionId !== null,
             sessionGoalControl: input.sessionGoalControl,
@@ -16804,6 +16805,7 @@ async function prepareRemoteExternalRunner({ input, target, runner, root, identi
 }
 
 type ManagedRunnerdBackend = NativeSessionBackend & {
+  readonly dynamicTools: readonly Readonly<Record<string, unknown>>[];
   bindManagedSession(session: NativeSession, options?: { releaseResumeOnly: true }): NativeSession;
   bindDiagnosticSession?(session: NativeSession): void;
   sessionCheckpointPersisted?(snapshot: PersistedNativeSession): void;
@@ -17249,7 +17251,7 @@ async function createRunnerdBackendWithinSessionClaim(
     input.executionContext?.signal.throwIfAborted();
     sessionToolAuthorityEpochs.get(sessionScopeId)?.revoke();
     sessionToolAuthorityEpochs.set(sessionScopeId, authorityEpoch);
-    return { ...backend, descriptor: () => backend.descriptor(), openSession: session => backend.openSession(session),
+    return { ...backend, dynamicTools, descriptor: () => backend.descriptor(), openSession: session => backend.openSession(session),
       recoverSession: (snapshot, options) => backend.recoverSession!(snapshot, options),
       bindManagedSession: (session, options) => {
         if (!options?.releaseResumeOnly || description.releaseResumeVersion === 1) pluginTaskSessionOwners.set(session, owner);
@@ -17298,7 +17300,7 @@ async function createRunnerdBackendWithinSessionClaim(
       : createNativeSessionBackend(externalExecution, { ...backendOptions, dotRunnerOptions: { ...externalOptions, port: dotRunnerBroker(input.db).port(externalExecution) } });
     const prior = sessionToolAuthorityEpochs.get(sessionScopeId); if (prior) prior.revoke();
     sessionToolAuthorityEpochs.set(sessionScopeId, authorityEpoch);
-    return { ...backend, descriptor: () => backend.descriptor(), openSession: input => backend.openSession(input),
+    return { ...backend, dynamicTools, descriptor: () => backend.descriptor(), openSession: input => backend.openSession(input),
       recoverSession: (snapshot, options) => backend.recoverSession!(snapshot, options), bindManagedSession: session => session };
   }
   if (remoteTarget && input.controllerPersistence && durableNativeHarnessStorage()) {
@@ -19353,6 +19355,7 @@ async function createRunnerdBackendWithinSessionClaim(
   };
   let replacementBackend: ManagedRunnerdBackend | null = null;
   return {
+    get dynamicTools() { return replacementBackend?.dynamicTools ?? dynamicTools; },
     bindManagedSession: (session, options) => replacementBackend
       ? replacementBackend.bindManagedSession(session, options) : wrapManagedSession(session),
     providerTurnNeverIssued: () => replacementBackend?.providerTurnNeverIssued
