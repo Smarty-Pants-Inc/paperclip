@@ -524,6 +524,7 @@ export async function conversationReplay(
         eq(issueComments.companyId, companyId),
         eq(issueComments.issueId, issueId),
         isNull(issueComments.deletedAt),
+        isNull(issueComments.conversationSessionGeneration),
         boundary
           ? sql`(${issueComments.createdAt}, ${issueComments.id}) > (select cursor.created_at, cursor.id from issue_comments cursor where cursor.id = ${boundary.id}::uuid)`
           : undefined,
