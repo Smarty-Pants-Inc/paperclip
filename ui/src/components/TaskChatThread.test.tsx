@@ -879,7 +879,7 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
     nativeTranscriptState.hydratedRunIds = new Set();
   });
 
-  it("opens saved compact replies without fetching their completed run and loads output on expansion", async () => {
+  it("hydrates the newest saved compact reply and retains the draft on expansion", async () => {
     const props = {
       issueId: "saved-compact-task", compactHistory: true, onAdd: async () => {}, onExpandHistory: vi.fn(),
       linkedRuns: [{ ...retryRun, runId: "saved-run", status: "succeeded", startedAt: retryRun.createdAt }],
@@ -892,14 +892,9 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
     render(<TaskChatThread {...props} initialHistoryPending={false} />);
     await settleThreadLayout();
     expect(container.textContent).toContain("Saved investigation result");
-    expect(transcriptHookRuns.native.at(-1)).toEqual([]);
-    expect(transcriptHookRuns.legacy.at(-1)).toEqual([]);
+    expect((runtimeMode === "native" ? transcriptHookRuns.native : transcriptHookRuns.legacy).at(-1)).toMatchObject([{ id: "saved-run" }]);
     const editor = container.querySelector('[data-testid="mock-editor"]');
     act(() => editorCallbacks.change("Keep this draft"));
-    const output = [...container.querySelectorAll("button")].find(button => button.textContent === "More run output");
-    expect(output).toBeDefined();
-    act(() => output!.click());
-    expect(props.onExpandHistory).toHaveBeenCalledOnce();
     render(<TaskChatThread {...props} compactHistory={false} />);
     expect((runtimeMode === "native" ? transcriptHookRuns.native : transcriptHookRuns.legacy).at(-1)).toMatchObject([{ id: "saved-run" }]);
     expect(container.querySelector('[data-testid="mock-editor"]')).toBe(editor);
@@ -947,13 +942,17 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
       expect(container.textContent).toContain("Thread message 1");
       expect(container.querySelector('[data-testid="mock-editor"]')).not.toBeNull();
       expect(container.textContent).not.toContain("Some task history is still loading.");
-      // The late transcript is no longer requested, so it cannot insert rows
-      // above the reader; the output stays one click away.
-      expect(transcriptHookCalls().at(-1)).toEqual([]);
-      const output = [...container.querySelectorAll("button")].find(button => button.textContent === "More run output");
-      expect(output).toBeDefined();
-      act(() => output!.click());
-      expect(props.onExpandHistory).toHaveBeenCalledOnce();
+      // Native turns keep hydrating their saved tools even when slow; only
+      // legacy output remains deferred behind the explicit expansion control.
+      if (runtimeMode === "native") {
+        expect(transcriptHookCalls().at(-1)).toMatchObject([{ id: "failed-run", conversationOnly: true }]);
+      } else {
+        expect(transcriptHookCalls().at(-1)).toEqual([]);
+        const output = [...container.querySelectorAll("button")].find(button => button.textContent === "More run output");
+        expect(output).toBeDefined();
+        act(() => output!.click());
+        expect(props.onExpandHistory).toHaveBeenCalledOnce();
+      }
       render(<TaskChatThread {...props} compactHistory={false} />);
       expect(transcriptHookCalls().at(-1)).toMatchObject([{ id: "failed-run" }]);
     } finally { vi.useRealTimers(); }
@@ -993,7 +992,7 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
     } finally { vi.useRealTimers(); }
   });
 
-  it("defers every slow settled run of a large compact task at the budget", async () => {
+  it("defers legacy output but retains native tool hydration on large compact tasks", async () => {
     vi.useFakeTimers();
     try {
       const linkedRuns = Array.from({ length: 300 }, (_, index) => ({
@@ -1008,7 +1007,7 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
       expect(historyLoading()).toBe(true);
       await passTranscriptBudget();
       expect(historyLoading()).toBe(false);
-      expect(transcriptHookCalls().at(-1)).toEqual([]);
+      expect(transcriptHookCalls().at(-1)).toHaveLength(runtimeMode === "native" ? linkedRuns.length : 0);
     } finally { vi.useRealTimers(); }
   });
 
