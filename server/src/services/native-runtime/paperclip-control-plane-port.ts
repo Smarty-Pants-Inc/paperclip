@@ -527,7 +527,7 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
               conversationSessionGeneration: issue.conversationSessionGeneration,
               body: "New session · Earlier messages and files are still available.",
               presentation: { kind: "system_notice", tone: "neutral", detailsDefaultOpen: false },
-              metadata: { version: 1, sourceRunId: run.id, sections: [] }, createdAt: persisted.row.createdAt,
+              metadata: { version: 1, sourceRunId: run.id, sections: [] }, createdAt: run.createdAt,
             });
             publication = (await persistActivity(tx as unknown as Db, {
               companyId: issue.companyId, actorType: "system", actorId: "conversation",
