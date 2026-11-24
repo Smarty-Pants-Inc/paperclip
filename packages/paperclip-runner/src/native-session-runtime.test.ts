@@ -6594,6 +6594,7 @@ describe("executeNativeSession recovery", () => {
         commandDigest: qualified.commandDigest,
       } },
     } : input;
+    const dynamicTools = [{ name: "call_api", description: "Current run API.", inputSchema: { type: "object" } }];
     const attachmentFailure = new Error("provider attachment failed");
     const openRun = vi.fn(async () => undefined);
     let retainedIdentity = { ...identity, runId: "run-previous" };
@@ -6664,14 +6665,15 @@ describe("executeNativeSession recovery", () => {
         runnerInstanceId: "runner-recovery",
         controlPlaneInstanceId: "control-recovery",
         existingSession,
+        dynamicTools,
         onSession,
       }),
     ).rejects.toBe(attachmentFailure);
     // The attaching run's own contract travels with the attachment.
     const completionContract = { revision: "1", criterionIds: ["objective"] };
     expect(attachRun).toHaveBeenCalledWith(provider === "copilot"
-      ? { identity, completionContract, currentRunGrant: { runtimeContext: null, instructions: expect.any(String) } }
-      : { identity, completionContract });
+      ? { identity, dynamicTools, completionContract, currentRunGrant: { runtimeContext: null, instructions: expect.any(String) } }
+      : { identity, dynamicTools, completionContract });
     expect(retainedIdentity).toEqual(identity);
     expect(onSession).toHaveBeenCalledOnce();
     expect(onSession).toHaveBeenCalledWith(null);
