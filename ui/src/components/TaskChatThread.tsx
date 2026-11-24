@@ -1398,8 +1398,29 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       }
       placements.set(run.runId, { byItem, bySegment });
     }
+    // A normal completion can save its reply before the final-channel event or
+    // run summary reaches the page. Its native item key already proves ownership.
+    for (const run of runs) {
+      if (!isNativePaperclipRunnerRun(run)) continue;
+      for (const entry of transcriptByRun.get(run.id) ?? []) {
+        if (entry.kind !== "assistant" || !entry.itemId) continue;
+        const key = `native-final:${run.id}:${entry.itemId}`;
+        const saved = projectedComments.find(comment => !comment.deletedAt && comment.authorType === "agent" &&
+          (comment.createdByRunId ?? comment.runId) === run.id &&
+          (comment.clientRequestId === key || comment.clientRequestId?.startsWith(`${key}:`)));
+        if (!saved) continue;
+        const placement = placements.get(run.id) ?? { byItem: new Map<string, number>(), bySegment: new Map<number, Map<string, string>>() };
+        if (placement.byItem.has(entry.itemId)) continue;
+        const segment = (steeringAnchorsByRun.get(run.id) ?? []).filter(anchor => anchor <= toMs(entry.ts)).length;
+        placement.byItem.set(entry.itemId, segment);
+        const replies = placement.bySegment.get(segment) ?? new Map<string, string>();
+        replies.set(entry.itemId, saved.id);
+        placement.bySegment.set(segment, replies);
+        placements.set(run.id, placement);
+      }
+    }
     return placements;
-  }, [linkedRuns, steeringAnchorsByRun, steeringAnchorByCommentId, transcriptByRun]);
+  }, [linkedRuns, runs, projectedComments, steeringAnchorsByRun, steeringAnchorByCommentId, transcriptByRun]);
 
   // A native-runner Plan is part of the turn that wrote its current revision.
   // Legacy adapters do not expose the semantic write_document boundary needed
