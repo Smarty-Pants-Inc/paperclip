@@ -8,7 +8,7 @@ import { AgentAvatar } from "@/components/AgentAvatar";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Link, useNavigate } from "@/lib/router";
-import { agentRouteRef, cn } from "@/lib/utils";
+import { agentRouteRef, cn, relativeTime } from "@/lib/utils";
 
 export interface AgentConversationSidebarProps {
   agents: Agent[];
@@ -17,7 +17,10 @@ export interface AgentConversationSidebarProps {
   existingChatAgentIds?: readonly string[];
   availableAgents?: Agent[];
   activeId?: string;
+  /** Per agent: the row's text line, up to two lines; the agent's role when absent. */
   previews?: Record<string, string>;
+  /** Per agent with a chat: when it last changed and whether the agent is replying now. */
+  chatActivity?: Record<string, { at: Date | string; working: boolean }>;
   unreadAgentIds?: readonly string[];
   unreadMessageCounts?: ReadonlyMap<string, number>;
   loading?: boolean;
@@ -40,7 +43,7 @@ const NO_PINNED_AGENTS: readonly string[] = [];
 const contactRowClassName = "agent-pin-row agent-contact-pin-row group/agent-pin relative rounded-md";
 
 /** Searchable navigation for one conversation per agent. */
-export function AgentConversationSidebar({ agents, compact = false, existingChatAgentIds, availableAgents = agents, activeId, previews = {}, unreadAgentIds = [], unreadMessageCounts, loading = false, error, onRetry, initialSearch = "", onSelect, onBrowse, onAddChat, historyLoading, historyError, onRetryHistory, onCreateAgent, renderAgentAction, pinnedAgentIds = NO_PINNED_AGENTS, onReorderPins }: AgentConversationSidebarProps) {
+export function AgentConversationSidebar({ agents, compact = false, existingChatAgentIds, availableAgents = agents, activeId, previews = {}, chatActivity, unreadAgentIds = [], unreadMessageCounts, loading = false, error, onRetry, initialSearch = "", onSelect, onBrowse, onAddChat, historyLoading, historyError, onRetryHistory, onCreateAgent, renderAgentAction, pinnedAgentIds = NO_PINNED_AGENTS, onReorderPins }: AgentConversationSidebarProps) {
   const navigate = useNavigate();
   const [pickerOpen, setPickerOpen] = useState(false);
   const [search, setSearch] = useState(initialSearch);
@@ -104,15 +107,22 @@ export function AgentConversationSidebar({ agents, compact = false, existingChat
           const unreadCount = unreadMessageCounts?.get(agent.id) ?? 0;
           const hasUnread = unreadCount > 0 || unreadIds.has(agent.id);
           const canReorder = pinnedIds.has(agent.id) && !!onReorderPins;
+          const activity = chatActivity?.[agent.id];
           const content = <><Link to={`/chats/${encodeURIComponent(agent.status === "terminated" ? agent.id : agentRouteRef(agent))}`}
           aria-current={activeId === agent.id ? "page" : undefined}
           title={`${agent.name}${agent.title ? ` · ${agent.title}` : ""}`}
           onClick={event => { if (onSelect) { event.preventDefault(); onSelect(agent); } }}
-          className={cn("agent-contact-row flex min-w-0 items-center gap-3 rounded-md px-2.5 py-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring", renderAgentAction && hasUnread && "pr-12", canReorder && "pr-20", activeId === agent.id ? "bg-accent text-accent-foreground" : "group-hover/agent-pin:bg-accent/60 group-focus-within/agent-pin:bg-accent/60")}>
+          className={cn("agent-contact-row flex min-w-0 items-center gap-3 rounded-md px-2.5 py-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring", renderAgentAction && (hasUnread || activity) && "pr-12", canReorder && "pr-20", activeId === agent.id ? "bg-accent text-accent-foreground" : "group-hover/agent-pin:bg-accent/60 group-focus-within/agent-pin:bg-accent/60")}>
           <AgentAvatar agent={agent} size={40} />
-          <span className="agent-pin-text flex min-w-0 flex-1 flex-col gap-0.5">
-            <span className="truncate text-sm font-medium">{agent.name}</span>
-            <span className="truncate text-xs text-muted-foreground">{agent.status === "terminated" ? "Terminated" : agent.title ?? agent.role}</span>
+          <span className={cn("flex min-w-0 flex-1 flex-col gap-0.5", !activity && "agent-pin-text")}>
+            <span className="flex min-w-0 flex-wrap items-baseline gap-x-2">
+              <span className="truncate text-sm font-medium">{agent.name}</span>
+              {activity && <span className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
+                <span aria-hidden className={cn("size-1.5 rounded-full", activity.working ? "bg-blue-400 motion-safe:animate-pulse" : "bg-muted-foreground/40")} />
+                {activity.working ? "Working" : "Idle"} · {relativeTime(activity.at)}
+              </span>}
+            </span>
+            <span className={cn("text-xs text-muted-foreground", activity ? "line-clamp-2" : "truncate")}>{agent.status === "terminated" ? "Terminated" : previews[agent.id] ?? agent.title ?? agent.role}</span>
           </span>
           {unreadCount > 0 ? <Badge variant="ghost" aria-label={`${unreadCount} unread ${unreadCount === 1 ? "message" : "messages"} from ${agent.name}`} className="shrink-0 bg-primary font-mono tabular-nums text-primary-foreground">{unreadCount}</Badge>
             : unreadIds.has(agent.id) && <span role="img" aria-label={`Unread messages from ${agent.name}`} className="size-2 shrink-0 rounded-full bg-primary" />}
