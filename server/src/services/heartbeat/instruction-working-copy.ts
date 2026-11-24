@@ -145,7 +145,7 @@ export function createHeartbeatInstructionWorkingCopy(input: InstructionWorkingC
           (nativeRuntimeResolution.profile.backend === "acpx_runtime" && parseObject(agent.adapterConfig).acpxAgent === "cursor")) &&
           nativeLifecyclePolicy?.mode === "warm";
         if (warmFiles && taskSessionForRun?.lastRunId) {
-          nativeInstructionReservation = await reserveWarmNativeInstructionDirectory({ companyId: agent.companyId, agentId: agent.id,
+          nativeInstructionReservation = await reserveWarmNativeInstructionDirectory({ db, companyId: agent.companyId, agentId: agent.id,
             previousRunId: taskSessionForRun.lastRunId, runId: readRun().id, target: executionTarget,
             observabilityCompatibilityKey: input.observabilityCompatibilityKey,
             canReuse: () => instructionCopies.canReuseWarm(agent.companyId, agent.id, taskSessionForRun!.lastRunId!),
