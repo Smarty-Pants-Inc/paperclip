@@ -1,4 +1,5 @@
 import { readPluginLoginCredential } from "./plugin-login-credential.js";
+import { nativeRunHasNoProviderWork } from "./native-runtime/native-session-resume.js";
 import { ENVIRONMENT_LEASE_CONTROLLER_KEY } from "./environment-lease-controller.js";
 import { RetainedSandboxAbsentError, resumeReplyConfirmsAbsence } from "./retained-sandbox-absent-error.js";
 import { readNativeWorkspaceMigration } from "./native-runtime/native-workspace-migration.js";
@@ -25,7 +26,7 @@ import {
 import { PluginWorkerUnavailableError } from "./plugin-worker-unavailable-error.js";
 import { HttpError } from "../errors.js";
 import { captureEnvironmentAcquisitionDiagnostic } from "./environment-acquisition-diagnostics.js";
-import { createOwnedSandbox, recoverSandboxCreations, recoverablePluginCreation } from "./sandbox-creation-operations.js";
+import { createOwnedSandbox, isBorrowedReusableSandboxLease, queueCancelledSandboxCreationStops, recoverSandboxCreations, recoverablePluginCreation } from "./sandbox-creation-operations.js";
 import { dueRunLeaseReleaseCondition, pendingRunLeaseReleaseCondition } from "./environment-lease-release-state.js";
 import { flushDeferredEnvironmentCleanup, registerDeferredEnvironmentCleanup, writeEnvironmentCleanup } from "./environment-cleanup-notifications.js";
 import { executeEnvironmentTask, pluginEnvironmentSupportsTasks, settleDispatchedEnvironmentTask } from "./environment-task-runtime.js";
@@ -44,7 +45,7 @@ import { inspectCloudSandboxCleanupAbsence } from "./sandbox-absence-proof.js";
 import { hasNativeWorkspaceExportResume, releaseCompletedNativeWorkspaceExportRetention } from "./native-runtime/native-workspace-export-resume.js";
 import { createHash, randomUUID } from "node:crypto";
 import { currentControllerProcess } from "./controller-process-identity.js";
-import { and, eq, inArray, ne, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { companySecrets, companySecretVersions, environmentLeases, heartbeatRuns } from "@paperclipai/db";
 import type {
@@ -2379,6 +2380,16 @@ function createSandboxEnvironmentDriver(
 
     async releaseRunLease(input) {
       if (input.status === "expired" && input.lease.leasePolicy === "reuse_by_environment") {
+        // Expiry of borrowed ownership is not expiry of the predecessor's box.
+        // Persist stop-only intent so even a direct driver caller cannot destroy it.
+        if (await isBorrowedReusableSandboxLease(db, input.lease)) {
+          if (input.lease.heartbeatRunId && input.lease.status === "active" &&
+            await isUnstartedCancelledRun(db, input.lease.heartbeatRunId)) {
+            return await environmentsSvc.releaseLease(input.lease.id, "released", { cleanupStatus: "success" });
+          }
+          const pending = await prepareSandboxStopAndRetain(db, input.lease);
+          return pending ? toEnvironmentLeaseSnapshot(pending) : null;
+        }
         return await destroyReusableSandboxLease({
           environment: input.environment,
           lease: input.lease,
@@ -3880,6 +3891,17 @@ function createPluginEnvironmentDriver(
   };
 }
 
+/** Cancellation fences dispatch; expiry must not stop a predecessor's warm
+ * writer when durable records show this follower never did provider work. */
+async function isUnstartedCancelledRun(db: Db, runId: string): Promise<boolean> {
+  const [run] = await db.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "cancelled"),
+  )).limit(1);
+  const issueId = run?.nativeIssueId ?? run?.issueId ?? run?.contextSnapshot?.issueId;
+  return Boolean(run && typeof issueId === "string" && await nativeRunHasNoProviderWork(db,
+    { companyId: run.companyId, agentId: run.agentId, issueId }, runId));
+}
+
 export function environmentRuntimeService(
   db: Db,
   options: {
@@ -4160,8 +4182,33 @@ export function environmentRuntimeService(
         assertCompanyBinding: input.assertCompanyBinding,
         ...(input.warmRunnerIdleTimeoutMs !== undefined ? { warmRunnerIdleTimeoutMs: input.warmRunnerIdleTimeoutMs } : {}),
         ...(input.runnerReconnectGraceMs !== undefined ? { runnerReconnectGraceMs: input.runnerReconnectGraceMs } : {}),
+      }).catch(async error => {
+        if (input.heartbeatRunId) {
+          // A late on-demand create may have a provider handle but no attached
+          // lease: materialize its existing cleanup custody, then use stop-only.
+          await queueCancelledSandboxCreationStops(db, input.companyId, input.heartbeatRunId);
+          const [cancelled] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+            eq(heartbeatRuns.id, input.heartbeatRunId), eq(heartbeatRuns.companyId, input.companyId),
+            eq(heartbeatRuns.status, "cancelled"),
+          ));
+          if (cancelled) await this.releaseRunLeases(input.heartbeatRunId, "expired", undefined, "stop_and_retain", true);
+        }
+        throw error;
       });
 
+      if (input.heartbeatRunId) {
+        const [cancelled] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.id, input.heartbeatRunId), eq(heartbeatRuns.companyId, input.companyId),
+          eq(heartbeatRuns.status, "cancelled"),
+        )).limit(1);
+        if (cancelled) {
+          // Stop may finish while provider resume is still in flight. Do not
+          // publish a fresh active owner after its cancellation already settled.
+          await this.releaseRunLeases(input.heartbeatRunId, "expired", undefined,
+            await isBorrowedReusableSandboxLease(db, lease) ? "stop_and_retain" : "destroy", true);
+          throw new Error("Environment acquisition completed after run cancellation");
+        }
+      }
       return {
         environment: input.environment,
         lease,
@@ -4190,14 +4237,24 @@ export function environmentRuntimeService(
       if (leaseRows.length === 0) {
         return [];
       }
+      // Expiry can run before the preparation owner's settled marker arrives.
+      // Recheck durable negative-work evidence: an unstarted cancelled follower
+      // borrowed the idle box, not its session, and must hand it back running.
+      const unstartedStop = status === "expired" && await isUnstartedCancelledRun(db, heartbeatRunId);
 
       // Release each lease in its own try/catch. One driver error must not stop
       // the release of the later leases. The caller records each lease-specific
       // error through `onLeaseReleaseError` for its log path. Keep the order
       // serial.
       const released: EnvironmentRuntimeLeaseRecord[] = [];
+      const requestedDisposition = providerResourceDisposition;
       for (let leaseRow of leaseRows) {
         try {
+          const borrowed = status === "expired" && await isBorrowedReusableSandboxLease(db, leaseRow);
+          const providerResourceDisposition = borrowed
+            ? unstartedStop && leaseRow.status === "active" && !hasStopOnlyCleanup(leaseRow)
+              ? "keep_running" : "stop_and_retain"
+            : requestedDisposition;
           if (providerResourceDisposition !== "stop_and_retain" && providerResourceDisposition !== "keep_running"
             && !hasStopOnlyCleanup(leaseRow) && await nativeWorkspaceExportPendingForLease(db, leaseRow)) continue;
           if (!(await allowLegacyShutdownWorkspaceCleanup(db, leaseRow, new Date(), {
@@ -4276,12 +4333,12 @@ export function environmentRuntimeService(
             continue;
           }
           if (
-            providerResourceDisposition === "keep_running" &&
+            (providerResourceDisposition === "keep_running" || (unstartedStop && borrowed && leaseSnapshot.status === "active")) &&
             leaseSnapshot.leasePolicy === "reuse_by_environment"
           ) {
             const lease = await environmentsSvc.releaseLease(
               leaseRow.id,
-              "retained",
+              unstartedStop ? "released" : "retained",
               { cleanupStatus: "success" },
             );
             if (lease) {
