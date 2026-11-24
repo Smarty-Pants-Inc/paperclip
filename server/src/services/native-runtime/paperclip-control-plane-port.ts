@@ -6,6 +6,7 @@ import type { Db } from "@paperclipai/db";
 import {
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   issues,
   nativeRunFinalizations,
   nativeRunResults,
@@ -31,6 +32,9 @@ import {
 import { appendHeartbeatRunEvent, appendHeartbeatRunEventBatch, type AppendHeartbeatRunEventInput,
   type AppendHeartbeatRunEventResult } from "../heartbeat-run-events.js";
 import { publishLiveEvent } from "../live-events.js";
+import { logger } from "../../middleware/logger.js";
+import { insertIssueComment } from "../issue-comment-writes.js";
+import { persistActivity, publishActivity, type ActivityPublication } from "../activity-log.js";
 import { nativeSha256 } from "./canonical.js";
 import { redactRunnerApiEvent, redactRunnerApiPayloads } from "./runner-api-log-redaction.js";
 import { createNativeControllerRecovery, NATIVE_CONTROLLER_RECOVERY_MAX_BYTES, type NativeControllerCompatibility } from "./native-controller-recovery.js";
@@ -485,6 +489,60 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
     this.#assertActive(options);
     const pendingObservation = this.#deferredEventObservers.get(observerKey);
     const persisted = await appendHeartbeatRunEvent(this.#db, input);
+    if (event.eventType === "session.started" && persisted.disposition === "committed") {
+      try {
+        let publication: ActivityPublication | null = null;
+        // The receipt has committed. Marker failure must never roll it back or fail the run.
+        await this.#db.transaction(async (tx) => {
+        const [issue] = await tx.select().from(issues).where(and(eq(issues.id, this.#binding.issueId),
+          eq(issues.companyId, this.#binding.companyId))).for("no key update");
+        const [run] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, this.#binding.runId));
+        if (issue && run && this.#matchesPersistedBinding(run)
+          && issue.assigneeAgentId === this.#binding.agentId
+          && (!issue.conversationAgentId || (issue.conversationAgentId === this.#binding.agentId
+            && record(run.contextSnapshot).conversationSessionGeneration === issue.conversationSessionGeneration))) {
+          // A queued/failed run or a deleted task-session pointer proves nothing.
+          // Only another run's durable provider receipt in this generation counts.
+          const [prior] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+            .innerJoin(heartbeatRunEvents, and(eq(heartbeatRunEvents.runId, heartbeatRuns.id),
+              eq(heartbeatRunEvents.companyId, issue.companyId), eq(heartbeatRunEvents.agentId, run.agentId),
+              sql`${heartbeatRunEvents.eventType} in ('session.started', 'session.resumed')`,
+              sql`${heartbeatRunEvents.sourceEventId} is not null`))
+            .where(and(eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, run.agentId),
+              eq(heartbeatRuns.nativeIssueId, issue.id), eq(heartbeatRuns.runtimeMode, "native"),
+              sql`${heartbeatRuns.id} <> ${run.id}`,
+              issue.conversationAgentId ? sql`${heartbeatRuns.contextSnapshot}->>'conversationSessionGeneration' = ${String(issue.conversationSessionGeneration)}` : undefined)).limit(1);
+          // Keep soft-deleted markers in the dedupe set: deletion is not a retry.
+          const [marker] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+            eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+            sql`${issueComments.conversationSessionGeneration} is not null`,
+            sql`${issueComments.presentation}->>'kind' = 'system_notice'`,
+            sql`${issueComments.metadata}->>'sourceRunId' = ${run.id}`)).limit(1);
+          if (prior && !marker) {
+            const [comment] = await insertIssueComment(tx, {
+              companyId: issue.companyId, issueId: issue.id, authorType: "system",
+              authorAgentId: null, authorUserId: null, createdByRunId: null,
+              conversationSessionGeneration: issue.conversationSessionGeneration,
+              body: "New session · Earlier messages and files are still available.",
+              presentation: { kind: "system_notice", tone: "neutral", detailsDefaultOpen: false },
+              metadata: { version: 1, sourceRunId: run.id, sections: [] }, createdAt: persisted.row.createdAt,
+            });
+            publication = (await persistActivity(tx as unknown as Db, {
+              companyId: issue.companyId, actorType: "system", actorId: "conversation",
+              action: "issue.conversation_session_started", entityType: "issue", entityId: issue.id, runId: run.id,
+              details: { automatic: true, source: "session.started", generation: issue.conversationSessionGeneration,
+                commentId: comment!.id, sourceRunId: run.id },
+            })).publication;
+          }
+        }
+        this.#assertActive(options);
+        });
+        if (publication) publishActivity(publication);
+      } catch (err) {
+        logger.warn({ err, runId: this.#binding.runId, issueId: this.#binding.issueId },
+          "Could not record fresh-session marker; continuing after committed session.started");
+      }
+    }
     const committedAtMs = Date.now();
     this.#assertActive(options);
     const persistenceEndedAt = persistenceStartedAt + performance.now() - persistenceClock;
