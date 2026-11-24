@@ -619,7 +619,7 @@ describe("executeNativeSession recovery", () => {
       return;
     }
     if (["other turn", "newer turn"].includes(scenario)) {
-      await expect(execution).rejects.toThrow("native_finalization_missing");
+      await expect(execution).rejects.toThrow("native_provider_output_without_result");
       expect(completeRun).not.toHaveBeenCalled();
       expect(recoveredTransport.calls.filter(call => call.method === "turn/start")).toEqual([]);
       return;
@@ -8705,24 +8705,10 @@ describe("executeNativeSession recovery", () => {
         runnerInstanceId: "runner-recovery",
         controlPlaneInstanceId: "control-recovery",
       }),
-    ).resolves.toMatchObject({
-      turnId: "turn-continuation",
-      providerSessionId: "provider-recovery",
-    });
-    const dispositionEnvelope = JSON.parse(
-      startTurn.mock.calls[0]![0].message.text,
-    ) as { task: { prompt: string } };
-    expect(dispositionEnvelope.task.prompt).toContain(
-      "semantic-result recovery for a prior completed provider turn",
-    );
-    expect(dispositionEnvelope.task.prompt).toContain(
-      "Do not repeat implementation, tests, research, or the final answer",
-    );
-    expect(dispositionEnvelope.task.prompt).not.toContain(input.task.prompt);
-
-    expect(dispositionEnvelope).toHaveProperty("completionContract", input.completionContract.contract);
-    expect(dispositionEnvelope).not.toHaveProperty("constraints");
-    if (prepared) expect(dispositionEnvelope).toHaveProperty("requestedSkills", []);
+    ).rejects.toThrow("native_provider_output_without_result");
+    // Output is not an effect-free turn: even disposition-only resubmission
+    // could repeat its tool effects. Keep the first half's no-output recovery.
+    expect(startTurn).not.toHaveBeenCalled();
 
     checkpoint.dispositionOnlyRecoveryTurnId = undefined;
     recoveredSnapshot.dispositionOnlyRecoveryTurnId = undefined;
@@ -9630,7 +9616,7 @@ describe("executeNativeSession recovery", () => {
         async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; }, completeRun,
       }, runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery", timeoutMs: 1000,
       resolveMissingResult: async () => null,
-    })).rejects.toThrow("native_finalization_missing");
+    })).rejects.toThrow("native_provider_output_without_result");
     expect(completeRun).not.toHaveBeenCalled();
     expect(events.some(event => event.eventType === "item.completed")).toBe(true);
     expect(events.some(event => event.eventType === "run.result.accepted")).toBe(false);
