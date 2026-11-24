@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import { agents, companies, createDb, heartbeatRunEvents, heartbeatRuns, issues, type Db } from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
@@ -60,7 +60,7 @@ const supported = Boolean(externalUrl) || (await getEmbeddedPostgresTestSupport(
     const saved = source();
     await db.insert(heartbeatRuns).values([saved, run(1), run(2)]);
     const result = await select();
-    expect(result).toEqual({ ...saved, runnerProfileJson: { nativeExecutionInput, sessionCheckpoint: checkpoint, nativeToolContractFingerprint: "fingerprint", nativeControllerRecovery: null,
+    expect(result).toEqual({ ...saved, startedAt: null, runnerProfileJson: { nativeExecutionInput, sessionCheckpoint: checkpoint, nativeToolContractFingerprint: "fingerprint", nativeControllerRecovery: null,
       nativeProviderStateUnsaved: null },
       contextSnapshot: { paperclipWake, paperclipIssue } });
     const stored = await db.select({ profile: heartbeatRuns.runnerProfileJson, context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(eq(heartbeatRuns.id, saved.id));
@@ -70,6 +70,33 @@ const supported = Boolean(externalUrl) || (await getEmbeddedPostgresTestSupport(
       await db.update(heartbeatRuns).set({ status }).where(eq(heartbeatRuns.id, saved.id));
       expect((await select())?.id).toBe(saved.id);
     }
+  });
+
+  it.each(["cancelled", "failed"])("skips an inherited %s pointer only when it never acquired execution authority", async status => {
+    const saved = source(), id = randomUUID();
+    const ownCheckpoint = { ...checkpoint, cursor: null,
+      identity: { runId: id, sessionId: normalizedSessionId } };
+    await db.insert(heartbeatRuns).values([saved, run(1, { id, status,
+      runnerProfileJson: { sessionCheckpoint: ownCheckpoint } })]);
+    if (status === "failed") {
+      await db.update(heartbeatRuns).set({ resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } })
+        .where(eq(heartbeatRuns.id, id));
+      await db.insert(nativeRunFinalizations).values({ companyId, issueId, runId: id, phase: "terminal_failure" });
+    }
+    expect((await select())?.id).toBe(saved.id);
+    if (status === "cancelled") {
+      await db.insert(nativeRunFinalizations).values({ companyId, issueId, runId: id, phase: "terminal_failure" });
+      expect((await select())?.id).toBe(saved.id);
+      await db.update(nativeRunFinalizations).set({ leaseOwner: "still-owned" }).where(eq(nativeRunFinalizations.runId, id));
+      expect((await select())?.id).toBe(id);
+      await db.update(nativeRunFinalizations).set({ leaseOwner: null }).where(eq(nativeRunFinalizations.runId, id));
+    }
+    await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: id, seq: 1, eventType: "turn.started" });
+    expect((await select())?.id).toBe(id);
+    await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, id));
+    await db.update(heartbeatRuns).set({ startedAt: at(1) }).where(eq(heartbeatRuns.id, id));
+    if (status === "cancelled") expect((await select())?.id).toBe(id);
+    await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, id));
   });
 
   it("treats every non-null checkpoint as a barrier, including invalid false, zero, empty string, array and object values", async () => {

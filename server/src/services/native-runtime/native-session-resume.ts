@@ -275,8 +275,8 @@ export async function findNativeContinuousSessionResumeId(db: Db, input: {
 export async function findNativeSessionResumeRun(db: Db, input: NativeSessionResumeSelection) {
   if (!isNativeSessionId(input.normalizedSessionId)) return null;
   const barrier = await selectNativeSessionResumeBarrier(db, input, []);
-  // A follow-up that failed before any provider or controller work holds only
-  // the checkpoint it inherited. Select its source instead, but only when
+  // A follow-up cancelled before start or failed before any provider/controller
+  // work holds only the checkpoint it inherited. Select its source, but only when
   // every skipped run proves that and inherited exactly that source session.
   const skipped: NonNullable<typeof barrier>[] = [];
   let selected = barrier;
@@ -299,12 +299,13 @@ export async function findNativeSessionResumeRun(db: Db, input: NativeSessionRes
 async function isUnstartedInheritedFollowUp(
   db: Db,
   input: NativeSessionResumeSelection,
-  run: { id: string; runtimeMode: string | null; status: string; processPid: number | null;
+  run: { id: string; runtimeMode: string | null; status: string; startedAt: Date | null; processPid: number | null;
     processGroupId: number | null; processStartedAt: Date | null; runnerProfileJson: { sessionCheckpoint: unknown; nativeControllerRecovery: unknown } },
 ): Promise<boolean> {
   const checkpoint = record(run.runnerProfileJson.sessionCheckpoint);
   const identity = record(checkpoint.identity);
-  if (run.runtimeMode !== "native" || run.status !== "failed" || run.processPid !== null ||
+  const cancelledBeforeStart = run.status === "cancelled" && run.startedAt === null;
+  if (run.runtimeMode !== "native" || !(run.status === "failed" || cancelledBeforeStart) || run.processPid !== null ||
       run.processGroupId !== null || run.processStartedAt !== null || run.runnerProfileJson.nativeControllerRecovery != null ||
       identity.runId !== run.id || identity.sessionId !== input.normalizedSessionId || checkpoint.cursor !== null) return false;
   const [evidence] = await db.select({
@@ -317,14 +318,16 @@ async function isUnstartedInheritedFollowUp(
       where ${nativeRunnerCheckpoints.companyId} = ${heartbeatRuns.companyId} and ${nativeRunnerCheckpoints.runId} = ${heartbeatRuns.id})`,
     result: sql<boolean>`exists (select 1 from ${nativeRunResults}
       where ${nativeRunResults.companyId} = ${heartbeatRuns.companyId} and ${nativeRunResults.runId} = ${heartbeatRuns.id})`,
-  }).from(heartbeatRuns).innerJoin(nativeRunFinalizations, and(
+  }).from(heartbeatRuns).leftJoin(nativeRunFinalizations, and(
     eq(nativeRunFinalizations.runId, heartbeatRuns.id), eq(nativeRunFinalizations.companyId, heartbeatRuns.companyId),
     eq(nativeRunFinalizations.issueId, input.issueId),
   )).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, input.companyId),
     eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.nativeIssueId, input.issueId)));
   const recovery = record(evidence?.executionRecovery);
-  return Boolean(evidence && recovery.kind === "bootstrap" && recovery.providerWorkStarted === false &&
-    evidence.phase === "terminal_failure" && evidence.resultId === null && evidence.leaseOwner === null &&
+  return Boolean(evidence && (cancelledBeforeStart
+      ? evidence.phase === null || evidence.phase === "terminal_failure"
+      : recovery.kind === "bootstrap" && recovery.providerWorkStarted === false && evidence.phase === "terminal_failure") &&
+    evidence.resultId === null && evidence.leaseOwner === null &&
     evidence.controllerPid === null && !evidence.controllerCheckpoint && !evidence.result &&
     !(await nativeSessionProviderEvidence(db, [run.id])).has(run.id));
 }
@@ -384,6 +387,7 @@ async function selectNativeSessionResumeBarrier(db: Db, input: NativeSessionResu
       runtimeMode: heartbeatRuns.runtimeMode,
       status: heartbeatRuns.status,
       errorCode: heartbeatRuns.errorCode,
+      startedAt: heartbeatRuns.startedAt,
       createdAt: heartbeatRuns.createdAt,
       processPid: heartbeatRuns.processPid,
       processGroupId: heartbeatRuns.processGroupId,
