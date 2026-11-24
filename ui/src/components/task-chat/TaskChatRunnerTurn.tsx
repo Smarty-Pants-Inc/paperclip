@@ -126,7 +126,7 @@ function RunnerCurrentActivityTail({ status, waitingLabel }: { status: string; w
   const shimmer = useTaskChatShimmer("working");
   if (isTerminalRunStatus(status)) return null;
   return <div className="mt-2 flex min-h-8 min-w-0 items-center gap-2 px-1 py-1 text-xs text-muted-foreground" data-testid="task-chat-current-activity" data-turn-position="tail">
-    <span className={cn(!waitingLabel && shimmer && "shimmer-text shimmer-text-muted")} aria-live="polite" data-testid="task-chat-current-activity-label">{waitingLabel ?? "Thinking"}</span>
+    <span className={cn(!waitingLabel && shimmer && "shimmer-text shimmer-text-muted")} aria-live="polite" data-testid="task-chat-current-activity-label">{waitingLabel ?? "Working"}</span>
   </div>;
 }
 
@@ -148,15 +148,15 @@ interface RunnerHeaderProps {
 function runnerWaitingLabel({ runId, status, execution, preparationLabel }: RunnerHeaderProps, waitingToStart = false) {
   if (status === "stopping") return "Stopping…";
   if (isTerminalRunStatus(status)) return null;
+  if (execution && (execution.cause || !["working", "reconnecting", "queued"].includes(execution.phase))) return execution.label;
   if (preparationLabel) return preparationLabel === "Starting…" && waitingToStart ? WAITING_TO_START_LABEL : preparationLabel;
   if (execution && execution.phase !== "working") return execution.label;
-  if (status === "queued" && execution?.cause) return execution.label;
-  return waitingToStart ? WAITING_TO_START_LABEL : status === "queued" ? "Starting…" : null;
+  return status === "queued" && runId ? "Queued" : waitingToStart ? WAITING_TO_START_LABEL : status === "queued" ? "Starting…" : null;
 }
 
 /** A run's queued turn with no named hold, past the startup grace period. */
 function useRunnerWaitingToStart({ runId, status, execution, preparationLabel, startedAtMs }: RunnerHeaderProps) {
-  return useWaitingToStart(preparationLabel === "Starting…" || (status === "queued" && !!runId && !execution?.cause), startedAtMs);
+  return useWaitingToStart(preparationLabel === "Starting…" || (!preparationLabel && status === "queued" && !!runId && !execution?.cause), startedAtMs);
 }
 
 function agentQueueWaitFor({ status, execution }: Pick<RunnerHeaderProps, "status" | "execution">) {
@@ -202,7 +202,7 @@ export function TaskChatRunnerTurn({
   readReceipt?: Pick<TaskChatMessageItem, "id" | "createdAtIso">;
   status: string;
   execution?: ExecutionProjection | null;
-  /** Presentation only while Send/Retry admission has no run yet. */
+  /** Receipt-backed progress, or neutral feedback while Send/Retry has no run yet. */
   preparationLabel?: string;
   startedAtMs: number | null;
   finishedAtMs?: number | null;
@@ -227,7 +227,7 @@ export function TaskChatRunnerTurn({
 }) {
   const { failures: mcpStartupFailures, rest: turnItems } = partitionRunHealthItems(items);
   const terminal = isTerminalRunStatus(status);
-  const waitingToStart = useRunnerWaitingToStart({ runId, status, execution, startedAtMs });
+  const waitingToStart = useRunnerWaitingToStart({ runId, status, execution, preparationLabel, startedAtMs });
   const waitingLabel = runnerWaitingLabel({ runId, status, execution, preparationLabel, startedAtMs }, waitingToStart);
   const yielded = turnItems.some(
     (item) =>
@@ -355,7 +355,7 @@ export function TaskChatRunnerTurn({
           />
         </div>
       ) : null}
-      {!final && currentActivityItems.length === 0 && !waitingLabel && !agentQueueWaitFor({ status, execution })
+      {(!final || final.streaming) && currentActivityItems.length === 0 && (!waitingLabel || (preparationLabel && !execution?.cause)) && !agentQueueWaitFor({ status, execution })
         ? <RunnerCurrentActivityTail status={status} waitingLabel={waitingLabel} /> : null}
     </div></ToolCallProgressRunProvider></TaskChatShimmerScope></RunnerReasoningDisplay>
   );
