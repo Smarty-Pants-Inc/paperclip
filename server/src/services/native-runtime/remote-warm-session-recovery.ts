@@ -238,24 +238,60 @@ export async function admitNativeContinuationRefusal(input: {
 }
 
 export async function publishNativeFreshSessionNotice(db: Db,
-  binding: Pick<NativeExecutionInput["binding"], "companyId" | "agentId" | "issueId" | "runId">): Promise<void> {
+  binding: Pick<NativeExecutionInput["binding"], "companyId" | "agentId" | "issueId" | "runId">,
+  state: "continuing" | "refused" = "continuing"): Promise<void> {
   const { companyId, agentId, issueId, runId } = binding;
   const notices = await db.transaction(async tx => {
+    // Serialize every run in this task, without conflicting with task FK KEY
+    // SHARE holders. Run ids are evidence links, not the idempotency boundary.
     const [task] = await tx.select().from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId))).for("no key update");
-    const [marker] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+    if (!task) return [];
+    const [run] = await tx.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId), eq(heartbeatRuns.agentId, agentId),
+      or(eq(heartbeatRuns.issueId, issueId), eq(heartbeatRuns.nativeIssueId, issueId)))).limit(1);
+    if (!run) return [];
+    // A late completion after Reset still belongs to its admitted generation.
+    const admittedGeneration = run.context?.conversationSessionGeneration;
+    const generation = typeof admittedGeneration === "number" && Number.isSafeInteger(admittedGeneration)
+      ? admittedGeneration : task.conversationSessionGeneration;
+    const key = `native-fresh-session:${generation}`;
+    const [marker] = await tx.select().from(issueComments).where(and(
       eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
-      eq(issueComments.createdByRunId, runId), isNotNull(issueComments.conversationSessionGeneration))).limit(1);
-    if (!task || marker) return [];
+      eq(issueComments.authorType, "system"), eq(issueComments.body, "New session"),
+      eq(issueComments.conversationSessionGeneration, generation))).limit(1);
+    const [notice] = await tx.select().from(issueComments).where(and(
+      eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system"),
+      or(eq(issueComments.clientRequestId, `${key}:notice`),
+        // Adopt an already committed 0405 notice instead of adding a second row.
+        marker?.createdByRunId ? and(eq(issueComments.createdByRunId, marker.createdByRunId),
+          eq(issueComments.body, `The saved session could not be restored; continuing in a new session. [Details of this attempt](/agents/${agentId}/runs/${marker.createdByRunId}). Earlier messages remain available.`)) : undefined))).limit(1);
+    // Correction is for an already published promise, not a new fallback door.
+    if (state === "refused" && !notice && !marker) return [];
     const now = new Date();
-    return tx.insert(issueComments).values([
-      { companyId, issueId, createdByRunId: runId, authorType: "system", createdAt: now,
-        body: `The saved session could not be restored; continuing in a new session. [Details of this attempt](/agents/${agentId}/runs/${runId}). Earlier messages remain available.` },
-      { companyId, issueId, createdByRunId: runId, authorType: "system", createdAt: new Date(now.getTime() + 1),
-        body: "New session", conversationSessionGeneration: task.conversationSessionGeneration },
-    ]).returning();
+    const changes: { id: string; body: string; action: string }[] = [];
+    const body = state === "refused"
+      ? `The saved session could not be restored. Couldn't continue; your message is saved. [Details of this attempt](/agents/${agentId}/runs/${runId}). Earlier messages remain available.`
+      : `The saved session could not be restored; continuing in a new session. [Details of this attempt](/agents/${agentId}/runs/${runId}). Earlier messages remain available.`;
+    if (!notice) {
+      const [added] = await tx.insert(issueComments).values({ companyId, issueId, createdByRunId: runId,
+        authorType: "system", createdAt: now, clientRequestId: `${key}:notice`, body }).returning();
+      changes.push({ ...added!, action: "issue.comment_added" });
+    } else if (state === "refused" && notice.body !== body) {
+      const [updated] = await tx.update(issueComments).set({ body, clientRequestId: `${key}:notice`, updatedAt: now })
+        .where(and(eq(issueComments.companyId, companyId), eq(issueComments.id, notice.id))).returning();
+      changes.push({ ...updated!, action: "issue.comment_updated" });
+    }
+    // A replay must never turn a corrected refusal back into a promise.
+    if (!marker) {
+      const [added] = await tx.insert(issueComments).values({ companyId, issueId, createdByRunId: runId,
+        authorType: "system", createdAt: new Date(now.getTime() + 1), clientRequestId: `${key}:marker`,
+        body: "New session", conversationSessionGeneration: generation }).returning();
+      changes.push({ ...added!, action: "issue.comment_added" });
+    }
+    return changes;
   });
   for (const notice of notices) await logActivity(db, { companyId, actorType: "system", actorId: "native-runtime",
-    agentId, runId, issueId, action: "issue.comment_added", entityType: "issue", entityId: issueId,
+    agentId, runId, issueId, action: notice.action, entityType: "issue", entityId: issueId,
     details: { commentId: notice.id, bodySnippet: notice.body.slice(0, 120), source: "pi_retirement_fallback" } }).catch(() => undefined);
 }
 
