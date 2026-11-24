@@ -262,6 +262,9 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
       ? readCaseProjectionMarker(previousExecution) : null;
   const workflowCase = input.caseContext && previousCaseProjection
     ? projectCaseContinuation(input.caseContext, previousCaseProjection) : null;
+  // Finished-task follow-ups are ordinary task turns. Only persistent chats
+  // change conversation mode: changing the provider or runtime prompt here
+  // invalidates the checkpoint binding and starts a new provider session.
   const piConversation = input.provider === "pi_rpc" && input.conversationMode === true && input.issue.conversationAgentId === input.agentId;
   const continuation = decideNativeContinuation({ ...input, hasSession: input.resumedSession === true && !!input.previousTurn,
     taskChanged: !!input.previousTurn && (input.issue.title !== input.previousTurn.task.title || input.issue.description !== input.previousTurn.task.description),
