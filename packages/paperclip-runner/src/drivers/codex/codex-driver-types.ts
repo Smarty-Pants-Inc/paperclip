@@ -31,7 +31,7 @@ export interface CodexAppServerDriverOptions {
   /** Explicit selected skills, resolved from this task's assigned runtime assets. */
   skillInputs?: readonly import("../../contracts/runtime-context.js").NativeSkillInput[];
   conversationMode?: "task" | "direct" | "prepared";
-  /** Server-authorized Pi conversation; retain task tools without requiring a report. */
+  /** Legacy conversation-session profile, never a per-turn reply instruction. */
   conversationReply?: boolean;
   requestedCollaborationMode?: "default" | "plan";
   /**
