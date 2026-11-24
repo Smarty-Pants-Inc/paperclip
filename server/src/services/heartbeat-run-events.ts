@@ -14,6 +14,7 @@ import { DATABASE_WORK_CHANNEL } from "@paperclipai/db/work-signals";
 import { nativeSha256 } from "./native-runtime/canonical.js";
 import { isUniqueViolation } from "../db-errors.js";
 import { trackRunIntake } from "./run-intake-stall-watch.js";
+import { retryTransientLockContention } from "./transient-lock-contention.js";
 
 export const RETRY_EXHAUSTION_MESSAGE_PREFIX = "Bounded retry exhausted";
 
@@ -128,7 +129,30 @@ export async function appendHeartbeatRunEvent(
   db: Db,
   input: AppendHeartbeatRunEventInput,
 ): Promise<AppendHeartbeatRunEventResult> {
-  return trackRunIntake(input.runId, "write", input.eventType, () => appendRunEvent(db, input));
+  return trackRunIntake(input.runId, "write", input.eventType,
+    () => retryRunEventAppend(db, () => appendRunEvent(db, input)));
+}
+
+function isRetryableRunEventError(error: unknown): boolean {
+  const seen = new Set<object>();
+  while (typeof error === "object" && error !== null && !seen.has(error)) {
+    seen.add(error);
+    const failure = error as { code?: unknown; cause?: unknown };
+    if (failure.code === "40P01" || failure.code === "40001") return true;
+    error = failure.cause;
+  }
+  return false;
+}
+
+async function retryRunEventAppend<T>(db: Db, append: () => Promise<T>): Promise<T> {
+  // A deadlock/serialization failure aborts the whole transaction. Re-enter
+  // append only after its own transaction rolled back (or autocommit failed).
+  // A caller-owned transaction must instead retry at its outer boundary.
+  if (is(db, PgTransaction)) return append();
+  return retryTransientLockContention(append, 4, {
+    shouldRetry: isRetryableRunEventError,
+    backoffMs: () => 20 + Math.floor(Math.random() * 61),
+  });
 }
 
 async function appendRunEvent(
@@ -197,7 +221,7 @@ export async function appendHeartbeatRunEventBatch(
   const first = inputs[0];
   if (!first) return [];
   return trackRunIntake(first.runId, "write", `${first.eventType} x${inputs.length}`,
-    () => appendRunEventBatch(db, inputs, assertWritable));
+    () => retryRunEventAppend(db, () => appendRunEventBatch(db, inputs, assertWritable)));
 }
 
 async function appendRunEventBatch(
