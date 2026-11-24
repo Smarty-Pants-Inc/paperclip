@@ -16,6 +16,7 @@ import {
   heartbeatRuns,
   heartbeatRunEvents,
   environmentLeases,
+  environments,
   issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
@@ -38,6 +39,8 @@ import type { AdapterExecutionContext, AdapterExecutionResult } from "../adapter
 import { HttpError } from "../errors.ts";
 import { settleCancelledLegacyPreparation } from "../services/legacy-execution-recovery.ts";
 import { settleUnrecoverableExecutions } from "../services/execution-recovery-resolution.ts";
+import * as deferredNotifications from "../services/deferred-execution-notifications.js";
+import { environmentService } from "../services/environments.js";
 
 const gates = vi.hoisted(() => new Map<string, (() => void) | null>());
 const preparation = vi.hoisted(() => ({
@@ -152,6 +155,18 @@ describeEmbeddedPostgres("Stop on a task whose run is still waiting in line", ()
     try {
       const { issue, run } = await assignAndWake(companyId, agentId, "Accidental submission");
       await vi.waitFor(() => expect(entered).toBe(true), { timeout: 10_000 });
+      // Gate 7: acquisition handed the idle allocation to this preparation.
+      // Neither Stop nor its finally may call the provider to archive that box.
+      const [environment] = await db.insert(environments).values({ name: "Borrowed idle box", driver: "sandbox" }).returning();
+      const leases = environmentService(db);
+      const input = { companyId, environmentId: environment!.id, issueId: issue.id, provider: "daytona",
+        providerLeaseId: "idle-box", leasePolicy: "reuse_by_environment" as const,
+        metadata: { agentId, priorSession: "saved-pi-session" } };
+      const predecessor = await leases.acquireLease(input);
+      await leases.releaseLease(predecessor.id, "retained", { cleanupStatus: "success" });
+      const borrowed = await leases.acquireLease({ ...input, heartbeatRunId: run.id,
+        replacesReusableLeaseId: predecessor.id });
+      expect(borrowed.metadata).not.toHaveProperty("replacesReusableLeaseId");
       const stop = await request(app).post(`/api/heartbeat-runs/${run.id}/cancel`).send({});
       expect(stop.status).toBe(200);
       expect(stop.body.status).toBe("cancelled");
@@ -161,6 +176,11 @@ describeEmbeddedPostgres("Stop on a task whose run is still waiting in line", ()
       await drainHeartbeatRunsToQuiescence(db, heartbeat);
       const settled = await request(app).get(`/api/heartbeat-runs/${run.id}`);
       expect(settled.status).toBe(200);
+      expect(settled.body.resultJson.preDispatchCancellationSettledAt).toEqual(expect.any(String));
+      const [returned] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, borrowed!.id));
+      expect(returned).toMatchObject({ status: "released", cleanupStatus: "success", providerLeaseId: "idle-box",
+        metadata: { priorSession: "saved-pi-session" } });
+      expect(returned!.metadata).not.toHaveProperty("remoteExecutionTermination");
       expect(settled.body.resultJson.executionCancellation).toMatchObject({ state: "acknowledged", proof: "preparation_settled", acknowledgedAt: expect.any(String) });
       expect(executedIssueIds()).not.toContain(issue.id);
       expect((await executionProjectionsForRuns(db, companyId, [run.id])).get(run.id)).toMatchObject({
@@ -227,7 +247,10 @@ describeEmbeddedPostgres("Stop on a task whose run is still waiting in line", ()
     }
 
     await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" }).where(eq(environmentLeases.id, lease.id));
+    const deferredHint = vi.spyOn(deferredNotifications, "notifyDeferredWakesForIssue");
     const settled = await settleCancelledLegacyPreparation(db, { run, providerDispatchStarted: false });
+    if (disposeFirst) expect(deferredHint).toHaveBeenCalledWith(expect.anything(), { companyId, issueId: issue.id });
+    deferredHint.mockRestore();
     expect(settled?.resultJson?.executionCancellation).toMatchObject({ state: "acknowledged", proof: "preparation_settled", requestedAt });
     expect((await executionProjectionsForRuns(db, companyId, [run.id])).get(run.id)).toMatchObject({ phase: "completed", label: "Stopped" });
     const [settledIssue] = await db.select().from(issues).where(eq(issues.id, issue.id));
