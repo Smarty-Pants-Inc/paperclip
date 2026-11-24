@@ -15736,17 +15736,20 @@ describe("native session bounded recovery", () => {
   it.each(["pending", "acknowledged"])("preserves a %s Stop when cancellation wins before the first turn", async (dispatchState) => {
     const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
     const stop: Record<string, unknown> = {};
-    state.execute.mockReset().mockImplementationOnce(async () => {
+    const db = leaseDb(execution, {}, stop, updates);
+    state.execute.mockReset().mockImplementationOnce(async (options) => {
       Object.assign(stop, { nativeCancellation: {
         schema: "paperclip.native-cancellation.v1", ...execution.binding,
         scope: "run", reasonCode: "cancellation_run_only", dispatchState,
         dispatched: true, intentAuditId: "intent", acknowledgementAuditId: "ack",
       } });
+      vi.spyOn(db, "update").mockReturnValueOnce({ set: () => ({ where: () => ({ returning: async () => [] }) }) } as never);
+      await options.getFirstTurnQueuedInput!();
       throw new Error("native_session_cancelled");
     });
     state.upsertRecoveryAction.mockClear();
     await expect(executePaperclipNativeSession({
-      db: leaseDb(execution, {}, stop, updates), execution, runnerInstanceId: "stop-before-first-turn",
+      db, execution, runnerInstanceId: "stop-before-first-turn",
     })).rejects.toThrow("native_cancellation_pending_recovery");
     expect(updates.some(update => update.table === heartbeatRuns && update.values.status === "failed")).toBe(false);
     expect(state.upsertRecoveryAction).not.toHaveBeenCalled();
