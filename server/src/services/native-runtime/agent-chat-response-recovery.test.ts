@@ -241,6 +241,61 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     }
   });
 
+  it.each([70_000, 300_000])("stores and publishes one complete held final past diagnostic caps (%i chars)", async size => {
+    const answer = "word ".repeat(size / 5);
+    const f = await fixture(true, { reply: answer, beforeFinalize: async scope => {
+      await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, scope.agentId));
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      const execution = { binding: scope, provider: { kind: "pi_rpc" as const } };
+      const port = new PaperclipControlPlanePort(db, { ...scope, sessionId: run.nativeSessionId!, sourceInstanceId: run.runnerInstanceId!,
+        controlPlaneSourceInstanceId: "large-final-control", completionContractId: run.completionContractId!, completionContractSha256: run.completionContractSha256! }, {
+        onCommittedEvent: async (event, cursor) => { await publishContinuousNativeReply({ db, execution, event, cursor }); },
+        onDuplicateEvent: async (event, cursor) => { await publishContinuousNativeReply({ db, execution, event, cursor }); },
+      });
+      const event: PrpEvent = { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceEventId: `${run.runnerInstanceId}:large-final`,
+        sourceInstanceId: run.runnerInstanceId!, sourceSeq: 1, sourceKind: "runner", runId: scope.runId,
+        normalizedSessionId: run.nativeSessionId!, turnId: "held-turn", itemId: "large-final:m1:b0", eventType: "item.completed",
+        priority: 0, emittedAt: new Date().toISOString(), payload: { kind: "agentMessage", channel: "final", text: answer, answers: [] } };
+      expect((await port.appendEvent(event)).disposition).toBe("committed");
+      expect((await port.appendEvent(event)).disposition).toBe("duplicate");
+      const [saved] = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, scope.runId),
+        eq(heartbeatRunEvents.sourceEventId, event.sourceEventId)));
+      expect((saved.payload as { prpEvent: PrpEvent }).prpEvent.payload).toMatchObject({ kind: "agentMessage", channel: "final", text: answer });
+      expect((await comments(scope.runId)).map(comment => comment.body)).toEqual([answer]);
+    } });
+    await recoverCommittedNativeChatResponse(db, f.input);
+    expect((await comments(f.runId)).map(comment => comment.body)).toEqual([answer]);
+    const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.runId));
+    expect(events.some(event => event.eventType === "turn.submitted")).toBe(false);
+    expect(events.some(event => event.message?.includes("without a semantic result"))).toBe(false);
+  });
+
+  it("retains ACKed unanswered follow-ups as one failed delivery receipt, never automatic resubmission", async () => {
+    const f = await fixture();
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, f.agentId));
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "native_provider_output_without_result",
+      resultJson: { queuedSteeringAcknowledgements: { [f.wakeId]: { status: "acknowledged", acknowledgedAt: new Date().toISOString() } } },
+    }).where(eq(heartbeatRuns.id, f.runId));
+    await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.runId));
+    await Promise.all([requeueContinuousUnanswered(db, { id: f.runId, companyId: f.companyId }), requeueContinuousUnanswered(db, { id: f.runId, companyId: f.companyId })]);
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]).toMatchObject({ status: "failed", error: "native_provider_output_without_result", runId: null,
+      payload: { issueId: f.issueId, _paperclipWakeContext: { wakeCommentIds: [f.wakeId] } } });
+    expect(wakes[0].finishedAt).toBeInstanceOf(Date);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    expect(run.resultJson?.continuousReplies).toBeUndefined();
+    expect(run.resultJson?.continuousUnansweredWakeId).toBe(wakes[0].id);
+    const notices = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system")));
+    expect(notices).toHaveLength(1);
+    expect(notices[0].body).toContain(`message ${f.wakeId}`);
+    expect(notices[0].body).toContain("remains unanswered");
+    expect(notices[0].body).toContain("nothing was re-sent");
+    expect(notices[0].presentation).toMatchObject({ kind: "system_notice", tone: "danger" });
+    await requeueContinuousUnanswered(db, { id: f.runId, companyId: f.companyId });
+    expect(await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system")))).toHaveLength(1);
+  });
+
   it("saves every held-turn final, including identical answers, and reuses the last at finalization", async () => {
     const f = await fixture(true, { beforeFinalize: async scope => {
       await db.update(agents).set({ adapterConfig: { provider: "pi_rpc" } }).where(eq(agents.id, scope.agentId));
