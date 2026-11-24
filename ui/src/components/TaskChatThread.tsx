@@ -1327,6 +1327,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // they settle. Runs already terminal at mount collapse instantly.
   const liveSeenRef = useRef<Set<string>>(new Set());
   const liveSegmentClock = useRef({ liveKey: "", ends: new Map<string, number>() });
+  const drawnRunnerSegments = useRef(new Set<string>());
   useEffect(() => {
     if (liveRun) liveSeenRef.current.add(liveRun.id);
   }, [liveRun]);
@@ -1388,13 +1389,14 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   } : emptyQueuedCommentQueue, [queuedMessageQueue, emptyQueuedCommentQueue, steeringAnchorByCommentId, returnedCommentIds]);
 
   const continuousReplyPlacements = useMemo(() => {
-    const placements = new Map<string, { byItem: Map<string, number>; bySegment: Map<number, string> }>();
+    const placements = new Map<string, { byItem: Map<string, number>; bySegment: Map<number, string>; questionsBySegment: Map<number, string[]> }>();
     for (const run of linkedRuns ?? []) {
       const replies = run.resultJson?.continuousReplies;
       if (!replies || typeof replies !== "object" || Array.isArray(replies)) continue;
       const anchors = steeringAnchorsByRun.get(run.runId) ?? [];
       const byItem = new Map<string, number>();
       const bySegment = new Map<number, string>();
+      const questionsBySegment = new Map<number, string[]>();
       for (const [itemId, value] of Object.entries(replies)) {
         if (!value || typeof value !== "object") continue;
         const reply = value as { questionCommentIds?: unknown; commentId?: unknown };
@@ -1411,8 +1413,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           ? anchors.filter(anchor => anchor <= toMs(first.ts)).length : questionSegment;
         byItem.set(itemId, segmentIndex);
         bySegment.set(segmentIndex, reply.commentId);
+        if (first?.kind === "assistant" && first.channel === "final" && first.text.trim()) {
+          questionsBySegment.set(segmentIndex, reply.questionCommentIds.filter((id): id is string => typeof id === "string"));
+        }
       }
-      placements.set(run.runId, { byItem, bySegment });
+      placements.set(run.runId, { byItem, bySegment, questionsBySegment });
     }
     return placements;
   }, [linkedRuns, steeringAnchorsByRun, steeringAnchorByCommentId, transcriptByRun]);
@@ -1809,7 +1814,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const { items, settledRunIds, settledReplyRunIds, runnerSegmentsById } = useMemo(() => {
     // A native segment owns the same renderer in the chronological body while
     // streaming, after a steering bubble, and after persistence. No tail handoff.
-    const runnerSegmentsById = new Map<string, ComponentProps<typeof TaskChatRunnerTurn>>();
+    const runnerSegmentsById = new Map<string, ComponentProps<typeof TaskChatRunnerTurn> & { emptyContinuation: boolean }>();
     // Runs whose settled turn made it into the assembled thread — the live tail
     // hands off to this as its "the settled turn has rendered" signal (PAP-462
     // B4), so the transcript stays mounted through the settle gap without ever
@@ -2433,15 +2438,24 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           )[0] ?? []).rest,
         };
         const children = settledRunChildren(runHealth.rest);
-        // Hide only empty post-steer acknowledgements, never a terminal failure header.
+        // Only an explicit answer receipt can continue a question below. An ACK
+        // alone says nothing about whether the model answered that question.
+        const segmentQuestions = segmentIndex === 0 ? [requestCommentByRun.get(source.id)] : comments
+          .filter(comment => steeringAnchorByCommentId.get(comment.id) === segment.startMs &&
+            (comment.steeredIntoRunId === source.id || Object.prototype.hasOwnProperty.call(
+              meta?.resultJson?.queuedSteeringAcknowledgements ?? {}, comment.id)))
+          .map(comment => comment.id);
+        const coveredByLaterReply = segmentQuestions.length > 0 &&
+          [...(continuousReplyPlacements.get(source.id)?.questionsBySegment ?? [])].some(([index, ids]) =>
+            index > segmentIndex && segmentQuestions.every(id => id !== undefined && ids.includes(id)) &&
+            Boolean(settledSegmentFinalResponse(index, projectedSegments[index]!.parsed)));
+        // Never remove a painted slot or a non-successful run's last work segment.
+        const emptyContinuation = sourceIsPaperclipRunner && !segmentStreaming && !failed && coveredByLaterReply &&
+          (segmentIndex !== lastPopulatedSegmentIndex || source.status === "succeeded") &&
+          children.length === 0 && !finalResponse && runHealth.failures.length === 0;
         if (
-          !stableRunnerSegment && children.length === 0 &&
-          !finalResponse &&
-          (!sourceIsPaperclipRunner || (
-            segmentIndex > 0 &&
-            runHealth.failures.length === 0 &&
-            (segmentIndex !== lastPopulatedSegmentIndex || source.status === "succeeded")
-          ))
+          (emptyContinuation && !drawnRunnerSegments.current.has(`${source.id}:turn:${segmentIndex}`)) ||
+          (!sourceIsPaperclipRunner && children.length === 0 && !finalResponse)
         ) {
           if (sourceIsPaperclipRunner || compactionMarkers.length > 0) settledRunIds.add(source.id);
           continue;
@@ -2468,6 +2482,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           !segments[segmentIndex - 1]!.entries.some(entry => entry.kind === "assistant" && entry.channel === "final" && !entry.delta) &&
           [...steeringAnchorByCommentId.values()].includes(segment.startMs);
         if (stableRunnerSegment) runnerSegmentsById.set(turnId, {
+          emptyContinuation,
           runId: source.id,
           finalResponse: finalResponse ?? null,
           items: finalResponse && !paperclipRunnerFinalResponse(parsed, yieldedOptions)
@@ -3065,9 +3080,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       activityUnavailable: tailActivityUnavailable,
       awaitingContinuation: paperclipRunnerTailAwaitingContinuation,
     } : segment;
-    return <div data-testid={current ? "task-chat-live-transcript" : undefined}>
+    return <div ref={node => { if (node) drawnRunnerSegments.current.add(item.id); }}
+      data-testid={current ? "task-chat-live-transcript" : undefined}>
       <TaskChatShimmerScope items={presentation.items}>
       <TaskChatRunnerHeader {...presentation} agentName={item.agentName} agentIcon={item.agentIcon} agent={item.agent}
+        statusContent={segment.emptyContinuation
+          ? <span className="text-sm font-normal text-muted-foreground" data-conversation-meta="">Continued below</span>
+          : undefined}
         personStopped={item.summary.personStopped === true} />
       {presentation.items.length > 0 || !presentation.preparationLabel ?
         <TaskChatRunnerTurn {...presentation} showHeader={false} agentName={item.agentName} agentIcon={item.agentIcon} agent={item.agent}
