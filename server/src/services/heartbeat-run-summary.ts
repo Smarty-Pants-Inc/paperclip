@@ -207,6 +207,8 @@ export interface CompletedFinalAgentMessageCandidate {
   replyKey?: string;
   /** The run log kept only a display preview of this message. */
   bounded?: boolean;
+  /** Server-composed visible transcript, not a receipt to replace with a summary. */
+  visibleText?: boolean;
 }
 
 /**
@@ -510,6 +512,7 @@ export function resolveHeartbeatRunResponse(input: {
     channel: "final" | "unknown";
     reasonCode?: string;
     bounded?: boolean;
+    visibleText?: boolean;
   } | null;
 }): ResolvedHeartbeatRunResponse {
   const resultJson = record(input.resultJson);
@@ -535,7 +538,7 @@ export function resolveHeartbeatRunResponse(input: {
   // A run-log preview is an incomplete copy of the agent's message. It never
   // outranks a complete source; it is posted only when no complete text exists.
   const boundedFinalAgentText =
-    rawFinalAgentText &&
+    rawFinalAgentText && input.finalAgentMessage?.visibleText !== true &&
     (input.finalAgentMessage?.bounded === true || isBoundedRunEventText(rawFinalAgentText))
       ? rawFinalAgentText
       : null;
@@ -769,7 +772,10 @@ export function findHeartbeatRunCompletionComment<T extends { id: string; presen
     const exact = comments.find(comment => comment.clientRequestId === replyKey || comment.clientRequestId?.startsWith(`${replyKey}:`));
     if (exact) return exact;
   }
-  const completionComments = comments.filter(comment => record(comment.presentation).kind !== "system_notice");
+  const priorSegmentCommentIds = new Set(replyKey ? Object.values(record(resultJson?.continuousReplies))
+    .flatMap(value => typeof record(value).commentId === "string" ? [record(value).commentId] : []) : []);
+  const completionComments = comments.filter(comment => record(comment.presentation).kind !== "system_notice" &&
+    !priorSegmentCommentIds.has(comment.id));
   const receipts = resultJson?.semanticToolReceipts;
   if (!receipts || typeof receipts !== "object" || Array.isArray(receipts)) {
     return completionComments[0] ?? null;
