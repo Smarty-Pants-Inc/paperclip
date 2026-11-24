@@ -106,6 +106,7 @@ import {
   isNotNull,
   isNull,
   lte,
+  lt,
   ne,
   notInArray,
   or,
@@ -2773,6 +2774,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string, savedInteractionOrigin?: unknown,
     admission?: { saved(): void }) {
+    const wakeRequestedAt = new Date();
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
     const contextSnapshot: Record<string, unknown> = {
@@ -3514,6 +3516,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const cancelledRunsToEmit: (typeof heartbeatRuns.$inferSelect)[] = [];
       const issueActivityPublications: ActivityPublication[] = [];
       const issuePostCommitActions: IssuePostCommitAction[] = [];
+      let incomingRequestedAt = receiptRequest?.requestedAt ?? wakeRequestedAt;
+      let oldestPersonWake: typeof agentWakeupRequests.$inferSelect | undefined;
 
       return wakeQueue.admitIssueWake(
         { companyId: agent.companyId, issueId, durableChatRequest: durableRequest },
@@ -3540,6 +3544,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   agent.companyId, issueId, pending.payload)))) {
               return { kind: "deferred" as const };
             }
+            incomingRequestedAt = pending.requestedAt;
             if (opts.taskRetryRequestId && durableRequest?.failedRunRetry) {
               if (pending.id !== durableRequest.id || pending.payload?.taskRetryRequestId !== opts.taskRetryRequestId)
                 return { kind: "deferred" as const };
@@ -4028,7 +4033,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               coalesce: coalesceExecutionWait,
               publications: issueActivityPublications,
               request: {
-                ...durableReceiptFields, agentId, source, triggerDetail, reason, payload,
+                requestedAt: incomingRequestedAt, ...durableReceiptFields, agentId, source, triggerDetail, reason, payload,
                 requestedByActorType: opts.requestedByActorType ?? null,
                 requestedByActorId: opts.requestedByActorId ?? null,
                 idempotencyKey: opts.idempotencyKey ?? null,
@@ -4948,6 +4953,28 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             return { kind: "skipped" as const };
           }
 
+          // A just-finished run may have left older person input deferred.
+          // Serialize this decision with admission, not with a later sweep: a
+          // new comment must not create an old-session run ahead of /new.
+          if (opts.requestedByActorType === "user" && wakeCommentId) {
+            const older = await tx.select().from(agentWakeupRequests).where(and(
+              eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
+              eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId),
+              eq(agentWakeupRequests.requestedByActorType, "user"),
+              sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
+              lt(agentWakeupRequests.requestedAt, incomingRequestedAt),
+              executionWaitRequestId ? ne(agentWakeupRequests.id, executionWaitRequestId) : undefined,
+              receiptRequest ? ne(agentWakeupRequests.id, receiptRequest.id) : undefined,
+            )).orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id));
+            const undelivered = new Set(await undeliveredLegacyUserCommentIds(tx as unknown as Db,
+              issue.companyId, issue.id, agentId, older.flatMap(wake => queuedCommentIdsFromWakePayload(wake.payload))));
+            oldestPersonWake = older.find(wake => queuedCommentIdsFromWakePayload(wake.payload).some(id => undelivered.has(id)));
+            if (oldestPersonWake) {
+              continuationWait = { reason: "execution_recovery", message: "Waiting for earlier saved messages. Your message is saved." };
+              return deferBlockedExecution(continuationHold());
+            }
+          }
+
           const freshRecovery = await busyRecovery.checkFreshAdmission();
           if (freshRecovery.wait) continuationWait = freshRecovery.wait;
           if (freshRecovery.kind === "blocked") return deferBlockedExecution(continuationHold());
@@ -5029,7 +5056,31 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           publishIssueActivity() {
             for (const publication of issueActivityPublications) publishActivity(publication);
           },
-          executeIssueActions: () => executeIssuePostCommitActions(db, issuePostCommitActions),
+          async executeIssueActions() {
+            await executeIssuePostCommitActions(db, issuePostCommitActions);
+            if (!oldestPersonWake) return;
+            // The newer receipt is committed before retrying the oldest. Normal
+            // admission rechecks ownership/recovery and consumes that exact
+            // receipt, so concurrent promoters cannot deliver it twice. Keep
+            // its context (especially forceFreshSession), never the new wake's.
+            const wake = oldestPersonWake;
+            try {
+              if (wake.idempotencyKey?.startsWith("chat-inbound:")) {
+                await resumeDeferredChatWake(db, { companyId: wake.companyId, issueId: issueId!,
+                  requestId: wake.id, agentId: wake.agentId });
+              } else {
+                const context = parseObject(wake.payload?.[DEFERRED_WAKE_CONTEXT_KEY]);
+                await enqueueWakeup(wake.agentId, {
+                  source: wake.source as WakeupOptions["source"], triggerDetail: wake.triggerDetail as WakeupOptions["triggerDetail"],
+                  reason: wake.reason ?? undefined, payload: wake.payload ?? undefined, contextSnapshot: context,
+                  requestedByActorType: "user", requestedByActorId: wake.requestedByActorId ?? undefined,
+                  allowRunCoalescing: false, idempotencyKey: wake.idempotencyKey ?? undefined,
+                }, wake.id, wake.payload?.interactionOrigin);
+              }
+            } catch (err) {
+              logger.warn({ err, requestId: wake.id, issueId }, "oldest saved person message could not resume");
+            }
+          },
           cancelledRuns: cancelledRunsToEmit,
           emitCancelledRun: (run) => emitAgentTaskRun(db, run),
           readRun: getRun,
