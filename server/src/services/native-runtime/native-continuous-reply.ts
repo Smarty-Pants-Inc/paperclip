@@ -1,4 +1,4 @@
-import { and, asc, eq, lt, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, lt, sql } from "drizzle-orm";
 import { agentWakeupRequests, agents, heartbeatRunEvents, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import type { NativeExecutionInput, PrpEvent } from "../../vendor/paperclip-runner/index.js";
 import { findHeartbeatRunCompletionComment, nativeFinalReplyKey, resolveHeartbeatRunResponse } from "../heartbeat-run-summary.js";
@@ -13,21 +13,89 @@ import { resolveSessionContinuity } from "./continued-session.js";
 import { parseObject } from "../../adapters/utils.js";
 import { logger } from "../../middleware/logger.js";
 import { drainContinuousPersonMessages } from "./native-continuous-drain.js";
+import { queuedCommentIdsFromWakePayload, withQueuedCommentIdsInWakePayload } from "../issue-queued-comment-queue.js";
+import { publishLiveEvent } from "../live-events.js";
+import { buildHeartbeatRunStatusLiveEventPayload } from "../heartbeat-run-status-payload.js";
+
+/** A Stop receipt is durable while its original comments await draft restoration. */
+async function applyNativePersonStopNotice(input: Parameters<typeof publishContinuousNativeReply>[0]) {
+  const payload = parseObject(input.event.payload);
+  if (input.event.eventType !== "provider.notice.recorded" || payload.category !== "pi_stop_returned_input") return;
+  const { companyId, issueId, runId, agentId } = input.execution.binding;
+  const ids = (Array.isArray(payload.details) ? payload.details : [])
+    .filter(detail => parseObject(detail).name === "returnedCommentIds")
+    .flatMap(detail => String(parseObject(detail).value ?? "").split(",")).map(id => id.trim()).filter(Boolean);
+  const updated = await input.db.transaction(async tx => {
+    const [issue] = await tx.select({ id: issues.id }).from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId))).for("no key update");
+    if (!issue) return;
+    // Queue mutations lock the issue, then its wakes, then the run.
+    const wakes = await tx.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId),
+      inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]), isNull(agentWakeupRequests.runId),
+      sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`)).for("update");
+    const [run] = await tx.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId),
+      eq(heartbeatRuns.nativeIssueId, issueId))).for("update");
+    const result = parseObject(run?.resultJson), stop = parseObject(result.personStop);
+    // Post-commit callbacks may race; a maximum cursor alone would lose an older receipt.
+    const applied = Array.isArray(stop.returnedNoticeSeqs) ? stop.returnedNoticeSeqs : [];
+    // This is a person's return receipt, not an agent write: terminal Stop recovery still applies it.
+    if (!run || run.runtimeMode !== "native" || run.nativeSessionId !== input.event.normalizedSessionId ||
+        !stop.requestedAt || applied.includes(input.cursor)) return;
+    const previous = Array.isArray(stop.returned) ? stop.returned.filter((id): id is string => typeof id === "string") : [];
+    // Keep the text readable: the browser copies to its draft BEFORE author-delete.
+    // UUIDs are compared as text so a malformed provider detail cannot abort ingestion.
+    const returned = ids.length ? (await tx.select().from(issueComments).where(and(
+      eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
+      inArray(sql<string>`${issueComments.id}::text`, [...previous, ...ids]),
+    )).orderBy(asc(issueComments.createdAt), asc(issueComments.id)))
+      .filter(comment => previous.includes(comment.id) || (typeof stop.userId === "string" && comment.authorUserId === stop.userId &&
+        !comment.deletedAt && comment.createdAt <= new Date(String(stop.requestedAt))))
+      .map(comment => comment.id) : previous;
+    for (const wake of wakes) {
+      const queued = queuedCommentIdsFromWakePayload(wake.payload), left = queued.filter(id => !returned.includes(id));
+      if (left.length === queued.length) continue;
+      const now = new Date();
+      await tx.update(agentWakeupRequests).set(left.length
+        ? { payload: withQueuedCommentIdsInWakePayload(wake.payload, left), updatedAt: now }
+        : { status: "cancelled", finishedAt: now, updatedAt: now }).where(eq(agentWakeupRequests.id, wake.id));
+    }
+    // A final may already have published when this post-commit observer is replayed.
+    const published = Object.keys(parseObject(result.continuousReplies));
+    const [answer] = published.length && !stop.settledAt && !stop.resumedAt && input.cursor > Number(stop.afterEventSeq ?? -1)
+      ? await tx.select({ payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents).where(and(
+        eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, runId),
+        eq(heartbeatRunEvents.eventType, "item.completed"), gt(heartbeatRunEvents.seq, input.cursor),
+        inArray(sql<string>`${heartbeatRunEvents.payload} #>> '{prpEvent,itemId}'`, published),
+      )).orderBy(asc(heartbeatRunEvents.seq)).limit(1) : [];
+    const [saved] = await tx.update(heartbeatRuns).set({ resultJson: { ...result, personStop: {
+      ...stop, returned, returnedNoticeSeq: Math.max(Number(stop.returnedNoticeSeq ?? -1), input.cursor),
+      ...(answer ? { settledAt: new Date().toISOString(), answerItemId: parseObject(parseObject(answer.payload).prpEvent).itemId } : {}),
+      returnedNoticeSeqs: [...applied, input.cursor],
+      ...(input.cursor > Number(stop.afterEventSeq ?? -1) ? { noticeSeq: Math.max(Number(stop.noticeSeq ?? -1), input.cursor) } : {}),
+    } } }).where(eq(heartbeatRuns.id, runId)).returning();
+    return saved;
+  });
+  if (updated) publishLiveEvent({
+    companyId, type: "heartbeat.run.status", payload: buildHeartbeatRunStatusLiveEventPayload(updated),
+  });
+}
 
 /** Replay the ingestion/publication crash gap before terminal presentation or queue release. */
 export async function recoverContinuousNativeReplies(db: Db, scope: { id: string; companyId: string }) {
   const [row] = await db.select({ run: heartbeatRuns, config: agents.adapterConfig }).from(heartbeatRuns)
     .innerJoin(agents, and(eq(agents.id, heartbeatRuns.agentId), eq(agents.companyId, scope.companyId)))
     .where(and(eq(heartbeatRuns.id, scope.id), eq(heartbeatRuns.companyId, scope.companyId)));
-  if (!row?.run.nativeIssueId || row.run.runtimeMode !== "native" || row.config.provider !== "pi_rpc" ||
-      resolveSessionContinuity("pi_rpc", row.config.sessionContinuity) !== "continuous") return;
-  const events = await db.select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents)
+  if (!row?.run.nativeIssueId || row.run.runtimeMode !== "native" ||
+      (row.config.provider !== "pi_rpc" && parseObject(parseObject(row.run.runnerProfileJson?.nativeExecutionInput).provider).kind !== "pi_rpc")) return;
+  const events = await db.select({ seq: heartbeatRunEvents.seq, eventType: heartbeatRunEvents.eventType, payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents)
     .where(and(eq(heartbeatRunEvents.companyId, scope.companyId), eq(heartbeatRunEvents.runId, scope.id),
-      eq(heartbeatRunEvents.eventType, "item.completed"))).orderBy(asc(heartbeatRunEvents.seq));
+      inArray(heartbeatRunEvents.eventType, ["item.completed", "provider.notice.recorded"]))).orderBy(asc(heartbeatRunEvents.seq));
   for (const event of events) await publishContinuousNativeReply({ db, cursor: event.seq, recoverTerminal: true,
     execution: { binding: { companyId: scope.companyId, issueId: row.run.nativeIssueId, runId: scope.id, agentId: row.run.agentId },
       provider: { kind: "pi_rpc" } },
-    event: { ...parseObject(parseObject(event.payload).prpEvent), eventType: "item.completed" } as Parameters<typeof publishContinuousNativeReply>[0]["event"],
+    event: { ...parseObject(parseObject(event.payload).prpEvent), eventType: event.eventType } as Parameters<typeof publishContinuousNativeReply>[0]["event"],
   });
 }
 
@@ -81,14 +149,16 @@ export async function publishContinuousNativeReply(input: {
     provider: Pick<NativeExecutionInput["provider"], "kind">;
   };
   event: Pick<PrpEvent, "eventType" | "payload" | "sourceEventId" | "runId" | "normalizedSessionId" | "itemId">;
-}) {
-  if (input.execution.provider.kind !== "pi_rpc" || input.event.eventType !== "item.completed") return;
+}): Promise<boolean | undefined> {
+  if (input.execution.provider.kind !== "pi_rpc" || input.event.runId !== input.execution.binding.runId) return;
+  await applyNativePersonStopNotice(input);
+  if (input.event.eventType !== "item.completed") return;
   const payload = parseObject(input.event.payload);
   if (!["agentMessage", "assistant_message"].includes(String(payload.kind)) || payload.channel !== "final" || !input.event.itemId) return;
   const { companyId, issueId, runId, agentId } = input.execution.binding;
-  if (input.event.runId !== runId) return;
   let steerableFinal = false;
-  const published = await input.db.transaction(async transaction => {
+  let published = false;
+  const updated = await input.db.transaction(async transaction => {
     const tx = transaction as unknown as Db;
     const [issue] = await tx.select().from(issues).where(and(
       eq(issues.id, issueId), eq(issues.companyId, companyId),
@@ -114,18 +184,20 @@ export async function publishContinuousNativeReply(input: {
     steerableFinal = row.run.status === "running" && !input.recoverTerminal;
     const result = parseObject(row.run.resultJson);
     const replies = parseObject(result.continuousReplies);
-    if (replies[input.event.itemId!]) return true;
+    if (replies[input.event.itemId!]) { published = true; return; }
+    const stop = parseObject(result.personStop);
+    const returned = new Set(Array.isArray(stop.returned) ? stop.returned : []);
     const answered = new Set(Object.values(replies).flatMap(value => {
       const ids = parseObject(value).questionCommentIds;
       return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : [];
     }));
     const pending = Object.entries(parseObject(result.queuedSteeringAcknowledgements))
-      .filter(([id, receipt]) => !answered.has(id) && parseObject(receipt).status === "acknowledged" &&
+      .filter(([id, receipt]) => !answered.has(id) && !returned.has(id) && parseObject(receipt).status === "acknowledged" &&
         (typeof parseObject(receipt).afterEventSeq !== "number" || Number(parseObject(receipt).afterEventSeq) < input.cursor))
       .sort((a, b) => String(parseObject(a[1]).acknowledgedAt).localeCompare(String(parseObject(b[1]).acknowledgedAt)));
     const wakeId = row.run.contextSnapshot?.wakeCommentId;
     const questionCommentIds = [...new Set([
-      ...(typeof wakeId === "string" && !answered.has(wakeId) ? [wakeId] : []),
+      ...(typeof wakeId === "string" && !answered.has(wakeId) && !returned.has(wakeId) ? [wakeId] : []),
       ...(pending[0] ? [pending[0][0]] : []),
     ])];
     const clientRequestId = `${nativeFinalReplyKey(runId, input.event.itemId!)}:${questionCommentIds.join(",") || "opening"}`;
@@ -147,16 +219,21 @@ export async function publishContinuousNativeReply(input: {
       authorizationReason, clientRequestId,
       ...(terminalReplay ? { persistedVisibleReplyThroughSeq: input.cursor } : {}),
     }, tx);
-    await tx.update(heartbeatRuns).set({ resultJson: { ...result, continuousReplies: { ...replies,
-      [input.event.itemId!]: { questionCommentIds, commentId: comment.id, sourceEventId: input.event.sourceEventId },
-    } } }).where(eq(heartbeatRuns.id, runId));
+    const [saved] = await tx.update(heartbeatRuns).set({ resultJson: { ...result,
+      ...(stop.requestedAt && !stop.settledAt && !stop.resumedAt && typeof stop.noticeSeq === "number" && stop.noticeSeq < input.cursor
+        ? { personStop: { ...stop, settledAt: new Date().toISOString(), answerItemId: input.event.itemId } } : {}),
+      continuousReplies: { ...replies,
+        [input.event.itemId!]: { questionCommentIds, commentId: comment.id, sourceEventId: input.event.sourceEventId },
+      } } }).where(eq(heartbeatRuns.id, runId)).returning();
     await logActivity(tx, { companyId, actorType: "agent", actorId: agentId, agentId, runId, issueId,
       action: "issue.comment_added", entityType: "issue", entityId: issueId,
       details: { commentId: comment.id, bodySnippet: comment.body.slice(0, 120), identifier: issue.identifier,
         issueTitle: issue.title, authorizationReason, source: "run_presentation_resolver",
         presentationSource: resolved.decision.chosenSource, sourceEventId: input.event.sourceEventId } });
-    return true;
+    published = true;
+    return saved;
   });
+  if (updated) publishLiveEvent({ companyId, type: "heartbeat.run.status", payload: buildHeartbeatRunStatusLiveEventPayload(updated) });
   // Never steer inside the publication transaction: it owns the ISSUE row,
   // while steering must persist run events before taking its own ACK locks.
   if (steerableFinal) {
