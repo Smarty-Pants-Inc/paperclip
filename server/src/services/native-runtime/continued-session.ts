@@ -4,6 +4,13 @@ export function resolveSessionContinuity(provider: unknown, setting: unknown) {
   return setting === "continuous" || setting === "paperclip" ? setting : provider === "pi_rpc" ? "continuous" : "paperclip";
 }
 
+/** Keep continuous Pi turns open unless the task configuration explicitly overrides the hold. */
+export function withPiOpenTurnDefault(provider: unknown, setting: unknown, environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  if (provider !== "pi_rpc" || resolveSessionContinuity(provider, setting) !== "continuous" ||
+      environment.PAPERCLIP_PI_OPEN_TURN_MS !== undefined) return environment;
+  return { ...environment, PAPERCLIP_PI_OPEN_TURN_MS: "600000" };
+}
+
 export function decideNativeContinuation(input: {
   provider?: unknown; sessionContinuity?: unknown; hasSession: boolean;
   resetRequired?: boolean; wakeReset?: boolean; wakePayload?: unknown; taskChanged?: boolean; previousRunId?: string; agentId?: string;
