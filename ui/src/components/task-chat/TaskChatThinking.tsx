@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { MarkdownBody } from "@/components/MarkdownBody";
 import { Brain, ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { TaskChatThinkingItem } from "./task-chat-model";
@@ -11,12 +12,15 @@ import { useTaskChatShimmer } from "./TaskChatShimmer";
 export function TaskChatThinking({
   item,
   defaultOpen,
+  inline = false,
   rowClassName,
   active = Boolean(item.streaming),
 }: {
   item: TaskChatThinkingItem;
   /** Activity timelines keep reasoning as one compact row until requested. */
   defaultOpen?: boolean;
+  /** Plain provider-authored prose at the answer's left edge. */
+  inline?: boolean;
   /** Optional alignment override for a containing activity rail. */
   rowClassName?: string;
   /** Whether this reasoning block is the runner's current activity. */
@@ -30,6 +34,13 @@ export function TaskChatThinking({
   const label = active
     ? body ? `${baseLabel}…` : "Thinking…"
     : item.summaryLabel ?? (body ? baseLabel : "Thought");
+
+  if (inline && body) {
+    return <div className="task-chat-reasoning-inline min-w-0 px-1 text-sm italic text-muted-foreground"
+      data-testid="task-chat-thinking-inline" data-conversation-text="reasoning">
+      <MarkdownBody className="task-chat-reasoning-markdown" softBreaks linkIssueReferences>{body}</MarkdownBody>
+    </div>;
+  }
 
   if (body && !active) {
     return (
