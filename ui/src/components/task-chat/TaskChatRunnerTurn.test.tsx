@@ -261,7 +261,7 @@ describe("TaskChatRunnerTurn", () => {
       expect(container.querySelector('[data-testid="task-chat-current-activity"]')).toBeNull();
       render([], "failed", "run-1", undefined, false, false, execution);
       expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent)
-        .toContain("Stopped");
+        .toContain("Couldn't finish after");
       expect(container.textContent).not.toContain("Reconnecting");
     },
   );
@@ -287,7 +287,7 @@ describe("TaskChatRunnerTurn", () => {
     // A stale waiting projection must never override a terminal run outcome.
     render([], "failed", "run-1", undefined, false, false, waiting);
     expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent)
-      .toContain("Stopped");
+      .toContain("Couldn't finish after");
     expect(container.querySelector('[data-testid="task-chat-current-activity"]')).toBeNull();
     expect(container.textContent).not.toContain(`Waiting for ${provider}`);
   });
@@ -1716,7 +1716,7 @@ describe("TaskChatRunnerTurn", () => {
     expect(
       container.querySelector('[data-testid="task-chat-turn-status-header"]')
         ?.textContent,
-    ).toContain("Stopped after");
+    ).toContain("Couldn't finish after");
     expect(
       container.querySelector('[data-testid="task-chat-final-response"]')
         ?.textContent,
