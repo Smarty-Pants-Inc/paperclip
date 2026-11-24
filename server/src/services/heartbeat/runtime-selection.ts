@@ -933,6 +933,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
       toolRefreshOnResume = backendDescriptor.capabilities.toolRefreshOnResume === true;
       const nativeExecutionWithCheckpoint = buildNativeExecutionWithCheckpoint({
         previousRun: previousNativeRun,
+        sessionContinuity: parseObject(agent.adapterConfig).sessionContinuity,
         normalizedSessionId: nativeSessionId,
         executionTargetKind: executionTarget?.kind ?? "local",
         toolRefreshOnResume,

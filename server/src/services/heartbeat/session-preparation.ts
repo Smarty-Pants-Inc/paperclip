@@ -209,7 +209,7 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
   if (decideNativeContinuation({
     provider: runtimeConfig.provider, sessionContinuity: runtimeConfig.sessionContinuity, hasSession: taskSession != null, wakeReset: true,
     resetRequired: context.explicitFreshSession === true || context.conversationReset === true || context.workspaceSelectionChanged === true ||
-      sessionConfigFreshness.reasons.some(reason => reason !== wakeSessionResetReason) ||
+      (runtimeConfig.provider !== "pi_rpc" && sessionConfigFreshness.reasons.some(reason => reason !== wakeSessionResetReason)) ||
       (context.wakeReason === "heartbeat_timer" && !deriveTaskKey(context, null)),
   }).continue) resetTaskSession = false;
   const sessionResetReason =

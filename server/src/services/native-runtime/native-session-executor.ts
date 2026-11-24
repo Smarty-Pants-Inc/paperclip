@@ -1,4 +1,5 @@
 import { currentControllerProcess } from "../controller-process-identity.js";
+import { resolveSessionContinuity } from "./continued-session.js";
 import { settleReattachRun } from "../heartbeat/run-admission.js";
 import { remoteRecoveryLeaseMismatch } from "./remote-recovery-lease-mismatch.js";
 import { isGovernancePauseStop } from "../governance-pause-stop.js";
@@ -8900,6 +8901,11 @@ function nativeProcessReuseKey(input: Parameters<typeof executePaperclipNativeSe
     networkAccess: environment?.PAPERCLIP_RUNNER_NETWORK_ACCESS === "enabled",
     coreGitHubAccess: needsCoreGitHubAccess(input),
     instructionRoot: input.instructionWorkingCopy?.root ?? null,
+    ...(input.execution.provider.kind === "pi_rpc" && resolveSessionContinuity("pi_rpc", input.sessionContinuity) === "continuous" ? {
+      // A changed SSH target retires the reachable warm writer before backend restore.
+      continuousSshTarget: input.runnerExecutionTarget?.kind === "remote" && input.runnerExecutionTarget.transport === "ssh"
+        ? [input.runnerExecutionTarget.spec.host, input.runnerExecutionTarget.spec.port, input.runnerExecutionTarget.spec.username, input.runnerExecutionTarget.remoteCwd] : null,
+    } : {}),
   });
 }
 
@@ -10663,6 +10669,7 @@ export function resolveNativeCancellationStatus(input: {
 }
 
 export async function executePaperclipNativeSession(input: {
+  sessionContinuity?: unknown;
   casesEnabled?: boolean;
   responsibilitiesEnabled?: boolean;
   getFreshSessionHandoff?: () => Promise<string | null>;
@@ -16577,6 +16584,7 @@ export function remoteCheckpointIncompleteFailure(
 
 /** Production runnerd backend seam, exported so provider wiring can be regression tested. */
 export async function createRunnerdBackend(input: {
+  sessionContinuity?: unknown;
   executionContext?: NativeExecutionContext;
   casesEnabled?: boolean;
   responsibilitiesEnabled?: boolean;
@@ -16921,7 +16929,12 @@ async function createRunnerdBackendWithinSessionClaim(
   if (preparedEnvironment.status === "rejected") throw preparedEnvironment.reason;
   if (preparedAssignedMcp.status === "rejected") throw preparedAssignedMcp.reason;
   if (preparedPluginTaskOwner.status === "rejected") throw preparedPluginTaskOwner.reason;
-  const runnerEnvironment = preparedEnvironment.value;
+  const runnerEnvironment = { ...preparedEnvironment.value };
+  // Server-owned launch flag, never an agent's environment-binding override.
+  delete runnerEnvironment.PAPERCLIP_PI_CONTINUOUS;
+  const continuousPi = input.execution.provider.kind === "pi_rpc" &&
+    resolveSessionContinuity(input.execution.provider.kind, input.sessionContinuity) === "continuous";
+  if (continuousPi) runnerEnvironment.PAPERCLIP_PI_CONTINUOUS = "1";
   const assignedMcpTools = preparedAssignedMcp.value;
   const dotAttachmentActor = input.execution.schema === "paperclip.native-execution-input.v6"
     ? await input.db.select({ config: agents.adapterConfig }).from(agents).where(and(
@@ -17409,7 +17422,8 @@ async function createRunnerdBackendWithinSessionClaim(
   // state even when no daemon survived. Its launch profile binds the admitted
   // artifact bytes and paths just as a live reattachment does.
   const reattachProviderPack = input.restartRecovery?.kind === "reattach_remote_runner" || input.remoteWarmRecovery !== undefined;
-  let retainProviderPack = reattachProviderPack || ["opencode", "pi_rpc"].includes(input.execution.provider.kind) && durableBinding !== null;
+  let retainProviderPack = reattachProviderPack || ["opencode", "pi_rpc"].includes(input.execution.provider.kind) && durableBinding !== null &&
+    !(continuousPi && !input.restartRecovery && !input.remoteWarmRecovery);
   if (requiresRemoteProviderPack && !retainProviderPack) resolveCurrentProviderPackManifest();
   // The transport hashes runnerBinary on the controller before an external
   // launcher starts runnerd. Keep that artifact identity in the controller's
@@ -18311,10 +18325,15 @@ async function createRunnerdBackendWithinSessionClaim(
                     }
                   }
                 } else if (remoteTarget && remoteCommandRunner) {
-                  // Local and generic SSH execution retain their existing checkpoint
-                  // behavior. The manifest-only failover gate applies to managed sandbox
-                  // replacement, where provider lease provenance is available.
-                  for (const directory of persistenceProfile.directories) {
+                  const runnerDirectory = persistenceProfile.directories.find(directory => directory.name === "runner");
+                  const runnerPath = runnerDirectory && remotePersistencePath(runnerDirectory);
+                  const verifiedSshContinuation = continuousPi && !input.restartRecovery && !input.remoteWarmRecovery &&
+                    remoteTarget.transport === "ssh" && runnerPath && !archivedRotationRunnerStatePath &&
+                    !(await remoteRunnerPathExists({ runner: remoteCommandRunner, path: posix.join(runnerPath, "runner-state.json"), kind: "file" })) &&
+                    (retiredSourceBackup = await verifyNativeHarnessBackupStreamed({ root, execution: input.execution, runnerInstanceId: input.runnerInstanceId }));
+                  if (verifiedSshContinuation) await restoreVerifiedHarnessBackup();
+                  // All other modes and unavailable/conflicting targets keep stock staging.
+                  else for (const directory of persistenceProfile.directories) {
                     const localDirectory = resolve(root, directory.name);
                     const remoteDirectory = remotePersistencePath(directory);
                     if (
