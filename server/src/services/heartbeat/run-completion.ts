@@ -1,5 +1,5 @@
 import { resolveSessionContinuity } from "../native-runtime/continued-session.js";
-import { recoverTerminalNativeVisibleReply } from "../native-runtime/native-continuous-reply.js";
+import { materializeSteeredTaskReplies, recoverTerminalNativeVisibleReply } from "../native-runtime/native-continuous-reply.js";
 import { preserveAcceptedRunUsageProjectionSql } from "../usage-receipts.js";
 import { isContextCompactionRun } from "../context-compaction.js";
 import { NativeProviderStateIncompatibleError, providerFailureFromError } from "../../vendor/paperclip-runner/index.js";
@@ -59,7 +59,7 @@ import { runnerGoalService } from "../runner-goals.js";
 import { resolveChatRunPresentationAuthorizationReason } from "../chat-run-publications.js";
 import { hasChatRunOwnedProviderInteraction } from "../chat-interaction-arbitration.js";
 import { conversationTurnPresentsAnswer } from "../native-runtime/native-governance.js";
-import { readAcceptedTaskContinuationSummary } from "../heartbeat-run-summary.js";
+import { readAcceptedTaskContinuationSummary, readSteeredTaskResponseScope } from "../heartbeat-run-summary.js";
 import { SANDBOX_PROVIDER_PLUGIN_NOT_READY_REASON } from "../recovery/stranded-notice.js";
 import { MAX_TURN_CONTINUATION_RETRY_REASON, allowsIssueInteractionWake, isResolvedInteractionContinuationWakeContext } from "../../modules/run-dispatch/index.js";
 import { ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS } from "../issue-tree-control.js";
@@ -868,6 +868,12 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
             livenessRun.id,
             livenessRun.companyId,
           ));
+        const steeredTaskResponse = livenessRun.runtimeMode === "native" && !isConversation(issueContext) &&
+          finalAgentMessage?.channel === "final" ? readSteeredTaskResponseScope({
+            runId: livenessRun.id, contextSnapshot: livenessRun.contextSnapshot,
+            resultJson: { ...persistedResultJson, ...parseObject(livenessRun.resultJson) },
+            finalAgentMessageSeq: finalAgentMessage.seq,
+          }) : null;
         const existingRunComment = issueId
           ? await measureRunPhase("response.resolve", () => findRunIssueComment(
               livenessRun.id,
@@ -892,7 +898,16 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         );
         const terminalVisibleReply = livenessRun.runtimeMode === "native" && finalAgentMessage?.visibleText === true &&
           ["cancelled", "interrupted", "failed", "timed_out"].includes(livenessRun.status);
-        const resolved = resolveHeartbeatRunResponse({
+        const separateReplies = issueId && !skipRunIssueComment && !terminalVisibleReply && steeredTaskResponse && finalAgentMessage
+          ? await materializeSteeredTaskReplies(db, {
+              companyId: livenessRun.companyId, issueId, runId: livenessRun.id, agentId: agent.id,
+              resultJson: { ...persistedResultJson, ...parseObject(livenessRun.resultJson) },
+              scope: steeredTaskResponse, finalAgentMessage,
+              authorizationReason: await resolveChatRunPresentationAuthorizationReason(db, {
+                companyId: livenessRun.companyId, issueId, runId: livenessRun.id,
+              }),
+            }) : null;
+        const resolved = separateReplies ? { text: null, decision: separateReplies.decision } : resolveHeartbeatRunResponse({
           resultJson: terminalVisibleReply ? null : persistedResultJson,
           interactionOwnsResponse: Boolean(issueId && readAcceptedTaskContinuationSummary(persistedResultJson) &&
             await hasChatRunOwnedProviderInteraction(db, { companyId: livenessRun.companyId, issueId, runId: livenessRun.id })),
