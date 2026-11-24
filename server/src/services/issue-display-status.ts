@@ -56,5 +56,10 @@ export function issueDisplayStatusSql(): SQL<IssueDisplayStatus> {
       AND ${issues.executionPolicy}->'monitor' IS NOT NULL
       AND COALESCE(${issues.executionPolicy}#>>'{monitor,serviceName}', '') <> ${PROVIDER_QUOTA_MONITOR_SERVICE_NAME}
       THEN 'monitoring'
+    WHEN EXISTS (SELECT 1 FROM status_decisions display_wait
+      WHERE display_wait.company_id = ${companyId} AND display_wait.issue_id = ${issueId}
+        AND display_wait.id = ${issues.lastStatusDecisionId}
+        AND display_wait.application_state = 'applied' AND display_wait.reason_code = 'response_wake_waiting_for_input'
+    ) THEN 'in_progress'
     ELSE 'todo' END`;
 }
