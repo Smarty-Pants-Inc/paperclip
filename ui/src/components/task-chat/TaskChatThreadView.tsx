@@ -73,6 +73,8 @@ interface TaskChatThreadViewProps {
   renderQueuedAction?: (item: TaskChatMessageItem) => ReactNode;
   /** A streaming turn keeps its chronological keyed slot when it settles. */
   renderTurn?: (item: TaskChatTurnItem) => ReactNode;
+  /** One execution notice, replacing its current slot or following the last turn. */
+  executionNotice?: { itemId?: string; content: ReactNode };
   /** Requeues a blocked task from its no-live-execution-path failure surfaces. */
   onTryAgainNoLiveExecutionPath?: () => Promise<void> | void;
   tryAgainNoLiveExecutionPathPending?: boolean;
@@ -329,6 +331,7 @@ export function TaskChatThreadView({
   renderMessageActions,
   renderQueuedAction,
   renderTurn,
+  executionNotice,
   onTryAgainNoLiveExecutionPath,
   tryAgainNoLiveExecutionPathPending = false,
   onRetryFailedRun,
@@ -358,6 +361,7 @@ export function TaskChatThreadView({
   // Streaming tail and header updates must not rebuild settled markdown/tool trees.
   const history = useMemo(() => {
     const renderVisibleItem = (item: TaskChatItem) => {
+      if (executionNotice?.itemId === item.id) return executionNotice.content;
       const turn = item.kind === "turn" ? renderTurn?.(item) : undefined;
       if (turn !== undefined) return turn;
       const marker = item.id === retryableMarkerId ? retryMarkers.get(item.id) : undefined;
@@ -425,7 +429,7 @@ export function TaskChatThreadView({
     );
   }, [
     visibleItems, retryMarkers, streamlined, onApprovalDecision, onRuntimeRequestDecision,
-    renderInteraction, renderBrief, renderMessageActions, renderQueuedAction, renderTurn,
+    renderInteraction, renderBrief, renderMessageActions, renderQueuedAction, renderTurn, executionNotice,
     onTryAgainNoLiveExecutionPath, tryAgainNoLiveExecutionPathPending,
     retryableMarkerId, onRetryFailedRun, retryFailedRunId, attachments, onOpenSkill, onOpenBrowser,
   ]);
@@ -447,6 +451,7 @@ export function TaskChatThreadView({
       ) : null}
       {history}
       {tail ? <div data-conversation-typography="" className={cn("empty:hidden", streamlined && "mt-4")}>{tail}</div> : null}
+      {executionNotice && !executionNotice.itemId ? <div data-conversation-typography="" className={cn(streamlined && "mt-4")}>{executionNotice.content}</div> : null}
     </div>
   );
 
