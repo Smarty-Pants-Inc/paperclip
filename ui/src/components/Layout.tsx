@@ -8,6 +8,8 @@ import { BoardDialogs } from "./BoardDialogs";
 import { ChatSetupSidebarProvider } from "@/context/ChatSetupSidebarContext";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import { Outlet, useLocation, useNavigate, useNavigationType, useParams } from "@/lib/router";
 import { Sidebar } from "./Sidebar";
 import { CompanySettingsSidebar } from "./CompanySettingsSidebar";
@@ -129,7 +131,16 @@ export function Layout({ sidebarSections }: { sidebarSections?: ReactNode }) {
   const { enabled: agentChatEnabled } = useAgentChatEnabled();
   const isAgentChatRoute = agentChatEnabled && companyPathSegments[0]?.toLowerCase() === "chats";
   const desktopAgentChat = !isMobile && isAgentChatRoute;
-  const measureChatSpace = desktopAgentChat && panelVisible && panelContent != null && panelShowsArtifact;
+  // An open chat is drawn alone. The list beside it is a remembered choice, off by default.
+  const [chatListBeside, setChatListBeside] = useState(() => { try { return localStorage.getItem("paperclip:chat-list-beside") === "true"; } catch { return false; } });
+  const chatOpen = isAgentChatRoute && isTaskDetailRoute;
+  const showChatList = !isMobile && chatOpen && chatListBeside;
+  const chatListLabel = chatListBeside ? "Hide chat list" : "Show chat list";
+  const chatListToggle = !isMobile && chatOpen ? <Button variant="ghost" size="icon-sm" className="size-9 shrink-0 text-muted-foreground" aria-label={chatListLabel} title={chatListLabel} aria-pressed={chatListBeside}
+    onClick={() => { setChatListBeside(!chatListBeside); try { localStorage.setItem("paperclip:chat-list-beside", String(!chatListBeside)); } catch { /* Ignore storage failures. */ } }}>
+    {chatListBeside ? <PanelLeftClose className="h-4 w-4" /> : <PanelLeftOpen className="h-4 w-4" />}
+  </Button> : null;
+  const measureChatSpace = showChatList && panelVisible && panelContent != null && panelShowsArtifact;
   const chatAreaRef = useRef<HTMLDivElement>(null);
   const [chatListTooWide, setChatListTooWide] = useState(false);
   const chatListCollapsed = measureChatSpace && chatListTooWide;
@@ -233,7 +244,7 @@ export function Layout({ sidebarSections }: { sidebarSections?: ReactNode }) {
       />
     )
   ) : null;
-  const secondarySidebar = isAgentChatRoute ? <AgentConversationsSidebar /> : shellRoute.builtInContextualSurface === "agent" && agentId ? (
+  const secondarySidebar = showChatList ? <AgentConversationsSidebar /> : shellRoute.builtInContextualSurface === "agent" && agentId ? (
     <AgentContextualSidebar agentRef={agentId} />
   ) : sharedSecondarySidebar;
   const hasSecondarySidebar = secondarySidebar != null;
@@ -584,7 +595,7 @@ export function Layout({ sidebarSections }: { sidebarSections?: ReactNode }) {
             )}
           >
             <StandaloneBrowserControls mobile={isMobile} />
-            <BreadcrumbBar showPropertiesToggle={isAgentChatRoute} toolbarAction={chatListCollapsed ? <AgentConversationsSidebar compact /> : undefined} />
+            <BreadcrumbBar showPropertiesToggle={chatOpen} toolbarAction={<>{chatListCollapsed ? <AgentConversationsSidebar compact /> : null}{chatListToggle}</>} />
             {isMobile && isCompanySettingsRoute ? (
               <div className="border-b border-border px-4 pb-3">
                 <CompanySettingsNav />
@@ -605,7 +616,7 @@ export function Layout({ sidebarSections }: { sidebarSections?: ReactNode }) {
               ref={desktopAgentChat ? chatAreaRef : undefined}
               className={cn(desktopAgentChat ? "flex min-w-0 flex-1" : !isMobile && useStreamlinedTaskDetailShell ? "flex min-w-0 flex-1 flex-col" : "contents")}
             >
-              {desktopAgentChat ? (
+              {showChatList ? (
                 <SecondarySidebar className={cn("w-(--sz-280px) shrink-0 bg-background", chatListCollapsed && "hidden")}>
                   {secondarySidebar}
                 </SecondarySidebar>
