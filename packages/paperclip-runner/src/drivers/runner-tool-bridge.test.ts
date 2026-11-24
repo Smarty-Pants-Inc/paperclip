@@ -42,6 +42,37 @@ async function rpc(
 }
 
 describe("runner semantic MCP bridge", () => {
+  it.each([
+    { label: "task", conversationReply: false, turnIntent: undefined, terminal: true },
+    { label: "Agent Chat", conversationReply: true, turnIntent: undefined, terminal: false },
+    { label: "finished-task reply", conversationReply: false, turnIntent: "conversation_reply" as const, terminal: false },
+  ])("offers terminal tools only for task turns ($label)", async ({ conversationReply, turnIntent, terminal }) => {
+    const handler = vi.fn(async () => ({ ok: true }));
+    const bridge = await startRunnerToolBridge({
+      conversationReply, turnIntent, tools: [tool("documents.read")], handler,
+    });
+    bridges.push(bridge);
+    const listed = await (await rpc(bridge, { id: 1, method: "tools/list" })).json();
+    expect(listed.result.tools.map((tool: { name: string }) => tool.name)).toEqual([
+      "documents.read", ...(terminal ? ["paperclip_finish", "paperclip_block"] : []),
+    ]);
+    if (!terminal) {
+      for (const name of ["paperclip_finish", "paperclip_block"]) {
+        const result = await (await rpc(bridge, { id: name, method: "tools/call", params: { name, arguments: {} } })).json();
+        expect(result.result).toMatchObject({ isError: true, content: [{ text: "Unsupported tool." }] });
+      }
+      expect(handler).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each(["paperclip_finish", "paperclip_block"])("keeps %s reserved even when conversation tools are hidden", async name => {
+    for (const visibility of ["tools", "privateTools"] as const) {
+      await expect(startRunnerToolBridge({
+        conversationReply: true, [visibility]: [tool(name)], handler: async () => ({}),
+      })).rejects.toThrow("reserved by the protocol");
+    }
+  });
+
   it.each([false, true])("preloads only essential public Claude task tools when opted in (%s)", async preloadClaudeTaskTools => {
     const bridge = await startRunnerToolBridge({
       preloadClaudeTaskTools,
