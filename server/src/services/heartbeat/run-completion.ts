@@ -1,4 +1,5 @@
 import { resolveSessionContinuity } from "../native-runtime/continued-session.js";
+import { recoverTerminalNativeVisibleReply } from "../native-runtime/native-continuous-reply.js";
 import { preserveAcceptedRunUsageProjectionSql } from "../usage-receipts.js";
 import { isContextCompactionRun } from "../context-compaction.js";
 import { providerFailureFromError } from "../../vendor/paperclip-runner/index.js";
@@ -440,6 +441,15 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     failedProcessRunCancellations,
   } = dependencies;
 
+  async function retainTerminalVisibleReply(run: Run | null | undefined) {
+    if (run?.runtimeMode !== "native" || !run.nativeIssueId) return;
+    try {
+      await recoverTerminalNativeVisibleReply(db, { companyId: run.companyId, issueId: run.nativeIssueId, runId: run.id });
+    } catch (err) {
+      logger.warn({ err, runId: run.id }, "Terminal visible reply awaits recovery");
+    }
+  }
+
   async function completeRun(input: CompleteHeartbeatRunInput) {
     const { run, agent, issueId, issueRef, signal, output, session, readFailureReportSecrets, adapterResult, sessionCodec, taskSessionForRun, sessionCompaction,
       configFreshnessResultMetadata, runLedgerScope, currentUserRedactionOptions,
@@ -771,6 +781,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           },
           "skipping late run finalization because the run already left running state",
         );
+        await retainTerminalVisibleReply(persistedRunWrite.run);
         return;
       }
     }
@@ -878,8 +889,10 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           livenessRun.contextSnapshot,
           externalChatPresentationAuthorization === CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
         );
+        const terminalVisibleReply = livenessRun.runtimeMode === "native" && finalAgentMessage?.visibleText === true &&
+          ["cancelled", "interrupted", "failed", "timed_out"].includes(livenessRun.status);
         const resolved = resolveHeartbeatRunResponse({
-          resultJson: persistedResultJson,
+          resultJson: terminalVisibleReply ? null : persistedResultJson,
           interactionOwnsResponse: Boolean(issueId && readAcceptedTaskContinuationSummary(persistedResultJson) &&
             await hasChatRunOwnedProviderInteraction(db, { companyId: livenessRun.companyId, issueId, runId: livenessRun.id })),
           conversationTurnFinished: Boolean(issueId) && isConversation(issueContext) && livenessRun.status === "succeeded"
@@ -906,7 +919,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         let presentationDecision: RunPresentationDecision =
           resolved.decision;
         // A same-run progress note that already says exactly the final answer is that answer: don't post it twice.
-        const sameRunAnswer = issueId && presentationDecision.commentAction === "create" && resolved.text
+        const sameRunAnswer = !finalAgentMessage?.visibleText && issueId && presentationDecision.commentAction === "create" && resolved.text
           ? (await db.select({ id: issueComments.id }).from(issueComments).where(and(eq(issueComments.companyId, livenessRun.companyId),
               eq(issueComments.issueId, issueId), eq(issueComments.createdByRunId, livenessRun.id),
               sql`btrim(${issueComments.body}) = ${resolved.text.trim()}`)).limit(1))[0] ?? null
@@ -920,9 +933,8 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           presentationDecision.commentAction === "create" &&
           resolved.text
         ) {
-          // The presentation resolver exposes only the final assistant
-          // surface selected from completed final messages or accepted
-          // semantic results. For an exactly bound external-chat run,
+          // The presentation resolver exposes the visible assistant segment
+          // or an accepted semantic response. For an exactly bound external-chat run,
           // authorize that narrow presentation as the provider reply;
           // ordinary internal runs retain the private default.
           const presentationAuthorizationReason =
@@ -935,7 +947,8 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
             issueId!,
             resolved.text!,
             { agentId: agent.id, runId: livenessRun.id },
-            { authorizationReason: presentationAuthorizationReason, completionReply: true },
+            { authorizationReason: presentationAuthorizationReason, completionReply: true,
+              ...(finalAgentMessage?.replyKey ? { clientRequestId: finalAgentMessage.replyKey } : {}) },
           ));
           presentationDecision = {
             ...presentationDecision,
@@ -1447,6 +1460,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         },
         "skipping late adapter failure finalization because the run already left running state",
       );
+      await retainTerminalVisibleReply(failedRunWrite.run);
       return;
     }
 
@@ -1486,6 +1500,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         );
       }
       await measureRunPhase("completion.summary", () => refreshContinuationSummaryForRun(livenessRun, agent));
+      await retainTerminalVisibleReply(livenessRun);
       if (await pendingCaseHandoffForRun(db, livenessRun.id, livenessRun.companyId)) {
         await settleStorageWaitMessage(livenessRun, null, err);
         await releaseIssueExecutionAndPromote(livenessRun, { suppressImmediateRecovery: true });
