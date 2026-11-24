@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { act } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Agent } from "@paperclipai/shared";
@@ -28,18 +29,25 @@ vi.mock("@/hooks/useAgentChatNavigation", () => ({
     userId: state.userId,
     enabled: true,
     loaded: true,
-    agents: { data: state.agents, isFetched: true, isPending: false, error: null },
-    chats: { data: state.chats, isFetched: state.chatsFetched, isSuccess: state.chatsFetched && !state.chatsError, error: state.chatsError },
-    session: { isFetched: !state.sessionError, isPending: false, error: state.sessionError },
+    agents: { data: state.agents, isSuccess: true, isFetched: true, isPending: false, error: null },
+    chats: { data: state.chatsFetched ? state.chats : undefined, isFetched: state.chatsFetched, isSuccess: state.chatsFetched && !state.chatsError, error: state.chatsError },
+    session: { data: state.sessionError ? undefined : {}, isFetched: !state.sessionError, isPending: false, error: state.sessionError },
   }),
   useOpenAgentChat: () => vi.fn(),
 }));
 vi.mock("@/lib/router", () => ({
   useNavigate: () => state.navigate,
-  Link: ({ to, children }: { to: string; children: React.ReactNode }) => <a href={to}>{children}</a>,
+  useLocation: () => ({ pathname: "/chats" }),
+  Link: ({ to, ...props }: React.ComponentProps<"a"> & { to: string }) => <a href={to} {...props} />,
 }));
 vi.mock("@/components/AgentAvatar", () => ({ AgentAvatar: () => null }));
+vi.mock("@/components/AgentChatPin", async (importOriginal) => ({ ...await importOriginal<typeof import("@/components/AgentChatPin")>(), useAgentChatPins: () => ({ orderedKeys: [], keys: new Set() }), AgentChatPin: () => null }));
+vi.mock("@/hooks/useResourceMemberships", () => ({ useResourceMemberships: () => ({ isSuccess: false }) }));
+vi.mock("@/context/SidebarContext", () => ({ useSidebar: () => ({ isMobile: false }) }));
+vi.mock("@/context/DialogContext", () => ({ useDialogActions: () => ({ openNewAgent: vi.fn() }) }));
+vi.mock("@/api/agents", () => ({ agentsApi: { get: async (id: string) => ({ id, name: id, status: "terminated" }) } }));
 
+let queryClient: QueryClient;
 let root: Root;
 let container: HTMLDivElement;
 const agent = (id: string, companyId = "company-a") => ({
@@ -47,11 +55,12 @@ const agent = (id: string, companyId = "company-a") => ({
 } as Agent);
 
 async function render() {
-  await act(async () => root.render(<AgentChats />));
+  await act(async () => root.render(<QueryClientProvider client={queryClient}><AgentChats /></QueryClientProvider>));
 }
 
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   state.primaryAgentId = null;
   state.primaryLoading = false;
   state.companyId = "company-a";
@@ -74,98 +83,109 @@ beforeEach(() => {
 
 afterEach(async () => {
   await act(async () => root.unmount());
+  queryClient.clear();
   container.remove();
   vi.unstubAllGlobals();
 });
 
 describe("Chat landing", () => {
-  it("uses the primary only when there is no valid recent conversation", async () => {
+  it("lists chats instead of redirecting to the primary or a recent conversation", async () => {
     state.primaryAgentId = "alice";
     recordAgentChatVisit("company-a", "user-a", "removed");
     await render();
-    expect(state.navigate).toHaveBeenCalledWith("/chats/alice-slug", { replace: true });
-    state.navigate.mockClear();
+    expect(state.navigate).not.toHaveBeenCalled();
+    expect(container.querySelector('a[href="/chats/alice-slug"]')).not.toBeNull();
     recordAgentChatVisit("company-a", "user-a", "bob");
     await render();
-    expect(state.navigate).toHaveBeenCalledWith("/chats/bob-slug", { replace: true });
+    expect(state.navigate).not.toHaveBeenCalled();
+    expect(container.querySelector('a[href="/chats/bob-slug"]')).not.toBeNull();
   });
 
-  it("waits for the primary without sending anything and preserves the chooser for unavailable primaries", async () => {
+  it("shows the list without waiting for a primary or requiring an available primary", async () => {
     state.primaryLoading = true;
     await render();
     expect(state.navigate).not.toHaveBeenCalled();
-    expect(container.textContent).toContain("Opening chat");
+    expect(container.querySelector('[aria-label="Search chats"]')).not.toBeNull();
     state.primaryLoading = false;
     state.primaryAgentId = "removed";
     await render();
     expect(state.navigate).not.toHaveBeenCalled();
-    expect(container.textContent).toContain("Who would you like to talk to?");
+    expect(container.querySelector('a[href="/chats/alice-slug"]')).not.toBeNull();
   });
 
-  it("opens the most recently visited agent and replaces the landing history entry", async () => {
+  it("opens a chosen chat with a push so Back returns to the list", async () => {
     recordAgentChatVisit("company-a", "user-a", "alice");
     recordAgentChatVisit("company-a", "user-a", "bob");
     await render();
-    expect(state.navigate).toHaveBeenCalledWith("/chats/bob-slug", { replace: true });
-    expect(container.textContent).toContain("Opening chat");
+    expect(state.navigate).not.toHaveBeenCalled();
+    await act(async () => container.querySelector<HTMLAnchorElement>('a[href="/chats/bob-slug"]')!.click());
+    expect(state.navigate).toHaveBeenCalledWith("/chats/bob-slug");
   });
 
-  it("skips unavailable saved agents and preserves the company and user scope", async () => {
+  it("ignores unavailable and other-scope visits while listing this company's agents", async () => {
     recordAgentChatVisit("company-a", "user-a", "alice");
     recordAgentChatVisit("company-a", "user-a", "removed");
     recordAgentChatVisit("company-b", "user-a", "other-company-agent");
     recordAgentChatVisit("company-a", "user-b", "other-user-agent");
     await render();
-    expect(state.navigate).toHaveBeenCalledWith("/chats/alice-slug", { replace: true });
+    expect(state.navigate).not.toHaveBeenCalled();
+    expect([...container.querySelectorAll('nav a')].map(a => a.getAttribute("href"))).toEqual(["/chats/alice-slug", "/chats/bob-slug"]);
   });
 
-  it("reopens historical chats for agents missing from the active roster", async () => {
+  it("lists historical chats for agents missing from the active roster", async () => {
     recordAgentChatVisit("company-a", "user-a", "retired-id");
     state.chats = [{ id: "chat-retired", conversationAgentId: "retired-id" }];
     await render();
-    expect(state.navigate).toHaveBeenCalledWith("/chats/retired-id", { replace: true });
+    await vi.waitFor(() => expect(container.querySelector('a[href="/chats/retired-id"]')).not.toBeNull());
+    expect(state.navigate).not.toHaveBeenCalled();
   });
 
-  it("waits for history before skipping a recent historical chat", async () => {
+  it("loads history in the list without redirecting to a recent historical chat", async () => {
     recordAgentChatVisit("company-a", "user-a", "alice");
     recordAgentChatVisit("company-a", "user-a", "retired-id");
     state.chatsFetched = false;
     await render();
     expect(state.navigate).not.toHaveBeenCalled();
+    expect(container.querySelector('[role="status"]')?.textContent).toContain("Loading agents");
     state.chatsFetched = true;
     state.chats = [{ id: "chat-retired", conversationAgentId: "retired-id" }];
     await render();
-    expect(state.navigate).toHaveBeenCalledWith("/chats/retired-id", { replace: true });
+    await vi.waitFor(() => expect(container.querySelector('a[href="/chats/retired-id"]')).not.toBeNull());
+    expect(state.navigate).not.toHaveBeenCalled();
   });
 
-  it("shows the chooser when no saved chat remains available", async () => {
+  it("lists all agents rather than a six-agent chooser when no saved chat remains", async () => {
+    state.agents = Array.from({ length: 8 }, (_, i) => agent(`agent-${i}`));
     recordAgentChatVisit("company-a", "user-a", "removed");
     await render();
     expect(state.navigate).not.toHaveBeenCalled();
-    expect(container.textContent).toContain("Who would you like to talk to?");
+    expect(container.querySelectorAll('nav a')).toHaveLength(8);
   });
 
-  it("skips a saved conversation that is no longer accessible even when its agent remains available", async () => {
+  it("does not reopen an inaccessible saved conversation even when its agent remains available", async () => {
     recordAgentChatVisit("company-a", "user-a", "alice");
     recordAgentChatVisit("company-a", "user-a", "bob", "deleted-chat");
     state.chats = [{ id: "chat-alice", conversationAgentId: "alice" }];
     await render();
-    expect(state.navigate).toHaveBeenCalledWith("/chats/alice-slug", { replace: true });
+    expect(state.navigate).not.toHaveBeenCalled();
+    expect(container.querySelector('a[href="/chats/alice-slug"]')).not.toBeNull();
   });
 
-  it("reopens an active agent when history fails", async () => {
+  it("shows the list's retry state when history fails instead of reopening an agent", async () => {
     recordAgentChatVisit("company-a", "user-a", "alice", "chat-alice");
     state.chatsFetched = false;
     state.chatsError = new Error("History unavailable");
     await render();
-    expect(state.navigate).toHaveBeenCalledWith("/chats/alice-slug", { replace: true });
+    expect(state.navigate).not.toHaveBeenCalled();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("Try again");
   });
 
-  it("reopens a visited empty chat without waiting for history", async () => {
+  it("loads the list instead of reopening a visited empty chat", async () => {
     recordAgentChatVisit("company-a", "user-a", "alice", null);
     state.chatsFetched = false;
     await render();
-    expect(state.navigate).toHaveBeenCalledWith("/chats/alice-slug", { replace: true });
+    expect(state.navigate).not.toHaveBeenCalled();
+    expect(container.querySelector('[role="status"]')?.textContent).toContain("Loading agents");
   });
 
   it("shows a retry state when identity fails instead of waiting for disabled history", async () => {
@@ -175,6 +195,6 @@ describe("Chat landing", () => {
     await render();
     expect(state.navigate).not.toHaveBeenCalled();
     expect(container.querySelector('[role="alert"]')?.textContent).toMatch(/Couldn[’']t load your chats/);
-    expect(container.querySelector('[role="alert"]')?.textContent).toContain("Retry");
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("Try again");
   });
 });

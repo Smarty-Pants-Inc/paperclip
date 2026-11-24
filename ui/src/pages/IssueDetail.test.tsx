@@ -2085,13 +2085,13 @@ describe("IssueDetail", () => {
     expect(mockNavigate).not.toHaveBeenCalled();
     expect(mockIssuesApi.markRead).not.toHaveBeenCalled();
     const [breadcrumbs] = mockSetBreadcrumbs.mock.calls.at(-1)!;
-    expect(breadcrumbs).toEqual([{ label: "Chat" }]);
+    expect(breadcrumbs).toEqual([{ label: "All chats", href: "/chats" }, { label: agent.name }]);
     const updatedAgent = { ...agent, name: "Updated agent" };
     await act(async () => {
       renderIssueView(<TaskDetailSurface conversation={{ agent: updatedAgent, issue: canonical, ensureIssue: async () => canonical }} />);
     });
     await flushReact();
-    expect(mockSetBreadcrumbs.mock.calls.at(-1)![0]).toEqual([{ label: "Chat" }]);
+    expect(mockSetBreadcrumbs.mock.calls.at(-1)![0]).toEqual([{ label: "All chats", href: "/chats" }, { label: updatedAgent.name }]);
 
   });
 
