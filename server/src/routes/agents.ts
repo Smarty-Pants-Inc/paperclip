@@ -7434,7 +7434,7 @@ export function agentRoutes(
             .where(and(eq(heartbeatRunEvents.runId, runId), inArray(heartbeatRunEvents.eventType,
               ["turn.started", "turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted"])))
             .limit(1);
-          if (started || (await getNativeSessionSteeringState(runId)).activeTurnId) return false;
+          if (current.resultJson?.firstTurnDispatchCommitted || started || (await getNativeSessionSteeringState(runId)).activeTurnId) return false;
           // Fence both runtime promotion and session startup before releasing the run lock.
           await tx.update(heartbeatRuns).set({
             resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
