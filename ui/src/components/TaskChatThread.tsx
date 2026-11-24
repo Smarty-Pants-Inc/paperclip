@@ -1310,6 +1310,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       // A message sent after the run's turn ended can't be a steer (the agent refused it), even
       // while the run is still saving: it is its own request, not a split of the finished reply.
       const runId = comment.authorType === "user" ? runs.find(run =>
+        // A finished native turn anchors only the messages it acknowledged as steers (none recorded = none).
+        (!isTerminalRunStatus(run.status) || !isNativePaperclipRunnerRun(run) ||
+          ((acks) => acks != null && Object.prototype.hasOwnProperty.call(acks, comment.id))(
+            linkedRunMetaById.get(run.id)?.resultJson?.queuedSteeringAcknowledgements)) &&
         toMs(run.createdAt) < anchorMs && (!isTerminalRunStatus(run.status) ||
           anchorMs <= toMs(linkedRunMetaById.get(run.id)?.finishedAt)) &&
         !((terminalAt => terminalAt && toMs(terminalAt) < anchorMs)(transcriptByRun.get(run.id)?.findLast((entry) => entry.kind === "run_terminal")?.ts)))?.id : null;
