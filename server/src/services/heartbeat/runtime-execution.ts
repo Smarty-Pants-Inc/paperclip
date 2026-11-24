@@ -134,7 +134,7 @@ export interface HeartbeatRuntimeExecutionInput {
     issueId: string | null;
     taskKey: string | null;
   };
-  runtime: Pick<Selected, "nativeExecution" | "nativeRunnerInstanceId" | "pluginTaskDescription" | "toolRefreshOnResume" | "getNativeFreshSessionHandoff"> & {
+  runtime: Pick<Selected, "nativeExecution" | "nativeRunnerInstanceId" | "pluginTaskDescription" | "workspaceContinuationSource" | "toolRefreshOnResume" | "getNativeFreshSessionHandoff"> & {
     nativeRuntimeResolution: Selection["nativeRuntimeResolution"];
     adapter: ServerAdapterModule;
     runtimeForAdapter: AdapterExecutionContext["runtime"];
@@ -670,6 +670,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               responsibilitiesEnabled: context.paperclipResponsibilitiesEnabled === true,
               db,
               execution: nativeExecution,
+              workspaceContinuationSource: input.runtime.workspaceContinuationSource,
               observability,
               getFreshSessionHandoff: getNativeFreshSessionHandoff,
               refreshTools: context.refreshTools === true,
