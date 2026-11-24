@@ -1,11 +1,14 @@
 import { normalizePaperclipWakePayload } from "@paperclipai/adapter-utils/server-utils";
 
+export function resolveSessionContinuity(provider: unknown, setting: unknown) {
+  return setting === "continuous" || setting === "paperclip" ? setting : provider === "pi_rpc" ? "continuous" : "paperclip";
+}
+
 export function decideNativeContinuation(input: {
   provider?: unknown; sessionContinuity?: unknown; hasSession: boolean;
   resetRequired?: boolean; wakeReset?: boolean; wakePayload?: unknown; taskChanged?: boolean; previousRunId?: string; agentId?: string;
 }): { continue: boolean; promptOnly: boolean } {
-  const mode = input.sessionContinuity === "continuous" || input.sessionContinuity === "paperclip"
-    ? input.sessionContinuity : input.provider === "pi_rpc" ? "continuous" : "paperclip";
+  const mode = resolveSessionContinuity(input.provider, input.sessionContinuity);
   const retained = input.hasSession && !input.resetRequired && (mode === "continuous" || !input.wakeReset);
   const wake = normalizePaperclipWakePayload(input.wakePayload);
   const raw = input.wakePayload && typeof input.wakePayload === "object" ? input.wakePayload as Record<string, unknown> : {};
