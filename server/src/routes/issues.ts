@@ -106,6 +106,7 @@ import {
   projectWorkspaces,
   projectAccessMembers,
   projects,
+  statusDecisions,
 } from "@paperclipai/db";
 import {
   addIssueCommentSchema,
@@ -3712,12 +3713,26 @@ export function issueRoutes(
   const instanceSettings = instanceSettingsService(db);
   const agentsSvc = agentService(db);
   async function finishedTaskConversationComment(
-    issue: { status: string; companyId: string; assigneeAgentId: string | null; conversationAgentId?: string | null },
+    issue: { id: string; status: string; companyId: string; assigneeAgentId: string | null; conversationAgentId?: string | null; lastStatusDecisionId?: string | null },
     actor: { actorType: string; runId?: string | null },
     resumeRequested: boolean,
   ) {
     if (issue.conversationAgentId || !issue.assigneeAgentId || actor.actorType !== "user" || actor.runId || resumeRequested ||
         !["done", "in_review"].includes(issue.status)) return false;
+    if (issue.status === "in_review") {
+      // In-review can mean unfinished work waiting for the person's answer,
+      // not a finished deliverable. Keep that turn on the execution/tool path.
+      const [decision] = issue.lastStatusDecisionId ? await db.select({ reasonCode: statusDecisions.reasonCode })
+        .from(statusDecisions).where(and(eq(statusDecisions.id, issue.lastStatusDecisionId),
+          eq(statusDecisions.companyId, issue.companyId), eq(statusDecisions.issueId, issue.id))).limit(1) : [];
+      if (["governed_response_waiting", "response_wake_waiting_for_input"].includes(decision?.reasonCode ?? "")) return false;
+      const [inputRequest] = await db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
+        eq(issueThreadInteractions.companyId, issue.companyId), eq(issueThreadInteractions.issueId, issue.id),
+        eq(issueThreadInteractions.status, "pending"), isNull(issueThreadInteractions.dismissedAt),
+        inArray(issueThreadInteractions.kind, ["ask_user_questions", "request_confirmation", "request_checkbox_confirmation", "request_item_verdicts"]),
+      )).limit(1);
+      if (inputRequest) return false;
+    }
     const agent = await agentsSvc.getById(issue.assigneeAgentId);
     return agent?.companyId === issue.companyId && isFinishedTaskConversationComment({
       issueStatus: issue.status, actorType: actor.actorType, actorRunId: actor.runId, resumeRequested, agent,
