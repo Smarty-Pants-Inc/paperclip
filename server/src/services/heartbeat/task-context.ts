@@ -32,7 +32,7 @@ type IssueContext = NonNullable<Awaited<ReturnType<RunPreparation["getIssueExecu
 
 export interface HeartbeatTaskContextInput {
   run: Pick<typeof heartbeatRuns.$inferSelect, "id">;
-  agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "adapterType">;
+  agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "adapterType"> & Partial<Pick<typeof agents.$inferSelect, "adapterConfig">>;
   task: {
     issueRef: Pick<IssueContext,
       "id" | "identifier" | "title" | "status" | "priority" | "workMode" |
@@ -59,6 +59,7 @@ function readNonEmptyString(value: unknown): string | null {
 /** Rebuilds task prompt fields on the run's context; acquires no execution resources. */
 export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskContextInput) {
   const { run, agent } = input;
+  const adapterConfig = parseObject(agent.adapterConfig);
   const { issueRef, issueContext, context, taskSession } = input.task;
   const { trustPreset, experimentalInstanceSettings } = input.policy;
   const { issuesSvc, getPinnedSkillTestContext } = input.services;
@@ -161,6 +162,7 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
     runId: run.id,
     contextSnapshot: context,
     wakeCommentRows,
+    retainFullCommentBodies: agent.adapterType === "paperclip_runner" && (adapterConfig.sessionContinuity === "continuous" || (adapterConfig.sessionContinuity !== "paperclip" && adapterConfig.provider === "pi_rpc")),
     continuationSummary,
     issueSummary: issueRef
       ? {
