@@ -59,14 +59,15 @@ export interface TranscriptTimeSegment {
 
 /**
  * Split one provider run at durable in-turn input timestamps. Each boundary
- * belongs to the segment after it, so a steering acknowledgement can stay in
- * the thread between the work produced before and after the steer. Live and
- * settled renderers share this projector to avoid re-sorting at handoff.
+ * belongs to the segment after it. Boundaries are acknowledged input slots;
+ * reply ownership can name a question's segment. Tool updates keep their call even when
+ * the result arrives after a boundary. Live and settled use the same projector.
  */
 export function splitTranscriptAtAnchors(
   entries: readonly TranscriptEntry[],
   startMs: number,
   rawAnchors: readonly number[],
+  replySegments?: ReadonlyMap<string, number>,
 ): TranscriptTimeSegment[] {
   const anchors = [...new Set(rawAnchors.filter(Number.isFinite))].sort(
     (a, b) => a - b,
@@ -80,19 +81,29 @@ export function splitTranscriptAtAnchors(
       },
     ];
   }
-  return [startMs, ...anchors].map((segmentStartMs, index) => {
-    const segmentEndMs = anchors[index] ?? Number.POSITIVE_INFINITY;
-    return {
-      startMs: segmentStartMs,
-      endMs: segmentEndMs,
-      entries: entries.filter((entry) => {
-        const parsed = Date.parse(entry.ts);
-        const entryMs = Number.isFinite(parsed) ? parsed : 0;
-        const afterStart = index === 0 || entryMs >= segmentStartMs;
-        return afterStart && entryMs < segmentEndMs;
-      }),
-    };
-  });
+  const segments: TranscriptTimeSegment[] = [startMs, ...anchors].map((segmentStartMs, index) => ({
+    startMs: segmentStartMs,
+    endMs: anchors[index] ?? Number.POSITIVE_INFINITY,
+    entries: [],
+  }));
+  const toolSegments = new Map<string, number>();
+  const authoredSegments = new Map<string, number>();
+  for (const entry of entries) {
+    const parsed = Date.parse(entry.ts);
+    const entryMs = Number.isFinite(parsed) ? parsed : 0;
+    let index = anchors.findIndex(anchor => entryMs < anchor);
+    if (index < 0) index = anchors.length;
+    if ((entry.kind === "assistant" || entry.kind === "thinking") && entry.itemId) {
+      index = Math.min(anchors.length, replySegments?.get(entry.itemId) ?? authoredSegments.get(entry.itemId) ?? index);
+      authoredSegments.set(entry.itemId, index);
+    }
+    if ((entry.kind === "tool_call" || entry.kind === "tool_result" || entry.kind === "diff") && entry.toolUseId) {
+      index = toolSegments.get(entry.toolUseId) ?? index;
+      toolSegments.set(entry.toolUseId, index);
+    }
+    segments[index]!.entries.push(entry);
+  }
+  return segments;
 }
 
 /**
@@ -820,7 +831,7 @@ export function transcriptToTaskChatItems(
           // waiting for one leaves every earlier brain blue and shimmering.
           finishThinking();
           items.push({
-            id: `${runId}:think:${i}`,
+            id: `${runId}:think:${entry.itemId ?? i}`,
             kind: "thinking",
             lines: entry.text ? entry.text.split("\n") : [],
             streaming: running && entry.lifecycle !== "completed",
@@ -863,9 +874,9 @@ export function transcriptToTaskChatItems(
           }
         } else {
           finishThinking();
-          const atMs = Date.parse(entry.ts);
+          const atMs = Date.parse(entry.completedAt ?? entry.ts);
           items.push({
-            id: `${runId}:msg:${i}`,
+            id: `${runId}:msg:${entry.itemId ?? i}`,
             kind: "message",
             author: "agent",
             authorName: agentName,
