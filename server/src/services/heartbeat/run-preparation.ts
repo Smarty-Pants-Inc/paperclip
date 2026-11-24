@@ -2285,6 +2285,7 @@ export async function buildPaperclipWakePayload(input: {
   runId?: string | null;
   contextSnapshot: Record<string, unknown>;
   wakeCommentRows?: Awaited<ReturnType<typeof readHeartbeatWakeComments>>;
+  retainFullCommentBodies?: boolean;
   continuationSummary?: {
     key: string;
     title: string | null;
@@ -2384,7 +2385,7 @@ export async function buildPaperclipWakePayload(input: {
       missingCommentCount += 1;
       continue;
     }
-    if (comments.length >= MAX_INLINE_WAKE_COMMENTS) {
+    if (comments.length >= MAX_INLINE_WAKE_COMMENTS && !input.retainFullCommentBodies) {
       truncated = true;
       break;
     }
@@ -2395,11 +2396,11 @@ export async function buildPaperclipWakePayload(input: {
         ? row
         : sanitizeQuarantinedCommentForHigherTrust(row);
     const fullBody = deletedAt ? "" : row.origin === "fast_response" ? `[Paperclip acknowledgement; not agent work] ${safeRow.body}` : safeRow.body;
-    const allowedBodyChars = Math.min(
+    const allowedBodyChars = Math.max(0, Math.min(
       MAX_INLINE_WAKE_COMMENT_BODY_CHARS,
       remainingBodyChars,
-    );
-    if (allowedBodyChars <= 0) {
+    ));
+    if (allowedBodyChars <= 0 && !input.retainFullCommentBodies) {
       truncated = true;
       break;
     }
@@ -2420,6 +2421,7 @@ export async function buildPaperclipWakePayload(input: {
         (row.authorAgentId ? "agent" : row.authorUserId ? "user" : "system"),
       body,
       bodyTruncated,
+      ...(input.retainFullCommentBodies && !deletedAt ? { fullBody } : {}),
       presentation: deletedAt ? null : (safeRow.presentation ?? null),
       metadata: deletedAt ? null : (safeRow.metadata ?? null),
       deletedAt: deletedAt ? deletedAt.toISOString() : null,
