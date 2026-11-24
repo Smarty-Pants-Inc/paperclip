@@ -912,6 +912,29 @@ describe("Codex app-server Codex driver", () => {
         ?.payload,
     ).toMatchObject({ reportedWorkDisposition: "blocked" });
   });
+  it.each([
+    { conversationReply: true, turnIntent: undefined },
+    { conversationReply: false, turnIntent: "conversation_reply" as const },
+  ])("omits terminal tools on fresh and resumed conversation catalogs (%j)", async intent => {
+    const first = new FakeCodexTransport();
+    const second = new FakeCodexTransport();
+    const read = { name: "read_task_document", inputSchema: { type: "object" } };
+    const driver = makeDriver([first, second], {
+      conversationMode: "prepared", ...intent,
+      dynamicTools: [read, { name: "paperclip_finish" }, { name: "paperclip_block" }],
+    });
+    const original = await driver.openSession({
+      runId: "run-conversation-catalog", normalizedSessionId: "conversation-catalog", workingDirectory: WORKSPACE,
+    });
+    const snapshot = await original.snapshot();
+    await original.close({ reason: "test transport lost" });
+    expect(first.calls.find(call => call.method === "thread/start")?.params.dynamicTools).toEqual([read]);
+    const recovery = await driver.recoverSession(snapshot);
+    expect(recovery.recovered).toBe(true);
+    expect(second.calls.find(call => call.method === "thread/resume")?.params.dynamicTools).toEqual([read]);
+    if (recovery.recovered) await recovery.session.close({ reason: "test complete" });
+  });
+
   it("exposes and dispatches only explicit chat tools across fresh and resumed direct chat", async () => {
     const first = new FakeCodexTransport();
     const second = new FakeCodexTransport();

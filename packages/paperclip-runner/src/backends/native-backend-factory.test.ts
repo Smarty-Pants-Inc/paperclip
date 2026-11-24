@@ -909,9 +909,10 @@ describe("native backend factory", () => {
     ).toThrow("Codex native backend requires provider kind codex");
   });
 
-  it.each(["v5", "v7", "v9", "pi-task", "pi-reply"] as const)("selects prepared transport for %s native input and retains prepared constraints", async version => {
-    const pi = version === "pi-task" || version === "pi-reply";
-    const base = execution(pi ? { kind: "pi_rpc", model: "provider/model" } : undefined);
+  it.each(["v5", "v7", "v9", "pi-task", "pi-reply", "pi-chat"] as const)("selects prepared transport for %s native input and retains prepared constraints", async version => {
+    const pi = version === "pi-task" || version === "pi-reply" || version === "pi-chat";
+    const conversation = version === "pi-reply" || version === "pi-chat";
+    const base = execution(pi ? { kind: "pi_rpc", model: "provider/model", ...(version === "pi-chat" ? { conversationMode: true } : {}) } : undefined);
     if (pi) base.session.driverKind = "pi_rpc";
     if (version === "pi-reply") base.turnIntent = "conversation_reply";
     const input = preparedExecution(base, pi ? "v5" : version);
@@ -936,12 +937,16 @@ describe("native backend factory", () => {
 
     expect(
       transport.calls.find((call) => call.method === "thread/start")?.params,
-    ).toMatchObject({ conversationMode: "prepared" });
+    ).toMatchObject({ conversationMode: version === "pi-chat" ? "conversation" : "prepared" });
+    const catalog = transport.calls.find((call) => call.method === "thread/start")?.params.dynamicTools as Array<{ name: string }>;
+    for (const name of ["paperclip_finish", "paperclip_block"]) {
+      expect(catalog.some(tool => tool.name === name)).toBe(!conversation);
+    }
     expect(currentInstructions).toContain("Keep assigned instructions.");
     expect(currentInstructions).toBe(transport.calls.find((call) => call.method === "thread/start")?.params[pi ? "baseInstructions" : "developerInstructions"]);
     expect(backend.preparedTaskConstraints).toEqual(
       expect.arrayContaining([
-        version === "pi-reply" ? PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION : expect.stringContaining("Obtain one accepted result"),
+        conversation ? PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION : expect.stringContaining("Obtain one accepted result"),
       ]),
     );
   });
