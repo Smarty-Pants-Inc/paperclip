@@ -80,14 +80,14 @@ describe("TaskChatRunnerTurn", () => {
         recoveryOwner: null, nextAction: null, permittedActions: ["inspect_run"],
         predecessorRunId: null, successorRunId: null,
       } : undefined);
-      expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent).toContain("Working");
+      expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent).toContain(projected ? "Queued" : "Working");
       if (!runId) {
-        expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent).toBe("Working");
+        expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent).toBe(projected ? "Queued" : "Working");
       }
       const activity = container.querySelector('[data-testid="task-chat-current-activity-label"]');
       expect(activity?.textContent).toBe("Thinking");
       expect(activity?.classList.contains("shimmer-text")).toBe(true);
-      expect(container.textContent).not.toContain("Queued");
+      expect(container.textContent?.includes("Queued")).toBe(projected);
     },
   );
 
