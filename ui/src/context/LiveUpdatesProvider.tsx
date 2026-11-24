@@ -63,7 +63,6 @@ import { queryKeys } from "../lib/queryKeys";
 import { extractCompanyPrefixFromPath, toCompanyRelativePath } from "../lib/company-routes";
 import { useLocation } from "../lib/router";
 import { agentRouteRef } from "../lib/utils";
-import { markdownToPlainText } from "../lib/markdown-plain-text";
 import { buildSameOriginWebSocketUrl } from "../lib/websocket-url";
 import { tryCreateWebSocket } from "../lib/websocket";
 
@@ -1249,12 +1248,10 @@ function buildActivityToast(
   }
 
   const commentId = readString(details?.commentId);
-  const snippet = markdownToPlainText(readString(details?.bodySnippet) ?? "");
-  const summary = changeDesc ? `${actor} ${changeDesc}` : actor;
   return {
     actor: toastActor,
     title,
-    body: truncate(snippet ? `${summary}: ${snippet}` : changeDesc ? summary : `${actor} added a comment`, 240),
+    body: actor,
     tone: "info",
     action: actionLink,
     dedupeKey: `activity:${action}:${entityId}:${commentId ?? "na"}`,
