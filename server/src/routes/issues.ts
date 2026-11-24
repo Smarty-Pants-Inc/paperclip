@@ -2830,7 +2830,7 @@ async function queueResolvedInteractionContinuationWakeup(input: {
         ...(reviewPathContext ?? {}),
         wakeReason: "issue_commented",
         source: input.source,
-        ...(forceFreshSession ? { forceFreshSession: true, explicitFreshSession: true } : {}),
+        ...(forceFreshSession ? { forceFreshSession: true } : {}),
         ...(workspaceRefreshReason ? { workspaceRefreshReason } : {}),
       },
     })
