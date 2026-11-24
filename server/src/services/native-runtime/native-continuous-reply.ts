@@ -163,7 +163,7 @@ export async function publishContinuousNativeReply(input: {
     const tx = transaction as unknown as Db;
     const [issue] = await tx.select().from(issues).where(and(
       eq(issues.id, issueId), eq(issues.companyId, companyId),
-    )).for("update");
+    )).for("no key update");
     const [row] = await tx.select({ run: heartbeatRuns, config: agents.adapterConfig }).from(heartbeatRuns)
       .innerJoin(agents, and(eq(agents.id, heartbeatRuns.agentId), eq(agents.companyId, companyId)))
       .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId),
