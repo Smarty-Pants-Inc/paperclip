@@ -2,7 +2,7 @@ import { resolveSessionContinuity } from "../native-runtime/continued-session.js
 import { recoverTerminalNativeVisibleReply } from "../native-runtime/native-continuous-reply.js";
 import { preserveAcceptedRunUsageProjectionSql } from "../usage-receipts.js";
 import { isContextCompactionRun } from "../context-compaction.js";
-import { providerFailureFromError } from "../../vendor/paperclip-runner/index.js";
+import { NativeProviderStateIncompatibleError, providerFailureFromError } from "../../vendor/paperclip-runner/index.js";
 import { GENERIC_RUN_FAILURE_CODES, NATIVE_PRE_DISPATCH_FAILURE_CODE, NATIVE_PRE_DISPATCH_FAILURE_KEY, NATIVE_PRE_DISPATCH_FAILURE_RECORD, failureCauseFromAdapterResult, failureCauseFromError,
   isNativePreDispatchTransientFailure } from "./run-failure-cause.js";
 import { INTERRUPTED_PREPARATION_RETRY_REASON } from "../execution-recovery-attempt.js";
@@ -190,6 +190,7 @@ export interface FailHeartbeatRunSetupInput {
 }
 
 function nonRetryablePreflightFailureCode(error: unknown): string | null {
+  if (error instanceof NativeProviderStateIncompatibleError) return error.code;
   if (error instanceof ProjectAccessDeniedError) return PROJECT_ACCESS_DENIED;
   if (error instanceof ChatControlRecoveryUnresolvedError)
     return CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE;

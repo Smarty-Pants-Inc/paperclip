@@ -169,6 +169,7 @@ export type HeartbeatRuntimeSelectionResult = { selected: false } | {
   nativeExecution: NativeExecutionInput | null;
   nativeRunnerInstanceId: string | null;
   pluginTaskDescription?: PluginTaskDescription;
+  workspaceContinuationSource?: NativeExecutionInput;
   toolRefreshOnResume?: boolean;
   getNativeFreshSessionHandoff: (() => Promise<string | null>) | undefined;
   nativeWorkspaceSync: Awaited<ReturnType<typeof prepareNativeWorkspaceSync>>;
@@ -340,6 +341,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
     authorityCwd: sshAuthority?.location?.remoteCwd ?? null,
   });
   let nativeExecution: NativeExecutionInput | null = null;
+  let workspaceContinuationSource: NativeExecutionInput | undefined;
   let toolRefreshOnResume: boolean | undefined;
   let getNativeFreshSessionHandoff: (() => Promise<string | null>) | undefined;
   let nativeRunnerInstanceId: string | null = null;
@@ -644,6 +646,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         nativeResumeCheckpoint = rebindNativeSessionCheckpoint({
           previousRun: previousNativeRun,
           currentExecution: nativeExecution,
+          sessionContinuity: parseObject(agent.adapterConfig).sessionContinuity,
           executionTargetKind: executionTarget?.kind ?? "local",
         });
       }
@@ -956,6 +959,15 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
       }
       nativeSessionId = nativeExecutionWithCheckpoint.normalizedSessionId;
     }
+    if (nativeResumeCheckpoint && previousNativeRun && nativeExecution.provider.kind === "pi_rpc" &&
+      resolveSessionContinuity("pi_rpc", parseObject(agent.adapterConfig).sessionContinuity) === "continuous" &&
+      (executionTarget?.kind ?? "local") === "local") {
+      const previous = parseNativeExecutionInput(parseObject(previousNativeRun.runnerProfileJson).nativeExecutionInput);
+      if (JSON.stringify(previous.workspace) !== JSON.stringify(nativeExecution.workspace) ||
+        (previous.binding.executionWorkspaceId !== nativeExecution.binding.executionWorkspaceId &&
+          (previous.binding.executionWorkspaceId !== previous.binding.runId || nativeExecution.binding.executionWorkspaceId !== nativeExecution.binding.runId)))
+        workspaceContinuationSource = previous;
+    }
     if (nativeResumeCheckpoint && antigravityForcesSameSessionRecovery(nativeExecution.provider)) {
       nativeResumeCheckpoint = { ...nativeResumeCheckpoint, providerRecoveryPolicy: "same_session_only" };
     }
@@ -1216,5 +1228,5 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
       })
       .where(eq(heartbeatRuns.id, run.id)));
   }
-  return { selected: true, nativeExecution, nativeRunnerInstanceId, pluginTaskDescription, toolRefreshOnResume, getNativeFreshSessionHandoff, nativeWorkspaceSync };
+  return { selected: true, nativeExecution, nativeRunnerInstanceId, pluginTaskDescription, workspaceContinuationSource, toolRefreshOnResume, getNativeFreshSessionHandoff, nativeWorkspaceSync };
 }
