@@ -52,6 +52,9 @@ import { parseHeartbeatPolicy } from "./heartbeat/timer-policy.js";
 import { RECOVERY_CONTINUATIONS_PER_COMPANY_PER_PASS, RECOVERY_CONTINUATION_BACKLOG_SHARE_PER_PASS, RECOVERY_CONTINUATION_MAX_HOLD_MS,
   recoveryContinuationHeldSince } from "./recovery-continuation-pacing.js";
 import { emitSystemTaskBlockedAfterCommit } from "./product-telemetry.js";
+import { parseObject } from "../adapters/utils.js";
+import { queuedCommentIdsFromRunContext, withQueuedCommentIdsInRunContext, withQueuedCommentIdsInWakePayload } from "../lib/queued-comment-context.js";
+import { readFirstTurnQueuedInputReceipt } from "./native-runtime/first-turn-queued-input.js";
 
 export { RECOVERY_CONTINUATIONS_PER_COMPANY_PER_PASS, RECOVERY_CONTINUATION_DELIVERY_BOUND_MS,
   RECOVERY_CONTINUATION_MAX_HOLD_MS } from "./recovery-continuation-pacing.js";
@@ -553,6 +556,28 @@ export async function deliverReconciledExecutions(
           seenAgents.add(action.returnOwnerAgentId);
           continue;
         }
+        // A retry owns the predecessor's unanswered input, not its sealed receipt.
+        const [retried] = await db.select().from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.companyId, action.companyId), eq(heartbeatRuns.id, decision.runId),
+          eq(heartbeatRuns.agentId, action.returnOwnerAgentId),
+          sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.issueId}::text,
+            ${heartbeatRuns.contextSnapshot}->>'issueId') = ${task.id}`,
+          task.conversationAgentId ? sql`${heartbeatRuns.contextSnapshot}->>'conversationSessionGeneration'
+            = ${String(task.conversationSessionGeneration)}` : undefined,
+        ));
+        const result = parseObject(retried?.resultJson);
+        const answered = new Set(Object.values(parseObject(result.continuousReplies)).flatMap(reply => {
+          const ids = parseObject(reply).questionCommentIds;
+          return Array.isArray(ids) ? ids : [];
+        }));
+        const returned = parseObject(result.personStop).returned;
+        const settled = new Set([...answered, ...(Array.isArray(returned) ? returned : [])]);
+        const wakeId = retried?.contextSnapshot?.wakeCommentId;
+        const inputIds = [...new Set([
+          ...queuedCommentIdsFromRunContext(retried?.contextSnapshot),
+          ...(typeof wakeId === "string" ? [wakeId] : []),
+          ...(retried ? readFirstTurnQueuedInputReceipt(retried)?.commentIds ?? [] : []),
+        ])].filter(id => !settled.has(id));
         const slot = await reserveAutomaticRunCreation(db, action.companyId, { issueId: task.id, sourceRunId: decision.runId });
         if (slot.heldUntil) { await deferRefusedContinuation(action); continue; }
         const run = await wake(action.returnOwnerAgentId, {
@@ -560,10 +585,10 @@ export async function deliverReconciledExecutions(
           triggerDetail: "system",
           reason: "issue_recovery_action_restored",
           idempotencyKey: `execution-reconciliation:${action.id}`,
-          payload: { issueId: task.id, recoveryActionId: action.id },
+          payload: withQueuedCommentIdsInWakePayload({ issueId: task.id, recoveryActionId: action.id }, inputIds),
           requestedByActorType: "system",
           requestedByActorId: "execution-recovery",
-          contextSnapshot: {
+          contextSnapshot: withQueuedCommentIdsInRunContext({
             issueId: task.id,
             taskId: task.id,
             recoveryActionId: action.id,
@@ -574,7 +599,7 @@ export async function deliverReconciledExecutions(
             source: "execution.reconciled",
             ...((action.evidence.freshContinuation as { isolation?: unknown } | undefined)?.isolation === "fresh_isolated_workspace"
               ? { freshContinuationIsolation: action.id } : {}),
-          },
+          }, inputIds),
         }).catch(async error => { await slot.release(); throw error; });
         seenAgents.add(action.returnOwnerAgentId);
         if (!run) {
