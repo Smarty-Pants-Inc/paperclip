@@ -53,6 +53,8 @@ import { hasAcknowledgedNativeReassignmentStopIntent } from "../acknowledged-nat
 import { questionResponseDeliveryService } from "../question-response-delivery.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { heartbeatService } from "../heartbeat.js";
+import { loadNativeVisibleReply } from "../native-runtime/native-visible-reply.js";
+import { issueService } from "../issues.js";
 
 vi.mock("../live-events.js", () => ({ publishLiveEvent: vi.fn() }));
 
@@ -193,6 +195,30 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     return { run, agent, wake, deps, controller, input, completion, failure, setup };
   }
   const read = (id: string) => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)).then(rows => rows[0]!);
+
+  it.each(["completion", "failure", "late-completion", "late-failure"])("retains partial native prose at the %s terminal door", async mode => {
+    const f = await fixture({ runtimeMode: "native" });
+    const [issue] = await db.insert(issues).values({ companyId: f.run.companyId, title: "Retain the reply",
+      assigneeAgentId: f.agent.id, status: "in_progress" }).returning();
+    const [run] = await db.update(heartbeatRuns).set({ nativeIssueId: issue.id, nativeSessionId: randomUUID(), nextEventSeq: 3,
+      ...(mode.startsWith("late-") ? { status: "cancelled", finishedAt: new Date() } : {}) })
+      .where(eq(heartbeatRuns.id, f.run.id)).returning();
+    await db.insert(heartbeatRunEvents).values(["Before tool.", "Partial answer"].map((text, index) => ({
+      companyId: run.companyId, runId: run.id, agentId: run.agentId, seq: index + 1,
+      eventType: index ? "item.delta" : "item.completed", payload: { prpEvent: { runId: run.id,
+        normalizedSessionId: run.nativeSessionId, turnId: "partial-turn", itemId: `message-${index}`, sourceEventId: `message-${index}`,
+        payload: { kind: "agentMessage", channel: "progress", text } } },
+    })));
+    f.deps.findLatestCompletedFinalAgentMessage.mockImplementation((runId, companyId) =>
+      loadNativeVisibleReply(db, { companyId, runId, normalizedSessionId: run.nativeSessionId }));
+    f.deps.issuesSvc.addComment.mockImplementation(issueService(db).addComment);
+    const input = { ...f.input, run, issueId: issue.id, issueRef: issue };
+    if (mode.endsWith("completion")) await f.completion.completeRun({ ...input,
+      adapterResult: { ...input.adapterResult, exitCode: 1, errorMessage: "Interrupted" } });
+    else await f.completion.failRun({ ...f.failure(new Error("Interrupted")), run, issueId: issue.id, issueRef: issue });
+    expect((await db.select().from(issueComments).where(eq(issueComments.createdByRunId, run.id))).map(c => c.body))
+      .toEqual(["Before tool.\n\nPartial answer"]);
+  });
 
   it("replays saved user intent through normal Retry after a first-attempt retained runner failure", async () => {
     for (const mode of ["unattached", "archive_failed", "provider_started", "system_wake", "stopped", "stopped_failed", "promoted"] as const) {

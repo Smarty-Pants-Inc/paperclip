@@ -1,4 +1,5 @@
-import { recoverContinuousNativeReplies } from "./native-continuous-reply.js";
+import { recoverContinuousNativeReplies, recoverTerminalNativeVisibleReply } from "./native-continuous-reply.js";
+import { loadNativeVisibleReply } from "./native-visible-reply.js";
 import { notifyNativeEnvironmentSettlement } from "../native-environment-settlement-notifications.js";
 import { isContextCompactionRun } from "../context-compaction.js";
 import { REMOTE_WORKSPACE_SANDBOX_DISK_FULL_CODE } from "../remote-workspace-transport.js";
@@ -108,10 +109,7 @@ import {
   findHeartbeatRunCompletionComment,
   isExternalChatPresentationContext,
   readAcceptedTaskContinuationSummary,
-  completedPlanProposalIds,
-  readCompletedAssistantMessageCandidate,
   resolveHeartbeatRunResponse,
-  selectHeartbeatRunFinalAgentMessage,
 } from "../heartbeat-run-summary.js";
 import { resolveChatRunPresentationAuthorizationReason } from "../chat-run-publications.js";
 import { settledResponsePublicationSql } from "./native-response-publication-receipt.js";
@@ -1025,6 +1023,7 @@ async function recoverCommittedNativeChatResponseInScope(
   input: { companyId: string; issueId: string; runId: string; onlyWhenDue?: boolean },
 ): Promise<boolean> {
   await recoverContinuousNativeReplies(db, { id: input.runId, companyId: input.companyId });
+  if (await recoverTerminalNativeVisibleReply(db, input)) return true;
   let agentId: string | null = null;
   let materialized = false;
   let conversationReply = false;
@@ -1227,32 +1226,8 @@ async function recoverCommittedNativeChatResponseInScope(
       const externalChatReply = blockedTaskReply &&
         isExternalChatPresentationContext(run.contextSnapshot, replyAuthorization === CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON);
       if (taskReplyEligible && replyAuthorization && (blockedTaskReply || replyAuthorization === "internal_agent_write")) {
-        const rows = await tx.select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload })
-          .from(heartbeatRunEvents).where(and(
-            eq(heartbeatRunEvents.companyId, input.companyId),
-            eq(heartbeatRunEvents.runId, run.id),
-            eq(heartbeatRunEvents.eventType, "item.completed"),
-            conversation ? and(eq(heartbeatRunEvents.agentId, run.agentId),
-              sql`${heartbeatRunEvents.payload}->'prpEvent'->>'runId' = ${run.id}`,
-              sql`${heartbeatRunEvents.payload}->'prpEvent'->>'normalizedSessionId' = ${run.nativeSessionId}`) : undefined,
-            sql`${heartbeatRunEvents.payload}->'prpEvent'->>'turnId' = ${accepted.turnId}`,
-            sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,kind}' = 'agentMessage'`,
-            currentConversation
-              ? inArray(sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,channel}'`, ["final", "unknown"])
-              : sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,channel}' = 'final'`,
-          )).orderBy(desc(heartbeatRunEvents.seq)).limit(200);
-        const proposedItemIds = completedPlanProposalIds(await tx.select({ payload: heartbeatRunEvents.payload })
-          .from(heartbeatRunEvents).where(and(
-            eq(heartbeatRunEvents.companyId, input.companyId),
-            eq(heartbeatRunEvents.runId, run.id),
-            eq(heartbeatRunEvents.eventType, "plan.proposed"),
-          )).limit(200));
-        const finalAgentMessage = selectHeartbeatRunFinalAgentMessage({
-          candidates: rows.flatMap((row) => {
-            const candidate = readCompletedAssistantMessageCandidate({ seq: row.seq, prpEvent: record(row.payload).prpEvent, proposedItemIds });
-            return candidate ? [candidate] : [];
-          }),
-        });
+        const finalAgentMessage = await loadNativeVisibleReply(tx, { companyId: input.companyId, runId: run.id, agentId: run.agentId,
+          normalizedSessionId: run.nativeSessionId, turnId: accepted.turnId });
         if (!finalAgentMessage && !blockedTaskReply) return false;
         const comments = await tx.select({ id: issueComments.id, body: issueComments.body, presentation: issueComments.presentation, clientRequestId: issueComments.clientRequestId })
           .from(issueComments).where(and(
@@ -1300,7 +1275,8 @@ async function recoverCommittedNativeChatResponseInScope(
         await notifyChatRunMilestones(tx, input);
         const comment = await issueService(db).addComment(input.issueId, resolved.text,
           { agentId: run.agentId, runId: run.id },
-          { authorizationReason: replyAuthorization, completionReply: true }, tx);
+          { authorizationReason: replyAuthorization, completionReply: true,
+            ...(finalAgentMessage?.replyKey ? { clientRequestId: finalAgentMessage.replyKey } : {}) }, tx);
         await tx.update(heartbeatRuns).set({
           resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
             presentationDecision: { ...resolved.decision, commentId: comment.id,
