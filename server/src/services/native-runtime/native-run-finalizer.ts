@@ -1,3 +1,4 @@
+import { recoverContinuousNativeReplies } from "./native-continuous-reply.js";
 import { notifyNativeEnvironmentSettlement } from "../native-environment-settlement-notifications.js";
 import { isContextCompactionRun } from "../context-compaction.js";
 import { REMOTE_WORKSPACE_SANDBOX_DISK_FULL_CODE } from "../remote-workspace-transport.js";
@@ -1025,6 +1026,7 @@ async function recoverCommittedNativeChatResponseInScope(
   db: Db,
   input: { companyId: string; issueId: string; runId: string; onlyWhenDue?: boolean },
 ): Promise<boolean> {
+  await recoverContinuousNativeReplies(db, { id: input.runId, companyId: input.companyId });
   let agentId: string | null = null;
   let materialized = false;
   let conversationReply = false;
@@ -1254,7 +1256,7 @@ async function recoverCommittedNativeChatResponseInScope(
           }),
         });
         if (!finalAgentMessage && !blockedTaskReply) return false;
-        const comments = await tx.select({ id: issueComments.id, body: issueComments.body, presentation: issueComments.presentation })
+        const comments = await tx.select({ id: issueComments.id, body: issueComments.body, presentation: issueComments.presentation, clientRequestId: issueComments.clientRequestId })
           .from(issueComments).where(and(
             eq(issueComments.companyId, input.companyId),
             eq(issueComments.issueId, input.issueId),
@@ -1268,7 +1270,7 @@ async function recoverCommittedNativeChatResponseInScope(
             db: tx, ...input, finalizationPhase: coordinator.phase, finalizationReasonCode: decision.reasonCode,
           }),
           interactionOwnsResponse: conversation && await hasChatRunOwnedProviderInteraction(tx, input),
-          existingComment: findHeartbeatRunCompletionComment(comments, run.resultJson),
+          existingComment: findHeartbeatRunCompletionComment(comments, run.resultJson, finalAgentMessage?.replyKey),
           finalAgentMessage,
           preferFinalResponseOverExistingComment: externalChatReply,
         });
@@ -1470,6 +1472,7 @@ export async function finalizeNativeRun(input: {
     .then((rows) => rows[0] ?? null);
   if (!admittedRun || admittedRun.runtimeMode !== "native")
     throw new Error("native_finalization_run_missing");
+  await recoverContinuousNativeReplies(input.db, admittedRun);
   const claim = await claimCoordinator({
     db: input.db,
     runId: input.runId,
