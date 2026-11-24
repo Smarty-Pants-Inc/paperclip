@@ -525,7 +525,8 @@ export function shouldRenderComposerHandoffPreview(
 
 export interface IssueChatComposerHandle {
   focus: () => void;
-  restoreDraft: (submittedBody: string) => void;
+  /** false when the text could not be kept in the draft store (the caller must not delete its source). */
+  restoreDraft: (submittedBody: string) => boolean | void;
 }
 
 interface IssueChatComposerProps {
