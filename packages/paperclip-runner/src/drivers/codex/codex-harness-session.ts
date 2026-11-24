@@ -119,7 +119,7 @@ export class CodexHarnessSession
     return this.transport.beginRunAttachment?.(input) ?? false;
   }
 
-  async attachRun(input: { runId: string; currentRunGrant?: NativeRunRuntimeGrant; completionContract?: { revision: string; criterionIds: readonly string[] } }): Promise<void> {
+  async attachRun(input: { runId: string; dynamicTools?: readonly Readonly<Record<string, unknown>>[]; currentRunGrant?: NativeRunRuntimeGrant; completionContract?: { revision: string; criterionIds: readonly string[] } }): Promise<void> {
     this.assertProtocolIntegrity();
     const transportOwnsQuiescence = this.transport.attachRun !== undefined;
     if (
@@ -137,6 +137,7 @@ export class CodexHarnessSession
         runId: input.runId,
         turnId: `turn_attachment_${randomUUID().replaceAll("-", "")}`,
         itemId: `item_attachment_${randomUUID().replaceAll("-", "")}`,
+        ...(input.dynamicTools !== undefined ? { dynamicTools: structuredClone(input.dynamicTools) } : {}),
         ...(input.currentRunGrant ? { currentRunGrant: structuredClone(input.currentRunGrant) } : {}),
         ...(input.completionContract ? { completionContract: structuredClone(input.completionContract) } : {}),
       });
