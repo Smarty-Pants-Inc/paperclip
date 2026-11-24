@@ -14,6 +14,7 @@ import { INBOX_MINE_ISSUE_STATUS_FILTER, latestFailedRunsByAgent } from "@paperc
 import { getHeartbeatRunReadDecisions, redactHeartbeatRunListRow } from "../services/heartbeat-run-privacy.js";
 import { taskInterruptionPresentation, taskInterruptionPresentations, taskRetryRefusal } from "../services/task-interruption-presentation.js";
 import { parseObject } from "../adapters/utils.js";
+import { resolveSessionContinuity } from "../services/native-runtime/continued-session.js";
 import { prepareRestrictedWorkspaceRetry } from "../services/restricted-workspace-retry.js";
 import { ISSUE_SUMMARIES_MAX_IDS, issueChatBootstrapQuerySchema, issueSummariesQuerySchema, type IssueSummary } from "@paperclipai/shared";
 import { readIssueChatBootstrapItems } from "../services/issue-chat-bootstrap.js";
@@ -17689,19 +17690,23 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!issue) return;
-      if (issue.conversationAgentId && process.env.PAPERCLIP_AGENT_CHAT_STEERING !== "true") throw conflict("Conversation messages are processed in order at turn boundaries");
       const decision = await decideIssueAccess(req, issue, "issue:comment");
       if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
-      // Seam 0251: a run a person is stopping takes no new steer (the 0233 mark is set before its interrupt).
-      // The message stays queued and its own wake answers it after the Stop.
-      const [stopping] = await db.select({ result: heartbeatRuns.resultJson }).from(heartbeatRuns).where(eq(heartbeatRuns.id, req.body.targetRunId)).limit(1);
-      if ((stopping?.result as { personStop?: unknown } | null)?.personStop) throw conflict("This run is being stopped; the message is answered after it stops");
       if (issue.conversationAgentId) {
         const [comment] = await db.select({ body: issueComments.body }).from(issueComments).where(and(
           eq(issueComments.id, commentId), eq(issueComments.issueId, issue.id), eq(issueComments.companyId, issue.companyId),
           isNull(issueComments.deletedAt))).limit(1);
         if (comment && isConversationReset(comment.body)) throw conflict("/new needs a new session and cannot be steered into this turn");
       }
+      const [target] = await db.select({ run: heartbeatRuns, config: agents.adapterConfig }).from(heartbeatRuns)
+        .innerJoin(agents, and(eq(agents.id, heartbeatRuns.agentId), eq(agents.companyId, issue.companyId)))
+        .where(and(eq(heartbeatRuns.id, req.body.targetRunId), eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.nativeIssueId, issue.id))).limit(1);
+      const heldPi = target?.run.runtimeMode === "native" &&
+        parseObject(parseObject(target.run.runnerProfileJson?.nativeExecutionInput).provider).kind === "pi_rpc" &&
+        resolveSessionContinuity("pi_rpc", target.config.sessionContinuity) === "continuous";
+      if (issue.conversationAgentId && !heldPi && process.env.PAPERCLIP_AGENT_CHAT_STEERING !== "true") throw conflict("Conversation messages are processed in order at turn boundaries");
+      const stop = parseObject(target?.run.resultJson?.personStop);
+      if (stop.requestedAt && !stop.settledAt && !stop.resumedAt) throw conflict("This turn is being stopped; retry after Stop settles");
       const actor = getActorInfo(req);
       const { queue, turnId, duplicate } = await runQueuedCommentMutation(() =>
         queuedCommentQueue.steerQueuedComment({
