@@ -44,9 +44,10 @@ const blockerAction: Record<string, string> = {
 };
 
 /** One ordinary interruption surface. Technical records remain in diagnostics. */
-export function ExecutionBlockerNotice({ presentation, observedStatus, blocker, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, companyId, agentName, projectName, blockers }: {
+export function ExecutionBlockerNotice({ presentation, observedStatus, observedResultJson, blocker, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, companyId, agentName, projectName, blockers }: {
   presentation: TaskInterruptionPresentation | null | undefined;
   observedStatus?: string;
+  observedResultJson?: Record<string, unknown> | null;
   blocker?: ExecutionBlocker | null;
   companyId?: string;
   blockers?: IssueRelationIssueSummary[];
@@ -60,7 +61,7 @@ export function ExecutionBlockerNotice({ presentation, observedStatus, blocker, 
   agentName?: string;
   projectName?: string;
 }) {
-  const recovery = isConversationRecovery(presentation,
+  const recovery = !observedResultJson?.personStop && isConversationRecovery(presentation,
     observedStatus ?? (blocker?.workspaceRepairRequired ? "failed" : undefined));
   if (presentation?.projectAccess && !optimistic && !takingLonger) return <TaskProjectAccessNotice
     access={presentation.projectAccess} issueId={issueId} agentName={agentName} projectName={projectName}
