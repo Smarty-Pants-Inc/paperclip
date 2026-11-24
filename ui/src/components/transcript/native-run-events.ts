@@ -1121,9 +1121,12 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
     // A completion replaces streamed content at its FIRST visible event, not
     // at its later completion time. Otherwise a final/reasoning item crosses a
     // steering bubble when its deltas disappear, including on a fresh reload.
-    if ((event.eventType === "item.delta" || event.eventType === "item.completed") &&
+    if ((event.eventType === "item.delta" || event.eventType === "item.completed" ||
+      (event.eventType === "item.started" && itemKind === "reasoning")) &&
       (isAssistantItemKind(itemKind) || itemKind === "reasoning")) {
       if (event.eventType === "item.delta" && !itemId) continue;
+      // A completion may replace visible text, not turn an empty start/delta into an earlier row.
+      if (event.eventType !== "item.completed" && !normalizedItemText(payload)) continue;
       const completion = itemId ? (itemKind === "reasoning" ? completedReasoning : completedAgentMessages).get(itemId) : undefined;
       if (completion && itemId && emittedCompletedItems.has(itemId)) continue;
       const raw = normalizedItemText(completion?.payload ?? payload) ?? "";
@@ -1134,7 +1137,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
       const contentIdentity = completion ? resolveItemIdentity(completion.payload, itemIdentity) : itemIdentity;
       entries.push(itemKind === "reasoning" ? {
         kind: "thinking", ts, text: value, ...(delta ? { delta: true } : {}), completedAt: completion?.ts,
-        lifecycle: delta ? "started" : "completed",
+        lifecycle: completion || event.eventType === "item.completed" ? "completed" : "started",
         channel: contentIdentity.reasoningChannel,
         ...(itemId ? { itemId } : {}),
       } : {
