@@ -44,8 +44,36 @@ import {
 } from "./codex-app-server-driver.test-support.js";
 
 import { RUNNERD_RUNTIME_ACTIVITY } from "./codex-driver-values.js";
+import { rehydrateRunnerdItemNotification } from "../../live/runnerd-codex-transport.js";
 
 describe("Codex app-server Codex driver", () => {
+  it.each([undefined, [], ["person-1", "person-2"], Array.from({ length: 129 }, (_, index) => `person-${index}`)].flatMap(answers =>
+    ["provider-item", "canonical"].map(form => ({ form, answers }))))("preserves optional final answers in the runtime payload ($form, $answers)", async ({ form, answers }) => {
+    const transport = new FakeCodexTransport();
+    const session = await makeDriver([transport]).openSession({
+      runId: "answer-mapping", normalizedSessionId: "answer-mapping-session", workingDirectory: WORKSPACE,
+    });
+    try {
+      const turn = await session.startTurn({ message: { role: "user", text: "Answer the person." } });
+      transport.push("turn/started", { threadId: "thread-1", turn: { id: turn.turnId, status: "inProgress" } });
+      const answerFields = answers === undefined ? {} : { answers };
+      transport.push("item/completed", form === "canonical"
+        ? rehydrateRunnerdItemNotification({ itemId: "answer-final", kind: "agentMessage", channel: "final", text: "Answered.", ...answerFields }, "thread-1", turn.turnId)
+        : { threadId: "thread-1", turnId: turn.turnId,
+          item: { id: "answer-final", type: "agentMessage", phase: "final_answer", text: "Answered.", ...answerFields } });
+      transport.push("paperclip/runResult", { threadId: "thread-1", turnId: turn.turnId, result });
+      transport.push("turn/completed", { threadId: "thread-1", turn: { id: turn.turnId, status: "completed", items: [] } });
+      const events = await collectUntilTerminal(session.events());
+      const final = events.find(event => event.eventType === "item.completed" && event.itemId === "answer-final");
+      expect(final?.payload).toMatchObject({ kind: "agentMessage", channel: "final", text: "Answered." });
+      if (answers === undefined) expect(final?.payload).not.toHaveProperty("answers");
+      else expect(final?.payload.answers).toEqual(answers);
+      expect(validatePrpEvent(final).ok).toBe(true);
+    } finally {
+      await session.close({ reason: "fixture complete" });
+    }
+  });
+
   it("binds a semantic result that arrives before its pending turn start settles", async () => {
     // Runnerd can deliver the new turn's semantic result before turn/start's
     // response binds the turn (as after a restart continuation). Like a
