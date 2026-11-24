@@ -175,6 +175,28 @@ async function runReleaseDrain(
       continue;
     }
 
+    // A successor can read an answer with its tools after it started. Settle
+    // that exact response before either the source-comment or owed-answer
+    // branch can reopen the task. Never swallow an independent follow-up that
+    // was coalesced into the receipt: only the answer's source binding is stale.
+    const sourceCommentId = readNonEmptyString(candidate.payload.sourceCommentId);
+    const interactionIds = candidate.payload.interactionIds;
+    if (
+      issue.status === "done" && run.status === "succeeded" &&
+      run.agentId === issue.assigneeAgentId && candidate.agentId === run.agentId &&
+      run.contextSnapshot.issueId === issue.id && !candidate.authorizedFailedChatRetry &&
+      candidate.payload.mutation === "interaction" &&
+      candidate.payload.resumeIntent !== true && candidate.deferredContextSeed.resumeIntent !== true &&
+      (!Array.isArray(interactionIds) || interactionIds.every(id => id === candidate.payload.interactionId)) &&
+      [...candidate.queuedCommentIds, ...candidate.deferredCommentIds].every(id => id === sourceCommentId) &&
+      await ports.transaction.hasConsumedInteractionResponse({ companyId: run.companyId, issueId: issue.id,
+        runId: run.id, agentId: run.agentId, payload: candidate.payload })
+    ) {
+      await ports.transaction.cancelDeferredWake({ companyId: run.companyId, wakeId: candidate.id, agentId: candidate.agentId,
+        reason: "Interaction response consumed by the successful run that completed the task", now: input.now });
+      continue;
+    }
+
     // An earlier reply in this conversation already reported this wake's
     // outcome. Settle it here so a duplicate report never becomes a run.
     if (await ports.transaction.skipAlreadyReportedChatWake({ companyId: run.companyId, issueId: issue.id, wake: candidate, now: input.now })) {
