@@ -7494,6 +7494,14 @@ export function agentRoutes(
         return;
       }
     }
+    // Seam 0254: a Stop on a run still waiting in line returns the messages that woke it (never received), like 0247.
+    if (existing.status === "queued" && req.actor.userId) {
+      const woke = asRecord(existing.contextSnapshot)?.wakeCommentIds, ids = Array.isArray(woke) ? woke.map(String) : [];
+      const mine = ids.length ? (await db.select({ id: issueComments.id }).from(issueComments).where(and(inArray(issueComments.id, ids), eq(issueComments.authorUserId, req.actor.userId),
+        isNull(issueComments.deletedAt), sql`${issueComments.createdAt} <= ${pressedAt}::timestamptz`))).map(row => row.id) : [];
+      if (mine.length) await db.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({ personStop: { requestedAt: pressedAt, userId: req.actor.userId, returned: mine } })}::jsonb` })
+        .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "queued")));
+    }
     await cancelStoppedRun();
     async function cancelStoppedRun() { if (!existing) return;
     // Stamp the cancellation as operator-initiated (this route is board-only).
