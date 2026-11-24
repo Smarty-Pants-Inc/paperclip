@@ -1780,7 +1780,7 @@ export async function commitNativeStatusDecision(input: {
       .limit(1)
       .then((rows) => rows[0] ?? null);
     if (!issue) throw new NativeStatusRaceError();
-    const [originRun] = await tx.select({ agentId: heartbeatRuns.agentId }).from(heartbeatRuns)
+    const [originRun] = await tx.select({ agentId: heartbeatRuns.agentId, startedAt: heartbeatRuns.startedAt }).from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId)));
     if (input.requireReassessmentSource) {
       const expected = input.requireReassessmentSource;
@@ -2246,6 +2246,7 @@ export async function commitNativeStatusDecision(input: {
       companyId: input.companyId, issueId: input.issueId, agentId: originRun?.agentId, reasonCode,
       toStatus: input.decision.toStatus, unblockOwner: input.decision.unblockDescriptor?.owner,
       blockerOwnerKind: input.decision.blockerOwnerKind,
+      runId: input.runId, runStartedAt: originRun?.startedAt,
     });
     const decisionJson = {
       statusAction: input.decision.statusAction,
