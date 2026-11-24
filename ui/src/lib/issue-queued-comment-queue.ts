@@ -130,19 +130,18 @@ export interface PendingIssueQueuedComment {
   targetRunId: string | null;
 }
 
-/**
- * Keeps a just-submitted follow-up in the composer queue while the comment and
- * queue endpoints acknowledge it independently. If the server has not yet
- * included every local entry, queue mutations are withheld by clearing the
- * queue id; local discard remains available through the optimistic comment
- * cancellation path.
- */
+export type DisplayIssueQueuedCommentQueue = IssueQueuedCommentQueue & {
+  /** Later wakes are visible, but never mutate or inherit the head's receipt. */
+  pendingQueue?: IssueQueuedCommentQueue | null;
+};
+
+/** Keep the authoritative head actionable while later wakes await their own receipt. */
 export function mergePendingIssueQueuedComments(params: {
   issueId: string;
   authoritativeQueue: IssueQueuedCommentQueue | null | undefined;
   pendingComments: PendingIssueQueuedComment[];
   fallbackProtocol: IssueQueuedCommentProtocol;
-}): IssueQueuedCommentQueue | null {
+}): DisplayIssueQueuedCommentQueue | null {
   const authoritativeEntries = params.authoritativeQueue?.entries ?? [];
   const authoritativeIds = new Set(
     authoritativeEntries.map((entry) => entry.comment.id),
@@ -160,7 +159,6 @@ export function mergePendingIssueQueuedComments(params: {
   );
   if (entries.length === 0) return null;
 
-  const queueAcknowledged = pendingEntries.length === 0;
   const authoritativeOwnsQueue = Boolean(params.authoritativeQueue?.queueId);
   const fallbackTargetRunId =
     params.pendingComments.find((entry) => entry.targetRunId)?.targetRunId ??
@@ -176,9 +174,7 @@ export function mergePendingIssueQueuedComments(params: {
 
   return {
     issueId: params.authoritativeQueue?.issueId ?? params.issueId,
-    queueId: queueAcknowledged
-      ? (params.authoritativeQueue?.queueId ?? null)
-      : null,
+    queueId: params.authoritativeQueue?.queueId ?? null,
     state:
       params.authoritativeQueue?.state ?? (targetRunId ? "deferred" : null),
     targetRunId,
@@ -189,7 +185,12 @@ export function mergePendingIssueQueuedComments(params: {
       (protocol === "paperclip_runner_v1" && targetRunId
         ? "temporarily_unavailable"
         : "unsupported"),
-    entries,
+    // In particular, /new owns a reset boundary, not the messages behind it.
+    entries: authoritativeOwnsQueue ? authoritativeEntries : entries,
+    pendingQueue: authoritativeOwnsQueue && pendingEntries.length ? mergePendingIssueQueuedComments({
+      ...params, authoritativeQueue: null,
+      pendingComments: params.pendingComments.filter(({ comment }) => !authoritativeIds.has(comment.id)),
+    }) : null,
     executionWait: params.authoritativeQueue?.executionWait ?? null,
     ...(params.authoritativeQueue?.firstTurnCommentIds ? { firstTurnCommentIds: params.authoritativeQueue.firstTurnCommentIds } : {}),
   };
