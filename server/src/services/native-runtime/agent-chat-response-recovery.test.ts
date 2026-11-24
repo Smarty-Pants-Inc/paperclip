@@ -17,13 +17,15 @@ import { compactRunLogChunk } from "../heartbeat/run-log.js";
 import { publishContinuousNativeReply } from "./native-continuous-reply.js";
 import { requeueContinuousUnanswered } from "./native-continuous-unanswered.js";
 import { deliverConversationComments } from "../agent-conversations.js";
+import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
+import type { PrpEvent } from "../../vendor/paperclip-runner/index.js";
 
-const heldSteering = vi.hoisted(() => ({ available: false, sent: [] as string[] }));
+const heldSteering = vi.hoisted(() => ({ available: false, sent: [] as string[], ack: undefined as Promise<void> | undefined }));
 vi.mock("./native-session-executor.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./native-session-executor.js")>();
   return { ...actual,
     getNativeSessionSteeringState: async () => ({ disposition: heldSteering.available ? "available" : "temporarily_unavailable", activeTurnId: heldSteering.available ? "held-turn" : null }),
-    steerNativeSession: async (input: { correlationId: string }) => { heldSteering.sent.push(input.correlationId); return { turnId: "held-turn" }; },
+    steerNativeSession: async (input: { correlationId: string }) => { heldSteering.sent.push(input.correlationId); await heldSteering.ack; return { turnId: "held-turn" }; },
   };
 });
 const runLogReads = vi.hoisted(() => [] as unknown[]);
@@ -160,6 +162,77 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
       expect(heldSteering.sent).toEqual(before);
       if (scenario === "drain") expect(await db.select().from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.companyId, f.companyId), eq(agentWakeupRequests.status, "deferred_issue_execution")))).toEqual([]);
+    } finally {
+      heldSteering.available = false;
+      if (steeringFlag === undefined) delete process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+      else process.env.PAPERCLIP_AGENT_CHAT_STEERING = steeringFlag;
+    }
+  });
+
+  it.each(["turn.started", "turn.accepted"] as const)("drains a cold-start deferred person wake at committed %s, not again at the final", async eventType => {
+    const commentId = randomUUID(), wakeId = randomUUID();
+    const steeringFlag = process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+    process.env.PAPERCLIP_AGENT_CHAT_STEERING = "true";
+    heldSteering.sent = [];
+    heldSteering.available = false;
+    try {
+      await fixture(true, { beforeFinalize: async scope => {
+        await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, scope.agentId));
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+        const [opening] = await db.select().from(issueComments).where(eq(issueComments.id, run.contextSnapshot!.wakeCommentId as string));
+        await db.insert(issueComments).values({ id: commentId, companyId: scope.companyId, issueId: scope.issueId,
+          authorType: "user", authorUserId: opening.authorUserId, body: "Sent while Starting…" });
+        await db.insert(agentWakeupRequests).values({ id: wakeId, companyId: scope.companyId, agentId: scope.agentId,
+          source: "on_demand", reason: "issue_execution_deferred", status: "deferred_issue_execution",
+          requestedByActorType: "user", requestedByActorId: opening.authorUserId,
+          payload: { issueId: scope.issueId, _paperclipWakeContext: { wakeCommentIds: [commentId] } } });
+        const execution = { binding: scope, provider: { kind: "pi_rpc" as const } };
+        const port = new PaperclipControlPlanePort(db, { ...scope, sessionId: run.nativeSessionId!,
+          sourceInstanceId: run.runnerInstanceId!, controlPlaneSourceInstanceId: "cold-start-control",
+          completionContractId: run.completionContractId!, completionContractSha256: run.completionContractSha256! }, {
+          onCommittedEvent: async (event, cursor) => { await publishContinuousNativeReply({ db, execution, event, cursor }); },
+          onDuplicateEvent: async (event, cursor) => { await publishContinuousNativeReply({ db, execution, event, cursor }); },
+        });
+        const event: PrpEvent = { schema: "paperclip.prp.event.v1", schemaVersion: 1,
+          sourceEventId: `${run.runnerInstanceId}:cold-start`, sourceInstanceId: run.runnerInstanceId!, sourceSeq: 1,
+          sourceKind: "runner", runId: scope.runId, normalizedSessionId: run.nativeSessionId!, turnId: "held-turn",
+          eventType, priority: 0, emittedAt: new Date().toISOString(), payload: {} };
+        // Admission during startup cannot send before the provider owns a turn.
+        await deliverConversationComments(db, { id: scope.issueId, companyId: scope.companyId, conversationAgentId: scope.agentId }, async () => null);
+        expect(heldSteering.sent).toEqual([]);
+        expect(run.resultJson?.continuousReplies).toBeUndefined();
+        heldSteering.available = true;
+        let acknowledge!: () => void;
+        heldSteering.ack = new Promise<void>(resolve => { acknowledge = resolve; });
+        const started = port.appendEvent(event);
+        try {
+          // Ingestion must return and accept a later event even while steering
+          // waits for the provider. A replay must not send the queued head twice.
+          await expect(Promise.race([started.then(receipt => receipt.disposition),
+            new Promise(resolve => setTimeout(() => resolve("blocked_by_steering"), 1000))])).resolves.toBe("committed");
+          await vi.waitFor(() => expect(heldSteering.sent).toEqual([commentId]));
+          expect((await port.appendEvent(event)).disposition).toBe("duplicate");
+          expect((await port.appendEvent({ ...event, eventType: "item.started", sourceSeq: 2,
+            sourceEventId: `${run.runnerInstanceId}:after-start`, itemId: "cold-final:m1:b0" })).disposition).toBe("committed");
+        } finally {
+          acknowledge();
+          await started;
+          heldSteering.ack = undefined;
+        }
+        await vi.waitFor(async () => {
+          const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+          const [steered] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+          expect(wake.status).toBe("cancelled");
+          expect(steered.resultJson?.queuedSteeringAcknowledgements).toMatchObject({ [commentId]: { status: "acknowledged" } });
+          expect(steered.resultJson?.continuousReplies).toBeUndefined();
+        });
+        await port.appendEvent({ ...event, eventType: "item.completed", sourceSeq: 3,
+          sourceEventId: `${run.runnerInstanceId}:cold-final`, itemId: "cold-final:m1:b0",
+          payload: { kind: "agentMessage", channel: "final", text: "Opening answer including your startup message." } });
+        expect(heldSteering.sent).toEqual([commentId]);
+        const [answered] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+        expect(answered.resultJson?.continuousReplies).toMatchObject({ "cold-final:m1:b0": { questionCommentIds: [opening.id, commentId] } });
+      } });
     } finally {
       heldSteering.available = false;
       if (steeringFlag === undefined) delete process.env.PAPERCLIP_AGENT_CHAT_STEERING;

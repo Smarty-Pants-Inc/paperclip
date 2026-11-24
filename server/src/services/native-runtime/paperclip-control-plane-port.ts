@@ -601,6 +601,21 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
       // returns to its synchronous governed-wait boundary.
       await this.#onDuplicateEvent?.(event, persisted.row.seq);
     }
+    if (event.eventType === "turn.started" || event.eventType === "turn.accepted") {
+      // Persistence and its observers have finished: no issue lock is held.
+      // The first steerable turn need not have published a reply yet. Replays
+      // use the same drain and durable queue ACKs as final publication.
+      // Runtime intake awaits appendEvent serially. Never make later events
+      // wait for provider steering round-trips; the drain owns idempotence.
+      void (async () => {
+        try {
+          const { drainContinuousPersonMessages } = await import("./native-continuous-drain.js");
+          await drainContinuousPersonMessages(this.#db, this.#binding, { beforeFirstReply: true });
+        } catch (error) {
+          logger.warn({ error, ...this.#binding }, "turn-start person-message drain deferred");
+        }
+      })();
+    }
   }
 
   /**
