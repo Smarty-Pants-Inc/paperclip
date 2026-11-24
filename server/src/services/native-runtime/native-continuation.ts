@@ -20,7 +20,7 @@ export function buildNativeContinuationPrompt(input: {
   const wake = normalizePaperclipWakePayload(input.wakePayload);
   if (input.promptOnly && wake) {
     const messages = [...(wake.executionContinuation?.messages ?? wake.executionContinuation?.resumeDelta?.messages ?? []), ...wake.comments];
-    return wake.commentIds.map(id => messages.find(message => message.id === id)!.body).join("\n\n");
+    return wake.commentIds.map(id => wake.comments.find(comment => comment.id === id)?.fullBody ?? messages.find(message => message.id === id)!.body).join("\n\n");
   }
   const continuation = wake?.executionContinuation;
   const delta = continuation?.resumeDelta;
