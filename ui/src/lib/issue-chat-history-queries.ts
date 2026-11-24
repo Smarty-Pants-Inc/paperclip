@@ -80,6 +80,14 @@ export async function fetchRecentIssueRunWindow(
     ? await activityApi.recentRunsForIssue(issueRef)
     : await readFromIssueChatBootstrap(queryClient, key, issueRef, (item) => item.recentRuns, () => activityApi.recentRunsForIssue(issueRef));
   let previous = previousWindow?.runs ?? [];
+  // The recent endpoint returns only two rows. On a cold retry chain, read the
+  // existing summary endpoint once so a cancelled/reconciled middle attempt
+  // cannot hide a failed ancestor outside that two-row window.
+  const requestId = recent[0]?.wakeCommentId ?? recent[0]?.contextCommentId;
+  if (!previousWindow && (recent.some(run => run.retryOfRunId) ||
+    (requestId && recent.slice(1).some(run => requestId === (run.wakeCommentId ?? run.contextCommentId))))) {
+    recent = await activityApi.runsForIssue(issueRef);
+  }
   let reconciledFullHistory = false;
   if (previous.some((run) =>
     (run.status === "running" || run.status === "queued") && !recent.some((next) => next.runId === run.runId),
@@ -109,6 +117,23 @@ export function buildRecentIssueRunWindow(
   // The second row refreshes a just-finished predecessor. Start with only
   // the latest run, then keep every run observed while this task is open.
   const visible = new Set([...previous.map((run) => run.runId), ...recent.slice(0, 1).map((run) => run.runId)]);
+  // Keep the whole saved-request chain, including cancelled/reconciled links,
+  // not only an immediately preceding failure. Unrelated history stays folded.
+  const byId = new Map([...previous, ...recent].map(run => [run.runId, run]));
+  const pending = [...visible];
+  while (pending.length) {
+    const run = byId.get(pending.pop()!);
+    if (!run) continue;
+    const requestId = run.wakeCommentId ?? run.contextCommentId;
+    for (const candidate of byId.values()) {
+      const candidateRequestId = candidate.wakeCommentId ?? candidate.contextCommentId;
+      if (!visible.has(candidate.runId) && ((requestId && requestId === candidateRequestId) ||
+        (run.retryOfRunId === candidate.runId && !(requestId && candidateRequestId)))) {
+        visible.add(candidate.runId);
+        pending.push(candidate.runId);
+      }
+    }
+  }
   const omitted = recent.find((run) => !visible.has(run.runId));
   const retained = recent.length >= 2 && previouslyHadEarlierRuns;
   const window: RecentIssueRunWindow = {
