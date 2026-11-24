@@ -1,4 +1,7 @@
 import type { NativeSession } from "../../vendor/paperclip-runner/index.js";
+import * as continuousReply from "./native-continuous-reply.js";
+import * as resetWakeQueue from "../../modules/wake-queue/index.js";
+import { closeHeldNativeTurn } from "./native-session-executor.js";
 import { currentControllerProcess } from "../controller-process-identity.js";
 import { activeNativeExecutionRunIds } from "./native-active-runs.js";
 import { onRetainedNativeSessionCleanupRelease } from "../retained-native-session-cleanup-notifications.js";
@@ -11145,14 +11148,16 @@ describe("native session same-turn steering", () => {
   const capabilities = vi.fn();
   const snapshot = vi.fn();
   const steer = vi.fn();
+  const interrupt = vi.fn();
 
   beforeEach(() => {
     state.release = null;
     capabilities.mockReset().mockResolvedValue({ steering: true });
     snapshot.mockReset().mockResolvedValue({ activeTurnId: "provider-turn-1" });
     steer.mockReset().mockResolvedValue(undefined);
+    interrupt.mockReset().mockResolvedValue(undefined);
     state.execute.mockReset().mockImplementation(async (options) => {
-      options.onSession?.({ capabilities, snapshot, steer, cancel: vi.fn() });
+      options.onSession?.({ capabilities, snapshot, steer, interrupt, cancel: vi.fn() });
       await new Promise<void>((resolve) => {
         state.release = resolve;
       });
@@ -11171,15 +11176,44 @@ describe("native session same-turn steering", () => {
     });
   });
 
-  async function startActiveSession() {
+  async function startActiveSession(input = execution) {
     const running = executePaperclipNativeSession({
       db: leaseDb(),
-      execution,
+      execution: input,
       runnerInstanceId: "runner",
     });
     await vi.waitFor(() => expect(state.release).toBeTypeOf("function"));
     return { running };
   }
+
+  it.each(["held", "working", "steered", "question", "pending-tool"])("closes a reset hold only when idle: %s", async mode => {
+    vi.spyOn(continuousReply, "publishContinuousNativeReply").mockImplementation(async input => input.event.eventType === "item.completed" ? true : undefined);
+    vi.spyOn(resetWakeQueue, "closeConversationResetHold").mockResolvedValue(false);
+    const piExecution = { ...execution, provider: { kind: "pi_rpc", model: "openai/gpt-5", conversationMode: true },
+      session: { ...execution.session, driverKind: "pi_rpc" } } as NativeExecutionInputV1;
+    const { running } = await startActiveSession(piExecution);
+    try {
+      expect(await closeHeldNativeTurn(execution.binding.runId)).toBe(false); // Before an answer, never interrupt work.
+      const final: PrpEvent = { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "runner", sourceSeq: 1,
+        priority: 0, emittedAt: new Date().toISOString(), sourceInstanceId: "runner", normalizedSessionId: "session-native-cancel",
+        eventType: "item.completed", runId: execution.binding.runId, itemId: "answer", sourceEventId: "answer",
+        payload: { kind: "agentMessage", channel: "final", text: "Done." } };
+      const work: PrpEvent = { ...final, eventType: "item.started", itemId: "tool", sourceEventId: "work", payload: { kind: "toolCall" } };
+      if (mode === "pending-tool") await accountingEvents.committed!(work);
+      await accountingEvents.committed!(final);
+      if (mode === "working") await accountingEvents.committed!(work);
+      if (mode === "steered") await steerNativeSession({ runId: execution.binding.runId, message: "More work", correlationId: "next" });
+      if (mode === "question") snapshot.mockResolvedValue({ activeTurnId: "provider-turn-1", pendingRuntimeRequests: [{ requestId: "question" }] });
+      const results = await Promise.all([closeHeldNativeTurn(execution.binding.runId), closeHeldNativeTurn(execution.binding.runId)]);
+      expect(results).toEqual(mode === "held" ? [true, false] : [false, false]);
+      expect(interrupt).toHaveBeenCalledTimes(mode === "held" ? 1 : 0);
+      if (mode === "held") {
+        expect(interrupt).toHaveBeenCalledWith({ turnId: "provider-turn-1", reason: "person_stop" });
+        await expect(steerNativeSession({ runId: execution.binding.runId, message: "Late", correlationId: "late" }))
+          .rejects.toMatchObject({ code: "steering_stale_turn" });
+      }
+    } finally { state.release?.(); await running; vi.restoreAllMocks(); }
+  });
 
   it("correlates the queued comment with the active provider turn acknowledgement", async () => {
     const { running } = await startActiveSession();
