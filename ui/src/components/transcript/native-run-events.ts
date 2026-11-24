@@ -897,8 +897,9 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
       envelope: Record<string, unknown>;
     }
   >();
-  const completedAgentMessageIds = new Set<string>();
-  const completedReasoningIds = new Set<string>();
+  const completedAgentMessages = new Map<string, { payload: Record<string, unknown>; ts: string }>();
+  const completedReasoning = new Map<string, { payload: Record<string, unknown>; ts: string }>();
+  const emittedCompletedItems = new Set<string>();
   const completionItemIdentityById = new Map<string, ItemIdentity>();
   const nativeToolItemsById = new Map<string, NativeToolItemDetails>();
   // An edit call reports an optimistic patch when it starts and the exact one
@@ -962,10 +963,10 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
     if (event.eventType !== "item.completed") continue;
     const kind = identity.kind;
     if (isAssistantItemKind(kind) && itemId && normalizedItemText(payload)) {
-      completedAgentMessageIds.add(itemId);
+      completedAgentMessages.set(itemId, { payload, ts: timestamp(event, envelope) });
     }
     if (kind === "reasoning" && itemId && normalizedItemText(payload)) {
-      completedReasoningIds.add(itemId);
+      completedReasoning.set(itemId, { payload, ts: timestamp(event, envelope) });
     }
   }
 
@@ -1041,51 +1042,28 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
       continue;
     }
 
-    if (event.eventType === "item.delta" && isAssistantItemKind(itemKind)) {
-      const value = normalizedItemText(payload);
-      if (!value || !itemId) continue;
-      // Once the loss-resistant completion is present, prefer its full text.
-      // Before that point the deltas still provide the live streaming view.
-      if (completedAgentMessageIds.has(itemId)) continue;
-      const channel = itemIdentity.assistantChannel;
-      entries.push({ kind: "assistant", ts, text: value, delta: true, channel, itemId });
-      continue;
-    }
-
-    if (event.eventType === "item.completed" && isAssistantItemKind(itemKind)) {
-      // A `<proposed_plan>` block is shown by its plan proposal card instead.
-      const raw = normalizedItemText(payload) ?? "";
+    // A completion replaces streamed content at its FIRST visible event, not
+    // at its later completion time. Otherwise a final/reasoning item crosses a
+    // steering bubble when its deltas disappear, including on a fresh reload.
+    if ((event.eventType === "item.delta" || event.eventType === "item.completed") &&
+      (isAssistantItemKind(itemKind) || itemKind === "reasoning")) {
+      if (event.eventType === "item.delta" && !itemId) continue;
+      const completion = itemId ? (itemKind === "reasoning" ? completedReasoning : completedAgentMessages).get(itemId) : undefined;
+      if (completion && itemId && emittedCompletedItems.has(itemId)) continue;
+      const raw = normalizedItemText(completion?.payload ?? payload) ?? "";
       const value = itemId && proposedMessageIds.has(itemId) ? withoutProposedPlanBlock(raw) : raw;
       if (!value) continue;
-      const channel = itemIdentity.assistantChannel;
-      entries.push({ kind: "assistant", ts, text: value, channel, ...(itemId ? { itemId } : {}) });
-      continue;
-    }
-
-    if (event.eventType === "item.delta" && itemKind === "reasoning") {
-      const value = normalizedItemText(payload);
-      if (!value || !itemId || completedReasoningIds.has(itemId)) continue;
-      entries.push({
-        kind: "thinking",
-        ts,
-        text: value,
-        delta: true,
-        lifecycle: "started",
-        channel: itemIdentity.reasoningChannel,
-        itemId,
-      });
-      continue;
-    }
-
-    if (event.eventType === "item.completed" && itemKind === "reasoning") {
-      const value = normalizedItemText(payload);
-      if (!value) continue;
-      entries.push({
-        kind: "thinking",
-        ts,
-        text: value,
-        lifecycle: "completed",
-        channel: itemIdentity.reasoningChannel,
+      if (completion && itemId) emittedCompletedItems.add(itemId);
+      const delta = !completion && event.eventType === "item.delta";
+      const contentIdentity = completion ? resolveItemIdentity(completion.payload, itemIdentity) : itemIdentity;
+      entries.push(itemKind === "reasoning" ? {
+        kind: "thinking", ts, text: value, ...(delta ? { delta: true } : {}), completedAt: completion?.ts,
+        lifecycle: delta ? "started" : "completed",
+        channel: contentIdentity.reasoningChannel,
+        ...(itemId ? { itemId } : {}),
+      } : {
+        kind: "assistant", ts, text: value, ...(delta ? { delta: true } : {}), completedAt: completion?.ts,
+        channel: contentIdentity.assistantChannel,
         ...(itemId ? { itemId } : {}),
       });
       continue;
