@@ -1265,11 +1265,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           )
         ? settlingRun.id
         : null;
-  const heldPaperclipRunnerStartedAtMs =
-    liveRun && heldPaperclipRunnerRunId === liveRun.id
-      ? ((liveRun.startedAt ? toMs(liveRun.startedAt) : null) ??
-        toMs(liveRun.createdAt))
-      : (settlingRun?.startedAtMs ?? null);
   const heldPaperclipRunnerFinalText = useMemo(() => {
     if (!heldPaperclipRunnerRunId) return null;
     const entries = transcriptByRun.get(heldPaperclipRunnerRunId) ?? [];
@@ -1468,19 +1463,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       (comment) => !comment.deletedAt,
     );
     visibleComments.forEach((comment, index) => {
-      // The live/settling runner lane already renders this run's final answer.
-      // Keep a just-persisted duplicate out of the backbone until the complete
-      // canonical bubble + Worked header can replace that lane atomically.
-      if (
-        heldPaperclipRunnerRunId &&
-        isRunnerResponseComment({
-          comment,
-          runId: heldPaperclipRunnerRunId,
-          runStartedAtMs: heldPaperclipRunnerStartedAtMs,
-          finalText: heldPaperclipRunnerFinalText,
-        })
-      )
-        return;
+      // Run membership does not mean a turn draws this reply: a resumed run's
+      // transcript may contain only its newest turn. Dedupe after assembling
+      // the turns, by the saved replies actually selected as their finals.
       const item = commentItems[index];
       if (!item || (queuedCommentIds.has(comment.id) && !steeringAnchorByCommentId.has(comment.id))) return;
       entries.push({
@@ -1688,9 +1673,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     liveRuns,
     planDocument,
     planDocumentSourceRunId,
-    heldPaperclipRunnerRunId,
-    heldPaperclipRunnerStartedAtMs,
-    heldPaperclipRunnerFinalText,
     queuedCommentIds,
     steeringAnchorByCommentId,
   ]);
@@ -1815,7 +1797,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         settledRunIds.add(source.id);
         continue;
       }
-      const openSegments = source.id === liveRun?.id && isNativePaperclipRunnerRun(source);
+      // Keep the same segment owner while activeRun disappears ahead of the
+      // terminal summary; otherwise a second settling tail bypasses dedupe.
+      const openSegments = isNativePaperclipRunnerRun(source) && (source.id === liveRun?.id ||
+        (!liveRun && source.id === settlingRun?.id && !isTerminalRunStatus(source.status)));
       if (!isTerminalRunStatus(source.status) && !openSegments) continue;
       if (liveRun && runChainIdsById.get(liveRun.id)?.includes(source.id) && !openSegments) continue;
       const entries = transcriptByRun.get(source.id) ?? [];
@@ -2325,11 +2310,16 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         if (!sourceIsPaperclipRunner) return undefined;
         const mappedReplyId = continuousReplyPlacements.get(source.id)?.bySegment.get(segmentIndex);
         const mappedReply = commentItems.find((item): item is TaskChatMessageItem => item.kind === "message" && item.id === mappedReplyId);
-        if (mappedReply) return { ...mappedReply, atMs: paperclipRunnerFinalResponse(parsed, yieldedOptions)?.atMs ?? mappedReply.atMs };
+        const final = paperclipRunnerFinalResponse(parsed, { ...yieldedOptions, yielded: sourceYielded });
+        // A continuous run can resume with only the new turn's transcript.
+        // Its old placement map is not proof that this segment draws that reply.
+        if (mappedReply && final && normalizedMessageText(mappedReply.text) === normalizedMessageText(final.text)) {
+          return { ...mappedReply, atMs: final.atMs ?? mappedReply.atMs };
+        }
+        if (openSegments && !final) return undefined;
         const lastSegment = segmentIndex === lastPopulatedSegmentIndex;
-        if (timelineAnchors.length > 0 || openSegments) {
+        if (final || timelineAnchors.length > 0 || openSegments) {
           const segment = segments[segmentIndex]!;
-          const final = paperclipRunnerFinalResponse(parsed, { ...yieldedOptions, yielded: sourceYielded });
           // Persistence may lag the next question; pair repeated answers in transcript order.
           const sameText = (text: string) => normalizedMessageText(text) === normalizedMessageText(final?.text ?? "");
           const occurrence = final ? projectedSegments.slice(0, segmentIndex).filter(({ parsed }) =>
@@ -2417,6 +2407,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           [...steeringAnchorByCommentId.values()].includes(segment.startMs);
         if (stableRunnerSegment) runnerSegmentsById.set(turnId, {
           runId: source.id,
+          finalResponse: finalResponse ?? null,
           items: finalResponse && !paperclipRunnerFinalResponse(parsed, yieldedOptions)
             ? [...parsed, { ...finalResponse, channel: "final", interstitial: false }]
             : parsed,
@@ -2559,6 +2550,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     runs,
     runChainIdsById,
     liveRun,
+    settlingRun,
     transcriptByRun,
     terminalHydratedRunIds,
     linkedRunMetaById,
