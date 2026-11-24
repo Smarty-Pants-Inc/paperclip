@@ -1387,8 +1387,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         if (!value || typeof value !== "object") continue;
         const reply = value as { questionCommentIds?: unknown; commentId?: unknown };
         if (!Array.isArray(reply.questionCommentIds) || typeof reply.commentId !== "string") continue;
-        const segmentIndex = Math.max(0, ...reply.questionCommentIds.map(id =>
-          anchors.indexOf(steeringAnchorByCommentId.get(String(id)) ?? NaN) + 1));
+        const first = transcriptByRun.get(run.runId)?.find(entry => entry.kind === "assistant" && entry.itemId === itemId);
+        // Question receipts can include a steer acknowledged mid-answer. They
+        // must not move text whose first streamed slot is already known.
+        const streamed = first?.kind === "assistant" && (first.delta || toMs(first.completedAt) > toMs(first.ts));
+        const segmentIndex = streamed ? anchors.filter(anchor => anchor <= toMs(first.ts)).length :
+          Math.max(0, ...reply.questionCommentIds.map(id =>
+            anchors.indexOf(steeringAnchorByCommentId.get(String(id)) ?? NaN) + 1));
         byItem.set(itemId, segmentIndex);
         const segmentReplies = bySegment.get(segmentIndex) ?? new Map<string, string>();
         segmentReplies.set(itemId, reply.commentId);
@@ -1397,7 +1402,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       placements.set(run.runId, { byItem, bySegment });
     }
     return placements;
-  }, [linkedRuns, steeringAnchorsByRun, steeringAnchorByCommentId]);
+  }, [linkedRuns, steeringAnchorsByRun, steeringAnchorByCommentId, transcriptByRun]);
 
   // A native-runner Plan is part of the turn that wrote its current revision.
   // Legacy adapters do not expose the semantic write_document boundary needed
