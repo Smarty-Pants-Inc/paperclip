@@ -2444,7 +2444,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
           "The queued message no longer has an active run target.",
         );
       const anchorAt = new Date().toISOString();
-      setLocalSteeringPlacements((current) => {
+      const acknowledgeSteeringPlacement = () => setLocalSteeringPlacements((current) => {
         const next = new Map(current);
         const sequence = [...current.values()].filter(
           (placement) => placement.targetRunId === targetRunId,
@@ -2459,7 +2459,6 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         });
         return next;
       });
-      setConsumedQueuedCommentIds((current) => new Set(current).add(commentId));
       try {
         const nextQueue = await issuesApi.steerQueuedComment(
           issueId,
@@ -2472,6 +2471,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         );
         // The local placement bridges the durable receipt refresh. Release the
         // control as soon as delivery is acknowledged, even on a slow refetch.
+        acknowledgeSteeringPlacement();
+        setConsumedQueuedCommentIds((current) => new Set(current).add(commentId));
         storeQueuedCommentQueue(nextQueue);
         void Promise.all([
           queryClient.invalidateQueries({
