@@ -18,9 +18,10 @@ export function isGitHubAppConnection(connection: Pick<Connection, "config">) {
 }
 
 /** Callers select/authorize the grant; stock vault ownership checks also run on cache hits. */
-export async function resolveGitHubAppCredential(db: Db, connection: Connection, grant: Grant, options: { forceRefresh?: boolean } = {}) {
+export async function resolveGitHubAppCredential(db: Db, connection: Connection, grant: Grant, options: { forceRefresh?: boolean; allowDraft?: boolean } = {}) {
   const config = connection.config.methodConfig as Record<string, unknown> | undefined;
-  if (!connection.enabled || connection.status !== "active" || grant.status !== "active" || !config
+  // The connect-time health check runs on the still-draft connection (seam 0169 follow-up).
+  if ((options.allowDraft ? connection.status !== "draft" : (!connection.enabled || connection.status !== "active")) || grant.status !== "active" || !config
     || grant.kind !== (connection.credentialPolicy === "per_user" ? "user" : connection.credentialPolicy === "per_agent" ? "agent" : "organization")
     || (config.version !== undefined && config.version !== 1 && config.version !== "1")
     || !/^(?:[1-9]\d*|Iv[0-9][A-Za-z0-9.]{1,97})$/.test(String(config.appId ?? ""))
