@@ -2100,6 +2100,7 @@ function subagentsFromDelegation(
 export function buildTurnTimelineRows(
   parsed: readonly TaskChatItem[],
   running: boolean,
+  hasFinalResponse = true,
 ): TaskChatTurnChildItem[] {
   const rows: TaskChatTurnChildItem[] = [];
   let current: TaskChatActivityPhaseItem | null = null;
@@ -2198,7 +2199,7 @@ export function buildTurnTimelineRows(
       const legacyTrailingReply =
         (item.channel == null || item.channel === "unknown") &&
         item === legacyReplyBoundary;
-      if (!running && (explicitFinal || legacyTrailingReply)) continue;
+      if (!running && (explicitFinal || (legacyTrailingReply && hasFinalResponse))) continue;
       current = {
         id: `${item.id}:phase`,
         kind: "activity_phase",
