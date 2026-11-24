@@ -89,6 +89,6 @@ export interface UIAdapterModule extends TranscriptParserSource {
      * auto-follows the newest line — for backends whose delta volume
      * overwhelms the ticker.
      */
-    liveReasoningView?: "ticker" | "scrollLog";
+    liveReasoningView?: "ticker" | "scrollLog" | "inline";
   };
 }
