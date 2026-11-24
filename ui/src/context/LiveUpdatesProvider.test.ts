@@ -1391,15 +1391,15 @@ describe("LiveUpdatesProvider issue invalidation", () => {
     });
   });
 
-  it("refetches visible comments when an authenticated event omits hydration details", () => {
+  it.each(["issue.comment_added", "issue.comment_updated"])("refetches visible comments for %s without hydration details", (action) => {
     const client = new QueryClient();
     client.setQueryData(queryKeys.issues.detail("PAP-759"), {
       id: "issue-1", companyId: "company-1", identifier: "PAP-759",
     });
     const invalidate = vi.spyOn(client, "invalidateQueries");
     __liveUpdatesTestUtils.invalidateActivityQueries(client, "company-1", {
-      entityType: "issue", entityId: "issue-1", action: "issue.comment_added",
-      actorType: "user", actorId: "another-user",
+      entityType: "issue", entityId: "issue-1", action,
+      actorType: "system", actorId: "native-runtime",
     }, { userId: "viewer", agentId: null }, {
       pathname: "/PAP/issues/PAP-759", isForegrounded: true,
     });

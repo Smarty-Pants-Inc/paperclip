@@ -6,7 +6,7 @@ import { NativeProviderStateIncompatibleError, providerFailureFromError } from "
 import { GENERIC_RUN_FAILURE_CODES, NATIVE_PRE_DISPATCH_FAILURE_CODE, NATIVE_PRE_DISPATCH_FAILURE_KEY, NATIVE_PRE_DISPATCH_FAILURE_RECORD, failureCauseFromAdapterResult, failureCauseFromError,
   isNativePreDispatchTransientFailure } from "./run-failure-cause.js";
 import { INTERRUPTED_PREPARATION_RETRY_REASON } from "../execution-recovery-attempt.js";
-import { PREDECESSOR_RETIREMENT_FALLBACK_KEY, readPredecessorRetirementFallback, type PredecessorRetirementFallback } from "../native-runtime/predecessor-retirement.js";
+import { findNativePredecessorRetirementUnproven, PREDECESSOR_RETIREMENT_FALLBACK_KEY, readPredecessorRetirementFallback, type PredecessorRetirementFallback } from "../native-runtime/predecessor-retirement.js";
 import { releaseUnchangedFallbackWorkspace } from "./predecessor-retirement-fallback.js";
 import { publishNativeFreshSessionNotice } from "../native-runtime/remote-warm-session-recovery.js";
 import { hasNativeExecutionStartEvidence } from "../native-runtime/native-restart-recovery.js";
@@ -1248,13 +1248,23 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
    */
   async function schedulePredecessorRetirementFallbackRetry(run: Run, agent: Agent, fallback: PredecessorRetirementFallback | null | undefined) {
     if (!fallback || run.status !== "failed") return null;
-    const scheduled = await schedulePredecessorRetirementContinuation(run, agent, fallback);
-    if (scheduled?.outcome !== "scheduled") {
-      await db.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || '{"continuationScheduling":"refused"}'::jsonb` })
-        .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "failed")))
-        .catch(error => logger.warn({ err: error, runId: run.id }, "could not record that a run's continuation was not scheduled"));
+    let scheduled: Awaited<ReturnType<typeof schedulePredecessorRetirementContinuation>> = null;
+    try {
+      scheduled = await schedulePredecessorRetirementContinuation(run, agent, fallback);
+      return scheduled;
+    } finally {
+      // Cleanup may refuse, swallow its own failure, or throw. Only a durable
+      // scheduled successor may leave the visible promise of continuation.
+      if (scheduled?.outcome !== "scheduled") {
+        await db.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || '{"continuationScheduling":"refused"}'::jsonb` })
+          .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "failed")))
+          .catch(error => logger.warn({ err: error, runId: run.id }, "could not record that a run's continuation was not scheduled"));
+        if (fallback.freshSessionRequired && run.issueId) {
+          await publishNativeFreshSessionNotice(db, { companyId: run.companyId, agentId: run.agentId,
+            issueId: run.issueId, runId: run.id }, "refused");
+        }
+      }
     }
-    return scheduled;
   }
 
   async function schedulePredecessorRetirementContinuation(run: Run, agent: Agent, fallback: PredecessorRetirementFallback) {
@@ -1557,6 +1567,15 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           livenessRun,
           agent,
         );
+      }
+      // A successor can be refused before it reaches the fallback scheduler
+      // (Stop, or a replacement that met the same unretired sandbox). Correct
+      // its generation's existing notice too; this never opens a new door.
+      if ((!predecessorRetirementFallback || stoppedDuringFailure) && livenessRun.issueId
+        && (predecessorRetirementFallback?.freshSessionRequired || findNativePredecessorRetirementUnproven(err)?.freshSessionRequired)
+        && fallbackRetry?.outcome !== "scheduled" && storageWait?.outcome !== "scheduled") {
+        await publishNativeFreshSessionNotice(db, { companyId: livenessRun.companyId, agentId: livenessRun.agentId,
+          issueId: livenessRun.issueId, runId: livenessRun.id }, "refused");
       }
       // Another retry that took over after a failed storage wait keeps the promise.
       await settleStorageWaitMessage(livenessRun, fallbackRetry?.outcome === "scheduled" ? fallbackRetry : storageWait, err);

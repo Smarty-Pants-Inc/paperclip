@@ -21,7 +21,7 @@ import { nativeRestartFixture, waitForCondition } from "./helpers/native-restart
 import { getRecoveryPostgresSupport } from "./helpers/recovery-postgres-fixture.js";
 import { DurablePrpControlPlane } from "../vendor/paperclip-runner/index.js";
 import { nativeRunnerCheckpointWriter } from "../services/native-runtime/native-runner-checkpoint.js";
-import { admitNativeContinuationRefusal, NativeContinuationAdmissionRefusalError } from "../services/native-runtime/remote-warm-session-recovery.js";
+import { admitNativeContinuationRefusal, NativeContinuationAdmissionRefusalError, publishNativeFreshSessionNotice } from "../services/native-runtime/remote-warm-session-recovery.js";
 import { retirePiRunnerByFact } from "../services/native-runtime/native-pi-retirement.js";
 import { appendHeartbeatRunEvent } from "../services/heartbeat-run-events.js";
 import { PROCESS_START_REQUESTED } from "../services/native-process-start-events.js";
@@ -50,6 +50,13 @@ vi.mock("../services/budget-reservations.js", async importOriginal => {
 });
 
 const support = await getRecoveryPostgresSupport({});
+
+function recordFreshSessionEvidence(name: string, evidence: Record<string, unknown>) {
+  const directory = process.env.PAPERCLIP_TEST_EVIDENCE_DIR;
+  if (!directory) return;
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(join(directory, `${name}.json`), JSON.stringify(evidence, null, 2), { mode: 0o600 });
+}
 
 type AdmissionFailure = { remaining: number; turnNeverIssued: boolean; environmentId: string; provider: string;
   providerLeaseId: string; leasePolicy: "reuse_by_environment" | "reuse_by_execution_workspace"; failedRuns: string[];
@@ -682,6 +689,147 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
     }
   }, 90_000);
 
+  it.each(["workspace", "scheduler_decline", "scheduler_throw"] as const)("corrects the committed notice in place after %s refusal", async fault => {
+    const db = createDb(fixture.current.temporary.connectionString, { maxConnections: 4 });
+    const name = `notice_refusal_${randomUUID().replaceAll("-", "")}`;
+    let installed = false;
+    const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: nativeBackend(db, {
+      unretiredPredecessorOnce: { failed: false, environmentId: randomUUID(), freshSessionRequired: true, noLease: true },
+      beforeRetirementFailure: async (runId, issueId) => {
+        // Real database faults occur only after the notice + marker commit.
+        // Keep the first notice id in the trigger's run record to prove UPDATE,
+        // not a second comment masquerading as a correction.
+        const checkoutRunId = randomUUID();
+        if (fault === "scheduler_decline") {
+          const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+          await db.insert(heartbeatRuns).values({ ...source!, id: checkoutRunId, status: "cancelled", retryOfRunId: null,
+            createdAt: new Date(source!.createdAt.getTime() - 1_000), finishedAt: new Date(source!.createdAt.getTime() - 500) });
+        }
+        await db.$client.unsafe(`CREATE FUNCTION ${name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+          IF NEW.created_by_run_id = '${runId}'::uuid AND NEW.body = 'New session' THEN
+            UPDATE heartbeat_runs SET result_json = coalesce(result_json, '{}'::jsonb) ||
+              jsonb_build_object('observedFreshNoticeId', (SELECT id FROM issue_comments
+                WHERE created_by_run_id = '${runId}'::uuid AND body LIKE '%continuing in a new session%' LIMIT 1))
+              WHERE id = '${runId}'::uuid;
+            ${fault === "workspace" ? `UPDATE heartbeat_runs SET runner_profile_json = runner_profile_json || '{"remoteWorkspace":{"invalid":true}}'::jsonb WHERE id = '${runId}'::uuid;` : ""}
+            ${fault === "scheduler_decline" ? `UPDATE issues SET checkout_run_id = '${checkoutRunId}'::uuid WHERE id = '${issueId}'::uuid;` : ""}
+          END IF; RETURN NEW; END $$;
+          CREATE TRIGGER ${name} AFTER INSERT ON issue_comments FOR EACH ROW EXECUTE FUNCTION ${name}();
+          ${fault === "scheduler_throw" ? `CREATE FUNCTION ${name}_retry() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+            IF NEW.retry_of_run_id = '${runId}'::uuid THEN RAISE EXCEPTION 'injected scheduler refusal after notice'; END IF;
+            RETURN NEW; END $$;
+            CREATE TRIGGER ${name}_retry BEFORE INSERT ON heartbeat_runs FOR EACH ROW EXECUTE FUNCTION ${name}_retry();` : ""}`);
+        installed = true;
+      },
+    }) });
+    try {
+      const { issueId, runId } = await startTask(db, heartbeat, "in_progress", "pi_rpc");
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      expect(comments.filter(c => c.body.includes("continuing in a new session"))).toHaveLength(0);
+      const corrected = comments.filter(c => c.body.includes("Couldn't continue; your message is saved."));
+      expect(corrected).toHaveLength(1);
+      await publishNativeFreshSessionNotice(db, { companyId: fixture.current.companyId, agentId: fixture.current.agentId, issueId, runId });
+      expect((await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+        .filter(c => c.body.includes("continuing in a new session"))).toHaveLength(0);
+      const [failed] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(failed!.resultJson).toMatchObject({ continuationScheduling: "refused", observedFreshNoticeId: corrected[0]!.id });
+      expect(comments.filter(c => c.body === "New session")).toHaveLength(1);
+      expect(comments.filter(c => c.body === "Done.")).toHaveLength(0);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(0);
+      expect(await db.select().from(activityLog).where(and(eq(activityLog.runId, runId), eq(activityLog.action, "issue.comment_added"))))
+        .toHaveLength(2);
+      const [task] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const presentation = await taskInterruptionPresentation(db, task!);
+      expect(presentation).toMatchObject({ state: "failed", canRetry: true });
+      recordFreshSessionEvidence(`refusal-${fault}`, { fault, issueId, runId,
+        status: failed!.status, continuationScheduling: failed!.resultJson?.continuationScheduling,
+        originalNoticeId: failed!.resultJson?.observedFreshNoticeId, correctedNoticeId: corrected[0]!.id, comments, presentation });
+    } finally {
+      if (installed) await db.$client.unsafe(`DROP TRIGGER ${name} ON issue_comments; DROP FUNCTION ${name}();
+        ${fault === "scheduler_throw" ? `DROP TRIGGER ${name}_retry ON heartbeat_runs; DROP FUNCTION ${name}_retry();` : ""}`);
+      await heartbeat.drainActiveRunExecutions(); await closeIdleWarmNativeSessionsForRestart(); await db.$client.end();
+    }
+  }, 90_000);
+
+  it("deduplicates a chain of three failed runs by task + conversation generation", async () => {
+    const { companyId, agentId } = fixture.current;
+    const db = createDb(fixture.current.temporary.connectionString, { maxConnections: 4 });
+    const attempts: string[] = [];
+    const unretired = { failed: false, environmentId: randomUUID(), freshSessionRequired: true, noLease: true,
+      repeat: attempts as string[] | undefined };
+    const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: nativeBackend(db, {
+      unretiredPredecessorOnce: unretired,
+      beforeRetirementFailure: async () => { if (attempts.length === 3) unretired.repeat = undefined; },
+    }) });
+    try {
+      const { issueId, runId } = await startTask(db, heartbeat, "in_progress", "pi_rpc");
+      let previous = runId;
+      for (let index = 0; index < 2; index += 1) {
+        const [next] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, previous));
+        expect(next).toBeDefined();
+        await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(0) }).where(eq(heartbeatRuns.id, next!.id));
+        expect(await heartbeat.promoteDueScheduledRetries()).toMatchObject({ promoted: 1 });
+        await heartbeat.resumeQueuedRuns();
+        await waitForCondition("failing chain attempt to settle", () => heartbeat.getTaskDrainStatus().quiescent);
+        expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next!.id)))[0]!.status).toBe("failed");
+        previous = next!.id;
+      }
+      expect(attempts).toHaveLength(3);
+      // Concurrent replays from different runs must use the very same door.
+      await Promise.all(attempts.map(id => publishNativeFreshSessionNotice(db, { companyId, agentId, issueId, runId: id })));
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      expect(comments.filter(c => c.body.includes("could not be restored"))).toHaveLength(1);
+      expect(comments.filter(c => c.body === "New session")).toHaveLength(1);
+      expect(await db.select().from(activityLog).where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.comment_added"))))
+        .toHaveLength(2);
+
+      // Existing 0405 rows have no clientRequestId. Adopt their generation
+      // marker and original notice in place, including a replay by a later run.
+      await db.update(issueComments).set({ clientRequestId: null }).where(eq(issueComments.issueId, issueId));
+      await publishNativeFreshSessionNotice(db, { companyId, agentId, issueId, runId: previous });
+      expect((await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+        .filter(c => c.body.includes("could not be restored"))).toHaveLength(1);
+      const [answerRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, previous));
+      await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(0) }).where(eq(heartbeatRuns.id, answerRun!.id));
+      expect(await heartbeat.promoteDueScheduledRetries()).toMatchObject({ promoted: 1 });
+      await heartbeat.resumeQueuedRuns();
+      await waitForCondition("three failed attempts to yield one answer", () => heartbeat.getTaskDrainStatus().quiescent);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, answerRun!.id)))[0]!.status).toBe("succeeded");
+      const answered = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      expect(answered.filter(c => c.body === "Done.")).toHaveLength(1);
+      expect(answered.filter(c => c.body === "New session")).toHaveLength(1);
+      expect(answered.filter(c => c.body.includes("could not be restored"))).toHaveLength(1);
+      recordFreshSessionEvidence("three-failing-runs", { issueId, failingRunIds: attempts, answerRunId: answerRun!.id,
+        generation: answered.find(c => c.body === "New session")!.conversationSessionGeneration, comments: answered });
+
+      // A real generation change permits one new pair, but a late old run
+      // still targets its old generation and must not consume the new one.
+      const [task] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const generation = task!.conversationSessionGeneration + 1;
+      await db.update(issues).set({ conversationSessionGeneration: generation }).where(eq(issues.id, issueId));
+      await publishNativeFreshSessionNotice(db, { companyId, agentId, issueId, runId });
+      expect((await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+        .filter(c => c.body === "New session")).toHaveLength(1);
+      const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, previous));
+      const newRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({ ...source!, id: newRunId, retryOfRunId: null,
+        contextSnapshot: { ...source!.contextSnapshot, conversationSessionGeneration: generation } });
+      await publishNativeFreshSessionNotice(db, { companyId, agentId, issueId, runId: newRunId }, "refused");
+      expect((await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+        .filter(c => c.body === "New session")).toHaveLength(1);
+      await publishNativeFreshSessionNotice(db, { companyId, agentId, issueId, runId: newRunId });
+      const final = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      expect(final.filter(c => c.body === "New session")).toHaveLength(2);
+      expect(final.filter(c => c.body.includes("could not be restored"))).toHaveLength(2);
+      expect(final.filter(c => c.body === "New session" && c.conversationSessionGeneration === generation)).toHaveLength(1);
+    } finally {
+      await heartbeat.drainActiveRunExecutions(); await closeIdleWarmNativeSessionsForRestart();
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(and(
+        eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.status, ["queued", "scheduled_retry"])));
+      await db.$client.end();
+    }
+  }, 90_000);
+
   // Never-OK: cleanup failure must not hide a continuity break; task FK key-share locks must not deadlock its notice.
   it.each(["retirement", "metadata_format", "backup_without_reusable_lease"] as const)("writes a visible $stage fresh-session failure despite coordinator-close failure while a task key-share lock is held", async stage => {
     const { companyId } = fixture.current;
@@ -717,6 +865,8 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
       const { issueId, runId } = await startTask(db, heartbeat, "in_progress", "pi_rpc");
       await noticeObservation; expect(noticeError).toBeUndefined();
       const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      expect(comments.filter(c => c.body.includes("continuing in a new session"))).toHaveLength(0);
+      expect(comments.filter(c => c.body.includes("Couldn't continue; your message is saved."))).toHaveLength(1);
       expect(comments.filter(c => c.conversationSessionGeneration != null)).toHaveLength(1);
       expect(comments.filter(c => c.body.includes("could not be restored") && c.body.includes(runId))).toHaveLength(1);
       expect(await db.select().from(activityLog).where(and(eq(activityLog.runId, runId), eq(activityLog.action, "issue.comment_added"))))
@@ -724,6 +874,7 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
       expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]).toMatchObject({ status: "failed" });
       expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.retryOfRunId, runId))))
         .toHaveLength(0);
+      recordFreshSessionEvidence(`coordinator-refusal-${stage}`, { issueId, runId, stage, comments });
     } finally {
       release.resolve(); await keyShare; await noticeObservation;
       if (triggered) await db.$client.unsafe(`DROP TRIGGER ${name} ON native_run_finalizations; DROP FUNCTION ${name}()`);
@@ -731,13 +882,13 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
     }
   }, 90_000);
 
-  it("stops retrying with a truthful failure when the next attempt met the same unretired sandbox instead of a fresh one", async () => {
+  it.each([false, true])("stops retrying with a truthful failure when the next attempt met the same unretired sandbox instead of a fresh one (fresh session = %s)", async freshSessionRequired => {
     const { companyId } = fixture.current;
     const db = createDb(fixture.current.temporary.connectionString, { maxConnections: 4 });
     const [environment] = await db.insert(environments).values({ name: `reused-${randomUUID()}`, driver: "sandbox" }).returning();
     const attempts: string[] = [];
     const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: nativeBackend(db,
-      { unretiredPredecessorOnce: { failed: false, environmentId: environment!.id, repeat: attempts } }) });
+      { unretiredPredecessorOnce: { failed: false, environmentId: environment!.id, repeat: attempts, freshSessionRequired } }) });
     try {
       const { issueId, runId } = await startTask(db, heartbeat);
       const [first] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
@@ -757,6 +908,10 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
       expect(await heartbeat.promoteDueScheduledRetries()).toMatchObject({ promoted: 0 });
       const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
       expect(await taskInterruptionPresentation(db, issue!)).toMatchObject({ canRetry: true });
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      expect(comments.filter(c => c.body.includes("continuing in a new session"))).toHaveLength(0);
+      expect(comments.filter(c => c.body.includes("Couldn't continue; your message is saved."))).toHaveLength(freshSessionRequired ? 1 : 0);
+      expect(comments.filter(c => c.body === "New session")).toHaveLength(freshSessionRequired ? 1 : 0);
     } finally {
       await heartbeat.drainActiveRunExecutions();
       await closeIdleWarmNativeSessionsForRestart();

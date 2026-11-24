@@ -1749,7 +1749,7 @@ function invalidateActivityQueries(
             : undefined;
         queryClient.invalidateQueries({ queryKey: queryKeys.issues.detail(ref), ...invalidationOptions });
         queryClient.invalidateQueries({ queryKey: queryKeys.issues.activity(ref), ...invalidationOptions });
-        if (action === "issue.comment_added" || action === "issue.conversation_session_started" || visibleConversation) {
+        if (action === "issue.comment_added" || action === "issue.comment_updated" || action === "issue.conversation_session_started" || visibleConversation) {
           queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments(ref), ...(visibleConversation ? undefined : invalidationOptions) });
         }
         // A server hold on a message (or its release) reaches the open page now, not on a reload.
