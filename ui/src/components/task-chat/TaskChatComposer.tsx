@@ -1024,7 +1024,7 @@ export function TaskChatComposer({
       (!trimmed && attachedRefs.length === 0) ||
       uploadPending ||
       uploadFailed ||
-      submitting ||
+      submittingRef.current ||
       uncertainSubmission ||
       disabled
     )
@@ -1067,6 +1067,7 @@ export function TaskChatComposer({
     setBody("");
     setSendingAttachmentIds(new Set(submittedAttachments.map(item => item.id)));
     setActionError(null);
+    submittingRef.current = true;
     setSubmitting(true);
     let attemptId: string | null = null;
     let request: ComposerSendRequest | null = null;
@@ -1183,6 +1184,7 @@ export function TaskChatComposer({
     } finally {
       if (pendingDraftRef.current?.attemptId === attemptId) pendingDraftRef.current = null;
       setSendingAttachmentIds(null);
+      submittingRef.current = false;
       setSubmitting(false);
     }
   }
