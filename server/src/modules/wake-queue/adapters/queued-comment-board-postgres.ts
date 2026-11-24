@@ -453,7 +453,7 @@ export function createQueuedCommentSteeringAdapter(db: Db): QueuedCommentSteerin
                 ...result,
                 queuedSteeringAcknowledgements: {
                   ...parseObject(result.queuedSteeringAcknowledgements),
-                  [commentId]: { status: "acknowledged", queueId: wake.id, turnId, acknowledgedAt: now.toISOString() },
+                  [commentId]: { status: "acknowledged", queueId: wake.id, turnId, acknowledgedAt: now.toISOString(), afterEventSeq: run!.nextEventSeq - 1 },
                 },
               },
               updatedAt: now,
