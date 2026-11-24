@@ -80,20 +80,21 @@ describe("TaskChatRunnerTurn", () => {
         recoveryOwner: null, nextAction: null, permittedActions: ["inspect_run"],
         predecessorRunId: null, successorRunId: null,
       } : undefined);
-      expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent).toBe(projected ? "Queued" : "Starting…");
-      expect(container.textContent?.split(projected ? "Queued" : "Starting…")).toHaveLength(2);
+      const label = projected || runId ? "Queued" : "Starting…";
+      expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent).toBe(label);
+      expect(container.textContent?.split(label)).toHaveLength(2);
       expect(container.querySelector('[data-testid="task-chat-current-activity"]')).toBeNull();
       expect(container.textContent).not.toContain("Working");
       expect(container.textContent).not.toContain("Thinking");
-      expect(container.textContent?.includes("Queued")).toBe(projected);
+      expect(container.textContent?.includes("Queued")).toBe(projected || Boolean(runId));
     },
   );
 
-  it("preserves a specific preparation label before a run ID exists", () => {
+  it("preserves receipt-backed preparation in the header and activity before a run ID exists", () => {
     render([], "queued", null, undefined, false, false, undefined, "Preparing workspace");
     expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent).toBe("Preparing workspace");
-    expect(container.textContent?.split("Preparing workspace")).toHaveLength(2);
-    expect(container.querySelector('[data-testid="task-chat-current-activity"]')).toBeNull();
+    expect(container.textContent?.split("Preparing workspace")).toHaveLength(3);
+    expect(container.querySelector('[data-testid="task-chat-current-activity-label"]')?.textContent).toBe("Preparing workspace");
   });
 
   it.each([
@@ -116,19 +117,20 @@ describe("TaskChatRunnerTurn", () => {
     expect(container.textContent).not.toContain("Thinking");
   });
 
-  it("keeps startup feedback briefly, then says a queued turn with no named hold is waiting for a machine", () => {
+  it("holds Queued without inventing a machine wait when no new startup receipt arrives", () => {
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date("2026-11-13T17:39:05Z"));
       render([], "queued");
-      expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent).toBe("Starting…");
+      expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent).toBe("Queued");
       expect(container.querySelector('[data-testid="task-chat-current-activity"]')).toBeNull();
-      // The fixture's run was queued 2 s before render: the grace ends at +28 s.
+      // Time alone cannot establish a machine wait; the known run remains Queued.
       act(() => { vi.advanceTimersByTime(27_000); });
       expect(container.textContent).not.toContain("Waiting for a machine…");
       act(() => { vi.advanceTimersByTime(2_000); });
-      expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent).toBe("Waiting for a machine…");
-      expect(container.textContent?.split("Waiting for a machine…")).toHaveLength(2);
+      expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent).toBe("Queued");
+      expect(container.textContent?.split("Queued")).toHaveLength(2);
+      expect(container.textContent).not.toContain("Waiting for a machine…");
       expect(container.querySelector('[data-testid="task-chat-current-activity"]')).toBeNull();
       expect(container.textContent).not.toContain("Working");
     } finally {
@@ -193,9 +195,9 @@ describe("TaskChatRunnerTurn", () => {
     },
   });
 
-  it("shows a stable Working header with Thinking at the turn tail", () => {
+  it("shows a stable Working header and an unclaimed-activity Working tail", () => {
     render([], "running");
-    expect(container.textContent).toContain("Thinking");
+    expect(container.textContent).not.toContain("Thinking");
     expect(container.textContent).toContain("Runner");
     expect(
       container.querySelector(
@@ -211,7 +213,7 @@ describe("TaskChatRunnerTurn", () => {
       container.querySelector(
         '[data-testid="task-chat-current-activity-label"]',
       )?.textContent,
-    ).toBe("Thinking");
+    ).toBe("Working");
     expect(
       container.querySelector('[data-testid="task-chat-current-activity"]')
         ?.tagName,
@@ -247,14 +249,14 @@ describe("TaskChatRunnerTurn", () => {
   });
 
   it.each(["reconnecting", "retry_scheduled"] as const)(
-    "keeps the active turn and Thinking tail visible with a %s projection",
+    "keeps the active turn and Working tail visible with a %s projection",
     (phase) => {
       const execution = { phase } as ExecutionProjection;
       render([], "running", "run-1", undefined, false, false, execution);
       expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent)
         .toContain("Working for");
       expect(container.querySelector('[data-testid="task-chat-current-activity-label"]')?.textContent)
-        .toBe("Thinking");
+        .toBe("Working");
       render([], "succeeded", "run-1", undefined, false, false, execution);
       expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent)
         .toContain("Worked");
@@ -282,7 +284,7 @@ describe("TaskChatRunnerTurn", () => {
     expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent)
       .toContain("Working for");
     expect(container.querySelector('[data-testid="task-chat-current-activity-label"]')?.textContent)
-      .toBe("Thinking");
+      .toBe("Working");
 
     // A stale waiting projection must never override a terminal run outcome.
     render([], "failed", "run-1", undefined, false, false, waiting);
@@ -301,7 +303,7 @@ describe("TaskChatRunnerTurn", () => {
     ).toContain("Continued after steering · Working for");
   });
 
-  it("renders completed progress exactly once when the live run returns to Thinking", () => {
+  it("renders completed progress exactly once when the live run returns to Working", () => {
     const text = "Understood—I’ll use a two-second wait instead.";
     const items = transcriptToTaskChatItems(
       [
@@ -346,7 +348,7 @@ describe("TaskChatRunnerTurn", () => {
       container.querySelector(
         '[data-testid="task-chat-current-activity-label"]',
       )?.textContent,
-    ).toBe("Thinking");
+    ).toBe("Working");
   });
 
   it("keeps progress mounted above its grouped current command", () => {
@@ -507,10 +509,10 @@ describe("TaskChatRunnerTurn", () => {
 
   it("keeps a visible fallback when completion tools are filtered before the final reply", () => {
     render([{ id: "finish", kind: "tool", name: "paperclip_finish", status: "in_progress" }]);
-    expect(container.querySelector('[data-testid="task-chat-current-activity"]')?.textContent).toContain("Thinking");
+    expect(container.querySelector('[data-testid="task-chat-current-activity"]')?.textContent).toContain("Working");
     expect(container.querySelector('[data-testid="task-chat-activity-phase"]')).toBeNull();
     render([{ id: "finish-provider", kind: "protocol", surface: "provider_activity", family: "tool_execution", eventType: "tool.execution.started", status: "running", title: "Finish", details: [{ label: "Name", value: "paperclip_finish" }], steps: [], links: [], children: [] }]);
-    expect(container.querySelector('[data-testid="task-chat-current-activity"]')?.textContent).toContain("Thinking");
+    expect(container.querySelector('[data-testid="task-chat-current-activity"]')?.textContent).toContain("Working");
     expect(container.querySelector('[data-testid="task-chat-activity-phase"]')).toBeNull();
   });
 
@@ -1295,7 +1297,7 @@ describe("TaskChatRunnerTurn", () => {
     expect(
       container.querySelector('[data-testid="task-chat-current-activity"]')
         ?.textContent,
-    ).toContain("Thinking");
+    ).toContain("Working");
   });
 
   it("omits runner lifecycle and token noise while preserving useful history", () => {
