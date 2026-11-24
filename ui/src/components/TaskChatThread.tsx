@@ -1208,7 +1208,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     return new Set(runs.filter(run => covered.has(run.id) && !isUserStop(run.id) &&
       ["failed", "cancelled", "timed_out", "interrupted"].includes(terminalStatuses.get(run.id) ?? run.status)).map(run => run.id));
   }, [runChainIdsById, props.interruption, runs, isUserStop, terminalStatuses]);
-  const stoppingReply = stopPending && !!liveRun && stoppedRunIds.current.has(liveRun.id);
+  const stoppingReply = !!liveRun && !isTerminalRunStatus(linkedRunMetaById.get(liveRun.id)?.status ?? liveRun.status) &&
+    ((stopPending && stoppedRunIds.current.has(liveRun.id)) || Boolean(linkedRunMetaById.get(liveRun.id)?.resultJson?.personStop));
 
   // The live runner turn remains the sole owner of its response until the
   // canonical comment and settled activity are both ready. This state is
@@ -3627,7 +3628,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                     startedAtMs={tailStartedAtMs}
                                     finishedAtMs={tailFinishedAtMs}
                                     continuedAfterSteering={paperclipRunnerTail && tailTimelineAnchors.length > 0}
-                                    statusContent={tailRunSource?.adapterType !== "paperclip_runner" && !optimisticRunnerStartup && !tailPreparationLabel && !isTerminalRunStatus(tailStatus) ? (
+                                    statusContent={tailRunSource?.adapterType !== "paperclip_runner" && !optimisticRunnerStartup && !tailPreparationLabel && !stoppingReply && !isTerminalRunStatus(tailStatus) ? (
                                       <TaskChatLiveRunPill status={tailStatus} execution={!tailHasFinalResponse && !tailFinalStreaming && !tailTerminal && liveRun?.id === tailRunId ? tailExecution : null}
                                         startedAtMs={tailStartedAtMs} finishedAtMs={tailFinishedAtMs} toolSummary={tailToolSummary} />
                                     ) : undefined}
