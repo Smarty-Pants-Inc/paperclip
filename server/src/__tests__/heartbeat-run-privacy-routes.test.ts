@@ -594,6 +594,21 @@ describeEmbeddedPostgres("heartbeat run privacy routes", { concurrent: false }, 
     expect(run.resultJson?.personStop).toBeUndefined(); expect(run.resultJson?.startupCancellation).toBeUndefined();
   });
 
+  it("holds Stop after first-turn dispatch is reserved but before turn.started is published", async () => {
+    const f = await seedFixture();
+    await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc" } }).where(eq(agents.id, f.ownerAgentId));
+    await db.update(heartbeatRuns).set({ finishedAt: null, runtimeMode: "native", nativeIssueId: f.issueId,
+      runnerProfileJson: { nativeExecutionInput: { provider: { kind: "pi_rpc" } } },
+      resultJson: { firstTurnDispatchCommitted: true }, nextEventSeq: 100,
+    }).where(eq(heartbeatRuns.id, f.privateRunId));
+    await db.insert(nativeRunFinalizations).values({ runId: f.privateRunId, companyId: f.companyId, issueId: f.issueId, phase: "observed" });
+    const stopped = await request(createBoardApp(f.companyId, f.ownerUserId)).post(`/api/heartbeat-runs/${f.privateRunId}/cancel`).send({});
+    expect(stopped.status).toBe(202);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.privateRunId));
+    expect(run).toMatchObject({ status: "running", resultJson: { firstTurnDispatchCommitted: true, personStopHeld: expect.any(Object) } });
+    expect(run.resultJson?.personStop).toBeUndefined(); expect(run.resultJson?.startupCancellation).toBeUndefined();
+  });
+
   it("conceals private runs from unauthorized cancellation and watchdog mutations", async () => {
     const fixture = await seedFixture();
 
