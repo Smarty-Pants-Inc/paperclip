@@ -8393,7 +8393,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
               action={issue.activeRecoveryAction ?? null} />
           )}
           {resolvedDetailTab === "chat" && (
-            <ExecutionBlockerNotice className={shellSectionClass} presentation={issue.interruption} blockers={issue.blockedBy}
+            <ExecutionBlockerNotice className={shellSectionClass} presentation={issue.interruption} blockers={issue.blockedBy} conversationMode={!!issue.conversationAgentId}
               observedStatus={interruptionRun?.status} observedResultJson={interruptionRun?.resultJson} observedErrorCode={interruptionRun?.errorCode}
               blocker={retainedRecoveryOwnsRetry ? null : issue.executionBlocker}
               issueId={issue.id} companyId={issue.companyId} agentName={agentMap.get(issue.assigneeAgentId ?? "")?.name} projectName={issue.project?.name}
