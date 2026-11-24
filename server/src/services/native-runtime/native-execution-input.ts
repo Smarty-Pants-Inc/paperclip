@@ -2,6 +2,7 @@ import type { PaperclipTurnContext } from "@paperclipai/adapter-utils/server-uti
 import { resolvePaperclipRunnerCursorMode, resolvePaperclipRunnerPiThinkingLevel } from "@paperclipai/adapter-utils";
 import { createHash } from "node:crypto";
 import { buildNativeContinuationPrompt } from "./native-continuation.js";
+import { decideNativeContinuation } from "./continued-session.js";
 import {
   caseExecutionMarkdown,
   caseProjectionBootstrapPrefix,
@@ -74,6 +75,7 @@ export interface BuildNativeExecutionInput {
   /** Skill keys selected from the admitted, manager-authored GitHub configuration. */
   githubInstructionSkillKeys?: readonly string[];
   resumedSession?: boolean;
+  sessionContinuity?: unknown;
   previousTurn?: {
     runId: string;
     task: { title: string; description: string | null };
@@ -261,6 +263,9 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
   const workflowCase = input.caseContext && previousCaseProjection
     ? projectCaseContinuation(input.caseContext, previousCaseProjection) : null;
   const piConversation = input.provider === "pi_rpc" && input.conversationMode === true && input.issue.conversationAgentId === input.agentId;
+  const continuation = decideNativeContinuation({ ...input, hasSession: input.resumedSession === true && !!input.previousTurn,
+    taskChanged: !!input.previousTurn && (input.issue.title !== input.previousTurn.task.title || input.issue.description !== input.previousTurn.task.description),
+    wakeReset: input.conversationMode === true });
   const runtimeContext = piConversation ? structuredClone(input.runtimeContext) : input.runtimeContext;
   if (piConversation) {
     runtimeContext.prompt.text = runtimeContext.prompt.text.replace(PAPERCLIP_EXECUTION_FINISH_INSTRUCTION, PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION);
@@ -275,9 +280,10 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
     ...((input.initialCommunicationGuidance || input.freshSessionHandoff) ? {
       initialCommunicationGuidance: [input.initialCommunicationGuidance, input.freshSessionHandoff].filter(Boolean).join("\n\n"),
     } : {}),
-    ...(input.resumedSession && input.previousTurn && !input.conversationMode ? {
+    ...(continuation.continue && input.previousTurn ? {
       continuationPrompt: buildNativeContinuationPrompt({
         wakePayload: input.wakePayload,
+        promptOnly: continuation.promptOnly,
         previousRunId: input.previousTurn.runId,
         previousIssue: input.previousTurn.task,
         previousGitHubReviewConfigurationKeys: input.previousTurn.githubReviewConfigurationKeys,
