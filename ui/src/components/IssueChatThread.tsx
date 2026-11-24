@@ -525,7 +525,7 @@ export function shouldRenderComposerHandoffPreview(
 export interface IssueChatComposerHandle {
   focus: () => void;
   /** false when the text could not be kept in the draft store (the caller must not delete its source). */
-  restoreDraft: (submittedBody: string) => boolean | void;
+  restoreDraft: (submittedBody: string, commentReceipt?: string) => boolean | void;
 }
 
 interface IssueChatComposerProps {
@@ -5068,21 +5068,25 @@ const IssueChatComposer = forwardRef<
     setPendingWorkMode(resolvedIssueWorkMode);
   }, [resolvedIssueWorkMode]);
 
+  const copiedCommentIds = useRef(new Set<string>());
   useImperativeHandle(
     forwardedRef,
     () => ({
       focus: focusComposer,
-      restoreDraft: (submittedBody: string) => {
-        setBody((current) =>
-          restoreSubmittedCommentDraft({
-            currentBody: current,
-            submittedBody,
-          }),
-        );
+      restoreDraft: (submittedBody: string, commentReceipt?: string) => {
+        const currentBody = bodyRef.current;
+        const next = commentReceipt
+          ? copiedCommentIds.current.has(commentReceipt) ? currentBody : currentBody ? `${currentBody}\n\n${submittedBody}` : submittedBody
+          : restoreSubmittedCommentDraft({ currentBody, submittedBody });
+        if (commentReceipt) copiedCommentIds.current.add(commentReceipt);
+        bodyRef.current = next;
+        setBody(next);
+        if (draftKey) saveDraft(draftKey, next);
         focusComposer();
+        return !draftKey || loadDraft(draftKey) === next;
       },
     }),
-    [],
+    [draftKey],
   );
 
   const showStop =
