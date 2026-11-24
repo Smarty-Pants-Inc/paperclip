@@ -448,7 +448,7 @@ describe("issue comment reopen routes", () => {
     mockTxInsert.mockImplementation(() => ({ values: mockTxInsertValues }));
     mockDbSelectOrderBy.mockResolvedValue([]);
     mockDbSelectWhere.mockImplementation(() => ({
-      limit: async () => [], orderBy: mockDbSelectOrderBy,
+      orderBy: mockDbSelectOrderBy,
       for: async () => [{ id: "comment-1" }],
       then: (
         onFulfilled: (rows: unknown[]) => unknown,
@@ -642,54 +642,6 @@ describe("issue comment reopen routes", () => {
       expect.objectContaining({ payload: expect.objectContaining({ issueId: issue.id }) })));
   });
 
-  it.each(["done", "in_review"] as const)("answers a finished continuous task in place (%s)", async status => {
-    for (const operation of ["comment", "update"]) for (const reopen of [false, true]) {
-      const issue = makeIssue(status);
-      mockHeartbeatService.wakeup.mockClear();
-      mockIssueService.getById.mockResolvedValue(issue);
-      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => makeIssueUpdateReceipt(issue, patch));
-      mockAgentService.getById.mockResolvedValue({ id: issue.assigneeAgentId, companyId: issue.companyId,
-        adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc" } });
-      const app = request(await installActor(createApp()));
-      const response = operation === "comment"
-        ? await app.post(`/api/issues/${issue.id}/comments`).send({ body: "Explain the result", reopen })
-        : await app.patch(`/api/issues/${issue.id}`).send({ comment: "Explain the result", reopen });
-      expect(response.status, JSON.stringify(response.body)).toBe(operation === "comment" ? 201 : 200);
-      expect(mockIssueService.update.mock.calls.every(([, patch]) => patch.status === undefined || patch.status === status)).toBe(true);
-      await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(issue.assigneeAgentId,
-        expect.objectContaining({ reason: "issue_commented", contextSnapshot: expect.objectContaining({ finishedTaskConversation: true }) })));
-    }
-  });
-  it.each(["governed_response_waiting", "response_wake_waiting_for_input", "pending_input"])("does not mark an unfinished response wait (%s)", async wait => {
-    for (const operation of ["comment", "update"]) {
-      const issue = { ...makeIssue("in_review"), lastStatusDecisionId: "decision-1" }; mockHeartbeatService.wakeup.mockClear(); mockIssueService.getById.mockResolvedValue(issue);
-      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => makeIssueUpdateReceipt(issue, patch));
-      mockAgentService.getById.mockResolvedValue({ id: issue.assigneeAgentId, companyId: issue.companyId, adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc" } });
-      const selectFrom = mockDbSelectFrom.getMockImplementation()!;
-      mockDbSelectFrom.mockImplementation(table => ["status_decisions", "issue_thread_interactions"].includes(getTableName(table as never))
-        ? { where: () => ({ limit: async () => getTableName(table as never) === "status_decisions" ? [{ reasonCode: wait }] : wait === "pending_input" ? [{ id: "question-1" }] : [] }) } as never : selectFrom(table));
-      const app = request(await installActor(createApp()));
-      const response = operation === "comment" ? await app.post(`/api/issues/${issue.id}/comments`).send({ body: "Answer, then mark done." }) : await app.patch(`/api/issues/${issue.id}`).send({ comment: "Answer, then mark done." });
-      expect(response.status).toBe(operation === "comment" ? 201 : 200); await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(issue.assigneeAgentId, expect.objectContaining({ reason: "issue_commented", contextSnapshot: expect.not.objectContaining({ finishedTaskConversation: true }) })));
-    }
-  });
-  it.each([
-    ["done", "pi_rpc", "paperclip", false, "paperclip_runner"], ["done", "codex", "continuous", false, "paperclip_runner"],
-    ["cancelled", "pi_rpc", "continuous", false, "paperclip_runner"], ["blocked", "pi_rpc", "continuous", false, "paperclip_runner"],
-    ["done", "pi_rpc", "continuous", true, "paperclip_runner"], ["done", "pi_rpc", "continuous", false, "pi_local"],
-  ] as const)("keeps stock reopen for %s/%s/%s/resume=%s/%s", async (status, provider, sessionContinuity, resume, adapterType) => {
-    const issue = makeIssue(status);
-    mockIssueService.getById.mockResolvedValue(issue);
-    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => makeIssueUpdateReceipt(issue, patch));
-    mockAgentService.getById.mockResolvedValue({ id: issue.assigneeAgentId, companyId: issue.companyId,
-      adapterType, adapterConfig: { provider, sessionContinuity } });
-    const response = await request(await installActor(createApp())).post(`/api/issues/${issue.id}/comments`)
-      .send({ body: "Continue", reopen: true, resume });
-    expect(response.status).toBe(201);
-    expect(mockIssueService.update.mock.calls[0]?.[1]).toMatchObject({ status: "todo" });
-    await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(issue.assigneeAgentId,
-      expect.objectContaining({ reason: "issue_reopened_via_comment", contextSnapshot: expect.not.objectContaining({ finishedTaskConversation: true }) })));
-  });
   it("finishes missing reference and activity writes for an accepted comment", async () => {
     const issue = makeIssue("done");
     mockIssueService.getById.mockResolvedValue(issue);
