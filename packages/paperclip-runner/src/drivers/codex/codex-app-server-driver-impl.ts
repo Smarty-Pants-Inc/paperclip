@@ -230,12 +230,9 @@ export class CodexAppServerDriver implements HarnessDriver {
           text(tool.name) === "read_chat_attachment",
       );
     }
-    const terminalTools = codexSemanticToolSpecs();
-    if (this.#options.conversationReply || this.#options.turnIntent === "conversation_reply") {
-      const terminalNames = new Set(terminalTools.map(tool => text(tool.name)));
-      return supplied.filter(tool => !terminalNames.has(text(tool.name)));
-    }
-    return [...supplied, ...terminalTools];
+    return [...supplied, ...codexSemanticToolSpecs().map(tool => this.#options.conversationReply
+      ? { ...tool, description: "Optional for this conversation: an ordinary reply needs only a final message. " + tool.description }
+      : tool)];
   }
 
   #baseInstructions(): string {

@@ -248,7 +248,6 @@ export function arbitrateNativeStatus(input: {
   hasActivePauseHold?: boolean;
   /** The run only compacted the agent's context; it carries no task outcome. */
   contextCompactionRun?: boolean;
-  finishedTaskConversation?: boolean;
   reviewOwnerUserId?: string | null;
   /** Review decisions own task state; a reviewer's finish report cannot override them. */
   nativeReviewOutcome?: "resolved" | "pending" | "stale";
@@ -291,18 +290,6 @@ export function arbitrateNativeStatus(input: {
       reasonCode: "context_compaction_status_preserved",
       unblockDescriptor: null,
       effects: [],
-    };
-  }
-  if (input.finishedTaskConversation && ["done", "in_review"].includes(input.priorIssueStatus)) {
-    // A conversational reply must not reopen finished work. Accepted completion
-    // still belongs to the stock arbiter, including its governance/evidence gates.
-    const decision = arbitrateNativeStatus({ ...input, finishedTaskConversation: false });
-    if (!["todo", "in_progress", "blocked", "backlog"].includes(decision.toStatus)) return decision;
-    return {
-      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
-      statusAction: "preserve", toStatus: input.priorIssueStatus,
-      reasonCode: "finished_task_conversation_status_preserved", unblockDescriptor: null,
-      effects: [{ kind: "release_checkout" }],
     };
   }
   if (["done", "cancelled"].includes(input.priorIssueStatus)) {

@@ -1126,7 +1126,7 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
     expect(await readFile(path.join(seeded.worktree, "retained.txt"), "utf8")).toBe("unexported original task edits\n");
   });
 
-  it.each(["todo", "in_review"])("rejects unrunnable workspaces without reopening finished conversations (%s)", async status => {
+  it("blocks projectless isolated git-worktree issues before dispatch", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
@@ -1149,8 +1149,8 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
       name: "CodexCoder",
       role: "engineer",
       status: "idle",
-      adapterType: status === "todo" ? "codex_local" : "paperclip_runner",
-      adapterConfig: status === "todo" ? {} : { provider: "pi_rpc" },
+      adapterType: "codex_local",
+      adapterConfig: {},
       runtimeConfig: {
         heartbeat: {
           wakeOnDemand: true,
@@ -1163,7 +1163,7 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
       id: issueId,
       companyId,
       title: "Projectless isolated worktree",
-      status,
+      status: "todo",
       workMode: "standard",
       priority: "medium",
       assigneeAgentId: agentId,
@@ -1176,19 +1176,17 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
       },
     });
 
-    const [personComment] = await db.insert(issueComments).values({ companyId, issueId, authorUserId: "responsible-user", body: "Explain the result" }).returning();
     const routineEvents: string[] = [];
     const unsubscribeRoutine = subscribeDatabaseWork(db, DELIVERY_QUEUES.routineExecutionStatus, event => routineEvents.push(event));
     const heartbeat = heartbeatService(db);
     const blockedTelemetry = vi.spyOn(productTelemetry, "emitSystemTaskBlockedAfterCommit");
     let run;
     try {
-      const reason = status === "todo" ? "issue_assigned" : "issue_commented";
-      run = await heartbeat.wakeup(agentId, { source: "assignment", triggerDetail: "system", reason, requestedByActorType: "user",
-        payload: { issueId }, contextSnapshot: { issueId, wakeReason: reason, ...(status === "todo" ? {} : { finishedTaskConversation: true, wakeCommentId: personComment.id }) } });
+      run = await heartbeat.wakeup(agentId, { source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+        payload: { issueId }, contextSnapshot: { issueId, wakeReason: "issue_assigned" } });
     } finally { unsubscribeRoutine(); }
     expect(blockedTelemetry.mock.calls.map(([, task, previousStatus]) => [task.id, task.companyId, previousStatus]))
-      .toEqual(status === "todo" ? [[issueId, companyId, "todo"]] : []);
+      .toEqual([[issueId, companyId, "todo"]]);
     blockedTelemetry.mockRestore();
     expect(routineEvents).toContain("intent"); expect(routineEvents).toContain("settled");
     expect(run).toBeNull();
@@ -1208,7 +1206,7 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(blockedIssue).toEqual({
-      status: status === "todo" ? "blocked" : status,
+      status: "blocked",
       checkoutRunId: null,
       executionRunId: null,
       executionAgentNameKey: null,
@@ -1237,7 +1235,7 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
       .select({ body: issueComments.body })
       .from(issueComments)
       .where(eq(issueComments.issueId, issueId))
-      .then((rows) => rows.find(row => row.body.includes(WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE)) ?? null);
+      .then((rows) => rows[0] ?? null);
     expect(comment?.body).toContain(WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE);
 
     const activity = await db

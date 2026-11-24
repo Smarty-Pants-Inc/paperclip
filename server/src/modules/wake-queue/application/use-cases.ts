@@ -368,14 +368,9 @@ async function promoteDeferredWake(
 ): Promise<ReleaseTransactionResult | null> {
   let currentIssue = issue;
   let shouldReopen = false;
-  const finishedTaskConversation = workingCandidate.deferredContextSeed.finishedTaskConversation === true &&
-    workingCandidate.requestedByActorType === "user" && workingCandidate.agentId === currentIssue.assigneeAgentId &&
-    (workingCandidate.wakeReason ?? workingCandidate.reason) === "issue_commented" && workingCandidate.payload.mutation !== "interaction" &&
-    workingCandidate.deferredContextSeed.resumeIntent !== true && ["done", "in_review"].includes(currentIssue.status);
   const freshDeferredCommentIds = workingCandidate.deferredCommentIds.filter(id => !bindingOnlyCommentIds.has(id));
   const freshQueuedCommentIds = workingCandidate.queuedCommentIds.filter(id => !bindingOnlyCommentIds.has(id));
   if (
-    !finishedTaskConversation &&
     !workingCandidate.authorizedFailedChatRetry &&
     freshDeferredCommentIds.length > 0 &&
     (currentIssue.status === "done" || currentIssue.status === "cancelled")
@@ -418,7 +413,6 @@ async function promoteDeferredWake(
   let reopenForAnswer = false;
   if (
     !shouldReopen &&
-    !finishedTaskConversation &&
     currentIssue.status === "done" &&
     workingCandidate.requestedByActorType === "user" &&
     workingCandidate.agentId === currentIssue.assigneeAgentId
@@ -445,7 +439,6 @@ async function promoteDeferredWake(
       contextSnapshot: workingCandidate.deferredContextSeed });
   if (
     !shouldReopen &&
-    !finishedTaskConversation &&
     !onboardingResultReport &&
     (currentIssue.status === "done" || currentIssue.status === "cancelled") &&
     workingCandidate.agentId === currentIssue.assigneeAgentId

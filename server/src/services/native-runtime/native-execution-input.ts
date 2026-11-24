@@ -2,7 +2,7 @@ import type { PaperclipTurnContext } from "@paperclipai/adapter-utils/server-uti
 import { resolvePaperclipRunnerCursorMode, resolvePaperclipRunnerPiThinkingLevel } from "@paperclipai/adapter-utils";
 import { createHash } from "node:crypto";
 import { buildNativeContinuationPrompt } from "./native-continuation.js";
-import { decideNativeContinuation, resolveSessionContinuity } from "./continued-session.js";
+import { decideNativeContinuation } from "./continued-session.js";
 import {
   caseExecutionMarkdown,
   caseProjectionBootstrapPrefix,
@@ -90,7 +90,6 @@ export interface BuildNativeExecutionInput {
   /** Fresh, authorized and redacted database context from task preparation. */
   caseContext?: CaseExecutionContext | null;
   conversationMode?: boolean;
-  finishedTaskConversation?: boolean;
   agentId: string;
   agentKeyId?: string;
   workspace: {
@@ -250,10 +249,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
   ]
     .filter((section) => section.length > 0)
     .join("\n\n");
-  const piConversation = input.provider === "pi_rpc" && input.conversationMode === true && input.issue.conversationAgentId === input.agentId;
-  const conversationReplyTurn = input.provider === "pi_rpc" && input.finishedTaskConversation === true &&
-    resolveSessionContinuity(input.provider, input.sessionContinuity) === "continuous";
-  const completionSources = !externalChatTurn && !input.conversationMode && !conversationReplyTurn && input.taskPrompt.trim()
+  const completionSources = !externalChatTurn && !input.conversationMode && input.taskPrompt.trim()
     ? verifiedCompletionSources(input.turnContext, input.completionContract.sources ?? [])
     : [];
   const previousExecution = input.previousTurn?.nativeExecutionInput;
@@ -266,6 +262,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
       ? readCaseProjectionMarker(previousExecution) : null;
   const workflowCase = input.caseContext && previousCaseProjection
     ? projectCaseContinuation(input.caseContext, previousCaseProjection) : null;
+  const piConversation = input.provider === "pi_rpc" && input.conversationMode === true && input.issue.conversationAgentId === input.agentId;
   const continuation = decideNativeContinuation({ ...input, hasSession: input.resumedSession === true && !!input.previousTurn,
     taskChanged: !!input.previousTurn && (input.issue.title !== input.previousTurn.task.title || input.issue.description !== input.previousTurn.task.description),
     wakeReset: input.conversationMode === true, previousRunId: input.previousTurn?.runId });
@@ -299,7 +296,6 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
       }),
     } : {}),
     executionMode,
-    ...(conversationReplyTurn ? { turnIntent: "conversation_reply" as const } : {}),
     planningContext: input.planningContext ?? null,
     binding: {
       companyId: input.companyId,
