@@ -1038,6 +1038,7 @@ export interface Issue {
   lastActivityAt?: Date | null;
   isUnreadForMe?: boolean;
   unreadMessageCount?: number;
+  latestMessagePreview?: string | null;
   isArchivedForMe?: boolean;
   archivedAt?: Date | null;
   archivedByActorType?: "user" | "agent" | null;
