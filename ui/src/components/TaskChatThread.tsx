@@ -137,6 +137,7 @@ import {
   useRunnerGoalControl,
 } from "@/components/task-chat/RunnerGoalWidget";
 import { TaskChatQueuedMessages } from "@/components/task-chat/TaskChatQueuedMessages";
+import { useWaitingToStart } from "@/components/task-chat/useWaitingToStart";
 import { QUEUED_MESSAGE_AUTO_STEER_DELAY_MS } from "@/components/task-chat/queued-message-auto-steer";
 import { useSidebar } from "@/context/SidebarContext";
 import { useStreamlinedUiEnabled } from "@/hooks/useStreamlinedUiEnabled";
@@ -2608,8 +2609,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       (entry.kind === "system" && entry.text === "Turn started"));
   const tailResuming = Boolean(liveExecution?.predecessorRunId ||
     tailEntries.some(entry => entry.kind === "system" && entry.text.startsWith("Paperclip session resumed")));
+  const tailResumeWaiting = useWaitingToStart(tailBeforeTurn && tailResuming, liveRun ? ((liveRun.startedAt ? toMs(liveRun.startedAt) : null) ?? toMs(liveRun.createdAt)) : null);
   const tailPreparationLabel = tailBeforeTurn
-    ? tailResuming ? "Resuming your conversation…" : "Starting…" : undefined;
+    ? tailResumeWaiting ? "Resuming your conversation…" : "Starting…" : undefined;
   const tailExecution = tailResuming && !tailBeforeTurn && liveExecution?.phase === "reconnecting"
     ? null : liveExecution;
   const tailPlanItem =
@@ -3123,7 +3125,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const renderQueuedAction = useCallback(
     (item: TaskChatMessageItem) => {
       const runId = item.queueTargetRunId;
-      if (composerPause || item.optimistic !== "queued" || !runId || !onInterruptQueued)
+      if (stopPending || stoppingReply || composerPause || item.optimistic !== "queued" || !runId || !onInterruptQueued)
         return null;
       // Agent Chat: Interrupt while the agent starts cancels the start; the tray says it sends when the agent starts.
       if (conversationMode && queuedMessageQueue?.steeringDisposition === "temporarily_unavailable") return null;
@@ -3141,7 +3143,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         </Button>
       );
     },
-    [composerPause, interruptingQueuedRunId, onInterruptQueued, conversationMode, queuedMessageQueue?.steeringDisposition],
+    [stopPending, stoppingReply, composerPause, interruptingQueuedRunId, onInterruptQueued, conversationMode, queuedMessageQueue?.steeringDisposition],
   );
 
   const reopenToolReview = useCallback((interactionId: string) => {
@@ -3757,12 +3759,14 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                     >
                       {!composerPause ? (
                         <TaskChatQueuedMessages
+                          agentStarting={tailBeforeTurn && queuedMessageQueue?.targetRunId === tailRunId}
+                          stopPending={stopPending || stoppingReply}
                           conversationMode={conversationMode}
                           key={issueId}
                           queue={queuedMessageQueue ?? emptyQueuedCommentQueue}
                           onEdit={beginQueuedEdit}
                           editingCommentId={queuedEdit?.commentId ?? null}
-                          autoSteerDelayMs={stopPending ? null : queuedMessageAutoSteerDelayMs}
+                          autoSteerDelayMs={stopPending || stoppingReply ? null : queuedMessageAutoSteerDelayMs}
                           attemptedAutoSteerKeys={attemptedAutoSteer.current}
                           onReorder={async (orderedCommentIds, revision) => {
                             if (!onReorderQueuedComments)
