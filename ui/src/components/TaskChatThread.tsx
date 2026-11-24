@@ -2504,6 +2504,14 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     settlingRun != null &&
     (settlingIsPaperclipRunner
       ? settledRunIds.has(settlingRun.id) &&
+        // A saved comment is not proof that the yielded turn can draw its reply.
+        // Keep the visible answer and its clock until both are ready to hand over.
+        (!paperclipRunnerFinalResponse(
+          transcriptToTaskChatItems(transcriptByRun.get(settlingRun.id) ?? [], { runId: settlingRun.id, running: false }),
+          { runId: settlingRun.id, allowFallback: false,
+            yielded: acceptedSemanticResultDisposition(linkedRunMetaById.get(settlingRun.id)?.resultJson) === "yielded" },
+        ) || (settledReplyRunIds.has(settlingRun.id) &&
+          linkedRunMetaById.get(settlingRun.id)?.finishedAt != null)) &&
         (settlingHasComment ||
           settlingHasDurableInteraction ||
           settlingRunStopped ||
