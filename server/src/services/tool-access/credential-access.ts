@@ -192,7 +192,7 @@ export function createConnectionCredentialAccess(db: Db, { secrets, audit, verce
     if (isGitHubAppConnection(connection)) {
       const grant = await vaultGrantForConnection(connection, connection.credentialPolicy === "shared" ? undefined : actor);
       if (!grant) throw unprocessable("The GitHub App authorization is unavailable");
-      return { Authorization: `Bearer ${(await resolveGitHubAppCredential(db, connection, grant, options)).token}` };
+      return { Authorization: `Bearer ${(await resolveGitHubAppCredential(db, connection, grant, { ...options, allowDraft: connection.status === "draft" })).token}` };
     }
     let grant: typeof connectionGrants.$inferSelect | null = null;
     try {
