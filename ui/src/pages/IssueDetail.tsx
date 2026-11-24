@@ -2257,13 +2257,20 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
           : comment.queueState === "queued"
             ? (comment.queueTargetRunId ?? null)
             : null);
-      // A saved message the server queue never listed (a run's first turn
-      // took it) is not pending once that run settles. Keeping it would
-      // withhold the queue id, and with it Steer and Discard, from every
-      // later message. A request still in flight keeps its original target.
-      if (targetRunId && !liveRunIds.has(targetRunId) && !comment.id.startsWith("optimistic-")) return [];
+      // The source run ending is not delivery. Keep later wakes pending until
+      // a consumption receipt above clears them; they never own the head's id.
       return targetRunId ? [{ comment, targetRunId }] : [];
-    }).sort((a, b) => new Date(a.comment.createdAt).getTime() - new Date(b.comment.createdAt).getTime());
+    });
+    // Merge all locally pending inputs with the server head once. Re-merging
+    // the display queue would drop its pendingQueue and erase an unacked target.
+    const pendingIds = new Set(pendingComments.map(({ comment }) => comment.id));
+    const steeredIds = new Set(commentsWithRunMeta.filter(comment => comment.steeredIntoRunId).map(comment => comment.id));
+    for (const [id, placement] of localSteeringPlacements) {
+      if (placement.comment && !steeredIds.has(id) && !pendingIds.has(id)) {
+        pendingComments.push({ comment: placement.comment, targetRunId: placement.targetRunId });
+      }
+    }
+    pendingComments.sort((a, b) => new Date(a.comment.createdAt).getTime() - new Date(b.comment.createdAt).getTime());
     const fallbackProtocol =
       liveRuntimeRun?.adapterType === "paperclip_runner" ||
       (!liveRuntimeRun && assigneeUsesPaperclipRunner)
@@ -2281,26 +2288,25 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     consumedQueuedCommentIds,
     discardedQueuedCommentIds,
     issueId,
-    liveRunIds,
     liveRuntimeRun,
     assigneeUsesPaperclipRunner,
     locallyQueuedCommentRunIds,
+    localSteeringPlacements,
     queuedCommentQueueEnabled,
   ]);
   const visibleQueuedCommentQueue = useMemo(() => {
-    // The POST can finish before the durable receipt refetch. Keep these inputs
-    // in the tray rather than inventing a client-clock conversation boundary.
-    const pendingComments = [...localSteeringPlacements].flatMap(([id, placement]) =>
-      placement.comment && !commentsWithRunMeta.some(comment => comment.id === id && comment.steeredIntoRunId)
-        ? [{ comment: placement.comment, targetRunId: placement.targetRunId }] : []);
-    const queue = pendingComments.length ? mergePendingIssueQueuedComments({ issueId, authoritativeQueue: effectiveQueuedCommentQueue,
-      pendingComments, fallbackProtocol: "paperclip_runner_v1" }) : effectiveQueuedCommentQueue;
+    const queue = effectiveQueuedCommentQueue;
     if (!queue) return null;
-    const pendingIds = new Set(pendingComments.map(({ comment }) => comment.id));
-    const entries = queue.entries.filter(entry => !startingCommentIds.has(entry.comment.id))
+    // A successful steering POST still awaits its durable delivery receipt.
+    const pendingIds = new Set([...localSteeringPlacements].flatMap(([id, placement]) =>
+      placement.comment && !commentsWithRunMeta.some(comment => comment.id === id && comment.steeredIntoRunId) ? [id] : []));
+    const visibleEntries = (entries: IssueQueuedCommentQueue["entries"]) => entries
+      .filter(entry => !startingCommentIds.has(entry.comment.id))
       .map((entry, position) => ({ ...entry, position, canDiscard: entry.canDiscard && !pendingIds.has(entry.comment.id) }));
-    return entries.length || queue.pendingQueue?.entries.length ? { ...queue, entries } : null;
-  }, [effectiveQueuedCommentQueue, startingCommentIds, localSteeringPlacements, commentsWithRunMeta, issueId]);
+    const entries = visibleEntries(queue.entries);
+    const pendingQueue = queue.pendingQueue ? { ...queue.pendingQueue, entries: visibleEntries(queue.pendingQueue.entries) } : null;
+    return entries.length || pendingQueue?.entries.length ? { ...queue, entries, pendingQueue } : null;
+  }, [effectiveQueuedCommentQueue, startingCommentIds, localSteeringPlacements, commentsWithRunMeta]);
   const commentsForThread = useMemo(
     () =>
       [...commentsWithRunMeta, ...(authoritativeQueuedCommentQueue?.entries ?? [])
@@ -3726,11 +3732,6 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     && (liveRunCount === 0 || liveRunSummary.waitingOnly)
     && (!resolvedHasActiveRun || activeRunSummary.waitingOnly);
   const headerAgentQueue = liveRunSummary.agentQueue ?? (resolvedHasActiveRun ? activeRunSummary.agentQueue : null);
-  useEffect(() => {
-    if (!hasLiveRuns && locallyQueuedCommentRunIds.size > 0) {
-      setLocallyQueuedCommentRunIds(new Map());
-    }
-  }, [hasLiveRuns, locallyQueuedCommentRunIds.size]);
   const sourceBreadcrumb = useMemo(
     () =>
       readIssueDetailBreadcrumb(issueId, location.state, location.search) ?? {
