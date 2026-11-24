@@ -203,7 +203,7 @@ describeEmbeddedPostgres("native run finalizer / status decision committer — a
     const f = await seedNativeRun();
     await db.update(issues).set({ status }).where(eq(issues.id, f.issueId));
     await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", finishedTaskConversation: true },
-      runnerProfileJson: { nativeExecutionInput: { schema: "paperclip.native-execution-input.v5", provider: { kind: "pi_rpc" } } } }).where(eq(heartbeatRuns.id, f.runId));
+      runnerProfileJson: { nativeExecutionInput: { schema: "paperclip.native-execution-input.v5", turnIntent: "conversation_reply", provider: { kind: "pi_rpc" } } } }).where(eq(heartbeatRuns.id, f.runId));
     await driveToCompleteResult(f);
     await finalizeNativeRun({ db, runId: f.runId, workspaceFinalizeStatus: "succeeded" });
     expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].status).toBe(status);

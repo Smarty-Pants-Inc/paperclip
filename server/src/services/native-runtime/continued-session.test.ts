@@ -3,7 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { buildPaperclipWakePayload } from "../heartbeat/run-preparation.js";
 import { shouldResetTaskSessionForWake } from "../heartbeat/run-state.js";
 import { decideNativeContinuation, withPiOpenTurnDefault } from "./continued-session.js";
-import { configuredEnvironmentProjection } from "../../vendor/paperclip-runner/index.js";
+import { configuredEnvironmentProjection, buildNativeModelEnvelope, PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION, PAPERCLIP_EXECUTION_FINISH_INSTRUCTION, canonicalNativeRuntimeContextDigest } from "../../vendor/paperclip-runner/index.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
 it("projects the continuous Pi open-turn default while preserving configured overrides and stock modes", () => {
@@ -66,12 +66,19 @@ it("retains recovery history, sends exact comments, and preserves other unseen e
   const mixed = { ...wakePayload, executionContinuation: { ...wakePayload.executionContinuation, resumeDelta: { baseRunId: "prior", messages: [...messages, { ...messages[0], id: "other", body: "Unseen event" }] } } };
   expect(JSON.parse(buildNativeExecutionInput({ ...args, wakePayload: mixed }).continuationPrompt!).messages).toHaveLength(2);
   expect(buildNativeExecutionInput({ ...args, sessionContinuity: "paperclip" }).continuationPrompt).toBe(JSON.stringify({ messages }));
-  const doneTask = { ...task, conversationAgentId: null, status: "done" };
-  const prior = buildNativeExecutionInput({ ...args, runId: "prior", resumedSession: false, previousTurn: undefined, wakePayload: null, issue: doneTask });
-  const finishedTaskRun = { ...args, issue: doneTask, previousTurn: { runId: "prior", task: doneTask, nativeExecutionInput: prior }, finishedTaskConversation: true };
-  const reply = buildNativeExecutionInput(finishedTaskRun);
-  expect({ provider: reply.provider, runtimeContext: reply.runtimeContext }).toEqual({ provider: prior.provider, runtimeContext: prior.runtimeContext });
-  expect(reply.continuationPrompt).toBe(messages[0].body);
+  for (const provider of ["pi_rpc", "codex"] as const) for (const sessionContinuity of [undefined, "continuous", "paperclip"]) {
+    const reply = buildNativeExecutionInput({ ...args, issue: { ...task, conversationAgentId: null }, provider, sessionContinuity, finishedTaskConversation: true });
+    const conversation = provider === "pi_rpc" && sessionContinuity !== "paperclip";
+    const ordinary = buildNativeExecutionInput({ ...args, issue: { ...task, conversationAgentId: null }, provider, sessionContinuity });
+    expect(reply.provider).toEqual(ordinary.provider);
+    expect(reply.runtimeContext).toEqual(ordinary.runtimeContext);
+    expect(reply.turnIntent).toBe(conversation ? "conversation_reply" : undefined);
+    expect(reply.runtimeContext.prompt.text).toContain(PAPERCLIP_EXECUTION_FINISH_INSTRUCTION);
+    if (conversation) expect(buildNativeModelEnvelope(reply, { resumedSession: true })).toMatchObject({ completion: { instruction: PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION } });
+    expect(reply.runtimeContext.aggregateDigest).toBe(canonicalNativeRuntimeContextDigest(reply.runtimeContext));
+    if (conversation) expect(reply.continuationPrompt).toBe(messages[0].body);
+  }
+  expect(args.runtimeContext.prompt.text).toContain(PAPERCLIP_EXECUTION_FINISH_INSTRUCTION);
 });
 it("keeps a reopened task's next prompt bare when only the agent's own reply is new", () => {
   const wake = (authorId: string) => { const messages = [{ id: "r", body: "Reply", authorType: "agent", authorId }, { id: "c", body: "Next", authorType: "user", authorId: "board" }]; return { reason: "issue_reopened_via_comment", commentIds: ["c"], comments: [], executionContinuation: { version: 1, messages, resumeDelta: { baseRunId: "prior", messages } } }; };
