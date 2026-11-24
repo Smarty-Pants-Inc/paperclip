@@ -448,7 +448,7 @@ describe("issue comment reopen routes", () => {
     mockTxInsert.mockImplementation(() => ({ values: mockTxInsertValues }));
     mockDbSelectOrderBy.mockResolvedValue([]);
     mockDbSelectWhere.mockImplementation(() => ({
-      orderBy: mockDbSelectOrderBy,
+      limit: async () => [], orderBy: mockDbSelectOrderBy,
       for: async () => [{ id: "comment-1" }],
       then: (
         onFulfilled: (rows: unknown[]) => unknown,
@@ -655,6 +655,19 @@ describe("issue comment reopen routes", () => {
       expect(mockIssueService.update.mock.calls.every(([, patch]) => patch.status === undefined || patch.status === status)).toBe(true);
       await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(issue.assigneeAgentId,
         expect.objectContaining({ reason: "issue_commented", contextSnapshot: expect.objectContaining({ finishedTaskConversation: true }) })));
+    }
+  });
+  it.each(["governed_response_waiting", "response_wake_waiting_for_input", "pending_input"])("does not mark an unfinished response wait (%s)", async wait => {
+    for (const operation of ["comment", "update"]) {
+      const issue = { ...makeIssue("in_review"), lastStatusDecisionId: "decision-1" }; mockHeartbeatService.wakeup.mockClear(); mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => makeIssueUpdateReceipt(issue, patch));
+      mockAgentService.getById.mockResolvedValue({ id: issue.assigneeAgentId, companyId: issue.companyId, adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc" } });
+      const selectFrom = mockDbSelectFrom.getMockImplementation()!;
+      mockDbSelectFrom.mockImplementation(table => ["status_decisions", "issue_thread_interactions"].includes(getTableName(table as never))
+        ? { where: () => ({ limit: async () => getTableName(table as never) === "status_decisions" ? [{ reasonCode: wait }] : wait === "pending_input" ? [{ id: "question-1" }] : [] }) } as never : selectFrom(table));
+      const app = request(await installActor(createApp()));
+      const response = operation === "comment" ? await app.post(`/api/issues/${issue.id}/comments`).send({ body: "Answer, then mark done." }) : await app.patch(`/api/issues/${issue.id}`).send({ comment: "Answer, then mark done." });
+      expect(response.status).toBe(operation === "comment" ? 201 : 200); await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(issue.assigneeAgentId, expect.objectContaining({ reason: "issue_commented", contextSnapshot: expect.not.objectContaining({ finishedTaskConversation: true }) })));
     }
   });
   it.each([
