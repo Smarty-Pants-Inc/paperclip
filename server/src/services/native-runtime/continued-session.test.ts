@@ -56,4 +56,5 @@ it("retains recovery history, sends exact comments, and preserves other unseen e
 it("keeps a reopened task's next prompt bare when only the agent's own reply is new", () => {
   const wake = (authorId: string) => { const messages = [{ id: "r", body: "Reply", authorType: "agent", authorId }, { id: "c", body: "Next", authorType: "user", authorId: "board" }]; return { reason: "issue_reopened_via_comment", commentIds: ["c"], comments: [], executionContinuation: { version: 1, messages, resumeDelta: { baseRunId: "prior", messages } } }; };
   for (const [authorId, expected] of [["agent", true], ["other", false]] as const) expect(decideNativeContinuation({ provider: "pi_rpc", hasSession: true, agentId: "agent", previousRunId: "prior", wakePayload: wake(authorId) }).promptOnly).toBe(expected);
+  expect(decideNativeContinuation({ provider: "pi_rpc", hasSession: true, agentId: "agent", previousRunId: "prior", wakePayload: { ...wake("agent"), reason: "issue_continuation_needed" } }).promptOnly).toBe(true);
 });
