@@ -3,7 +3,7 @@ import { act } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Agent } from "@paperclipai/shared";
+import type { Agent, Issue } from "@paperclipai/shared";
 import { recordAgentChatVisit } from "@/lib/recent-agent-chats";
 import { AgentChats } from "./AgentChats";
 
@@ -13,7 +13,7 @@ const state = vi.hoisted(() => ({
   companyId: "company-a",
   userId: "user-a",
   agents: [] as Agent[],
-  chats: [] as { id: string; conversationAgentId: string }[],
+  chats: [] as Pick<Issue, "id" | "conversationAgentId" | "title" | "updatedAt">[],
   chatsFetched: true,
   chatsError: null as Error | null,
   sessionError: null as Error | null,
@@ -53,6 +53,9 @@ let container: HTMLDivElement;
 const agent = (id: string, companyId = "company-a") => ({
   id, companyId, name: id, urlKey: `${id}-slug`, role: "engineer", status: "idle",
 } as Agent);
+const chat = (id: string, conversationAgentId: string): (typeof state.chats)[number] => ({
+  id, conversationAgentId, title: `Chat with ${conversationAgentId}`, updatedAt: new Date(),
+});
 
 async function render() {
   await act(async () => root.render(<QueryClientProvider client={queryClient}><AgentChats /></QueryClientProvider>));
@@ -134,7 +137,7 @@ describe("Chat landing", () => {
 
   it("lists historical chats for agents missing from the active roster", async () => {
     recordAgentChatVisit("company-a", "user-a", "retired-id");
-    state.chats = [{ id: "chat-retired", conversationAgentId: "retired-id" }];
+    state.chats = [chat("chat-retired", "retired-id")];
     await render();
     await vi.waitFor(() => expect(container.querySelector('a[href="/chats/retired-id"]')).not.toBeNull());
     expect(state.navigate).not.toHaveBeenCalled();
@@ -148,7 +151,7 @@ describe("Chat landing", () => {
     expect(state.navigate).not.toHaveBeenCalled();
     expect(container.querySelector('[role="status"]')?.textContent).toContain("Loading agents");
     state.chatsFetched = true;
-    state.chats = [{ id: "chat-retired", conversationAgentId: "retired-id" }];
+    state.chats = [chat("chat-retired", "retired-id")];
     await render();
     await vi.waitFor(() => expect(container.querySelector('a[href="/chats/retired-id"]')).not.toBeNull());
     expect(state.navigate).not.toHaveBeenCalled();
@@ -165,7 +168,7 @@ describe("Chat landing", () => {
   it("does not reopen an inaccessible saved conversation even when its agent remains available", async () => {
     recordAgentChatVisit("company-a", "user-a", "alice");
     recordAgentChatVisit("company-a", "user-a", "bob", "deleted-chat");
-    state.chats = [{ id: "chat-alice", conversationAgentId: "alice" }];
+    state.chats = [chat("chat-alice", "alice")];
     await render();
     expect(state.navigate).not.toHaveBeenCalled();
     expect(container.querySelector('a[href="/chats/alice-slug"]')).not.toBeNull();
