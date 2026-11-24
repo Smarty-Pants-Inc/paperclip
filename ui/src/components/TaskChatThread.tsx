@@ -714,7 +714,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
 
   const attemptedAutoSteer = useRef(new Set<string>());
   const queuedMessageQueue =
-    queuedCommentQueue && queuedCommentQueue.entries.length > 0
+    queuedCommentQueue && (queuedCommentQueue.entries.length > 0 || queuedCommentQueue.pendingQueue?.entries.length)
       ? queuedCommentQueue
       : null;
   const emptyQueuedCommentQueue = useMemo<IssueQueuedCommentQueue>(
@@ -733,7 +733,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const queuedCommentIds = useMemo(
     () =>
       new Set(
-        queuedMessageQueue?.entries.map((entry) => entry.comment.id) ?? [],
+        [...(queuedMessageQueue?.entries ?? []), ...(queuedMessageQueue?.pendingQueue?.entries ?? [])]
+          .map((entry) => entry.comment.id),
       ),
     [queuedMessageQueue],
   );
