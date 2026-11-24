@@ -2924,7 +2924,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const tailAgent = tailAgentId ? agentMap?.get(tailAgentId) : undefined;
   const visibleTailAgentName = tailAgentName ?? tailAgent?.name ?? null;
   const visibleTailAgentIcon = tailAgent?.icon ?? null;
-  const tailItems = useMemo(
+  const streamedTailItems = useMemo(
     () => {
       if (!tailRunId) return [];
       const runtimeRequests = runtimeRequestSegmentContext(tailEntries, {
@@ -2955,6 +2955,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       tailPlanContentKey,
     ],
   );
+  // A saved Stop reply can be drawn before the run's terminal receipt.
+  const stoppingResponse = stoppingReply ? threadItems.findLast((item): item is TaskChatMessageItem =>
+    item.kind === "message" && item.author === "agent" && item.sourceRunId === tailRunId &&
+    toMs(item.createdAtIso) >= tailSegment.startMs && toMs(item.createdAtIso) < tailSegment.endMs) : undefined;
+  const tailItems = omitProgressRepeatedByResponseAcrossSegments([streamedTailItems], stoppingResponse?.text)[0] ?? streamedTailItems;
   // Final-response presentation and its header/tail settle in the same render.
   const tailFinalResponse = paperclipRunnerTail ? paperclipRunnerFinalResponse(tailItems, {
     runId: tailRunId ?? undefined,
