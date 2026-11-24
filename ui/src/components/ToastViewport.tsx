@@ -114,9 +114,9 @@ export function ToastViewport() {
     <aside
       aria-live="polite"
       aria-atomic="false"
-      className="pointer-events-none fixed bottom-3 left-3 z-(--z-120) w-full max-w-sm px-1"
+      className="pointer-events-none fixed top-(--mobile-notification-top) left-3 right-3 z-(--z-120) max-w-sm max-h-(--mobile-notification-max-height) overflow-y-auto px-1 md:top-auto md:bottom-3 md:right-auto md:w-full md:max-h-none md:overflow-visible"
     >
-      <ol className="flex w-full flex-col-reverse gap-2">
+      <ol className="flex w-full flex-col gap-2 md:flex-col-reverse">
         {toasts.map((toast) => (
           <AnimatedToast
             key={toast.id}
