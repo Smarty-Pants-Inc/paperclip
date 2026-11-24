@@ -13952,6 +13952,8 @@ export function issueService(db: Db) {
                 ? eq(issueComments.authorAgentId, actor.agentId)
                 : isNull(issueComments.authorAgentId),
               eq(issueComments.body, redactedBody),
+              // Event-keyed replies may repeat the same words for distinct inputs.
+              actor.agentId && options?.clientRequestId?.startsWith("native-final:") ? eq(issueComments.clientRequestId, options.clientRequestId) : undefined,
               isNull(issueComments.deletedAt),
             ),
           )
