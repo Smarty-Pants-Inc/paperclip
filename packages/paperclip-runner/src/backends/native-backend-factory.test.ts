@@ -7,6 +7,7 @@ import * as codexSecurity from "../drivers/codex/codex-security-config.js";
 
 import { buildNativeModelEnvelope, parseNativeExecutionInput, type NativeExecutionInput, type NativeExecutionInputV1, type NativeExecutionInputV2 } from "../contracts/native-execution.js";
 import { NATIVE_RUNTIME_ASSET_SCHEMA, PAPERCLIP_EXECUTION_PROMPT, PAPERCLIP_EXECUTION_PROMPT_REVISION, nativeRuntimePromptDigest, canonicalNativeRuntimeContextDigest, composeNativeSystemInstructions } from "../contracts/runtime-context.js";
+import { PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION } from "../contracts/runtime-context-prompts.js";
 
 const contextRoots: string[] = [];
 afterEach(() => { for (const root of contextRoots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -908,11 +909,15 @@ describe("native backend factory", () => {
     ).toThrow("Codex native backend requires provider kind codex");
   });
 
-  it.each(["v5", "v7", "v9"] as const)("selects prepared transport for %s native input and retains prepared constraints", async version => {
-    const input = preparedExecution(execution(), version);
+  it.each(["v5", "v7", "v9", "pi-task", "pi-chat"] as const)("selects prepared transport for %s native input and retains prepared constraints", async version => {
+    const pi = version === "pi-task" || version === "pi-chat";
+    const conversation = version === "pi-chat";
+    const base = execution(pi ? { kind: "pi_rpc", model: "provider/model", ...(conversation ? { conversationMode: true } : {}) } : undefined);
+    if (pi) base.session.driverKind = "pi_rpc";
+    const input = preparedExecution(base, pi ? "v5" : version);
     const transport = new FakeCodexTransport();
     let currentInstructions: string | undefined;
-    const backend = createCodexNativeSessionBackend(input, {
+    const backend = createRunnerdNativeSessionBackend(input, {
       transportFactory: (context) => { currentInstructions = context?.baseInstructions; return transport; },
       workingDirectoryAuthority: "remote_runner",
       environment: { PAPERCLIP_WORKSPACE_CWD: WORKSPACE },
@@ -931,12 +936,16 @@ describe("native backend factory", () => {
 
     expect(
       transport.calls.find((call) => call.method === "thread/start")?.params,
-    ).toMatchObject({ conversationMode: "prepared" });
+    ).toMatchObject({ conversationMode: conversation ? "conversation" : "prepared" });
+    const catalog = transport.calls.find((call) => call.method === "thread/start")?.params.dynamicTools as Array<{ name: string }>;
+    for (const name of ["paperclip_finish", "paperclip_block"]) {
+      expect(catalog.some(tool => tool.name === name)).toBe(!conversation);
+    }
     expect(currentInstructions).toContain("Keep assigned instructions.");
-    expect(currentInstructions).toBe(transport.calls.find((call) => call.method === "thread/start")?.params.developerInstructions);
+    expect(currentInstructions).toBe(transport.calls.find((call) => call.method === "thread/start")?.params[pi ? "baseInstructions" : "developerInstructions"]);
     expect(backend.preparedTaskConstraints).toEqual(
       expect.arrayContaining([
-        expect.stringContaining("Obtain one accepted result"),
+        conversation ? PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION : expect.stringContaining("Obtain one accepted result"),
       ]),
     );
   });
