@@ -305,7 +305,7 @@ async function lockBoardQueueRows(input: Pick<BoardQueueTarget, "tx" | "issue" |
         eq(issues.companyId, input.issue.companyId),
       ),
     )
-    .for("update");
+    .for("no key update");
   if (!currentIssue) throw new QueuedCommentMutationError("queued_comment_issue_not_found", "Issue not found");
   const wake = await input.tx
     .select()
