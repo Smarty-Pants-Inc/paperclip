@@ -57,7 +57,7 @@ import { ProviderToolIconsProvider } from "@/components/ProviderToolIcon";
 import { McpAppTurnViews, mcpAppRunRefreshKey } from "@/components/mcp-app/McpAppTurnViews";
 import { ToolCallProgressProvider } from "@/components/task-chat/tool-call-progress";
 import { TaskChatRunnerHeader, TaskChatRunnerTurn } from "@/components/task-chat/TaskChatRunnerTurn";
-import { isConversationRecovery } from "./ExecutionBlockerNotice";
+import { ExecutionBlockerNotice, isConversationRecovery } from "./ExecutionBlockerNotice";
 import { partitionRunHealthItems } from "@/components/task-chat/TaskChatRunHealthBanner";
 import {
   TaskChatTurnStatusIsland,
@@ -410,6 +410,7 @@ function resolvedWithoutUserFacingResponse(value: unknown): boolean {
 }
 
 export type TaskChatThreadProps = ComponentProps<typeof IssueChatThread> & {
+  renderConversationRecovery?: (unanswered?: boolean, retryPending?: boolean) => ReactNode;
   /** A person's Stop hands back the messages the agent hadn't taken (resultJson.personStop.returned). */
   onRestoreStoppedMessages?: (commentIds: readonly string[]) => Promise<boolean>;
   conversationMode?: boolean;
@@ -1198,6 +1199,33 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       typeof runId === "string" && typeof status === "string" && isTerminalRunStatus(status) && runs.some((run) => run.id === runId))
       setTerminalStatuses((current) => new Map(current).set(runId, status));
   });
+  // Failure belongs to the saved request, not its latest attempt. A queued retry,
+  // recovery projection or unrelated reply cannot erase it; a saved answer can.
+  const { unansweredRequests, failedRequestCommentIds } = useMemo(() => {
+    const requests = new Map<string, string[]>();
+    for (const run of [...runs].sort((a, b) => toMs(a.createdAt) - toMs(b.createdAt))) {
+      const chain = runChainIdsById.get(run.id) ?? [run.id];
+      const commentId = chain.map(id => requestCommentByRun.get(id)).find(id => id && comments.some(comment =>
+        comment.id === id && !comment.deletedAt && comment.authorUserId && !comment.authorAgentId));
+      if (!commentId) continue;
+      requests.set(commentId, [...new Set([...(requests.get(commentId) ?? []), ...chain])]);
+    }
+    const unansweredRequests = new Map<string, { runId: string; runIds: string[] }>();
+    const failedRequestCommentIds = new Set<string>();
+    for (const [commentId, runIds] of requests) {
+      const failedId = [...runIds].reverse().find(id => !isUserStop(id) &&
+        ["failed", "timed_out", "interrupted"].includes(terminalStatuses.get(id) ?? linkedRunMetaById.get(id)?.status ?? runs.find(run => run.id === id)?.status ?? ""));
+      if (!failedId) continue;
+      failedRequestCommentIds.add(commentId);
+      // Stop suppresses Retry, not the saved message's already drawn placement.
+      if (isUserStop(runIds.at(-1) ?? "")) continue;
+      if (!runIds.some(id => hasVisibleRunAnswer(projectedComments, id, linkedRunMetaById.get(id)?.resultJson)))
+        unansweredRequests.set(commentId, { runId: failedId, runIds });
+    }
+    return { unansweredRequests, failedRequestCommentIds };
+  }, [runs, runChainIdsById, requestCommentByRun, comments, isUserStop, terminalStatuses, linkedRunMetaById, projectedComments]);
+  const unansweredRunIds = new Set([...unansweredRequests.values()].flatMap(request => request.runIds));
+
   // The single in-flight run whose turn we stream live (non-terminal).
   const liveRun = useMemo(() => {
     if (isTerminalIssueStatus(issueStatus)) return null;
@@ -1340,8 +1368,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
 
   const visibleQueuedMessageQueue = useMemo(() => queuedMessageQueue ? {
     ...queuedMessageQueue,
-    entries: queuedMessageQueue.entries.filter(entry => !steeringAnchorByCommentId.has(entry.comment.id)),
-  } : emptyQueuedCommentQueue, [queuedMessageQueue, emptyQueuedCommentQueue, steeringAnchorByCommentId]);
+    entries: queuedMessageQueue.entries.filter(entry => !steeringAnchorByCommentId.has(entry.comment.id) && !failedRequestCommentIds.has(entry.comment.id)),
+    pendingQueue: queuedMessageQueue.pendingQueue ? { ...queuedMessageQueue.pendingQueue,
+      entries: queuedMessageQueue.pendingQueue.entries.filter(entry => !failedRequestCommentIds.has(entry.comment.id)),
+    } : queuedMessageQueue.pendingQueue,
+  } : emptyQueuedCommentQueue, [queuedMessageQueue, emptyQueuedCommentQueue, steeringAnchorByCommentId, failedRequestCommentIds]);
 
   const continuousReplyPlacements = useMemo(() => {
     const placements = new Map<string, { byItem: Map<string, number>; bySegment: Map<number, string> }>();
@@ -1469,7 +1500,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       // transcript may contain only its newest turn. Dedupe after assembling
       // the turns, by the saved replies actually selected as their finals.
       const item = commentItems[index];
-      if (!item || (queuedCommentIds.has(comment.id) && !steeringAnchorByCommentId.has(comment.id))) return;
+      if (!item || (queuedCommentIds.has(comment.id) && !steeringAnchorByCommentId.has(comment.id) && !failedRequestCommentIds.has(comment.id))) return;
       entries.push({
         // A steer enters the thread at its acknowledged boundary, not while queued.
         ms: steeringAnchorByCommentId.get(comment.id) ?? (comment.authorType !== "user" && comment.conversationAnchorAt
@@ -1676,6 +1707,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     planDocument,
     planDocumentSourceRunId,
     queuedCommentIds,
+    failedRequestCommentIds,
     steeringAnchorByCommentId,
   ]);
 
@@ -3004,8 +3036,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     } : segment;
     return <div data-testid={current ? "task-chat-live-transcript" : undefined}>
       <TaskChatShimmerScope items={presentation.items}>
-      <TaskChatRunnerHeader {...presentation} agentName={item.agentName} agentIcon={item.agentIcon} agent={item.agent}
-        personStopped={item.summary.personStopped === true} />
+      {!unansweredRunIds.has(segment.runId ?? "") && <TaskChatRunnerHeader {...presentation} agentName={item.agentName} agentIcon={item.agentIcon} agent={item.agent}
+        personStopped={item.summary.personStopped === true} />}
       <TaskChatRunnerTurn {...presentation} showHeader={false} agentName={item.agentName} agentIcon={item.agentIcon} agent={item.agent}
         onRuntimeRequestDecision={handleRuntimeRequestDecision} />
       </TaskChatShimmerScope>
@@ -3207,7 +3239,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // a message with no run is pending only while it is being sent or the server says why it holds it.
   // A blocked task starts nothing by itself: its blocker notice speaks, not a pending
   // block, and no optimistic start block either (whatever the presentation claims).
-  const requestPending = !!latestUserComment && !requestAnswered && issueStatus !== "blocked" &&
+  const requestPending = !!latestUserComment && !unansweredRequests.has(latestUserComment.id) && !requestAnswered && issueStatus !== "blocked" &&
     !(liveRun && !requestChain.includes(liveRun.id)) &&
     (requestRun ? !isUserStop(requestRun.id) && (requestStatus === "queued" ||
       // Only a run the server cancelled to reconcile is followed by another for the same message.
@@ -3224,7 +3256,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // A person's message the server holds behind a Stop's recovery is still on
   // its way: draw the working sign with the server's own words, not a blank.
   const optimisticRunnerStartup =
-    hasAgentAssignee && issueStatus !== "blocked" &&
+    !unansweredRequests.has(latestUserComment?.id ?? "") && hasAgentAssignee && issueStatus !== "blocked" &&
     (!startupBlocked || requestPending) && !isUserStop(requestRun?.id ?? "") &&
     (!tailRunId || (requestPending && requestChain.includes(tailRunId))) &&
     (props.retryPreparing || (!isTerminalIssueStatus(issueStatus) && ((props.interruption?.state === "working" && !observedRunEnded) || props.interruption?.state === "retry_scheduled")) || requestPending || runnerSubmissionPending ||
@@ -3234,6 +3266,40 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           item.author === "human" &&
           item.optimistic === "pending",
       ));
+
+  const failureOwnsRecovery = unansweredRunIds.has(observedRunId) || unansweredRequests.has(latestUserComment?.id ?? "");
+  const unansweredTail = unansweredRunIds.has(tailRunId ?? "");
+  const visibleThreadItems = threadItems.flatMap((item): TaskChatItem[] => {
+    if (item.kind === "message" && failedRequestCommentIds.has(item.id))
+      return [{ ...item, optimistic: undefined, queueTargetRunId: null }];
+    if (item.kind === "marker" && item.variant === "interrupted" && !item.credentialAccess && item.retryable !== false &&
+      ((item.runId && unansweredRunIds.has(item.runId)) || [...unansweredRunIds].some(id => item.id === `${id}:execution-wait`))) return [];
+    if (item.kind === "turn" && [...unansweredRunIds].some(id => item.id.startsWith(`${id}:turn`)) && !item.finalResponse)
+      return item.items.length ? [{ ...item, historical: true }] : [];
+    if (requestPending && requestChain.some(id => item.id.startsWith(`${id}:turn`) || item.id === `${id}:execution-wait`)) return [];
+    return [item];
+  });
+  const [requestRetryErrors, setRequestRetryErrors] = useState<Record<string, Error | undefined>>({});
+  const [retryingRequestId, setRetryingRequestId] = useState<string | null>(null);
+  const issueRetryPending = Boolean(retryingRequestId || retryFailedRunId || props.retryPreparing) || runs.some(run =>
+    ["running", "queued"].includes(terminalStatuses.get(run.id) ?? linkedRunMetaById.get(run.id)?.status ?? run.status));
+  const renderMessageStatus = (item: TaskChatMessageItem) => {
+    const request = unansweredRequests.get(item.id);
+    if (!request) return null;
+    const retryPending = Boolean(liveRun && request.runIds.includes(liveRun.id) &&
+      !isTerminalRunStatus(terminalStatuses.get(liveRun.id) ?? linkedRunMetaById.get(liveRun.id)?.status ?? liveRun.status));
+    if (item.id === latestUserComment?.id && props.renderConversationRecovery) return props.renderConversationRecovery(true, retryPending || issueRetryPending);
+    return <ExecutionBlockerNotice className="mt-3" presentation={null} unanswered
+      canRetry={Boolean(onRetryFailedRun)} onRetry={async () => {
+        if (issueRetryPending) return;
+        setRetryingRequestId(item.id);
+        setRequestRetryErrors(errors => ({ ...errors, [item.id]: undefined }));
+        try { await onRetryFailedRun?.(request.runId); }
+        catch (error) { setRequestRetryErrors(errors => ({ ...errors, [item.id]: error instanceof Error ? error : new Error(String(error)) })); }
+        finally { setRetryingRequestId(null); }
+      }}
+      optimistic={issueRetryPending} error={requestRetryErrors[item.id]} />;
+  };
 
   // Feedback votes keyed by the comment they target (targetType
   // "issue_comment"), mirroring IssueChatThread — the redesign attaches the
@@ -3744,13 +3810,14 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                       </div>
                     ) : (
                       <TaskChatThreadView
-                        items={requestPending ? threadItems.filter(item => !requestChain.some(id => item.id.startsWith(`${id}:turn`) || item.id === `${id}:execution-wait`)) : threadItems}
+                        items={visibleThreadItems}
                         scrollingHistory={scrollingHistory}
                         attachments={attachments}
                         header={<>{threadHeaderWithBlockers}{!issueBrief ? historyControl : null}<CoordinatorChatQuestionStatus query={pendingQuestions} /><CoordinatorChatReceiptStatus query={decisionReceipts} scroll={!!scrollingHistory} /><CoordinatorChatHandoffStatus query={taskHandoffs} scroll={!!scrollingHistory} /></>}
                         renderInteraction={renderInteraction}
                         renderBrief={renderBrief}
                         renderMessageActions={renderMessageActions}
+                        renderMessageStatus={renderMessageStatus}
                         renderQueuedAction={renderQueuedAction}
                         renderTurn={renderRunnerSegment}
                         onTryAgainNoLiveExecutionPath={
@@ -3774,12 +3841,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                         tail={
                           tailRunId ||
                           optimisticRunnerStartup || requestPending ||
-                          bottomBlockerLinks ? (
+                          bottomBlockerLinks || (recoveryOwnsStatus && !failureOwnsRecovery) ? (
                             <>
-                              {!tailSegmentSettled && !recoveryOwnsStatus && (tailRunId || optimisticRunnerStartup) ? (
+                              {!tailSegmentSettled && !recoveryOwnsStatus && (tailRunId || optimisticRunnerStartup) &&
+                                (!unansweredTail || tailEntries.some(entry => ["assistant", "thinking", "tool_call", "tool_result", "runtime_request"].includes(entry.kind))) ? (
                                 <div key={tailRunId ? requestCommentByRun.get(tailRunId) ?? tailRunId : latestUserComment?.id} data-testid="task-chat-live-transcript">
                                   <TaskChatShimmerScope items={tailItems}>
-                                  <TaskChatRunnerHeader
+                                  {!unansweredTail && <TaskChatRunnerHeader
                                     runId={tailRunId}
                                     agentName={visibleTailAgentName}
                                     agentIcon={visibleTailAgentIcon}
@@ -3796,7 +3864,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                       <TaskChatLiveRunPill status={tailStatus} execution={!tailHasFinalResponse && !tailFinalStreaming && !tailTerminal && liveRun?.id === tailRunId ? tailExecution : null}
                                         startedAtMs={tailStartedAtMs} finishedAtMs={tailFinishedAtMs} toolSummary={tailToolSummary} />
                                     ) : undefined}
-                                  />
+                                  />}
                                   {tailRunSource?.adapterType === "paperclip_runner" ||
                                   optimisticRunnerStartup || tailBeforeTurn ? (
                                     <TaskChatRunnerTurn
@@ -3872,6 +3940,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                     : item.kind === "interaction" ? renderInteraction(item) : null}
                                 </div>
                               ))}
+                              {!failureOwnsRecovery && props.renderConversationRecovery?.()}
                               {bottomBlockerLinks}
                             </>
                           ) : null
