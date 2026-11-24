@@ -1,4 +1,5 @@
 import { nativeTaskConstraints } from "../backends/runtime-context.js";
+import { PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION } from "./runtime-context-prompts.js";
 import { createHash } from "node:crypto";
 import { QUALIFIED_ACPX_PROFILES } from "../drivers/acpx/qualified-profiles.js";
 import { QUALIFIED_ACPX_VERSION } from "../drivers/acpx/generated-profiles.js";
@@ -60,6 +61,16 @@ const input: NativeExecutionInputV1 = {
 };
 
 describe("NativeExecutionInputV1", () => {
+  it("round-trips per-turn reply intent without changing saved session identity", () => {
+    const saved = { ...input, provider: { kind: "pi_rpc", model: "provider/model" }, session: { ...input.session, driverKind: "pi_rpc" } };
+    expect(parseNativeExecutionInput(saved).turnIntent).toBeUndefined();
+    const reply = parseNativeExecutionInput({ ...saved, turnIntent: "conversation_reply" });
+    expect(parseNativeExecutionInput(JSON.parse(JSON.stringify(reply)))).toEqual(reply);
+    expect(reply.provider).toEqual(saved.provider);
+    expect(nativeTaskConstraints(reply)).toContain(PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION);
+    expect(() => parseNativeExecutionInput({ ...saved, turnIntent: false })).toThrow("turnIntent");
+    expect(() => parseNativeExecutionInput({ ...input, turnIntent: "conversation_reply" })).toThrow("requires pi_rpc");
+  });
   it.each(["paperclip.native-execution-input.v3", "paperclip.native-execution-input.v4", NATIVE_EXECUTION_INPUT_SCHEMA])(
     "preserves a saved %s execution through recovery parsing",
     (schema) => {
