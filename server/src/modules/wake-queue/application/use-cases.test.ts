@@ -597,11 +597,15 @@ describe("releaseIssueExecution", () => {
       reason: "issue_commented", wakeReason: "issue_commented", deferredCommentIds: ["human-follow-up"],
       deferredContextSeed: { finishedTaskConversation: true } })];
     const transaction = createFakeTransaction({ findNextDeferredWake: vi.fn(async () => queue.shift() ?? null) });
-    const release = createReleaseIssueExecution({ issueLock: createFakeIssueLock(createFakeHost(), transaction, { ...ISSUE, status }), recovery: createFakeRecovery() });
+    const release = createReleaseIssueExecution({
+      issueLock: createFakeIssueLock(createFakeHost(), transaction, { ...ISSUE, status }), recovery: createFakeRecovery(),
+    });
     expect((await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() })).outcome.kind).toBe("promoted");
     expect(transaction.reopenIssue).not.toHaveBeenCalled();
-    expect(transaction.finalizePromotedWake).toHaveBeenCalledWith(expect.objectContaining({ contextSnapshot: expect.objectContaining({ finishedTaskConversation: true }) }));
+    expect(transaction.finalizePromotedWake).toHaveBeenCalledWith(expect.objectContaining({
+      contextSnapshot: expect.objectContaining({ finishedTaskConversation: true }) }));
   });
+
   it("reopens a completed task before promoting its assignee's human follow-up", async () => {
     const queue = [wakeCandidate({
       agentId: ISSUE.assigneeAgentId!,
