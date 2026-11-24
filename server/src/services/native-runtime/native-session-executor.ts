@@ -12942,12 +12942,34 @@ async function executePaperclipNativeSessionAttempt(
               // A person's Stop (seam 0233) owes no task result: its short final reply ends the turn.
               const [stopRun] = await input.db.select({ resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns)
                 .where(eq(heartbeatRuns.id, input.execution.binding.runId)).limit(1);
+              const isConversation = conversation?.agentId === input.execution.binding.agentId
+                || (input.execution.provider.kind === "pi_rpc" &&
+                  (input.execution.turnIntent === "conversation_reply" || input.execution.provider.conversationMode === true))
+                || (record(record(stopRun?.resultJson).personStop).requestedAt !== undefined
+                  && !record(record(stopRun?.resultJson).personStop).resumedAt);
+              // Held finals are durable before turn.completed. A replacement
+              // controller may resume past them, so its in-memory observation
+              // (including duplicate replay) is not proof that no reply exists.
+              if (isConversation && terminalEvent.turnId && !nativeConversationReplyResult({
+                conversation: true, terminalEvent, replyEvent: completedConversationReply,
+                completionContract: input.execution.completionContract.contract,
+              })) {
+                const [saved] = await input.db.select({ payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents)
+                  .where(and(eq(heartbeatRunEvents.companyId, input.execution.binding.companyId),
+                    eq(heartbeatRunEvents.runId, input.execution.binding.runId),
+                    eq(heartbeatRunEvents.agentId, input.execution.binding.agentId),
+                    eq(heartbeatRunEvents.eventType, "item.completed"),
+                    sql`${heartbeatRunEvents.payload}->'prpEvent'->>'runId' = ${terminalEvent.runId}`,
+                    sql`${heartbeatRunEvents.payload}->'prpEvent'->>'normalizedSessionId' = ${terminalEvent.normalizedSessionId}`,
+                    sql`${heartbeatRunEvents.payload}->'prpEvent'->>'turnId' = ${terminalEvent.turnId}`,
+                    sql`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'kind' = 'agentMessage'`,
+                    sql`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'channel' = 'final'`,
+                    sql`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'text' ~ '[^[:space:]]'`))
+                  .orderBy(desc(heartbeatRunEvents.seq)).limit(1);
+                if (saved) completedConversationReply = record(record(saved.payload).prpEvent) as unknown as PrpEvent;
+              }
               return nativeConversationReplyResult({
-                conversation: conversation?.agentId === input.execution.binding.agentId
-                  || (input.execution.provider.kind === "pi_rpc" &&
-                    (input.execution.turnIntent === "conversation_reply" || input.execution.provider.conversationMode === true))
-                  || (record(record(stopRun?.resultJson).personStop).requestedAt !== undefined
-                    && !record(record(stopRun?.resultJson).personStop).resumedAt),
+                conversation: isConversation,
                 terminalEvent,
                 replyEvent: completedConversationReply,
                 completionContract: input.execution.completionContract.contract,
