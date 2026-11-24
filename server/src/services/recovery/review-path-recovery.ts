@@ -100,11 +100,6 @@ export function decideIssueReviewPathRecovery(input: {
   }
 
   const context = input.contextSnapshot ?? {};
-  // This turn answered a comment on finished work; it consumed no work/review
-  // obligation. A pathless preserved in_review is not a request to restart it.
-  if (context.finishedTaskConversation === true && context.wakeReason === "issue_commented") {
-    return { kind: "skip", reason: "finished-task conversation preserved the existing review status" };
-  }
   if (isIssueReviewPathRecoveryRun(context)) {
     return { kind: "exhausted" };
   }
