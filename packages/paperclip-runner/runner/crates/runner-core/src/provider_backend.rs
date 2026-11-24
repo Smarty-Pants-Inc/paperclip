@@ -904,31 +904,6 @@ fn goal_continues_after_turn(state: &CodexProviderState, goal_active: bool) -> b
     goal_active && !terminal_completion_rejected(state)
 }
 
-const CONVERSATION_REPLY_INSTRUCTION: &str = "Answer this conversation with a final message. An ordinary reply needs no paperclip_finish or paperclip_block call; those tools remain available to finish or block task work.";
-
-fn conversation_reply_turn(text: &str) -> bool {
-    let Ok(envelope) = serde_json::from_str::<Value>(text) else {
-        return false;
-    };
-    match envelope.get("schema").and_then(Value::as_str) {
-        Some("paperclip.native-continuation.v1") => {
-            envelope
-                .pointer("/completion/instruction")
-                .and_then(Value::as_str)
-                == Some(CONVERSATION_REPLY_INSTRUCTION)
-        }
-        Some("paperclip.native-model-envelope.v3") => envelope
-            .get("constraints")
-            .and_then(Value::as_array)
-            .is_some_and(|constraints| {
-                constraints
-                    .iter()
-                    .any(|value| value.as_str() == Some(CONVERSATION_REPLY_INSTRUCTION))
-            }),
-        _ => false,
-    }
-}
-
 fn terminal_events(
     state: &CodexProviderState,
     event_type: &str,
@@ -979,10 +954,7 @@ fn terminal_events(
     }
     if state.config.provider == "pi_rpc"
         && event_type == "turn.completed"
-        && state.active_conversation_reply.unwrap_or_else(|| {
-            // Saved in-flight turns predate the per-turn signal.
-            state.config.conversation_mode.as_deref() == Some("conversation")
-        })
+        && state.config.conversation_mode.as_deref() == Some("conversation")
         && state.active_provider_result_fingerprint.is_none()
     {
         return Vec::new(); // Core resolves the bound final reply as a conversation yield.
@@ -1353,8 +1325,6 @@ struct CodexProviderState {
     provider_session_id: Option<String>,
     #[serde(default)]
     active_provider_turn_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    active_conversation_reply: Option<bool>,
     #[serde(default)]
     ambiguous_turn_start_pending: bool,
     #[serde(default)]
@@ -1469,7 +1439,6 @@ impl CodexProviderState {
             thread_id,
             provider_session_id: None,
             active_provider_turn_id: None,
-            active_conversation_reply: None,
             ambiguous_turn_start_pending: false,
             completed_turn_authoritative: false,
             provider_process_generation: 0,
@@ -4236,8 +4205,6 @@ impl CodexCommandExecutor {
                 .state
                 .as_mut()
                 .expect("Codex state remains available before turn/start dispatch");
-            state.active_conversation_reply =
-                (state.config.provider == "pi_rpc").then(|| conversation_reply_turn(text));
             state.ambiguous_turn_start_pending = true;
         }
         self.save_state()?;
@@ -8455,7 +8422,6 @@ done
             thread_id: Some("thread-1".to_owned()),
             provider_session_id: None,
             active_provider_turn_id: None,
-            active_conversation_reply: None,
             ambiguous_turn_start_pending: false,
             completed_turn_authoritative: false,
             provider_process_generation: 0,

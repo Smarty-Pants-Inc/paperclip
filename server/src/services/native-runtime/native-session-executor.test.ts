@@ -7909,13 +7909,12 @@ describe("provider plan synchronization", () => {
 });
 
 describe("native conversation replies", () => {
-  it.each(["saved", "pi-intent", "pi-mode", "stop", "stop-resumed", "no-final", "wrong-turn", "wrong-session", "wrong-run"] as const)(
+  it.each(["saved", "pi-mode", "stop", "stop-resumed", "no-final", "wrong-turn", "wrong-session", "wrong-run"] as const)(
     "restores the held reply from durable events after controller replacement (%s)", async mode => {
       vi.spyOn(issueServiceModule, "issueService").mockReturnValue({ update: vi.fn(async () => ({ status: "blocked", statusVersion: 1 })) } as never);
       const isStop = mode === "stop" || mode === "stop-resumed";
-      const current = isStop ? execution : { ...execution, ...(mode === "pi-intent" ? { turnIntent: "conversation_reply" as const } : {}),
-        provider: { kind: "pi_rpc" as const, model: "fixture/model",
-          ...(mode === "pi-intent" ? {} : { conversationMode: true as const }) },
+      const current = isStop ? execution : { ...execution,
+        provider: { kind: "pi_rpc" as const, model: "fixture/model", conversationMode: true as const },
         session: { ...execution.session, driverKind: "pi_rpc" as const } };
       const saved = { ...reply, runId: current.binding.runId, normalizedSessionId: current.session.normalizedSessionId!,
         ...(mode === "wrong-turn" ? { turnId: "older-turn" } : {}),
@@ -7930,8 +7929,8 @@ describe("native conversation replies", () => {
       const select = db.select.bind(db);
       db.select = ((fields: unknown) => {
         if ((fields as { agentId?: unknown })?.agentId === issues.conversationAgentId) {
-          // Explicit Pi intent/mode and an unresumed Stop need no issue conversation agent.
-          return { from: () => ({ where: () => ({ limit: async () => mode === "pi-intent" || mode === "pi-mode" || isStop
+          // Explicit Pi mode and an unresumed Stop need no issue conversation agent.
+          return { from: () => ({ where: () => ({ limit: async () => mode === "pi-mode" || isStop
             ? [] : [{ agentId: current.binding.agentId }] }) }) };
         }
         return select(fields as never);
@@ -7945,7 +7944,7 @@ describe("native conversation replies", () => {
       const outcome = await executePaperclipNativeSession({ db, execution: current,
         runnerInstanceId: "runner", useRunnerd: false }).catch(error => error);
       expect(outcome.stack).toContain("held-restart-policy-checked");
-      if (mode === "saved" || mode === "pi-intent" || mode === "pi-mode" || mode === "stop") expect(observed).toMatchObject({ reportedWorkDisposition: "yielded",
+      if (mode === "saved" || mode === "pi-mode" || mode === "stop") expect(observed).toMatchObject({ reportedWorkDisposition: "yielded",
         summary: "Which project should own this?", evidence: [{ ref: `run-event:${saved.sourceEventId}` }] });
       else expect(observed).toBeNull();
     },

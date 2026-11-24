@@ -199,21 +199,6 @@ describeEmbeddedPostgres("native run finalizer / status decision committer — a
     });
   }
 
-  it.each([["done", false], ["in_review", false], ["in_review", true]] as const)("settles finished-task %s (completion claim=%s)", async (status, claim) => {
-    const f = await seedNativeRun();
-    await db.update(issues).set({ status }).where(eq(issues.id, f.issueId));
-    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", finishedTaskConversation: true },
-      runnerProfileJson: { nativeExecutionInput: { schema: "paperclip.native-execution-input.v5", turnIntent: "conversation_reply", provider: { kind: "pi_rpc" } } } }).where(eq(heartbeatRuns.id, f.runId));
-    await db.update(completionContracts).set({ risk: "low", completionAuthority: "agent_claim_policy",
-      contractJson: { revision: CONTROL_PLANE_CONFORMANCE_RESULT.completionClaim.contractRevision, objective: "Finish", criteria: [{ id: "objective", requirement: "Finish" }] } }).where(eq(completionContracts.id, f.contractId));
-    await driveToCompleteResult(f, { ...CONTROL_PLANE_CONFORMANCE_TERMINAL, reportedWorkDisposition: claim ? "done" : "yielded" },
-      { ...CONTROL_PLANE_CONFORMANCE_RESULT, reportedWorkDisposition: claim ? "done" : "yielded",
-        ...(claim ? {} : { continuation: { kind: "response_wake", summary: "Wait for another comment", idempotencyKey: "conversation-reply:test" } }) });
-    await finalizeNativeRun({ db, runId: f.runId, workspaceFinalizeStatus: "succeeded" });
-    expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].status).toBe(claim ? "done" : status);
-    expect((await db.select().from(statusDecisions).where(eq(statusDecisions.runId, f.runId)))[0].decisionJson).toMatchObject({ reasonCode: claim ? "completion_claim_policy_accepted" : status === "done" ? "terminal_status_preserved" : "finished_task_conversation_status_preserved" });
-    expect(await db.select().from(agentWakeupRequests).where(sql`${agentWakeupRequests.payload}->>'issueId' = ${f.issueId}`)).toHaveLength(0);
-  });
   it("finishes an accepted result after shutdown failed and workspace repair succeeded", async () => {
     const fixture = await seedNativeRun();
     await db.update(completionContracts).set({ risk: "low", completionAuthority: "agent_claim_policy",

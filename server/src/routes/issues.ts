@@ -106,7 +106,6 @@ import {
   projectWorkspaces,
   projectAccessMembers,
   projects,
-  statusDecisions,
 } from "@paperclipai/db";
 import {
   addIssueCommentSchema,
@@ -317,7 +316,7 @@ import {
 } from "../attachment-types.js";
 import { retainBacklogHumanAssignment } from "../services/human-directed-work.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
-import { isFinishedTaskConversationComment, shouldWakeAssigneeForIssueComment } from "../services/issue-comment-wakeup.js";
+import { shouldWakeAssigneeForIssueComment } from "../services/issue-comment-wakeup.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
 import {
   renderOnboardingGreeting,
@@ -3711,32 +3710,6 @@ export function issueRoutes(
     opts.searchRateLimiter ?? defaultCompanySearchRateLimiter;
   const instanceSettings = instanceSettingsService(db);
   const agentsSvc = agentService(db);
-  async function finishedTaskConversationComment(
-    issue: { id: string; status: string; companyId: string; assigneeAgentId: string | null; conversationAgentId?: string | null; lastStatusDecisionId?: string | null },
-    actor: { actorType: string; runId?: string | null },
-    resumeRequested: boolean,
-  ) {
-    if (issue.conversationAgentId || !issue.assigneeAgentId || actor.actorType !== "user" || actor.runId || resumeRequested ||
-        !["done", "in_review"].includes(issue.status)) return false;
-    if (issue.status === "in_review") {
-      // In-review can mean unfinished work waiting for the person's answer,
-      // not a finished deliverable. Keep that turn on the execution/tool path.
-      const [decision] = issue.lastStatusDecisionId ? await db.select({ reasonCode: statusDecisions.reasonCode })
-        .from(statusDecisions).where(and(eq(statusDecisions.id, issue.lastStatusDecisionId),
-          eq(statusDecisions.companyId, issue.companyId), eq(statusDecisions.issueId, issue.id))).limit(1) : [];
-      if (["governed_response_waiting", "response_wake_waiting_for_input"].includes(decision?.reasonCode ?? "")) return false;
-      const [inputRequest] = await db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
-        eq(issueThreadInteractions.companyId, issue.companyId), eq(issueThreadInteractions.issueId, issue.id),
-        eq(issueThreadInteractions.status, "pending"), isNull(issueThreadInteractions.dismissedAt),
-        inArray(issueThreadInteractions.kind, ["ask_user_questions", "request_confirmation", "request_checkbox_confirmation", "request_item_verdicts"]),
-      )).limit(1);
-      if (inputRequest) return false;
-    }
-    const agent = await agentsSvc.getById(issue.assigneeAgentId);
-    return agent?.companyId === issue.companyId && isFinishedTaskConversationComment({
-      issueStatus: issue.status, actorType: actor.actorType, actorRunId: actor.runId, resumeRequested, agent,
-    });
-  }
   const projectsSvc = projectService(db);
   const goalsSvc = goalService(db);
   const issueApprovalsSvc = issueApprovalService(db);
@@ -14935,10 +14908,8 @@ export function issueRoutes(
         normalizedAssigneeAgentId === undefined
           ? existing.assigneeAgentId
           : normalizedAssigneeAgentId;
-      const finishedTaskConversation = !!commentBody && !reviewRequest && !requestedReviewInteractionId && hiddenAtRaw === undefined &&
-        Object.keys(updateFields).length === 0 && await finishedTaskConversationComment(existing, actor, resumeRequested === true);
       const explicitMoveToTodoRequested =
-        (!finishedTaskConversation && reopenRequested) || resumeRequested === true;
+        reopenRequested || resumeRequested === true;
       const recoveryRelevantSourceMutationRequested =
         req.body.status !== undefined ||
         normalizedAssigneeAgentId !== undefined ||
@@ -15002,7 +14973,6 @@ export function issueRoutes(
           actorId: actor.actorId,
         });
       const effectiveMoveToTodoRequested =
-        !finishedTaskConversation &&
         !assigneeSelfCommentOnTerminal &&
         !(isBlocked && !!commentBody && (await getExecutionBlocker(db, existing.companyId, existing.id))?.workspaceRepairRequired) &&
         (explicitMoveToTodoRequested ||
@@ -16784,8 +16754,6 @@ export function issueRoutes(
           // stale issue_commented wake for an already-completed issue.
           // A completed prior run may explicitly resume, but the run that still
           // owns this issue is already executing the comment's work.
-          const conversationReply = finishedTaskConversation && issue.assigneeAgentId === existing.assigneeAgentId &&
-            ["done", "in_review"].includes(issue.status);
           const shouldWakeAssigneeForComment =
             shouldWakeAssigneeForIssueComment({
               selfComment,
@@ -16793,7 +16761,6 @@ export function issueRoutes(
               commentCreatedByRunId: comment.createdByRunId,
               issueAtCommentStart: existing,
               reopened,
-              finishedTaskConversation: conversationReply,
               currentStatus: issue.status,
             });
 
@@ -16834,7 +16801,6 @@ export function issueRoutes(
                 commentId: comment.id,
                 wakeCommentId: comment.id,
                 source: reopened ? "issue.comment.reopen" : "issue.comment",
-                ...(conversationReply ? { finishedTaskConversation: true } : {}),
                 wakeReason: reopened
                   ? "issue_reopened_via_comment"
                   : "issue_commented",
@@ -19491,7 +19457,6 @@ export function issueRoutes(
         ));
       const reopenRequested = req.body.reopen === true;
       const resumeRequested = req.body.resume === true;
-      const finishedTaskConversation = await finishedTaskConversationComment(issue, actor, resumeRequested);
       const interruptRequested = req.body.interrupt === true;
       const isClosed = isClosedIssueStatus(issue.status);
       const isBlocked = issue.status === "blocked";
@@ -19505,7 +19470,7 @@ export function issueRoutes(
             !resumeRequested &&
             (isIssueMentionGrantDecision(commentAccessDecision) ||
               isDefaultOpenIssueWriteDecision(commentAccessDecision))));
-      const effectiveReopenRequested = crossIssueCommentOnlyGrant || finishedTaskConversation
+      const effectiveReopenRequested = crossIssueCommentOnlyGrant
         ? false
         : reopenRequested;
       const effectiveResumeRequested = crossIssueCommentOnlyGrant
@@ -19563,7 +19528,6 @@ export function issueRoutes(
           actorId: actor.actorId,
         });
       const effectiveMoveToTodoRequested =
-        !finishedTaskConversation &&
         !assigneeSelfCommentOnTerminal &&
         !(isBlocked && (await getExecutionBlocker(db, issue.companyId, issue.id))?.workspaceRepairRequired) &&
         (explicitMoveToTodoRequested ||
@@ -20217,12 +20181,8 @@ export function issueRoutes(
         // to the returnAssignee for an already-completed issue.
         // An explicit resume from the run that still owns this issue is redundant;
         // explicit resume from a completed prior run remains a valid new turn.
-        const conversationReply = finishedTaskConversation && !shouldAutoApproveReviewComment &&
-          wakeIssueSnapshot.assigneeAgentId === issue.assigneeAgentId &&
-          ["done", "in_review"].includes(wakeIssueSnapshot.status);
         const shouldWakeAssigneeForComment = shouldWakeAssigneeForIssueComment({
           selfComment,
-          finishedTaskConversation: conversationReply,
           resumeRequested: resumeRequested === true,
           commentCreatedByRunId: comment.createdByRunId,
           issueAtCommentStart: issue,
@@ -20291,7 +20251,6 @@ export function issueRoutes(
                 wakeCommentId: comment.id,
                 source: "issue.comment",
                 wakeReason: "issue_commented",
-                ...(conversationReply ? { finishedTaskConversation: true } : {}),
                 ...(resumeRequested === true
                   ? { resumeIntent: true, followUpRequested: true }
                   : {}),

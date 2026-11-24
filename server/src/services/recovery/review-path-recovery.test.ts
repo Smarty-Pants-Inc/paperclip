@@ -13,20 +13,19 @@ const stalled = {
 };
 
 describe("review-path recovery", () => {
-  it.each([false, true])("queues recovery only for a consumed work path (finished conversation=%s)", finishedTaskConversation => {
+  it("queues one bounded recovery wake fingerprinted to the consumed path", () => {
     const first = decideIssueReviewPathRecovery({
       issueId: "issue-1",
       sourceRunId: "run-1",
       assigneeAgentId: "agent-1",
       contextSnapshot: {
-        wakeReason: "issue_commented", finishedTaskConversation,
+        wakeReason: "issue_commented",
         reviewPathConsumedRef: "interaction-1",
       },
       reviewAttention: stalled,
       existingWake: false,
     });
 
-    if (finishedTaskConversation) { expect(first.kind).toBe("skip"); return; }
     expect(first).toMatchObject({
       kind: "enqueue",
       idempotencyKey: buildIssueReviewPathLostIdempotencyKey({
