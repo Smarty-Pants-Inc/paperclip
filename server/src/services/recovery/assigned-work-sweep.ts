@@ -460,7 +460,7 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
             [CHAT_CONTROL_RECOVERY_STOP_CODE, CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE, "operator_interrupted"].includes(latest.errorCode ?? "")
             || (latest.status === "cancelled" && ["user", "board"].includes(String(json(latest.resultJson).cancelledByActorType)))
             // Seam 0260: a person's Stop that ended the turn (0233, run succeeded) is the person's move too.
-            || (latest.status === "succeeded" && json(latest.resultJson).personStop != null)),
+            || (latest.status === "succeeded" && json(latest.resultJson).personStop != null && !json(json(latest.resultJson).personStop).resumedAt)),
         } : null,
         pendingWakes: (wakeCounts.get(issue.id) ?? 0) + (chatWakeIds.has(issue.id) ? 1 : 0),
         nativeRecoveryPending: nativeIds.has(issue.id),
