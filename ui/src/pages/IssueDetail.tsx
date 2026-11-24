@@ -32,7 +32,7 @@ import { AgentIdentity } from "@/components/AgentIdentity";
 import { clearLegacyChatMessageRequests } from "@/lib/chat-message-request";
 import { agentChatDraft } from "@/lib/agent-chat-draft";
 import { trackRecentProject } from "@/lib/recent-projects";
-import { ExecutionBlockerNotice } from "../components/ExecutionBlockerNotice";
+import { ExecutionBlockerNotice, isConversationRecovery } from "../components/ExecutionBlockerNotice";
 import { WorkspaceReconstructionRecovery } from "../components/WorkspaceReconstructionRecovery";
 import type { TaskComposerPause } from "../components/task-chat/TaskChatPausedTakeover";
 import { TaskDetailTasksPanel } from "@/components/task-detail/TaskDetailTasksPanel";
@@ -1228,6 +1228,7 @@ type IssueDetailChatTabProps = {
   queuedMessageAutoSteerDelayMs?: number | null;
   executionBlocked?: boolean;
   interruption?: Issue["interruption"];
+  renderConversationRecovery?: (unanswered?: boolean, retryPending?: boolean) => ReactNode;
   retryPreparing?: boolean;
   queryIssueId?: string;
   hasLiveConnection: boolean;
@@ -1398,6 +1399,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   queuedMessageAutoSteerDelayMs,
   executionBlocked,
   interruption,
+  renderConversationRecovery,
   retryPreparing,
   queryIssueId,
   hasLiveConnection,
@@ -2684,6 +2686,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             } : {})}
             executionBlocked={executionBlocked}
             interruption={interruption}
+            renderConversationRecovery={renderConversationRecovery}
             retryPreparing={retryPreparing}
             key={conversationMode ? draftKey : issueId}
             {...(!classicTaskInterfaceEnabled ? { creationActivity: resolvedActivity, createdTasks } : {})}
@@ -8350,6 +8353,18 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     </>
   ) : undefined;
 
+  const observedStatus = interruptionRun?.resultJson?.personStop ? "person_stopped" : interruptionRun?.status;
+  const conversationRecovery = isConversationRecovery(issue.interruption, observedStatus);
+  const renderExecutionNotice = (unanswered = false, className = shellSectionClass, retryPending = false) => (
+    <ExecutionBlockerNotice className={className} presentation={issue.interruption} blockers={issue.blockedBy}
+      unanswered={unanswered} observedStatus={observedStatus}
+      blocker={retainedRecoveryOwnsRetry ? null : issue.executionBlocker}
+      issueId={issue.id} companyId={issue.companyId} agentName={agentMap.get(issue.assigneeAgentId ?? "")?.name} projectName={issue.project?.name}
+      canRetry={canResolveBoardRecoveryAction && !(issue.executionBlocker?.workspaceRepairRequired
+        && isRetainedWorkspaceExportCause(issue.executionBlocker.cause) && retainedRecoveryOwnsRetry)} onRetry={taskRetry.retry}
+      optimistic={taskRetry.optimistic || retryPending} takingLonger={taskRetry.takingLonger} error={taskRetry.error} />
+  );
+
   return (
     <FileViewerProvider issueId={conversation && !conversation.issue ? "" : issue.id} enabled={fileViewerEnabled}>
       <AgentChatReadProvider issueId={issue.conversationAgentId && issue.conversationUserId === (currentUserId ?? "local-board") && (!conversation || conversation.issue) ? issue.id : undefined} companyId={issue.companyId} userId={currentUserId}>
@@ -8396,15 +8411,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
               onRecoveryControlChange={setRetainedRecoveryOwnsRetry}
               action={issue.activeRecoveryAction ?? null} />
           )}
-          {resolvedDetailTab === "chat" && (
-            <ExecutionBlockerNotice className={shellSectionClass} presentation={issue.interruption} blockers={issue.blockedBy}
-              observedStatus={interruptionRun?.resultJson?.personStop ? "person_stopped" : interruptionRun?.status}
-              blocker={retainedRecoveryOwnsRetry ? null : issue.executionBlocker}
-              issueId={issue.id} companyId={issue.companyId} agentName={agentMap.get(issue.assigneeAgentId ?? "")?.name} projectName={issue.project?.name}
-              canRetry={canResolveBoardRecoveryAction && !(issue.executionBlocker?.workspaceRepairRequired
-                && isRetainedWorkspaceExportCause(issue.executionBlocker.cause) && retainedRecoveryOwnsRetry)} onRetry={taskRetry.retry}
-              optimistic={taskRetry.optimistic} takingLonger={taskRetry.takingLonger} error={taskRetry.error} />
-          )}
+          {resolvedDetailTab === "chat" && (!taskChatShellEnabled || !conversationRecovery) && renderExecutionNotice()}
           {resolvedDetailTab === "chat" && issue.executionBlocker?.canReconstructWorkspace && (
             <div className={shellSectionClass}>
               <WorkspaceReconstructionRecovery key={`${issue.id}:${issue.executionBlocker.recoveryActionId}`}
@@ -8724,6 +8731,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                   queuedMessageAutoSteerDelayMs={instanceExperimentalSettings?.enableQueuedMessageSteerCountdown === true ? QUEUED_MESSAGE_AUTO_STEER_DELAY_MS : 0}
                   executionBlocked={Boolean(issue.executionBlocker)}
                   interruption={issue.interruption}
+                  renderConversationRecovery={(unanswered, retryPending) => unanswered || conversationRecovery ? renderExecutionNotice(unanswered, "mt-3", retryPending) : null}
                   retryPreparing={taskRetry.optimistic}
                   queryIssueId={issueId ?? issue.id}
                   hasLiveConnection={hasLiveConnection}
