@@ -613,12 +613,6 @@ impl DurableState {
             &payload,
             sanitize_value(&payload),
         )?;
-        let sanitized_payload = preserve_final_agent_message_text(
-            event_type.as_str(),
-            &payload,
-            sanitized_payload,
-            config.max_frame_bytes,
-        );
         // Restore authoritative tool arguments before checking protocol identities.
         // Their contents are execution data, not a redacted diagnostic preview.
         let sanitized_payload =
@@ -629,6 +623,15 @@ impl DurableState {
             ));
         }
 
+        // Overflow is an explicit failure transformation (including final ->
+        // detail), not credential redaction of an authoritative channel. Check
+        // identities above before applying that transformation.
+        let sanitized_payload = preserve_transcript_text(
+            event_type.as_str(),
+            &payload,
+            sanitized_payload,
+            config.max_frame_bytes,
+        );
         let source_seq = self.next_source_seq;
         let emitted_at = current_timestamp()?;
         let schema_version = if event_type.starts_with("external_provider.")
@@ -2016,23 +2019,22 @@ fn preserve_bounded_display_content(
     Ok(sanitized)
 }
 
-/// A completed final answer is the reply the person receives. The generic
-/// diagnostic preview cap would turn it into a cut-off copy, so keep its
-/// complete redacted text when it fits comfortably inside one transport frame.
-/// Otherwise the bounded preview remains, still marked as truncated.
-fn preserve_final_agent_message_text(
+/// Reasoning and agent messages are the saved transcript, not diagnostics.
+/// Preserve their complete redacted text within the existing frame budget.
+/// Tool output and arbitrary diagnostic strings retain their existing bounds.
+fn preserve_transcript_text(
     event_type: &str,
     original: &Value,
     mut sanitized: Value,
     max_frame_bytes: usize,
 ) -> Value {
-    if event_type != "item.completed"
-        || !matches!(
-            original.get("kind").and_then(Value::as_str),
-            Some("agentMessage" | "assistant_message")
-        )
-        || original.get("channel").and_then(Value::as_str) != Some("final")
-    {
+    if !matches!(
+        event_type,
+        "item.started" | "item.updated" | "item.completed" | "item.delta"
+    ) || !matches!(
+        original.get("kind").and_then(Value::as_str),
+        Some("agentMessage" | "assistant_message" | "reasoning")
+    ) {
         return sanitized;
     }
     let Some(text) = original.get("text").and_then(Value::as_str) else {
@@ -2048,13 +2050,24 @@ fn preserve_final_agent_message_text(
     );
     // Size the serialized payload, not the raw text: JSON escaping can double
     // the text, and the secure frame hex-encodes the encrypted envelope,
-    // doubling it again. Keep the bounded preview unless the complete payload,
-    // its envelope and the secure-frame wrapper all fit in one frame.
+    // doubling it again. A bounded preview must never masquerade as an answer.
     let Ok(serialized_bytes) = serde_json::to_vec(&candidate).map(|bytes| bytes.len()) else {
         return sanitized;
     };
     let budget = (max_frame_bytes / 2).saturating_sub(FINAL_AGENT_MESSAGE_FRAME_HEADROOM_BYTES);
     if serialized_bytes > budget {
+        // Preserve the durable failure fact, not a valid-looking final preview.
+        // The controller settles visibly and permanently without resubmission.
+        sanitized["transcriptOverflow"] = Value::Bool(true);
+        sanitized["truncated"] = Value::Bool(true);
+        sanitized["channel"] = Value::String("detail".to_owned());
+        sanitized["text"] = Value::String(
+            "Provider output exceeded the durable frame budget; no complete answer was saved."
+                .to_owned(),
+        );
+        if let Some(object) = sanitized.as_object_mut() {
+            object.remove("answers");
+        }
         return sanitized;
     }
     candidate
@@ -4574,11 +4587,12 @@ mod tests {
 
     #[test]
     fn keeps_the_complete_final_answer_instead_of_a_display_preview() {
-        let config = config(PathBuf::from("unused"));
+        let mut config = config(PathBuf::from("unused"));
+        config.max_outbox_bytes = 1024 * 1024;
         let mut state = DurableState::new(&config);
         let answer = format!("token=secret-value {}", "Every open task. ".repeat(400));
         assert!(answer.len() > 4_096);
-        for (channel, complete) in [("final", true), ("progress", false)] {
+        for (channel, complete) in [("final", true), ("progress", true)] {
             state
                 .enqueue_event(
                     &config,
@@ -4604,7 +4618,7 @@ mod tests {
             }
         }
 
-        // A frame too small for the complete answer keeps the marked preview.
+        // A frame too small for the complete answer keeps a failure, not a preview.
         let mut small_frame = config.clone();
         small_frame.max_frame_bytes = 8_000;
         let mut small = DurableState::new(&small_frame);
@@ -4616,12 +4630,8 @@ mod tests {
                 json!({"kind": "agentMessage", "channel": "final", "text": answer}),
             )
             .unwrap();
-        assert!(small.outbox[0]
-            .envelope
-            .pointer("/payload/payload/text")
-            .and_then(Value::as_str)
-            .unwrap()
-            .ends_with("…[truncated]"));
+        assert_eq!(small.outbox[0].envelope.pointer("/payload/payload/transcriptOverflow"), Some(&Value::Bool(true)));
+        assert_eq!(small.outbox[0].envelope.pointer("/payload/payload/channel").and_then(Value::as_str), Some("detail"));
     }
 
     #[test]
@@ -4653,9 +4663,9 @@ mod tests {
                 .to_owned()
         };
 
-        // 20,000 raw bytes, but about 40,000 once JSON-escaped: keep the preview.
+        // 20,000 raw bytes, but about 40,000 once JSON-escaped: fail visibly.
         let quotes = "\"".repeat(20_000);
-        assert!(final_text(&quotes).ends_with("…[truncated]"));
+        assert_eq!(final_text(&quotes), "Provider output exceeded the durable frame budget; no complete answer was saved.");
 
         // The same length of plain prose fits and is kept complete.
         let prose = "a".repeat(20_000);
