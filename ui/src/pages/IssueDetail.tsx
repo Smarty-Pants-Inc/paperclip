@@ -7100,6 +7100,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       clientRequestId?: string,
       runSettings?: ComposerRunSettings,
     ) => {
+      if (!body.trim() && !attachmentIds?.length)
+        throw new Error("Write a message or attach a file before sending.");
       const assignee = agentMap.get(issue?.assigneeAgentId ?? "");
       if (!reassignment && !issue?.conversationAgentId &&
           (issue?.status === "done" || issue?.status === "in_review") &&
