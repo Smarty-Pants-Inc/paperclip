@@ -11,7 +11,7 @@ import { isVideoLikeOutput } from "@/lib/issue-output";
 import { AgentAvatar, type AvatarAgent } from "../AgentAvatar";
 import { Identity } from "../Identity";
 import { paperclipHumanAvatarUrl } from "@/lib/issue-chat-human-author";
-import { useCallback, useContext, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useState, type ReactNode } from "react";
 import { useEmailComment } from "@/components/EmailMessageCard";
 import type { IssueAttachment } from "@paperclipai/shared";
 import { IssueGalleryContext } from "@/context/IssueGalleryContext";
@@ -45,6 +45,9 @@ import {
 import { TaskChatBubbleActions } from "./TaskChatBubbleActions";
 import { TaskChatSystemNotice } from "./TaskChatSystemNotice";
 import type { TaskChatMessageItem } from "./task-chat-model";
+
+/** Only attachments represented by a resource card in this rendered thread. */
+export const TaskChatResourceAttachmentIdsContext = createContext<ReadonlySet<string>>(new Set());
 
 interface TaskChatBubbleProps {
   item: TaskChatMessageItem;
@@ -170,6 +173,7 @@ function TaskChatBubbleContent({
     ? <CoordinatorRelativeTime value={recordedTimestamp} /> : item.timestamp;
   const { enabled: artifactsV1 } = useArtifactsV1Enabled();
   const openText = useContext(TextAttachmentContext);
+  const resourceAttachmentIds = useContext(TaskChatResourceAttachmentIdsContext);
   // Task attachments share the page gallery; standalone images retain the bubble viewer.
   const openIssueGallery = useContext(IssueGalleryContext);
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
@@ -200,19 +204,21 @@ function TaskChatBubbleContent({
   const isHuman = item.author === "human";
   const isOwnMessage = isHuman && item.isCurrentUser === true;
   const sentFromIMessage = isHuman && item.sourceChannel === "imessage-photon";
-  // Non-image file references ("[name](/api/attachments/…/content)") render as
-  // attachment chips under the bubble; link-only lines leave the body text.
-  const { refs: linkedRefs, text: bodyWithoutAttachmentLinks } =
-    extractAttachmentRefs(item.text);
+  // Agent mentions stay links; omit a chip only when this thread owns its card.
+  // Standalone bubbles and uncarded attachments retain their attachment access.
+  const { refs: linkedRefs, text } = extractAttachmentRefs(item.text);
+  const bodyWithoutAttachmentLinks = isHuman ? text : item.text;
   const embeddedImageRefs = extractImageRefs(bodyWithoutAttachmentLinks);
   const bodyText = stripStandaloneImageEmbeds(bodyWithoutAttachmentLinks);
-  const hydratedLinkedRefs = hydrateAttachmentRefs(linkedRefs, attachments);
+  const hydratedLinkedRefs = hydrateAttachmentRefs(linkedRefs, attachments)
+    .filter(ref => isHuman || !resourceAttachmentIds.has(ref.id ?? ""));
   const hydratedEmbeddedRefs = hydrateAttachmentRefs(
     embeddedImageRefs,
     attachments,
   );
   const boundAttachmentRefs: AttachmentRef[] = attachments
-    .filter((attachment) => attachment.issueCommentId === item.id)
+    .filter((attachment) => attachment.issueCommentId === item.id &&
+      (isHuman || !resourceAttachmentIds.has(attachment.id)))
     .map((attachment) => ({
       id: attachment.id,
       name: attachment.originalFilename?.trim() || "attachment",
