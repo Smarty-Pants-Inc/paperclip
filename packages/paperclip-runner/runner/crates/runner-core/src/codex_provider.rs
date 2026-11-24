@@ -2499,7 +2499,7 @@ impl CodexProvider {
         }
     }
 
-    pub fn steer_turn(&mut self, message: &str) -> Result<Value, LocalRunnerError> {
+    pub fn steer_turn(&mut self, message: &str, correlation_id: Option<&str>) -> Result<Value, LocalRunnerError> {
         let turn_id = self
             .active_provider_turn_id
             .clone()
@@ -2509,14 +2509,14 @@ impl CodexProvider {
                 "Codex steering text is empty or oversized",
             ));
         }
-        self.request(
-            "turn/steer",
-            json!({
-                "threadId": self.thread_id,
-                "expectedTurnId": turn_id,
-                "input": [{"type": "text", "text": message, "text_elements": []}],
-            }),
-        )
+        let mut params = json!({
+            "threadId": self.thread_id,
+            "expectedTurnId": turn_id,
+            "input": [{"type": "text", "text": message, "text_elements": []}],
+        });
+        // Seam 0265: our Pi proxy maps a steer back to its comment by this id; Codex's app-server never sees it.
+        if let (Some(id), "pi_rpc") = (correlation_id, self.config.provider.as_str()) { params["correlationId"] = json!(id); }
+        self.request("turn/steer", params)
     }
 
     pub fn interrupt_turn(&mut self, reason: Option<&str>) -> Result<Value, LocalRunnerError> {
