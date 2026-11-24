@@ -30,6 +30,7 @@ import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { createHeartbeatTimerPolicy, parseHeartbeatPolicy } from "./heartbeat/timer-policy.js";
 import { isAgentAwaitingSetup } from "../modules/agent-lifecycle/index.js";
 import { HttpError } from "../errors.js";
+import { logger } from "../middleware/logger.js";
 import { ONBOARDING_CHAT_GREETING_REASON } from "./onboarding-chat-prompt.js";
 
 import { isConversation, isWaitingConversation, type ConversationIdentity } from "../lib/conversation-wake-policy.js";
@@ -724,7 +725,23 @@ export async function deliverConversationComments(
       }
       return "delivered" as const;
     });
-    if (delivered !== "retry") return delivered;
+    if (delivered !== "retry") {
+      // Admission may have parked messages while Pi was preparing. Once held,
+      // drain the same FIFO before a later person message can remain behind it.
+      // Outside the outbox transaction: steering owns its own ISSUE/ACK locks.
+      if (delivered === "delivered") {
+        const [current] = await db.select({ runId: issues.executionRunId }).from(issues).where(and(
+          eq(issues.id, issue.id), eq(issues.companyId, issue.companyId),
+        ));
+        if (current?.runId) {
+          const { drainContinuousPersonMessages } = await import("./native-runtime/native-continuous-drain.js");
+          try { await drainContinuousPersonMessages(db, { companyId: issue.companyId, issueId: issue.id,
+            runId: current.runId, agentId: issue.conversationAgentId }); }
+          catch (error) { logger.warn({ error, issueId: issue.id }, "held-run person-message drain deferred"); }
+        }
+      }
+      return delivered;
+    }
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
