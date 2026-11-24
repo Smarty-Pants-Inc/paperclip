@@ -1393,12 +1393,15 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         const reply = value as { questionCommentIds?: unknown; commentId?: unknown };
         if (!Array.isArray(reply.questionCommentIds) || typeof reply.commentId !== "string") continue;
         const first = transcriptByRun.get(run.runId)?.find(entry => entry.kind === "assistant" && entry.itemId === itemId);
-        // Question receipts can include a steer acknowledged mid-answer. They
-        // must not move text whose first streamed slot is already known.
-        const streamed = first?.kind === "assistant" && (first.delta || toMs(first.completedAt) > toMs(first.ts));
-        const segmentIndex = streamed ? anchors.filter(anchor => anchor <= toMs(first.ts)).length :
-          Math.max(0, ...reply.questionCommentIds.map(id =>
-            anchors.indexOf(steeringAnchorByCommentId.get(String(id)) ?? NaN) + 1));
+        // ACK is queue admission, not consumption: several steers can precede
+        // the first output. Their reply receipts, not that timestamp, own it.
+        const questionSegment = Math.max(0, ...reply.questionCommentIds.map(id =>
+          anchors.indexOf(steeringAnchorByCommentId.get(String(id)) ?? NaN) + 1));
+        // A later steer cannot claim text already streaming before its ACK.
+        // Keep that first slot (also on reload), but not a later timestamp slot
+        // that would put an earlier question's answer below a second question.
+        const segmentIndex = first && toMs(first.ts) < (anchors[questionSegment - 1] ?? -Infinity)
+          ? anchors.filter(anchor => anchor <= toMs(first.ts)).length : questionSegment;
         byItem.set(itemId, segmentIndex);
         const segmentReplies = bySegment.get(segmentIndex) ?? new Map<string, string>();
         segmentReplies.set(itemId, reply.commentId);
@@ -1847,7 +1850,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       // Keep the same segment owner while activeRun disappears ahead of the
       // terminal summary; otherwise a second settling tail bypasses dedupe.
       const openSegments = isNativePaperclipRunnerRun(source) && (source.id === liveRun?.id ||
-        (!liveRun && source.id === settlingRun?.id && !isTerminalRunStatus(source.status)));
+        (!liveRun && (source.id === settlingRun?.id || liveSeenRef.current.has(source.id)) && !isTerminalRunStatus(source.status)));
       if (!isTerminalRunStatus(source.status) && !openSegments) continue;
       if (liveRun && runChainIdsById.get(liveRun.id)?.includes(source.id) && !openSegments) continue;
       const entries = transcriptByRun.get(source.id) ?? [];

@@ -1676,10 +1676,15 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     [...queryKeys.issues.runs(issueQueryRef), "comment-window"], observedRunIds,
     ids => activityApi.runsByIdsForIssue(issueQueryRef, ids), !!issueId && !!conversationMode && !historyExpanded,
   );
-  const linkedRuns = useMemo(() => [...new Map([
-    ...(Array.isArray(linkedRunHistory) ? linkedRunHistory : linkedRunHistory?.runs ?? []),
-    ...(conversationMode && !historyExpanded ? commentRuns.data ?? [] : []),
-  ].map(run => [run.runId, run])).values()], [linkedRunHistory, conversationMode, historyExpanded, commentRuns.data]);
+  const linkedRuns = useMemo(() => {
+    const history = Array.isArray(linkedRunHistory) ? linkedRunHistory : linkedRunHistory?.runs ?? [];
+    const byId = new Map(history.map(run => [run.runId, run]));
+    // Batches fill older runs, but must not overwrite the every-second poll's receipts.
+    for (const run of conversationMode && !historyExpanded ? commentRuns.data ?? [] : []) {
+      if (!byId.has(run.runId)) byId.set(run.runId, run);
+    }
+    return [...byId.values()];
+  }, [linkedRunHistory, conversationMode, historyExpanded, commentRuns.data]);
   const earlierRun = Array.isArray(linkedRunHistory) ? undefined : linkedRunHistory?.earlierRun;
   const hasEarlierRuns = !Array.isArray(linkedRunHistory) && linkedRunHistory?.hasEarlierRuns === true && !(
     earlierRun?.status === "succeeded" && hasVisibleRunAnswer(comments, earlierRun.runId, earlierRun.resultJson)
@@ -1764,17 +1769,14 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   [resolvedLiveRuns, polledRunMetaById]);
   const freshActiveRun = resolvedActiveRun && polledRunMetaById.has(resolvedActiveRun.id)
     ? { ...resolvedActiveRun, ...polledRunMetaById.get(resolvedActiveRun.id) } : resolvedActiveRun;
-  const timelineRuns = useMemo(() => {
-    const historicalRuns =
-      liveRunIds.size === 0
-        ? resolvedLinkedRuns
-        : resolvedLinkedRuns.filter((run) => !liveRunIds.has(run.runId));
-    return historicalRuns.map((run) => ({
-      ...run,
-      adapterType: run.adapterType,
-      hasStoredOutput: (run.logBytes ?? 0) > 0,
-    }));
-  }, [liveRunIds, resolvedLinkedRuns]);
+  // The thread also needs the polled reply/input receipts while a run is live.
+  // It merges these records with liveRuns by ID; dropping them until settlement
+  // withholds answer ownership and changes the conversation when the hold ends.
+  const timelineRuns = useMemo(() => resolvedLinkedRuns.map((run) => ({
+    ...run,
+    adapterType: run.adapterType,
+    hasStoredOutput: (run.logBytes ?? 0) > 0,
+  })), [resolvedLinkedRuns]);
   const commentsWithRunMeta = useMemo<IssueDetailComment[]>(() => {
     const activeRunStartedAt =
       interruptibleIssueRun?.startedAt ??
