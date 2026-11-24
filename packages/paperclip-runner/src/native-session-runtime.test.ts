@@ -261,6 +261,63 @@ function highestContiguous(events: PrpEvent[]): number {
 }
 
 describe("executeNativeSession recovery", () => {
+  it.each(["held", "held-no-final", "completed", "no-final", "no-replay"] as const)(
+    "never resubmits a held Pi conversation's original input after restart (%s)", async mode => {
+      const piInput = { ...input,
+        provider: { kind: "pi_rpc" as const, model: "fixture/model", conversationMode: true as const },
+        session: { ...input.session, driverKind: "pi_rpc" as const } };
+      const final = runnerEvent(1, "item.completed", { kind: "agentMessage", channel: "final", text: "Already published." });
+      const end = runnerEvent(2, "turn.completed");
+      const held = mode === "held" || mode === "held-no-final";
+      const durable = mode === "no-replay" || mode === "held-no-final" ? [] : held ? [final] : mode === "no-final" ? [end] : [final, end];
+      const checkpoint: PersistedNativeSession = { backendKind: "mock", sessionId: identity.sessionId, identity,
+        providerSessionId: "provider-recovery", cursor: held ? "1" : "2",
+        activeTurnId: held ? end.turnId : null, pendingRuntimeRequests: [], lineage: [],
+        terminalTurns: held ? [] : [{ turnId: end.turnId!, fingerprint: "completed" }] };
+      const startTurn = vi.fn(async () => { throw new Error("ORIGINAL INPUT REPLAYED"); });
+      const session: NativeSession = {
+        identity: () => identity,
+        async capabilities() { return { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true }; },
+        async *events() { if (held) yield end; }, startTurn,
+        async result() { return null; }, async snapshot() { return structuredClone(checkpoint); }, async close() {},
+      };
+      const accepted: PrpEvent[] = [];
+      const completeRun = vi.fn(async () => undefined);
+      const backend: NativeSessionBackend = {
+        async descriptor() { return { kind: "mock", name: "held-pi-restart", version: "1", capabilities: await session.capabilities() }; },
+        async openSession() { throw new Error("must recover the same session"); },
+        async recoverSession() { return { recovered: true, session }; },
+      };
+      const port: ControlPlanePort = {
+        async openRun() {}, async loadSessionCheckpoint() { return structuredClone(checkpoint); }, async checkpointSession() {},
+        async appendEvent(event: PrpEvent) { accepted.push(structuredClone(event)); return { cursor: event.sourceSeq, highestContiguousSourceSeq: event.sourceSeq, disposition: "committed" }; },
+        async replayEvents(query) { const events = [...durable, ...accepted].filter(event => event.sourceInstanceId === query.sourceInstanceId);
+          return { events: events.filter(event => event.sourceSeq > query.afterSourceSeq), highestContiguousSourceSeq: highestContiguous(events) }; },
+        completeRun,
+      };
+      const execute = () => executeNativeSession({ input: piInput, backend, controlPlane: port,
+        runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery", timeoutMs: 1000,
+        resolveMissingResult: async ({ terminalEvent }) => durable.some(event => event.eventType === "item.completed" && event.turnId === terminalEvent.turnId)
+          ? { ...yieldedResult, summary: "Already published." } : null });
+      if (mode === "no-final" || mode === "no-replay" || mode === "held-no-final") {
+        await expect(execute()).rejects.toThrow("native_finalization_missing");
+        expect(completeRun).not.toHaveBeenCalled();
+        expect(accepted.some(event => event.eventType === "run.result.accepted")).toBe(false);
+      } else {
+        await expect(execute()).resolves.toMatchObject({ turnId: end.turnId, result: { reportedWorkDisposition: "yielded", summary: "Already published." } });
+        expect(accepted.filter(event => event.eventType === "run.result.accepted")).toHaveLength(1);
+        expect(accepted.filter(event => event.eventType === "run.terminal")).toHaveLength(1);
+        expect(completeRun).toHaveBeenCalledOnce();
+        if (mode === "completed") {
+          await expect(execute()).resolves.toMatchObject({ turnId: end.turnId });
+          expect(accepted.filter(event => event.eventType === "run.result.accepted")).toHaveLength(1);
+          expect(accepted.filter(event => event.eventType === "run.terminal")).toHaveLength(1);
+        }
+      }
+      expect(startTurn).not.toHaveBeenCalled();
+      expect(durable.filter(event => event.eventType === "item.completed")).toHaveLength(mode === "held" || mode === "completed" ? 1 : 0);
+    },
+  );
   it("completes Cursor Cloud semantic planning through its default-only harness without losing the pinned revision", async () => {
     await writeFile(join(WORKSPACE, "cloud-plan-instructions.md"), "Make the plan only. Do not implement it.\n");
     const prepared = preparedInput();
