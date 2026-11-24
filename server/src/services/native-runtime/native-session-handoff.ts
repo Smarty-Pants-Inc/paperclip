@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, isNull, lte, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, isNull, lte, notInArray, or, sql, type SQL } from "drizzle-orm";
 import { documents, heartbeatRunEvents, heartbeatRuns, issueComments, issueDocuments, issues, issueThreadInteractions, type Db } from "@paperclipai/db";
 import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
 import { buildLowTrustSourceTrust, redactQuarantinedBodyForHigherTrust, sanitizeQuarantinedCommentForHigherTrust } from "../source-trust.js";
@@ -49,7 +49,7 @@ export function renderNativeSessionHandoff(input: {
 /** All reads are company/task scoped, row bounded and text bounded in SQL. */
 export async function buildNativeSessionHandoff(input: {
   db: Db; companyId: string; issueId: string; agentId: string; before: Date;
-  throughCommentId?: string | null;
+  throughCommentId?: string | null; excludeCommentIds?: string[];
 }): Promise<string | null> {
   const { db, companyId, issueId, agentId } = input;
   const [issue] = await db.select({
@@ -78,6 +78,7 @@ export async function buildNativeSessionHandoff(input: {
   const commentScope = and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), isNull(issueComments.deletedAt),
     isNull(issueComments.conversationSessionGeneration),
     lte(issueComments.createdAt, input.before),
+    input.excludeCommentIds?.length ? notInArray(issueComments.id, input.excludeCommentIds) : undefined,
     boundary ? sql`(${issueComments.createdAt}, ${issueComments.id}) > (${boundary.createdAt.toISOString()}::timestamptz, ${boundary.id}::uuid)` : undefined,
     cutoff ? sql`(${issueComments.createdAt}, ${issueComments.id}) <= (${cutoff.createdAt.toISOString()}::timestamptz, ${cutoff.id}::uuid)` : undefined);
   const runIssueScope = or(eq(heartbeatRuns.nativeIssueId, issueId), and(isNull(heartbeatRuns.nativeIssueId),
