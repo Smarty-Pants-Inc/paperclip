@@ -7472,6 +7472,8 @@ export function agentRoutes(
       if (!landed) await mark(false); else await returnQueued().catch(error => logger.warn({ error, runId }, "person Stop could not return queued messages"));
       const hasTurn = async () => (await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, runId), inArray(heartbeatRunEvents.eventType, ["turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted"]))).limit(1)).length > 0;
       if (outcome === "no_turn" && !finishing?.resultId && !await hasTurn()) {
+        await db.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || jsonb_build_object('personStopHeld', coalesce(${heartbeatRuns.resultJson} -> 'personStopHeld', ${JSON.stringify({ pressedAt })}::jsonb))` })
+          .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")));
         res.status(202).json(await runRedactions.redactForRun(existing.companyId, runId, existing, getActorInfo(req).actorId));
         if (personStopHolds.has(runId)) return; personStopHolds.add(runId); let why: "turn" | "terminal" | "non_pi" = "turn";
         void (async () => { for (;;) {
