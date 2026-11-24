@@ -447,6 +447,7 @@ vi.mock("../components/TaskChatThread", () => ({
     comments?: Array<{ metadata?: { recovery?: DispositionRecoverySnapshot } | null }>;
     workProducts?: IssueWorkProduct[];
     threadHeader?: ReactNode;
+    renderConversationRecovery?: () => ReactNode;
     onStopRun?: (runId: string) => Promise<void>;
     stopRunLabel?: string;
     onTryAgainNoLiveExecutionPath?: () => Promise<void> | void;
@@ -467,6 +468,7 @@ vi.mock("../components/TaskChatThread", () => ({
       <div data-testid="task-chat-thread">
         {props.threadHeader}
         Task chat thread
+        {props.renderConversationRecovery?.()}
         {props.comments?.map((comment, index) => comment.metadata?.recovery ? <DispositionRecoveryNotice key={index} snapshot={comment.metadata.recovery} /> : null)}
         {props.workProducts?.map((workProduct) => (
           <RichWorkProductCard
@@ -4022,7 +4024,7 @@ describe("IssueDetail", () => {
     if (mode !== "verified") {
       // The notice says "Retry to try again"; an unverifiable source must not
       // leave it without a Retry. The server re-verifies the source.
-      await waitForAssertion(() => expect(labels()).toContain("Retry"));
+      await waitForAssertion(() => expect(labels().filter(label => label === "Retry")).toHaveLength(1));
       expect(labels()).not.toContain("Recover saved files");
       expect(container.textContent).not.toContain("Refresh the task");
       const retry = [...container.querySelectorAll("button")].find(button => button.textContent === "Retry")!;
@@ -4036,7 +4038,7 @@ describe("IssueDetail", () => {
       return;
     }
     await waitForAssertion(() => expect([...container.querySelectorAll("button")]
-      .some(button => button.textContent === "Recover saved files")).toBe(true));
+      .filter(button => button.textContent === "Recover saved files")).toHaveLength(1));
     expect([...container.querySelectorAll("button")].some(button => button.textContent === "Retry")).toBe(false);
     const preserve = [...container.querySelectorAll("button")].find(button => button.textContent === "Recover saved files")!;
     await act(async () => preserve.click());
@@ -4071,7 +4073,7 @@ describe("IssueDetail", () => {
     });
     mockIssuesApi.retryTask.mockResolvedValue({ requestId: "legacy-retry", accepted: true, stale: false, presentation: interruption });
     await act(async () => renderIssueView());
-    await waitForAssertion(() => expect([...container.querySelectorAll("button")].some(button => button.textContent === "Retry")).toBe(true));
+    await waitForAssertion(() => expect([...container.querySelectorAll("button")].filter(button => button.textContent === "Retry")).toHaveLength(1));
     expect([...container.querySelectorAll("button")].some(button => button.textContent === "Recover saved files")).toBe(false);
     const retry = [...container.querySelectorAll("button")].find(button => button.textContent === "Retry")!;
     await act(async () => retry.click());
