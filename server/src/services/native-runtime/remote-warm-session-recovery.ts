@@ -168,9 +168,22 @@ export function describeFailedAttachment(failureMessage: unknown): string | null
   return `This run could not attach to its provider session: ${cause}. A later run may start a new provider thread.`;
 }
 
-type WarmRecoveryRefusal = "identity_incomplete" | "target_not_resumed_sandbox" | "owner_unsettled" | "execution_mismatch"
+export type WarmRecoveryRefusal = "identity_incomplete" | "target_not_resumed_sandbox" | "owner_unsettled" | "execution_mismatch"
   | "checkpoint_unsettled" | "journal_unsettled" | "controller_not_stopped" | "prior_lease_mismatch"
   | "current_run_not_admitted" | "current_owner_changed" | "owner_changed" | "current_lease_changed";
+
+/** A typed refusal (possibly wrapped in the stock predecessor failure), not an arbitrary I/O error. */
+export class NativeWarmRecoveryRefusalError extends Error {
+  constructor(readonly reason: WarmRecoveryRefusal) {
+    super(`runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; warm_recovery_refused=${reason}`);
+    this.name = "NativeWarmRecoveryRefusalError";
+  }
+}
+
+export function isNativeWarmRecoveryRefusal(error: unknown): boolean {
+  return error instanceof NativeWarmRecoveryRefusalError ||
+    (error instanceof NativePredecessorRetirementUnprovenError && error.cause instanceof NativeWarmRecoveryRefusalError);
+}
 
 export async function inspectRemoteWarmSessionRecovery(input: {
   db: Db;
@@ -187,14 +200,14 @@ export async function inspectRemoteWarmSessionRecovery(input: {
   const { target } = input;
   let settledPredecessor: { runId: string; providerLeaseId: string } | null = null;
   const deny = (reason: WarmRecoveryRefusal): never => {
-    const refusal = new Error(`runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; warm_recovery_refused=${reason}`);
+    const refusal = new NativeWarmRecoveryRefusalError(reason);
     if (settledPredecessor) {
       throw new NativePredecessorRetirementUnprovenError(settledPredecessor.runId, settledPredecessor.providerLeaseId, refusal);
     }
     throw refusal;
   };
   const refuseCurrentRun = (reason: WarmRecoveryRefusal): never => {
-    throw new Error(`runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; warm_recovery_refused=${reason}`);
+    throw new NativeWarmRecoveryRefusalError(reason);
   };
   const identity: Record<string, string> = {};
   for (const key of ["runId", "normalizedSessionId", "runnerInstanceId", "environmentLeaseId", "turnId", "itemId"]) {

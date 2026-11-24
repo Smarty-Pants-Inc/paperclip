@@ -527,6 +527,31 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     } });
   });
 
+  it.each(["continuous", "paperclip"] as const)("keeps persisted effective %s publication policy despite opposite agent config and replay", async sessionContinuity => {
+    await fixture(false, { beforeFinalize: async scope => {
+      await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: sessionContinuity === "continuous" ? "paperclip" : "continuous" } })
+        .where(eq(agents.id, scope.agentId));
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      await db.update(heartbeatRuns).set({ runnerProfileJson: { ...run.runnerProfileJson, nativeSessionContinuity: sessionContinuity } })
+        .where(eq(heartbeatRuns.id, scope.runId));
+      const execution = { binding: scope, provider: { kind: "pi_rpc" as const } };
+      for (let index = 0; index < 2; index++) {
+        const event = { eventType: "item.completed" as const, runId: scope.runId, normalizedSessionId: run.nativeSessionId!,
+          sourceEventId: `effective-final-${index}`, itemId: `effective:m${index}`, payload: { kind: "agentMessage", channel: "final", text: `Effective answer ${index}.` } };
+        await db.insert(heartbeatRunEvents).values({ companyId: scope.companyId, runId: scope.runId, agentId: scope.agentId,
+          seq: 171 + index, eventType: event.eventType, payload: { prpEvent: event } });
+        if (index === 0) await publishContinuousNativeReply({ db, execution, event, cursor: 171 });
+      }
+      expect(await comments(scope.runId)).toHaveLength(sessionContinuity === "continuous" ? 1 : 0);
+      // Saved policy also outranks a stale caller hint. Replay must dedupe the live answer.
+      await recoverContinuousNativeReplies(db, { id: scope.runId, companyId: scope.companyId,
+        sessionContinuity: sessionContinuity === "continuous" ? "paperclip" : "continuous" });
+      await recoverContinuousNativeReplies(db, { id: scope.runId, companyId: scope.companyId });
+      expect((await comments(scope.runId)).map(comment => comment.body).sort()).toEqual(sessionContinuity === "continuous"
+        ? ["Effective answer 0.", "Effective answer 1."] : []);
+    } });
+  });
+
   it("replays persisted finals if ingestion committed but live publication crashed", async () => {
     const f = await fixture(true, { beforeFinalize: async scope => {
       await db.update(agents).set({ adapterConfig: { provider: "pi_rpc" } }).where(eq(agents.id, scope.agentId));
