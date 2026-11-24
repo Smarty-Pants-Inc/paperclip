@@ -395,6 +395,11 @@ import {
 type ActiveNativeSession = {
   session: NativeSession;
   cancelRequested: boolean;
+  /** A continuous Pi final was published, with no later provider work or steer. */
+  heldIdle?: boolean;
+  holdActivityVersion?: number;
+  holdPendingItems?: Set<string>;
+  holdCloseRequested?: boolean;
   admissionAbort?: AbortController;
   cancellationSettled?: Promise<void>;
   restartDetach?: Promise<void>;
@@ -9887,6 +9892,13 @@ export async function steerNativeSession(input: {
       "The active native session is not attached.",
     );
   }
+  if (active.holdCloseRequested) {
+    throw new NativeSessionSteeringError("steering_stale_turn", "This held turn is closing for a new session.");
+  }
+  // Reserve work before any asynchronous capability/snapshot reads. An old
+  // published final must not make a newly delivered follow-up look idle.
+  active.heldIdle = false;
+  active.holdActivityVersion = (active.holdActivityVersion ?? 0) + 1;
   const capabilities = await active.session.capabilities();
   if (!capabilities.steering || !active.session.steer) {
     throw new NativeSessionSteeringError(
@@ -9965,12 +9977,32 @@ export async function steerNativeSession(input: {
   }
 }
 
+/** End only an idle open-turn hold, once. No personStop/returned-input or cancel/requeue machinery. */
+export async function closeHeldNativeTurn(runId: string): Promise<boolean> {
+  const active = activeNativeSessions.get(runId);
+  if (!active?.heldIdle || active.cancelRequested || active.holdCloseRequested) return false;
+  active.holdCloseRequested = true;
+  try {
+    const outcome = await interruptNativeTurn({ runId, reason: "person_stop", onlyIfHeldIdle: true });
+    if (!outcome || outcome === "no_turn") { active.holdCloseRequested = false; return false; }
+    return true;
+  } catch (error) {
+    active.holdCloseRequested = false;
+    throw error;
+  }
+}
+
 /** A person's Stop ends the live turn only: the stock turn interrupt, never cancel (seam 0233). */
-export async function interruptNativeTurn(input: { runId: string; reason: string; timeoutMs?: number }): Promise<{ turnId: string } | "no_turn" | null> {
+export async function interruptNativeTurn(input: { runId: string; reason: string; timeoutMs?: number; onlyIfHeldIdle?: boolean }): Promise<{ turnId: string } | "no_turn" | null> {
   const active = activeNativeSessions.get(input.runId);
   if (!active || active.cancelRequested || !active.session.interrupt) return active ? null : "no_turn";
-  const turnId = (await active.session.snapshot()).activeTurnId ?? null;
+  const snapshot = await active.session.snapshot();
+  const turnId = snapshot.activeTurnId ?? null;
   if (!turnId) return "no_turn";
+  // The outer PRP turn remains open during the driver's hold. Check logical
+  // work again after snapshot, not merely whether that outer turn exists.
+  if (input.onlyIfHeldIdle && (activeNativeSessions.get(input.runId) !== active ||
+      !active.heldIdle || active.cancelRequested || active.holdPendingItems?.size || snapshot.pendingRuntimeRequests?.length)) return "no_turn";
   let timeout: ReturnType<typeof setTimeout> | null = null;
   try {
     await Promise.race([
@@ -11969,7 +12001,28 @@ async function executePaperclipNativeSessionAttempt(
         }
       },
       onCommittedEvent: async (event, cursor) => {
-        await publishContinuousNativeReply({ db: input.db, execution: input.execution, event, cursor });
+        const active = input.execution.provider.kind === "pi_rpc" && input.execution.provider.conversationMode === true
+          ? activeNativeSessions.get(input.execution.binding.runId) : undefined;
+        if (active && (event.eventType === "turn.started" || event.eventType === "item.started" || event.eventType === "item.delta")) {
+          active.heldIdle = false;
+          active.holdActivityVersion = (active.holdActivityVersion ?? 0) + 1;
+        }
+        if (active && event.itemId) {
+          if (event.eventType === "item.started") (active.holdPendingItems ??= new Set()).add(event.itemId);
+          if (event.eventType === "item.completed") active.holdPendingItems?.delete(event.itemId);
+        }
+        const activityVersion = active?.holdActivityVersion;
+        const published = await publishContinuousNativeReply({ db: input.db, execution: input.execution, event, cursor });
+        if (published && active && !active.holdPendingItems?.size && activeNativeSessions.get(input.execution.binding.runId) === active &&
+            active.holdActivityVersion === activityVersion && input.execution.provider.kind === "pi_rpc" &&
+            input.execution.provider.conversationMode === true) {
+          active.heldIdle = true;
+          // Do not join a provider command from its event-persistence callback.
+          // The same check also runs after enqueue, covering both arrival orders.
+          void import("../../modules/wake-queue/index.js").then(({ closeConversationResetHold }) =>
+            closeConversationResetHold(input.db, input.execution.binding)).catch(error =>
+              logger.warn({ error, runId: input.execution.binding.runId }, "could not close reset hold"));
+        }
         if (event.eventType === "run.result.proposed") {
           const at = Date.now();
           await trace.record({name:"completion.tool_accepted",parentName:"native.session.execute",startedAtMs:at,endedAtMs:at});
