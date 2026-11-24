@@ -4462,7 +4462,8 @@ impl CodexCommandExecutor {
             .get("text")
             .and_then(Value::as_str)
             .ok_or_else(|| DurableRunnerError::invalid("turn.steer payload.text is required"))?;
-        self.ensure_provider()?.steer_turn(text).map_err(|error| {
+        let correlation_id = payload.get("correlationId").and_then(Value::as_str);
+        self.ensure_provider()?.steer_turn(text, correlation_id).map_err(|error| {
             DurableRunnerError::invalid(format!("Codex turn steer failed: {error}"))
         })?;
         Ok(CommandExecution::result(json!({"status": "steered"})))
