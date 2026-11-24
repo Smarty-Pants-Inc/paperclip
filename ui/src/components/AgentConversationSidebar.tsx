@@ -19,8 +19,8 @@ export interface AgentConversationSidebarProps {
   activeId?: string;
   /** Per agent: the row's text line, up to two lines; the agent's role when absent. */
   previews?: Record<string, string>;
-  /** Per agent with a chat: when it last changed and whether the agent is replying now. */
-  chatActivity?: Record<string, { at: Date | string; working: boolean }>;
+  /** Per agent with a chat: when it last changed, not whether a turn is running. */
+  chatActivity?: Record<string, { at: Date | string }>;
   unreadAgentIds?: readonly string[];
   unreadMessageCounts?: ReadonlyMap<string, number>;
   loading?: boolean;
@@ -118,8 +118,7 @@ export function AgentConversationSidebar({ agents, compact = false, existingChat
             <span className="flex min-w-0 flex-wrap items-baseline gap-x-2">
               <span className="truncate text-sm font-medium">{agent.name}</span>
               {activity && <span className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
-                <span aria-hidden className={cn("size-1.5 rounded-full", activity.working ? "bg-blue-400 motion-safe:animate-pulse" : "bg-muted-foreground/40")} />
-                {activity.working ? "Working" : "Idle"} · {relativeTime(activity.at)}
+                {relativeTime(activity.at)}
               </span>}
             </span>
             <span className={cn("text-xs text-muted-foreground", activity ? "line-clamp-2" : "truncate")}>{agent.status === "terminated" ? "Terminated" : previews[agent.id] ?? agent.title ?? agent.role}</span>
