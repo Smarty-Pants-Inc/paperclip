@@ -1057,7 +1057,7 @@ export function transcriptToTaskChatItems(
         // retains these diagnostics.
         if (entry.family === "provider_notice" && !isStatusNoticePayload(entry.payload) &&
           (entry.payload.userActionable !== true ||
-          ["error", "warning", "guardianWarning", "configWarning", "deprecationNotice", "windows_worldWritableWarning"]
+          ["error", "warning", "guardianWarning", "configWarning", "deprecationNotice", "windows_worldWritableWarning", "pi_stop_returned_input"]
             .includes(String(entry.payload.category)))) break;
         // Each retry keeps its own position, so work between two retries in
         // one turn cannot make the later retry look recovered.
