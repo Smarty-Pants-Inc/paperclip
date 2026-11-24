@@ -275,7 +275,8 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
     ...((input.initialCommunicationGuidance || input.freshSessionHandoff) ? {
       initialCommunicationGuidance: [input.initialCommunicationGuidance, input.freshSessionHandoff].filter(Boolean).join("\n\n"),
     } : {}),
-    ...(input.resumedSession && input.previousTurn && !input.conversationMode ? {
+    // Seam 0255: our Pi Agent Chat takes stock's compact resume delta too, so a kept session is not re-sent the whole brief every message.
+    ...(input.resumedSession && input.previousTurn && (!input.conversationMode || piConversation) ? {
       continuationPrompt: buildNativeContinuationPrompt({
         wakePayload: input.wakePayload,
         previousRunId: input.previousTurn.runId,
