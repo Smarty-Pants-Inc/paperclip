@@ -645,6 +645,50 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     expect(f.deps.executeRun).not.toHaveBeenCalled();
   });
 
+  it.each(["/new", "older message"])("FIFO admission: %s is re-admitted once with its own context, ahead of newer input", async body => {
+    const f = await waitingConversationFixture();
+    await db.update(issues).set({ conversationState: "active", status: "in_progress" }).where(eq(issues.id, f.issue.id));
+    f.deps.getSchedulingSuppression.mockResolvedValue({ suppressed: false, reason: null });
+    f.deps.isRunAdmissionClosed = () => true; // Exercise admission without launching a provider.
+    const [older, newer] = await db.insert(issueComments).values([body, "new question"].map((text, index) => ({
+      companyId: f.company.id, issueId: f.issue.id, authorType: "user" as const, authorUserId: f.user.id,
+      body: text, createdAt: new Date(Date.now() - (1 - index) * 5_000),
+    }))).returning();
+    const context = { issueId: f.issue.id, wakeReason: "issue_commented", savedContext: "oldest",
+      ...(body === "/new" ? { forceFreshSession: true } : {}) };
+    const [old] = await db.insert(agentWakeupRequests).values({
+      companyId: f.company.id, agentId: f.agent.id, source: "automation", triggerDetail: "system",
+      reason: "issue_commented", status: "deferred_issue_execution", requestedAt: older.createdAt,
+      requestedByActorType: "user", requestedByActorId: f.user.id,
+      payload: withQueuedCommentIdsInWakePayload({ issueId: f.issue.id,
+        executionWait: { reason: "execution_recovery", message: "Old run was ending." },
+        [DEFERRED_WAKE_CONTEXT_KEY]: context }, [older.id]),
+    }).returning();
+    const queue = createHeartbeatQueue(db, f.deps);
+    expect(await queue.enqueueWakeup(f.agent.id, {
+      source: "automation", triggerDetail: "system", reason: "issue_commented",
+      requestedByActorType: "user", requestedByActorId: f.user.id,
+      payload: { issueId: f.issue.id, commentId: newer.id }, contextSnapshot: { savedContext: "newer" },
+    })).toBeNull();
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agent.id));
+    expect(runs).toHaveLength(1); // Immediate re-admission must not self-block or loop.
+    expect(runs[0].contextSnapshot).toMatchObject({ ...context, wakeCommentIds: [older.id] });
+    expect(runs[0].contextSnapshot?.forceFreshSession).toBe(body === "/new" ? true : undefined);
+    const receipts = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agent.id));
+    expect(receipts.find(wake => wake.id === old.id)).toMatchObject({ runId: runs[0].id, status: "coalesced" });
+    expect(receipts.filter(wake => wake.status === "deferred_issue_execution")).toHaveLength(1);
+    expect(receipts.find(wake => wake.status === "deferred_issue_execution"))
+      .toMatchObject({ runId: null, payload: { [DEFERRED_WAKE_CONTEXT_KEY]: { wakeCommentIds: [newer.id], savedContext: "newer" } } });
+    expect(await queue.enqueueWakeup(f.agent.id, {
+      source: "automation", triggerDetail: "system", reason: "issue_commented",
+      requestedByActorType: "user", requestedByActorId: f.user.id,
+      payload: old.payload!, contextSnapshot: context,
+    }, old.id)).toBeNull();
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agent.id))).toHaveLength(1);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, old.id)))[0])
+      .toMatchObject({ runId: runs[0].id, status: "coalesced" });
+  });
+
   async function fixture(status = "running") {
     const [company] = await db.insert(companies).values({ name: "Queue module", issuePrefix: "QM" }).returning();
     const [agent] = await db.insert(agents).values({ companyId: company.id, name: "Queue agent", role: "engineer", status: "idle", adapterType: "process", adapterConfig: {} }).returning();
