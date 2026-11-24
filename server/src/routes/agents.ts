@@ -75,7 +75,8 @@ import type { ChatChannelService } from "../services/chat-channels.js";
 import { activityLog, agentWakeupRequests, agents as agentsTable, chatConversations, companies, heartbeatRunEvents, heartbeatRuns, issueComments, issues as issuesTable, nativeRunFinalizations, projects as projectsTable } from "@paperclipai/db";
 import { queuedCommentIdsFromWakePayload, withQueuedCommentIdsInWakePayload } from "../lib/queued-comment-context.js";
 import { readFirstTurnQueuedInputReceipt } from "../services/native-runtime/first-turn-queued-input.js";
-import { and, desc, eq, inArray, isNull, not, sql } from "drizzle-orm";
+import { executionStartedEventPredicate } from "../services/pre-dispatch-execution-evidence.js";
+import { and, desc, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
 import { sha256Digest } from "../services/feedback-redaction.js";
 import {
   agentSkillSyncSchema,
@@ -7384,21 +7385,32 @@ export function agentRoutes(
     const provider = asRecord(asRecord(asRecord(existing.runnerProfileJson)?.nativeExecutionInput)?.provider);
     const preparing = existing.status === "running" && existing.runtimeMode === "legacy" && !existing.runtimeModeResolvedAt && existing.executionStage === "preparing" && claimedAdapterType(existing) === "paperclip_runner" && asRecord(existing.runnerProfileJson)?.nativeExecutionInput == null;
     const agent = preparing ? await svc.getById(existing.agentId) : null;
+    // Setup may have failed before this request even read the run. Stop still
+    // owns its undelivered input, not its already-recorded terminal status.
+    if (!["running", "queued"].includes(existing.status)) {
+      const settled = await settleStartupStop();
+      if (settled) { res.json(await runRedactions.redactForRun(settled.companyId, runId, settled, getActorInfo(req).actorId)); return; }
+    }
     if ((existing.status === "running" && existing.runtimeMode === "native" && provider?.kind === "pi_rpc") || (preparing && agent?.adapterType === "paperclip_runner" && agent.adapterConfig?.provider === "pi_rpc")) {
       // The mark is set before the interrupt (the driver can end the turn at once) and removed unless it landed.
       const mark = (on: boolean) => db.update(heartbeatRuns).set({ resultJson: on
-        ? sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
-          personStop: { requestedAt: new Date().toISOString(), userId: req.actor.userId ?? null } })}::jsonb`
+        ? sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || jsonb_build_object('personStop',
+            coalesce(${heartbeatRuns.resultJson}->'personStop', '{}'::jsonb) || ${JSON.stringify({ requestedAt: pressedAt, userId: req.actor.userId ?? null })}::jsonb)`
         : sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) - 'personStop'` })
-        .where(on ? and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")) : eq(heartbeatRuns.id, runId));
+        .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running"),
+          ...(on ? [] : [sql`${heartbeatRuns.resultJson}->'startupCancellation' is null`,
+            sql`${heartbeatRuns.resultJson}#>'{personStop,returned}' is null`])));
       // Seam 0247: his messages still QUEUED behind this run (never delivered) go back to him with the Stop, beside 0237's.
       const returnQueued = async () => { const issueId = existing.nativeIssueId ?? asRecord(existing.contextSnapshot)?.issueId;
         if (typeof issueId !== "string" || !req.actor.userId) return;
-        await db.transaction(async (tx) => { const wakes = await tx.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, existing.companyId),
+        await db.transaction(async (tx) => {
+          await tx.select({ id: issuesTable.id }).from(issuesTable)
+            .where(and(eq(issuesTable.id, issueId), eq(issuesTable.companyId, existing.companyId))).for("update");
+          const [run] = await tx.select({ result: heartbeatRuns.resultJson, context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).for("update");
+          const wakes = await tx.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, existing.companyId),
           eq(agentWakeupRequests.agentId, existing.agentId), inArray(agentWakeupRequests.status, ["deferred_issue_execution", "queued"]),
           isNull(agentWakeupRequests.runId), sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`)).for("update", { skipLocked: true });
           // A message this run already received (an acknowledged steer) stays in the thread (product rule). One sent after the press is a new message, not returned.
-          const [run] = await tx.select({ result: heartbeatRuns.resultJson, context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
           const received = Object.keys(asRecord(asRecord(run?.result)?.queuedSteeringAcknowledgements) ?? {}) // stock's first-turn receipt: sealed into its first prompt
             .concat(readFirstTurnQueuedInputReceipt({ id: runId, contextSnapshot: run?.context })?.commentIds ?? []);
           const ids = wakes.flatMap(wake => queuedCommentIdsFromWakePayload(wake.payload)).filter(id => !received.includes(id)), mine = ids.length ? (await tx.select({ id: issueComments.id }).from(issueComments)
@@ -7420,33 +7432,14 @@ export function agentRoutes(
       const hasTurn = async () => (await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, runId), inArray(heartbeatRunEvents.eventType, ["turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted"]))).limit(1)).length > 0;
       if (outcome === "no_turn" && !finishing?.resultId && !await hasTurn()) {
         // Before the first provider turn, Stop returns the prompt instead of delivering it.
-        const stoppedBeforeTurn = await db.transaction(async tx => {
-          const [current] = await tx.select().from(heartbeatRuns)
-            .where(eq(heartbeatRuns.id, runId)).for("update");
-          if (!current || current.status !== "running") return false;
-          const currentProvider = asRecord(asRecord(asRecord(current.runnerProfileJson)?.nativeExecutionInput)?.provider);
-          const stillPreparing = current.runtimeMode === "legacy" && !current.runtimeModeResolvedAt &&
-            current.executionStage === "preparing" && claimedAdapterType(current) === "paperclip_runner" &&
-            asRecord(current.runnerProfileJson)?.nativeExecutionInput == null;
-          if (!stillPreparing && !(current.runtimeMode === "native" && currentProvider?.kind === "pi_rpc")) return false;
-          // Event publication shares this lock; snapshot also catches a live turn not yet published.
-          const [started] = await tx.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents)
-            .where(and(eq(heartbeatRunEvents.runId, runId), inArray(heartbeatRunEvents.eventType,
-              ["turn.started", "turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted"])))
-            .limit(1);
-          if (current.resultJson?.firstTurnDispatchCommitted || started || (await getNativeSessionSteeringState(runId)).activeTurnId) return false;
-          // Fence both runtime promotion and session startup before releasing the run lock.
-          await tx.update(heartbeatRuns).set({
-            resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
-              startupCancellation: { requestedAt: pressedAt, beforeNativeSelection: stillPreparing },
-            })}::jsonb`,
-          }).where(eq(heartbeatRuns.id, runId));
-          await returnWakeComments(tx as unknown as Db, current);
-          return true;
-        });
+        const stoppedBeforeTurn = await settleStartupStop();
         if (stoppedBeforeTurn) {
           await returnQueued().catch(error => logger.warn({ error, runId }, "person Stop could not return queued messages"));
-          await cancelStoppedRun();
+          if (stoppedBeforeTurn.status === "running") await cancelStoppedRun();
+          else {
+            const settled = (await heartbeat.getRun(runId)) ?? stoppedBeforeTurn;
+            res.json(await runRedactions.redactForRun(settled.companyId, runId, settled, getActorInfo(req).actorId));
+          }
           return;
         }
         await db.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || jsonb_build_object('personStopHeld', coalesce(${heartbeatRuns.resultJson} -> 'personStopHeld', ${JSON.stringify({ pressedAt })}::jsonb))` })
@@ -7476,15 +7469,86 @@ export function agentRoutes(
     // Seam 0254: a Stop on a run still waiting in line returns the messages that woke it (never received), like 0247.
     if (existing.status === "queued") await returnWakeComments(db, existing);
     await cancelStoppedRun();
-    async function returnWakeComments(target: Db, run: typeof heartbeatRuns.$inferSelect) {
+    async function settleStartupStop() {
+      return db.transaction(async tx => {
+        // Checkout cleanup and terminalization own the issue before its run.
+        // Take that same ownership lock before the run or dependent wake input.
+        const issueId = existing!.nativeIssueId ?? existing!.issueId ?? asRecord(existing!.contextSnapshot)?.issueId;
+        if (typeof issueId === "string") await tx.select({ id: issuesTable.id }).from(issuesTable)
+          .where(and(eq(issuesTable.id, issueId), eq(issuesTable.companyId, existing!.companyId))).for("update");
+        const [current] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).for("update");
+        if (!current || current.status === "queued") return null;
+        const terminal = ["failed", "cancelled", "timed_out", "interrupted", "succeeded"].includes(current.status);
+        // Terminal cancellation need not carry a bootstrap label. Durable work
+        // evidence, not runtime/stage or a recovery classification, owns input.
+        if (current.processPid || current.processGroupId || current.processStartedAt ||
+            asRecord(asRecord(current.usageJson)?.budgetDispatch)?.handedOffAt || readFirstTurnQueuedInputReceipt(current) ||
+            Object.keys(asRecord(current.resultJson?.queuedSteeringAcknowledgements) ?? {}).length) return null;
+        const stillPreparing = current.runtimeMode === "legacy" && !current.runtimeModeResolvedAt &&
+          current.executionStage === "preparing" && claimedAdapterType(current) === "paperclip_runner" &&
+          asRecord(current.runnerProfileJson)?.nativeExecutionInput == null;
+        if (!terminal && current.status !== "running") return null;
+        // Event publication shares the run lock. A setup-failure projection is
+        // not sufficient if durable dispatch/receipt evidence contradicts it.
+        const [started] = await tx.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+          eq(heartbeatRunEvents.runId, runId), or(executionStartedEventPredicate(), inArray(heartbeatRunEvents.eventType,
+            ["turn.started", "turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted"])))).limit(1);
+        const [finalization] = await tx.select({ resultId: nativeRunFinalizations.resultId, attempt: nativeRunFinalizations.attempt })
+          .from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId)).limit(1);
+        if (current.resultJson?.firstTurnDispatchCommitted || started || finalization?.resultId ||
+            (await getNativeSessionSteeringState(runId)).activeTurnId) return null;
+        const returned = await returnWakeComments(tx as unknown as Db, current, true);
+        if (terminal && !returned && !current.resultJson?.personStop) return null;
+        await tx.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
+          startupCancellation: { requestedAt: pressedAt, beforeNativeSelection: stillPreparing },
+        })}::jsonb` }).where(eq(heartbeatRuns.id, runId));
+        const [settled] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        return settled;
+      });
+    }
+    async function returnWakeComments(target: Db, run: typeof heartbeatRuns.$inferSelect, settleWakeInput = false) {
       if (!req.actor.userId) return;
-      const woke = asRecord(run.contextSnapshot)?.wakeCommentIds, ids = Array.isArray(woke) ? woke.map(String) : [];
-      const mine = ids.length ? (await target.select({ id: issueComments.id }).from(issueComments).where(and(inArray(issueComments.id, ids), eq(issueComments.authorUserId, req.actor.userId),
+      const context = asRecord(run.contextSnapshot), issueId = run.nativeIssueId ?? run.issueId ?? context?.issueId;
+      const contextIds = (value: unknown) => { const object = asRecord(value);
+        return [...new Set([...(Array.isArray(object?.wakeCommentIds) ? object.wakeCommentIds : []), object?.wakeCommentId, object?.commentId]
+          .filter((id): id is string => typeof id === "string" && isUuidLike(id)))]; };
+      const wakeIds = (payload: unknown) => [...new Set([...queuedCommentIdsFromWakePayload(payload),
+        ...contextIds(asRecord(payload)?._paperclipWakeContext), ...contextIds(payload)])];
+      const wakes = settleWakeInput ? await target.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
+        or(eq(agentWakeupRequests.runId, run.id), ...(run.wakeupRequestId ? [eq(agentWakeupRequests.id, run.wakeupRequestId)] : []),
+          and(isNull(agentWakeupRequests.runId), inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+            sql`${agentWakeupRequests.payload}->>'issueId' = ${typeof issueId === "string" ? issueId : null}`)),
+      )).for("update") : [];
+      const received = Object.keys(asRecord(run.resultJson?.queuedSteeringAcknowledgements) ?? {})
+        .concat(readFirstTurnQueuedInputReceipt(run)?.commentIds ?? []);
+      const ids = [...new Set([...contextIds(context), ...wakes.flatMap(wake => wakeIds(wake.payload))])].filter(id => !received.includes(id));
+      const mine = ids.length ? (await target.select({ id: issueComments.id }).from(issueComments).where(and(
+        inArray(issueComments.id, ids), eq(issueComments.companyId, run.companyId),
+        ...(typeof issueId === "string" ? [eq(issueComments.issueId, issueId)] : []), eq(issueComments.authorUserId, req.actor.userId),
         isNull(issueComments.deletedAt), sql`${issueComments.createdAt} <= ${pressedAt}::timestamptz`))).map(row => row.id) : [];
-      if (mine.length || run.status === "running") await target.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({ personStop: { requestedAt: pressedAt, userId: req.actor.userId, returned: mine } })}::jsonb` })
-        .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, run.status)));
+      for (const wake of wakes) {
+        const original = wakeIds(wake.payload);
+        if (!original.some(id => mine.includes(id))) continue;
+        const left = original.filter(id => !mine.includes(id)), now = new Date();
+        await target.update(agentWakeupRequests).set({ payload: withQueuedCommentIdsInWakePayload(wake.payload, left),
+          ...(left.length ? {} : { status: "cancelled", finishedAt: now }), updatedAt: now }).where(eq(agentWakeupRequests.id, wake.id));
+      }
+      if (mine.length || run.status === "running" || (settleWakeInput && run.resultJson?.personStop)) await target.update(heartbeatRuns).set({ resultJson:
+        sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || jsonb_build_object('personStop',
+          coalesce(${heartbeatRuns.resultJson}->'personStop', '{}'::jsonb) || ${JSON.stringify({ requestedAt: pressedAt, userId: req.actor.userId })}::jsonb ||
+          jsonb_build_object('returned', (select coalesce(jsonb_agg(distinct id), '[]'::jsonb) from jsonb_array_elements(
+            coalesce(${heartbeatRuns.resultJson}->'personStop'->'returned', '[]'::jsonb) || ${JSON.stringify(mine)}::jsonb) as ids(id))))` })
+        .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, run.status))).returning({ id: heartbeatRuns.id }).then(rows => {
+          if (!rows.length) logger.info({ runId }, "Run changed while returning stopped input; returning current Stop state");
+        });
+      return mine.length;
     }
     async function cancelStoppedRun() { if (!existing) return;
+    // Re-read under the same ownership locks if setup/runtime selection changed
+    // while Stop was interrupting or waiting. Never cancel first, then try a
+    // receipt write guarded on the old running status.
+    if (existing.status !== "queued") await settleStartupStop();
     // Stamp the cancellation as operator-initiated (this route is board-only).
     // Recovery reads this to stand down instead of classifying the cancelled
     // run as agent stranding and re-waking the agent the operator just stopped.
