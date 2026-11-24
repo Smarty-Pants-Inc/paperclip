@@ -276,6 +276,45 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     }
   });
 
+  it.each([false, true])("drains a deferred person wake once only after Stop settles (settled=%s)", async settled => {
+    const commentId = randomUUID(), wakeId = randomUUID();
+    const steeringFlag = process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+    process.env.PAPERCLIP_AGENT_CHAT_STEERING = "true";
+    heldSteering.sent = [];
+    heldSteering.available = true;
+    try {
+      await fixture(true, { beforeFinalize: async scope => {
+        await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, scope.agentId));
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+        const [opening] = await db.select().from(issueComments).where(eq(issueComments.id, run.contextSnapshot!.wakeCommentId as string));
+        await db.update(heartbeatRuns).set({ resultJson: { personStop: {
+          requestedAt: "2020-01-01T00:00:00Z", ...(settled ? { settledAt: "2020-01-01T00:01:00Z" } : {}),
+        } } }).where(eq(heartbeatRuns.id, scope.runId));
+        await db.insert(issueComments).values({ id: commentId, companyId: scope.companyId, issueId: scope.issueId,
+          authorType: "user", authorUserId: opening.authorUserId, body: "Continue after Stop." });
+        await db.insert(agentWakeupRequests).values({ id: wakeId, companyId: scope.companyId, agentId: scope.agentId,
+          source: "on_demand", reason: "issue_execution_deferred", status: "deferred_issue_execution",
+          requestedByActorType: "user", requestedByActorId: opening.authorUserId,
+          payload: { issueId: scope.issueId, _paperclipWakeContext: { wakeCommentIds: [commentId] } } });
+        const execution = { binding: scope, provider: { kind: "pi_rpc" as const } };
+        const event = { eventType: "item.completed" as const, runId: scope.runId, normalizedSessionId: run.nativeSessionId!,
+          sourceEventId: "stop-drain-final", itemId: "stop-drain:m1:b0", payload: { kind: "agentMessage", channel: "final", text: "Stopped." } };
+        await Promise.all([publishContinuousNativeReply({ db, execution, event, cursor: 171 }),
+          publishContinuousNativeReply({ db, execution, event, cursor: 171 })]);
+        await publishContinuousNativeReply({ db, execution, event, cursor: 171 });
+        expect(heldSteering.sent).toEqual(settled ? [commentId] : []);
+        const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+        expect(wake.status).toBe(settled ? "cancelled" : "deferred_issue_execution");
+        const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+        if (settled) expect(saved.resultJson?.queuedSteeringAcknowledgements).toMatchObject({ [commentId]: { status: "acknowledged" } });
+      } });
+    } finally {
+      heldSteering.available = false;
+      if (steeringFlag === undefined) delete process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+      else process.env.PAPERCLIP_AGENT_CHAT_STEERING = steeringFlag;
+    }
+  });
+
   it.each(["turn.started", "turn.accepted"] as const)("drains a cold-start deferred person wake at committed %s, not again at the final", async eventType => {
     const commentId = randomUUID(), wakeId = randomUUID();
     const steeringFlag = process.env.PAPERCLIP_AGENT_CHAT_STEERING;
