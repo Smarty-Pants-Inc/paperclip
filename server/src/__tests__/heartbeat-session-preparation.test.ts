@@ -1,3 +1,4 @@
+import { NativeProviderStateIncompatibleError } from "../vendor/paperclip-runner/index.js";
 import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES, PluginWorkspaceOperationError, workspaceOperationErrorData } from "@paperclipai/plugin-sdk";
 import * as nativeRuntimeMode from "../services/native-runtime/runtime-mode.js";
 import * as aiRuntime from "../services/ai-connection-runtime.js";
@@ -308,6 +309,34 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     const history = String(next.input.context.paperclipFreshSessionHandoffMarkdown);
     expect(history).toContain("EARLIER HISTORY");
     expect(history).not.toMatch(/(?:QUEUED|LATEST) CURRENT REQUEST/);
+  });
+
+  it.each(["continuous", "paperclip"])("a Pi workspace change preserves resume fields only in %s mode", async sessionContinuity => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "workspace-continuation-"));
+    const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({ kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
+    try {
+      await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: "fixture/model", sessionContinuity, cwd } }).where(eq(agents.id, f.agentId));
+      await execute(f);
+      const next = await execute(f, { workspaceSelectionChanged: true });
+      expect(next.input.runtime.sessionId).toBe(sessionContinuity === "continuous" ? "saved-session" : null);
+      expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: { reset: sessionContinuity !== "continuous" } } });
+    } finally { mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true }); }
+  });
+
+  it("keeps a workspace source refusal typed before provider startup", async () => {
+    const f = await seed(), type = `${adapterType}_source_refusal`;
+    registerServerAdapter({ ...getServerAdapter(adapterType), type,
+      execute: async () => { throw new NativeProviderStateIncompatibleError("workspace_continuation_source_missing"); } });
+    try {
+      await db.update(agents).set({ adapterType: type }).where(eq(agents.id, f.agentId));
+      const run = await heartbeat.wakeup(f.agentId, { source: "on_demand", triggerDetail: "manual", reason: "manual",
+        payload: { issueId: f.issueId }, contextSnapshot: { issueId: f.issueId } });
+      await heartbeat.drainActiveRunExecutions();
+      const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id));
+      expect(finished).toMatchObject({ status: "failed", errorCode: "native_provider_state_incompatible",
+        error: expect.stringContaining("workspace_continuation_source_missing") });
+    } finally { unregisterServerAdapter(type); }
   });
 
   it("starts fresh when effective model configuration changes and persists the reason", async () => {
