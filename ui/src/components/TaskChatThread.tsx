@@ -57,7 +57,8 @@ import { ProviderToolIconsProvider } from "@/components/ProviderToolIcon";
 import { McpAppTurnViews, mcpAppRunRefreshKey } from "@/components/mcp-app/McpAppTurnViews";
 import { ToolCallProgressProvider } from "@/components/task-chat/tool-call-progress";
 import { TaskChatRunnerHeader, TaskChatRunnerTurn } from "@/components/task-chat/TaskChatRunnerTurn";
-import { isConversationRecovery, isPersonStoppedRun } from "./ExecutionBlockerNotice";
+import { ExecutionBlockerNotice, isConversationRecovery, isPersonStoppedRun } from "./ExecutionBlockerNotice";
+import { isNoLiveExecutionPathNotice } from "./task-chat/adjacent-errors";
 import { partitionRunHealthItems } from "@/components/task-chat/TaskChatRunHealthBanner";
 import {
   TaskChatTurnStatusIsland,
@@ -3332,6 +3333,37 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           item.optimistic === "pending",
       ));
 
+  const latestRun = runs.reduce<(typeof runs)[number] | undefined>((latest, run) =>
+    !latest || toMs(run.createdAt) > toMs(latest.createdAt) ? run : latest, undefined);
+  const latestRunStatus = terminalStatuses.get(latestRun?.id ?? "") ?? latestRun?.status;
+  // Saved replies have createdAt, not the streaming item's atMs. Progress is not an answer.
+  const savedAnswer = latestUserComment && projectedComments.some(comment => {
+    const runId = comment.createdByRunId ?? comment.runId ?? comment.derivedCreatedByRunId;
+    return toMs(comment.createdAt) > toMs(latestUserComment.createdAt) && comment.authorType === "agent" &&
+      !comment.deletedAt && (runId ? hasVisibleRunAnswer([comment], runId, linkedRunMetaById.get(runId)?.resultJson)
+        : Boolean(comment.body.trim()) && comment.body !== LEGACY_WITHHELD_RUN_COMMENT);
+  });
+  const requestStopped = latestRun && isUserStop(latestRun.id) && latestUserComment &&
+    toMs(latestUserComment.createdAt) <= toMs(linkedRunMetaById.get(latestRun.id)?.finishedAt ?? latestRun.createdAt);
+  // A resolved projection is silent, not evidence that this saved question was answered.
+  const blockedChat = conversationMode && issueStatus === "blocked" && latestUserComment &&
+    latestUserComment.body.trim() !== "/new" && !requestStopped && !requestAnswered && !savedAnswer &&
+    !liveRun && !runs.some(run => ["queued", "running", "scheduled_retry"].includes(terminalStatuses.get(run.id) ?? run.status)) &&
+    !props.retryPreparing && !props.scheduledRetry && !composerPause &&
+    !interactions?.some(interaction => interaction.status === "pending") &&
+    (!props.interruption || props.interruption.state === "resolved");
+  const blockedRetry = blockedChat && canRetryFailedRun
+    ? onTryAgainNoLiveExecutionPath ?? (latestRun && ["failed", "timed_out"].includes(latestRunStatus ?? "") &&
+      linkedRunMetaById.get(latestRun.id)?.errorCode !== "native_session_cleanup_quarantined"
+      ? () => retryFailedRunHandler!(latestRun.id) : undefined) : undefined;
+  const blockedChatNotice = blockedChat ? <ExecutionBlockerNotice savedMessageBlocked conversationMode presentation={null}
+    canRetry={!!blockedRetry} onRetry={() => { void Promise.resolve().then(blockedRetry).catch(() => undefined); }}
+    optimistic={tryAgainNoLiveExecutionPathPending || retryFailedRunId === latestRun?.id} /> : null;
+  const blockedNoticeItem = blockedChatNotice ? threadItems.slice(
+    threadItems.findIndex(item => item.id === latestUserComment?.id) + 1,
+  ).findLast(item => (item.kind === "marker" && item.variant === "interrupted" && item.tone !== "neutral" && !item.credentialAccess) ||
+    (item.kind === "message" && isNoLiveExecutionPathNotice(item))) : undefined;
+
   // Feedback votes keyed by the comment they target (targetType
   // "issue_comment"), mirroring IssueChatThread — the redesign attaches the
   // 👍/👎 state to each agent bubble by its comment id (PAP-413).
@@ -3859,6 +3891,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                         renderMessageActions={renderMessageActions}
                         renderQueuedAction={renderQueuedAction}
                         renderTurn={renderRunnerSegment}
+                        executionNotice={blockedChatNotice ? { itemId: blockedNoticeItem?.id, content: blockedChatNotice } : undefined}
                         onTryAgainNoLiveExecutionPath={
                           issueStatus === "blocked" &&
                           !requiresExecutionReconciliation(
@@ -3982,7 +4015,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                             </>
                           ) : null
                         }
-                        contentKey={`${autoFollowContentKey}:${historyRevealed}`}
+                        contentKey={`${autoFollowContentKey}:${historyRevealed}:${Boolean(blockedChatNotice)}`}
                         className={isMobile ? undefined : "pt-3"}
                       />
                     )}
