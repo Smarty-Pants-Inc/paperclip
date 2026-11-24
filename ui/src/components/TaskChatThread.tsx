@@ -85,6 +85,7 @@ import {
   settledCompactionMarkers,
   settledRunChildren,
   splitTranscriptAtAnchors,
+  runnerAnswerStartMs,
   transcriptToTaskChatItems,
   runtimeRequestSegmentContext,
   reconcileSegmentRuntimeRequests,
@@ -2463,8 +2464,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         const segmentFinishedMs = liveSegmentClock.current.ends.get(segmentKey) ?? (segmented && answerComplete ? finalResponse.atMs : undefined) ?? (Number.isFinite(segment.endMs)
           ? segment.endMs
           : finished);
-        const answerStartMs = sourceIsPaperclipRunner ? segments[segments.slice(0, segmentIndex).findLastIndex(({ entries }) =>
-          entries.some(entry => entry.kind === "assistant" && entry.channel === "final" && !entry.delta)) + 1]!.startMs : segment.startMs;
+        const answerStartMs = sourceIsPaperclipRunner ? runnerAnswerStartMs(segments, segmentIndex) : segment.startMs;
         const segmentDurationMs =
           Number.isFinite(answerStartMs) && Number.isFinite(segmentFinishedMs)
             ? Math.max(0, segmentFinishedMs - answerStartMs)
@@ -2795,7 +2795,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       : (legacyTimelineAnchorsByRun.get(tailRunId) ?? [])
     : [];
   const tailSegments = splitTranscriptAtAnchors(tailRunId ? (transcriptByRun.get(tailRunId) ?? []) : [],
-    toMs(linkedRunMetaById.get(tailRunId ?? "")?.startedAt ?? tailRunSource?.createdAt), tailTimelineAnchors,
+    toMs(linkedRunMetaById.get(tailRunId ?? "")?.startedAt ?? liveRun?.startedAt ?? tailRunSource?.createdAt), tailTimelineAnchors,
     continuousReplyPlacements.get(tailRunId ?? "")?.byItem);
   const tailSegment = tailSegments[tailSegments.length - 1]!;
   const tailSegmentSettled = paperclipRunnerTail && threadItems.some(item =>
@@ -2804,8 +2804,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const tailContinued = paperclipRunnerTail && tailTimelineAnchors.length > 0 &&
     !tailSegments[tailSegments.length - 2]?.entries.some(entry => entry.kind === "assistant" && entry.channel === "final" && !entry.delta);
   const tailSegmentKey = paperclipRunnerTail ? `${tailRunId}:${tailSegment.startMs}` : tailRunId;
-  const tailAnswerStartMs = tailSegments[tailSegments.slice(0, -1).findLastIndex(({ entries }) =>
-    entries.some(entry => entry.kind === "assistant" && entry.channel === "final" && !entry.delta)) + 1]!.startMs;
+  const tailAnswerStartMs = runnerAnswerStartMs(tailSegments, tailSegments.length - 1);
   // A reply that has ended (its terminal event is in) is finishing, not stoppable.
   // The interruption projection can still say "working" for a run whose end the page
   // already has (its status event or its terminal entry); that run is not starting again.
@@ -2893,7 +2892,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     ? liveRun.status
     : isTerminalIssueStatus(issueStatus) ? (issueStatus === "cancelled" ? "cancelled" : "succeeded")
     : (runs.find((run) => run.id === settlingRun?.id)?.status ?? "succeeded"));
-  const tailStartedAtMs = paperclipRunnerTail && tailTimelineAnchors.length > 0 ? tailAnswerStartMs :
+  const tailStartedAtMs = paperclipRunnerTail ? tailAnswerStartMs :
     (liveRun
       ? ((liveRun.startedAt ? toMs(liveRun.startedAt) : null) ??
         toMs(liveRun.createdAt))
