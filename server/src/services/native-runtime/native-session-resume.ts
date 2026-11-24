@@ -732,8 +732,8 @@ export function rebindNativeSessionCheckpoint(input: {
     !sameProvider(previousExecution.provider, current.provider, input.sessionContinuity) ||
     previousExecution.schema !== current.schema ||
     ("homeMode" in previousExecution ? previousExecution.homeMode : "isolated") !== ("homeMode" in current ? current.homeMode : "isolated") ||
-    ("runtimeContext" in previousExecution &&
-      "runtimeContext" in current &&
+    (!(current.provider.kind === "pi_rpc" && resolveSessionContinuity(current.provider.kind, input.sessionContinuity) === "continuous") &&
+      "runtimeContext" in previousExecution && "runtimeContext" in current &&
       !nativeRuntimeContextsMatch(previousExecution.runtimeContext, current.runtimeContext, input.toolRefreshOnResume))
   )
     return null;
