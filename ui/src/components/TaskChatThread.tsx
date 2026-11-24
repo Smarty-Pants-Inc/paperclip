@@ -1128,6 +1128,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     // Active runs still need the websocket log stream. Only settled native
     // history can skip the legacy transport when event history is available.
     run.status === "running" || run.status === "queued" ||
+    // Retain the old source until native history is ready (no blank at the hand-over).
+    !hydratedNativeRunIds.has(run.id) ||
     nativeTranscriptErrorsByRun.has(run.id) ||
     (hydratedNativeRunIds?.has(run.id) &&
       (nativeTranscriptByRun.get(run.id)?.length ?? 0) === 0)
@@ -1145,10 +1147,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   );
   const transcriptByRun = useMemo(() => {
     const next = new Map(logTranscriptByRun);
-    for (const run of nativeRuns) {
+    for (const run of transcriptRuns) {
       const nativeTranscript = nativeTranscriptByRun.get(run.id) ?? [];
       const logTranscript = logTranscriptByRun.get(run.id) ?? [];
-      if (nativeTranscriptErrorsByRun.has(run.id) && logTranscript.length > 0) {
+      if (logTranscript.length > 0) {
         fallbackByRunRef.current.set(run.id, logTranscript);
       }
       const fallback = fallbackByRunRef.current.get(run.id);
@@ -1158,8 +1160,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       // empty successful poll must not rewind a response the reader just saw.
       if (
         fallback &&
-        (nativeTranscriptErrorsByRun.has(run.id) ||
-          lastTimestamp(nativeTranscript) < lastTimestamp(fallback))
+        (nativeTranscriptErrorsByRun.has(run.id) || (!isTerminalRunStatus(run.status) &&
+          (lastTimestamp(nativeTranscript.filter(entry => entry.kind === "assistant")) < lastTimestamp(fallback.filter(entry => entry.kind === "assistant")) ||
+          lastTimestamp(nativeTranscript) < lastTimestamp(fallback))))
       ) {
         next.set(run.id, fallback);
       } else if (nativeTranscript.length > 0) {
@@ -1168,13 +1171,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       }
     }
     for (const id of fallbackByRunRef.current.keys()) {
-      if (!nativeRuns.some((run) => run.id === id))
+      if (!transcriptRuns.some((run) => run.id === id))
         fallbackByRunRef.current.delete(id);
     }
     return next;
   }, [
     logTranscriptByRun,
-    nativeRuns,
+    transcriptRuns,
     nativeTranscriptByRun,
     nativeTranscriptErrorsByRun,
   ]);
