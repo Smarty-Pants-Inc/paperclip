@@ -216,6 +216,7 @@ export function activityService(db: Db) {
         ),
         'stopReason', ${heartbeatRuns.resultJson} -> 'stopReason',
         'personStop', ${heartbeatRuns.resultJson} -> 'personStop',
+        'queuedSteeringAcknowledgements', ${heartbeatRuns.resultJson} -> 'queuedSteeringAcknowledgements',
         'effectiveTimeoutSec', ${heartbeatRuns.resultJson} -> 'effectiveTimeoutSec',
         'effectiveTimeoutMs', ${heartbeatRuns.resultJson} -> 'effectiveTimeoutMs',
         'timeoutConfigured', ${heartbeatRuns.resultJson} -> 'timeoutConfigured',
