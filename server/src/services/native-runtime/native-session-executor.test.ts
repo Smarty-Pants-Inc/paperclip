@@ -11287,12 +11287,13 @@ describe("native session same-turn steering", () => {
 
   beforeEach(() => {
     state.release = null;
+    vi.spyOn(continuousReply, "recoverContinuousNativeReplies").mockResolvedValue(undefined);
     capabilities.mockReset().mockResolvedValue({ steering: true });
     snapshot.mockReset().mockResolvedValue({ activeTurnId: "provider-turn-1" });
     steer.mockReset().mockResolvedValue(undefined);
     interrupt.mockReset().mockResolvedValue(undefined);
     state.execute.mockReset().mockImplementation(async (options) => {
-      options.onSession?.({ capabilities, snapshot, steer, interrupt, cancel: vi.fn() });
+      await options.onSession?.({ capabilities, snapshot, steer, interrupt, cancel: vi.fn() });
       await new Promise<void>((resolve) => {
         state.release = resolve;
       });
@@ -11311,10 +11312,11 @@ describe("native session same-turn steering", () => {
     });
   });
 
-  async function startActiveSession(input = execution) {
+  async function startActiveSession(input = execution, conversationMode = false) {
     const running = executePaperclipNativeSession({
       db: leaseDb(),
       execution: input,
+      conversationMode,
       runnerInstanceId: "runner",
     });
     await vi.waitFor(() => expect(state.release).toBeTypeOf("function"));
@@ -11348,6 +11350,23 @@ describe("native session same-turn steering", () => {
           .rejects.toMatchObject({ code: "steering_stale_turn" });
       }
     } finally { state.release?.(); await running; vi.restoreAllMocks(); }
+  });
+
+  it.each(["before", "snapshot", "chat"])("fences new task steering after a proposed claim (%s)", async order => {
+    const pi = { ...execution, provider: order === "chat" ? execution.provider : { kind: "pi_rpc", model: "openai/gpt-5" } } as NativeExecutionInputV1;
+    const { running } = await startActiveSession(pi, order === "chat");
+    const claim = () => accountingEvents.committed!({ schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "runner",
+      sourceSeq: 2, priority: 0, emittedAt: new Date().toISOString(), sourceInstanceId: "runner", normalizedSessionId: "session",
+      eventType: "run.result.proposed", runId: execution.binding.runId, sourceEventId: "claim", payload: {} });
+    try {
+      await steerNativeSession({ runId: execution.binding.runId, message: "Before claim", correlationId: "before" });
+      if (order === "snapshot") snapshot.mockImplementationOnce(async () => { await claim(); return { activeTurnId: "provider-turn-1" }; });
+      else await claim();
+      const input = { runId: execution.binding.runId, message: "After claim", correlationId: "after" };
+      if (order === "chat") await expect(steerNativeSession(input)).resolves.toEqual({ turnId: "provider-turn-1" });
+      else await expect(steerNativeSession(input)).rejects.toMatchObject({ code: "steering_stale_turn" });
+      expect((await getNativeSessionSteeringState(input.runId)).disposition).toBe(order === "chat" ? "available" : "temporarily_unavailable");
+    } finally { state.release?.(); await running; }
   });
 
   it("correlates the queued comment with the active provider turn acknowledgement", async () => {

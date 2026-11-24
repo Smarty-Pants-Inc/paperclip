@@ -221,7 +221,7 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     expect(wake.finishedAt).not.toBeNull();
   });
 
-  it.each(["drain", "reset", "non-pi", "paperclip", "unavailable", "agent"])("consumes deferred person wakes only at a steerable continuous final (%s)", async scenario => {
+  it.each(["drain", "reset", "non-pi", "paperclip", "unavailable", "agent"].flatMap(scenario => [true, false].map(conversation => ({ scenario, conversation }))))("consumes deferred person wakes only at a steerable continuous final ($scenario, conversation=$conversation)", async ({ scenario, conversation }) => {
     const ids = [randomUUID(), randomUUID(), randomUUID()];
     const wakeIds = [randomUUID(), randomUUID()];
     heldSteering.sent = [];
@@ -229,7 +229,7 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     process.env.PAPERCLIP_AGENT_CHAT_STEERING = "true";
     heldSteering.available = scenario !== "unavailable";
     try {
-      const f = await fixture(true, { beforeFinalize: async scope => {
+      const f = await fixture(conversation, { beforeFinalize: async scope => {
         const provider = scenario === "non-pi" ? "codex" : "pi_rpc";
         await db.update(agents).set({ adapterConfig: { provider, sessionContinuity: scenario === "paperclip" ? "paperclip" : "continuous" } }).where(eq(agents.id, scope.agentId));
         const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));

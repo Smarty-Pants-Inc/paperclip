@@ -393,6 +393,7 @@ type ActiveNativeSession = {
   holdActivityVersion?: number;
   holdPendingItems?: Set<string>;
   holdCloseRequested?: boolean;
+  taskClaimed?: boolean;
   admissionAbort?: AbortController;
   cancellationSettled?: Promise<void>;
   restartDetach?: Promise<void>;
@@ -9855,7 +9856,7 @@ export async function getNativeSessionSteeringState(
   }
   const snapshot = await active.session.snapshot();
   return {
-    disposition: snapshot.activeTurnId
+    disposition: snapshot.activeTurnId && !active.taskClaimed
       ? "available"
       : "temporarily_unavailable",
     activeTurnId: snapshot.activeTurnId ?? null,
@@ -9885,8 +9886,8 @@ export async function steerNativeSession(input: {
       "The active native session is not attached.",
     );
   }
-  if (active.holdCloseRequested) {
-    throw new NativeSessionSteeringError("steering_stale_turn", "This held turn is closing for a new session.");
+  if (active.holdCloseRequested || active.taskClaimed) {
+    throw new NativeSessionSteeringError("steering_stale_turn", "This turn is closing and cannot accept new steering.");
   }
   // Reserve work before any asynchronous capability/snapshot reads. An old
   // published final must not make a newly delivered follow-up look idle.
@@ -9901,10 +9902,10 @@ export async function steerNativeSession(input: {
   }
   const snapshot = await active.session.snapshot();
   const turnId = snapshot.activeTurnId ?? null;
-  if (!turnId) {
+  if (!turnId || active.taskClaimed) {
     throw new NativeSessionSteeringError(
       "steering_stale_turn",
-      "The target turn is no longer active.",
+      "The target turn is no longer active or has claimed its task result.",
     );
   }
 
@@ -11997,6 +11998,13 @@ async function executePaperclipNativeSessionAttempt(
         }
       },
       onCommittedEvent: async (event, cursor) => {
+        // Proposed is the claim boundary; accepted is emitted only at finalization.
+        // Fence new task input, not already ACKed work or Agent Chat replies.
+        if (event.eventType === "run.result.proposed" && input.conversationMode !== true &&
+            !(input.execution.provider.kind === "pi_rpc" && input.execution.provider.conversationMode === true)) {
+          const claiming = activeNativeSessions.get(input.execution.binding.runId);
+          if (claiming) claiming.taskClaimed = true;
+        }
         const active = input.execution.provider.kind === "pi_rpc" && input.execution.provider.conversationMode === true
           ? activeNativeSessions.get(input.execution.binding.runId) : undefined;
         if (active && (event.eventType === "turn.started" || event.eventType === "item.started" || event.eventType === "item.delta")) {
@@ -13162,6 +13170,16 @@ async function executePaperclipNativeSessionAttempt(
                 // Replay committed receipts before exposing this attachment to new input.
                 if (input.execution.provider.kind === "pi_rpc") await recoverContinuousNativeReplies(input.db, { id: input.execution.binding.runId, companyId: input.execution.binding.companyId });
                 const active: ActiveNativeSession = { session, cancelRequested: false, admissionAbort: new AbortController() };
+                if (input.conversationMode !== true &&
+                    !(input.execution.provider.kind === "pi_rpc" && input.execution.provider.conversationMode === true)) {
+                  // A reattached controller must retain the event log's claim fence.
+                  const [claim] = await input.db.select({ eventType: heartbeatRunEvents.eventType }).from(heartbeatRunEvents).where(and(
+                    eq(heartbeatRunEvents.companyId, input.execution.binding.companyId),
+                    eq(heartbeatRunEvents.runId, input.execution.binding.runId),
+                    eq(heartbeatRunEvents.eventType, "run.result.proposed"),
+                  )).limit(1);
+                  active.taskClaimed = claim?.eventType === "run.result.proposed";
+                }
                 activeNativeSessions.set(input.execution.binding.runId, active);
                 const startup = nativeSessionStartups.get(input.execution.binding.runId);
                 const stopBeforeProviderTurn = startup?.stopRequested === true && startup.sessionPublished !== true
