@@ -42,11 +42,14 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 
+import { closeConversationResetHold } from "../modules/wake-queue/index.js";
+const closeHeldNativeTurnMock = vi.hoisted(() => vi.fn());
 const steerNativeSessionMock = vi.hoisted(() => vi.fn());
 vi.mock("../services/native-runtime/native-session-executor.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/native-runtime/native-session-executor.js")>();
   steerNativeSessionMock.mockImplementation(actual.steerNativeSession);
-  return { ...actual, steerNativeSession: steerNativeSessionMock };
+  closeHeldNativeTurnMock.mockImplementation(actual.closeHeldNativeTurn);
+  return { ...actual, steerNativeSession: steerNativeSessionMock, closeHeldNativeTurn: closeHeldNativeTurnMock };
 });
 const { NativeSessionSteeringError } = await import("../services/native-runtime/native-session-executor.js");
 
@@ -1868,6 +1871,56 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     const wake = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId)).then(rows => rows[0]);
     expect((wake?.payload as any)._paperclipWakeContext.wakeCommentIds).toEqual(seeded.commentIds);
     expect(await db.select().from(activityLog).where(eq(activityLog.entityId, seeded.issueId))).toHaveLength(0);
+  });
+
+  it.each([true, false])("asks only an idle hold to close for a reset head (held=%s)", async held => {
+    const f = await seedQueue();
+    await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: "queue-owner", conversationState: "active" }).where(eq(issues.id, f.issueId));
+    await db.update(issueComments).set({ body: " /new " }).where(eq(issueComments.id, f.commentIds[0]));
+    closeHeldNativeTurnMock.mockClear().mockResolvedValueOnce(held);
+    expect(await closeConversationResetHold(db, { companyId: f.companyId, issueId: f.issueId })).toBe(held);
+    expect(closeHeldNativeTurnMock).toHaveBeenCalledExactlyOnceWith(f.runId);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    expect(wake.status).toBe("deferred_issue_execution");
+    expect(run).toMatchObject({ status: "running", resultJson: null });
+    expect(run.resultJson?.personStop).toBeUndefined();
+    await db.update(issueComments).set({ body: "ordinary follow-up" }).where(eq(issueComments.id, f.commentIds[0]));
+    closeHeldNativeTurnMock.mockClear();
+    expect(await closeConversationResetHold(db, { companyId: f.companyId, issueId: f.issueId })).toBe(false);
+    expect(closeHeldNativeTurnMock).not.toHaveBeenCalled();
+  });
+
+  it("asks an idle hold to close once for a deferred non-person wake", async () => {
+    const f = await seedQueue();
+    await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: "queue-owner", conversationState: "active" }).where(eq(issues.id, f.issueId));
+    await db.update(agentWakeupRequests).set({ payload: { issueId: f.issueId }, reason: "subtask_completed", requestedByActorType: "system" }).where(eq(agentWakeupRequests.id, f.wakeId));
+    closeHeldNativeTurnMock.mockClear().mockResolvedValueOnce(true);
+    expect(await closeConversationResetHold(db, { companyId: f.companyId, issueId: f.issueId })).toBe(true);
+    expect(closeHeldNativeTurnMock).toHaveBeenCalledExactlyOnceWith(f.runId);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    expect(wake.status).toBe("deferred_issue_execution");
+    expect(run.resultJson?.personStop).toBeUndefined();
+  });
+
+  it("refuses steering a /new head or a later row across that reset", async () => {
+    const f = await seedQueue();
+    await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: "queue-owner", conversationState: "active" }).where(eq(issues.id, f.issueId));
+    await db.update(issueComments).set({ body: "/new" }).where(eq(issueComments.id, f.commentIds[0]));
+    const previous = process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+    process.env.PAPERCLIP_AGENT_CHAT_STEERING = "true";
+    try {
+      const initial = await request(app(f.companyId)).get(`/api/issues/${f.issueId}/queued-comments`);
+      steerNativeSessionMock.mockClear();
+      for (const commentId of f.commentIds) {
+        const reply = await request(app(f.companyId)).post(`/api/issues/${f.issueId}/queued-comments/${commentId}/steer`)
+          .send({ queueId: f.wakeId, revision: initial.body.revision, targetRunId: f.runId });
+        expect(reply.status, JSON.stringify(reply.body)).toBe(409);
+        expect(reply.body.error).toContain("/new needs a new session");
+      }
+      expect(steerNativeSessionMock).not.toHaveBeenCalled();
+    } finally { if (previous === undefined) delete process.env.PAPERCLIP_AGENT_CHAT_STEERING; else process.env.PAPERCLIP_AGENT_CHAT_STEERING = previous; }
   });
 
   it("leaves the selected row queued when no native steering session is attached", async () => {
