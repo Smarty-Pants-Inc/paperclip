@@ -9101,6 +9101,7 @@ export function nativeSessionFailureDisposition(
     sourceFailureCode === "runner_remote_provider_artifact_incompatible" ||
     sourceFailureCode === "runner_remote_provider_verification_unavailable" && !options.freshBootstrap ||
     sourceFailureCode === "native_provider_terminal_failed" ||
+    sourceFailureCode === "native_provider_output_without_result" ||
     sourceFailureCode === NATIVE_PROVIDER_STATE_INCOMPATIBLE ||
     sourceFailureCode === NATIVE_PROVIDER_SIDE_EFFECT_PENDING ||
     sourceFailureCode === NATIVE_CURRENT_WAKE_COMMENTS_UNREAD ||
@@ -9302,6 +9303,7 @@ function classifyNativeSessionFailure(
   error: unknown,
 ):
   | "native_permission_declined"
+  | "native_provider_output_without_result"
   | "native_provider_terminal_failed"
   | "native_governed_wait_settlement_pending"
   | typeof NATIVE_PROVIDER_STATE_INCOMPATIBLE
@@ -9380,6 +9382,7 @@ function classifyNativeSessionFailure(
   }
   if (runnerClosedTurnStartSession(error)) return NATIVE_PROVIDER_SESSION_CLOSED;
   const message = error instanceof Error ? error.message : String(error);
+  if (message.startsWith("native_provider_output_without_result:")) return "native_provider_output_without_result";
   if (/"code":"controller_sequence_mismatch"/.test(message)) return NATIVE_CONTROLLER_JOURNAL_BEHIND_RUNNER;
   if (/^(?:runner_ingress_unavailable: runnerd exited unexpectedly with code 1: )?runner_task_admission_rejected: (session_state_unavailable|account_binding_mismatch)$/.test(message)) {
     return "runner_task_admission_rejected";
@@ -13439,7 +13442,7 @@ async function executePaperclipNativeSessionAttempt(
       // another turn to perform completion bookkeeping.
       const stoppedBeforeFirstTurn = error instanceof Error && error.message === "native_session_cancelled";
       if (!startupUnsettled && protocolIntegrityFailure === null && error instanceof Error &&
-          (stoppedBeforeFirstTurn || error instanceof NativePermissionDeclinedError || error instanceof NativeCancellationPendingRecoveryError || error.message === "native_finalization_missing: session returned no semantic result")) {
+          (stoppedBeforeFirstTurn || error instanceof NativePermissionDeclinedError || error instanceof NativeCancellationPendingRecoveryError || error.message === "native_finalization_missing: session returned no semantic result" || error.message.startsWith("native_provider_output_without_result:"))) {
         const [stoppedRun] = await input.db.select().from(heartbeatRuns).where(and(
           eq(heartbeatRuns.id, input.execution.binding.runId),
           eq(heartbeatRuns.companyId, input.execution.binding.companyId),
@@ -13716,6 +13719,8 @@ async function executePaperclipNativeSessionAttempt(
               nextAction:
                 providerLimit
                   ? providerLimit.nextAction
+                  : sourceFailureCode === "native_provider_output_without_result"
+                  ? "The provider produced output but no complete answer could be saved. This question remains unanswered. Automatic retries are stopped; nothing was re-sent."
                   : sourceFailureCode === "native_permission_declined"
                   ? "Provider permission was declined. Inspect the task and give explicit direction before starting further provider work. Automatic recovery is stopped."
                   : sourceFailureCode === "native_provider_approval_required"
@@ -13971,6 +13976,14 @@ async function executePaperclipNativeSessionAttempt(
             .where(eq(issues.id, input.execution.binding.issueId));
         }
         if (!stillOwnsTask) return;
+        if (sourceFailureCode === "native_provider_output_without_result" && phase === "terminal_failure") {
+          // The fenced terminal write and this system notice commit together.
+          // It is not an assistant answer and does not consume the question.
+          await issueService(tx as unknown as Db).addComment(input.execution.binding.issueId,
+            "The provider produced output but no complete answer could be saved. This question remains unanswered. Automatic retries are stopped; nothing was re-sent.",
+            {}, { authorType: "system", clientRequestId: `native-output-without-result:${input.execution.binding.runId}`,
+              presentation: { kind: "system_notice", tone: "danger", detailsDefaultOpen: false } }, tx);
+        }
         // The hold's reset deadline belongs to the provider-limit owner.
         if (providerLimit?.plan.automatic) await notifyDeliveryWork(tx, DELIVERY_QUEUES.providerLimitResume,
           JSON.stringify({ companyId: input.execution.binding.companyId }));
@@ -14010,6 +14023,8 @@ async function executePaperclipNativeSessionAttempt(
           nextAction:
             providerLimit
               ? providerLimit.nextAction
+              : sourceFailureCode === "native_provider_output_without_result"
+              ? "The provider produced output but no complete answer could be saved. This question remains unanswered. Automatic retries are stopped; nothing was re-sent."
               : sourceFailureCode === "native_permission_declined"
               ? "Provider permission was declined. Inspect the task and give explicit direction before starting further provider work. Automatic recovery is stopped."
               : sourceFailureCode === "native_provider_approval_required"
