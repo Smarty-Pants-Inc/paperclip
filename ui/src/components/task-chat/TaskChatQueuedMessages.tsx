@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   DndContext,
   KeyboardSensor,
@@ -88,6 +88,8 @@ function queueActionErrorCode(error: unknown): string | null {
 export interface TaskChatQueuedMessagesProps {
   agentStarting?: boolean; stopPending?: boolean;
   conversationMode?: boolean;
+  /** A generic deferred-wake reason alone does not establish recovery. */
+  executionRecoveryPending?: boolean;
   queue: DisplayIssueQueuedCommentQueue;
   onEdit: (commentId: string) => void;
   onReorder: (orderedCommentIds: string[], revision: string) => Promise<void>;
@@ -102,7 +104,7 @@ export interface TaskChatQueuedMessagesProps {
 }
 
 function SortableQueuedMessage({
-  agentStarting, stopPending,
+  agentStarting, stopPending, waitingForRun,
   conversationMode,
   entry,
   queue,
@@ -116,7 +118,7 @@ function SortableQueuedMessage({
   onDiscard,
   onCancelAutoSteer,
 }: {
-  agentStarting?: boolean; stopPending?: boolean;
+  agentStarting?: boolean; stopPending?: boolean; waitingForRun: boolean;
   conversationMode?: boolean;
   entry: IssueQueuedCommentEntry;
   queue: IssueQueuedCommentQueue;
@@ -196,7 +198,7 @@ function SortableQueuedMessage({
         </div> : null}
       </div>
 
-      {stopPending ? <span className="px-1 text-xs text-muted-foreground">Queued</span> : queue.executionWait ? <span className="px-1 text-xs text-muted-foreground">Held</span> : conversationMode && queue.steeringDisposition === "temporarily_unavailable" ? (
+      {stopPending || waitingForRun ? <span className="px-1 text-xs text-muted-foreground">Queued</span> : queue.executionWait ? <span className="px-1 text-xs text-muted-foreground">Held</span> : conversationMode && queue.steeringDisposition === "temporarily_unavailable" ? (
         <span className="px-1 text-xs text-muted-foreground">{agentStarting ? "Sends when the agent starts" : "Queued"}</span>
       ) : autoSteerSecondsLeft !== null ? (
         <span className="flex shrink-0 items-center gap-1" data-testid={`task-chat-queued-auto-steer-${entry.comment.id}`}>
@@ -315,6 +317,7 @@ export function TaskChatQueuedMessages(props: TaskChatQueuedMessagesProps) {
 function TaskChatQueuedMessageQueue({
   agentStarting, stopPending,
   conversationMode,
+  executionRecoveryPending = true,
   queue,
   onEdit,
   onReorder,
@@ -326,6 +329,9 @@ function TaskChatQueuedMessageQueue({
   attemptedAutoSteerKeys,
 }: TaskChatQueuedMessagesProps) {
   const [entries, setEntries] = useState(queue.entries);
+  // Keep the server wait for admission/actions; only its presentation changes.
+  const waitingForRun = queue.executionWait?.reason === "first_turn_pending" ||
+    (queue.state === "deferred" && queue.executionWait?.reason === "execution_recovery" && !executionRecoveryPending);
   // Automatic steering: Cancel keeps a message queued for this view; each
   // message revision gets at most one automatic attempt, so a failure falls
   // back to the ordinary queue instead of retrying in a loop.
@@ -356,7 +362,8 @@ function TaskChatQueuedMessageQueue({
     }),
   );
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    // Remove delivered rows before paint, when the thread draws their bubbles.
     // Polling can return the old queue while delivery is still in flight.
     setEntries(queue.entries.filter(
       (entry) => !optimisticDeliveryIds.current.has(entry.comment.id),
@@ -557,7 +564,8 @@ function TaskChatQueuedMessageQueue({
   }
 
   // Explain a server hold once for the whole strip, including receipt-backed waits.
-  const statusMessage = queue.executionWait?.message ?? deferredStatus?.message ?? null;
+  const statusMessage = entries.length && !waitingForRun
+    ? queue.executionWait?.message ?? deferredStatus?.message ?? null : null;
 
   if (entries.length === 0 && !visibleError && !statusMessage) return null;
 
@@ -586,7 +594,7 @@ function TaskChatQueuedMessageQueue({
             );
             return (
               <SortableQueuedMessage
-                agentStarting={agentStarting} stopPending={stopPending}
+                agentStarting={agentStarting} stopPending={stopPending} waitingForRun={waitingForRun}
                 conversationMode={conversationMode}
                 key={entry.comment.id}
                 entry={entry}
