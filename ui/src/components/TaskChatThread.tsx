@@ -2718,7 +2718,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     tailEntries.some(entry => entry.kind === "system" && entry.text.startsWith("Paperclip session resumed")));
   const tailResumeWaiting = useWaitingToStart(tailBeforeTurn && tailResuming, liveRun ? ((liveRun.startedAt ? toMs(liveRun.startedAt) : null) ?? toMs(liveRun.createdAt)) : null);
   const tailPreparationLabel = tailBeforeTurn
-    ? tailResumeWaiting ? "Resuming your conversation…" : "Starting…" : undefined;
+    ? tailResumeWaiting ? tailEntries.some(entry => entry.kind === "system" && entry.text.startsWith("Paperclip session resumed")) ? "Resuming your conversation…" : "Preparing your reply…" : "Starting…" : undefined;
   const tailExecution = tailResuming && !tailBeforeTurn && liveExecution?.phase === "reconnecting"
     ? null : liveExecution;
   const tailPlanItem =
@@ -3203,7 +3203,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       : runnerSubmissionPending || (queuedCommentIds.has(latestUserComment.id) && !!queuedMessageQueue?.executionWait));
   const requestExecution = requestRun?.id === liveRun?.id ? liveExecution : linkedRunMetaById.get(requestRun?.id ?? "")?.execution;
   const requestWait = latestUserComment && queuedCommentIds.has(latestUserComment.id) ? queuedMessageQueue?.executionWait : null;
-  const requestLabel = recoveryOwnsStatus ? "Resuming your conversation…"
+  const requestLabel = recoveryOwnsStatus ? "Preparing your reply…"
     : requestWait?.message ?? (requestStatus === "queued" && requestExecution?.phase !== "reconnecting" ? requestExecution?.label : undefined) ?? "Starting…";
   // While the task offers Retry nothing is on its way by itself: words, no working sign.
   const requestWorking = !(props.interruption?.state === "failed" && props.interruption.canRetry) &&
