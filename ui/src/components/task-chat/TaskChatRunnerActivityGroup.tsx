@@ -30,6 +30,8 @@ import {
 } from "./TaskChatProtocolActivityRow";
 import { TaskChatUsageReadout } from "./TaskChatUsageReadout";
 import { TaskChatReasoningSummary } from "./TaskChatReasoningSummary";
+import { TaskChatThinking } from "./TaskChatThinking";
+import { useInlineReasoning } from "./reasoning-display";
 import { latestReasoningHeadline } from "./reasoning-summary";
 import { toolActivityPresentation, type ToolIcon } from "./tool-taxonomy";
 import { useTaskChatShimmer } from "./TaskChatShimmer";
@@ -583,8 +585,43 @@ function ReadRunActivity({ items }: { items: ToolActivity[] }) {
   );
 }
 
+/** Keep reasoning in chronological prose while leaving tool history inspectable. */
+export function TaskChatRunnerActivityGroup(props: {
+  item: TaskChatActivityPhaseItem;
+  defaultExpanded?: boolean;
+}) {
+  const inline = useInlineReasoning();
+  const { item } = props;
+  if (!inline) return <FoldedActivityGroup {...props} />;
+  // Keep the inline tree's shape when the first reasoning line arrives: same wrapper, same key as flush() gives.
+  if (!item.items.some(activity => activity.kind === "thinking" && activity.lines.some(line => line.trim()))) {
+    const id = `${item.id}:${item.items[0]?.id ?? "commentary"}`;
+    return <div className="flex min-w-0 flex-col gap-2"><FoldedActivityGroup key={id} {...props} item={{ ...item, id }} /></div>;
+  }
+  const rows: ReactNode[] = [];
+  let pending: Activity[] = [];
+  let interstitial = item.interstitial;
+  const flush = () => {
+    if (!pending.length && !interstitial) return;
+    const id = `${item.id}:${pending[0]?.id ?? "commentary"}`;
+    rows.push(<FoldedActivityGroup key={id} {...props} item={{ ...item, id, interstitial, items: pending,
+      active: item.active && pending.at(-1) === item.items.at(-1) }} />);
+    pending = [];
+    interstitial = undefined;
+  };
+  for (const activity of item.items) {
+    if (activity.kind === "thinking" && activity.lines.some(line => line.trim())) {
+      flush();
+      rows.push(<TaskChatThinking key={activity.id} item={activity} inline
+        active={item.active && activity === item.items.at(-1) && Boolean(activity.streaming)} />);
+    } else pending.push(activity);
+  }
+  flush();
+  return <div className="flex min-w-0 flex-col gap-2">{rows}</div>;
+}
+
 /** One rolling activity between commentary messages, with persistent optional history. */
-export function TaskChatRunnerActivityGroup({
+function FoldedActivityGroup({
   item,
   defaultExpanded = false,
 }: {
