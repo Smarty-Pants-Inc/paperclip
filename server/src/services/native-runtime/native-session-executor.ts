@@ -34,6 +34,7 @@ import { prepareRuntimeContextSource, rehydratePinnedInstructionAsset } from "./
 import { createNativeUsageDelivery } from "./native-usage-delivery.js";
 import { createNativeRecoveryUsageDelivery } from "./native-recovery-usage-delivery.js";
 import { nativeProviderStartedTurns, nativeProviderTurnWaitOptions } from "./native-provider-turn-wait.js";
+import { publishContinuousNativeReply } from "./native-continuous-reply.js";
 import { createNativeTurnAccounting, NATIVE_LOST_TURN_USAGE_EVIDENCE, nativeUsageCostUsd, nativeUsageBiller, normalizeNativeUsage, usesNativeUsageDelivery, isNativeUsageAccountingEvent, isNativeUsageDeliveryEvent } from "./native-usage-accounting.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
 export { nativeUsageCostUsd, nativeUsageBiller, normalizeNativeUsage } from "./native-usage-accounting.js";
@@ -11964,6 +11965,7 @@ async function executePaperclipNativeSessionAttempt(
         }
       },
       onCommittedEvent: async (event, cursor) => {
+        await publishContinuousNativeReply({ db: input.db, execution: input.execution, event, cursor });
         if (event.eventType === "run.result.proposed") {
           const at = Date.now();
           await trace.record({name:"completion.tool_accepted",parentName:"native.session.execute",startedAtMs:at,endedAtMs:at});
@@ -12236,6 +12238,7 @@ async function executePaperclipNativeSessionAttempt(
         );
       },
       onDuplicateEvent: async (event, cursor) => {
+        await publishContinuousNativeReply({ db: input.db, execution: input.execution, event, cursor });
         await input.onPersistedNativeLog?.(cursor, formatNativeRunLogEvent(event));
         if (!firstTokenRecorded) observeDeliverableText(event);
         await observeAccountingEvent(event);
