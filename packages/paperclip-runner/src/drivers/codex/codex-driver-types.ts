@@ -31,10 +31,8 @@ export interface CodexAppServerDriverOptions {
   /** Explicit selected skills, resolved from this task's assigned runtime assets. */
   skillInputs?: readonly import("../../contracts/runtime-context.js").NativeSkillInput[];
   conversationMode?: "task" | "direct" | "prepared";
-  /** Legacy conversation-session profile, never a per-turn reply instruction. */
+  /** Server-authorized Pi conversation; retain task tools without requiring a report. */
   conversationReply?: boolean;
-  /** Current-turn catalog intent, independent of the saved session profile. */
-  turnIntent?: "conversation_reply";
   requestedCollaborationMode?: "default" | "plan";
   /**
    * Include Codex's built-in collaboration instructions. Defaults to true so
