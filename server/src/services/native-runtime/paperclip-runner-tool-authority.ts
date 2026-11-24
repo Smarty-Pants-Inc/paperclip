@@ -32,7 +32,8 @@ import { isConversation } from "../agent-conversations.js";
 import { setIssueTitle } from "../issue-title.js";
 import { externalObjectService } from "../external-objects.js";
 import { instanceSettingsService } from "../instance-settings.js";
-import { fastResponseHistoryBody, setIssueTitleSchema } from "@paperclipai/shared";
+import { setIssueTitleSchema } from "@paperclipai/shared";
+import { readNativeTaskHistory } from "./native-task-history.js";
 import { authorizeInstructionCommit } from "../agent-instruction-authorization.js";
 import { executeAgentInstructionTool } from "./agent-instruction-tools.js";
 import { createReadStream } from "node:fs";
@@ -46,7 +47,7 @@ import { assertAssignableAgent } from "../agent-assignability.js";
 import { approvalReadSqlCondition, canActorReadApproval, authorizationService, issueReadSqlCondition, type AuthorizationActor } from "../authorization.js";
 import { resolveCoreTrustPreset } from "../trust-preset-resolver.js";
 import { normalizeIssueExecutionPolicy, redactIssueMonitorExternalRef } from "../issue-execution-policy.js";
-import { buildLowTrustSourceTrust, isLowTrustQuarantined, LOW_TRUST_QUARANTINED_BODY, resolveActorSourceTrustForIssue, sanitizeQuarantinedCommentForHigherTrust } from "../source-trust.js";
+import { buildLowTrustSourceTrust, isLowTrustQuarantined, LOW_TRUST_QUARANTINED_BODY, resolveActorSourceTrustForIssue } from "../source-trust.js";
 import { handoffPlanContext } from "./handoff-plan-context.js";
 import { callCreateSkillTool, callUpdateSkillDetailsTool, callUpdateSkillTool } from "../skill-tools.js";
 import { callProjectTool } from "../project-tools.js";
@@ -1071,33 +1072,16 @@ export class PaperclipRunnerToolAuthority {
       case "get_task_history": {
         const readerSourceTrust = await resolveActorSourceTrustForIssue({ db: this.db, issue: context.issue,
           actor: { actorType: "agent", actorId: this.binding.agentId, agentId: this.binding.agentId, runId: this.binding.runId } });
-        const limit = boundedLimit(input.limit);
-        const comments = await this.db.select({
-          id: issueComments.id,
-          body: issueComments.body,
-          origin: issueComments.origin,
-          sourceTrust: issueComments.sourceTrust,
-          authorAgentId: issueComments.authorAgentId,
-          authorUserId: issueComments.authorUserId,
-          createdAt: issueComments.createdAt,
-          updatedAt: issueComments.updatedAt,
-        }).from(issueComments)
-          .where(and(
-            eq(issueComments.companyId, this.binding.companyId),
-            eq(issueComments.issueId, this.binding.issueId),
-            isNull(issueComments.deletedAt),
-          ))
-          .orderBy(desc(issueComments.createdAt))
-          .limit(limit);
+        const { rows: comments, ...history } = await readNativeTaskHistory(this.db, {
+          companyId: this.binding.companyId, issue: context.issue, limit: input.limit, cursor: input.cursor,
+          lowTrustReader: isLowTrustQuarantined(readerSourceTrust),
+        });
         await recordTaskHistoryRead(this.db, { companyId: this.binding.companyId, agentId: this.binding.agentId,
           runId: this.binding.runId, comments }).catch(error =>
           logger.warn({ err: error, runId: this.binding.runId }, "could not record the task history a run read"));
         const arrived = await commentsArrivedDuringRun(this.db, { companyId: this.binding.companyId,
           runId: this.binding.runId, agentId: this.binding.agentId, comments }).catch(() => [] as string[]);
-        return { comments: comments.reverse().map(({ updatedAt: _updatedAt, ...comment }) => {
-          const visible = isLowTrustQuarantined(readerSourceTrust) ? comment : sanitizeQuarantinedCommentForHigherTrust(comment);
-          return { ...visible, body: fastResponseHistoryBody(visible) };
-        }), ...taskHistoryHandlingGuidance(arrived) };
+        return { ...history, ...taskHistoryHandlingGuidance(arrived) };
       }
       case "search_tasks": {
         const tasks = await issueService(this.db).list(this.binding.companyId, { readCondition: await issueReadSqlCondition(this.db, this.#privacyActor(context.run)) });
