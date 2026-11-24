@@ -2288,7 +2288,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           running: openSegments,
         }), segment.entries, runtimeRequests, openSegments);
         // A segment can own several replies. Merge each saved reply into its
-        // own native item; a missing item leaves the saved bubble in the backbone.
+        // own native item. An accepted finish has no provider item: project its
+        // saved reply through this same map; other missing items stay in the backbone.
         for (const [itemId, commentId] of continuousReplyPlacements.get(source.id)?.bySegment.get(segmentIndex) ?? []) {
           const saved = commentItems.find((item): item is TaskChatMessageItem => item.kind === "message" && item.id === commentId);
           if (!saved) continue;
@@ -2296,6 +2297,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           const native = parsedTranscript[nativeIndex];
           if (native?.kind === "message") {
             parsedTranscript[nativeIndex] = { ...native, text: saved.text, channel: "final", interstitial: false };
+          } else if (itemId === "accepted-summary") {
+            parsedTranscript.push({ ...saved, channel: "final", interstitial: false });
           }
         }
         const parsed =
