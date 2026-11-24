@@ -1,12 +1,14 @@
 import { and, asc, eq, lt, sql } from "drizzle-orm";
 import { agentWakeupRequests, agents, heartbeatRunEvents, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import type { NativeExecutionInput, PrpEvent } from "../../vendor/paperclip-runner/index.js";
-import { completedPlanProposalIds, nativeFinalReplyKey, readCompletedAssistantMessageCandidate, resolveHeartbeatRunResponse } from "../heartbeat-run-summary.js";
+import { findHeartbeatRunCompletionComment, nativeFinalReplyKey, resolveHeartbeatRunResponse } from "../heartbeat-run-summary.js";
+import { loadNativeVisibleReply } from "./native-visible-reply.js";
 import { issueService } from "../issues.js";
 import { resolveChatRunPresentationAuthorizationReason } from "../chat-run-publications.js";
 import { logActivity } from "../activity-log.js";
 import { hasChatRunOwnedProviderInteraction } from "../chat-interaction-arbitration.js";
-import { agentRunWritesRevoked } from "../../agent-run-cancellation.js";
+import { agentRunSupersededByFreshContinuation, agentRunWritesRevoked } from "../../agent-run-cancellation.js";
+import { isNativeRunnerOwnershipHeld } from "./native-runner-ownership.js";
 import { resolveSessionContinuity } from "./continued-session.js";
 import { parseObject } from "../../adapters/utils.js";
 import { logger } from "../../middleware/logger.js";
@@ -29,6 +31,46 @@ export async function recoverContinuousNativeReplies(db: Db, scope: { id: string
   });
 }
 
+/** Interrupted turns need no accepted semantic result to retain their shown prose.
+ * This is server-owned history publication, not restored execution authority. */
+export async function recoverTerminalNativeVisibleReply(db: Db, scope: { companyId: string; issueId: string; runId: string }) {
+  return db.transaction(async transaction => {
+    const tx = transaction as unknown as Db;
+    const [issue] = await tx.select().from(issues).where(and(eq(issues.id, scope.issueId), eq(issues.companyId, scope.companyId))).for("update");
+    const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, scope.runId),
+      eq(heartbeatRuns.companyId, scope.companyId), eq(heartbeatRuns.nativeIssueId, scope.issueId))).for("update");
+    if (!issue || !run || run.runtimeMode !== "native" || !run.finishedAt || isNativeRunnerOwnershipHeld(run) ||
+        !["cancelled", "interrupted", "failed", "timed_out"].includes(run.status) || agentRunSupersededByFreshContinuation(run) ||
+        run.contextSnapshot?.skipIssueComment === true ||
+        (issue.conversationAgentId && (issue.conversationAgentId !== run.agentId ||
+          issue.conversationUserId !== run.responsibleUserId ||
+          run.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration))) return false;
+    const presentation = parseObject(run.resultJson?.presentationDecision);
+    if (typeof presentation.commentId === "string" ||
+        (presentation.commentAction !== undefined && presentation.commentAction !== "create")) return false;
+    const finalAgentMessage = await loadNativeVisibleReply(tx, { ...scope, agentId: run.agentId, normalizedSessionId: run.nativeSessionId });
+    if (!finalAgentMessage) return false;
+    const comments = await tx.select({ id: issueComments.id, body: issueComments.body, presentation: issueComments.presentation,
+      clientRequestId: issueComments.clientRequestId }).from(issueComments).where(and(eq(issueComments.companyId, scope.companyId),
+        eq(issueComments.issueId, scope.issueId), eq(issueComments.createdByRunId, scope.runId))).orderBy(asc(issueComments.createdAt));
+    const resolved = resolveHeartbeatRunResponse({ resultJson: null, finalAgentMessage,
+      nativeConversationFinalResponse: Boolean(issue.conversationAgentId),
+      existingComment: findHeartbeatRunCompletionComment(comments, run.resultJson, finalAgentMessage.replyKey) });
+    if (!resolved.text || resolved.decision.commentAction === "none") return false;
+    const authorizationReason = await resolveChatRunPresentationAuthorizationReason(tx, scope);
+    const commentId = resolved.decision.commentAction === "reuse" ? resolved.decision.commentId :
+      (await issueService(db).addComment(scope.issueId, resolved.text, { agentId: run.agentId, runId: run.id },
+        { authorizationReason, completionReply: true, clientRequestId: finalAgentMessage.replyKey ?? `native-visible:${run.id}:${finalAgentMessage.seq}` }, tx)).id;
+    await tx.update(heartbeatRuns).set({ resultJson: { ...parseObject(run.resultJson),
+      presentationDecision: { ...resolved.decision, commentId, reasonCodes: [...resolved.decision.reasonCodes, "terminal_visible_reply_recovered"] } },
+      updatedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
+    if (resolved.decision.commentAction === "create") await logActivity(tx, { ...scope, actorType: "agent", actorId: run.agentId,
+      agentId: run.agentId, action: "issue.comment_added", entityType: "issue", entityId: scope.issueId,
+      details: { commentId, source: "run_presentation_resolver", presentationSource: resolved.decision.chosenSource } });
+    return resolved.decision.commentAction === "create";
+  });
+}
+
 /** A held turn can answer more than once; the event, not the run, owns each reply. */
 export async function publishContinuousNativeReply(input: {
   db: Db;
@@ -41,8 +83,8 @@ export async function publishContinuousNativeReply(input: {
   event: Pick<PrpEvent, "eventType" | "payload" | "sourceEventId" | "runId" | "normalizedSessionId" | "itemId">;
 }) {
   if (input.execution.provider.kind !== "pi_rpc" || input.event.eventType !== "item.completed") return;
-  const finalAgentMessage = readCompletedAssistantMessageCandidate({ seq: 0, prpEvent: input.event });
-  if (finalAgentMessage?.channel !== "final" || !input.event.itemId) return;
+  const payload = parseObject(input.event.payload);
+  if (!["agentMessage", "assistant_message"].includes(String(payload.kind)) || payload.channel !== "final" || !input.event.itemId) return;
   const { companyId, issueId, runId, agentId } = input.execution.binding;
   if (input.event.runId !== runId) return;
   let steerableFinal = false;
@@ -55,8 +97,11 @@ export async function publishContinuousNativeReply(input: {
       .innerJoin(agents, and(eq(agents.id, heartbeatRuns.agentId), eq(agents.companyId, companyId)))
       .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId),
         eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.nativeIssueId, issueId))).for("update", { of: heartbeatRuns });
-    if (!issue || !row || (row.run.status !== "running" && !input.recoverTerminal) || row.run.runtimeMode !== "native" ||
-        row.run.nativeSessionId !== input.event.normalizedSessionId || agentRunWritesRevoked(row.run) ||
+    const terminalReplay = Boolean(input.recoverTerminal && row?.run.finishedAt &&
+      ["succeeded", "failed", "timed_out", "cancelled", "interrupted"].includes(row.run.status) &&
+      !agentRunSupersededByFreshContinuation(row.run));
+    if (!issue || !row || (row.run.status !== "running" && !terminalReplay) || row.run.runtimeMode !== "native" ||
+        row.run.nativeSessionId !== input.event.normalizedSessionId || (agentRunWritesRevoked(row.run) && !terminalReplay) ||
         (issue.conversationAgentId && (issue.conversationAgentId !== agentId || issue.conversationState !== "active" ||
           row.run.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration)) ||
         row.run.contextSnapshot?.skipIssueComment === true ||
@@ -88,10 +133,11 @@ export async function publishContinuousNativeReply(input: {
       eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
       eq(issueComments.authorAgentId, agentId), eq(issueComments.clientRequestId, clientRequestId)));
     if (existing) return;
-    const proposedItemIds = completedPlanProposalIds(await tx.select({ payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents).where(and(
-      eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, runId), eq(heartbeatRunEvents.eventType, "plan.proposed"))));
+    const finalAgentMessage = await loadNativeVisibleReply(tx, { companyId, runId, agentId,
+      normalizedSessionId: row.run.nativeSessionId, throughSeq: input.cursor,
+      finalEvent: { seq: input.cursor, prpEvent: input.event } });
     const resolved = resolveHeartbeatRunResponse({ resultJson: null,
-      finalAgentMessage: readCompletedAssistantMessageCandidate({ seq: input.cursor, prpEvent: input.event, proposedItemIds }),
+      finalAgentMessage,
       nativeConversationFinalResponse: Boolean(issue.conversationAgentId),
       interactionOwnsResponse: Boolean(issue.conversationAgentId) && await hasChatRunOwnedProviderInteraction(tx, { companyId, issueId, runId }),
     });
@@ -99,6 +145,7 @@ export async function publishContinuousNativeReply(input: {
     const authorizationReason = await resolveChatRunPresentationAuthorizationReason(tx, { companyId, issueId, runId });
     const comment = await issueService(input.db).addComment(issueId, resolved.text, { agentId, runId }, {
       authorizationReason, clientRequestId,
+      ...(terminalReplay ? { persistedVisibleReplyThroughSeq: input.cursor } : {}),
     }, tx);
     await tx.update(heartbeatRuns).set({ resultJson: { ...result, continuousReplies: { ...replies,
       [input.event.itemId!]: { questionCommentIds, commentId: comment.id, sourceEventId: input.event.sourceEventId },
@@ -107,7 +154,7 @@ export async function publishContinuousNativeReply(input: {
       action: "issue.comment_added", entityType: "issue", entityId: issueId,
       details: { commentId: comment.id, bodySnippet: comment.body.slice(0, 120), identifier: issue.identifier,
         issueTitle: issue.title, authorizationReason, source: "run_presentation_resolver",
-        presentationSource: resolved.decision.chosenSource, sourceEventId: finalAgentMessage.sourceEventId } });
+        presentationSource: resolved.decision.chosenSource, sourceEventId: input.event.sourceEventId } });
     return true;
   });
   // Never steer inside the publication transaction: it owns the ISSUE row,
