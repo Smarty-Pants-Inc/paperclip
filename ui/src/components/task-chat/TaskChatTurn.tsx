@@ -96,7 +96,7 @@ export function TaskChatTurn({
         data-settled={item.settled ? "true" : "false"}
       >
         {item.agentName || !item.historical ? <div
-          className="flex min-h-8 w-full min-w-0 items-center gap-2 pb-1 pt-1.5 text-sm text-muted-foreground"
+          className="flex min-h-8 w-full min-w-0 flex-wrap items-center gap-x-2 gap-y-1 pb-1 pt-1.5 text-sm text-muted-foreground"
           data-testid="task-chat-turn-summary"
           data-turn-position="identity"
         >
@@ -106,7 +106,7 @@ export function TaskChatTurn({
               agentIcon={item.agentIcon} agent={item.agent}
             />
           ) : null}
-          {!item.historical ? <span className="min-w-0 truncate">
+          {!item.historical ? <span className="min-w-0 break-words">
             {item.continuedAfterSteering ? "Continued after steering · " : ""}
             {item.summary.durationLabel
               ? `${settledLabel} ${item.summary.failed ? "after" : "for"} ${item.summary.durationLabel}`
