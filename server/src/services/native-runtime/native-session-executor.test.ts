@@ -11186,7 +11186,8 @@ describe("native session same-turn steering", () => {
     return { running };
   }
 
-  it.each(["held", "working", "steered", "question", "pending-tool"])("closes a reset hold only when idle: %s", async mode => {
+  it.each(["held", "held-70000", "held-300000", "working", "steered", "question", "pending-tool"])("closes a reset hold only when idle: %s", async mode => {
+    const isHeld = mode.startsWith("held");
     vi.spyOn(continuousReply, "publishContinuousNativeReply").mockImplementation(async input => input.event.eventType === "item.completed" ? true : undefined);
     vi.spyOn(resetWakeQueue, "closeConversationResetHold").mockResolvedValue(false);
     const piExecution = { ...execution, provider: { kind: "pi_rpc", model: "openai/gpt-5", conversationMode: true },
@@ -11197,7 +11198,7 @@ describe("native session same-turn steering", () => {
       const final: PrpEvent = { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "runner", sourceSeq: 1,
         priority: 0, emittedAt: new Date().toISOString(), sourceInstanceId: "runner", normalizedSessionId: "session-native-cancel",
         eventType: "item.completed", runId: execution.binding.runId, itemId: "answer", sourceEventId: "answer",
-        payload: { kind: "agentMessage", channel: "final", text: "Done." } };
+        payload: { kind: "agentMessage", channel: "final", text: mode === "held-70000" ? "word ".repeat(14_000) : mode === "held-300000" ? "word ".repeat(60_000) : "Done." } };
       const work: PrpEvent = { ...final, eventType: "item.started", itemId: "tool", sourceEventId: "work", payload: { kind: "toolCall" } };
       if (mode === "pending-tool") await accountingEvents.committed!(work);
       await accountingEvents.committed!(final);
@@ -11205,9 +11206,9 @@ describe("native session same-turn steering", () => {
       if (mode === "steered") await steerNativeSession({ runId: execution.binding.runId, message: "More work", correlationId: "next" });
       if (mode === "question") snapshot.mockResolvedValue({ activeTurnId: "provider-turn-1", pendingRuntimeRequests: [{ requestId: "question" }] });
       const results = await Promise.all([closeHeldNativeTurn(execution.binding.runId), closeHeldNativeTurn(execution.binding.runId)]);
-      expect(results).toEqual(mode === "held" ? [true, false] : [false, false]);
-      expect(interrupt).toHaveBeenCalledTimes(mode === "held" ? 1 : 0);
-      if (mode === "held") {
+      expect(results).toEqual(isHeld ? [true, false] : [false, false]);
+      expect(interrupt).toHaveBeenCalledTimes(isHeld ? 1 : 0);
+      if (isHeld) {
         expect(interrupt).toHaveBeenCalledWith({ turnId: "provider-turn-1", reason: "person_stop" });
         await expect(steerNativeSession({ runId: execution.binding.runId, message: "Late", correlationId: "late" }))
           .rejects.toMatchObject({ code: "steering_stale_turn" });
@@ -15607,6 +15608,28 @@ describe("native session bounded recovery", () => {
     expect(state.execute).toHaveBeenCalledOnce();
     } finally { service.mockRestore(); }
   });
+  it("settles provider output without a result once, with one system failure notice and no recovery wake", async () => {
+    const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+    const failure = new Error("native_provider_output_without_result: provider produced output but no complete answer could be saved");
+    state.execute.mockReset().mockRejectedValueOnce(failure);
+    state.upsertRecoveryAction.mockReset().mockResolvedValue({});
+    const addComment = vi.fn(async () => ({}));
+    const service = vi.spyOn(issueServiceModule, "issueService").mockReturnValue({
+      update: vi.fn(async () => ({ status: "blocked", statusVersion: 7 })), addComment,
+    } as unknown as ReturnType<typeof issueServiceModule.issueService>);
+    try {
+      await expect(executePaperclipNativeSession({ db: leaseDb(execution, {}, {}, updates), execution, runnerInstanceId: "runner" })).rejects.toBe(failure);
+      expect(updates.find(update => update.table === nativeRunFinalizations && update.values.phase === "terminal_failure")?.values).toMatchObject({
+        failureCode: "native_provider_output_without_result", nextAttemptAt: null,
+        failureDetail: { recoverable: false, nextAction: expect.stringContaining("nothing was re-sent") },
+      });
+      expect(state.upsertRecoveryAction).toHaveBeenCalledWith(expect.objectContaining({ cause: "native_provider_output_without_result", ownerType: "board", wakePolicy: null }));
+      expect(addComment).toHaveBeenCalledExactlyOnceWith(execution.binding.issueId, expect.stringContaining("question remains unanswered"), {},
+        expect.objectContaining({ authorType: "system", presentation: { kind: "system_notice", tone: "danger", detailsDefaultOpen: false } }), expect.anything());
+      expect(state.execute).toHaveBeenCalledTimes(1);
+    } finally { service.mockRestore(); }
+  });
+
   it("blocks a denied Cursor task and gives recovery to the operator without another provider attempt", async () => {
     const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
     const failure = new NativePermissionDeclinedError();
