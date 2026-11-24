@@ -45,6 +45,8 @@ export interface RunnerToolCall {
 
 export interface RunnerToolBridgeOptions {
   tools?: readonly Readonly<Record<string, unknown>>[];
+  /** Agent Chat replies cannot finish or block task work. Names stay reserved. */
+  conversationReply?: boolean;
   /** Claude-only: avoid tool search for task naming and terminal disposition. */
   preloadClaudeTaskTools?: boolean;
   preserveToolNames?: boolean;
@@ -157,8 +159,9 @@ export async function startRunnerToolBridge(
       );
     }
   }
-  const validators = compileValidators(tools, [...structuredClone(RESERVED_TOOLS), ...privateTools]);
-  const visibleTools = [...tools.filter((tool) => validators.has(tool.name)), ...structuredClone(RESERVED_TOOLS)];
+  const terminalTools = options.conversationReply ? [] : structuredClone(RESERVED_TOOLS);
+  const validators = compileValidators(tools, [...terminalTools, ...privateTools]);
+  const visibleTools = [...tools.filter((tool) => validators.has(tool.name)), ...terminalTools];
   if (options.preloadClaudeTaskTools) {
     for (const tool of visibleTools) {
       if (tool.name === "set_task_title" || tool.name === PRP_COMPLETION_TOOL_NAME || tool.name === PRP_BLOCK_TOOL_NAME) {
