@@ -2,6 +2,7 @@ import {
   isPaperclipRunnerProvider,
   PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES,
 } from "@paperclipai/adapter-utils";
+import { resolveSessionContinuity } from "../native-runtime/continued-session.js";
 
 export type SessionFingerprintClassification =
   | { kind: "kept"; reason: string }
@@ -138,8 +139,11 @@ function omitKeys(value: Record<string, unknown>, keys: Iterable<string>): Recor
   return result;
 }
 
+export const continuousSessionAdapterConfig = (config: Record<string, unknown>, provider = config.provider, setting = config.sessionContinuity) =>
+  provider === "pi_rpc" && resolveSessionContinuity(provider, setting) === "continuous" ? omitKeys(config, ["model", "piRpcThinkingLevel", "piThinkingLevel", "thinkingLevel", "modelReasoningEffort", "reasoningEffort", "effort", "variant"]) : config;
+
 export function paperclipRunnerSessionAdapterConfig(config: Record<string, unknown>): Record<string, unknown> {
-  const result = omitKeys(config, RUNNER_EXCLUDED_KEYS);
+  const result = omitKeys(continuousSessionAdapterConfig(config), RUNNER_EXCLUDED_KEYS);
   const provider = config.provider ?? "codex";
   if (!isPaperclipRunnerProvider(provider)) return result;
   const active = PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES[provider];

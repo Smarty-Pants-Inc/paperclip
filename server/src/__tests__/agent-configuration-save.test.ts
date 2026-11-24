@@ -6,8 +6,9 @@ import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
-import { agents, agentConfigRevisions, activityLog, builtInManagedResources, companies, companyMemberships, connectionGrants, createDb, environments, issues, toolConnections, toolConnectionInstalls } from "@paperclipai/db";
+import { agents, agentConfigRevisions, agentTaskSessions, agentRuntimeState, activityLog, builtInManagedResources, companies, companyMemberships, connectionGrants, createDb, environments, issues, toolConnections, toolConnectionInstalls } from "@paperclipai/db";
 import { agentRoutes } from "../routes/agents.js";
+import { agentService } from "../services/agents.js";
 import { issueRoutes } from "../routes/issues.js";
 import * as issueServices from "../services/issues.js";
 import * as activityLogging from "../services/activity-log.js";
@@ -87,11 +88,23 @@ describePostgres("agent configuration save latency", () => {
     expect(await db.select().from(activityLog).where(and(eq(activityLog.entityId, agent.id), eq(activityLog.action, "agent.updated")))).toHaveLength(1);
   });
 
-  it("saves model edits against an existing healthy account without a runtime probe", async () => {
-    await db.update(agents).set({ runtimeConfig: { aiConnection: binding } }).where(eq(agents.id, agent.id));
-    const response = await request(app).patch(`/api/agents/${agent.id}`).send({ adapterConfig: { model: "gpt-5.6-luna" } });
-    expect(response.status, JSON.stringify(response.body)).toBe(200);
-    expect((await readAgent()).adapterConfig.model).toBe("gpt-5.6-luna");
+  it.each(["pi_rpc", "codex", "acpx"].flatMap(provider => ["continuous", "paperclip"].map(sessionContinuity => ({ provider, sessionContinuity }))))("saves model edits without a probe and honors $provider / $sessionContinuity retention", async ({ provider, sessionContinuity }) => {
+    const retain = provider === "pi_rpc" && sessionContinuity === "continuous";
+    const model = provider === "pi_rpc" ? "openai/gpt-5.6-luna" : "gpt-5.6-luna";
+    await db.update(agents).set({ runtimeConfig: { aiConnection: binding }, adapterConfig: { ...agent.adapterConfig, provider, ...(provider === "acpx" ? { acpxAgent: "codex" } : {}), sessionContinuity } }).where(eq(agents.id, agent.id));
+    await db.insert(agentTaskSessions).values({ companyId: agent.companyId, agentId: agent.id, adapterType: agent.adapterType, taskKey: "task", sessionParamsJson: { sessionId: "retained" } });
+    await db.insert(agentRuntimeState).values({ companyId: agent.companyId, agentId: agent.id, adapterType: agent.adapterType, sessionId: "retained" });
+    if (provider === "pi_rpc") {
+      // This base's managed-account route does not admit Pi RPC. Exercise its
+      // real configuration transaction directly, not an unrelated auth refusal.
+      await agentService(db).update(agent.id, { adapterConfig: { ...(await readAgent()).adapterConfig, model } });
+    } else {
+      const response = await request(app).patch(`/api/agents/${agent.id}`).send({ adapterConfig: { model } });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+    }
+    expect((await readAgent()).adapterConfig.model).toBe(model);
+    expect(await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, agent.id))).toHaveLength(retain ? 1 : 0);
+    expect((await db.select().from(agentRuntimeState).where(eq(agentRuntimeState.agentId, agent.id)))[0].sessionId).toBe(retain ? "retained" : null);
     expect(allocate).not.toHaveBeenCalled(); expect(probe).not.toHaveBeenCalled(); expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
