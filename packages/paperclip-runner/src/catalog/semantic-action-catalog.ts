@@ -153,9 +153,8 @@ const descriptors: readonly PaperclipSemanticActionDescriptor[] = [
     operationId: "get_task_history",
     title: "Get active task history",
     description: getTaskHistoryAction.live.descriptor.description,
-    inputSchema: object({
-      limit: { type: "integer", minimum: 1, maximum: 200, default: 50 },
-    }),
+    inputSchema: getTaskHistoryAction.live.descriptor.inputSchema,
+    outputSchema: getTaskHistoryAction.live.descriptor.outputSchema,
   }),
   descriptor({
     operationId: "list_documents",
