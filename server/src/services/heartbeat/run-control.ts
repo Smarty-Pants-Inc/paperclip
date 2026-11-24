@@ -1,3 +1,4 @@
+import { requeueContinuousUnanswered } from "../native-runtime/native-continuous-unanswered.js";
 import { writeDeferredExecutionWait } from "../deferred-execution-wait.js";
 import type { DeferredReceiptRecoveryOptions } from "../deferred-execution-notifications.js";
 import { observeStoppedWorkspaceRecovery } from "../workspace-recovery.js";
@@ -1037,6 +1038,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       }).from(heartbeatRuns).where(and(
         eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
       ));
+      await requeueContinuousUnanswered(db, run);
       const sourceHandoff = await pendingCaseHandoffForRun(db, run.id, run.companyId);
       const { postCommitEffects } = await wakeQueue.releaseIssueExecution({
         companyId: run.companyId,
