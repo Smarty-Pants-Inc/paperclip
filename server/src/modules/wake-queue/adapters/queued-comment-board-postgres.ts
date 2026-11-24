@@ -1,6 +1,7 @@
 import { agentWakeupRequests, agents, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import type { IssueQueuedCommentQueue } from "@paperclipai/shared";
 import { isConversationReset } from "../../../services/agent-conversations.js";
+import { resolveSessionContinuity } from "../../../services/native-runtime/continued-session.js";
 import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { assertQueuedCommentInteractionDelivery, recheckQueuedCommentInteractionDelivery } from "../../../services/agent-interaction-delivery.js";
 import { deliverSteeredMessage, steeringDeliveryIsUncertain } from "../../../services/queued-comment-steering.js";
@@ -225,7 +226,7 @@ export async function readBoardQueuedComments(input: {
   )).filter((comment) => !claimedByFirstTurn.has(comment.id));
   const assignedAgent = input.issue.assigneeAgentId
     ? await input.executor
-        .select({ adapterType: agents.adapterType })
+        .select({ adapterType: agents.adapterType, adapterConfig: agents.adapterConfig })
         .from(agents)
         .where(
           and(
@@ -243,8 +244,11 @@ export async function readBoardQueuedComments(input: {
     assignedAgentAdapterType: assignedAgent?.adapterType ?? null,
     queuedCommentCount: comments.length,
   });
+  const heldPi = input.activeRun?.runtimeMode === "native" &&
+    parseObject(parseObject(input.activeRun.runnerProfileJson?.nativeExecutionInput).provider).kind === "pi_rpc" &&
+    resolveSessionContinuity("pi_rpc", assignedAgent?.adapterConfig.sessionContinuity) === "continuous";
   const steeringDisposition: IssueQueuedCommentQueue["steeringDisposition"] =
-    input.issue.conversationAgentId && (process.env.PAPERCLIP_AGENT_CHAT_STEERING !== "true" || comments.some(({ body }) => isConversationReset(body)))
+    input.issue.conversationAgentId && ((!heldPi && process.env.PAPERCLIP_AGENT_CHAT_STEERING !== "true") || comments.some(({ body }) => isConversationReset(body)))
       ? "unsupported" : steering.kind !== "probe"
       ? steering.kind
       : input.steeringDisposition
@@ -446,6 +450,9 @@ export function createQueuedCommentSteeringAdapter(db: Db): QueuedCommentSteerin
             executor: tx, issue, actor, activeRun: run?.status === "running" ? run : null,
           }),
           async readPendingQueue() {
+            const stop = parseObject(parseObject(run?.resultJson).personStop);
+            if (stop.requestedAt && !stop.settledAt && !stop.resumedAt)
+              throw new QueuedCommentMutationError("queued_comment_stale_target", "This turn is being stopped; retry after Stop settles");
             const { queue } = await readLockedBoardQueue({ ...input, tx, issue }, wake, run);
             // Recheck under the queue lock against edits and later-row delivery.
             if (issue.conversationAgentId && queue.entries.some(({ comment }) => isConversationReset(comment.body))) {
@@ -484,6 +491,8 @@ export function createQueuedCommentSteeringAdapter(db: Db): QueuedCommentSteerin
             await tx.update(heartbeatRuns).set({
               resultJson: {
                 ...result,
+                ...(parseObject(result.personStop).settledAt && !parseObject(result.personStop).resumedAt
+                  ? { personStop: { ...parseObject(result.personStop), resumedAt: now.toISOString() } } : {}),
                 queuedSteeringAcknowledgements: {
                   ...parseObject(result.queuedSteeringAcknowledgements),
                   [commentId]: { status: "acknowledged", queueId: wake.id, turnId, acknowledgedAt: now.toISOString(), afterEventSeq: run!.nextEventSeq - 1 },
