@@ -4901,8 +4901,11 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   const stopResponse = useMutation({
     mutationFn: async (runId: string) => {
       const stoppedRun = await heartbeatsApi.cancel(runId);
-      // A cold Pi start can take 330 s (0234): keep Stop pending through the server hold and settlement.
-      await waitForStoppedRuns([runId], { initialRuns: [stoppedRun], timeoutMs: 400_000 });
+      const stop = stoppedRun?.resultJson?.personStop as { requestedAt?: unknown } | undefined;
+      // Held Pi turns settle without ending the run. Older servers and true cancels
+      // still need terminal proof; a cold start can take 330 s (0234).
+      await waitForStoppedRuns([runId], { initialRuns: [stoppedRun], timeoutMs: 400_000,
+        personStopRequestedAt: typeof stop?.requestedAt === "string" ? stop.requestedAt : undefined });
     },
     onSettled: () => Promise.all([
       queryClient.invalidateQueries({ queryKey: queryKeys.issues.detail(issueId!) }),
@@ -5829,23 +5832,27 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     },
   });
 
-  // The text goes back into the input box FIRST (a failure can only duplicate it, never lose it), then
-  // the person's own delete takes it out of the thread and every hand-over (deleted comments are never handed on).
+  // Copy EVERY returned message before any network wait. A durable per-comment receipt
+  // survives sending the draft, reloads and later Stops; failed deletes retry only the delete.
   const restoreStoppedMessages = useCallback(async (commentIds: readonly string[]) => {
-    for (const id of commentIds) {
-      const comment = threadComments.find((candidate) => candidate.id === id && !candidate.deletedAt);
-      if (!comment) continue;
-      if (!commentComposerRef.current) return false; // no box to take the text: restore nothing, delete nothing, try again later
-      const restoreKey = `${issueId}:${id}`;
-      if (!restoredStoppedCommentIds.has(restoreKey)) {
-        // Marked only once the text is kept: a box that could not keep it leaves the message in the thread.
-        if (commentComposerRef.current.restoreDraft(comment.body) === false) return false;
-        restoredStoppedCommentIds.add(restoreKey);
-      }
-      await issuesApi.deleteComment(issueId!, id).then(upsertCommentInCache).catch(() => undefined);
+    const returned = threadComments.filter(comment => commentIds.includes(comment.id) &&
+      !comment.deletedAt && comment.authorUserId === currentUserId)
+      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+    for (const comment of returned) {
+      const restoreKey = `paperclip:stopped-input:v1:${currentUserId}:${issueId}:${comment.id}`;
+      try {
+        if (localStorage.getItem(restoreKey)) continue;
+        if (!restoredStoppedCommentIds.has(restoreKey)) {
+          if (!commentComposerRef.current || commentComposerRef.current.restoreDraft(comment.body, restoreKey) === false) return false;
+          restoredStoppedCommentIds.add(restoreKey);
+        }
+        localStorage.setItem(restoreKey, "restored");
+      } catch { return false; } // Keep the source if durable custody could not be recorded.
     }
-    return true;
-  }, [threadComments, issueId, upsertCommentInCache]);
+    const deleted = await Promise.all(returned.map(comment => issuesApi.deleteComment(issueId!, comment.id)
+      .then(upsertCommentInCache).then(() => true, () => false)));
+    return deleted.every(Boolean);
+  }, [threadComments, currentUserId, issueId, upsertCommentInCache]);
   const deleteComment = useMutation({
     mutationFn: async ({ commentId }: { commentId: string }) =>
       issuesApi.deleteComment(issueId!, commentId),
