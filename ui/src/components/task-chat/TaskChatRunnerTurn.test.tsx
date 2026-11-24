@@ -2,6 +2,9 @@
 
 import type { ExecutionProjection } from "@paperclipai/shared";
 import { act } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { queryKeys } from "@/lib/queryKeys";
+import { useReasoningDisplay } from "./reasoning-display";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeProvider } from "@/context/ThemeContext";
@@ -477,20 +480,11 @@ describe("TaskChatRunnerTurn", () => {
     expect(
       container.querySelector('[data-testid="task-chat-runner-activity-list"]'),
     ).toBeNull();
-    act(() =>
-      container
-        .querySelector<HTMLButtonElement>(
-          '[data-testid="task-chat-activity-phase-toggle"]',
-        )
-        ?.click(),
-    );
-    expect(
-      container.querySelector('[data-testid="task-chat-runner-activity-list"]')
-        ?.textContent,
-    ).toContain("Thought");
+    expect(container.querySelector('[data-testid="task-chat-thinking-inline"]')?.textContent)
+      .toContain("The saved preview can be reused.");
   });
 
-  it("keeps the latest provider-authored reasoning line visible while activity is folded", () => {
+  it("shows all provider-authored reasoning inline without opening activity", () => {
     render([
       {
         id: "reasoning",
@@ -502,10 +496,11 @@ describe("TaskChatRunnerTurn", () => {
       },
     ]);
 
-    const ticker = container.querySelector(
-      '[data-testid="task-chat-activity-viewport"]',
-    );
-    expect(ticker?.textContent).toContain("Checking the steering path.");
+    const prose = container.querySelector('[data-testid="task-chat-thinking-inline"]');
+    expect(prose?.textContent).toContain("Inspecting the task state.");
+    expect(prose?.textContent).toContain("Checking the steering path.");
+    expect(prose?.classList.contains("italic")).toBe(true);
+    expect(prose?.querySelector("button, ul")).toBeNull();
     expect(
       container.querySelector('[data-testid="task-chat-runner-activity-list"]'),
     ).toBeNull();
@@ -599,7 +594,7 @@ describe("TaskChatRunnerTurn", () => {
     ).toBe(true);
   });
 
-  it("keeps internal reasoning nested inside its activity group", () => {
+  it("keeps summary and detail reasoning inline in chronological order", () => {
     render([
       {
         id: "summary",
@@ -618,26 +613,15 @@ describe("TaskChatRunnerTurn", () => {
         transcriptIndex: 2,
       },
     ]);
-    expect(
-      container.querySelectorAll('[data-testid="task-chat-thinking"]'),
-    ).toHaveLength(0);
-    act(() =>
-      container
-        .querySelector<HTMLButtonElement>(
-          '[data-testid="task-chat-activity-phase-toggle"]',
-        )
-        ?.click(),
-    );
-    const history = container.querySelector('[data-testid="task-chat-runner-activity-list"]');
-    expect(container.querySelector('[data-testid="task-chat-runner-activity-rail"]')).toBeNull();
-    expect(history?.querySelectorAll("li")).toHaveLength(2);
-    expect(history?.textContent).toContain("ThoughtInspect the current card.");
-    expect(history?.textContent).toContain("ThinkingKeep the canonical revision atomic.");
-    expect(container.querySelector('[data-testid="task-chat-runner-activity-detail"]')).toBeNull();
+    const prose = container.querySelectorAll('[data-testid="task-chat-thinking-inline"]');
+    expect(prose).toHaveLength(2);
+    expect(prose[0]?.textContent).toContain("Inspect the current card.");
+    expect(prose[1]?.textContent).toContain("Keep the canonical revision atomic.");
+    expect(container.querySelector('[data-testid="task-chat-activity-phase-toggle"]')).toBeNull();
 
   });
 
-  it("renders only the current reasoning block as active", () => {
+  it("keeps reasoning on either side of inspectable tool activity", () => {
     render([
       {
         id: "old-reasoning",
@@ -670,8 +654,12 @@ describe("TaskChatRunnerTurn", () => {
         ?.click(),
     );
 
-    expect(container.querySelector('[data-activity-item-id="old-reasoning"]')?.textContent).toContain("ThoughtInspect the current card.");
-    expect(container.querySelector('[data-activity-item-id="current-reasoning"]')?.textContent).toContain("ThinkingVerify the updated state.");
+    const prose = container.querySelectorAll('[data-testid="task-chat-thinking-inline"]');
+    expect(prose[0]?.textContent).toContain("Inspect the current card.");
+    expect(prose[1]?.textContent).toContain("Verify the updated state.");
+    const tools = container.querySelector('[data-testid="task-chat-activity-phase"]');
+    expect(prose[0]?.compareDocumentPosition(tools!)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(tools?.compareDocumentPosition(prose[1]!)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
 
   });
 
@@ -1210,7 +1198,33 @@ describe("TaskChatRunnerTurn", () => {
     );
   });
 
-  it("collapses terminal reasoning to the existing Worked summary", () => {
+  it("stores Inline / Folded per viewer and updates mounted reasoning", () => {
+    const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity, retry: false } } });
+    client.setQueryData(queryKeys.auth.session, { user: { id: "reasoning-viewer-a" } });
+    localStorage.setItem("paperclip.reasoning-display.reasoning-viewer-a", "folded");
+    localStorage.setItem("paperclip.reasoning-display.reasoning-viewer-b", "folded");
+    function Preference() {
+      const preference = useReasoningDisplay("paperclip_runner");
+      return <button data-testid="reasoning-preference" onClick={() => preference.setDisplay("inline")}>{preference.display}</button>;
+    }
+    const show = () => act(() => root.render(<QueryClientProvider client={client}><MemoryRouter><ThemeProvider>
+      <Preference /><TaskChatRunnerTurn status="running" startedAtMs={null} items={[
+        { id: "reason", kind: "thinking", lines: ["Visible provider reasoning."], streaming: true },
+      ]} />
+    </ThemeProvider></MemoryRouter></QueryClientProvider>));
+    show();
+    expect(container.querySelector('[data-testid="task-chat-thinking-inline"]')).toBeNull();
+    act(() => container.querySelector<HTMLButtonElement>('[data-testid="reasoning-preference"]')!.click());
+    expect(container.querySelector('[data-testid="task-chat-thinking-inline"]')?.textContent).toContain("Visible provider reasoning.");
+    expect(localStorage.getItem("paperclip.reasoning-display.reasoning-viewer-a")).toBe("inline");
+    act(() => client.setQueryData(queryKeys.auth.session, { user: { id: "reasoning-viewer-b" } }));
+    show();
+    expect(container.querySelector('[data-testid="task-chat-thinking-inline"]')).toBeNull();
+    expect(localStorage.getItem("paperclip.reasoning-display.reasoning-viewer-b")).toBe("folded");
+    client.clear();
+  });
+
+  it("retains inline reasoning after the turn settles", () => {
     render(
       [
         {
@@ -1231,9 +1245,9 @@ describe("TaskChatRunnerTurn", () => {
         ?.textContent,
     ).toContain("Worked for");
     expect(
-      container.querySelector('[data-testid="task-chat-activity-phase-toggle"]')
+      container.querySelector('[data-testid="task-chat-thinking-inline"]')
         ?.textContent,
-    ).toContain("Thought");
+    ).toContain("Provider-authored trace");
   });
 
   it("keeps final text mounted through a transient replay gap", () => {
