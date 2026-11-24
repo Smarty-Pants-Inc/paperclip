@@ -19,6 +19,15 @@ describe("bounded fresh-session handoff", () => {
     expect(rendered).toContain("Legacy adapters can use the equivalent Paperclip");
   });
 
+  it("bounds whole handoffs by keeping the newest messages whole and naming every omission", () => {
+    const entries = Array.from({ length: 6 }, (_, i) => ({ kind: "message", id: String(i), body: `${i}:` + "🦖".repeat(45_000) }));
+    const rendered = renderNativeSessionHandoff({ issueId: "task", generation: 1, mode: "whole", entries, omittedEntriesAtLeast: 0 });
+    const packet = JSON.parse(rendered.split("\n").at(-1)!);
+    expect(rendered.length).toBeLessThanOrEqual(400_000);
+    expect(rendered.split("\n")[0]).toBe("2 earlier messages were not handed over.");
+    expect(packet.entries.map((entry: { body: string }) => entry.body)).toEqual(entries.slice(2).map(entry => entry.body));
+  });
+
   it("restores the handoff on fresh bootstrap and resume failure, without replaying it on resume", () => {
     const input = buildNativeExecutionInput({
       companyId: "company", runId: "run", agentId: "agent", normalizedSessionId: "session", conversationMode: true,
@@ -162,6 +171,73 @@ const support = await getEmbeddedPostgresTestSupport();
     const fallback = buildNativeModelEnvelope(input);
     expect(fallback.task.prompt).toContain(`/api/issues/${issueId}/documents/workflow`);
     expect(fallback.task.prompt).not.toContain("WORKFLOW_BODY_CANARY");
+  });
+
+  it("keeps whole comments and unmatched finals chronological beyond every stock cap, with stock form/document context", async () => {
+    const taskId = randomUUID(), commentedRun = randomUUID(), finalRun = randomUUID();
+    await db.insert(issues).values({ id: taskId, companyId, title: "Long handoff", assigneeAgentId: agentId });
+    await db.insert(heartbeatRuns).values([commentedRun, finalRun].map(id => ({ id, companyId, agentId,
+      nativeIssueId: taskId, status: "succeeded", createdAt: new Date(29_000) })));
+    const comments = Array.from({ length: 12 }, (_, i) => ({ id: randomUUID(), companyId, issueId: taskId,
+      body: `comment-${i}:` + "x".repeat(i === 0 ? 5_000 : 2_500), createdAt: new Date(30_000 + i * 1_000),
+      ...(i === 1 ? { authorAgentId: agentId, createdByRunId: commentedRun, clientRequestId: `native-final:${commentedRun}:saved-comment` } : { authorUserId: "user" }),
+    }));
+    await db.insert(issueComments).values(comments);
+    const finals = Array.from({ length: 6 }, (_, i) => `final-${i}:` + "y".repeat(i === 0 ? 5_000 : 10));
+    await db.insert(heartbeatRunEvents).values(finals.map((text, i) => ({ companyId, agentId, runId: finalRun,
+      seq: i + 1, eventType: "item.completed", createdAt: new Date(30_500 + i * 1_000),
+      payload: { prpEvent: { payload: { kind: "agentMessage", channel: "final", text } } },
+    })));
+    await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: commentedRun, seq: 1,
+      eventType: "item.completed", createdAt: new Date(31_000),
+      payload: { prpEvent: { itemId: "saved-comment", payload: { kind: "agentMessage", channel: "final", text: comments[1].body } } } });
+    await db.insert(issueThreadInteractions).values({ companyId, issueId: taskId, kind: "ask_user_questions", status: "answered",
+      createdByAgentId: agentId, createdAt: new Date(30_000), resolvedAt: new Date(30_800),
+      payload: { version: 1, questions: [] }, result: { version: 1, summaryMarkdown: "FORM ANSWER: keep CODEOWNERS" } });
+    const args = { db, companyId, issueId: taskId, agentId, before: new Date(50_000) };
+    const whole = await buildNativeSessionHandoff({ ...args, mode: "whole" });
+    const stock = await buildNativeSessionHandoff(args);
+    const entries = JSON.parse(whole!.split("\n").at(-1)!).entries;
+    const expected = comments.flatMap((comment, i) => i < finals.length ? [comment.body, finals[i]] : [comment.body]);
+    expect(entries.filter((entry: { kind: string }) => entry.kind !== "resolved_interaction").map((entry: { body: string }) => entry.body)).toEqual(expected);
+    expect(entries.filter((entry: { body: string }) => entry.body === comments[1].body)).toHaveLength(1);
+    expect(Buffer.byteLength(whole!)).toBeGreaterThan(NATIVE_HANDOFF_MAX_BYTES);
+    expect(Buffer.byteLength(stock!)).toBeLessThanOrEqual(NATIVE_HANDOFF_MAX_BYTES);
+    expect(stock).not.toContain(comments[0].body);
+    expect(whole).toContain("FORM ANSWER: keep CODEOWNERS");
+    const input = buildNativeExecutionInput({ companyId, runId: randomUUID(), agentId, normalizedSessionId: "session", conversationMode: true,
+      issue: { id: taskId, identifier: "HAND-2", title: "Long handoff", description: null, workMode: "standard" },
+      taskPrompt: "Continue", freshSessionHandoff: whole, runtimeContext: nativeRuntimeContextFixture(),
+      workspace: { id: "workspace", cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
+      completionContract: { id: "contract", sha256: "a".repeat(64), schemaVersion: "paperclip.run-result.v1", contract: {
+        revision: "1", objective: "Continue", criteria: [{ id: "objective", requirement: "Continue" }] } },
+    });
+    expect(buildNativeModelEnvelope(input).task.prompt).toContain(whole);
+    const resumed = buildNativeModelEnvelope(input, { resumedSession: true });
+    expect("task" in resumed && resumed.task.prompt).not.toContain("Fresh session handoff");
+    const context = await buildNativeSessionHandoff({ db, companyId, issueId, agentId, before: new Date(20_000), mode: "whole" });
+    for (const text of ["Saved plan", 'read_document using key \\"workflow\\"', "Use CODEOWNERS"]) expect(context).toContain(text);
+    for (const text of ["OLD TOPIC", "Deleted private message", "FUTURE MESSAGE", "UNTRUSTED BODY", "WORKFLOW_BODY_CANARY"]) expect(context).not.toContain(text);
+  });
+
+  it.each(["mapped", "keyed"])("keeps a progress comment and distinct finals once each, deduping only the saved item (%s)", async (identity) => {
+    const taskId = randomUUID(), runId = randomUUID(), savedId = randomUUID();
+    await db.insert(issues).values({ id: taskId, companyId, title: "Per-item handoff", assigneeAgentId: agentId });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: taskId, status: "succeeded",
+      createdAt: new Date(30_000), resultJson: identity === "mapped" ? { continuousReplies: { saved: { commentId: savedId } } } : {} });
+    const rows = [
+      { body: "PROGRESS: investigating", createdAt: new Date(31_000) },
+      { id: savedId, body: "SAVED FINAL", createdAt: new Date(32_000),
+        ...(identity === "keyed" ? { clientRequestId: `native-final:${runId}:saved:opening` } : {}) },
+    ];
+    await db.insert(issueComments).values(rows.map(row => ({ ...row, companyId, issueId: taskId, authorAgentId: agentId, createdByRunId: runId })));
+    await db.insert(heartbeatRunEvents).values(["saved", "distinct"].map((itemId, i) => ({ companyId, agentId, runId, seq: i + 1,
+      eventType: "item.completed", createdAt: new Date(32_000 + i * 1_000),
+      payload: { prpEvent: { itemId, payload: { kind: "agentMessage", channel: "final", text: i === 0 ? "SAVED FINAL" : "DISTINCT FINAL" } } } })));
+    const result = await buildNativeSessionHandoff({ db, companyId, issueId: taskId, agentId, before: new Date(40_000), mode: "whole" });
+    const packet = JSON.parse(result!.split("\n").at(-1)!);
+    expect(packet.entries.map((entry: { body: string }) => entry.body)).toEqual(["PROGRESS: investigating", "SAVED FINAL", "DISTINCT FINAL"]);
+    expect(packet.omittedEntriesAtLeast).toBe(0);
   });
 
   it("loads and redacts history once only when a fresh attempt requests it", async () => {
