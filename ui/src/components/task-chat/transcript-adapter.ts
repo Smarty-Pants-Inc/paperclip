@@ -51,6 +51,14 @@ export function isTerminalRunStatus(
   return status != null && TERMINAL_STATUSES.has(status);
 }
 
+/** A saved final does not settle work that began after that response. */
+export function hasTranscriptWorkAfter(entries: readonly TranscriptEntry[], responseAtMs: number | undefined): boolean {
+  return responseAtMs !== undefined && entries.some(entry => Date.parse(entry.ts) > responseAtMs && (
+    entry.kind === "assistant" || entry.kind === "thinking" || entry.kind === "tool_call" ||
+    (entry.kind === "system" && entry.text === "Turn started")
+  ));
+}
+
 export interface TranscriptTimeSegment {
   startMs: number;
   endMs: number;
