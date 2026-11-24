@@ -215,7 +215,8 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
     managedAiRuntime.sessionIdentity,
     managedAiRuntime.identity,
   );
-  const resetRequired = context.explicitFreshSession === true || context.conversationReset === true || context.workspaceSelectionChanged === true ||
+  const resetRequired = context.explicitFreshSession === true || context.conversationReset === true ||
+    (context.workspaceSelectionChanged === true && (agent.adapterType !== "paperclip_runner" || runtimeConfig.provider !== "pi_rpc")) ||
     (runtimeConfig.provider !== "pi_rpc" && sessionConfigFreshness.reasons.some(reason => reason !== wakeSessionResetReason)) ||
     (context.wakeReason === "heartbeat_timer" && !deriveTaskKey(context, null));
   const taskSessionId = readNonEmptyString(taskSessionDecodedParams?.sessionId);
