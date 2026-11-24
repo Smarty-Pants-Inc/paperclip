@@ -1754,14 +1754,16 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   }, [resolvedActiveRun, resolvedLiveRuns]);
   // The live-run records keep their first execution projection between status
   // events; the run history the page polls every second while live has the
-  // current one. The thread's status reads the run, so give it the fresh one.
-  const polledExecutionByRunId = useMemo(() => new Map(resolvedLinkedRuns.flatMap((run) =>
-    run.execution ? [[run.runId, run.execution] as const] : [])), [resolvedLinkedRuns]);
+  // current execution and runtime mode. Both status and transcript selection need them.
+  const polledRunMetaById = useMemo(() => new Map((Array.isArray(linkedRunHistory) ? linkedRunHistory : linkedRunHistory?.runs ?? []).map((run) => [run.runId, {
+    ...(run.execution ? { execution: run.execution } : {}),
+    ...(run.runtimeMode ? { runtimeMode: run.runtimeMode } : {}),
+  }])), [linkedRunHistory]);
   const freshLiveRuns = useMemo(() => resolvedLiveRuns.map((run) =>
-    polledExecutionByRunId.has(run.id) ? { ...run, execution: polledExecutionByRunId.get(run.id) } : run),
-  [resolvedLiveRuns, polledExecutionByRunId]);
-  const freshActiveRun = resolvedActiveRun && polledExecutionByRunId.has(resolvedActiveRun.id)
-    ? { ...resolvedActiveRun, execution: polledExecutionByRunId.get(resolvedActiveRun.id) } : resolvedActiveRun;
+    polledRunMetaById.has(run.id) ? { ...run, ...polledRunMetaById.get(run.id) } : run),
+  [resolvedLiveRuns, polledRunMetaById]);
+  const freshActiveRun = resolvedActiveRun && polledRunMetaById.has(resolvedActiveRun.id)
+    ? { ...resolvedActiveRun, ...polledRunMetaById.get(resolvedActiveRun.id) } : resolvedActiveRun;
   const timelineRuns = useMemo(() => {
     const historicalRuns =
       liveRunIds.size === 0
