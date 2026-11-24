@@ -10,8 +10,24 @@ import { logger } from "../middleware/logger.js";
 import { notifyEnvironmentCleanup, writeEnvironmentCleanup } from "./environment-cleanup-notifications.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
 import { hasRemoteTerminationReceipt, resolveRemoteTerminationLease } from "./remote-execution-termination.js";
+import { prepareUnconfirmedSourceSandboxStop } from "./sandbox-stop-and-retain.js";
 
 export type SandboxCreationOperation = typeof sandboxCreationOperations.$inferSelect;
+
+/** Acquisition arguments are not persisted metadata. Creation custody, including
+ * a same-row reacquisition, decides whether this run owns the physical box. */
+export async function isBorrowedReusableSandboxLease(db: Db, lease: Pick<typeof environmentLeases.$inferSelect,
+  "id" | "companyId" | "heartbeatRunId" | "leasePolicy" | "provider" | "providerLeaseId">): Promise<boolean> {
+  if (lease.leasePolicy !== "reuse_by_environment" || !lease.heartbeatRunId || !lease.providerLeaseId) return false;
+  const [created] = await db.select({ id: sandboxCreationOperations.id }).from(sandboxCreationOperations).where(and(
+    eq(sandboxCreationOperations.companyId, lease.companyId), eq(sandboxCreationOperations.runId, lease.heartbeatRunId),
+    or(eq(sandboxCreationOperations.leaseId, lease.id), and(
+      sql`${sandboxCreationOperations.provider} is not distinct from ${lease.provider}`,
+      sql`${sandboxCreationOperations.metadata}->>'creationProviderLeaseId' = ${lease.providerLeaseId}`,
+    )),
+  )).limit(1);
+  return !created;
+}
 
 // A live creator may still be waiting for the provider, and a provider may still
 // materialize an aborted request. Absence is conclusive only after this delay.
@@ -108,6 +124,8 @@ export async function createOwnedSandbox(
   try {
     crashPoint("sandbox.create.after_intent_before_provider");
     const lease = await create({ id, runId });
+    if (lease.providerLeaseId) await recordSandboxCreationResource(db, { id, companyId: owner.companyId, environmentId: owner.environmentId,
+      providerLeaseId: lease.providerLeaseId });
     crashPoint("sandbox.create.after_provider_before_lease");
     return { ...lease, metadata: { ...lease.metadata, creationOperationId: id } };
   } catch (error) {
@@ -122,6 +140,31 @@ export async function createOwnedSandbox(
       }
     }
     throw error;
+  }
+}
+
+/** A provider reply can outlive Stop and then fail active-run attachment. Keep
+ * its exact allocation under durable cleanup custody before dispatching stop. */
+export async function queueCancelledSandboxCreationStops(db: Db, companyId: string, runId: string): Promise<void> {
+  const [cancelled] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "cancelled"),
+  ));
+  if (!cancelled) return;
+  const operations = await db.select().from(sandboxCreationOperations).where(and(
+    eq(sandboxCreationOperations.companyId, companyId), eq(sandboxCreationOperations.runId, runId),
+    eq(sandboxCreationOperations.state, "pending"),
+  ));
+  for (const operation of operations) {
+    const providerLeaseId = operation.metadata.creationProviderLeaseId;
+    if (typeof providerLeaseId !== "string" || !providerLeaseId) continue;
+    await queueSandboxCreationCleanup(db, { id: operation.id, companyId, environmentId: operation.originalEnvironmentId,
+      providerLeaseId, providerMetadata: operation.metadata.creationProviderMetadata as Record<string, unknown> | undefined });
+    const [lease] = await db.select().from(environmentLeases).where(and(
+      eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, runId),
+      sql`${environmentLeases.metadata}->>'creationOperationId' = ${operation.id}`,
+      eq(environmentLeases.providerLeaseId, providerLeaseId), eq(environmentLeases.status, "pending_cleanup"),
+    ));
+    if (lease) await prepareUnconfirmedSourceSandboxStop(db, lease);
   }
 }
 
