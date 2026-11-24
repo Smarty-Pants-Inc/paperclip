@@ -609,7 +609,7 @@ export interface HarnessSession {
   };
   events(): AsyncIterable<PrpEvent>;
   beginRunAttachment?(input: { runId: string }): boolean;
-  attachRun?(input: { runId: string; currentRunGrant?: NativeRunRuntimeGrant; completionContract?: { revision: string; criterionIds: readonly string[] } }): Promise<void> | void;
+  attachRun?(input: { runId: string; dynamicTools?: readonly Readonly<Record<string, unknown>>[]; currentRunGrant?: NativeRunRuntimeGrant; completionContract?: { revision: string; criterionIds: readonly string[] } }): Promise<void> | void;
   startTurn(input: {
     message: NativeUserMessage;
     /** Set by orchestration only after successful provider-session recovery. */
