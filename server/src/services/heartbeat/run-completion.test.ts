@@ -16,7 +16,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { createNativeRunLogCoverageVerifier, formatNativeRunLogEvent } from "../native-runtime/native-run-log-export.js";
 import type { Db } from "@paperclipai/db";
-import { activityLog, agents, agentWakeupRequests, approvals, issueApprovals, budgetReservations, caseHandoffs, cases, companies, completionContracts, costEvents, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, heartbeatRunEvents, issueComments, issueQuestionResponseDeliveries, issueRecoveryActions, issues, issueThreadInteractions, nativeRunFinalizations } from "@paperclipai/db";
+import { activityLog, agents, agentWakeupRequests, authUsers, approvals, issueApprovals, budgetReservations, caseHandoffs, cases, companies, completionContracts, costEvents, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, heartbeatRunEvents, issueComments, issueQuestionResponseDeliveries, issueRecoveryActions, issues, issueThreadInteractions, nativeRunFinalizations } from "@paperclipai/db";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -501,6 +501,52 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(f.deps.releaseIssueExecutionAndPromote).toHaveBeenCalledOnce();
     expect(f.deps.finalizeAgentStatus).toHaveBeenCalledWith(f.agent.id, "succeeded", null, expect.any(Object));
   });
+
+  it.each(["accepted+steered", "summary-only", "unaccepted+steered"] as const)(
+    "materializes terminal task answer text and coverage (%s)", async scenario => {
+      const f = await fixture({ runtimeMode: "native" });
+      const [issue] = await db.insert(issues).values({ companyId: f.run.companyId, title: "Answer both questions",
+        assigneeAgentId: f.agent.id, status: "in_progress" }).returning();
+      const userId = `terminal-${randomUUID()}`;
+      await db.insert(authUsers).values({ id: userId, name: "Question author", email: `${userId}@example.test`,
+        createdAt: new Date(), updatedAt: new Date() });
+      const questions = await db.insert(issueComments).values(["Which river?", "And which city?"].map(body => ({
+        companyId: f.run.companyId, issueId: issue.id, authorUserId: userId, body,
+      }))).returning();
+      const [run] = await db.update(heartbeatRuns).set({ nativeIssueId: issue.id, nativeSessionId: randomUUID(),
+        responsibleUserId: userId, contextSnapshot: { issueId: issue.id, wakeCommentId: questions[0].id },
+      }).where(eq(heartbeatRuns.id, f.run.id)).returning();
+      const summary = { schema: "paperclip.run_result.v1", reportedWorkDisposition: "done", summary: "The river is the Nile." };
+      f.input.adapterResult.resultJson = {
+        ...(scenario === "unaccepted+steered" ? { proposedResult: summary } : { nativeResult: summary }),
+        queuedSteeringAcknowledgements: { [questions[1].id]: { status: "acknowledged", afterEventSeq: 10 } },
+      };
+      if (scenario !== "summary-only") await db.insert(heartbeatRunEvents).values({
+        companyId: run.companyId, runId: run.id, agentId: run.agentId, seq: 30, eventType: "item.completed",
+        payload: { prpEvent: { runId: run.id, normalizedSessionId: run.nativeSessionId, itemId: "rome", sourceEventId: "final-30",
+          payload: { kind: "agentMessage", channel: "final", text: "The city is Rome." } } },
+      });
+      f.deps.findLatestCompletedFinalAgentMessage.mockImplementation((runId, companyId) => loadNativeVisibleReply(db, { companyId, runId }));
+      f.deps.issuesSvc.addComment.mockImplementation(issueService(db).addComment);
+      await f.completion.completeRun({ ...f.input, run, issueId: issue.id, issueRef: issue });
+      const replies = await db.select().from(issueComments).where(eq(issueComments.createdByRunId, run.id));
+      expect(replies.map(comment => comment.body)).toEqual(scenario === "accepted+steered"
+        ? [summary.summary, "The city is Rome."] : [scenario === "summary-only" ? summary.summary : "The city is Rome."]);
+      if (scenario === "accepted+steered") {
+        expect(replies[0].clientRequestId).toBe(`native-final:${run.id}:accepted-summary`);
+        expect(replies[1].clientRequestId).toBe(`native-final:${run.id}:rome`);
+        const reread = await read(run.id);
+        expect(reread.resultJson).toMatchObject({ presentationDecision: { commentId: replies[1].id }, continuousReplies: {
+          "accepted-summary": { questionCommentIds: [questions[0].id], commentId: replies[0].id },
+          rome: { questionCommentIds: [questions[1].id], commentId: replies[1].id },
+        } });
+        // The durable placement contract used by TaskChatThread survives reread.
+        const again = await db.select().from(issueComments).where(eq(issueComments.createdByRunId, run.id));
+        expect(again).toEqual(replies);
+        expect(replies[0].createdAt.getTime()).toBeLessThanOrEqual(replies[1].createdAt.getTime());
+      }
+    }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  );
 
   // A chat turn can finish while its task keeps waiting: a resubmitted hire
   // approval, an execution stage or a dependency blocker holds the status.

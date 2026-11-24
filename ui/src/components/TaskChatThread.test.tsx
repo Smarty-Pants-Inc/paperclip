@@ -3589,6 +3589,47 @@ describe("TaskChatThread runtime transcript selection", () => {
     );
   });
 
+  it.each([true, false])("places a saved accepted summary under its original question before the steered final, once after reread (original progress=%s)", originalProgress => {
+    const runId = "nile-steered-finish";
+    nativeTranscriptState.hydratedRunIds = new Set([runId]);
+    nativeTranscriptState.terminalHydratedRunIds = new Set([runId]);
+    nativeTranscriptState.transcriptByRun.set(runId, [
+      ...(originalProgress ? [assistantEntry("2026-08-25T18:00:02Z", "Checking the river.", "progress")] : []),
+      assistantEntry("2026-08-25T18:00:15Z", "The city is Rome.", "final"),
+    ]);
+    const comment = (id: string, body: string, at: string, agent = false) => ({
+      id, companyId: "company-1", issueId: "issue-1", body, authorType: agent ? "agent" as const : "user" as const,
+      authorAgentId: agent ? "agent-1" : null, authorUserId: agent ? null : "user-1", presentation: null, metadata: null,
+      runId: agent ? runId : null, createdAt: new Date(at), updatedAt: new Date(at),
+      ...(id === "second" ? { steeredIntoRunId: runId, conversationAnchorAt: new Date("2026-08-25T18:00:10Z") } : {}),
+    });
+    const props = { comments: [
+      comment("first", "Which river?", "2026-08-25T18:00:00Z"),
+      comment("second", "And which city?", "2026-08-25T18:00:05Z"),
+      comment("nile", "The river is the Nile.", "2026-08-25T18:00:20Z", true),
+      comment("rome", "The city is Rome.", "2026-08-25T18:00:21Z", true),
+    ], onAdd: async () => {}, linkedRuns: [{ runId, runtimeMode: "native" as const, status: "succeeded",
+      agentId: "agent-1", agentName: "Runner", adapterType: "paperclip_runner", createdAt: "2026-08-25T18:00:01Z",
+      startedAt: "2026-08-25T18:00:01Z", finishedAt: "2026-08-25T18:00:22Z", resultJson: {
+        nativeResult: { schema: "paperclip.run_result.v1", reportedWorkDisposition: "done", summary: "The river is the Nile." },
+        queuedSteeringAcknowledgements: { second: { status: "acknowledged", acknowledgedAt: "2026-08-25T18:00:10Z", afterEventSeq: 10 } },
+        presentationDecision: { commentId: "rome" }, continuousReplies: {
+          "accepted-summary": { questionCommentIds: ["first"], commentId: "nile", sourceEventId: null },
+          rome: { questionCommentIds: ["second"], commentId: "rome", sourceEventId: "final-30" },
+        },
+      },
+    }] };
+    for (let reread = 0; reread < 2; reread++) {
+      renderThread({ ...props, comments: [...props.comments], linkedRuns: [...props.linkedRuns] });
+      const text = container.textContent ?? "";
+      expect(text.split("The river is the Nile.")).toHaveLength(2);
+      expect(text.split("The city is Rome.")).toHaveLength(2);
+      const positions = ["Which river?", "The river is the Nile.", "And which city?", "The city is Rome."].map(body => text.indexOf(body));
+      expect(positions.every(position => position >= 0)).toBe(true);
+      expect(positions).toEqual([...positions].sort((a, b) => a - b));
+    }
+  });
+
   it("keeps a steered yielded turn's reply in the segment that wrote it", () => {
     const runId = "steered-interview";
     nativeTranscriptState.transcriptByRun.set(runId, [
