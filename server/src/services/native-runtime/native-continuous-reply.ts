@@ -9,6 +9,8 @@ import { hasChatRunOwnedProviderInteraction } from "../chat-interaction-arbitrat
 import { agentRunWritesRevoked } from "../../agent-run-cancellation.js";
 import { resolveSessionContinuity } from "./continued-session.js";
 import { parseObject } from "../../adapters/utils.js";
+import { logger } from "../../middleware/logger.js";
+import { drainContinuousPersonMessages } from "./native-continuous-drain.js";
 
 /** Replay the ingestion/publication crash gap before terminal presentation or queue release. */
 export async function recoverContinuousNativeReplies(db: Db, scope: { id: string; companyId: string }) {
@@ -43,6 +45,7 @@ export async function publishContinuousNativeReply(input: {
   if (finalAgentMessage?.channel !== "final" || !input.event.itemId) return;
   const { companyId, issueId, runId, agentId } = input.execution.binding;
   if (input.event.runId !== runId) return;
+  let steerableFinal = false;
   await input.db.transaction(async transaction => {
     const tx = transaction as unknown as Db;
     const [issue] = await tx.select().from(issues).where(and(
@@ -63,6 +66,7 @@ export async function publishContinuousNativeReply(input: {
       eq(heartbeatRunEvents.eventType, "lifecycle"), lt(heartbeatRunEvents.seq, input.cursor),
       sql`${heartbeatRunEvents.payload}->>'retryReasonCode' = 'semantic_result_missing'`)).limit(1);
     if (recovery) return;
+    steerableFinal = row.run.status === "running" && !input.recoverTerminal;
     const result = parseObject(row.run.resultJson);
     const replies = parseObject(result.continuousReplies);
     if (replies[input.event.itemId!]) return;
@@ -105,4 +109,14 @@ export async function publishContinuousNativeReply(input: {
         issueTitle: issue.title, authorizationReason, source: "run_presentation_resolver",
         presentationSource: resolved.decision.chosenSource, sourceEventId: finalAgentMessage.sourceEventId } });
   });
+  // Never steer inside the publication transaction: it owns the ISSUE row,
+  // while steering must persist run events before taking its own ACK locks.
+  if (steerableFinal) {
+    try { await drainContinuousPersonMessages(input.db, { companyId, issueId, runId, agentId }); }
+    catch (error) {
+      // A competing queue mutation, Stop, or uncertain ACK leaves the durable
+      // wake intact for replay/the ordinary end-of-run release path.
+      logger.warn({ error, companyId, issueId, runId }, "held-run person-message drain deferred");
+    }
+  }
 }
