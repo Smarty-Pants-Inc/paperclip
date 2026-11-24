@@ -7,7 +7,11 @@ import { completedPlanProposalIds, isBoundedRunEventText, nativeFinalReplyKey,
 type Row = { seq: number; payload: unknown; eventType?: string };
 type Scope = { runId: string; agentId?: string; normalizedSessionId?: string | null; turnId?: string | null;
   throughSeq?: number; finalEvent?: { seq: number; prpEvent: unknown } };
-export type VisibleAssistantReply = CompletedFinalAgentMessageCandidate & { visibleText: true; reasonCode: string };
+export type VisibleAssistantReply = CompletedFinalAgentMessageCandidate & {
+  visibleText: true; reasonCode: string;
+  fromSeq: number; throughSeq: number; turnId: string | null; normalizedSessionId: string | null;
+  visibleItems: Array<{ itemId: string | null; seq: number; throughSeq: number; text: string }>;
+};
 
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
@@ -53,11 +57,12 @@ export function composeNativeVisibleReply(rows: readonly Row[], scope: Scope): V
   if (targetTurn) events = events.filter(({ event }) => !event.turnId || event.turnId === targetTurn);
 
   type Item = { id: string; kind: string; channel: string; delta: string; completed: string;
-    seq: number; sourceEventId: string | null; itemId: string | null };
+    seq: number; firstSeq: number; sourceEventId: string | null; itemId: string | null };
   let items = new Map<string, Item>();
   const identities = new Map<string, { kind: string; channel: string }>();
   const closedItems = new Set<string>();
   let last: VisibleAssistantReply | null = null;
+  let fromSeq = events[0]?.seq ?? 0;
   const compose = (boundary?: Item): VisibleAssistantReply | null => {
     const visible = [...items.values()].flatMap(item => {
       const value = settledText(item.delta, item.completed);
@@ -74,7 +79,12 @@ export function composeNativeVisibleReply(rows: readonly Row[], scope: Scope): V
     return { seq: owner.seq, text: visible.map(value => value.text).join("\n\n"),
       sourceEventId: owner.sourceEventId, channel: boundary?.channel === "unknown" ? "unknown" : "final",
       ...(owner.itemId ? { replyKey: nativeFinalReplyKey(scope.runId, owner.itemId) } : {}),
-      visibleText: true, reasonCode: "visible_assistant_reply_segment" };
+      visibleText: true, reasonCode: "visible_assistant_reply_segment",
+      fromSeq, throughSeq: boundary?.seq ?? events.at(-1)?.seq ?? owner.seq,
+      turnId: text(targetTurn), normalizedSessionId: scope.normalizedSessionId
+        ?? text(events.find(({ seq }) => seq === owner.seq)?.event.normalizedSessionId),
+      visibleItems: visible.map(({ item, text: value }) => ({ itemId: item.itemId,
+        seq: item.firstSeq, throughSeq: item.seq, text: value })) };
   };
   const observe = (seq: number, event: Record<string, unknown>, eventType: string) => {
     if (!["item.started", "item.delta", "item.completed"].includes(eventType)) return;
@@ -89,7 +99,7 @@ export function composeNativeVisibleReply(rows: readonly Row[], scope: Scope): V
     identities.set(id, { kind, channel });
     if (!["agentmessage", "assistantmessage"].includes(kind) || !["progress", "commentary", "final", "unknown"].includes(channel)) return;
     const value = text(payload.text) ?? text(nested.text) ?? "";
-    const item = items.get(id) ?? { id, kind, channel, delta: "", completed: "", seq, sourceEventId, itemId };
+    const item = items.get(id) ?? { id, kind, channel, delta: "", completed: "", seq, firstSeq: seq, sourceEventId, itemId };
     if (eventType !== "item.started") {
       if (eventType === "item.delta") item.delta += value;
       else item.completed = settledText(item.completed, value);
@@ -100,11 +110,12 @@ export function composeNativeVisibleReply(rows: readonly Row[], scope: Scope): V
       last = compose(item);
       for (const key of items.keys()) closedItems.add(key);
       items = new Map();
+      fromSeq = seq + 1;
     }
   };
   for (const { seq, event, eventType: storedType } of events) {
     const eventType = text(event.eventType) ?? storedType ?? "item.completed";
-    if (eventType === "turn.started") { items = new Map(); last = null; }
+    if (eventType === "turn.started") { items = new Map(); last = null; fromSeq = seq; }
     const payload = record(event.payload);
     if (/^(item|turn|session)\.(completed|failed|cancelled|interrupted|closed)$/.test(eventType) && Array.isArray(payload.outputTails)) {
       payload.outputTails.forEach((raw, index) => {
