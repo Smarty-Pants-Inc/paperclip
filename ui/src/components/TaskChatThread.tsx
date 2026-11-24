@@ -2913,8 +2913,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const tailEndStatus = isTerminalRunStatus(tailRunStatus) ? tailRunStatus :
     tailTerminal?.runState ?? (tailHasFinalResponse ? "succeeded" : tailRunStatus);
   const tailStatus = stoppedHeldReply || (tailEndStatus === "succeeded" && isUserStop(tailRunId ?? "")) ? "cancelled" : tailEndStatus;
-  const tailFinishedAtMs = tailRunFinishedAtMs ?? (tailTerminal ? toMs(tailTerminal.ts) :
-    tailFinalRef.current.item?.atMs ?? (stoppedHeldReply ? toMs(liveStop?.settledAt) : null));
+  const tailFinishedAtMs = (tailHasFinalResponse ? tailFinalRef.current.item?.atMs : undefined) ?? tailRunFinishedAtMs ??
+    (tailTerminal ? toMs(tailTerminal.ts) : stoppedHeldReply ? toMs(liveStop?.settledAt) : null);
   const tailTurnStatus = useMemo(
     () =>
       isTerminalRunStatus(tailStatus)
