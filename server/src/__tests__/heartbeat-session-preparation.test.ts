@@ -41,7 +41,8 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
         // Settle the fixture's work so no automatic unfinished-task retry
         // competes with the next explicit session-continuation wake.
         await db.update(issues).set({ status: "done" }).where(eq(issues.id, String(input.context.issueId)));
-        return { exitCode: 0, signal: null, timedOut: false, sessionId: "saved-session", sessionParams: { sessionId: "saved-session", adapterState: "preserved" }, resultJson: {} };
+        const sessionId = typeof input.config.fixtureSessionId === "string" ? input.config.fixtureSessionId : "saved-session";
+        return { exitCode: 0, signal: null, timedOut: false, sessionId, sessionParams: { sessionId, adapterState: "preserved" }, resultJson: {} };
       },
       testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }),
     });
@@ -265,6 +266,21 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       await rm(cwd, { recursive: true, force: true });
       await db.delete(plugins).where(eq(plugins.id, storage.pluginId));
       await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false, enableIsolatedWorkspacesByDefault: false });
+    }
+  });
+
+  it("continues Pi across a changed config fingerprint only in continuous mode", async () => {
+    for (const sessionContinuity of ["continuous", "paperclip"]) {
+      const f = await seed(), sessionId = randomUUID();
+      const adapterConfig = { provider: "pi_rpc", model: "model-a", sessionContinuity, fixtureSessionId: sessionId, env: { PACK_NOTE: "old" } };
+      await db.update(agents).set({ adapterConfig }).where(eq(agents.id, f.agentId));
+      await execute(f);
+      await db.update(agents).set({ adapterConfig: { ...adapterConfig, env: { PACK_NOTE: "new" } } }).where(eq(agents.id, f.agentId));
+      const next = await execute(f);
+      expect(next.input.runtime.sessionId).toBe(sessionContinuity === "continuous" ? sessionId : null);
+      expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: {
+        reset: sessionContinuity !== "continuous", taskSessionReused: sessionContinuity === "continuous", changedCategories: ["adapterConfig"],
+      } } });
     }
   });
 
