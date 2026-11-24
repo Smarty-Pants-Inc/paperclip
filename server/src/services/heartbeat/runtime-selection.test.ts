@@ -4,7 +4,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { activityLog, agents, authUsers, companyMemberships, companySkillRepositorySnapshots, principalPermissionGrants, environments, environmentLeases, companies, completionContracts, costEvents, createDb, applyPendingMigrations, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, executionWorkspaces, heartbeatRuns, issues, nativeRunFinalizations, workspaceOperations, type Db } from "@paperclipai/db";
+import { activityLog, agents, agentTaskSessions, authUsers, companyMemberships, companySkillRepositorySnapshots, principalPermissionGrants, environments, environmentLeases, companies, completionContracts, costEvents, createDb, applyPendingMigrations, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, executionWorkspaces, heartbeatRuns, issues, nativeRunFinalizations, workspaceOperations, type Db } from "@paperclipai/db";
 import { accountRunCost } from "../run-cost-accounting.js";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -33,6 +33,8 @@ import { legacyControllerClaim } from "../legacy-controller-lease.js";
 import { agentInstructionWorkingCopyService } from "../agent-instruction-working-copies.js";
 import { createHeartbeatInstructionWorkingCopy } from "./instruction-working-copy.js";
 import { environmentService } from "../environments.js";
+import { prepareHeartbeatSession } from "./session-preparation.js";
+import { getAdapterSessionCodec } from "./run-state.js";
 
 // Keep the real contract, session, and runtime-selection transactions. Replace only
 // filesystem materialization and sandbox synchronization at their external boundaries.
@@ -421,6 +423,50 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       payload: expect.objectContaining({ state: changed ? "saved" : "unchanged", contract: "agent_files", errorCode: null }) }));
     if (changed) expect(await readFile(join(canonical, "memory.txt"), "utf8")).toBe("Synthetic changed memory.\n");
   }, 45_000);
+
+  it.each(["cancelled", "failed"] as const)("continues a %s uncommitted first turn without a published session pointer", async status => {
+    const { input, run, agent, issue } = await fixture();
+    input.config.runtimeConfig = { provider: "codex", sessionContinuity: "continuous" };
+    const prior = await selectHeartbeatRuntime(db, input);
+    if (!prior.selected || !prior.nativeExecution) throw new Error("Expected prior selection");
+    const sessionId = prior.nativeExecution.session.normalizedSessionId;
+    await db.update(heartbeatRuns).set({ status, runnerProfileJson: { ...(await read(run.id)).runnerProfileJson, sessionCheckpoint: {
+      backendKind: "runner", driverKind: "codex_app_server", sessionId: "retained-provider-thread", providerSessionId: "retained-provider-thread",
+      identity: { ...prior.nativeExecution.binding, sessionId }, activeTurnId: "interrupted-turn", cursor: 10,
+    } } }).where(eq(heartbeatRuns.id, run.id));
+    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", resultId: null }).where(eq(nativeRunFinalizations.runId, run.id));
+    const [next] = await db.insert(heartbeatRuns).values({ companyId: agent.companyId, agentId: agent.id, issueId: issue.id,
+      scopeKind: "issue", status: "running", createdAt: new Date(run.createdAt.getTime() + 1000) }).returning();
+    const [stub] = status === "cancelled" ? await db.insert(agentTaskSessions).values({ companyId: agent.companyId,
+      agentId: agent.id, adapterType: agent.adapterType, taskKey: issue.id }).returning() : [null];
+    const preparation: Parameters<typeof prepareHeartbeatSession>[1] = { run: next, agent,
+      task: { context: { forceFreshSession: true, wakeReason: status === "cancelled" ? "issue_commented" : "issue_recovery_action_restored", explicitUserContinuation: status === "cancelled" }, issueRef: issue, issueContext: null,
+        taskProjectContext: null, workspaceProjectContext: null, wakeCommentId: null, acceptedPlanContinuationWake: false, acceptedPlanWakeRoutingDecision: null },
+      session: { taskSession: stub, taskSessionDecodedParams: null, explicitResumeSessionParams: null, explicitResumeSessionDisplayId: null, sessionCodec: getAdapterSessionCodec(agent.adapterType) },
+      config: { runtimeConfig: input.config.runtimeConfig, agentIdentity: undefined, issueAssigneeOverrides: null, originalAiIssueOverrides: null,
+        managedAiRuntime: undefined, aiBinding: undefined, requestedAiBinding: undefined, secretManifest: [], runtimeSkillEntries: [], routineEnvContext: { env: null } },
+      workspace: { requestedExecutionWorkspaceMode: "shared_workspace", effectiveExecutionWorkspaceMode: "shared_workspace", projectExecutionWorkspacePolicy: null,
+        issueExecutionWorkspaceSettings: null, executionPolicy: {} as never, requestedReusableExecutionWorkspaceConfig: null, reusableExistingExecutionWorkspace: null },
+      environment: { environmentResolution: { environmentId: null, source: "default" }, selectedEnvironmentId: null, selectedEnvironmentForConfig: null }, getLatestAgentConfigRevision: async () => ({ id: agent.id, changedKeys: [], createdAt: run.createdAt }) };
+    const prepared = await prepareHeartbeatSession(db, preparation);
+    expect(prepared.taskResumeSessionId).toBe(sessionId);
+    expect((await prepareHeartbeatSession(db, { ...preparation, task: { ...preparation.task, context: { explicitFreshSession: true } } })).taskResumeSessionId).toBeNull();
+    expect((await prepareHeartbeatSession(db, { ...preparation, task: { ...preparation.task, context: { conversationSessionGeneration: 1 } } })).taskResumeSessionId).toBeNull();
+    const paperclip = await prepareHeartbeatSession(db, { ...preparation,
+      config: { ...preparation.config, runtimeConfig: { provider: "codex", sessionContinuity: "paperclip" } } });
+    expect(paperclip.taskResumeSessionId).toBeNull();
+    if (stub) {
+      expect(paperclip.sessionConfigFreshness.reasons).toEqual([
+        "effective run configuration fingerprint metadata is missing", "forceFreshSession was requested",
+      ]);
+      expect(paperclip.resetTaskSession).toBe(true);
+      expect(paperclip.taskSessionForRun).toBeNull();
+    }
+    input.run = next; input.session.taskResumeSessionId = prepared.taskResumeSessionId;
+    const selected = await selectHeartbeatRuntime(db, input);
+    expect(selected).toMatchObject({ selected: true, nativeExecution: { session: { normalizedSessionId: sessionId } } });
+    expect((await read(next.id)).runnerProfileJson?.sessionCheckpoint).toMatchObject({ providerSessionId: "retained-provider-thread", activeTurnId: null });
+  });
 
   it.each([true, false])("records which earlier run a follow-up's process identity came from (prior identity: %s)", async priorIdentity => {
     const { input, run, agent, issue } = await fixture();

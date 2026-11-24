@@ -12,6 +12,8 @@ import { insertMigratedNativeRunnerCheckpoint, loadNativeRunnerCheckpoint } from
 import { offlineMigrationExecutionWhere } from "../offline-migration-execution.js";
 import { redactRunnerApiPayloads } from "./runner-api-log-redaction.js";
 import { NATIVE_AGENT_DIRECTORY_BUSY_WAIT, NATIVE_RETAINED_OWNER_WAIT } from "./native-recovery-wait-codes.js";
+import { piRetirementProves } from "./native-pi-retirement.js";
+import { resolveSessionContinuity } from "./continued-session.js";
 
 export { NATIVE_AGENT_DIRECTORY_BUSY_WAIT, NATIVE_RETAINED_OWNER_WAIT };
 
@@ -215,10 +217,29 @@ const WORKSPACE_ALLOCATION = new RegExp(`^(${UUID})(?:-[1-9][0-9]*-${UUID})?$`);
 /** Bind a read of retained Runner lifecycle to the surviving sandbox and
  * return the directory that Runner wrote under. The ordinary admission owner
  * still checks current permissions before execution. */
-export async function assertNativeRetainedSandboxBinding(db: Db, input: {
+interface RetainedSandboxBindingInput {
   companyId: string; issueId: string; runId: string;
   target: Extract<AdapterExecutionTarget, { kind: "remote" }>;
-}): Promise<{ remoteCwd: string }> {
+  provider?: string;
+  sessionContinuity?: "continuous" | "paperclip";
+  piRetirementProof?: Record<string, unknown>;
+}
+
+export async function assertNativeRetainedSandboxBinding(db: Db, input: RetainedSandboxBindingInput): Promise<{ remoteCwd: string }> {
+  return readNativeRetainedSandboxBinding(db, input, false);
+}
+
+/** Allocation/lease authorization for the physical stop door ONLY. This is not
+ * a result, absence, suspension or adoption receipt; the caller must still stop
+ * Runner + Pi and ingest their tail before issuing a PiRetirementProof. */
+export async function assertNativePiRetirementAllocation(db: Db, input: RetainedSandboxBindingInput): Promise<{ remoteCwd: string }> {
+  if (input.provider !== "pi_rpc" || resolveSessionContinuity(input.provider, input.sessionContinuity) !== "continuous") {
+    throw new Error("native_pi_retirement_scope_mismatch");
+  }
+  return readNativeRetainedSandboxBinding(db, input, true);
+}
+
+async function readNativeRetainedSandboxBinding(db: Db, input: RetainedSandboxBindingInput, physicalStopPreflight: boolean): Promise<{ remoteCwd: string }> {
   const { target } = input;
   if (target.transport !== "sandbox" || target.sandboxLeaseAcquisition?.outcome !== "resumed"
     || !target.providerKey || !target.environmentId || !target.leaseId) {
@@ -232,7 +253,11 @@ export async function assertNativeRetainedSandboxBinding(db: Db, input: {
     eq(environmentLeases.heartbeatRunId, input.runId), eq(environmentLeases.environmentId, target.environmentId),
     eq(environmentLeases.provider, target.providerKey), eq(environmentLeases.providerLeaseId, target.sandboxLeaseAcquisition.providerLeaseId)));
   const recordedCwd = leases.length === 1 ? leases[0].metadata?.remoteCwd : undefined;
-  if (!owner || !owner.resultId || owner.recoveryState || typeof recordedCwd !== "string"
+  const proof = input.piRetirementProof;
+  const exitProven = input.provider === "pi_rpc" && resolveSessionContinuity(input.provider, input.sessionContinuity) === "continuous"
+    && proof?.runId === input.runId && piRetirementProves(proof, proof);
+  const uncommittedResult = (physicalStopPreflight || exitProven) && owner && (owner.phase !== "committed" || !owner.resultId);
+  if (!owner || (!uncommittedResult && (!owner.resultId || owner.recoveryState)) || typeof recordedCwd !== "string"
     || !sameSandboxWorkspaceAllocation(recordedCwd, target.remoteCwd)
     || !["active", "released", "expired"].includes(leases[0].status)) {
     throw new Error("native_controller_recovery_missing_evidence:retained_sandbox_binding");
@@ -240,7 +265,7 @@ export async function assertNativeRetainedSandboxBinding(db: Db, input: {
   if (owner.leaseOwner && owner.leaseExpiresAt && owner.leaseExpiresAt > new Date()) {
     throw new NativeControllerRecoveryWaitingError(owner.leaseExpiresAt);
   }
-  if (owner.leaseOwner || owner.phase !== "committed") {
+  if (owner.leaseOwner || (!uncommittedResult && owner.phase !== "committed")) {
     throw new Error("native_controller_recovery_missing_evidence:retained_sandbox_binding");
   }
   return { remoteCwd: recordedCwd };

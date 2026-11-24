@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { activityLog, agents, authUsers, companyMemberships, createDb, environmentLeases, environments, heartbeatRuns, issueComments,
-  issueRecoveryActions, issueRelations, issues } from "@paperclipai/db";
+  issueRecoveryActions, issueRelations, issues, nativeRunFinalizations } from "@paperclipai/db";
 import { NativePredecessorRetirementUnprovenError } from "../services/native-runtime/predecessor-retirement.js";
 import { NativeProviderArtifactTransferTimeoutError } from "../services/native-runtime/native-provider-artifacts.js";
 import { taskInterruptionPresentation } from "../services/task-interruption-presentation.js";
@@ -14,7 +14,7 @@ import { describe, expect, it, vi } from "vitest";
 import { logger } from "../middleware/logger.js";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
-import { closeIdleWarmNativeSessionsForRestart, scopedRunnerdStateRoot } from "../services/native-runtime/native-session-executor.js";
+import { closeIdleWarmNativeSessionsForRestart, restoreRemoteSuspendedRunnerCheckpoint, retireRefusedContinuousPiOwner, scopedRunnerdStateRoot } from "../services/native-runtime/native-session-executor.js";
 import { nativeRestartFixture, waitForCondition } from "./helpers/native-restart-fixture.js";
 import { getRecoveryPostgresSupport } from "./helpers/recovery-postgres-fixture.js";
 
@@ -45,8 +45,8 @@ type AdmissionFailure = { remaining: number; turnNeverIssued: boolean; environme
   sessionRoots: string[] };
 
 function nativeBackend(db: ReturnType<typeof createDb>, options: { failDescriptorOnce?: { failed: boolean };
-  unretiredPredecessorOnce?: { failed: boolean; environmentId: string; taskBlocked?: boolean; repeat?: string[] }; turnMessages?: Map<string, string>;
-  admissionFailure?: AdmissionFailure } = {}):
+  unretiredPredecessorOnce?: { failed: boolean; environmentId: string; taskBlocked?: boolean; repeat?: string[]; freshSessionRequired?: boolean; preDoorRunId?: string }; turnMessages?: Map<string, string>;
+  admissionFailure?: AdmissionFailure; beforeRetirementFailure?: (runId: string, issueId: string) => Promise<void> } = {}):
   NonNullable<HeartbeatServiceOptions["nativeSessionBackendFactory"]> {
   return execution => {
     let identity: NativeRunIdentity;
@@ -99,8 +99,32 @@ function nativeBackend(db: ReturnType<typeof createDb>, options: { failDescripto
           await db.insert(environmentLeases).values({ companyId: run!.companyId, environmentId: unretired.environmentId,
             issueId: execution.binding.issueId, heartbeatRunId: run!.id, provider: "daytona", providerLeaseId: "sandbox-reused",
             leasePolicy: "reuse_by_environment", status: "active", metadata: { remoteCwd: "/workspace" } });
+          await options.beforeRetirementFailure?.(run!.id, execution.binding.issueId);
+          if (unretired.preDoorRunId) {
+            // Real uncommitted predecessor row + missing local authority. Let
+            // the actual pre-door restore branch, not a fabricated error,
+            // choose the typed visible failure consumed by run completion.
+            await db.insert(heartbeatRuns).values({ ...run!, id: unretired.preDoorRunId, status: "cancelled",
+              startedAt: new Date(), finishedAt: new Date(), retryOfRunId: null });
+            await db.insert(nativeRunFinalizations).values({ runId: unretired.preDoorRunId,
+              companyId: run!.companyId, issueId: execution.binding.issueId, phase: "observed" });
+            const root = scopedRunnerdStateRoot(execution);
+            mkdirSync(join(root, "control-plane"), { recursive: true, mode: 0o700 });
+            writeFileSync(join(root, "control-plane/control-plane-state.json"), JSON.stringify({
+              schema: "paperclip.runner.durable.control-plane-state.v1", identity: {
+                runId: unretired.preDoorRunId, normalizedSessionId: execution.session.normalizedSessionId,
+                runnerInstanceId: "pre-door-prior-runner", environmentLeaseId: "pre-door-prior-lease" } }));
+            const input = { db, execution, sessionContinuity: "continuous" as const,
+              runnerExecutionTarget: { kind: "remote" as const, transport: "sandbox" as const, remoteCwd: "/workspace",
+                sandboxLeaseAcquisition: { outcome: "resumed" as const, providerLeaseId: "sandbox-reused" } } };
+            await restoreRemoteSuspendedRunnerCheckpoint(input, root); // Must defer to the door, not refuse here.
+            await retireRefusedContinuousPiOwner(input, root, { runId: unretired.preDoorRunId,
+              normalizedSessionId: execution.session.normalizedSessionId!, runnerInstanceId: "pre-door-prior-runner",
+              environmentLeaseId: "pre-door-prior-lease", turnId: "prior-turn", itemId: "prior-item" });
+            throw new Error("the door must not admit an uncommitted predecessor without exit proof");
+          }
           throw new NativePredecessorRetirementUnprovenError("previous-run", "sandbox-reused",
-            new Error("Controller journal drain timed out; preserve the session before replacing its writer."));
+            new Error("Controller journal drain timed out; preserve the session before replacing its writer."), unretired.freshSessionRequired);
         }
         const [run] = await db.select({ runnerInstanceId: heartbeatRuns.runnerInstanceId }).from(heartbeatRuns)
           .where(eq(heartbeatRuns.id, execution.binding.runId));
@@ -140,13 +164,13 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
   const fixture = nativeRestartFixture({});
 
   async function startTask(db: ReturnType<typeof createDb>, heartbeat: ReturnType<typeof heartbeatService>,
-    status: "in_progress" | "blocked" = "in_progress") {
+    status: "in_progress" | "blocked" = "in_progress", provider = "codex") {
     const { companyId, agentId } = fixture.current;
     const userId = randomUUID();
     await db.insert(authUsers).values({ id: userId, name: "Task owner", email: `${userId}@example.invalid`,
       createdAt: new Date(), updatedAt: new Date() });
     await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId, membershipRole: "owner" });
-    await db.update(agents).set({ status: "idle", adapterConfig: { provider: "codex" } }).where(eq(agents.id, agentId));
+    await db.update(agents).set({ status: "idle", adapterConfig: { provider } }).where(eq(agents.id, agentId));
     await instanceSettingsService(db).updateExperimental({ enableAgentChat: true, enableNativeRunner: true });
     const [issue] = await db.insert(issues).values({ companyId, title: "Survive a database fault", status,
       assigneeAgentId: agentId, responsibleUserId: userId, conversationAgentId: agentId, conversationUserId: userId,
@@ -203,29 +227,36 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
     }
   }, 90_000);
 
-  it("re-queues a run whose predecessor could not be retired onto a fresh sandbox without a Retry", async () => {
+  it.each([{ freshSessionRequired: false, preDoor: false }, { freshSessionRequired: true, preDoor: false },
+    { freshSessionRequired: true, preDoor: true }])("re-queues an unretired predecessor onto a fresh sandbox (fresh session = $freshSessionRequired, pre-door absent authority = $preDoor)", async ({ freshSessionRequired, preDoor }) => {
     const { companyId } = fixture.current;
+    const predecessorRunId = preDoor ? randomUUID() : "previous-run";
     const db = createDb(fixture.current.temporary.connectionString, { maxConnections: 4 });
     const [environment] = await db.insert(environments).values({ name: `reused-${randomUUID()}`, driver: "sandbox" }).returning();
     const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: nativeBackend(db,
-      { unretiredPredecessorOnce: { failed: false, environmentId: environment!.id } }) });
+      { unretiredPredecessorOnce: { failed: false, environmentId: environment!.id, freshSessionRequired,
+        ...(preDoor ? { preDoorRunId: predecessorRunId } : {}) } }) });
     try {
-      const { issueId, runId } = await startTask(db, heartbeat);
+      const { issueId, runId } = await startTask(db, heartbeat, "in_progress", freshSessionRequired ? "pi_rpc" : "codex");
       const [failed] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       expect(failed).toMatchObject({ status: "failed", runtimeMode: "native", errorCode: "adapter_failed",
         resultJson: expect.objectContaining({ failureCause: "native_predecessor_retirement_unproven",
           executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
           predecessorRetirementFallback: expect.objectContaining({ version: 1, providerWorkStarted: false,
-            predecessorRunId: "previous-run", replacedProviderLeaseIds: ["sandbox-reused"] }) }) });
+            predecessorRunId, replacedProviderLeaseIds: ["sandbox-reused"] }) }) });
       // The reused sandbox is replaced at the next acquisition, not resumed.
       const [lease] = await db.select().from(environmentLeases).where(and(eq(environmentLeases.heartbeatRunId, runId),
         eq(environmentLeases.providerLeaseId, "sandbox-reused")));
       expect(lease?.metadata).toMatchObject({ replaceBeforeReuse: { schema: "paperclip.replace-before-reuse.v1", runId,
-        predecessorRunId: "previous-run" } });
+        predecessorRunId } });
       expect(await db.select().from(activityLog).where(and(eq(activityLog.runId, runId),
         eq(activityLog.action, "environment.lease_replacement_requested")))).toHaveLength(1);
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      expect(comments.filter(c => c.conversationSessionGeneration != null)).toHaveLength(freshSessionRequired ? 1 : 0);
+      expect(comments.filter(c => c.body.includes("could not be stopped safely"))).toHaveLength(freshSessionRequired ? 1 : 0);
       const successors = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
         eq(heartbeatRuns.retryOfRunId, runId)));
+      if (freshSessionRequired) expect(successors[0]!.contextSnapshot?.explicitFreshSession).toBe(true);
       expect(successors).toEqual([expect.objectContaining({ scheduledRetryReason: "interrupted_preparation", scheduledRetryAttempt: 1 })]);
       expect(successors[0]!.contextSnapshot?.executionRetryAccounting).toMatchObject({ failureRetries: 0 });
       expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).not.toBe("blocked");
@@ -236,11 +267,78 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
       await waitForCondition("the retry to succeed", async () =>
         (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successors[0]!.id)))[0]?.status === "succeeded");
       await waitForCondition("the retry to settle", () => heartbeat.getTaskDrainStatus().quiescent);
+      const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successors[0]!.id));
+      if (freshSessionRequired) expect(finished!.nativeSessionId).not.toBe(failed!.nativeSessionId);
+      expect((await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).filter(c => c.body === "Done.")).toHaveLength(1);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, issueId))).filter(r => r.status === "failed")).toHaveLength(1);
       expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(0);
+      if (preDoor) {
+        const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+        const [message] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user",
+          authorUserId: issue!.conversationUserId!, body: "Next message after fresh recovery." }).returning();
+        const next = await heartbeat.wakeup(fixture.current.agentId, { source: "on_demand", triggerDetail: "manual",
+          reason: "issue_commented", requestedByActorType: "user", requestedByActorId: issue!.conversationUserId!, manualUserWake: true,
+          payload: { issueId, commentId: message!.id }, contextSnapshot: { issueId, taskKey: issueId, wakeCommentId: message!.id } });
+        expect(next).not.toBeNull();
+        await waitForCondition("next message after fresh recovery to settle", () => heartbeat.getTaskDrainStatus().quiescent);
+        expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next!.id)))[0]?.status).toBe("succeeded");
+        const finalComments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+        expect(finalComments.filter(c => c.body === "Done.")).toHaveLength(2);
+        expect(finalComments.filter(c => c.conversationSessionGeneration != null)).toHaveLength(1);
+        expect(finalComments.filter(c => c.body.includes("could not be stopped safely"))).toHaveLength(1);
+      }
     } finally {
       await heartbeat.drainActiveRunExecutions();
       await closeIdleWarmNativeSessionsForRestart();
       await db.$client.end();
+    }
+  }, 90_000);
+
+  // Never-OK: cleanup failure must not hide a continuity break; task FK key-share locks must not deadlock its notice.
+  it("writes a visible fresh-session failure despite coordinator-close failure while a task key-share lock is held", async () => {
+    const { companyId } = fixture.current;
+    const db = createDb(fixture.current.temporary.connectionString, { maxConnections: 4 });
+    const [environment] = await db.insert(environments).values({ name: `close-fault-${randomUUID()}`, driver: "sandbox" }).returning();
+    const name = `retirement_close_${randomUUID().replaceAll("-", "")}`;
+    const release = Promise.withResolvers<void>(), acquired = Promise.withResolvers<void>();
+    let keyShare: Promise<unknown> | undefined, noticeObservation: Promise<unknown> | undefined, triggered = false;
+    let noticeError: unknown;
+    const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: nativeBackend(db, {
+      unretiredPredecessorOnce: { failed: false, environmentId: environment!.id, freshSessionRequired: true },
+      beforeRetirementFailure: async (runId, issueId) => {
+        await db.$client.unsafe(`CREATE FUNCTION ${name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+          IF NEW.run_id = '${runId}'::uuid AND NEW.phase = 'terminal_failure' AND NEW.failure_code = 'native_pre_dispatch_failure'
+          THEN RAISE EXCEPTION 'injected coordinator-close failure'; END IF; RETURN NEW; END $$;
+          CREATE TRIGGER ${name} BEFORE UPDATE ON native_run_finalizations FOR EACH ROW EXECUTE FUNCTION ${name}()`);
+        triggered = true;
+        keyShare = db.transaction(async tx => {
+          await tx.execute(sql`select id from issues where id = ${issueId} for key share`);
+          acquired.resolve(); await release.promise;
+        });
+        await acquired.promise;
+        // The remainder of stock failure cleanup can need a stronger lock;
+        // retain KEY SHARE only until this marker transaction finishes.
+        noticeObservation = waitForCondition("notice to commit under KEY SHARE", async () =>
+          (await db.select().from(issueComments).where(eq(issueComments.createdByRunId, runId)))
+            .some(comment => comment.conversationSessionGeneration != null), 5_000)
+          .catch(error => { noticeError = error; }).finally(() => release.resolve());
+      },
+    }) });
+    try {
+      const { issueId, runId } = await startTask(db, heartbeat, "in_progress", "pi_rpc");
+      await noticeObservation; expect(noticeError).toBeUndefined();
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      expect(comments.filter(c => c.conversationSessionGeneration != null)).toHaveLength(1);
+      expect(comments.filter(c => c.body.includes("could not be stopped safely") && c.body.includes(runId))).toHaveLength(1);
+      expect(await db.select().from(activityLog).where(and(eq(activityLog.runId, runId), eq(activityLog.action, "issue.comment_added"))))
+        .toHaveLength(2);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]).toMatchObject({ status: "failed" });
+      expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.retryOfRunId, runId))))
+        .toHaveLength(0);
+    } finally {
+      release.resolve(); await keyShare; await noticeObservation;
+      if (triggered) await db.$client.unsafe(`DROP TRIGGER ${name} ON native_run_finalizations; DROP FUNCTION ${name}()`);
+      await heartbeat.drainActiveRunExecutions(); await closeIdleWarmNativeSessionsForRestart(); await db.$client.end();
     }
   }, 90_000);
 
