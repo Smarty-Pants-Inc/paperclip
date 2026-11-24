@@ -12943,8 +12943,7 @@ async function executePaperclipNativeSessionAttempt(
               const [stopRun] = await input.db.select({ resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns)
                 .where(eq(heartbeatRuns.id, input.execution.binding.runId)).limit(1);
               const isConversation = conversation?.agentId === input.execution.binding.agentId
-                || (input.execution.provider.kind === "pi_rpc" &&
-                  (input.execution.turnIntent === "conversation_reply" || input.execution.provider.conversationMode === true))
+                || (input.execution.provider.kind === "pi_rpc" && input.execution.provider.conversationMode === true)
                 || (record(record(stopRun?.resultJson).personStop).requestedAt !== undefined
                   && !record(record(stopRun?.resultJson).personStop).resumedAt);
               // Held finals are durable before turn.completed. A replacement
