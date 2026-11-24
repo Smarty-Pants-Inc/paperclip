@@ -17,6 +17,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueAccessGrants,
+  issueComments,
   issues,
   nativeRunFinalizations,
   toolApplications,
@@ -554,6 +555,43 @@ describeEmbeddedPostgres("heartbeat run privacy routes", { concurrent: false }, 
     expect(activity.find((row) => row.action === "issue.updated")).toMatchObject({ actorType: "user",
       actorId: fixture.ownerUserId, entityId: fixture.issueId, details: expect.objectContaining({ status: "todo",
         previousStatus: "in_progress", reason: "stopped_while_waiting" }) });
+  });
+
+  it.each(["queued", "preparing", "native"] as const)("Stop returns the undelivered prompt while %s", async phase => {
+    const f = await seedFixture(), mine = randomUUID(), other = randomUUID();
+    await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, f.ownerAgentId));
+    await db.insert(issueComments).values([mine, other].map(id => ({ id, companyId: f.companyId, issueId: f.issueId,
+      authorUserId: id === mine ? f.ownerUserId : f.otherUserId, body: "Undelivered prompt" })));
+    await db.update(heartbeatRuns).set({ status: phase === "queued" ? "queued" : "running", finishedAt: null,
+      runtimeMode: phase === "native" ? "native" : "legacy", runtimeModeResolvedAt: null, executionStage: "preparing",
+      nativeIssueId: phase === "native" ? f.issueId : null, driverKind: phase === "native" ? "pi_rpc" : null,
+      runnerProfileJson: phase === "native" ? { nativeExecutionInput: { provider: { kind: "pi_rpc" } } } : { adapterDispatch: { adapterType: "paperclip_runner" } },
+      contextSnapshot: { issueId: f.issueId, wakeCommentIds: [mine, other] }, nextEventSeq: 100,
+    }).where(eq(heartbeatRuns.id, f.privateRunId));
+    if (phase === "native") await db.insert(nativeRunFinalizations).values({ runId: f.privateRunId, companyId: f.companyId, issueId: f.issueId, phase: "observed" });
+    const stopped = await request(createBoardApp(f.companyId, f.ownerUserId)).post(`/api/heartbeat-runs/${f.privateRunId}/cancel`).send({});
+    expect(stopped.status, JSON.stringify(stopped.body)).toBe(200);
+    expect(stopped.body).toMatchObject({ status: "cancelled", resultJson: { personStop: { userId: f.ownerUserId, returned: [mine] } } });
+    expect(stopped.body.resultJson.personStopHeld).toBeUndefined();
+    if (phase !== "queued") expect(stopped.body.resultJson.startupCancellation).toBeTruthy();
+    expect((await db.select().from(issueComments).where(eq(issueComments.id, mine)))[0]?.body).toBe("Undelivered prompt");
+  });
+  it("keeps the hold when a provider turn wins before the locked recheck", async () => {
+    const f = await seedFixture(); await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc" } }).where(eq(agents.id, f.ownerAgentId));
+    await db.update(heartbeatRuns).set({ finishedAt: null, executionStage: "preparing", runtimeModeResolvedAt: null,
+      runnerProfileJson: { adapterDispatch: { adapterType: "paperclip_runner" } }, nextEventSeq: 100,
+    }).where(eq(heartbeatRuns.id, f.privateRunId));
+    const transaction = db.transaction.bind(db);
+    vi.spyOn(db, "transaction").mockImplementationOnce(async (callback, config) => {
+      await db.insert(heartbeatRunEvents).values(["turn.started", "turn.completed"].map((eventType, i) => ({
+        companyId: f.companyId, runId: f.privateRunId, agentId: f.ownerAgentId, seq: i + 2, eventType })));
+      return transaction(callback, config);
+    });
+    const stopped = await request(createBoardApp(f.companyId, f.ownerUserId)).post(`/api/heartbeat-runs/${f.privateRunId}/cancel`).send({});
+    expect(stopped.status).toBe(202);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.privateRunId));
+    expect(run).toMatchObject({ status: "running", resultJson: { personStopHeld: expect.any(Object) } });
+    expect(run.resultJson?.personStop).toBeUndefined(); expect(run.resultJson?.startupCancellation).toBeUndefined();
   });
 
   it("conceals private runs from unauthorized cancellation and watchdog mutations", async () => {
