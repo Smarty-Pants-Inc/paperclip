@@ -2615,7 +2615,7 @@ a.paperclip-mention-chip[data-mention-kind="agent"]::before {
 }
 
 @media (width < 48rem) {
-  .paperclip-mobile-thread .paperclip-markdown :where(ul, ol) {
+  .paperclip-mobile-thread .paperclip-markdown ul {
     padding-left: calc(var(--spacing) * 5);
   }
 }
