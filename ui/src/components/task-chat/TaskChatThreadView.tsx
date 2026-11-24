@@ -446,7 +446,7 @@ export function TaskChatThreadView({
         </div>
       ) : null}
       {history}
-      {tail ? <div data-conversation-typography="" className={streamlined ? "mt-4" : undefined}>{tail}</div> : null}
+      {tail ? <div data-conversation-typography="" className={cn("empty:hidden", streamlined && "mt-4")}>{tail}</div> : null}
     </div>
   );
 
