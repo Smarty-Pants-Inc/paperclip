@@ -49,7 +49,11 @@ async function drain(db: Db, scope: { companyId: string; issueId: string; runId:
         (!options.beforeFirstReply && !Object.keys((row.run.resultJson?.continuousReplies ?? {}) as object).length)) return;
     const board = await readBoardQueuedComments({ executor: db, issue: row.issue, activeRun: row.run, actor });
     const head = board.entries[0];
-    if (board.state !== "deferred" || board.executionWait || board.steeringDisposition !== "available" || !board.queueId ||
+    // A recovery wait saved before admission is stale once this live run owns
+    // the issue and can accept steering. Other waits and all owner/Stop/reset
+    // guards remain authoritative; consume saved person input through its ACK.
+    if (board.state !== "deferred" || (board.executionWait && board.executionWait.reason !== "execution_recovery") ||
+        board.steeringDisposition !== "available" || !board.queueId ||
         !head || head.comment.authorType !== "user" || !head.comment.authorUserId ||
         head.comment.body.trim() === "/new" || head.source?.requiresFreshSession) return;
     const [wake] = await db.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
