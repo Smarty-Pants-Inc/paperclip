@@ -94,6 +94,113 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     const input = { companyId, issueId, runId };
     return { ...input, input, agentId, userId, wakeId, prpEvent, reply };
   }
+  it.each(["Done.", "Stopped."])("saves visible held reply segments through %s, once per final", async terminalText => {
+    await fixture(true, { beforeFinalize: async scope => {
+      await db.update(agents).set({ adapterConfig: { provider: "pi_rpc" } }).where(eq(agents.id, scope.agentId));
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      const execution = { binding: scope, provider: { kind: "pi_rpc" as const } };
+      for (let segment = 0; segment < 2; segment++) {
+        const cursor = 173 + segment * 3;
+        const base = { runId: scope.runId, normalizedSessionId: run.nativeSessionId!, turnId: "hire-turn" };
+        const event = { ...base, eventType: "item.completed" as const, sourceEventId: `visible-final-${segment}`,
+          itemId: `visible-final-${segment}`, payload: { kind: "agentMessage", channel: "final", text: terminalText } };
+        await db.insert(heartbeatRunEvents).values([
+          { companyId: scope.companyId, runId: scope.runId, agentId: scope.agentId, seq: cursor - 2, eventType: "item.completed",
+            payload: { prpEvent: { ...base, itemId: `visible-preview-${segment}`, sourceEventId: `visible-preview-${segment}`,
+              payload: { kind: "agentMessage", channel: segment ? "commentary" : "progress", text: `Before tool ${segment}.` } } } },
+          { companyId: scope.companyId, runId: scope.runId, agentId: scope.agentId, seq: cursor - 1, eventType: "item.completed",
+            payload: { prpEvent: { ...base, itemId: `tool-${segment}`, sourceEventId: `tool-${segment}`,
+              payload: { kind: "toolCall", text: "not assistant prose", input: { command: "read" } } } } },
+          { companyId: scope.companyId, runId: scope.runId, agentId: scope.agentId, seq: cursor, eventType: event.eventType,
+            payload: { prpEvent: event } },
+        ]);
+        await Promise.all([publishContinuousNativeReply({ db, execution, event, cursor }),
+          publishContinuousNativeReply({ db, execution, event, cursor })]);
+        await publishContinuousNativeReply({ db, execution, event, cursor });
+        expect((await comments(scope.runId)).map(c => c.body).sort()).toEqual(
+          Array.from({ length: segment + 1 }, (_, index) => `Before tool ${index}.\n\n${terminalText}`));
+      }
+      const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      expect(Object.keys(saved.resultJson!.continuousReplies as object)).toEqual(["visible-final-0", "visible-final-1"]);
+    } });
+  });
+
+  it("recovers the visible text before a final, not just the final item", async () => {
+    const f = await fixture(true, { beforeFinalize: async scope => {
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      await db.insert(heartbeatRunEvents).values({ companyId: scope.companyId, runId: scope.runId, agentId: scope.agentId,
+        seq: 169, eventType: "item.completed", payload: { prpEvent: { runId: scope.runId, normalizedSessionId: run.nativeSessionId,
+          turnId: "hire-turn", itemId: "before-final", sourceEventId: "before-final",
+          payload: { kind: "agentMessage", channel: "progress", text: "I will check first." } } } });
+    } });
+    await recoverCommittedNativeChatResponse(db, f.input);
+    await recoverCommittedNativeChatResponse(db, f.input);
+    expect((await comments(f.runId)).map(c => c.body)).toEqual([`I will check first.\n\n${f.reply}`]);
+  });
+
+  it.each(["cancelled", "interrupted", "failed", "timed_out"])("retains a %s turn's partial visible reply without granting agent writes", async status => {
+    const f = await fixture(true);
+    await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.runId));
+    await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId));
+    const base = { runId: f.runId, normalizedSessionId: f.prpEvent.normalizedSessionId, turnId: "stopped-turn" };
+    await db.insert(heartbeatRunEvents).values([
+      { companyId: f.companyId, runId: f.runId, agentId: f.agentId, seq: 1, eventType: "item.completed", payload: { prpEvent: {
+        ...base, itemId: "intro", sourceEventId: "intro", payload: { kind: "agentMessage", channel: "progress", text: "Before tool." } } } },
+      { companyId: f.companyId, runId: f.runId, agentId: f.agentId, seq: 2, eventType: "item.completed", payload: { prpEvent: {
+        ...base, itemId: "tool", sourceEventId: "tool", payload: { kind: "toolCall", text: "not prose" } } } },
+      { companyId: f.companyId, runId: f.runId, agentId: f.agentId, seq: 3, eventType: "item.delta", payload: { prpEvent: {
+        ...base, itemId: "partial", sourceEventId: "partial", payload: { kind: "agentMessage", channel: "progress", text: "Partial answer" } } } },
+    ]);
+    await db.update(heartbeatRuns).set({ status, resultJson: {}, finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+    await recoverCommittedNativeChatResponse(db, f.input);
+    await recoverCommittedNativeChatResponse(db, f.input);
+    expect((await comments(f.runId)).map(c => c.body)).toEqual(["Before tool.\n\nPartial answer"]);
+    if (status === "cancelled") {
+      for (const completionReply of [false, true]) await expect(issueService(db).addComment(f.issueId, "New unauthorized text",
+        { agentId: f.agentId, runId: f.runId }, { completionReply })).rejects.toThrow(/cancelled/);
+    }
+  });
+
+  it("saves a stopped partial after an already-published final as its own segment", async () => {
+    const f = await fixture(true, { beforeFinalize: async scope => {
+      await db.update(agents).set({ adapterConfig: { provider: "pi_rpc" } }).where(eq(agents.id, scope.agentId));
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      const event = { eventType: "item.completed" as const, runId: scope.runId, normalizedSessionId: run.nativeSessionId!,
+        itemId: "first-final", sourceEventId: "first-final", payload: { kind: "agentMessage", channel: "final", text: "OK" } };
+      await db.insert(heartbeatRunEvents).values({ ...scope, seq: 171, eventType: event.eventType, payload: { prpEvent: event } });
+      await publishContinuousNativeReply({ db, execution: { binding: scope, provider: { kind: "pi_rpc" } }, cursor: 171, event });
+      await db.insert(heartbeatRunEvents).values({ ...scope, seq: 172, eventType: "item.delta", payload: { prpEvent: {
+        ...event, itemId: "next-partial", sourceEventId: "next-partial", eventType: "item.delta",
+        payload: { kind: "agentMessage", channel: "progress", text: "Next answer" } } } });
+    } });
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+    await recoverCommittedNativeChatResponse(db, f.input);
+    await recoverCommittedNativeChatResponse(db, f.input);
+    expect((await comments(f.runId)).map(c => c.body).sort()).toEqual(["Next answer", "OK"]);
+  });
+
+  it("replays both persisted reply segments after cancellation without restoring write authority", async () => {
+    const f = await fixture(true);
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc" } }).where(eq(agents.id, f.agentId));
+    for (let index = 0; index < 2; index++) {
+      const base = { runId: f.runId, normalizedSessionId: f.prpEvent.normalizedSessionId, turnId: "hire-turn" };
+      await db.insert(heartbeatRunEvents).values([
+        { companyId: f.companyId, runId: f.runId, agentId: f.agentId, seq: 171 + index * 2, eventType: "item.completed",
+          payload: { prpEvent: { ...base, itemId: `crash-progress-${index}`, sourceEventId: `crash-progress-${index}`,
+            payload: { kind: "agentMessage", channel: "progress", text: `Before tool ${index}.` } } } },
+        { companyId: f.companyId, runId: f.runId, agentId: f.agentId, seq: 172 + index * 2, eventType: "item.completed",
+          payload: { prpEvent: { ...base, itemId: `crash-final-${index}`, sourceEventId: `crash-final-${index}`,
+            payload: { kind: "agentMessage", channel: "final", text: "OK" } } } },
+      ]);
+    }
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+    await recoverCommittedNativeChatResponse(db, f.input);
+    await recoverCommittedNativeChatResponse(db, f.input);
+    expect((await comments(f.runId)).map(c => c.body).sort()).toEqual(["Before tool 0.\n\nOK", "Before tool 1.\n\nOK"]);
+    await expect(issueService(db).addComment(f.issueId, "Not shown", { agentId: f.agentId, runId: f.runId },
+      { persistedVisibleReplyThroughSeq: 172 })).rejects.toThrow(/cancelled/);
+  });
+
   it("settles the exact claimed wake when recovery projects a committed native run", async () => {
     // The provider and result are already committed. Recovery owns terminal
     // projection because the live executor will not return to completeRun.
