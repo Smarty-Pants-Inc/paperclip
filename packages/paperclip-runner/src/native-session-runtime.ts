@@ -3260,8 +3260,30 @@ export async function executeNativeSession(
           : null;
       const checkpointedDispositionTerminal =
         replayedDisposition !== null || dispositionFallback !== null;
+      // A completed turn from this run is not a new conversation input. Its
+      // final may predate this controller's cursor (a held Pi turn can cross a
+      // restart), so settle through durable replay rather than startTurn.
+      const conversationTurnId = recovered && persistedSession && isNativePiConversation(input) &&
+        !recoveredActiveTurnId && !adoptedProviderTerminal && !governedWait &&
+        !checkpointedDispositionTerminal && !recoveredSnapshot.goal && recoveredSnapshot.awaitingProviderTurn !== true &&
+        !recoveredSnapshot.pendingRuntimeRequests?.length && !options.sessionCompaction &&
+        !options.sessionGoalControl && !options.resumeSessionGoalHeartbeat
+        ? persistedSession.terminalTurns?.at(-1)?.turnId ?? null : null;
+      const replayedConversationTerminal = conversationTurnId
+        ? (await replayCheckpointedTurnTerminal({ controlPlane: options.controlPlane,
+            runId: input.binding.runId, sourceInstanceId: options.runnerInstanceId,
+            priorTerminalTurnIds: [], expectedTurnId: conversationTurnId }))?.terminal ?? null : null;
+      if (conversationTurnId && !replayedConversationTerminal) {
+        throw new Error("native_finalization_missing: checkpointed conversation turn has no durable terminal");
+      }
+      const conversationTerminal = replayedConversationTerminal?.eventType === "turn.completed"
+        ? replayedConversationTerminal : null;
+      if (conversationTerminal && (conversationTerminal.runId !== input.binding.runId ||
+          conversationTerminal.normalizedSessionId !== normalizedSessionId)) {
+        throw new NativeSessionProtocolIntegrityError("source_event_replay_conflict");
+      }
       const recoveryTerminal =
-        replayedDisposition?.terminal ?? dispositionFallback;
+        replayedDisposition?.terminal ?? dispositionFallback ?? conversationTerminal;
       const awaitedTurnId = persistedSession?.terminalTurns?.at(-1)?.turnId ?? null;
       const awaitedTerminal = recovered && recoveredSnapshot.awaitingProviderTurn === true && !recoveredActiveTurnId &&
           !recoveredSnapshot.semanticResult && !governedWait && !checkpointedDispositionTerminal && awaitedTurnId !== null
@@ -3337,6 +3359,7 @@ export async function executeNativeSession(
           (!recoveredActiveTurnId &&
             !adoptedProviderTerminal &&
             !checkpointedDispositionTerminal &&
+            !conversationTerminal &&
             !dispositionRecoveryStillOwned &&
             !resumedProviderTurnWait));
         if (options.sessionCompaction) {
