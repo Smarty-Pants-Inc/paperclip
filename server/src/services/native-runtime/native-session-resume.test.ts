@@ -240,7 +240,7 @@ function previousRun(overrides: Record<string, unknown> = {}) {
   };
 }
 
-it.each(["model", "piRpcThinkingLevel", "kind", "conversationMode", "runtimeContext"])("keeps Pi continuity strict except model/level: %s", (key) => {
+it.each(["model", "piRpcThinkingLevel", "kind", "conversationMode", "runtimeContext"])("keeps Pi continuity strict except model/level/runtime context: %s", (key) => {
   const pi = (runId: string) => parseNativeExecutionInput({ ...execution(runId), provider: { kind: "pi_rpc", model: "prior", piRpcThinkingLevel: "low" }, session: { ...execution(runId).session, driverKind: "pi_rpc" } });
   const prior = pi(previousRunId), current = pi(currentRunId);
   if (key === "runtimeContext" && "runtimeContext" in current) current.runtimeContext.aggregateDigest = "b".repeat(64);
@@ -248,7 +248,7 @@ it.each(["model", "piRpcThinkingLevel", "kind", "conversationMode", "runtimeCont
   const previous = previousRun({ nativeToolContractFingerprint: nativeToolContractFingerprintForTarget("local", "pi_rpc"), nativeExecutionInput: prior });
   for (const sessionContinuity of [undefined, "continuous", "paperclip"]) {
     const result = buildNativeExecutionWithCheckpoint({ previousRun: previous, normalizedSessionId, sessionContinuity, buildExecution: options => { const next = structuredClone(current); next.session.normalizedSessionId = options.normalizedSessionId; return next; } });
-    const retained = sessionContinuity !== "paperclip" && (key === "model" || key === "piRpcThinkingLevel");
+    const retained = sessionContinuity !== "paperclip" && (key === "model" || key === "piRpcThinkingLevel" || key === "runtimeContext"); // 0342: a pack / env change continues
     expect(result.normalizedSessionId === normalizedSessionId).toBe(retained);
     expect(result.checkpoint?.sessionId ?? null).toBe(retained ? "provider-thread-123" : null);
     expect(result.execution.provider).toEqual(current.provider);
