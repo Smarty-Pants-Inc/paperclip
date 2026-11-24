@@ -40,7 +40,7 @@ async function drain(db: Db, scope: { companyId: string; issueId: string; runId:
       .where(and(eq(heartbeatRuns.id, scope.runId), eq(heartbeatRuns.companyId, scope.companyId),
         eq(heartbeatRuns.agentId, scope.agentId), eq(heartbeatRuns.nativeIssueId, scope.issueId)));
     if (!row || row.run.status !== "running" || row.run.runtimeMode !== "native" || agentRunWritesRevoked(row.run) ||
-        (parseObject(row.run.resultJson?.personStop).requestedAt && !parseObject(row.run.resultJson?.personStop).resumedAt) ||
+        (parseObject(row.run.resultJson?.personStop).requestedAt && !parseObject(row.run.resultJson?.personStop).settledAt && !parseObject(row.run.resultJson?.personStop).resumedAt) ||
         row.issue.executionRunId !== scope.runId || row.issue.assigneeAgentId !== scope.agentId ||
         (row.issue.conversationAgentId && (row.issue.conversationAgentId !== scope.agentId || row.issue.conversationState !== "active" ||
           row.run.contextSnapshot?.conversationSessionGeneration !== row.issue.conversationSessionGeneration)) ||
