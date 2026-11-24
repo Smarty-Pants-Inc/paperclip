@@ -1265,6 +1265,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // Runs observed non-terminal while mounted: their turns ANIMATE the fold when
   // they settle. Runs already terminal at mount collapse instantly.
   const liveSeenRef = useRef<Set<string>>(new Set());
+  const liveSegmentClock = useRef({ liveKey: "", ends: new Map<string, number>() });
   useEffect(() => {
     if (liveRun) liveSeenRef.current.add(liveRun.id);
   }, [liveRun]);
@@ -2341,7 +2342,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         const turnId = segmented
           ? `${source.id}:turn:${segmentIndex}`
           : `${source.id}:turn`;
-        const segmentFinishedMs = (segmented ? finalResponse?.atMs : undefined) ?? (Number.isFinite(segment.endMs)
+        const segmentKey = `${source.id}:${segmentIndex}`;
+        if (finalResponse && liveSegmentClock.current.liveKey === segmentKey && !liveSegmentClock.current.ends.has(segmentKey)) liveSegmentClock.current.ends.set(segmentKey, Math.max(finalResponse.atMs ?? 0, Date.now()));
+        const segmentFinishedMs = liveSegmentClock.current.ends.get(segmentKey) ?? (segmented ? finalResponse?.atMs : undefined) ?? (Number.isFinite(segment.endMs)
           ? segment.endMs
           : finished);
         const answerStartMs = sourceIsPaperclipRunner ? segments[segments.slice(0, segmentIndex).findLastIndex(({ entries }) =>
@@ -2380,7 +2383,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             ...(runHealth.failures.length > 0 ? { mcpStartupFailures: runHealth.failures } : {}),
             finalResponse,
             summary: buildTurnSummary(segment.entries, {
-              durationMs: sourceIsPaperclipRunner && segmented ? segmentDurationMs : durationMs,
+              durationMs: sourceIsPaperclipRunner ? segmentDurationMs : durationMs,
               failed,
               personStopped: isUserStop(source.id),
             }),
@@ -2815,6 +2818,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   )) tailFinalRef.current = { runId: tailSegmentKey };
   if (tailFinalResponse && !tailFinalStreaming) tailFinalRef.current.item = tailFinalResponse;
   const tailHasFinalResponse = Boolean(tailFinalRef.current.item) && !tailFinalStreaming;
+  if (liveRun && paperclipRunnerTail && !tailHasFinalResponse) liveSegmentClock.current.liveKey = `${tailRunId}:${tailSegments.length - 1}`;
   const tailTerminal = tailEntries.findLast((entry) => entry.kind === "run_terminal");
   const tailEndStatus = isTerminalRunStatus(tailRunStatus) ? tailRunStatus :
     tailTerminal?.runState ?? (tailHasFinalResponse ? "succeeded" : tailRunStatus);
