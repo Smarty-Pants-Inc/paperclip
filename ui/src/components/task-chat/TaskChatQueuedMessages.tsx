@@ -86,6 +86,7 @@ function queueActionErrorCode(error: unknown): string | null {
 }
 
 export interface TaskChatQueuedMessagesProps {
+  agentStarting?: boolean; stopPending?: boolean;
   conversationMode?: boolean;
   queue: IssueQueuedCommentQueue;
   onEdit: (commentId: string) => void;
@@ -101,6 +102,7 @@ export interface TaskChatQueuedMessagesProps {
 }
 
 function SortableQueuedMessage({
+  agentStarting, stopPending,
   conversationMode,
   entry,
   queue,
@@ -114,6 +116,7 @@ function SortableQueuedMessage({
   onDiscard,
   onCancelAutoSteer,
 }: {
+  agentStarting?: boolean; stopPending?: boolean;
   conversationMode?: boolean;
   entry: IssueQueuedCommentEntry;
   queue: IssueQueuedCommentQueue;
@@ -193,8 +196,8 @@ function SortableQueuedMessage({
         </div> : null}
       </div>
 
-      {queue.executionWait ? <span className="px-1 text-xs text-muted-foreground">Held</span> : conversationMode && queue.steeringDisposition === "temporarily_unavailable" ? (
-        <span className="px-1 text-xs text-muted-foreground">Sends when the agent starts</span>
+      {stopPending ? <span className="px-1 text-xs text-muted-foreground">Queued</span> : queue.executionWait ? <span className="px-1 text-xs text-muted-foreground">Held</span> : conversationMode && queue.steeringDisposition === "temporarily_unavailable" ? (
+        <span className="px-1 text-xs text-muted-foreground">{agentStarting ? "Sends when the agent starts" : "Queued"}</span>
       ) : autoSteerSecondsLeft !== null ? (
         <span className="flex shrink-0 items-center gap-1" data-testid={`task-chat-queued-auto-steer-${entry.comment.id}`}>
           <span className="px-1 text-xs text-muted-foreground tabular-nums">
@@ -297,6 +300,7 @@ function SortableQueuedMessage({
 
 /** Compact production queue shown immediately above the default task composer. */
 export function TaskChatQueuedMessages({
+  agentStarting, stopPending,
   conversationMode,
   queue,
   onEdit,
@@ -569,6 +573,7 @@ export function TaskChatQueuedMessages({
             );
             return (
               <SortableQueuedMessage
+                agentStarting={agentStarting} stopPending={stopPending}
                 conversationMode={conversationMode}
                 key={entry.comment.id}
                 entry={entry}
