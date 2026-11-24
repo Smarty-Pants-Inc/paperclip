@@ -14,7 +14,7 @@ import { createHeartbeatQueue, DEFERRED_WAKE_CONTEXT_KEY, notifyOtherAgentsQueue
 import { createWakeQueue } from "../../modules/wake-queue/index.js";
 import { enrichWakeContextSnapshot, mergeCoalescedContextSnapshot } from "./run-preparation.js";
 import { withQueuedCommentIdsInWakePayload, withQueuedCommentIdsInRunContext } from "../issue-queued-comment-queue.js";
-import { settleConversationTurn } from "../agent-conversations.js";
+import { prepareConversationTurn, settleConversationTurn } from "../agent-conversations.js";
 import { chatCompletionDeliveryService, recordChatCompletion, recordChatHandoff } from "../chat-completion-delivery.js";
 import { createDurableChatWakeupRequest } from "../durable-chat-wakeup.js";
 import { instanceSettingsService } from "../instance-settings.js";
@@ -643,6 +643,171 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     expect(run).toMatchObject({ agentId: f.agent.id, status: "queued" });
     expect(run.contextSnapshot).toMatchObject({ issueId: f.issue.id, wakeReason: "chat_task_completed" });
     expect(f.deps.executeRun).not.toHaveBeenCalled();
+  });
+
+  // FIFO admission: real issue locking, receipt adoption and stock release on disposable PostgreSQL.
+  async function fifoFixture(bodies: string[]) {
+    const f = await waitingConversationFixture();
+    await db.update(issues).set({ conversationState: "active", status: "in_progress" }).where(eq(issues.id, f.issue.id));
+    f.deps.getSchedulingSuppression.mockResolvedValue({ suppressed: false, reason: null });
+    // Provider execution is held; admission, reset preparation and release are real.
+    f.deps.isRunAdmissionClosed = () => true;
+    const queue = createHeartbeatQueue(db, f.deps);
+    // The old run has just ended; there is no running/queued successor and no
+    // release worker left to promote the messages that arrived during it.
+    const [previous] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.agent.id,
+      status: "succeeded", invocationSource: "on_demand", startedAt: new Date(Date.now() - 60_000),
+      finishedAt: new Date(Date.now() - 1_000), contextSnapshot: { issueId: f.issue.id } }).returning();
+    const startedAt = Date.now() - (bodies.length - 1) * 5_000;
+    const comments = await db.insert(issueComments).values(bodies.map((body, index) => ({
+      companyId: f.company.id, issueId: f.issue.id, authorType: "user" as const, authorUserId: f.user.id,
+      body, createdAt: new Date(startedAt + index * 5_000),
+    }))).returning();
+    async function defer(index: number) {
+      const comment = comments[index]!;
+      const [wake] = await db.insert(agentWakeupRequests).values({
+        companyId: f.company.id, agentId: f.agent.id, source: "automation", triggerDetail: "system",
+        reason: "issue_commented", status: "deferred_issue_execution", requestedAt: comment.createdAt,
+        requestedByActorType: "user", requestedByActorId: f.user.id,
+        payload: withQueuedCommentIdsInWakePayload({ issueId: f.issue.id,
+          executionWait: { reason: "execution_recovery", message: "Old run was ending." },
+          _paperclipWakeContext: { issueId: f.issue.id, wakeReason: "issue_commented",
+            ...(comment.body === "/new" ? { forceFreshSession: true } : {}) } }, [comment.id]),
+      }).returning();
+      return wake;
+    }
+    function enqueue(index: number, receipt?: typeof agentWakeupRequests.$inferSelect) {
+      const comment = comments[index]!;
+      return queue.enqueueWakeup(f.agent.id, {
+        source: "automation", triggerDetail: "system", reason: "issue_commented",
+        requestedByActorType: "user", requestedByActorId: f.user.id,
+        payload: { issueId: f.issue.id, commentId: comment.id },
+        contextSnapshot: receipt?.payload?._paperclipWakeContext as Record<string, unknown> | undefined,
+      }, receipt?.id);
+    }
+    const release = createWakeQueue(db, {
+      resolveResponsibleUserId: async () => f.user.id,
+      getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+      resolveSessionBeforeForWakeup: async () => (await db.select().from(agentTaskSessions)
+        .where(eq(agentTaskSessions.taskKey, f.issue.id)))[0]?.sessionDisplayId ?? null,
+      wakeAdmissionHelpers: { filterZombieCoalesceTarget: f.deps.filterZombieCoalesceTarget,
+        mergeCoalescedContextSnapshot, shouldDeferFollowupWakeForSameIssue, shouldQueueFollowupForRunningIssueWake },
+      recovery: { escalateStrandedAssignedIssue: async () => undefined, escalateStrandedRecoveryIssueInPlace: async () => undefined },
+    }).releaseIssueExecution;
+    async function complete(run: typeof heartbeatRuns.$inferSelect) {
+      await db.update(heartbeatRuns).set({ status: "succeeded", startedAt: new Date(), finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, run.id));
+      await release({ companyId: f.company.id, runId: run.id, now: new Date(), suppressImmediateRecovery: true });
+    }
+    async function runs() {
+      return (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agent.id))
+        .orderBy(heartbeatRuns.createdAt)).filter(run => run.id !== previous.id);
+    }
+    return { ...f, queue, comments, defer, enqueue, complete, runs, release };
+  }
+
+  it("FIFO admission: deferred /new precedes a question five seconds later and resets before its new-session answer", async () => {
+    const f = await fifoFixture(["/new", "What session is this?"]);
+    await db.insert(agentTaskSessions).values({ companyId: f.company.id, agentId: f.agent.id,
+      adapterType: f.agent.adapterType, taskKey: f.issue.id, sessionDisplayId: "OLD-session" });
+    const old = await f.defer(0);
+    expect(await f.enqueue(1)).toBeNull();
+    let runs = await f.runs();
+    expect(runs).toHaveLength(1);
+    expect(runs[0].contextSnapshot).toMatchObject({ wakeCommentIds: [f.comments[0].id], forceFreshSession: true });
+    const prepared = await prepareConversationTurn(db, runs[0]);
+    expect(prepared).toMatchObject({ reset: true, context: { conversationSessionGeneration: 1 } });
+    expect(await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.taskKey, f.issue.id))).toEqual([]);
+    await db.insert(agentTaskSessions).values({ companyId: f.company.id, agentId: f.agent.id,
+      adapterType: f.agent.adapterType, taskKey: f.issue.id, sessionDisplayId: "NEW-session" });
+    await f.complete(runs[0]);
+    runs = await f.runs();
+    expect(runs).toHaveLength(2);
+    expect(runs[1]).toMatchObject({ sessionIdBefore: "NEW-session", contextSnapshot: { wakeCommentIds: [f.comments[1].id] } });
+    expect(await prepareConversationTurn(db, runs[1])).toMatchObject({ reset: false, context: { conversationSessionGeneration: 1 } });
+    expect(await f.enqueue(0, old)).toBeNull();
+    expect(await f.runs()).toHaveLength(2);
+  });
+
+  it("FIFO admission: two deferred messages and a new third run in arrival order once each", async () => {
+    const f = await fifoFixture(["one", "two", "three"]);
+    const first = await f.defer(0), second = await f.defer(1);
+    expect(await f.enqueue(2)).toBeNull();
+    for (let index = 0; index < 3; index++) {
+      const runs = await f.runs();
+      expect(runs).toHaveLength(index + 1);
+      expect(runs[index].contextSnapshot).toMatchObject({ wakeCommentIds: [f.comments[index].id] });
+      await f.complete(runs[index]);
+    }
+    await f.enqueue(0, first); await f.enqueue(1, second);
+    expect((await f.runs()).map(run => run.contextSnapshot?.wakeCommentId)).toEqual(f.comments.map(comment => comment.id));
+    const saved = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.company.id));
+    expect(saved.filter(wake => wake.status === "deferred_issue_execution")).toEqual([]);
+  });
+
+  it("FIFO admission: a resumed non-oldest receipt cannot overtake or self-block the oldest", async () => {
+    const f = await fifoFixture(["one", "two"]);
+    await f.defer(0); const second = await f.defer(1);
+    expect(await f.enqueue(1, second)).toBeNull();
+    expect((await f.runs()).map(run => run.contextSnapshot?.wakeCommentId)).toEqual([f.comments[0].id]);
+    const [retained] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, second.id));
+    expect(retained).toMatchObject({ status: "deferred_issue_execution", runId: null, requestedAt: second.requestedAt });
+    await f.complete((await f.runs())[0]);
+    expect((await f.runs()).map(run => run.contextSnapshot?.wakeCommentId)).toEqual(f.comments.map(comment => comment.id));
+  });
+
+  it("FIFO admission: no older deferred person input keeps direct admission unchanged", async () => {
+    const f = await fifoFixture(["direct"]);
+    const run = await f.enqueue(0);
+    expect(run).toMatchObject({ status: "queued", contextSnapshot: { wakeCommentIds: [f.comments[0].id] } });
+    expect(await f.runs()).toHaveLength(1);
+  });
+
+  it("FIFO admission: a consumed stale deferred receipt does not hold new input", async () => {
+    const f = await fifoFixture(["already read", "direct"]);
+    await f.defer(0);
+    await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.agent.id,
+      status: "succeeded", startedAt: new Date(), finishedAt: new Date(), invocationSource: "automation",
+      contextSnapshot: { issueId: f.issue.id, wakeCommentIds: [f.comments[0].id] } });
+    expect(await f.enqueue(1)).toMatchObject({ status: "queued", contextSnapshot: { wakeCommentIds: [f.comments[1].id] } });
+    expect(await f.runs()).toHaveLength(2);
+  });
+
+  it.each(["company", "issue", "agent"] as const)("FIFO admission: older receipt for another %s does not block direct input", async scope => {
+    const f = await fifoFixture(["elsewhere", "direct"]);
+    const saved = await f.defer(0);
+    if (scope === "agent") {
+      const [other] = await db.insert(agents).values({ companyId: f.company.id, name: "Other agent", adapterType: "process" }).returning();
+      await db.update(agentWakeupRequests).set({ agentId: other.id }).where(eq(agentWakeupRequests.id, saved.id));
+    } else if (scope === "issue") {
+      const [other] = await db.insert(issues).values({ companyId: f.company.id, title: "Other issue", assigneeAgentId: f.agent.id }).returning();
+      await db.update(agentWakeupRequests).set({ payload: { ...saved.payload, issueId: other.id } }).where(eq(agentWakeupRequests.id, saved.id));
+    } else {
+      const [other] = await db.insert(companies).values({ name: "Other company", issuePrefix: "OC" }).returning();
+      await db.update(agentWakeupRequests).set({ companyId: other.id }).where(eq(agentWakeupRequests.id, saved.id));
+    }
+    expect(await f.enqueue(1)).toMatchObject({ status: "queued", contextSnapshot: { wakeCommentIds: [f.comments[1].id] } });
+    expect(await f.runs()).toHaveLength(1);
+  });
+
+  it("FIFO admission: a newer deferred receipt does not block the incoming older receipt", async () => {
+    const f = await fifoFixture(["older", "newer"]);
+    const first = await f.defer(0); await f.defer(1);
+    expect(await f.enqueue(0, first)).toMatchObject({ status: "queued", contextSnapshot: { wakeCommentIds: [f.comments[0].id] } });
+    expect(await f.runs()).toHaveLength(1);
+  });
+
+  it("FIFO admission: concurrent arrivals promote the oldest only once", async () => {
+    const f = await fifoFixture(["oldest", "new one", "new two"]);
+    await f.defer(0);
+    await Promise.all([f.enqueue(1), f.enqueue(2)]);
+    const runs = await f.runs();
+    expect(runs).toHaveLength(1);
+    expect(runs[0].contextSnapshot).toMatchObject({ wakeCommentIds: [f.comments[0].id] });
+    const pending = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.company.id));
+    const queued = pending.filter(wake => wake.status === "deferred_issue_execution")
+      .flatMap(wake => (wake.payload?._paperclipWakeContext as { wakeCommentIds: string[] }).wakeCommentIds);
+    expect(queued.sort()).toEqual([f.comments[1].id, f.comments[2].id].sort());
   });
 
   async function fixture(status = "running") {
