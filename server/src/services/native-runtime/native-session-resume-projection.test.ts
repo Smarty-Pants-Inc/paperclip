@@ -72,10 +72,13 @@ const supported = Boolean(externalUrl) || (await getEmbeddedPostgresTestSupport(
     }
   });
 
-  it.each(["cancelled", "failed"])("skips an inherited %s pointer only when it never acquired execution authority", async status => {
-    const saved = source(), id = randomUUID();
-    const ownCheckpoint = { ...checkpoint, cursor: null,
-      identity: { runId: id, sessionId: normalizedSessionId } };
+  it.each([
+    { status: "cancelled", cursor: null }, { status: "failed", cursor: null },
+    { status: "cancelled", cursor: "42" }, { status: "failed", cursor: "42" },
+  ])("skips an inherited $status pointer at cursor=$cursor only when it never acquired execution authority", async ({ status, cursor }) => {
+    const saved = { ...source(), runnerProfileJson: { ...profile, sessionCheckpoint: { ...checkpoint, cursor } } }, id = randomUUID();
+    const ownCheckpoint = { ...checkpoint, cursor,
+      identity: { companyId, agentId, issueId, runId: id, sessionId: normalizedSessionId } };
     await db.insert(heartbeatRuns).values([saved, run(1, { id, status,
       runnerProfileJson: { sessionCheckpoint: ownCheckpoint } })]);
     if (status === "failed") {
@@ -84,6 +87,11 @@ const supported = Boolean(externalUrl) || (await getEmbeddedPostgresTestSupport(
       await db.insert(nativeRunFinalizations).values({ companyId, issueId, runId: id, phase: "terminal_failure" });
     }
     expect((await select())?.id).toBe(saved.id);
+    if (cursor !== null) {
+      await writeProfile(id, { sessionCheckpoint: { ...ownCheckpoint, cursor: "different-progress" } });
+      expect((await select())?.id).toBe(id);
+      await writeProfile(id, { sessionCheckpoint: ownCheckpoint });
+    }
     if (status === "cancelled") {
       await db.insert(nativeRunFinalizations).values({ companyId, issueId, runId: id, phase: "terminal_failure" });
       expect((await select())?.id).toBe(saved.id);
