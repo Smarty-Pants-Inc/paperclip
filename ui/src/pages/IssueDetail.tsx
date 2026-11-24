@@ -6150,7 +6150,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   }, [breadcrumbParentRef, resolvedIssueDetailState, location.state, location.search]);
   useEffect(() => {
     if (isAgentChatRoute) {
-      setBreadcrumbs([{ label: "Chat" }]);
+      setBreadcrumbs([{ label: "All chats", href: "/chats" }, { label: conversationAgent?.name ?? "Chat" }]);
       return;
     }
     setBreadcrumbs([
@@ -6177,6 +6177,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     ]);
   }, [
     isAgentChatRoute,
+    conversationAgent?.name,
     coordinatorWorkspaceEnabled,
     breadcrumbTitle,
     breadcrumbIdentifier,
