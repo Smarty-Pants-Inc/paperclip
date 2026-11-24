@@ -370,8 +370,7 @@ export async function resolveHeartbeatAdapterSession(input: HeartbeatAdapterSess
     (!taskSessionForRun ||
       !taskSession?.sessionDisplayId ||
       runtimeForAdapter.sessionDisplayId !== taskSession.sessionDisplayId ||
-      resetTaskSession ||
-      context.forceFreshSession === true)
+      resetTaskSession)
   ) {
     delete executionContinuation.resumeDelta;
   }
