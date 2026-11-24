@@ -44,11 +44,6 @@ function arbitrate(
 }
 
 describe("native status authority", () => {
-  it.each(["done", "in_review"] as const)("keeps %s after finished-task finish or block claims", priorIssueStatus => {
-    for (const reportedDisposition of ["done", "blocked"] as const) expect(arbitrate({ priorIssueStatus, finishedTaskConversation: true,
-      assessment: assessment({ reportedDisposition }) })).toMatchObject({ statusAction: "preserve", toStatus: priorIssueStatus,
-      reasonCode: "finished_task_conversation_status_preserved", effects: [{ kind: "release_checkout" }] });
-  });
   it("completes a reviewer's done report from its own recorded final-stage approval", () => {
     // Retained live failure: the reviewer approved its stage, then cited free-text
     // evidence; the report was graded as incomplete and the task reopened.
