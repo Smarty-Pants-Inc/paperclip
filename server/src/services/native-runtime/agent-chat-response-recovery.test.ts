@@ -259,6 +259,35 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0].nativeSessionId).toBe(f.prpEvent.normalizedSessionId);
   });
 
+  it("acknowledges a queued completion at the first held final without swallowing the second final", async () => {
+    await fixture(true, { beforeFinalize: async scope => {
+      await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, scope.agentId));
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      const taskId = randomUUID(), deliveryId = randomUUID();
+      await db.insert(issues).values({ id: taskId, companyId: scope.companyId, title: "Completed delegated work", status: "done", statusVersion: 2 });
+      await db.insert(chatTaskHandoffs).values({ companyId: scope.companyId, taskId, conversationId: scope.issueId, agentId: scope.agentId, sessionGeneration: 0 });
+      await db.insert(chatCompletionDeliveries).values({ id: deliveryId, companyId: scope.companyId, taskId, statusVersion: 2,
+        status: "queued", targetRunId: scope.runId, error: "Completion turn ended without a reply" });
+      await db.update(heartbeatRuns).set({ contextSnapshot: { ...run.contextSnapshot,
+        chatCompletionDeliveryIds: [deliveryId], chatCompletionUpdates: [{ taskId }] } }).where(eq(heartbeatRuns.id, scope.runId));
+      const execution = { binding: scope, provider: { kind: "pi_rpc" as const } };
+      const event = { eventType: "item.completed" as const, runId: scope.runId, normalizedSessionId: run.nativeSessionId!,
+        sourceEventId: "completion-first", itemId: "completion:m1:b0", payload: { kind: "agentMessage", channel: "final", text: "Delegated work is done." } };
+      await publishContinuousNativeReply({ db, execution, event, cursor: 171 });
+      const [first] = await comments(scope.runId);
+      expect(first.body).toBe("Delegated work is done.");
+      const [delivered] = await db.select().from(chatCompletionDeliveries).where(eq(chatCompletionDeliveries.id, deliveryId));
+      expect(delivered).toMatchObject({ status: "delivered", responseCommentId: first.id, targetRunId: scope.runId, error: null });
+      await publishContinuousNativeReply({ db, execution, cursor: 172, event: { ...event,
+        sourceEventId: "completion-second", itemId: "completion:m2:b0", payload: { ...event.payload, text: "A separate later answer." } } });
+      const replies = await comments(scope.runId);
+      expect(replies).toHaveLength(2);
+      expect(replies.map(reply => reply.body).sort()).toEqual(["A separate later answer.", "Delegated work is done."]);
+      expect(replies.find(reply => reply.body === "A separate later answer.")!.id).not.toBe(first.id);
+      expect((await db.select().from(chatCompletionDeliveries).where(eq(chatCompletionDeliveries.id, deliveryId)))[0]).toEqual(delivered);
+    } });
+  });
+
   it.each(["paperclip", "continuous", undefined])("gates held-turn publication on pi_rpc + resolved continuity (%s)", async sessionContinuity => {
     await fixture(false, { beforeFinalize: async scope => {
       await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity } }).where(eq(agents.id, scope.agentId));
