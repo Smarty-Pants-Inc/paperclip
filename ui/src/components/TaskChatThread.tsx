@@ -1375,13 +1375,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   } : emptyQueuedCommentQueue, [queuedMessageQueue, emptyQueuedCommentQueue, steeringAnchorByCommentId, failedRequestCommentIds]);
 
   const continuousReplyPlacements = useMemo(() => {
-    const placements = new Map<string, { byItem: Map<string, number>; bySegment: Map<number, string> }>();
+    const placements = new Map<string, { byItem: Map<string, number>; bySegment: Map<number, Map<string, string>> }>();
     for (const run of linkedRuns ?? []) {
       const replies = run.resultJson?.continuousReplies;
       if (!replies || typeof replies !== "object" || Array.isArray(replies)) continue;
       const anchors = steeringAnchorsByRun.get(run.runId) ?? [];
       const byItem = new Map<string, number>();
-      const bySegment = new Map<number, string>();
+      const bySegment = new Map<number, Map<string, string>>();
       for (const [itemId, value] of Object.entries(replies)) {
         if (!value || typeof value !== "object") continue;
         const reply = value as { questionCommentIds?: unknown; commentId?: unknown };
@@ -1389,7 +1389,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         const segmentIndex = Math.max(0, ...reply.questionCommentIds.map(id =>
           anchors.indexOf(steeringAnchorByCommentId.get(String(id)) ?? NaN) + 1));
         byItem.set(itemId, segmentIndex);
-        bySegment.set(segmentIndex, reply.commentId);
+        const segmentReplies = bySegment.get(segmentIndex) ?? new Map<string, string>();
+        segmentReplies.set(itemId, reply.commentId);
+        bySegment.set(segmentIndex, segmentReplies);
       }
       placements.set(run.runId, { byItem, bySegment });
     }
@@ -2143,7 +2145,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           },
         });
       }
-      if (entries.length === 0 && !(sourceIsPaperclipRunner && (openSegments || steeringAnchorsByRun.has(source.id)))) {
+      if (entries.length === 0 && !(sourceIsPaperclipRunner && (openSegments || steeringAnchorsByRun.has(source.id) || continuousReplyPlacements.has(source.id)))) {
         if (sourceIsPaperclipRunner && sourceYielded) {
           settledRunIds.add(source.id);
           continue;
@@ -2266,12 +2268,23 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       const runtimeRequests = runtimeRequestSegmentContext(entries, {
         runId: source.id, agentName: meta?.agentName, running: false,
       });
-      const projectedSegments = segments.map((segment) => {
+      const projectedSegments = segments.map((segment, segmentIndex) => {
         const parsedTranscript = reconcileSegmentRuntimeRequests(transcriptToTaskChatItems(segment.entries, {
           runId: source.id,
           agentName: meta?.agentName,
           running: openSegments,
         }), segment.entries, runtimeRequests, openSegments);
+        // A segment can own several replies. Merge each saved reply into its
+        // own native item; a missing item leaves the saved bubble in the backbone.
+        for (const [itemId, commentId] of continuousReplyPlacements.get(source.id)?.bySegment.get(segmentIndex) ?? []) {
+          const saved = commentItems.find((item): item is TaskChatMessageItem => item.kind === "message" && item.id === commentId);
+          if (!saved) continue;
+          const nativeIndex = parsedTranscript.findIndex(item => item.id === `${source.id}:msg:${itemId}`);
+          const native = parsedTranscript[nativeIndex];
+          if (native?.kind === "message") {
+            parsedTranscript[nativeIndex] = { ...native, text: saved.text, channel: "final", interstitial: false };
+          }
+        }
         const parsed =
           source.id === planDocumentSourceRunId && planTurnItem
             ? embedPlanDocumentAtWriteBoundary(parsedTranscript, planTurnItem)
@@ -2342,7 +2355,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         parsed: readonly TaskChatItem[],
       ): TaskChatMessageItem | undefined => {
         if (!sourceIsPaperclipRunner) return undefined;
-        const mappedReplyId = continuousReplyPlacements.get(source.id)?.bySegment.get(segmentIndex);
+        const mappedReplyId = [...(continuousReplyPlacements.get(source.id)?.bySegment.get(segmentIndex)?.values() ?? [])].at(-1);
         const mappedReply = commentItems.find((item): item is TaskChatMessageItem => item.kind === "message" && item.id === mappedReplyId);
         const final = paperclipRunnerFinalResponse(parsed, { ...yieldedOptions, yielded: sourceYielded });
         // A continuous run can resume with only the new turn's transcript.
@@ -2537,7 +2550,16 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     entriesWithFailures.sort(
       (a, b) => a.ms - b.ms || a.order - b.order || a.id.localeCompare(b.id),
     );
-    const responseIds = new Set(settledTurns.flatMap(({ turn }) => turn.finalResponse ? [turn.finalResponse.id] : []));
+    const responseIds = new Set(settledTurns.flatMap(({ turn, sourceRunId }) => {
+      const drawnItems = runnerSegmentsById.get(turn.id)?.items ?? [];
+      // A placement receipt alone cannot hide a saved reply. Only this drawn
+      // segment's projected native/saved item (or its selected final) owns it.
+      const drawnReplies = [...(continuousReplyPlacements.get(sourceRunId)?.bySegment.values() ?? [])]
+        .flatMap(replies => [...replies].filter(([itemId, commentId]) => drawnItems.some(item =>
+          item.kind === "message" && (item.id === commentId || item.id === `${sourceRunId}:msg:${itemId}`)))
+          .map(([, commentId]) => commentId));
+      return [...(turn.finalResponse ? [turn.finalResponse.id] : []), ...drawnReplies];
+    }));
     const out = assembleThreadItems(
       entriesWithFailures.filter((entry) => !responseIds.has(entry.id)),
       turnsByAnchor,
@@ -3025,7 +3047,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     const current = segment.runId === tailRunId && item.id === `${tailRunId}:turn:${tailSegments.length - 1}`;
     const presentation = current ? {
       ...segment,
-      items: item.finalResponse && !tailFinalResponse ? segment.items : tailItems,
+      items: item.finalResponse && (!tailFinalResponse || continuousReplyPlacements.has(segment.runId ?? "")) ? segment.items : tailItems,
       status: isTerminalRunStatus(segment.status) ? segment.status : tailStatus,
       startedAtMs: tailStartedAtMs,
       finishedAtMs: isTerminalRunStatus(segment.status) ? segment.finishedAtMs : tailFinishedAtMs,
