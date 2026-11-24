@@ -1,4 +1,5 @@
 import { groupImageResources } from "./image-resources";
+import { RunnerReasoningDisplay } from "./reasoning-display";
 import { AgentQueueWait } from "@/components/AgentQueueWait";
 import { agentQueueWaitOf } from "@/lib/agent-queue-wait";
 import { WAITING_TO_START_LABEL, useWaitingToStart } from "./useWaitingToStart";
@@ -284,7 +285,7 @@ export function TaskChatRunnerTurn({
   ));
 
   return (
-    <TaskChatShimmerScope items={items}><ToolCallProgressRunProvider runId={runId}><div
+    <RunnerReasoningDisplay><TaskChatShimmerScope items={items}><ToolCallProgressRunProvider runId={runId}><div
       className="flex min-w-0 flex-col"
       data-testid="task-chat-runner-turn"
       data-phase={status === "queued" ? "startup" : undefined}
@@ -356,6 +357,6 @@ export function TaskChatRunnerTurn({
       ) : null}
       {!final && currentActivityItems.length === 0 && !waitingLabel && !agentQueueWaitFor({ status, execution })
         ? <RunnerCurrentActivityTail status={status} waitingLabel={waitingLabel} /> : null}
-    </div></ToolCallProgressRunProvider></TaskChatShimmerScope>
+    </div></ToolCallProgressRunProvider></TaskChatShimmerScope></RunnerReasoningDisplay>
   );
 }
