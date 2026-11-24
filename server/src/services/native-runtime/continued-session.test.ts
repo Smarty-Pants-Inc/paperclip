@@ -46,6 +46,12 @@ it("retains recovery history, sends exact comments, and preserves other unseen e
   const mixed = { ...wakePayload, executionContinuation: { ...wakePayload.executionContinuation, resumeDelta: { baseRunId: "prior", messages: [...messages, { ...messages[0], id: "other", body: "Unseen event" }] } } };
   expect(JSON.parse(buildNativeExecutionInput({ ...args, wakePayload: mixed }).continuationPrompt!).messages).toHaveLength(2);
   expect(buildNativeExecutionInput({ ...args, sessionContinuity: "paperclip" }).continuationPrompt).toBe(JSON.stringify({ messages }));
+  const doneTask = { ...task, conversationAgentId: null, status: "done" };
+  const prior = buildNativeExecutionInput({ ...args, runId: "prior", resumedSession: false, previousTurn: undefined, wakePayload: null, issue: doneTask });
+  const finishedTaskRun = { ...args, issue: doneTask, previousTurn: { runId: "prior", task: doneTask, nativeExecutionInput: prior }, finishedTaskConversation: true };
+  const reply = buildNativeExecutionInput(finishedTaskRun);
+  expect({ provider: reply.provider, runtimeContext: reply.runtimeContext }).toEqual({ provider: prior.provider, runtimeContext: prior.runtimeContext });
+  expect(reply.continuationPrompt).toBe(messages[0].body);
 });
 it("keeps a reopened task's next prompt bare when only the agent's own reply is new", () => {
   const wake = (authorId: string) => { const messages = [{ id: "r", body: "Reply", authorType: "agent", authorId }, { id: "c", body: "Next", authorType: "user", authorId: "board" }]; return { reason: "issue_reopened_via_comment", commentIds: ["c"], comments: [], executionContinuation: { version: 1, messages, resumeDelta: { baseRunId: "prior", messages } } }; };
