@@ -11,17 +11,22 @@ import { resolveSessionContinuity } from "./continued-session.js";
 // still owns durable idempotence; this only serializes local drain attempts.
 const drains = new Map<string, Promise<void>>();
 
-/** Reuse the board's FIFO queue and ACK/consumption path, never the release path. */
-export async function drainContinuousPersonMessages(db: Db, scope: { companyId: string; issueId: string; runId: string; agentId: string }) {
+/** Reuse the board's FIFO queue and ACK/consumption path, never the release path.
+ * beforeFirstReply is reserved for a persisted turn.started/turn.accepted event;
+ * the board still has to confirm that the live turn is steerable.
+ */
+export async function drainContinuousPersonMessages(db: Db, scope: { companyId: string; issueId: string; runId: string; agentId: string },
+  options: { beforeFirstReply?: boolean } = {}) {
   const key = `${scope.companyId}:${scope.runId}`;
   const pending = drains.get(key);
   if (pending) return pending;
-  const work = drain(db, scope);
+  const work = drain(db, scope, options);
   drains.set(key, work);
   try { await work; } finally { if (drains.get(key) === work) drains.delete(key); }
 }
 
-async function drain(db: Db, scope: { companyId: string; issueId: string; runId: string; agentId: string }) {
+async function drain(db: Db, scope: { companyId: string; issueId: string; runId: string; agentId: string },
+  options: { beforeFirstReply?: boolean }) {
   const steer = createSteerQueuedComment(createQueuedCommentSteeringAdapter(db));
   const actor = { actorType: "agent" as const, actorId: scope.agentId, agentId: scope.agentId,
     runId: scope.runId, agentApiKeyId: null };
@@ -40,7 +45,7 @@ async function drain(db: Db, scope: { companyId: string; issueId: string; runId:
           row.run.contextSnapshot?.conversationSessionGeneration !== row.issue.conversationSessionGeneration)) ||
         ["paused", "terminated", "pending_approval", "error"].includes(row.agentStatus) ||
         row.config.provider !== "pi_rpc" || resolveSessionContinuity("pi_rpc", row.config.sessionContinuity) !== "continuous" ||
-        !Object.keys((row.run.resultJson?.continuousReplies ?? {}) as object).length) return;
+        (!options.beforeFirstReply && !Object.keys((row.run.resultJson?.continuousReplies ?? {}) as object).length)) return;
     const board = await readBoardQueuedComments({ executor: db, issue: row.issue, activeRun: row.run, actor });
     const head = board.entries[0];
     if (board.state !== "deferred" || board.executionWait || board.steeringDisposition !== "available" || !board.queueId ||
