@@ -17,6 +17,14 @@ const recoveryStepText: Record<NonNullable<TaskInterruptionPresentation["recover
   finishing_recovery: "Finishing recovery of saved work",
 };
 
+/** A startup cancellation fence alone also covers budget stops, not just person Stop. */
+export function isPersonStoppedRun(run: { errorCode?: string | null; resultJson?: Record<string, unknown> | null } | undefined) {
+  const cancellation = run?.resultJson?.cancellation as { source?: string; initiator?: { type?: string } } | undefined;
+  return Boolean(run?.resultJson?.personStop ||
+    (cancellation?.source === "operator" && cancellation.initiator?.type === "user") ||
+    (run?.errorCode === "cancelled" && run.resultJson?.executionCancellation));
+}
+
 /** Ordinary working/resolved projections are not recovery ownership. */
 export function isConversationRecovery(presentation: TaskInterruptionPresentation | null | undefined, observedStatus?: string) {
   return presentation?.responsibility === "system" && ["working", "retry_scheduled", "failed"].includes(presentation.state)
@@ -44,10 +52,11 @@ const blockerAction: Record<string, string> = {
 };
 
 /** One ordinary interruption surface. Technical records remain in diagnostics. */
-export function ExecutionBlockerNotice({ presentation, observedStatus, observedResultJson, blocker, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, companyId, agentName, projectName, blockers }: {
+export function ExecutionBlockerNotice({ presentation, observedStatus, observedResultJson, observedErrorCode, blocker, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, companyId, agentName, projectName, blockers }: {
   presentation: TaskInterruptionPresentation | null | undefined;
   observedStatus?: string;
   observedResultJson?: Record<string, unknown> | null;
+  observedErrorCode?: string | null;
   blocker?: ExecutionBlocker | null;
   companyId?: string;
   blockers?: IssueRelationIssueSummary[];
@@ -61,7 +70,8 @@ export function ExecutionBlockerNotice({ presentation, observedStatus, observedR
   agentName?: string;
   projectName?: string;
 }) {
-  const recovery = !observedResultJson?.personStop && isConversationRecovery(presentation,
+  if (isPersonStoppedRun({ resultJson: observedResultJson, errorCode: observedErrorCode })) return null;
+  const recovery = isConversationRecovery(presentation,
     observedStatus ?? (blocker?.workspaceRepairRequired ? "failed" : undefined));
   if (presentation?.projectAccess && !optimistic && !takingLonger) return <TaskProjectAccessNotice
     access={presentation.projectAccess} issueId={issueId} agentName={agentName} projectName={projectName}
