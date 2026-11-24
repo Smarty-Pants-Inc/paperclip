@@ -19,11 +19,13 @@ import {
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { issueService } from "../services/issues.ts";
+import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
+import { questionResponseDeliveryService } from "../services/question-response-delivery.js";
 import { commitNativeStatusDecision } from "../services/native-runtime/status-decision-committer.js";
 import { arbitrateNativeStatus, NATIVE_STATUS_ARBITER_POLICY_VERSION, type NativeStatusDecision } from "../services/native-runtime/status-arbiter.js";
 import { classifyNativeEvidence } from "../services/native-runtime/evidence-classifier.js";
 
-const mockAdapterExecute = vi.hoisted(() => vi.fn(async () => ({
+const mockAdapterExecute = vi.hoisted(() => vi.fn(async (_input: { runId: string; context: Record<string, unknown> }) => ({
   exitCode: 0, signal: null, timedOut: false, errorMessage: null,
   summary: "Wrote the brief with the answer.", provider: "test", model: "test-model",
 })));
@@ -83,7 +85,7 @@ describeEmbeddedPostgres("an answer to the agent's own question continues the ta
   }
 
   async function agentReportsBlocker(input: { companyId: string; agentId: string; issueId: string;
-    blocker?: Record<string, unknown>; arbiter?: Partial<Parameters<typeof arbitrateNativeStatus>[0]> }): Promise<void> {
+    blocker?: Record<string, unknown>; arbiter?: Partial<Parameters<typeof arbitrateNativeStatus>[0]>; duringRun?: () => Promise<void> }): Promise<void> {
     const runId = randomUUID(), contractId = randomUUID(), resultId = randomUUID(), assessmentId = randomUUID();
     await db.insert(completionContracts).values({ id: contractId, companyId: input.companyId, issueId: input.issueId,
       revision: 1, schemaVersion: "paperclip.completion-contract.v1", policyVersion: "test", risk: "standard",
@@ -91,7 +93,8 @@ describeEmbeddedPostgres("an answer to the agent's own question continues the ta
       contractJson: {}, canonicalSha256: contractId, createdByActorType: "system", createdByActorId: "test" });
     await db.insert(heartbeatRuns).values({ id: runId, companyId: input.companyId, agentId: input.agentId,
       status: "running", runtimeMode: "native", nativeIssueId: input.issueId, invocationSource: "automation",
-      triggerDetail: "system", completionContractId: contractId, contextSnapshot: { issueId: input.issueId } });
+      triggerDetail: "system", completionContractId: contractId, contextSnapshot: { issueId: input.issueId }, startedAt: new Date() });
+    await input.duringRun?.();
     const result = { schema: "paperclip.run_result.v1", reportedWorkDisposition: "blocked",
       summary: "Waiting for the codename answer.", blocker: input.blocker,
       completionClaim: { contractRevision: "1", objectiveSatisfied: false,
@@ -162,6 +165,34 @@ describeEmbeddedPostgres("an answer to the agent's own question continues the ta
     expect(mockAdapterExecute).toHaveBeenCalled();
     const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(issue).toMatchObject({ blockedTransitionAt: null, unblockDescriptor: null });
+  }, 60_000);
+
+  it.each([true, false])("answer during a successor run resumes only its awaited card (matching=%s)", async (matching) => {
+    mockAdapterExecute.mockClear();
+    const { companyId, agentId, issueId, question } = await seed();
+    const saveAnswer = async () => { await issueThreadInteractionService(db).answerQuestions(
+      { id: issueId, companyId }, question.id, { answers: [{ questionId: "codename", optionIds: ["bravo"] }] }, { userId }); };
+    if (!matching) {
+      await saveAnswer(); // An old answer is not the different card B still awaits.
+      await db.insert(issueThreadInteractions).values({ ...question, id: randomUUID(), title: "Different card" });
+    }
+    await agentReportsBlocker({ companyId, agentId, issueId, duringRun: matching ? saveAnswer : undefined,
+      blocker: { owner: { kind: "user", name: "Board" }, scope: "task_wide", reasonCode: "awaiting_codename_answer", unblockAction: "Answer the codename card." } });
+    const [blocked] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const [decision] = await db.select().from(statusDecisions).where(eq(statusDecisions.id, blocked!.lastStatusDecisionId!));
+    const delivery = questionResponseDeliveryService(db, { heartbeat });
+    const outcome = await delivery.deliver(question.id);
+    await heartbeat.drainActiveRunExecutions();
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, outcome!.targetRunId!));
+    expect(run).toMatchObject(matching ? { status: "succeeded", errorCode: null }
+      : { status: "cancelled", errorCode: "issue_not_in_progress" });
+    expect(((decision!.decisionJson as { awaitingInteractionIds?: string[] }).awaitingInteractionIds ?? []).includes(question.id)).toBe(matching);
+    if (matching) {
+      expect(await delivery.deliver(question.id)).toMatchObject({ duplicate: true, targetRunId: run!.id });
+      const calls = mockAdapterExecute.mock.calls.filter(([invocation]) => invocation.context.interactionId === question.id);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]![0].context).toMatchObject({ paperclipWake: { questionResponse: { interactionId: question.id, summaryMarkdown: expect.stringContaining("BRAVO") } } });
+    } else expect(mockAdapterExecute).not.toHaveBeenCalled();
   }, 60_000);
 
   it.each([
