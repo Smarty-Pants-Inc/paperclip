@@ -1,9 +1,45 @@
+import { isDeepStrictEqual } from "node:util";
 import { and, eq, inArray, sql } from "drizzle-orm";
-import { agentWakeupRequests, issueThreadInteractions, type Db } from "@paperclipai/db";
+import { agentWakeupRequests, heartbeatRunEvents, heartbeatRuns, issueThreadInteractions, type Db } from "@paperclipai/db";
+import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import type { IssueComment, IssueQueuedCommentEntry } from "@paperclipai/shared";
 
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+/** The exact resolved response returned to a live assignee run by its tools. */
+export const INTERACTION_RESPONSE_READ_EVENT = "interaction.response_read";
+
+export async function recordInteractionResponseRead(db: Db, input: {
+  companyId: string; agentId: string; runId: string;
+  issue: { id: string; companyId: string; assigneeAgentId: string | null };
+  interactions: Array<{ id: string; status: string; result?: unknown; resolvedAt?: Date | string | null }>;
+}) {
+  if (input.issue.companyId !== input.companyId || input.issue.assigneeAgentId !== input.agentId) return;
+  const resolved = input.interactions.filter(row => ["accepted", "answered", "rejected"].includes(row.status) && row.resolvedAt);
+  if (!resolved.length) return;
+  const [run] = await db.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId),
+    eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.status, "running"),
+  ));
+  if (record(run?.context).issueId !== input.issue.id) return;
+  const previous = await db.select({ payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents).where(and(
+    eq(heartbeatRunEvents.companyId, input.companyId), eq(heartbeatRunEvents.runId, input.runId),
+    eq(heartbeatRunEvents.eventType, INTERACTION_RESPONSE_READ_EVENT),
+  ));
+  const seen = new Map<string, unknown[]>();
+  for (const event of previous) {
+    const id = String(record(event.payload).interactionId);
+    seen.set(id, [...(seen.get(id) ?? []), event.payload]);
+  }
+  for (const row of resolved) {
+    const payload = { issueId: input.issue.id, interactionId: row.id, status: row.status,
+      resolvedAt: new Date(row.resolvedAt!).toISOString(), result: row.result ?? null };
+    if (seen.get(row.id)?.some(previous => isDeepStrictEqual(previous, payload))) continue;
+    await appendHeartbeatRunEvent(db, { companyId: input.companyId, agentId: input.agentId, runId: input.runId,
+      eventType: INTERACTION_RESPONSE_READ_EVENT, stream: "system", level: "info", payload });
+  }
 }
 
 /** Interaction receipts keep their typed payload; they never become editable comments. */
@@ -48,25 +84,67 @@ export function queuedInteractionSummary(interaction: {
   return `${label}: ${subject}`;
 }
 
-/**
- * A run that started with this exact response in its context already received
- * it. The run must carry the resolved status: the card-creation wake carries
- * the same interaction id while the card is still pending, so it never counts.
- * Any other wake that still carries the same receipt (for example a recovery
- * continuation that raced the response's own wake) is redundant: it is not
- * pending input, so it must not hold the composer queue or the issue.
- * A cancelled or failed start does not count; that response is still owed.
- */
 // Table-qualified on purpose: inside a select list Drizzle renders columns
 // unqualified, which would bind them to the subquery's own run row.
+/** A tool read alone is not delivery: that same successful assignee must close
+ * this task afterward. Match the stored resolution, not just the card ID (which
+ * survives retries/revisions). Shared by queue projection, recovery and drain. */
+function consumedInteractionResponseExists(companyId: string, issueId: string, runId?: string, agentId?: string) {
+  return sql<boolean>`EXISTS (SELECT 1 FROM heartbeat_run_events response_read
+    JOIN heartbeat_runs consuming_run ON consuming_run.id = response_read.run_id
+      AND consuming_run.company_id = response_read.company_id AND consuming_run.agent_id = response_read.agent_id
+    JOIN issues consumed_task ON consumed_task.id = ${issueId} AND consumed_task.company_id = response_read.company_id
+    JOIN activity_log response_done ON response_done.company_id = response_read.company_id
+      AND response_done.run_id = consuming_run.id AND response_done.action = 'issue.updated'
+      AND response_done.entity_type = 'issue' AND response_done.entity_id = ${issueId}
+      AND ((response_done.actor_type = 'agent' AND response_done.agent_id = consuming_run.agent_id
+        AND response_done.details->>'status' = 'done' AND response_done.details->'_previous'->>'status' <> 'done')
+        OR (response_done.actor_type = 'system' AND response_done.actor_id = 'native-status-committer'
+          AND response_done.details->>'source' = 'native_status_decision'
+          AND response_done.details->>'toStatus' = 'done' AND response_done.details->>'fromStatus' <> 'done'))
+    WHERE response_read.company_id = ${companyId}
+      AND response_read.event_type = ${INTERACTION_RESPONSE_READ_EVENT}
+      AND response_read.payload->>'issueId' = ${issueId}
+      AND response_read.payload->>'interactionId' = issue_thread_interactions.id::text
+      AND response_read.payload->>'status' = issue_thread_interactions.status
+      AND (response_read.payload->>'resolvedAt')::timestamptz = issue_thread_interactions.resolved_at
+      AND response_read.payload->'result' = COALESCE(issue_thread_interactions.result, 'null'::jsonb)
+      AND consuming_run.context_snapshot->>'issueId' = ${issueId}
+      AND consuming_run.status = 'succeeded' AND consuming_run.started_at IS NOT NULL
+      AND consuming_run.agent_id = consumed_task.assignee_agent_id
+      AND consumed_task.status = 'done' AND consumed_task.completed_at >= date_trunc('milliseconds', response_read.created_at)
+      AND response_read.created_at >= issue_thread_interactions.resolved_at
+      AND response_read.created_at >= consuming_run.started_at
+      AND response_done.created_at >= response_read.created_at
+      AND response_done.created_at >= consumed_task.completed_at
+      AND consuming_run.finished_at >= date_trunc('milliseconds', response_read.created_at)
+      ${runId ? sql`AND consuming_run.id = ${runId}` : sql``}
+      ${agentId ? sql`AND consuming_run.agent_id = ${agentId}` : sql``})`;
+}
+
+export async function hasConsumedInteractionResponse(db: Pick<Db, "select">, input: {
+  companyId: string; issueId: string; runId: string; agentId: string; payload: unknown;
+}) {
+  const id = queuedInteractionId(input.payload);
+  if (!id) return false;
+  const [row] = await db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
+    eq(issueThreadInteractions.companyId, input.companyId), eq(issueThreadInteractions.issueId, input.issueId),
+    eq(issueThreadInteractions.id, id), eq(issueThreadInteractions.status, String(record(input.payload).interactionStatus)),
+    consumedInteractionResponseExists(input.companyId, input.issueId, input.runId, input.agentId),
+  )).limit(1);
+  return Boolean(row);
+}
+
+/** A resolved response in a started run's initial context is delivered too.
+ * Pending card-creation wakes and failed/cancelled starts still do not count. */
 function deliveredInteractionRunExists(companyId: string, issueId: string) {
-  return sql<boolean>`EXISTS (SELECT 1 FROM heartbeat_runs delivered_run
+  return sql<boolean>`(${consumedInteractionResponseExists(companyId, issueId)} OR EXISTS (SELECT 1 FROM heartbeat_runs delivered_run
     WHERE delivered_run.company_id = ${companyId}
       AND delivered_run.context_snapshot->>'issueId' = ${issueId}
       AND delivered_run.context_snapshot->>'interactionId' = issue_thread_interactions.id::text
       AND delivered_run.context_snapshot->>'interactionStatus' = issue_thread_interactions.status
       AND delivered_run.started_at IS NOT NULL
-      AND delivered_run.status IN ('running', 'succeeded'))`;
+      AND delivered_run.status IN ('running', 'succeeded')))`;
 }
 
 /**
