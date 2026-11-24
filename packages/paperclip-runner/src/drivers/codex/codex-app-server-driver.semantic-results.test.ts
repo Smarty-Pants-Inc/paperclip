@@ -912,6 +912,34 @@ describe("Codex app-server Codex driver", () => {
         ?.payload,
     ).toMatchObject({ reportedWorkDisposition: "blocked" });
   });
+  it.each([false, true])("offers terminal tools only on fresh and resumed task catalogs (Agent Chat=%s)", async conversationReply => {
+    const first = new FakeCodexTransport();
+    const second = new FakeCodexTransport();
+    const read = { name: "read_task_document", inputSchema: { type: "object" } };
+    const driver = makeDriver([first, second], {
+      conversationMode: "prepared", conversationReply,
+      dynamicTools: [read, ...(conversationReply ? [{ name: "paperclip_finish" }, { name: "paperclip_block" }] : [])],
+    });
+    const original = await driver.openSession({
+      runId: "run-conversation-catalog", normalizedSessionId: "conversation-catalog", workingDirectory: WORKSPACE,
+    });
+    const snapshot = await original.snapshot();
+    await original.close({ reason: "test transport lost" });
+    const catalog = (transport: FakeCodexTransport, method: string) => transport.calls.find(call => call.method === method)?.params.dynamicTools as Array<{ name: string }>;
+    const checkCatalog = (tools: Array<{ name: string }>) => {
+      expect(tools).toContainEqual(read);
+      for (const name of ["paperclip_finish", "paperclip_block"]) {
+        expect(tools.some(tool => tool.name === name)).toBe(!conversationReply);
+      }
+      if (conversationReply) expect(tools).toEqual([read]);
+    };
+    checkCatalog(catalog(first, "thread/start"));
+    const recovery = await driver.recoverSession(snapshot);
+    expect(recovery.recovered).toBe(true);
+    checkCatalog(catalog(second, "thread/resume"));
+    if (recovery.recovered) await recovery.session.close({ reason: "test complete" });
+  });
+
   it("exposes and dispatches only explicit chat tools across fresh and resumed direct chat", async () => {
     const first = new FakeCodexTransport();
     const second = new FakeCodexTransport();
