@@ -1524,6 +1524,19 @@ pub fn normalize_codex_notification_in(
                     })
                         .or_else(|| (item_type == "reasoning").then(|| reasoning_summary_text(provider_item)).flatten()),
                 });
+                // Pi attributes each final to the person inputs actually consumed,
+                // not one FIFO question per reply. Keep an explicit empty list too.
+                if completed && item_type == "agentMessage" && provider_phase == "final_answer" {
+                    if let Some(answers) = provider_item.get("answers").and_then(Value::as_array) {
+                        payload["answers"] = Value::Array(
+                            answers
+                                .iter()
+                                .filter(|id| id.is_string())
+                                .cloned()
+                                .collect(),
+                        );
+                    }
+                }
                 // Preserve only actual terminal invocation identity in the compatibility
                 // projection. Arguments, arbitrary tool names and result bodies stay omitted.
                 if item_type == "tool_call" {
@@ -3027,6 +3040,33 @@ mod tests {
                 assert!(events[0].payload.get("inputUpdated").is_none());
             }
             assert!(!events[0].payload.to_string().contains("secret"));
+        }
+    }
+
+    #[test]
+    fn preserves_optional_person_answers_only_on_completed_final_messages() {
+        for answers in [None, Some(json!([])), Some(json!(["person-1", "person-2"]))] {
+            for (method, phase) in [
+                ("item/completed", "final_answer"),
+                ("item/started", "final_answer"),
+                ("item/completed", "commentary"),
+            ] {
+                let mut item = json!({"id": "answer", "type": "agentMessage", "phase": phase, "text": "Answered."});
+                if let Some(value) = &answers {
+                    item["answers"] = value.clone();
+                }
+                let events = normalize_codex_notification(method, &json!({"item": item}));
+                let expected = if method == "item/completed" && phase == "final_answer" {
+                    answers.as_ref()
+                } else {
+                    None
+                };
+                assert_eq!(
+                    events[0].payload.get("answers"),
+                    expected,
+                    "{method} {phase}"
+                );
+            }
         }
     }
 
