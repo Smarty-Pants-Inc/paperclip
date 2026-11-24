@@ -1097,6 +1097,7 @@ function instructionTargetIdentity(target?: AdapterExecutionTarget | null): stri
 /** Reserve the actual live owner before handing its directory to another run.
  * A persisted conversation alone is not proof that a working tree is reusable. */
 export async function reserveWarmNativeInstructionDirectory(input: {
+  db: Db;
   companyId: string; agentId: string; previousRunId: string; runId: string; target?: AdapterExecutionTarget | null;
   observabilityCompatibilityKey?: string;
   canReuse: () => Promise<boolean>;
@@ -1104,10 +1105,64 @@ export async function reserveWarmNativeInstructionDirectory(input: {
   for (const [id, entry] of warmNativeSessions) {
     if (entry.companyId !== input.companyId || entry.agentId !== input.agentId || entry.instructionCopy?.runId !== input.previousRunId) continue;
     if (forgetUnretiredOwnerOnOtherSandbox(id, entry, input.target)) return null;
-    if (entry.busy || entry.preparingRunId) throw new Error("native_session_supervisor_busy");
+    if (entry.busy || entry.preparingRunId) {
+      // Normal release may already be stopping this generation. Join its
+      // cleanup rather than issuing a second close while it is in flight.
+      if (settlingNativeSessionScopes.has(id)) {
+        await waitForWarmNativeSessionSettled(id);
+        if (settlingNativeSessionScopes.has(id)) throw new Error("native_session_supervisor_busy");
+        return reserveWarmNativeInstructionDirectory(input);
+      }
+      const closing = closingWarmNativeSessions.get(id);
+      if (closing) {
+        await closing;
+        return reserveWarmNativeInstructionDirectory(input);
+      }
+      // The directory's previous owner need not be the run blocking admission:
+      // a successor may already be preparing it, or have attached a new turn.
+      const token = entry.ownerToken, runId = entry.runId, preparingRunId = entry.preparingRunId, busy = entry.busy;
+      const executingRunId = executingRunnerdSessionScopes.get(id);
+      const holderRunId = (executingRunId !== input.runId ? executingRunId : undefined) ?? preparingRunId ?? runId;
+      const [holder] = await input.db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, holderRunId), eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId),
+      ));
+      // A DB read yields. Never apply its terminal verdict to a new generation
+      // or to a reservation/turn that changed while the query was pending.
+      if (warmNativeSessions.get(id) !== entry || entry.ownerToken !== token || entry.runId !== runId
+        || entry.preparingRunId !== preparingRunId || entry.busy !== busy || executingRunnerdSessionScopes.get(id) !== executingRunId
+        || settlingNativeSessionScopes.has(id)) return reserveWarmNativeInstructionDirectory(input);
+      if (!holder || !TERMINAL_HEARTBEAT_RUN_STATUSES.has(holder.status)) throw new Error("native_session_supervisor_busy");
+      if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
+      entry.idleTimer = null;
+      entry.closeOnReleaseReason = "warm instruction holder run is terminal";
+      // Fence the old turn's callbacks before stopping it. Its late release
+      // must not race retirement or close/collect the same generation twice.
+      entry.ownerToken = Symbol(`retiring-native-warm-session:${holderRunId}`);
+      entry.busy = true;
+      const startup = nativeSessionStartups.get(holderRunId);
+      delete entry.finishRelease;
+      const retirement = (async () => {
+        await retireWarmPredecessor(entry, entry.closeOnReleaseReason!);
+        if (startup) {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            await Promise.race([startup.settled, new Promise<never>((_resolve, reject) => {
+              timer = setTimeout(() => reject(new NativePredecessorRetirementUnprovenError(runId, entry.providerLeaseId ?? null,
+                new Error("terminal warm holder ownership cleanup did not settle"))), warmSessionReleaseWait.timeoutMs);
+            })]);
+          } finally { clearTimeout(timer); }
+        }
+        forgetWarmNativeSession(id, entry);
+      })();
+      closingWarmNativeSessions.set(id, retirement);
+      try { await retirement; }
+      finally { if (closingWarmNativeSessions.get(id) === retirement) closingWarmNativeSessions.delete(id); }
+      return reserveWarmNativeInstructionDirectory(input);
+    }
     if (entry.idleTimer) clearTimeout(entry.idleTimer);
     entry.idleTimer = null;
     entry.preparingRunId = input.runId;
+    const reservationOwnerToken = entry.ownerToken;
     const retire = async (reason: string) => {
       entry.closeOnReleaseReason = reason;
       try {
@@ -1131,7 +1186,7 @@ export async function reserveWarmNativeInstructionDirectory(input: {
     return { reuseRunId: input.previousRunId, adopt: (root, collectStopped) => {
       entry.instructionCopy = { runId: input.runId, root, targetIdentity: instructionTargetIdentity(input.target), collectStopped };
     }, release: async () => {
-      if (warmNativeSessions.get(id) === entry && entry.preparingRunId === input.runId) {
+      if (warmNativeSessions.get(id) === entry && entry.ownerToken === reservationOwnerToken && entry.preparingRunId === input.runId) {
         await retire("managed warm turn preparation ended without attachment");
       }
     } };
