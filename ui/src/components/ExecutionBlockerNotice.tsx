@@ -44,8 +44,10 @@ const blockerAction: Record<string, string> = {
 };
 
 /** One ordinary interruption surface. Technical records remain in diagnostics. */
-export function ExecutionBlockerNotice({ presentation, observedStatus, blocker, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, companyId, agentName, projectName, blockers }: {
+export function ExecutionBlockerNotice({ presentation, observedStatus, blocker, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, companyId, agentName, projectName, blockers, unanswered = false }: {
   presentation: TaskInterruptionPresentation | null | undefined;
+  /** A saved request with a failed attempt and no saved answer, across retries. */
+  unanswered?: boolean;
   observedStatus?: string;
   blocker?: ExecutionBlocker | null;
   companyId?: string;
@@ -62,16 +64,19 @@ export function ExecutionBlockerNotice({ presentation, observedStatus, blocker, 
 }) {
   const recovery = isConversationRecovery(presentation,
     observedStatus ?? (blocker?.workspaceRepairRequired ? "failed" : undefined));
-  if (presentation?.projectAccess && !optimistic && !takingLonger) return <TaskProjectAccessNotice
+  if (!unanswered && presentation?.projectAccess && !optimistic && !takingLonger) return <TaskProjectAccessNotice
     access={presentation.projectAccess} issueId={issueId} agentName={agentName} projectName={projectName}
     canRetry={canRetry && presentation.canRetry} onRetry={onRetry} error={error} className={className} />;
-  if (recovery && presentation) return <div role="status" aria-label="Task status"
+  if (unanswered || (recovery && presentation)) return <div role="status" aria-label="Task status"
     className={cn("flex items-center gap-3 text-sm text-muted-foreground", className)}>
-    {(optimistic || presentation.state !== "failed") && <LoaderCircle className="size-4 shrink-0 motion-safe:animate-spin" aria-hidden="true" />}
-    <span className="min-w-0 flex-1">{!optimistic && presentation.state === "failed"
-      ? "Couldn't resume this conversation. Your message is saved." : "Preparing your reply…"}</span>
-    {!optimistic && presentation.state === "failed" && canRetry && presentation.canRetry &&
-      <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}
+    {!unanswered && (optimistic || presentation?.state !== "failed") && <LoaderCircle className="size-4 shrink-0 motion-safe:animate-spin" aria-hidden="true" />}
+    <span className="min-w-0 flex-1">{unanswered ? "Couldn't answer. Your message is saved."
+      : !optimistic && presentation?.state === "failed"
+        ? "Couldn't resume this conversation. Your message is saved." : "Preparing your reply…"}
+      {unanswered && error ? <span className="block text-destructive">{describeError(error).body}</span> : null}
+    </span>
+    {canRetry && (unanswered || (!optimistic && presentation?.state === "failed" && presentation.canRetry)) &&
+      <Button variant="outline" size="sm" onClick={onRetry} disabled={unanswered && optimistic} data-testid="task-execution-retry">Retry</Button>}
   </div>;
   if (error && !optimistic && !takingLonger) return <div role="alert" className={cn("flex items-center justify-between gap-2 text-sm text-destructive", className)}><span>{describeError(error).body}</span>{canRetry && <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}</div>;
   if (takingLonger) return <div role="status" className={cn("flex items-center justify-between gap-2 text-sm text-muted-foreground", className)}><span>Taking longer than usual…</span>{canRetry && <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}</div>;
