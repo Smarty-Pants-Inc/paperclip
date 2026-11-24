@@ -142,6 +142,9 @@ export class CodexHarnessSession
         ...(input.completionContract ? { completionContract: structuredClone(input.completionContract) } : {}),
       });
       this.assertProtocolIntegrity();
+      if (input.dynamicTools !== undefined) {
+        this.dynamicTools = structuredClone(input.dynamicTools);
+      }
       if (transportOwnsQuiescence) {
         // Runnerd's attachment contract performs two durable readiness probes,
         // drains the settled provider tail, and rotates authority atomically.
