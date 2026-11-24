@@ -832,4 +832,5 @@ export const paperclipRunnerUIAdapter: UIAdapterModule = {
   },
   ConfigFields: CodexLocalConfigFields,
   buildAdapterConfig: buildPaperclipRunnerConfig,
+  transcriptPresentation: { liveReasoningView: "inline" },
 };
