@@ -199,6 +199,17 @@ describeEmbeddedPostgres("native run finalizer / status decision committer — a
     });
   }
 
+  it.each(["done", "in_review"])("preserves %s after a finished-task conversation turn", async status => {
+    const f = await seedNativeRun();
+    await db.update(issues).set({ status }).where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", finishedTaskConversation: true },
+      runnerProfileJson: { nativeExecutionInput: { schema: "paperclip.native-execution-input.v5", provider: { kind: "pi_rpc" } } } }).where(eq(heartbeatRuns.id, f.runId));
+    await driveToCompleteResult(f);
+    await finalizeNativeRun({ db, runId: f.runId, workspaceFinalizeStatus: "succeeded" });
+    expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].status).toBe(status);
+    expect((await db.select().from(statusDecisions).where(eq(statusDecisions.runId, f.runId)))[0].decisionJson).toMatchObject({ reasonCode: "finished_task_conversation_status_preserved" });
+    expect(await db.select().from(agentWakeupRequests).where(sql`${agentWakeupRequests.payload}->>'issueId' = ${f.issueId}`)).toHaveLength(0);
+  });
   it("finishes an accepted result after shutdown failed and workspace repair succeeded", async () => {
     const fixture = await seedNativeRun();
     await db.update(completionContracts).set({ risk: "low", completionAuthority: "agent_claim_policy",
