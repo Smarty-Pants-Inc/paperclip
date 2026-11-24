@@ -204,6 +204,7 @@ export interface CompletedFinalAgentMessageCandidate {
   text: string;
   sourceEventId: string | null;
   channel: "final" | "unknown";
+  replyKey?: string;
   /** The run log kept only a display preview of this message. */
   bounded?: boolean;
 }
@@ -303,6 +304,10 @@ export function completedPlanProposalIds(rows: readonly { payload: unknown }[]):
   return ids;
 }
 
+export function nativeFinalReplyKey(runId: string, itemId: string) {
+  return `native-final:${runId}:${itemId}`;
+}
+
 export function readCompletedAssistantMessageCandidate(input: {
   seq: number;
   prpEvent: unknown;
@@ -335,6 +340,7 @@ export function readCompletedAssistantMessageCandidate(input: {
     text,
     sourceEventId: readCommentText(prpEvent.sourceEventId),
     channel: payload.channel,
+    ...(itemId && typeof prpEvent.runId === "string" ? { replyKey: nativeFinalReplyKey(prpEvent.runId, itemId) } : {}),
     ...(isBoundedRunEventText(payload.text) ? { bounded: true } : {}),
   };
 }
@@ -754,10 +760,15 @@ export function buildHeartbeatRunIssueComment(
   return resolveHeartbeatRunResponse({ resultJson }).text;
 }
 
-export function findHeartbeatRunCompletionComment<T extends { id: string; presentation?: unknown }>(
+export function findHeartbeatRunCompletionComment<T extends { id: string; presentation?: unknown; clientRequestId?: string | null }>(
   comments: T[],
   resultJson: Record<string, unknown> | null | undefined,
+  replyKey?: string,
 ): T | null {
+  if (replyKey) {
+    const exact = comments.find(comment => comment.clientRequestId === replyKey || comment.clientRequestId?.startsWith(`${replyKey}:`));
+    if (exact) return exact;
+  }
   const completionComments = comments.filter(comment => record(comment.presentation).kind !== "system_notice");
   const receipts = resultJson?.semanticToolReceipts;
   if (!receipts || typeof receipts !== "object" || Array.isArray(receipts)) {
