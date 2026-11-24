@@ -61,7 +61,7 @@ export function AgentConversationsSidebar({ compact = false, detailed = false }:
   // Prefer the latest visible message; chats without messages retain their title/role fallback.
   const listed = detailed ? chats.data ?? [] : [];
   const previews = Object.fromEntries(listed.filter(chat => chat.latestMessagePreview != null || !chat.title.startsWith("Chat with ")).map(chat => [chat.conversationAgentId!, chat.latestMessagePreview ?? chat.title]));
-  const chatActivity = Object.fromEntries(listed.map(chat => [chat.conversationAgentId!, { at: chat.updatedAt, working: chat.conversationState === "active" }]));
+  const chatActivity = Object.fromEntries(listed.map(chat => [chat.conversationAgentId!, { at: chat.updatedAt }]));
   const pinnedAgentIds = useMemo(() => {
     const prefix = `agent-chat:${companyId}:`;
     return agentChatPins.orderedKeys.filter(key => key.startsWith(prefix)).map(key => key.slice(prefix.length));
