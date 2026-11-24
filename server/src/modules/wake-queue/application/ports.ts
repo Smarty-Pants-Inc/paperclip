@@ -173,6 +173,7 @@ export interface WakeQueueTransaction {
    * that was saved before the task was completed. Such an answer is owed input, like the person's own queued message.
    * "deliver" when the task can run now; "blocked" when unresolved blockers keep it from in_progress; null otherwise.
    */
+  hasConsumedInteractionResponse(input: { companyId: string; issueId: string; runId: string; agentId: string; payload: Record<string, unknown> }): Promise<boolean>;
   owedInteractionAnswer(input: { companyId: string; issueId: string; payload: Record<string, unknown> }): Promise<"deliver" | "blocked" | null>;
   getCommentSelfAuthorship(input: {
     companyId: string;
