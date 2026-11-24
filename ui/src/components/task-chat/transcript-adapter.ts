@@ -87,13 +87,26 @@ export function splitTranscriptAtAnchors(
   }));
   const toolSegments = new Map<string, number>();
   const authoredSegments = new Map<string, number>();
+  // Multi-block messages use :bN item suffixes. A mapped final also owns the
+  // preceding blocks of that message (not unrelated work at the same time).
+  const messageReplies = new Map<string, { block: number; segment: number }[]>();
+  for (const [itemId, segment] of replySegments ?? []) {
+    const match = /^(.*):b(\d+)$/.exec(itemId);
+    if (!match) continue;
+    const replies = messageReplies.get(match[1]!) ?? [];
+    replies.push({ block: Number(match[2]), segment });
+    messageReplies.set(match[1]!, replies);
+  }
+  for (const replies of messageReplies.values()) replies.sort((a, b) => a.block - b.block);
   for (const entry of entries) {
     const parsed = Date.parse(entry.ts);
     const entryMs = Number.isFinite(parsed) ? parsed : 0;
     let index = anchors.findIndex(anchor => entryMs < anchor);
     if (index < 0) index = anchors.length;
     if ((entry.kind === "assistant" || entry.kind === "thinking") && entry.itemId) {
-      index = Math.min(anchors.length, replySegments?.get(entry.itemId) ?? authoredSegments.get(entry.itemId) ?? index);
+      const block = /^(.*):b(\d+)$/.exec(entry.itemId);
+      const messageSegment = block && messageReplies.get(block[1]!)?.find(reply => reply.block >= Number(block[2]))?.segment;
+      index = Math.min(anchors.length, replySegments?.get(entry.itemId) ?? messageSegment ?? authoredSegments.get(entry.itemId) ?? index);
       authoredSegments.set(entry.itemId, index);
     }
     if ((entry.kind === "tool_call" || entry.kind === "tool_result" || entry.kind === "diff") && entry.toolUseId) {
