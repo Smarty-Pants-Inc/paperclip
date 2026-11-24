@@ -72,7 +72,7 @@ describe("TaskChatRunnerTurn", () => {
     );
 
   it.each([null, "run-1"].flatMap(runId => [false, true].map(projected => ({ runId, projected }))))(
-    "shows Working and Thinking during ordinary admission (runId=$runId, projected=$projected)",
+    "shows admission once without claiming work or thinking (runId=$runId, projected=$projected)",
     ({ runId, projected }) => {
       render([], "queued", runId, undefined, false, false, projected ? {
         phase: "queued", label: "Queued", cause: null,
@@ -80,20 +80,20 @@ describe("TaskChatRunnerTurn", () => {
         recoveryOwner: null, nextAction: null, permittedActions: ["inspect_run"],
         predecessorRunId: null, successorRunId: null,
       } : undefined);
-      expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent).toContain(projected ? "Queued" : "Working");
-      if (!runId) {
-        expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent).toBe(projected ? "Queued" : "Working");
-      }
-      const activity = container.querySelector('[data-testid="task-chat-current-activity-label"]');
-      expect(activity?.textContent).toBe("Thinking");
-      expect(activity?.classList.contains("shimmer-text")).toBe(true);
+      expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent).toBe(projected ? "Queued" : "Starting…");
+      expect(container.textContent?.split(projected ? "Queued" : "Starting…")).toHaveLength(2);
+      expect(container.querySelector('[data-testid="task-chat-current-activity"]')).toBeNull();
+      expect(container.textContent).not.toContain("Working");
+      expect(container.textContent).not.toContain("Thinking");
       expect(container.textContent?.includes("Queued")).toBe(projected);
     },
   );
 
   it("preserves a specific preparation label before a run ID exists", () => {
     render([], "queued", null, undefined, false, false, undefined, "Preparing workspace");
-    expect(container.querySelector('[data-testid="task-chat-current-activity-label"]')?.textContent).toBe("Preparing workspace");
+    expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent).toBe("Preparing workspace");
+    expect(container.textContent?.split("Preparing workspace")).toHaveLength(2);
+    expect(container.querySelector('[data-testid="task-chat-current-activity"]')).toBeNull();
   });
 
   it.each([
@@ -121,8 +121,8 @@ describe("TaskChatRunnerTurn", () => {
     try {
       vi.setSystemTime(new Date("2026-11-13T17:39:05Z"));
       render([], "queued");
-      expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent).toContain("Working");
-      expect(container.querySelector('[data-testid="task-chat-current-activity-label"]')?.textContent).toBe("Thinking");
+      expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent).toBe("Starting…");
+      expect(container.querySelector('[data-testid="task-chat-current-activity"]')).toBeNull();
       // The fixture's run was queued 2 s before render: the grace ends at +28 s.
       act(() => { vi.advanceTimersByTime(27_000); });
       expect(container.textContent).not.toContain("Waiting to start");
