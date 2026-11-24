@@ -64,6 +64,9 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
   }, [queryClient, options.companyId, options.enabled, nativeRuns]);
   const [eventsByRun, setEventsByRun] = useState<Map<string, HeartbeatRunEvent[]>>(new Map());
   const persistedEventsByRunRef = useRef(new Map<string, HeartbeatRunEvent[]>());
+  // Deltas beyond a transport gap are not a contiguous answer yet. Keep them
+  // off the painted transcript until history has supplied the missing prefix.
+  const pendingEventsByRunRef = useRef(new Map<string, HeartbeatRunEvent[]>());
   const [errorsByRun, setErrorsByRun] = useState<Map<string, NativeRunTranscriptError>>(new Map());
   const [hydratedRunIds, setHydratedRunIds] = useState<ReadonlySet<string>>(new Set());
   const [hydratedStatusByRun, setHydratedStatusByRun] = useState(new Map<string, string>());
@@ -90,7 +93,7 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
     previousCompanyRef.current = options.companyId;
     setEventsByRun(new Map()); setErrorsByRun(new Map()); setHydratedRunIds(new Set()); setHydratedStatusByRun(new Map());
     projectionCacheRef.current.clear(); cursorByRunRef.current.clear(); conversationOnlyByRunRef.current.clear();
-    persistedEventsByRunRef.current.clear();
+    persistedEventsByRunRef.current.clear(); pendingEventsByRunRef.current.clear();
     sequencesRef.current.clear(); gapPendingRef.current.clear(); interruptedReadsRef.current.clear();
   }, [options.companyId]);
   const stream = useTranscriptLiveStream(nativeRuns.filter(run => isLive(run.status)).map(run => run.id), options, event => {
@@ -109,7 +112,12 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
       gapPendingRef.current.add(runId);
       refreshByRunRef.current.get(runId)?.();
     }
-    if (hasTranscriptBody) setEventsByRun(previous => new Map(previous).set(runId, mergeRunEvents(previous.get(runId) ?? [], [row])));
+    if (!hasTranscriptBody) return;
+    if (cursor.needsCatchup) {
+      pendingEventsByRunRef.current.set(runId, mergeRunEvents(pendingEventsByRunRef.current.get(runId) ?? [], [row]));
+      return;
+    }
+    setEventsByRun(previous => new Map(previous).set(runId, mergeRunEvents(previous.get(runId) ?? [], [row])));
   });
 
 
@@ -123,6 +131,7 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
       const mode = Boolean(run.conversationOnly);
       if (conversationOnlyByRunRef.current.get(run.id) !== mode) {
         changedModes.add(run.id); cursorByRunRef.current.delete(run.id); sequencesRef.current.delete(run.id);
+        for (const row of pendingEventsByRunRef.current.get(run.id) ?? []) sequence(run.id).requireHistory(row.seq);
       }
       if (changedModes.has(run.id) || !persistedEventsByRunRef.current.has(run.id)) {
         persistedEventsByRunRef.current.set(run.id, savedHistory.get(run.id)?.events ?? []);
@@ -160,8 +169,8 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
         cursorByRunRef.current.delete(id); sequencesRef.current.delete(id); gapPendingRef.current.delete(id);
       }
     }
-    for (const id of persistedEventsByRunRef.current.keys()) {
-      if (!retainedIds.has(id)) persistedEventsByRunRef.current.delete(id);
+    for (const map of [persistedEventsByRunRef.current, pendingEventsByRunRef.current]) {
+      for (const id of map.keys()) if (!retainedIds.has(id)) map.delete(id);
     }
 
     const refreshRun = async (run: NativeRunTranscriptSource) => {
@@ -198,9 +207,12 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
         sequence(run.id).confirm(coveredCursor);
         failed = sequence(run.id).needsCatchup;
         if (!failed) gapPendingRef.current.delete(run.id);
-        if (incoming.length > 0) setEventsByRun((previous) => {
+        const pending = pendingEventsByRunRef.current.get(run.id) ?? [];
+        const ready = pending.filter(row => !failed || row.seq <= coveredCursor);
+        pendingEventsByRunRef.current.set(run.id, pending.filter(row => failed && row.seq > coveredCursor));
+        if (incoming.length > 0 || ready.length > 0) setEventsByRun((previous) => {
           const next = new Map(previous);
-          next.set(run.id, mergeRunEvents(previous.get(run.id) ?? saved?.events ?? [], incoming));
+          next.set(run.id, mergeRunEvents(previous.get(run.id) ?? saved?.events ?? [], [...ready, ...incoming]));
           return next;
         });
         const previousEvents = persistedEventsByRunRef.current.get(run.id) ?? [];
