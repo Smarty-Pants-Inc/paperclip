@@ -64,6 +64,7 @@ export function composeNativeVisibleReply(rows: readonly Row[], scope: Scope): V
   let last: VisibleAssistantReply | null = null;
   let fromSeq = events[0]?.seq ?? 0;
   const compose = (boundary?: Item): VisibleAssistantReply | null => {
+    const commentaryTexts = new Set<string>();
     const visible = [...items.values()].flatMap(item => {
       const value = settledText(item.delta, item.completed);
       // Reuse the presentation boundary for recorded plan proposals.
@@ -72,6 +73,11 @@ export function composeNativeVisibleReply(rows: readonly Row[], scope: Scope): V
           payload: { kind: "agentMessage", channel: "final", text: value } } });
       if (!candidate) return [];
       try { if (record(JSON.parse(candidate.text)).schema === "paperclip.run_result.v1") return []; } catch { /* Prose is not JSON. */ }
+      // A final may repeat an answer already shown before the finish tool.
+      // Suppress only that repeated final, preserving commentary and its formatting.
+      const normalized = candidate.text.trim().replace(/\s+/g, " ");
+      if (item.channel === "final" && commentaryTexts.has(normalized)) return [];
+      if (item.channel === "commentary") commentaryTexts.add(normalized);
       return [{ item, text: candidate.text }];
     });
     if (!visible.length) return null;

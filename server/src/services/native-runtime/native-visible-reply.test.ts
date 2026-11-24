@@ -17,6 +17,32 @@ describe("visible assistant reply composition", () => {
       row(7, "item.completed", "final", message("Done.", "final"))];
     expect(composeNativeVisibleReply(events.reverse(), scope)?.text).toBe("Check this.\n\nCheck this.\n\nDone.");
   });
+  it.each([
+    { commentary: "**Rome**.", final: "**Rome**.", expected: "**Rome**." },
+    { commentary: "  **Rome**.\n\nCapital of Italy.  ", final: "**Rome**. Capital\tof Italy.",
+      expected: "  **Rome**.\n\nCapital of Italy.  " },
+    { commentary: "Before tool.", final: "Done.", expected: "Before tool.\n\nDone." },
+    { commentary: "**Rome**.", final: "", expected: "**Rome**." },
+    { commentary: "**Rome**.", final: " \n\t ", expected: "**Rome**." },
+  ])("composes commentary $commentary and final $final once without losing distinct text", ({ commentary, final, expected }) => {
+    const events = [row(1, "item.completed", "intro", message(commentary, "commentary")),
+      row(2, "item.completed", "tool", { kind: "toolCall", text: "private tool JSON" }),
+      row(3, "item.completed", "answer", message(final, "final"))];
+    expect(composeNativeVisibleReply(events, scope)).toMatchObject({ text: expected,
+      replyKey: "native-final:run:answer", seq: 3, fromSeq: 1, throughSeq: 3 });
+  });
+  it("suppresses a final matching earlier commentary in the same segment, not a prior segment", () => {
+    const events = [row(1, "item.completed", "intro", message("**Rome**.", "commentary")),
+      row(2, "item.completed", "more", message("Before tool.", "commentary")),
+      row(3, "item.completed", "answer", message("**Rome**.", "final")),
+      row(4, "item.completed", "next", message("**Rome**.", "final"))];
+    expect(composeNativeVisibleReply(events, { ...scope, throughSeq: 3 })).toMatchObject({
+      text: "**Rome**.\n\nBefore tool.", replyKey: "native-final:run:answer",
+      visibleItems: [{ itemId: "intro", text: "**Rome**.", seq: 1, throughSeq: 1 },
+        { itemId: "more", text: "Before tool.", seq: 2, throughSeq: 2 }] });
+    expect(composeNativeVisibleReply(events, scope)).toMatchObject({ text: "**Rome**.",
+      replyKey: "native-final:run:next", fromSeq: 4, throughSeq: 4 });
+  });
   it.each(["", "Partial", "Partial…[truncated]"])("never erases visible partial deltas with receipt %j", receipt => {
     const events = [row(1, "item.completed", "intro", message("Before tool.")),
       row(2, "item.completed", "tool", { kind: "toolCall", text: "private tool JSON" }),
