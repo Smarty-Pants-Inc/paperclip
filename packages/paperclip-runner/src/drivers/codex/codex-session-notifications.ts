@@ -654,13 +654,18 @@ async function mapNotificationBody(state: CodexSessionState, notification: Codex
         : channelForStartedItem(state, item);
       state.emit(
         "item.completed",
-        boundedPayload({
-          kind: text(item.type, "unknown"),
-          channel,
-          providerPhase: text(item.phase) || undefined,
-          text: itemText(item),
-          item,
-        }),
+        {
+          ...boundedPayload({
+            kind: text(item.type, "unknown"),
+            channel,
+            providerPhase: text(item.phase) || undefined,
+            text: itemText(item),
+            item,
+          }),
+          // Answer attribution is authoritative, not a 128-entry display preview.
+          ...(text(item.type) === "agentMessage" && Array.isArray(item.answers)
+            ? { answers: item.answers.filter((id): id is string => typeof id === "string") } : {}),
+        },
         { turnId, itemId },
       );
       if (text(item.type) === "agentMessage") {
