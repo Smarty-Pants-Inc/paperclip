@@ -4,6 +4,7 @@ import type { NativeExecutionInput, PrpEvent } from "../../vendor/paperclip-runn
 import { findHeartbeatRunCompletionComment, nativeFinalReplyKey, resolveHeartbeatRunResponse } from "../heartbeat-run-summary.js";
 import { loadNativeVisibleReply } from "./native-visible-reply.js";
 import { issueService } from "../issues.js";
+import { acknowledgeChatCompletionReply } from "../chat-completion-delivery.js";
 import { resolveChatRunPresentationAuthorizationReason } from "../chat-run-publications.js";
 import { logActivity } from "../activity-log.js";
 import { hasChatRunOwnedProviderInteraction } from "../chat-interaction-arbitration.js";
@@ -219,6 +220,7 @@ export async function publishContinuousNativeReply(input: {
       authorizationReason, clientRequestId,
       ...(terminalReplay ? { persistedVisibleReplyThroughSeq: input.cursor } : {}),
     }, tx);
+    await acknowledgeChatCompletionReply(tx, runId, comment.id);
     const [saved] = await tx.update(heartbeatRuns).set({ resultJson: { ...result,
       ...(stop.requestedAt && !stop.settledAt && !stop.resumedAt && typeof stop.noticeSeq === "number" && stop.noticeSeq < input.cursor
         ? { personStop: { ...stop, settledAt: new Date().toISOString(), answerItemId: input.event.itemId } } : {}),
