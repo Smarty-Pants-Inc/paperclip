@@ -223,7 +223,7 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
             r.finished_at as "finishedAt", r.scheduled_retry_at as "scheduledRetryAt",
             r.controller_boot_id as "controllerBootId", r.controller_lease_expires_at as "controllerLeaseExpiresAt",
             r.controller_process as "controllerProcess",
-            jsonb_build_object('cancelledByActorType', r.result_json->'cancelledByActorType') as "resultJson"
+            jsonb_build_object('cancelledByActorType', r.result_json->'cancelledByActorType', 'personStop', r.result_json->'personStop') as "resultJson"
           from heartbeat_runs r
           where r.company_id = ${companyId} and (r.context_snapshot->>'issueId') = requested.id
           order by r.created_at desc limit 1
@@ -458,7 +458,9 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
             && !NON_TERMINAL_RUN_STATUSES.includes(latest.status) ? leaseUntil : null,
           operatorStopped: latest.agentId === issue.assigneeAgentId && (
             [CHAT_CONTROL_RECOVERY_STOP_CODE, CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE, "operator_interrupted"].includes(latest.errorCode ?? "")
-            || (latest.status === "cancelled" && ["user", "board"].includes(String(json(latest.resultJson).cancelledByActorType)))),
+            || (latest.status === "cancelled" && ["user", "board"].includes(String(json(latest.resultJson).cancelledByActorType)))
+            // Seam 0260: a person's Stop that ended the turn (0233, run succeeded) is the person's move too.
+            || (latest.status === "succeeded" && json(latest.resultJson).personStop != null)),
         } : null,
         pendingWakes: (wakeCounts.get(issue.id) ?? 0) + (chatWakeIds.has(issue.id) ? 1 : 0),
         nativeRecoveryPending: nativeIds.has(issue.id),
