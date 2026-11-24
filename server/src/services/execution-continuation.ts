@@ -246,10 +246,13 @@ export async function buildExecutionContinuation(input: {
     !issue ||
     issue.assigneeAgentId !== input.agentId ||
     issue.status === "cancelled" ||
-    (issue.status === "done" && input.prospectiveTaskStatus !== "todo" && !await isCompletedOnboardingHandoffWake(db, {
-      companyId, issueId, agentId: input.agentId,
-      reason: string(input.context.wakeReason), contextSnapshot: input.context,
-    }))
+    (issue.status === "done" && input.prospectiveTaskStatus !== "todo"
+      // The comment route validates this server-owned contextSnapshot marker.
+      && !(input.context.finishedTaskConversation === true && input.context.wakeReason === "issue_commented")
+      && !await isCompletedOnboardingHandoffWake(db, {
+        companyId, issueId, agentId: input.agentId,
+        reason: string(input.context.wakeReason), contextSnapshot: input.context,
+      }))
   )
     throw new StaleExecutionContinuationError("continuation_task_ownership_changed");
   const rows = await db
