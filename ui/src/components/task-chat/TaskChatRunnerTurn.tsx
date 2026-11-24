@@ -179,6 +179,7 @@ export function TaskChatRunnerTurn({
   agentIcon,
   agent,
   items,
+  finalResponse,
   readReceipt,
   status,
   execution,
@@ -199,6 +200,8 @@ export function TaskChatRunnerTurn({
   agentIcon?: string | null;
   agent?: import("../AgentAvatar").AvatarAgent;
   items: readonly TaskChatItem[];
+  /** Thread-owned final; null leaves saved replies in their own bubbles. */
+  finalResponse?: TaskChatMessageItem | null;
   readReceipt?: Pick<TaskChatMessageItem, "id" | "createdAtIso">;
   status: string;
   execution?: ExecutionProjection | null;
@@ -274,7 +277,10 @@ export function TaskChatRunnerTurn({
     finalRef.current.item = observedFinal;
     finalRef.current.providerText = observedProviderText;
   }
-  const final = finalRef.current.item;
+  // The thread's dedupe set and this rendered final must have the same owner.
+  // Standalone turns retain their replay latch; controlled segments must not
+  // replay an older final beside the saved bubble the thread kept visible.
+  const final = finalResponse === undefined ? finalRef.current.item : finalResponse ?? undefined;
   const timelineItems = paperclipRunnerTimelineItems(turnItems.map((item) =>
     item.kind === "message" && item.id !== final?.id ? { ...item, interstitial: true } : item,
   ));
