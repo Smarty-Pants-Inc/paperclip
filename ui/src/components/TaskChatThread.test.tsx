@@ -945,7 +945,9 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
       // Native turns keep hydrating their saved tools even when slow; only
       // legacy output remains deferred behind the explicit expansion control.
       if (runtimeMode === "native") {
-        expect(transcriptHookCalls().at(-1)).toMatchObject([{ id: "failed-run", conversationOnly: true }]);
+        expect(transcriptHookCalls().at(-1)).toMatchObject([{ id: "failed-run" }]);
+        expect(transcriptHookCalls().at(-1)?.[0]).not.toHaveProperty("conversationOnly", true);
+        expect(container.textContent).not.toContain("More run output");
       } else {
         expect(transcriptHookCalls().at(-1)).toEqual([]);
         const output = [...container.querySelectorAll("button")].find(button => button.textContent === "More run output");
