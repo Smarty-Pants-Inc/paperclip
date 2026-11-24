@@ -1,7 +1,7 @@
 import { and, asc, eq, gt, inArray, isNull, lt, sql } from "drizzle-orm";
 import { agentWakeupRequests, agents, heartbeatRunEvents, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import type { NativeExecutionInput, PrpEvent } from "../../vendor/paperclip-runner/index.js";
-import { findHeartbeatRunCompletionComment, nativeFinalReplyKey, resolveHeartbeatRunResponse } from "../heartbeat-run-summary.js";
+import { findHeartbeatRunCompletionComment, nativeFinalReplyKey, resolveHeartbeatRunResponse, type CompletedFinalAgentMessageCandidate, type SteeredTaskResponseScope } from "../heartbeat-run-summary.js";
 import { loadNativeVisibleReply } from "./native-visible-reply.js";
 import { issueService } from "../issues.js";
 import { acknowledgeChatCompletionReply } from "../chat-completion-delivery.js";
@@ -18,6 +18,68 @@ import { readFirstTurnQueuedInputReceipt } from "./first-turn-queued-input.js";
 import { queuedCommentIdsFromWakePayload, withQueuedCommentIdsInWakePayload } from "../issue-queued-comment-queue.js";
 import { publishLiveEvent } from "../live-events.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "../heartbeat-run-status-payload.js";
+
+/** Terminal finish and steering answer different questions. Reuse the existing
+ * per-item reply/placement contract; never concatenate or compare their prose.
+ * The caller supplies only an accepted result, after its presentation gates. */
+export async function materializeSteeredTaskReplies(db: Db, input: {
+  companyId: string; issueId: string; runId: string; agentId: string;
+  resultJson: Record<string, unknown>;
+  scope: SteeredTaskResponseScope;
+  finalAgentMessage: CompletedFinalAgentMessageCandidate & { reasonCode?: string };
+  authorizationReason: string | null;
+}) {
+  const finalResponse = resolveHeartbeatRunResponse({ resultJson: null, finalAgentMessage: input.finalAgentMessage });
+  if (!finalResponse.text || finalResponse.decision.chosenSource !== "final_agent_message" ||
+      finalResponse.decision.reasonCodes.includes("bounded_final_agent_message_without_complete_source")) return null;
+  return db.transaction(async transaction => {
+    const tx = transaction as unknown as Db;
+    await tx.select({ id: issues.id }).from(issues).where(and(eq(issues.id, input.issueId),
+      eq(issues.companyId, input.companyId))).for("update");
+    const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.runId),
+      eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.nativeIssueId, input.issueId))).for("update");
+    if (!run) throw new Error("native_task_reply_run_missing");
+    const summary = resolveHeartbeatRunResponse({ resultJson: input.resultJson }).text;
+    if (!summary) throw new Error("native_task_reply_accepted_summary_missing");
+    const summaryKey = nativeFinalReplyKey(run.id, "accepted-summary");
+    const finalKey = input.finalAgentMessage.replyKey ?? nativeFinalReplyKey(run.id, `terminal-${input.finalAgentMessage.seq}`);
+    const comments = await tx.select().from(issueComments).where(and(eq(issueComments.companyId, input.companyId),
+      eq(issueComments.issueId, input.issueId), eq(issueComments.createdByRunId, run.id)));
+    const existingSummary = comments.find(comment => comment.clientRequestId === summaryKey);
+    const selectedId = parseObject(run.resultJson?.presentationDecision).commentId;
+    // A selected reply that was removed must not be resurrected by recovery.
+    if (typeof selectedId === "string" && !comments.some(comment => comment.id === selectedId)) return null;
+    const existingFinal = comments.find(comment => comment.clientRequestId === finalKey || comment.clientRequestId?.startsWith(`${finalKey}:`))
+      ?? comments.find(comment => comment.id === selectedId && comment.id !== existingSummary?.id)
+      ?? findHeartbeatRunCompletionComment(comments.filter(comment => comment.id !== existingSummary?.id), run.resultJson, finalKey);
+    const actor = { agentId: input.agentId, runId: run.id };
+    const options = { authorizationReason: input.authorizationReason, completionReply: true };
+    const summaryComment = existingSummary ?? await issueService(db).addComment(input.issueId, summary, actor,
+      { authorizationReason: input.authorizationReason, clientRequestId: summaryKey,
+        ...(existingFinal ? { createdAt: new Date(existingFinal.createdAt.getTime() - 1) } : {}) }, tx);
+    const finalComment = existingFinal ?? await issueService(db).addComment(input.issueId, finalResponse.text!, actor,
+      { ...options, clientRequestId: finalKey }, tx);
+    const replies = parseObject(run.resultJson?.continuousReplies);
+    const finalItemId = finalKey.slice(`native-final:${run.id}:`.length);
+    const decision = { ...finalResponse.decision,
+      commentAction: "reuse" as const, commentId: finalComment.id,
+      reasonCodes: ["accepted_summary_and_steered_final_separate_replies"] };
+    await tx.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
+      presentationDecision: decision,
+      continuousReplies: { ...replies,
+        "accepted-summary": { questionCommentIds: input.scope.originalQuestionCommentIds, commentId: summaryComment.id, sourceEventId: null },
+        [finalItemId]: { questionCommentIds: input.scope.steeredQuestionCommentIds, commentId: finalComment.id,
+          sourceEventId: input.finalAgentMessage.sourceEventId },
+      },
+    })}::jsonb`, updatedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
+    for (const comment of [!existingSummary && summaryComment, !existingFinal && finalComment]) {
+      if (comment) await logActivity(tx, { companyId: input.companyId, actorType: "agent", actorId: input.agentId,
+        agentId: input.agentId, runId: run.id, issueId: input.issueId, action: "issue.comment_added", entityType: "issue",
+        entityId: input.issueId, details: { commentId: comment.id, source: "run_presentation_resolver" } });
+    }
+    return { decision, created: !existingSummary || !existingFinal };
+  });
+}
 
 /** A Stop receipt is durable while its original comments await draft restoration. */
 async function applyNativePersonStopNotice(input: Parameters<typeof publishContinuousNativeReply>[0]) {

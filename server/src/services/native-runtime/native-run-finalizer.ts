@@ -1,4 +1,4 @@
-import { recoverContinuousNativeReplies, recoverTerminalNativeVisibleReply } from "./native-continuous-reply.js";
+import { materializeSteeredTaskReplies, recoverContinuousNativeReplies, recoverTerminalNativeVisibleReply } from "./native-continuous-reply.js";
 import { loadNativeVisibleReply } from "./native-visible-reply.js";
 import { notifyNativeEnvironmentSettlement } from "../native-environment-settlement-notifications.js";
 import { isContextCompactionRun } from "../context-compaction.js";
@@ -110,6 +110,7 @@ import {
   findHeartbeatRunCompletionComment,
   isExternalChatPresentationContext,
   readAcceptedTaskContinuationSummary,
+  readSteeredTaskResponseScope,
   resolveHeartbeatRunResponse,
 } from "../heartbeat-run-summary.js";
 import { resolveChatRunPresentationAuthorizationReason } from "../chat-run-publications.js";
@@ -1088,6 +1089,9 @@ async function recoverCommittedNativeChatResponseInScope(
             else jsonb_build_object(
               'skipIssueComment', ${heartbeatRuns.contextSnapshot}->'skipIssueComment',
               'issueId', ${heartbeatRuns.contextSnapshot}->'issueId',
+              'wakeCommentId', ${heartbeatRuns.contextSnapshot}->'wakeCommentId',
+              'wakeCommentIds', ${heartbeatRuns.contextSnapshot}->'wakeCommentIds',
+              'firstTurnQueuedInput', ${heartbeatRuns.contextSnapshot}->'firstTurnQueuedInput',
               'conversationSessionGeneration', ${heartbeatRuns.contextSnapshot}->'conversationSessionGeneration',
               'source', ${heartbeatRuns.contextSnapshot}->'source',
               'externalChatContinuation', ${heartbeatRuns.contextSnapshot}->'externalChatContinuation',
@@ -1112,15 +1116,13 @@ async function recoverCommittedNativeChatResponseInScope(
         !run.finishedAt
       )
         return false;
-      // An existing selected answer, including a subsequently deleted one, must
-      // never be replaced or resurrected by a background presentation repair.
+      // Never replace or resurrect a selected final. The steered task path
+      // below may only fill its separate accepted original-question summary.
       const recordedPresentation = record(record(run.resultJson).presentationDecision);
-      if (
-        typeof recordedPresentation.commentId === "string" ||
-        (recordedPresentation.commentAction !== undefined && recordedPresentation.commentAction !== "create") ||
-        record(run.contextSnapshot).skipIssueComment === true
-      )
-        return false;
+      const selectedPresentation = typeof recordedPresentation.commentId === "string" ||
+        (recordedPresentation.commentAction !== undefined && recordedPresentation.commentAction !== "create");
+      if (record(run.contextSnapshot).skipIssueComment === true ||
+          (selectedPresentation && typeof recordedPresentation.commentId !== "string")) return false;
       if (input.onlyWhenDue) {
         if (coordinator.nextAttemptAt && coordinator.nextAttemptAt.getTime() > Date.now()) return false;
         const [pendingEffect] = await tx.select({ id: statusDecisionEffects.id }).from(statusDecisionEffects).where(and(
@@ -1176,7 +1178,7 @@ async function recoverCommittedNativeChatResponseInScope(
       if (record(decision.decisionJson).externalChatReviewPresentation)
         return false;
       const monitorResult = { nativeResult: result, finalizationPhase: "committed", finalizationReasonCode: decision.reasonCode };
-      if (readAcceptedTaskContinuationSummary(monitorResult) && run.status === "succeeded" &&
+      if (!selectedPresentation && readAcceptedTaskContinuationSummary(monitorResult) && run.status === "succeeded" &&
           terminal.runTerminalState === "succeeded" && terminal.turnTerminalState === "completed" &&
           terminal.reportedWorkDisposition === "yielded" && record(run.contextSnapshot).skipIssueComment !== true &&
           !await hasChatRunOwnedProviderInteraction(tx, input)) {
@@ -1231,6 +1233,25 @@ async function recoverCommittedNativeChatResponseInScope(
         const finalAgentMessage = await loadNativeVisibleReply(tx, { companyId: input.companyId, runId: run.id, agentId: run.agentId,
           normalizedSessionId: run.nativeSessionId, turnId: accepted.turnId });
         if (!finalAgentMessage && !blockedTaskReply) return false;
+        const steeredTaskResponse = !conversation && finalAgentMessage?.channel === "final"
+          ? readSteeredTaskResponseScope({ runId: run.id, contextSnapshot: run.contextSnapshot,
+              resultJson: { ...record(run.resultJson), nativeResult: result }, finalAgentMessageSeq: finalAgentMessage.seq }) : null;
+        if (steeredTaskResponse && finalAgentMessage) {
+          await notifyChatRunMilestones(tx, input);
+          const saved = await materializeSteeredTaskReplies(tx as unknown as Db, {
+            ...input, agentId: run.agentId, resultJson: { ...record(run.resultJson), nativeResult: result },
+            scope: steeredTaskResponse, finalAgentMessage, authorizationReason: replyAuthorization,
+          });
+          if (saved) {
+            await tx.update(heartbeatRuns).set({
+              resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${settledResponsePublicationSql()}`,
+              updatedAt: new Date(),
+            }).where(eq(heartbeatRuns.id, run.id));
+            if (saved.created) agentId = run.agentId;
+            return saved.created;
+          }
+        }
+        if (selectedPresentation) return false;
         const comments = await tx.select({ id: issueComments.id, body: issueComments.body, presentation: issueComments.presentation, clientRequestId: issueComments.clientRequestId })
           .from(issueComments).where(and(
             eq(issueComments.companyId, input.companyId),
@@ -1289,6 +1310,7 @@ async function recoverCommittedNativeChatResponseInScope(
         conversationReply = conversation;
         return true;
       }
+      if (selectedPresentation) return false;
       if (
         result.reportedWorkDisposition !== "yielded" ||
         record(result.continuation).kind !== "response_wake" ||

@@ -347,6 +347,41 @@ export function readCompletedAssistantMessageCandidate(input: {
   };
 }
 
+export type SteeredTaskResponseScope = {
+  originalQuestionCommentIds: string[];
+  steeredQuestionCommentIds: string[];
+};
+
+/** Terminal task presentation only. ACKs prove delivery to the later final,
+ * never ownership of a finish summary (which can be proposed after the ACK). */
+export function readSteeredTaskResponseScope(input: {
+  runId: string;
+  contextSnapshot: unknown;
+  resultJson: Record<string, unknown> | null | undefined;
+  finalAgentMessageSeq: number | undefined;
+}): SteeredTaskResponseScope | null {
+  const result = record(input.resultJson), context = record(input.contextSnapshot);
+  if (!readAcceptedSemanticSummary(result) || hasYieldedSemanticResult(result) ||
+      input.finalAgentMessageSeq === undefined || !Number.isFinite(input.finalAgentMessageSeq)) return null;
+  const ids = (value: unknown) => Array.isArray(value)
+    ? value.filter((id): id is string => typeof id === "string" && id.trim().length > 0) : [];
+  const claimed = record(context.firstTurnQueuedInput);
+  const returned = new Set(ids(record(result.personStop).returned));
+  const originalQuestionCommentIds = [...new Set([
+    ...ids(context.wakeCommentIds), ...ids([context.wakeCommentId]),
+    ...(claimed.schema === "paperclip.first-turn-queued-input.v1" && claimed.runId === input.runId
+      ? ids(claimed.commentIds) : []),
+  ])].filter(id => !returned.has(id));
+  const original = new Set(originalQuestionCommentIds);
+  const steeredQuestionCommentIds = Object.entries(record(result.queuedSteeringAcknowledgements))
+    .filter(([id, receipt]) => !original.has(id) && !returned.has(id) &&
+      record(receipt).status === "acknowledged" && typeof record(receipt).afterEventSeq === "number" &&
+      Number(record(receipt).afterEventSeq) < input.finalAgentMessageSeq!)
+    .map(([id]) => id);
+  return originalQuestionCommentIds.length && steeredQuestionCommentIds.length
+    ? { originalQuestionCommentIds, steeredQuestionCommentIds } : null;
+}
+
 function readAcceptedSemanticSummary(resultJson: Record<string, unknown>) {
   const candidates = semanticResultCandidates(resultJson);
   for (const candidate of candidates) {
