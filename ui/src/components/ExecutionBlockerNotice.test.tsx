@@ -26,6 +26,15 @@ describe("ordinary task interruption", () => {
   const render = async (presentation = failed, options: { canRetry?: boolean; optimistic?: boolean; takingLonger?: boolean; error?: Error } = {}) => {
     await act(async () => root.render(<ExecutionBlockerNotice presentation={presentation} canRetry onRetry={retry} {...options} />));
   };
+  it.each(["personStop"])("does not call a person's %s a failed conversation resume", async key => {
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={failed} observedStatus="failed"
+      observedResultJson={{ [key]: { requestedAt: "2026-11-24T20:00:00Z" } }} canRetry onRetry={retry} />));
+    expect(container.textContent).not.toContain("Couldn't resume this conversation");
+  });
+  it("still reports a failed resume when no person stopped the failed run (a budget cancel's startup fence included)", async () => {
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={failed} observedStatus="failed" observedResultJson={{ startupCancellation: { requestedAt: "2026-11-24T20:00:00Z" } }} canRetry onRetry={retry} />));
+    expect(container.textContent).toContain("Couldn't resume this conversation");
+  });
   it("offers one Retry without delegating infrastructure chores", async () => {
     await render();
     expect(container.textContent).toContain("Couldn’t finish this attempt. Your message is saved.");
