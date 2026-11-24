@@ -7592,7 +7592,7 @@ describe("IssueDetail", () => {
     },
   );
 
-  it.each([true, false])("optimistically promotes the last steering message and restores it without a toast on rejection (history loaded: %s)", async historyLoaded => {
+  it.each([true, false])("keeps the last steering message in the tray until acknowledgement and retains it on rejection (history loaded: %s)", async historyLoaded => {
     const queue = createQueuedCommentQueue();
     mockIssuesApi.get.mockResolvedValue(createIssue({ status: "in_progress", assigneeAgentId: "agent-1", executionRunId: "run-active-1" }));
     mockAgentsApi.list.mockResolvedValue([createAgent({ adapterType: "paperclip_runner" })]);
@@ -7618,9 +7618,10 @@ describe("IssueDetail", () => {
     let pending!: Promise<unknown>;
     await act(async () => { pending = props.onSteerQueuedComment("queued-comment-1", queue.revision).catch(error => error); });
     const whilePending = mockIssueChatThreadRender.mock.calls.at(-1)?.[0] as Props;
-    expect(whilePending.queuedCommentQueue).toBeNull();
-    expect(mockIssueChatThreadRender.mock.calls.at(-1)?.[0]?.comments).toContainEqual(expect.objectContaining({
-      id: "queued-comment-1", steeredIntoRunId: "run-active-1", queueState: undefined,
+    expect(whilePending.queuedCommentQueue?.entries).toHaveLength(1);
+    expect(whilePending.queuedCommentQueue?.entries[0]?.comment.id).toBe("queued-comment-1");
+    expect(mockIssueChatThreadRender.mock.calls.at(-1)?.[0]?.comments).not.toContainEqual(expect.objectContaining({
+      id: "queued-comment-1", steeredIntoRunId: "run-active-1",
     }));
     const failure = new ApiError("This runner does not support steering", 409, { code: "steering_unsupported" });
     await act(async () => { rejectSteer(failure); await pending; });
