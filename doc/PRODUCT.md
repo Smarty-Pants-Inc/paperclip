@@ -448,6 +448,14 @@ in-app only.
 
 Coordinator is the standard workspace for everyone. Settings → Experimental offers a personal **Classic workspace** opt-in, off by default. Historical Coordinator experiment settings do not enable Classic. Agent Chat is available to everyone on new and existing instances. The retired `enableAgentChat` key remains accepted for compatibility; stored and managed off values are ignored. Each person has one persistent task-backed conversation per agent and company, with ordinary company task visibility. The shared task composer, transcript, tools, files, and document panel remain the interaction surface. Agents clarify goals and hand substantial execution to linked, assigned tasks; a reply ends a turn without completing the conversation. `/new` starts fresh provider context in the same conversation while preserving visible history and artifacts. Healthy idle conversations wait for a message and do not count as unfinished execution work. See `doc/plans/2026-09-10-agent-chat.md` for the implementation contract.
 
+After publishing a continuous Pi chat's final answer, the server first drains
+queued person messages into the held turn. A `/new` head or any deferred
+non-person wake (such as a sub-task report, approval, or automation) then ends
+an idle open-turn hold through the normal turn interrupt. These wakes stay
+queued for ordinary admission; `/new` is never sent as steering text. Active
+provider work is not interrupted, the run is not marked person-stopped, and no
+messages are returned to the draft by this idle-hold release.
+
 Document links labeled to open in the sidebar keep the conversation on screen
 and show the requested document revision. **Open source task** in the sidebar
 takes the reader to the owning task's detail page with its task breadcrumb.
