@@ -284,9 +284,11 @@ async function isUnstartedInheritedFollowUp(
 ): Promise<boolean> {
   const checkpoint = record(run.runnerProfileJson.sessionCheckpoint);
   const identity = record(checkpoint.identity);
-  if (run.runtimeMode !== "native" || run.status !== "failed" || run.processPid !== null ||
-      run.processGroupId !== null || run.processStartedAt !== null || run.runnerProfileJson.nativeControllerRecovery != null ||
-      identity.runId !== run.id || identity.sessionId !== input.normalizedSessionId || checkpoint.cursor !== null) return false;
+  if (run.runtimeMode !== "native" || !["failed", "cancelled"].includes(run.status) || run.processPid !== null ||
+      run.processGroupId !== null || run.processStartedAt !== null ||
+      record(run.runnerProfileJson.nativeControllerRecovery).schema === "paperclip.native-controller-recovery.v1" ||
+      identity.runId !== run.id || identity.sessionId !== input.normalizedSessionId || checkpoint.cursor !== null ||
+      checkpoint.activeTurnId != null || (Array.isArray(checkpoint.pendingRuntimeRequests) && checkpoint.pendingRuntimeRequests.length > 0)) return false;
   const [evidence] = await db.select({
     executionRecovery: sql<unknown>`${heartbeatRuns.resultJson}->'executionRecovery'`,
     phase: nativeRunFinalizations.phase,
@@ -297,15 +299,18 @@ async function isUnstartedInheritedFollowUp(
       where ${nativeRunnerCheckpoints.companyId} = ${heartbeatRuns.companyId} and ${nativeRunnerCheckpoints.runId} = ${heartbeatRuns.id})`,
     result: sql<boolean>`exists (select 1 from ${nativeRunResults}
       where ${nativeRunResults.companyId} = ${heartbeatRuns.companyId} and ${nativeRunResults.runId} = ${heartbeatRuns.id})`,
-  }).from(heartbeatRuns).innerJoin(nativeRunFinalizations, and(
+  }).from(heartbeatRuns).leftJoin(nativeRunFinalizations, and(
     eq(nativeRunFinalizations.runId, heartbeatRuns.id), eq(nativeRunFinalizations.companyId, heartbeatRuns.companyId),
     eq(nativeRunFinalizations.issueId, input.issueId),
   )).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, input.companyId),
     eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.nativeIssueId, input.issueId)));
+  // Stop before dispatch may have no coordinator and no executionRecovery
+  // record at all. Absence of actual work, not the failure label, is the proof.
   const recovery = record(evidence?.executionRecovery);
-  return Boolean(evidence && recovery.kind === "bootstrap" && recovery.providerWorkStarted === false &&
-    evidence.phase === "terminal_failure" && evidence.resultId === null && evidence.leaseOwner === null &&
-    evidence.controllerPid === null && !evidence.controllerCheckpoint && !evidence.result &&
+  return Boolean(evidence && recovery.providerWorkStarted !== true &&
+    (evidence.phase === null || ["observed", "terminal_failure"].includes(evidence.phase)) &&
+    evidence.resultId === null && evidence.leaseOwner === null && evidence.controllerPid === null &&
+    !evidence.controllerCheckpoint && !evidence.result &&
     !(await nativeSessionProviderEvidence(db, [run.id])).has(run.id));
 }
 

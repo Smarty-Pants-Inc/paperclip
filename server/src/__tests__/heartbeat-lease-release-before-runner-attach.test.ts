@@ -19,6 +19,7 @@ const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 vi.mock("../telemetry.ts", () => ({ getTelemetryClient: () => mockTelemetryClient }));
 
 import { heartbeatService } from "../services/heartbeat.ts";
+import { requestNativeStartupCleanup } from "../services/native-runtime/native-startup-cleanup.js";
 import { createLifecycleDriver } from "../services/agent-lifecycle-driver.js";
 import { configureAgentLifecycle, createAgentLifecycle } from "../services/agent-lifecycle.js";
 import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED } from "../services/native-local-process-stop.js";
@@ -136,6 +137,63 @@ describeEmbeddedPostgres("environment lease release between sandbox acquire and 
     expect(fixture.teardownCalls()).toContainEqual([expect.any(String), expect.any(String),
       expect.objectContaining({ providerLeaseId: fixture.providerLeaseId }), expect.any(Number)]);
   }
+
+  it("returns a reusable sandbox untouched after its preparation owner proves Stop before dispatch", async () => {
+    const fixture = await seed("artifact_discovery");
+    const prior = await lease(fixture.leaseId);
+    await db.update(environmentLeases).set({ leasePolicy: "reuse_by_environment",
+      metadata: { ...prior.metadata, reusesReusableLeaseId: randomUUID(), nativeHarnessBackup: { sentinel: "exact prior save" } } }).where(eq(environmentLeases.id, fixture.leaseId));
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date(),
+      resultJson: { preDispatchCancellationSettledAt: new Date().toISOString() } }).where(eq(heartbeatRuns.id, fixture.runId));
+    const heartbeat = heartbeatService(db, { pluginWorkerManager: fixture.manager });
+    await heartbeat.releaseEnvironmentLeasesForRun({ runId: fixture.runId, companyId: fixture.companyId,
+      agentId: fixture.agentId, status: "cancelled" });
+    const saved = await lease(fixture.leaseId);
+    expect(saved.status).toBe("released");
+    expect(saved.cleanupStatus).toBe("success");
+    expect(saved.providerLeaseId).toBe(fixture.providerLeaseId);
+    expect(saved.metadata?.nativeHarnessBackup).toEqual({ sentinel: "exact prior save" });
+    expect(fixture.teardownCalls()).toHaveLength(0);
+  });
+
+  it("still destroys a startup-created box even with preparation-owner Stop proof", async () => {
+    const fixture = await seed("artifact_discovery");
+    await db.update(environmentLeases).set({ leasePolicy: "reuse_by_environment" })
+      .where(eq(environmentLeases.id, fixture.leaseId));
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date(), runnerProfileJson: {},
+      resultJson: { preDispatchCancellationSettledAt: new Date().toISOString() } }).where(eq(heartbeatRuns.id, fixture.runId));
+    await heartbeatService(db, { pluginWorkerManager: fixture.manager }).releaseEnvironmentLeasesForRun({
+      runId: fixture.runId, companyId: fixture.companyId, agentId: fixture.agentId, status: "cancelled" });
+    expect(await lease(fixture.leaseId)).toMatchObject({ status: "expired", cleanupStatus: "success",
+      metadata: { remoteExecutionTermination: { state: "destroyed" } } });
+    expect(fixture.teardownCalls().map(([, method]) => method)).toEqual(["environmentDestroyLease"]);
+  });
+
+  it.each([true, false])("startup Stop retains only a borrowed box (borrowed=%s)", async borrowed => {
+    const fixture = await seed("artifact_discovery"), prior = await lease(fixture.leaseId);
+    await db.update(environmentLeases).set({ leasePolicy: "reuse_by_environment", metadata: {
+      ...prior.metadata, runnerTaskLease: true, ...(borrowed ? { reusesReusableLeaseId: randomUUID() } : {}),
+    } }).where(eq(environmentLeases.id, prior.id));
+    expect(await requestNativeStartupCleanup(db, { companyId: fixture.companyId, agentId: fixture.agentId,
+      runId: fixture.runId, contextId: randomUUID(), deadlineAtMs: Date.now() - 1,
+      leaseOwner: `executor-${fixture.runId}`, requiresPreparationStop: false })).toBe(true);
+    const stopping = heartbeatService(db, { pluginWorkerManager: fixture.manager }).cancelRun(fixture.runId, "Person Stop",
+      { resultJson: { cancelledByActorType: "user", cancelledByUserId: "operator" } });
+    if (!borrowed) {
+      // A new box retains stock's strict destruction/backup obligations; this
+      // intentionally incomplete fixture cannot produce its destroy receipt.
+      await expect(stopping).rejects.toThrow("Task cleanup is still pending");
+      expect(fixture.teardownCalls().map(([, method]) => method)).not.toContain("environmentStopLease");
+      expect((await run(fixture.runId)).resultJson?.nativeStartupCleanup).toMatchObject({ state: "pending" });
+      return;
+    }
+    await stopping;
+    const saved = await lease(fixture.leaseId);
+    expect(saved.cleanupStatus).toBe("success");
+    expect(saved.status).toBe(borrowed ? "released" : "expired");
+    expect(fixture.teardownCalls().map(([, method]) => method)).toEqual([borrowed ? "environmentStopLease" : "environmentDestroyLease"]);
+    expect((await run(fixture.runId)).resultJson?.nativeStartupCleanup).toMatchObject({ state: "complete" });
+  }, 60_000);
 
   it.each(ALL_WINDOWS)("terminating the agent releases a sandbox leased during %s", async window => {
     const fixture = await seed(window);
