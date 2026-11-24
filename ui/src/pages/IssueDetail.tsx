@@ -3714,7 +3714,9 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     ? shouldTrackIssueActiveRun(issue) && hasActiveRun
     : hasActiveRun;
   const hasLiveRuns = liveRunCount > 0 || resolvedHasActiveRun;
-  const interruptionRunId = issue?.interruption?.observedRunId;
+  const interruptionRunId = issue?.executionBlocker?.workspaceRepairRequired
+    ? issue.executionBlocker.runId ?? issue.interruption?.observedRunId
+    : issue?.interruption?.observedRunId;
   const { data: interruptionRun } = useQuery<RunForIssue[] | RecentIssueRunWindow, Error, RunForIssue | undefined>({
     queryKey: historyExpanded ? queryKeys.issues.runs(issueId ?? "") : recentIssueRunWindowQueryKey(issueId ?? ""),
     enabled: false, // Observe the thread's existing run window; do not add another poll.
@@ -8392,7 +8394,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
           )}
           {resolvedDetailTab === "chat" && (
             <ExecutionBlockerNotice className={shellSectionClass} presentation={issue.interruption} blockers={issue.blockedBy}
-              observedStatus={interruptionRun?.status} observedResultJson={interruptionRun?.resultJson}
+              observedStatus={interruptionRun?.status} observedResultJson={interruptionRun?.resultJson} observedErrorCode={interruptionRun?.errorCode}
               blocker={retainedRecoveryOwnsRetry ? null : issue.executionBlocker}
               issueId={issue.id} companyId={issue.companyId} agentName={agentMap.get(issue.assigneeAgentId ?? "")?.name} projectName={issue.project?.name}
               canRetry={canResolveBoardRecoveryAction && !(issue.executionBlocker?.workspaceRepairRequired
