@@ -11,10 +11,6 @@ use crate::stable_identity::{
 };
 
 const MAX_TEXT_CHARS: usize = 4_000;
-/// A completed final answer is the reply the person receives, not a run-log
-/// preview. It keeps its complete (redacted) text up to this transport-safe
-/// bound; the durable outbox applies its own frame check.
-pub(crate) const MAX_FINAL_AGENT_MESSAGE_CHARS: usize = 32_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NormalizedProviderEvent {
@@ -634,17 +630,10 @@ fn plan_proposal_markdown(value: &str) -> String {
         .collect()
 }
 
-/// Redacts a completed final answer without the run-log display preview cap.
+/// Transcript text is authoritative, not a diagnostic preview. The durable
+/// outbox owns the serialized frame budget; projection only redacts secrets.
 fn final_agent_message_text(value: &str) -> String {
-    let redacted = redact_sensitive_text_values(value);
-    if redacted.chars().count() <= MAX_FINAL_AGENT_MESSAGE_CHARS {
-        return redacted;
-    }
-    let marker = "…[truncated]";
-    let retained_chars = MAX_FINAL_AGENT_MESSAGE_CHARS.saturating_sub(marker.chars().count());
-    let mut bounded: String = redacted.chars().take(retained_chars).collect();
-    bounded.push_str(marker);
-    bounded
+    redact_sensitive_text_values(value)
 }
 
 fn bounded_text(value: &str, max_chars: usize) -> String {
@@ -937,7 +926,7 @@ fn reasoning_summary_text(provider_item: &Value) -> Option<String> {
         })
         .filter(|part| !part.is_empty())
         .collect();
-    (!parts.is_empty()).then(|| bounded_text(&parts.join("\n\n"), MAX_TEXT_CHARS))
+    (!parts.is_empty()).then(|| redact_sensitive_text_values(&parts.join("\n\n")))
 }
 
 fn optional_bounded_text(value: Option<&Value>, max_chars: usize) -> Value {
@@ -1331,12 +1320,14 @@ pub fn normalize_codex_notification_in(
                 "kind": "agentMessage",
                 "channel": "progress",
                 "providerMethod": method,
-                "text": bounded_text(string(params.get("delta")), MAX_TEXT_CHARS),
+                "text": redact_sensitive_text_values(string(params.get("delta"))),
             }),
         ),
         // Provider-written reasoning summaries. Each later summary part starts
         // after a blank line, matching the completed item's joined `summary[]`.
-        "item/reasoning/summaryTextDelta" | "item/reasoning/summaryPartAdded" => {
+        "item/reasoning/summaryTextDelta"
+        | "item/reasoning/summaryPartAdded"
+        | "item/reasoning/textDelta" => {
             let text = if method == "item/reasoning/summaryPartAdded" {
                 if params
                     .get("summaryIndex")
@@ -1348,7 +1339,7 @@ pub fn normalize_codex_notification_in(
                 }
                 "\n\n".to_owned()
             } else {
-                bounded_text(string(params.get("delta")), MAX_TEXT_CHARS)
+                redact_sensitive_text_values(string(params.get("delta")))
             };
             push(
                 &mut events,
@@ -1358,7 +1349,7 @@ pub fn normalize_codex_notification_in(
                     "provider": "codex",
                     "itemId": stable_id(string(params.get("itemId")), "codex-item"),
                     "kind": "reasoning",
-                    "channel": "summary",
+                    "channel": if method == "item/reasoning/textDelta" { "detail" } else { "summary" },
                     "providerMethod": method,
                     "text": text,
                 }),
@@ -1516,8 +1507,8 @@ pub fn normalize_codex_notification_in(
                         "detail"
                     },
                     "text": provider_item.get("text").and_then(Value::as_str).map(|value| {
-                        if completed && item_type == "agentMessage" && provider_phase == "final_answer" {
-                            final_agent_message_text(value)
+                        if matches!(item_type, "agentMessage" | "assistant_message" | "reasoning") {
+                            redact_sensitive_text_values(value)
                         } else {
                             bounded_text(value, MAX_TEXT_CHARS)
                         }
@@ -1632,7 +1623,7 @@ pub fn normalize_acpx_runtime_event(
                 "kind": "agentMessage",
                 "channel": "progress",
                 "providerMethod": "runtime.event",
-                "text": bounded_text(string(payload.get("text")), MAX_TEXT_CHARS),
+                "text": redact_sensitive_text_values(string(payload.get("text"))),
             }),
         }],
         AcpxRuntimeEventKind::Thinking => vec![NormalizedProviderEvent {
@@ -1644,7 +1635,7 @@ pub fn normalize_acpx_runtime_event(
                 "kind": "reasoning",
                 "channel": "summary",
                 "providerMethod": "runtime.event",
-                "text": bounded_text(string(payload.get("text")), MAX_TEXT_CHARS),
+                "text": redact_sensitive_text_values(string(payload.get("text"))),
             }),
         }],
         AcpxRuntimeEventKind::Plan => normalize_acpx_plan(payload, &item_id),
@@ -3086,7 +3077,7 @@ mod tests {
         );
         assert_eq!(completed[0].payload["channel"], "final");
         assert_eq!(completed[0].payload["text"].as_str(), Some(answer.as_str()));
-        // Progress prose and in-flight items stay display previews.
+        // Progress prose and in-flight items are saved transcript text too.
         for (method, phase) in [
             ("item/completed", "commentary"),
             ("item/started", "final_answer"),
@@ -3096,8 +3087,7 @@ mod tests {
                 &json!({"item": {"id": "msg-2", "type": "agentMessage", "phase": phase, "text": answer}}),
             );
             let text = events[0].payload["text"].as_str().unwrap();
-            assert_eq!(text.chars().count(), MAX_TEXT_CHARS, "{method} {phase}");
-            assert!(text.ends_with("…[truncated]"));
+            assert_eq!(text, answer, "{method} {phase}");
         }
         // A legacy agentMessage without a phase is never treated as the final answer.
         let legacy = normalize_codex_notification(
@@ -3106,12 +3096,9 @@ mod tests {
         );
         assert_eq!(legacy[0].payload["channel"], "progress");
         let text = legacy[0].payload["text"].as_str().unwrap();
-        assert_eq!(text.chars().count(), MAX_TEXT_CHARS);
-        assert!(text.ends_with("…[truncated]"));
-        let oversized = "x".repeat(MAX_FINAL_AGENT_MESSAGE_CHARS + 1);
-        let bounded = final_agent_message_text(&oversized);
-        assert_eq!(bounded.chars().count(), MAX_FINAL_AGENT_MESSAGE_CHARS);
-        assert!(bounded.ends_with("…[truncated]"));
+        assert_eq!(text, answer);
+        let oversized = "word ".repeat(60_000);
+        assert_eq!(final_agent_message_text(&oversized), oversized);
     }
 
     #[test]
