@@ -914,6 +914,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
                   : null,
               ...nativeProvider,
               lifecyclePolicy: effectiveLifecyclePolicy,
+              sessionContinuity: parseObject(agent.adapterConfig).sessionContinuity,
               interactionResponses,
               completionContract: {
                 id: completionContract.row.id,
