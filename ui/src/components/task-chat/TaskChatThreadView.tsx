@@ -5,7 +5,7 @@ import { TaskChatProjectCreatedCard } from "./TaskChatProjectCreatedCard";
 import { TaskChatSkillCreatedCard } from "./TaskChatSkillCreatedCard";
 import { TaskChatTaskCreatedCard } from "./TaskChatTaskCreatedCard";
 import { useMemo, type ReactNode } from "react";
-import type { IssueAttachment } from "@paperclipai/shared";
+import { getAttachmentArtifactWorkProductMetadata, type IssueAttachment } from "@paperclipai/shared";
 import { cn } from "@/lib/utils";
 import { useStreamlinedTaskChatPresentation } from "./presentation-mode";
 import type {
@@ -17,7 +17,7 @@ import type {
   TaskChatRuntimeRequestItem,
 } from "./task-chat-model";
 import { TaskChatTurn } from "./TaskChatTurn";
-import { TaskChatBubble } from "./TaskChatBubble";
+import { TaskChatBubble, TaskChatResourceAttachmentIdsContext } from "./TaskChatBubble";
 import { TaskChatMarker } from "./TaskChatMarker";
 import { TaskChatStatusPill } from "./TaskChatStatusPill";
 import { TaskChatToolCard } from "./TaskChatToolCard";
@@ -347,6 +347,14 @@ export function TaskChatThreadView({
   const streamlined = useStreamlinedTaskChatPresentation();
   const { items: compactedItems, retryMarkers } = useMemo(() => compactAdjacentErrors(items), [items]);
   const visibleItems = useMemo(() => groupImageResources(compactedItems), [compactedItems]);
+  const resourceAttachmentIds = useMemo(() => new Set(visibleItems.flatMap(item => {
+    if (item.kind !== "protocol" || item.surface !== "resource") return [];
+    return (item.imageItems ?? [item]).flatMap(resource => {
+      const id = resource.attachment?.id ?? (resource.workProduct
+        ? getAttachmentArtifactWorkProductMetadata(resource.workProduct)?.attachmentId : undefined);
+      return id ? [id] : [];
+    });
+  })), [visibleItems]);
   const retryableMarkerId =
     onRetryFailedRun || onTryAgainNoLiveExecutionPath
       ? [...visibleItems]
@@ -434,6 +442,7 @@ export function TaskChatThreadView({
     retryableMarkerId, onRetryFailedRun, retryFailedRunId, attachments, onOpenSkill, onOpenBrowser,
   ]);
   const body = (
+    <TaskChatResourceAttachmentIdsContext.Provider value={resourceAttachmentIds}>
     <div
       className={cn(
         "paperclip-mobile-thread mx-auto flex w-full max-w-(--tc-shell-max-w) flex-col px-1 py-3 md:px-4 md:py-4",
@@ -452,6 +461,7 @@ export function TaskChatThreadView({
       {history}
       {tail ? <div data-conversation-typography="" className={streamlined ? "mt-4" : undefined}>{tail}</div> : null}
     </div>
+    </TaskChatResourceAttachmentIdsContext.Provider>
   );
 
   if (!scroll) return body;
