@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { expect, it } from "vitest";
 import request from "supertest";
-import { agents, heartbeatRuns, issueComments, issueRecoveryActions, issueRelations, issueThreadInteractions, issues, statusCards } from "@paperclipai/db";
+import { agents, completionContracts, heartbeatRuns, issueComments, issueRecoveryActions, issueRelations, issueThreadInteractions, issues, nativeRunResults, statusCards, statusDecisions, workAssessments } from "@paperclipai/db";
 import { companySearchQuerySchema, createIssueSchema, defaultStatusCardRefreshPolicy, PROVIDER_QUOTA_MONITOR_SERVICE_NAME, type Issue } from "@paperclipai/shared";
 import { issueDisplayStatusSql } from "../services/issue-display-status.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
@@ -51,6 +51,40 @@ describeEmbeddedPostgres("Execution-backed task presentation", () => {
     expect(await svc.list(f.companyId, { displayStatus: "todo", limit: 1 })).toEqual([expect.objectContaining({ id: f.issueId })]);
     // Presentation must not clear ownership or change recovery/admission inputs.
     expect((await ctx.db.select().from(issues).where(eq(issues.id, f.issueId)))[0]).toMatchObject({ status: "in_progress", executionRunId: run!.id, checkoutRunId: run!.id });
+  });
+
+  it("keeps a current applied response-wake wait In Progress without relabeling unstarted or superseded work", async () => {
+    const f = await fixture();
+    await ctx.db.update(issues).set({ monitorNextCheckAt: null, executionPolicy: null }).where(eq(issues.id, f.issueId));
+    expect(await displayStatus(f.issueId)).toEqual({ status: "in_progress", displayStatus: "todo" });
+    const contractId = randomUUID(), runId = randomUUID(), resultId = randomUUID();
+    const assessmentId = randomUUID(), decisionId = randomUUID();
+    await ctx.db.insert(completionContracts).values({ id: contractId, companyId: f.companyId, issueId: f.issueId, revision: 1,
+      schemaVersion: "paperclip.completion-contract.v1", policyVersion: "test", risk: "standard",
+      completionAuthority: "server_arbiter", incompleteCriteriaPolicy: "preserve_non_terminal",
+      contractJson: { objective: "Wait for the person" }, canonicalSha256: contractId,
+      createdByActorType: "system", createdByActorId: "test" });
+    await ctx.db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId,
+      issueId: f.issueId, nativeIssueId: f.issueId, runtimeMode: "native", nativeSessionId: runId,
+      completionContractId: contractId, completionContractSha256: contractId,
+      status: "succeeded", finishedAt: new Date(), resultJson: { personStop: { requestedAt: new Date().toISOString() } } });
+    await ctx.db.insert(nativeRunResults).values({ id: resultId, companyId: f.companyId, issueId: f.issueId, runId,
+      completionContractId: contractId, serverFingerprint: "test", schemaStatus: "accepted", resultJson: {}, canonicalSha256: resultId });
+    await ctx.db.insert(workAssessments).values({ id: assessmentId, companyId: f.companyId, issueId: f.issueId, runId,
+      contractId, resultId, triggerKind: "turn_finished", triggerActorCompanyId: f.companyId,
+      priorIssueStatus: "in_progress", priorStatusVersion: 0, policyVersion: "test", assessmentJson: {}, inputDigest: assessmentId });
+    await ctx.db.insert(statusDecisions).values({ id: decisionId, companyId: f.companyId, issueId: f.issueId, runId, assessmentId,
+      decisionVersion: 1, policyVersion: "test", fromStatus: "in_progress", toStatus: "in_progress",
+      reasonCode: "response_wake_waiting_for_input", decisionJson: {}, decisionDigest: decisionId });
+    await ctx.db.update(issues).set({ lastStatusDecisionId: decisionId }).where(eq(issues.id, f.issueId));
+    expect((await displayStatus(f.issueId)).displayStatus).toBe("todo");
+    await ctx.db.update(statusDecisions).set({ applicationState: "applied", appliedAt: new Date() }).where(eq(statusDecisions.id, decisionId));
+    const svc = issueService(ctx.db);
+    expect(await svc.getById(f.issueId)).toMatchObject({ status: "in_progress", displayStatus: "in_progress" });
+    expect(await svc.count(f.companyId, { displayStatus: "in_progress" })).toBe(1);
+    expect(await svc.list(f.companyId, { displayStatus: "in_progress", limit: 1 })).toEqual([expect.objectContaining({ id: f.issueId })]);
+    await ctx.db.update(issues).set({ lastStatusDecisionId: null }).where(eq(issues.id, f.issueId));
+    expect((await displayStatus(f.issueId)).displayStatus).toBe("todo");
   });
 
   it("shows a stopped task waiting for a human as In Review across API reads and search", async () => {
