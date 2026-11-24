@@ -1,5 +1,5 @@
 /** Canonical definition and documentation for `get_task_history`. */
-const description = "Read bounded comments on the active task only. Calling get_task does not change the active task. This is not a status or assignment audit. For progress chronology and handoff actors, use search_api to discover the company timeline or issue activity, then call_api.";
+const description = "Read bounded comments on the active task only, with each saved native agent reply's visibleTurn: composed text and ordered text/tool/activity rows, run/turn/session references and event cursors. Tool rows contain a name, status and short result summary, never raw JSON. Pages select newest comments and return them chronologically; follow nextCursor as cursor to read older pages until hasMore is false. Calling get_task does not change the active task. This is not a status or assignment audit. For progress chronology and handoff actors, use search_api to discover the company timeline or issue activity, then call_api.";
 
 export const getTaskHistoryAction = {
   "id": "get_task_history",
@@ -67,6 +67,10 @@ export const getTaskHistoryAction = {
             "minimum": 1,
             "maximum": 200,
             "default": 50
+          },
+          "cursor": {
+            "type": "string", "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+            "description": "nextCursor from the previous page; omit for the newest comments."
           }
         },
         "required": [],
@@ -74,6 +78,12 @@ export const getTaskHistoryAction = {
       },
       "outputSchema": {
         "type": "object",
+        "properties": {
+          "comments": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+          "limit": { "type": "integer" }, "returnedCount": { "type": "integer" },
+          "hasMore": { "type": "boolean" }, "nextCursor": { "type": ["string", "null"] }
+        },
+        "required": ["comments"],
         "additionalProperties": true
       }
     }
@@ -99,7 +109,11 @@ export const getTaskHistoryAction = {
         "properties": {
           "limit": {
             "type": "integer",
-            "minimum": 1
+            "minimum": 1, "maximum": 200
+          },
+          "cursor": {
+            "type": "string", "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+            "description": "nextCursor from the previous page; omit for the newest comments."
           }
         },
         "required": [],

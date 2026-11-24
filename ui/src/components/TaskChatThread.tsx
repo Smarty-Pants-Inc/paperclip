@@ -1102,7 +1102,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       .sort((a, b) => toMs(a.createdAt) - toMs(b.createdAt)).at(-1)?.id;
     for (const run of runs) if (slowSettledTranscriptRunIds.has(run.id) && run.id !== newestSucceededRunId) deferred.add(run.id);
     for (const run of runs) {
-      if (run.id === newestSucceededRunId) continue;
+      // Native compact history now retains visible tools; a saved body alone
+      // cannot stand in for the turn's activity after reload.
+      if (run.runtimeMode === "native" || run.id === newestSucceededRunId) continue;
       if (requestedTranscripts.current.ids.has(run.id) || run.status !== "succeeded" ||
         !run.createdAt || toMs(run.createdAt) > openedAt) continue;
       const meta = linkedRunMetaById.get(run.id);

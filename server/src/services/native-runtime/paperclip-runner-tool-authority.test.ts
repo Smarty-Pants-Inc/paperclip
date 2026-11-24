@@ -18,6 +18,7 @@ import {
   createDb,
   documents,
   heartbeatRuns,
+  heartbeatRunEvents,
   issueApprovals,
   issueComments,
   issueThreadInteractions,
@@ -492,6 +493,82 @@ describe("PaperclipRunnerToolAuthority", () => {
           authorAgentId: agentId, body: "I will check the configuration." });
     } finally {
       await db.delete(issueComments).where(inArray(issueComments.id, commentIds));
+    }
+  });
+
+  it("returns the same ordered saved turns and tools through both readers, across history pages", async () => {
+    const savedRun = randomUUID(), session = randomUUID();
+    const ids = Array.from({ length: 4 }, () => randomUUID());
+    await db.insert(heartbeatRuns).values({ id: savedRun, companyId, agentId, runtimeMode: "native", nativeIssueId: issueId,
+      status: "cancelled", nativeSessionId: session, resultJson: { continuousReplies: {
+        f1: { commentId: ids[1] }, f2: { commentId: ids[2] },
+      }, presentationDecision: { commentId: ids[3] } } });
+    const event = (seq: number, eventType: string, itemId: string, payload: Record<string, unknown>, turnId = "turn") => ({
+      companyId, agentId, runId: savedRun, seq, eventType, payload: { prpEvent: { schema: "paperclip.prp.event.v1",
+        runId: savedRun, normalizedSessionId: session, sourceEventId: `history-${seq}`, turnId, eventType, itemId, payload } },
+    });
+    await db.insert(heartbeatRunEvents).values([
+      event(1, "turn.started", "", {}),
+      event(2, "item.completed", "p1", { kind: "agentMessage", channel: "progress", text: "Before tool." }),
+      event(3, "item.completed", "thought", { kind: "reasoning", text: "hidden reasoning canary" }),
+      event(4, "item.started", "cmd1", { kind: "tool_use", item: { id: "cmd1", type: "tool_use", name: "Bash", input: { command: "pwd" } } }),
+      event(5, "tool.execution.completed", "cmd1", { executionId: "cmd1", name: "Bash", status: "completed", summary: "Read current directory" }),
+      event(6, "item.completed", "f1", { kind: "agentMessage", channel: "final", text: "Done." }),
+      event(7, "item.completed", "p2", { kind: "agentMessage", channel: "progress", text: "Next check." }),
+      event(8, "item.started", "cmd2", { kind: "tool_use", item: { id: "cmd2", type: "tool_use", name: "Bash" } }),
+      event(9, "item.completed", "cmd2", { kind: "tool_result", item: { id: "cmd2", type: "tool_result", isError: true,
+        result: { summary: "Command failed", raw: "raw JSON canary" } } }),
+      event(10, "item.completed", "f2", { kind: "agentMessage", channel: "final", text: "Stopped." }),
+      event(11, "turn.started", "", {}, "partial-turn"),
+      event(12, "item.delta", "partial", { kind: "agentMessage", channel: "progress", text: "Partial answer" }, "partial-turn"),
+      event(13, "tool.execution.started", "cmd3", { executionId: "cmd3", name: "Bash", status: "running" }, "partial-turn"),
+      event(14, "turn.cancelled", "", {}, "partial-turn"),
+      event(15, "wait.completed", "", { schema: "paperclip.wait.v1", waitId: "wait", status: "completed", reason: "Waiting for result" }, "partial-turn"),
+    ]);
+    await db.insert(issueComments).values(ids.map((id, i) => ({ id, companyId, issueId, createdAt: new Date(2_000_000 + i),
+      ...(i ? { authorAgentId: agentId, createdByRunId: savedRun, clientRequestId: `native-final:${savedRun}:${["", "f1", "f2", "partial"][i]}` }
+        : { authorUserId: "board-user" }), body: ["Please check", "Before tool.\n\nDone.", "Next check.\n\nStopped.", "Partial answer"][i]! })));
+    try {
+      const tool = new PaperclipRunnerToolAuthority(db, { companyId, agentId, issueId, runId });
+      const semantic = new PaperclipRunnerSemanticAuthority(db, { companyId, agentId, issueId, runId });
+      const readers = [async (input: Record<string, unknown>) => tool.execute({ tool: "get_task_history", callId: randomUUID(), arguments: input }),
+        async (input: Record<string, unknown>) => {
+          const result = await semantic.dispatch({ callId: randomUUID(), operationId: "get_task_history", input,
+            correlation: { runId, normalizedSessionId: randomUUID(), turnId: "history", itemId: "history" } });
+          expect(result.ok, JSON.stringify(result)).toBe(true); return result.ok ? result.value : null;
+        }];
+      for (const read of readers) {
+        const first = await read({ limit: 2 }) as any;
+        expect(first).toMatchObject({ returnedCount: 2, hasMore: true, nextCursor: ids[2], comments: [
+          { id: ids[2], visibleTurn: { runId: savedRun, turnId: "turn", normalizedSessionId: session, fromSeq: 7, throughSeq: 10,
+            text: "Next check.\n\nStopped.", rows: [{ type: "text", text: "Next check." },
+              { type: "tool", name: "Bash", status: "failed", summary: "Command failed", seq: 8, throughSeq: 9 },
+              { type: "text", text: "Stopped." }] } },
+          { id: ids[3], visibleTurn: { turnId: "partial-turn", throughSeq: 15, rows: [{ type: "text", text: "Partial answer" },
+            { type: "tool", name: "Bash", status: "interrupted" },
+            { type: "activity", name: "Intentional wait", status: "completed", summary: "Waiting for result" }] } },
+        ] });
+        const older = await read({ limit: 2, cursor: first.nextCursor }) as any;
+        expect(older).toMatchObject({ returnedCount: 2, hasMore: false, nextCursor: null, comments: [{ id: ids[0] },
+          { id: ids[1], visibleTurn: { fromSeq: 1, throughSeq: 6, rows: [{ type: "text", text: "Before tool." },
+            { type: "activity", name: "Thought through the task", status: "completed", summary: "" },
+            { type: "tool", name: "Bash", status: "completed", summary: "Read current directory" }, { type: "text", text: "Done." }] } }] });
+        expect(JSON.stringify([first, older])).not.toMatch(/hidden reasoning canary|raw JSON canary/);
+        await db.update(issueComments).set({ sourceTrust: buildLowTrustSourceTrust({ issueId, runId: savedRun, agentId }) })
+          .where(eq(issueComments.id, ids[1]));
+        const quarantined = await read({ limit: 2, cursor: first.nextCursor }) as any;
+        expect(quarantined.comments[1]).not.toHaveProperty("visibleTurn");
+        expect(quarantined.comments[1].body).toBe(LOW_TRUST_QUARANTINED_BODY);
+        await db.update(issueComments).set({ sourceTrust: buildPromotedSourceTrust({ sourceIssueId: issueId,
+          sourceArtifactKind: "comment", sourceArtifactId: ids[1], promotedByActorType: "user", promotedByActorId: "board-user" }) })
+          .where(eq(issueComments.id, ids[1]));
+        expect((await read({ limit: 2, cursor: first.nextCursor }) as any).comments[1]).not.toHaveProperty("visibleTurn");
+        await db.update(issueComments).set({ sourceTrust: null }).where(eq(issueComments.id, ids[1]));
+      }
+    } finally {
+      await db.delete(issueComments).where(inArray(issueComments.id, ids));
+      await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, savedRun));
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, savedRun));
     }
   });
 
