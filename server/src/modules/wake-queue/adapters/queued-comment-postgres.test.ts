@@ -14,6 +14,7 @@ import { QueuedCommentMutationError } from "../application/queued-comment-use-ca
 import { buildAgentMentionHref } from "@paperclipai/shared";
 import { createQueuedCommentSteeringAdapter } from "./queued-comment-board-postgres.js";
 import { appendHeartbeatRunEventBatch } from "../../../services/heartbeat-run-events.js";
+import { publishContinuousNativeReply } from "../../../services/native-runtime/native-continuous-reply.js";
 
 // Proves the same two properties the release-half adapter test proves for
 // this module's other transaction: the one company the caller names in
@@ -192,6 +193,71 @@ describeEmbeddedPostgres("queued-comment postgres adapter", () => {
       releaseBoard();
       await board;
     }
+  });
+
+  it("commits two native event appends while person-stop notice ingestion holds its issue lock", async () => {
+    const companyId = await seedCompany(), agentId = await seedAgent({ companyId });
+    const issueId = await seedIssue({ companyId, assigneeAgentId: agentId }), runId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, issueId, nativeIssueId: issueId,
+      status: "running", runtimeMode: "native", contextSnapshot: { issueId } });
+    let markLocked!: () => void, failLocked!: (error: unknown) => void, releaseNotice!: () => void;
+    const locked = new Promise<void>((resolve, reject) => { markLocked = resolve; failLocked = reject; });
+    const release = new Promise<void>(resolve => { releaseNotice = resolve; });
+    let noticeReleased = false;
+    // Pause the real observer immediately after its first SELECT ... FOR lock,
+    // before it can acquire RUN. Keep its actual SQL lock mode, not a test copy.
+    function observeFirstSelect(builder: object): object {
+      return new Proxy(builder, { get(target, key) {
+        const value = Reflect.get(target, key, target);
+        if (key === "for") return async (...args: unknown[]) => {
+          const rows = await Reflect.apply(value, target, args);
+          markLocked();
+          await release;
+          noticeReleased = true;
+          return rows;
+        };
+        if (key === "from" || key === "where") return (...args: unknown[]) => observeFirstSelect(Reflect.apply(value, target, args));
+        return typeof value === "function" ? value.bind(target) : value;
+      } });
+    }
+    const observingDb = new Proxy(db, { get(target, key) {
+      if (key !== "transaction") return Reflect.get(target, key, target);
+      return (work: (tx: Db) => Promise<unknown>) => target.transaction(async tx => {
+        let first = true;
+        const observed = new Proxy(tx, { get(inner, property) {
+          if (property !== "select") return Reflect.get(inner, property, inner);
+          return (...args: unknown[]) => {
+            const selection = Reflect.apply(inner.select, inner, args);
+            if (!first) return selection;
+            first = false;
+            return observeFirstSelect(selection);
+          };
+        } });
+        return work(observed as unknown as Db);
+      });
+    } });
+    const notice = publishContinuousNativeReply({ db: observingDb, cursor: 1,
+      execution: { binding: { companyId, issueId, runId, agentId }, provider: { kind: "pi_rpc" } },
+      event: { eventType: "provider.notice.recorded", runId, sourceEventId: randomUUID(),
+        normalizedSessionId: "stop-lock-test", payload: { category: "pi_stop_returned_input", details: [] } } });
+    void notice.catch(failLocked);
+    try {
+      await locked;
+      const receipts = await db.transaction(async tx => {
+        await tx.execute(sql`set local lock_timeout = '750ms'`);
+        await tx.execute(sql`set local statement_timeout = '3s'`);
+        const sourceInstanceId = randomUUID();
+        return appendHeartbeatRunEventBatch(tx as unknown as Db, [1, 2].map(sourceSeq => ({
+          companyId, agentId, runId, eventType: "test.person_stop_lock_compatibility",
+          nativeSource: { sourceInstanceId, sourceEventId: randomUUID(), sourceSeq,
+            protocolSchemaVersion: 1, canonicalPayload: { sourceSeq } },
+        })));
+      });
+      expect(noticeReleased).toBe(false);
+      expect(receipts.map(receipt => receipt.disposition)).toEqual(["committed", "committed"]);
+      expect(receipts.map(receipt => receipt.row.seq)).toEqual([1, 2]);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]?.nextEventSeq).toBe(3);
+    } finally { releaseNotice(); await notice; }
   });
 
   it("checks the authenticated editor and changed mentions atomically before updating a queued comment", async () => {

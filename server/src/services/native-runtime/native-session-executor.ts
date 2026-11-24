@@ -34,7 +34,7 @@ import { prepareRuntimeContextSource, rehydratePinnedInstructionAsset } from "./
 import { createNativeUsageDelivery } from "./native-usage-delivery.js";
 import { createNativeRecoveryUsageDelivery } from "./native-recovery-usage-delivery.js";
 import { nativeProviderStartedTurns, nativeProviderTurnWaitOptions } from "./native-provider-turn-wait.js";
-import { publishContinuousNativeReply } from "./native-continuous-reply.js";
+import { publishContinuousNativeReply, recoverContinuousNativeReplies } from "./native-continuous-reply.js";
 import { createNativeTurnAccounting, NATIVE_LOST_TURN_USAGE_EVIDENCE, nativeUsageCostUsd, nativeUsageBiller, normalizeNativeUsage, usesNativeUsageDelivery, isNativeUsageAccountingEvent, isNativeUsageDeliveryEvent } from "./native-usage-accounting.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
 export { nativeUsageCostUsd, nativeUsageBiller, normalizeNativeUsage } from "./native-usage-accounting.js";
@@ -12946,7 +12946,8 @@ async function executePaperclipNativeSessionAttempt(
                 conversation: conversation?.agentId === input.execution.binding.agentId
                   || (input.execution.provider.kind === "pi_rpc" &&
                     (input.execution.turnIntent === "conversation_reply" || input.execution.provider.conversationMode === true))
-                  || record(record(stopRun?.resultJson).personStop).requestedAt !== undefined,
+                  || (record(record(stopRun?.resultJson).personStop).requestedAt !== undefined
+                    && !record(record(stopRun?.resultJson).personStop).resumedAt),
                 terminalEvent,
                 replyEvent: completedConversationReply,
                 completionContract: input.execution.completionContract.contract,
@@ -13136,6 +13137,8 @@ async function executePaperclipNativeSessionAttempt(
                 }
               }
               if (session) {
+                // Replay committed receipts before exposing this attachment to new input.
+                if (input.execution.provider.kind === "pi_rpc") await recoverContinuousNativeReplies(input.db, { id: input.execution.binding.runId, companyId: input.execution.binding.companyId });
                 const active: ActiveNativeSession = { session, cancelRequested: false, admissionAbort: new AbortController() };
                 activeNativeSessions.set(input.execution.binding.runId, active);
                 const startup = nativeSessionStartups.get(input.execution.binding.runId);

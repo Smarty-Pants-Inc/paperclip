@@ -8,6 +8,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   agents,
   agentRuntimeState,
+  agentWakeupRequests,
   activityLog,
   authUsers,
   companies,
@@ -36,6 +37,7 @@ import { authorizationService } from "../services/authorization.js";
 import { canActorReadWorkspaceOperation, getHeartbeatRunReadDecisions } from "../services/heartbeat-run-privacy.js";
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 import { claimCancellationRequest } from "../services/native-runtime/native-cancellation-request.js";
+import * as nativeSessionExecutor from "../services/native-runtime/native-session-executor.js";
 
 const externalDatabaseUrl = resolveExternalTestDatabaseUrl("PAPERCLIP_RUN_LOG_PRIVACY_TEST_DATABASE_URL");
 const embeddedPostgresSupport = externalDatabaseUrl ? { supported: true } : await getEmbeddedPostgresTestSupport();
@@ -60,6 +62,7 @@ describeEmbeddedPostgres("heartbeat run privacy routes", { concurrent: false }, 
     await db.delete(issueAccessGrants);
     await db.delete(agentRuntimeState);
     await db.delete(nativeRunFinalizations);
+    await db.delete(agentWakeupRequests);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(agents);
@@ -576,6 +579,44 @@ describeEmbeddedPostgres("heartbeat run privacy routes", { concurrent: false }, 
     if (phase !== "queued") expect(stopped.body.resultJson.startupCancellation).toBeTruthy();
     expect((await db.select().from(issueComments).where(eq(issueComments.id, mine)))[0]?.body).toBe("Undelivered prompt");
   });
+  it.each([false, true])("never turns a held Pi interrupt failure into run cancellation (throws=%s)", async throws => {
+    const f = await seedFixture(), prior = { requestedAt: "2020-01-01T00:00:00Z", userId: f.ownerUserId,
+      returned: [randomUUID()], settledAt: "2020-01-01T00:00:01Z", resumedAt: "2020-01-01T00:00:02Z" };
+    await db.update(heartbeatRuns).set({ status: "running", finishedAt: null, runtimeMode: "native", nativeIssueId: f.issueId,
+      runnerProfileJson: { nativeExecutionInput: { provider: { kind: "pi_rpc" } } }, resultJson: { personStop: prior }, nextEventSeq: 100,
+    }).where(eq(heartbeatRuns.id, f.privateRunId));
+    const interrupt = vi.spyOn(nativeSessionExecutor, "interruptNativeTurn");
+    if (throws) interrupt.mockRejectedValueOnce(new Error("interrupt rejected")); else interrupt.mockResolvedValueOnce(null);
+    const response = await request(createBoardApp(f.companyId, f.ownerUserId)).post(`/api/heartbeat-runs/${f.privateRunId}/cancel`).send({});
+    expect(response.status).toBe(409);
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.privateRunId)))[0])
+      .toMatchObject({ status: "running", resultJson: { personStop: prior } });
+    expect((await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).some(row => row.action === "heartbeat.cancelled")).toBe(false);
+  });
+
+  it("interrupts the held turn on a second Stop without losing previous returns", async () => {
+    const f = await seedFixture(), old = randomUUID(), queued = randomUUID();
+    await db.insert(issueComments).values([old, queued].map(id => ({ id, companyId: f.companyId, issueId: f.issueId,
+      authorUserId: f.ownerUserId, body: "Keep until restored" })));
+    await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.ownerAgentId, source: "issue",
+      status: "deferred_issue_execution", payload: { issueId: f.issueId, _paperclipWakeContext: { wakeCommentIds: [queued] } } });
+    await db.update(heartbeatRuns).set({ status: "running", finishedAt: null, runtimeMode: "native", nativeIssueId: f.issueId,
+      runnerProfileJson: { nativeExecutionInput: { provider: { kind: "pi_rpc" } } }, nextEventSeq: 100,
+      resultJson: { personStop: { requestedAt: "2020-01-01T00:00:00Z", userId: f.ownerUserId, returned: [old],
+        returnedNoticeSeq: 90, noticeSeq: 90, settledAt: "2020-01-01T00:00:01Z", resumedAt: "2020-01-01T00:00:02Z" } },
+    }).where(eq(heartbeatRuns.id, f.privateRunId));
+    vi.spyOn(nativeSessionExecutor, "interruptNativeTurn").mockResolvedValueOnce({ turnId: "held-turn" });
+    const response = await request(createBoardApp(f.companyId, f.ownerUserId)).post(`/api/heartbeat-runs/${f.privateRunId}/cancel`).send({});
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ status: "running", resultJson: { personStop: {
+      returned: [old, queued], returnedNoticeSeq: 90, afterEventSeq: 99,
+    } } });
+    expect(response.body.resultJson.personStop.settledAt).toBeUndefined();
+    expect(response.body.resultJson.personStop.resumedAt).toBeUndefined();
+    expect(response.body.resultJson.personStop.noticeSeq).toBeUndefined();
+    expect((await db.select().from(issueComments).where(eq(issueComments.id, queued)))[0].deletedAt).toBeNull();
+  });
+
   it("keeps the hold when a provider turn wins before the locked recheck", async () => {
     const f = await seedFixture(); await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc" } }).where(eq(agents.id, f.ownerAgentId));
     await db.update(heartbeatRuns).set({ finishedAt: null, executionStage: "preparing", runtimeModeResolvedAt: null,
