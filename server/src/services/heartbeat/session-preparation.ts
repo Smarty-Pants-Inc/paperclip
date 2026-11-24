@@ -9,6 +9,7 @@ import { createNativeSessionHandoffLoader } from "../native-runtime/native-sessi
 import { decideNativeContinuation, resolveSessionContinuity } from "../native-runtime/continued-session.js";
 import { findNativeContinuousSessionResumeId } from "../native-runtime/native-session-resume.js";
 import { deriveTaskKey } from "./run-preparation.js";
+import { queuedCommentIdsFromRunContext } from "../../lib/queued-comment-context.js";
 import { agentInstructionsService } from "../agent-instructions.js";
 import {
   describeSessionResetReason, shouldResetTaskSessionForWake, isCanonicalSessionIdForAdapter,
@@ -235,7 +236,11 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
     : taskSessionForRun?.lastRunId && taskSessionForRun.lastRunId !== run.id && isNativeSessionId(taskSessionId) ? taskSessionId : recoveredSessionId;
   const getFreshSessionHandoff = issueRef ? createNativeSessionHandoffLoader({
     db, companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id, before: run.createdAt,
+    mode: resolveSessionContinuity(runtimeConfig.provider, runtimeConfig.sessionContinuity) === "continuous" ? "whole" : "bounded",
     throughCommentId: readNonEmptyString(context.conversationReplayThroughCommentId) ?? (context.interactionKind ? null : wakeCommentId),
+    excludeCommentIds: [...new Set([...queuedCommentIdsFromRunContext(context),
+      ...[wakeCommentId, readNonEmptyString(context.wakeCommentId), readNonEmptyString(context.commentId)]
+        .filter((id): id is string => id !== null)])],
   }) : undefined;
   const previousSessionParams =
     explicitResumeSessionParams ??
