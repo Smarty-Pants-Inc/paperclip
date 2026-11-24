@@ -1204,25 +1204,27 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     for (const run of transcriptRuns) {
       const nativeTranscript = nativeTranscriptByRun.get(run.id) ?? [];
       const logTranscript = logTranscriptByRun.get(run.id) ?? [];
-      if (logTranscript.length > 0) {
-        fallbackByRunRef.current.set(run.id, logTranscript);
-      }
-      const fallback = fallbackByRunRef.current.get(run.id);
-      const lastTimestamp = (entries: typeof nativeTranscript) =>
-        entries.reduce((latest, entry) => Math.max(latest, toMs(entry.ts)), 0);
-      // Keep a newer fallback visible through native transport recovery. An
-      // empty successful poll must not rewind a response the reader just saw.
-      if (
-        fallback &&
-        (nativeTranscriptErrorsByRun.has(run.id) || (!isTerminalRunStatus(run.status) &&
-          (lastTimestamp(nativeTranscript.filter(entry => entry.kind === "assistant")) < lastTimestamp(fallback.filter(entry => entry.kind === "assistant")) ||
-          lastTimestamp(nativeTranscript) < lastTimestamp(fallback))))
-      ) {
-        next.set(run.id, fallback);
-      } else if (nativeTranscript.length > 0) {
-        fallbackByRunRef.current.delete(run.id);
-        next.set(run.id, nativeTranscript);
-      }
+      // Once native owns the source, later log receipts cannot replace it.
+      // Before that handoff, keep the available log history current.
+      const fallback = nativeTranscript.length === 0 && logTranscript.length > 0
+        ? logTranscript
+        : fallbackByRunRef.current.get(run.id) ?? logTranscript;
+      const reasoningItems = (entries: typeof nativeTranscript) =>
+        paperclipRunnerTimelineItems(transcriptToTaskChatItems(entries, { runId: run.id, running: false }))
+          .filter(item => item.kind === "thinking");
+      const nativeReasoning = new Map(reasoningItems(nativeTranscript).map(item => [item.id, item]));
+      const losesReasoning = reasoningItems(fallback).filter(item => item.lines.some(line => line.trim())).some(item => {
+        const native = nativeReasoning.get(item.id);
+        return !native || native.channel !== item.channel;
+      });
+      // Coverage is rows, identities and channels, never prose or receipt time.
+      const source = nativeTranscript.length > 0 && !losesReasoning
+        ? nativeTranscript
+        : run.runtimeMode === "native" && !hydratedNativeRunIds.has(run.id) && !fallbackByRunRef.current.has(run.id)
+          ? nativeTranscript
+          : fallback;
+      if (source.length > 0) fallbackByRunRef.current.set(run.id, source);
+      next.set(run.id, source);
     }
     for (const id of fallbackByRunRef.current.keys()) {
       if (!transcriptRuns.some((run) => run.id === id))
@@ -1233,7 +1235,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     logTranscriptByRun,
     transcriptRuns,
     nativeTranscriptByRun,
-    nativeTranscriptErrorsByRun,
+    hydratedNativeRunIds,
   ]);
 
   useCompanyLiveEvent((event) => {
@@ -3685,8 +3687,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     planError ||
     runs.some((run) =>
       run.runtimeMode === "native"
-        ? nativeTranscriptErrorsByRun.has(run.id) &&
-          (logTranscriptByRun.get(run.id)?.length ?? 0) === 0
+        ? nativeTranscriptErrorsByRun.has(run.id)
         : Boolean(logErrorsByRun?.has(run.id)),
     );
   const historyKey = conversationMode && draftKey ? draftKey : issueId;
