@@ -8050,11 +8050,20 @@ describe("IssueDetail", () => {
       queryKey: [...queryKeys.issues.comments("PAP-1"), "recent"],
       queryFn: () => new Promise<IssueRecentComments>((resolve) => { finishStaleRead = resolve; }),
     }).catch(() => undefined);
+    const restoreDraft = vi.fn();
+    if (action === "cancel") {
+      // 0201 refuses cancellation when the mocked thread has no mounted composer.
+      await act(async () => props().onCancelQueued(comment.id));
+      expect(mockIssuesApi.cancelComment).not.toHaveBeenCalled();
+      expect(mockPushToast).toHaveBeenCalledWith(expect.objectContaining({ title: "Message kept" }));
+      props().composerRef.current = { focus: vi.fn(), restoreDraft };
+    }
     await act(async () => {
       if (action === "discard" || action === "discard-unacknowledged") await props().onDiscardQueuedComment(comment.id, queue.revision);
       if (action === "cancel") props().onCancelQueued(comment.id);
       if (action === "delete") await props().onDeleteComment(comment.id);
     });
+    if (action === "cancel") await waitForAssertion(() => expect(restoreDraft).toHaveBeenCalledWith(comment.body));
     await waitForAssertion(() => expect(queryClient.isFetching({ queryKey: queryKeys.issues.comments("PAP-1") })).toBe(0));
     await act(async () => {
       finishStaleRead({ comments: [earlier, comment], latestCommentId: comment.id, hasMore: true });
