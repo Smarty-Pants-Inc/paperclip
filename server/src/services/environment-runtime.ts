@@ -44,7 +44,7 @@ import { inspectCloudSandboxCleanupAbsence } from "./sandbox-absence-proof.js";
 import { hasNativeWorkspaceExportResume, releaseCompletedNativeWorkspaceExportRetention } from "./native-runtime/native-workspace-export-resume.js";
 import { createHash, randomUUID } from "node:crypto";
 import { currentControllerProcess } from "./controller-process-identity.js";
-import { and, eq, inArray, ne, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { companySecrets, companySecretVersions, environmentLeases, heartbeatRuns } from "@paperclipai/db";
 import type {
@@ -4190,6 +4190,14 @@ export function environmentRuntimeService(
       if (leaseRows.length === 0) {
         return [];
       }
+      // The preparation owner persisted this only after its dispatch gate
+      // unwound. A cancelled follower borrowed the idle box, not its session.
+      const [unstartedStop] = status === "expired" ? await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, heartbeatRunId), eq(heartbeatRuns.status, "cancelled"),
+        isNull(heartbeatRuns.processPid), isNull(heartbeatRuns.processGroupId), isNull(heartbeatRuns.processStartedAt),
+        sql`${heartbeatRuns.resultJson}->>'preDispatchCancellationSettledAt' is not null`,
+        sql`${heartbeatRuns.usageJson}#>'{budgetDispatch,handedOffAt}' is null`,
+      )).limit(1) : [];
 
       // Release each lease in its own try/catch. One driver error must not stop
       // the release of the later leases. The caller records each lease-specific
@@ -4276,12 +4284,13 @@ export function environmentRuntimeService(
             continue;
           }
           if (
-            providerResourceDisposition === "keep_running" &&
+            (providerResourceDisposition === "keep_running" || (unstartedStop && leaseSnapshot.status === "active" &&
+              (typeof leaseSnapshot.metadata?.reusesReusableLeaseId === "string" || typeof leaseSnapshot.metadata?.replacesReusableLeaseId === "string"))) &&
             leaseSnapshot.leasePolicy === "reuse_by_environment"
           ) {
             const lease = await environmentsSvc.releaseLease(
               leaseRow.id,
-              "retained",
+              unstartedStop ? "released" : "retained",
               { cleanupStatus: "success" },
             );
             if (lease) {

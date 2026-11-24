@@ -85,6 +85,36 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
       supervisor: { schema: "paperclip.native-session-supervisor.v1", ...compatibility, snapshot } };
   }
 
+  // Gate 7: idle saved session, message + Stop before Pi starts, then two messages.
+  it("selects the committed idle session past Stop-before-start and failed admissions for two messages", async () => {
+    const fixture = await seed();
+    expect(await importNativeControllerRecovery(db, { ...fixture.scope,
+      expectedConfigDigest: compatibility.configDigest, supervisor: fixture.supervisor })).toEqual({ kind: "imported" });
+    const baseTime = Date.now();
+    for (const [index, status] of ["cancelled", "failed", "failed"].entries()) {
+      const id = randomUUID();
+      await db.insert(heartbeatRuns).values({ id, companyId, agentId, nativeIssueId: fixture.scope.issueId,
+        nativeSessionId: fixture.scope.normalizedSessionId, runtimeMode: "native", status,
+        createdAt: new Date(baseTime + index * 10), finishedAt: new Date(baseTime + index * 10 + 1),
+        runnerProfileJson: { sessionCheckpoint: { ...fixture.snapshot, cursor: null,
+          identity: { ...fixture.snapshot.identity, runId: id } } },
+        resultJson: status === "cancelled" ? { nativeCancellation: { beforeStart: true } } : {},
+      });
+    }
+    for (let message = 0; message < 2; message++) {
+      const currentRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: currentRunId, companyId, agentId, nativeIssueId: fixture.scope.issueId,
+        nativeSessionId: fixture.scope.normalizedSessionId, runtimeMode: "native", status: "running",
+        createdAt: new Date(baseTime + 100 + message) });
+      const recovered = await resolveNativeControllerRecovery(db, { ...fixture.scope, currentRunId });
+      expect(recovered.kind).toBe("recoverable");
+      if (recovered.kind !== "recoverable") throw new Error(JSON.stringify(recovered));
+      expect(recovered.metadata.checkpoint?.runId).toBe(fixture.scope.runId);
+      expect(recovered.snapshot.sessionId).toBe(fixture.snapshot.sessionId);
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, currentRunId));
+    }
+  });
+
   it("imports a retained source once, rejects stale input, and resolves it without any local projection", async () => {
     const fixture = await seed();
     const input = { ...fixture.scope, expectedConfigDigest: compatibility.configDigest, supervisor: fixture.supervisor };

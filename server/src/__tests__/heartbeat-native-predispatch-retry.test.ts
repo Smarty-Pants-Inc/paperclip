@@ -21,7 +21,8 @@ import { getRecoveryPostgresSupport } from "./helpers/recovery-postgres-fixture.
 // Budget admission is the last database write before the dispatch gate enters
 // the native executor. Exhausted serialization retries there fail the run with
 // no provider work started.
-const admissionFaults = vi.hoisted(() => ({ remaining: 0 }));
+const admissionFaults = vi.hoisted(() => ({ remaining: 0,
+  beforeReserve: undefined as (() => Promise<void>) | undefined }));
 vi.mock("../services/budget-reservations.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../services/budget-reservations.js")>();
   const { AccountingContentionError } = await import("../services/accounting-transaction.js");
@@ -33,6 +34,7 @@ vi.mock("../services/budget-reservations.js", async importOriginal => {
         throw new AccountingContentionError(Object.assign(new Error("could not serialize access due to concurrent update"),
           { name: "PostgresError", code: "40001" }), 4);
       }
+      await admissionFaults.beforeReserve?.();
       return actual.reserveRunBudget(...args);
     },
   };
@@ -140,13 +142,13 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
   const fixture = nativeRestartFixture({});
 
   async function startTask(db: ReturnType<typeof createDb>, heartbeat: ReturnType<typeof heartbeatService>,
-    status: "in_progress" | "blocked" = "in_progress") {
+    status: "in_progress" | "blocked" = "in_progress", provider: "codex" | "pi_rpc" = "codex") {
     const { companyId, agentId } = fixture.current;
     const userId = randomUUID();
     await db.insert(authUsers).values({ id: userId, name: "Task owner", email: `${userId}@example.invalid`,
       createdAt: new Date(), updatedAt: new Date() });
     await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId, membershipRole: "owner" });
-    await db.update(agents).set({ status: "idle", adapterConfig: { provider: "codex" } }).where(eq(agents.id, agentId));
+    await db.update(agents).set({ status: "idle", adapterConfig: { provider } }).where(eq(agents.id, agentId));
     await instanceSettingsService(db).updateExperimental({ enableAgentChat: true, enableNativeRunner: true });
     const [issue] = await db.insert(issues).values({ companyId, title: "Survive a database fault", status,
       assigneeAgentId: agentId, responsibleUserId: userId, conversationAgentId: agentId, conversationUserId: userId,
@@ -163,8 +165,65 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
       contextSnapshot: { issueId: issue!.id, taskKey: issue!.id, wakeCommentId: message!.id } });
     expect(run).not.toBeNull();
     await waitForCondition("the first run to settle", () => heartbeat.getTaskDrainStatus().quiescent);
-    return { issueId: issue!.id, runId: run!.id };
+    return { issueId: issue!.id, runId: run!.id, userId };
   }
+
+  it("warm Pi session survives Stop before dispatch and answers two later messages in the same session", async () => {
+    const { companyId, agentId } = fixture.current;
+    const db = createDb(fixture.current.temporary.connectionString, { maxConnections: 4 });
+    const messages = new Map<string, string>();
+    const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: nativeBackend(db, { turnMessages: messages }) });
+    const gate = Promise.withResolvers<void>();
+    let entered = false;
+    try {
+      const { issueId, runId, userId } = await startTask(db, heartbeat, "in_progress", "pi_rpc");
+      const good = (await heartbeat.getRun(runId))!;
+      expect(good.status).toBe("succeeded");
+      expect(good.nativeSessionId).toEqual(expect.any(String));
+      const send = async (body: string) => {
+        const [comment] = await db.insert(issueComments).values({ companyId, issueId,
+          authorType: "user", authorUserId: userId, body }).returning();
+        return heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual", reason: "issue_commented",
+          requestedByActorType: "user", requestedByActorId: userId, manualUserWake: true,
+          payload: { issueId, commentId: comment!.id },
+          contextSnapshot: { issueId, taskKey: issueId, wakeCommentId: comment!.id } });
+      };
+      admissionFaults.beforeReserve = async () => { entered = true; await gate.promise; };
+      const stopped = await send("Accidental submission; Stop before start");
+      expect(stopped).not.toBeNull();
+      await waitForCondition("pre-dispatch admission gate", () => entered);
+      await heartbeat.cancelRun(stopped!.id, "Person Stop", {
+        resultJson: { cancelledByActorType: "user", cancelledByUserId: userId } });
+      admissionFaults.beforeReserve = undefined;
+      gate.resolve();
+      await waitForCondition("Stop preparation settlement", () => heartbeat.getTaskDrainStatus().quiescent);
+      const cancelled = (await heartbeat.getRun(stopped!.id))!;
+      expect(cancelled.status).toBe("cancelled");
+      expect(cancelled.resultJson?.preDispatchCancellationSettledAt).toEqual(expect.any(String));
+      expect(messages.has(stopped!.id)).toBe(false);
+      for (const body of ["First follow-up", "Second follow-up"]) {
+        const next = await send(body);
+        expect(next).not.toBeNull();
+        await waitForCondition("follow-up settlement", () => heartbeat.getTaskDrainStatus().quiescent);
+        const answered = (await heartbeat.getRun(next!.id))!;
+        expect(answered.status, JSON.stringify(answered.resultJson)).toBe("succeeded");
+        expect(answered.nativeSessionId).toBe(good.nativeSessionId);
+        expect(messages.get(next!.id)).toContain(body);
+      }
+      const all = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.nativeIssueId, issueId));
+      expect(all.filter(run => run.status === "succeeded")).toHaveLength(3);
+      expect(all.some(run => run.error?.includes("metadata_format"))).toBe(false);
+      expect(all.some(run => run.status === "scheduled_retry")).toBe(false);
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      expect(comments.filter(comment => comment.body === "Done.")).toHaveLength(3);
+      expect(comments.some(comment => comment.body === "New session")).toBe(false);
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.status).not.toBe("blocked");
+      expect(await heartbeat.promoteDueScheduledRetries()).toMatchObject({ promoted: 0 });
+    } finally {
+      admissionFaults.beforeReserve = undefined; gate.resolve();
+      await heartbeat.drainActiveRunExecutions(); await closeIdleWarmNativeSessionsForRestart(); await db.$client.end();
+    }
+  }, 90_000);
 
   it("re-queues a native run that failed at budget admission and completes it without a Retry", async () => {
     const { companyId } = fixture.current;

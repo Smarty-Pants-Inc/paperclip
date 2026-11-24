@@ -1530,12 +1530,20 @@ export function heartbeatService(
   const runControl = createHeartbeatRunControl(db, {
     scheduleBoundedRetry,
     verifyStartupCleanup: async run => {
+      const marker = readNativeStartupCleanup(run);
+      const [lease] = marker ? await db.select().from(environmentLeases).where(and(
+        eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id),
+        eq(environmentLeases.id, marker.leaseId),
+      )) : [];
+      // Startup owns its task, not a borrowed idle conversation's box. Stop
+      // that task with verified receipts; destroy only a newly created box.
+      const borrowed = lease?.leasePolicy === "reuse_by_environment" &&
+        (typeof lease.metadata?.reusesReusableLeaseId === "string" || typeof lease.metadata?.replacesReusableLeaseId === "string");
       await verifyNativeStartupCleanup(db, run, () => envOrchestrator.releaseForRun({
         heartbeatRunId: run.id, companyId: run.companyId, agentId: run.agentId, status: "expired",
-        cancelActiveWork: true, providerResourceDisposition: "destroy",
+        cancelActiveWork: true, providerResourceDisposition: borrowed ? "stop_and_retain" : "destroy",
       }));
-      const marker = readNativeStartupCleanup(run)!;
-      await options.pluginWorkerManager?.retireStartup?.(marker.contextId);
+      await options.pluginWorkerManager?.retireStartup?.(readNativeStartupCleanup(run)!.contextId);
     },
     getRun,
     getRunCleanupState,
@@ -4217,6 +4225,19 @@ export function heartbeatService(
               payload: { state: "unavailable", code: uncapturedInstructions.errorCode } });
           }
           await withAdapterExecutionPhase(executionPhaseContext, "instruction_cleanup", releaseInstructionCopy);
+          // Only this preparation owner knows the dispatch gate was never
+          // entered. Persist that proof before releasing a reused allocation;
+          // Stop must return the predecessor's box, not archive its session.
+          if (latestRun?.status === "cancelled" && latestRun.errorCode === "cancelled" &&
+              (latestRun.resultJson?.cancelledByActorType === "user" ||
+                parseObject(parseObject(latestRun.resultJson?.cancellation).initiator).type === "user") &&
+              !legacyAdapterEntered && !nativeDispatchStarted && !nativeOwnershipHeld) {
+            const [settled] = await db.update(heartbeatRuns).set({ resultJson:
+              sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({ preDispatchCancellationSettledAt: new Date().toISOString() })}::jsonb`,
+            }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "cancelled"),
+              sql`${heartbeatRuns.usageJson}#>'{budgetDispatch,handedOffAt}' is null`)).returning();
+            latestRun = settled ?? latestRun;
+          }
           await withAdapterExecutionPhase(executionPhaseContext, "lease_release", () => releaseEnvironmentLeasesForRun({
             runId: run.id,
             companyId: run.companyId,
