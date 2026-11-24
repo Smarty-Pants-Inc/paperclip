@@ -396,6 +396,8 @@ export interface ExecuteNativeSessionOptions {
   /** Observes why a retained session was removed from warm reuse. */
   onSessionQuarantined?: (reason: string) => Promise<void> | void;
   existingSession?: NativeSession;
+  /** This run's rebuilt catalog, forwarded when attaching to an existing session. */
+  dynamicTools?: readonly Readonly<Record<string, unknown>>[];
   persistedSession?: PersistedNativeSession | null;
   keepSessionOpen?: boolean;
   /** Apply a structured session-goal control instead of starting an ordinary turn. */
@@ -2668,6 +2670,7 @@ export async function executeNativeSession(
       const attach = async (signal?: AbortSignal) => {
         signal?.throwIfAborted();
         await options.existingSession!.attachRun!({ identity,
+        ...(options.dynamicTools !== undefined ? { dynamicTools: options.dynamicTools } : {}),
         completionContract: {
           revision: input.completionContract.contract.revision,
           criterionIds: input.completionContract.contract.criteria.map((criterion) => criterion.id),
