@@ -235,7 +235,10 @@ export async function publishContinuousNativeReply(input: {
       authorizationReason, clientRequestId,
       ...(terminalReplay ? { persistedVisibleReplyThroughSeq: input.cursor } : {}),
     }, tx);
-    await acknowledgeChatCompletionReply(tx, runId, comment.id);
+    if (Object.keys(replies).length === 0 && Array.isArray(row.run.contextSnapshot?.chatCompletionDeliveryIds) && row.run.contextSnapshot.chatCompletionDeliveryIds.length)
+      await acknowledgeChatCompletionReply(tx, runId, comment.id);
+    if (Array.isArray(payload.answers) && payload.answers.length)
+      await acknowledgeChatCompletionReply(tx, runId, comment.id, payload.answers.filter((id): id is string => typeof id === "string"));
     const [saved] = await tx.update(heartbeatRuns).set({ resultJson: { ...result,
       ...(stop.requestedAt && !stop.settledAt && !stop.resumedAt && typeof stop.noticeSeq === "number" && stop.noticeSeq < input.cursor
         ? { personStop: { ...stop, settledAt: new Date().toISOString(), answerItemId: input.event.itemId } } : {}),
