@@ -30,7 +30,8 @@ type Run = Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">;
 export async function preparePredecessorRetirementFallback(db: Db, run: Run, error: unknown)
   : Promise<PredecessorRetirementFallback | null> {
   const beforeProviderTurn = findNativeFailedBeforeProviderTurn(error);
-  const failure = findNativePredecessorRetirementUnproven(error) ?? beforeProviderTurn;
+  const retirement = findNativePredecessorRetirementUnproven(error);
+  const failure = retirement ?? beforeProviderTurn;
   if (!failure) return null;
   if (!beforeProviderTurn && await hasNativeExecutionStartEvidence(db, { companyId: run.companyId, id: run.id })) return null;
   const [result] = await db.select({ id: nativeRunResults.id }).from(nativeRunResults)
@@ -65,7 +66,7 @@ export async function preparePredecessorRetirementFallback(db: Db, run: Run, err
       action: "environment.lease_replacement_requested", entityType: "heartbeat_run", entityId: run.id, runId: run.id,
       details: { reason: failure.code, predecessorRunId: failure.predecessorRunId, providerLeaseIds: replacedProviderLeaseIds } });
     return { version: 1 as const, providerWorkStarted: false as const, predecessorRunId: failure.predecessorRunId,
-      replacedProviderLeaseIds };
+      replacedProviderLeaseIds, ...(retirement?.freshSessionRequired ? { freshSessionRequired: true as const } : {}) };
   });
 }
 

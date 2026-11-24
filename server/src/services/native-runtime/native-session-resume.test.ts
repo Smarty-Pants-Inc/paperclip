@@ -1,4 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
+import { execFile, spawn } from "node:child_process";
+import { once } from "node:events";
+import { promisify } from "node:util";
+import { piRetirementProves, retirePiRunnerByFact, STOP_PI_PROCESS_GROUP } from "./native-pi-retirement.js";
+import { sandboxPiProcessVisibility } from "../../__tests__/helpers/pi-process-visibility.js";
 import { existsSync, readFileSync } from "node:fs";
 import {
   chmod,
@@ -44,6 +49,7 @@ import {
   parseNativeExecutionInput,
   type NativeExecutionInput,
   type NativeSession,
+  type PersistedNativeSession,
 } from "../../vendor/paperclip-runner/index.js";
 import {
   runnerPrpWebSocketInternals,
@@ -78,6 +84,7 @@ import {
   selectNativeSessionResumeRun,
 } from "./native-session-resume.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
+import { archivePiRunnerAuthority, assertPiColdResumeSettled, installPiColdResume, piModelSelectionChanged, retryPiAttachOnSameSession } from "./native-pi-cold-resume.js";
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
 
 const externalTestDatabaseUrl = resolveExternalTestDatabaseUrl("PAPERCLIP_TEST_DATABASE_URL");
@@ -233,6 +240,190 @@ function previousRun(overrides: Record<string, unknown> = {}) {
   };
 }
 
+it.each(["model", "piRpcThinkingLevel", "kind", "conversationMode", "runtimeContext"])("keeps Pi continuity strict except model/level: %s", (key) => {
+  const pi = (runId: string) => parseNativeExecutionInput({ ...execution(runId), provider: { kind: "pi_rpc", model: "prior", piRpcThinkingLevel: "low" }, session: { ...execution(runId).session, driverKind: "pi_rpc" } });
+  const prior = pi(previousRunId), current = pi(currentRunId);
+  if (key === "runtimeContext" && "runtimeContext" in current) current.runtimeContext.aggregateDigest = "b".repeat(64);
+  else Object.assign(current.provider, { [key]: key === "model" ? "next" : key === "piRpcThinkingLevel" ? "high" : key === "kind" ? "codex" : true });
+  const previous = previousRun({ nativeToolContractFingerprint: nativeToolContractFingerprintForTarget("local", "pi_rpc"), nativeExecutionInput: prior });
+  for (const sessionContinuity of [undefined, "continuous", "paperclip"]) {
+    const result = buildNativeExecutionWithCheckpoint({ previousRun: previous, normalizedSessionId, sessionContinuity, buildExecution: options => { const next = structuredClone(current); next.session.normalizedSessionId = options.normalizedSessionId; return next; } });
+    const retained = sessionContinuity !== "paperclip" && (key === "model" || key === "piRpcThinkingLevel");
+    expect(result.normalizedSessionId === normalizedSessionId).toBe(retained);
+    expect(result.checkpoint?.sessionId ?? null).toBe(retained ? "provider-thread-123" : null);
+    expect(result.execution.provider).toEqual(current.provider);
+  }
+});
+// Unit test agreed: requested deterministic cold-launch boundary; no provider credentials or real-org writes.
+it.each(["model", "piRpcThinkingLevel", "retired-owner"].flatMap(key => ["local", "remote"].map(location => ({ key, location }))))("cold-starts Pi with current $key and the same $location session file reference, without attach", async ({ key, location }) => {
+  const root = await mkdtemp(join(tmpdir(), "pi-selection-cold-"));
+  const runner = join(root, "runner"), threadId = "retained-pi-thread";
+  await mkdir(runner); await mkdir(join(root, "control-plane"));
+  const prior = { kind: "pi_rpc" as const, model: "vendor/prior", piRpcThinkingLevel: "low" as const };
+  const selected = { ...prior, ...(key === "model" ? { model: "vendor/next" } : key === "piRpcThinkingLevel" ? { piRpcThinkingLevel: "high" as const } : {}) };
+  const factRetirement = !["model", "piRpcThinkingLevel"].includes(key);
+  expect(piModelSelectionChanged(prior, selected)).toBe(!factRetirement);
+  expect(piModelSelectionChanged(prior, { ...selected, conversationMode: true })).toBe(false);
+  const owner = { runId: previousRunId, normalizedSessionId, runnerInstanceId: "old-runner", environmentLeaseId: "lease", turnId: "old-turn", itemId: "old-item" };
+  const savedRunner = { ...owner, schema: "paperclip.runner.durable.state.v1", lifecycle: factRetirement ? "ready" : "suspended", outbox: [] };
+  const savedProvider = { schema: "paperclip.runner.codex-provider-state.v1", config: { provider: "pi_rpc" }, threadId, toolBridge: { pending: {} },
+    ...(factRetirement ? { activeProviderTurnId: "cancelled-before-cleanup" } : {}) };
+  const proof = factRetirement ? await retirePiRunnerByFact({ identity: owner, read: async () => ({ runner: savedRunner, provider: savedProvider }),
+    settle: async () => {}, stop: async () => {}, collectStopped: async () => {}, recordProof: async () => {} }) : undefined;
+  for (const [name, value] of [["runner-state.json", savedRunner], ["codex-provider-state.json", savedProvider]] as const) await writeFile(join(runner, name), JSON.stringify(value));
+  const runtimeDirectory = location === "local" ? root : runner;
+  const sessionFile = join(runtimeDirectory, `${threadId}.jsonl`), sessionBytes = '{"type":"session","id":"retained-pi-thread"}\n';
+  await writeFile(sessionFile, sessionBytes);
+  let launched: Record<string, unknown> | undefined;
+  const bundle = createCapabilityRunnerdCodexTransport({ provider: "pi_rpc", stateDirectory: root,
+    piProxyPath: "/pack/pi-rpc-command.sh", piRuntimeDirectory: runtimeDirectory, piRpcThinkingLevel: selected.piRpcThinkingLevel,
+    runnerBinary: "/not-executed/runnerd", runnerArtifact: { version: "test", digest: `sha256:${"a".repeat(64)}` },
+    prpIdentity: { runnerInstanceId: "runner", environmentLeaseId: "lease", runId: currentRunId, normalizedSessionId, turnId: "turn", itemId: "item" },
+    runnerProcessLauncher: spec => { launched = spec as unknown as Record<string, unknown>; throw new Error("captured cold launch"); },
+  });
+  installPiColdResume(bundle.transport, { threadId, model: selected.model, retireRunnerAuthority: async () => {
+    assertPiColdResumeSettled(savedRunner, savedProvider, normalizedSessionId, threadId, proof);
+    archivePiRunnerAuthority(root, runner);
+  } });
+  try {
+    const backend = new HarnessDriverBackend(new CodexAppServerDriver({ runnerInstanceId: "runner", model: selected.model,
+      approvalPolicy: "never", taskEnvelope: createCodexTaskEnvelope({ objective: "Continue the same Pi conversation" }),
+      transportFactory: () => bundle.transport, environment: { HOME: join(tmpdir(), "pi-cold-test-host-home") } }));
+    const recovered = await backend.recoverSession!({ backendKind: "runner", driverKind: "codex_app_server", sessionId: threadId,
+      providerSessionId: threadId, cursor: "0", identity: { companyId, issueId, agentId, runId: currentRunId, sessionId: normalizedSessionId },
+      activeTurnId: null, pendingRuntimeRequests: [], workingDirectory: root }, { signal: new AbortController().signal });
+    expect(recovered).toMatchObject({ recovered: false, reason: expect.stringContaining("captured cold launch") });
+    const state = JSON.parse(await readFile(join(root, "control-plane", "control-plane-state.json"), "utf8"));
+    expect(state.identity.normalizedSessionId).toBe(normalizedSessionId);
+    expect(state.commands.map((command: { type: string }) => command.type)).toEqual(["run.prepare", "session.open"]);
+    expect(state.runAttachTemplate.provider).toMatchObject({ kind: "pi_rpc", model: selected.model, providerSessionId: threadId });
+    expect(launched).toMatchObject({ environment: { PAPERCLIP_PI_RUNTIME_DIR: runtimeDirectory, PAPERCLIP_PI_THINKING_LEVEL: selected.piRpcThinkingLevel } });
+    expect(await readFile(sessionFile, "utf8")).toBe(sessionBytes);
+    expect(existsSync(join(runner, "codex-provider-state.json"))).toBe(false);
+    expect((await readdir(join(root, "continuity-breaks"))).length).toBe(1);
+  } finally { await bundle.transport.close().catch(() => undefined); await rm(root, { recursive: true, force: true }); }
+});
+// Unit test agreed: exit-proof forgery, tail loss, and signalling another process are never-OK guards.
+it("observes real Pi group exit, settles both tails, and only then collects warm files and issues a receipt", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-process-exit-"));
+  const child = spawn(process.execPath, ["-e", "process.stdout.write('ready\\n');setInterval(()=>{},1000)"], {
+    detached: true, env: { ...process.env, PAPERCLIP_PI_RUNTIME_DIR: directory }, stdio: ["ignore", "pipe", "pipe"],
+  });
+  const exited = once(child, "exit");
+  const owner = { runId: previousRunId, normalizedSessionId, runnerInstanceId: "runner", environmentLeaseId: "lease", turnId: "turn", itemId: "item" };
+  const runner = { ...owner, schema: "paperclip.runner.durable.state.v1", lifecycle: "turn_active", outbox: ["unpublished final"] };
+  const provider = { schema: "paperclip.runner.codex-provider-state.v1", config: { provider: "pi_rpc" }, threadId: "same", activeProviderTurnId: "cancelled", startupAttempt: { processId: child.pid, processGroupId: child.pid }, toolBridge: { pending: {} } };
+  const order: string[] = [];
+  try {
+    await once(child.stdout!, "data");
+    const proof = await retirePiRunnerByFact({ identity: owner, read: async () => ({ runner, provider }),
+      settle: async state => { order.push("replay"); expect(state.outbox).toEqual(["unpublished final"]); },
+      checkpointWarm: async () => { order.push("checkpoint warm files"); },
+      stop: async () => { const result = await promisify(execFile)(process.execPath, ["-e", sandboxPiProcessVisibility(STOP_PI_PROCESS_GROUP, [child.pid]), directory, JSON.stringify(provider)]);
+        expect(result.stdout).toContain("pi_process_group_exit_observed"); await exited; order.push("exit"); },
+      collectStopped: async () => { expect(child.exitCode !== null || child.signalCode !== null).toBe(true); order.push("collect warm_saved"); },
+      recordProof: async () => { order.push("record proof"); } });
+    expect(order).toEqual(["replay", "checkpoint warm files", "exit", "replay", "collect warm_saved", "record proof"]);
+    expect(piRetirementProves(proof, owner, runner, provider)).toBe(true);
+    expect(piRetirementProves({ ...proof }, owner, runner, provider)).toBe(false);
+    expect(() => assertPiColdResumeSettled(runner, provider, normalizedSessionId, "same", proof)).not.toThrow();
+    expect(() => assertPiColdResumeSettled({ ...runner, outbox: ["late final"] }, provider, normalizedSessionId, "same", proof)).toThrow("unsettled");
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) { process.kill(-child.pid!, "SIGKILL"); await exited; }
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+it("finds restarted Pi groups by runtime directory despite an obsolete pre-stop process group", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-restarted-group-"));
+  const start = (runtime: string) => spawn(process.execPath, ["-e", "process.stdout.write('ready\\n');setInterval(()=>{},1000)"], {
+    detached: true, env: { ...process.env, PAPERCLIP_PI_RUNTIME_DIR: runtime }, stdio: ["ignore", "pipe", "pipe"],
+  });
+  const old = start(directory), restarted = start(directory), alsoRestarted = start(directory), unrelated = start(`${directory}-other`);
+  const children = [old, restarted, alsoRestarted, unrelated];
+  const exits = children.map(child => once(child, "exit"));
+  try {
+    await Promise.all(children.map(child => once(child.stdout!, "data")));
+    // Runner's saved startupAttempt names the group which exited before the restart.
+    process.kill(-old.pid!, "SIGKILL"); await exits[0];
+    const result = await promisify(execFile)(process.execPath, ["-e", sandboxPiProcessVisibility(STOP_PI_PROCESS_GROUP, children.map(child => child.pid)), directory,
+      JSON.stringify({ startupAttempt: { processGroupId: old.pid } })]);
+    expect(result.stdout).toContain("pi_process_group_exit_observed");
+    // Check immediately: awaiting a missed exit would hide the bug as a test timeout.
+    expect(() => process.kill(restarted.pid!, 0)).toThrow();
+    expect(() => process.kill(alsoRestarted.pid!, 0)).toThrow();
+    await Promise.all([exits[1], exits[2]]);
+    expect(() => process.kill(unrelated.pid!, 0)).not.toThrow();
+  } finally {
+    for (const [i, child] of children.entries()) {
+      if (child.exitCode === null && child.signalCode === null) { process.kill(-child.pid!, "SIGKILL"); await exits[i]; }
+    }
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+it("publishes the post-stop answer before a failed warm-file collection without granting a receipt", async () => {
+  const owner = { runId: previousRunId, normalizedSessionId, runnerInstanceId: "runner", environmentLeaseId: "lease", turnId: "turn", itemId: "item" };
+  let runner = { ...owner, outbox: [] as string[] };
+  const provider = { config: { provider: "pi_rpc" } }, published = new Set<string>();
+  let recorded = false;
+  await expect(retirePiRunnerByFact({ identity: owner, read: async () => ({ runner, provider }),
+    settle: async state => { for (const answer of state.outbox as string[]) published.add(answer); },
+    stop: async () => { runner = { ...runner, outbox: ["answer written during shutdown"] }; },
+    collectStopped: async () => { throw new Error("warm files unavailable"); },
+    recordProof: async () => { recorded = true; },
+  })).rejects.toThrow("warm files unavailable");
+  expect([...published]).toEqual(["answer written during shutdown"]);
+  expect(recorded).toBe(false);
+});
+it.each(["box unreachable", "stop failed", "warm files uncollected", "replay gap"])("never grants cold authority after %s", async fault => {
+  const owner = { runId: previousRunId, normalizedSessionId, runnerInstanceId: "runner", environmentLeaseId: "lease", turnId: "turn", itemId: "item" };
+  const runner = { ...owner, outbox: [] }, provider = { config: { provider: "pi_rpc" } };
+  const fail = async () => { throw new Error(fault); };
+  const recorded: unknown[] = [];
+  await expect(retirePiRunnerByFact({ identity: owner, read: fault === "box unreachable" ? fail : async () => ({ runner, provider }),
+    settle: fault === "replay gap" ? fail : async () => {}, stop: fault === "stop failed" ? fail : async () => {},
+    collectStopped: fault === "warm files uncollected" ? fail : async () => {}, recordProof: async proof => { recorded.push(proof); } })).rejects.toThrow(fault);
+  expect(recorded).toEqual([]);
+});
+it.each(["active", "pending", "identity", "goal"])("refuses Pi cold restart with %s obligations, preserving state", kind => {
+  const runner = { schema: "paperclip.runner.durable.state.v1", normalizedSessionId, lifecycle: "suspended", outbox: [] };
+  const provider = { schema: "paperclip.runner.codex-provider-state.v1", config: { provider: "pi_rpc" }, threadId: "thread", toolBridge: { pending: {} } };
+  if (kind === "active") Object.assign(provider, { activeProviderTurnId: "live-turn" });
+  if (kind === "pending") provider.toolBridge.pending = { call: { input: "unsettled side effect" } };
+  if (kind === "identity") runner.normalizedSessionId = "other";
+  if (kind === "goal") Object.assign(provider, { goal: { status: "active" } });
+  expect(() => assertPiColdResumeSettled(runner, provider, normalizedSessionId, "thread")).toThrow("native_pi_cold_resume_unsettled");
+});
+it("cold-retires an idle stopped remote owner only with its exact identity and no provider work", () => {
+  const owner = { runId: previousRunId, normalizedSessionId, runnerInstanceId: "runner", environmentLeaseId: "lease", turnId: "turn", itemId: "item" };
+  const state = { ...owner, schema: "paperclip.runner.durable.state.v1", lifecycle: "ready", outbox: [] };
+  const provider = { schema: "paperclip.runner.codex-provider-state.v1", config: { provider: "pi_rpc" }, threadId: "same", toolBridge: { pending: {} } };
+  expect(() => assertPiColdResumeSettled(state, provider, normalizedSessionId, "same", owner)).not.toThrow();
+  for (const proof of [undefined, {}, { ...owner, runId: currentRunId }]) expect(() => assertPiColdResumeSettled(state, provider, normalizedSessionId, "same", proof)).toThrow("unsettled");
+  expect(() => assertPiColdResumeSettled(state, { ...provider, activeProviderTurnId: "active" }, normalizedSessionId, "same", owner)).toThrow("unsettled");
+});
+it("rejects an unconfirmed Pi model before admitting any turn", async () => {
+  const bundle = createCapabilityRunnerdCodexTransport();
+  const request = vi.spyOn(bundle.transport, "request").mockResolvedValue({ model: "vendor/old", thread: { id: "same" } });
+  installPiColdResume(bundle.transport, { threadId: "same", model: "vendor/new", retireRunnerAuthority: async () => {} });
+  await expect(bundle.transport.prepareConversationResume!({ threadId: "same", model: "vendor/new" })).rejects.toThrow("native_pi_cold_resume_model_unconfirmed");
+  expect(request.mock.calls.map(([method]) => method)).toEqual(["thread/start"]);
+  await bundle.transport.close();
+});
+it("cold-retries Pi attach refusal once with the exact same checkpoint, never replacement", async () => {
+  const checkpoint = { ...previousRun().runnerProfileJson.sessionCheckpoint, activeTurnId: null, pendingRuntimeRequests: [] } as unknown as PersistedNativeSession;
+  const recover = vi.fn().mockResolvedValueOnce({ recovered: false, failureClass: "provider_attach_refused", runnerExitConfirmed: true }).mockResolvedValueOnce({ recovered: true });
+  const enableColdResume = vi.fn();
+  expect(await retryPiAttachOnSameSession({ pi: true, checkpoint, recover, enableColdResume })).toEqual({ recovered: true });
+  expect(enableColdResume).toHaveBeenCalledOnce();
+  expect(recover.mock.calls.map(([saved]) => saved)).toEqual([checkpoint, checkpoint]);
+});
+it.each(["other-provider", "paperclip", "owner-unproven", "active-turn", "pending-request", "other-failure"])("does not cold-retry unsafe attach failure: %s", async kind => {
+  const checkpoint = { ...previousRun().runnerProfileJson.sessionCheckpoint, activeTurnId: kind === "active-turn" ? "active" : null, pendingRuntimeRequests: kind === "pending-request" ? [{}] : [] } as unknown as PersistedNativeSession;
+  const recover = vi.fn().mockResolvedValue({ recovered: false, failureClass: kind === "other-failure" ? "side_effect_ambiguity" : "provider_attach_refused", runnerExitConfirmed: kind !== "owner-unproven" });
+  const enableColdResume = vi.fn();
+  await retryPiAttachOnSameSession({ pi: kind !== "other-provider", sessionContinuity: kind === "paperclip" ? "paperclip" : "continuous", checkpoint, recover, enableColdResume });
+  expect(recover).toHaveBeenCalledOnce(); expect(enableColdResume).not.toHaveBeenCalled();
+});
 describe("capability-gated connection tool refresh", () => {
   it("retains the exact provider session for an MCP-only change when the harness supports it", () => {
     const current = execution(currentRunId);
