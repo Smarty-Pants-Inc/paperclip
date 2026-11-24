@@ -494,8 +494,8 @@ describe("PaperclipControlPlanePort conformance", () => {
         expect(comments[0]).toMatchObject({ authorType: "system", authorAgentId: null, authorUserId: null,
           createdByRunId: null, conversationSessionGeneration: 0, metadata: { sourceRunId: runId },
           presentation: { kind: "system_notice", tone: "neutral" } });
-        const [receipt] = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
-        expect(comments[0]!.createdAt).toEqual(receipt!.createdAt);
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        expect(comments[0]!.createdAt).toEqual(run!.createdAt); // 0346: above the run's answer
         await db.update(issueComments).set({ deletedAt: new Date() }).where(eq(issueComments.id, comments[0]!.id));
         await port.appendEvent(event);
         await port.appendEvent({ ...event, sourceEventId: `${runnerId}:2`, sourceSeq: 2 });
