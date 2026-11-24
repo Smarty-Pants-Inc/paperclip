@@ -1,6 +1,6 @@
 /** Redact diagnostic text without importing the provider process or its credentials. */
 export function redactProviderDiagnostic(message: string): string {
-  return message
+  let redacted = message
     .replaceAll(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
     .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, "Bearer [REDACTED]")
     .replace(/Basic\s+([A-Za-z0-9+/=]+)/gi, (match, encoded: string) => {
@@ -12,9 +12,13 @@ export function redactProviderDiagnostic(message: string): string {
       } catch {
         return match;
       }
-    })
-    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi, "$1[REDACTED]@")
-    .replace(
+    });
+  // No URI can match without this separator. Avoid the URL regex's repeated
+  // scheme-prefix backtracking on large unbroken transcript words.
+  if (redacted.includes("://")) {
+    redacted = redacted.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi, "$1[REDACTED]@");
+  }
+  return redacted.replace(
       /([?&](?:api[_-]?key|token|secret|password)=)[^&#\s]+/gi,
       "$1[REDACTED]",
     )
