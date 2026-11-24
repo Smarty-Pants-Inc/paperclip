@@ -2350,7 +2350,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               ? agentMap?.get(meta.agentId)?.icon
               : undefined,
             standaloneHeader: sourceIsPaperclipRunner,
-            continuedAfterSteering: sourceIsPaperclipRunner && segmentIndex > 0,
+            continuedAfterSteering: sourceIsPaperclipRunner && timelineAnchors.length > 0,
             animateFold: liveSeenRef.current.has(source.id),
             items: children,
             ...(runHealth.failures.length > 0 ? { mcpStartupFailures: runHealth.failures } : {}),
