@@ -233,6 +233,7 @@ export async function claimFirstTurnQueuedInput(
       id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status,
       runtimeMode: heartbeatRuns.runtimeMode, responsibleUserId: heartbeatRuns.responsibleUserId,
       contextSnapshot: heartbeatRuns.contextSnapshot,
+      resultJson: heartbeatRuns.resultJson,
     }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.id, binding.runId), eq(heartbeatRuns.companyId, binding.companyId),
       eq(heartbeatRuns.agentId, binding.agentId))).for("update").limit(1);
@@ -248,8 +249,9 @@ export async function claimFirstTurnQueuedInput(
     const joining = !issue || issue.conversationAgentId || issue.executionRunId !== run.id
       ? [] : wakes.filter(wake => deferredWakeJoinsFirstTurn(wake, run));
     const commentIds = [...new Set(joining.flatMap(wake => queuedCommentIdsFromWakePayload(wake.payload)))];
-    const taken = await readQueuedMessages(tx as unknown as Db, { ...binding, responsibleUserId: run.responsibleUserId,
-      commentIds, excludeDelivered: true });
+    const pressedAt = nonEmptyString(record(record(run.resultJson).personStopHeld).pressedAt);
+    const taken = (await readQueuedMessages(tx as unknown as Db, { ...binding, responsibleUserId: run.responsibleUserId,
+      commentIds, excludeDelivered: true })).filter(message => !pressedAt || message.createdAt.getTime() <= Date.parse(pressedAt));
     // Render before sealing: once the receipt commits, nothing can fail
     // between it and the turn input that the receipt describes.
     const text = await render(taken);
