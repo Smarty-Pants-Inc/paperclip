@@ -76,6 +76,7 @@ export async function buildNativeSessionHandoff(input: {
     createdAt: issueComments.createdAt, origin: issueComments.origin,
   };
   const commentScope = and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), isNull(issueComments.deletedAt),
+    isNull(issueComments.conversationSessionGeneration),
     lte(issueComments.createdAt, input.before),
     boundary ? sql`(${issueComments.createdAt}, ${issueComments.id}) > (${boundary.createdAt.toISOString()}::timestamptz, ${boundary.id}::uuid)` : undefined,
     cutoff ? sql`(${issueComments.createdAt}, ${issueComments.id}) <= (${cutoff.createdAt.toISOString()}::timestamptz, ${cutoff.id}::uuid)` : undefined);
