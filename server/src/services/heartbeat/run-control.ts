@@ -397,8 +397,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
   }) {
     let leaseOwnerRun = await getRunCleanupState(input.runId);
     if (leaseOwnerRun && isNativeRunnerOwnershipHeld(leaseOwnerRun)) return;
-    const cancelledRun = leaseOwnerRun?.runtimeMode === "native" && leaseOwnerRun.status === "cancelled"
-      ? await getRun(input.runId) : null;
+    const cancelledRun = leaseOwnerRun?.status === "cancelled" ? await getRun(input.runId) : null;
     if (cancelledRun) leaseOwnerRun = cancelledRun;
     if (leaseOwnerRun && isNativeRunnerOwnershipHeld(leaseOwnerRun)) return;
     // Recovery can finish workspace copy-back outside the executor's finally.
@@ -408,6 +407,10 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       input.providerResourceDisposition,
       status,
     );
+    // The preparation owner proved the dispatch gate never opened. Do not
+    // close the prior warm owner: runtime returns only reusable leases untouched.
+    if (cancelledRun?.resultJson?.preDispatchCancellationSettledAt &&
+        !parseObject(cancelledRun.usageJson?.budgetDispatch).handedOffAt) providerResourceDisposition = undefined;
     let neverLaunched: boolean | undefined;
     const runnerNeverLaunched = async () => neverLaunched ??= leaseOwnerRun?.runtimeMode === "native"
       && isHeartbeatRunTerminalStatus(status) && await nativeRunNeverLaunchedRunner(db, input.runId, input.companyId);
