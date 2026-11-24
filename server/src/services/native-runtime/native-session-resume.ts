@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { resolveSessionContinuity } from "./continued-session.js";
 import { isDeepStrictEqual } from "node:util";
 import { and, desc, eq, exists, inArray, isNotNull, ne, not, notInArray, or, sql } from "drizzle-orm";
 import {
@@ -548,6 +549,7 @@ export function buildNativeExecutionWithCheckpoint(input: {
   previousRun:
     Parameters<typeof rebindNativeSessionCheckpoint>[0]["previousRun"] | null;
   normalizedSessionId: string;
+  sessionContinuity?: unknown;
   executionTargetKind?: NativeToolExecutionTargetKind;
   toolRefreshOnResume?: boolean;
   refreshTools?: boolean;
@@ -575,6 +577,7 @@ export function buildNativeExecutionWithCheckpoint(input: {
       const retainedCheckpoint = rebindNativeSessionCheckpoint({
         previousRun: input.previousRun,
         currentExecution: retainedFormat,
+        sessionContinuity: input.sessionContinuity,
         executionTargetKind: input.executionTargetKind,
         toolRefreshOnResume: input.toolRefreshOnResume,
         refreshTools: input.refreshTools,
@@ -586,6 +589,7 @@ export function buildNativeExecutionWithCheckpoint(input: {
     ? rebindNativeSessionCheckpoint({
         previousRun: input.previousRun,
         currentExecution: execution,
+        sessionContinuity: input.sessionContinuity,
         executionTargetKind: input.executionTargetKind,
         toolRefreshOnResume: input.toolRefreshOnResume,
         refreshTools: input.refreshTools,
@@ -634,6 +638,7 @@ export function rebindNativeSessionCheckpoint(input: {
     runnerProfileJson: unknown;
   };
   currentExecution: NativeExecutionInput;
+  sessionContinuity?: unknown;
   executionTargetKind?: NativeToolExecutionTargetKind;
   toolRefreshOnResume?: boolean;
   refreshTools?: boolean;
@@ -682,6 +687,11 @@ export function rebindNativeSessionCheckpoint(input: {
   } catch {
     return null;
   }
+  const workspaceChanged = !sameWorkspaceScope({ previousExecution, previousRunId: input.previousRun.id, currentExecution: current }) || previousExecution.workspace.cwd !== current.workspace.cwd;
+  const workspaceContinuation = workspaceChanged && current.provider.kind === "pi_rpc" &&
+    resolveSessionContinuity(current.provider.kind, input.sessionContinuity) === "continuous" &&
+    (input.executionTargetKind ?? "local") === "local" &&
+    (!rawCheckpoint.goal || record(rawCheckpoint.goal).status === "complete");
   if (
     previousExecution.binding.runId !== input.previousRun.id ||
     previousExecution.binding.companyId !== current.binding.companyId ||
@@ -689,11 +699,7 @@ export function rebindNativeSessionCheckpoint(input: {
     previousExecution.binding.agentId !== current.binding.agentId ||
     previousExecution.session.normalizedSessionId !== normalizedSessionId ||
     previousExecution.session.driverKind !== current.session.driverKind ||
-    !sameWorkspaceScope({
-      previousExecution,
-      previousRunId: input.previousRun.id,
-      currentExecution: current,
-    }) ||
+    (!workspaceContinuation && !sameWorkspaceScope({ previousExecution, previousRunId: input.previousRun.id, currentExecution: current })) ||
     previousExecution.task.workMode !== current.task.workMode ||
     ("executionMode" in previousExecution
       ? previousExecution.executionMode
@@ -702,7 +708,7 @@ export function rebindNativeSessionCheckpoint(input: {
     !sameProvider(previousExecution.provider, current.provider) ||
     previousExecution.schema !== current.schema ||
     ("homeMode" in previousExecution ? previousExecution.homeMode : "isolated") !== ("homeMode" in current ? current.homeMode : "isolated") ||
-    ("runtimeContext" in previousExecution &&
+    (!workspaceContinuation && "runtimeContext" in previousExecution &&
       "runtimeContext" in current &&
       !nativeRuntimeContextsMatch(previousExecution.runtimeContext, current.runtimeContext, input.toolRefreshOnResume))
   )
@@ -731,6 +737,7 @@ export function rebindNativeSessionCheckpoint(input: {
       issueId: current.binding.issueId,
       agentId: current.binding.agentId,
     },
+    ...(workspaceContinuation ? { workingDirectory: current.workspace.cwd ?? undefined } : {}),
     cursor: null,
     semanticResult: null,
     terminal: null,

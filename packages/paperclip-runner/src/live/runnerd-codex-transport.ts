@@ -4086,7 +4086,7 @@ function createSanitizedPiRunnerEnvironment(source: NodeJS.ProcessEnv | undefine
       && (OPEN_CODE_RUNNER_ENVIRONMENT_KEYS.has(key) || /^LC_[A-Z0-9_]{1,32}$/.test(key)))),
     ...Object.fromEntries(["PAPERCLIP_AI_PROVIDER_URL", "PAPERCLIP_AI_PROVIDER_KEY",
       "PAPERCLIP_AI_PROVIDER_PROTOCOL", "PAPERCLIP_AI_PROVIDER_AUTH", "PAPERCLIP_AI_PROVIDER_HEADERS",
-      "PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY"]
+      "PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY", "PAPERCLIP_PI_CONTINUOUS"]
       .flatMap(key => source?.[key] === undefined ? [] : [[key, source[key]]])),
   };
 }
