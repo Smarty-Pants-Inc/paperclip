@@ -1863,7 +1863,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       }
       // Keep the same segment owner while activeRun disappears ahead of the
       // terminal summary; otherwise a second settling tail bypasses dedupe.
-      const openSegments = isNativePaperclipRunnerRun(source) && (source.id === liveRun?.id ||
+      const openSegments = isNativePaperclipRunnerRun(source) && (source.status === "queued" || source.id === liveRun?.id ||
         (!liveRun && (source.id === settlingRun?.id || liveSeenRef.current.has(source.id)) && !isTerminalRunStatus(source.status)));
       if (!isTerminalRunStatus(source.status) && !openSegments) continue;
       if (liveRun && runChainIdsById.get(liveRun.id)?.includes(source.id) && !openSegments) continue;
@@ -2476,6 +2476,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             ? [...parsed, { ...finalResponse, channel: "final", interstitial: false }]
             : parsed,
           status: segmentStreaming ? source.status : failed ? source.status : "succeeded",
+          ...(source.status === "queued" ? { execution: meta?.execution } : {}),
           startedAtMs: answerStartMs,
           finishedAtMs: Number.isFinite(segmentFinishedMs) ? segmentFinishedMs : null,
           continuedAfterSteering,
@@ -2518,15 +2519,17 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               personStopped,
             }),
           },
-          anchorCommentId: segmented
-            ? null
-            : sourceIsPaperclipRunner
-              ? null
-              : (lastCommentIdByRun.get(source.id) ?? null),
-          // A post-steering segment ties the acknowledgement-backed human
-          // bubble and is therefore inserted immediately after it. The first
-          // segment retains the normal run-start slot.
-          startMs: segment.startMs,
+          // Admission already owns a response slot under this request. Starting
+          // the provider later must not move that slot past a newer question.
+          anchorCommentId: sourceIsPaperclipRunner && segmentIndex === 0 &&
+            orderedEntries.some(entry => entry.id === requestCommentByRun.get(source.id))
+            ? requestCommentByRun.get(source.id)!
+            : segmented ? null : (lastCommentIdByRun.get(source.id) ?? null),
+          // Later segments follow their acknowledged human boundary. Without
+          // request provenance, admission time is stable across queued → running.
+          startMs: sourceIsPaperclipRunner && segmentIndex === 0
+            ? toMs(meta?.createdAt ?? source.createdAt) || segment.startMs
+            : segment.startMs,
         });
       }
     }
@@ -2613,6 +2616,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     interactions,
     runs,
     runChainIdsById,
+    requestCommentByRun,
     liveRun,
     settlingRun,
     transcriptByRun,
@@ -3059,7 +3063,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       startedAtMs: tailStartedAtMs,
       finishedAtMs: isTerminalRunStatus(segment.status) ? segment.finishedAtMs : tailFinishedAtMs,
       execution: !tailHasFinalResponse && !tailFinalStreaming && !tailTerminal ? tailExecution : null,
-      preparationLabel: tailPreparationLabel,
+      preparationLabel: tailProgressLabel ?? tailPreparationLabel,
       activityUnavailable: tailActivityUnavailable,
       awaitingContinuation: paperclipRunnerTailAwaitingContinuation,
     } : segment;
@@ -3067,8 +3071,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       <TaskChatShimmerScope items={presentation.items}>
       <TaskChatRunnerHeader {...presentation} agentName={item.agentName} agentIcon={item.agentIcon} agent={item.agent}
         personStopped={item.summary.personStopped === true} />
-      <TaskChatRunnerTurn {...presentation} showHeader={false} agentName={item.agentName} agentIcon={item.agentIcon} agent={item.agent}
-        onRuntimeRequestDecision={handleRuntimeRequestDecision} />
+      {presentation.items.length > 0 || !presentation.preparationLabel ?
+        <TaskChatRunnerTurn {...presentation} showHeader={false} agentName={item.agentName} agentIcon={item.agentIcon} agent={item.agent}
+          onRuntimeRequestDecision={handleRuntimeRequestDecision} /> : null}
       </TaskChatShimmerScope>
     </div>;
   };
@@ -3261,6 +3266,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const requestRun = [...runs].filter(run => latestUserComment && requestCommentByRun.get(run.id) === latestUserComment.id)
     .sort((a, b) => toMs(a.createdAt) - toMs(b.createdAt)).at(-1);
   const requestChain = requestRun ? runChainIdsById.get(requestRun.id) ?? [requestRun.id] : [];
+  const requestHasTurnSlot = requestChain.some(id => runnerSegmentsById.has(`${id}:turn:0`));
   const requestAnswered = latestUserComment && (commentItems.some(item => item.kind === "message" && item.author === "agent" && !item.interstitial && item.channel !== "progress" && (item.atMs ?? 0) > toMs(latestUserComment.createdAt)) ||
     requestChain.some(id => settledReplyRunIds.has(id)) || (tailHasFinalResponse && (tailFinalRef.current.item?.atMs ?? 0) > toMs(latestUserComment.createdAt)));
   const requestStatus = terminalStatuses.get(requestRun?.id ?? "") ?? requestRun?.status;
@@ -3814,7 +3820,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                       </div>
                     ) : (
                       <TaskChatThreadView
-                        items={requestPending ? threadItems.filter(item => !requestChain.some(id => item.id.startsWith(`${id}:turn`) || item.id === `${id}:execution-wait`)) : threadItems}
+                        items={requestPending ? threadItems.filter(item => runnerSegmentsById.has(item.id) || !requestChain.some(id => item.id.startsWith(`${id}:turn`) || item.id === `${id}:execution-wait`)) : threadItems}
                         scrollingHistory={scrollingHistory}
                         attachments={attachments}
                         header={<>{threadHeaderWithBlockers}{!issueBrief ? historyControl : null}<CoordinatorChatQuestionStatus query={pendingQuestions} /><CoordinatorChatReceiptStatus query={decisionReceipts} scroll={!!scrollingHistory} /><CoordinatorChatHandoffStatus query={taskHandoffs} scroll={!!scrollingHistory} /></>}
@@ -3846,7 +3852,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                           optimisticRunnerStartup || requestPending ||
                           bottomBlockerLinks ? (
                             <>
-                              {!tailSegmentSettled && !recoveryOwnsStatus && (tailRunId || optimisticRunnerStartup) ? (
+                              {!tailSegmentSettled && !recoveryOwnsStatus && (tailRunId || (optimisticRunnerStartup && !requestHasTurnSlot)) ? (
                                 <div key={tailRunId ? requestCommentByRun.get(tailRunId) ?? tailRunId : latestUserComment?.id} data-testid="task-chat-live-transcript">
                                   <TaskChatShimmerScope items={tailItems}>
                                   <TaskChatRunnerHeader
@@ -3931,7 +3937,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                   </TaskChatShimmerScope>
                                 </div>
                               ) : null}
-                              {requestPending && !optimisticRunnerStartup && !recoveryOwnsStatus ? <div key={latestUserComment?.id} data-testid="task-chat-live-transcript">
+                              {requestPending && !optimisticRunnerStartup && !recoveryOwnsStatus && !requestHasTurnSlot ? <div key={latestUserComment?.id} data-testid="task-chat-live-transcript">
                                 <TaskChatShimmerScope items={[]}><TaskChatRunnerHeader status="queued" startedAtMs={null}
                                   agentName={tailAgent?.name} agent={tailAgent} working={requestWorking} preparationLabel={requestLabel} /></TaskChatShimmerScope>
                               </div> : null}
