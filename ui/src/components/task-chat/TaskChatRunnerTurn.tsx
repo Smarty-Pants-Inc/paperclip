@@ -110,7 +110,7 @@ function RunnerTurnStatus({
 
   return (
     <span
-      className={cn("min-w-0 truncate text-sm font-normal", working && shimmer ? "shimmer-text shimmer-text-muted" : "text-muted-foreground")}
+      className={cn("min-w-0 break-words text-sm font-normal", working && shimmer ? "shimmer-text shimmer-text-muted" : "text-muted-foreground")}
       data-testid="task-chat-turn-status-header"
       data-turn-position="identity"
       aria-live="polite"
@@ -166,7 +166,7 @@ function agentQueueWaitFor({ status, execution }: Pick<RunnerHeaderProps, "statu
 /** One identity stays mounted while admission discovers the run's renderer. */
 export function TaskChatRunnerHeader({ statusContent, ...props }: RunnerHeaderProps & { statusContent?: ReactNode }) {
   const waitingToStart = useRunnerWaitingToStart(props);
-  return <div className="flex min-h-8 min-w-0 items-center gap-2 pb-1 pt-2" data-testid="task-chat-runner-identity-row">
+  return <div className="flex min-h-8 min-w-0 flex-wrap items-center gap-x-2 gap-y-1 pb-1 pt-2" data-testid="task-chat-runner-identity-row">
     {props.agentName ? <TaskChatAgentIdentity agentName={props.agentName} agentIcon={props.agentIcon} agent={props.agent} /> : null}
     {statusContent ?? (agentQueueWaitFor(props) ? <AgentQueueWait queue={agentQueueWaitFor(props)!} /> : null) ?? <RunnerTurnStatus status={props.status} startedAtMs={props.startedAtMs} finishedAtMs={props.finishedAtMs}
       continuedAfterSteering={props.continuedAfterSteering} waitingLabel={runnerWaitingLabel(props, waitingToStart)} working={props.working === true} personStopped={props.personStopped} />}
