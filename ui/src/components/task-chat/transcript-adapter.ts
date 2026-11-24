@@ -127,6 +127,23 @@ export function splitTranscriptAtAnchors(
   return segments;
 }
 
+/** The answer clock starts at the durable turn receipt, not the run's setup.
+ * A steer without a completed answer continues the same clock across segments.
+ */
+export function runnerAnswerStartMs(
+  segments: readonly TranscriptTimeSegment[],
+  segmentIndex: number,
+): number {
+  const first = segments.slice(0, segmentIndex).findLastIndex(({ entries }) =>
+    entries.some(entry => entry.kind === "assistant" && entry.channel === "final" && !entry.delta)) + 1;
+  for (let index = first; index <= segmentIndex; index += 1) {
+    const turnStart = segments[index]!.entries.find(entry =>
+      entry.kind === "system" && entry.text === "Turn started" && Number.isFinite(Date.parse(entry.ts)));
+    if (turnStart) return Date.parse(turnStart.ts);
+  }
+  return segments[first]!.startMs;
+}
+
 /**
  * The live parent row's nesting rule (PAP-354, narrowed by PAP-361): only tool
  * calls, provider-supplied reasoning summaries, and usage readouts nest inside
