@@ -7909,6 +7909,142 @@ describe("provider plan synchronization", () => {
 });
 
 describe("native conversation replies", () => {
+  it.each(["saved", "pi-intent", "pi-mode", "stop", "stop-resumed", "no-final", "wrong-turn", "wrong-session", "wrong-run"] as const)(
+    "restores the held reply from durable events after controller replacement (%s)", async mode => {
+      vi.spyOn(issueServiceModule, "issueService").mockReturnValue({ update: vi.fn(async () => ({ status: "blocked", statusVersion: 1 })) } as never);
+      const isStop = mode === "stop" || mode === "stop-resumed";
+      const current = isStop ? execution : { ...execution, ...(mode === "pi-intent" ? { turnIntent: "conversation_reply" as const } : {}),
+        provider: { kind: "pi_rpc" as const, model: "fixture/model",
+          ...(mode === "pi-intent" ? {} : { conversationMode: true as const }) },
+        session: { ...execution.session, driverKind: "pi_rpc" as const } };
+      const saved = { ...reply, runId: current.binding.runId, normalizedSessionId: current.session.normalizedSessionId!,
+        ...(mode === "wrong-turn" ? { turnId: "older-turn" } : {}),
+        ...(mode === "wrong-session" ? { normalizedSessionId: "older-session" } : {}),
+        ...(mode === "wrong-run" ? { runId: "older-run" } : {}) };
+      const end = { ...terminal, runId: current.binding.runId, normalizedSessionId: current.session.normalizedSessionId! };
+      const db = leaseDb(current, {}, {
+        continuousReplies: { answer: { commentId: "published-comment", sourceEventId: saved.sourceEventId } },
+        ...(isStop ? { personStop: { requestedAt: "2026-11-24T10:00:00.000Z",
+          ...(mode === "stop-resumed" ? { resumedAt: "2026-11-24T10:01:00.000Z" } : {}) } } : {}),
+      }, [], {}, "running", mode === "no-final" ? [] : [saved]);
+      const select = db.select.bind(db);
+      db.select = ((fields: unknown) => {
+        if ((fields as { agentId?: unknown })?.agentId === issues.conversationAgentId) {
+          // Explicit Pi intent/mode and an unresumed Stop need no issue conversation agent.
+          return { from: () => ({ where: () => ({ limit: async () => mode === "pi-intent" || mode === "pi-mode" || isStop
+            ? [] : [{ agentId: current.binding.agentId }] }) }) };
+        }
+        return select(fields as never);
+      }) as unknown as Db["select"];
+      let observed: PrpStructuredRunResult | null | undefined;
+      state.execute.mockReset().mockImplementationOnce(async options => {
+        // No onCommittedEvent call: this final is behind the resumed cursor.
+        observed = await options.resolveMissingResult({ turnId: end.turnId, terminalEvent: end });
+        throw new Error("held-restart-policy-checked");
+      });
+      const outcome = await executePaperclipNativeSession({ db, execution: current,
+        runnerInstanceId: "runner", useRunnerd: false }).catch(error => error);
+      expect(outcome.stack).toContain("held-restart-policy-checked");
+      if (mode === "saved" || mode === "pi-intent" || mode === "pi-mode" || mode === "stop") expect(observed).toMatchObject({ reportedWorkDisposition: "yielded",
+        summary: "Which project should own this?", evidence: [{ ref: `run-event:${saved.sourceEventId}` }] });
+      else expect(observed).toBeNull();
+    },
+  );
+  it("settles held and already-completed Pi turns from PostgreSQL finals without republishing comments", async () => {
+    vi.spyOn(issueServiceModule, "issueService").mockReturnValue({ update: vi.fn(async () => ({ status: "blocked", statusVersion: 1 })) } as never);
+    const tables = await import("@paperclipai/db");
+    const temporary = await (await import("../../__tests__/helpers/embedded-postgres.js")).startEmbeddedPostgresTestDatabase("held-restart-");
+    const durableDb = tables.createDb(temporary.connectionString);
+    try {
+      for (const mode of ["held", "completed", "no-final"] as const) {
+        const current = { ...execution, binding: { ...execution.binding, companyId: randomUUID(), agentId: randomUUID(), issueId: randomUUID(), runId: randomUUID() },
+          provider: { kind: "pi_rpc" as const, model: "fixture/model", conversationMode: true as const },
+          session: { ...execution.session, normalizedSessionId: randomUUID(), driverKind: "pi_rpc" as const } };
+        const { companyId, agentId, issueId, runId } = current.binding;
+        const finals = ["First published answer.", "Second published answer."].map((text, index) => ({ ...reply,
+          sourceInstanceId: "runner", sourceEventId: `runner:${runId}:${index + 1}`, sourceSeq: index + 1,
+          runId, normalizedSessionId: current.session.normalizedSessionId, itemId: `final-${index}`,
+          payload: { kind: "agentMessage", channel: "final", text } }));
+        const end = { ...finals[1]!, sourceEventId: `runner:${runId}:3`, sourceSeq: 3, eventType: "turn.completed" as const, payload: {} };
+        const replies = mode === "no-final" ? [] : finals;
+        await durableDb.insert(tables.companies).values({ id: companyId, name: "Held restart regression", issuePrefix: mode === "held" ? "HELD" : mode === "completed" ? "DONE" : "NONE" });
+        await durableDb.insert(tables.agents).values({ id: agentId, companyId, name: "Held restart regression" });
+        await durableDb.insert(tables.issues).values({ id: issueId, companyId, title: "Held restart regression" });
+        await durableDb.insert(tables.heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: issueId,
+          invocationSource: "on_demand", status: "running", runtimeMode: "native" });
+        const receipts: Record<string, unknown> = {};
+        for (const event of replies) {
+          const [comment] = await durableDb.insert(tables.issueComments).values({ companyId, issueId, authorAgentId: agentId,
+            createdByRunId: runId, body: event.payload.text! }).returning();
+          receipts[event.itemId!] = { sourceEventId: event.sourceEventId, commentId: comment!.id };
+        }
+        // A newer final from a different turn must never win the durable query.
+        const other = { ...finals[1]!, sourceEventId: `runner:${runId}:4`, sourceSeq: 4, turnId: "different-turn",
+          payload: { kind: "agentMessage", channel: "final", text: "Wrong turn." } };
+        for (const event of [...replies, ...(mode === "held" ? [] : [end]), other]) {
+          await durableDb.insert(tables.heartbeatRunEvents).values({ companyId, agentId, runId, seq: event.sourceSeq,
+            eventType: event.eventType, payload: { prpEvent: event } });
+        }
+        const before = await durableDb.select().from(tables.issueComments);
+        const db = leaseDb(current, {}, { continuousReplies: receipts });
+        const select = db.select.bind(db);
+        db.select = ((fields: Record<string, unknown> | undefined) => {
+          if (fields?.agentId === issues.conversationAgentId) return { from: () => ({ where: () => ({ limit: async () => [{ agentId }] }) }) };
+          if (fields?.payload === heartbeatRunEvents.payload) return durableDb.select(fields as never);
+          return select(fields as never);
+        }) as unknown as Db["select"];
+        const identity = { companyId, agentId, issueId, runId, sessionId: current.session.normalizedSessionId };
+        let checkpoint: import("@paperclipai/paperclip-runner").PersistedNativeSession = {
+          backendKind: "mock", sessionId: identity.sessionId, identity, cursor: mode === "held" ? "2" : "3",
+          activeTurnId: mode === "held" ? end.turnId : null, pendingRuntimeRequests: [], lineage: [],
+          terminalTurns: mode === "held" ? [] : [{ turnId: end.turnId!, fingerprint: "completed" }] };
+        const startTurn = vi.fn(async () => { throw new Error("ORIGINAL INPUT REPLAYED"); });
+        const capabilities = { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true };
+        const session: import("@paperclipai/paperclip-runner").NativeSession = {
+          identity: () => identity, async capabilities() { return capabilities; }, startTurn,
+          async *events() { if (mode === "held") { checkpoint = { ...checkpoint, activeTurnId: null,
+            terminalTurns: [{ turnId: end.turnId!, fingerprint: "completed" }] }; yield end; } },
+          async result() { return null; }, async snapshot() { return structuredClone(checkpoint); }, async close() {},
+        };
+        const accepted: PrpEvent[] = [];
+        const completeRun = vi.fn(async () => undefined);
+        let settled: unknown;
+        state.execute.mockReset().mockImplementationOnce(async options => {
+          settled = await executeNativeSession({ ...options, input: current, existingSession: undefined, persistedSession: checkpoint,
+            onCheckpoint: undefined, onSession: undefined, timeoutMs: 1000,
+            backend: { async descriptor() { return { kind: "mock", name: "held-restart", version: "1", capabilities }; },
+              async openSession() { throw new Error("must recover"); }, async recoverSession() { return { recovered: true, session }; } },
+            controlPlane: { async openRun() {}, async checkpointSession() {},
+              async appendEvent(event: PrpEvent) { accepted.push(event); return { cursor: event.sourceSeq, highestContiguousSourceSeq: event.sourceSeq, disposition: "committed" as const }; },
+              async replayEvents(query: { sourceInstanceId: string; afterSourceSeq: number }) {
+                const rows = await durableDb.select({ payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents);
+                const events = [...rows.map(row => (row.payload as { prpEvent: PrpEvent }).prpEvent), ...accepted]
+                  .filter(event => event.runId === runId && event.sourceInstanceId === query.sourceInstanceId && event.sourceSeq > query.afterSourceSeq);
+                return { events, highestContiguousSourceSeq: events.at(-1)?.sourceSeq ?? 0 }; }, completeRun },
+          });
+          throw new Error("held-restart-runtime-settled");
+        });
+        const outcome = await executePaperclipNativeSession({ db, execution: current, runnerInstanceId: "runner", useRunnerd: false }).catch(error => error);
+        if (mode === "no-final") {
+          expect(outcome.message).toContain("native_finalization_missing"); expect(completeRun).not.toHaveBeenCalled();
+        } else {
+          expect(outcome.message).toContain("held-restart-runtime-settled");
+          expect(settled).toMatchObject({ result: { reportedWorkDisposition: "yielded", summary: "Second published answer." }, turnId: end.turnId });
+          expect(completeRun).toHaveBeenCalledOnce();
+          expect(accepted.filter(event => event.eventType === "run.result.accepted")).toHaveLength(1);
+          expect(accepted.filter(event => event.eventType === "run.terminal")).toHaveLength(1);
+        }
+        expect(startTurn).not.toHaveBeenCalled();
+        expect(await durableDb.select().from(tables.issueComments)).toEqual(before);
+        console.info("held-restart PostgreSQL regression", { mode, runId, sessionId: identity.sessionId,
+          turnId: end.turnId, publishedFinals: replies.length, providerSubmissions: startTurn.mock.calls.length,
+          acceptedResults: accepted.filter(event => event.eventType === "run.result.accepted").length,
+          terminals: accepted.filter(event => event.eventType === "run.terminal").length,
+          commentsUnchanged: true, settled, error: mode === "no-final" ? outcome.message : null });
+      }
+    } finally { await temporary.cleanup(); }
+  }, 120000);
+
   const reply: PrpEvent = {
     schema: "paperclip.prp.event.v1", sourceInstanceId: "runner-1",
     sourceEventId: "runner-1:run-1:8", sourceSeq: 8, sourceKind: "runner",
