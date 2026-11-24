@@ -2,7 +2,7 @@ import { expect, it } from "vitest";
 import type { Db } from "@paperclipai/db";
 import { buildPaperclipWakePayload } from "../heartbeat/run-preparation.js";
 import { shouldResetTaskSessionForWake } from "../heartbeat/run-state.js";
-import { decideNativeContinuation, withPiOpenTurnDefault } from "./continued-session.js";
+import { decideNativeContinuation, resolveSessionContinuity, withPiOpenTurnDefault } from "./continued-session.js";
 import { configuredEnvironmentProjection } from "../../vendor/paperclip-runner/index.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
@@ -25,6 +25,7 @@ it("projects the continuous Pi open-turn default while preserving configured ove
   expect(configured).toEqual({ CUSTOM_VALUE: "kept" });
 });
 
+it.each([["pi_rpc", undefined, "continuous"], ["pi_rpc", "paperclip", "paperclip"], ["codex", "continuous", "continuous"], ["codex", undefined, "paperclip"]])("resolves %s/%s continuity", (provider, setting, expected) => expect(resolveSessionContinuity(provider, setting)).toBe(expected));
 it("honors explicit fresh-session resets under continuous", () => {
   const context = { forceFreshSession: true, explicitFreshSession: true };
   expect(decideNativeContinuation({ provider: "pi_rpc", sessionContinuity: "continuous", hasSession: true, wakeReset: shouldResetTaskSessionForWake(context), resetRequired: context.explicitFreshSession === true }).continue).toBe(false);

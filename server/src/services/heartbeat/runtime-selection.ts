@@ -19,6 +19,7 @@ import { renewLegacyControllerLease } from "../legacy-controller-lease.js";
 import type { prepareManagedAiRuntime } from "../ai-connection-runtime.js";
 import { resolveHeartbeatNativeLifecyclePolicy, type NativeLifecyclePolicy } from "./native-lifecycle.js";
 import { resolveWarmProviderSelection } from "../native-runtime/native-warm-capability.js";
+import { readNativeSessionContinuity, resolveSessionContinuity } from "../native-runtime/continued-session.js";
 import {
   getNativeReviewAssignment,
   readNativeReviewAssignmentContext,
@@ -921,7 +922,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
                   : null,
               ...nativeProvider,
               lifecyclePolicy: effectiveLifecyclePolicy,
-              sessionContinuity: parseObject(agent.adapterConfig).sessionContinuity,
+              sessionContinuity: runtimeConfig.sessionContinuity,
               interactionResponses,
               completionContract: {
                 id: completionContract.row.id,
@@ -939,6 +940,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
       const nativeExecutionWithCheckpoint = buildNativeExecutionWithCheckpoint({
         previousRun: previousNativeRun,
         normalizedSessionId: nativeSessionId,
+        sessionContinuity: runtimeConfig.sessionContinuity,
         executionTargetKind: executionTarget?.kind ?? "local",
         toolRefreshOnResume,
         refreshTools: context.refreshTools === true,
@@ -1076,6 +1078,9 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
               : {}),
             nativeExecutionInput:
               lockedProfile.nativeExecutionInput ?? nativeExecution,
+            ...(nativeExecution?.provider.kind === "pi_rpc" ? {
+              nativeSessionContinuity: readNativeSessionContinuity(lockedProfile) ?? resolveSessionContinuity("pi_rpc", runtimeConfig.sessionContinuity),
+            } : {}),
             nativeToolRefreshOnResume: lockedProfile.nativeExecutionInput
               ? lockedProfile.nativeToolRefreshOnResume === true : toolRefreshOnResume === true,
             ...(typeof lockedProfile.inheritedProcessIdentityRunId === "string"

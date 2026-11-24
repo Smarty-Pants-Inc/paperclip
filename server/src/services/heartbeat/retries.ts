@@ -510,6 +510,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
       maxAttempts?: number;
       delayMs?: number;
       preserveWakeContext?: boolean;
+      freshSessionRequired?: boolean;
     },
   ) {
     if (isProviderQuotaActionRequired(run, opts?.now)) return { outcome: "not_scheduled" as const,
@@ -851,6 +852,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
       "normal_model",
     );
     // A successor resolves current assignments; the failed run retains its snapshot.
+    if (opts?.freshSessionRequired) retryContextSnapshot.explicitFreshSession = true;
     delete retryContextSnapshot.skillVersions;
     delete retryContextSnapshot.skillSelectionSnapshot;
     delete retryContextSnapshot.shadowedSkills;
