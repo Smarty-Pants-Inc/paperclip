@@ -1807,6 +1807,16 @@ html:has(.paperclip-app-shell[data-keyboard-open="true"] [data-classic-task-shel
   line-height: inherit;
 }
 
+/* Inline reasoning shares the answer's inset and type; only tone and italic differ. */
+.task-chat-reasoning-inline .paperclip-markdown,
+.task-chat-reasoning-inline .paperclip-markdown :is(p, h1, h2, h3, h4, h5, h6, strong, em, a) {
+  color: inherit;
+  font-style: inherit;
+}
+.task-chat-reasoning-inline .paperclip-markdown code {
+  font-style: normal;
+}
+
 /* Activity rows stay on one bounded line until explicitly expanded. The mask
    gives long provider text a quieter edge than an ellipsis, while the shared
    expanded treatment safely wraps paths, identifiers, and unbroken tokens. */
