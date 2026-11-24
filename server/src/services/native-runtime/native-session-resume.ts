@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
+import { OWN_PROCESS_START_EVENT_TYPES } from "../native-process-start-events.js";
 import { and, desc, eq, exists, inArray, isNotNull, ne, not, notInArray, or, sql } from "drizzle-orm";
 import {
   heartbeatRunEvents, heartbeatRuns, nativeRunFinalizations, nativeRunnerCheckpoints, nativeRunResults, type Db,
@@ -269,7 +270,10 @@ export async function findNativeSessionResumeRun(db: Db, input: NativeSessionRes
   const source = record(selected?.runnerProfileJson.sessionCheckpoint);
   const inherited = selected !== null && typeof source.sessionId === "string" && skipped.every(run => {
     const checkpoint = record(run.runnerProfileJson.sessionCheckpoint);
-    return INHERITED_CHECKPOINT_SOURCE_FIELDS.every(field => checkpoint[field] === source[field]);
+    return INHERITED_CHECKPOINT_SOURCE_FIELDS.every(field => checkpoint[field] === source[field]) &&
+      // A staged follower may inherit a non-null committed cursor. It is not
+      // new progress, but it must still be the exact source cursor.
+      (checkpoint.cursor == null || isDeepStrictEqual(checkpoint.cursor, source.cursor));
   });
   return inherited ? selected : barrier;
 }
@@ -284,29 +288,55 @@ async function isUnstartedInheritedFollowUp(
 ): Promise<boolean> {
   const checkpoint = record(run.runnerProfileJson.sessionCheckpoint);
   const identity = record(checkpoint.identity);
-  if (run.runtimeMode !== "native" || run.status !== "failed" || run.processPid !== null ||
-      run.processGroupId !== null || run.processStartedAt !== null || run.runnerProfileJson.nativeControllerRecovery != null ||
-      identity.runId !== run.id || identity.sessionId !== input.normalizedSessionId || checkpoint.cursor !== null) return false;
+  if (run.runtimeMode !== "native" || !["failed", "cancelled"].includes(run.status) || run.processPid !== null ||
+      run.processGroupId !== null || run.processStartedAt !== null ||
+      record(run.runnerProfileJson.nativeControllerRecovery).schema === "paperclip.native-controller-recovery.v1" ||
+      identity.companyId !== input.companyId || identity.agentId !== input.agentId || identity.issueId !== input.issueId ||
+      identity.sessionId !== input.normalizedSessionId || typeof identity.runId !== "string" ||
+      checkpoint.activeTurnId != null || (Array.isArray(checkpoint.pendingRuntimeRequests) && checkpoint.pendingRuntimeRequests.length > 0)) return false;
+  return nativeRunHasNoProviderWork(db, input, run.id);
+}
+
+/** Shared negative-work proof for inherited-source selection and the preparation
+ * owner's Stop settlement. A cancellation label or lease release alone is not proof. */
+export async function nativeRunHasNoProviderWork(db: Db,
+  input: Pick<NativeSessionResumeSelection, "companyId" | "agentId" | "issueId">, runId: string): Promise<boolean> {
   const [evidence] = await db.select({
+    processPid: heartbeatRuns.processPid, processGroupId: heartbeatRuns.processGroupId,
+    processStartedAt: heartbeatRuns.processStartedAt, profile: heartbeatRuns.runnerProfileJson,
+    dispatchHandedOffAt: sql<unknown>`${heartbeatRuns.usageJson}#>'{budgetDispatch,handedOffAt}'`,
     executionRecovery: sql<unknown>`${heartbeatRuns.resultJson}->'executionRecovery'`,
     phase: nativeRunFinalizations.phase,
     resultId: nativeRunFinalizations.resultId,
     leaseOwner: nativeRunFinalizations.leaseOwner,
     controllerPid: nativeRunFinalizations.controllerPid,
+    processStart: sql<boolean>`exists (select 1 from ${heartbeatRunEvents}
+      where ${heartbeatRunEvents.companyId} = ${heartbeatRuns.companyId} and ${heartbeatRunEvents.runId} = ${heartbeatRuns.id}
+        and ${heartbeatRunEvents.eventType} in (${sql.join(OWN_PROCESS_START_EVENT_TYPES.map(type => sql`${type}`), sql`, `)}))`,
     controllerCheckpoint: sql<boolean>`exists (select 1 from ${nativeRunnerCheckpoints}
       where ${nativeRunnerCheckpoints.companyId} = ${heartbeatRuns.companyId} and ${nativeRunnerCheckpoints.runId} = ${heartbeatRuns.id})`,
     result: sql<boolean>`exists (select 1 from ${nativeRunResults}
       where ${nativeRunResults.companyId} = ${heartbeatRuns.companyId} and ${nativeRunResults.runId} = ${heartbeatRuns.id})`,
-  }).from(heartbeatRuns).innerJoin(nativeRunFinalizations, and(
+  }).from(heartbeatRuns).leftJoin(nativeRunFinalizations, and(
     eq(nativeRunFinalizations.runId, heartbeatRuns.id), eq(nativeRunFinalizations.companyId, heartbeatRuns.companyId),
     eq(nativeRunFinalizations.issueId, input.issueId),
-  )).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, input.companyId),
-    eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.nativeIssueId, input.issueId)));
+  )).where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, input.companyId),
+    eq(heartbeatRuns.agentId, input.agentId),
+    sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.issueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${input.issueId}`));
+  // Stop before dispatch may have no coordinator and no executionRecovery
+  // record at all. Absence of actual work, not the failure label, is the proof.
   const recovery = record(evidence?.executionRecovery);
-  return Boolean(evidence && recovery.kind === "bootstrap" && recovery.providerWorkStarted === false &&
-    evidence.phase === "terminal_failure" && evidence.resultId === null && evidence.leaseOwner === null &&
-    evidence.controllerPid === null && !evidence.controllerCheckpoint && !evidence.result &&
-    !(await nativeSessionProviderEvidence(db, [run.id])).has(run.id));
+  const checkpoint = record(evidence?.profile?.sessionCheckpoint);
+  return Boolean(evidence && evidence.processPid === null && evidence.processGroupId === null &&
+    evidence.processStartedAt === null && evidence.dispatchHandedOffAt == null &&
+    record(evidence.profile?.nativeControllerRecovery).schema !== "paperclip.native-controller-recovery.v1" &&
+    checkpoint.activeTurnId == null &&
+    (!Array.isArray(checkpoint.pendingRuntimeRequests) || checkpoint.pendingRuntimeRequests.length === 0) &&
+    recovery.providerWorkStarted !== true &&
+    (evidence.phase === null || ["observed", "terminal_failure"].includes(evidence.phase)) &&
+    evidence.resultId === null && evidence.leaseOwner === null && evidence.controllerPid === null &&
+    !evidence.processStart && !evidence.controllerCheckpoint && !evidence.result &&
+    !(await nativeSessionProviderEvidence(db, [runId])).has(runId));
 }
 
 async function selectNativeSessionResumeBarrier(db: Db, input: NativeSessionResumeSelection, skippedRunIds: string[]) {
