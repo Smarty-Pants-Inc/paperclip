@@ -195,7 +195,8 @@ describeEmbeddedPostgres("queued-comment postgres adapter", () => {
     }
   });
 
-  it("commits two native event appends while person-stop notice ingestion holds its issue lock", async () => {
+  it.each(["person-stop notice ingestion", "continuous-reply publication"] as const)(
+    "commits two native event appends while %s holds its issue lock", async observer => {
     const companyId = await seedCompany(), agentId = await seedAgent({ companyId });
     const issueId = await seedIssue({ companyId, assigneeAgentId: agentId }), runId = randomUUID();
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, issueId, nativeIssueId: issueId,
@@ -238,8 +239,11 @@ describeEmbeddedPostgres("queued-comment postgres adapter", () => {
     } });
     const notice = publishContinuousNativeReply({ db: observingDb, cursor: 1,
       execution: { binding: { companyId, issueId, runId, agentId }, provider: { kind: "pi_rpc" } },
-      event: { eventType: "provider.notice.recorded", runId, sourceEventId: randomUUID(),
-        normalizedSessionId: "stop-lock-test", payload: { category: "pi_stop_returned_input", details: [] } } });
+      event: observer === "person-stop notice ingestion"
+        ? { eventType: "provider.notice.recorded", runId, sourceEventId: randomUUID(),
+          normalizedSessionId: "stop-lock-test", payload: { category: "pi_stop_returned_input", details: [] } }
+        : { eventType: "item.completed", runId, sourceEventId: randomUUID(), itemId: "final-reply",
+          normalizedSessionId: "reply-lock-test", payload: { kind: "agentMessage", channel: "final", text: "Saved reply" } } });
     void notice.catch(failLocked);
     try {
       await locked;
@@ -248,7 +252,7 @@ describeEmbeddedPostgres("queued-comment postgres adapter", () => {
         await tx.execute(sql`set local statement_timeout = '3s'`);
         const sourceInstanceId = randomUUID();
         return appendHeartbeatRunEventBatch(tx as unknown as Db, [1, 2].map(sourceSeq => ({
-          companyId, agentId, runId, eventType: "test.person_stop_lock_compatibility",
+          companyId, agentId, runId, eventType: "test.continuous_observer_lock_compatibility",
           nativeSource: { sourceInstanceId, sourceEventId: randomUUID(), sourceSeq,
             protocolSchemaVersion: 1, canonicalPayload: { sourceSeq } },
         })));
