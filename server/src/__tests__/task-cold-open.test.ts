@@ -174,7 +174,7 @@ const support = externalDatabase ? { supported: true } : await getEmbeddedPostgr
     expect(await activity.inputFactsForIssue(companyId, randomUUID(), [commentId])).toEqual([]);
   });
 
-  it("pages conversation events without ordinary tools, including identity-less deltas and requests", async () => {
+  it("pages conversation events with ordinary tools, identity-less deltas and requests", async () => {
     const event = (seq: number, eventType: string, payload: Record<string, unknown>, itemId?: string) => ({
       companyId, runId, agentId, seq, eventType, payload: { prpEvent: { schema: "paperclip.prp.event.v1", eventType, itemId, payload } },
     });
@@ -190,15 +190,20 @@ const support = externalDatabase ? { supported: true } : await getEmbeddedPostgr
       event(9, "provider.notice.recorded", { schema: "paperclip.provider.notice.v1", category: "mcp_server_startup_failed",
         summary: "github MCP server failed to start: No such file or directory (os error 2)" }),
       event(10, "provider.notice.recorded", { schema: "paperclip.provider.notice.v1", category: "configWarning", summary: "diagnostic" }),
+      event(11, "item.completed", { kind: "reasoning", channel: "summary", text: "Checked the configuration" }, "thought"),
+      event(12, "tool.execution.started", { schema: "paperclip.tool.execution.v1", executionId: "command", transport: "process", name: "pwd", status: "running" }),
+      event(13, "tool.execution.completed", { schema: "paperclip.tool.execution.v1", executionId: "command", transport: "process", name: "pwd", status: "completed", exitCode: 0 }),
+      event(14, "research.started", { schema: "paperclip.research.v1", researchId: "search", status: "running", query: "configuration" }),
+      event(15, "research.completed", { schema: "paperclip.research.v1", researchId: "search", status: "completed", query: "configuration" }),
     ]);
     const service = createHeartbeatRunState(db);
     const first = await service.listEvents(runId, 0, 2, true);
-    expect(first.map(e => e.seq)).toEqual([3, 4]);
-    const rest = await service.listEvents(runId, 4, 1000, true);
+    expect(first.map(e => e.seq)).toEqual([1, 2]);
+    const rest = await service.listEvents(runId, 2, 1000, true);
     // A settled run keeps the MCP startup failure that explains missing tools.
-    expect(rest.map(e => e.seq)).toEqual([5, 6, 7, 8, 9]);
-    expect(JSON.stringify([...first, ...rest])).not.toContain("large tool arguments");
-    expect(await service.listEvents(runId)).toHaveLength(10);
+    expect(rest.map(e => e.seq)).toEqual([3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15]);
+    expect(JSON.stringify([...first, ...rest])).toContain("large tool arguments");
+    expect(await service.listEvents(runId)).toHaveLength(15);
     await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, status: "succeeded", createdAt: new Date(Date.now() + 1000) });
     const activity = activityService(db);
     await db.insert(activityLog).values(Array.from({ length: 55 }, () => ({
@@ -209,7 +214,7 @@ const support = externalDatabase ? { supported: true } : await getEmbeddedPostgr
     expect(await activity.runsForIssue(companyId, issueId, null, 1)).toHaveLength(1);
     expect(await activity.runsForIssue(companyId, issueId)).toHaveLength(2);
   });
-  it("retains only successful Plan writes, with bodies removed in the database", async () => {
+  it("retains tool lifecycle rows and removes successful Plan receipt bodies in the database", async () => {
     const planRunId = randomUUID();
     await db.insert(heartbeatRuns).values({ id: planRunId, companyId, agentId, issueId, runtimeMode: "native", status: "succeeded" });
     const event = (seq: number, eventType: string, item: Record<string, unknown>, turnId = "turn-1", sourceKind = "runner") => ({
@@ -243,16 +248,16 @@ const support = externalDatabase ? { supported: true } : await getEmbeddedPostgr
       event(19, "item.completed", result("shared", "notes")),
     ]);
     const service = createHeartbeatRunState(db);
-    const first = await service.listEvents(planRunId, 0, 1, true);
+    const first = await service.listEvents(planRunId, 1, 1, true);
     expect(first.map(event => event.seq)).toEqual([2]);
     expect(first[0]).toMatchObject({ message: null, payload: { prpEvent: { sourceKind: "runner", sourceSeq: 2,
       payload: { item: { type: "tool_result", id: "write-plan", name: "write_document", input: { key: "plan" },
         result: { disposition: "applied", document: { key: "plan" } } } } } } });
     const rest = await service.listEvents(planRunId, 2, 1000, true);
-    expect(rest.map(event => event.seq)).toEqual([3, 5, 18, 19]);
-    expect(rest[3]).toMatchObject({ message: "private tool message", payload: { prpEvent: { payload: { item: { result: { document: { key: "notes" } } } } } } });
+    expect(rest.map(event => event.seq)).toEqual(Array.from({ length: 17 }, (_, i) => i + 3));
+    expect(rest.at(-1)).toMatchObject({ message: "private tool message", payload: { prpEvent: { payload: { item: { result: { document: { key: "notes" } } } } } } });
     expect(rest[0].payload).toMatchObject({ prpEvent: { payload: { item: { text: "Plan saved.\u0000" } } } });
-    const writes = [first[0], rest[1]];
+    const writes = [first[0], rest[2]];
     expect(JSON.stringify(writes)).not.toContain("private");
     expect(Buffer.byteLength(JSON.stringify(writes))).toBeLessThan(4_000);
     const full = await service.listEvents(planRunId);
@@ -267,11 +272,12 @@ const support = externalDatabase ? { supported: true } : await getEmbeddedPostgr
       payload: { prpEvent: { ...event.payload.prpEvent, runId: captureRunId } } })));
     const service = createHeartbeatRunState(db);
     const compact = await service.listEvents(captureRunId, 0, 1000, true);
-    expect(compact.map(event => event.seq)).toEqual([events.find(event => event.eventType === "item.completed")!.seq]);
-    expect(compact[0].payload).toMatchObject({ prpEvent: { payload: { item: {
+    expect(compact.map(event => event.seq)).toEqual(events.map(event => event.seq));
+    const receipt = compact.find(event => event.eventType === "item.completed")!;
+    expect(receipt.payload).toMatchObject({ prpEvent: { payload: { item: {
       type: "tool_result", name: "write_document", result: { document: { key: "plan" } },
     } } } });
-    expect(JSON.stringify(compact)).not.toContain("private fixture body");
+    expect(JSON.stringify(receipt)).not.toContain("private fixture body");
     expect(await service.listEvents(captureRunId)).toHaveLength(events.length);
   });
 

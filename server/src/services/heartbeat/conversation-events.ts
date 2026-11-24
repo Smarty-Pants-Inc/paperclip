@@ -47,8 +47,9 @@ function compactionUsageCondition(runId: string) {
 }
 
 /**
- * Canonical PRP conversation data, excluding ordinary historical tool activity.
- * Successful document writes retain a body-free boundary for saved Plan cards.
+ * Canonical PRP conversation data, including the visible tool/reasoning lifecycle.
+ * A cold open must not erase rows the live turn displayed. Successful document
+ * writes still retain a body-free boundary for saved Plan cards.
  * Keep request lifecycles so a cold open cannot hide a question or approval.
  * Keep MCP startup failures so a settled run still explains missing tools.
  * Keep context compactions, with their run's context readings, for the divider.
@@ -60,7 +61,12 @@ export function conversationEventCondition(runId: string) {
     or (
       ${planWriteCondition(runId)}
     )
-    or ${heartbeatRunEvents.eventType} in ('run.result.accepted', 'run.terminal', 'turn.completed', 'turn.failed', 'turn.cancelled', 'turn.interrupted')
+    or ${heartbeatRunEvents.eventType} in ('run.result.accepted', 'run.terminal', 'turn.started', 'turn.completed', 'turn.failed', 'turn.cancelled', 'turn.interrupted',
+      'tool.execution.started', 'tool.execution.progressed', 'tool.execution.completed', 'workspace.change.updated', 'workspace.diff.recorded',
+      'research.started', 'research.progressed', 'research.completed', 'delegation.started', 'delegation.updated', 'delegation.completed',
+      'plan.updated', 'plan.proposed', 'model.route.changed', 'model.verification.updated', 'artifact.viewed', 'artifact.generated',
+      'review.mode.changed', 'hook.started', 'hook.completed', 'safety.review.started', 'safety.review.completed',
+      'memory.citation.referenced', 'terminal.input.sent', 'wait.started', 'wait.completed')
     or (
       ${heartbeatRunEvents.eventType} = 'provider.notice.recorded'
       and ${heartbeatRunEvents.payload} #>> '{prpEvent,payload,category}' = 'mcp_server_startup_failed'
@@ -71,7 +77,7 @@ export function conversationEventCondition(runId: string) {
     )
     or (
       ${heartbeatRunEvents.eventType} in ('item.started', 'item.delta', 'item.completed')
-      and (lower(replace(coalesce(${heartbeatRunEvents.payload} #>> '{prpEvent,payload,kind}', ${heartbeatRunEvents.payload} #>> '{prpEvent,payload,item,kind}', ${heartbeatRunEvents.payload} #>> '{prpEvent,payload,item,type}', ''), '_', '')) in ('agentmessage', 'assistantmessage')
+      and (lower(replace(coalesce(${heartbeatRunEvents.payload} #>> '{prpEvent,payload,kind}', ${heartbeatRunEvents.payload} #>> '{prpEvent,payload,item,kind}', ${heartbeatRunEvents.payload} #>> '{prpEvent,payload,item,type}', ''), '_', '')) in ('agentmessage', 'assistantmessage', 'tooluse', 'toolresult', 'toolcall', 'dynamictoolcall', 'reasoning')
       or coalesce(
         ${heartbeatRunEvents.payload} #>> '{prpEvent,itemId}',
         ${heartbeatRunEvents.payload} #>> '{prpEvent,payload,itemId}',
@@ -82,7 +88,7 @@ export function conversationEventCondition(runId: string) {
         from heartbeat_run_events e
         where e.run_id = ${runId}
           and e.event_type in ('item.started', 'item.delta', 'item.completed')
-          and lower(replace(coalesce(e.payload #>> '{prpEvent,payload,kind}', e.payload #>> '{prpEvent,payload,item,kind}', e.payload #>> '{prpEvent,payload,item,type}', ''), '_', '')) in ('agentmessage', 'assistantmessage')
+          and lower(replace(coalesce(e.payload #>> '{prpEvent,payload,kind}', e.payload #>> '{prpEvent,payload,item,kind}', e.payload #>> '{prpEvent,payload,item,type}', ''), '_', '')) in ('agentmessage', 'assistantmessage', 'tooluse', 'toolresult', 'toolcall', 'dynamictoolcall', 'reasoning')
       ))
     )
   )`;

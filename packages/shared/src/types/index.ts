@@ -1,3 +1,4 @@
+export type { TaskHistoryComment, TaskHistoryPage, TaskHistoryVisibleTurn, TaskHistoryVisibleRow, TaskHistoryPageInfo } from "./task-history.js";
 export { decisionEffectTargetIssueIds } from "./decision.js";
 export { WORKSPACE_SOURCE_VERIFICATION_REASONS, type WorkspaceSourceVerificationFailure,
   type WorkspaceSourceInspection } from "./workspace-source-verification.js";
