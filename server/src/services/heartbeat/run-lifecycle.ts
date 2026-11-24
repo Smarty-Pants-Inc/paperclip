@@ -2394,12 +2394,14 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     companyId: string,
     issueId: string,
     resultJson?: Record<string, unknown> | null,
+    replyKey?: string,
   ) {
     const comments = await db
       .select({
         id: issueComments.id,
         body: issueComments.body,
         presentation: issueComments.presentation,
+        clientRequestId: issueComments.clientRequestId,
       })
       .from(issueComments)
       .where(
@@ -2410,7 +2412,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
         ),
       )
       .orderBy(desc(issueComments.createdAt), desc(issueComments.id));
-    return findHeartbeatRunCompletionComment(comments, resultJson);
+    return findHeartbeatRunCompletionComment(comments, resultJson, replyKey);
   }
 
   async function findLatestCompletedFinalAgentMessage(
