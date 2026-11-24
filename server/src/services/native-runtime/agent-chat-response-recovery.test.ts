@@ -14,7 +14,7 @@ import { instanceSettingsService } from "../instance-settings.js";
 import { issueService } from "../issues.js";
 import * as nativeResponseNotifications from "../native-response-presentation-notifications.js";
 import { compactRunLogChunk } from "../heartbeat/run-log.js";
-import { publishContinuousNativeReply } from "./native-continuous-reply.js";
+import { publishContinuousNativeReply, recoverContinuousNativeReplies } from "./native-continuous-reply.js";
 import { requeueContinuousUnanswered } from "./native-continuous-unanswered.js";
 import { deliverConversationComments } from "../agent-conversations.js";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
@@ -366,6 +366,109 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0].nativeSessionId).toBe(f.prpEvent.normalizedSessionId);
   });
 
+  it("applies a Stop notice while running, preserves copy-before-delete, and never requeues after its timer", async () => {
+    const returnedId = randomUUID(), otherId = randomUUID(), lateId = randomUUID();
+    let snapshot: unknown;
+    const f = await fixture(true, { beforeFinalize: async scope => {
+      await db.update(agents).set({ adapterConfig: { provider: "pi_rpc" } }).where(eq(agents.id, scope.agentId));
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      const [opening] = await db.select().from(issueComments).where(eq(issueComments.id, run.contextSnapshot!.wakeCommentId as string));
+      await db.insert(issueComments).values([returnedId, otherId, lateId].map((id, index) => ({ id,
+        companyId: scope.companyId, issueId: scope.issueId, authorUserId: index === 1 ? null : opening.authorUserId,
+        body: `Returned input ${index}`, createdAt: new Date(index === 2 ? "2021-01-01" : "2020-01-01") })));
+      await db.update(heartbeatRuns).set({ resultJson: { personStop: { requestedAt: "2020-06-01T00:00:00Z",
+        userId: opening.authorUserId, afterEventSeq: 170 }, queuedSteeringAcknowledgements: {
+        [returnedId]: { status: "acknowledged" }, [lateId]: { status: "acknowledged" },
+      } } }).where(eq(heartbeatRuns.id, scope.runId));
+      const wakeId = randomUUID();
+      await db.insert(agentWakeupRequests).values({ id: wakeId, companyId: scope.companyId, agentId: scope.agentId,
+        source: "issue", status: "deferred_issue_execution", payload: { issueId: scope.issueId, _paperclipWakeContext: { wakeCommentIds: [returnedId] } } });
+      const execution = { binding: scope, provider: { kind: "pi_rpc" as const } };
+      const notice = { eventType: "provider.notice.recorded" as const, runId: scope.runId,
+        normalizedSessionId: run.nativeSessionId!, sourceEventId: "stop-returned", payload: {
+          category: "pi_stop_returned_input", details: [{ name: "returnedCommentIds", value: `${returnedId},${returnedId},${otherId},${lateId}` }],
+        } };
+      await db.insert(heartbeatRunEvents).values({ companyId: scope.companyId, runId: scope.runId,
+        agentId: scope.agentId, seq: 169, eventType: notice.eventType, payload: { prpEvent: { ...notice, sourceEventId: "older-returned" } } });
+      await db.insert(heartbeatRunEvents).values({ companyId: scope.companyId, runId: scope.runId,
+        agentId: scope.agentId, seq: 171, eventType: notice.eventType, payload: { prpEvent: notice } });
+      await Promise.all([publishContinuousNativeReply({ db, execution, event: notice, cursor: 171 }),
+        publishContinuousNativeReply({ db, execution, event: notice, cursor: 171 })]);
+      await publishContinuousNativeReply({ db, execution, event: { ...notice, sourceEventId: "older-returned" }, cursor: 169 });
+      const [atStop] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      expect(atStop).toMatchObject({ status: "running", resultJson: { personStop: {
+        returned: [returnedId], noticeSeq: 171, returnedNoticeSeqs: [171, 169],
+      } } });
+      expect((await db.select().from(issueComments).where(eq(issueComments.id, returnedId)))[0])
+        .toMatchObject({ deletedAt: null, body: "Returned input 0" });
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId)))[0].status).toBe("cancelled");
+      const event = { eventType: "item.completed" as const, runId: scope.runId, normalizedSessionId: run.nativeSessionId!,
+        sourceEventId: "stop-final", itemId: "stop:m0:b0", payload: { kind: "agentMessage", channel: "final", text: "Stopped." } };
+      await db.insert(heartbeatRunEvents).values({ companyId: scope.companyId, runId: scope.runId,
+        agentId: scope.agentId, seq: 172, eventType: event.eventType, payload: { prpEvent: event } });
+      await publishContinuousNativeReply({ db, execution, event, cursor: 172 });
+      const [settled] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      expect(settled).toMatchObject({ status: "running", resultJson: { personStop: {
+        returned: [returnedId], answerItemId: event.itemId, settledAt: expect.any(String),
+      } } });
+      const replies = settled.resultJson!.continuousReplies as Record<string, { questionCommentIds: string[] }>;
+      expect(replies[event.itemId].questionCommentIds).not.toContain(returnedId);
+      expect((await comments(scope.runId)).map(c => c.body)).toEqual(["Stopped."]);
+      snapshot = settled.resultJson!.personStop;
+    }, reply: "Stopped." });
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0].resultJson!.personStop).toEqual(snapshot);
+    await finalizeNativeRun({ db, runId: f.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: false });
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0].resultJson!.personStop).toEqual(snapshot);
+    expect(await comments(f.runId)).toHaveLength(1);
+    await db.update(heartbeatRuns).set({ status: "timed_out" }).where(eq(heartbeatRuns.id, f.runId));
+    await requeueContinuousUnanswered(db, { id: f.runId, companyId: f.companyId });
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, `continuous-unanswered:${f.runId}`))).toEqual([]);
+    await db.update(heartbeatRuns).set({ status: "cancelled", resultJson: sql`jsonb_set(${heartbeatRuns.resultJson}, '{personStop}',
+      (${heartbeatRuns.resultJson}->'personStop') - 'returned' - 'returnedNoticeSeq' - 'returnedNoticeSeqs')` }).where(eq(heartbeatRuns.id, f.runId));
+    await recoverContinuousNativeReplies(db, { id: f.runId, companyId: f.companyId });
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0])
+      .toMatchObject({ status: "cancelled", resultJson: { personStop: { returned: [returnedId] } } });
+  });
+
+  it("recovers empty Stop receipts across two answers without waiting for run terminal", async () => {
+    await fixture(true, { reply: "Stopped.", beforeFinalize: async scope => {
+      await db.update(agents).set({ adapterConfig: { provider: "pi_rpc" } }).where(eq(agents.id, scope.agentId));
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      for (let index = 0; index < 2; index++) {
+        const requestedAt = new Date(Date.now() + index).toISOString(), cursor = 171 + index * 2;
+        const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+        const old = current.resultJson?.personStop as Record<string, unknown> | undefined;
+        await db.update(heartbeatRuns).set({ resultJson: { ...current.resultJson, personStop: {
+          returned: old?.returned ?? [], returnedNoticeSeq: old?.returnedNoticeSeq, returnedNoticeSeqs: old?.returnedNoticeSeqs, userId: null, requestedAt, afterEventSeq: cursor - 1,
+        } } }).where(eq(heartbeatRuns.id, scope.runId));
+        const notice = { eventType: "provider.notice.recorded" as const, runId: scope.runId,
+          normalizedSessionId: run.nativeSessionId!, sourceEventId: `empty-stop-${index}`, payload: {
+            category: "pi_stop_returned_input", details: [{ name: "returnedCommentIds", value: "" }],
+          } };
+        await db.insert(heartbeatRunEvents).values({ companyId: scope.companyId, runId: scope.runId, agentId: scope.agentId,
+          seq: cursor, eventType: notice.eventType, payload: { prpEvent: notice } });
+        if (index === 0) {
+          await recoverContinuousNativeReplies(db, { id: scope.runId, companyId: scope.companyId });
+          const [pending] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+          expect(pending.resultJson!.personStop).toMatchObject({ returned: [], noticeSeq: cursor, requestedAt });
+          expect(pending.resultJson!.personStop).not.toHaveProperty("settledAt");
+        }
+        const event = { eventType: "item.completed" as const, runId: scope.runId, normalizedSessionId: run.nativeSessionId!,
+          sourceEventId: `empty-final-${index}`, itemId: `empty:m${index}:b0`, payload: { kind: "agentMessage", channel: "final", text: "Stopped." } };
+        await db.insert(heartbeatRunEvents).values({ companyId: scope.companyId, runId: scope.runId, agentId: scope.agentId,
+          seq: cursor + 1, eventType: event.eventType, payload: { prpEvent: event } });
+        if (index === 1) await publishContinuousNativeReply({ db, event, cursor: cursor + 1,
+          execution: { binding: scope, provider: { kind: "pi_rpc" } } });
+        await recoverContinuousNativeReplies(db, { id: scope.runId, companyId: scope.companyId });
+        const [settled] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+        expect(settled).toMatchObject({ status: "running", resultJson: { personStop: {
+          requestedAt, settledAt: expect.any(String), answerItemId: event.itemId, returned: [],
+        } } });
+      }
+      expect((await comments(scope.runId)).map(c => c.body)).toEqual(["Stopped.", "Stopped."]);
+    } });
+  });
+
   it.each(["paperclip", "continuous", undefined])("gates held-turn publication on pi_rpc + resolved continuity (%s)", async sessionContinuity => {
     await fixture(false, { beforeFinalize: async scope => {
       await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity } }).where(eq(agents.id, scope.agentId));
@@ -430,15 +533,19 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0].nativeSessionId).toBe(f.prpEvent.normalizedSessionId);
   });
 
-  it.each(["continuous", "paperclip"])("restores an ACK with no answer at all only in %s mode", async sessionContinuity => {
+  it.each([["continuous", undefined], ["paperclip", undefined], ["continuous", false], ["continuous", true]] as const)("restores unanswered new input only in %s mode after resume=%s", async (sessionContinuity, resumed) => {
     const f = await fixture(false);
     await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity } }).where(eq(agents.id, f.agentId));
+    const returnedId = randomUUID();
     await db.update(heartbeatRuns).set({ status: "failed", resultJson: {
-      queuedSteeringAcknowledgements: { [f.wakeId]: { status: "acknowledged", acknowledgedAt: new Date().toISOString() } },
+      ...(resumed === undefined ? {} : { personStop: { requestedAt: "2020-01-01T00:00:00Z", returned: [returnedId], ...(resumed ? { resumedAt: "2020-01-01T00:00:01Z" } : {}) } }),
+      queuedSteeringAcknowledgements: { [f.wakeId]: { status: "acknowledged", acknowledgedAt: new Date().toISOString() },
+        ...(resumed === undefined ? {} : { [returnedId]: { status: "acknowledged" } }) },
     } }).where(eq(heartbeatRuns.id, f.runId));
     await requeueContinuousUnanswered(db, { id: f.runId, companyId: f.companyId });
     const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, `continuous-unanswered:${f.runId}`));
-    expect(wakes).toHaveLength(sessionContinuity === "continuous" ? 1 : 0);
+    expect(wakes).toHaveLength(sessionContinuity === "continuous" && resumed !== false ? 1 : 0);
+    if (wakes.length) expect(wakes[0].payload).toMatchObject({ _paperclipWakeContext: { wakeCommentIds: [f.wakeId] } });
   });
 
   const comments = (runId: string) => db.select().from(issueComments).where(eq(issueComments.createdByRunId, runId));

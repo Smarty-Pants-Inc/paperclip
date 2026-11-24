@@ -77,7 +77,7 @@ import type { ChatChannelService } from "../services/chat-channels.js";
 import { activityLog, agentWakeupRequests, agents as agentsTable, chatConversations, companies, heartbeatRunEvents, heartbeatRuns, issueComments, issues as issuesTable, nativeRunFinalizations, projects as projectsTable } from "@paperclipai/db";
 import { queuedCommentIdsFromWakePayload, withQueuedCommentIdsInWakePayload } from "../lib/queued-comment-context.js";
 import { readFirstTurnQueuedInputReceipt } from "../services/native-runtime/first-turn-queued-input.js";
-import { and, desc, eq, inArray, isNull, not, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, not, sql } from "drizzle-orm";
 import { sha256Digest } from "../services/feedback-redaction.js";
 import {
   agentSkillSyncSchema,
@@ -7434,17 +7434,22 @@ export function agentRoutes(
     if (personStopHolds.has(runId)) { res.status(202).json(await runRedactions.redactForRun(existing.companyId, runId, existing, getActorInfo(req).actorId)); return; }
     const requestId = cancellationRequestId(req.body?.cancellationRequestId);
     const PERSON_STOP_TURN_WAIT_MS = 60_000, stopDeadline = Date.now() + PERSON_STOP_TURN_WAIT_MS, pressedAt = new Date().toISOString();
-    // A person's Stop on a live Pi turn ends that turn only (seam 0233). The run then
-    // finishes through the ordinary door and keeps its session, runner and machine.
+    // A person's Stop interrupts the live turn, not its held run or session.
     const provider = asRecord(asRecord(asRecord(existing.runnerProfileJson)?.nativeExecutionInput)?.provider);
     const preparing = existing.status === "running" && existing.runtimeMode === "legacy" && !existing.runtimeModeResolvedAt && existing.executionStage === "preparing" && claimedAdapterType(existing) === "paperclip_runner" && asRecord(existing.runnerProfileJson)?.nativeExecutionInput == null;
     const agent = preparing ? await svc.getById(existing.agentId) : null;
     if ((existing.status === "running" && existing.runtimeMode === "native" && provider?.kind === "pi_rpc") || (preparing && agent?.adapterType === "paperclip_runner" && agent.adapterConfig?.provider === "pi_rpc")) {
-      // The mark is set before the interrupt (the driver can end the turn at once) and removed unless it landed.
+      // Keep cumulative returns; only the current Stop's settlement is reset.
+      const previousStop = asRecord(existing.resultJson?.personStop);
       const mark = (on: boolean) => db.update(heartbeatRuns).set({ resultJson: on
-        ? sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
-          personStop: { requestedAt: new Date().toISOString(), userId: req.actor.userId ?? null } })}::jsonb`
-        : sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) - 'personStop'` })
+        ? sql`jsonb_set(coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb), '{personStop}',
+            (coalesce(${heartbeatRuns.resultJson}->'personStop', '{}'::jsonb) - 'settledAt' - 'resumedAt' - 'answerItemId' - 'noticeSeq') ||
+            ${JSON.stringify({ requestedAt: pressedAt, userId: req.actor.userId ?? null })}::jsonb ||
+            jsonb_build_object('afterEventSeq', ${heartbeatRuns.nextEventSeq} - 1))`
+        : sql`case when ${heartbeatRuns.resultJson} #>> '{personStop,requestedAt}' = ${pressedAt}
+            and ${heartbeatRuns.resultJson} #> '{personStop,noticeSeq}' is null then
+            ${previousStop ? sql`jsonb_set(${heartbeatRuns.resultJson}, '{personStop}', ${JSON.stringify(previousStop)}::jsonb)`
+              : sql`${heartbeatRuns.resultJson} - 'personStop'`} else ${heartbeatRuns.resultJson} end` })
         .where(on ? and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")) : eq(heartbeatRuns.id, runId));
       // Seam 0247: his messages still QUEUED behind this run (never delivered) go back to him with the Stop, beside 0237's.
       const returnQueued = async () => { const issueId = existing.nativeIssueId ?? asRecord(existing.contextSnapshot)?.issueId;
@@ -7453,18 +7458,21 @@ export function agentRoutes(
           eq(agentWakeupRequests.agentId, existing.agentId), inArray(agentWakeupRequests.status, ["deferred_issue_execution", "queued"]),
           isNull(agentWakeupRequests.runId), sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`)).for("update", { skipLocked: true });
           // A message this run already received (an acknowledged steer) stays in the thread (product rule). One sent after the press is a new message, not returned.
-          const [run] = await tx.select({ result: heartbeatRuns.resultJson, context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+          const [run] = await tx.select({ result: heartbeatRuns.resultJson, context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).for("update");
           const received = Object.keys(asRecord(asRecord(run?.result)?.queuedSteeringAcknowledgements) ?? {}) // stock's first-turn receipt: sealed into its first prompt
             .concat(readFirstTurnQueuedInputReceipt({ id: runId, contextSnapshot: run?.context })?.commentIds ?? []);
           const ids = wakes.flatMap(wake => queuedCommentIdsFromWakePayload(wake.payload)).filter(id => !received.includes(id)), mine = ids.length ? (await tx.select({ id: issueComments.id }).from(issueComments)
-            .where(and(inArray(issueComments.id, ids), eq(issueComments.authorUserId, req.actor.userId!), isNull(issueComments.deletedAt),
-              sql`${issueComments.createdAt} <= ${pressedAt}::timestamptz`))).map(row => row.id) : [];
+            .where(and(inArray(issueComments.id, ids), eq(issueComments.companyId, existing.companyId), eq(issueComments.issueId, issueId),
+              eq(issueComments.authorUserId, req.actor.userId!), isNull(issueComments.deletedAt),
+              sql`${issueComments.createdAt} <= ${pressedAt}::timestamptz`)).orderBy(asc(issueComments.createdAt), asc(issueComments.id))).map(row => row.id) : [];
           if (!mine.length) return;
           for (const wake of wakes) { if (!queuedCommentIdsFromWakePayload(wake.payload).some(id => mine.includes(id))) continue;
             const left = queuedCommentIdsFromWakePayload(wake.payload).filter(id => !mine.includes(id)), now = new Date();
             await tx.update(agentWakeupRequests).set(left.length ? { payload: withQueuedCommentIdsInWakePayload(wake.payload, left), updatedAt: now }
               : { status: "cancelled", finishedAt: now, updatedAt: now }).where(eq(agentWakeupRequests.id, wake.id)); }
-          await tx.update(heartbeatRuns).set({ resultJson: sql`jsonb_set(${heartbeatRuns.resultJson}, '{personStop,returned}', coalesce(${heartbeatRuns.resultJson}->'personStop'->'returned', '[]'::jsonb) || ${JSON.stringify(mine)}::jsonb)` }).where(eq(heartbeatRuns.id, runId)); }); };
+          const previous = asRecord(asRecord(run?.result)?.personStop)?.returned;
+          const returned = [...new Set([...(Array.isArray(previous) ? previous : []), ...mine])];
+          await tx.update(heartbeatRuns).set({ resultJson: sql`jsonb_set(${heartbeatRuns.resultJson}, '{personStop,returned}', ${JSON.stringify(returned)}::jsonb)` }).where(eq(heartbeatRuns.id, runId)); }); };
       if (!preparing) await mark(true);
       const outcome = preparing ? "no_turn" : await interruptNativeTurn({ runId, reason: "person_stop" }).catch(() => null);
       // Attached with no live turn and a result already accepted: the run is finishing, so Stop is a no-op.
@@ -7527,6 +7535,8 @@ export function agentRoutes(
         res.json(await runRedactions.redactForRun(stopped.companyId, stopped.id, stopped, getActorInfo(req).actorId));
         return;
       }
+      // An interrupt failure never escalates a live turn Stop into run cancellation.
+      throw conflict("The turn could not be stopped. Retry Stop; the run is still open.");
     }
     // Seam 0254: a Stop on a run still waiting in line returns the messages that woke it (never received), like 0247.
     if (existing.status === "queued") await returnWakeComments(db, existing);

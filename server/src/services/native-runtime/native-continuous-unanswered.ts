@@ -25,7 +25,7 @@ export async function requeueContinuousUnanswered(db: Db, scope: { id: string; c
         resolveSessionContinuity("pi_rpc", row.config.sessionContinuity) !== "continuous") return;
     const result = parseObject(row.run.resultJson);
     // Nothing self-starts after a person's Stop (0260): whatever was not taken went back to their input box.
-    if (result.continuousUnansweredWakeId || parseObject(result.personStop).requestedAt !== undefined) return;
+    if (result.continuousUnansweredWakeId || (parseObject(result.personStop).requestedAt !== undefined && !parseObject(result.personStop).resumedAt)) return;
     const answered = new Set(Object.values(parseObject(result.continuousReplies)).flatMap(value => {
       const ids = parseObject(value).questionCommentIds;
       return Array.isArray(ids) ? ids : [];
