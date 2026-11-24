@@ -438,7 +438,7 @@ describe("Layout", () => {
     } finally { await act(async () => root.unmount()); queryClient.clear(); }
   });
 
-  it("collapses the mounted chat list only when an artifact crowds the conversation", async () => {
+  it("opens chats alone, with an optional desktop list that collapses for artifacts", async () => {
     classicWorkspace.enabled = false;
     currentPathname = "/PAP/chats/planner";
     const root = createRoot(container);
@@ -455,8 +455,12 @@ describe("Layout", () => {
       disconnect() {}
     });
     const render = () => reactAct(async () => renderLayoutView(root, queryClient));
+    localStorage.removeItem("paperclip:chat-list-beside");
     try {
       await render();
+      expect(container.querySelector("[data-secondary-sidebar]")).toBeNull();
+      await reactAct(async () => container.querySelector<HTMLButtonElement>('[aria-label="Show chat list"]')!.click());
+      expect(localStorage.getItem("paperclip:chat-list-beside")).toBe("true");
       const list = container.querySelector('[aria-label="Chat contacts"]')?.closest("[data-secondary-sidebar]");
       expect(list?.classList.contains("hidden")).toBe(false);
       expect(container.textContent).not.toContain("Browse chats");
@@ -490,7 +494,19 @@ describe("Layout", () => {
       await render();
       expect(list?.classList.contains("hidden")).toBe(false);
       expect(container.textContent).not.toContain("Browse chats");
+      mockSidebarState.isMobile = true;
+      await render();
+      expect(container.querySelector("[data-secondary-sidebar]")).toBeNull();
+      expect(container.textContent).toContain("Main company nav");
+      expect(container.querySelector('[aria-label="Chat contacts"]')).toBeNull();
+      expect(container.querySelector('[aria-label="Hide chat list"]')).toBeNull();
+      mockSidebarState.isMobile = false;
+      await render();
+      await reactAct(async () => container.querySelector<HTMLButtonElement>('[aria-label="Hide chat list"]')!.click());
+      expect(container.querySelector("[data-secondary-sidebar]")).toBeNull();
+      expect(localStorage.getItem("paperclip:chat-list-beside")).toBe("false");
     } finally {
+      localStorage.removeItem("paperclip:chat-list-beside");
       await reactAct(async () => root.unmount());
       queryClient.clear();
       width.mockRestore();
