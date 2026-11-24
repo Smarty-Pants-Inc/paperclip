@@ -14,6 +14,7 @@ import { resolveSessionContinuity } from "./continued-session.js";
 import { parseObject } from "../../adapters/utils.js";
 import { logger } from "../../middleware/logger.js";
 import { drainContinuousPersonMessages } from "./native-continuous-drain.js";
+import { readFirstTurnQueuedInputReceipt } from "./first-turn-queued-input.js";
 import { queuedCommentIdsFromWakePayload, withQueuedCommentIdsInWakePayload } from "../issue-queued-comment-queue.js";
 import { publishLiveEvent } from "../live-events.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "../heartbeat-run-status-payload.js";
@@ -197,9 +198,21 @@ export async function publishContinuousNativeReply(input: {
         (typeof parseObject(receipt).afterEventSeq !== "number" || Number(parseObject(receipt).afterEventSeq) < input.cursor))
       .sort((a, b) => String(parseObject(a[1]).acknowledgedAt).localeCompare(String(parseObject(b[1]).acknowledgedAt)));
     const wakeId = row.run.contextSnapshot?.wakeCommentId;
+    // Pi knows which inputs entered the model before this final. An explicit
+    // empty list is authoritative too: do not shift the next question onto it.
+    // Older packs omit answers and retain the original FIFO behavior.
+    const answers = input.event.payload.answers;
+    const explicitAnswers = Array.isArray(answers);
+    const firstInputIds = Object.keys(replies).length === 0 ? [
+      ...(Array.isArray(row.run.contextSnapshot?.wakeCommentIds) ? row.run.contextSnapshot.wakeCommentIds : []),
+      ...(typeof wakeId === "string" ? [wakeId] : []),
+      ...(readFirstTurnQueuedInputReceipt(row.run)?.commentIds ?? []),
+    ].filter((id): id is string => typeof id === "string" && !answered.has(id) && !returned.has(id)) : [];
     const questionCommentIds = [...new Set([
-      ...(typeof wakeId === "string" && !answered.has(wakeId) && !returned.has(wakeId) ? [wakeId] : []),
-      ...(pending[0] ? [pending[0][0]] : []),
+      ...(explicitAnswers ? firstInputIds : typeof wakeId === "string" && !answered.has(wakeId) && !returned.has(wakeId) ? [wakeId] : []),
+      ...(explicitAnswers
+        ? answers.filter((id): id is string => typeof id === "string" && !answered.has(id) && !returned.has(id))
+        : pending[0] ? [pending[0][0]] : []),
     ])];
     const clientRequestId = `${nativeFinalReplyKey(runId, input.event.itemId!)}:${questionCommentIds.join(",") || "opening"}`;
     const [existing] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
