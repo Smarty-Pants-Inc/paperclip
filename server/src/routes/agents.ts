@@ -6509,6 +6509,7 @@ export function agentRoutes(
         responsibleUserId: req.actor.type === "agent" ? req.actor.onBehalfOfUserId ?? null : req.actor.userId ?? null,
         actorId: req.actor.type === "agent" ? req.actor.agentId : req.actor.userId,
         forceFreshSession: req.body.forceFreshSession === true,
+        explicitFreshSession: req.body.forceFreshSession === true,
         ...(req.body.reason === "rerun_with_provider_trace" &&
         req.body.debug?.providerTrace === "raw"
           ? { resumeIntent: true }
@@ -6617,6 +6618,7 @@ export function agentRoutes(
     };
     if (body.forceFreshSession === true) {
       contextSnapshot.forceFreshSession = true;
+      contextSnapshot.explicitFreshSession = true;
     }
     if (providerTraceRequested) {
       contextSnapshot.debug = { providerTrace: "raw" };

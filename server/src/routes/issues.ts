@@ -2831,7 +2831,7 @@ async function queueResolvedInteractionContinuationWakeup(input: {
         ...(reviewPathContext ?? {}),
         wakeReason: "issue_commented",
         source: input.source,
-        ...(forceFreshSession ? { forceFreshSession: true } : {}),
+        ...(forceFreshSession ? { forceFreshSession: true, explicitFreshSession: true } : {}),
         ...(workspaceRefreshReason ? { workspaceRefreshReason } : {}),
       },
     })
