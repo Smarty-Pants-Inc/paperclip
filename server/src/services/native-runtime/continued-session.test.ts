@@ -2,9 +2,29 @@ import { expect, it } from "vitest";
 import type { Db } from "@paperclipai/db";
 import { buildPaperclipWakePayload } from "../heartbeat/run-preparation.js";
 import { shouldResetTaskSessionForWake } from "../heartbeat/run-state.js";
-import { decideNativeContinuation } from "./continued-session.js";
+import { decideNativeContinuation, withPiOpenTurnDefault } from "./continued-session.js";
+import { configuredEnvironmentProjection } from "../../vendor/paperclip-runner/index.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
+it("projects the continuous Pi open-turn default while preserving configured overrides and stock modes", () => {
+  const project = (provider: unknown, setting: unknown, environment: NodeJS.ProcessEnv = {}) =>
+    configuredEnvironmentProjection(withPiOpenTurnDefault(provider, setting, environment));
+  for (const setting of [undefined, "continuous"]) {
+    const projected = project("pi_rpc", setting, { CUSTOM_VALUE: "kept" });
+    expect(projected.PAPERCLIP_PI_OPEN_TURN_MS).toBe("600000");
+    expect(projected.CUSTOM_VALUE).toBe("kept");
+    expect(JSON.parse(projected.PAPERCLIP_CONFIGURED_ENV_KEYS!)).toContain("PAPERCLIP_PI_OPEN_TURN_MS");
+    expect(project("pi_rpc", setting, { PAPERCLIP_PI_OPEN_TURN_MS: "0" }).PAPERCLIP_PI_OPEN_TURN_MS).toBe("0");
+  }
+  const configured = { CUSTOM_VALUE: "kept" };
+  expect(project("pi_rpc", "paperclip", configured)).toEqual(configuredEnvironmentProjection(configured));
+  expect(project("pi_rpc", "paperclip", configured)).not.toHaveProperty("PAPERCLIP_PI_OPEN_TURN_MS");
+  for (const provider of ["codex", "acpx", "openai_dot"]) {
+    expect(project(provider, "continuous", configured)).toEqual(configuredEnvironmentProjection(configured));
+  }
+  expect(configured).toEqual({ CUSTOM_VALUE: "kept" });
+});
+
 it("honors explicit fresh-session resets under continuous", () => {
   const context = { forceFreshSession: true, explicitFreshSession: true };
   expect(decideNativeContinuation({ provider: "pi_rpc", sessionContinuity: "continuous", hasSession: true, wakeReset: shouldResetTaskSessionForWake(context), resetRequired: context.explicitFreshSession === true }).continue).toBe(false);
