@@ -887,8 +887,6 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
                 }
               })(),
               conversationMode: context.conversationMode === true,
-              finishedTaskConversation: context.finishedTaskConversation === true && context.resumeIntent !== true && context.wakeReason === "issue_commented" &&
-                issueContext?.assigneeAgentId === agent.id && ["done", "in_review"].includes(issueContext.status),
               agentId: agent.id,
               workspace: {
                 // Projectless paperclip_runner tasks still have a resolved local cwd. Bind that
