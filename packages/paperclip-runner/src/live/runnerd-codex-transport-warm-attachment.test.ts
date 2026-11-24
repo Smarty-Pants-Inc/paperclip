@@ -11,7 +11,7 @@ import { DurablePrpControlPlane } from "../control-plane/durable-prp-control-pla
 import * as durableControlPlane from "../control-plane/durable-prp-control-plane.js";
 import { codexSemanticToolSpecs } from "../drivers/codex/codex-app-server-driver.js";
 import { releaseMaterializedNativeRuntimeSkills } from "../drivers/runtime-context-materializer.js";
-import { createCapabilityRunnerdCodexTransport, readRunnerdArtifactBinding } from "./runnerd-codex-transport.js";
+import { authorizedToolSetForProvider, createCapabilityRunnerdCodexTransport, readRunnerdArtifactBinding } from "./runnerd-codex-transport.js";
 import {
   committableStore,
   defaultCapabilityRunnerdBinary,
@@ -709,7 +709,11 @@ it("rotates PRP authority in place for a warm cross-run attachment", async () =>
   }
 }, 30_000);
 
-it("carries each warm run's own completion contract and keeps the provider process", async () => {
+it.each([false, true])("carries each warm run's own contract and catalog (changed tools: %s)", async (changed) => {
+  const priorTools = [{ name: "resolve_review", description: "Resolve review.", inputSchema: { type: "object" } }];
+  const nextTools = changed ? [{ name: "call_api", description: "Call API.", inputSchema: { type: "object" } }] : priorTools;
+  const expectedTools = authorizedToolSetForProvider("codex", [...nextTools, ...codexSemanticToolSpecs()]);
+  const queued = vi.spyOn(DurablePrpControlPlane.prototype, "queueCommand");
   const stateDirectory = await mkdtemp(join(tmpdir(), "runnerd-warm-contract-"));
   const bundle = createCapabilityRunnerdCodexTransport({
     runnerBinary: defaultCapabilityRunnerdBinary(),
@@ -730,7 +734,7 @@ it("carries each warm run's own completion contract and keeps the provider proce
   try {
     await bundle.transport.request("initialize", {});
     await bundle.transport.request("thread/start", {
-      cwd: tmpdir(), dynamicTools: [],
+      cwd: tmpdir(), dynamicTools: [...priorTools, ...codexSemanticToolSpecs()],
       completionContract: { revision: "first-run-contract", criterionIds: ["objective"] },
     });
     const providerPid = bundle.evidence().codexPid;
@@ -739,14 +743,24 @@ it("carries each warm run's own completion contract and keeps the provider proce
 
     await bundle.transport.attachRun!({
       runId: "run-warm-contract-second", turnId: "turn-warm-contract-second", itemId: "item-warm-contract-second",
+      dynamicTools: nextTools,
       completionContract: { revision: "second-run-contract", criterionIds: ["objective", "follow-up"] },
     });
     expect(await savedContract()).toEqual({ revision: "second-run-contract", criterionIds: ["objective", "follow-up"] });
-    await bundle.transport.request("turn/start", { input: [{ type: "text", text: "second run" }] });
-    await completed();
-    // A changed contract no longer forces a cold provider resume.
-    expect(bundle.evidence()).toMatchObject({ codexPid: providerPid, runnerExited: false });
+    expect(queued.mock.calls.findLast(([type]) => type === "run.attach")?.[1]?.authorizedTools).toEqual(expectedTools);
+    if (!changed) {
+      await bundle.transport.request("turn/start", { input: [{ type: "text", text: "second run" }] });
+      await completed();
+      // An unchanged catalog still keeps the warm provider across a new contract.
+      expect(bundle.evidence()).toMatchObject({ codexPid: providerPid, runnerExited: false });
+    }
+    // Omission on a subsequent attachment must use the updated transport cache.
+    await bundle.transport.attachRun!({
+      runId: "run-warm-contract-third", turnId: "turn-warm-contract-third", itemId: "item-warm-contract-third",
+    });
+    expect(queued.mock.calls.findLast(([type]) => type === "run.attach")?.[1]?.authorizedTools).toEqual(expectedTools);
   } finally {
+    queued.mockRestore();
     await bundle.transport.close();
     await rm(stateDirectory, { recursive: true, force: true });
   }

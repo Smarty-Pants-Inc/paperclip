@@ -5166,6 +5166,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     runId: string;
     turnId: string;
     itemId: string;
+    dynamicTools?: readonly Readonly<Record<string, unknown>>[];
     currentRunGrant?: NativeRunRuntimeGrant;
     completionContract?: { revision: string; criterionIds: readonly string[] };
   }): Promise<void> {
@@ -5186,6 +5187,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     runId: string;
     turnId: string;
     itemId: string;
+    dynamicTools?: readonly Readonly<Record<string, unknown>>[];
     currentRunGrant?: NativeRunRuntimeGrant;
     completionContract?: { revision: string; criterionIds: readonly string[] };
   }, earlyClaim?: Promise<void>): Promise<void> {
@@ -5214,6 +5216,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     runId: string;
     turnId: string;
     itemId: string;
+    dynamicTools?: readonly Readonly<Record<string, unknown>>[];
     currentRunGrant?: NativeRunRuntimeGrant;
     completionContract?: { revision: string; criterionIds: readonly string[] };
   }, earlyClaim?: Promise<void>): Promise<void> {
@@ -5260,13 +5263,20 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         .update(`${prior.runId}:${desired.runId}:${desired.turnId}`)
         .digest("hex")
         .slice(0, 32)}`;
+      // The retained transport's options and cache belong to the prior run.
+      const authorizedTools = input.dynamicTools === undefined ? this.#authorizedTools
+        : authorizedToolSetForProvider(this.options.provider, [...input.dynamicTools, ...codexSemanticToolSpecs()]);
       const stagedCandidate = inspectStagedRunAttachment(core.store.state);
       const staged = stagedCandidate && recoveryIdentityMatches(stagedCandidate.targetIdentity, desired) ? stagedCandidate : undefined;
+      if (staged && input.dynamicTools !== undefined
+        && commandDigest(staged.runAttachTemplate.authorizedTools) !== commandDigest(authorizedTools)) {
+        throw new Error("native_runner_staged_attachment_tools_changed");
+      }
       const runAttachTemplate = staged ? structuredClone(staged.runAttachTemplate) : this.#runAttachTemplate
         ? retargetRunAttachPayload(
             this.#runAttachTemplate,
             desired,
-            this.#authorizedTools,
+            authorizedTools,
             // A retained transport's options belong to its first run.
             input.completionContract ?? this.options.resumeCompletionContract,
             currentRunGrant?.runtimeContext,
@@ -5275,7 +5285,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         : rotatedRunAttachPayload(
             core.store.state,
             desired,
-            this.#authorizedTools,
+            authorizedTools,
             // A retained transport's options belong to its first run.
             input.completionContract ?? this.options.resumeCompletionContract,
             currentRunGrant?.runtimeContext,
@@ -5386,6 +5396,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       }
       this.#assertStartupOpen();
       if (retainingSource) await core.flushCheckpoint();
+      this.#authorizedTools = authorizedTools;
       this.#eventIdentity = structuredClone(desired);
       this.#retainedSourceIdentity = null;
       this.#eventSourceSeq = 0;
