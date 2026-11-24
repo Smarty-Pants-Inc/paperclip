@@ -25,6 +25,7 @@ import { skillCreatedItems } from "@/components/task-chat/skill-created-items";
 import { taskCreatedItems } from "@/components/task-chat/task-created-items";
 import { useCoordinatorPresentation } from "@/components/coordinator/CoordinatorPresentation";
 import { useConnectivity } from "@/lib/connectivity";
+import { useSecondTick } from "@/hooks/useSecondTick";
 import { CoordinatorChatHandoffStatus, CoordinatorChatTaskHandoff, standaloneChatHandoffs, useCoordinatorChatTaskHandoffs, useLiveChatHandoffIds } from "@/components/coordinator/CoordinatorChatTaskHandoffs";
 import { CoordinatorChatReceiptStatus, useCoordinatorChatDecisionReceipts } from "@/components/coordinator/CoordinatorChatDecisionReceipts";
 import { CoordinatorChatQuestionStatus, useCoordinatorChatPendingQuestions } from "@/components/coordinator/CoordinatorChatPendingQuestions";
@@ -513,7 +514,9 @@ const HELD_BY_RECOVERY_REASONS = new Set([
 
 export function TaskChatThread(props: TaskChatThreadProps) {
   const coordinatorEnabled = useCoordinatorPresentation();
-  const { status: connectionStatus } = useConnectivity();
+  const { status: connectionStatus, recoveredAt } = useConnectivity();
+  const historyRecoveryGrace = recoveredAt !== null && Date.now() - recoveredAt < 10_000;
+  useSecondTick(connectionStatus === "online" && historyRecoveryGrace);
   const { enabled: streamlinedPreference } = useStreamlinedUiEnabled();
   const streamlinedUiEnabled = coordinatorEnabled || streamlinedPreference;
   const {
@@ -3487,7 +3490,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               )}
               aria-busy={!historyRevealed}
             >
-              {historyError || (historyPending && historyWaitExpired) ? (
+              {connectionStatus === "online" && !historyRecoveryGrace && (historyError || (historyPending && historyWaitExpired)) ? (
                 <div
                   role="status"
                   className="absolute inset-x-0 top-0 z-20 mx-auto flex w-full max-w-(--tc-shell-max-w) items-center gap-2 border border-border bg-background px-4 py-2 text-sm text-muted-foreground"
