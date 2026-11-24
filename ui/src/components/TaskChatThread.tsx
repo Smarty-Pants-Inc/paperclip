@@ -1168,8 +1168,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         fallbackByRunRef.current.set(run.id, logTranscript);
       }
       const fallback = fallbackByRunRef.current.get(run.id);
+      // Delivery notices are not new output; anchored text advances when it completes.
       const lastTimestamp = (entries: typeof nativeTranscript) =>
-        entries.reduce((latest, entry) => Math.max(latest, toMs(entry.ts)), 0);
+        entries.reduce((latest, entry) => entry.kind === "system" ? latest : Math.max(latest, toMs(entry.ts), toMs(entry.completedAt)), 0);
       // Keep a newer fallback visible through native transport recovery. An
       // empty successful poll must not rewind a response the reader just saw.
       if (
