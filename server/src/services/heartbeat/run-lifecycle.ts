@@ -1,4 +1,5 @@
 import { notifyTerminalWorkspaceWork } from "../terminal-workspace-work.js";
+import { loadNativeVisibleReply } from "../native-runtime/native-visible-reply.js";
 import { settleReattachRun } from "./run-admission.js";
 import { readNativeStartupCleanup } from "../native-runtime/native-startup-cleanup.js";
 import { isContextCompactionRun } from "../context-compaction.js";
@@ -129,9 +130,7 @@ import {
 import {
   findHeartbeatRunCompletionComment,
   hasAcceptedSemanticResult,
-  completedPlanProposalIds,
-  readCompletedAssistantMessageCandidate,
-  selectHeartbeatRunFinalAgentMessage,
+  type CompletedFinalAgentMessageCandidate,
   type RunPresentationDecision,
 } from "../heartbeat-run-summary.js";
 import {
@@ -2418,75 +2417,10 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
   async function findLatestCompletedFinalAgentMessage(
     runId: string,
     companyId: string,
-  ) {
-    const rows = await db
-      .select({
-        seq: heartbeatRunEvents.seq,
-        payload: heartbeatRunEvents.payload,
-      })
-      .from(heartbeatRunEvents)
-      .where(
-        and(
-          eq(heartbeatRunEvents.companyId, companyId),
-          eq(heartbeatRunEvents.runId, runId),
-          eq(heartbeatRunEvents.eventType, "item.completed"),
-        ),
-      )
-      .orderBy(desc(heartbeatRunEvents.seq))
-      .limit(200);
-    const candidates: Array<{
-      seq: number;
-      text: string;
-      sourceEventId: string | null;
-      channel: "final" | "unknown";
-    }> = [];
-    const proposedItemIds = completedPlanProposalIds(await db
-      .select({ payload: heartbeatRunEvents.payload })
-      .from(heartbeatRunEvents)
-      .where(
-        and(
-          eq(heartbeatRunEvents.companyId, companyId),
-          eq(heartbeatRunEvents.runId, runId),
-          eq(heartbeatRunEvents.eventType, "plan.proposed"),
-        ),
-      )
-      .limit(200));
-    for (const row of rows) {
-      const prpEvent = parseObject(parseObject(row.payload).prpEvent);
-      const candidate = readCompletedAssistantMessageCandidate({
-        seq: row.seq,
-        prpEvent,
-        proposedItemIds,
-      });
-      if (candidate) candidates.push(candidate);
-    }
-    const recoveryBoundary = await db
-      .select({
-        seq: heartbeatRunEvents.seq,
-        payload: heartbeatRunEvents.payload,
-      })
-      .from(heartbeatRunEvents)
-      .where(
-        and(
-          eq(heartbeatRunEvents.companyId, companyId),
-          eq(heartbeatRunEvents.runId, runId),
-          eq(heartbeatRunEvents.eventType, "lifecycle"),
-        ),
-      )
-      .orderBy(heartbeatRunEvents.seq)
-      .limit(200)
-      .then(
-        (lifecycleRows) =>
-          lifecycleRows.find(
-            (row) =>
-              parseObject(row.payload).retryReasonCode ===
-              "semantic_result_missing",
-          )?.seq ?? null,
-      );
-    return selectHeartbeatRunFinalAgentMessage({
-      candidates,
-      semanticResultRecoveryAfterSeq: recoveryBoundary,
-    });
+  ): Promise<(CompletedFinalAgentMessageCandidate & { reasonCode: string }) | null> {
+    const [run] = await db.select({ nativeSessionId: heartbeatRuns.nativeSessionId, agentId: heartbeatRuns.agentId })
+      .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
+    return loadNativeVisibleReply(db, { companyId, runId, agentId: run?.agentId, normalizedSessionId: run?.nativeSessionId });
   }
 
   async function refreshContinuationSummaryForRun(

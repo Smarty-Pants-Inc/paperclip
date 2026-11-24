@@ -49,7 +49,8 @@ import { requestIssueConnectionContentDeletion } from "./tool-access/connections
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { recordChatHandoff, recordAcceptedChatHandoff, lockAcceptedChatHandoffSource, recordChatCompletion, existingChatCompletionReply, acknowledgeChatCompletionReply } from "./chat-completion-delivery.js";
 import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
-import { agentRunWritesRevoked, assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
+import { agentRunSupersededByFreshContinuation, agentRunWritesRevoked, assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
+import { loadNativeVisibleReply } from "./native-runtime/native-visible-reply.js";
 import { assertHandedOffRunTaskOwnership } from "../run-task-ownership.js";
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
 import { externalConversationStateSql, nonIdleSlackIssueCondition, resumeSlackConversation } from "./slack-conversation-state.js";
@@ -13709,8 +13710,10 @@ export function issueService(db: Db) {
         metadata?: IssueCommentMetadata | null;
         attachmentIds?: string[];
         authorizationReason?: string | null;
-        /** Server-only final assistant response, never a tool/progress comment. */
+        /** Server-only assistant reply publication, never a tool-authored comment. */
         completionReply?: boolean;
+        /** Server-only replay cursor; body must equal the persisted visible segment. */
+        persistedVisibleReplyThroughSeq?: number;
         sourceTrust?: typeof issueComments.$inferInsert.sourceTrust;
         createdAt?: Date | string | null;
         clientRequestId?: string;
@@ -13798,7 +13801,20 @@ export function issueService(db: Db) {
       if (issue.conversationAgentId && actor.runId) {
         const [run] = await dbOrTx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, actor.runId));
         const [current] = await dbOrTx.select().from(issues).where(eq(issues.id, issueId));
-        if (agentRunWritesRevoked(run)) throw conflict("This conversation turn was cancelled; it cannot post a reply");
+        if (agentRunWritesRevoked(run)) {
+          // Stop still revokes all agent writes. The server may only materialize
+          // the exact already-persisted visible transcript of a settled turn.
+          const settledVisibleReply = (options?.completionReply || Number.isSafeInteger(options?.persistedVisibleReplyThroughSeq)) &&
+            !pluginOrigin && run?.runtimeMode === "native" &&
+            run.finishedAt && ["succeeded", "failed", "timed_out", "cancelled", "interrupted"].includes(run.status) &&
+            run.companyId === issue.companyId && run.agentId === actor.agentId && run.nativeIssueId === issueId &&
+            !agentRunSupersededByFreshContinuation(run)
+            ? await loadNativeVisibleReply(dbOrTx, { companyId: issue.companyId, runId: run.id, agentId: run.agentId, normalizedSessionId: run.nativeSessionId,
+                throughSeq: options?.persistedVisibleReplyThroughSeq })
+            : null;
+          if (!settledVisibleReply || settledVisibleReply.text !== body)
+            throw conflict("This conversation turn was cancelled; it cannot post a reply");
+        }
         const runTaskId = run?.nativeIssueId ?? run?.issueId ?? run?.contextSnapshot?.issueId ?? run?.contextSnapshot?.taskId;
         if (options?.proactiveChatMessage) {
           if (run?.status !== "running" || run.agentId !== actor.agentId || run.companyId !== issue.companyId
