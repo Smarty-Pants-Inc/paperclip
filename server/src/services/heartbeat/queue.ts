@@ -1,6 +1,5 @@
 import { QUEUED_MESSAGES_DELIVERED_REASON } from "../../modules/wake-queue/index.js";
 import { connectionIntentService } from "../connection-intents.js";
-import { isFinishedTaskConversationComment } from "../issue-comment-wakeup.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
 import { CONTEXT_COMPACTION_WAKE_REASON, ContextCompactionError, isContextCompactionRun, readContextCompactionRequest } from "../context-compaction.js";
 import { isProcessRunAdmissionClosed, isReattachPhaseActive as isProcessReattachPhaseActive } from "./run-admission.js";
@@ -4560,11 +4559,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 issue.identifier,
                 issue.id,
               );
-              const preserveFinishedTaskStatus = enrichedContextSnapshot.finishedTaskConversation === true && reason === "issue_commented" &&
-                isFinishedTaskConversationComment({ issueStatus: issue.status, actorType: opts.requestedByActorType ?? "",
-                  resumeRequested: enrichedContextSnapshot.resumeIntent === true, agent });
               const blockedComment = [
-                preserveFinishedTaskStatus ? `Paperclip could not answer ${issueLabel} because its workspace settings are not runnable.` :
                 `Paperclip blocked ${issueLabel} before dispatch because its workspace settings are not runnable.`,
                 "",
                 `- Code: \`${WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE}\``,
@@ -4577,11 +4572,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentTimers);
               if (issue.status !== "blocked") await notifyChatResponseAvailability(tx, { companyId: issue.companyId, issueId: issue.id });
               await notifyRoutineExecutionStatus(tx, issue.id, issue.companyId);
-              if (!preserveFinishedTaskStatus && issue.status === "done") {
+              if (issue.status === "done") {
                 const blocked = await issuesSvc.updateForCompany(issue.id, issue.companyId,
                   { status: "blocked", executionState: null }, tx, issueActivityPublications, issuePostCommitActions);
                 if (!blocked) throw conflict("The task changed before its workspace settings could be checked");
-              } else if (!preserveFinishedTaskStatus) {
+              } else {
                 const [blocked] = await tx
                   .update(issues)
                   .set({
