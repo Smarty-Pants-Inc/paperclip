@@ -49,7 +49,7 @@ export function useOnboardingInProgress(companyId: string | null) {
 /**
  * Where the card lives. `sidebar` docks it in the desktop sidebar column, in
  * normal layout flow, so it never covers the task thread or composer.
- * `floating` keeps the mobile placement above the bottom navigation.
+ * `floating` stays at the top on phones, clear of the task composer.
  */
 export type AnnouncementPlacement = "sidebar" | "floating";
 
@@ -80,7 +80,7 @@ export function AnnouncementWell({ health, placement = "floating" }: { health?: 
         "announcement-well",
         placement === "sidebar"
           ? "shrink-0 overflow-y-auto px-3 pb-2 max-h-(--announcement-sidebar-max-height)"
-          : "fixed left-3 bottom-(--announcement-mobile-bottom) z-40 w-(--announcement-available-width) max-w-(--announcement-width) max-h-(--announcement-mobile-max-height) overflow-y-auto md:bottom-3 md:max-h-(--announcement-max-height)",
+          : "fixed left-3 top-(--mobile-notification-top) z-40 w-(--announcement-available-width) max-w-(--announcement-width) max-h-(--mobile-notification-max-height) overflow-y-auto md:top-auto md:bottom-3 md:max-h-(--announcement-max-height)",
       )}
     >
       <AnnouncementCard key={announcement.id} announcement={announcement} onDismiss={() => dismiss(announcement.id)} />
