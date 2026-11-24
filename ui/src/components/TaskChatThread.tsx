@@ -996,12 +996,15 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     return [...map.values()];
   }, [linkedRuns, liveRuns, activeRun]);
 
-  const requestCommentByRun = useMemo(() => new Map([
-    ...(linkedRuns ?? []).map(run => { const request = run as typeof run & { wakeCommentId?: string; contextCommentId?: string };
-      return [run.runId, request.wakeCommentId ?? request.contextCommentId] as const; }),
-    ...[...(liveRuns ?? []), ...(activeRun ? [activeRun] : [])].map(run =>
-      [run.id, run.contextWakeCommentId ?? run.contextCommentId] as const),
-  ]), [linkedRuns, liveRuns, activeRun]);
+  const requestCommentByRun = useMemo(() => {
+    const byRun = new Map((linkedRuns ?? []).map(run => { const request = run as typeof run & { wakeCommentId?: string; contextCommentId?: string };
+      return [run.runId, request.wakeCommentId ?? request.contextCommentId] as const; }));
+    for (const run of [...(liveRuns ?? []), ...(activeRun ? [activeRun] : [])]) {
+      const commentId = run.contextWakeCommentId ?? run.contextCommentId;
+      if (commentId) byRun.set(run.id, commentId);
+    }
+    return byRun;
+  }, [linkedRuns, liveRuns, activeRun]);
   const stoppedRunIds = useRef(new Set<string>());
   const isUserStop = useCallback((id: string) => {
     const meta = linkedRunMetaById.get(id);
@@ -1013,12 +1016,20 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       // A person's Stop of a Pi turn ends the run normally; the server marks it (resultJson.personStop).
       Boolean(meta?.resultJson?.personStop);
   }, [linkedRunMetaById]);
-  // Explicit predecessors or the same human request join runs; proximity never does.
+  // Retries of one request join runs; session continuity across new messages does not.
   const runChainIdsById = useMemo(() => {
     const predecessors = new Map<string, string | null | undefined>();
     for (const run of linkedRuns ?? []) predecessors.set(run.runId, run.retryOfRunId ?? run.execution?.predecessorRunId);
     for (const run of [...(liveRuns ?? []), ...(activeRun ? [activeRun] : [])]) {
       predecessors.set(run.id, run.execution?.predecessorRunId ?? predecessors.get(run.id));
+    }
+    for (const [runId, predecessorId] of predecessors) {
+      const request = requestCommentByRun.get(runId);
+      const previousRequest = predecessorId && requestCommentByRun.get(predecessorId);
+      const explicitRetry = linkedRunMetaById.get(runId)?.retryOfRunId === predecessorId;
+      if (!(request && request === previousRequest) && (!explicitRetry || (request && previousRequest))) {
+        predecessors.delete(runId);
+      }
     }
     const previousByComment = new Map<string, string>();
     for (const run of [...runs].sort((a, b) => toMs(a.createdAt) - toMs(b.createdAt))) {
@@ -1038,7 +1049,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       chains.set(run.id, ids);
     }
     return chains;
-  }, [runs, linkedRuns, liveRuns, activeRun, requestCommentByRun, comments, isUserStop]);
+  }, [runs, linkedRuns, liveRuns, activeRun, requestCommentByRun, linkedRunMetaById, comments, isUserStop]);
 
   // Pi's Stop (Esc): the messages it hadn't taken go back into the stopping person's input box, once.
   // Keyed on state (his returned messages still exist), so a reload or another of his devices restores too.
