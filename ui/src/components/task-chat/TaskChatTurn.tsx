@@ -1,4 +1,5 @@
 import { groupImageResources } from "./image-resources";
+import { RunnerReasoningDisplay } from "./reasoning-display";
 import { useState, type ReactNode } from "react";
 import { useAgentChatRead } from "@/hooks/useAgentChatRead";
 import { cn } from "@/lib/utils";
@@ -90,7 +91,7 @@ export function TaskChatTurn({
   // to use the run-wide fold below.
   if (item.standaloneHeader) {
     return (
-      <div
+      <RunnerReasoningDisplay><div
         data-testid="task-chat-turn"
         data-settled={item.settled ? "true" : "false"}
       >
@@ -143,7 +144,7 @@ export function TaskChatTurn({
             </div>
           </div>
         ) : null}
-      </div>
+      </div></RunnerReasoningDisplay>
     );
   }
   const persistentItems = item.settled
