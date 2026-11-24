@@ -114,7 +114,7 @@ export abstract class CodexSessionState {
   readonly skillInputs: NonNullable<CodexAppServerDriverOptions["skillInputs"]>;
   readonly reasoningEffort: string | undefined;
   readonly diagnosticEnvironment: NodeJS.ProcessEnv;
-  readonly dynamicTools: readonly Readonly<Record<string, unknown>>[];
+  dynamicTools: readonly Readonly<Record<string, unknown>>[];
   readonly completionFeedback: CodexAppServerDriverOptions["completionFeedback"];
   readonly dynamicToolHandler: CodexAppServerDriverOptions["dynamicToolHandler"];
   readonly eventQueue = new AsyncQueue<PrpEvent>();
