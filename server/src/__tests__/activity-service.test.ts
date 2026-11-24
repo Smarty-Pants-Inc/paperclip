@@ -440,6 +440,35 @@ describeEmbeddedPostgres("activity service", () => {
     expect(runs[0]).not.toHaveProperty("contextSnapshot");
   });
 
+  it("preserves continuous reply placement in the runsForIssue summary", async () => {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
+    const questionCommentId = randomUUID(), replyCommentId = randomUUID();
+    const continuousReplies = {
+      "assistant-reply:1": {
+        questionCommentIds: [questionCommentId],
+        commentId: replyCommentId,
+        sourceEventId: "provider-event:1",
+      },
+      "assistant-reply:2": {
+        questionCommentIds: [],
+        commentId: randomUUID(),
+        sourceEventId: "provider-event:2",
+      },
+    };
+    await db.insert(companies).values({ id: companyId, name: "Reply summary", issuePrefix: `C${companyId.slice(0, 6)}` });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Replying runner", adapterType: "process" });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Place saved replies", assigneeAgentId: agentId });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, issueId, scopeKind: "issue",
+      status: "running", livenessState: "advanced",
+      resultJson: { continuousReplies, summary: "Not part of the compact history" } });
+
+    const runs = await activityService(db).runsForIssue(companyId, issueId, null, undefined, undefined,
+      { skipLivenessBackfill: true });
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({ runId, resultJson: { continuousReplies } });
+    expect(runs[0]!.resultJson).toEqual({ continuousReplies });
+  });
+
   it.each(["requested", "acknowledged", "pending_native", "missing_native", "wrong_run", "wrong_company",
     "malformed_execution", "null_execution", "malformed_native"] as const)(
     "projects only bounded, owner-matched Stop evidence in issue history: %s", async proof => {
