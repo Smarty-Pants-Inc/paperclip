@@ -1,9 +1,10 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { activityLog, agents, authUsers, companyMemberships, createDb, environmentLeases, environments, heartbeatRuns, issueComments,
-  issueRecoveryActions, issueRelations, issues, nativeRunFinalizations } from "@paperclipai/db";
+  issueRecoveryActions, issueRelations, issues, nativeRunFinalizations, nativeRunResults } from "@paperclipai/db";
 import { NativePredecessorRetirementUnprovenError } from "../services/native-runtime/predecessor-retirement.js";
 import { NativeProviderArtifactTransferTimeoutError } from "../services/native-runtime/native-provider-artifacts.js";
 import { taskInterruptionPresentation } from "../services/task-interruption-presentation.js";
@@ -14,9 +15,15 @@ import { describe, expect, it, vi } from "vitest";
 import { logger } from "../middleware/logger.js";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
-import { closeIdleWarmNativeSessionsForRestart, restoreRemoteSuspendedRunnerCheckpoint, retireRefusedContinuousPiOwner, scopedRunnerdStateRoot } from "../services/native-runtime/native-session-executor.js";
+import { buildNativeHarnessBackupManifest, resolveNativeHarnessPersistenceProfile, restoreNativeControllerProjections, closeIdleWarmNativeSessionsForRestart, restoreRemoteSuspendedRunnerCheckpoint, retireRefusedContinuousPiOwner, scopedRunnerdStateRoot } from "../services/native-runtime/native-session-executor.js";
 import { nativeRestartFixture, waitForCondition } from "./helpers/native-restart-fixture.js";
 import { getRecoveryPostgresSupport } from "./helpers/recovery-postgres-fixture.js";
+import { DurablePrpControlPlane } from "../vendor/paperclip-runner/index.js";
+import { nativeRunnerCheckpointWriter } from "../services/native-runtime/native-runner-checkpoint.js";
+import { admitNativeContinuationRefusal, NativeContinuationAdmissionRefusalError } from "../services/native-runtime/remote-warm-session-recovery.js";
+import { retirePiRunnerByFact } from "../services/native-runtime/native-pi-retirement.js";
+import { appendHeartbeatRunEvent } from "../services/heartbeat-run-events.js";
+import { PROCESS_START_REQUESTED } from "../services/native-process-start-events.js";
 
 // Budget admission is the last database write before the dispatch gate enters
 // the native executor. Exhausted serialization retries there fail the run with
@@ -45,7 +52,9 @@ type AdmissionFailure = { remaining: number; turnNeverIssued: boolean; environme
   sessionRoots: string[] };
 
 function nativeBackend(db: ReturnType<typeof createDb>, options: { failDescriptorOnce?: { failed: boolean };
-  unretiredPredecessorOnce?: { failed: boolean; environmentId: string; taskBlocked?: boolean; repeat?: string[]; freshSessionRequired?: boolean; preDoorRunId?: string }; turnMessages?: Map<string, string>;
+  unretiredPredecessorOnce?: { failed: boolean; environmentId: string; taskBlocked?: boolean; repeat?: string[]; freshSessionRequired?: boolean; noLease?: boolean; preDoorRunId?: string }; turnMessages?: Map<string, string>;
+  savedAdmission?: { attempted: boolean; stage: "metadata_format" | "backup_without_reusable_lease";
+    readable: boolean; noLease: boolean; retire429?: boolean; failedSource?: boolean; selectedSession?: string; predecessorRunId?: string };
   admissionFailure?: AdmissionFailure; beforeRetirementFailure?: (runId: string, issueId: string) => Promise<void> } = {}):
   NonNullable<HeartbeatServiceOptions["nativeSessionBackendFactory"]> {
   return execution => {
@@ -87,6 +96,98 @@ function nativeBackend(db: ReturnType<typeof createDb>, options: { failDescripto
           options.failDescriptorOnce.failed = true;
           throw Object.assign(new Error("could not serialize access due to concurrent update"), { name: "PostgresError", code: "40001" });
         }
+        const saved = options.savedAdmission;
+        if (saved && !saved.attempted) {
+          saved.attempted = true;
+          const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, execution.binding.runId));
+          const priorRunId = saved.predecessorRunId = randomUUID(), environmentId = randomUUID(), priorLeaseId = randomUUID();
+          saved.selectedSession = run!.nativeSessionId!;
+          const previous = { ...execution, binding: { ...execution.binding, runId: priorRunId } };
+          const priorIdentity = { runId: priorRunId, normalizedSessionId: run!.nativeSessionId!, runnerInstanceId: run!.runnerInstanceId!,
+            environmentLeaseId: priorLeaseId, turnId: "saved-turn", itemId: "saved-item" };
+          const snapshot = { backendKind: "runner" as const, driverKind: execution.session.driverKind, sessionId: "saved-thread",
+            providerSessionId: "saved-provider", identity: { ...execution.binding, runId: priorRunId, sessionId: run!.nativeSessionId! },
+            activeTurnId: null, pendingRuntimeRequests: [] };
+          const profile: Record<string, unknown> = { ...run!.runnerProfileJson, nativeExecutionInput: previous, sessionCheckpoint: snapshot };
+          delete profile.nativeControllerRecovery;
+          await db.insert(heartbeatRuns).values({ ...run!, id: priorRunId, status: saved.failedSource ? "failed" : "succeeded", retryOfRunId: null,
+            createdAt: new Date(run!.createdAt.getTime() - 1_000), finishedAt: new Date(run!.createdAt.getTime() - 100), runnerProfileJson: profile });
+          const owner = { companyId: run!.companyId, issueId: execution.binding.issueId, runId: priorRunId,
+            authorityRunId: priorRunId, bootId: randomUUID(), generation: 1, leaseOwner: randomUUID() };
+          await db.insert(nativeRunFinalizations).values({ companyId: owner.companyId, issueId: owner.issueId, runId: priorRunId,
+            phase: "observed", controllerBootId: owner.bootId, controllerGeneration: 1,
+            leaseOwner: owner.leaseOwner, leaseExpiresAt: new Date(Date.now() + 60_000) });
+          const root = scopedRunnerdStateRoot(execution);
+          if (saved.readable) {
+            const core = new DurablePrpControlPlane({ stateDirectory: join(root, "saved-controller"), identity: priorIdentity,
+              expectedRunnerVersion: "saved-build", expectedRunnerDigest: `sha256:${"a".repeat(64)}` });
+            core.setCheckpointPersistence(nativeRunnerCheckpointWriter(db, owner));
+            try { await core.flushCheckpoint(); } finally { await core.stop(); }
+          }
+          const [result] = await db.insert(nativeRunResults).values({ companyId: run!.companyId, issueId: execution.binding.issueId,
+            runId: priorRunId, completionContractId: run!.completionContractId!, serverFingerprint: "saved-build",
+            schemaStatus: "accepted", resultJson: {}, canonicalSha256: "saved-result" }).returning();
+          await db.update(nativeRunFinalizations).set({ phase: "committed", resultId: result!.id,
+            leaseOwner: null, leaseExpiresAt: null }).where(eq(nativeRunFinalizations.runId, priorRunId));
+          await db.insert(environments).values({ id: environmentId, name: `saved-${priorRunId}`, driver: "sandbox" });
+          if (!saved.noLease) await db.insert(environmentLeases).values([
+            { id: priorLeaseId, companyId: run!.companyId, environmentId, issueId: execution.binding.issueId, heartbeatRunId: priorRunId,
+              provider: "daytona", providerLeaseId: "saved-sandbox", leasePolicy: "reuse_by_environment", status: "released",
+              metadata: { remoteCwd: execution.workspace.cwd } },
+            { companyId: run!.companyId, environmentId, issueId: execution.binding.issueId, heartbeatRunId: run!.id,
+              provider: "daytona", providerLeaseId: "saved-sandbox", leasePolicy: "reuse_by_environment", status: "active",
+              metadata: { remoteCwd: execution.workspace.cwd } },
+          ]);
+          if (saved.readable) {
+            const backupRoot = join(root, "failover-backups", "current");
+            for (const directory of resolveNativeHarnessPersistenceProfile(execution).directories)
+              mkdirSync(join(backupRoot, directory.name), { recursive: true });
+            const runnerState = { schema: "paperclip.runner.durable.state.v1", ...priorIdentity, lifecycle: "suspended", outbox: [] };
+            const providerState = { schema: "paperclip.runner.codex-provider-state.v1", lifecycle: "prepared", threadId: "saved-thread",
+              providerSessionId: "saved-provider", activeProviderTurnId: null, config: { provider: "pi_rpc", driver: "pi_rpc" } };
+            const remoteRoot = join(execution.workspace.cwd!, ".paperclip-runtime", "paperclip-runner", "sessions",
+              createHash("sha256").update(run!.nativeSessionId!).digest("hex"), "runner");
+            mkdirSync(remoteRoot, { recursive: true });
+            for (const directory of [join(backupRoot, "runner"), remoteRoot]) {
+              writeFileSync(join(directory, "runner-state.json"), JSON.stringify(runnerState));
+              writeFileSync(join(directory, "codex-provider-state.json"), JSON.stringify(providerState));
+            }
+            writeFileSync(join(backupRoot, "manifest.json"), JSON.stringify(buildNativeHarnessBackupManifest({
+              backupRoot, execution, runnerInstanceId: run!.runnerInstanceId!, sourceProviderLeaseId: "saved-sandbox",
+              providerSessionIdentity: { providerSessionId: "saved-thread", providerBackendSessionId: "saved-provider", providerSessionIdentity: null },
+            })));
+          }
+          // The earlier retirement's 429 is historical: it must converge on
+          // admission of this selected save, never start another retry owner.
+          if (saved.retire429) {
+            const retirement = await retirePiRunnerByFact({ identity: priorIdentity,
+              read: async () => ({ runner: { ...priorIdentity, outbox: [] }, provider: { config: { provider: "pi_rpc" } } }),
+              settle: async () => {}, collectStopped: async () => {}, recordProof: async () => {},
+              stop: async () => { throw Object.assign(new Error("Boat retire returned 429"), { status: 429 }); },
+            }).catch(error => error);
+            expect(retirement).toMatchObject({ status: 429 });
+            await db.update(heartbeatRuns).set({ error: retirement.message }).where(eq(heartbeatRuns.id, priorRunId));
+          }
+          await options.beforeRetirementFailure?.(run!.id, execution.binding.issueId);
+          const restore = () => restoreNativeControllerProjections({ db, execution, sessionContinuity: "continuous",
+            runnerExecutionTarget: { kind: "remote", transport: "sandbox", environmentId, leaseId: priorLeaseId,
+              providerKey: "daytona", remoteCwd: execution.workspace.cwd,
+              sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "saved-sandbox" },
+              runner: { execute: async (request: { command: string; args?: string[] }) => {
+                try { return { exitCode: 0, timedOut: false, stderr: "", stdout: execFileSync(request.command, request.args ?? [], { encoding: "utf8" }) }; }
+                catch { return { exitCode: 1, timedOut: false, stderr: "", stdout: "" }; }
+              } } } as never }, root);
+          if (saved.stage === "metadata_format") await restore();
+          else {
+            // The real first refusal happens after admission intent, but before
+            // runner.process.launch. This must not be mistaken for provider work.
+            await appendHeartbeatRunEvent(db, { companyId: run!.companyId, agentId: run!.agentId, runId: run!.id,
+              eventType: PROCESS_START_REQUESTED, stream: "system", level: "info", message: "Admission requested before host preparation" });
+            await admitNativeContinuationRefusal({ db, binding: execution.binding,
+              refusal: new NativeContinuationAdmissionRefusalError(saved.stage, priorRunId), providerLeaseId: "saved-sandbox",
+              beforeProviderTurn: true, restoreSameSession: saved.readable ? restore : async () => false });
+          }
+        }
         const unretired = options.unretiredPredecessorOnce;
         if (unretired && (!unretired.failed || unretired.repeat)) {
           unretired.repeat?.push(execution.binding.runId);
@@ -96,7 +197,7 @@ function nativeBackend(db: ReturnType<typeof createDb>, options: { failDescripto
           unretired.failed = true;
           if (unretired.taskBlocked) await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, execution.binding.issueId));
           const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, execution.binding.runId));
-          await db.insert(environmentLeases).values({ companyId: run!.companyId, environmentId: unretired.environmentId,
+          if (!unretired.noLease) await db.insert(environmentLeases).values({ companyId: run!.companyId, environmentId: unretired.environmentId,
             issueId: execution.binding.issueId, heartbeatRunId: run!.id, provider: "daytona", providerLeaseId: "sandbox-reused",
             leasePolicy: "reuse_by_environment", status: "active", metadata: { remoteCwd: "/workspace" } });
           await options.beforeRetirementFailure?.(run!.id, execution.binding.issueId);
@@ -190,6 +291,84 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
     return { issueId: issue!.id, runId: run!.id };
   }
 
+  it.each([
+    { stage: "metadata_format", readable: true, noLease: false },
+    { stage: "metadata_format", readable: true, noLease: false, failedSource: true },
+    { stage: "backup_without_reusable_lease", readable: true, noLease: false },
+    { stage: "metadata_format", readable: false, noLease: false },
+    { stage: "backup_without_reusable_lease", readable: false, noLease: false },
+    { stage: "metadata_format", readable: false, noLease: true },
+    { stage: "backup_without_reusable_lease", readable: false, noLease: true },
+    { stage: "metadata_format", readable: false, noLease: true, retire429: true },
+    { stage: "backup_without_reusable_lease", readable: false, noLease: true, retire429: true },
+  ] as const)("saved admission $stage readable=$readable noLease=$noLease retire429=$retire429 failedSource=$failedSource answers once", async input => {
+    const cell = { failedSource: false, ...input };
+    const sameSession = cell.readable && !cell.failedSource;
+    const { companyId } = fixture.current;
+    const db = createDb(fixture.current.temporary.connectionString, { maxConnections: 4 });
+    const saved = { ...cell, attempted: false, selectedSession: "", predecessorRunId: "" };
+    const messages = new Map<string, string>();
+    const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: nativeBackend(db, { savedAdmission: saved, turnMessages: messages }) });
+    try {
+      const { issueId, runId } = await startTask(db, heartbeat, "in_progress", "pi_rpc");
+      const [first] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(first!.status).toBe(sameSession ? "succeeded" : "failed");
+      if (sameSession) expect(first!.nativeSessionId).toBe(saved.selectedSession);
+      const successors = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
+      expect(successors).toHaveLength(sameSession ? 0 : 1);
+      if (!sameSession) {
+        expect(first!.resultJson).toMatchObject({ predecessorRetirementFallback: { freshSessionRequired: true,
+          ...(cell.noLease ? { replacedProviderLeaseIds: [] } : {}) } });
+        expect(successors[0]!.contextSnapshot?.explicitFreshSession).toBe(true);
+        expect(await heartbeat.promoteDueScheduledRetries()).toMatchObject({ promoted: 1 });
+        await heartbeat.resumeQueuedRuns();
+        await waitForCondition("saved admission fresh continuation to answer", async () =>
+          (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successors[0]!.id)))[0]?.status === "succeeded");
+        await waitForCondition("saved admission continuation to settle", () => heartbeat.getTaskDrainStatus().quiescent);
+        expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successors[0]!.id)))[0]!.nativeSessionId)
+          .not.toBe(saved.selectedSession);
+      }
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      expect(comments.filter(c => c.body === "Done.")).toHaveLength(1);
+      expect(comments.filter(c => c.body === "New session" && c.conversationSessionGeneration != null)).toHaveLength(sameSession ? 0 : 1);
+      expect(comments.filter(c => c.body.includes("The saved session could not be restored; continuing in a new session.")
+        && c.body.includes(`/runs/${runId}`))).toHaveLength(sameSession ? 0 : 1);
+      expect([...messages.values()]).toHaveLength(1);
+      expect([...messages.values()][0]).toContain("Start.");
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.status).not.toBe("blocked");
+      expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(0);
+      expect(await heartbeat.promoteDueScheduledRetries()).toMatchObject({ promoted: 0 });
+    } finally {
+      await heartbeat.drainActiveRunExecutions(); await closeIdleWarmNativeSessionsForRestart(); await db.$client.end();
+    }
+  }, 90_000);
+
+  it("keeps the fresh-session notice and answers once with no reusable lease", async () => {
+    const db = createDb(fixture.current.temporary.connectionString, { maxConnections: 4 });
+    const messages = new Map<string, string>();
+    const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: nativeBackend(db, {
+      unretiredPredecessorOnce: { failed: false, environmentId: randomUUID(), freshSessionRequired: true, noLease: true },
+      turnMessages: messages,
+    }) });
+    try {
+      const { issueId, runId } = await startTask(db, heartbeat, "in_progress", "pi_rpc");
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      expect(comments.filter(c => c.body === "New session" && c.conversationSessionGeneration != null)).toHaveLength(1);
+      expect(comments.filter(c => c.body.includes("could not be restored") && c.body.includes(runId))).toHaveLength(1);
+      const successors = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
+      expect(successors).toHaveLength(1);
+      expect(await heartbeat.promoteDueScheduledRetries()).toMatchObject({ promoted: 1 });
+      await heartbeat.resumeQueuedRuns();
+      await waitForCondition("no-lease fresh continuation to answer", async () =>
+        (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successors[0]!.id)))[0]?.status === "succeeded");
+      await waitForCondition("no-lease continuation to settle", () => heartbeat.getTaskDrainStatus().quiescent);
+      expect(messages.size).toBe(1);
+      expect((await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).filter(c => c.body === "Done.")).toHaveLength(1);
+    } finally {
+      await heartbeat.drainActiveRunExecutions(); await closeIdleWarmNativeSessionsForRestart(); await db.$client.end();
+    }
+  }, 90_000);
+
   it("re-queues a native run that failed at budget admission and completes it without a Retry", async () => {
     const { companyId } = fixture.current;
     const db = createDb(fixture.current.temporary.connectionString, { maxConnections: 4 });
@@ -253,7 +432,7 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
         eq(activityLog.action, "environment.lease_replacement_requested")))).toHaveLength(1);
       const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
       expect(comments.filter(c => c.conversationSessionGeneration != null)).toHaveLength(freshSessionRequired ? 1 : 0);
-      expect(comments.filter(c => c.body.includes("could not be stopped safely"))).toHaveLength(freshSessionRequired ? 1 : 0);
+      expect(comments.filter(c => c.body.includes("could not be restored"))).toHaveLength(freshSessionRequired ? 1 : 0);
       const successors = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
         eq(heartbeatRuns.retryOfRunId, runId)));
       if (freshSessionRequired) expect(successors[0]!.contextSnapshot?.explicitFreshSession).toBe(true);
@@ -285,7 +464,7 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
         const finalComments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
         expect(finalComments.filter(c => c.body === "Done.")).toHaveLength(2);
         expect(finalComments.filter(c => c.conversationSessionGeneration != null)).toHaveLength(1);
-        expect(finalComments.filter(c => c.body.includes("could not be stopped safely"))).toHaveLength(1);
+        expect(finalComments.filter(c => c.body.includes("could not be restored"))).toHaveLength(1);
       }
     } finally {
       await heartbeat.drainActiveRunExecutions();
@@ -295,7 +474,7 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
   }, 90_000);
 
   // Never-OK: cleanup failure must not hide a continuity break; task FK key-share locks must not deadlock its notice.
-  it("writes a visible fresh-session failure despite coordinator-close failure while a task key-share lock is held", async () => {
+  it.each(["retirement", "metadata_format", "backup_without_reusable_lease"] as const)("writes a visible $stage fresh-session failure despite coordinator-close failure while a task key-share lock is held", async stage => {
     const { companyId } = fixture.current;
     const db = createDb(fixture.current.temporary.connectionString, { maxConnections: 4 });
     const [environment] = await db.insert(environments).values({ name: `close-fault-${randomUUID()}`, driver: "sandbox" }).returning();
@@ -304,7 +483,8 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
     let keyShare: Promise<unknown> | undefined, noticeObservation: Promise<unknown> | undefined, triggered = false;
     let noticeError: unknown;
     const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: nativeBackend(db, {
-      unretiredPredecessorOnce: { failed: false, environmentId: environment!.id, freshSessionRequired: true },
+      ...(stage === "retirement" ? { unretiredPredecessorOnce: { failed: false, environmentId: environment!.id, freshSessionRequired: true } }
+        : { savedAdmission: { attempted: false, stage, readable: false, noLease: true } }),
       beforeRetirementFailure: async (runId, issueId) => {
         await db.$client.unsafe(`CREATE FUNCTION ${name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
           IF NEW.run_id = '${runId}'::uuid AND NEW.phase = 'terminal_failure' AND NEW.failure_code = 'native_pre_dispatch_failure'
@@ -329,7 +509,7 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
       await noticeObservation; expect(noticeError).toBeUndefined();
       const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
       expect(comments.filter(c => c.conversationSessionGeneration != null)).toHaveLength(1);
-      expect(comments.filter(c => c.body.includes("could not be stopped safely") && c.body.includes(runId))).toHaveLength(1);
+      expect(comments.filter(c => c.body.includes("could not be restored") && c.body.includes(runId))).toHaveLength(1);
       expect(await db.select().from(activityLog).where(and(eq(activityLog.runId, runId), eq(activityLog.action, "issue.comment_added"))))
         .toHaveLength(2);
       expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]).toMatchObject({ status: "failed" });

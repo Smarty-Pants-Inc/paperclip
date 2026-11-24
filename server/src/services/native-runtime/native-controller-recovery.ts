@@ -70,7 +70,9 @@ export function readNativeControllerRecovery(value: unknown, snapshot: unknown):
 export type NativeControllerRecoveryOutcome =
   | { kind: "recoverable"; snapshot: PersistedNativeSession; metadata: NativeControllerRecovery; checkpoint: DurablePrpCheckpoint }
   | { kind: "waiting_for_owner"; deadline: Date }
-  | { kind: "missing_evidence" | "unsupported" | "dependency_unavailable"; reason: string; cause?: unknown }
+  | { kind: "missing_evidence" | "unsupported" | "dependency_unavailable"; reason: string; cause?: unknown;
+      /** Exact bounded selector result, never permission to choose older history. */
+      sourceRun?: NonNullable<Awaited<ReturnType<typeof findNativeSessionResumeRun>>> }
   | { kind: "no_prior_execution" };
 
 
@@ -316,7 +318,7 @@ export async function resolveNativeControllerRecovery(db: Db, input: {
     return { kind: "missing_evidence", reason: "snapshot_binding" };
   }
   if (record(profile.nativeControllerRecovery).schema !== "paperclip.native-controller-recovery.v1") {
-    return { kind: "unsupported", reason: "metadata_format" };
+    return { kind: "unsupported", reason: "metadata_format", sourceRun: source };
   }
   const metadata = readNativeControllerRecovery(profile.nativeControllerRecovery, snapshot);
   if (!metadata?.checkpoint || metadata.checkpoint.runId !== source.id

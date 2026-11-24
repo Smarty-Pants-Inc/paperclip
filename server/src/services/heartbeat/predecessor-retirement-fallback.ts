@@ -47,7 +47,7 @@ export async function preparePredecessorRetirementFallback(db: Db, run: Run, err
       beforeProviderTurn ? inArray(environmentLeases.leasePolicy, ["reuse_by_environment", "reuse_by_execution_workspace"])
         : eq(environmentLeases.leasePolicy, "reuse_by_environment"), isNotNull(environmentLeases.providerLeaseId),
     )).for("update")).filter(lease => !failure.providerLeaseId || lease.providerLeaseId === failure.providerLeaseId);
-    if (leases.length === 0 && !beforeProviderTurn) return null;
+    if (leases.length === 0 && !beforeProviderTurn && !retirement?.freshSessionRequired) return null;
     if (await replacementAlreadyMissed(tx as unknown as Db, current, leases.map(lease => lease.providerLeaseId!))) return null;
     if (beforeProviderTurn) await tx.update(heartbeatRuns).set({ runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb) || ${JSON.stringify({
       [FAILED_BEFORE_PROVIDER_TURN_KEY]: { schema: FAILED_BEFORE_PROVIDER_TURN_SCHEMA, cause: beforeProviderTurn.code, proof: beforeProviderTurn.proof,

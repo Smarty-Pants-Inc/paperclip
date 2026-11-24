@@ -1,14 +1,17 @@
-import { and, eq } from "drizzle-orm";
-import { agents, companies, environmentLeases, heartbeatRuns, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { and, eq, inArray, isNotNull, or } from "drizzle-orm";
+import { agents, companies, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { parseNativeExecutionInput, type NativeExecutionInput, type PersistedNativeSession, type DurableRecoveryIdentity } from "../../vendor/paperclip-runner/index.js";
-import { currentNativeControllerIdentity, evaluateNativeControllerTakeover, recordLegacyHostFallbackProof } from "./native-restart-recovery.js";
+import { NativeFailedBeforeProviderTurnError } from "./failed-before-provider-turn.js";
+import { currentNativeControllerIdentity, evaluateNativeControllerTakeover, hasNativeExecutionStartEvidence, recordLegacyHostFallbackProof } from "./native-restart-recovery.js";
 import { NativeControllerRecoveryWaitingError, readNativeControllerRecovery } from "./native-controller-recovery.js";
 import { NativePredecessorRetirementUnprovenError } from "./predecessor-retirement.js";
 import { readyPortableTaskSource } from "../plugin-task-ownership.js";
 import { PAPERCLIP_RUNNER_IDLE_TIMEOUT_MAX_MS } from "@paperclipai/adapter-utils";
 import { currentControllerBootId } from "../controller-process-identity.js";
 import { currentProcessProbe, proveOwnerGone } from "../owner-proof.js";
+import { logActivity } from "../activity-log.js";
+import { PROCESS_IDENTITY_RECORDED } from "../native-process-start-events.js";
 
 export const WARM_OWNER_RECHECK_MS = 5_000;
 const WARM_OWNER_CLOSE_MARGIN_MS = 2 * 60_000;
@@ -170,7 +173,8 @@ export function describeFailedAttachment(failureMessage: unknown): string | null
 
 export type WarmRecoveryRefusal = "identity_incomplete" | "target_not_resumed_sandbox" | "owner_unsettled" | "execution_mismatch"
   | "checkpoint_unsettled" | "journal_unsettled" | "controller_not_stopped" | "prior_lease_mismatch"
-  | "current_run_not_admitted" | "current_owner_changed" | "owner_changed" | "current_lease_changed";
+  | "current_run_not_admitted" | "current_owner_changed" | "owner_changed" | "current_lease_changed"
+  | "backup_without_reusable_lease" | "metadata_format";
 
 /** A typed refusal (possibly wrapped in the stock predecessor failure), not an arbitrary I/O error. */
 export class NativeWarmRecoveryRefusalError extends Error {
@@ -178,6 +182,81 @@ export class NativeWarmRecoveryRefusalError extends Error {
     super(`runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; warm_recovery_refused=${reason}`);
     this.name = "NativeWarmRecoveryRefusalError";
   }
+}
+
+/** Admission refusals are not transport failures and must not enter generic recovery. */
+export class NativeContinuationAdmissionRefusalError extends NativeWarmRecoveryRefusalError {
+  readonly code = "native_continuation_admission_refused";
+  constructor(reason: "backup_without_reusable_lease" | "metadata_format", readonly predecessorRunId: string | null) {
+    super(reason);
+    this.name = "NativeContinuationAdmissionRefusalError";
+    this.message = reason === "backup_without_reusable_lease"
+      ? "runner_harness_state_mismatch: backup_without_reusable_lease" : "native_controller_recovery_unsupported:metadata_format";
+  }
+}
+
+/** One bounded decision owner for both early controller and late harness admission.
+ * The stage must independently authenticate the exact selected checkpoint, its
+ * conversation and safe source isolation. Never search older history or loop. */
+export async function admitNativeContinuationRefusal(input: {
+  db: Db;
+  binding: NativeExecutionInput["binding"];
+  refusal: NativeContinuationAdmissionRefusalError;
+  providerLeaseId: string | null;
+  /** Host preparation of this new sandbox failed before any process launch. */
+  beforeProviderTurn?: boolean;
+  restoreSameSession: () => Promise<boolean>;
+}): Promise<void> {
+  let cause: unknown = input.refusal;
+  try {
+    if (await input.restoreSameSession()) return;
+  } catch (error) {
+    if (error instanceof Error && (error.name === "AbortError" || error.message === "native_session_cancelled")) throw error;
+    cause = new AggregateError([input.refusal, error], "Saved session restoration refused");
+  }
+  // Never turn an uncertain provider attempt or Stop into a fresh continuation.
+  const [run] = await input.db.select({ result: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.id, input.binding.runId), eq(heartbeatRuns.companyId, input.binding.companyId),
+    eq(heartbeatRuns.agentId, input.binding.agentId), eq(heartbeatRuns.nativeIssueId, input.binding.issueId))).limit(1);
+  if (!run || run.result?.nativeCancellation || run.result?.startupCancellation || run.result?.firstTurnDispatchCommitted) throw input.refusal;
+  if (await hasNativeExecutionStartEvidence(input.db, { companyId: input.binding.companyId, id: input.binding.runId })) {
+    if (!input.beforeProviderTurn) throw input.refusal;
+    // onSessionAdmission records intent before host preparation. Intent alone
+    // is not a launch; every actual process/provider/tool event still blocks.
+    const [started] = await input.db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+      eq(heartbeatRunEvents.companyId, input.binding.companyId), eq(heartbeatRunEvents.runId, input.binding.runId),
+      or(isNotNull(heartbeatRunEvents.sourceEventId), inArray(heartbeatRunEvents.eventType,
+        ["adapter.invoke", PROCESS_IDENTITY_RECORDED, "tool.execution.started"])))).limit(1);
+    if (started) throw input.refusal;
+  }
+  // Commit the visible break before executor teardown can throw a different
+  // cleanup error. Completion uses this same idempotent publisher.
+  await publishNativeFreshSessionNotice(input.db, input.binding);
+  const fresh = new NativePredecessorRetirementUnprovenError(input.refusal.predecessorRunId,
+    input.providerLeaseId, cause, true);
+  throw input.beforeProviderTurn ? new NativeFailedBeforeProviderTurnError(input.providerLeaseId, fresh) : fresh;
+}
+
+export async function publishNativeFreshSessionNotice(db: Db,
+  binding: Pick<NativeExecutionInput["binding"], "companyId" | "agentId" | "issueId" | "runId">): Promise<void> {
+  const { companyId, agentId, issueId, runId } = binding;
+  const notices = await db.transaction(async tx => {
+    const [task] = await tx.select().from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId))).for("no key update");
+    const [marker] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+      eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
+      eq(issueComments.createdByRunId, runId), isNotNull(issueComments.conversationSessionGeneration))).limit(1);
+    if (!task || marker) return [];
+    const now = new Date();
+    return tx.insert(issueComments).values([
+      { companyId, issueId, createdByRunId: runId, authorType: "system", createdAt: now,
+        body: `The saved session could not be restored; continuing in a new session. [Details of this attempt](/agents/${agentId}/runs/${runId}). Earlier messages remain available.` },
+      { companyId, issueId, createdByRunId: runId, authorType: "system", createdAt: new Date(now.getTime() + 1),
+        body: "New session", conversationSessionGeneration: task.conversationSessionGeneration },
+    ]).returning();
+  });
+  for (const notice of notices) await logActivity(db, { companyId, actorType: "system", actorId: "native-runtime",
+    agentId, runId, issueId, action: "issue.comment_added", entityType: "issue", entityId: issueId,
+    details: { commentId: notice.id, bodySnippet: notice.body.slice(0, 120), source: "pi_retirement_fallback" } }).catch(() => undefined);
 }
 
 export function isNativeWarmRecoveryRefusal(error: unknown): boolean {

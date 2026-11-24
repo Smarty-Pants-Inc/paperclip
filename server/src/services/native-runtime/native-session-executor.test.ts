@@ -13,7 +13,7 @@ import * as controllerRecovery from "./native-controller-recovery.js";
 import * as ownerProof from "../owner-proof.js";
 import { isSettledRemoteWarmControlState } from "./remote-warm-session-recovery.js";
 import * as remoteWarmRecoveryRuntime from "./remote-warm-session-recovery.js";
-import { NativePredecessorRetirementUnprovenError } from "./predecessor-retirement.js";
+import { findNativePredecessorRetirementUnproven, NativePredecessorRetirementUnprovenError } from "./predecessor-retirement.js";
 import * as pluginTaskOwnership from "../plugin-task-ownership.js";
 import { DurablePrpControlPlane } from "../../vendor/paperclip-runner/index.js";
 import * as environmentTaskRuntime from "../environment-task-runtime.js";
@@ -8441,10 +8441,11 @@ function leaseDb(
     },
   });
   const insert = (table: unknown) => ({
-    values: (values: Record<string, unknown>) => {
-      updates.push({ table, values });
-      const query = { returning: async () => [values], onConflictDoUpdate: () => query, onConflictDoNothing: () => query,
-        then: Promise.resolve([values]).then.bind(Promise.resolve([values])) };
+    values: (values: Record<string, unknown> | Record<string, unknown>[]) => {
+      const rows = Array.isArray(values) ? values : [values];
+      for (const row of rows) updates.push({ table, values: row });
+      const query = { returning: async () => rows, onConflictDoUpdate: () => query, onConflictDoNothing: () => query,
+        then: Promise.resolve(rows).then.bind(Promise.resolve(rows)) };
       return query;
     },
   });
@@ -23168,7 +23169,8 @@ describe("runnerd provider runtime wiring", () => {
         }) } }),
       })]);
     } else {
-      await expect(options.prepareExternalRunnerState()).rejects.toThrow("backup_without_reusable_lease");
+      const refusal = await options.prepareExternalRunnerState().catch((error: unknown) => error);
+      expect(findNativePredecessorRetirementUnproven(refusal)?.freshSessionRequired).toBe(true);
       expect(syncIn).not.toHaveBeenCalled();
       expect(updates.filter(update => update.table === environmentLeases)).toEqual([]);
     }
@@ -23337,7 +23339,12 @@ describe("runnerd provider runtime wiring", () => {
           supersededByRunId: current.binding.runId, supersededByProviderLeaseId: "sandbox-created",
           reusableSandboxLease: { version: 1, executionWorkspaceId: current.binding.executionWorkspaceId } }) }));
     } else {
-      await expect(options.prepareExternalRunnerState()).rejects.toThrow(resumed ? "resumed_unavailable" : "backup_without_reusable_lease");
+      const refusal = await options.prepareExternalRunnerState().catch((error: unknown) => error);
+      if (resumed) expect(String(refusal)).toContain("resumed_unavailable");
+      // This mock exposes later provider events to both queries. Preserve the
+      // no-provider-work fence rather than authorizing a fresh attempt there.
+      else if (laterProviderWork) expect(refusal).toMatchObject({ name: "NativeContinuationAdmissionRefusalError" });
+      else expect(findNativePredecessorRetirementUnproven(refusal)?.freshSessionRequired).toBe(true);
       expect(syncIn).not.toHaveBeenCalled();
       expect(updates.filter(update => update.table === environmentLeases)).toEqual([]);
     }
@@ -23368,7 +23375,13 @@ describe("runnerd provider runtime wiring", () => {
       await prepareReplacement();
       return replacement;
     });
-    state.createBackend.mockReturnValueOnce({ kind: "test", openSession } as never);
+    // Match the driver's string-only failure boundary: the outer backend must
+    // preserve admission evidence rather than retrying this redacted reason.
+    const recoverSession = vi.fn(async () => {
+      try { await prepareReplacement(); return { recovered: true, session: replacement }; }
+      catch (error) { return { recovered: false, reason: String(error) }; }
+    });
+    state.createBackend.mockReturnValueOnce({ kind: "test", openSession, recoverSession } as never);
     const backend = await createRunnerdBackend({
       db: leaseDb(execution), execution, runnerInstanceId: "runner-replacement",
       runnerIngressAuthorized: true,
@@ -23394,7 +23407,15 @@ describe("runnerd provider runtime wiring", () => {
     await writeFile(join(root, "provider-artifacts", "opencodeProxy"), "retained prior launch bytes");
     // Ambiguous ordinary recovery must still fail closed. Only the runtime's
     // explicitly admitted replacement may retire these prior-session backups.
-    await expect(prepareReplacement()).rejects.toThrow("runner_harness_state_mismatch: backup_without_reusable_lease");
+    const refusal = await prepareReplacement().catch((error: unknown) => error);
+    expect(findNativePredecessorRetirementUnproven(refusal)).toMatchObject({
+      name: "NativePredecessorRetirementUnprovenError", freshSessionRequired: true,
+      cause: expect.objectContaining({ name: "NativeContinuationAdmissionRefusalError", reason: "backup_without_reusable_lease" }),
+    });
+    const flattened = await backend.recoverSession!({ identity: { runId: execution.binding.runId } } as never, {} as never)
+      .catch((error: unknown) => error);
+    expect(findNativePredecessorRetirementUnproven(flattened)).toMatchObject({ freshSessionRequired: true });
+    expect(recoverSession).toHaveBeenCalledOnce();
     await expect(backend.openReplacementSession!({
       identity: { runId: execution.binding.runId }, workingDirectory: execution.workspace.cwd,
     } as never, {} as never)).resolves.toBe(replacement);
