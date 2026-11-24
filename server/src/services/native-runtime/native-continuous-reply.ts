@@ -3,6 +3,7 @@ import { agentWakeupRequests, agents, heartbeatRunEvents, heartbeatRuns, issueCo
 import type { NativeExecutionInput, PrpEvent } from "../../vendor/paperclip-runner/index.js";
 import { completedPlanProposalIds, nativeFinalReplyKey, readCompletedAssistantMessageCandidate, resolveHeartbeatRunResponse } from "../heartbeat-run-summary.js";
 import { issueService } from "../issues.js";
+import { acknowledgeChatCompletionReply } from "../chat-completion-delivery.js";
 import { resolveChatRunPresentationAuthorizationReason } from "../chat-run-publications.js";
 import { logActivity } from "../activity-log.js";
 import { hasChatRunOwnedProviderInteraction } from "../chat-interaction-arbitration.js";
@@ -100,6 +101,7 @@ export async function publishContinuousNativeReply(input: {
     const comment = await issueService(input.db).addComment(issueId, resolved.text, { agentId, runId }, {
       authorizationReason, clientRequestId,
     }, tx);
+    await acknowledgeChatCompletionReply(tx, runId, comment.id);
     await tx.update(heartbeatRuns).set({ resultJson: { ...result, continuousReplies: { ...replies,
       [input.event.itemId!]: { questionCommentIds, commentId: comment.id, sourceEventId: input.event.sourceEventId },
     } } }).where(eq(heartbeatRuns.id, runId));
