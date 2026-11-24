@@ -92,6 +92,8 @@ export interface CodexAppServerTransport {
     runId: string;
     turnId: string;
     itemId: string;
+    /** Fresh semantic definitions; the transport adds its standard completion tools. */
+    dynamicTools?: readonly Readonly<Record<string, unknown>>[];
     currentRunGrant?: NativeRunRuntimeGrant;
     /** The attaching run's own completion contract. */
     completionContract?: { revision: string; criterionIds: readonly string[] };
