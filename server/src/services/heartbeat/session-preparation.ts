@@ -6,7 +6,7 @@ import { getServerAdapter } from "../../adapters/index.js";
 import type { prepareManagedAiRuntime } from "../ai-connection-runtime.js";
 import { aiConnectionSessionCompatibilityInputs, managedAiSessionIdentityCompatible } from "../ai-connection-session.js";
 import { createNativeSessionHandoffLoader } from "../native-runtime/native-session-handoff.js";
-import { decideNativeContinuation } from "../native-runtime/continued-session.js";
+import { decideNativeContinuation, resolveSessionContinuity } from "../native-runtime/continued-session.js";
 import { deriveTaskKey } from "./run-preparation.js";
 import { agentInstructionsService } from "../agent-instructions.js";
 import {
@@ -225,6 +225,7 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
     taskSessionForRun.lastRunId !== run.id && isNativeSessionId(taskSessionId) ? taskSessionId : null;
   const getFreshSessionHandoff = issueRef ? createNativeSessionHandoffLoader({
     db, companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id, before: run.createdAt,
+    mode: resolveSessionContinuity(runtimeConfig.provider, runtimeConfig.sessionContinuity) === "continuous" ? "whole" : "bounded",
     throughCommentId: readNonEmptyString(context.conversationReplayThroughCommentId) ?? (context.interactionKind ? null : wakeCommentId),
   }) : undefined;
   const previousSessionParams =
