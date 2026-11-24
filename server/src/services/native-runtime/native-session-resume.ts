@@ -10,6 +10,8 @@ import type {
 } from "../../vendor/paperclip-runner/index.js";
 import { canonicalNativeRuntimeContextDigest, parseNativeExecutionInput, type NativeRuntimeContextSnapshot } from "../../vendor/paperclip-runner/index.js";
 
+import { resolveSessionContinuity } from "./continued-session.js";
+
 export type NativeToolExecutionTargetKind = "local" | "remote";
 
 /** Fence live ACPX owners when shared runtime semantics change, even if the
@@ -251,6 +253,24 @@ type NativeSessionResumeSelection = {
 
 const NATIVE_RESUME_CANDIDATE_WINDOW = 32;
 const INHERITED_CHECKPOINT_SOURCE_FIELDS = ["backendKind", "driverKind", "sessionId", "providerSessionId"] as const;
+
+/** A failed first turn can save its checkpoint before publishing a task-session
+ * pointer. Discover only within this issue/agent and the current /new generation;
+ * the ordinary exact-session selector and rebind still validate its authority. */
+export async function findNativeContinuousSessionResumeId(db: Db, input: {
+  companyId: string; agentId: string; issueId: string; currentRunId: string;
+  beforeCreatedAt: Date; conversationSessionGeneration: unknown;
+}): Promise<string | null> {
+  const [prior] = await db.select({ sessionId: heartbeatRuns.nativeSessionId }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId),
+    eq(heartbeatRuns.nativeIssueId, input.issueId), ne(heartbeatRuns.id, input.currentRunId),
+    eq(heartbeatRuns.runtimeMode, "native"), inArray(heartbeatRuns.status, [...LEGACY_RETRY_SOURCE_TERMINAL_STATUSES]),
+    sql`date_trunc('milliseconds', ${heartbeatRuns.createdAt}) <= ${input.beforeCreatedAt.toISOString()}::timestamptz`,
+    sql`jsonb_typeof(${heartbeatRuns.runnerProfileJson}->'sessionCheckpoint') = 'object'`,
+    sql`coalesce(${heartbeatRuns.contextSnapshot}->'conversationSessionGeneration', 'null'::jsonb) = ${JSON.stringify(input.conversationSessionGeneration ?? null)}::jsonb`,
+  )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+  return isNativeSessionId(prior?.sessionId) ? prior.sessionId : null;
+}
 
 export async function findNativeSessionResumeRun(db: Db, input: NativeSessionResumeSelection) {
   if (!isNativeSessionId(input.normalizedSessionId)) return null;
@@ -496,8 +516,14 @@ export function isUnusedLegacyNativeRetryReplacement(input: {
 function sameProvider(
   previous: NativeExecutionInput["provider"],
   current: NativeExecutionInput["provider"],
+  sessionContinuity?: unknown,
 ): boolean {
-  return JSON.stringify(previous) === JSON.stringify(current);
+  const continuousPi = previous.kind === "pi_rpc" && current.kind === "pi_rpc" &&
+    resolveSessionContinuity(current.kind, sessionContinuity) === "continuous";
+  const compatible = (provider: NativeExecutionInput["provider"]) => continuousPi
+    ? Object.fromEntries(Object.entries(provider).filter(([key]) => key !== "model" && key !== "piRpcThinkingLevel"))
+    : provider;
+  return JSON.stringify(compatible(previous)) === JSON.stringify(compatible(current));
 }
 
 function nativeCheckpointWorkspaceScope(
@@ -548,6 +574,7 @@ export function buildNativeExecutionWithCheckpoint(input: {
   previousRun:
     Parameters<typeof rebindNativeSessionCheckpoint>[0]["previousRun"] | null;
   normalizedSessionId: string;
+  sessionContinuity?: unknown;
   executionTargetKind?: NativeToolExecutionTargetKind;
   toolRefreshOnResume?: boolean;
   refreshTools?: boolean;
@@ -575,6 +602,7 @@ export function buildNativeExecutionWithCheckpoint(input: {
       const retainedCheckpoint = rebindNativeSessionCheckpoint({
         previousRun: input.previousRun,
         currentExecution: retainedFormat,
+        sessionContinuity: input.sessionContinuity,
         executionTargetKind: input.executionTargetKind,
         toolRefreshOnResume: input.toolRefreshOnResume,
         refreshTools: input.refreshTools,
@@ -586,6 +614,7 @@ export function buildNativeExecutionWithCheckpoint(input: {
     ? rebindNativeSessionCheckpoint({
         previousRun: input.previousRun,
         currentExecution: execution,
+        sessionContinuity: input.sessionContinuity,
         executionTargetKind: input.executionTargetKind,
         toolRefreshOnResume: input.toolRefreshOnResume,
         refreshTools: input.refreshTools,
@@ -634,6 +663,7 @@ export function rebindNativeSessionCheckpoint(input: {
     runnerProfileJson: unknown;
   };
   currentExecution: NativeExecutionInput;
+  sessionContinuity?: unknown;
   executionTargetKind?: NativeToolExecutionTargetKind;
   toolRefreshOnResume?: boolean;
   refreshTools?: boolean;
@@ -699,7 +729,7 @@ export function rebindNativeSessionCheckpoint(input: {
       ? previousExecution.executionMode
       : "default") !==
       ("executionMode" in current ? current.executionMode : "default") ||
-    !sameProvider(previousExecution.provider, current.provider) ||
+    !sameProvider(previousExecution.provider, current.provider, input.sessionContinuity) ||
     previousExecution.schema !== current.schema ||
     ("homeMode" in previousExecution ? previousExecution.homeMode : "isolated") !== ("homeMode" in current ? current.homeMode : "isolated") ||
     ("runtimeContext" in previousExecution &&

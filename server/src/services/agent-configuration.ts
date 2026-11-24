@@ -25,6 +25,7 @@ import { secretService, assertClaudeOAuthBindingInvariant } from "./secrets.js";
 import { agentCredentialService } from "./agent-credentials.js";
 import { clearPrimaryAgent } from "./primary-agent.js";
 import { budgetServiceInTransaction } from "./budgets.js";
+import { resolveSessionContinuity } from "./native-runtime/continued-session.js";
 
 export async function lockAgentConfigurationInteractions(tx: Db, id: string, data: AgentConfigurationPatch, options?: UpdateAgentOptions) {
   const pluginOrigin = currentPluginInteractionOrigin();
@@ -170,7 +171,7 @@ export async function completeAgentConfiguration(txDb: Db, existing: AgentConfig
   const afterConfig = isPlainRecord(updated.adapterConfig) ? updated.adapterConfig : {};
   const changedExecution = updated.adapterType !== existing.adapterType
     || (updated.adapterType === "paperclip_runner" && ["provider", "acpxAgent", "model"].some(
-      (key) => priorAdapterConfig[key] !== afterConfig[key],
+      (key) => priorAdapterConfig[key] !== afterConfig[key] && (key !== "model" || afterConfig.provider !== "pi_rpc" || resolveSessionContinuity(afterConfig.provider, afterConfig.sessionContinuity) !== "continuous"),
     ));
   if (changedExecution) {
     await notifyExternalConversationSettlement(txDb, { companyId: existing.companyId });

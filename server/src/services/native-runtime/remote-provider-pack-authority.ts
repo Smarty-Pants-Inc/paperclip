@@ -32,6 +32,8 @@ export function resolveRemoteProviderPackAuthority<T extends ProviderPackIdentit
   binding: ProviderPackBinding;
   reattach: boolean;
   retainProviderPack?: boolean;
+  /** Attested prior digest, only after same-session Pi model/level-only admission and owner retirement. */
+  previousProviderDigest?: string;
   current: () => T;
   runnerArtifact: () => RunnerArtifactIdentity;
 }): { manifest: T; runnerArtifact: RunnerArtifactIdentity; select: (manifest: T) => void; verified: () => void } {
@@ -49,7 +51,10 @@ export function resolveRemoteProviderPackAuthority<T extends ProviderPackIdentit
       const stat = fstatSync(fd);
       if (!stat.isFile() || stat.size > maximumBytes) throw new Error("invalid authority file");
       const saved = JSON.parse(readFileSync(fd, "utf8"));
-      if (saved.schema !== schema || canonicalProviderPackJson(saved.binding) !== canonicalProviderPackJson(input.binding)) {
+      const expectedBinding = input.previousProviderDigest && !input.reattach
+        ? { ...input.binding, providerDigest: input.previousProviderDigest } : input.binding;
+      if (saved.schema !== schema || (canonicalProviderPackJson(saved.binding) !== canonicalProviderPackJson(input.binding)
+        && canonicalProviderPackJson(saved.binding) !== canonicalProviderPackJson(expectedBinding))) {
         throw new Error("authority binding mismatch");
       }
       assertManifest(saved.manifest);

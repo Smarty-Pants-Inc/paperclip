@@ -7,6 +7,7 @@ import { acceptedNativeAdapterResult } from "../native-runtime/native-accepted-r
 import { NativeStartupCleanupPendingError } from "../native-runtime/native-startup-cleanup.js";
 import { NativeControllerRecoveryWaitingError } from "../native-runtime/native-controller-recovery.js";
 import { describeFailedAttachment } from "../native-runtime/remote-warm-session-recovery.js";
+import { readNativeSessionContinuity, resolveSessionContinuity } from "../native-runtime/continued-session.js";
 
 import { usesNativeUsageDelivery } from "../native-runtime/native-usage-accounting.js";
 import { INTERACTION_DELIVERY_DENIED, preparedRunInteractionDeliveryDenied } from "../agent-interaction-delivery.js";
@@ -654,6 +655,11 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       await outputSecretStore.registerAll(run.companyId, run.id,
         identityRedactor.secretSources.filter((value) => secretOutputForms([value]).length > 0));
       identityRedactor.addSecretValues(await outputSecretStore.valuesForRun(run.companyId, run.id));
+      const [selectedPolicy] = nativeExecution.provider.kind === "pi_rpc"
+        ? await db.select({ profile: heartbeatRuns.runnerProfileJson }).from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId))).limit(1) : [];
+      const nativeSessionContinuity = readNativeSessionContinuity(selectedPolicy?.profile)
+        ?? resolveSessionContinuity(nativeExecution.provider.kind, runtimeConfig.sessionContinuity);
       const stopCleanup = runOptions.nativeRestartRecovery?.kind === "reattach_remote_runner"
         && await readClaimedNativeStopRecovery(db, run, runOptions.nativeLeaseOwner);
       const guardedDispatch =
@@ -668,6 +674,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               getFreshSessionHandoff: getNativeFreshSessionHandoff,
               refreshTools: context.refreshTools === true,
               toolRefreshOnResume: input.runtime.toolRefreshOnResume,
+              sessionContinuity: nativeSessionContinuity,
               conversationMode: isConversation(issueContext),
               turnTimeoutMs: Math.max(0, asNumber(runtimeConfig.timeoutSec, 0)) * 1_000,
               runnerInstanceId: nativeRunnerInstanceId,

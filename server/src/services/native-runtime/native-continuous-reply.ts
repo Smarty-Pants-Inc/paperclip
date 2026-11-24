@@ -10,7 +10,7 @@ import { logActivity } from "../activity-log.js";
 import { hasChatRunOwnedProviderInteraction } from "../chat-interaction-arbitration.js";
 import { agentRunSupersededByFreshContinuation, agentRunWritesRevoked } from "../../agent-run-cancellation.js";
 import { isNativeRunnerOwnershipHeld } from "./native-runner-ownership.js";
-import { resolveSessionContinuity } from "./continued-session.js";
+import { readNativeSessionContinuity, resolveSessionContinuity } from "./continued-session.js";
 import { parseObject } from "../../adapters/utils.js";
 import { logger } from "../../middleware/logger.js";
 import { drainContinuousPersonMessages } from "./native-continuous-drain.js";
@@ -85,16 +85,17 @@ async function applyNativePersonStopNotice(input: Parameters<typeof publishConti
 }
 
 /** Replay the ingestion/publication crash gap before terminal presentation or queue release. */
-export async function recoverContinuousNativeReplies(db: Db, scope: { id: string; companyId: string }) {
+export async function recoverContinuousNativeReplies(db: Db, scope: { id: string; companyId: string; sessionContinuity?: "continuous" | "paperclip" }) {
   const [row] = await db.select({ run: heartbeatRuns, config: agents.adapterConfig }).from(heartbeatRuns)
     .innerJoin(agents, and(eq(agents.id, heartbeatRuns.agentId), eq(agents.companyId, scope.companyId)))
     .where(and(eq(heartbeatRuns.id, scope.id), eq(heartbeatRuns.companyId, scope.companyId)));
-  if (!row?.run.nativeIssueId || row.run.runtimeMode !== "native" ||
-      (row.config.provider !== "pi_rpc" && parseObject(parseObject(row.run.runnerProfileJson?.nativeExecutionInput).provider).kind !== "pi_rpc")) return;
+  const provider = parseObject(parseObject(row?.run.runnerProfileJson).nativeExecutionInput).provider;
+  if (!row?.run.nativeIssueId || row.run.runtimeMode !== "native" || (parseObject(provider).kind ?? row.config.provider) !== "pi_rpc" ||
+      resolveSessionContinuity("pi_rpc", readNativeSessionContinuity(row.run.runnerProfileJson) ?? scope.sessionContinuity ?? row.config.sessionContinuity) !== "continuous") return;
   const events = await db.select({ seq: heartbeatRunEvents.seq, eventType: heartbeatRunEvents.eventType, payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents)
     .where(and(eq(heartbeatRunEvents.companyId, scope.companyId), eq(heartbeatRunEvents.runId, scope.id),
       inArray(heartbeatRunEvents.eventType, ["item.completed", "provider.notice.recorded"]))).orderBy(asc(heartbeatRunEvents.seq));
-  for (const event of events) await publishContinuousNativeReply({ db, cursor: event.seq, recoverTerminal: true,
+  for (const event of events) await publishContinuousNativeReply({ db, cursor: event.seq, recoverTerminal: true, sessionContinuity: scope.sessionContinuity,
     execution: { binding: { companyId: scope.companyId, issueId: row.run.nativeIssueId, runId: scope.id, agentId: row.run.agentId },
       provider: { kind: "pi_rpc" } },
     event: { ...parseObject(parseObject(event.payload).prpEvent), eventType: event.eventType } as Parameters<typeof publishContinuousNativeReply>[0]["event"],
@@ -106,7 +107,7 @@ export async function recoverContinuousNativeReplies(db: Db, scope: { id: string
 export async function recoverTerminalNativeVisibleReply(db: Db, scope: { companyId: string; issueId: string; runId: string }) {
   return db.transaction(async transaction => {
     const tx = transaction as unknown as Db;
-    const [issue] = await tx.select().from(issues).where(and(eq(issues.id, scope.issueId), eq(issues.companyId, scope.companyId))).for("update");
+    const [issue] = await tx.select().from(issues).where(and(eq(issues.id, scope.issueId), eq(issues.companyId, scope.companyId))).for("no key update");
     const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, scope.runId),
       eq(heartbeatRuns.companyId, scope.companyId), eq(heartbeatRuns.nativeIssueId, scope.issueId))).for("update");
     if (!issue || !run || run.runtimeMode !== "native" || !run.finishedAt || isNativeRunnerOwnershipHeld(run) ||
@@ -146,6 +147,7 @@ export async function publishContinuousNativeReply(input: {
   db: Db;
   cursor: number;
   recoverTerminal?: boolean;
+  sessionContinuity?: "continuous" | "paperclip";
   execution: {
     binding: Pick<NativeExecutionInput["binding"], "companyId" | "issueId" | "runId" | "agentId">;
     provider: Pick<NativeExecutionInput["provider"], "kind">;
@@ -177,7 +179,7 @@ export async function publishContinuousNativeReply(input: {
         (issue.conversationAgentId && (issue.conversationAgentId !== agentId || issue.conversationState !== "active" ||
           row.run.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration)) ||
         row.run.contextSnapshot?.skipIssueComment === true ||
-        resolveSessionContinuity("pi_rpc", row.config.sessionContinuity) !== "continuous") return;
+        resolveSessionContinuity("pi_rpc", readNativeSessionContinuity(row.run.runnerProfileJson) ?? input.sessionContinuity ?? row.config.sessionContinuity) !== "continuous") return;
     const [recovery] = await tx.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
       eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, runId),
       eq(heartbeatRunEvents.eventType, "lifecycle"), lt(heartbeatRunEvents.seq, input.cursor),

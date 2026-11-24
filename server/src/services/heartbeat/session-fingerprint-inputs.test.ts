@@ -164,6 +164,23 @@ async function freshness(next: Partial<MetadataInput>, compatible: Partial<Metad
   });
 }
 
+it.each([undefined, "continuous", "paperclip"])("gates model and reasoning fingerprints on continuity %s", async sessionContinuity => {
+  for (const key of ["model", "piRpcThinkingLevel", "piThinkingLevel", "thinkingLevel", "modelReasoningEffort", "reasoningEffort", "effort", "variant"]) {
+    const metadata = (value: string) => buildEffectiveRunSessionConfigMetadata({ ...baseInput, effectiveAdapterConfig: { provider: "pi_rpc", sessionContinuity, [key]: value }, issueOverrides: { adapterConfig: { [key]: value } } });
+    const saved = await metadata("low"), next = await metadata("high");
+    expect(resolveTaskSessionConfigFreshness({ provider: "pi_rpc", sessionContinuity, hasTaskSession: true, configuredModel: "next", configMetadata: next, taskSessionParams: { __paperclipConfiguredModel: "prior", __paperclipConfigFingerprint: saved.fingerprint, __paperclipConfigFingerprintVersion: saved.version, __paperclipConfigCategoryFingerprints: saved.categoryFingerprints } }).reset).toBe(sessionContinuity === "paperclip");
+  }
+});
+it.each(["codex", "acpx", "opencode"])("keeps stock model reset/fingerprints for non-Pi %s even with continuous selected", async provider => {
+  const metadata = (model: string) => buildEffectiveRunSessionConfigMetadata({ ...baseInput,
+    effectiveAdapterConfig: { provider, sessionContinuity: "continuous", model }, issueOverrides: { adapterConfig: { model } } });
+  const saved = await metadata("prior"), next = await metadata("next");
+  expect(next.fingerprint).not.toBe(saved.fingerprint);
+  expect(resolveTaskSessionConfigFreshness({ provider, sessionContinuity: "continuous", hasTaskSession: true, configuredModel: "next", configMetadata: next,
+    taskSessionParams: { __paperclipConfiguredModel: "prior", __paperclipConfigFingerprint: saved.fingerprint,
+      __paperclipConfigFingerprintVersion: saved.version, __paperclipConfigCategoryFingerprints: saved.categoryFingerprints } }).reset).toBe(true);
+});
+
 describe("session fingerprint keeps sessions across non-thread changes", () => {
   it.each<[string, Partial<MetadataInput>]>([
     ["a new config revision, even one that restores the same values",

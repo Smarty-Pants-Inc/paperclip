@@ -2,7 +2,7 @@ import { and, eq } from "drizzle-orm";
 import { agentWakeupRequests, agents, heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { parseObject } from "../../adapters/utils.js";
 import { withQueuedCommentIdsInRunContext, withQueuedCommentIdsInWakePayload } from "../issue-queued-comment-queue.js";
-import { resolveSessionContinuity } from "./continued-session.js";
+import { readNativeSessionContinuity, resolveSessionContinuity } from "./continued-session.js";
 import { recoverContinuousNativeReplies } from "./native-continuous-reply.js";
 
 /** Hand unanswered delivery receipts back to the ordinary deferred queue before release. */
@@ -20,9 +20,10 @@ export async function requeueContinuousUnanswered(db: Db, scope: { id: string; c
       .for("update", { of: heartbeatRuns });
     // A run that ended normally answered every prompt Pi took (a person's Stop returns the rest itself); only a run that
     // died mid-answer can leave an acknowledged comment unanswered, so only that hands comments to the next run.
+    const savedProvider = parseObject(parseObject(parseObject(row?.run.runnerProfileJson).nativeExecutionInput).provider).kind;
     if (!issue || !row || !["failed", "cancelled", "timed_out", "interrupted"].includes(row.run.status) ||
-        row.run.runtimeMode !== "native" || row.config.provider !== "pi_rpc" ||
-        resolveSessionContinuity("pi_rpc", row.config.sessionContinuity) !== "continuous") return;
+        row.run.runtimeMode !== "native" || (savedProvider ?? row.config.provider) !== "pi_rpc" ||
+        resolveSessionContinuity("pi_rpc", readNativeSessionContinuity(row.run.runnerProfileJson) ?? row.config.sessionContinuity) !== "continuous") return;
     const result = parseObject(row.run.resultJson);
     // Nothing self-starts after a person's Stop (0260): whatever was not taken went back to their input box.
     if (result.continuousUnansweredWakeId || (parseObject(result.personStop).requestedAt !== undefined && !parseObject(result.personStop).resumedAt)) return;
