@@ -43,7 +43,7 @@ import {
   nativeRunFinalizations,
 } from "@paperclipai/db";
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
-import { readQueuedInteractionResponse } from "../../../services/queued-interaction-response.js";
+import { hasConsumedInteractionResponse, readQueuedInteractionResponse } from "../../../services/queued-interaction-response.js";
 import { legacyExecutionNeedsReconciliationWithEvidence } from "../../../services/legacy-execution-recovery.js";
 import {
   authorizeFailedChatRunRetryWake,
@@ -474,6 +474,10 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         reason: activePauseHold.reason,
         releasePolicy: activePauseHold.releasePolicy,
       };
+    },
+
+    async hasConsumedInteractionResponse(input) {
+      return hasConsumedInteractionResponse(tx, input);
     },
 
     async owedInteractionAnswer({ companyId, issueId, payload }) {
