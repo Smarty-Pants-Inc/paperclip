@@ -1,3 +1,4 @@
+import { resolveSessionContinuity } from "../native-runtime/continued-session.js";
 import { preserveAcceptedRunUsageProjectionSql } from "../usage-receipts.js";
 import { isContextCompactionRun } from "../context-compaction.js";
 import { providerFailureFromError } from "../../vendor/paperclip-runner/index.js";
@@ -850,19 +851,20 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       let resolvedPresentationDecision: RunPresentationDecision | null =
         null;
       try {
+        const finalAgentMessage =
+          await measureRunPhase("response.resolve", () => findLatestCompletedFinalAgentMessage(
+            livenessRun.id,
+            livenessRun.companyId,
+          ));
         const existingRunComment = issueId
           ? await measureRunPhase("response.resolve", () => findRunIssueComment(
               livenessRun.id,
               livenessRun.companyId,
               issueId,
               persistedResultJson,
+              finalAgentMessage?.replyKey,
             ))
           : null;
-        const finalAgentMessage =
-          await measureRunPhase("response.resolve", () => findLatestCompletedFinalAgentMessage(
-            livenessRun.id,
-            livenessRun.companyId,
-          ));
         const externalChatPresentationCandidate = isChatOriginPublicationCandidate(livenessRun.contextSnapshot);
         const externalChatPresentationAuthorization =
           issueId && externalChatPresentationCandidate
@@ -1384,7 +1386,10 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     });
 
     const stoppedDuringFailure = signal.aborted;
-    const stopSnapshot = stoppedDuringFailure ? await getRun(run.id) : null;
+    const config = parseObject(agent.adapterConfig);
+    const continuousPi = run.runtimeMode === "native" && config.provider === "pi_rpc" &&
+      resolveSessionContinuity("pi_rpc", config.sessionContinuity) === "continuous";
+    const stopSnapshot = stoppedDuringFailure || continuousPi ? await getRun(run.id) : null;
     const failureOutcome = stoppedDuringFailure ? "cancelled" : "failed";
     const nativePreDispatchFailure = !stoppedDuringFailure && nativeTerminalFailureCode === null
       ? await nativePreDispatchFailureResult(run.id, nativeDispatchMayHaveStarted) : null;
