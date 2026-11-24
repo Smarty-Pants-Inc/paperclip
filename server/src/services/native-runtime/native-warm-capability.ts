@@ -18,7 +18,7 @@ export function resolveWarmProviderSelection(adapterConfig: unknown, companyId?:
 
 /** Providers with a session-owned home and the current instruction-grant handoff. */
 export function supportsNativeWarmFiles(profile: WarmProviderSelection): boolean {
-  return profile.backend === "codex_app_server" ||
+  return profile.backend === "codex_app_server" || profile.backend === "pi_rpc" ||
     (profile.backend === "acpx_runtime" && profile.acpxAgent === "copilot");
 }
 
