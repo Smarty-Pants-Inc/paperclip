@@ -16,6 +16,7 @@ import { REPOSITORY_CATALOG_UNAVAILABLE_CODE } from "./repository-catalog-unavai
 import { RUNNER_REVISION_MISMATCH_CODE } from "./runner-revision-mismatch.js";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { normalizeMaxTurnStopReason } from "./heartbeat-stop-metadata.js";
+import { preservePersonStopResultSql } from "./person-stop-result.js";
 import { claimedAdapterType, hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { canonicalExecutionUuid } from "./execution-identity.js";
 import { randomUUID } from "node:crypto";
@@ -227,6 +228,9 @@ export async function terminalizeLegacyExecution(input: {
       .set({
         status: input.recordRestoreFailureOnly ? current.status : status,
         ...patch,
+        ...(status === "failed" && patch?.resultJson !== undefined ? {
+          resultJson: preservePersonStopResultSql(sql`${JSON.stringify(patch.resultJson)}::jsonb`),
+        } : {}),
         executionStatusDeliveryId: input.recordRestoreFailureOnly || current.status !== status || Object.keys(patch ?? {}).length > 0
           ? randomUUID() : current.executionStatusDeliveryId,
         updatedAt: new Date(),

@@ -13,6 +13,7 @@ import { notifyNativeRecoveryNotices } from "../native-recovery-notice-notificat
 import { notifyNativeRunProjection } from "../native-run-projection-notifications.js";
 import { notifyRetainedNativeSessionCleanup } from "../retained-native-session-cleanup-notifications.js";
 import { notifyUnsafeWorkspaceExportRunChange } from "../unsafe-workspace-export-notifications.js";
+import { preservePersonStopResultSql } from "../person-stop-result.js";
 import { notifyCancelledWorkspacePreservation } from "../cancelled-workspace-preservation-notifications.js";
 import { notifyInstructionCollection } from "../instruction-collection-notifications.js";
 import { notifyScheduledRetryCancellation } from "../scheduled-retry-cancellation-notifications.js";
@@ -697,7 +698,7 @@ function readNonEmptyString(value: unknown): string | null {
 }
 
 function preserveNativeExecutionObligationsSql(incoming: Record<string, unknown> | null, setupFailure = false) {
-  const projected = incoming === null ? sql`null::jsonb` : sql`${JSON.stringify(incoming)}::jsonb`;
+  const projected = preservePersonStopResultSql(incoming === null ? sql`null::jsonb` : sql`${JSON.stringify(incoming)}::jsonb`);
   const result = setupFailure ? sql`case when ${heartbeatRuns.runtimeMode} = 'native'
     and exists (select 1 from ${nativeRunFinalizations}
       where ${nativeRunFinalizations.runId} = ${heartbeatRuns.id}
