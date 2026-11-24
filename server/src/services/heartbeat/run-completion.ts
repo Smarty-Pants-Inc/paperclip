@@ -8,6 +8,7 @@ import { GENERIC_RUN_FAILURE_CODES, NATIVE_PRE_DISPATCH_FAILURE_CODE, NATIVE_PRE
 import { INTERRUPTED_PREPARATION_RETRY_REASON } from "../execution-recovery-attempt.js";
 import { PREDECESSOR_RETIREMENT_FALLBACK_KEY, readPredecessorRetirementFallback, type PredecessorRetirementFallback } from "../native-runtime/predecessor-retirement.js";
 import { releaseUnchangedFallbackWorkspace } from "./predecessor-retirement-fallback.js";
+import { publishNativeFreshSessionNotice } from "../native-runtime/remote-warm-session-recovery.js";
 import { hasNativeExecutionStartEvidence } from "../native-runtime/native-restart-recovery.js";
 import { isSandboxProviderDiskFullError, NATIVE_SANDBOX_DISK_FULL } from "../native-runtime/native-sandbox-disk-full.js";
 import { withoutSqlStatementText } from "@paperclipai/shared";
@@ -1260,26 +1261,8 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     // The continuity break is already known. Publish it before workspace or
     // coordinator cleanup can refuse/throw; neither may hide the failed session.
     if (fallback.freshSessionRequired && run.issueId) {
-      const notices = await db.transaction(async tx => {
-        // Non-key task updates and comment FK checks must not deadlock each other.
-        const [task] = await tx.select().from(issues).where(and(eq(issues.companyId, run.companyId), eq(issues.id, run.issueId!))).for("no key update");
-        const [marker] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
-          eq(issueComments.companyId, run.companyId), eq(issueComments.issueId, run.issueId!),
-          eq(issueComments.createdByRunId, run.id), isNotNull(issueComments.conversationSessionGeneration))).limit(1);
-        if (task && !marker) {
-          const now = new Date();
-          return tx.insert(issueComments).values([
-            { companyId: run.companyId, issueId: task.id, createdByRunId: run.id, authorType: "system", createdAt: now,
-              body: `The previous session could not be stopped safely. [This run failed](/agents/${run.agentId}/runs/${run.id}); a fresh session is required for the next attempt. Earlier messages remain available.` },
-            { companyId: run.companyId, issueId: task.id, createdByRunId: run.id, authorType: "system", createdAt: new Date(now.getTime() + 1),
-              body: "New session", conversationSessionGeneration: task.conversationSessionGeneration },
-          ]).returning();
-        }
-        return [];
-      });
-      for (const notice of notices) await logActivity(db, { companyId: run.companyId, actorType: "system", actorId: "native-runtime",
-        agentId: run.agentId, runId: run.id, issueId: run.issueId, action: "issue.comment_added", entityType: "issue", entityId: run.issueId,
-        details: { commentId: notice.id, bodySnippet: notice.body.slice(0, 120), source: "pi_retirement_fallback" } });
+      await publishNativeFreshSessionNotice(db, { companyId: run.companyId, agentId: run.agentId,
+        issueId: run.issueId, runId: run.id });
     }
     // Files this run's setup may have written are never dropped: without the
     // shared unchanged-files proof the workspace stays dirty and preserved.
