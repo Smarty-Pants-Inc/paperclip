@@ -1062,6 +1062,10 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
     const payload = record(envelope.payload);
     if (!payload) continue;
     const ts = timestamp(event, envelope);
+    if (event.eventType === "turn.started") {
+      entries.push({ kind: "system", ts, text: "Turn started" });
+      continue;
+    }
 
     const itemId = normalizedItemId(envelope, payload);
     const itemIdentity = resolveItemIdentity(
