@@ -109,11 +109,13 @@ function Viewer({
   description,
   action,
   children,
+  dataView = false,
 }: {
   title: string;
   description: string;
   action: string;
   children: ReactNode;
+  dataView?: boolean;
 }) {
   return (
     <Dialog>
@@ -122,12 +124,16 @@ function Viewer({
           {action}
         </Button>
       </DialogTrigger>
-      <DialogContent className="max-h-dvh overflow-y-auto sm:max-w-2xl">
-        <DialogHeader>
-          <DialogTitle className="pr-6">{title}</DialogTitle>
+      <DialogContent className={dataView
+        ? "flex max-h-(--sz-calc-18) flex-col overflow-hidden sm:max-w-5xl"
+        : "max-h-dvh overflow-y-auto sm:max-w-2xl"}>
+        <DialogHeader className={dataView ? "shrink-0 break-words pr-6" : undefined}>
+          <DialogTitle className={dataView ? undefined : "pr-6"}>{title}</DialogTitle>
           <DialogDescription>{description}</DialogDescription>
         </DialogHeader>
-        {children}
+        {dataView ? <div className="min-h-0 space-y-4 overflow-auto" role="region" aria-label={title} tabIndex={0}>
+          {children}
+        </div> : children}
       </DialogContent>
     </Dialog>
   );
@@ -450,11 +456,11 @@ export interface DataCardProps extends ArtifactIdentity {
   downloadUrl?: string;
   actions?: ReactNode;
 }
-function DataTable({ columns, rows }: Pick<DataCardProps, "columns" | "rows">) {
+function DataTable({ columns, rows, stackOnMobile = false }: Pick<DataCardProps, "columns" | "rows"> & { stackOnMobile?: boolean }) {
   return (
     <div className="overflow-x-auto">
-      <table className={cn("w-full text-left text-xs", ANALYTICS_MASK_CLASS)}>
-        <thead>
+      <table className={cn("w-full text-left text-xs", ANALYTICS_MASK_CLASS, stackOnMobile && "max-lg:block")}>
+        <thead className={stackOnMobile ? "max-lg:hidden" : undefined}>
           <tr>
             {columns.map((column, i) => (
               <th
@@ -466,12 +472,13 @@ function DataTable({ columns, rows }: Pick<DataCardProps, "columns" | "rows">) {
             ))}
           </tr>
         </thead>
-        <tbody>
+        <tbody className={stackOnMobile ? "max-lg:block" : undefined}>
           {rows.map((row, i) => (
-            <tr key={i}>
-              {columns.map((_, j) => (
-                <td key={j} className="border-b border-border/50 px-3 py-3">
-                  {row[j] ?? ""}
+            <tr key={i} className={stackOnMobile ? "max-lg:block max-lg:py-2" : undefined}>
+              {columns.map((column, j) => (
+                <td key={j} className={cn("border-b border-border/50 px-3 py-3", stackOnMobile && "max-lg:grid max-lg:grid-cols-2 max-lg:gap-3 max-lg:wrap-anywhere")}>
+                  {stackOnMobile && <span className="font-medium text-muted-foreground lg:hidden">{column}</span>}
+                  <span>{row[j] ?? ""}</span>
                 </td>
               ))}
             </tr>
@@ -516,8 +523,9 @@ export function DataCard(props: DataCardProps) {
               title={props.title}
               description={props.filename}
               action="View data"
+              dataView
             >
-              <DataTable {...props} />
+              <DataTable {...props} stackOnMobile />
               <Button asChild variant="outline" size="sm" className="w-fit">
                 <a
                   download={props.filename}
