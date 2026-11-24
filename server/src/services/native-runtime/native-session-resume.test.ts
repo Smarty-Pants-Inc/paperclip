@@ -234,6 +234,21 @@ function previousRun(overrides: Record<string, unknown> = {}) {
 }
 
 describe("capability-gated connection tool refresh", () => {
+  it("rebinds changed Pi instructions only under continuous without changing its normalized identity", () => {
+    const prior = execution(previousRunId), current = execution(currentRunId);
+    for (const value of [prior, current]) { value.provider = { kind: "pi_rpc", model: "provider/model" }; value.session.driverKind = "pi_rpc"; }
+    const source = previousRun({ nativeExecutionInput: prior });
+    source.runnerProfileJson.sessionCheckpoint.driverKind = "pi_rpc";
+    current.runtimeContext.instructions.bundle.digest = "b".repeat(64);
+    current.runtimeContext.aggregateDigest = canonicalNativeRuntimeContextDigest(current.runtimeContext);
+    for (const sessionContinuity of ["continuous", "paperclip"]) {
+      const result = buildNativeExecutionWithCheckpoint({ previousRun: source, normalizedSessionId, sessionContinuity, buildExecution: () => current });
+      expect(result.normalizedSessionId === normalizedSessionId).toBe(sessionContinuity === "continuous");
+      expect(!!result.checkpoint).toBe(sessionContinuity === "continuous");
+    }
+    current.binding.agentId = randomUUID();
+    expect(rebindNativeSessionCheckpoint({ previousRun: source, currentExecution: current, sessionContinuity: "continuous" })).toBeNull();
+  });
   it("retains the exact provider session for an MCP-only change when the harness supports it", () => {
     const current = execution(currentRunId);
     current.runtimeContext.mcp.digest = "b".repeat(64);

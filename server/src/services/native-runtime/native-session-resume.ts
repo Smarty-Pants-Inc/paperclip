@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
+import { resolveSessionContinuity } from "./continued-session.js";
 import { and, desc, eq, exists, inArray, isNotNull, ne, not, notInArray, or, sql } from "drizzle-orm";
 import {
   heartbeatRunEvents, heartbeatRuns, nativeRunFinalizations, nativeRunnerCheckpoints, nativeRunResults, type Db,
@@ -548,6 +549,7 @@ export function buildNativeExecutionWithCheckpoint(input: {
   previousRun:
     Parameters<typeof rebindNativeSessionCheckpoint>[0]["previousRun"] | null;
   normalizedSessionId: string;
+  sessionContinuity?: unknown;
   executionTargetKind?: NativeToolExecutionTargetKind;
   toolRefreshOnResume?: boolean;
   refreshTools?: boolean;
@@ -575,6 +577,7 @@ export function buildNativeExecutionWithCheckpoint(input: {
       const retainedCheckpoint = rebindNativeSessionCheckpoint({
         previousRun: input.previousRun,
         currentExecution: retainedFormat,
+        sessionContinuity: input.sessionContinuity,
         executionTargetKind: input.executionTargetKind,
         toolRefreshOnResume: input.toolRefreshOnResume,
         refreshTools: input.refreshTools,
@@ -586,6 +589,7 @@ export function buildNativeExecutionWithCheckpoint(input: {
     ? rebindNativeSessionCheckpoint({
         previousRun: input.previousRun,
         currentExecution: execution,
+        sessionContinuity: input.sessionContinuity,
         executionTargetKind: input.executionTargetKind,
         toolRefreshOnResume: input.toolRefreshOnResume,
         refreshTools: input.refreshTools,
@@ -634,6 +638,7 @@ export function rebindNativeSessionCheckpoint(input: {
     runnerProfileJson: unknown;
   };
   currentExecution: NativeExecutionInput;
+  sessionContinuity?: unknown;
   executionTargetKind?: NativeToolExecutionTargetKind;
   toolRefreshOnResume?: boolean;
   refreshTools?: boolean;
@@ -702,8 +707,8 @@ export function rebindNativeSessionCheckpoint(input: {
     !sameProvider(previousExecution.provider, current.provider) ||
     previousExecution.schema !== current.schema ||
     ("homeMode" in previousExecution ? previousExecution.homeMode : "isolated") !== ("homeMode" in current ? current.homeMode : "isolated") ||
-    ("runtimeContext" in previousExecution &&
-      "runtimeContext" in current &&
+    (!(current.provider.kind === "pi_rpc" && resolveSessionContinuity(current.provider.kind, input.sessionContinuity) === "continuous") &&
+      "runtimeContext" in previousExecution && "runtimeContext" in current &&
       !nativeRuntimeContextsMatch(previousExecution.runtimeContext, current.runtimeContext, input.toolRefreshOnResume))
   )
     return null;

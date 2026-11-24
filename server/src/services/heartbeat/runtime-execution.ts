@@ -664,6 +664,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               responsibilitiesEnabled: context.paperclipResponsibilitiesEnabled === true,
               db,
               execution: nativeExecution,
+              sessionContinuity: resolvedConfig.sessionContinuity,
               observability,
               getFreshSessionHandoff: getNativeFreshSessionHandoff,
               refreshTools: context.refreshTools === true,
