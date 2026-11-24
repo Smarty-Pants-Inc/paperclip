@@ -232,8 +232,8 @@ struct ProviderCompletionContract {
 ///
 /// The completion contract is run-scoped and changes with each follow-up.
 /// Codex app-server never receives it (runnerd validates the claim), and the
-/// OpenCode proxy receives the current contract with each turn/start, so a
-/// replaced contract needs no cold resume for them. Other providers, a changed
+/// OpenCode and Pi proxies receive the current contract with each turn/start,
+/// so a replaced contract needs no cold resume for them. Other providers, a changed
 /// tool set, and adding or removing a contract keep the cold-resume boundary.
 fn warm_attachment_keeps_provider(
     provider: &str,
@@ -245,7 +245,9 @@ fn warm_attachment_keeps_provider(
         return false;
     }
     current == next
-        || (current.is_some() && next.is_some() && matches!(provider, "codex" | "opencode"))
+        || (current.is_some()
+            && next.is_some()
+            && matches!(provider, "codex" | "opencode" | "pi_rpc"))
 }
 
 /// Run-scoped identity a retained OpenCode proxy needs on each turn/start: its
