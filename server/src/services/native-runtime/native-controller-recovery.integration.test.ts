@@ -3,7 +3,7 @@ import { nativeProviderRecoveryEvidence, nativeSessionFailureSourceCode, restore
   verifyRemoteRunnerReattachment } from "./native-session-executor.js";
 import { readRemoteRunnerRecoveryError } from "./remote-runner-recovery-diagnostics.js";
 import { RunnerIngressConnectionError } from "../../realtime/runner-prp-outbound.js";
-import { nativeToolContractFingerprintForTarget, rebindNativeSessionCheckpoint } from "./native-session-resume.js";
+import { findNativeSessionResumeRun, nativeToolContractFingerprintForTarget, rebindNativeSessionCheckpoint } from "./native-session-resume.js";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -56,7 +56,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
     else process.env.PAPERCLIP_HOME = previousHome;
   });
 
-  async function seed() {
+  async function seed(cursor?: string) {
     const issueId = randomUUID(), runId = randomUUID();
     await db.insert(issues).values({ id: issueId, companyId, title: "Continue retained execution", assigneeAgentId: agentId, status: "in_progress" });
     const [run] = await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native", nativeIssueId: issueId }).returning();
@@ -72,7 +72,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
     await core.flushCheckpoint();
     await core.stop();
     const snapshot: PersistedNativeSession = { backendKind: "mock", sessionId: native.normalizedSessionId,
-      identity: { companyId, agentId, issueId, runId, sessionId: native.normalizedSessionId } };
+      ...(cursor ? { cursor } : {}), identity: { companyId, agentId, issueId, runId, sessionId: native.normalizedSessionId } };
     const [prepared] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     const [result] = await db.insert(nativeRunResults).values({ companyId, issueId, runId,
       completionContractId: prepared.completionContractId!, serverFingerprint: "fixture", schemaStatus: "accepted",
@@ -84,6 +84,41 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
     return { scope, native, profile, snapshot, owner,
       supervisor: { schema: "paperclip.native-session-supervisor.v1", ...compatibility, snapshot } };
   }
+
+  // Gate 7: idle saved session, message + Stop before Pi starts, then two messages.
+  it.each(["pre-dispatch", "staged"] as const)("selects the committed idle session past %s Stop and failed admissions for two messages", async stage => {
+    const fixture = await seed(stage === "staged" ? "7" : undefined);
+    expect(await importNativeControllerRecovery(db, { ...fixture.scope,
+      expectedConfigDigest: compatibility.configDigest, supervisor: fixture.supervisor })).toEqual({ kind: "imported" });
+    const baseTime = Date.now();
+    for (const [index, status] of ["cancelled", "failed", "failed"].entries()) {
+      const id = randomUUID();
+      await db.insert(heartbeatRuns).values({ id, companyId, agentId, nativeIssueId: fixture.scope.issueId,
+        nativeSessionId: fixture.scope.normalizedSessionId, runtimeMode: "native", status,
+        createdAt: new Date(baseTime + index * 10), finishedAt: new Date(baseTime + index * 10 + 1),
+        runnerProfileJson: { ...fixture.profile, nativeControllerRecovery: undefined,
+          nativeExecutionInput: { staged: true }, sessionCheckpoint: { ...fixture.snapshot,
+          cursor: stage === "staged" ? fixture.snapshot.cursor : null,
+          identity: { ...fixture.snapshot.identity, runId: id } } },
+        resultJson: status === "cancelled" ? { nativeCancellation: { beforeStart: true } } : {},
+      });
+    }
+    for (let message = 0; message < 2; message++) {
+      const currentRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: currentRunId, companyId, agentId, nativeIssueId: fixture.scope.issueId,
+        nativeSessionId: fixture.scope.normalizedSessionId, runtimeMode: "native", status: "running",
+        createdAt: new Date(baseTime + 100 + message) });
+      const barrier = await findNativeSessionResumeRun(db, { ...fixture.scope, currentRunId,
+        beforeCreatedAt: new Date(baseTime + 100 + message) });
+      expect(barrier?.id).toBe(fixture.scope.runId);
+      const recovered = await resolveNativeControllerRecovery(db, { ...fixture.scope, currentRunId });
+      expect(recovered.kind).toBe("recoverable");
+      if (recovered.kind !== "recoverable") throw new Error(JSON.stringify(recovered));
+      expect(recovered.metadata.checkpoint?.runId).toBe(fixture.scope.runId);
+      expect(recovered.snapshot.sessionId).toBe(fixture.snapshot.sessionId);
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, currentRunId));
+    }
+  });
 
   it("imports a retained source once, rejects stale input, and resolves it without any local projection", async () => {
     const fixture = await seed();
