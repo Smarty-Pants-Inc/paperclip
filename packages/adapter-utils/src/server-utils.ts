@@ -559,6 +559,7 @@ type PaperclipWakeComment = {
   id: string | null;
   issueId: string | null;
   body: string;
+  fullBody?: string;
   bodyTruncated: boolean;
   createdAt: string | null;
   authorType: string | null;
@@ -938,11 +939,12 @@ function normalizePaperclipWakeComment(
   const comment = parseObject(value);
   const author = parseObject(comment.author);
   const body = asString(comment.body, "");
-  if (!body.trim()) return null;
+  if (!body.trim() && typeof comment.fullBody !== "string") return null;
   return {
     id: asString(comment.id, "").trim() || null,
     issueId: asString(comment.issueId, "").trim() || null,
     body,
+    ...(typeof comment.fullBody === "string" ? { fullBody: comment.fullBody } : {}),
     bodyTruncated: asBoolean(comment.bodyTruncated, false),
     createdAt: asString(comment.createdAt, "").trim() || null,
     authorType: asString(author.type, "").trim() || null,
