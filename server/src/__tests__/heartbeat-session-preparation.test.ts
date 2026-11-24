@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, agentTaskSessions, authUsers, companies, companyMemberships, createDb, executionWorkspaces, environments, heartbeatRuns, issues, plugins, projects } from "@paperclipai/db";
+import { agents, agentTaskSessions, authUsers, companies, companyMemberships, createDb, executionWorkspaces, environments, heartbeatRuns, issueComments, issues, plugins, projects } from "@paperclipai/db";
 import { getServerAdapter, registerServerAdapter, unregisterServerAdapter, type AdapterExecutionContext } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
@@ -282,6 +282,32 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
         reset: sessionContinuity !== "continuous", taskSessionReused: sessionContinuity === "continuous", changedCategories: ["adapterConfig"],
       } } });
     }
+  });
+
+  it.each([
+    ["pi_rpc", undefined, true], ["pi_rpc", "paperclip", false],
+    ["codex", undefined, false], ["codex", "continuous", true],
+  ])("selects whole history only for effective continuous (%s, %s)", async (provider, sessionContinuity, whole) => {
+    const f = await seed();
+    await db.update(agents).set({ adapterConfig: { model: "model-a", provider, sessionContinuity } }).where(eq(agents.id, f.agentId));
+    const body = "HISTORY:" + "z".repeat(6_000);
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorUserId: f.userId, body });
+    const next = await execute(f);
+    expect(next.input.context.paperclipFreshSessionHandoffMarkdown).toEqual(expect.any(String));
+    expect(String(next.input.context.paperclipFreshSessionHandoffMarkdown).includes(body)).toBe(whole);
+  });
+
+  it("excludes the current wake and all coalesced comments from dispatched fresh history", async () => {
+    const f = await seed();
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", model: "model-a" } }).where(eq(agents.id, f.agentId));
+    const ids = [randomUUID(), randomUUID(), randomUUID()];
+    await db.insert(issueComments).values(ids.map((id, i) => ({ id, companyId: f.companyId, issueId: f.issueId,
+      authorUserId: f.userId, body: ["EARLIER HISTORY", "QUEUED CURRENT REQUEST", "LATEST CURRENT REQUEST"][i],
+      createdAt: new Date(Date.now() - 3_000 + i * 1_000) })));
+    const next = await execute(f, { wakeCommentId: ids[2], commentId: ids[2], wakeCommentIds: ids.slice(1) });
+    const history = String(next.input.context.paperclipFreshSessionHandoffMarkdown);
+    expect(history).toContain("EARLIER HISTORY");
+    expect(history).not.toMatch(/(?:QUEUED|LATEST) CURRENT REQUEST/);
   });
 
   it("starts fresh when effective model configuration changes and persists the reason", async () => {
