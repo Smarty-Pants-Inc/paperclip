@@ -1775,11 +1775,12 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         settledRunIds.add(source.id);
         continue;
       }
-      const openSegments = source.id === liveRun?.id && isNativePaperclipRunnerRun(source) && (steeringAnchorsByRun.get(source.id)?.length ?? 0) > 0;
+      const openSegments = source.id === liveRun?.id && isNativePaperclipRunnerRun(source);
       if (!isTerminalRunStatus(source.status) && !openSegments) continue;
       if (liveRun && runChainIdsById.get(liveRun.id)?.includes(source.id) && !openSegments) continue;
       const entries = transcriptByRun.get(source.id) ?? [];
-      const meta = linkedRunMetaById.get(source.id);
+      const meta: NonNullable<TaskChatThreadProps["linkedRuns"]>[number] | undefined = linkedRunMetaById.get(source.id) ??
+        (openSegments && liveRun ? { ...liveRun, runId: source.id } : undefined);
       const credentialAccess = credentialAccessNotice(meta ? {
         ...meta,
         agentName: meta.agentName || agentMap?.get(meta.agentId)?.name,
@@ -2281,7 +2282,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       ): TaskChatMessageItem | undefined => {
         if (!sourceIsPaperclipRunner) return undefined;
         const lastSegment = segmentIndex === lastPopulatedSegmentIndex;
-        if (timelineAnchors.length > 0) {
+        if (timelineAnchors.length > 0 || openSegments) {
           const segment = segments[segmentIndex]!;
           const final = paperclipRunnerFinalResponse(parsed, { ...yieldedOptions, yielded: sourceYielded });
           // Persistence may lag the next question; pair repeated answers in transcript order.
@@ -2319,8 +2320,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       };
       for (const [segmentIndex, projected] of projectedSegments.entries()) {
         const { segment, parsed } = projected;
-        if (segment.entries.length === 0 || (openSegments && segmentIndex === segments.length - 1)) continue;
+        if (segment.entries.length === 0) continue;
         const finalResponse = settledSegmentFinalResponse(segmentIndex, parsed);
+        // An answered open segment already owns its slot before the next queued message arrives.
+        const finalEntry = segment.entries.findLast(entry => entry.kind === "assistant" && entry.channel === "final");
+        if (openSegments && segmentIndex === segments.length - 1 && (!finalResponse || finalEntry?.kind !== "assistant" || finalEntry.delta)) continue;
         const runHealth = {
           failures: projectedSegments[segmentIndex]?.mcpStartupFailures ?? [],
           rest: partitionRunHealthItems(omitProgressRepeatedByResponseAcrossSegments(
@@ -2343,7 +2347,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         }
         settledRunIds.add(source.id);
         if (finalResponse) settledReplyRunIds.add(source.id);
-        const segmented = timelineAnchors.length > 0;
+        const segmented = timelineAnchors.length > 0 || openSegments;
         const turnId = segmented
           ? `${source.id}:turn:${segmentIndex}`
           : `${source.id}:turn`;
@@ -2586,12 +2590,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     const tail: TaskChatItem[] = [];
     for (const item of items) {
       if (item.kind === "turn" && (runChainIdsById.get(tailRunId) ?? [tailRunId])
-        .some((id) => item.id.startsWith(`${id}:turn`) && !(id === tailRunId &&
-          item.id !== `${id}:turn:${steeringAnchorsByRun.get(id)?.length}` && (steeringAnchorsByRun.get(id)?.length ?? 0) > 0))) continue;
+        .some((id) => item.id.startsWith(`${id}:turn`) && !(id === liveRun?.id && isNativePaperclipRunnerRun(liveRun) && item.id.startsWith(`${id}:turn:`)))) continue;
       (coordinatorEnabled && taskCreationSourceRunId(item) === tailRunId ? tail : body).push(item);
     }
     return [body, tail];
-  }, [items, coordinatorEnabled, tailRunId, runChainIdsById, steeringAnchorsByRun]);
+  }, [items, coordinatorEnabled, tailRunId, runChainIdsById, liveRun]);
   const tailStreaming = Boolean(liveRun) && !stoppingReply;
   const tailRunSource = tailRunId
     ? runs.find((run) => run.id === tailRunId)
@@ -2624,6 +2627,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const tailSegments = splitTranscriptAtAnchors(tailRunId ? (transcriptByRun.get(tailRunId) ?? []) : [],
     toMs(linkedRunMetaById.get(tailRunId ?? "")?.startedAt ?? tailRunSource?.createdAt), tailTimelineAnchors);
   const tailSegment = tailSegments[tailSegments.length - 1]!;
+  const tailSegmentSettled = paperclipRunnerTail && threadItems.some(item =>
+    item.kind === "turn" && item.id === `${tailRunId}:turn:${tailSegments.length - 1}`);
   const tailEntries = paperclipRunnerTail ? tailSegment.entries : (tailRunId ? (transcriptByRun.get(tailRunId) ?? []) : []);
   const tailContinued = paperclipRunnerTail && tailTimelineAnchors.length > 0 &&
     !tailSegments[tailSegments.length - 2]?.entries.some(entry => entry.kind === "assistant" && entry.channel === "final" && !entry.delta);
@@ -3661,7 +3666,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                           optimisticRunnerStartup || requestPending ||
                           bottomBlockerLinks ? (
                             <>
-                              {!recoveryOwnsStatus && (tailRunId || optimisticRunnerStartup) ? (
+                              {!tailSegmentSettled && !recoveryOwnsStatus && (tailRunId || optimisticRunnerStartup) ? (
                                 <div key={tailRunId ? requestCommentByRun.get(tailRunId) ?? tailRunId : latestUserComment?.id} data-testid="task-chat-live-transcript">
                                   <TaskChatShimmerScope items={tailItems}>
                                   <TaskChatRunnerHeader
