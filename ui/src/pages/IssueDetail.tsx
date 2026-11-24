@@ -2297,7 +2297,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     const pendingIds = new Set(pendingComments.map(({ comment }) => comment.id));
     const entries = queue.entries.filter(entry => !startingCommentIds.has(entry.comment.id))
       .map((entry, position) => ({ ...entry, position, canDiscard: entry.canDiscard && !pendingIds.has(entry.comment.id) }));
-    return entries.length ? { ...queue, entries } : null;
+    return entries.length || queue.pendingQueue?.entries.length ? { ...queue, entries } : null;
   }, [effectiveQueuedCommentQueue, startingCommentIds, localSteeringPlacements, commentsWithRunMeta, issueId]);
   const commentsForThread = useMemo(
     () =>
@@ -2546,7 +2546,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
 
   const discardQueuedComment = useCallback(
     async (commentId: string, revision: string) => {
-      const queueId = effectiveQueuedCommentQueue?.queueId;
+      const queueId = effectiveQueuedCommentQueue?.entries.some(entry => entry.comment.id === commentId)
+        ? effectiveQueuedCommentQueue.queueId : null;
       try {
         if (queueId) {
           storeQueuedCommentQueue(
@@ -2604,7 +2605,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       }
     },
     [
-      effectiveQueuedCommentQueue?.queueId,
+      effectiveQueuedCommentQueue,
       issueId,
       onRemoveCommentFromCache,
       pushToast,
