@@ -1100,7 +1100,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     // even when its transcript misses the reveal budget (it stops holding the reveal and draws when it lands).
     const newestSucceededRunId = runs.filter(run => run.status === "succeeded" && run.createdAt)
       .sort((a, b) => toMs(a.createdAt) - toMs(b.createdAt)).at(-1)?.id;
-    for (const run of runs) if (slowSettledTranscriptRunIds.has(run.id) && run.id !== newestSucceededRunId) deferred.add(run.id);
+    for (const run of runs) if (run.runtimeMode !== "native" && slowSettledTranscriptRunIds.has(run.id) && run.id !== newestSucceededRunId) deferred.add(run.id);
     for (const run of runs) {
       // Native compact history now retains visible tools; a saved body alone
       // cannot stand in for the turn's activity after reload.
