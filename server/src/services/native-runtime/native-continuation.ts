@@ -7,6 +7,7 @@ import { caseInstructionAlreadyRepresented } from "../case-context.js";
  */
 export function buildNativeContinuationPrompt(input: {
   wakePayload: unknown;
+  promptOnly?: boolean;
   previousRunId: string;
   issue: { title: string; description: string | null };
   previousIssue: { title: string; description: string | null };
@@ -17,6 +18,10 @@ export function buildNativeContinuationPrompt(input: {
   previousGitHubReviewConfigurationKeys?: readonly string[];
 }): string | null {
   const wake = normalizePaperclipWakePayload(input.wakePayload);
+  if (input.promptOnly && wake) {
+    const messages = [...(wake.executionContinuation?.messages ?? wake.executionContinuation?.resumeDelta?.messages ?? []), ...wake.comments];
+    return wake.commentIds.map(id => messages.find(message => message.id === id)!.body).join("\n\n");
+  }
   const continuation = wake?.executionContinuation;
   const delta = continuation?.resumeDelta;
   if (!wake || !delta || delta.baseRunId !== input.previousRunId) return null;
