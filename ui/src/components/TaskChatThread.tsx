@@ -165,7 +165,7 @@ import { issuesApi } from "@/api/issues";
 import { queryKeys } from "@/lib/queryKeys";
 import { useQueryClient } from "@tanstack/react-query";
 import { TaskChatPresentationProvider } from "@/components/task-chat/presentation-mode";
-import { isRunStopConfirmed } from "@/lib/wait-for-stopped-runs";
+import { isHeldTurnStopConfirmed, isRunStopConfirmed } from "@/lib/wait-for-stopped-runs";
 import { safeNavigableUrl } from "@/lib/safe-url";
 
 const EMPTY_BROWSERS: TaskBrowser[] = [];
@@ -1010,12 +1010,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const isUserStop = useCallback((id: string) => {
     const meta = linkedRunMetaById.get(id);
     const cancellation = meta?.resultJson?.cancellation as { source?: string; initiator?: { type?: string } } | undefined;
+    const stop = meta?.resultJson?.personStop as { resumedAt?: string } | undefined;
     // After a reload the run list's summary carries no cancellation source, only the Stop
     // receipt (executionCancellation) and the error code a person's Stop leaves ('cancelled').
-    return stoppedRunIds.current.has(id) || (cancellation?.source === "operator" && cancellation.initiator?.type === "user") ||
+    return (stoppedRunIds.current.has(id) && !stop?.resumedAt) || (cancellation?.source === "operator" && cancellation.initiator?.type === "user") ||
       (meta?.errorCode === "cancelled" && Boolean(meta?.resultJson?.executionCancellation)) ||
-      // A person's Stop of a Pi turn ends the run normally; the server marks it (resultJson.personStop).
-      Boolean(meta?.resultJson?.personStop);
+      // The held turn, not the open run, stopped. Its next accepted message releases the mark.
+      Boolean(stop && !stop.resumedAt);
   }, [linkedRunMetaById]);
   // Retries of one request join runs; session continuity across new messages does not.
   const runChainIdsById = useMemo(() => {
@@ -1054,14 +1055,15 @@ export function TaskChatThread(props: TaskChatThreadProps) {
 
   // Pi's Stop (Esc): the messages it hadn't taken go back into the stopping person's input box, once.
   // Keyed on state (his returned messages still exist), so a reload or another of his devices restores too.
-  const restoredStopRunIds = useRef(new Set<string>());
+  const restoringStopCommentIds = useRef(new Set<string>());
   useEffect(() => {
-    for (const [runId, meta] of linkedRunMetaById) {
+    for (const meta of linkedRunMetaById.values()) {
       const stop = meta.resultJson?.personStop as { userId?: unknown; returned?: unknown } | undefined;
-      const returned = Array.isArray(stop?.returned) ? stop.returned.filter((id): id is string => typeof id === "string" && comments.some((comment) => comment.id === id && !comment.deletedAt && comment.authorUserId === currentUserId)) : [];
-      if (!onRestoreStoppedMessages || !currentUserId || stop?.userId !== currentUserId || returned.length === 0 || restoredStopRunIds.current.has(runId)) continue;
-      restoredStopRunIds.current.add(runId);
-      void onRestoreStoppedMessages(returned).then((done) => { if (!done) restoredStopRunIds.current.delete(runId); });
+      const returned = Array.isArray(stop?.returned) ? stop.returned.filter((id): id is string => typeof id === "string" && !restoringStopCommentIds.current.has(id) && comments.some((comment) => comment.id === id && !comment.deletedAt && comment.authorUserId === currentUserId)) : [];
+      if (!onRestoreStoppedMessages || !currentUserId || stop?.userId !== currentUserId || returned.length === 0) continue;
+      returned.forEach(id => restoringStopCommentIds.current.add(id));
+      const retry = () => returned.forEach(id => restoringStopCommentIds.current.delete(id));
+      void onRestoreStoppedMessages(returned).then(done => { if (!done) retry(); }, retry);
     }
   }, [linkedRunMetaById, comments, currentUserId, onRestoreStoppedMessages]);
   const openedAt = useMemo(() => Date.now(), [issueId]);
@@ -1216,8 +1218,16 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     return new Set(runs.filter(run => covered.has(run.id) && !isUserStop(run.id) &&
       ["failed", "cancelled", "timed_out", "interrupted"].includes(terminalStatuses.get(run.id) ?? run.status)).map(run => run.id));
   }, [runChainIdsById, props.interruption, runs, isUserStop, terminalStatuses]);
+  const liveStop = (liveRun ? linkedRunMetaById.get(liveRun.id)?.resultJson?.personStop : null) as
+    { requestedAt?: string; settledAt?: string; resumedAt?: string } | null;
+  const liveStopConfirmed = !!liveRun && !!liveStop?.requestedAt && isHeldTurnStopConfirmed({
+    id: liveRun.id, companyId: companyId ?? "", status: linkedRunMetaById.get(liveRun.id)?.status ?? liveRun.status,
+    runtimeMode: linkedRunMetaById.get(liveRun.id)?.runtimeMode ?? liveRun.runtimeMode,
+    resultJson: linkedRunMetaById.get(liveRun.id)?.resultJson ?? null,
+  }, liveStop.requestedAt);
+  const stoppedHeldReply = liveStopConfirmed && !liveStop?.resumedAt;
   const stoppingReply = !!liveRun && !isTerminalRunStatus(linkedRunMetaById.get(liveRun.id)?.status ?? liveRun.status) &&
-    ((stopPending && stoppedRunIds.current.has(liveRun.id)) || Boolean(linkedRunMetaById.get(liveRun.id)?.resultJson?.personStop));
+    (stopPending || Boolean(liveStop?.requestedAt && !liveStopConfirmed && !liveStop.resumedAt));
 
   // The live runner turn remains the sole owner of its response until the
   // canonical comment and settled activity are both ready. This state is
@@ -2657,7 +2667,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     }
     return [body, tail];
   }, [items, coordinatorEnabled, tailRunId, runChainIdsById, liveRun, runnerSegmentsById]);
-  const tailStreaming = Boolean(liveRun) && !stoppingReply;
+  const tailStreaming = Boolean(liveRun) && !stoppingReply && !stoppedHeldReply;
   const tailRunSource = tailRunId
     ? runs.find((run) => run.id === tailRunId)
     : undefined;
@@ -2908,8 +2918,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const tailTerminal = tailEntries.findLast((entry) => entry.kind === "run_terminal");
   const tailEndStatus = isTerminalRunStatus(tailRunStatus) ? tailRunStatus :
     tailTerminal?.runState ?? (tailHasFinalResponse ? "succeeded" : tailRunStatus);
-  const tailStatus = tailEndStatus === "succeeded" && isUserStop(tailRunId ?? "") ? "cancelled" : tailEndStatus;
-  const tailFinishedAtMs = tailRunFinishedAtMs ?? (tailTerminal ? toMs(tailTerminal.ts) : tailFinalRef.current.item?.atMs ?? null);
+  const tailStatus = stoppedHeldReply || (tailEndStatus === "succeeded" && isUserStop(tailRunId ?? "")) ? "cancelled" : tailEndStatus;
+  const tailFinishedAtMs = tailRunFinishedAtMs ?? (tailTerminal ? toMs(tailTerminal.ts) :
+    tailFinalRef.current.item?.atMs ?? (stoppedHeldReply ? toMs(liveStop?.settledAt) : null));
   const tailTurnStatus = useMemo(
     () =>
       isTerminalRunStatus(tailStatus)
@@ -3964,7 +3975,14 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                             comment.authorUserId === currentUserId && comment.clientRequestId &&
                             !("clientStatus" in comment && comment.clientStatus)
                           ).map((comment) => comment.clientRequestId!))}
-                          onStop={liveRun && !tailEnded && !tailHasFinalResponse && onCancelRun ? () => { stoppedRunIds.current.add(liveRun.id); return onCancelRun(); } : undefined}
+                          onStop={liveRun && !tailEnded && !tailHasFinalResponse && !stoppedHeldReply && onCancelRun ? async () => {
+                            const id = liveRun.id;
+                            stoppedRunIds.current.add(id);
+                            try { await onCancelRun(); } catch (error) {
+                              stoppedRunIds.current.delete(id);
+                              throw error;
+                            }
+                          } : undefined}
                           confirmedStoppedRunIds={confirmedStoppedRunIds}
                           stopPending={stoppingReply}
                           stopScope={stopScope}
