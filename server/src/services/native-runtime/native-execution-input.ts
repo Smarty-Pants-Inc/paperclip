@@ -265,7 +265,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
   const piConversation = input.provider === "pi_rpc" && input.conversationMode === true && input.issue.conversationAgentId === input.agentId;
   const continuation = decideNativeContinuation({ ...input, hasSession: input.resumedSession === true && !!input.previousTurn,
     taskChanged: !!input.previousTurn && (input.issue.title !== input.previousTurn.task.title || input.issue.description !== input.previousTurn.task.description),
-    wakeReset: input.conversationMode === true });
+    wakeReset: input.conversationMode === true, previousRunId: input.previousTurn?.runId });
   const runtimeContext = piConversation ? structuredClone(input.runtimeContext) : input.runtimeContext;
   if (piConversation) {
     runtimeContext.prompt.text = runtimeContext.prompt.text.replace(PAPERCLIP_EXECUTION_FINISH_INSTRUCTION, PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION);
