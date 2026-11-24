@@ -46,7 +46,7 @@ export async function publishContinuousNativeReply(input: {
   const { companyId, issueId, runId, agentId } = input.execution.binding;
   if (input.event.runId !== runId) return;
   let steerableFinal = false;
-  await input.db.transaction(async transaction => {
+  const published = await input.db.transaction(async transaction => {
     const tx = transaction as unknown as Db;
     const [issue] = await tx.select().from(issues).where(and(
       eq(issues.id, issueId), eq(issues.companyId, companyId),
@@ -69,7 +69,7 @@ export async function publishContinuousNativeReply(input: {
     steerableFinal = row.run.status === "running" && !input.recoverTerminal;
     const result = parseObject(row.run.resultJson);
     const replies = parseObject(result.continuousReplies);
-    if (replies[input.event.itemId!]) return;
+    if (replies[input.event.itemId!]) return true;
     const answered = new Set(Object.values(replies).flatMap(value => {
       const ids = parseObject(value).questionCommentIds;
       return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : [];
@@ -108,6 +108,7 @@ export async function publishContinuousNativeReply(input: {
       details: { commentId: comment.id, bodySnippet: comment.body.slice(0, 120), identifier: issue.identifier,
         issueTitle: issue.title, authorizationReason, source: "run_presentation_resolver",
         presentationSource: resolved.decision.chosenSource, sourceEventId: finalAgentMessage.sourceEventId } });
+    return true;
   });
   // Never steer inside the publication transaction: it owns the ISSUE row,
   // while steering must persist run events before taking its own ACK locks.
@@ -119,4 +120,7 @@ export async function publishContinuousNativeReply(input: {
       logger.warn({ error, companyId, issueId, runId }, "held-run person-message drain deferred");
     }
   }
+  // The executor may mark this run idle and request a reset close only after
+  // publication commits and the deferred person-message drain finishes.
+  return published;
 }
