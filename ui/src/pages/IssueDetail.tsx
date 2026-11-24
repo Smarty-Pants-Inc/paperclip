@@ -7090,11 +7090,6 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     ) => {
       if (!body.trim() && !attachmentIds?.length)
         throw new Error("Write a message or attach a file before sending.");
-      const assignee = agentMap.get(issue?.assigneeAgentId ?? "");
-      if (!reassignment && !issue?.conversationAgentId &&
-          issue?.status === "done" &&
-          assignee?.adapterType === "paperclip_runner" && assignee.adapterConfig.provider === "pi_rpc" &&
-          assignee.adapterConfig.sessionContinuity !== "paperclip") reopen = undefined;
       if (!issue?.conversationAgentId && (reassignment || runSettings)) {
         await addCommentAndReassign.mutateAsync({
           body,
@@ -7108,7 +7103,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       }
       await addComment.mutateAsync({ body, reopen, attachmentIds, clientRequestId, runSettings });
     },
-    [addComment, addCommentAndReassign, agentMap, issue?.conversationAgentId, issue?.assigneeAgentId, issue?.status],
+    [addComment, addCommentAndReassign, issue?.conversationAgentId],
   );
   const handleCommentImageUpload = useCallback(
     async (file: File) => {
