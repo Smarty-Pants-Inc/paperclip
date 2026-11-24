@@ -75,6 +75,7 @@ import {
   buildTurnSummary,
   coalesceSettledTurns,
   isTerminalRunStatus,
+  hasTranscriptWorkAfter,
   embedPlanDocumentAtWriteBoundary,
   omitProgressRepeatedByResponseAcrossSegments,
   paperclipRunnerFinalResponse,
@@ -2410,7 +2411,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         const finalResponse = settledSegmentFinalResponse(segmentIndex, parsed);
         const finalEntry = segment.entries.findLast(entry => entry.kind === "assistant" && entry.channel === "final");
         const segmentStreaming = openSegments && segmentIndex === segments.length - 1 &&
-          (!finalResponse || (finalEntry?.kind === "assistant" && finalEntry.delta === true));
+          (!finalResponse || (finalEntry?.kind === "assistant" && finalEntry.delta === true) ||
+            hasTranscriptWorkAfter(segment.entries, finalResponse.atMs));
         const runHealth = {
           failures: projectedSegments[segmentIndex]?.mcpStartupFailures ?? [],
           rest: partitionRunHealthItems(omitProgressRepeatedByResponseAcrossSegments(
@@ -2438,7 +2440,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           ? `${source.id}:turn:${segmentIndex}`
           : `${source.id}:turn`;
         const segmentKey = `${source.id}:${segmentIndex}`;
-        const answerComplete = finalResponse && !(finalEntry?.kind === "assistant" && finalEntry.delta);
+        const answerComplete = finalResponse && !segmentStreaming && !(finalEntry?.kind === "assistant" && finalEntry.delta);
+        if (segmentStreaming) liveSegmentClock.current.ends.delete(segmentKey);
         if (answerComplete && liveSegmentClock.current.liveKey === segmentKey && !liveSegmentClock.current.ends.has(segmentKey)) liveSegmentClock.current.ends.set(segmentKey, Math.max(finalResponse.atMs ?? 0, Date.now()));
         const segmentFinishedMs = liveSegmentClock.current.ends.get(segmentKey) ?? (segmented && answerComplete ? finalResponse.atMs : undefined) ?? (Number.isFinite(segment.endMs)
           ? segment.endMs
@@ -2961,7 +2964,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       item.kind === "protocol" && item.surface === "run_result" && item.disposition === "yielded"))
   )) tailFinalRef.current = { runId: tailSegmentKey };
   if (tailFinalResponse && !tailFinalStreaming) tailFinalRef.current.item = tailFinalResponse;
-  const tailHasFinalResponse = Boolean(tailFinalRef.current.item) && !tailFinalStreaming;
+  const tailHasFinalResponse = Boolean(tailFinalRef.current.item) && !tailFinalStreaming &&
+    !hasTranscriptWorkAfter(tailEntries, tailFinalRef.current.item?.atMs);
   if (liveRun && paperclipRunnerTail && !tailHasFinalResponse) liveSegmentClock.current.liveKey = `${tailRunId}:${tailSegments.length - 1}`;
   const tailTerminal = tailEntries.findLast((entry) => entry.kind === "run_terminal");
   const tailEndStatus = isTerminalRunStatus(tailRunStatus) ? tailRunStatus :
