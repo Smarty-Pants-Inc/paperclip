@@ -12979,7 +12979,36 @@ describe("native warm session supervision", () => {
         expect(admitted).toBe(false);
         expect(await f.reserve(h.db)).toBeNull();
       } else expect(await outcome).toBeNull();
-      expect(f.copy.collectStopped).toHaveBeenCalledTimes(timeout ? 2 : 1);
+      expect(f.close).toHaveBeenCalledOnce();
+      expect(f.copy.collectStopped).toHaveBeenCalledOnce();
+    });
+
+    it("does not retire a live warm successor before onSession publishes its run ID", async () => {
+      const f = await start("terminal-holder-live-before-on-session");
+      const reservation = await f.reserve(async () => true);
+      const nextRunId = "terminal-holder-live-before-on-session-two";
+      const next = { ...f.current, binding: { ...f.current.binding, runId: nextRunId } };
+      let entered!: () => void, release!: () => void;
+      const ready = new Promise<void>(resolve => { entered = resolve; });
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      state.execute.mockImplementationOnce(async options => {
+        entered(); await gate;
+        await options.onSession?.(f.session);
+        return result;
+      });
+      const running = f.run(next, { ...f.copy, runId: nextRunId });
+      onTestFinished(async () => { release(); await running; });
+      await ready;
+      const h = holderDb({ [f.current.binding.runId]: "succeeded", [nextRunId]: "running" });
+      try {
+        await expect(reserveWarmNativeInstructionDirectory({ db: h.db,
+          companyId: f.current.binding.companyId, agentId: f.current.binding.agentId,
+          previousRunId: f.current.binding.runId, runId: "terminal-holder-live-before-on-session-three",
+          target: f.target, canReuse: async () => true })).rejects.toThrow("native_session_supervisor_busy");
+        expect(h.holders).toEqual([nextRunId]);
+        expect(f.close).not.toHaveBeenCalled();
+        expect(f.copy.collectStopped).not.toHaveBeenCalled();
+      } finally { release(); await running; await reservation!.release(); }
     });
 
     it("keeps a terminal busy holder registered when retirement fails, then retries containment", async () => {

@@ -753,6 +753,8 @@ type WarmNativeSession = {
   closeFailureEvidenceLogged?: boolean;
   /** A successor's retirement of this owner failed; it stays registered for its own sandbox. */
   retirementUnproven?: boolean;
+  /** Terminal-holder close/collection completed; only startup cleanup remains. */
+  terminalHolderRetired?: boolean;
   observabilityCompatibilityKey?: string;
   runId: string;
   issueId: string;
@@ -1149,7 +1151,10 @@ export async function reserveWarmNativeInstructionDirectory(input: {
       const startup = nativeSessionStartups.get(holderRunId);
       delete entry.finishRelease;
       const retirement = (async () => {
-        await retireWarmPredecessor(entry, entry.closeOnReleaseReason!);
+        if (!entry.terminalHolderRetired) {
+          await retireWarmPredecessor(entry, entry.closeOnReleaseReason!);
+          entry.terminalHolderRetired = true;
+        }
         if (startup) {
           let timer: ReturnType<typeof setTimeout> | undefined;
           try {
@@ -12745,6 +12750,9 @@ async function executePaperclipNativeSessionAttempt(
         }
         entry.instructionPreparationRunId = undefined;
         entry.instructionWorkingCopy = input.instructionWorkingCopy?.checkpointWarm ? undefined : input.instructionWorkingCopy;
+        // Non-runnerd turns have no executing scope: publish their live holder
+        // before busy becomes visible to a directory reservation.
+        entry.runId = input.execution.binding.runId;
         entry.busy = true;
         entry.ownerToken = warmSessionOwnerToken;
         reusingReleasedRunner = entry.released === true;
