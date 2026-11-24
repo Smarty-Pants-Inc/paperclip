@@ -63,6 +63,7 @@ export const PAPERCLIP_RUNNER_ADAPTER_CONFIG_SESSION_INPUTS = {
   env: kept("Process environment and secret bindings."),
   workspaceStrategy: kept("Workspace strategy."),
   workspaceRuntime: kept("Workspace runtime services."),
+  sessionContinuity: excluded("Controls session reuse and next-turn framing, not retained session compatibility."),
   timeoutSec: excluded("Whole-turn time limit; the executor receives it apart from the native execution input."),
   graceSec: excluded("Legacy child-process kill grace; the native runner path never reads it."),
 } as const satisfies Record<string, SessionFingerprintClassification>;
