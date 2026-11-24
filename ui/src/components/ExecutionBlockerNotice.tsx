@@ -69,7 +69,7 @@ export function ExecutionBlockerNotice({ presentation, observedStatus, blocker, 
     className={cn("flex items-center gap-3 text-sm text-muted-foreground", className)}>
     {(optimistic || presentation.state !== "failed") && <LoaderCircle className="size-4 shrink-0 motion-safe:animate-spin" aria-hidden="true" />}
     <span className="min-w-0 flex-1">{!optimistic && presentation.state === "failed"
-      ? "Couldn't resume this conversation. Your message is saved." : "Resuming your conversation…"}</span>
+      ? "Couldn't resume this conversation. Your message is saved." : "Preparing your reply…"}</span>
     {!optimistic && presentation.state === "failed" && canRetry && presentation.canRetry &&
       <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}
   </div>;
