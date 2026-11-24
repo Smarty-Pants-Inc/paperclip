@@ -73,6 +73,8 @@ interface TaskChatThreadViewProps {
   renderQueuedAction?: (item: TaskChatMessageItem) => ReactNode;
   /** A streaming turn keeps its chronological keyed slot when it settles. */
   renderTurn?: (item: TaskChatTurnItem) => ReactNode;
+  /** Request-owned feedback stays beside its saved message, not a retry's run. */
+  renderMessageStatus?: (item: TaskChatMessageItem) => ReactNode;
   /** Requeues a blocked task from its no-live-execution-path failure surfaces. */
   onTryAgainNoLiveExecutionPath?: () => Promise<void> | void;
   tryAgainNoLiveExecutionPathPending?: boolean;
@@ -329,6 +331,7 @@ export function TaskChatThreadView({
   renderMessageActions,
   renderQueuedAction,
   renderTurn,
+  renderMessageStatus,
   onTryAgainNoLiveExecutionPath,
   tryAgainNoLiveExecutionPathPending = false,
   onRetryFailedRun,
@@ -365,13 +368,14 @@ export function TaskChatThreadView({
       const runRetry = !onTryAgainNoLiveExecutionPath && onRetryFailedRun && runId
         ? () => onRetryFailedRun(runId)
         : undefined;
-      return renderItem(
+      const content = renderItem(
         item, onApprovalDecision, renderInteraction, renderBrief, renderMessageActions,
         renderQueuedAction, onRuntimeRequestDecision, "classic",
         runRetry ?? onTryAgainNoLiveExecutionPath,
         runRetry ? retryFailedRunId === runId : tryAgainNoLiveExecutionPathPending,
         retryableMarkerId, onRetryFailedRun, retryFailedRunId, attachments, onOpenSkill, onOpenBrowser,
       );
+      return item.kind === "message" ? <>{content}{renderMessageStatus?.(item)}</> : content;
     };
     const renderedItems = streamlined
       ? visibleItems.map((item) => ({ item, content: renderVisibleItem(item) }))
@@ -425,7 +429,7 @@ export function TaskChatThreadView({
     );
   }, [
     visibleItems, retryMarkers, streamlined, onApprovalDecision, onRuntimeRequestDecision,
-    renderInteraction, renderBrief, renderMessageActions, renderQueuedAction, renderTurn,
+    renderInteraction, renderBrief, renderMessageActions, renderQueuedAction, renderTurn, renderMessageStatus,
     onTryAgainNoLiveExecutionPath, tryAgainNoLiveExecutionPathPending,
     retryableMarkerId, onRetryFailedRun, retryFailedRunId, attachments, onOpenSkill, onOpenBrowser,
   ]);
