@@ -1826,6 +1826,10 @@ export async function finalizeNativeRun(input: {
       isConversation: isConversation(authoritativeIssue),
       hasActivePauseHold: pauseHold !== null,
       contextCompactionRun: isContextCompactionRun(run.contextSnapshot),
+      finishedTaskConversation: record(run.contextSnapshot).finishedTaskConversation === true &&
+        record(run.contextSnapshot).wakeReason === "issue_commented" &&
+        record(record(record(run.runnerProfileJson).nativeExecutionInput).provider).kind === "pi_rpc" &&
+        record(record(record(run.runnerProfileJson).nativeExecutionInput).provider).conversationMode === true,
       reviewOwnerUserId:
         authoritativeIssue.responsibleUserId ??
         authoritativeIssue.createdByUserId ??

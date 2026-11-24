@@ -5,6 +5,7 @@ import { shouldResetTaskSessionForWake } from "../heartbeat/run-state.js";
 import { decideNativeContinuation } from "./continued-session.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
+import { PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION, PAPERCLIP_EXECUTION_FINISH_INSTRUCTION, canonicalNativeRuntimeContextDigest } from "../../vendor/paperclip-runner/index.js";
 it("honors explicit fresh-session resets under continuous", () => {
   const context = { forceFreshSession: true, explicitFreshSession: true };
   expect(decideNativeContinuation({ provider: "pi_rpc", sessionContinuity: "continuous", hasSession: true, wakeReset: shouldResetTaskSessionForWake(context), resetRequired: context.explicitFreshSession === true }).continue).toBe(false);
@@ -46,6 +47,16 @@ it("retains recovery history, sends exact comments, and preserves other unseen e
   const mixed = { ...wakePayload, executionContinuation: { ...wakePayload.executionContinuation, resumeDelta: { baseRunId: "prior", messages: [...messages, { ...messages[0], id: "other", body: "Unseen event" }] } } };
   expect(JSON.parse(buildNativeExecutionInput({ ...args, wakePayload: mixed }).continuationPrompt!).messages).toHaveLength(2);
   expect(buildNativeExecutionInput({ ...args, sessionContinuity: "paperclip" }).continuationPrompt).toBe(JSON.stringify({ messages }));
+  for (const provider of ["pi_rpc", "codex"] as const) for (const sessionContinuity of [undefined, "continuous", "paperclip"]) {
+    const reply = buildNativeExecutionInput({ ...args, issue: { ...task, conversationAgentId: null }, provider, sessionContinuity, finishedTaskConversation: true });
+    const conversation = provider === "pi_rpc" && sessionContinuity !== "paperclip";
+    expect("conversationMode" in reply.provider && reply.provider.conversationMode === true).toBe(conversation);
+    expect(reply.runtimeContext.prompt.text.includes(PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION)).toBe(conversation);
+    expect(reply.runtimeContext.prompt.text.includes(PAPERCLIP_EXECUTION_FINISH_INSTRUCTION)).toBe(!conversation);
+    expect(reply.runtimeContext.aggregateDigest).toBe(canonicalNativeRuntimeContextDigest(reply.runtimeContext));
+    if (conversation) expect(reply.continuationPrompt).toBe(messages[0].body);
+  }
+  expect(args.runtimeContext.prompt.text).toContain(PAPERCLIP_EXECUTION_FINISH_INSTRUCTION);
 });
 it("keeps a reopened task's next prompt bare when only the agent's own reply is new", () => {
   const wake = (authorId: string) => { const messages = [{ id: "r", body: "Reply", authorType: "agent", authorId }, { id: "c", body: "Next", authorType: "user", authorId: "board" }]; return { reason: "issue_reopened_via_comment", commentIds: ["c"], comments: [], executionContinuation: { version: 1, messages, resumeDelta: { baseRunId: "prior", messages } } }; };
