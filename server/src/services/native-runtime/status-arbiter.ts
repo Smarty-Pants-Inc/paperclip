@@ -297,6 +297,10 @@ export function arbitrateNativeStatus(input: {
     };
   }
   if (input.finishedTaskConversation && ["done", "in_review"].includes(input.priorIssueStatus)) {
+    // A conversational reply must not reopen finished work. Accepted completion
+    // still belongs to the stock arbiter, including its governance/evidence gates.
+    const decision = arbitrateNativeStatus({ ...input, finishedTaskConversation: false });
+    if (!["todo", "in_progress", "blocked", "backlog"].includes(decision.toStatus)) return decision;
     return {
       policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
       statusAction: "preserve", toStatus: input.priorIssueStatus,
