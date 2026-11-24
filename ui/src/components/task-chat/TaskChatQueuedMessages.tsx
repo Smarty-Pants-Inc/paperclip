@@ -38,7 +38,7 @@ import {
   queuedMessageAutoSteerEligible,
   queuedMessageAutoSteerKey,
 } from "./queued-message-auto-steer";
-import { isQueuedInterruptHandoff } from "@/lib/issue-queued-comment-queue";
+import { isQueuedInterruptHandoff, type DisplayIssueQueuedCommentQueue } from "@/lib/issue-queued-comment-queue";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -88,7 +88,7 @@ function queueActionErrorCode(error: unknown): string | null {
 export interface TaskChatQueuedMessagesProps {
   agentStarting?: boolean; stopPending?: boolean;
   conversationMode?: boolean;
-  queue: IssueQueuedCommentQueue;
+  queue: DisplayIssueQueuedCommentQueue;
   onEdit: (commentId: string) => void;
   onReorder: (orderedCommentIds: string[], revision: string) => Promise<void>;
   onSteer: (commentId: string, revision: string) => Promise<void>;
@@ -299,7 +299,20 @@ function SortableQueuedMessage({
 }
 
 /** Compact production queue shown immediately above the default task composer. */
-export function TaskChatQueuedMessages({
+export function TaskChatQueuedMessages(props: TaskChatQueuedMessagesProps) {
+  return <>
+    <TaskChatQueuedMessageQueue {...props} />
+    {props.queue.pendingQueue?.entries.length ? <TaskChatQueuedMessageQueue
+      {...props}
+      key="pending"
+      queue={props.queue.pendingQueue}
+      onInterrupt={undefined}
+      autoSteerDelayMs={null}
+    /> : null}
+  </>;
+}
+
+function TaskChatQueuedMessageQueue({
   agentStarting, stopPending,
   conversationMode,
   queue,
