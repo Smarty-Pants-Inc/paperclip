@@ -998,6 +998,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     ],
   );
 
+  const [terminalStatuses, setTerminalStatuses] = useState(new Map<string, string>());
   // Every run we might need a transcript for (history + live), deduped by id.
   const runs = useMemo<RunTranscriptSource[]>(() => {
     const map = new Map<string, RunTranscriptSource>();
@@ -1035,8 +1036,12 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         lastOutputBytes: activeRun.lastOutputBytes,
       });
     }
-    return [...map.values()];
-  }, [linkedRuns, liveRuns, activeRun]);
+    return [...map.values()].map((run) => {
+      // A stale live snapshot must not restart a settled segment's clock or tail.
+      const status = terminalStatuses.get(run.id) ?? linkedRunMetaById.get(run.id)?.status;
+      return status && isTerminalRunStatus(status) ? { ...run, status } : run;
+    });
+  }, [linkedRuns, liveRuns, activeRun, linkedRunMetaById, terminalStatuses]);
 
   const requestCommentByRun = useMemo(() => {
     const byRun = new Map((linkedRuns ?? []).map(run => { const request = run as typeof run & { wakeCommentId?: string; contextCommentId?: string };
@@ -1227,7 +1232,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     nativeTranscriptErrorsByRun,
   ]);
 
-  const [terminalStatuses, setTerminalStatuses] = useState(new Map<string, string>());
   useCompanyLiveEvent((event) => {
     const { runId, status } = event.payload;
     if (event.companyId === companyId && event.type === "heartbeat.run.status" &&
