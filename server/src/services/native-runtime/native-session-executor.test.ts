@@ -20525,6 +20525,37 @@ describe("runnerd provider runtime wiring", () => {
     );
   });
 
+  it.each(["continuous", "paperclip", "unverified", "missing", "unreadable"] as const)("workspace root rename admits only its recorded Pi source: %s", async mode => {
+    const prior = { ...scopedNativeExecution(`workspace-${mode}`), provider: { kind: "pi_rpc" as const, model: "provider/model" } };
+    prior.session = { ...prior.session, driverKind: "pi_rpc" };
+    const current = { ...prior, binding: { ...prior.binding, runId: "run-workspace-next", executionWorkspaceId: "workspace-Y" }, workspace: { ...prior.workspace, cwd: "/workspace-Y" } };
+    const root = await initializeScopedRunnerRoot(prior, "workspace-runner");
+    const identity = { runId: prior.binding.runId, normalizedSessionId: prior.session.normalizedSessionId, runnerInstanceId: "workspace-runner", environmentLeaseId: "workspace-lease" };
+    await mkdir(join(root, "control-plane"), { recursive: true }); await mkdir(join(root, "runner"), { recursive: true });
+    await writeFile(join(root, "control-plane/control-plane-state.json"), JSON.stringify(durableControlPlaneState(identity)));
+    await writeFile(join(root, "runner/runner-state.json"), JSON.stringify(durableRunnerState(identity, "suspended")));
+    await writeFile(join(root, "retained-transcript"), "prior answer\n");
+    if (mode === "missing") await rm(root, { recursive: true });
+    if (mode === "unreadable") await Promise.all(["control-plane/control-plane-state.json", "runner/runner-state.json"].map(file => writeFile(join(root, file), "invalid")));
+    const input = { db: priorNativeRunDb(mode === "unverified" ? { ...prior, workspace: { ...prior.workspace, cwd: "/not-admitted" } } : prior), execution: current,
+      runnerInstanceId: "next-runner", sessionContinuity: mode === "paperclip" ? "paperclip" : "continuous", workspaceContinuationSource: prior };
+    state.createTransport.mockClear();
+    if (mode === "unverified" || mode === "missing" || mode === "unreadable") {
+      await expect(createRunnerdBackend(input)).rejects.toMatchObject({ code: "native_provider_state_incompatible",
+        message: expect.stringContaining(`workspace_continuation_source_${mode === "missing" ? "missing" : mode === "unreadable" ? "unverifiable" : "scope_mismatch"}`) });
+      expect(existsSync(root)).toBe(mode !== "missing");
+      return;
+    }
+    await createRunnerdBackend(input); state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+    const target = state.createTransport.mock.calls.at(-1)![0].stateDirectory!;
+    expect(target).not.toBe(root);
+    if (mode === "continuous") {
+      expect(await readFile(join(target, "retained-transcript"), "utf8")).toBe("prior answer\n");
+      expect(existsSync(root)).toBe(false);
+      await expect(createRunnerdBackend(input)).resolves.toBeDefined(); // retry after rename, before the next owner writes
+    } else { expect(existsSync(root)).toBe(true); expect(existsSync(join(target, "retained-transcript"))).toBe(false); }
+  });
+
   it("migrates the former company/session scope into the full native session scope", async () => {
     const stateBase = isolatedStateDirectory;
 

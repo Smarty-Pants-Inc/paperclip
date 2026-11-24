@@ -209,7 +209,8 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
     context.workspaceSelectionChanged === true || shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
   if (decideNativeContinuation({
     provider: runtimeConfig.provider, sessionContinuity: runtimeConfig.sessionContinuity, hasSession: taskSession != null, wakeReset: true,
-    resetRequired: context.explicitFreshSession === true || context.conversationReset === true || context.workspaceSelectionChanged === true ||
+    resetRequired: context.explicitFreshSession === true || context.conversationReset === true ||
+      (context.workspaceSelectionChanged === true && (agent.adapterType !== "paperclip_runner" || runtimeConfig.provider !== "pi_rpc")) ||
       (runtimeConfig.provider !== "pi_rpc" && sessionConfigFreshness.reasons.some(reason => reason !== wakeSessionResetReason)) ||
       (context.wakeReason === "heartbeat_timer" && !deriveTaskKey(context, null)),
   }).continue) resetTaskSession = false;
