@@ -4,6 +4,7 @@ import { parseObject } from "../../adapters/utils.js";
 import { withQueuedCommentIdsInRunContext, withQueuedCommentIdsInWakePayload } from "../issue-queued-comment-queue.js";
 import { resolveSessionContinuity } from "./continued-session.js";
 import { recoverContinuousNativeReplies } from "./native-continuous-reply.js";
+import { issueService } from "../issues.js";
 
 /** Hand unanswered delivery receipts back to the ordinary deferred queue before release. */
 export async function requeueContinuousUnanswered(db: Db, scope: { id: string; companyId: string }) {
@@ -26,6 +27,7 @@ export async function requeueContinuousUnanswered(db: Db, scope: { id: string; c
     const result = parseObject(row.run.resultJson);
     // Nothing self-starts after a person's Stop (0260): whatever was not taken went back to their input box.
     if (result.continuousUnansweredWakeId || parseObject(result.personStop).requestedAt !== undefined) return;
+    const outputWithoutResult = row.run.errorCode === "native_provider_output_without_result";
     const answered = new Set(Object.values(parseObject(result.continuousReplies)).flatMap(value => {
       const ids = parseObject(value).questionCommentIds;
       return Array.isArray(ids) ? ids : [];
@@ -43,10 +45,23 @@ export async function requeueContinuousUnanswered(db: Db, scope: { id: string; c
       ...(issue.conversationAgentId ? { conversationSessionGeneration: issue.conversationSessionGeneration } : {}),
     }, ids);
     const [wake] = await tx.insert(agentWakeupRequests).values({ companyId: scope.companyId, agentId: row.run.agentId,
-      source: "issue", triggerDetail: "comment", reason: "issue_commented", status: "deferred_issue_execution",
+      source: "issue", triggerDetail: "comment", reason: "issue_commented",
+      // Retain exact per-message delivery identities for explicit user retry,
+      // but never make these follow-ups dispatchable.
+      status: outputWithoutResult ? "failed" : "deferred_issue_execution",
+      ...(outputWithoutResult ? { finishedAt: new Date(), error: "native_provider_output_without_result" } : {}),
       payload: withQueuedCommentIdsInWakePayload({ issueId: issue.id, _paperclipWakeContext: context }, ids),
       requestedByActorType: row.run.responsibleUserId ? "user" : "system", requestedByActorId: row.run.responsibleUserId,
       idempotencyKey: `continuous-unanswered:${scope.id}` }).returning({ id: agentWakeupRequests.id });
+    if (outputWithoutResult) {
+      // Use the existing system-notice path rather than silently dropping ACKed
+      // messages or misreporting a person's Stop. Same transaction/idempotency
+      // fence as the receipt: one unanswered notice per follow-up, not an answer.
+      for (const id of ids) await issueService(tx as unknown as Db).addComment(issue.id,
+        `Your follow-up remains unanswered (message ${id}). Automatic retries are stopped; nothing was re-sent. You can send the follow-up again when you choose.`,
+        {}, { authorType: "system", clientRequestId: `native-unanswered:${scope.id}:${id}`,
+          presentation: { kind: "system_notice", tone: "danger", detailsDefaultOpen: false } }, tx);
+    }
     await tx.update(heartbeatRuns).set({ resultJson: { ...result, continuousUnansweredWakeId: wake.id } })
       .where(eq(heartbeatRuns.id, scope.id));
   });
