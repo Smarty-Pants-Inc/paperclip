@@ -7632,7 +7632,7 @@ describe("IssueDetail", () => {
     expect(mockPushToast).not.toHaveBeenCalled();
   });
 
-  it("promotes a steered message immediately while its durable timeline position refreshes", async () => {
+  it("keeps a steered message in the tray until its durable timeline receipt arrives", async () => {
     const queue = createQueuedCommentQueue();
     const steeredQueue = createQueuedCommentQueue({
       queueId: null,
@@ -7702,7 +7702,9 @@ describe("IssueDetail", () => {
     await waitForAssertion(() => {
       expect(mockIssuesApi.steerQueuedComment).toHaveBeenCalled();
       expect(mockActivityApi.forIssue.mock.calls.length).toBeGreaterThan(1);
-      expect(mockIssueChatThreadRender.mock.calls.at(-1)?.[0]?.queuedCommentQueue).toBeNull();
+      expect(mockIssueChatThreadRender.mock.calls.at(-1)?.[0]?.queuedCommentQueue?.entries).toMatchObject([
+        { comment: { id: "queued-comment-1" }, canDiscard: false },
+      ]);
       expect(deliverySettled).toBe(true);
     });
 
@@ -7716,15 +7718,12 @@ describe("IssueDetail", () => {
       }>;
       queuedCommentQueue?: IssueQueuedCommentQueue | null;
     };
-    expect(whileRefreshing.queuedCommentQueue).toBeNull();
+    expect(whileRefreshing.queuedCommentQueue?.entries).toHaveLength(1);
     expect(
       whileRefreshing.comments?.find(
         (comment) => comment.id === "queued-comment-1",
-      ),
-    ).toMatchObject({
-      steeredIntoRunId: "run-active-1",
-      conversationAnchorAt: expect.any(String),
-    });
+      )?.steeredIntoRunId,
+    ).toBeUndefined();
 
     releaseActivity([
       {
