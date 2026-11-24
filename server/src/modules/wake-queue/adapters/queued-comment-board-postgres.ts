@@ -18,7 +18,7 @@ import {
   firstTurnWakeContextFields,
   firstTurnWakePayloadFields,
 } from "../../../services/native-runtime/first-turn-queued-input.js";
-import { getNativeSessionSteeringState } from "../../../services/native-runtime/native-session-executor.js";
+import { closeHeldNativeTurn, getNativeSessionSteeringState } from "../../../services/native-runtime/native-session-executor.js";
 import { queuedInteractionId, readQueuedInteractionResponse, type QueuedInteractionResponse } from "../../../services/queued-interaction-response.js";
 import type { QueuedCommentActor, QueuedCommentSteeringPort, SteerQueuedCommentInput } from "../application/queued-comment-ports.js";
 import { QueuedCommentMutationError } from "../application/queued-comment-use-cases.js";
@@ -165,6 +165,35 @@ async function queueCommentsForWake(
     const row = byId.get(id);
     return row && !row.deletedAt ? [{ ...row, authorType: row.authorType ?? (row.authorAgentId ? "agent" as const : "user" as const) }] : [];
   });
+}
+
+/** Release an idle hold for deferred work that cannot be person-message steering.
+ * Keep every wake untouched: ordinary terminal cleanup/admission delivers it. */
+export async function closeConversationResetHold(executor: Db, scope: { companyId: string; issueId: string }): Promise<boolean> {
+  const [current] = await executor.select({ issue: issues, runId: heartbeatRuns.id }).from(issues)
+    .innerJoin(heartbeatRuns, and(eq(heartbeatRuns.id, issues.executionRunId),
+      eq(heartbeatRuns.companyId, issues.companyId), eq(heartbeatRuns.agentId, issues.conversationAgentId),
+      eq(heartbeatRuns.status, "running"), eq(heartbeatRuns.runtimeMode, "native")))
+    .where(and(eq(issues.id, scope.issueId), eq(issues.companyId, scope.companyId))).limit(1);
+  if (!current?.issue.conversationAgentId || current.issue.conversationState !== "active") return false;
+  // The board snapshot intentionally hides automation wakes and prefers person
+  // messages over receipts. Inspect all deferred wakes so neither can mask work
+  // that needs ordinary admission after this idle turn closes.
+  const wakes = await executor.select().from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, scope.companyId),
+    eq(agentWakeupRequests.agentId, current.issue.conversationAgentId),
+    eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    sql`${agentWakeupRequests.payload}->'issueId' = to_jsonb(${scope.issueId}::text)`,
+  )).orderBy(asc(agentWakeupRequests.requestedAt));
+  for (const wake of wakes) {
+    if (queuedInteractionId(wake.payload)) return closeHeldNativeTurn(current.runId);
+    const comments = await queueCommentsForWake(executor, scope.issueId, wake, null);
+    const head = comments[0];
+    // Ordinary person messages remain the drain's responsibility, not a close.
+    if (head?.authorType === "user" && !isConversationReset(head.body)) continue;
+    return closeHeldNativeTurn(current.runId);
+  }
+  return false;
 }
 
 export async function readBoardQueuedComments(input: {
@@ -418,6 +447,10 @@ export function createQueuedCommentSteeringAdapter(db: Db): QueuedCommentSteerin
           }),
           async readPendingQueue() {
             const { queue } = await readLockedBoardQueue({ ...input, tx, issue }, wake, run);
+            // Recheck under the queue lock against edits and later-row delivery.
+            if (issue.conversationAgentId && queue.entries.some(({ comment }) => isConversationReset(comment.body))) {
+              throw new QueuedCommentMutationError("queued_response_requires_fresh_session", "/new needs a new session and cannot be steered into this turn");
+            }
             return queue;
           },
           assertDeliveryAllowed: () => assertQueuedCommentInteractionDelivery(tx, {
