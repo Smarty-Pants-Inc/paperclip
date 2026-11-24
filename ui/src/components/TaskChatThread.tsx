@@ -2876,6 +2876,17 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const tailFinalEntry = tailFinalResponse?.transcriptIndex == null
     ? undefined : tailEntries[tailFinalResponse.transcriptIndex];
   const tailFinalStreaming = tailFinalEntry?.kind === "assistant" && tailFinalEntry.delta === true;
+  // The visible transcript answer uses its own saved comment's read cutoff, even while the run stays open.
+  const tailReplyKey = tailFinalEntry?.kind === "assistant" && !tailFinalStreaming && tailFinalEntry.itemId
+    ? `native-final:${tailRunId}:${tailFinalEntry.itemId}` : null;
+  const tailReadReceipt = useMemo(() => {
+    if (!tailReplyKey) return undefined;
+    const reply = projectedComments.find(comment => !comment.deletedAt && comment.authorType === "agent" &&
+      (comment.createdByRunId ?? comment.runId) === tailRunId &&
+      (comment.clientRequestId === tailReplyKey || comment.clientRequestId?.startsWith(`${tailReplyKey}:`)) &&
+      normalizedMessageText(comment.body) === normalizedMessageText(tailFinalResponse?.text ?? ""));
+    return commentItems.find((item): item is TaskChatMessageItem => item.kind === "message" && item.id === reply?.id);
+  }, [tailReplyKey, tailRunId, tailFinalResponse?.text, projectedComments, commentItems]);
   // Match the runner turn's replay latch, including its yielded-wait reset.
   const tailFinalRef = useRef<{ runId: string | null; item?: TaskChatMessageItem }>({ runId: null });
   if (tailFinalRef.current.runId !== tailSegmentKey || (
@@ -3791,6 +3802,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                       agentIcon={visibleTailAgentIcon}
                                       agent={tailAgent ?? (tailAgentId ? { id: tailAgentId } : undefined)}
                                       items={tailItems}
+                                      readReceipt={tailReadReceipt}
                                       allowSummaryFallback={!paperclipRunnerTail ||
                                         terminalHydratedRunIds.has(tailRunId ?? "") ||
                                         tailEntries.some((entry) => entry.kind === "run_terminal")}

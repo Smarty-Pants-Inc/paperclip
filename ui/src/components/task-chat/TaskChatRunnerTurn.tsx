@@ -178,6 +178,7 @@ export function TaskChatRunnerTurn({
   agentIcon,
   agent,
   items,
+  readReceipt,
   status,
   execution,
   preparationLabel,
@@ -197,6 +198,7 @@ export function TaskChatRunnerTurn({
   agentIcon?: string | null;
   agent?: import("../AgentAvatar").AvatarAgent;
   items: readonly TaskChatItem[];
+  readReceipt?: Pick<TaskChatMessageItem, "id" | "createdAtIso">;
   status: string;
   execution?: ExecutionProjection | null;
   /** Presentation only while Send/Retry admission has no run yet. */
@@ -345,7 +347,7 @@ export function TaskChatRunnerTurn({
           data-testid="task-chat-final-response"
         >
           <TaskChatBubble
-            item={{ ...final, authorName: agentName ?? undefined, agentIcon, agent, timestamp: final.timestamp ?? formatTaskChatTimestamp(final.atMs) }}
+            item={{ ...final, id: readReceipt?.id ?? final.id, createdAtIso: readReceipt?.createdAtIso ?? final.createdAtIso, authorName: agentName ?? undefined, agentIcon, agent, timestamp: final.timestamp ?? formatTaskChatTimestamp(final.atMs) }}
             animateEntry={false}
             hideAgentIdentity
             actions={<TaskChatBubbleActions copyText={final.text} />}
