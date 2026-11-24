@@ -508,6 +508,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
       maxAttempts?: number;
       delayMs?: number;
       preserveWakeContext?: boolean;
+      freshSessionRequired?: boolean;
     },
   ) {
     const preparation = parseObject(run.resultJson?.executionRecovery);
@@ -842,6 +843,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
       "normal_model",
     );
     // A successor resolves current assignments; the failed run retains its snapshot.
+    if (opts?.freshSessionRequired) retryContextSnapshot.explicitFreshSession = true;
     delete retryContextSnapshot.skillVersions;
     delete retryContextSnapshot.skillSelectionSnapshot;
     delete retryContextSnapshot.shadowedSkills;

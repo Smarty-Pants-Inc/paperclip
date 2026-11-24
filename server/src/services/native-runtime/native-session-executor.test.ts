@@ -13,6 +13,7 @@ import * as controllerRecovery from "./native-controller-recovery.js";
 import * as ownerProof from "../owner-proof.js";
 import { isSettledRemoteWarmControlState } from "./remote-warm-session-recovery.js";
 import * as remoteWarmRecoveryRuntime from "./remote-warm-session-recovery.js";
+import { NativePredecessorRetirementUnprovenError } from "./predecessor-retirement.js";
 import * as pluginTaskOwnership from "../plugin-task-ownership.js";
 import { DurablePrpControlPlane } from "../../vendor/paperclip-runner/index.js";
 import * as environmentTaskRuntime from "../environment-task-runtime.js";
@@ -18396,6 +18397,102 @@ describe("runnerd provider runtime wiring", () => {
     expect(state.createBackend).not.toHaveBeenCalled();
   });
 
+  it.each(["continuous", "paperclip"] as const)("defers pre-door warm restore to the refusal door with absent local authority and an uncommitted Pi predecessor in effective %s mode", async sessionContinuity => {
+    const base = scopedNativeExecution(`pre-door-absent-pi-${sessionContinuity}`);
+    const prior = { ...base, schema: "paperclip.native-execution-input.v5" as const, executionMode: "default" as const,
+      provider: { kind: "pi_rpc" as const, model: "openai/gpt-5" }, planningContext: null, runtimeContext: nativeRuntimeContextFixture(),
+      session: { ...base.session, driverKind: "pi_rpc" as const, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 300_000 } } };
+    const current = { ...prior, binding: { ...prior.binding, runId: `${prior.binding.runId}-follow-up` } };
+    const root = await initializeScopedRunnerRoot(prior, "pre-door-pi-runner");
+    const identity = { runId: prior.binding.runId, normalizedSessionId: prior.session.normalizedSessionId,
+      runnerInstanceId: "pre-door-pi-runner", environmentLeaseId: "pre-door-pi-lease", turnId: "prior-turn", itemId: "prior-item" };
+    await mkdir(join(root, "control-plane"), { recursive: true });
+    await writeFile(join(root, "control-plane/control-plane-state.json"), JSON.stringify(durableControlPlaneState(identity)));
+    await rm(join(root, "runner"), { recursive: true, force: true });
+    const restoreSessionDirectory = vi.fn();
+    vi.mocked(controllerRecovery.resolveNativeControllerRecovery).mockResolvedValueOnce({ kind: "recoverable",
+      checkpoint: { restoreSessionDirectory }, metadata: { configDigest: "prior-config" },
+      snapshot: { identity: { ...prior.binding, sessionId: prior.session.normalizedSessionId } },
+    } as never);
+    const inspect = vi.spyOn(remoteWarmRecoveryRuntime, "inspectRemoteWarmSessionRecovery")
+      .mockRejectedValueOnce(new remoteWarmRecoveryRuntime.NativeWarmRecoveryRefusalError("owner_unsettled"));
+    const wait = vi.spyOn(remoteWarmRecoveryRuntime, "waitForLiveWarmSessionOwner").mockResolvedValueOnce();
+    const onExecutionLeaseAcquired = vi.fn(), updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+    state.createBackend.mockClear();
+    try {
+      const attempt = executePaperclipNativeSession({ db: leaseDb(current, {}, {}, updates), execution: current,
+        sessionContinuity, runnerInstanceId: "pre-door-follow-up", useRunnerd: true, onExecutionLeaseAcquired,
+        runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace",
+          environmentId: "retained-environment", leaseId: "pre-door-pi-lease",
+          sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "pre-door-retained-box" } } });
+      if (sessionContinuity === "continuous") await expect(attempt).rejects.toMatchObject({
+        name: "NativePredecessorRetirementUnprovenError", predecessorRunId: prior.binding.runId,
+        providerLeaseId: "pre-door-retained-box", freshSessionRequired: true });
+      else await expect(attempt).rejects.toThrow("native_controller_recovery_missing_evidence:retained_sandbox_binding");
+      expect(restoreSessionDirectory).toHaveBeenCalledWith(root);
+      expect(inspect).toHaveBeenCalledTimes(sessionContinuity === "continuous" ? 1 : 0);
+      expect(onExecutionLeaseAcquired).not.toHaveBeenCalled();
+      expect(updates.some(update => update.table === nativeRunFinalizations && update.values.attempt !== undefined)).toBe(false);
+      expect(state.createBackend).not.toHaveBeenCalled();
+    } finally { inspect.mockRestore(); wait.mockRestore(); }
+  });
+
+  it.each(["continuous", "paperclip"] as const)("bounds a cold resumed Pi retained-owner wait only in effective %s mode", async sessionContinuity => {
+    const base = scopedNativeExecution(`cold-pi-wait-${sessionContinuity}`);
+    const fresh = { ...base, schema: "paperclip.native-execution-input.v5" as const, executionMode: "default" as const,
+      provider: { kind: "pi_rpc" as const, model: "openai/gpt-5" }, planningContext: null, runtimeContext: nativeRuntimeContextFixture(),
+      session: { ...base.session, driverKind: "pi_rpc" as const } };
+    const deadline = new Date(Date.now() + 60_000);
+    vi.mocked(controllerRecovery.resolveNativeControllerRecovery).mockResolvedValueOnce({ kind: "waiting_for_owner", deadline });
+    const defer = vi.spyOn(controllerRecovery, "deferNativeControllerRecovery").mockResolvedValueOnce();
+    const onExecutionLeaseAcquired = vi.fn(), updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+    const db = leaseDb(fresh, {}, {}, updates);
+    await expect(executePaperclipNativeSession({ db, execution: fresh, sessionContinuity,
+      runnerInstanceId: "cold-wait-controller", useRunnerd: true, onExecutionLeaseAcquired,
+      runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace",
+        environmentId: "retained-environment", leaseId: "retained-lease",
+        sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "retained-box" } },
+    })).rejects.toMatchObject(sessionContinuity === "continuous"
+      ? { name: "NativePredecessorRetirementUnprovenError", freshSessionRequired: true }
+      : { name: "NativeControllerRecoveryWaitingError", retryAt: deadline });
+    expect(defer).toHaveBeenCalledTimes(sessionContinuity === "continuous" ? 0 : 1);
+    expect(onExecutionLeaseAcquired).not.toHaveBeenCalled();
+    expect(updates.some(update => update.table === nativeRunFinalizations && update.values.attempt !== undefined)).toBe(false);
+    expect(state.createBackend).not.toHaveBeenCalled();
+  });
+
+  it.each((["identity_incomplete", "execution_mismatch", "prior_lease_mismatch", "owner_unsettled", "checkpoint_unsettled",
+    "journal_unsettled", "controller_not_stopped", "target_not_resumed_sandbox", "current_run_not_admitted",
+    "current_owner_changed", "owner_changed", "current_lease_changed", "unrelated"] as const).flatMap(reason =>
+      (["continuous", "paperclip"] as const).map(sessionContinuity => ({ reason, sessionContinuity }))))(
+    "dispatches every typed warm refusal, but not unrelated errors, in effective $sessionContinuity: $reason", async ({ reason, sessionContinuity }) => {
+      const base = scopedNativeExecution(`pi-refusal-${sessionContinuity}-${reason}`);
+      const prior = { ...base, schema: "paperclip.native-execution-input.v5" as const, executionMode: "default" as const,
+        provider: { kind: "pi_rpc" as const, model: "openai/gpt-5" }, planningContext: null, runtimeContext: nativeRuntimeContextFixture(),
+        session: { ...base.session, driverKind: "pi_rpc" as const, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 300_000 } } };
+      const current = { ...prior, binding: { ...prior.binding, runId: `${prior.binding.runId}-follow-up` } };
+      const root = await initializeScopedRunnerRoot(prior, "pi-refusal-runner");
+      const identity = { runId: prior.binding.runId, normalizedSessionId: prior.session.normalizedSessionId,
+        runnerInstanceId: "pi-refusal-runner", environmentLeaseId: "pi-refusal-lease", turnId: "prior-turn", itemId: "prior-item" };
+      await mkdir(join(root, "control-plane"), { recursive: true }); await mkdir(join(root, "runner"), { recursive: true });
+      await writeFile(join(root, "control-plane", "control-plane-state.json"), JSON.stringify(durableControlPlaneState(identity)));
+      await writeFile(join(root, "runner", "runner-state.json"), JSON.stringify(durableRunnerState(identity, "ready")));
+      const refusal = reason === "unrelated" ? new Error("unrelated storage failure") : new remoteWarmRecoveryRuntime.NativeWarmRecoveryRefusalError(reason);
+      const failure = reason === "prior_lease_mismatch" ? new NativePredecessorRetirementUnprovenError(prior.binding.runId, "retained-box", refusal) : refusal;
+      const inspect = vi.spyOn(remoteWarmRecoveryRuntime, "inspectRemoteWarmSessionRecovery").mockRejectedValueOnce(failure);
+      const wait = vi.spyOn(remoteWarmRecoveryRuntime, "waitForLiveWarmSessionOwner").mockResolvedValueOnce();
+      try {
+        const attempt = executePaperclipNativeSession({ db: leaseDb(current), execution: current, sessionContinuity,
+          runnerInstanceId: "pi-refusal-follow-up", useRunnerd: true,
+          runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace", providerKey: "daytona",
+            environmentId: "retained-environment", leaseId: "retained-lease", sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "retained-box" } } });
+        if (sessionContinuity === "continuous" && reason !== "unrelated") await expect(attempt).rejects.toMatchObject({
+          name: "NativePredecessorRetirementUnprovenError", freshSessionRequired: true });
+        else await expect(attempt).rejects.toBe(failure);
+        expect(inspect).toHaveBeenCalledOnce();
+      } finally { inspect.mockRestore(); wait.mockRestore(); }
+    });
+
   it("a follow-up that starts within the outgoing server's close window waits for its live lease instead of relaunching the Runner", async () => {
     const prior = scopedNativeExecution("close-window");
     prior.session.lifecyclePolicy = { mode: "warm", idleTimeoutMs: 300_000 };
@@ -19324,10 +19421,15 @@ describe("runnerd provider runtime wiring", () => {
       }
       const db = leaseDb(next);
       const ordinarySelect = db.select.bind(db);
+      // This fixture's prior run completed with a blocked result. Do not return
+      // the new run's uncommitted coordinator for the stock prior-result fence.
+      const priorCommittedDb = leaseDb(first, { phase: "committed", resultId: "prior-blocked-result" });
       db.select = ((fields?: Record<string, unknown>) => fields?.status === heartbeatRuns.status && fields?.runnerProfileJson === heartbeatRuns.runnerProfileJson
         ? priorNativeRunDb(mode === "foreign-scope" ? { ...first, binding: { ...first.binding, agentId: "foreign" } } : first,
           mode === "active" ? "running" : "succeeded").select(fields as never)
-        : ordinarySelect(fields as never)) as Db["select"];
+        : fields?.phase === nativeRunFinalizations.phase && fields?.resultId === nativeRunFinalizations.resultId
+          ? priorCommittedDb.select(fields as never)
+          : ordinarySelect(fields as never)) as Db["select"];
       const throughExecutor = policy === "warm" && ["canonical", "local-receipt", "pending-outbox"].includes(mode);
       let inspected = false;
       const resume = vi.spyOn(environmentTaskRuntime, "resolvePluginTaskResume").mockImplementation(async (_db, request) => {
