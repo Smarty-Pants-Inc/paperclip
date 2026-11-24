@@ -531,6 +531,7 @@ async function withHireRunLock<T>(key: string, fn: () => Promise<T>): Promise<T>
   }
 }
 
+const personStopHolds = new Set<string>();
 export function agentRoutes(
   db: Db,
   options: {
@@ -7373,6 +7374,7 @@ export function agentRoutes(
     const existing = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!existing) return;
     if (!(await assertRunReadAllowed(req, res, existing))) return;
+    if (personStopHolds.has(runId)) { res.status(202).json(await runRedactions.redactForRun(existing.companyId, runId, existing, getActorInfo(req).actorId)); return; }
     const requestId = cancellationRequestId(req.body?.cancellationRequestId);
     const PERSON_STOP_TURN_WAIT_MS = 60_000, stopDeadline = Date.now() + PERSON_STOP_TURN_WAIT_MS, pressedAt = new Date().toISOString();
     // A person's Stop on a live Pi turn ends that turn only (seam 0233). The run then
@@ -7416,19 +7418,19 @@ export function agentRoutes(
       const hasTurn = async () => (await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, runId), inArray(heartbeatRunEvents.eventType, ["turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted"]))).limit(1)).length > 0;
       if (outcome === "no_turn" && !finishing?.resultId && !await hasTurn()) {
         res.status(202).json(await runRedactions.redactForRun(existing.companyId, runId, existing, getActorInfo(req).actorId));
+        if (personStopHolds.has(runId)) return; personStopHolds.add(runId); let why: "turn" | "terminal" | "non_pi" = "turn";
         void (async () => { for (;;) {
-            const current = await heartbeat.getRun(runId); if (current?.status !== "running") return;
-            if (current.runtimeMode === "native" && asRecord(asRecord(asRecord(current.runnerProfileJson)?.nativeExecutionInput)?.provider)?.kind !== "pi_rpc") { await cancelStoppedRun(); return; }
+            const current = await heartbeat.getRun(runId); if (current?.status !== "running") { why = "terminal"; return; }
+            if (current.runtimeMode === "native" && asRecord(asRecord(asRecord(current.runnerProfileJson)?.nativeExecutionInput)?.provider)?.kind !== "pi_rpc") { why = "non_pi"; await cancelStoppedRun(); return; }
             const state = await getNativeSessionSteeringState(runId);
             if (state.activeTurnId) { await mark(true);
-              const sent = await interruptNativeTurn({ runId, reason: "person_stop", timeoutMs: Math.max(1, stopDeadline - Date.now()) }).catch(() => null);
+              const sent = await interruptNativeTurn({ runId, reason: "person_stop", timeoutMs: 10_000 }).catch(() => null);
               if (sent && sent !== "no_turn") { await returnQueued().catch(() => undefined); return; }
               await mark(false);
             }
             if (await hasTurn()) return;
-            if (Date.now() >= stopDeadline) { await cancelStoppedRun(); return; }
-            await new Promise(resolve => setTimeout(resolve, Math.min(250, stopDeadline - Date.now())));
-        } })().catch(error => logger.warn({ error, runId }, "person Stop turn wait failed"));
+            await new Promise(resolve => setTimeout(resolve, Date.now() >= stopDeadline ? 1_000 : 250));
+        } })().catch(error => logger.warn({ error, runId }, "person Stop turn wait failed")).finally(() => { personStopHolds.delete(runId); logger.info({ runId, why }, "person Stop hold ended"); });
         return;
       }
       if (landed || finishing?.resultId || outcome === "no_turn") {
