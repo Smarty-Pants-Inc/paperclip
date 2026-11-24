@@ -1,4 +1,6 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { once } from "node:events";
+import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { cp, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
@@ -8,7 +10,7 @@ import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   agents, companies, completionContracts, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations,
-  nativeRunnerCheckpoints, nativeRunResults,
+  nativeRunnerCheckpoints, nativeRunResults, issueComments, authUsers, companyMemberships, principalPermissionGrants,
 } from "@paperclipai/db";
 import { DurablePrpControlPlane, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
 import { startRecoveryPostgres, recoveryPostgresSupport } from "../../__tests__/helpers/recovery-postgres.js";
@@ -17,6 +19,8 @@ import { prepareNativeHeartbeatRun } from "./prepare-native-run.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { loadNativeRunnerCheckpoint, nativeRunnerCheckpointWriter } from "./native-runner-checkpoint.js";
 import { createNativeControllerRecovery } from "./native-controller-recovery.js";
+import { agentInstructionWorkingCopyService } from "../agent-instruction-working-copies.js";
+import { resolveManagedInstructionsRoot } from "../agent-instructions.js";
 import { currentNativeControllerIdentity } from "./native-restart-recovery.js";
 import { lockSourceRecoveryCoordinators } from "./native-source-recovery-ownership.js";
 import { readProcessStartedAt } from "../hot-restart.js";
@@ -24,8 +28,22 @@ import {
   buildNativeExecutionWithCheckpoint, findNativeSessionResumeRun, nativeToolContractFingerprintForTarget,
 } from "./native-session-resume.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
+import { STOP_PI_PROCESS_GROUP } from "./native-pi-retirement.js";
+import { publishContinuousNativeReply } from "./native-continuous-reply.js";
+import { sandboxPiProcessVisibility } from "../../__tests__/helpers/pi-process-visibility.js";
 
 const toolDefinitions = vi.hoisted(() => vi.fn());
+const collectionFault = vi.hoisted(() => ({ active: false }));
+vi.mock("../agent-instruction-working-copies.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../agent-instruction-working-copies.js")>();
+  return { ...actual, agentInstructionWorkingCopyService: (...args: Parameters<typeof actual.agentInstructionWorkingCopyService>) => {
+    const service = actual.agentInstructionWorkingCopyService(...args);
+    return { ...service, collectStopped: async (...input: Parameters<typeof service.collectStopped>) => {
+      if (collectionFault.active) throw new Error("injected stopped-file collection failure");
+      return service.collectStopped(...input);
+    } };
+  } };
+});
 vi.mock("../../runtime-api.js", async importOriginal => ({ ...await importOriginal<typeof import("../../runtime-api.js")>(), resolveLocalRuntimeApiUrl: () => "http://127.0.0.1:43219" }));
 vi.mock("./paperclip-runner-tool-authority.js", () => ({
   PaperclipRunnerToolAuthority: class {
@@ -77,6 +95,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     stateDirectory = await mkdtemp(join(tmpdir(), "native-recovered-owner-state-"));
     process.env.PAPERCLIP_RUNNER_STATE_DIR = stateDirectory;
     toolDefinitions.mockReset().mockRejectedValue(new Error(ADMITTED));
+    await db.update(agents).set({ adapterConfig: { provider: "acpx", acpxAgent: "claude" } }).where(eq(agents.id, agentId));
   });
   afterEach(async () => {
     if (previousStateDirectory === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
@@ -93,7 +112,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
   async function seedRecoveredPriorRun(control: "settled" | "pending-command" | "unanswered-tool"
     | "failed-turn-start" | "rejected-turn-start" | "indeterminate-turn-start" | "unknown-outcome-turn-start"
     | "unsuperseded-unknown-outcome-turn-start" | "failed-suspend" | "pending-attach" | "pending-tool-result" = "settled",
-    options: { controller?: { bootId: string; pid: number; processStartedAt: Date }; provider?: "codex" | "acpx" | "opencode";
+    options: { controller?: { bootId: string; pid: number; processStartedAt: Date }; provider?: "codex" | "acpx" | "opencode" | "pi_rpc";
       lifecycle?: "warm"; governedWait?: boolean } = {}) {
     const issueId = randomUUID(), workspaceId = randomUUID(), runId = randomUUID();
     await db.insert(issues).values({ id: issueId, companyId, title: "Continue after recovery", assigneeAgentId: agentId, status: "in_progress" });
@@ -104,6 +123,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     const executionFor = (currentRunId: string) => buildNativeExecutionInput({
       companyId, agentId, runId: currentRunId, provider: options.provider ?? "acpx", acpxAgent: "claude",
       model: options.provider === "codex" ? "gpt-6.1-sol"
+        : options.provider === "pi_rpc" ? "openai/gpt-6.1-sol"
         : options.provider === "opencode" ? "openrouter/deepseek/deepseek-v4.1-flash-1017" : "claude-opus-5-5",
       issue: { id: issueId, identifier: "ROF-1", title: "Continue after recovery", description: null, workMode: "standard" },
       taskPrompt: "Continue the conversation.",
@@ -192,7 +212,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
 
   /** Mirrors runtime selection: the follow-up inherits the selected source's
    * provider checkpoint before the executor admits its durable root. */
-  async function admitFollowUp(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>) {
+  async function admitFollowUp(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>, sessionContinuity?: "continuous" | "paperclip") {
     const runId = randomUUID();
     const [row] = await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native",
       nativeIssueId: prior.issueId, nativeSessionId: prior.native.normalizedSessionId, contextSnapshot: { issueId: prior.issueId } }).returning();
@@ -214,11 +234,11 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       throw new Error("admission must not reach the sandbox");
     });
     const start = (outcome: "created" | "replacement" | "resumed" = "created",
-      restartRecovery?: Parameters<typeof createRunnerdBackend>[0]["restartRecovery"]) => createRunnerdBackend({
-      db, execution, runnerInstanceId: next.runnerInstanceId, onLog: async (_stream, chunk) => { logs.push(chunk); },
+      restartRecovery?: Parameters<typeof createRunnerdBackend>[0]["restartRecovery"], remoteCwd = "/workspace") => createRunnerdBackend({
+      db, execution, sessionContinuity, runnerInstanceId: next.runnerInstanceId, onLog: async (_stream, chunk) => { logs.push(chunk); },
       ...(restartRecovery ? { restartRecovery } : {}),
       runnerExecutionTarget: { kind: "remote", transport: "sandbox", providerKey: "daytona", environmentId,
-        leaseId, remoteCwd: "/workspace", reusableLeaseConfigured: true,
+        leaseId, remoteCwd, reusableLeaseConfigured: true,
         runner: { execute: remoteExecute },
         sandboxLeaseAcquisition: { outcome, providerLeaseId } } as never,
     }).then(() => "constructed", (error: Error) => error.message);
@@ -229,6 +249,214 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     }).then(() => "constructed", (error: Error) => error.message);
     return { runId, logs, start, startLocal, native: next, environmentId, leaseId, providerLeaseId, remoteExecute, selectedRunId: selected?.id ?? null };
   }
+
+  // Missing controller authority is not process-exit evidence. These stock
+  // paths must stay fenced, including a non-Pi agent's paperclip default.
+  it.each([
+    { status: "cancelled", provider: "acpx" }, { status: "failed", provider: "acpx" },
+    { status: "cancelled", provider: "pi_rpc" }, { status: "failed", provider: "pi_rpc" },
+  ] as const)(
+    "keeps the stock $provider fence after a $status predecessor with absent resumed Runner authority", async ({ status, provider }) => {
+      await db.update(agents).set({ adapterConfig: { provider, sessionContinuity: "paperclip" } }).where(eq(agents.id, agentId));
+      const prior = await seedRecoveredPriorRun("settled", { lifecycle: "warm", provider });
+      await db.update(heartbeatRuns).set({ status }).where(eq(heartbeatRuns.id, prior.runId));
+      await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", resultId: null })
+        .where(eq(nativeRunFinalizations.runId, prior.runId));
+      const followUp = await admitFollowUp(prior);
+      await db.insert(environments).values({ id: followUp.environmentId, name: `retained-${followUp.environmentId}`, driver: "sandbox" });
+      await db.insert(environmentLeases).values({ companyId, environmentId: followUp.environmentId,
+        issueId: prior.issueId, heartbeatRunId: prior.runId, provider: "daytona", providerLeaseId: followUp.providerLeaseId,
+        status: "released", metadata: { remoteCwd: "/workspace" } });
+      expect(await followUp.start("resumed")).not.toBe(ADMITTED);
+      expect(followUp.selectedRunId).toBe(prior.runId);
+      expect(followUp.native.normalizedSessionId).toBe(prior.native.normalizedSessionId);
+      const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, followUp.runId));
+      expect(current.runnerProfileJson?.sessionCheckpoint).toMatchObject({
+        sessionId: prior.native.normalizedSessionId, providerSessionId: "provider-session-before-recovery", activeTurnId: null,
+      });
+      expect(await archivedOwners(await sessionRoot())).toEqual([]);
+      expect(await quarantined()).toEqual([]);
+      expect(followUp.remoteExecute).not.toHaveBeenCalled();
+    }, 60_000);
+
+  it.each((["ready", "malformed", "absent"] as const).flatMap(lifecycle => [false, true].map(override => ({ lifecycle, override }))))(
+    "keeps paperclip mode stock when uncommitted resumed Runner authority is $lifecycle (effective override=$override)", async ({ lifecycle, override }) => {
+      await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: override ? "continuous" : "paperclip" } }).where(eq(agents.id, agentId));
+      const prior = await seedRecoveredPriorRun("settled", { lifecycle: "warm", provider: "pi_rpc" });
+      await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, prior.runId));
+      await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", resultId: null })
+        .where(eq(nativeRunFinalizations.runId, prior.runId));
+      const followUp = await admitFollowUp(prior, override ? "paperclip" : undefined), root = scopedRunnerdStateRoot(prior.executionFor(followUp.runId));
+      await db.insert(environments).values({ id: followUp.environmentId, name: `retained-${followUp.environmentId}`, driver: "sandbox" });
+      await db.insert(environmentLeases).values({ companyId, environmentId: followUp.environmentId,
+        issueId: prior.issueId, heartbeatRunId: prior.runId, provider: "daytona", providerLeaseId: followUp.providerLeaseId,
+        status: "released", metadata: { remoteCwd: "/workspace" } });
+      const checkpoint = await loadNativeRunnerCheckpoint(db, { companyId, issueId: prior.issueId, runId: prior.runId });
+      checkpoint!.restoreSessionDirectory(root);
+      if (lifecycle !== "absent") {
+        await mkdir(join(root, "runner"), { recursive: true });
+        await writeFile(join(root, "runner", "runner-state.json"), lifecycle === "malformed" ? "not-json" : JSON.stringify({
+          schema: "paperclip.runner.durable.state.v1", lifecycle, ...prior.identity,
+        }));
+      }
+      expect(await followUp.start("resumed")).toMatch(/retirement_refused=sandbox_resumed|retained_sandbox_binding/);
+      expect(await archivedOwners(root)).toEqual([]);
+      expect(followUp.logs.join("")).not.toContain("starting a new runner");
+      expect(followUp.remoteExecute).not.toHaveBeenCalled();
+    }, 60_000);
+
+  it.each(["wrong allocation", "held lease", "pending recovery", "pending turn", "unanswered tool"] as const)(
+    "keeps an absent resumed uncommitted owner fenced with %s", async fault => {
+      const prior = await seedRecoveredPriorRun(fault === "pending turn" ? "pending-command"
+        : fault === "unanswered tool" ? "unanswered-tool" : "settled", { lifecycle: "warm", provider: "pi_rpc" });
+      await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, prior.runId));
+      await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", resultId: null,
+        ...(fault === "held lease" ? { leaseOwner: "still-owned" } : {}),
+        ...(fault === "pending recovery" ? { recoveryState: "resuming_session" } : {}),
+      }).where(eq(nativeRunFinalizations.runId, prior.runId));
+      const followUp = await admitFollowUp(prior);
+      await db.insert(environments).values({ id: followUp.environmentId, name: `retained-${followUp.environmentId}`, driver: "sandbox" });
+      await db.insert(environmentLeases).values({ companyId, environmentId: followUp.environmentId,
+        issueId: prior.issueId, heartbeatRunId: prior.runId, provider: "daytona", providerLeaseId: followUp.providerLeaseId,
+        status: "released", metadata: { remoteCwd: fault === "wrong allocation" ? "/another-workspace" : "/workspace" } });
+      expect(await followUp.start("resumed")).not.toBe(ADMITTED);
+      expect(followUp.logs.join("")).not.toContain("starting a new runner");
+      expect(followUp.remoteExecute).not.toHaveBeenCalled();
+    }, 60_000);
+
+  // Unit test agreed: requested process/DB admission boundary, without model credentials.
+  it.each(["tray-cancelled", "failed-no-result", "journal-after-restart", "settled-image-only", "warm_saved", "warm-v2-receipt", "collect-fails-tail", "pre-door-absent"] as const)(
+    "retires by observed exec exit on the same Pi checkpoint: %s", async scenario => {
+      await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, agentId));
+      const prior = await seedRecoveredPriorRun("settled", { lifecycle: "warm", provider: "pi_rpc" });
+      if (scenario === "tray-cancelled" || scenario === "failed-no-result" || scenario === "pre-door-absent") {
+        await db.update(heartbeatRuns).set({ status: scenario === "tray-cancelled" ? "cancelled" : "failed" }).where(eq(heartbeatRuns.id, prior.runId));
+        await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", resultId: null }).where(eq(nativeRunFinalizations.runId, prior.runId));
+      }
+      const followUp = await admitFollowUp(prior), root = scopedRunnerdStateRoot(prior.executionFor(followUp.runId));
+      const box = join(stateDirectory, `box-${scenario}`), runner = join(box, ".paperclip-runtime", "paperclip-runner", "sessions",
+        createHash("sha256").update(prior.native.normalizedSessionId).digest("hex"), "runner");
+      await mkdir(runner, { recursive: true });
+      const checkpoint = await loadNativeRunnerCheckpoint(db, { companyId, issueId: prior.issueId, runId: prior.runId });
+      checkpoint!.restoreSessionDirectory(root);
+      const controlPath = join(root, "control-plane", "control-plane-state.json");
+      const control = JSON.parse(await readFile(controlPath, "utf8"));
+      if (scenario === "warm-v2-receipt") {
+        control.schema = "paperclip.runner.durable.control-plane-state.v2";
+        control.warmTransition = { transitionId: "completed-before-swap", status: "completed" };
+      }
+      if (scenario.includes("restart") || scenario === "settled-image-only" || scenario === "warm-v2-receipt") {
+        control.committedEvents.push({ eventType: "run.presentation.resolved", envelope: { ...prior.identity, turnId: "out-of-run", itemId: "saved-files",
+          payload: { schema: "paperclip.prp.event.v2", sourceKind: "control_plane", sourceInstanceId: "new-server" } } });
+        await writeFile(controlPath, JSON.stringify(control));
+      }
+      const final = { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "runner", sourceInstanceId: prior.identity.runnerInstanceId,
+        sourceSeq: 1, sourceEventId: "unpublished-final", priority: 0, emittedAt: new Date().toISOString(), eventType: "item.completed",
+        runId: prior.runId, normalizedSessionId: prior.native.normalizedSessionId, turnId: prior.identity.turnId, itemId: prior.identity.itemId,
+        payload: { kind: "agentMessage", channel: "final", text: "Recovered finished answer." } };
+      const state = { ...prior.identity, schema: "paperclip.runner.durable.state.v1", lifecycle: "ready",
+        outbox: scenario === "journal-after-restart" ? [{ sourceSeq: 1, eventType: "item.completed", envelope: { ...prior.identity, payload: final } }] : [] };
+      await mkdir(join(root, "runner"), { recursive: true });
+      await writeFile(join(root, "runner", "runner-state.json"), JSON.stringify(state));
+      if (scenario === "pre-door-absent") await rm(join(root, "runner"), { recursive: true, force: true });
+      await writeFile(join(runner, "runner-state.json"), JSON.stringify(state));
+      const old = spawn(process.execPath, ["-e", "process.stdout.write('ready\\n');setInterval(()=>{},1000)", "--", "--runner-id", prior.identity.runnerInstanceId], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
+      const pi = spawn(process.execPath, ["-e", "process.stdout.write('ready\\n');setInterval(()=>{},1000)"], { detached: true,
+        env: { ...process.env, PAPERCLIP_PI_RUNTIME_DIR: runner }, stdio: ["ignore", "pipe", "pipe"] });
+      const oldExit = once(old, "exit"), piExit = once(pi, "exit");
+      try {
+        await Promise.all([once(old.stdout!, "data"), once(pi.stdout!, "data")]);
+        const stat = await readFile(`/proc/${old.pid}/stat`, "utf8"), ticks = stat.slice(stat.lastIndexOf(") ") + 2).trim().split(/\s+/)[19];
+        const boot = (await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim();
+        await writeFile(join(runner, "runner-process.identity"), `nonce\n${old.pid}\n${new Date().toISOString()}\n${prior.identity.runnerInstanceId}\nlinux:${boot}:${ticks}\n`);
+        await writeFile(join(runner, "codex-provider-state.json"), JSON.stringify({ schema: "paperclip.runner.codex-provider-state.v1", config: { provider: "pi_rpc" },
+          threadId: "provider-session-before-recovery", activeProviderTurnId: scenario === "tray-cancelled" ? "cancelled" : null,
+          toolBridge: { pending: {} }, startupAttempt: { processId: pi.pid, processGroupId: pi.pid } }));
+        const sessionFile = join(runner, "pi-session.jsonl"), sessionBytes = '{"type":"session","id":"same"}\n';
+        await writeFile(sessionFile, sessionBytes);
+        await db.insert(environments).values({ id: followUp.environmentId, name: `fact-${followUp.environmentId}`, driver: "sandbox" });
+        await db.insert(environmentLeases).values({ companyId, environmentId: followUp.environmentId, issueId: prior.issueId, heartbeatRunId: prior.runId,
+          provider: "daytona", providerLeaseId: followUp.providerLeaseId, status: "released", metadata: { remoteCwd: box } });
+        followUp.remoteExecute.mockImplementation(async (request: unknown) => {
+          const spec = request as { command: string; args: string[]; timeoutMs?: number; cwd?: string; env?: Record<string, string>; stdin?: string };
+          const args = [...spec.args], env = { ...process.env, ...spec.env };
+          if (args[0] === "-e" && args[1] === STOP_PI_PROCESS_GROUP) {
+            // Runner is now gone: append the shutdown tail after the first replay.
+            if (scenario === "collect-fails-tail") {
+              await writeFile(join(runner, "runner-state.json"), JSON.stringify({ ...state,
+                outbox: [{ sourceSeq: 1, eventType: "item.completed", envelope: { ...prior.identity, payload: final } }] }));
+            }
+            args[1] = sandboxPiProcessVisibility(args[1], [old.pid, pi.pid]);
+          }
+          if (spec.stdin != null) { env.PAPERCLIP_TEST_STDIN = spec.stdin; args[1] = `printf '%s' "$PAPERCLIP_TEST_STDIN" | (${args[1]})`; }
+          try { const result = await promisify(execFile)(spec.command, args, { cwd: spec.cwd, env, timeout: spec.timeoutMs ?? 10_000, maxBuffer: 35 * 1024 * 1024 });
+            return { ...result, exitCode: 0, timedOut: false }; }
+          catch (error) { const e = error as { code: number; stdout: string; stderr: string; killed: boolean };
+            return { exitCode: typeof e.code === "number" ? e.code : 1, timedOut: e.killed, stdout: e.stdout ?? "", stderr: e.stderr ?? "" }; }
+        });
+        const canonicalFiles = resolveManagedInstructionsRoot({ id: agentId, companyId, name: "Runner", adapterConfig: {} }), copies = agentInstructionWorkingCopyService(db);
+        if (scenario === "warm_saved" || scenario === "warm-v2-receipt") {
+          const userId = randomUUID();
+          await db.insert(authUsers).values({ id: userId, name: "Editor", email: `${userId}@example.invalid`, createdAt: new Date(), updatedAt: new Date() });
+          await db.insert(companyMemberships).values([{ companyId, principalType: "user", principalId: userId, membershipRole: "operator" },
+            { companyId, principalType: "agent", principalId: agentId, membershipRole: "member" }]).onConflictDoNothing();
+          await db.insert(principalPermissionGrants).values({ companyId, principalType: "user", principalId: userId, permissionKey: "agents:configure", scope: { agentIds: [agentId] } });
+          await db.update(heartbeatRuns).set({ responsibleUserId: userId }).where(eq(heartbeatRuns.id, prior.runId));
+          await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous", instructionsBundleMode: "managed",
+            instructionsRootPath: canonicalFiles, instructionsEntryFile: "AGENTS.md" } }).where(eq(agents.id, agentId));
+          await mkdir(canonicalFiles, { recursive: true }); await writeFile(join(canonicalFiles, "AGENTS.md"), "# Policy\n");
+          // Use only one allocation row for the retirement fence, as stock requires.
+          await db.delete(environmentLeases).where(eq(environmentLeases.heartbeatRunId, prior.runId));
+          await db.insert(environmentLeases).values({ id: followUp.leaseId, companyId, environmentId: followUp.environmentId, issueId: prior.issueId,
+            heartbeatRunId: prior.runId, provider: "daytona", providerLeaseId: followUp.providerLeaseId, status: "active", metadata: { remoteCwd: box } });
+          const target = { kind: "remote" as const, transport: "sandbox" as const, environmentId: followUp.environmentId, leaseId: followUp.leaseId,
+            remoteCwd: box, runner: { execute: followUp.remoteExecute } };
+          const copy = (await copies.prepare({ companyId, agentId, runId: prior.runId, cwd: box, target: target as never, warm: true }))!;
+          await writeFile(join(copy.executionRoot, "memory.txt"), "checkpointed warm files\n");
+          expect((await copies.checkpointWarm({ companyId, runId: prior.runId, target: target as never }))?.state).toBe("warm_saved");
+          await writeFile(join(copy.executionRoot, "memory.txt"), "tail collected before cold start\n");
+        }
+        collectionFault.active = scenario === "collect-fails-tail";
+        const result = await followUp.start("resumed", undefined, box);
+        if (scenario === "collect-fails-tail") expect(result).toContain("could not be retired");
+        else expect(result).toBe(ADMITTED);
+        if (scenario === "warm_saved" || scenario === "warm-v2-receipt") {
+          expect(await readFile(join(canonicalFiles, "memory.txt"), "utf8")).toBe("tail collected before cold start\n");
+          expect(await copies.get(companyId, prior.runId)).toMatchObject({ state: "unchanged", processStoppedAt: expect.any(Date) });
+        }
+        await Promise.all([oldExit, piExit]);
+        expect(followUp.native.normalizedSessionId).toBe(prior.native.normalizedSessionId);
+        expect(await readFile(sessionFile, "utf8")).toBe(sessionBytes);
+        const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, followUp.runId));
+        expect(current.runnerProfileJson?.sessionCheckpoint).toMatchObject({ providerSessionId: "provider-session-before-recovery" });
+        const proofs = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, followUp.runId));
+        expect(proofs.filter(e => e.eventType === "native.pi_owner_retired")).toHaveLength(scenario === "collect-fails-tail" ? 0 : 1);
+        const replies = await db.select().from(issueComments).where(eq(issueComments.issueId, prior.issueId));
+        expect(replies.filter(c => c.body === "Recovered finished answer.")).toHaveLength(["journal-after-restart", "collect-fails-tail"].includes(scenario) ? 1 : 0);
+        if (scenario === "pre-door-absent") {
+          // Admission reached after actual observed exit, not a synthetic proof.
+          // Re-entering this saved same-session continuation must not hit the
+          // pre-door missing-authority fence a second time.
+          expect(await followUp.start("resumed", undefined, box)).toBe(ADMITTED);
+          expect(followUp.native.normalizedSessionId).toBe(prior.native.normalizedSessionId);
+          // Provider events are controlled test input; publication and its
+          // dedupe run on the actual DB after same-session process admission.
+          const [question] = await db.insert(issueComments).values({ companyId, issueId: prior.issueId,
+            authorType: "user", body: "Next message after same-session recovery." }).returning();
+          const event = { eventType: "item.completed" as const, sourceEventId: "post-absent-follow-up-final",
+            runId: followUp.runId, normalizedSessionId: prior.native.normalizedSessionId, itemId: "post-absent-follow-up-item",
+            payload: { kind: "agentMessage", channel: "final", text: "Same-session next answer.", answers: [question!.id] } };
+          const publication = { db, cursor: 1, execution: prior.executionFor(followUp.runId), event };
+          await publishContinuousNativeReply(publication);
+          await publishContinuousNativeReply(publication);
+          const answered = await db.select().from(issueComments).where(eq(issueComments.issueId, prior.issueId));
+          expect(answered.filter(c => c.body === "Same-session next answer.")).toHaveLength(1);
+        }
+      } finally {
+        collectionFault.active = false;
+        for (const [child, exited] of [[old, oldExit], [pi, piExit]] as const) if (child.exitCode === null && child.signalCode === null) { process.kill(-child.pid!, "SIGKILL"); await exited; }
+      }
+    }, 60_000);
 
   async function quarantined() {
     const path = join(stateDirectory, "quarantine");

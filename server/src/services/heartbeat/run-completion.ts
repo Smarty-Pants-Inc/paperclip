@@ -44,7 +44,7 @@ import { accountRunCost } from "../run-cost-accounting.js";
 import { isConversation, settleConversationTurn } from "../agent-conversations.js";
 import { legacyExecutionNeedsReconciliationWithEvidence } from "../legacy-execution-recovery.js";
 import { isWorkspaceGitScanError } from "../workspace-git-operation-scheduler.js";
-import { and, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import { heartbeatRunEvents, heartbeatRuns, issueComments, issues, nativeRunFinalizations, nativeRunResults } from "@paperclipai/db";
 import { HttpError } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
@@ -1241,6 +1241,30 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
   }
 
   async function schedulePredecessorRetirementContinuation(run: Run, agent: Agent, fallback: PredecessorRetirementFallback) {
+    // The continuity break is already known. Publish it before workspace or
+    // coordinator cleanup can refuse/throw; neither may hide the failed session.
+    if (fallback.freshSessionRequired && run.issueId) {
+      const notices = await db.transaction(async tx => {
+        // Non-key task updates and comment FK checks must not deadlock each other.
+        const [task] = await tx.select().from(issues).where(and(eq(issues.companyId, run.companyId), eq(issues.id, run.issueId!))).for("no key update");
+        const [marker] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+          eq(issueComments.companyId, run.companyId), eq(issueComments.issueId, run.issueId!),
+          eq(issueComments.createdByRunId, run.id), isNotNull(issueComments.conversationSessionGeneration))).limit(1);
+        if (task && !marker) {
+          const now = new Date();
+          return tx.insert(issueComments).values([
+            { companyId: run.companyId, issueId: task.id, createdByRunId: run.id, authorType: "system", createdAt: now,
+              body: `The previous session could not be stopped safely. [This run failed](/agents/${run.agentId}/runs/${run.id}); a fresh session is required for the next attempt. Earlier messages remain available.` },
+            { companyId: run.companyId, issueId: task.id, createdByRunId: run.id, authorType: "system", createdAt: new Date(now.getTime() + 1),
+              body: "New session", conversationSessionGeneration: task.conversationSessionGeneration },
+          ]).returning();
+        }
+        return [];
+      });
+      for (const notice of notices) await logActivity(db, { companyId: run.companyId, actorType: "system", actorId: "native-runtime",
+        agentId: run.agentId, runId: run.id, issueId: run.issueId, action: "issue.comment_added", entityType: "issue", entityId: run.issueId,
+        details: { commentId: notice.id, bodySnippet: notice.body.slice(0, 120), source: "pi_retirement_fallback" } });
+    }
     // Files this run's setup may have written are never dropped: without the
     // shared unchanged-files proof the workspace stays dirty and preserved.
     const released = await releaseUnchangedFallbackWorkspace(db, run).catch((error) => {
@@ -1273,6 +1297,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       || allowsIssueInteractionWake(parseObject(run.contextSnapshot), ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS)
       ? readNonEmptyString(parseObject(run.contextSnapshot).wakeReason) : null;
     return scheduleBoundedRetryForRun(run, agent, { retryReason: INTERRUPTED_PREPARATION_RETRY_REASON,
+      ...(fallback.freshSessionRequired ? { freshSessionRequired: true } : {}),
       ...(wakeReason ? { wakeReason } : {}) }).catch((retryError) => {
       logger.warn({ err: retryError, runId: run.id }, "failed to re-queue a run whose predecessor could not be retired");
       return null;

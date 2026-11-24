@@ -6689,6 +6689,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const prepared = await this.#prepareLaunch(params, identity, dynamicTools);
     this.#startupSteps?.end();
     const { runAttachTemplate } = prepared;
+    if (this.options.provider === "pi_rpc" && typeof params.threadId === "string") Object.assign(runAttachTemplate.provider, { providerSessionId: params.threadId });
     // Preserve the first generation's provider attachment seed independently
     // of bounded command history. The in-memory copy serves a live warm
     // continuation; the control-plane copy serves a controller/runner resume.

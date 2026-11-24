@@ -19,6 +19,7 @@ export class NativePredecessorRetirementUnprovenError extends Error {
     /** The sandbox that still holds the unretired owner, when known. */
     readonly providerLeaseId: string | null,
     cause: unknown,
+    readonly freshSessionRequired = false,
   ) {
     super(`The previous run's session on this sandbox could not be retired (${
       cause instanceof Error ? cause.message : String(cause)}).`, { cause });
@@ -57,6 +58,8 @@ export type PredecessorRetirementFallback = {
   predecessorRunId: string | null;
   replacedProviderLeaseIds: string[];
   issueStatusAtFailure?: string;
+  /** Continuous Pi could not prove the previous process gone; never select its checkpoint again. */
+  freshSessionRequired?: true;
 };
 
 export function readPredecessorRetirementFallback(resultJson: unknown): PredecessorRetirementFallback | null {

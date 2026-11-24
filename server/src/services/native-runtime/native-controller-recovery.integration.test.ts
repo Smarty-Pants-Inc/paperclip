@@ -1,4 +1,8 @@
 import { execFile, spawn } from "node:child_process";
+import { once } from "node:events";
+import { promisify } from "node:util";
+import { retirePiRunnerByFact, STOP_PI_PROCESS_GROUP } from "./native-pi-retirement.js";
+import { sandboxPiProcessVisibility } from "../../__tests__/helpers/pi-process-visibility.js";
 import { nativeProviderRecoveryEvidence, nativeSessionFailureSourceCode, restoreRemoteSuspendedRunnerCheckpoint,
   verifyRemoteRunnerReattachment } from "./native-session-executor.js";
 import { readRemoteRunnerRecoveryError } from "./remote-runner-recovery-diagnostics.js";
@@ -1294,6 +1298,40 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
       .rejects.toThrow("retained_sandbox_binding");
   });
 
+  it("gates uncommitted retained binding on an authentic physical-exit receipt and effective continuous Pi", async () => {
+    const fixture = await seed(), environmentId = randomUUID(), providerLeaseId = randomUUID();
+    const remoteCwd = join(root, `proof-binding-${fixture.scope.runId}`);
+    await mkdir(remoteCwd, { recursive: true });
+    await db.insert(environments).values({ id: environmentId, name: environmentId, driver: "sandbox" });
+    await db.insert(environmentLeases).values({ companyId, environmentId, issueId: fixture.scope.issueId,
+      heartbeatRunId: fixture.scope.runId, provider: "daytona", providerLeaseId, status: "released", metadata: { remoteCwd } });
+    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", resultId: null }).where(eq(nativeRunFinalizations.runId, fixture.scope.runId));
+    const target = { kind: "remote", transport: "sandbox", environmentId, leaseId: randomUUID(), providerKey: "daytona",
+      remoteCwd, sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId } } as const;
+    const identity = { runId: fixture.scope.runId, normalizedSessionId: fixture.native.normalizedSessionId,
+      runnerInstanceId: fixture.native.runnerInstanceId, environmentLeaseId: fixture.native.environmentLeaseId,
+      turnId: fixture.native.turnId, itemId: fixture.native.itemId };
+    const child = spawn(process.execPath, ["-e", "process.stdout.write('ready\\n');setInterval(()=>{},1000)"], {
+      detached: true, env: { ...process.env, PAPERCLIP_PI_RUNTIME_DIR: remoteCwd }, stdio: ["ignore", "pipe", "pipe"],
+    });
+    const exited = once(child, "exit");
+    try {
+      await once(child.stdout!, "data");
+      const runner = { ...identity, outbox: [] }, provider = { config: { provider: "pi_rpc" }, startupAttempt: { processGroupId: child.pid } };
+      const proof = await retirePiRunnerByFact({ identity, read: async () => ({ runner, provider }), settle: async () => {},
+        stop: async () => { await promisify(execFile)(process.execPath, ["-e", sandboxPiProcessVisibility(STOP_PI_PROCESS_GROUP, [child.pid]), remoteCwd, JSON.stringify(provider)]); await exited; },
+        collectStopped: async () => {}, recordProof: async () => {} });
+      const scope = { ...fixture.scope, target: target as never, provider: "pi_rpc", sessionContinuity: "continuous" as const, piRetirementProof: proof };
+      for (const override of [{ piRetirementProof: undefined }, { piRetirementProof: { ...proof } }, { provider: "codex" },
+        { provider: "acpx" }, { sessionContinuity: "paperclip" as const }, { piRetirementProof: { ...proof, runId: randomUUID() } }]) {
+        await expect(assertNativeRetainedSandboxBinding(db, { ...scope, ...override })).rejects.toThrow("retained_sandbox_binding");
+      }
+      await expect(assertNativeRetainedSandboxBinding(db, scope)).resolves.toEqual({ remoteCwd });
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) { process.kill(-child.pid!, "SIGKILL"); await exited; }
+    }
+  });
+
   // The same move, driven through the changed read with sandbox confinement:
   // the Runner command may touch only paths inside the sandbox's workspace base.
   it.each(["suspended", "ready"] as const)("reads a moved source's %s Runner state from its own directory through a confined sandbox", async lifecycle => {
@@ -1350,6 +1388,25 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
     const restore = () => restoreRemoteSuspendedRunnerCheckpoint({ db, execution, runnerExecutionTarget: target as never }, controller);
 
     if (lifecycle === "suspended") {
+      const [committed] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, fixture.scope.runId));
+      const journal = await readFile(join(controller, "control-plane", "control-plane-state.json"), "utf8");
+      for (const status of ["cancelled", "failed", "interrupted"] as const) {
+        await db.update(heartbeatRuns).set({ status }).where(eq(heartbeatRuns.id, fixture.scope.runId));
+        await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", resultId: null }).where(eq(nativeRunFinalizations.runId, fixture.scope.runId));
+        // Stock Codex must not treat a missing controller receipt as process absence.
+        await expect(restore()).rejects.toThrow("retained_sandbox_binding");
+        await expect(readFile(join(controller, "plugin-runner-state.json"))).rejects.toMatchObject({ code: "ENOENT" });
+        expect(await readFile(join(controller, "control-plane", "control-plane-state.json"), "utf8")).toBe(journal);
+        await db.update(environmentLeases).set({ metadata: { remoteCwd: "/another-workspace" } }).where(eq(environmentLeases.heartbeatRunId, fixture.scope.runId));
+        await expect(restore()).rejects.toThrow("retained_sandbox_binding");
+        await db.update(environmentLeases).set({ metadata: { remoteCwd: sourceCwd } }).where(eq(environmentLeases.heartbeatRunId, fixture.scope.runId));
+      }
+      const [duplicate] = await db.insert(environmentLeases).values({ companyId, environmentId, issueId: fixture.scope.issueId,
+        heartbeatRunId: fixture.scope.runId, provider: "daytona", providerLeaseId, status: "expired", metadata: { remoteCwd: sourceCwd } }).returning();
+      await expect(restore()).rejects.toThrow("retained_sandbox_binding");
+      await db.delete(environmentLeases).where(eq(environmentLeases.id, duplicate.id));
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, fixture.scope.runId));
+      await db.update(nativeRunFinalizations).set({ phase: "committed", resultId: committed.resultId }).where(eq(nativeRunFinalizations.runId, fixture.scope.runId));
       await restore();
       expect(commands.some(script => script.includes(runnerDirectory(sourceCwd)))).toBe(true);
       expect(commands.some(script => script.includes(movedCwd))).toBe(false);

@@ -130,6 +130,21 @@ it("retains the original projectless lease across warm run placeholders but reje
   expect(() => resolveRemoteProviderPackAuthority({ ...input, binding: changed, reattach: true })).toThrow("does not match this execution");
 });
 
+it("retains exact pack bytes on an attested cold Pi selection change, without relaxing other binding fields", () => {
+  const { input, path } = fixture();
+  resolveRemoteProviderPackAuthority(input).verified();
+  const cold = { ...input, retainProviderPack: true, previousProviderDigest: binding.providerDigest,
+    binding: { ...binding, providerDigest: "current-selection" }, current: () => manifest("b") };
+  const authority = resolveRemoteProviderPackAuthority(cold);
+  expect(authority.manifest).toEqual(manifest("a"));
+  expect(() => authority.select(manifest("b"))).toThrow("cannot replace");
+  for (const field of ["sessionId", "workspaceId", "environmentLeaseId", "agentId"] as const) {
+    expect(() => resolveRemoteProviderPackAuthority({ ...cold, binding: { ...cold.binding, [field]: "other" } })).toThrow("does not match this execution");
+  }
+  expect(() => resolveRemoteProviderPackAuthority({ ...cold, reattach: true })).toThrow("does not match this execution");
+  authority.verified();
+  expect(JSON.parse(readFileSync(path, "utf8")).binding).toEqual(cold.binding);
+});
 it("persists the compatible installation selected at launch, then pins it on reattachment", () => {
   const { input } = fixture();
   const authority = resolveRemoteProviderPackAuthority(input);

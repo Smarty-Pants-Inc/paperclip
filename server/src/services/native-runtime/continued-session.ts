@@ -11,6 +11,12 @@ export function withPiOpenTurnDefault(provider: unknown, setting: unknown, envir
   return { ...environment, PAPERCLIP_PI_OPEN_TURN_MS: "600000" };
 }
 
+/** Persisted per-run policy outranks later agent edits during replay/recovery. */
+export function readNativeSessionContinuity(profile: unknown): "continuous" | "paperclip" | undefined {
+  const value = profile && typeof profile === "object" ? (profile as Record<string, unknown>).nativeSessionContinuity : undefined;
+  return value === "continuous" || value === "paperclip" ? value : undefined;
+}
+
 export function decideNativeContinuation(input: {
   provider?: unknown; sessionContinuity?: unknown; hasSession: boolean;
   resetRequired?: boolean; wakeReset?: boolean; wakePayload?: unknown; taskChanged?: boolean; previousRunId?: string; agentId?: string;
