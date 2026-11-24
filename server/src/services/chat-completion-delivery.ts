@@ -318,11 +318,7 @@ export async function acknowledgeChatCompletionReply(tx: Connection, runId: stri
       answers ? inArray(sql<string>`${deliveries.id}::text`, answers) : undefined));
 }
 
-export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentId: string, options: {
-  source: "automation"; triggerDetail: "system"; reason: string; idempotencyKey: string; allowRunCoalescing: boolean;
-  requestedByActorType: "system"; requestedByActorId: string; payload: Record<string, unknown>; contextSnapshot: Record<string, unknown>;
-}): Promise<{ id: string } | null> }) {
-  async function deliverIntoLiveTurn(claimed: typeof deliveries.$inferSelect, key: string) {
+export async function deliverIntoLiveTurn(db: Db, claimed: typeof deliveries.$inferSelect, key: string) {
     return db.transaction(async tx => {
       // Match status writers' task-first order; promotion and publication own the chat lock.
       await tx.select({ id: issues.id }).from(issues).where(and(eq(issues.id, claimed.taskId),
@@ -388,6 +384,10 @@ export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentI
       return true;
     });
   }
+export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentId: string, options: {
+  source: "automation"; triggerDetail: "system"; reason: string; idempotencyKey: string; allowRunCoalescing: boolean;
+  requestedByActorType: "system"; requestedByActorId: string; payload: Record<string, unknown>; contextSnapshot: Record<string, unknown>;
+}): Promise<{ id: string } | null> }) {
   async function deliver(id: string): Promise<void> {
     // Lease outbox work before leaving the transaction; recovery reuses the same wake key.
     const claimed = await db.update(deliveries).set({ nextAttemptAt: new Date(Date.now() + LEASE_MS) })
@@ -454,7 +454,7 @@ export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentI
         if (advanced && claimed.attempts + 1 < MAX_ATTEMPTS) await deliver(id);
         return;
       }
-      if (wakes.some(w => w.status === "deferred_issue_execution") && await deliverIntoLiveTurn(claimed, key)) return;
+      if (wakes.some(w => w.status === "deferred_issue_execution") && await deliverIntoLiveTurn(db, claimed, key)) return;
       if (wakes.some(w => ["queued", "claimed", "deferred_issue_execution", "coalesced"].includes(w.status))) return;
       if (wakes.length) {
         // Terminal receipts must advance the key; reusing them collides forever.
@@ -495,7 +495,7 @@ export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentI
         const receipts = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
           .where(and(eq(agentWakeupRequests.companyId, claimed.companyId), eq(agentWakeupRequests.idempotencyKey, key)));
         if (!receipts.length) throw new Error("Completion wake returned no run or durable receipt");
-        await deliverIntoLiveTurn(claimed, key);
+        await deliverIntoLiveTurn(db, claimed, key);
       }
       if (run) await db.update(deliveries).set({ targetRunId: run.id, status: "queued" })
         .where(and(eq(deliveries.id, id), inArray(deliveries.status, [...pending]), sql`${deliveries.targetRunId} is null`));

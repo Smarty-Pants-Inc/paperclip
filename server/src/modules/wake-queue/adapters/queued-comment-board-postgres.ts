@@ -1,4 +1,5 @@
-import { agentWakeupRequests, agents, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
+import { agentWakeupRequests, agents, chatCompletionDeliveries, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
+import { CHAT_COMPLETION_WAKE_REASON, deliverIntoLiveTurn } from "../../../services/chat-completion-delivery.js";
 import type { IssueQueuedCommentQueue } from "@paperclipai/shared";
 import { isConversationReset } from "../../../services/agent-conversations.js";
 import { resolveSessionContinuity } from "../../../services/native-runtime/continued-session.js";
@@ -187,6 +188,17 @@ export async function closeConversationResetHold(executor: Db, scope: { companyI
     sql`${agentWakeupRequests.payload}->'issueId' = to_jsonb(${scope.issueId}::text)`,
   )).orderBy(asc(agentWakeupRequests.requestedAt));
   for (const wake of wakes) {
+    const context = parseObject(wake.payload?._paperclipWakeContext);
+    if ((context.wakeReason ?? wake.reason) === CHAT_COMPLETION_WAKE_REASON && wake.idempotencyKey) {
+      const ids = context.chatCompletionDeliveryIds;
+      const [delivery] = Array.isArray(ids) && ids.length === 1 && typeof ids[0] === "string"
+        ? await executor.select().from(chatCompletionDeliveries).where(and(
+          eq(chatCompletionDeliveries.companyId, scope.companyId), eq(chatCompletionDeliveries.id, ids[0]))) : [];
+      if (delivery && await deliverIntoLiveTurn(executor, delivery, wake.idempotencyKey)) continue;
+      const [latest] = await executor.select({ status: agentWakeupRequests.status }).from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, scope.companyId)));
+      if (latest?.status !== "deferred_issue_execution") continue;
+    }
     if (queuedInteractionId(wake.payload)) return closeHeldNativeTurn(current.runId);
     const comments = await queueCommentsForWake(executor, scope.issueId, wake, null);
     const head = comments[0];

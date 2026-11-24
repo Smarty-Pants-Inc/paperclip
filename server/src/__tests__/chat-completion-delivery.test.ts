@@ -1,9 +1,10 @@
 import { publishContinuousNativeReply } from "../services/native-runtime/native-continuous-reply.js";
-const heldCompletion = vi.hoisted(() => ({ refused: false }));
+const heldCompletion = vi.hoisted(() => ({ refused: false, closed: false }));
 vi.mock("../services/native-runtime/native-session-executor.js", async importOriginal => ({
   ...await importOriginal<typeof import("../services/native-runtime/native-session-executor.js")>(),
-  getNativeSessionSteeringState: async () => ({ disposition: "available", activeTurnId: "held-turn" }),
-  steerNativeSession: async () => { if (heldCompletion.refused) throw new Error("steer refused"); return { turnId: "held-turn" }; },
+  getNativeSessionSteeringState: async () => ({ disposition: heldCompletion.closed ? "stale_turn" : "available", activeTurnId: "held-turn" }),
+  closeHeldNativeTurn: async () => { heldCompletion.closed = true; return true; },
+  steerNativeSession: async () => { if (heldCompletion.refused || heldCompletion.closed) throw new Error("steer refused"); return { turnId: "held-turn" }; },
 }));
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { subscribeDeliveryWork, DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
@@ -25,6 +26,7 @@ import { heartbeatService, shouldQueueFollowupForRunningIssueWake } from "../ser
 import { createHeartbeatQueue } from "../services/heartbeat/queue.js";
 import { createHeartbeatQueueTestDependencies } from "./helpers/heartbeat-queue.js";
 import { createReleaseIssueExecution } from "../modules/wake-queue/application/use-cases.js";
+import { closeConversationResetHold } from "../modules/wake-queue/adapters/queued-comment-board-postgres.js";
 import { conversationDecisionReceiptsService } from "../services/conversation-decision-receipts.js";
 import { ALREADY_REPORTED_WAKE_REASON, createPostgresWakeQueueAdapter } from "../modules/wake-queue/adapters/postgres.js";
 
@@ -66,7 +68,7 @@ import { ALREADY_REPORTED_WAKE_REASON, createPostgresWakeQueueAdapter } from "..
   }
   // catch: a held report must not be repeated after the hold is released
   it.each(["continuous", "legacy", "paperclip", "refused"])("reports a held completion once, without a hold-end successor (%s)", async mode => {
-    const f = await seed(), sessionId = randomUUID(); heldCompletion.refused = mode === "refused";
+    const f = await seed(), sessionId = randomUUID(); heldCompletion.refused = mode === "refused"; heldCompletion.closed = false;
     await db.insert(authUsers).values({ id: "operator", name: "Operator", email: "operator@example.test", createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
     await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: mode === "paperclip" ? "paperclip" : "continuous" } }).where(eq(agents.id, f.agentId));
     await db.update(issues).set({ executionRunId: f.runId, conversationState: "active" }).where(eq(issues.id, f.sourceId));
@@ -76,6 +78,8 @@ import { ALREADY_REPORTED_WAKE_REASON, createPostgresWakeQueueAdapter } from "..
       await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "automation",
         reason: "issue_execution_deferred", status: "deferred_issue_execution", idempotencyKey: options.idempotencyKey,
         payload: { ...options.payload, _paperclipWakeContext: options.contextSnapshot } });
+      if (mode === "continuous" || mode === "legacy")
+        await closeConversationResetHold(db, { companyId: f.companyId, issueId: f.sourceId });
       return null as never;
     });
     const report = `Finished: [${f.task.identifier}](/issues/${f.task.identifier}).`;
@@ -86,6 +90,7 @@ import { ALREADY_REPORTED_WAKE_REASON, createPostgresWakeQueueAdapter } from "..
     await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, runId: f.runId, agentId: f.agentId, seq: 170, eventType: event.eventType, payload: { prpEvent: unrelated } });
     await publishContinuousNativeReply({ ...publication, event: unrelated, cursor: 170 });
     await f.service.deliver(delivery.id);
+    if (mode === "continuous" || mode === "legacy") expect(heldCompletion.closed).toBe(mode === "legacy");
     await publishContinuousNativeReply({ ...publication, event: { ...unrelated, itemId: "held:another-person" } });
     if (mode === "paperclip") await issueService(db).addComment(f.sourceId, report, { agentId: f.agentId, runId: f.runId });
     else if (mode !== "legacy") {
@@ -121,7 +126,7 @@ import { ALREADY_REPORTED_WAKE_REASON, createPostgresWakeQueueAdapter } from "..
       expect(await f.rows()).toMatchObject([{ status: "delivered", targetRunId: f.runId, responseCommentId: reports[0].id, attempts: 0 }]);
       expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toMatchObject([{ id: f.runId, nativeSessionId: sessionId }]);
     }
-    heldCompletion.refused = false;
+    heldCompletion.refused = false; heldCompletion.closed = false;
   });
   /** The person's own message woke a turn that read the task done and linked it in its reply. */
   async function reportedByEarlierTurn(f: Awaited<ReturnType<typeof seed>>, read = true) {
