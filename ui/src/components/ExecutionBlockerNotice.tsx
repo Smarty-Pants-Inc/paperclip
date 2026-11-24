@@ -52,9 +52,12 @@ const blockerAction: Record<string, string> = {
 };
 
 /** One ordinary interruption surface. Technical records remain in diagnostics. */
-export function ExecutionBlockerNotice({ presentation, observedStatus, observedResultJson, observedErrorCode, blocker, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, companyId, agentName, projectName, blockers }: {
+export function ExecutionBlockerNotice({ presentation, observedStatus, observedResultJson, observedErrorCode, blocker, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, companyId, agentName, projectName, blockers, savedMessageBlocked = false, conversationMode = false }: {
   presentation: TaskInterruptionPresentation | null | undefined;
   observedStatus?: string;
+  /** Saved, unanswered chat with no live work or actionable interruption projection. */
+  savedMessageBlocked?: boolean;
+  conversationMode?: boolean;
   observedResultJson?: Record<string, unknown> | null;
   observedErrorCode?: string | null;
   blocker?: ExecutionBlocker | null;
@@ -71,7 +74,11 @@ export function ExecutionBlockerNotice({ presentation, observedStatus, observedR
   projectName?: string;
 }) {
   if (isPersonStoppedRun({ resultJson: observedResultJson, errorCode: observedErrorCode })) return null;
-  const recovery = isConversationRecovery(presentation,
+  if (savedMessageBlocked) presentation = { state: "failed", responsibility: "system", canRetry,
+    intentId: null, nextRetryAt: null, userAction: null, sourceRunIds: [], observedRunId: null };
+  const newSession = conversationMode && presentation?.state === "failed" && !(canRetry && presentation.canRetry)
+    ? <> Send <code>/new</code> to start a fresh session, then send your message again.</> : null;
+  const recovery = !savedMessageBlocked && isConversationRecovery(presentation,
     observedStatus ?? (blocker?.workspaceRepairRequired ? "failed" : undefined));
   if (presentation?.projectAccess && !optimistic && !takingLonger) return <TaskProjectAccessNotice
     access={presentation.projectAccess} issueId={issueId} agentName={agentName} projectName={projectName}
@@ -80,7 +87,7 @@ export function ExecutionBlockerNotice({ presentation, observedStatus, observedR
     className={cn("flex items-center gap-3 text-sm text-muted-foreground", className)}>
     {(optimistic || presentation.state !== "failed") && <LoaderCircle className="size-4 shrink-0 motion-safe:animate-spin" aria-hidden="true" />}
     <span className="min-w-0 flex-1">{!optimistic && presentation.state === "failed"
-      ? "Couldn't resume this conversation. Your message is saved." : "Preparing your reply…"}</span>
+      ? <>Couldn't resume this conversation. Your message is saved.{newSession}</> : "Preparing your reply…"}</span>
     {!optimistic && presentation.state === "failed" && canRetry && presentation.canRetry &&
       <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}
   </div>;
@@ -172,7 +179,7 @@ export function ExecutionBlockerNotice({ presentation, observedStatus, observedR
       </div>
     </div>
   );
-  if (optimistic || !presentation || presentation.responsibility !== "system" ||
+  if ((optimistic && !savedMessageBlocked) || !presentation || presentation.responsibility !== "system" ||
       !["failed", "retry_scheduled"].includes(presentation.state)) return null;
   return (
     <div className={cn(presentation.state === "failed" && "pt-4", className)}>
@@ -189,8 +196,10 @@ export function ExecutionBlockerNotice({ presentation, observedStatus, observedR
             ? <>Couldn’t prepare the task folders. {presentation.workspaceFailure.message}</>
           : presentation.setupFailure
             ? <>Couldn’t set up the task workspace. {presentation.setupFailure.message}. Fix the command in the project’s workspace settings, then retry.</>
-            : "Couldn’t finish this attempt. Your message is saved."}</span>
-        {canRetry && presentation.canRetry && <Button variant="outline" size="sm" className="shrink-0" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}
+            : "Couldn’t finish this attempt. Your message is saved."}
+          {!presentation.retryWait && !presentation.workspaceFailure && !presentation.setupFailure ? newSession : null}
+        </span>
+        {canRetry && presentation.canRetry && <Button variant="outline" size="sm" className="shrink-0" disabled={optimistic} onClick={onRetry} data-testid="task-execution-retry">{optimistic ? "Retrying…" : "Retry"}</Button>}
       </div>
     </div>
   );
