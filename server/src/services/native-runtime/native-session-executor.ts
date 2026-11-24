@@ -12949,6 +12949,8 @@ async function executePaperclipNativeSessionAttempt(
                 .where(eq(heartbeatRuns.id, input.execution.binding.runId)).limit(1);
               return nativeConversationReplyResult({
                 conversation: conversation?.agentId === input.execution.binding.agentId
+                  || (input.execution.provider.kind === "pi_rpc" &&
+                    (input.execution.turnIntent === "conversation_reply" || input.execution.provider.conversationMode === true))
                   || record(record(stopRun?.resultJson).personStop).requestedAt !== undefined,
                 terminalEvent,
                 replyEvent: completedConversationReply,

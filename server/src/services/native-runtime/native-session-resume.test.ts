@@ -234,6 +234,19 @@ function previousRun(overrides: Record<string, unknown> = {}) {
 }
 
 describe("capability-gated connection tool refresh", () => {
+  it("retains the provider checkpoint when only the turn intent changes", () => {
+    const prior = execution(previousRunId);
+    prior.provider = { kind: "pi_rpc", model: "provider/model" };
+    prior.session.driverKind = "pi_rpc";
+    const source = previousRun({ nativeExecutionInput: prior });
+    source.runnerProfileJson.sessionCheckpoint.driverKind = "pi_rpc";
+    for (const turnIntent of [undefined, "conversation_reply"] as const) {
+      const current = { ...execution(currentRunId), provider: prior.provider, session: prior.session, turnIntent };
+      const result = buildNativeExecutionWithCheckpoint({ previousRun: source, normalizedSessionId, buildExecution: () => current });
+      expect(result.normalizedSessionId).toBe(normalizedSessionId);
+      expect(result.checkpoint).toMatchObject({ sessionId: "provider-thread-123", providerSessionId: "provider-thread-123" });
+    }
+  });
   it("retains the exact provider session for an MCP-only change when the harness supports it", () => {
     const current = execution(currentRunId);
     current.runtimeContext.mcp.digest = "b".repeat(64);
