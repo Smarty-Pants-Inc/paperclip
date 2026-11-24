@@ -1,5 +1,6 @@
 import { readClaimedNativeStopRecovery } from "../native-runtime/native-cancellation-request.js";
 import { readContextCompactionRequest } from "../context-compaction.js";
+import { withPiOpenTurnDefault } from "../native-runtime/continued-session.js";
 import { remoteWorkspaceFailureCause } from "../remote-workspace-transport.js";
 import { readNativePostResultFailureDiagnostic } from "../native-runtime/native-post-result-failure.js";
 import { acceptedNativeAdapterResult } from "../native-runtime/native-accepted-result-settlement.js";
@@ -731,7 +732,10 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               outputSecrets: [...identityRedactor.secretSources, ...observabilitySecretValues(observability)],
               dotWorkspaceRoot: nativeExecution.provider.kind === "openai_dot" && resolvedConfig.dotWorkspaceAccess === true ? executionWorkspace.cwd : undefined,
               runnerEnvironment: {
-                ...configuredEnvironmentProjection(configuredTaskEnvironment, secretKeys ?? []),
+                ...configuredEnvironmentProjection(
+                  withPiOpenTurnDefault(nativeExecution.provider.kind, resolvedConfig.sessionContinuity, configuredTaskEnvironment),
+                  secretKeys ?? [],
+                ),
                 ...buildNativeProviderEnvironment(
                   adapterEnv,
                   process.env,
