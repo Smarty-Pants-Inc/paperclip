@@ -176,6 +176,8 @@ export type NativeProviderConfigV5 =
 
 export interface NativeExecutionInputV1 {
   schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA_V1;
+  /** Current invocation only; never part of provider or runtime-context identity. */
+  turnIntent?: "conversation_reply";
   binding: {
     companyId: string;
     runId: string;
@@ -292,8 +294,9 @@ export interface NativeExecutionInputV8 extends Omit<NativeExecutionInputV6, "sc
 
 export type NativeExecutionInput = NativeExecutionInputV1 | NativeExecutionInputV2 | NativeExecutionInputV3 | NativeExecutionInputV4 | NativeExecutionInputV5 | NativeExecutionInputV6 | NativeExecutionInputV7 | NativeExecutionInputV8 | NativeExecutionInputV9 | NativeExecutionInputV10;
 
-export function isNativePiConversation(input: Pick<NativeExecutionInput, "provider">): boolean {
-  return input.provider.kind === "pi_rpc" && input.provider.conversationMode === true;
+export function isNativePiConversation(input: Pick<NativeExecutionInput, "provider" | "turnIntent">): boolean {
+  return input.provider?.kind === "pi_rpc" &&
+    (input.turnIntent === "conversation_reply" || input.provider.conversationMode === true);
 }
 
 /** The only task data that may enter provider-visible model input. */
@@ -447,6 +450,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
   const isV2 = isV3 || input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V2;
   exactKeys(input, [
     "schema",
+    "turnIntent",
     "binding",
     "task",
     "workspace",
@@ -485,6 +489,9 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
       && !(selected.kind === "acpx" && selected.agent === "claude")) {
       throw new NativeExecutionInputError("preconfigured home supports native Codex and ACPX Claude only");
     }
+  }
+  if (input.turnIntent !== undefined && (input.turnIntent !== "conversation_reply" || record(input.provider, "input.provider").kind !== "pi_rpc")) {
+    throw new NativeExecutionInputError("input.turnIntent must be conversation_reply and requires pi_rpc");
   }
   const binding = record(input.binding, "input.binding");
   exactKeys(binding, ["companyId", "runId", "issueId", "agentId", "agentKeyId", "executionWorkspaceId"], "input.binding");
@@ -919,6 +926,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
       lifecyclePolicy,
     },
     provider: parsedProvider,
+    ...(input.turnIntent === "conversation_reply" ? { turnIntent: "conversation_reply" as const } : {}),
     completionContract: {
       id: text(completionContract.id, "input.completionContract.id"),
       sha256: text(completionContract.sha256, "input.completionContract.sha256"),
