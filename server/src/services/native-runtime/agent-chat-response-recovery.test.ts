@@ -178,7 +178,9 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     await db.update(heartbeatRuns).set({ status }).where(eq(heartbeatRuns.id, f.runId));
     await Promise.all([requeueContinuousUnanswered(db, { id: f.runId, companyId: f.companyId }), requeueContinuousUnanswered(db, { id: f.runId, companyId: f.companyId })]);
     const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, `continuous-unanswered:${f.runId}`));
-    expect(wakes).toHaveLength(1);
+    // A run that ended normally answered what Pi took; only a run that died hands an unanswered comment on.
+    expect(wakes).toHaveLength(status === "succeeded" ? 0 : 1);
+    if (status === "succeeded") return;
     expect(wakes[0]).toMatchObject({ status: "deferred_issue_execution", runId: null,
       payload: { issueId: f.issueId, _paperclipWakeContext: { wakeCommentIds: [ids[2]], forceFreshSession: false } } });
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0].nativeSessionId).toBe(f.prpEvent.normalizedSessionId);
