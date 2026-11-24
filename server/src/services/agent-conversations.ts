@@ -739,6 +739,10 @@ export async function deliverConversationComments(
             runId: current.runId, agentId: issue.conversationAgentId }); }
           catch (error) { logger.warn({ error, issueId: issue.id }, "held-run person-message drain deferred"); }
         }
+        // Drain first; it leaves a /new head queued. Only then ask the driver
+        // to end an idle hold. The reset remains stock fresh-session input.
+        const { closeConversationResetHold } = await import("../modules/wake-queue/index.js");
+        await closeConversationResetHold(db, { companyId: issue.companyId, issueId: issue.id });
       }
       return delivered;
     }
