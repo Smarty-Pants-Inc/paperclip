@@ -2178,7 +2178,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         });
       }
       const failed = (!openSegments && source.status !== "succeeded") || isUserStop(source.id);
-      const startSlotRaw = meta?.startedAt ?? meta?.createdAt;
+      // Live runs are omitted from linkedRuns; their first segment still owns its run-start slot.
+      const startSlotRaw = meta?.startedAt ??
+        (source.id === liveRun?.id ? liveRun.startedAt : undefined) ??
+        meta?.createdAt ?? source.createdAt;
       const startSlotMs = startSlotRaw
         ? toMs(startSlotRaw)
         : Number.POSITIVE_INFINITY;
