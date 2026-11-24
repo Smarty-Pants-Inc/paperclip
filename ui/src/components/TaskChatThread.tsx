@@ -1115,11 +1115,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     for (const run of transcriptRuns) requestedTranscripts.current.ids.add(run.id);
   }, [transcriptRuns]);
   const nativeRuns = useMemo(
-    () => transcriptRuns.filter((run) => run.runtimeMode === "native").map((run) => ({
-      ...run,
-      conversationOnly: Boolean(props.compactHistory && (!run.createdAt || new Date(run.createdAt).getTime() <= openedAt)),
-    })),
-    [transcriptRuns, props.compactHistory, openedAt],
+    // Compact presentation must not request a history that omits visible work.
+    () => transcriptRuns.filter((run) => run.runtimeMode === "native"),
+    [transcriptRuns],
   );
   const {
     transcriptByRun: nativeTranscriptByRun,
@@ -1131,9 +1129,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     retry: retryNativeEvents,
   } = useNativeRunTranscripts(nativeRuns, { companyId });
   const logRuns = useMemo(() => transcriptRuns.filter((run) =>
-    (!nativeRuns.some((nativeRun) => nativeRun.id === run.id && nativeRun.conversationOnly) ||
-      nativeTranscriptErrorsByRun.has(run.id) ||
-      (hydratedNativeRunIds.has(run.id) && (nativeTranscriptByRun.get(run.id)?.length ?? 0) === 0)) && (
     run.runtimeMode !== "native" ||
     // Active runs still need the websocket log stream. Only settled native
     // history can skip the legacy transport when event history is available.
@@ -1143,7 +1138,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     nativeTranscriptErrorsByRun.has(run.id) ||
     (hydratedNativeRunIds?.has(run.id) &&
       (nativeTranscriptByRun.get(run.id)?.length ?? 0) === 0)
-  )), [transcriptRuns, nativeRuns, nativeTranscriptErrorsByRun, hydratedNativeRunIds, nativeTranscriptByRun]);
+  ), [transcriptRuns, nativeTranscriptErrorsByRun, hydratedNativeRunIds, nativeTranscriptByRun]);
   const {
     transcriptByRun: logTranscriptByRun,
     isInitialHydrating: logsAreInitiallyHydrating,
