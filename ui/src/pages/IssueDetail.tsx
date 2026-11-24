@@ -2292,8 +2292,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     const pendingComments = [...localSteeringPlacements].flatMap(([id, placement]) =>
       placement.comment && !commentsWithRunMeta.some(comment => comment.id === id && comment.steeredIntoRunId)
         ? [{ comment: placement.comment, targetRunId: placement.targetRunId }] : []);
-    const queue = mergePendingIssueQueuedComments({ issueId, authoritativeQueue: effectiveQueuedCommentQueue,
-      pendingComments, fallbackProtocol: "paperclip_runner_v1" });
+    const queue = pendingComments.length ? mergePendingIssueQueuedComments({ issueId, authoritativeQueue: effectiveQueuedCommentQueue,
+      pendingComments, fallbackProtocol: "paperclip_runner_v1" }) : effectiveQueuedCommentQueue;
     if (!queue) return null;
     const pendingIds = new Set(pendingComments.map(({ comment }) => comment.id));
     const entries = queue.entries.filter(entry => !startingCommentIds.has(entry.comment.id))
