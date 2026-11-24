@@ -240,8 +240,8 @@ export interface NativeSession {
   identity(): NativeRunIdentity;
   capabilities(): Promise<NativeSessionCapabilities>;
   downloadAttachment?: DownloadRunnerAttachment;
-  /** completionContract is the attaching run's own contract; a retained session must not keep the prior run's. */
-  attachRun?(input: { identity: NativeRunIdentity; currentRunGrant?: NativeRunRuntimeGrant; completionContract?: { revision: string; criterionIds: readonly string[] } }): Promise<void>;
+  /** Catalog and completion contract belong to the attaching run, not the retained session. */
+  attachRun?(input: { identity: NativeRunIdentity; dynamicTools?: readonly Readonly<Record<string, unknown>>[]; currentRunGrant?: NativeRunRuntimeGrant; completionContract?: { revision: string; criterionIds: readonly string[] } }): Promise<void>;
   beginRunAttachment?(input: { identity: NativeRunIdentity }): boolean;
   /** Return the confirmed released source, or false when active use was not released. */
   release?(): Promise<DurableRecoveryIdentity | false>;
