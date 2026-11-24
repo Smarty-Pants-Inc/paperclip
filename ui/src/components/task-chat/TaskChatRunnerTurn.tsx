@@ -105,7 +105,7 @@ function RunnerTurnStatus({
   const failed = terminalStatusFailed(status);
   const label = waitingLabel ?? (terminal ? (personStopped ? "Stopped" : failed ? "Couldn't finish" : "Worked") : "Working");
   const suffix = waitingLabel ? "" : terminal
-    ? elapsed ? ` ${failed ? "after" : "for"} ${elapsed}` : ""
+    ? elapsed ? ` ${failed || personStopped ? "after" : "for"} ${elapsed}` : ""
     : elapsed ? `${waitingLabel ? " · " : " for "}${elapsed}` : "";
 
   return (
