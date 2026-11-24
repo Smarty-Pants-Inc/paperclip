@@ -718,10 +718,33 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   );
 
   const attemptedAutoSteer = useRef(new Set<string>());
-  const queuedMessageQueue =
-    queuedCommentQueue && (queuedCommentQueue.entries.length > 0 || queuedCommentQueue.pendingQueue?.entries.length)
-      ? queuedCommentQueue
-      : null;
+  // Polls of comments, wakes and receipts are independent. Once painted, a
+  // person's message cannot go back to either queue without a Stop return.
+  const drawnComments = useRef({ issueId, ids: new Set<string>() });
+  if (drawnComments.current.issueId !== issueId) drawnComments.current = { issueId, ids: new Set() };
+  const { drawnCommentIds, returnedCommentIds, queuedMessageQueue } = useMemo(() => {
+    const drawnCommentIds = new Set(drawnComments.current.ids);
+    for (const comment of comments) {
+      if (comment.clientId && drawnCommentIds.has(comment.clientId)) drawnCommentIds.add(comment.id);
+    }
+    const returnedCommentIds = new Set((linkedRuns ?? []).flatMap(run => {
+      const stop = run.resultJson?.personStop as { returned?: unknown } | undefined;
+      return Array.isArray(stop?.returned) ? stop.returned.filter((id): id is string => typeof id === "string") : [];
+    }));
+    for (const comment of comments) {
+      if (returnedCommentIds.has(comment.id) && comment.clientId) returnedCommentIds.add(comment.clientId);
+    }
+    for (const id of returnedCommentIds) drawnCommentIds.delete(id);
+    const queuedMessageQueue = queuedCommentQueue ? {
+      ...queuedCommentQueue,
+      entries: queuedCommentQueue.entries.filter(entry => !drawnCommentIds.has(entry.comment.id)),
+      pendingQueue: queuedCommentQueue.pendingQueue ? {
+        ...queuedCommentQueue.pendingQueue,
+        entries: queuedCommentQueue.pendingQueue.entries.filter(entry => !drawnCommentIds.has(entry.comment.id)),
+      } : null,
+    } : null;
+    return { drawnCommentIds, returnedCommentIds, queuedMessageQueue };
+  }, [issueId, comments, linkedRuns, queuedCommentQueue]);
   const emptyQueuedCommentQueue = useMemo<IssueQueuedCommentQueue>(
     () => ({
       issueId: issueId ?? "",
@@ -930,8 +953,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     [comments, attachments, workProducts],
   );
   const projectedComments = useMemo(
-    () =>
-      comments.flatMap((comment) => {
+    () => {
+      const byId = new Map(comments.map(comment => [comment.id, comment]));
+      // A queue refresh can precede the comment-history page containing it.
+      for (const entry of [...(queuedCommentQueue?.entries ?? []), ...(queuedCommentQueue?.pendingQueue?.entries ?? [])]) {
+        if (drawnCommentIds.has(entry.comment.id) && !byId.has(entry.comment.id)) byId.set(entry.comment.id, entry.comment);
+      }
+      return [...byId.values()].flatMap((comment) => {
         if (imageReceipts.has(comment.id)) return [];
         if (comment.authorType === "system" && comment.metadata?.recoveryResponsibility === "system") return [];
         if (statusRelevance.isHistoricalNotice(comment)) return [];
@@ -947,8 +975,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         }
         const summary = acceptedSemanticResultSummary(resultJson);
         return [summary ? { ...comment, body: summary } : comment];
-      }),
-    [comments, interactions, linkedRunMetaById, statusRelevance, imageReceipts],
+      });
+    },
+    [comments, queuedCommentQueue, drawnCommentIds, interactions, linkedRunMetaById, statusRelevance, imageReceipts],
   );
 
   const commentItems = useMemo(
@@ -1373,11 +1402,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
 
   const visibleQueuedMessageQueue = useMemo(() => queuedMessageQueue ? {
     ...queuedMessageQueue,
-    entries: queuedMessageQueue.entries.filter(entry => !steeringAnchorByCommentId.has(entry.comment.id) && !failedRequestCommentIds.has(entry.comment.id)),
+    entries: queuedMessageQueue.entries.filter(entry => returnedCommentIds.has(entry.comment.id) || (!steeringAnchorByCommentId.has(entry.comment.id) && !failedRequestCommentIds.has(entry.comment.id))),
     pendingQueue: queuedMessageQueue.pendingQueue ? { ...queuedMessageQueue.pendingQueue,
-      entries: queuedMessageQueue.pendingQueue.entries.filter(entry => !failedRequestCommentIds.has(entry.comment.id)),
+      entries: queuedMessageQueue.pendingQueue.entries.filter(entry => returnedCommentIds.has(entry.comment.id) || (!steeringAnchorByCommentId.has(entry.comment.id) && !failedRequestCommentIds.has(entry.comment.id))),
     } : queuedMessageQueue.pendingQueue,
-  } : emptyQueuedCommentQueue, [queuedMessageQueue, emptyQueuedCommentQueue, steeringAnchorByCommentId, failedRequestCommentIds]);
+  } : emptyQueuedCommentQueue, [queuedMessageQueue, emptyQueuedCommentQueue, steeringAnchorByCommentId, failedRequestCommentIds, returnedCommentIds]);
 
   const continuousReplyPlacements = useMemo(() => {
     const placements = new Map<string, { byItem: Map<string, number>; bySegment: Map<number, Map<string, string>> }>();
@@ -1536,12 +1565,12 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       // transcript may contain only its newest turn. Dedupe after assembling
       // the turns, by the saved replies actually selected as their finals.
       const item = commentItems[index];
-      if (!item || (queuedCommentIds.has(comment.id) && !steeringAnchorByCommentId.has(comment.id) && !failedRequestCommentIds.has(comment.id))) return;
+      if (!item || (queuedCommentIds.has(comment.id) && (returnedCommentIds.has(comment.id) || (!steeringAnchorByCommentId.has(comment.id) && !failedRequestCommentIds.has(comment.id))))) return;
       entries.push({
-        // A steer enters the thread at its acknowledged boundary, not while queued.
-        ms: steeringAnchorByCommentId.get(comment.id) ?? (comment.authorType !== "user" && comment.conversationAnchorAt
+        // Human messages keep send order. ACK time splits agent output only.
+        ms: comment.authorType !== "user" && comment.conversationAnchorAt
           ? toMs(comment.conversationAnchorAt)
-          : toMs(comment.createdAt)),
+          : toMs(comment.createdAt),
         order:
           1 + Math.min(comment.authorType === "user" ? 0 : comment.conversationAnchorSequence ?? 0, 999) / 1000,
         id: comment.clientId ?? item.id,
@@ -1751,6 +1780,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     queuedCommentIds,
     failedRequestCommentIds,
     steeringAnchorByCommentId,
+    returnedCommentIds,
   ]);
 
   const legacyTimelineAnchorsByRun = useMemo(() => {
@@ -3737,6 +3767,15 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const [revealedHistoryKey, setRevealedHistoryKey] = useState<string | null | undefined>(undefined);
   const revealCachedHeader = connectionStatus !== "online" && Boolean(threadHeader);
   const historyRevealed = revealedHistoryKey === historyKey || revealCachedHeader;
+  useLayoutEffect(() => {
+    if (!historyRevealed) return;
+    for (const id of returnedCommentIds) drawnComments.current.ids.delete(id);
+    for (const item of threadItems) {
+      if (item.kind !== "message" || item.author !== "human" || returnedCommentIds.has(item.id)) continue;
+      drawnComments.current.ids.add(item.id);
+      if (item.renderKey) drawnComments.current.ids.add(item.renderKey);
+    }
+  });
   useEffect(() => {
     if (revealCachedHeader) setRevealedHistoryKey(historyKey);
   }, [revealCachedHeader, historyKey]);
@@ -4094,6 +4133,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                           agentStarting={tailBeforeTurn && queuedMessageQueue?.targetRunId === tailRunId}
                           stopPending={stopPending || stoppingReply}
                           conversationMode={conversationMode}
+                          executionRecoveryPending={Boolean(
+                            (props.recoveryAction && !["resolved", "cancelled"].includes(props.recoveryAction.status)) ||
+                            [...(linkedRuns ?? []).map(run => ({ ...run, id: run.runId })), ...(liveRuns ?? []), ...(activeRun ? [activeRun] : [])]
+                              .some(run => run.execution?.phase === "recovery_needed" && !statusRelevance.isHistoricalRun(run.id))
+                          )}
                           key={issueId}
                           queue={visibleQueuedMessageQueue}
                           onEdit={beginQueuedEdit}
