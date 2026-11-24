@@ -1598,10 +1598,12 @@ export function paperclipRunnerTimelineItems(
   const activityIds = new Set(
     paperclipRunnerActivityItems(parsed).map((item) => item.id),
   );
+  // Keep textless reasoning at settle, but not empty receipts for prose already present.
   return parsed.filter(
     (item) =>
-      activityIds.has(item.id) ||
-      (item.kind === "thinking" && Boolean(item.streaming)) ||
+      (item.kind === "thinking"
+        ? item.lines.some(line => line.trim()) || !activityIds.has(item.id)
+        : activityIds.has(item.id)) ||
       item.kind === "plan_document" ||
       (item.kind === "protocol" && item.surface === "runtime_request"),
   );
