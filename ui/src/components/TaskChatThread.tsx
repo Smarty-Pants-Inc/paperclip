@@ -940,7 +940,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
 
   const commentItems = useMemo(
     () =>
-      commentsToTaskChatItems(projectedComments, {
+      // A reset is still the person's message. Its boundary is a separate row below it.
+      commentsToTaskChatItems(projectedComments.map(comment => comment.authorType === "user" && comment.conversationSessionGeneration != null
+        ? { ...comment, conversationSessionGeneration: null } : comment), {
         agentMap,
         userLabelMap,
         userProfileMap,
@@ -1517,6 +1519,12 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         id: comment.clientId ?? item.id,
         item,
       });
+      if (comment.authorType === "user" && comment.conversationSessionGeneration != null) {
+        const id = `session-start:${comment.id}`;
+        entries.push({ ms: toMs(comment.createdAt), order: 1.001, id,
+          item: { id, kind: "marker", variant: "session_start", label: "New session",
+            detail: "Earlier messages and files are still available.", createdAtIso: new Date(comment.createdAt).toISOString() } });
+      }
     });
     for (const interaction of interactions ?? []) {
       // Withdrawn/superseded confirmations are retracted calls to action — drop
@@ -2568,6 +2576,36 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       unanchored,
     );
 
+    // A /new receipt and the provider's first-session notice can announce the
+    // same boundary. Keep the command's row; later restarts after work are distinct.
+    const resetWindows = new Set<string>();
+    let sessionWindow = 0;
+    const isSessionStart = (item: TaskChatItem) => item.kind === "marker" && item.variant === "session_start";
+    const separatesSessions = (item: TaskChatItem) => !isSessionStart(item) && (item.kind !== "message" || item.author !== "human");
+    for (const item of out) {
+      if (isSessionStart(item) && item.id.startsWith("session-start:")) {
+        const command = commentsById.get(item.id.slice("session-start:".length));
+        if (command?.conversationSessionGeneration != null) resetWindows.add(`${sessionWindow}:${command.conversationSessionGeneration}`);
+      }
+      if (separatesSessions(item)) sessionWindow += 1;
+    }
+    sessionWindow = 0;
+    const seenSessionRuns = new Set<string>();
+    const sessionItems = out.filter(item => {
+      if (isSessionStart(item)) {
+        const isCommand = item.id.startsWith("session-start:");
+        const notice = commentsById.get(item.id);
+        const generation = notice?.conversationSessionGeneration;
+        const sourceRunId = notice?.metadata?.sourceRunId;
+        const duplicate = !isCommand && ((sourceRunId != null && seenSessionRuns.has(sourceRunId)) ||
+          (generation != null && resetWindows.has(`${sessionWindow}:${generation}`)));
+        if (sourceRunId) seenSessionRuns.add(sourceRunId);
+        return !duplicate;
+      }
+      if (separatesSessions(item)) sessionWindow += 1;
+      return true;
+    });
+
     // PAP-362: two runs replying back-to-back (same agent, nothing but the
     // agent's own bubbles between) fold into ONE "Worked" row below the last
     // reply; a user message or interaction keeps them apart.
@@ -2580,7 +2618,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       items: prependIssueBrief(
         attachSettledTurns(
           coalesceSettledTurns(
-            coordinatorEnabled ? orderTaskCreationItems(out, sourceRunByItemId) : out,
+            coordinatorEnabled ? orderTaskCreationItems(sessionItems, sourceRunByItemId) : sessionItems,
             turnMergeMetaById,
           ),
           turnMergeMetaById,
