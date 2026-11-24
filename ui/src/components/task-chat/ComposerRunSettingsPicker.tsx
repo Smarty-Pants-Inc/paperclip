@@ -19,6 +19,7 @@ import {
   type ComposerRunSettings,
 } from "./composer-run-settings";
 import "./composer-run-settings.css";
+import { useReasoningDisplay, type ReasoningDisplay } from "./reasoning-display";
 
 interface Props {
   companyId: string;
@@ -108,6 +109,7 @@ export function ComposerRunSettingsPicker({
   const mobileViewportStyle = useMobileEntityPickerViewportStyle();
   const agentId = assigneeValue.startsWith("agent:") ? assigneeValue.slice(6) : "";
   const agent = agents.get(agentId);
+  const reasoning = useReasoningDisplay(agent?.adapterType);
   const cloud = Boolean(useCloudInstance());
   const harnessPolicy = useCloudHarnessPolicy();
   const modelSupported = supportsComposerModel(agent) && (!cloud || Boolean(agent && harnessPolicy.isCloudHarnessAllowed(agent.adapterType, agent.adapterConfig)));
@@ -261,6 +263,14 @@ export function ComposerRunSettingsPicker({
           className="composer-run-effort-range mt-3 w-full" style={{ "--fill": `${effortIndex / choices.length * 100}%` } as CSSProperties} />
       </div> : null}
     </> : agent ? <div className="mt-3 rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground" data-testid="model-unavailable">{unavailableModelReason(agent)}</div> : null}
+    {reasoning.supported ? <label className="mt-3 flex items-center gap-2 px-1 text-sm">
+      <span className="flex-1 text-muted-foreground">Reasoning</span>
+      <select aria-label="Reasoning display" value={reasoning.display} disabled={!reasoning.canSave}
+        onChange={event => reasoning.setDisplay(event.target.value as ReasoningDisplay)}
+        className="rounded-md border border-border bg-background px-2 py-1 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+        <option value="inline">Inline</option><option value="folded">Folded</option>
+      </select>
+    </label> : null}
   </div> : view === "agents" ? <div className="composer-run-settings-list-view p-2">
     <div className="flex items-center gap-2 px-1 py-1.5"><span className="min-w-0 flex-1 text-xs font-semibold">Choose assignee</span>{closeButton}</div>
     <div className="relative mt-2"><Search className="pointer-events-none absolute left-2.5 top-2.5 size-4 text-muted-foreground" aria-hidden /><input autoFocus type="search" aria-label="Search assignees" placeholder="Search assignees…" value={assigneeSearch} onChange={(event) => { setAssigneeSearch(event.target.value); setHighlightedAssignee(0); }} onKeyDown={(event) => {
