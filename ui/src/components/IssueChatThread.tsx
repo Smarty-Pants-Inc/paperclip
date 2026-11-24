@@ -693,7 +693,7 @@ interface IssueChatThreadProps {
   onInterruptQueued?: (runId: string | null) => Promise<IssueQueuedCommentQueue | void>;
   onCancelQueued?: (commentId: string) => void;
   /** Authoritative PRP queue. The classic thread intentionally ignores it. */
-  queuedCommentQueue?: IssueQueuedCommentQueue | null;
+  queuedCommentQueue?: import("@/lib/issue-queued-comment-queue").DisplayIssueQueuedCommentQueue | null;
   onEditQueuedComment?: (
     commentId: string,
     body: string,
