@@ -11,6 +11,7 @@ import {
   mergeHeartbeatRunResultJson,
   completedPlanProposalIds,
   readCompletedAssistantMessageCandidate,
+  readSteeredTaskResponseScope,
   resolveHeartbeatRunResponse,
   selectHeartbeatRunFinalAgentMessage,
 } from "../services/heartbeat-run-summary.js";
@@ -73,6 +74,37 @@ describe("continuation origin verification", () => {
   it("keeps internal work internal", () => {
     expect(isChatOriginPublicationCandidate({ source: "issue.assigned" })).toBe(false);
     expect(isExternalChatPresentationContext({ source: "issue.assigned" }, true)).toBe(false);
+  });
+});
+
+// Unit test agreed by the bounded task: pure question-ownership/ACK guards,
+// with comment creation and reread covered separately by real Postgres rows.
+describe("accepted steered task question scope", () => {
+  const accepted = { schema: "paperclip.run_result.v1", reportedWorkDisposition: "done", summary: "Nile" };
+  const resultJson = { nativeResult: accepted, queuedSteeringAcknowledgements: {
+    second: { status: "acknowledged", afterEventSeq: 10 },
+  } };
+  it.each(["run", "predecessor"])("binds pre-claim questions only from this run (%s)", runId => {
+    expect(readSteeredTaskResponseScope({ runId: "run", resultJson, finalAgentMessageSeq: 30,
+      contextSnapshot: { wakeCommentId: "first", firstTurnQueuedInput: {
+        schema: "paperclip.first-turn-queued-input.v1", runId, commentIds: ["claimed"],
+      } },
+    })).toEqual({ originalQuestionCommentIds: runId === "run" ? ["first", "claimed"] : ["first"], steeredQuestionCommentIds: ["second"] });
+  });
+  it("never publishes a proposal or a yielded finish as a separate answer", () => {
+    for (const result of [{ proposedResult: accepted }, { nativeResult: { ...accepted, reportedWorkDisposition: "yielded" } }]) {
+      expect(readSteeredTaskResponseScope({ runId: "run", contextSnapshot: { wakeCommentId: "first" },
+        resultJson: { ...result, queuedSteeringAcknowledgements: resultJson.queuedSteeringAcknowledgements }, finalAgentMessageSeq: 30 })).toBeNull();
+    }
+  });
+  it("requires a prior explicit ACK, excluding original, returned and future inputs", () => {
+    expect(readSteeredTaskResponseScope({ runId: "run", contextSnapshot: { wakeCommentIds: ["first", "pre-claim"] }, finalAgentMessageSeq: 30,
+      resultJson: { ...resultJson, personStop: { returned: ["returned"] }, queuedSteeringAcknowledgements: {
+        first: { status: "acknowledged", afterEventSeq: 2 }, second: { status: "acknowledged", afterEventSeq: 10 },
+        future: { status: "acknowledged", afterEventSeq: 30 }, missing: { status: "acknowledged" },
+        pending: { status: "pending", afterEventSeq: 2 }, returned: { status: "acknowledged", afterEventSeq: 3 },
+      } },
+    })).toEqual({ originalQuestionCommentIds: ["first", "pre-claim"], steeredQuestionCommentIds: ["second"] });
   });
 });
 

@@ -51,7 +51,7 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
 
   async function fixture(conversation = true, options: { succeed?: boolean; disposition?: "done" | "needs_review" | "yielded"; channel?: "final" | "unknown";
     beforeFinalize?: (ids: { companyId: string; issueId: string; runId: string; agentId: string }) => Promise<void>;
-    reply?: string; logRef?: string } = {}) {
+    reply?: string; summary?: string; logRef?: string } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
     const sessionId = randomUUID(), runnerId = randomUUID(), userId = `fixture-${randomUUID()}`, wakeId = randomUUID();
     await db.insert(authUsers).values({ id: userId, name: "Conversation owner", email: `${userId}@example.test`,
@@ -83,7 +83,7 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     const disposition = options.disposition ?? "done";
     await options.beforeFinalize?.({ companyId, issueId, runId, agentId });
     await port.completeRun({ result: { schema: "paperclip.run_result.v1", reportedWorkDisposition: disposition,
-      summary: "A completed hire, with its final message preserved separately.",
+      summary: options.summary ?? "A completed hire, with its final message preserved separately.",
       ...(disposition === "yielded" ? { continuation: { kind: "response_wake" as const, summary: "Wait for the next human message", idempotencyKey: "conversation-next-message" } } : {}),
       completionClaim: { contractRevision: "test",
         objectiveSatisfied: true, criteria: [], remainingWork: [] }, evidence: [], verification: [],
@@ -1318,6 +1318,63 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     expect(await comments(f.runId)).toEqual([expect.objectContaining({ body: f.reply })]);
     expect((await issue(f.issueId)).conversationAgentId).toBeNull();
   });
+  it.each(["none", "steered-final", "unkeyed-steered-final", "summary", "both", "final-with-receipt", "concurrent", "suppressed", "deleted-final"] as const)("saves separate accepted original and steered replies, once each (prior=%s)", async prior => {
+    const second = randomUUID(), summary = "The river is the Nile.", reply = "The city is Rome.";
+    const f = await fixture(false, { summary, reply, beforeFinalize: async scope => {
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      await db.insert(issueComments).values({ id: second, companyId: scope.companyId, issueId: scope.issueId,
+        authorUserId: run.responsibleUserId, body: "And which city?" });
+      // The steer was ACKed BEFORE the finish summary proposal. Only the
+      // accepted result, not this proposal or its timing, can supply answer #1.
+      await db.update(heartbeatRuns).set({ resultJson: {
+        queuedSteeringAcknowledgements: { [second]: { status: "acknowledged", afterEventSeq: 90 } },
+      } }).where(eq(heartbeatRuns.id, scope.runId));
+      await db.insert(heartbeatRunEvents).values({ ...scope, seq: 100, eventType: "run.result.proposed",
+        payload: { prpEvent: { runId: scope.runId, payload: { result: { schema: "paperclip.run_result.v1", summary } } } } });
+      const [event] = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, scope.runId), eq(heartbeatRunEvents.seq, 170)));
+      const prpEvent = (event.payload as { prpEvent: Record<string, unknown> }).prpEvent;
+      await db.update(heartbeatRunEvents).set({ payload: { prpEvent: { ...prpEvent, itemId: "rome" } } }).where(eq(heartbeatRunEvents.id, event.id));
+      if (["steered-final", "unkeyed-steered-final", "both", "final-with-receipt"].includes(prior)) await db.insert(issueComments).values({
+        companyId: scope.companyId, issueId: scope.issueId, authorAgentId: scope.agentId, createdByRunId: scope.runId,
+        body: reply, ...(prior !== "unkeyed-steered-final" ? { clientRequestId: `native-final:${scope.runId}:rome:${second}` } : {}),
+      });
+      if (["summary", "both"].includes(prior)) await db.insert(issueComments).values({
+        companyId: scope.companyId, issueId: scope.issueId, authorAgentId: scope.agentId, createdByRunId: scope.runId,
+        body: summary, clientRequestId: `native-final:${scope.runId}:accepted-summary`,
+      });
+    } });
+    const before = await comments(f.runId);
+    if (prior === "suppressed" || prior === "deleted-final") {
+      await db.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
+        presentationDecision: prior === "suppressed" ? { commentAction: "none" } : { commentAction: "reuse", commentId: randomUUID() },
+      })}::jsonb` }).where(eq(heartbeatRuns.id, f.runId));
+      await expect(recoverCommittedNativeChatResponse(db, f.input)).resolves.toBe(false);
+      expect(await comments(f.runId)).toEqual(before);
+      return;
+    }
+    if (prior === "final-with-receipt") await db.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
+      presentationDecision: { commentId: before[0].id, commentAction: "reuse" },
+    })}::jsonb` }).where(eq(heartbeatRuns.id, f.runId));
+    if (prior === "concurrent") {
+      expect((await Promise.all([recoverCommittedNativeChatResponse(db, f.input), recoverCommittedNativeChatResponse(db, f.input)])).sort()).toEqual([false, true]);
+    } else await expect(recoverCommittedNativeChatResponse(db, f.input)).resolves.toBe(prior !== "both");
+    const saved = await comments(f.runId);
+    expect(saved.map(comment => comment.body).sort()).toEqual([summary, reply].sort());
+    const summaryComment = saved.find(comment => comment.body === summary)!;
+    const finalComment = saved.find(comment => comment.body === reply)!;
+    for (const old of before) expect(saved.find(comment => comment.id === old.id)).toEqual(old);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    expect(run.resultJson).toMatchObject({ presentationDecision: { commentId: finalComment.id }, continuousReplies: {
+      "accepted-summary": { questionCommentIds: [f.wakeId], commentId: summaryComment.id, sourceEventId: null },
+      rome: { questionCommentIds: [second], commentId: finalComment.id, sourceEventId: "fixture-final-answer" },
+    } });
+    if (!["summary", "both"].includes(prior)) {
+      expect(summaryComment.createdAt.getTime()).toBeLessThanOrEqual(finalComment.createdAt.getTime());
+    }
+    await expect(recoverCommittedNativeChatResponse(db, f.input)).resolves.toBe(false);
+    expect(await comments(f.runId)).toEqual(saved);
+  });
+
   it("recovers a deferred review reply once without resolving the review or rerunning work", async () => {
     const f = await fixture(false, { disposition: "needs_review" });
     const before = await issue(f.issueId);
