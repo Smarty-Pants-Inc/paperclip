@@ -1740,6 +1740,11 @@ export function paperclipRunnerFinalResponse(
         ? undefined
         : paperclipRunnerAcceptedResponseWake(parsed, options?.runId);
     if (accepted) {
+      // A copied provider reply keeps its native identity, so it cannot also
+      // survive as timeline prose beside the saved reply. Keep earlier repeats.
+      const reply = parsed.findLast((item): item is TaskChatMessageItem =>
+        item.kind === "message" && item.channel === "final" && item.text.trim() === accepted.summary.trim());
+      if (reply) return reply;
       return {
         id: `${accepted.id}:final-response`,
         kind: "message",
