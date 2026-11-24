@@ -3,7 +3,7 @@ import { createCodexTaskEnvelope } from "../contracts/codex.js";
 import { ACPX_CAPABILITY_PROFILES } from "../drivers/acpx/capability-profiles.js";
 import { QUALIFIED_ACPX_VERSION } from "../drivers/acpx/generated-profiles.js";
 import { NATIVE_EXECUTION_INPUT_SCHEMA, NATIVE_EXECUTION_INPUT_SCHEMA_V7, NATIVE_EXECUTION_INPUT_SCHEMA_V9, NATIVE_EXECUTION_INPUT_SCHEMA_V10 } from "../contracts/native-execution.js";
-import type { NativeExecutionInput } from "../contracts/native-execution.js";
+import { isNativePiConversation, type NativeExecutionInput } from "../contracts/native-execution.js";
 import type { PersistedHarnessSession } from "../contracts/harness-driver.js";
 import type {
   NativeSessionBackend,
@@ -206,9 +206,7 @@ function createTransportBackedNativeSessionBackend(
         constraints,
       }),
       conversationMode: preparedContext ? "prepared" : "task",
-      // Only legacy conversation-session identity may change the launch profile.
-      ...(input.provider.kind === "pi_rpc" && input.provider.conversationMode === true ? { conversationReply: true } : {}),
-      turnIntent: input.turnIntent,
+      ...(isNativePiConversation(input) ? { conversationReply: true } : {}),
       runnerInstanceId:
         options.runnerInstanceId ?? `paperclip-native-${input.binding.runId}`,
       onSpawn: options.onSpawn,
