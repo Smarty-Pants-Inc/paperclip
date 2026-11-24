@@ -1352,15 +1352,23 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         if (!value || typeof value !== "object") continue;
         const reply = value as { questionCommentIds?: unknown; commentId?: unknown };
         if (!Array.isArray(reply.questionCommentIds) || typeof reply.commentId !== "string") continue;
-        const segmentIndex = Math.max(0, ...reply.questionCommentIds.map(id =>
+        const first = transcriptByRun.get(run.runId)?.find(entry => entry.kind === "assistant" && entry.itemId === itemId);
+        // ACK is queue admission, not consumption: several steers can precede
+        // the first output. Their reply receipts, not that timestamp, own it.
+        const questionSegment = Math.max(0, ...reply.questionCommentIds.map(id =>
           anchors.indexOf(steeringAnchorByCommentId.get(String(id)) ?? NaN) + 1));
+        // A later steer cannot claim text already streaming before its ACK.
+        // Keep that first slot (also on reload), but not a later timestamp slot
+        // that would put an earlier question's answer below a second question.
+        const segmentIndex = first && toMs(first.ts) < (anchors[questionSegment - 1] ?? -Infinity)
+          ? anchors.filter(anchor => anchor <= toMs(first.ts)).length : questionSegment;
         byItem.set(itemId, segmentIndex);
         bySegment.set(segmentIndex, reply.commentId);
       }
       placements.set(run.runId, { byItem, bySegment });
     }
     return placements;
-  }, [linkedRuns, steeringAnchorsByRun, steeringAnchorByCommentId]);
+  }, [linkedRuns, steeringAnchorsByRun, steeringAnchorByCommentId, transcriptByRun]);
 
   // A native-runner Plan is part of the turn that wrote its current revision.
   // Legacy adapters do not expose the semantic write_document boundary needed
@@ -1799,7 +1807,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       // Keep the same segment owner while activeRun disappears ahead of the
       // terminal summary; otherwise a second settling tail bypasses dedupe.
       const openSegments = isNativePaperclipRunnerRun(source) && (source.id === liveRun?.id ||
-        (!liveRun && source.id === settlingRun?.id && !isTerminalRunStatus(source.status)));
+        (!liveRun && (source.id === settlingRun?.id || liveSeenRef.current.has(source.id)) && !isTerminalRunStatus(source.status)));
       if (!isTerminalRunStatus(source.status) && !openSegments) continue;
       if (liveRun && runChainIdsById.get(liveRun.id)?.includes(source.id) && !openSegments) continue;
       const entries = transcriptByRun.get(source.id) ?? [];
