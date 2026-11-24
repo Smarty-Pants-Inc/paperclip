@@ -2281,6 +2281,33 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     });
   });
 
+  it.each([false, true])("keeps pending Stop fenced, then resumes the same held Pi run after settlement (settled=%s)", async settled => {
+    const f = await seedQueue(), returned = randomUUID(), flag = process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+    delete process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+    try {
+      await seedDispatchIdentity(f);
+      await db.update(agents).set({ adapterConfig: { provider: "pi_rpc" } }).where(eq(agents.id, f.agentId));
+      await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: "queue-owner", conversationState: "active", conversationSessionGeneration: 0 }).where(eq(issues.id, f.issueId));
+      const stop = { requestedAt: "2020-01-01T00:00:00Z", userId: "queue-owner", returned: [returned],
+        ...(settled ? { settledAt: "2020-01-01T00:00:01Z", answerItemId: "stop-answer" } : {}) };
+      await db.update(heartbeatRuns).set({ nativeIssueId: f.issueId,
+        runnerProfileJson: { nativeExecutionInput: { provider: { kind: "pi_rpc" } } }, resultJson: { personStop: stop },
+      }).where(eq(heartbeatRuns.id, f.runId));
+      const initial = await request(app(f.companyId)).get(`/api/issues/${f.issueId}/queued-comments`);
+      expect(initial.body.steeringDisposition).not.toBe("unsupported");
+      if (settled) steerNativeSessionMock.mockResolvedValueOnce({ turnId: "held-turn" });
+      const response = await request(app(f.companyId)).post(`/api/issues/${f.issueId}/queued-comments/${f.commentIds[0]}/steer`)
+        .send({ queueId: f.wakeId, targetRunId: f.runId, revision: initial.body.revision });
+      expect(response.status, JSON.stringify(response.body)).toBe(settled ? 200 : 409);
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      expect(run).toMatchObject({ status: "running", resultJson: { personStop: stop } });
+      if (settled) expect(run.resultJson!.personStop).toMatchObject({ resumedAt: expect.any(String), returned: [returned] });
+      else expect(run.resultJson!.personStop).not.toHaveProperty("resumedAt");
+    } finally {
+      if (flag === undefined) delete process.env.PAPERCLIP_AGENT_CHAT_STEERING; else process.env.PAPERCLIP_AGENT_CHAT_STEERING = flag;
+    }
+  });
+
   it("allows the runner to persist its acknowledgement while steering, preserving concurrent run updates", async () => {
     const seeded = await seedQueue();
     await seedDispatchIdentity(seeded);
