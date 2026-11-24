@@ -57,7 +57,7 @@ import { ProviderToolIconsProvider } from "@/components/ProviderToolIcon";
 import { McpAppTurnViews, mcpAppRunRefreshKey } from "@/components/mcp-app/McpAppTurnViews";
 import { ToolCallProgressProvider } from "@/components/task-chat/tool-call-progress";
 import { TaskChatRunnerHeader, TaskChatRunnerTurn } from "@/components/task-chat/TaskChatRunnerTurn";
-import { isConversationRecovery } from "./ExecutionBlockerNotice";
+import { isConversationRecovery, isPersonStoppedRun } from "./ExecutionBlockerNotice";
 import { partitionRunHealthItems } from "@/components/task-chat/TaskChatRunHealthBanner";
 import {
   TaskChatTurnStatusIsland,
@@ -1062,14 +1062,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   }, [linkedRuns, liveRuns, activeRun]);
   const stoppedRunIds = useRef(new Set<string>());
   const isUserStop = useCallback((id: string) => {
-    const meta = linkedRunMetaById.get(id);
-    const cancellation = meta?.resultJson?.cancellation as { source?: string; initiator?: { type?: string } } | undefined;
-    // After a reload the run list's summary carries no cancellation source, only the Stop
-    // receipt (executionCancellation) and the error code a person's Stop leaves ('cancelled').
-    return stoppedRunIds.current.has(id) || (cancellation?.source === "operator" && cancellation.initiator?.type === "user") ||
-      (meta?.errorCode === "cancelled" && Boolean(meta?.resultJson?.executionCancellation)) ||
-      // A person's Stop of a Pi turn ends the run normally; the server marks it (resultJson.personStop).
-      Boolean(meta?.resultJson?.personStop);
+    return stoppedRunIds.current.has(id) || isPersonStoppedRun(linkedRunMetaById.get(id));
   }, [linkedRunMetaById]);
   // Retries of one request join runs; session continuity across new messages does not.
   const runChainIdsById = useMemo(() => {
@@ -1880,6 +1873,14 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         agentName: meta.agentName || agentMap?.get(meta.agentId)?.name,
       } : undefined, currentUserId, userLabelMap);
       const historical = statusRelevance.isHistoricalRun(source.id);
+      const returned = (meta?.resultJson?.personStop as { returned?: unknown } | undefined)?.returned;
+      const stoppedRequest = requestCommentByRun.get(source.id);
+      // An empty turn whose request went back to the composer has no Stopped block.
+      if (isUserStop(source.id) && entries.length === 0 && !lastCommentIdByRun.has(source.id) &&
+          Array.isArray(returned) && returned.length > 0 && (!stoppedRequest || returned.includes(stoppedRequest))) {
+        settledRunIds.add(source.id);
+        continue;
+      }
       // A workspace admission attempt never started provider work. Its live
       // successor owns the waiting indicator; retain this attempt in the run log.
       if (source.status === "cancelled" && (meta?.errorCode === "workspace_busy" || meta?.errorCode === "agent_directory_busy")) {
@@ -2026,7 +2027,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           source.status === "timed_out" ||
           source.status === "cancelled" ||
           source.status === "interrupted");
-      if (sourceHasNativeStop) {
+      if (sourceHasNativeStop && !isUserStop(source.id)) {
         settledRunIds.add(source.id);
         const code =
           meta?.errorCode ??
@@ -2118,7 +2119,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         source.status === "failed" || source.status === "timed_out" ||
         (source.status === "cancelled" && entries.length === 0)
       );
-      if (sourceHasLegacyStop) {
+      if (sourceHasLegacyStop && !isUserStop(source.id)) {
         settledRunIds.add(source.id);
         const code = meta?.errorCode ?? "native_runner_process_exited";
         const retryDetail = meta?.scheduledRetryAt
@@ -2663,7 +2664,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const settlingIsPaperclipRunner =
     settlingRun != null && isNativePaperclipRunnerRun(settlingRunSource);
   // A stopped turn posts no reply, so its settled turn is already complete.
-  const settlingRunStopped = settlingRunSource?.status === "cancelled";
+  const settlingRunStopped = settlingRunSource?.status === "cancelled" || isUserStop(settlingRun?.id ?? "");
   const settlingHasComment =
     settlingRun != null &&
     comments.some((comment) =>
@@ -2775,8 +2776,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     toMs(linkedRunMetaById.get(tailRunId ?? "")?.startedAt ?? tailRunSource?.createdAt), tailTimelineAnchors,
     continuousReplyPlacements.get(tailRunId ?? "")?.byItem);
   const tailSegment = tailSegments[tailSegments.length - 1]!;
-  const tailSegmentSettled = paperclipRunnerTail && threadItems.some(item =>
-    item.kind === "turn" && item.id === `${tailRunId}:turn:${tailSegments.length - 1}`);
+  const tailReturned = (linkedRunMetaById.get(tailRunId ?? "")?.resultJson?.personStop as { returned?: unknown } | undefined)?.returned;
+  const tailRequest = requestCommentByRun.get(tailRunId ?? "");
+  const tailSegmentSettled = (paperclipRunnerTail && threadItems.some(item =>
+    item.kind === "turn" && item.id === `${tailRunId}:turn:${tailSegments.length - 1}`)) ||
+    (Boolean(tailRunId) && isUserStop(tailRunId!) && Array.isArray(tailReturned) && tailReturned.length > 0 &&
+      (!tailRequest || tailReturned.includes(tailRequest)) && !lastCommentIdByRun.has(tailRunId!) &&
+      (transcriptByRun.get(tailRunId!)?.length ?? 0) === 0);
   const tailEntries = paperclipRunnerTail ? tailSegment.entries : (tailRunId ? (transcriptByRun.get(tailRunId) ?? []) : []);
   const tailContinued = paperclipRunnerTail && tailTimelineAnchors.length > 0 &&
     !tailSegments[tailSegments.length - 2]?.entries.some(entry => entry.kind === "assistant" && entry.channel === "final" && !entry.delta);
