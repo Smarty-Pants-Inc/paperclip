@@ -1,8 +1,9 @@
 import type { ComponentType } from "react";
-import type { CreateConfigValues } from "@paperclipai/adapter-utils";
+import type { CreateConfigValues, TranscriptEntry as SharedTranscriptEntry } from "@paperclipai/adapter-utils";
 
-// Re-export shared types so local consumers don't need to change imports
-export type { TranscriptEntry, StdoutLineParser, CreateConfigValues } from "@paperclipai/adapter-utils";
+// Placement keeps the first visible timestamp; completion still owns the clock.
+export type TranscriptEntry = SharedTranscriptEntry & { completedAt?: string };
+export type { StdoutLineParser, CreateConfigValues } from "@paperclipai/adapter-utils";
 
 export interface StatefulStdoutParser {
   parseLine: (line: string, ts: string) => import("@paperclipai/adapter-utils").TranscriptEntry[];
