@@ -489,11 +489,12 @@ export function TaskChatComposer({
     focus: () => editorRef.current?.focus(),
     restoreDraft: (submittedBody: string) => {
       if (!submittedBody) return;
-      const next = bodyRef.current ? `${bodyRef.current}\n\n${submittedBody}` : submittedBody;
+      const next = bodyRef.current.includes(submittedBody) ? bodyRef.current : bodyRef.current ? `${bodyRef.current}\n\n${submittedBody}` : submittedBody;
       changeBody(next);
       // Written at once (not after the debounce), and kept past the tab, before the caller deletes the message.
       if (draftKey) { saveDraft(draftKey, next); saveRestoredDraft(draftKey, next); }
       requestAnimationFrame(() => editorRef.current?.focus());
+      return !draftKey || loadDraft(draftKey).includes(submittedBody);
     },
   }));
   const draftTimer = useRef<ReturnType<typeof setTimeout> | null>(null);

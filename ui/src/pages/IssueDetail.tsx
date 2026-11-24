@@ -436,6 +436,7 @@ import { openSafeUrl } from "@/lib/safe-url";
 // depend on it. Reusing one shared reference keeps those values stable.
 const EMPTY_ISSUES: Issue[] = [];
 const EMPTY_PROJECTS: Project[] = [];
+const restoredStoppedCommentIds = new Set<string>();
 
 type StopAndFinalizeRunError = Error & {
   runCancelledBeforeStatusUpdateFailed?: boolean;
@@ -5851,11 +5852,16 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   // The text goes back into the input box FIRST (a failure can only duplicate it, never lose it), then
   // the person's own delete takes it out of the thread and every hand-over (deleted comments are never handed on).
   const restoreStoppedMessages = useCallback(async (commentIds: readonly string[]) => {
-    if (!commentComposerRef.current) return false; // no box to take the text: restore nothing, delete nothing, try again later
     for (const id of commentIds) {
       const comment = threadComments.find((candidate) => candidate.id === id && !candidate.deletedAt);
       if (!comment) continue;
-      commentComposerRef.current?.restoreDraft(comment.body);
+      if (!commentComposerRef.current) return false; // no box to take the text: restore nothing, delete nothing, try again later
+      const restoreKey = `${issueId}:${id}`;
+      if (!restoredStoppedCommentIds.has(restoreKey)) {
+        // Marked only once the text is kept: a box that could not keep it leaves the message in the thread.
+        if (commentComposerRef.current.restoreDraft(comment.body) === false) return false;
+        restoredStoppedCommentIds.add(restoreKey);
+      }
       await issuesApi.deleteComment(issueId!, id).then(upsertCommentInCache).catch(() => undefined);
     }
     return true;
