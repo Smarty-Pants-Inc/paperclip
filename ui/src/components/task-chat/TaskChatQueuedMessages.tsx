@@ -469,7 +469,7 @@ export function TaskChatQueuedMessages({
     }
     const deliveredIds = action === "interrupt"
       ? entries.map((entry) => entry.comment.id)
-      : action === "steer" ? [commentId] : [];
+      : [];
     for (const id of deliveredIds) optimisticDeliveryIds.current.add(id);
     if (deliveredIds.length) {
       setEntries((current) => current.filter(
