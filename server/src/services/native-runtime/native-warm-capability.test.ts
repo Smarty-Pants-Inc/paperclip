@@ -24,5 +24,6 @@ describe("native warm credential and file admission", () => {
     const profile: PaperclipRunnerProviderProfile = { provider: "codex", backend: "codex_app_server", model: "gpt-5.6-sol" };
     expect(supportsNativeWarmFiles(profile)).toBe(true);
     expect(supportsManagedNativeWarmSession(profile, undefined)).toBe(true);
+    expect(supportsNativeWarmFiles({ backend: "pi_rpc" })).toBe(true);
   });
 });
