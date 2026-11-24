@@ -12780,10 +12780,25 @@ async function executePaperclipNativeSessionAttempt(
             // A failed seal commits nothing: the messages stay queued for the
             // turn boundary instead of failing this run before its turn.
             prepareWakeAttachmentPrompt: input.prepareAttachmentPrompt,
-            getFirstTurnQueuedInput: () => claimFirstTurnQueuedInput(input.db, input.execution.binding).catch((error) => {
-              logger.warn({ err: error, runId: input.execution.binding.runId }, "first-turn queued input was not sealed");
-              return null;
-            }),
+            getFirstTurnQueuedInput: async () => {
+              // Reserve dispatch under the same run-row lock as pre-turn Stop.
+              const [admitted] = await input.db.update(heartbeatRuns).set({
+                resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || '{"firstTurnDispatchCommitted":true}'::jsonb`,
+              }).where(and(
+                eq(heartbeatRuns.id, input.execution.binding.runId),
+                eq(heartbeatRuns.companyId, input.execution.binding.companyId),
+                eq(heartbeatRuns.agentId, input.execution.binding.agentId),
+                eq(heartbeatRuns.status, "running"),
+                sql`${heartbeatRuns.resultJson}->'startupCancellation' is null`,
+                sql`not (coalesce(${heartbeatRuns.resultJson}#>>'{nativeCancellation,scope}', '') = 'run'
+                  and coalesce(${heartbeatRuns.resultJson}#>>'{nativeCancellation,dispatchState}', '') in ('pending', 'acknowledged'))`,
+              )).returning({ id: heartbeatRuns.id });
+              if (!admitted) throw new NativeCancellationPendingRecoveryError();
+              return claimFirstTurnQueuedInput(input.db, input.execution.binding).catch((error) => {
+                logger.warn({ err: error, runId: input.execution.binding.runId }, "first-turn queued input was not sealed");
+                return null;
+              });
+            },
             getUnreadSteeredMessages: () => readUnreadSteeredMessages(input.db, {
               companyId: input.execution.binding.companyId,
               runId: input.execution.binding.runId,
