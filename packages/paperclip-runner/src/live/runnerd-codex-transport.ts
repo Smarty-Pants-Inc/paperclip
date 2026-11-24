@@ -122,6 +122,10 @@ const MAX_NOTIFICATION_COUNT = 2_048;
 const MAX_NOTIFICATION_BYTES = 4 * 1024 * 1024;
 // How often the event pump retries events that it is holding back itself.
 const PUMP_HELD_RETRY_MS = 5;
+export const ADOPTED_RUNNER_POLL_MS = (() => {
+  const value = Number(process.env.PAPERCLIP_ADOPTED_RUNNER_POLL_MS);
+  return Number.isInteger(value) && value >= 250 && value <= 60_000 ? value : 250;
+})();
 const RUNNER_CLIENT_VERSION = "0.3.0";
 const RUNNER_BOOTSTRAP_TICKET_TTL_MS = 60_000;
 const RUNNER_RESTORE_STABLE_MS = 60_000;
@@ -9235,7 +9239,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         .finally(() => {
           checking = false;
         });
-    }, 250);
+    }, ADOPTED_RUNNER_POLL_MS);
     this.#adoptedRunnerMonitor.unref?.();
   }
 
