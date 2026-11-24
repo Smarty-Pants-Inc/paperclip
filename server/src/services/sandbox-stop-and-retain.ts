@@ -4,7 +4,7 @@ import { notifyInstructionCopyStopEvidence } from "./instruction-collection-noti
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { randomUUID } from "node:crypto";
 import { and, eq, sql, type SQL } from "drizzle-orm";
-import { environmentLeases, heartbeatRuns, type Db } from "@paperclipai/db";
+import { environmentLeases, heartbeatRuns, sandboxCreationOperations, type Db } from "@paperclipai/db";
 import { isBuiltinSandboxProvider } from "./sandbox-provider-runtime.js";
 import { hasRemoteTerminationReceipt, remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { hasNativeWorkspaceExportResume, readNativeWorkspaceExportResume, settleNativeWorkspaceExportResume } from "./native-runtime/native-workspace-export-resume.js";
@@ -246,7 +246,7 @@ export async function settleStopOnlyCleanup(db: Db, lease: Lease, options: { att
       await notifyDeliveryWork(tx, DELIVERY_QUEUES.nativeRunProjection,
         JSON.stringify({ companyId: lease.companyId, runId: lease.heartbeatRunId }));
     }
-    return tx.update(environmentLeases).set({
+    const updated = await tx.update(environmentLeases).set({
       status: stopped || gone ? "released" : "pending_cleanup", cleanupStatus: stopped || gone ? "success" : "failed",
       failureReason: stopped ? null : gone ? "workspace_source_unavailable" : "sandbox_stop_pending",
       releasedAt: now, lastUsedAt: now, updatedAt: now,
@@ -264,6 +264,12 @@ export async function settleStopOnlyCleanup(db: Db, lease: Lease, options: { att
         pendingCleanupInFlight: false, pendingCleanupLeaseExpiresAtMs: 0,
       })}::jsonb`,
     }).where(stopOnlyAttempt(lease, options.attemptId)).returning();
+    const creationOperationId = updated[0]?.metadata?.creationOperationId;
+    if ((stopped || gone) && typeof creationOperationId === "string") await tx.update(sandboxCreationOperations)
+      .set({ state: "resolved", updatedAt: now }).where(and(eq(sandboxCreationOperations.id, creationOperationId),
+        eq(sandboxCreationOperations.companyId, lease.companyId), eq(sandboxCreationOperations.leaseId, lease.id),
+        eq(sandboxCreationOperations.state, "cleanup_pending")));
+    return updated;
   }, { companyId: lease.companyId, runId: lease.heartbeatRunId ?? undefined });
   return updated ?? null;
 }
