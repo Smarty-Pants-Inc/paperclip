@@ -2550,6 +2550,7 @@ export function rehydrateRunnerdItemNotification(
       type: rawItem.type ?? rawParams.kind,
       status: rawItem.status ?? rawParams.status,
       text: rawItem.text ?? rawParams.text,
+      ...(rawItem.answers === undefined && Array.isArray(rawParams.answers) ? { answers: rawParams.answers } : {}),
       ...(phase === undefined ? {} : { phase }),
       ...(channel === undefined ? {} : { channel }),
     },
