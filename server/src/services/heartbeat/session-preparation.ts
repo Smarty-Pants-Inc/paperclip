@@ -6,7 +6,8 @@ import { getServerAdapter } from "../../adapters/index.js";
 import type { prepareManagedAiRuntime } from "../ai-connection-runtime.js";
 import { aiConnectionSessionCompatibilityInputs, managedAiSessionIdentityCompatible } from "../ai-connection-session.js";
 import { createNativeSessionHandoffLoader } from "../native-runtime/native-session-handoff.js";
-import { decideNativeContinuation } from "../native-runtime/continued-session.js";
+import { decideNativeContinuation, resolveSessionContinuity } from "../native-runtime/continued-session.js";
+import { findNativeContinuousSessionResumeId } from "../native-runtime/native-session-resume.js";
 import { deriveTaskKey } from "./run-preparation.js";
 import { agentInstructionsService } from "../agent-instructions.js";
 import {
@@ -193,8 +194,12 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
     if (!canRefresh) context.forceFreshSession = true;
   }
   const wakeSessionResetReason = describeSessionResetReason(context);
+  const nativeContinuous = agent.adapterType === "paperclip_runner"
+    && resolveSessionContinuity(runtimeConfig.provider, runtimeConfig.sessionContinuity) === "continuous";
   const sessionConfigFreshness = resolveTaskSessionConfigFreshness({
-    hasTaskSession: taskSession != null,
+    provider: agent.adapterType === "paperclip_runner" ? runtimeConfig.provider : undefined, sessionContinuity: agent.adapterType === "paperclip_runner" ? runtimeConfig.sessionContinuity : undefined,
+    // A continuous native goal-only stub is not a saved session/configuration pointer.
+    hasTaskSession: taskSession != null && (!nativeContinuous || isNativeSessionId(taskSessionDecodedParams?.sessionId)),
     configuredModel,
     taskSessionParams:
       taskSession?.sessionParamsJson ?? taskSessionDecodedParams,
@@ -204,25 +209,30 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
     preserveLegacySessionWithoutConfigMetadata:
       acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision && !agentIdentity,
   });
-  let resetTaskSession =
-    context.workspaceSelectionChanged === true || shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
-  if (decideNativeContinuation({
-    provider: runtimeConfig.provider, sessionContinuity: runtimeConfig.sessionContinuity, hasSession: taskSession != null, wakeReset: true,
-    resetRequired: context.explicitFreshSession === true || context.conversationReset === true || context.workspaceSelectionChanged === true ||
-      sessionConfigFreshness.reasons.some(reason => reason !== wakeSessionResetReason) ||
-      (context.wakeReason === "heartbeat_timer" && !deriveTaskKey(context, null)),
-  }).continue) resetTaskSession = false;
-  const sessionResetReason =
-    sessionConfigFreshness.reasons.join("; ") || null;
-  const taskSessionForRun = resetTaskSession ? null : taskSession;
   const taskSessionCredentialCompatible = !managedAiRuntime || managedAiSessionIdentityCompatible(
     taskSession?.sessionParamsJson?.paperclipAiCredentialIdentity,
     managedAiRuntime.sessionIdentity,
     managedAiRuntime.identity,
   );
+  const resetRequired = context.explicitFreshSession === true || context.conversationReset === true || context.workspaceSelectionChanged === true ||
+    sessionConfigFreshness.reasons.some(reason => reason !== wakeSessionResetReason) ||
+    (context.wakeReason === "heartbeat_timer" && !deriveTaskKey(context, null));
   const taskSessionId = readNonEmptyString(taskSessionDecodedParams?.sessionId);
-  const taskResumeSessionId = taskSessionCredentialCompatible && taskSessionForRun?.lastRunId &&
-    taskSessionForRun.lastRunId !== run.id && isNativeSessionId(taskSessionId) ? taskSessionId : null;
+  const recoveredSessionId = nativeContinuous && issueRef && !resetRequired && taskSessionCredentialCompatible
+    && (!isNativeSessionId(taskSessionId) || !taskSession?.lastRunId)
+    ? await findNativeContinuousSessionResumeId(db, { companyId: agent.companyId, agentId: agent.id, issueId: issueRef.id,
+        currentRunId: run.id, beforeCreatedAt: run.createdAt, conversationSessionGeneration: context.conversationSessionGeneration }) : null;
+  let resetTaskSession =
+    context.workspaceSelectionChanged === true || shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
+  if (decideNativeContinuation({
+    provider: runtimeConfig.provider, sessionContinuity: runtimeConfig.sessionContinuity,
+    hasSession: taskSession != null || recoveredSessionId !== null, wakeReset: true, resetRequired,
+  }).continue) resetTaskSession = false;
+  const sessionResetReason =
+    sessionConfigFreshness.reasons.join("; ") || null;
+  const taskSessionForRun = resetTaskSession ? null : taskSession;
+  const taskResumeSessionId = resetTaskSession || !taskSessionCredentialCompatible ? null
+    : taskSessionForRun?.lastRunId && taskSessionForRun.lastRunId !== run.id && isNativeSessionId(taskSessionId) ? taskSessionId : recoveredSessionId;
   const getFreshSessionHandoff = issueRef ? createNativeSessionHandoffLoader({
     db, companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id, before: run.createdAt,
     throughCommentId: readNonEmptyString(context.conversationReplayThroughCommentId) ?? (context.interactionKind ? null : wakeCommentId),

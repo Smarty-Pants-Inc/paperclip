@@ -16,7 +16,8 @@ import { sql } from "drizzle-orm";
 import { materializeIsolatedTaskDirectory } from "../isolated-task-directory.js";
 import { readConnectionFailure, type GitConnectionFailure } from "@paperclipai/adapter-utils/connection-failure";
 import { managedAiSessionFingerprintConfig } from "../ai-connection-runtime.js";
-import { paperclipRunnerSessionAdapterConfig, sessionAgentRuntimeConfig, sessionEnvironment } from "./session-fingerprint-inputs.js";
+import { continuousSessionAdapterConfig, paperclipRunnerSessionAdapterConfig, sessionAgentRuntimeConfig, sessionEnvironment } from "./session-fingerprint-inputs.js";
+import { resolveSessionContinuity } from "../native-runtime/continued-session.js";
 import {
   PROJECT_REPOSITORIES_DIR,
   readGitWorkspaceSnapshot,
@@ -2832,7 +2833,7 @@ export function buildSessionConfigCategoryValues(input: {
       : paperclipRunnerSessionAdapterConfig(input.effectiveAdapterConfig),
     agentRuntimeConfig: legacy ? input.agentRuntimeConfig : sessionAgentRuntimeConfig(input.agentRuntimeConfig),
     instructions: input.instructions,
-    issueOverrides: input.issueOverrides,
+    issueOverrides: !legacy && input.adapterType === "paperclip_runner" && parseObject(input.issueOverrides).adapterConfig ? { ...parseObject(input.issueOverrides), adapterConfig: continuousSessionAdapterConfig(parseObject(parseObject(input.issueOverrides).adapterConfig), input.effectiveAdapterConfig.provider, input.effectiveAdapterConfig.sessionContinuity) } : input.issueOverrides,
     workspaceConfig,
     environment: legacy ? input.environment : sessionEnvironment(input.environment),
     envBindings: {
@@ -3205,11 +3206,12 @@ function readConfiguredModelFromSessionParams(
 }
 
 export function shouldResetTaskSessionForModelChange(input: {
+  provider?: unknown; sessionContinuity?: unknown;
   configuredModel: string | null;
   taskSessionParams: Record<string, unknown> | null | undefined;
 }) {
   const { configuredModel, taskSessionParams } = input;
-  if (!configuredModel || !taskSessionParams) return false;
+  if ((input.provider === "pi_rpc" && resolveSessionContinuity(input.provider, input.sessionContinuity) === "continuous") || !configuredModel || !taskSessionParams) return false;
   const sessionModel = readConfiguredModelFromSessionParams(taskSessionParams);
   return !!sessionModel && sessionModel !== configuredModel;
 }
@@ -3235,6 +3237,7 @@ export function stripPaperclipSessionMetadataFromSessionParams(
 }
 
 export function resolveTaskSessionConfigFreshness(input: {
+  provider?: unknown; sessionContinuity?: unknown;
   hasTaskSession: boolean;
   configuredModel: string | null;
   taskSessionParams: Record<string, unknown> | null | undefined;
@@ -3261,6 +3264,7 @@ export function resolveTaskSessionConfigFreshness(input: {
     input.taskSessionParams,
   );
   const modelChangedSinceTaskSession = shouldResetTaskSessionForModelChange({
+    provider: input.provider, sessionContinuity: input.sessionContinuity,
     configuredModel: input.configuredModel,
     taskSessionParams: input.taskSessionParams,
   });
