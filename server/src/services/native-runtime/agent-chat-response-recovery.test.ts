@@ -389,17 +389,24 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
 
   it("saves every held-turn final, including identical answers, and reuses the last at finalization", async () => {
     const f = await fixture(true, { beforeFinalize: async scope => {
+      const [personRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      const outbox = await completion(scope);
+      await db.update(heartbeatRuns).set({ contextSnapshot: personRun.contextSnapshot }).where(eq(heartbeatRuns.id, scope.runId));
       await db.update(agents).set({ adapterConfig: { provider: "pi_rpc" } }).where(eq(agents.id, scope.agentId));
       const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
       const execution = { binding: scope, provider: { kind: "pi_rpc" as const, model: null } };
       for (let index = 0; index < 4; index++) {
         const event = { eventType: "item.completed" as const, runId: scope.runId, normalizedSessionId: run.nativeSessionId!,
-          sourceEventId: `held-final-${index}`, itemId: `hire-turn:m${index}:b0`, payload: { kind: "agentMessage", channel: "final", text: index < 3 ? "Same answer." : "Last answer." } };
+          sourceEventId: `held-final-${index}`, itemId: `hire-turn:m${index}:b0`, payload: { kind: "agentMessage", channel: "final", text: index < 3 ? "Same answer." : "Last answer.", ...(index === 1 ? {} : { answers: index === 3 ? [outbox.deliveryId] : [] }) } };
         const cursor = 171 + index;
         await db.insert(heartbeatRunEvents).values({ companyId: scope.companyId, runId: scope.runId, agentId: scope.agentId, seq: cursor, eventType: event.eventType, payload: { prpEvent: event } });
         await Promise.all([publishContinuousNativeReply({ db, execution, event, cursor }), publishContinuousNativeReply({ db, execution, event, cursor })]);
+        console.info("completion-attribution-row", { itemId: event.itemId, answers: event.payload.answers ?? "missing", delivery: await outbox.delivery() });
+        if (index < 3) expect(await outbox.delivery(), "a person's unrelated answer must not consume the completion report").toMatchObject({ status: "queued", responseCommentId: null });
       }
       expect((await comments(scope.runId)).map(c => c.body).sort()).toEqual(["Last answer.", "Same answer.", "Same answer.", "Same answer."]);
+      expect(await outbox.delivery()).toMatchObject({ status: "delivered", targetRunId: scope.runId, attempts: 0,
+        responseCommentId: (await comments(scope.runId)).find(c => c.body === "Last answer.")!.id });
     }, reply: "Last answer." });
     await recoverCommittedNativeChatResponse(db, f.input);
     expect(await comments(f.runId)).toHaveLength(4);
@@ -687,7 +694,7 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
   const comments = (runId: string) => db.select().from(issueComments).where(eq(issueComments.createdByRunId, runId));
   const issue = async (issueId: string) => (await db.select().from(issues).where(eq(issues.id, issueId)))[0];
 
-  async function completion(f: Awaited<ReturnType<typeof fixture>>) {
+  async function completion(f: { companyId: string; issueId: string; runId: string; agentId: string }) {
     const taskId = randomUUID(), deliveryId = randomUUID();
     await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
     await db.insert(issues).values({ id: taskId, companyId: f.companyId, title: "Completed review", status: "done", statusVersion: 2 });
