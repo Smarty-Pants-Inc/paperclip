@@ -34,6 +34,13 @@ export function isRunStopConfirmed(run: StopRunEvidence) {
     && "dispatchState" in cancellation && cancellation.dispatchState === "acknowledged");
 }
 
+/** A held turn receipt is separate from proof that a run was cancelled. */
+export function isHeldTurnStopConfirmed(run: StopRunEvidence, requestedAt: string) {
+  const stop = run.resultJson?.personStop as { requestedAt?: unknown; settledAt?: unknown } | undefined;
+  return run.status === "running" && run.runtimeMode === "native" &&
+    stop?.requestedAt === requestedAt && typeof stop.settledAt === "string";
+}
+
 /** A cancel response can prove termination; a tree hold alone only acknowledges the hold. */
 export async function waitForStoppedRuns(
   runIds: string[],
@@ -42,13 +49,17 @@ export async function waitForStoppedRuns(
     initialRuns?: Array<HeartbeatRun | null>;
     timeoutMs?: number;
     intervalMs?: number;
+    /** Only the person-Stop path may accept this correlated held-turn receipt. */
+    personStopRequestedAt?: string;
   } = {},
 ) {
   const getRun = options.getRun ?? heartbeatsApi.get;
   const deadline = Date.now() + (options.timeoutMs ?? 30_000);
   const targets = [...new Set(runIds)];
+  const confirmed = (run: StopRunEvidence) => isRunStopConfirmed(run) ||
+    Boolean(options.personStopRequestedAt && isHeldTurnStopConfirmed(run, options.personStopRequestedAt));
   let remaining = targets.filter((id) =>
-    !options.initialRuns?.some((run) => run?.id === id && isRunStopConfirmed(run)),
+    !options.initialRuns?.some((run) => run?.id === id && confirmed(run)),
   );
   let transientFailure = false;
   while (remaining.length > 0) {
@@ -80,7 +91,7 @@ export async function waitForStoppedRuns(
         throw new StopVerificationError(VERIFICATION_ERROR, targets);
       }
       transientFailure = false;
-      remaining = remaining.filter((_id, index) => !isRunStopConfirmed(states[index]!));
+      remaining = remaining.filter((_id, index) => !confirmed(states[index]!));
     }
     if (remaining.length === 0) return;
     if (Date.now() >= deadline) {
