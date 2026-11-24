@@ -7,7 +7,7 @@ import { QueryClientContext } from "@tanstack/react-query";
 import type { HeartbeatRunEvent } from "@paperclipai/shared";
 import type { TranscriptEntry } from "@/adapters";
 import { heartbeatsApi } from "@/api/heartbeats";
-import { nativeRunEventsToTranscript } from "./native-run-events";
+import { nativeRunActivityLabel, nativeRunEventsToTranscript } from "./native-run-events";
 import { readTranscriptRequest } from "./read-transcript-request";
 
 const EVENT_PAGE_SIZE = 1_000;
@@ -69,7 +69,7 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
   const [hydratedStatusByRun, setHydratedStatusByRun] = useState(new Map<string, string>());
   const [retryGeneration, setRetryGeneration] = useState(0);
   const retry = useCallback(() => setRetryGeneration((value) => value + 1), []);
-  const projectionCacheRef = useRef(new Map<string, { events: HeartbeatRunEvent[]; transcript: TranscriptEntry[] }>());
+  const projectionCacheRef = useRef(new Map<string, { events: HeartbeatRunEvent[]; transcript: TranscriptEntry[]; activityLabel?: string }>());
   const cursorByRunRef = useRef(new Map<string, number>());
   const conversationOnlyByRunRef = useRef(new Map<string, boolean>());
 
@@ -270,22 +270,24 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
     };
   }, [nativeRuns, retryGeneration, visible, options.enabled, options.companyId, stream.healthy, stream.epoch, queryClient, savedHistory]);
 
-  const transcriptByRun = useMemo(() => {
+  const { transcriptByRun, activityLabelByRun } = useMemo(() => {
     const transcripts = new Map<string, TranscriptEntry[]>();
+    const labels = new Map<string, string>();
     for (const run of nativeRuns) {
       const events = eventsByRun.get(run.id) ?? savedHistory.get(run.id)?.events;
       if (!events) continue;
       let cached = projectionCacheRef.current.get(run.id);
       if (!cached || cached.events !== events) {
-        cached = { events, transcript: nativeRunEventsToTranscript(events) };
+        cached = { events, transcript: nativeRunEventsToTranscript(events), activityLabel: nativeRunActivityLabel(events) };
         projectionCacheRef.current.set(run.id, cached);
       }
       transcripts.set(run.id, cached.transcript);
+      if (cached.activityLabel) labels.set(run.id, cached.activityLabel);
     }
     for (const id of projectionCacheRef.current.keys()) {
       if (!transcripts.has(id)) projectionCacheRef.current.delete(id);
     }
-    return transcripts;
+    return { transcriptByRun: transcripts, activityLabelByRun: labels };
   }, [eventsByRun, nativeRuns, savedHistory]);
 
   const terminalHydratedRunIds = useMemo(() => new Set(nativeRuns
@@ -295,7 +297,7 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
   const availableRunIds = useMemo(() => new Set([...savedHistory.keys(), ...hydratedRunIds]), [savedHistory, hydratedRunIds]);
   const availableTerminalRunIds = useMemo(() => new Set([...savedHistory.keys(), ...terminalHydratedRunIds]), [savedHistory, terminalHydratedRunIds]);
   return {
-    transcriptByRun, errorsByRun, hydratedRunIds: availableRunIds, terminalHydratedRunIds: availableTerminalRunIds, retry,
+    transcriptByRun, activityLabelByRun, errorsByRun, hydratedRunIds: availableRunIds, terminalHydratedRunIds: availableTerminalRunIds, retry,
     isInitialHydrating: nativeRuns.some((run) => !availableRunIds.has(run.id)),
   };
 }

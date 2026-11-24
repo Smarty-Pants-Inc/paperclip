@@ -1127,6 +1127,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   );
   const {
     transcriptByRun: nativeTranscriptByRun,
+    activityLabelByRun: nativeActivityLabelByRun,
     errorsByRun: nativeTranscriptErrorsByRun,
     isInitialHydrating: nativeEventsAreInitiallyHydrating,
     hydratedRunIds: hydratedNativeRunIds,
@@ -2729,6 +2730,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const tailResumeWaiting = useWaitingToStart(tailBeforeTurn && tailResuming, liveRun ? ((liveRun.startedAt ? toMs(liveRun.startedAt) : null) ?? toMs(liveRun.createdAt)) : null);
   const tailPreparationLabel = tailBeforeTurn
     ? tailResumeWaiting ? tailEntries.some(entry => entry.kind === "system" && entry.text.startsWith("Paperclip session resumed")) ? "Resuming your conversation…" : "Preparing your reply…" : "Starting…" : undefined;
+  // A receipt beats the startup grace, but never a terminal state or a named hold.
+  const tailProgressLabel = liveRun?.id === tailRunId && !tailEnded && !isTerminalRunStatus(liveRun?.status ?? "") &&
+    (!liveExecution || (["working", "reconnecting", "queued"].includes(liveExecution.phase) && !liveExecution.cause))
+    ? nativeActivityLabelByRun.get(tailRunId ?? "") ?? (tailBeforeTurn ? liveRun?.status === "queued" ? "Queued" : "Preparing run…" : undefined)
+    : undefined;
   const tailExecution = tailResuming && !tailBeforeTurn && liveExecution?.phase === "reconnecting"
     ? null : liveExecution;
   const tailPlanItem =
@@ -3214,7 +3220,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const requestExecution = requestRun?.id === liveRun?.id ? liveExecution : linkedRunMetaById.get(requestRun?.id ?? "")?.execution;
   const requestWait = latestUserComment && queuedCommentIds.has(latestUserComment.id) ? queuedMessageQueue?.executionWait : null;
   const requestLabel = recoveryOwnsStatus ? "Preparing your reply…"
-    : requestWait?.message ?? (requestStatus === "queued" && requestExecution?.phase !== "reconnecting" ? requestExecution?.label : undefined) ?? "Starting…";
+    : requestWait?.message ?? (requestStatus === "queued" ? requestExecution?.cause ? requestExecution.label : "Queued" : undefined) ?? "Starting…";
   // While the task offers Retry nothing is on its way by itself: words, no working sign.
   const requestWorking = !(props.interruption?.state === "failed" && props.interruption.canRetry) &&
     (HELD_BY_RECOVERY_REASONS.has(requestWait?.reason ?? requestExecution?.cause ?? "") ||
@@ -3786,11 +3792,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                     personStopped={isUserStop(tailRunId ?? "")}
                                     working={optimisticRunnerStartup ? requestWorking : undefined}
                                     execution={!optimisticRunnerStartup && !tailHasFinalResponse && !tailFinalStreaming && !tailTerminal && liveRun?.id === tailRunId ? tailExecution : null}
-                                    preparationLabel={tailPreparationLabel ?? (optimisticRunnerStartup ? requestLabel : liveRun && tailHasFinalResponse && (liveExecution?.phase === "finishing" || tailEntries.some((entry) => entry.kind === "run_terminal" && entry.runState === "succeeded")) ? "Answer ready · Saving…" : undefined)}
+                                    preparationLabel={tailProgressLabel ?? tailPreparationLabel ?? (optimisticRunnerStartup ? requestLabel : liveRun && tailHasFinalResponse && (liveExecution?.phase === "finishing" || tailEntries.some((entry) => entry.kind === "run_terminal" && entry.runState === "succeeded")) ? "Answer ready · Saving…" : undefined)}
                                     startedAtMs={tailStartedAtMs}
                                     finishedAtMs={tailFinishedAtMs}
                                     continuedAfterSteering={tailContinued}
-                                    statusContent={tailRunSource?.adapterType !== "paperclip_runner" && !optimisticRunnerStartup && !tailPreparationLabel && !stoppingReply && !isTerminalRunStatus(tailStatus) ? (
+                                    statusContent={tailRunSource?.adapterType !== "paperclip_runner" && !optimisticRunnerStartup && !tailProgressLabel && !tailPreparationLabel && !stoppingReply && !isTerminalRunStatus(tailStatus) ? (
                                       <TaskChatLiveRunPill status={tailStatus} execution={!tailHasFinalResponse && !tailFinalStreaming && !tailTerminal && liveRun?.id === tailRunId ? tailExecution : null}
                                         startedAtMs={tailStartedAtMs} finishedAtMs={tailFinishedAtMs} toolSummary={tailToolSummary} />
                                     ) : undefined}
@@ -3800,7 +3806,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                     <TaskChatRunnerTurn
                                       key={tailSegmentKey}
                                       showHeader={false}
-                                      preparationLabel={tailPreparationLabel ?? (optimisticRunnerStartup ? requestLabel : undefined)}
+                                      preparationLabel={tailProgressLabel ?? tailPreparationLabel ?? (optimisticRunnerStartup ? requestLabel : undefined)}
                                       runId={tailRunId}
                                       execution={
                                         // While the answer itself streams the reply is Working, whatever the label poll says.
