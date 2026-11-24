@@ -116,7 +116,7 @@ describe("TaskChatRunnerTurn", () => {
     expect(container.textContent).not.toContain("Thinking");
   });
 
-  it("keeps startup feedback briefly, then says a queued turn with no named hold is waiting to start", () => {
+  it("keeps startup feedback briefly, then says a queued turn with no named hold is waiting for a machine", () => {
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date("2026-11-13T17:39:05Z"));
@@ -125,10 +125,10 @@ describe("TaskChatRunnerTurn", () => {
       expect(container.querySelector('[data-testid="task-chat-current-activity"]')).toBeNull();
       // The fixture's run was queued 2 s before render: the grace ends at +28 s.
       act(() => { vi.advanceTimersByTime(27_000); });
-      expect(container.textContent).not.toContain("Waiting to start");
+      expect(container.textContent).not.toContain("Waiting for a machine…");
       act(() => { vi.advanceTimersByTime(2_000); });
-      expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent).toContain("Waiting to start");
-      expect(container.textContent?.split("Waiting to start")).toHaveLength(2);
+      expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent).toBe("Waiting for a machine…");
+      expect(container.textContent?.split("Waiting for a machine…")).toHaveLength(2);
       expect(container.querySelector('[data-testid="task-chat-current-activity"]')).toBeNull();
       expect(container.textContent).not.toContain("Working");
     } finally {
@@ -158,7 +158,7 @@ describe("TaskChatRunnerTurn", () => {
     try {
       render([], "running");
       act(() => { vi.advanceTimersByTime(10 * 60_000); });
-      expect(container.textContent).not.toContain("Waiting to start");
+      expect(container.textContent).not.toContain("Waiting for a machine…");
       expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent).toContain("Working");
     } finally {
       vi.useRealTimers();
@@ -271,9 +271,8 @@ describe("TaskChatRunnerTurn", () => {
     render([], "running", "run-1", undefined, false, false, waiting);
     expect(container.querySelector('[data-testid="task-chat-turn-status-header"]')?.textContent)
       .toContain(`Waiting for ${provider}`);
-    const tail = container.querySelector('[data-testid="task-chat-current-activity-label"]');
-    expect(tail?.textContent).toBe(`Waiting for ${provider}`);
-    expect(tail?.classList.contains("shimmer-text")).toBe(false);
+    expect(container.querySelector('[data-testid="task-chat-current-activity"]')).toBeNull();
+    expect(container.textContent?.split(`Waiting for ${provider}`)).toHaveLength(2);
     expect(container.textContent).not.toContain("Working");
     expect(container.textContent).not.toContain("Thinking");
 
