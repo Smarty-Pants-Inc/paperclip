@@ -2525,6 +2525,7 @@ export function coalesceSettledTurns(
         const merged: TaskChatTurnItem = {
           ...held,
           historical: latest.historical,
+          continuedAfterSteering: held.continuedAfterSteering || item.continuedAfterSteering,
           items: [...held.items, ...(meta.chainId && held.finalResponse ? [held.finalResponse] : []), ...item.items],
           ...(mcpStartupFailures ? { mcpStartupFailures } : {}),
           finalResponse: meta.chainId ? item.finalResponse : item.finalResponse ?? held.finalResponse,
