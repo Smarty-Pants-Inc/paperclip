@@ -7074,6 +7074,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       clientRequestId?: string,
       runSettings?: ComposerRunSettings,
     ) => {
+      if (!body.trim() && !attachmentIds?.length)
+        throw new Error("Write a message or attach a file before sending.");
       if (!issue?.conversationAgentId && (reassignment || runSettings)) {
         await addCommentAndReassign.mutateAsync({
           body,
