@@ -6,6 +6,8 @@ import { getServerAdapter } from "../../adapters/index.js";
 import type { prepareManagedAiRuntime } from "../ai-connection-runtime.js";
 import { aiConnectionSessionCompatibilityInputs, managedAiSessionIdentityCompatible } from "../ai-connection-session.js";
 import { createNativeSessionHandoffLoader } from "../native-runtime/native-session-handoff.js";
+import { decideNativeContinuation } from "../native-runtime/continued-session.js";
+import { deriveTaskKey } from "./run-preparation.js";
 import { agentInstructionsService } from "../agent-instructions.js";
 import {
   describeSessionResetReason, shouldResetTaskSessionForWake, isCanonicalSessionIdForAdapter,
@@ -202,8 +204,14 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
     preserveLegacySessionWithoutConfigMetadata:
       acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision && !agentIdentity,
   });
-  const resetTaskSession =
+  let resetTaskSession =
     context.workspaceSelectionChanged === true || shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
+  if (decideNativeContinuation({
+    provider: runtimeConfig.provider, sessionContinuity: runtimeConfig.sessionContinuity, hasSession: taskSession != null, wakeReset: true,
+    resetRequired: context.explicitFreshSession === true || context.conversationReset === true || context.workspaceSelectionChanged === true ||
+      sessionConfigFreshness.reasons.some(reason => reason !== wakeSessionResetReason) ||
+      (context.wakeReason === "heartbeat_timer" && !deriveTaskKey(context, null)),
+  }).continue) resetTaskSession = false;
   const sessionResetReason =
     sessionConfigFreshness.reasons.join("; ") || null;
   const taskSessionForRun = resetTaskSession ? null : taskSession;
