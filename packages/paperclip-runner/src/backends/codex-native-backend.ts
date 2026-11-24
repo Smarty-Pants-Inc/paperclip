@@ -208,6 +208,7 @@ function createTransportBackedNativeSessionBackend(
       conversationMode: preparedContext ? "prepared" : "task",
       // Only legacy conversation-session identity may change the launch profile.
       ...(input.provider.kind === "pi_rpc" && input.provider.conversationMode === true ? { conversationReply: true } : {}),
+      turnIntent: input.turnIntent,
       runnerInstanceId:
         options.runnerInstanceId ?? `paperclip-native-${input.binding.runId}`,
       onSpawn: options.onSpawn,
