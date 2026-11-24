@@ -1001,6 +1001,17 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     ...[...(liveRuns ?? []), ...(activeRun ? [activeRun] : [])].map(run =>
       [run.id, run.contextWakeCommentId ?? run.contextCommentId] as const),
   ]), [linkedRuns, liveRuns, activeRun]);
+  const stoppedRunIds = useRef(new Set<string>());
+  const isUserStop = useCallback((id: string) => {
+    const meta = linkedRunMetaById.get(id);
+    const cancellation = meta?.resultJson?.cancellation as { source?: string; initiator?: { type?: string } } | undefined;
+    // After a reload the run list's summary carries no cancellation source, only the Stop
+    // receipt (executionCancellation) and the error code a person's Stop leaves ('cancelled').
+    return stoppedRunIds.current.has(id) || (cancellation?.source === "operator" && cancellation.initiator?.type === "user") ||
+      (meta?.errorCode === "cancelled" && Boolean(meta?.resultJson?.executionCancellation)) ||
+      // A person's Stop of a Pi turn ends the run normally; the server marks it (resultJson.personStop).
+      Boolean(meta?.resultJson?.personStop);
+  }, [linkedRunMetaById]);
   // Explicit predecessors or the same human request join runs; proximity never does.
   const runChainIdsById = useMemo(() => {
     const predecessors = new Map<string, string | null | undefined>();
@@ -1019,26 +1030,15 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     for (const run of runs) {
       const ids = [run.id];
       let predecessor = predecessors.get(run.id);
-      while (predecessor && !ids.includes(predecessor)) {
+      while (predecessor && !ids.includes(predecessor) && !isUserStop(predecessor)) {
         ids.unshift(predecessor);
         predecessor = predecessors.get(predecessor);
       }
       chains.set(run.id, ids);
     }
     return chains;
-  }, [runs, linkedRuns, liveRuns, activeRun, requestCommentByRun, comments]);
+  }, [runs, linkedRuns, liveRuns, activeRun, requestCommentByRun, comments, isUserStop]);
 
-  const stoppedRunIds = useRef(new Set<string>());
-  const isUserStop = useCallback((id: string) => {
-    const meta = linkedRunMetaById.get(id);
-    const cancellation = meta?.resultJson?.cancellation as { source?: string; initiator?: { type?: string } } | undefined;
-    // After a reload the run list's summary carries no cancellation source, only the Stop
-    // receipt (executionCancellation) and the error code a person's Stop leaves ('cancelled').
-    return stoppedRunIds.current.has(id) || (cancellation?.source === "operator" && cancellation.initiator?.type === "user") ||
-      (meta?.errorCode === "cancelled" && Boolean(meta?.resultJson?.executionCancellation)) ||
-      // A person's Stop of a Pi turn ends the run normally; the server marks it (resultJson.personStop).
-      Boolean(meta?.resultJson?.personStop);
-  }, [linkedRunMetaById]);
   // Pi's Stop (Esc): the messages it hadn't taken go back into the stopping person's input box, once.
   // Keyed on state (his returned messages still exist), so a reload or another of his devices restores too.
   const restoredStopRunIds = useRef(new Set<string>());
