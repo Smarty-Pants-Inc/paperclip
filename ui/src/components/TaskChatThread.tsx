@@ -2420,15 +2420,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           )[0] ?? []).rest,
         };
         const children = settledRunChildren(runHealth.rest);
-        // Hide only empty post-steer acknowledgements, never a terminal failure header.
+        // An input boundary alone is not completed work. Keep every populated
+        // segment, plus the current tail (including an empty stopped turn).
         if (
-          !stableRunnerSegment && children.length === 0 &&
-          !finalResponse &&
-          (!sourceIsPaperclipRunner || (
-            segmentIndex > 0 &&
-            runHealth.failures.length === 0 &&
-            (segmentIndex !== lastPopulatedSegmentIndex || source.status === "succeeded")
-          ))
+          children.length === 0 && !finalResponse &&
+          (!stableRunnerSegment || segmentIndex < segments.length - 1) && runHealth.failures.length === 0
         ) {
           if (sourceIsPaperclipRunner || compactionMarkers.length > 0) settledRunIds.add(source.id);
           continue;
