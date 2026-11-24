@@ -281,12 +281,18 @@ export function TaskChatRunnerTurn({
   // Standalone turns retain their replay latch; controlled segments must not
   // replay an older final beside the saved bubble the thread kept visible.
   const final = finalResponse === undefined ? finalRef.current.item : finalResponse ?? undefined;
-  const timelineItems = paperclipRunnerTimelineItems(turnItems.map((item) =>
-    item.kind === "message" && item.id !== final?.id ? { ...item, interstitial: true } : item,
-  ));
+  const timelineItems = paperclipRunnerTimelineItems(turnItems.filter((item) =>
+    // A controlled final may carry the saved comment ID rather than its native
+    // item's ID. Exclude that one native copy before preserving earlier prose.
+    item.kind !== "message" || !final || (item.id !== final.id &&
+      !(item.id === observedFinal?.id && item.text.trim().replace(/\s+/g, " ") === final.text.trim().replace(/\s+/g, " "))),
+  ).map((item) => item.kind === "message" ? { ...item, interstitial: true } : item));
   const currentActivityItems = currentActivityStatusItems(timelineItems);
   const timelineRows = groupImageResources(buildTurnTimelineRows(
-    omitProgressRepeatedByResponse(timelineItems, final?.text),
+    // The response copy is already excluded. All remaining authored prose
+    // keeps its slot when this segment settles, including an unfinished stream.
+    omitProgressRepeatedByResponse(timelineItems, final?.text).map(item =>
+      item.kind === "message" ? { ...item, channel: "progress" as const } : item),
     !terminal && status !== "stopping",
   ));
 
