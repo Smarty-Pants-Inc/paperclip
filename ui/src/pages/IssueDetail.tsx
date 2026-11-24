@@ -1626,8 +1626,6 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       string,
       {
         targetRunId: string;
-        anchorAt: string;
-        sequence: number;
         comment?: IssueDetailComment;
       }
     >
@@ -1870,11 +1868,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         });
       }
     }
-    // Same-turn steering has a durable PRP acknowledgement and a matching
-    // activity fact keyed by commentId/targetRunId. Its acknowledgement time,
-    // not the comment submission time, is the causal conversation slot. Use
-    // only the first acknowledgement; an idempotent replay emits a diagnostic
-    // activity row with duplicate=true but must not move the message later.
+    // A steering bubble enters the conversation at its delivery receipt, not
+    // while it is queued. Duplicate receipts must not move that boundary.
     const steeringEvents = resolvedActivity
       .filter((evt) => evt.action === "issue.queued_comment_steered")
       .sort(
@@ -1892,10 +1887,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
           ? details["targetRunId"]
           : null;
       if (!commentId || !targetRunId) continue;
-      const anchorAt =
-        evt.createdAt instanceof Date
-          ? evt.createdAt.toISOString()
-          : evt.createdAt;
+      const anchorAt = new Date(evt.createdAt).toISOString();
       const anchorMs = new Date(anchorAt).getTime();
       if (!Number.isFinite(anchorMs)) continue;
       const sequence = steeringSequenceByRunId.get(targetRunId) ?? 0;
@@ -1927,17 +1919,6 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
           kind: "run_start",
           queueIds: new Set(authoritativeQueuedCommentQueue.queueId ? [authoritativeQueuedCommentQueue.queueId] : []),
         });
-      });
-    }
-    for (const [commentId, placement] of localSteeringPlacements) {
-      if (inputPlacementByCommentId.has(commentId)) continue;
-      inputPlacementByCommentId.set(commentId, {
-        runId: placement.targetRunId,
-        anchorAt: placement.anchorAt,
-        sequence: placement.sequence,
-        anchorMs: new Date(placement.anchorAt).getTime(),
-        kind: "steer",
-        queueIds: new Set(),
       });
     }
     for (const evt of resolvedActivity) {
@@ -2305,12 +2286,19 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     queuedCommentQueueEnabled,
   ]);
   const visibleQueuedCommentQueue = useMemo(() => {
-    if (!effectiveQueuedCommentQueue) return null;
-    const entries = effectiveQueuedCommentQueue.entries
-      .filter(entry => !startingCommentIds.has(entry.comment.id))
-      .map((entry, position) => ({ ...entry, position }));
-    return entries.length ? { ...effectiveQueuedCommentQueue, entries } : null;
-  }, [effectiveQueuedCommentQueue, startingCommentIds]);
+    // The POST can finish before the durable receipt refetch. Keep these inputs
+    // in the tray rather than inventing a client-clock conversation boundary.
+    const pendingComments = [...localSteeringPlacements].flatMap(([id, placement]) =>
+      placement.comment && !commentsWithRunMeta.some(comment => comment.id === id && comment.steeredIntoRunId)
+        ? [{ comment: placement.comment, targetRunId: placement.targetRunId }] : []);
+    const queue = mergePendingIssueQueuedComments({ issueId, authoritativeQueue: effectiveQueuedCommentQueue,
+      pendingComments, fallbackProtocol: "paperclip_runner_v1" });
+    if (!queue) return null;
+    const pendingIds = new Set(pendingComments.map(({ comment }) => comment.id));
+    const entries = queue.entries.filter(entry => !startingCommentIds.has(entry.comment.id))
+      .map((entry, position) => ({ ...entry, position, canDiscard: entry.canDiscard && !pendingIds.has(entry.comment.id) }));
+    return entries.length ? { ...queue, entries } : null;
+  }, [effectiveQueuedCommentQueue, startingCommentIds, localSteeringPlacements, commentsWithRunMeta, issueId]);
   const commentsForThread = useMemo(
     () =>
       [...commentsWithRunMeta, ...(authoritativeQueuedCommentQueue?.entries ?? [])
@@ -2445,20 +2433,11 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         throw new Error(
           "The queued message no longer has an active run target.",
         );
-      const anchorAt = new Date().toISOString();
+      const queuedComment = effectiveQueuedCommentQueue.entries.find(entry => entry.comment.id === commentId)?.comment;
+      if (!queuedComment) throw new Error("The queued message is no longer available.");
       const acknowledgeSteeringPlacement = () => setLocalSteeringPlacements((current) => {
         const next = new Map(current);
-        const sequence = [...current.values()].filter(
-          (placement) => placement.targetRunId === targetRunId,
-        ).length;
-        next.set(commentId, {
-          targetRunId,
-          anchorAt,
-          sequence,
-          comment: effectiveQueuedCommentQueue?.entries.find(
-            (entry) => entry.comment.id === commentId,
-          )?.comment,
-        });
+        next.set(commentId, { targetRunId, comment: queuedComment });
         return next;
       });
       try {
@@ -2471,8 +2450,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             revision,
           },
         );
-        // The local placement bridges the durable receipt refresh. Release the
-        // control as soon as delivery is acknowledged, even on a slow refetch.
+        // Retain the submitted input while the durable receipt refreshes. Only
+        // that receipt, never the POST callback's clock, places it in the thread.
         acknowledgeSteeringPlacement();
         setConsumedQueuedCommentIds((current) => new Set(current).add(commentId));
         storeQueuedCommentQueue(nextQueue);
