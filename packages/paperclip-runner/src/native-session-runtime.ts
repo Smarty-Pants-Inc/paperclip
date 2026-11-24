@@ -1214,6 +1214,36 @@ async function retryQuarantinedSessionCleanups(
     );
   }
 }
+// A preview-only final from an older runner still proves provider output.
+// Observe before append: losing its projection must never authorize prompt replay.
+function isProviderOutput(event: PrpEvent): boolean {
+  const payload = event.payload;
+  // Canonical tool rows can be the only evidence of an executed command or
+  // file edit. Even an empty output is not an effect-free turn to replay.
+  return event.eventType === "tool.execution.completed"
+    || event.eventType === "tool.execution.progressed"
+    || (event.eventType === "item.completed" && payload.kind === "fileChange")
+    || (event.eventType === "item.delta" && typeof payload.text === "string" && payload.text.length > 0)
+    || (event.eventType === "item.completed" && !["usage", "thread_lineage", "model", "goal", "goal_cleared", "interrupt_acknowledgement"].includes(String(payload.kind))
+      && (payload.truncated === true || payload.transcriptOverflow === true
+        || typeof payload.text === "string" && payload.text.length > 0));
+}
+
+function providerOutputWithoutResult(): Error {
+  return new Error("native_provider_output_without_result: The provider produced output but no complete answer could be saved. This question remains unanswered. Automatic retries are stopped; nothing was re-sent.");
+}
+
+async function replayHasProviderOutput(controlPlane: ControlPlanePort, runId: string, sourceInstanceId: string): Promise<boolean> {
+  let afterSourceSeq = 0;
+  while (true) {
+    const page = await controlPlane.replayEvents({ runId, sourceInstanceId, afterSourceSeq, limit: 1_000 });
+    if (page.events.some(isProviderOutput)) return true;
+    const next = page.events.at(-1)?.sourceSeq;
+    if (next === undefined || next <= afterSourceSeq) return false;
+    afterSourceSeq = next;
+  }
+}
+
 async function consumeTurn(
   session: NativeSession,
   controlPlane: ControlPlanePort,
@@ -1239,6 +1269,7 @@ async function consumeTurn(
   providerTurnWaitOptions?: ProviderTurnWaitOptions,
   resumedProviderTurnWait?: PrpEvent,
   checkpointProviderTurn?: (signal: AbortSignal, sourceSeq: number) => Promise<unknown>,
+  onProviderOutput?: () => void,
 ) {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const providerTurnWait = createProviderTurnWait({
@@ -1479,6 +1510,7 @@ async function consumeTurn(
         );
       }
       const event = next.value;
+      if (isProviderOutput(event)) onProviderOutput?.();
       const payload = event.payload as Record<string, unknown>;
       const settlingRequestId =
         [
@@ -1516,6 +1548,10 @@ async function consumeTurn(
           highestContiguousSourceSeq,
           receipt.highestContiguousSourceSeq,
         );
+      }
+      if (payload.transcriptOverflow === true) {
+        await settlePendingDeltas();
+        throw providerOutputWithoutResult();
       }
       if (providerTurnWait.endedBy(event)) {
         const ended = await endProviderTurnWait(providerTurnWait.awaitedTerminal!);
@@ -3051,6 +3087,7 @@ export async function executeNativeSession(
     let settleStartupDecision: () => void = () => undefined;
     const startupDecision = new Promise<void>(resolve => { settleStartupDecision = resolve; });
     let continuationDispositionRequested = false;
+    let providerOutputObserved = false;
     // The consumer may already be running when a continuation starts, and the
     // continuation can complete before its start checkpoint settles. A
     // terminal waits for this setup so it neither misses the borrowed turn nor
@@ -3085,6 +3122,7 @@ export async function executeNativeSession(
       if (snapshot.semanticResult || snapshot.activeTurnId || snapshot.goal || snapshot.pendingRuntimeRequests?.length ||
           snapshot.dispositionOnlyRecoveryConsumed !== false ||
           !snapshot.terminalTurns?.some(terminal => terminal.turnId === borrowedContinuationTurnId)) return false;
+      if (providerOutputObserved) throw providerOutputWithoutResult();
       continuationDispositionRequested = true;
       await persistCheckpoint(snapshot, signal);
       signal.throwIfAborted();
@@ -3260,8 +3298,38 @@ export async function executeNativeSession(
           : null;
       const checkpointedDispositionTerminal =
         replayedDisposition !== null || dispositionFallback !== null;
+      // A completed turn from this run is not a new conversation input. Its
+      // final may predate this controller's cursor (a held Pi turn can cross a
+      // restart), so settle through durable replay rather than startTurn.
+      const conversationTurnId = recovered && persistedSession &&
+        (isNativePiConversation(input) || options.resolveMissingResult) &&
+        !recoveredActiveTurnId && !adoptedProviderTerminal && !governedWait &&
+        !checkpointedDispositionTerminal && !recoveredSnapshot.goal && recoveredSnapshot.awaitingProviderTurn !== true &&
+        !recoveredSnapshot.pendingRuntimeRequests?.length && !options.sessionCompaction &&
+        !options.sessionGoalControl && !options.resumeSessionGoalHeartbeat
+        ? persistedSession.terminalTurns?.at(-1)?.turnId ?? null : null;
+      const replayedConversationTerminal = conversationTurnId
+        ? (await replayCheckpointedTurnTerminal({ controlPlane: options.controlPlane,
+            runId: input.binding.runId, sourceInstanceId: options.runnerInstanceId,
+            priorTerminalTurnIds: [], expectedTurnId: conversationTurnId }))?.terminal ?? null : null;
+      if (conversationTurnId && !replayedConversationTerminal && isNativePiConversation(input)) {
+        throw new Error("native_finalization_missing: checkpointed conversation turn has no durable terminal");
+      }
+      if (replayedConversationTerminal && (replayedConversationTerminal.runId !== input.binding.runId ||
+          replayedConversationTerminal.normalizedSessionId !== normalizedSessionId)) {
+        throw new NativeSessionProtocolIntegrityError("source_event_replay_conflict");
+      }
+      // Restore a valid saved answer before the saved-output/no-resubmit fence.
+      // A resultless or empty task turn must retain its ordinary recovery path.
+      const savedConversationResult = !isNativePiConversation(input) &&
+          replayedConversationTerminal?.eventType === "turn.completed" && options.resolveMissingResult
+        ? await options.resolveMissingResult({ turnId: replayedConversationTerminal.turnId ?? null,
+            terminalEvent: replayedConversationTerminal }) : null;
+      const conversationTerminal = replayedConversationTerminal?.eventType === "turn.completed" &&
+          (isNativePiConversation(input) || savedConversationResult !== null)
+        ? replayedConversationTerminal : null;
       const recoveryTerminal =
-        replayedDisposition?.terminal ?? dispositionFallback;
+        replayedDisposition?.terminal ?? dispositionFallback ?? conversationTerminal;
       const awaitedTurnId = persistedSession?.terminalTurns?.at(-1)?.turnId ?? null;
       const awaitedTerminal = recovered && recoveredSnapshot.awaitingProviderTurn === true && !recoveredActiveTurnId &&
           !recoveredSnapshot.semanticResult && !governedWait && !checkpointedDispositionTerminal && awaitedTurnId !== null
@@ -3314,6 +3382,7 @@ export async function executeNativeSession(
               options.providerTurnWait,
               resumedProviderTurnWait,
               checkpoint,
+              () => { providerOutputObserved = true; },
             )
           : Promise.resolve({
               event: recoveryTerminal,
@@ -3323,7 +3392,7 @@ export async function executeNativeSession(
               // A restarted compaction run adopts its completed compaction turn.
               governedResult: options.sessionCompaction && recoveryTerminal.eventType === "turn.completed"
                 ? sessionCompactionResult(input, options.sessionCompaction.requestId)
-                : null,
+                : savedConversationResult,
             });
       // Event consumption must begin before startTurn so an eager provider cannot
       // outrun us. Observe its rejection immediately, though: if startTurn or
@@ -3337,8 +3406,16 @@ export async function executeNativeSession(
           (!recoveredActiveTurnId &&
             !adoptedProviderTerminal &&
             !checkpointedDispositionTerminal &&
+            !conversationTerminal &&
             !dispositionRecoveryStillOwned &&
             !resumedProviderTurnWait));
+        // Durable same-run finals above take precedence over resultless-output
+        // protection. Only reject output when recovery would submit a new turn;
+        // an empty provider history still follows normal no-output recovery.
+        if (recovered && shouldStartFreshTurn && !options.sessionCompaction
+          && await replayHasProviderOutput(options.controlPlane, input.binding.runId, options.runnerInstanceId)) {
+          throw providerOutputWithoutResult();
+        }
         if (options.sessionCompaction) {
           // Compaction summarizes existing provider context. A new session or
           // one that is still running a turn has nothing safe to compact.
@@ -3568,6 +3645,9 @@ export async function executeNativeSession(
           completed = settledCompletion;
         }
         if (settledCompletion === null) {
+          if (providerOutputObserved || await replayHasProviderOutput(options.controlPlane, input.binding.runId, options.runnerInstanceId)) {
+            throw providerOutputWithoutResult();
+          }
           throw new Error(
             "native_finalization_missing: session returned no semantic result",
           );
