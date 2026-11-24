@@ -485,16 +485,19 @@ export function TaskChatComposer({
       requestOwner: pending.requestOwner,
     });
   }
+  const copiedCommentIds = useRef(new Set<string>());
   useImperativeHandle(composerRef, () => ({
     focus: () => editorRef.current?.focus(),
-    restoreDraft: (submittedBody: string) => {
+    restoreDraft: (submittedBody: string, commentReceipt?: string) => {
       if (!submittedBody) return;
-      const next = bodyRef.current.includes(submittedBody) ? bodyRef.current : bodyRef.current ? `${bodyRef.current}\n\n${submittedBody}` : submittedBody;
+      const copied = commentReceipt ? copiedCommentIds.current.has(commentReceipt) : bodyRef.current.includes(submittedBody);
+      const next = copied ? bodyRef.current : bodyRef.current ? `${bodyRef.current}\n\n${submittedBody}` : submittedBody;
+      if (commentReceipt) copiedCommentIds.current.add(commentReceipt);
       changeBody(next);
       // Written at once (not after the debounce), and kept past the tab, before the caller deletes the message.
       if (draftKey) { saveDraft(draftKey, next); saveRestoredDraft(draftKey, next); }
       requestAnimationFrame(() => editorRef.current?.focus());
-      return !draftKey || loadDraft(draftKey).includes(submittedBody);
+      return !draftKey || loadDraft(draftKey) === next;
     },
   }));
   const draftTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
