@@ -60,7 +60,7 @@ import { deferredWakeJoinsFirstTurn, firstTurnTakesAllQueuedComments, runAccepts
 import { reconstructNativeWorkspace, unreconciledNativeExportPredicate } from "../services/native-runtime/native-workspace-reconstruction.js";
 import { reconstructWorkspaceSchema } from "@paperclipai/shared";
 import { hasQueuedInteractionResponse } from "../services/queued-interaction-response.js";
-import { deliverConversationComments, heldConversationComments, isConversation } from "../services/agent-conversations.js";
+import { deliverConversationComments, heldConversationComments, isConversation, isConversationReset } from "../services/agent-conversations.js";
 import { assertOnboardingFirstTaskDependenciesAllowed } from "../services/onboarding-first-task-admission.js";
 import { resolveChatTaskAssignment } from "../services/chat-task-assignment.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
@@ -17695,6 +17695,12 @@ export function issueRoutes(
       // The message stays queued and its own wake answers it after the Stop.
       const [stopping] = await db.select({ result: heartbeatRuns.resultJson }).from(heartbeatRuns).where(eq(heartbeatRuns.id, req.body.targetRunId)).limit(1);
       if ((stopping?.result as { personStop?: unknown } | null)?.personStop) throw conflict("This run is being stopped; the message is answered after it stops");
+      if (issue.conversationAgentId) {
+        const [comment] = await db.select({ body: issueComments.body }).from(issueComments).where(and(
+          eq(issueComments.id, commentId), eq(issueComments.issueId, issue.id), eq(issueComments.companyId, issue.companyId),
+          isNull(issueComments.deletedAt))).limit(1);
+        if (comment && isConversationReset(comment.body)) throw conflict("/new needs a new session and cannot be steered into this turn");
+      }
       const actor = getActorInfo(req);
       const { queue, turnId, duplicate } = await runQueuedCommentMutation(() =>
         queuedCommentQueue.steerQueuedComment({
