@@ -7474,6 +7474,36 @@ export function agentRoutes(
       if (!landed) await mark(false); else await returnQueued().catch(error => logger.warn({ error, runId }, "person Stop could not return queued messages"));
       const hasTurn = async () => (await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, runId), inArray(heartbeatRunEvents.eventType, ["turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted"]))).limit(1)).length > 0;
       if (outcome === "no_turn" && !finishing?.resultId && !await hasTurn()) {
+        // Before the first provider turn, Stop returns the prompt instead of delivering it.
+        const stoppedBeforeTurn = await db.transaction(async tx => {
+          const [current] = await tx.select().from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, runId)).for("update");
+          if (!current || current.status !== "running") return false;
+          const currentProvider = asRecord(asRecord(asRecord(current.runnerProfileJson)?.nativeExecutionInput)?.provider);
+          const stillPreparing = current.runtimeMode === "legacy" && !current.runtimeModeResolvedAt &&
+            current.executionStage === "preparing" && claimedAdapterType(current) === "paperclip_runner" &&
+            asRecord(current.runnerProfileJson)?.nativeExecutionInput == null;
+          if (!stillPreparing && !(current.runtimeMode === "native" && currentProvider?.kind === "pi_rpc")) return false;
+          // Event publication shares this lock; snapshot also catches a live turn not yet published.
+          const [started] = await tx.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents)
+            .where(and(eq(heartbeatRunEvents.runId, runId), inArray(heartbeatRunEvents.eventType,
+              ["turn.started", "turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted"])))
+            .limit(1);
+          if (started || (await getNativeSessionSteeringState(runId)).activeTurnId) return false;
+          // Fence both runtime promotion and session startup before releasing the run lock.
+          await tx.update(heartbeatRuns).set({
+            resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
+              startupCancellation: { requestedAt: pressedAt, beforeNativeSelection: stillPreparing },
+            })}::jsonb`,
+          }).where(eq(heartbeatRuns.id, runId));
+          await returnWakeComments(tx as unknown as Db, current);
+          return true;
+        });
+        if (stoppedBeforeTurn) {
+          await returnQueued().catch(error => logger.warn({ error, runId }, "person Stop could not return queued messages"));
+          await cancelStoppedRun();
+          return;
+        }
         await db.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || jsonb_build_object('personStopHeld', coalesce(${heartbeatRuns.resultJson} -> 'personStopHeld', ${JSON.stringify({ pressedAt })}::jsonb))` })
           .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")));
         res.status(202).json(await runRedactions.redactForRun(existing.companyId, runId, existing, getActorInfo(req).actorId));
@@ -7499,14 +7529,16 @@ export function agentRoutes(
       }
     }
     // Seam 0254: a Stop on a run still waiting in line returns the messages that woke it (never received), like 0247.
-    if (existing.status === "queued" && req.actor.userId) {
-      const woke = asRecord(existing.contextSnapshot)?.wakeCommentIds, ids = Array.isArray(woke) ? woke.map(String) : [];
-      const mine = ids.length ? (await db.select({ id: issueComments.id }).from(issueComments).where(and(inArray(issueComments.id, ids), eq(issueComments.authorUserId, req.actor.userId),
-        isNull(issueComments.deletedAt), sql`${issueComments.createdAt} <= ${pressedAt}::timestamptz`))).map(row => row.id) : [];
-      if (mine.length) await db.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({ personStop: { requestedAt: pressedAt, userId: req.actor.userId, returned: mine } })}::jsonb` })
-        .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "queued")));
-    }
+    if (existing.status === "queued") await returnWakeComments(db, existing);
     await cancelStoppedRun();
+    async function returnWakeComments(target: Db, run: typeof heartbeatRuns.$inferSelect) {
+      if (!req.actor.userId) return;
+      const woke = asRecord(run.contextSnapshot)?.wakeCommentIds, ids = Array.isArray(woke) ? woke.map(String) : [];
+      const mine = ids.length ? (await target.select({ id: issueComments.id }).from(issueComments).where(and(inArray(issueComments.id, ids), eq(issueComments.authorUserId, req.actor.userId),
+        isNull(issueComments.deletedAt), sql`${issueComments.createdAt} <= ${pressedAt}::timestamptz`))).map(row => row.id) : [];
+      if (mine.length || run.status === "running") await target.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({ personStop: { requestedAt: pressedAt, userId: req.actor.userId, returned: mine } })}::jsonb` })
+        .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, run.status)));
+    }
     async function cancelStoppedRun() { if (!existing) return;
     // Stamp the cancellation as operator-initiated (this route is board-only).
     // Recovery reads this to stand down instead of classifying the cancelled
