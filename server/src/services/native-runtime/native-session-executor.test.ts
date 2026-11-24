@@ -12478,7 +12478,7 @@ describe("native warm session supervision", () => {
       expect(checkpointWarm).toHaveBeenCalledTimes(managedFiles ? 1 : 0);
       if (managedFiles) expect(checkpointWarm.mock.invocationCallOrder[0]).toBeLessThan(close.mock.invocationCallOrder[0]!);
       sandboxStopped = true;
-      expect(await reserveWarmNativeInstructionDirectory({ companyId: current.binding.companyId,
+      expect(await reserveWarmNativeInstructionDirectory({ db: leaseDb(current), companyId: current.binding.companyId,
         agentId: current.binding.agentId, previousRunId: current.binding.runId, runId: `${name}-two`,
         target, canReuse: async () => true })).toBeNull();
       // A corrected credential rotates the native identity on the next run.
@@ -12868,11 +12868,194 @@ describe("native warm session supervision", () => {
         db: leaseDb(next), execution: next, runnerInstanceId: name, runnerExecutionTarget: target, instructionWorkingCopy: nextCopy });
       await run(current);
       const reserve = (canReuse: () => Promise<boolean>, nextTarget = target) => reserveWarmNativeInstructionDirectory({
-        companyId: current.binding.companyId, agentId: current.binding.agentId, previousRunId: current.binding.runId,
+        db: leaseDb(current), companyId: current.binding.companyId, agentId: current.binding.agentId, previousRunId: current.binding.runId,
         runId: `${name}-two`, target: nextTarget, canReuse });
       return { current, copy, close, session, target, run, reserve };
     }
     afterEach(async () => { await closeIdleWarmNativeSessionsForRestart(); });
+
+    // Recovery may terminalize the DB row without unwinding this live turn.
+    async function startBlocked(name: string) {
+      const current = { ...execution, binding: { ...execution.binding, runId: `${name}-holder`, executionWorkspaceId: name },
+        session: { ...execution.session, normalizedSessionId: name, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } } } as NativeExecutionInputV1;
+      let stopped!: () => void, published!: () => void;
+      const stop = new Promise<void>(resolve => { stopped = resolve; });
+      const ready = new Promise<void>(resolve => { published = resolve; });
+      const close = vi.fn(async () => { stopped(); });
+      const collectStopped = vi.fn(async () => undefined);
+      const copy = { runId: current.binding.runId, root: `/tmp/${name}/home`, collectStopped,
+        checkpointWarm: vi.fn(async () => true), hasChanges: vi.fn(async () => false) };
+      state.execute.mockReset().mockImplementationOnce(async options => {
+        await options.onSession?.({ close }); published(); await stop; return result;
+      });
+      const db = leaseDb(current);
+      const running = executePaperclipNativeSession({ db, execution: current,
+        runnerInstanceId: name, instructionWorkingCopy: copy }).then(value => value, error => error);
+      onTestFinished(async () => { stopped(); await running; await closeIdleWarmNativeSessionsForRestart(); });
+      await ready;
+      const reserve = (db: Db) => reserveWarmNativeInstructionDirectory({ db,
+        companyId: current.binding.companyId, agentId: current.binding.agentId,
+        previousRunId: current.binding.runId, runId: `${name}-next`, canReuse: async () => true });
+      return { current, copy, close, running, reserve, finish: stopped, db };
+    }
+    function holderDb(statuses: Record<string, string>, read?: () => Promise<void>) {
+      const holders: string[] = [];
+      const db = { select: () => ({ from: (table: unknown) => ({ where: async (condition: SQL) => {
+        expect(table).toBe(heartbeatRuns);
+        const params = new PgDialect().sqlToQuery(condition).params;
+        const holder = Object.keys(statuses).find(id => params.includes(id));
+        holders.push(holder ?? "missing");
+        const status = holder ? statuses[holder] : undefined;
+        await read?.();
+        return holder ? [{ status }] : [];
+      } }) }) } as unknown as Db;
+      return { db, holders };
+    }
+
+    it.each(["succeeded", "cancelled", "interrupted", "failed", "timed_out"])("retires a busy %s DB holder before fresh reservation and releases its execution scopes", async status => {
+      const f = await startBlocked(`terminal-busy-${status}`);
+      const h = holderDb({ [f.current.binding.runId]: status });
+      expect(await f.reserve(h.db)).toBeNull();
+      expect(h.holders).toEqual([f.current.binding.runId]);
+      expect(f.close).toHaveBeenCalledOnce();
+      expect(f.copy.collectStopped).toHaveBeenCalledOnce();
+      expect(f.close.mock.invocationCallOrder[0]).toBeLessThan(f.copy.collectStopped.mock.invocationCallOrder[0]!);
+      const next = { ...f.current, binding: { ...f.current.binding, runId: `${f.current.binding.runId}-next` } };
+      state.execute.mockImplementationOnce(async options => {
+        expect(options.existingSession).toBeUndefined();
+        await options.onSession?.({ close: vi.fn(async () => undefined) }); return result;
+      });
+      await expect(executePaperclipNativeSession({ db: leaseDb(next), execution: next,
+        runnerInstanceId: "next", instructionWorkingCopy: { ...f.copy, runId: next.binding.runId } })).resolves.toMatchObject({ exitCode: 0 });
+    });
+
+    it.each(["running", "queued", "missing"])("still refuses a busy holder whose DB status is %s", async status => {
+      const f = await startBlocked(`live-busy-${status}`);
+      const h = holderDb(status === "missing" ? {} : { [f.current.binding.runId]: status });
+      await expect(f.reserve(h.db)).rejects.toThrow("native_session_supervisor_busy");
+      expect(f.close).not.toHaveBeenCalled();
+      expect(f.copy.collectStopped).not.toHaveBeenCalled();
+    });
+
+    it.each(["running", "cancelled"])("checks the actual %s preparing successor, not the terminal directory predecessor", async status => {
+      const f = await start(`preparing-holder-${status}`);
+      const reservation = await f.reserve(async () => true);
+      const preparingRunId = `preparing-holder-${status}-two`;
+      const h = holderDb({ [f.current.binding.runId]: "succeeded", [preparingRunId]: status });
+      const attempt = reserveWarmNativeInstructionDirectory({ db: h.db,
+        companyId: f.current.binding.companyId, agentId: f.current.binding.agentId,
+        previousRunId: f.current.binding.runId, runId: `preparing-holder-${status}-three`, canReuse: async () => true });
+      if (status === "running") {
+        await expect(attempt).rejects.toThrow("native_session_supervisor_busy");
+        expect(f.close).not.toHaveBeenCalled();
+      } else {
+        expect(await attempt).toBeNull();
+        expect(f.close).toHaveBeenCalledOnce();
+        expect(f.copy.collectStopped).toHaveBeenCalledOnce();
+      }
+      expect(h.holders).toEqual([preparingRunId]);
+      await reservation!.release();
+    });
+
+    it.each([false, true])("does not admit over terminal-holder ownership cleanup (timeout=%s)", async timeout => {
+      const f = await startBlocked(`terminal-holder-cleanup-${timeout}`);
+      let entered!: () => void, release!: () => void;
+      const cleanup = new Promise<void>(resolve => { entered = resolve; });
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const transaction = f.db.transaction.bind(f.db);
+      vi.spyOn(f.db, "transaction").mockImplementation(async operation => { entered(); await gate; return transaction(operation); });
+      const previousTimeout = warmSessionReleaseWait.timeoutMs;
+      if (timeout) warmSessionReleaseWait.timeoutMs = 100;
+      const h = holderDb({ [f.current.binding.runId]: "cancelled" });
+      let admitted = false;
+      const outcome = f.reserve(h.db).then(value => { admitted = true; return value; }, error => error);
+      try {
+        await cleanup;
+        if (timeout) expect((await outcome).message).toContain("ownership cleanup did not settle");
+        else { await new Promise(resolve => setTimeout(resolve, 25)); expect(admitted).toBe(false); }
+      } finally { release(); warmSessionReleaseWait.timeoutMs = previousTimeout; }
+      await f.running;
+      if (timeout) {
+        expect(admitted).toBe(false);
+        expect(await f.reserve(h.db)).toBeNull();
+      } else expect(await outcome).toBeNull();
+      expect(f.copy.collectStopped).toHaveBeenCalledTimes(timeout ? 2 : 1);
+    });
+
+    it("keeps a terminal busy holder registered when retirement fails, then retries containment", async () => {
+      const f = await startBlocked("terminal-busy-stop-fails");
+      const h = holderDb({ [f.current.binding.runId]: "cancelled" });
+      f.close.mockRejectedValueOnce(new Error("containment failed"));
+      await expect(f.reserve(h.db)).rejects.toThrow("containment failed");
+      expect(f.copy.collectStopped).not.toHaveBeenCalled();
+      expect(await f.reserve(h.db)).toBeNull();
+      expect(f.close).toHaveBeenCalledTimes(2);
+      expect(f.copy.collectStopped).toHaveBeenCalledOnce();
+      await f.running;
+    });
+
+    it("joins concurrent terminal-holder reservations without retiring the generation twice", async () => {
+      const f = await startBlocked("terminal-holder-concurrent");
+      let releaseClose!: () => void;
+      const gate = new Promise<void>(resolve => { releaseClose = resolve; });
+      const stop = f.close.getMockImplementation()!;
+      f.close.mockImplementation(async () => { await gate; await stop(); });
+      onTestFinished(releaseClose);
+      const h = holderDb({ [f.current.binding.runId]: "cancelled" });
+      const attempts = Promise.all([f.reserve(h.db), f.reserve(h.db)]);
+      await vi.waitFor(() => expect(f.close).toHaveBeenCalledOnce());
+      expect(f.copy.collectStopped).not.toHaveBeenCalled();
+      releaseClose();
+      expect(await attempts).toEqual([null, null]);
+      expect(f.close).toHaveBeenCalledOnce();
+      expect(f.copy.collectStopped).toHaveBeenCalledOnce();
+    });
+
+    it("waits for an already settling terminal turn instead of closing its generation twice", async () => {
+      const f = await startBlocked("terminal-holder-already-settling");
+      let releaseClose!: () => void;
+      const gate = new Promise<void>(resolve => { releaseClose = resolve; });
+      onTestFinished(releaseClose);
+      f.copy.checkpointWarm.mockResolvedValue(false);
+      f.close.mockImplementation(async () => { await gate; });
+      f.finish();
+      await vi.waitFor(() => expect(f.close).toHaveBeenCalledOnce());
+      const h = holderDb({ [f.current.binding.runId]: "succeeded" });
+      const attempt = f.reserve(h.db);
+      try {
+        await new Promise(resolve => setTimeout(resolve, 50));
+        expect(f.close).toHaveBeenCalledOnce();
+      } finally { releaseClose(); }
+      expect(await attempt).toBeNull();
+      expect(f.close).toHaveBeenCalledOnce();
+      expect(f.copy.collectStopped).toHaveBeenCalledOnce();
+    });
+
+    it("rechecks generation after the holder DB read so an old terminal row cannot retire a live successor", async () => {
+      const f = await start("terminal-holder-generation-race");
+      const reservation = await f.reserve(async () => true);
+      let queried!: () => void, resume!: () => void;
+      const query = new Promise<void>(resolve => { queried = resolve; });
+      const gate = new Promise<void>(resolve => { resume = resolve; });
+      const statuses = { "terminal-holder-generation-race-two": "cancelled" };
+      const h = holderDb(statuses, async () => { queried(); await gate; });
+      const attempt = reserveWarmNativeInstructionDirectory({ db: h.db,
+        companyId: f.current.binding.companyId, agentId: f.current.binding.agentId,
+        previousRunId: f.current.binding.runId, runId: "terminal-holder-generation-race-three", canReuse: async () => true });
+      const observed = attempt.then(value => value, error => error);
+      await query;
+      await reservation!.release();
+      // Replace the retired generation while the old holder lookup is pending.
+      const replacement = await start("terminal-holder-generation-race");
+      const liveReservation = await replacement.reserve(async () => true);
+      statuses["terminal-holder-generation-race-two"] = "running";
+      resume();
+      // A second lookup must see the successor as live, not consume the stale verdict.
+      const outcome = await observed;
+      expect(outcome).toBeInstanceOf(Error);
+      expect(replacement.close).not.toHaveBeenCalled();
+      await liveReservation!.release();
+    });
 
     it("saves each turn while retaining the provider and collects only the latest directory owner at retirement", async () => {
       const f = await start("managed-retained");
