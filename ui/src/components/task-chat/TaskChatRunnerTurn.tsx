@@ -288,6 +288,7 @@ export function TaskChatRunnerTurn({
   const timelineRows = groupImageResources(buildTurnTimelineRows(
     omitProgressRepeatedByResponse(timelineItems, final?.text),
     !terminal && status !== "stopping",
+    Boolean(final),
   ));
 
   return (
