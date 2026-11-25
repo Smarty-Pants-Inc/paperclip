@@ -1,4 +1,5 @@
 import { describeError } from "../api/errors";
+import type { IssueChatComment } from "../lib/issue-chat-messages";
 import type { ExecutionBlocker, IssueRelationIssueSummary, TaskInterruptionPresentation } from "@paperclipai/shared";
 import { AlertCircle, LoaderCircle } from "lucide-react";
 import { Link } from "@/lib/router";
@@ -23,6 +24,16 @@ export function isPersonStoppedRun(run: { errorCode?: string | null; resultJson?
   return Boolean(run?.resultJson?.personStop ||
     (cancellation?.source === "operator" && cancellation.initiator?.type === "user") ||
     (run?.errorCode === "cancelled" && run.resultJson?.executionCancellation));
+}
+
+/** Only the persisted no-result receipt can own this failure's explanation. */
+export function nativeFailureNoticeRunId(comment: IssueChatComment) {
+  const runId = comment.clientRequestId?.match(/^native-output-without-result:(.+)$/)?.[1];
+  return runId && !comment.deletedAt && comment.body.trim() && comment.authorType === "system" &&
+    comment.presentation?.kind === "system_notice" && comment.presentation.tone === "danger" &&
+    comment.metadata?.recoveryResponsibility !== "system" &&
+    [comment.metadata?.sourceRunId, comment.createdByRunId, comment.runId, comment.derivedCreatedByRunId].every(id => !id || id === runId)
+    ? runId : null;
 }
 
 /** Ordinary working/resolved projections are not recovery ownership. */
