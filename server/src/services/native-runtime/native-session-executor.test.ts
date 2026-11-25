@@ -19091,8 +19091,8 @@ describe("runnerd provider runtime wiring", () => {
     "recoverable_failure-warm-transition", "recoverable_failure-empty-reason", "recoverable_failure-changed-receipt",
     "recoverable_failure-changed-identity"] as const)(
     "cold-restores only a settled inert warm box after live admission: %s", async scenario => {
-      const managedGitHub = scenario.endsWith("-github");
-      const mode = scenario.replace(/-github$/, "");
+      const managedGitHub = scenario.includes("-github");
+      const mode = scenario.replace(/-github.*$/, "");
       const coldRestore = mode === "suspended" || mode === "recoverable_failure";
       const lifecycle = mode.startsWith("recoverable_failure") ? "recoverable_failure" : "suspended";
       const first = scopedNativeExecution(`suspended-live-adoption-${scenario}`);
