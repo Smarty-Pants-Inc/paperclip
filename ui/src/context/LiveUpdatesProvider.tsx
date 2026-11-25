@@ -1366,8 +1366,21 @@ function buildRunStatusToast(
   const title = `${name} run ${statusLabel}`;
 
   let body: string | undefined;
-  if (error) {
-    body = truncate(error, 100);
+  if (error || errorCode) {
+    // Use the chat's classified titles, never diagnostic text from the runner.
+    const code = (errorCode ?? error ?? "").split(":", 1)[0]!;
+    body = ({
+      provider_quota: "Error: usage limit reached",
+      claude_auth_required: "Error: not logged in to Claude",
+      acpx_auth_required: "Error: agent login required",
+      native_provider_runtime_missing: "Runtime missing",
+      native_provider_model_rejected: "Model unavailable",
+      native_provider_approval_required: "Approval required",
+      native_provider_usage_limit: "Usage limit reached",
+      sandbox_disk_full: "Disk full",
+    } as Record<string, string>)[code] ?? (code.startsWith("native_controller_recovery_")
+      ? "Automatic recovery blocked"
+      : "Open the run for details.");
   } else if (triggerDetail) {
     body = `Trigger: ${triggerDetail}`;
   }
