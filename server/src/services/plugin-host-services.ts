@@ -764,6 +764,11 @@ export function recordWorkerProviderSpan(
   try { visit(params, parent, 0); } catch {}
 }
 
+function isConversationInputPlugin(pluginId: string): boolean {
+  return (process.env.PAPERCLIP_CONVERSATION_INPUT_PLUGIN_IDS ?? "")
+    .split(",").map(id => id.trim()).filter(Boolean).includes(pluginId);
+}
+
 export function buildHostServices(
   db: Db,
   pluginId: string,
@@ -2673,8 +2678,7 @@ export function buildHostServices(
             // Installation identity comes from the authenticated host context,
             // never from plugin-supplied comment attribution. Default deny.
             allowConversationAgentInput: !params.actorUserId && Boolean(params.authorAgentId)
-              && (process.env.PAPERCLIP_CONVERSATION_INPUT_PLUGIN_IDS ?? "")
-                .split(",").map(id => id.trim()).filter(Boolean).includes(pluginId),
+              && isConversationInputPlugin(pluginId),
           },
         )) as IssueComment;
         await logPluginActivity({
@@ -2692,7 +2696,9 @@ export function buildHostServices(
 
         // Authored plugin comments use the HTTP comment's ordinary wake door,
         // including post-commit agent steering when admission defers to a live
-        // run. Self-authored output never wakes its own assignee. No separate
+        // run. Agent input requires an allow-listed installation, on ordinary
+        // tasks as well as conversations. Self-authored output never wakes its
+        // own assignee. No separate
         // delivery/ACK path, reopen, resume or interrupt semantics live here.
         //
         // The guard re-fetches the issue instead of trusting the pre-insert
@@ -2707,7 +2713,7 @@ export function buildHostServices(
         // write and invite a retry that inserts a duplicate comment.
         // addComment may replace supplied attribution with the authenticated
         // tool-call origin. Only persisted identity can authorize/attribute wake.
-        if (comment.authorUserId || comment.authorAgentId) {
+        if (comment.authorUserId || (comment.authorAgentId && isConversationInputPlugin(pluginId))) {
           const postCommentIssue = (await issues.getById(issue.id).catch((err) => {
             logger.warn(
               { err, issueId: issue.id, commentId: comment.id },
