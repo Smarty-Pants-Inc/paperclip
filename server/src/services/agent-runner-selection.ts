@@ -381,6 +381,36 @@ function resolveAgentRunner(input: AgentRunnerSelection): { adapterType: string;
 export async function resolveNewAgentRunnerForCompany(db: Db, companyId: string, input: AgentRunnerSelection & { defaultEnvironmentId?: string | null }) {
   const disabledTypes = await adapterSettingsService(db).getDisabledTypes();
   input = { ...input, disabledTypes };
+  const piCard = input.adapterType === "pi_local" && input.runner !== "legacy";
+  const nativePi = input.adapterConfig?.provider === "pi_rpc" && input.runner !== "legacy"
+    && (input.adapterType === "pi_local" || input.adapterType === "paperclip_runner");
+  if (piCard || nativePi) {
+    const unavailable = () => unprocessable(
+      "The native Pi driver is unavailable. Restore the installed provider pack and retry; no ACPX Pi fallback was used.",
+      { code: "pi_rpc_driver_unavailable" },
+    );
+    const { installedNativePiDriverAvailable } = await import("./native-runtime/remote-provider-pack.js");
+    let installed: boolean;
+    try { installed = await installedNativePiDriverAvailable(); }
+    catch { throw unavailable(); }
+    if (nativePi && !installed) throw unavailable();
+    if (installed) {
+      const target = await resolveAgentRunnerTargetForCompany(db, companyId, input.defaultEnvironmentId, disabledTypes);
+      const selected = resolveNewAgentRunner({ ...input, target });
+      if (selected.adapterType !== "paperclip_runner") throw unprocessable(
+        "The installed native Pi driver requires Paperclip Runner in a supported environment. Choose a supported Computer or explicitly select Legacy.",
+        { code: "agent_runner_unavailable" },
+      );
+      const config = { ...selected.adapterConfig };
+      const thinking = config.piThinkingLevel ?? config.piRpcThinkingLevel;
+      for (const key of ["acpxAgent", "acpxPermissionMode", "acpxSessionMode", "piThinkingLevel", "codexPermissionMode"]) delete config[key];
+      // The card's instance-specific choice lives here, beside server-owned
+      // runner resolution. Shared harness defaults remain unchanged.
+      return { adapterType: "paperclip_runner", adapterConfig: {
+        ...config, ...paperclipRunnerProfileForHarness("pi_rpc"), piRpcThinkingLevel: thinking,
+      } };
+    }
+  }
   const cursor = agentHarnessType(input.adapterType ?? "process", input.adapterConfig) === "cursor_cloud";
   const nativeCursor = cursor && input.runner !== "legacy"
     && (input.adapterType === "paperclip_runner" || input.runner === "paperclip");
