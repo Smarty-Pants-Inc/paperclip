@@ -1,6 +1,8 @@
 import { NativeProviderStateIncompatibleError } from "../vendor/paperclip-runner/index.js";
 import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES, PluginWorkspaceOperationError, workspaceOperationErrorData } from "@paperclipai/plugin-sdk";
 import * as nativeRuntimeMode from "../services/native-runtime/runtime-mode.js";
+import * as sessionFingerprintInputs from "../services/heartbeat/session-fingerprint-inputs.js";
+import * as sessionWorkspaces from "../services/heartbeat/workspaces.js";
 import * as aiRuntime from "../services/ai-connection-runtime.js";
 import { aiConnectionService } from "../services/ai-connections.js";
 import { randomUUID } from "node:crypto";
@@ -92,6 +94,48 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       const next = await execute(f, { workspaceSelectionChanged: true });
       expect(next.input.runtime.sessionId).toBe(sessionContinuity === "continuous" ? "saved-session" : null);
       expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: { reset: sessionContinuity !== "continuous" } } });
+    } finally { mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    { continuity: "continuous", change: "none", retain: true },
+    { continuity: undefined, change: "none", retain: true },
+    { continuity: "continuous", change: "env", retain: false },
+    { continuity: "continuous", change: "provider", retain: false },
+    { continuity: "continuous", change: "tools", retain: false },
+    { continuity: "paperclip", change: "none", retain: true },
+  ])("pre-update Pi fingerprint: $continuity, changed $change compatible: $retain", async ({ continuity, change, retain }) => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "fingerprint-transition-"));
+    const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
+    const config = { provider: "pi_rpc", model: "fixture/model-a", piRpcThinkingLevel: "low", sessionContinuity: continuity, cwd };
+    try {
+      await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: config }).where(eq(agents.id, f.agentId));
+      // Save through preparation using the previous release's exact adapter-input projection.
+      const previousProjection = vi.spyOn(sessionFingerprintInputs, "paperclipRunnerSessionAdapterConfig")
+        .mockImplementation(sessionFingerprintInputs.paperclipRunnerRetainedAdapterConfig);
+      try { await execute(f); } finally { previousProjection.mockRestore(); }
+      const [saved] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId));
+      const patch = change === "env" ? { env: { THREAD_INPUT: "changed" } }
+        : change === "provider" ? { provider: "codex" }
+        : change === "tools" ? { tools: ["read"] } : {};
+      await db.update(agents).set({ adapterConfig: { ...config, ...patch } }).where(eq(agents.id, f.agentId));
+      const freshness = vi.spyOn(sessionWorkspaces, "resolveTaskSessionConfigFreshness");
+      const { next, decision } = await execute(f).then(next => ({ next,
+        decision: freshness.mock.results[0].value as ReturnType<typeof sessionWorkspaces.resolveTaskSessionConfigFreshness>,
+      })).finally(() => freshness.mockRestore());
+      console.info("fingerprint-transition", JSON.stringify({ continuity: continuity ?? "default", change,
+        savedFingerprint: saved.sessionParamsJson?.__paperclipConfigFingerprint, decision,
+        sessionIdBefore: next.finished.sessionIdBefore, runtimeSessionId: next.input.runtime.sessionId }));
+      expect(decision).toMatchObject({ reset: !retain, ...(retain ? { changedCategories: [], reasons: [] } : {}) });
+      expect(next.input.runtime.sessionId).toBe(change === "provider" ? null : "saved-session");
+      if (retain) {
+        const [upgraded] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId));
+        const result = next.finished.resultJson as { configFreshness: { session: { nextFingerprint: string } } };
+        expect(upgraded.sessionParamsJson?.__paperclipConfigFingerprint).toBe(result.configFreshness.session.nextFingerprint);
+        expect((await execute(f)).input.runtime.sessionId).toBe("saved-session");
+      }
     } finally { mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true }); }
   });
 

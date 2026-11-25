@@ -2798,6 +2798,7 @@ export function buildSessionConfigCategoryValues(input: {
   agentConfigRevision: unknown;
   agentIdentityKeyId?: string;
   legacyComposition?: boolean;
+  retainPiModelSettings?: boolean;
 }) {
   const sanitizedSecretManifest = sanitizeSecretManifestForConfigFingerprint(
     input.secretManifest,
@@ -2829,7 +2830,7 @@ export function buildSessionConfigCategoryValues(input: {
     },
     adapterConfig: legacy || input.adapterType !== "paperclip_runner"
       ? input.effectiveAdapterConfig
-      : paperclipRunnerSessionAdapterConfig(input.effectiveAdapterConfig),
+      : paperclipRunnerSessionAdapterConfig(input.effectiveAdapterConfig, input.retainPiModelSettings),
     agentRuntimeConfig: legacy ? input.agentRuntimeConfig : sessionAgentRuntimeConfig(input.agentRuntimeConfig),
     instructions: input.instructions,
     issueOverrides: input.issueOverrides,
@@ -2863,6 +2864,7 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
   agentConfigRevision?: unknown;
   agentIdentityKeyId?: string;
   legacyComposition?: boolean;
+  retainPiModelSettings?: boolean;
 }): Promise<EffectiveRunSessionConfigMetadata> {
   const secretManifest = input.secretManifest ?? [];
   const instructions = input.managedInstructions ? {
@@ -2909,6 +2911,7 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
     agentConfigRevision: input.agentConfigRevision ?? null,
     agentIdentityKeyId: input.agentIdentityKeyId,
     legacyComposition: input.legacyComposition,
+    retainPiModelSettings: input.retainPiModelSettings,
   });
   const fingerprints = createEffectiveRunConfigFingerprints({
     session: categoryValues,

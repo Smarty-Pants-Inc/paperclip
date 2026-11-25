@@ -183,8 +183,13 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
   const legacyInputs = storedFingerprintDiffers
     ? [sessionConfigMetadataInput, ...compatibleInputs].map(candidate => ({ ...candidate, legacyComposition: true }))
     : [];
+  // Reproduce the saved projection from before continuous Pi model/level rebinding.
+  const retainedPiInputs = storedFingerprintDiffers && agent.adapterType === "paperclip_runner" &&
+    runtimeConfig.provider === "pi_rpc" && resolveSessionContinuity(runtimeConfig.provider, runtimeConfig.sessionContinuity) === "continuous"
+    ? [sessionConfigMetadataInput, ...compatibleInputs].map(candidate => ({ ...candidate, retainPiModelSettings: true }))
+    : [];
   const compatibleConfigMetadata: EffectiveRunSessionConfigMetadata[] = await Promise.all(
-    [...compatibleInputs, ...legacyInputs].map(candidate => buildEffectiveRunSessionConfigMetadata(candidate)),
+    [...compatibleInputs, ...legacyInputs, ...retainedPiInputs].map(candidate => buildEffectiveRunSessionConfigMetadata(candidate)),
   );
   const configuredModel =
     readConfiguredModelFromAdapterConfig(runtimeConfig);

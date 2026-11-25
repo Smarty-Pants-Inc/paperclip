@@ -153,9 +153,9 @@ export function paperclipRunnerRetainedAdapterConfig(config: Record<string, unkn
   return omitKeys(result, [...inactivePermissionKeys, ...(provider === "codex" ? [] : CODEX_ONLY_KEYS)]);
 }
 
-export function paperclipRunnerSessionAdapterConfig(config: Record<string, unknown>): Record<string, unknown> {
+export function paperclipRunnerSessionAdapterConfig(config: Record<string, unknown>, retainPiModelSettings = false): Record<string, unknown> {
   const retained = paperclipRunnerRetainedAdapterConfig(config);
-  return config.provider === "pi_rpc" && resolveSessionContinuity(config.provider, config.sessionContinuity) === "continuous"
+  return !retainPiModelSettings && config.provider === "pi_rpc" && resolveSessionContinuity(config.provider, config.sessionContinuity) === "continuous"
     ? omitKeys(retained, ["model", "piRpcThinkingLevel", "piThinkingLevel", "thinkingLevel", "modelReasoningEffort", "reasoningEffort", "effort", "variant"]) : retained;
 }
 
