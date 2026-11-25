@@ -20969,6 +20969,45 @@ describe("runnerd provider runtime wiring", () => {
     } else { expect(existsSync(root)).toBe(true); expect(existsSync(join(target, "retained-transcript"))).toBe(false); }
   });
 
+  it.each(["stale-owner", "stale-owner-source-missing", "source-copy", "unreadable", "unverified-source-after-rename", "unproven-same-run", "same-run-retry"] as const)("workspace destination conflict preserves both roots: %s", async mode => {
+    const prior = { ...scopedNativeExecution(`destination-${mode}`), provider: { kind: "pi_rpc" as const, model: "provider/model" } };
+    prior.session = { ...prior.session, driverKind: "pi_rpc" };
+    const current: NativeExecutionInput = { ...prior, binding: { ...prior.binding, runId: "destination-current", executionWorkspaceId: "workspace-Y" },
+      workspace: { ...prior.workspace, cwd: "/workspace-Y" } };
+    const source = await initializeScopedRunnerRoot(prior, "source-runner");
+    const target = await initializeScopedRunnerRoot(current, "target-runner");
+    const stale = { ...current, binding: { ...current.binding, runId: "stale-destination-owner" } };
+    const targetOwner = mode === "source-copy" || mode === "unverified-source-after-rename" ? prior
+      : mode === "same-run-retry" || mode === "unproven-same-run" ? current : stale;
+    for (const [root, owner] of [[source, prior], [target, targetOwner]] as const) {
+      const identity = { runId: owner.binding.runId, normalizedSessionId: owner.session.normalizedSessionId, runnerInstanceId: "retained-runner", environmentLeaseId: "retained-lease" };
+      await mkdir(join(root, "control-plane"), { recursive: true }); await mkdir(join(root, "runner"), { recursive: true });
+      await writeFile(join(root, "control-plane/control-plane-state.json"), JSON.stringify(durableControlPlaneState(identity)));
+      await writeFile(join(root, "runner/runner-state.json"), JSON.stringify(durableRunnerState(identity, "suspended")));
+      await writeFile(join(root, "retained-transcript"), root);
+    }
+    if (mode === "unreadable") await writeFile(join(target, "control-plane/control-plane-state.json"), "invalid");
+    const sourceMissing = ["same-run-retry", "stale-owner-source-missing", "unverified-source-after-rename", "unproven-same-run"].includes(mode);
+    if (sourceMissing) await rm(source, { recursive: true });
+    const snapshot = async (root: string) => Promise.all(["control-plane/control-plane-state.json", "runner/runner-state.json", "retained-transcript"].map(file => readFile(join(root, file), "utf8")));
+    const beforeTarget = await snapshot(target);
+    const beforeSource = sourceMissing ? null : await snapshot(source);
+    state.createBackend.mockClear(); state.createTransport.mockClear();
+    const persistedOwner = mode === "unverified-source-after-rename" ? { ...prior, workspace: { ...prior.workspace, cwd: "/not-admitted" } }
+      : mode === "unproven-same-run" ? prior : targetOwner;
+    const input = { db: priorNativeRunDb(persistedOwner), execution: current, runnerInstanceId: "current-runner",
+      sessionContinuity: "continuous" as const, workspaceContinuationSource: prior };
+    if (mode === "same-run-retry") await expect(createRunnerdBackend(input)).resolves.toBeDefined();
+    else {
+      await expect(createRunnerdBackend(input)).rejects.toMatchObject({ code: "native_provider_state_incompatible",
+        message: expect.stringContaining("workspace_continuation_target_conflict") });
+      expect(state.createBackend).not.toHaveBeenCalled(); expect(state.createTransport).not.toHaveBeenCalled();
+      if (sourceMissing) expect(existsSync(source)).toBe(false);
+      else expect(await snapshot(source)).toEqual(beforeSource);
+    }
+    expect(await snapshot(target)).toEqual(beforeTarget);
+  });
+
   it("migrates the former company/session scope into the full native session scope", async () => {
     const stateBase = isolatedStateDirectory;
 

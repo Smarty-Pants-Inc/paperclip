@@ -734,7 +734,7 @@ export function rebindNativeSessionCheckpoint(input: {
     previousExecution.binding.agentId !== current.binding.agentId ||
     previousExecution.session.normalizedSessionId !== normalizedSessionId ||
     previousExecution.session.driverKind !== current.session.driverKind ||
-    (!workspaceContinuation && !sameWorkspaceScope({ previousExecution, previousRunId: input.previousRun.id, currentExecution: current })) ||
+    (workspaceChanged && !workspaceContinuation) ||
     previousExecution.task.workMode !== current.task.workMode ||
     ("executionMode" in previousExecution
       ? previousExecution.executionMode

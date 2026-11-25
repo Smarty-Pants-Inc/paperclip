@@ -511,9 +511,16 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     input.workspace.executionWorkspace.cwd = workspace!.cwd!;
     const selected = await selectHeartbeatRuntime(db, input);
     if (!selected.selected || !selected.nativeExecution) throw new Error("Expected migrated native selection");
-    expect(selected.nativeExecution.session.normalizedSessionId).toBe(sessionId);
+    const saved = await read(nextRun!.id);
+    if (sameSession) {
+      expect(selected.nativeExecution.session.normalizedSessionId).toBe(sessionId);
+      expect(saved.runnerProfileJson?.sessionCheckpoint).toMatchObject({ providerSessionId: "retained-provider-thread" });
+    } else {
+      expect(selected.nativeExecution.session.normalizedSessionId).not.toBe(sessionId);
+      expect(saved.runnerProfileJson?.sessionCheckpoint).toBeUndefined();
+    }
     expect(selected.nativeExecution.workspace.cwd).toBe(sameSession ? logicalCwd : workspace!.cwd);
-    expect((await read(nextRun!.id)).runnerProfileJson?.nativeExecutionInput).toEqual(selected.nativeExecution);
+    expect(saved.runnerProfileJson?.nativeExecutionInput).toEqual(selected.nativeExecution);
     expect((await read(nextRun!.id)).nativeSessionId).toBe(selected.nativeExecution.session.normalizedSessionId);
   });
 
