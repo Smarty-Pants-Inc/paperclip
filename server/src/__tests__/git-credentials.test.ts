@@ -1,4 +1,7 @@
 import { spawn } from "node:child_process";
+import { generateKeyPairSync, randomUUID } from "node:crypto";
+import * as connectionCredentials from "../services/connection-credentials.js";
+import { resolveGitHubAppCredential, resolveGitHubAppInstallation } from "../services/github-app-credentials.js";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -17,6 +20,39 @@ import {
 } from "../services/git-credentials.ts";
 
 const fakeDb = null as unknown as Db;
+
+describe("GitHub App installation routing metadata and token scope", () => {
+  it.each(["all", "selected"] as const)("reuses the installation account and mints %s repository access", async selection => {
+    const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048, privateKeyEncoding: { type: "pkcs8", format: "pem" }, publicKeyEncoding: { type: "spki", format: "pem" } });
+    const secret = vi.spyOn(connectionCredentials, "resolveConnectionGrantSecret").mockResolvedValue({ value: privateKey, latestVersion: 1 });
+    const connection = { id: randomUUID(), companyId: "example-company", enabled: true, status: "active", credentialPolicy: "shared",
+      config: { sourceTemplateKey: "github", connectionMethodKey: "app-installation",
+        methodConfig: { appId: "123", installationId: "456", repositories: "second-org/saved", permissionProfile: "author" } },
+    } as unknown as Parameters<typeof resolveGitHubAppCredential>[1];
+    const grant = { id: randomUUID(), companyId: connection.companyId, connectionId: connection.id, kind: "organization", status: "active",
+      credentialSecretRefs: [{ secretId: "key", configPath: "credentials.privateKey", versionSelector: "latest" }],
+    } as Parameters<typeof resolveGitHubAppCredential>[2];
+    const requests: Array<{ url: string; body: unknown }> = [];
+    vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+      requests.push({ url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      return Response.json(url.endsWith("/access_tokens")
+        ? { token: "installation-token", expires_at: new Date(Date.now() + 3_600_000).toISOString() }
+        : { account: { login: "Second-Org" }, repository_selection: selection });
+    });
+    try {
+      expect(await resolveGitHubAppInstallation(fakeDb, connection, grant)).toMatchObject({ account: { login: "Second-Org" }, repository_selection: selection });
+      expect((await resolveGitHubAppCredential(fakeDb, connection, grant)).token).toBe("installation-token");
+      expect((await resolveGitHubAppCredential(fakeDb, connection, grant)).token).toBe("installation-token");
+      expect(requests).toEqual([
+        { url: "https://api.github.com/app/installations/456", body: undefined },
+        { url: "https://api.github.com/app/installations/456/access_tokens", body: {
+          ...(selection === "selected" ? { repositories: ["saved"] } : {}),
+          permissions: { contents: "write", pull_requests: "write", issues: "read" },
+        } },
+      ]);
+    } finally { secret.mockRestore(); vi.unstubAllGlobals(); }
+  });
+});
 
 function buildSecretsFake(byName: Record<string, string | Error>) {
   const getByName = vi.fn(async (_companyId: string, name: string) => {

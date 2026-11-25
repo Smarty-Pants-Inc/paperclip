@@ -14,7 +14,7 @@ export function githubLauncherSource(options: { brokerFile?: boolean; interprete
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 // A PATH shim can capture this launcher's absolute path and call it again.
 // Reject that cycle before resolving another executable or capturing authority.
 if (process.env.PAPERCLIP_GITHUB_OPERATION_ACTIVE) {
@@ -110,7 +110,67 @@ ${options.brokerFile ? String.raw`
       GIT_CONFIG_KEY_4: 'user.useConfigOnly', GIT_CONFIG_VALUE_4: 'true',
     });
     const base = env.PAPERCLIP_GITHUB_BROKER_URL || env.PAPERCLIP_API_URL;
-    const askBroker = !isLocalGit(process.argv.slice(2));
+    const args = process.argv.slice(2);
+    const normalizeRepo = value => {
+      if (typeof value !== 'string') return undefined;
+      const repo = value.replace(/^git@(?:www\.)?github\.com:/i, '')
+        .replace(/^(?:https?|ssh):\/\/(?:git@)?(?:www\.)?github\.com(?::\d+)?\//i, '')
+        .replace(/\.git\/?$/i, '').replace(/\/$/, '');
+      return /^[a-z0-9][a-z0-9-]*\/[a-z0-9_.-]+$/i.test(repo) ? repo.toLowerCase() : undefined;
+    };
+    const repositoryHint = () => {
+      const git = program === 'git' ? executable : originalPath.map(p => path.join(p, 'git')).find(p => {
+        try { fs.accessSync(p, fs.constants.X_OK); return fs.statSync(p).isFile(); } catch { return false; }
+      });
+      const prefix = [];
+      let commandIndex = 0;
+      if (program === 'git') for (; commandIndex < args.length; commandIndex++) {
+        const arg = args[commandIndex];
+        if (gitValueOptions.includes(arg)) { prefix.push(arg, args[++commandIndex]); continue; }
+        if (gitValueOptions.some(option => arg.startsWith(option + '=')) || gitFlagOptions.includes(arg)) { prefix.push(arg); continue; }
+        break;
+      }
+      const remoteRepository = () => {
+        if (!git) return undefined;
+        const command = program === 'git' ? args[commandIndex] : '';
+        let remote = 'origin';
+        if (['fetch', 'push', 'pull'].includes(command)) for (let index = commandIndex + 1; index < args.length; index++) {
+          const arg = args[index];
+          if (['-o', '--push-option', '--receive-pack', '--upload-pack', '--exec', '--depth', '--shallow-since', '--shallow-exclude', '--deepen', '--jobs', '-j'].includes(arg)) { index++; continue; }
+          if (arg === '--repo') { remote = args[index + 1]; break; }
+          if (arg.startsWith('--repo=')) { remote = arg.slice(7); break; }
+          if (arg === '--' || arg.startsWith('-')) continue;
+          remote = arg; break;
+        }
+        const result = spawnSync(git, [...prefix, 'remote', 'get-url', ...(command === 'push' ? ['--push'] : []), remote], { env, encoding: 'utf8', timeout: 2000, maxBuffer: 65536 });
+        return result.status === 0 ? normalizeRepo(result.stdout.trim()) : undefined;
+      };
+      if (program === 'gh') {
+        for (let index = 0; index < args.length; index++) {
+          if (args[index] === '-R' || args[index] === '--repo') return normalizeRepo(args[index + 1]);
+          if (args[index].startsWith('--repo=')) return normalizeRepo(args[index].slice(7));
+          if (args[index].startsWith('-R') && args[index].length > 2) return normalizeRepo(args[index].slice(2));
+        }
+        if (args[0] === 'api') {
+          const endpoint = args.map(arg => arg.replace(/^https:\/\/api\.github\.com\//i, ''))
+            .find(arg => /^\/?repos\/[^/]+\/[^/?]+/.test(arg));
+          if (endpoint) {
+            const context = /\{(?:owner|repo)\}/.test(endpoint) ? (normalizeRepo(env.GH_REPO) || remoteRepository())?.split('/') : [];
+            return normalizeRepo(endpoint.replace(/\{owner\}/g, context?.[0] || '').replace(/\{repo\}/g, context?.[1] || '')
+              .replace(/^\/?repos\//, '').split(/[/?]/).slice(0, 2).join('/'));
+          }
+        }
+        if (args[0] === 'repo' && ['view', 'clone', 'fork'].includes(args[1]) && normalizeRepo(args[2])) return normalizeRepo(args[2]);
+        const url = args.find(arg => /^https:\/\/(?:www\.)?github\.com\//i.test(arg));
+        if (url) return normalizeRepo(new URL(url).pathname.split('/').slice(1, 3).join('/'));
+        if (env.GH_REPO) return normalizeRepo(env.GH_REPO);
+      }
+      const remoteUrl = args.find(arg => /^(?:https?:\/\/|ssh:\/\/|git@)(?:git@)?(?:www\.)?github\.com[:/]/i.test(arg));
+      if (remoteUrl) return normalizeRepo(remoteUrl);
+      return remoteRepository();
+    };
+    const askBroker = !isLocalGit(args);
+    const repository = askBroker ? repositoryHint() : undefined;
     try {
     let response;
     if (askBroker && base && env.PAPERCLIP_GITHUB_BROKER_TOKEN) {
@@ -129,8 +189,9 @@ ${options.brokerFile ? String.raw`
           response = await fetch(url, {
             method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10000),
             headers: { authorization: 'Bearer ' + (env.PAPERCLIP_GITHUB_BRIDGE_TOKEN || env.PAPERCLIP_API_KEY || env.PAPERCLIP_GITHUB_BROKER_TOKEN),
-              'x-paperclip-github-capability': env.PAPERCLIP_GITHUB_BROKER_TOKEN, 'content-type': 'application/json' },
-            body: '{}',
+              'x-paperclip-github-capability': env.PAPERCLIP_GITHUB_BROKER_TOKEN, 'content-type': 'application/json',
+              ...(repository ? { 'x-paperclip-github-repository': repository } : {}) },
+            body: JSON.stringify(repository ? { repository } : {}),
           });
           // A sandbox gateway that outlived its controller answers 503 until
           // the replacement broker is published, so it waits like a refusal.
