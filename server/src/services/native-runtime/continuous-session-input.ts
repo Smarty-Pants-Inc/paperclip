@@ -1,8 +1,9 @@
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
-import { agentWakeupRequests, agents, heartbeatRuns, issueComments, issueQuestionResponseDeliveries, issues, type Db } from "@paperclipai/db";
+import { agentWakeupRequests, agents, heartbeatRuns, issueComments, issueQuestionResponseDeliveries, issueThreadInteractions, issues, type Db } from "@paperclipai/db";
 import { parseObject } from "../../adapters/utils.js";
 import { queuedCommentIdsFromRunContext, queuedCommentIdsFromWakePayload, withQueuedCommentIdsInWakePayload } from "../issue-queued-comment-queue.js";
 import { resolveSessionContinuity } from "./continued-session.js";
+import { queuedInteractionId, queuedInteractionSteeringBody } from "../queued-interaction-response.js";
 
 type Scope = { companyId: string; issueId: string; runId: string; agentId?: string };
 type Evidence = { sessionId: string; commentIds: string[] };
@@ -39,15 +40,22 @@ export async function readContinuousSessionInput(db: Pick<Db, "select">, scope: 
   if (!entries) return null; // Missing, truncated or unreadable history: deliver again.
   const comments = await db.select({ id: issueComments.id, body: issueComments.body }).from(issueComments).where(and(
     eq(issueComments.companyId, scope.companyId), eq(issueComments.issueId, scope.issueId), inArray(issueComments.id, candidates)));
+  const interactions = await db.select().from(issueThreadInteractions).where(and(
+    eq(issueThreadInteractions.companyId, scope.companyId), eq(issueThreadInteractions.issueId, scope.issueId),
+    inArray(issueThreadInteractions.id, candidates), inArray(issueThreadInteractions.status, ["accepted", "answered", "rejected"])));
+  // Interaction ACKs are keyed by interaction id, not by issue-comment id.
+  // Use the same typed receipt text as readQueuedInteractionResponse/steering.
+  const texts = [...comments, ...interactions.map(interaction => ({ id: interaction.id, body: queuedInteractionSteeringBody(interaction) }))];
   // Legacy receipts contain no provider-entry id. Exact retained text is proof
-  // only when it identifies one issue comment; repeated text is ambiguous and
-  // must fail open rather than mistake an older user entry for the lost steer.
-  const sameText = comments.length ? await db.select({ body: issueComments.body }).from(issueComments).where(and(
+  // only when it identifies one input; repeated text (even across the two
+  // source types) is ambiguous and must fail open rather than lose an answer.
+  const sameText = texts.length ? await db.select({ body: issueComments.body }).from(issueComments).where(and(
     eq(issueComments.companyId, scope.companyId), eq(issueComments.issueId, scope.issueId),
-    inArray(issueComments.body, comments.map(comment => comment.body)))) : [];
+    inArray(issueComments.body, texts.map(comment => comment.body)))) : [];
   const counts = new Map<string, number>();
-  for (const comment of sameText) counts.set(comment.body, (counts.get(comment.body) ?? 0) + 1);
-  return { sessionId: row.run.nativeSessionId, commentIds: comments.filter(comment =>
+  for (const { body } of [...sameText, ...interactions.map(interaction => ({ body: queuedInteractionSteeringBody(interaction) }))])
+    counts.set(body, (counts.get(body) ?? 0) + 1);
+  return { sessionId: row.run.nativeSessionId, commentIds: texts.filter(comment =>
     counts.get(comment.body) === 1 && entries.includes(comment.body)).map(comment => comment.id) };
 }
 
@@ -79,6 +87,12 @@ export async function settleContinuousSessionInput(tx: Db, scope: Scope, evidenc
     ? [...new Set([...saved.commentIds.filter((id): id is string => typeof id === "string"), ...evidence.commentIds])] : evidence.commentIds;
   const consumed = new Set(ids), now = new Date();
   for (const wake of wakes) {
+    const interactionId = queuedInteractionId(wake.payload);
+    if (interactionId && consumed.has(interactionId)) {
+      await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: now, updatedAt: now })
+        .where(eq(agentWakeupRequests.id, wake.id));
+      continue;
+    }
     const pending = queuedCommentIdsFromWakePayload(wake.payload), remaining = pending.filter(id => !consumed.has(id));
     if (remaining.length === pending.length) continue;
     await tx.update(agentWakeupRequests).set({ ...(remaining.length

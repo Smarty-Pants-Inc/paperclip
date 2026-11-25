@@ -27,6 +27,7 @@ import { readReleaseRun, type ReleaseRun } from "./release-run-read.js";
 import { isGovernancePauseStop } from "../../../services/governance-pause-stop.js";
 import { agentRunSupersededByFreshContinuation } from "../../../agent-run-cancellation.js";
 import { freshContinuationIsolatesRun } from "../../../services/fresh-continuation-fallback.js";
+import { answeredContinuousHeldRun } from "../../../services/native-runtime/continuous-session-input.js";
 import type { Db } from "@paperclipai/db";
 import { deliveredQueuedCommentIds, EXTERNAL_CHAT_MESSAGE_WAKE_MUTATION, EXTERNAL_CHAT_MESSAGE_WAKE_REASON } from "../../../services/queued-comment-delivery.js";
 import { extractIssueReferenceIdentifiers, isUuidLike } from "@paperclipai/shared";
@@ -904,6 +905,10 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: ReleaseRun, iss
     issue.assigneeAgentId === run.agentId &&
     !["done", "cancelled"].includes(issue.status);
   if (!applies || isAcknowledgedNativeStop(run) || isAcknowledgedNativeReassignmentStop(run)) return false;
+  // The caller holds the issue lock. A held Pi conversation that already
+  // answered every input owes no continuation: do not block it or open an
+  // active_run_watchdog incident for the fresh-continuation sweep to restore.
+  if (await answeredContinuousHeldRun(tx, { companyId: issue.companyId, issueId: issue.id, runId: run.id })) return true;
   // A pause's stop is intentional: the task keeps its status and resuming
   // continues it. It is never a reconciliation incident with no control. A
   // termination that replaced the pause shares its stop reason, so the agent
