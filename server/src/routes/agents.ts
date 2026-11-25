@@ -2786,6 +2786,13 @@ export function agentRoutes(
     "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "PAPERCLIP_OPENCODE_PROVIDERS", "OPENCODE_AUTH_JSON",
   ] as const;
 
+  async function inheritCallerEnvironment(req: Request, companyId: string, input: { defaultEnvironmentId?: string | null }) {
+    if (input.defaultEnvironmentId !== undefined || req.actor.type !== "agent" || !req.actor.agentId) return;
+    const caller = await svc.getById(req.actor.agentId);
+    if (!caller || caller.companyId !== companyId) throw forbidden("The caller agent is not in this company");
+    input.defaultEnvironmentId = caller.defaultEnvironmentId ?? null;
+  }
+
   async function callerUsesAiConnectionPool(req: Request, companyId: string): Promise<boolean> {
     if (req.actor.type !== "agent" || !req.actor.agentId) return false;
     const caller = await svc.getById(req.actor.agentId);
@@ -4675,10 +4682,8 @@ export function agentRoutes(
       }
       hireInput.adapterConfig = inheritNativeRunnerAdapterConfig(caller.adapterConfig);
       hireInput.defaultEnvironmentId = caller.defaultEnvironmentId ?? null;
-    } else if (hireInput.defaultEnvironmentId === undefined && req.actor.type === "agent" && req.actor.agentId) {
-      const caller = await svc.getById(req.actor.agentId);
-      if (!caller || caller.companyId !== companyId) throw forbidden("The caller agent is not in this company");
-      hireInput.defaultEnvironmentId = caller.defaultEnvironmentId ?? null;
+    } else {
+      await inheritCallerEnvironment(req, companyId, hireInput);
     }
     if (inheritRuntimeFrom === "caller" && hireRunner !== undefined) throw unprocessable("inheritRuntimeFrom=caller cannot be combined with runner");
     let configurationWarnings: AgentConfigurationWarning[] = [];
@@ -5021,6 +5026,7 @@ export function agentRoutes(
     if (createInput.adapterType === "paperclip_runner" && createInput.adapterConfig?.provider === "pi_rpc") {
       createInput.adapterConfig = applyReasoningCreateDefaults(createInput.adapterType, createInput.adapterConfig, requestedCreateConfig);
     }
+    await inheritCallerEnvironment(req, companyId, createInput);
     Object.assign(createInput, await resolveNewAgentRunnerForCompany(db, companyId, { ...createInput, runner: createRunner, setupOnly: Boolean(setupId),
       onConfigurationWarnings: warnings => { configurationWarnings = warnings; } }));
     createInput.adapterConfig = applyReasoningCreateDefaults(createInput.adapterType, createInput.adapterConfig, requestedCreateConfig);
