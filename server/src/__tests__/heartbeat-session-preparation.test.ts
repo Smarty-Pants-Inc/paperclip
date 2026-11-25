@@ -44,7 +44,8 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
         const [issue] = await db.select().from(issues).where(eq(issues.id, String(input.context.issueId)));
         await db.update(issues).set(issue.conversationAgentId ? { status: "todo", conversationState: "waiting" } : { status: "done" })
           .where(eq(issues.id, issue.id));
-        return { exitCode: 0, signal: null, timedOut: false, sessionId: "saved-session", sessionParams: { sessionId: "saved-session", adapterState: "preserved" }, resultJson: {} };
+        const sessionId = typeof input.config.fixtureSessionId === "string" ? input.config.fixtureSessionId : "saved-session";
+        return { exitCode: 0, signal: null, timedOut: false, sessionId, sessionParams: { sessionId, adapterState: "preserved" }, resultJson: {} };
       },
       testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }),
     });
@@ -387,6 +388,21 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     const history = String(next.input.context.paperclipFreshSessionHandoffMarkdown);
     expect(history).toContain("EARLIER HISTORY");
     expect(history).not.toMatch(/(?:QUEUED|LATEST) CURRENT REQUEST/);
+  });
+
+  it("continues Pi across a changed config fingerprint only in continuous mode", async () => {
+    for (const sessionContinuity of ["continuous", "paperclip"]) {
+      const f = await seed(), sessionId = randomUUID();
+      const adapterConfig = { provider: "pi_rpc", model: "model-a", sessionContinuity, fixtureSessionId: sessionId, env: { PACK_NOTE: "old" } };
+      await db.update(agents).set({ adapterConfig }).where(eq(agents.id, f.agentId));
+      await execute(f);
+      await db.update(agents).set({ adapterConfig: { ...adapterConfig, env: { PACK_NOTE: "new" } } }).where(eq(agents.id, f.agentId));
+      const next = await execute(f);
+      expect(next.input.runtime.sessionId).toBe(sessionContinuity === "continuous" ? sessionId : null);
+      expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: {
+        reset: sessionContinuity !== "continuous", taskSessionReused: sessionContinuity === "continuous", changedCategories: ["adapterConfig"],
+      } } });
+    }
   });
 
   it("starts fresh when effective model configuration changes and persists the reason", async () => {
