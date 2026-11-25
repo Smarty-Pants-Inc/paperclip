@@ -234,6 +234,35 @@ function previousRun(overrides: Record<string, unknown> = {}) {
 }
 
 describe("capability-gated connection tool refresh", () => {
+  it.each(["continuous", "paperclip"] as const)("workspace continuation in %s mode retains only the admitted Pi session", sessionContinuity => {
+    const prior = execution(previousRunId);
+    prior.provider = { kind: "pi_rpc", model: "provider/model" }; prior.session.driverKind = "pi_rpc";
+    const source = previousRun({ nativeExecutionInput: prior });
+    source.runnerProfileJson.sessionCheckpoint.driverKind = "pi_rpc";
+    const buildExecution = ({ normalizedSessionId: id }: { normalizedSessionId: string }) => ({ ...execution(currentRunId, "/workspace-Y"), provider: prior.provider,
+      session: { ...prior.session, normalizedSessionId: id } });
+    const result = buildNativeExecutionWithCheckpoint({ previousRun: source, normalizedSessionId, sessionContinuity, buildExecution });
+    if (sessionContinuity === "continuous") {
+      expect(result.normalizedSessionId).toBe(normalizedSessionId);
+      expect(result.checkpoint).toMatchObject({ sessionId: "provider-thread-123", workingDirectory: "/workspace-Y" });
+      expect(rebindNativeSessionCheckpoint({ previousRun: { ...source, companyId: "foreign" }, currentExecution: buildExecution({ normalizedSessionId }), sessionContinuity })).toBeNull();
+    } else { expect(result.normalizedSessionId).not.toBe(normalizedSessionId); expect(result.checkpoint).toBeNull(); }
+  });
+  it.each(["continuous", "unfinished-goal", "paperclip", "remote"] as const)("same-id cwd relocation refuses an inadmissible checkpoint: %s", mode => {
+    const prior = execution(previousRunId, "/workspace-X", "standard", { id: "managed-workspace" });
+    prior.provider = { kind: "pi_rpc", model: "provider/model" }; prior.session.driverKind = "pi_rpc";
+    const source = previousRun({ nativeExecutionInput: prior });
+    source.runnerProfileJson.sessionCheckpoint.driverKind = "pi_rpc";
+    if (mode === "unfinished-goal") Object.assign(source.runnerProfileJson.sessionCheckpoint, { goal: { status: "in_progress" } });
+    const targetKind = mode === "remote" ? "remote" as const : "local" as const;
+    source.runnerProfileJson.nativeToolContractFingerprint = nativeToolContractFingerprintForTarget(targetKind, "pi_rpc");
+    const current = { ...execution(currentRunId, "/workspace-Y", "standard", { id: "managed-workspace" }), provider: prior.provider, session: prior.session };
+    const result = rebindNativeSessionCheckpoint({ previousRun: source, currentExecution: current,
+      sessionContinuity: mode === "paperclip" ? "paperclip" : "continuous", executionTargetKind: targetKind });
+    if (mode === "continuous") expect(result).toMatchObject({ workingDirectory: "/workspace-Y" });
+    else expect(result).toBeNull();
+  });
+
   it("retains the exact provider session for an MCP-only change when the harness supports it", () => {
     const current = execution(currentRunId);
     current.runtimeContext.mcp.digest = "b".repeat(64);
