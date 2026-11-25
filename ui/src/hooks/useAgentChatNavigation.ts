@@ -82,7 +82,7 @@ export function useStartAgentChat(companyId: string | null, userId: string | nul
       // Read the complete overrides first so unrelated options survive.
       const fresh = await issuesApi.getCore(chat.id, { cache: "no-store", fresh: true });
       const updated = await issuesApi.update(chat.id, {
-        assigneeAdapterOverrides: mergeComposerRunSettings(fresh.assigneeAdapterOverrides, agent.adapterType, runSettings),
+        assigneeAdapterOverrides: mergeComposerRunSettings(fresh.assigneeAdapterOverrides, agent.adapterType, runSettings, false, agent.adapterConfig),
       });
       client.setQueryData(queryKeys.issues.detail(chat.id), updated);
     }
