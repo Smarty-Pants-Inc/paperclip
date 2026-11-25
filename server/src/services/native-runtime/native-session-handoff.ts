@@ -3,7 +3,7 @@ import { documents, heartbeatRunEvents, heartbeatRuns, issueComments, issueDocum
 import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
 import { buildLowTrustSourceTrust, redactQuarantinedBodyForHigherTrust, sanitizeQuarantinedCommentForHigherTrust } from "../source-trust.js";
 import { resolveCoreTrustPreset } from "../trust-preset-resolver.js";
-import { fastResponseHistoryBody } from "@paperclipai/shared";
+import { fastResponseHistoryBody, type ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { nativeFinalReplyKey } from "../heartbeat-run-summary.js";
 
 export const NATIVE_HANDOFF_MAX_BYTES = 24_000;
@@ -41,7 +41,9 @@ export function renderNativeSessionHandoff(input: {
   ].join("\n");
   for (const entry of input.entries) {
     const complete = whole && isConversationEntry(entry);
-    const clipped = !complete && entry.body.length > ENTRY_MAX_CHARS;
+    const oversizedOrigin = whole && entry.kind === "original_request" &&
+      JSON.stringify(entry).length > NATIVE_WHOLE_HANDOFF_MAX_CHARS - 8_000;
+    const clipped = oversizedOrigin || (!complete && entry.body.length > ENTRY_MAX_CHARS);
     // Preserve both the start and latest direction in exceptionally long messages.
     const body = clipped ? `${entry.body.slice(0, 2_900)}\n[content omitted]\n${entry.body.slice(-900)}` : entry.body;
     const bounded = { ...entry, body, truncated: entry.truncated === true || clipped };
@@ -57,11 +59,12 @@ export function renderNativeSessionHandoff(input: {
     }
   }
   if (whole) {
-    // Drop supporting excerpts before conversation, then oldest messages first.
+    // Drop supporting excerpts before conversation, then oldest non-origin messages.
     // Account for the growing visible note without re-serializing the history.
     let overhead = render([]).length;
     let size = overhead + entries.reduce((sum, entry, i) => sum + JSON.stringify(entry).length + Number(i > 0), 0);
-    const evictionOrder = [...entries.filter(entry => !isConversationEntry(entry)).reverse(), ...entries.filter(isConversationEntry)];
+    const evictionOrder = [...entries.filter(entry => !isConversationEntry(entry)).reverse(),
+      ...entries.filter(entry => isConversationEntry(entry) && entry.kind !== "original_request")];
     const evicted = new Set<HandoffEntry>();
     for (const entry of evictionOrder) {
       if (size <= NATIVE_WHOLE_HANDOFF_MAX_CHARS) break;
@@ -83,9 +86,14 @@ export function renderNativeSessionHandoff(input: {
 export async function buildNativeSessionHandoff(input: {
   db: Db; companyId: string; issueId: string; agentId: string; before: Date;
   throughCommentId?: string | null; excludeCommentIds?: string[]; mode?: HandoffMode;
+  continuation?: ExecutionContinuationEnvelope | null;
 }): Promise<string | null> {
   const { db, companyId, issueId, agentId } = input;
   const whole = input.mode === "whole";
+  const coverage = input.continuation;
+  const coveredCommentIds = new Set(whole && coverage?.companyId === companyId && coverage.issueId === issueId &&
+    coverage.coverage.kind === "full_task_history" ? coverage.messages.map(message => message.id) : []);
+  const excludedCommentIds = input.excludeCommentIds?.filter(id => !coveredCommentIds.has(id));
   const bounded = <T extends { limit(n: number): T }>(query: T, limit: number) => whole ? query : query.limit(limit);
   const [issue] = await db.select({
     id: issues.id, companyId: issues.companyId, projectId: issues.projectId,
@@ -114,7 +122,7 @@ export async function buildNativeSessionHandoff(input: {
   const commentScope = and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), isNull(issueComments.deletedAt),
     isNull(issueComments.conversationSessionGeneration),
     lte(issueComments.createdAt, input.before),
-    input.excludeCommentIds?.length ? notInArray(issueComments.id, input.excludeCommentIds) : undefined,
+    excludedCommentIds?.length ? notInArray(issueComments.id, excludedCommentIds) : undefined,
     boundary ? sql`(${issueComments.createdAt}, ${issueComments.id}) > (${boundary.createdAt.toISOString()}::timestamptz, ${boundary.id}::uuid)` : undefined,
     cutoff ? sql`(${issueComments.createdAt}, ${issueComments.id}) <= (${cutoff.createdAt.toISOString()}::timestamptz, ${cutoff.id}::uuid)` : undefined);
   const runIssueScope = or(eq(heartbeatRuns.nativeIssueId, issueId), and(isNull(heartbeatRuns.nativeIssueId),
@@ -204,16 +212,25 @@ export async function buildNativeSessionHandoff(input: {
       return !(row.savedCommentId && agentCommentIds.has(row.savedCommentId)) && !(key && finalKeys.has(key));
     });
     const candidates = [
-      ...[...commentsById.values()].map(row => ({ type: "comment" as const, row })),
+      ...[...commentsById.values()].filter(row => !coveredCommentIds.has(row.id)).map(row => ({ type: "comment" as const, row })),
       ...distinctReplies.map(row => ({ type: "reply" as const, row })),
     ].sort((a, b) => (b.row.createdAt?.getTime() ?? 0) - (a.row.createdAt?.getTime() ?? 0) ||
       Number("sequence" in b.row ? b.row.sequence : 0) - Number("sequence" in a.row ? a.row.sequence : 0) || b.row.id.localeCompare(a.row.id));
     const selected = new Set<string>();
     const bodySizes = new Map(candidates.map(({ type, row }) => [`${type}:${row.id}`, Number(row.bodySize)]));
     let remaining = NATIVE_WHOLE_HANDOFF_MAX_CHARS - 8_000;
+    // An individually oversized original keeps a marked stock excerpt rather
+    // than disappearing or allocating an unbounded body during hydration.
+    const oversizedOriginId = origin[0] && Number(origin[0].bodySize) + 1_024 > remaining ? origin[0].id : null;
+    // Reserve the original before newer messages consume the body budget.
+    if (origin[0] && !coveredCommentIds.has(origin[0].id)) {
+      selected.add(`comment:${origin[0].id}`);
+      remaining -= (oversizedOriginId ? ENTRY_MAX_CHARS * 6 : Number(origin[0].bodySize)) + 1_024;
+    }
     for (const { type, row } of candidates) {
+      if (selected.has(`${type}:${row.id}`)) continue;
       const size = Number(row.bodySize) + 1_024;
-      if (size > remaining) break;
+      if (size > remaining) continue;
       remaining -= size;
       selected.add(`${type}:${row.id}`);
     }
@@ -229,7 +246,9 @@ export async function buildNativeSessionHandoff(input: {
         const fits = (idColumn: SQL, body: SQL) => or(...batch.map(id => and(eq(idColumn, id),
           sql`octet_length(to_json(${body})::text) <= ${bodySizes.get(`${kind}:${id}`)}`)));
         const rows = kind === "comment"
-          ? await db.select({ id: issueComments.id, body: issueComments.body }).from(issueComments)
+          ? await db.select({ id: issueComments.id, body: oversizedOriginId
+              ? sql<string>`case when ${issueComments.id} = ${oversizedOriginId} then ${excerpt(sql`${issueComments.body}`)} else ${issueComments.body} end`
+              : issueComments.body }).from(issueComments)
             .where(and(commentScope, inArray(issueComments.id, batch), fits(sql`${issueComments.id}`, sql`${issueComments.body}`))).limit(32)
           : await db.select({ id: sql<string>`${heartbeatRunEvents.id}::text`, body: sql<string>`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,text}'` })
             .from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.agentId, agentId),
@@ -249,7 +268,10 @@ export async function buildNativeSessionHandoff(input: {
     retainedRecent = retainedRecent.filter(row => commentBodies.has(row.id));
     retainedOrigin = retainedOrigin.filter(row => commentBodies.has(row.id));
     retainedReplies = retainedReplies.filter(row => replyBodies.has(row.id));
-    for (const row of [...retainedOrigin, ...retainedRecent]) row.body = commentBodies.get(row.id)!;
+    for (const row of [...retainedOrigin, ...retainedRecent]) {
+      row.body = commentBodies.get(row.id)!;
+      if (row.id === oversizedOriginId) row.truncated = true;
+    }
     for (const row of retainedReplies) row.body = replyBodies.get(row.id)!;
   }
   const entries: HandoffEntry[] = [];
