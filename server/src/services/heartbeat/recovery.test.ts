@@ -144,6 +144,7 @@ describe("heartbeat recovery module callbacks", () => {
     const recovery = createHeartbeatRecovery(database.db, deps);
     expect(await recovery.prepareHotRestartShutdown("SIGTERM")).toEqual({ mode, skipDrain: false, activeRunIds: [] });
     expect(native.closeIdle).toHaveBeenCalledAfter(deps.enterShutdown);
+    expect(native.closeIdle).toHaveBeenCalledWith({ abort: undefined });
     expect(hotRestart.read).toHaveBeenCalledAfter(native.closeIdle);
     expect(database.access).not.toHaveBeenCalled();
   });
