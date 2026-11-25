@@ -1,14 +1,16 @@
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
-import { agentWakeupRequests, agents, heartbeatRuns, issueComments, issueQuestionResponseDeliveries, issues, type Db } from "@paperclipai/db";
+import { and, asc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { agentWakeupRequests, agents, heartbeatRuns, issueComments, issueQuestionResponseDeliveries, issueThreadInteractions, issues, type Db } from "@paperclipai/db";
 import { parseObject } from "../../adapters/utils.js";
 import { queuedCommentIdsFromRunContext, queuedCommentIdsFromWakePayload, withQueuedCommentIdsInWakePayload } from "../issue-queued-comment-queue.js";
 import { resolveSessionContinuity } from "./continued-session.js";
+import { queuedInteractionId, unansweredResolvedInteractionIds } from "../queued-interaction-response.js";
 
 type Scope = { companyId: string; issueId: string; runId: string; agentId?: string };
 type Evidence = { sessionId: string; commentIds: string[] };
 
 /** No runner/Boat call is permitted while the issue or run is locked. ACKs
- * nominate candidates only; the provider's retained user entries prove input. */
+ * nominate candidates only; provider-retained correlation IDs prove input.
+ * Text equality is never input identity (including for legacy receipts). */
 export async function readContinuousSessionInput(db: Pick<Db, "select">, scope: Scope): Promise<Evidence | null> {
   const [row] = await db.select({ run: heartbeatRuns, config: agents.adapterConfig }).from(heartbeatRuns)
     .innerJoin(agents, and(eq(agents.id, heartbeatRuns.agentId), eq(agents.companyId, scope.companyId)))
@@ -34,21 +36,17 @@ export async function readContinuousSessionInput(db: Pick<Db, "select">, scope: 
     Object.entries(parseObject(parseObject(source.result).queuedSteeringAcknowledgements))
       .filter(([id, receipt]) => !settled.has(id) && parseObject(receipt).status === "acknowledged").map(([id]) => id)))];
   if (!candidates.length) return null;
-  const { readNativeSessionUserMessages } = await import("./native-session-executor.js");
-  const entries = await readNativeSessionUserMessages(scope.runId, row.run.nativeSessionId);
-  if (!entries) return null; // Missing, truncated or unreadable history: deliver again.
-  const comments = await db.select({ id: issueComments.id, body: issueComments.body }).from(issueComments).where(and(
+  const { readNativeSessionUserInputIds } = await import("./native-session-executor.js");
+  const entries = await readNativeSessionUserInputIds(scope.runId, row.run.nativeSessionId);
+  if (!entries) return null; // Missing/unreadable/legacy history: no retention proof.
+  const comments = await db.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, scope.companyId), eq(issueComments.issueId, scope.issueId), inArray(issueComments.id, candidates)));
-  // Legacy receipts contain no provider-entry id. Exact retained text is proof
-  // only when it identifies one issue comment; repeated text is ambiguous and
-  // must fail open rather than mistake an older user entry for the lost steer.
-  const sameText = comments.length ? await db.select({ body: issueComments.body }).from(issueComments).where(and(
-    eq(issueComments.companyId, scope.companyId), eq(issueComments.issueId, scope.issueId),
-    inArray(issueComments.body, comments.map(comment => comment.body)))) : [];
-  const counts = new Map<string, number>();
-  for (const comment of sameText) counts.set(comment.body, (counts.get(comment.body) ?? 0) + 1);
-  return { sessionId: row.run.nativeSessionId, commentIds: comments.filter(comment =>
-    counts.get(comment.body) === 1 && entries.includes(comment.body)).map(comment => comment.id) };
+  const interactions = await db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
+    eq(issueThreadInteractions.companyId, scope.companyId), eq(issueThreadInteractions.issueId, scope.issueId),
+    inArray(issueThreadInteractions.id, candidates), inArray(issueThreadInteractions.status, ["accepted", "answered", "rejected"])));
+  const retained = new Set(entries);
+  return { sessionId: row.run.nativeSessionId, commentIds: [...comments, ...interactions]
+    .filter(input => retained.has(input.id)).map(input => input.id) };
 }
 
 /** Board reads use only the receipt written atomically with queue settlement. */
@@ -79,6 +77,12 @@ export async function settleContinuousSessionInput(tx: Db, scope: Scope, evidenc
     ? [...new Set([...saved.commentIds.filter((id): id is string => typeof id === "string"), ...evidence.commentIds])] : evidence.commentIds;
   const consumed = new Set(ids), now = new Date();
   for (const wake of wakes) {
+    const interactionId = queuedInteractionId(wake.payload);
+    if (interactionId && consumed.has(interactionId)) {
+      await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: now, updatedAt: now })
+        .where(eq(agentWakeupRequests.id, wake.id));
+      continue;
+    }
     const pending = queuedCommentIdsFromWakePayload(wake.payload), remaining = pending.filter(id => !consumed.has(id));
     if (remaining.length === pending.length) continue;
     await tx.update(agentWakeupRequests).set({ ...(remaining.length
@@ -94,25 +98,45 @@ export async function settleContinuousSessionInput(tx: Db, scope: Scope, evidenc
  * unanswered person input can authorize its automatic failure continuation. */
 export async function answeredContinuousHeldRun(db: Db, scope: Scope): Promise<boolean> {
   const [row] = await db.select({ run: heartbeatRuns, config: agents.adapterConfig }).from(heartbeatRuns)
-    .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId)).where(and(
-      eq(heartbeatRuns.id, scope.runId), eq(heartbeatRuns.companyId, scope.companyId), eq(heartbeatRuns.nativeIssueId, scope.issueId)));
+    .innerJoin(agents, and(eq(agents.id, heartbeatRuns.agentId), eq(agents.companyId, scope.companyId))).where(and(
+      eq(heartbeatRuns.id, scope.runId), eq(heartbeatRuns.companyId, scope.companyId), eq(heartbeatRuns.nativeIssueId, scope.issueId),
+      scope.agentId ? eq(heartbeatRuns.agentId, scope.agentId) : undefined));
   if (!row || row.run.runtimeMode !== "native" || row.config.provider !== "pi_rpc" ||
       resolveSessionContinuity("pi_rpc", row.config.sessionContinuity) !== "continuous") return false;
-  const result = parseObject(row.run.resultJson), replies = Object.values(parseObject(result.continuousReplies));
-  if (!replies.length) return false;
-  const answered = new Set(replies.flatMap(reply => {
-    const ids = parseObject(reply).questionCommentIds;
-    return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : [];
-  }));
-  const returned = parseObject(result.personStop).returned;
-  if (Array.isArray(returned)) for (const id of returned) if (typeof id === "string") answered.add(id);
+  const result = parseObject(row.run.resultJson);
+  if (!Object.keys(parseObject(result.continuousReplies)).length) return false;
+  // An ordinary successor may have answered between recovery delivery and
+  // admission. Inventory durable input, then subtract attributable answers or
+  // explicit returns across this assignee's runs, never transport statuses.
+  const runs = await db.select({ result: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, scope.companyId), eq(heartbeatRuns.agentId, row.run.agentId),
+    or(eq(heartbeatRuns.nativeIssueId, scope.issueId), eq(heartbeatRuns.issueId, scope.issueId),
+      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${scope.issueId}`)));
+  const answered = new Set<string>();
+  for (const source of runs) {
+    const saved = parseObject(source.result);
+    for (const reply of Object.values(parseObject(saved.continuousReplies))) {
+      const ids = parseObject(reply).questionCommentIds;
+      if (Array.isArray(ids)) for (const id of ids) if (typeof id === "string") answered.add(id);
+    }
+    const returned = parseObject(saved.personStop).returned;
+    if (Array.isArray(returned)) for (const id of returned) if (typeof id === "string") answered.add(id);
+  }
+  const comments = await db.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, scope.companyId), eq(issueComments.issueId, scope.issueId), isNull(issueComments.deletedAt),
+    or(eq(issueComments.authorType, "user"), sql`${issueComments.authorUserId} IS NOT NULL`)));
+  const interactions = await unansweredResolvedInteractionIds(db, {
+    companyId: scope.companyId, issueId: scope.issueId, agentId: row.run.agentId,
+  });
   const context = row.run.contextSnapshot;
   const pending = new Set([
+    ...comments.map(comment => comment.id), ...interactions,
     ...queuedCommentIdsFromRunContext(context),
     ...(typeof context?.wakeCommentId === "string" ? [context.wakeCommentId] : []),
     ...(Array.isArray(context?.wakeCommentIds) ? context.wakeCommentIds : []),
     ...Object.keys(parseObject(result.queuedSteeringAcknowledgements)),
     ...(Array.isArray(parseObject(context?.firstTurnQueuedInput).commentIds) ? parseObject(context?.firstTurnQueuedInput).commentIds as string[] : []),
+    ...(Array.isArray(parseObject(context?.firstTurnQueuedInput).interactionIds) ? parseObject(context?.firstTurnQueuedInput).interactionIds as string[] : []),
     ...(Array.isArray(parseObject(result.continuedSessionInput).commentIds) ? parseObject(result.continuedSessionInput).commentIds as string[] : []),
   ]);
   const wakes = await db.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
@@ -123,7 +147,8 @@ export async function answeredContinuousHeldRun(db: Db, scope: Scope): Promise<b
     // Card/question responses are distinct input, never settled by a comment
     // attribution. Keep ordinary failure arbitration while their wake is pending.
     const payload = parseObject(wake.payload), wakeContext = parseObject(payload._paperclipWakeContext);
-    if (payload.interactionId || wakeContext.interactionId) return false;
+    const interactionId = payload.interactionId ?? wakeContext.interactionId;
+    if (typeof interactionId === "string") pending.add(interactionId);
     for (const id of queuedCommentIdsFromWakePayload(wake.payload)) pending.add(id);
   }
   const [response] = await db.select({ id: issueQuestionResponseDeliveries.id }).from(issueQuestionResponseDeliveries).where(and(
