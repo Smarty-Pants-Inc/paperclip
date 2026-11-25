@@ -1034,6 +1034,21 @@ it("reopens Copilot with the current registered files after collecting the previ
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+it.each(["local", "ssh"])("refreshes continuous Pi instructions on %s rotation without changing the pinned profile", target => {
+  const identity = { runnerInstanceId: "runner", environmentLeaseId: "lease", runId: "next-run", normalizedSessionId: "session", turnId: "turn", itemId: "item" };
+  const prior = assignedRuntimeContext("/old/skills", "/old/instructions");
+  const current = assignedRuntimeContext("/new/skills", "/new/instructions");
+  const remote = target === "ssh" ? assignedRuntimeContext("/guest/skills", "/guest/instructions") : current;
+  const provider = { kind: "pi_rpc", instructions: composeNativeSystemInstructions(prior, "Old instruction bytes"), runtimeContext: prior,
+    command: "/pinned/node", args: ["/pinned/proxy.cjs"], model: "pinned-model" };
+  const payload = runnerdRecoveryInternals.rotatedRunAttachPayload({ runAttachTemplate: { provider } }, identity, null, undefined,
+    remote, { text: composeNativeSystemInstructions(current, "End every reply with BANANA."), context: current }, true);
+  expect(payload.provider).toEqual({ ...provider, instructions: composeNativeSystemInstructions(remote, "End every reply with BANANA.") });
+  expect(provider.instructions).toContain("Old instruction bytes");
+  expect(runnerdRecoveryInternals.rotatedRunAttachPayload({ runAttachTemplate: { provider } }, identity, null, undefined,
+    remote, { text: "New instructions", context: null }).provider).toEqual(provider);
+});
+
 it("refreshes Cloud instructions on cold rotation without replacing the pinned launch profile", () => {
   const identity = { runnerInstanceId: "runner", environmentLeaseId: "lease", runId: "next-run", normalizedSessionId: "session", turnId: "turn", itemId: "item" };
   const provider = { kind: "cursor_cloud", provider: "cursor_cloud", instructions: "Prior instructions.", command: "/pinned/node", args: ["/pinned/proxy.cjs"], model: "pinned-model", conversationMode: "task" };
@@ -3778,6 +3793,34 @@ it.each(["installed", "explicit"] as const)("records the selected %s Codex comma
     await rm(root, { recursive: true, force: true });
   }
 });
+
+it.each([true, false])("applies current Pi instructions through local cold rotation only when continuous=%s", async continuous => {
+  const root = await mkdtemp(join(tmpdir(), "pi-local-instruction-refresh-"));
+  const proxy = join(root, "provider-proxy"), requests = join(root, "requests.jsonl");
+  const args = [fakeCodex, ...fakeCodexArgs(root, "--request-log", requests)];
+  await writeFile(proxy, `#!/bin/sh\nexec ${args.map(arg => `'${arg.replaceAll("'", "'\\''")}'`).join(" ")}\n`, { mode: 0o700 });
+  const create = (runId: string, baseInstructions?: string) => createCapabilityRunnerdCodexTransport({
+    provider: "pi_rpc", piProxyPath: proxy, stateDirectory: root, sourceCodexHome: "", baseInstructions,
+    environment: continuous ? { PAPERCLIP_PI_CONTINUOUS: "1" } : {},
+    prpIdentity: { runnerInstanceId: "runner", environmentLeaseId: "lease", runId, normalizedSessionId: "session", turnId: "turn", itemId: "item" },
+  });
+  const first = create("prior-run");
+  try {
+    const opened = await first.transport.request("thread/start", { cwd: root, model: "provider/model", baseInstructions: "Original instructions.", dynamicTools: codexSemanticToolSpecs() });
+    await first.transport.close();
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const next = create("next-run", "End every reply with BANANA.");
+      try {
+        await next.transport.request("thread/read", { threadId: (opened.thread as { id: string }).id });
+        const state = JSON.parse(await readFile(join(root, "runner/codex-provider-state.json"), "utf8"));
+        const expected = continuous ? "End every reply with BANANA." : "Original instructions.";
+        expect(state.config.instructions).toBe(expected);
+        const frames = (await readFile(requests, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+        expect(frames.findLast(frame => frame.method === "thread/resume").params.baseInstructions).toContain(expected);
+      } finally { await next.transport.close(); }
+    }
+  } finally { await first.transport.close(); await rm(root, { recursive: true, force: true }); }
+}, 60_000);
 
 it.each(["reuse", "large-instructions", "rotated-recovery", "removed-context", "omitted-context", "close-attachment", "timeout-attachment", "pi-current-instructions", "pi-stock-current-instructions", "codex-current-instructions"] as const)("runs an environment-prepared descriptor without Core filesystem preparation (%s)", async mode => {
   const provider = mode.startsWith("pi-") ? "pi_rpc" : "codex";
