@@ -75,6 +75,7 @@ import {
   assembleThreadItems,
   attachSettledTurns,
   buildTurnSummary,
+  buildTurnTimelineRows,
   coalesceSettledTurns,
   isTerminalRunStatus,
   embedPlanDocumentAtWriteBoundary,
@@ -1840,7 +1841,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // heavy assembly memo doesn't recompute on every parent render.
   const hasBrief = Boolean(issueBrief);
 
-  const { items, settledRunIds, settledReplyRunIds, runnerSegmentsById } = useMemo(() => {
+  const { items, settledRunIds, settledReplyRunIds, emptyStoppedRunIds, runnerSegmentsById } = useMemo(() => {
     // A native segment owns the same renderer in the chronological body while
     // streaming, after a steering bubble, and after persistence. No tail handoff.
     const runnerSegmentsById = new Map<string, ComponentProps<typeof TaskChatRunnerTurn> & { emptyContinuation: boolean }>();
@@ -1850,6 +1851,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     // double-rendering beside its own settled turn.
     const settledRunIds = new Set<string>();
     const settledReplyRunIds = new Set<string>();
+    const emptyStoppedRunIds = new Set<string>();
     const sourceRunByItemId = new Map<string, string>();
     const commentsById = new Map(projectedComments.map(comment => [comment.id, comment]));
     for (const { item } of orderedEntries) {
@@ -1907,12 +1909,22 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         agentName: meta.agentName || agentMap?.get(meta.agentId)?.name,
       } : undefined, currentUserId, userLabelMap);
       const historical = statusRelevance.isHistoricalRun(source.id);
-      const returned = (meta?.resultJson?.personStop as { returned?: unknown } | undefined)?.returned;
-      const stoppedRequest = requestCommentByRun.get(source.id);
-      // An empty turn whose request went back to the composer has no Stopped block.
-      if (isUserStop(source.id) && entries.length === 0 && !lastCommentIdByRun.has(source.id) &&
-          Array.isArray(returned) && returned.length > 0 && (!stoppedRequest || returned.includes(stoppedRequest))) {
+      const acceptedSummary = acceptedSemanticResultSummary(meta?.resultJson);
+      const parsedSource = transcriptToTaskChatItems(entries, {
+        runId: source.id,
+        agentName: meta?.agentName,
+        running: false,
+      });
+      // Stop receipts are not output. Decide from display rows at the first
+      // terminal frame, not the later receipt returning the request to the box.
+      if (isUserStop(source.id) &&
+          (isTerminalRunStatus(source.status) || entries.some(entry => entry.kind === "run_terminal")) &&
+          !lastCommentIdByRun.has(source.id) &&
+          !(source.id === planDocumentSourceRunId && planTurnItem) &&
+          buildTurnTimelineRows(paperclipRunnerTimelineItems(parsedSource), false).length === 0 &&
+          !paperclipRunnerFinalResponse(parsedSource, { runId: source.id, fallbackSummary: acceptedSummary })) {
         settledRunIds.add(source.id);
+        emptyStoppedRunIds.add(source.id);
         continue;
       }
       // A workspace admission attempt never started provider work. Its live
@@ -1973,12 +1985,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       for (const marker of compactionMarkers) {
         entriesWithFailures.push({ id: marker.id, ms: toMs(marker.createdAtIso), order: 3, item: marker });
       }
-      const acceptedSummary = acceptedSemanticResultSummary(meta?.resultJson);
-      const parsedSource = transcriptToTaskChatItems(entries, {
-        runId: source.id,
-        agentName: meta?.agentName,
-        running: false,
-      });
       // A run that posted a card yielded to that card. Its wake summary
       // describes the wait, not an answer, so it never becomes the turn's
       // reply, even after the card is answered.
@@ -2685,6 +2691,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       ),
       settledRunIds,
       settledReplyRunIds,
+      emptyStoppedRunIds,
       runnerSegmentsById,
     };
   }, [
@@ -2848,13 +2855,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     toMs(linkedRunMetaById.get(tailRunId ?? "")?.startedAt ?? tailRunSource?.createdAt), tailTimelineAnchors,
     continuousReplyPlacements.get(tailRunId ?? "")?.byItem);
   const tailSegment = tailSegments[tailSegments.length - 1]!;
-  const tailReturned = (linkedRunMetaById.get(tailRunId ?? "")?.resultJson?.personStop as { returned?: unknown } | undefined)?.returned;
-  const tailRequest = requestCommentByRun.get(tailRunId ?? "");
   const tailSegmentSettled = (paperclipRunnerTail && threadItems.some(item =>
     item.kind === "turn" && item.id === `${tailRunId}:turn:${tailSegments.length - 1}`)) ||
-    (Boolean(tailRunId) && isUserStop(tailRunId!) && Array.isArray(tailReturned) && tailReturned.length > 0 &&
-      (!tailRequest || tailReturned.includes(tailRequest)) && !lastCommentIdByRun.has(tailRunId!) &&
-      (transcriptByRun.get(tailRunId!)?.length ?? 0) === 0);
+    emptyStoppedRunIds.has(tailRunId ?? "");
   const tailEntries = paperclipRunnerTail ? tailSegment.entries : (tailRunId ? (transcriptByRun.get(tailRunId) ?? []) : []);
   const tailContinued = paperclipRunnerTail && tailTimelineAnchors.length > 0 &&
     !tailSegments[tailSegments.length - 2]?.entries.some(entry => entry.kind === "assistant" && entry.channel === "final" && !entry.delta);
