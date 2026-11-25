@@ -2400,6 +2400,18 @@ export function agentRoutes(
     };
   }
 
+  function applyPiRpcCreateDefaults(
+    adapterType: string | null | undefined,
+    adapterConfig: Record<string, unknown> = {},
+  ): Record<string, unknown> {
+    if (adapterType !== "paperclip_runner" || adapterConfig.provider !== "pi_rpc") return adapterConfig;
+    return {
+      ...adapterConfig,
+      piRpcThinkingLevel: adapterConfig.piRpcThinkingLevel === undefined ? "medium" : adapterConfig.piRpcThinkingLevel,
+      model: adapterConfig.model === undefined ? "paperclip/claude-opus-5-5" : adapterConfig.model,
+    };
+  }
+
   function applyCreateDefaultsByAdapterType(
     adapterType: string | null | undefined,
     adapterConfig: Record<string, unknown>,
@@ -4604,6 +4616,9 @@ export function agentRoutes(
     let configurationWarnings: AgentConfigurationWarning[] = [];
     Object.assign(hireInput, await resolveNewAgentRunnerForCompany(db, companyId, { ...hireInput, runner: hireRunner,
       onConfigurationWarnings: warnings => { configurationWarnings = warnings; } }));
+    if (inheritRuntimeFrom !== "caller") {
+      hireInput.adapterConfig = applyPiRpcCreateDefaults(hireInput.adapterType, hireInput.adapterConfig);
+    }
     hireInput.adapterType = await assertSelectableAdapterType(hireInput.adapterType, hireInput.adapterConfig, companyId);
     const rawHireAdapterConfig = (hireInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertProviderTraceSettingTransition(req, hireInput.runtimeConfig);
@@ -4936,6 +4951,7 @@ export function agentRoutes(
     let configurationWarnings: AgentConfigurationWarning[] = [];
     Object.assign(createInput, await resolveNewAgentRunnerForCompany(db, companyId, { ...createInput, runner: createRunner, setupOnly: Boolean(setupId),
       onConfigurationWarnings: warnings => { configurationWarnings = warnings; } }));
+    createInput.adapterConfig = applyPiRpcCreateDefaults(createInput.adapterType, createInput.adapterConfig);
     createInput.adapterType = await assertSelectableAdapterType(createInput.adapterType, createInput.adapterConfig, companyId);
     const rawCreateAdapterConfig = (createInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertProviderTraceSettingTransition(req, createInput.runtimeConfig);

@@ -512,6 +512,33 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     expect(Object.keys(childEnvOf(res))).toHaveLength(0);
   });
 
+  it.each([
+    { name: "agent hire stores medium when level is omitted", board: false, requestedLevel: undefined, requestedModel: "openai-codex/gpt-5.6", expectedLevel: "medium" },
+    { name: "person create stores medium when level is omitted", board: true, requestedLevel: undefined, requestedModel: "openai-codex/gpt-5.6", expectedLevel: "medium" },
+    { name: "keeps a named level", board: false, requestedLevel: "low", requestedModel: "openai-codex/gpt-5.6", expectedLevel: "low" },
+    { name: "stores Opus 5.5 when model is omitted", board: false, requestedLevel: "high", requestedModel: undefined, expectedLevel: "high" },
+    { name: "keeps a named model", board: true, requestedLevel: "off", requestedModel: "openai-codex/gpt-5.6", expectedLevel: "off" },
+  ])("pi_rpc create defaults: $name", async ({ board, requestedLevel, requestedModel, expectedLevel }) => {
+    const companyId = await seedCompany();
+    const parent = await seedParentAgent(companyId, "paperclip_runner", {});
+    await db.update(agents).set({ adapterConfig: {
+      provider: "pi_rpc", model: "openai-codex/gpt-5.6", piRpcThinkingLevel: "xhigh",
+    } }).where(eq(agents.id, parent.id));
+    const actor = board ? userActor() : agentActor(companyId, parent.id);
+    const res = await request(createApp(db, actor))
+      .post(`/api/companies/${companyId}/${board ? "agents" : "agent-hires"}`).send({
+        name: "Pi Child", role: "engineer", adapterType: "paperclip_runner",
+        adapterConfig: { provider: "pi_rpc", ...(requestedModel ? { model: requestedModel } : {}),
+          ...(requestedLevel ? { piRpcThinkingLevel: requestedLevel } : {}) },
+      });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const childId = board ? res.body.id : res.body.agent.id;
+    const [child] = await db.select().from(agents).where(eq(agents.id, childId));
+    const expected = { piRpcThinkingLevel: expectedLevel, model: requestedModel ?? "paperclip/claude-opus-5-5" };
+    expect(child!.adapterConfig).toMatchObject(expected);
+    expect((board ? res.body : res.body.agent).adapterConfig).toMatchObject(expected);
+  });
+
   it("rejects native runtime inheritance for a board actor", async () => {
     const companyId = await seedCompany();
     const parent = await seedParentAgent(companyId, "paperclip_runner", {});
