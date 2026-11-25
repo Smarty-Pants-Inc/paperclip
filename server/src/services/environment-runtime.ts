@@ -1131,6 +1131,13 @@ async function waitForSettlingReusableLease(db: Db, input: {
   }
 }
 
+async function resumeLeaseLastRun(db: Db, lease: Pick<EnvironmentLease, "companyId" | "heartbeatRunId">) {
+  if (!lease.heartbeatRunId) return null;
+  const [run] = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, finishedAt: heartbeatRuns.finishedAt })
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, lease.heartbeatRunId), eq(heartbeatRuns.companyId, lease.companyId))).limit(1);
+  return run ? { id: run.id, status: run.status, finishedAt: run.finishedAt?.toISOString() ?? null } : null;
+}
+
 function reusableLeaseCanBeResumed(input: {
   lease: Pick<EnvironmentLease, "status" | "heartbeatRunId" | "metadata">;
   heartbeatRunId: string | null;
@@ -1910,6 +1917,7 @@ function createSandboxEnvironmentDriver(
             let retryDelayMs = RESUME_RETRY_FIRST_DELAY_MS;
             let idleStartWaitExtended = false;
             let everyResumeTimedOut = true;
+            const lastRun = await resumeLeaseLastRun(db, reusableLease);
             let resumed: PluginEnvironmentLease;
             while (true) {
               try {
@@ -1924,6 +1932,8 @@ function createSandboxEnvironmentDriver(
                     config: workerConfig,
                     providerLeaseId: reusableLease.providerLeaseId,
                     leaseMetadata: reusableLease.metadata ?? undefined,
+                    leaseStatus: reusableLease.status,
+                    lastRun,
                   },
                   Math.min(
                     configuredResumeTimeoutMs,
@@ -2780,6 +2790,8 @@ function createSandboxEnvironmentDriver(
         driverKey: providerKey, companyId: input.lease.companyId, environmentId: input.environment.id,
         issueId: input.lease.issueId, config, providerLeaseId: input.lease.providerLeaseId,
         leaseMetadata: input.lease.metadata ?? undefined,
+        leaseStatus: input.lease.status,
+        lastRun: await resumeLeaseLastRun(db, input.lease),
         ...(input.requestedCwd !== undefined ? { requestedCwd: input.requestedCwd } : {}),
       }, Math.min(resolvePluginSandboxRpcTimeoutMs(config) ?? 60_000, input.timeoutMs ?? Number.POSITIVE_INFINITY));
       if (resumed?.providerLeaseId !== input.lease.providerLeaseId) {
