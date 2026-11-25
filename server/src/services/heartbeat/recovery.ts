@@ -514,7 +514,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     abort?: AbortSignal,
   ) {
     enterShutdown();
-    const idleSessions = await closeIdleWarmNativeSessionsForRestart();
+    const idleSessions = await closeIdleWarmNativeSessionsForRestart({ abort });
     if (idleSessions.failed > 0) {
       logger.warn({ idleSessions }, "idle native session cleanup failed before controller shutdown");
     }
