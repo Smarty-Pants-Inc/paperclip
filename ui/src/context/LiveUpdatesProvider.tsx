@@ -43,10 +43,11 @@ import type {
   LiveEvent,
 } from "@paperclipai/shared";
 import type { RunForIssue } from "../api/activity";
-import type { ActiveRunForIssue, LiveRunForIssue } from "../api/heartbeats";
+import { heartbeatsApi, type ActiveRunForIssue, type LiveRunForIssue } from "../api/heartbeats";
 import type { CompanyUserDirectoryResponse } from "../api/access";
 import type { CaseDetail, IssueCaseLink } from "../api/cases";
 import { issuesApi } from "../api/issues";
+import { detachInflightGet } from "../api/client";
 import { authApi } from "../api/auth";
 import type { CompanyListResult } from "../api/companies-query";
 import { healthApi } from "../api/health";
@@ -1235,7 +1236,9 @@ function buildActivityToast(
     };
   }
 
-  const changeDesc = describeIssueUpdate(details);
+  // System admission/retry puts work back on the queue; keep other changes audible.
+  const changeDesc = describeIssueUpdate(actorType === "system" && action === "issue.updated" && details?.status === "todo"
+    ? { ...details, status: undefined, reopened: false } : details);
   if (action === "issue.updated") {
     if (details?.source === "comment" || !changeDesc) return null;
     return {
@@ -2205,7 +2208,21 @@ function handleLiveEvent(
     if (event.type === "heartbeat.run.status") {
       const toast = buildRunStatusToast(payload, nameOf);
       if (toast && event.toastEligible === true && !suppressRunToast) {
-        gatedPushToast(gate, pushToast, "run-status", toast);
+        const notify = () => gatedPushToast(gate, pushToast, "run-status", toast);
+        if (payload.status === "failed" || payload.status === "timed_out") {
+          // Status events precede retry projection and carry no retry linkage.
+          // Read the existing execution projection, not retryOf on this attempt:
+          // a final failed retry still needs its own notification.
+          detachInflightGet(`/heartbeat-runs/${readString(payload.runId)!}`);
+          void heartbeatsApi.get(readString(payload.runId)!).then((run) => {
+            if (!["failed", "timed_out"].includes(run.status)) return;
+            if (run.execution?.successorRunId || run.execution?.phase === "retry_scheduled" ||
+              (!run.retryExhaustedReason && run.execution?.phase === "reconnecting" && run.execution.recoveryOwner === "agent")) return;
+            notify();
+          }, notify);
+        } else {
+          notify();
+        }
       }
     }
     return;
@@ -2611,7 +2628,10 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
             liveCompanyId,
             pathnameRef.current,
             parsed,
-            pushToast,
+            (toast) => !closed && socket === nextSocket && getPageVisibility().visible &&
+              !(parsed.type === "heartbeat.run.status" &&
+                shouldSuppressRunStatusToastForVisibleIssue(coalescingClient, pathnameRef.current, parsed.payload ?? {}))
+              ? pushToast(toast) : null,
             gateRef.current,
             {
               userId: currentActorRef.current.userId,
