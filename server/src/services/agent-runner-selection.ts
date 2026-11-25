@@ -124,7 +124,7 @@ function resolvePiRunnerConfig(config: Record<string, unknown>): Record<string, 
 }
 
 function resolveNativePiRunnerConfig(config: Record<string, unknown>, setupOnly?: boolean): Record<string, unknown> {
-  const unsupported = ["extraArgs", "args", "modelReasoningEffort", "reasoningEffort", "effort"]
+  const unsupported = ["extraArgs", "args"]
     .filter(key => config[key] !== undefined && config[key] !== "" && !(Array.isArray(config[key]) && config[key].length === 0));
   if (config.command && config.command !== "pi") unsupported.push("command");
   if (config.model !== undefined && typeof config.model !== "string") unsupported.push("model");
