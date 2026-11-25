@@ -276,10 +276,10 @@ export function projectPaperclipRunnerTaskConfig(
   return config;
 }
 
-// doc/runner-internals.md: native Pi defaults to low thinking.
+// Native Pi deliberately defaults to medium thinking when no level is set.
 export function piRpcThinking(config: Record<string, unknown>): unknown {
-  const effort = config.modelReasoningEffort ?? config.reasoningEffort ?? config.effort ?? "low";
-  return config.piRpcThinkingLevel !== undefined ? config.piRpcThinkingLevel : effort === "auto" ? "low" : effort === "none" ? "off" : effort;
+  const effort = config.modelReasoningEffort ?? config.reasoningEffort ?? config.effort ?? "medium";
+  return config.piRpcThinkingLevel !== undefined ? config.piRpcThinkingLevel : effort === "auto" ? "medium" : effort === "none" ? "off" : effort;
 }
 
 function positiveNumberOrNull(
