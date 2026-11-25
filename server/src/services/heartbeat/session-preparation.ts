@@ -180,6 +180,14 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
       ...(importedManagedInstructions ? [{ ...sessionConfigMetadataInput, ...candidate, retainManagedInstructionPaths: true }] : []),
     ]));
   }
+  const continuousPi = runtimeConfig.provider === "pi_rpc" &&
+    resolveSessionContinuity(runtimeConfig.provider, runtimeConfig.sessionContinuity) === "continuous";
+  if (storedFingerprintDiffers && agent.adapterType === "paperclip_runner" && continuousPi) {
+    // Older fingerprints retained the chip's model and level in issue overrides.
+    compatibleInputs.push(...[sessionConfigMetadataInput, ...compatibleInputs].map(candidate => ({
+      ...candidate, retainIssueOverrideModelKeys: true,
+    })));
+  }
   const legacyInputs = storedFingerprintDiffers
     ? [sessionConfigMetadataInput, ...compatibleInputs].map(candidate => ({ ...candidate, legacyComposition: true }))
     : [];
@@ -206,8 +214,6 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
     preserveLegacySessionWithoutConfigMetadata:
       acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision && !agentIdentity,
   });
-  const continuousPi = runtimeConfig.provider === "pi_rpc" &&
-    resolveSessionContinuity(runtimeConfig.provider, runtimeConfig.sessionContinuity) === "continuous";
   // Only instruction content and pack/environment configuration may advance.
   // Missing/versioned metadata and mixed changes still require stock reset.
   const continuableConfigChange = continuousPi && sessionConfigFreshness.changedCategories.length > 0 &&
