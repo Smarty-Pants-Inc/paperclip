@@ -1214,8 +1214,7 @@ async function retryQuarantinedSessionCleanups(
     );
   }
 }
-// A preview-only final from an older runner still proves provider output.
-// Observe before append: losing its projection must never authorize prompt replay.
+// A preview-only final from an older runner still fences held-input replay.
 function isProviderOutput(event: PrpEvent): boolean {
   const payload = event.payload;
   // Canonical tool rows can be the only evidence of an executed command or
@@ -1269,7 +1268,6 @@ async function consumeTurn(
   providerTurnWaitOptions?: ProviderTurnWaitOptions,
   resumedProviderTurnWait?: PrpEvent,
   checkpointProviderTurn?: (signal: AbortSignal, sourceSeq: number) => Promise<unknown>,
-  onProviderOutput?: () => void,
 ) {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const providerTurnWait = createProviderTurnWait({
@@ -1510,7 +1508,6 @@ async function consumeTurn(
         );
       }
       const event = next.value;
-      if (isProviderOutput(event)) onProviderOutput?.();
       const payload = event.payload as Record<string, unknown>;
       const settlingRequestId =
         [
@@ -3087,7 +3084,6 @@ export async function executeNativeSession(
     let settleStartupDecision: () => void = () => undefined;
     const startupDecision = new Promise<void>(resolve => { settleStartupDecision = resolve; });
     let continuationDispositionRequested = false;
-    let providerOutputObserved = false;
     // The consumer may already be running when a continuation starts, and the
     // continuation can complete before its start checkpoint settles. A
     // terminal waits for this setup so it neither misses the borrowed turn nor
@@ -3122,7 +3118,6 @@ export async function executeNativeSession(
       if (snapshot.semanticResult || snapshot.activeTurnId || snapshot.goal || snapshot.pendingRuntimeRequests?.length ||
           snapshot.dispositionOnlyRecoveryConsumed !== false ||
           !snapshot.terminalTurns?.some(terminal => terminal.turnId === borrowedContinuationTurnId)) return false;
-      if (providerOutputObserved) throw providerOutputWithoutResult();
       continuationDispositionRequested = true;
       await persistCheckpoint(snapshot, signal);
       signal.throwIfAborted();
@@ -3382,7 +3377,6 @@ export async function executeNativeSession(
               options.providerTurnWait,
               resumedProviderTurnWait,
               checkpoint,
-              () => { providerOutputObserved = true; },
             )
           : Promise.resolve({
               event: recoveryTerminal,
@@ -3409,10 +3403,10 @@ export async function executeNativeSession(
             !conversationTerminal &&
             !dispositionRecoveryStillOwned &&
             !resumedProviderTurnWait));
-        // Durable same-run finals above take precedence over resultless-output
-        // protection. Only reject output when recovery would submit a new turn;
-        // an empty provider history still follows normal no-output recovery.
-        if (recovered && shouldStartFreshTurn && !options.sessionCompaction
+        // Our held Pi path re-submits the person's input, unlike stock's
+        // disposition-only task recovery. Fence only that original-input replay;
+        // durable same-run finals above still settle without a new turn.
+        if (isNativePiConversation(input) && recovered && shouldStartFreshTurn && !options.sessionCompaction
           && await replayHasProviderOutput(options.controlPlane, input.binding.runId, options.runnerInstanceId)) {
           throw providerOutputWithoutResult();
         }
@@ -3645,9 +3639,6 @@ export async function executeNativeSession(
           completed = settledCompletion;
         }
         if (settledCompletion === null) {
-          if (providerOutputObserved || await replayHasProviderOutput(options.controlPlane, input.binding.runId, options.runnerInstanceId)) {
-            throw providerOutputWithoutResult();
-          }
           throw new Error(
             "native_finalization_missing: session returned no semantic result",
           );
