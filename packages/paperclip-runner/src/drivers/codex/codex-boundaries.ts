@@ -364,6 +364,8 @@ export function codexToolAcceptsResult(
 export function redactCodexValue(value: unknown, depth = 0): unknown {
   if (depth > 8) return "[TRUNCATED]";
   if (typeof value === "string") return redactCodexDiagnostic(value);
+  // Preserve JSON scalar types and absent optional fields in semantic envelopes.
+  if (typeof value !== "object" || value === null) return value;
   if (Array.isArray(value)) {
     return value
       .slice(0, 128)
