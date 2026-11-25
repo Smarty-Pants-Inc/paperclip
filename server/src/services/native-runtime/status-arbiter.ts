@@ -338,7 +338,7 @@ export function arbitrateNativeStatus(input: {
       policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
       statusAction: "preserve", toStatus: input.priorIssueStatus,
       reasonCode: "continuous_held_input_already_answered", unblockDescriptor: null,
-      effects: [{ kind: "release_run_resources" }],
+      effects: [{ kind: "release_run_resources" }, { kind: "release_checkout" }],
     };
   }
   if (input.providerModelRejected && input.terminalState === "failed" &&

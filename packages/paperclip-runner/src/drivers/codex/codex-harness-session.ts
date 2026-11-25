@@ -1,4 +1,4 @@
-import { readCodexThreadState, readCodexTurnMetadata, readCodexTurnItems, readCodexUserMessages } from "./codex-history.js";
+import { readCodexThreadState, readCodexTurnMetadata, readCodexTurnItems, readCodexUserMessages, readCodexUserInputIds } from "./codex-history.js";
 import type { DurableRecoveryIdentity } from "../../contracts/durable-recovery.js";
 import { codexRunUsage, codexUsageBaselineForNextRun, observeCodexUsage } from "./codex-usage-baseline.js";
 import { randomUUID } from "node:crypto";
@@ -920,6 +920,10 @@ export class CodexHarnessSession
 
   async readUserMessages(): Promise<string[] | null> {
     return readCodexUserMessages(this.transport, this.opened.threadId);
+  }
+
+  async readUserInputIds(): Promise<string[] | null> {
+    return readCodexUserInputIds(this.transport, this.opened.threadId);
   }
 
   async usage(): Promise<Record<string, unknown> | null> {
