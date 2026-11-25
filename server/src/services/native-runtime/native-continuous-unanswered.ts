@@ -35,10 +35,16 @@ export async function requeueContinuousUnanswered(db: Db, scope: { id: string; c
     // A comment a person's Stop handed back to the input box is the person's to send again, never the next run's.
     const returned = parseObject(result.personStop).returned;
     if (Array.isArray(returned)) for (const id of returned) answered.add(id);
-    const ids = Object.entries(parseObject(result.queuedSteeringAcknowledgements))
-      .filter(([id, receipt]) => !answered.has(id) && parseObject(receipt).status === "acknowledged")
-      .sort((a, b) => String(parseObject(a[1]).acknowledgedAt).localeCompare(String(parseObject(b[1]).acknowledgedAt)))
-      .map(([id]) => id);
+    const inherited = parseObject(result.continuedSessionInput);
+    const inheritedIds = inherited.runId === row.run.id && inherited.sessionId === row.run.nativeSessionId && Array.isArray(inherited.commentIds)
+      ? inherited.commentIds.filter((id): id is string => typeof id === "string") : [];
+    const ids = [...new Set([
+      ...Object.entries(parseObject(result.queuedSteeringAcknowledgements))
+        .filter(([, receipt]) => parseObject(receipt).status === "acknowledged")
+        .sort((a, b) => String(parseObject(a[1]).acknowledgedAt).localeCompare(String(parseObject(b[1]).acknowledgedAt)))
+        .map(([id]) => id),
+      ...inheritedIds,
+    ])].filter(id => !answered.has(id));
     if (!ids.length) return;
     const context = withQueuedCommentIdsInRunContext({ issueId: issue.id, source: "issue.comment",
       wakeReason: "issue_commented", forceFreshSession: false,
