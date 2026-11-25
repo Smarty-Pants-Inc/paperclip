@@ -37,10 +37,20 @@ export class RunnerLaunchPreparationStore {
     return this.#read().find(entry => sameIdentity(entry.requirements.identity, identity));
   }
 
-  save(requirements: RunnerProviderLaunchRequirements, prepared: PreparedRunnerProviderLaunch, activeIdentity: DurableRecoveryIdentity): void {
+  save(requirements: RunnerProviderLaunchRequirements, prepared: PreparedRunnerProviderLaunch, activeIdentity: DurableRecoveryIdentity, refreshInstructions = false): void {
     validatePreparedRunnerLaunch(requirements, prepared);
     const entries = this.#read();
     const existing = entries.find(entry => sameIdentity(entry.requirements.identity, requirements.identity));
+    // A cold Pi attachment may refresh text, never its saved launch or policy.
+    if (existing && refreshInstructions && requirements.provider === "pi_rpc"
+      && runnerLaunchRequirementsDigest({ ...existing.requirements, instructions: requirements.instructions }) === runnerLaunchRequirementsDigest(requirements)
+      && durableRecoveryInternals.canonicalJson({ ...existing.prepared,
+        requirementsDigest: prepared.requirementsDigest,
+        provider: { ...existing.prepared.provider, instructions: prepared.provider.instructions },
+      }) === durableRecoveryInternals.canonicalJson(prepared)) {
+      existing.requirements = requirements;
+      existing.prepared = prepared;
+    }
     if (existing && (runnerLaunchRequirementsDigest(existing.requirements) !== runnerLaunchRequirementsDigest(requirements)
       || existing.prepared.configurationId !== prepared.configurationId
       || durableRecoveryInternals.canonicalJson(existing.prepared) !== durableRecoveryInternals.canonicalJson(prepared))) {

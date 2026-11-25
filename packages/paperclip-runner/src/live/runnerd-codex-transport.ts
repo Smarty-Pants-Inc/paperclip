@@ -7,7 +7,7 @@ import { resolveGrokDisableWebSearch, admittedGrokWebSearchPolicy } from "../dri
 import { PRP_COMPLETION_TOOL_NAME, PRP_COMPLETION_RESULT_BRIDGE_INPUT_SCHEMA } from "../contracts/completion-result.js";
 import { RunnerLaunchPreparationStore } from "./runner-launch-preparation-store.js";
 import type { PreparedRunnerProviderLaunch, RunnerProviderLaunchRequirements } from "./runner-provider-launch.js";
-import { preparedRunnerLaunchWorkingDirectory, validatePreparedRunnerLaunch, runnerLaunchSettingsMatch, runnerProviderLaunchRequirements, createRunnerProviderLaunch, createRunnerdCodexAppServerArgs, trustedRuntimeReadOnlyRoots } from "./runner-provider-launch.js";
+import { preparedRunnerLaunchWorkingDirectory, validatePreparedRunnerLaunch, runnerLaunchRequirementsDigest, runnerLaunchSettingsMatch, runnerProviderLaunchRequirements, createRunnerProviderLaunch, createRunnerdCodexAppServerArgs, trustedRuntimeReadOnlyRoots } from "./runner-provider-launch.js";
 export { createRunnerdCodexAppServerArgs, resolveRunnerdAcpxPermissionMode, trustedRuntimeReadOnlyRoots, withCodexCollaborationRuntimeInstructions } from "./runner-provider-launch.js";
 import { applyProviderObservabilityEnvironment, redactObservabilityDiagnostic } from "../drivers/agent-observability.js";
 import type { RunnerExecutionDriver } from "../control-plane/runner-execution-driver.js";
@@ -6285,9 +6285,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     runtimeContext: NativeRuntimeContextSnapshot | null, instructions: string,
     recovery?: PreparedRunnerProviderLaunch,
     recordedRequirements?: RunnerProviderLaunchRequirements,
+    refreshInstructions = false,
   ): Promise<PreparedRunnerProviderLaunch> {
     const prior = record(template.provider);
-    const requirements = recordedRequirements ?? runnerProviderLaunchRequirements(this.options, identity, {
+    let requirements = recordedRequirements ?? runnerProviderLaunchRequirements(this.options, identity, {
       model: prior.model, approvalPolicy: prior.approvalPolicy,
       permissions: prior.readOnly === true || record(prior.providerPolicy).readOnly === true || prior.collaborationMode === "plan"
         ? "paperclip-runner-workspace-read-only" : "paperclip-runner-workspace-only",
@@ -6299,15 +6300,27 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       throw new Error("runner_launch_recovery_requirements_unavailable");
     }
     this.#assertStartupOpen();
-    const prepared = await this.options.prepareLaunch!(requirements, recovery);
+    let prepared = await this.options.prepareLaunch!(requirements, recovery);
     validatePreparedRunnerLaunch(requirements, prepared);
+    if (refreshInstructions) {
+      // Reuse the environment's launch, not the first run's instruction text.
+      const currentInstructions = runtimeContext
+        ? retargetComposedInstructions(instructions, runtimeContext, requirements.runtimeContext) : instructions;
+      requirements = { ...requirements, instructions: currentInstructions };
+      prepared = { ...prepared, requirementsDigest: runnerLaunchRequirementsDigest(requirements),
+        provider: { ...prepared.provider, instructions: requirements.runtimeContext
+          ? retargetComposedInstructions(currentInstructions, requirements.runtimeContext,
+            prepared.provider.runtimeContext as NativeRuntimeContextSnapshot | null)
+          : currentInstructions } };
+      validatePreparedRunnerLaunch(requirements, prepared);
+    }
     this.#recordPreparedWorkingDirectory(prepared);
     this.#assertStartupOpen();
     template.provider = prepared.provider;
     const sourceLaunch = this.options.recoveryLaunch
       && recoveryIdentityMatches(identity, this.options.recoveryLaunch.requirements.identity);
     if (!sourceLaunch) {
-      new RunnerLaunchPreparationStore(this.#root).save(requirements, prepared, this.#core!.store.state.identity);
+      new RunnerLaunchPreparationStore(this.#root).save(requirements, prepared, this.#core!.store.state.identity, refreshInstructions);
       this.#core!.persistPreparedLaunchConfiguration(identity, prepared.configurationId);
     }
     return prepared;
@@ -7314,7 +7327,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           ? retargetComposedInstructions(previous.requirements.instructions, previous.requirements.runtimeContext, preparedContext)
           : previous?.requirements.instructions ?? String(record(template.provider).instructions ?? ""));
       environmentPrepared = await this.#prepareOwnedProvider(template, desiredIdentity,
-        preparedContext, preparedInstructions, saved?.prepared, saved?.requirements);
+        preparedContext, preparedInstructions, saved?.prepared, saved?.requirements,
+        rotatedAuthority && provider === "pi_rpc" && this.options.environment?.PAPERCLIP_PI_CONTINUOUS === "1"
+          && saved !== undefined && this.options.baseInstructions !== undefined
+          && this.options.baseInstructions !== saved.requirements.instructions);
       this.#runAttachTemplate = structuredClone(template);
     }
     if (rotatedAuthority || sourceAttachmentTarget) {
