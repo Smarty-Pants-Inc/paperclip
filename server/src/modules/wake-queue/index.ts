@@ -14,6 +14,7 @@ import { createQueuedCommentIssueLockWriter } from "./adapters/queued-comment-po
 import { createQueuedCommentSteeringAdapter, lockBoardQueuedComments, readBoardQueuedComments } from "./adapters/queued-comment-board-postgres.js";
 import { closeConversationResetHold } from "./adapters/queued-comment-board-postgres.js";
 export { closeConversationResetHold };
+export { steerCommittedQueuedComment } from "./adapters/automatic-comment-steering.js";
 import { logger } from "../../middleware/logger.js";
 import type { QueuedCommentQueuePostgresAdapterDeps } from "./adapters/queued-comment-postgres.js";
 import { createFreshIssueRunAdmission } from "./application/fresh-issue-run.js";
@@ -44,7 +45,7 @@ export type {
 export { createAutomaticGoalCommentSteering } from "./application/automatic-goal-comment-steering.js";
 export { WakeQueueApplicationError } from "./application/types.js";
 export { hasRetainedExternalChatRetry } from "./domain/context.js";
-export { QUEUED_MESSAGES_DELIVERED_REASON } from "./domain/policy.js";
+export { QUEUED_MESSAGES_DELIVERED_REASON, isAutomaticSteeringComment } from "./domain/policy.js";
 export type {
   IssueSnapshot,
   RunSnapshot,
