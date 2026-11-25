@@ -1303,11 +1303,14 @@ function armWarmIdleCloseRetry(sessionId: string, entry: WarmNativeSession): voi
 
 /** Detach released owners and checkpoint unreleased owners before a controller
  * exits. Active turns keep their separate authenticated restart handoff. */
-export async function closeIdleWarmNativeSessionsForRestart(): Promise<WarmNativeSessionCloseResult> {
+export async function closeIdleWarmNativeSessionsForRestart(input: {
+  abort?: AbortSignal;
+} = {}): Promise<WarmNativeSessionCloseResult> {
   return closeIdleWarmNativeSessions({
     reason: "controller restart",
     closeBusyOnRelease: true,
     detachReleased: true,
+    abort: input.abort,
   });
 }
 
@@ -1323,6 +1326,7 @@ async function closeIdleWarmNativeSessions(input: {
   reason: string;
   closeBusyOnRelease?: boolean;
   detachReleased?: boolean;
+  abort?: AbortSignal;
   canRetire?: () => boolean;
   forceStopUnsettled?: boolean;
   db?: Db;
@@ -1392,7 +1396,11 @@ async function closeIdleWarmNativeSessions(input: {
     }
   };
   const agentQueues = new Map<string, [string, WarmNativeSession][]>();
-  for (const [sessionId, entry] of [...warmNativeSessions]) {
+  // Budgeted restart admission visits recent owners first. A close already
+  // admitted is always awaited to settlement; abort only fences the next owner.
+  const owners = [...warmNativeSessions];
+  if (input.abort) owners.sort((a, b) => b[1].lastActivityAt.localeCompare(a[1].lastActivityAt));
+  for (const [sessionId, entry] of owners) {
     if (input.environmentId !== undefined && entry.environmentId !== input.environmentId) continue;
     if (input.providerLeaseId !== undefined && entry.providerLeaseId !== input.providerLeaseId) continue;
     const agentKey = `${entry.companyId}:${entry.agentId}`;
@@ -1403,7 +1411,7 @@ async function closeIdleWarmNativeSessions(input: {
   const closeAgentQueues = async () => {
     for (let queue = pendingAgents.shift(); queue; queue = pendingAgents.shift()) {
       for (const [sessionId, entry] of queue) {
-        if (stopped || (input.canRetire && !input.canRetire())) {
+        if (stopped || input.abort?.aborted || (input.canRetire && !input.canRetire())) {
           stopped = true;
           return;
         }
