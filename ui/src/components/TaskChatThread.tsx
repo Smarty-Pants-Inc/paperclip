@@ -3701,7 +3701,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     planError ||
     runs.some((run) =>
       run.runtimeMode === "native"
-        ? nativeTranscriptErrorsByRun.has(run.id)
+        ? nativeTranscriptErrorsByRun.has(run.id) && (
+            // A successful fallback is the history now shown, not a failed load.
+            !hydratedLogRunIds.has(run.id) || logErrorsByRun.has(run.id) ||
+            (logTranscriptByRun.get(run.id)?.length ?? 0) === 0
+          )
         : Boolean(logErrorsByRun?.has(run.id)),
     );
   const historyKey = conversationMode && draftKey ? draftKey : issueId;
