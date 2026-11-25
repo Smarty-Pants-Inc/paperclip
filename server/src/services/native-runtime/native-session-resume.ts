@@ -735,10 +735,12 @@ export function rebindNativeSessionCheckpoint(input: {
   } catch {
     return null;
   }
-  const workspaceChanged = !sameWorkspaceScope({ previousExecution, previousRunId: input.previousRun.id, currentExecution: current }) || previousExecution.workspace.cwd !== current.workspace.cwd;
-  const workspaceContinuation = workspaceChanged && current.provider.kind === "pi_rpc" &&
+  const localContinuousPi = current.provider.kind === "pi_rpc" &&
     resolveSessionContinuity(current.provider.kind, input.sessionContinuity) === "continuous" &&
-    (input.executionTargetKind ?? "local") === "local" &&
+    (input.executionTargetKind ?? "local") === "local";
+  const workspaceChanged = !sameWorkspaceScope({ previousExecution, previousRunId: input.previousRun.id, currentExecution: current }) ||
+    (localContinuousPi && previousExecution.workspace.cwd !== current.workspace.cwd);
+  const workspaceContinuation = workspaceChanged && localContinuousPi &&
     (!rawCheckpoint.goal || record(rawCheckpoint.goal).status === "complete");
   if (
     previousExecution.binding.runId !== input.previousRun.id ||
