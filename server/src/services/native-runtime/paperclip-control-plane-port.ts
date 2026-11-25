@@ -415,7 +415,7 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
     this.#assertActive(options);
     if (!isPrpEvent(value)) throw new Error("native_legacy_event_not_supported");
     const validated = validatePrpEvent(value);
-    if (!validated.ok) throw new Error(`native_event_schema_invalid:${validated.issues[0]?.message ?? "unknown"}`);
+    if (!validated.ok) throw new Error(`native_event_schema_invalid:${validated.issues[0]?.path ?? "/"} ${validated.issues[0]?.message ?? "unknown"} (${String((value as { eventType?: unknown }).eventType ?? "unknown")})`);
     let event = this.#identityRedactor.redact(validated.event);
     if (event.runId !== this.#binding.runId || (this.#sessionId && event.normalizedSessionId !== this.#sessionId)) {
       throw new Error("native_event_binding_mismatch");
