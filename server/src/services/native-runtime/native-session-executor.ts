@@ -386,6 +386,8 @@ import {
   carriesSettledPredecessorSession,
 } from "./native-restart-recovery.js";
 
+import { observeHeldNativeConfiguration, readHeldNativeTurnWork } from "./held-native-turn.js";
+
 type ActiveNativeSession = {
   session: NativeSession;
   cancelRequested: boolean;
@@ -394,6 +396,13 @@ type ActiveNativeSession = {
   holdActivityVersion?: number;
   holdPendingItems?: Set<string>;
   holdCloseRequested?: boolean;
+  /** Once dispatched, an interrupt's uncertain outcome must never cause a resend. */
+  holdInterruptSent?: boolean;
+  holdIdlePublicationVersion?: number;
+  /** Latched until this exact attachment reaches a genuinely idle publication. */
+  holdEndPending?: boolean;
+  holdSteeredInputs?: Map<string, { preparing: number; dispatched: boolean }>;
+  refreshHeldTurnWork?: () => Promise<boolean>;
   admissionAbort?: AbortController;
   cancellationSettled?: Promise<void>;
   restartDetach?: Promise<void>;
@@ -9853,6 +9862,11 @@ export async function getNativeSessionSteeringState(
   const active = activeNativeSessions.get(runId);
   if (!active)
     return { disposition: "temporarily_unavailable", activeTurnId: null };
+  await active.refreshHeldTurnWork?.();
+  if (active.holdEndPending || active.holdCloseRequested) {
+    reconcileHeldTurn(runId, active);
+    return { disposition: "temporarily_unavailable", activeTurnId: null };
+  }
   const capabilities = await active.session.capabilities();
   if (!capabilities.steering || !active.session.steer) {
     return { disposition: "unsupported", activeTurnId: null };
@@ -9874,6 +9888,22 @@ function clearSteeringDeliveries(runId: string) {
     if (key.startsWith(`${runId}:`)) steeringDeliveries.delete(key);
 }
 
+/** One release owner for preparation failures, definitive refusals and committed answers.
+ * Preparations sharing a correlation cannot release each other's dispatched debt. */
+function releaseHeldSteeringInput(active: ActiveNativeSession, id: string, phase: "preparation" | "delivery") {
+  const reservation = active.holdSteeredInputs?.get(id);
+  if (!reservation) return;
+  if (phase === "preparation") reservation.preparing--;
+  else reservation.dispatched = false;
+  if (!reservation.preparing && !reservation.dispatched) active.holdSteeredInputs!.delete(id);
+}
+
+function reconcileHeldTurn(runId: string, active: ActiveNativeSession) {
+  void active.refreshHeldTurnWork?.().then(() => {
+    if (activeNativeSessions.get(runId) === active && active.holdEndPending) return closeHeldNativeTurn(runId);
+  }).catch(error => logger.warn({ error, runId }, "could not reconcile held turn"));
+}
+
 /** Dispatches a true same-turn steering message and resolves only after ack. */
 export async function steerNativeSession(input: {
   runId: string;
@@ -9889,43 +9919,65 @@ export async function steerNativeSession(input: {
       "The active native session is not attached.",
     );
   }
-  if (active.holdCloseRequested) {
-    throw new NativeSessionSteeringError("steering_stale_turn", "This held turn is closing for a new session.");
+  if (active.holdEndPending || active.holdCloseRequested) {
+    throw new NativeSessionSteeringError("steering_stale_turn", "This held turn is closing. Your message stays queued for the next run.");
   }
   // Reserve work before any asynchronous capability/snapshot reads. An old
   // published final must not make a newly delivered follow-up look idle.
+  const idleBeforeReservation = active.heldIdle || (active.holdIdlePublicationVersion !== undefined &&
+    active.holdIdlePublicationVersion === active.holdActivityVersion);
   active.heldIdle = false;
   active.holdActivityVersion = (active.holdActivityVersion ?? 0) + 1;
-  const capabilities = await active.session.capabilities();
-  if (!capabilities.steering || !active.session.steer) {
-    throw new NativeSessionSteeringError(
-      "steering_unsupported",
-      "This provider does not support same-turn steering.",
-    );
-  }
-  const snapshot = await active.session.snapshot();
-  const turnId = snapshot.activeTurnId ?? null;
-  if (!turnId) {
-    throw new NativeSessionSteeringError(
-      "steering_stale_turn",
-      "The target turn is no longer active.",
-    );
-  }
-
-  const deliveryKey = `${input.runId}:${input.correlationId}`;
-  let delivery = steeringDeliveries.get(deliveryKey);
-  if (!delivery) {
-    delivery = active.session
-      .steer({
-        turnId,
-        message: { role: "user", text: input.message },
-        correlationId: input.correlationId,
-      })
-      .then(() => ({ turnId }));
-    steeringDeliveries.set(deliveryKey, delivery);
-    void delivery.catch(() => {
-      steeringDeliveries.delete(deliveryKey);
-    });
+  // Reservation bookkeeping is not provider activity; preserve the last idle
+  // certificate across overlapping preparations. Real item activity invalidates it.
+  if (idleBeforeReservation) active.holdIdlePublicationVersion = active.holdActivityVersion;
+  const reservations = active.holdSteeredInputs ??= new Map();
+  const reservation = reservations.get(input.correlationId) ?? { preparing: 0, dispatched: false };
+  reservation.preparing++;
+  reservations.set(input.correlationId, reservation);
+  const closingTurn = () => new NativeSessionSteeringError("steering_stale_turn", "This held turn is closing. Your message stays queued for the next run.");
+  // A transport failure/timeout is not proof of refusal. Unknown outcomes retain
+  // both the correlation reservation and cached delivery until attributed.
+  const rejected = (error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    return !/timeout|timed out|transport|disconnect|connection|already terminal/i.test(message)
+      && /reject|unsupported|unavailable|capability|named a stale turn|PRP command turn[.]steer failed/i.test(message);
+  };
+  let delivery: Promise<{ turnId: string }>;
+  try {
+    await active.refreshHeldTurnWork?.();
+    if (active.holdEndPending || active.holdCloseRequested) throw closingTurn();
+    const capabilities = await active.session.capabilities();
+    if (!capabilities.steering || !active.session.steer) {
+      throw new NativeSessionSteeringError("steering_unsupported", "This provider does not support same-turn steering.");
+    }
+    const snapshot = await active.session.snapshot();
+    const turnId = snapshot.activeTurnId ?? null;
+    if (!turnId) throw new NativeSessionSteeringError("steering_stale_turn", "The target turn is no longer active.");
+    // A close can commit while either provider read is awaiting; never dispatch past it.
+    await active.refreshHeldTurnWork?.();
+    if (activeNativeSessions.get(input.runId) !== active || active.holdEndPending || active.holdCloseRequested) throw closingTurn();
+    const deliveryKey = `${input.runId}:${input.correlationId}`;
+    const cached = steeringDeliveries.get(deliveryKey);
+    if (cached) delivery = cached;
+    else {
+      reservation.dispatched = true; // Protect the provider-ACK -> durable ACK gap.
+      delivery = Promise.resolve().then(() => active.session.steer!({
+        turnId, message: { role: "user", text: input.message }, correlationId: input.correlationId,
+      })).then(() => ({ turnId }));
+      steeringDeliveries.set(deliveryKey, delivery);
+      void delivery.catch(error => {
+        if (!rejected(error)) return; // An uncertain ACK still owes its answer.
+        if (steeringDeliveries.get(deliveryKey) === delivery) steeringDeliveries.delete(deliveryKey);
+        releaseHeldSteeringInput(active, input.correlationId, "delivery");
+        reconcileHeldTurn(input.runId, active);
+      });
+    }
+  } finally {
+    // Includes the first authority SELECT, capability/snapshot errors and fences:
+    // none dispatched this preparation. Recovery never needs an unrelated final.
+    releaseHeldSteeringInput(active, input.correlationId, "preparation");
+    reconcileHeldTurn(input.runId, active);
   }
   // The route still serializes queue mutations on the task until acknowledgement.
   // Reconciliation can acquire that task lock after success or a timeout; never
@@ -9953,6 +10005,7 @@ export async function steerNativeSession(input: {
   } catch (error) {
     if (error instanceof NativeSessionSteeringError) throw error;
     const message = error instanceof Error ? error.message : String(error);
+    if (!rejected(error)) throw new NativeSessionSteeringError("steering_timeout", "Steering outcome is uncertain. Your message stays queued pending acknowledgement.");
     if (/stale|terminal|active turn/i.test(message)) {
       throw new NativeSessionSteeringError(
         "steering_stale_turn",
@@ -9974,18 +10027,20 @@ export async function steerNativeSession(input: {
   }
 }
 
-/** End only an idle open-turn hold, once. No personStop/returned-input or cancel/requeue machinery. */
+/** Shared close-at-next-idle door: committed answers, not an ACK or an old final,
+ * release the hold. No personStop state or cancel/requeue machinery. */
 export async function closeHeldNativeTurn(runId: string): Promise<boolean> {
   const active = activeNativeSessions.get(runId);
-  if (!active?.heldIdle || active.cancelRequested || active.holdCloseRequested) return false;
+  if (!active || active.cancelRequested || active.holdCloseRequested) return false;
+  active.holdEndPending = true;
   active.holdCloseRequested = true;
   try {
+    const pending = await active.refreshHeldTurnWork?.();
+    if (pending || !active.heldIdle) return false;
     const outcome = await interruptNativeTurn({ runId, reason: "person_stop", onlyIfHeldIdle: true });
-    if (!outcome || outcome === "no_turn") { active.holdCloseRequested = false; return false; }
-    return true;
-  } catch (error) {
-    active.holdCloseRequested = false;
-    throw error;
+    return Boolean(outcome && outcome !== "no_turn");
+  } finally {
+    if (!active.holdInterruptSent) active.holdCloseRequested = false;
   }
 }
 
@@ -9993,13 +10048,20 @@ export async function closeHeldNativeTurn(runId: string): Promise<boolean> {
 export async function interruptNativeTurn(input: { runId: string; reason: string; timeoutMs?: number; onlyIfHeldIdle?: boolean }): Promise<{ turnId: string } | "no_turn" | null> {
   const active = activeNativeSessions.get(input.runId);
   if (!active || active.cancelRequested || !active.session.interrupt) return active ? null : "no_turn";
+  const activityVersion = active.holdActivityVersion;
   const snapshot = await active.session.snapshot();
   const turnId = snapshot.activeTurnId ?? null;
   if (!turnId) return "no_turn";
+  const pendingSteering = input.onlyIfHeldIdle && await active.refreshHeldTurnWork?.();
   // The outer PRP turn remains open during the driver's hold. Check logical
   // work again after snapshot, not merely whether that outer turn exists.
   if (input.onlyIfHeldIdle && (activeNativeSessions.get(input.runId) !== active ||
-      !active.heldIdle || active.cancelRequested || active.holdPendingItems?.size || snapshot.pendingRuntimeRequests?.length)) return "no_turn";
+      !active.heldIdle || active.holdActivityVersion !== activityVersion || pendingSteering || active.cancelRequested ||
+      active.holdPendingItems?.size || snapshot.pendingRuntimeRequests?.length)) return "no_turn";
+  if (input.onlyIfHeldIdle) {
+    if (active.holdInterruptSent) return "no_turn";
+    active.holdInterruptSent = true;
+  }
   let timeout: ReturnType<typeof setTimeout> | null = null;
   try {
     await Promise.race([
@@ -12013,10 +12075,16 @@ async function executePaperclipNativeSessionAttempt(
         }
         const activityVersion = active?.holdActivityVersion;
         const published = await publishContinuousNativeReply({ db: input.db, execution: input.execution, event, cursor });
-        if (published && active && !active.holdPendingItems?.size && activeNativeSessions.get(input.execution.binding.runId) === active &&
+        const pendingSteering = published && active ? await active.refreshHeldTurnWork?.() : false;
+        if (published && active && !active.holdPendingItems?.size && active.holdActivityVersion === activityVersion) {
+          active.holdIdlePublicationVersion = activityVersion;
+        }
+        if (published && active && !pendingSteering && !active.holdPendingItems?.size && activeNativeSessions.get(input.execution.binding.runId) === active &&
             active.holdActivityVersion === activityVersion && input.execution.provider.kind === "pi_rpc" &&
             input.execution.provider.conversationMode === true) {
           active.heldIdle = true;
+          if (active.holdEndPending) void closeHeldNativeTurn(input.execution.binding.runId).catch(error =>
+            logger.warn({ error, runId: input.execution.binding.runId }, "could not close latched held turn"));
           // Do not join a provider command from its event-persistence callback.
           // The same check also runs after enqueue, covering both arrival orders.
           void import("../../modules/wake-queue/index.js").then(({ closeConversationResetHold }) =>
@@ -12331,7 +12399,10 @@ async function executePaperclipNativeSessionAttempt(
   );
   let native: Awaited<ReturnType<typeof executeNativeSession>>;
   let releaseGoalController: (() => void) | null = null;
+  let releaseHeldConfigurationObserver: (() => void) | undefined;
   const releaseRegisteredGoalController = () => {
+    releaseHeldConfigurationObserver?.();
+    releaseHeldConfigurationObserver = undefined;
     // The controller is assigned from the asynchronous onSession callback.
     // Keep release idempotent without relying on TypeScript's synchronous
     // control-flow model for that callback assignment.
@@ -13186,6 +13257,21 @@ async function executePaperclipNativeSessionAttempt(
               if (session) {
                 const active: ActiveNativeSession = { session, cancelRequested: false, admissionAbort: new AbortController() };
                 activeNativeSessions.set(input.execution.binding.runId, active);
+                if (input.execution.provider.kind === "pi_rpc" && input.execution.provider.conversationMode === true) {
+                  active.refreshHeldTurnWork = async () => {
+                    const work = await readHeldNativeTurnWork(input.db, input.execution.binding);
+                    if (!work) return true;
+                    if (work.endRequested) active.holdEndPending = true;
+                    for (const id of work.answered) releaseHeldSteeringInput(active, id, "delivery");
+                    const pending = work.unanswered || Boolean(active.holdSteeredInputs?.size);
+                    if (pending) active.heldIdle = false;
+                    else if (active.holdIdlePublicationVersion !== undefined && active.holdIdlePublicationVersion === active.holdActivityVersion && !active.holdPendingItems?.size) active.heldIdle = true;
+                    return pending;
+                  };
+                  const reconcile = () => reconcileHeldTurn(input.execution.binding.runId, active);
+                  releaseHeldConfigurationObserver = observeHeldNativeConfiguration(input.db, input.execution.binding, reconcile);
+                  reconcile(); // Includes changes committed before attachment or a controller replacement.
+                }
                 const startup = nativeSessionStartups.get(input.execution.binding.runId);
                 const stopBeforeProviderTurn = startup?.stopRequested === true && startup.sessionPublished !== true
                   && startup.providerWorkMayPrecede !== true;
@@ -14191,6 +14277,7 @@ async function executePaperclipNativeSessionAttempt(
       if (protocolIntegrityFailure !== null) throw protocolIntegrityFailure;
     }
   } finally {
+    releaseHeldConfigurationObserver?.();
     // The provider turn is over, whether it succeeded or threw: what follows is
     // release and hand-back, which a follow-up's admission may wait for
     // (`warmSessionReleaseWait`). The outer execution's finally clears it.
