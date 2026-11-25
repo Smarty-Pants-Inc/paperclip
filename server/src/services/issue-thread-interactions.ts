@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { parseObject } from "../adapters/utils.js";
+import { readFirstTurnQueuedInputReceipt } from "./native-runtime/first-turn-queued-input.js";
 import { completionReviewStageEntry } from "./issue-execution-policy.js";
 import { agentConfigurationChangeTargetId } from "./change-consent-gate.js";
 import { assertAgentInteraction } from "./agent-interaction-policy.js";
@@ -5077,11 +5079,13 @@ export function issueThreadInteractionService(
       let originCommentIds: string[] = data.sourceCommentId ? [data.sourceCommentId] : [];
       let sourceIdentityContextId: string | null = null;
       let sourceRunContext: Record<string, unknown> | null = null;
+      let sourceRunResult: Record<string, unknown> | null = null;
       let sourceRunCreatedAt: Date | null = null;
       if (data.sourceRunId) {
         const sourceRun = await db
           .select({
             contextSnapshot: heartbeatRuns.contextSnapshot,
+            resultJson: heartbeatRuns.resultJson,
             companyId: heartbeatRuns.companyId,
             agentId: heartbeatRuns.agentId,
             nativeIssueId: heartbeatRuns.nativeIssueId,
@@ -5109,6 +5113,7 @@ export function issueThreadInteractionService(
           }
         }
         sourceRunContext = sourceRun.contextSnapshot;
+        sourceRunResult = sourceRun.resultJson;
         sourceRunCreatedAt = sourceRun.createdAt;
         originCommentIds = [...new Set([...originCommentIds, ...await currentContinuationOrigins(db, issue.companyId, issue.id, sourceRun.contextSnapshot)])];
         sourceIdentityContextId = actor.identityContextId ?? sourceRun.activeIdentityContextId;
@@ -5190,11 +5195,26 @@ export function issueThreadInteractionService(
           }
           if (
             data.kind === "ask_user_questions" &&
+            data.sourceRunId &&
             sourceRunContext &&
             sourceRunCreatedAt
           ) {
             const delivered = deliveredContinuationCommentIds(sourceRunContext);
             if (delivered.known) {
+              // The snapshot predates input delivered into a held conversation.
+              // Only durable receipts from this source run count, never queued input.
+              const result = parseObject(sourceRunResult);
+              for (const [id, receipt] of Object.entries(parseObject(result.queuedSteeringAcknowledgements))) {
+                if (parseObject(receipt).status === "acknowledged") delivered.ids.add(id);
+              }
+              const firstTurn = readFirstTurnQueuedInputReceipt({ id: data.sourceRunId, contextSnapshot: sourceRunContext });
+              for (const id of firstTurn?.commentIds ?? []) delivered.ids.add(id);
+              const continued = parseObject(result.continuedSessionInput);
+              if (continued.runId === data.sourceRunId && Array.isArray(continued.commentIds)) {
+                for (const id of continued.commentIds) {
+                  if (typeof id === "string" && id.length > 0) delivered.ids.add(id);
+                }
+              }
               const newerHumanComments = await tx
                 .select({ id: issueComments.id })
                 .from(issueComments)
