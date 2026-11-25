@@ -116,8 +116,8 @@ export function isSettledRemoteWarmControlState(control: Record<string, unknown>
   if (!Array.isArray(commands) || unsettledControllerCommands(commands.map(record)).length > 0 ||
       !Array.isArray(events) || Object.entries(identity).some(([key, value]) => record(control.identity)[key] !== value)) return false;
   let terminalIndex = events.findLastIndex(event => record(event).eventType === "run.terminal");
-  if (terminalIndex < 0 && allowCompletedPiConversation) {
-    terminalIndex = events.findLastIndex(event => record(event).eventType === "turn.completed");
+  if (allowCompletedPiConversation) {
+    terminalIndex = Math.max(terminalIndex, events.findLastIndex(event => record(event).eventType === "turn.completed"));
   }
   if (terminalIndex < 0) return false;
   const matchesSession = (event: unknown) => {
