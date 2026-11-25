@@ -159,7 +159,8 @@ export function ComposerRunSettingsPicker({
   const defaultEffort = readComposerRunSettings({ adapterConfig: agent?.adapterConfig }, agent?.adapterType, agent?.adapterConfig).effort ?? (provider === "pi_rpc" ? "low" : null);
   const effectiveEffort = piLevel ? selected.effort ?? defaultEffort : effort;
   const effectiveEffortLabel = effectiveEffort ? EFFORT_LABELS[effectiveEffort] ?? effectiveEffort : "Default";
-  const effortLabel = effort ? EFFORT_LABELS[effort] ?? effort : piLevel ? `Default (${effectiveEffortLabel})` : "Default";
+  const effortLabel = selected.effort ? EFFORT_LABELS[selected.effort] ?? selected.effort
+    : piLevel ? `Default (${defaultEffort ? EFFORT_LABELS[defaultEffort] ?? defaultEffort : "Default"})` : "Default";
   const fastAvailable = composerFastAvailable(agent, model);
   const effortChoicesKey = choices.join(",");
   useEffect(() => {
@@ -170,7 +171,6 @@ export function ComposerRunSettingsPicker({
       onSettingsChange({ ...base, effort: remembered });
     }
   }, [companyId, agentId, model, modelSupported, piLevel, settings, base.model, base.effort, base.fast, effortChoicesKey, onSettingsChange]);
-  const changed = Boolean(selected.model || selected.effort || selected.fast);
   const assigneeOptions = [{ id: "", label: "No assignee", searchText: "Unassigned" }, ...options.filter((item) => item.id !== "")];
   const filteredAgents = assigneeOptions.filter((item) => {
     const optionAgent = agents.get(item.id.startsWith("agent:") ? item.id.slice(6) : "");
@@ -207,13 +207,14 @@ export function ComposerRunSettingsPicker({
   const chooseModel = (value: string | null) => {
     const nextChoices = composerEfforts(agent, value ?? configuredModel, models.map((item) => item.id));
     const preferred = selected.effort ?? (piLevel ? null : getLastComposerEffort(companyId));
-    onSettingsChange({ model: value, effort: preferred && nextChoices.includes(preferred) ? preferred : null, fast: false });
+    onSettingsChange(value === null ? { ...selected, model: null }
+      : { model: value, effort: preferred && nextChoices.includes(preferred) ? preferred : null, fast: false });
     setView("settings");
     setModelSearch("");
   };
-  const reset = () => {
+  const resetEffort = () => {
     rememberComposerEffort(companyId, null);
-    onSettingsChange(DEFAULT_COMPOSER_RUN_SETTINGS);
+    onSettingsChange({ ...selected, effort: null });
   };
   const closeButton = mobile ? <DialogClose asChild><button type="button" aria-label="Close picker" className="grid size-8 place-items-center rounded-md text-muted-foreground hover:bg-accent"><X className="size-4" /></button></DialogClose> : null;
   const Trigger = mobile ? DialogTrigger : PopoverTrigger;
@@ -245,7 +246,7 @@ export function ComposerRunSettingsPicker({
         <span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">{agent?.name ?? options.find((item) => item.id === assigneeValue)?.label ?? "Unassigned"}</span><span className="block truncate text-xs text-muted-foreground">{harnessLabel(agent)}</span></span>
         {allowAssigneeChange ? <ChevronDown className="size-4 shrink-0 text-muted-foreground" aria-hidden /> : null}
       </AssigneeHeader>
-      {!choices.length && modelSupported ? <button type="button" aria-label="Reset to agent default" title="Reset to agent default" disabled={!changed} onClick={reset} className="grid size-8 place-items-center rounded-md text-muted-foreground hover:bg-accent disabled:opacity-40"><RotateCcw className="size-4" /></button> : null}
+      {!choices.length && modelSupported ? <button type="button" aria-label="Reset model to agent default" title="Reset model to agent default" disabled={!selected.model} onClick={() => chooseModel(null)} className="grid size-8 place-items-center rounded-md text-muted-foreground hover:bg-accent disabled:opacity-40"><RotateCcw className="size-4" /></button> : null}
       {closeButton}
     </div>
     {modelSupported ? <>
@@ -256,7 +257,7 @@ export function ComposerRunSettingsPicker({
         <div className="flex items-center gap-2">
           {fastAvailable ? <button type="button" aria-label="Fast mode" aria-pressed={selected.fast} title="Fast mode" onClick={() => onSettingsChange({ ...selected, fast: !selected.fast })} className={cn("grid size-8 shrink-0 place-items-center rounded-md hover:bg-accent", selected.fast ? "composer-run-settings-accent bg-accent" : "text-muted-foreground")}><Zap className="size-4" /></button> : <span className="size-8 shrink-0" aria-hidden />}
           <label htmlFor="composer-run-effort" data-testid="selected-effort" className="composer-run-settings-accent min-w-0 flex-1 text-center text-sm font-medium">{piLevel ? "Reasoning level · " : ""}{effortLabel}</label>
-          <button type="button" aria-label="Reset to agent default" title="Reset to agent default" disabled={!changed} onClick={reset} className="grid size-8 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-accent disabled:opacity-40"><RotateCcw className="size-4" /></button>
+          <button type="button" aria-label="Reset reasoning level to agent default" title="Reset reasoning level to agent default" disabled={!selected.effort} onClick={resetEffort} className="grid size-8 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-accent disabled:opacity-40"><RotateCcw className="size-4" /></button>
         </div>
         <input id="composer-run-effort" type="range" min={0} max={choices.length} step={1} value={effortIndex} aria-label={piLevel ? "Reasoning level" : "Effort"} aria-valuetext={effortLabel}
           onChange={(event) => {
