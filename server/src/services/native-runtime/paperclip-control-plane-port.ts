@@ -1,4 +1,5 @@
 import { notifyNativeResultCommit } from "../native-result-commit-notifications.js";
+import { settleProviderReturnedStopInput } from "../person-stop-before-turn.js";
 import { notifyNativeWorkspaceFinalization } from "../native-workspace-finalization-notifications.js";
 import { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
 import { and, asc, eq, gt, or, sql } from "drizzle-orm";
@@ -600,6 +601,17 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
       // embedding runtime refresh observational state before appendEvent
       // returns to its synchronous governed-wait boundary.
       await this.#onDuplicateEvent?.(event, persisted.row.seq);
+    }
+    // A provider can flush clear_queue after settlement, or replay its notice.
+    // Apply the same click-time filter outside the append's run-row lock; do
+    // not rely solely on the finalizer having seen the notice in time.
+    if (event.eventType === "provider.notice.recorded" && event.payload.category === "pi_stop_returned_input") {
+      const details = Array.isArray(event.payload.details) ? event.payload.details : [];
+      const ids = details.filter(detail => record(detail).name === "returnedCommentIds")
+        .flatMap(detail => String(record(detail).value ?? "").split(",")).map(id => id.trim());
+      const [run] = await this.#db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, this.#binding.companyId), eq(heartbeatRuns.id, this.#binding.runId)));
+      if (run && ids.length) await settleProviderReturnedStopInput(this.#db, run, ids);
     }
     if (event.eventType === "turn.started" || event.eventType === "turn.accepted") {
       // Persistence and its observers have finished: no issue lock is held.
