@@ -47,6 +47,7 @@ const QUEUED_INTERRUPT_HANDOFF_WAIT = { reason: "interrupt_handoff", message: "S
 async function findQueuedCommentWake(
   executor: IssueQueueDb,
   issue: { id: string; companyId: string; assigneeAgentId: string | null },
+  claimedIds: Set<string> = new Set(),
 ): Promise<IssueQueueState | null> {
   if (!issue.assigneeAgentId) return null;
   const rows = await executor
@@ -88,12 +89,14 @@ async function findQueuedCommentWake(
   // messages, which are separately queued and remain editable and sendable.
   let receipt: IssueQueueState | null = null;
   let agentOnly: IssueQueueState | null = null;
+  let firstTurn: IssueQueueState | null = null;
   const hasMessage = async (wake: { payload: unknown }) => {
-    const ids = queuedCommentIdsFromWakePayload(wake.payload);
+    const ids = queuedCommentIdsFromWakePayload(wake.payload).filter(id => !claimedIds.has(id));
     if (ids.length === 0) return false;
     const [row] = await executor.select({ id: issueComments.id }).from(issueComments).where(and(
       eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
       inArray(issueComments.id, ids), isNull(issueComments.deletedAt),
+      sql`${issueComments.authorAgentId} is distinct from ${issue.assigneeAgentId}`,
     )).limit(1);
     return Boolean(row);
   };
@@ -109,7 +112,8 @@ async function findQueuedCommentWake(
       }
       return state;
     }
-    agentOnly = state;
+    // Preserve the oldest fallback while looking for later eligible input.
+    agentOnly ??= state;
     return null;
   };
   for (const wake of rows) {
@@ -118,9 +122,17 @@ async function findQueuedCommentWake(
       (queuedCommentIdsFromWakePayload(wake.payload).length === 0 && !queuedInteractionId(wake.payload))
     )
       continue;
-    const isReceipt = Boolean(queuedInteractionId(wake.payload));
+    const interactionId = queuedInteractionId(wake.payload);
+    const isReceipt = Boolean(interactionId);
+    if (interactionId && claimedIds.has(interactionId)) continue;
+    const commentIds = queuedCommentIdsFromWakePayload(wake.payload);
+    if (!isReceipt && wake.status === "deferred_issue_execution" && commentIds.length > 0 && commentIds.every(id => claimedIds.has(id))) {
+      // Keep the sent receipt for the board's firstTurnCommentIds display, but
+      // do not let it hide a later message from the live-turn drain.
+      firstTurn ??= { wake, state: "deferred", queueRun: null };
+      continue;
+    }
     if (isReceipt && receipt) continue;
-    if (!isReceipt && agentOnly) continue;
     const readReceipt = () => readQueuedInteractionResponse(executor as Db, wake.companyId, issue.id, wake.payload);
     if (wake.status === "deferred_issue_execution") {
       if (isReceipt) {
@@ -156,7 +168,7 @@ async function findQueuedCommentWake(
       if (messages) return messages;
     }
   }
-  return receipt ?? agentOnly;
+  return receipt ?? agentOnly ?? firstTurn;
 }
 
 async function queueCommentsForWake(
@@ -240,7 +252,7 @@ export async function readBoardQueuedComments(input: {
 }): Promise<IssueQueuedCommentQueue> {
   const queueState =
     input.queueState === undefined
-      ? await findQueuedCommentWake(input.executor, input.issue)
+      ? await findQueuedCommentWake(input.executor, input.issue, firstTurnClaimedCommentIds(input.activeRun))
       : input.queueState;
   const wake = queueState?.wake ?? null;
   // Read an interaction receipt once per snapshot.
@@ -310,7 +322,8 @@ export async function readBoardQueuedComments(input: {
   });
   if (wake && queuedInteractionId(wake.payload)) {
     if (response?.source.requiresFreshSession) queue.steeringDisposition = "unsupported";
-    queue.entries = response ? [{ comment: response.comment, source: response.source, position: 0, canEdit: false, canDiscard: false }] : [];
+    queue.entries = response && comments.some(comment => comment.id === response.comment.id)
+      ? [{ comment: response.comment, source: response.source, position: 0, canEdit: false, canDiscard: false }] : [];
   } else if (wake && queueState?.state === "deferred" && input.activeRun?.status === "running") {
     // A starting run (a booting sandbox, say) cannot be steered yet, but its
     // first turn takes these messages. The view shows them as sent.
@@ -492,7 +505,7 @@ export function createQueuedCommentSteeringAdapter(db: Db, options: { requireQue
             // after locking, not just the optimistic snapshot: a concurrent
             // older person wake must not be overtaken by automatic delivery.
             if (options.requireQueueHead) {
-              const first = await findQueuedCommentWake(tx, issue);
+              const first = await findQueuedCommentWake(tx, issue, firstTurnClaimedCommentIds(run));
               if (first?.wake.id !== input.queueId || queue.entries[0]?.comment.id !== commentId) {
                 throw new QueuedCommentMutationError("queued_comment_order_mismatch", "Older queued input must be delivered first");
               }
