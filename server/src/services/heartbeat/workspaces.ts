@@ -3242,6 +3242,7 @@ export function resolveTaskSessionConfigFreshness(input: {
   compatibleConfigMetadata?: readonly EffectiveRunSessionConfigMetadata[];
   wakeResetReason?: string | null;
   preserveLegacySessionWithoutConfigMetadata?: boolean;
+  preserveSessionOnModelChange?: boolean;
 }): TaskSessionConfigFreshnessDecision {
   if (!input.hasTaskSession) {
     return {
@@ -3264,7 +3265,7 @@ export function resolveTaskSessionConfigFreshness(input: {
     configuredModel: input.configuredModel,
     taskSessionParams: input.taskSessionParams,
   });
-  if (modelChangedSinceTaskSession && taskSessionConfiguredModel) {
+  if (!input.preserveSessionOnModelChange && modelChangedSinceTaskSession && taskSessionConfiguredModel) {
     reasons.push(
       `configured model changed from "${taskSessionConfiguredModel}" to "${input.configuredModel}"`,
     );

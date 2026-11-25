@@ -3,7 +3,7 @@ import * as nativeRuntimeMode from "../services/native-runtime/runtime-mode.js";
 import * as aiRuntime from "../services/ai-connection-runtime.js";
 import { aiConnectionService } from "../services/ai-connections.js";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
@@ -40,7 +40,9 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
         captured.set(input.runId, input);
         // Settle the fixture's work so no automatic unfinished-task retry
         // competes with the next explicit session-continuation wake.
-        await db.update(issues).set({ status: "done" }).where(eq(issues.id, String(input.context.issueId)));
+        const [issue] = await db.select().from(issues).where(eq(issues.id, String(input.context.issueId)));
+        await db.update(issues).set(issue.conversationAgentId ? { status: "todo", conversationState: "waiting" } : { status: "done" })
+          .where(eq(issues.id, issue.id));
         return { exitCode: 0, signal: null, timedOut: false, sessionId: "saved-session", sessionParams: { sessionId: "saved-session", adapterState: "preserved" }, resultJson: {} };
       },
       testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }),
@@ -268,25 +270,67 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     }
   });
 
-  it.each(["model", "piRpcThinkingLevel"])("held configuration: next run applies changed %s with stock fresh-session policy", async key => {
+  it.each([
+    { key: "model", continuity: "continuous", retain: true, conversation: true },
+    { key: "piRpcThinkingLevel", continuity: "continuous", retain: true, conversation: true },
+    { key: "model", continuity: "continuous", retain: true, conversation: false },
+    { key: "piRpcThinkingLevel", continuity: "continuous", retain: true, conversation: false },
+    { key: "model", continuity: "paperclip", retain: false },
+    { key: "piRpcThinkingLevel", continuity: "paperclip", retain: false },
+    { key: "provider", continuity: "continuous", retain: false },
+    { key: "adapterType", continuity: "continuous", retain: false },
+  ])("held configuration: changed $key in $continuity (agent chat=$conversation) retains session: $retain", async ({ key, continuity, retain, conversation }) => {
     const { agentService } = await import("../services/agents.js");
     const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "hold-config-continuation-"));
     const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
       kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
     registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
-    const config = { provider: "pi_rpc", model: "fixture/model-a", piRpcThinkingLevel: "low", sessionContinuity: "continuous", cwd };
+    const config = { provider: "pi_rpc", model: "fixture/model-a", piRpcThinkingLevel: "low", sessionContinuity: continuity, cwd };
     try {
       await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: config }).where(eq(agents.id, f.agentId));
+      if (conversation) await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: f.userId, conversationState: "active" }).where(eq(issues.id, f.issueId));
       await execute(f);
       const [saved] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId));
       expect(saved.sessionParamsJson?.sessionId).toBe("saved-session");
-      const nextConfig = { ...config, [key]: key === "model" ? "fixture/model-b" : "high" };
-      await agentService(db).update(f.agentId, { adapterConfig: nextConfig });
+      const nextConfig = { ...config, ...(key === "adapterType" ? {} : {
+        [key]: key === "model" ? "fixture/model-b" : key === "provider" ? "codex" : "high",
+      }) };
+      await agentService(db).update(f.agentId, { adapterConfig: nextConfig,
+        ...(key === "adapterType" ? { adapterType } : {}) });
+      const [retained] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId));
+      if (retain) expect(retained?.id).toBe(saved.id);
+      else if (key !== "piRpcThinkingLevel") expect(retained).toBeUndefined();
+      const next = await execute(f);
+      expect(next.input.runtime.sessionId).toBe(retain ? "saved-session" : null);
+      if (key !== "adapterType") expect(next.input.config[key]).toBe(nextConfig[key as keyof typeof nextConfig]);
+      expect(next.finished.sessionIdBefore).toBe(retain ? "saved-session" : null);
+      expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: {
+        ...(retain ? { reset: false } : {}), taskSessionReused: retain,
+      } } });
+    } finally { mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true }); }
+  });
+
+  it("held configuration: an INSTRUCTIONS content change still starts continuous Pi fresh", async () => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "pi-instructions-freshness-"));
+    const instructionsFilePath = join(cwd, "INSTRUCTIONS.md");
+    const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
+    try {
+      await writeFile(instructionsFilePath, "Original instructions.\n");
+      await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: {
+        provider: "pi_rpc", model: "fixture/model-a", sessionContinuity: "continuous", cwd, instructionsFilePath,
+        instructionsRootPath: cwd, instructionsEntryFile: "INSTRUCTIONS.md", instructionsBundleMode: "external",
+      } }).where(eq(agents.id, f.agentId));
+      await execute(f);
+      await writeFile(instructionsFilePath, "Changed instructions.\n");
       const next = await execute(f);
       expect(next.input.runtime.sessionId).toBeNull();
-      expect(next.input.config[key]).toBe(nextConfig[key as keyof typeof nextConfig]);
       expect(next.finished.sessionIdBefore).toBeNull();
-      expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: { taskSessionReused: false } } });
+      expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: {
+        reset: true, taskSessionReused: false, changedCategories: ["instructions"],
+        resetReasons: ["effective run configuration changed: instructions"],
+      } } });
     } finally { mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true }); }
   });
 
