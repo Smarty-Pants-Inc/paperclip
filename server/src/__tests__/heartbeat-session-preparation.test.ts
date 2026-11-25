@@ -4,7 +4,7 @@ import * as nativeRuntimeMode from "../services/native-runtime/runtime-mode.js";
 import * as aiRuntime from "../services/ai-connection-runtime.js";
 import { aiConnectionService } from "../services/ai-connections.js";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
@@ -340,28 +340,42 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     } finally { mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true }); }
   });
 
-  it("held configuration: an INSTRUCTIONS content change still starts continuous Pi fresh", async () => {
+  it.each(["continuous", "paperclip"])("held configuration: an INSTRUCTIONS save continues Pi only in continuous mode (%s)", async sessionContinuity => {
     const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "pi-instructions-freshness-"));
-    const instructionsFilePath = join(cwd, "INSTRUCTIONS.md");
+    const { resolveManagedInstructionsRoot } = await import("../services/agent-instructions.js");
+    const instructionsRoot = resolveManagedInstructionsRoot({ id: f.agentId, companyId: f.companyId, name: "Session reader", adapterConfig: {} });
+    await mkdir(instructionsRoot, { recursive: true });
+    const instructionsFilePath = join(instructionsRoot, "INSTRUCTIONS.md");
     const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
       kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
     registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
     try {
       await writeFile(instructionsFilePath, "Original instructions.\n");
       await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: {
-        provider: "pi_rpc", model: "fixture/model-a", sessionContinuity: "continuous", cwd, instructionsFilePath,
-        instructionsRootPath: cwd, instructionsEntryFile: "INSTRUCTIONS.md", instructionsBundleMode: "external",
+        provider: "pi_rpc", model: "fixture/model-a", sessionContinuity, cwd, instructionsFilePath,
+        instructionsRootPath: instructionsRoot, instructionsEntryFile: "INSTRUCTIONS.md", instructionsBundleMode: "managed",
       } }).where(eq(agents.id, f.agentId));
+      const { agentInstructionRevisionService } = await import("../services/agent-instruction-revisions.js");
+      const revisions = agentInstructionRevisionService(db);
+      const actor = { type: "board" as const, source: "local_implicit" as const, userId: f.userId };
+      const target = { companyId: f.companyId, agentId: f.agentId };
+      const before = await revisions.readCurrent(target, actor);
       await execute(f);
-      await writeFile(instructionsFilePath, "Changed instructions.\n");
+      await revisions.commit({ ...target, entryFile: "INSTRUCTIONS.md", content: "Changed instructions.\n",
+        baseRevisionId: before!.revision.id, source: "board" }, actor);
       const next = await execute(f);
-      expect(next.input.runtime.sessionId).toBeNull();
-      expect(next.finished.sessionIdBefore).toBeNull();
+      const retain = sessionContinuity === "continuous";
+      expect(next.input.runtime.sessionId).toBe(retain ? "saved-session" : null);
+      expect(next.finished.sessionIdBefore).toBe(retain ? "saved-session" : null);
       expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: {
-        reset: true, taskSessionReused: false, changedCategories: ["instructions"],
+        reset: !retain, taskSessionReused: retain, changedCategories: ["instructions"],
         resetReasons: ["effective run configuration changed: instructions"],
       } } });
-    } finally { mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true }); }
+    } finally {
+      mode.mockRestore(); unregisterServerAdapter("paperclip_runner");
+      await rm(cwd, { recursive: true, force: true });
+      await rm(instructionsRoot, { recursive: true, force: true });
+    }
   });
 
   it.each([
