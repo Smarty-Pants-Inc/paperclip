@@ -19,12 +19,14 @@ import { usesManagedCloudSandboxImage } from "./sandbox-snapshot-qualification.j
 import { environmentCustomImageTemplateMatchesBaseConfig } from "./environment-custom-image-runtime.js";
 import type { ExecutionPolicy } from "./execution-allowlist.js";
 import { pluginEnvironmentRunnerTaskDriver } from "./plugin-runner-ai-connection.js";
+import { isBuiltinSandboxProvider } from "./sandbox-provider-runtime.js";
 
 export type RunnerTarget = {
   driver: string; platform?: string; architecture?: string; libc?: "glibc" | "musl" | "unknown"; glibcVersion?: string;
   /** A plugin environment whose driver declares Runner task execution. It runs agents only through Paperclip Runner. */
   runnerTasks?: boolean;
   managedCloudImage?: boolean;
+  pluginSandbox?: boolean;
   warmTaskVersion?: 1;
   executionMode?: ExecutionPolicy["executionMode"];
 };
@@ -357,6 +359,10 @@ function resolveAgentRunner(input: AgentRunnerSelection): { adapterType: string;
     }
     return { adapterType: "paperclip_runner", adapterConfig: config };
   }
+  return { adapterType: "paperclip_runner", adapterConfig: resolveCodexRunnerConfig(config) };
+}
+
+function resolveCodexRunnerConfig(config: Record<string, unknown>): Record<string, unknown> {
   const aliasSources = new Map<string, string>();
   for (const [canonical, alias] of [
     ["agentCommand", "acpAgentCommand"], ["stateDir", "acpStateDir"],
@@ -408,7 +414,7 @@ function resolveAgentRunner(input: AgentRunnerSelection): { adapterType: string;
     if (error instanceof PaperclipRunnerProviderProfileError) throw unprocessable(error.message, { code: error.code });
     throw error;
   }
-  return { adapterType: "paperclip_runner", adapterConfig: config };
+  return config;
 }
 
 export async function resolveNewAgentRunnerForCompany(db: Db, companyId: string, input: AgentRunnerSelection & { defaultEnvironmentId?: string | null }) {
@@ -466,6 +472,14 @@ export async function resolveNewAgentRunnerForCompany(db: Db, companyId: string,
   if (!paperclipRunnerProfileForHarness(agentHarnessType(input.adapterType ?? "process", input.adapterConfig))
     || input.runner === "legacy" || (input.adapterType === "paperclip_runner" && (input.runner === undefined || input.runner === "paperclip"))) return resolveNewAgentRunner(input);
   const target = await resolveAgentRunnerTargetForCompany(db, companyId, input.defaultEnvironmentId, input.disabledTypes);
+  if (input.adapterType === "codex_local" && (input.runner === undefined || input.runner === "auto")
+    && target.pluginSandbox && !target.platform) {
+    if (!runnerAdaptersAvailable("codex_local", target.driver, disabledTypes)) throw unprocessable(
+      "Paperclip Runner Codex is unavailable. Enable its adapters or explicitly select Legacy.",
+      { code: "agent_runner_unavailable" },
+    );
+    return { adapterType: "paperclip_runner", adapterConfig: resolveCodexRunnerConfig({ ...input.adapterConfig }) };
+  }
   return resolveNewAgentRunner({ ...input, target });
 }
 
@@ -501,6 +515,9 @@ export async function resolveAgentRunnerTargetForCompany(db: Db, companyId: stri
     const { readSandboxPlatformQualification } = await import("./environment-probe.js");
     const qualified = await readSandboxPlatformQualification(db, environment, companyId);
     if (qualified) target = { driver, ...qualified };
+    else if (typeof environment.config.provider === "string" && !isBuiltinSandboxProvider(environment.config.provider)) {
+      target = { driver, pluginSandbox: true };
+    }
   }
   const disabledForSsh = driver === "ssh" && environment
     ? disabledTypes ?? await adapterSettingsService(db).getDisabledTypes() : [];
