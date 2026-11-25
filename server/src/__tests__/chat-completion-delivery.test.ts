@@ -20,6 +20,11 @@ import { createHeartbeatQueueTestDependencies } from "./helpers/heartbeat-queue.
 import { createReleaseIssueExecution } from "../modules/wake-queue/application/use-cases.js";
 import { conversationDecisionReceiptsService } from "../services/conversation-decision-receipts.js";
 import { ALREADY_REPORTED_WAKE_REASON, createPostgresWakeQueueAdapter } from "../modules/wake-queue/adapters/postgres.js";
+import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
+import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
+import { publishContinuousNativeReply } from "../services/native-runtime/native-continuous-reply.js";
+import { prepareConversationTurn } from "../services/agent-conversations.js";
+import type { NativeRestartRecoveryClaim } from "../services/native-runtime/native-restart-recovery.js";
 
 (support.supported ? describe : describe.skip)("chat completion delivery", () => {
   let db: ReturnType<typeof createDb>;
@@ -57,6 +62,91 @@ import { ALREADY_REPORTED_WAKE_REASON, createPostgresWakeQueueAdapter } from "..
     };
     return { companyId, agentId, sourceId, runId, task, create, finish, rows, due, wakeup, service, run };
   }
+  async function heldCompletion() {
+    const f = await seed();
+    await f.finish();
+    const prepared = await f.run(), sessionId = randomUUID();
+    const execution = buildNativeExecutionInput({ companyId: f.companyId, agentId: f.agentId, runId: prepared.id,
+      issue: { id: f.sourceId, title: "Held completion", description: null, identifier: null, workMode: "standard" },
+      provider: "pi_rpc", taskPrompt: "Report the frozen completed task.", normalizedSessionId: sessionId,
+      runtimeContext: nativeRuntimeContextFixture(),
+      workspace: { id: prepared.id, cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
+      completionContract: { id: randomUUID(), sha256: `sha256:${"a".repeat(64)}`, schemaVersion: "paperclip.run-result.v1",
+        contract: { revision: "1", objective: "Reply", criteria: [{ id: "reply", requirement: "Report completed work" }] } } });
+    await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } })
+      .where(eq(agents.id, f.agentId));
+    await db.update(issues).set({ conversationState: "active", executionRunId: prepared.id }).where(eq(issues.id, f.sourceId));
+    await db.update(heartbeatRuns).set({ status: "running", runtimeMode: "native", nativeIssueId: f.sourceId,
+      nativeSessionId: sessionId, runnerInstanceId: randomUUID(), runnerProfileJson: { nativeExecutionInput: execution } })
+      .where(eq(heartbeatRuns.id, prepared.id));
+    const event = { eventType: "item.completed" as const, runId: prepared.id, normalizedSessionId: sessionId,
+      sourceEventId: randomUUID(), itemId: "completion-final", payload: { kind: "agentMessage", channel: "final", text: "The delegated task is complete." } };
+    expect(await publishContinuousNativeReply({ db, cursor: 1, execution, event })).toBe(true);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, prepared.id));
+    expect(run).toMatchObject({ status: "running", finishedAt: null, resultJson: { continuousReplies: {
+      "completion-final": { commentId: expect.any(String) } } } });
+    expect(await f.rows()).toMatchObject([{ status: "delivered", targetRunId: run.id, responseCommentId: expect.any(String) }]);
+    const claim = (kind: "reattach_remote_runner" | "reattach_existing_runner"): NativeRestartRecoveryClaim => ({
+      kind, runId: run.id, leaseOwner: "server-restart-owner", controllerGeneration: 2, providerAttempt: 1,
+      restartKind: "graceful", recoveryRequestId: null,
+      ...(kind === "reattach_remote_runner" ? { remote: { providerLeaseId: "original-allocation", remoteCwd: "/workspace" } }
+        : { process: { pid: 12345, processGroupId: null, startedAt: new Date().toISOString() } }),
+    } as NativeRestartRecoveryClaim);
+    return { ...f, run, claim, execution };
+  }
+  it.each([
+    { kind: "reattach_remote_runner" as const, laterPending: false },
+    { kind: "reattach_existing_runner" as const, laterPending: false },
+    { kind: "reattach_remote_runner" as const, laterPending: true },
+    { kind: "reattach_existing_runner" as const, laterPending: true },
+  ])("reuses a held completion acknowledged by native-continuous-reply on same-run $kind (later pending: $laterPending)", async ({ kind, laterPending }) => {
+      const f = await heldCompletion();
+      // A later completion belongs to a new turn, never this reattachment.
+      if (laterPending) { const later = await f.create(); await f.finish(later.id); }
+      const before = await f.rows();
+      const resumed = await prepareChatCompletionTurn(db, f.run, f.claim(kind));
+      await prepareConversationTurn(db, resumed);
+      expect(resumed).toEqual(f.run);
+      expect(await f.rows()).toEqual(before);
+      const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.run.id));
+      expect(current).toMatchObject({ status: "running", error: null, finishedAt: null, runnerProfileJson: f.run.runnerProfileJson,
+        resultJson: f.run.resultJson, contextSnapshot: { chatCompletionDeliveryIds: f.run.contextSnapshot!.chatCompletionDeliveryIds,
+          chatCompletionUpdates: f.run.contextSnapshot!.chatCompletionUpdates } });
+      expect(await db.select().from(issueComments).where(eq(issueComments.createdByRunId, f.run.id))).toHaveLength(1);
+    });
+  it.each(["bootstrap", "no_claim", "other_run", "no_frozen_input", "foreign_binding", "no_updates", "context_claim"] as const)(
+    "does not bypass a genuine completion freeze without admitted same-run recovery proof (%s)", async mode => {
+      const f = await heldCompletion();
+      let claim: NativeRestartRecoveryClaim | undefined = f.claim("reattach_remote_runner");
+      const run = { ...f.run };
+      if (mode === "bootstrap") claim = { ...claim, kind: "bootstrap_incomplete" };
+      if (mode === "no_claim") claim = undefined;
+      if (mode === "other_run") claim = { ...f.claim("reattach_remote_runner"), runId: randomUUID() };
+      if (mode === "no_frozen_input") run.runnerProfileJson = {};
+      if (mode === "foreign_binding") run.runnerProfileJson = { nativeExecutionInput: { ...f.execution,
+        binding: { ...f.execution.binding, runId: randomUUID() } } };
+      if (mode === "no_updates") run.contextSnapshot = { ...run.contextSnapshot, chatCompletionUpdates: [] };
+      if (mode === "context_claim") { run.contextSnapshot = { ...run.contextSnapshot, nativeRestartRecovery: claim }; claim = undefined; }
+      await expect(prepareChatCompletionTurn(db, run, claim)).rejects.toThrow("chat_completion_superseded");
+      expect((await f.rows())[0].status).toBe("delivered");
+    });
+  it("still rejects a genuine bootstrap completion wake with no pending completion", async () => {
+    const f = await seed();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      status: "running", runtimeMode: "native", nativeIssueId: f.sourceId,
+      contextSnapshot: { issueId: f.sourceId, wakeReason: "chat_task_completed", conversationSessionGeneration: 0 } }).returning();
+    const claim: NativeRestartRecoveryClaim = { kind: "bootstrap_incomplete", runId: run.id,
+      leaseOwner: "server-bootstrap-owner", controllerGeneration: 1, providerAttempt: 1,
+      restartKind: "graceful", recoveryRequestId: null };
+    await expect(prepareChatCompletionTurn(db, run, claim)).rejects.toThrow("chat_completion_superseded");
+    expect(await f.rows()).toEqual([]);
+  });
+  it("still rejects a changed conversation generation after reusing admitted completion input", async () => {
+    const f = await heldCompletion();
+    await db.update(issues).set({ conversationSessionGeneration: 1 }).where(eq(issues.id, f.sourceId));
+    const resumed = await prepareChatCompletionTurn(db, f.run, f.claim("reattach_remote_runner"));
+    await expect(prepareConversationTurn(db, resumed)).rejects.toThrow("Conversation session changed");
+  });
   /** The person's own message woke a turn that read the task done and linked it in its reply. */
   async function reportedByEarlierTurn(f: Awaited<ReturnType<typeof seed>>, read = true) {
     const identifier = `CHAT-${Math.floor(Math.random() * 1e6)}`;
