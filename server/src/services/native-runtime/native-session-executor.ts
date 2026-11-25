@@ -14817,8 +14817,8 @@ export function readBundledRemoteProviderPackManifest(manifestPath = bundledRemo
 
 type ProviderPackHashRequest = { kind: "file" | "tree"; path: string };
 
-function readRemoteProviderPackIdentity(packRoot: string, verifyControllerFiles: boolean): RemoteProviderPackManifest {
-  const checks = providerPackIdentityChecks(packRoot, verifyControllerFiles);
+function readRemoteProviderPackIdentity(packRoot: string, verifyControllerFiles: boolean, optionalProvider?: "pi_rpc"): RemoteProviderPackManifest {
+  const checks = providerPackIdentityChecks(packRoot, verifyControllerFiles, optionalProvider);
   let step = checks.next();
   while (!step.done) {
     const request = step.value;
@@ -14833,6 +14833,7 @@ function readRemoteProviderPackIdentity(packRoot: string, verifyControllerFiles:
 function* providerPackIdentityChecks(
   packRoot: string,
   verifyControllerFiles: boolean,
+  optionalProvider?: "pi_rpc",
 ): Generator<ProviderPackHashRequest, RemoteProviderPackManifest, string> {
   let manifest: RemoteProviderPackManifest;
   try {
@@ -14854,6 +14855,10 @@ function* providerPackIdentityChecks(
     );
   }
   const payload = manifest?.payload;
+  // A selection probe must not admit or reject an unrelated provider. A readable
+  // stock pack stays stock even when its execution identity needs repair.
+  // Execution never supplies this option and retains every admission check.
+  if (optionalProvider && payload && typeof payload === "object" && !(optionalProvider in payload)) return manifest;
   if (
     manifest?.schema !== REMOTE_PROVIDER_PACK_SCHEMA ||
     !payload ||
@@ -15347,15 +15352,18 @@ export async function prepareRemoteProviderPackOnTarget(input: {
   return { root: activeRemoteProviderPackRoot!, manifest: selectedProviderPackManifest, source: packSource };
 }
 
-/** Read selection identity only; verify controller contents only if upload is needed. */
-export function resolveRemoteProviderPackSource(configuredPath?: string | null): {
+/** Read selection identity only; verify controller contents only if upload is needed.
+ * An optional-provider probe returns a stock manifest without admitting its
+ * execution identity when that provider is absent. Execution must omit the probe.
+ */
+export function resolveRemoteProviderPackSource(configuredPath?: string | null, optionalProvider?: "pi_rpc"): {
   configuredRoot: string; manifest: RemoteProviderPackManifest;
 } {
   const configuredRoot = configuredPath?.trim() || null;
   if (!configuredRoot || !existsSync(configuredRoot) || !lstatSync(configuredRoot).isDirectory()) {
     throw new Error("runner_remote_provider_artifact_incompatible: configure PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH with the build-owned provider pack");
   }
-  return { configuredRoot, manifest: readRemoteProviderPackIdentity(configuredRoot, false) };
+  return { configuredRoot, manifest: readRemoteProviderPackIdentity(configuredRoot, false, optionalProvider) };
 }
 
 async function remoteRunnerPathExists(input: {
