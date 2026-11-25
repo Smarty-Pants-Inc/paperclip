@@ -112,7 +112,8 @@ export async function publishContinuousNativeReply(input: {
     const impliedInputIds = Object.keys(replies).length === 0 && continued.runId === runId &&
       continued.sessionId === row.run.nativeSessionId && Array.isArray(continued.commentIds)
       ? continued.commentIds.filter((id): id is string => typeof id === "string" && !answered.has(id)) : [];
-    const questionCommentIds = [...new Set([
+    const handback = row.run.contextSnapshot?.preDispatchInputHandback === true;
+    let questionCommentIds = [...new Set([
       ...(explicitAnswers
         ? [...answers.filter((id): id is string => typeof id === "string" && !answered.has(id)),
           ...(answers.some(id => submittedInputIds.includes(id)) ? sealedIds.filter(id => !answered.has(id)) : [])]
@@ -120,6 +121,14 @@ export async function publishContinuousNativeReply(input: {
       ...(input.event.turnId ? firstInputIds : []),
       ...sameTurnAcknowledgements,
     ])];
+    if (handback && questionCommentIds.length) {
+      const chronological = (await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+        eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, questionCommentIds),
+      )).orderBy(asc(issueComments.createdAt), asc(issueComments.id))).map(comment => comment.id);
+      // Interaction delivery IDs are not comments; keep their attribution too.
+      const commentIds = new Set(chronological);
+      questionCommentIds = [...chronological, ...questionCommentIds.filter(id => !commentIds.has(id))];
+    }
     const clientRequestId = `${nativeFinalReplyKey(runId, input.event.itemId!)}:${questionCommentIds.join(",") || "opening"}`;
     const [existing] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
       eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
@@ -165,6 +174,24 @@ export async function publishContinuousNativeReply(input: {
         await tx.update(agentWakeupRequests).set({ ...(remaining.length
           ? { payload: withQueuedCommentIdsInWakePayload(wake.payload, remaining) }
           : { status: "cancelled", finishedAt: now }), updatedAt: now }).where(eq(agentWakeupRequests.id, wake.id));
+      }
+    }
+    if (handback && questionCommentIds.length) {
+      const receipts = await tx.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+        sql`${agentWakeupRequests.payload}->'preDispatchInputOnly' = 'true'::jsonb`,
+      ));
+      const handled = new Set(questionCommentIds);
+      for (const receipt of receipts) {
+        const ids = queuedCommentIdsFromWakePayload(receipt.payload);
+        const remaining = ids.filter(id => !handled.has(id));
+        if (remaining.length === ids.length) continue;
+        await tx.update(agentWakeupRequests).set({
+          payload: withQueuedCommentIdsInWakePayload(receipt.payload, remaining), updatedAt: new Date(),
+          ...(!remaining.length ? { status: "completed", finishedAt: new Date() } : {}),
+        }).where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, receipt.id)));
       }
     }
     await logActivity(tx, { companyId, actorType: "agent", actorId: agentId, agentId, runId, issueId,
