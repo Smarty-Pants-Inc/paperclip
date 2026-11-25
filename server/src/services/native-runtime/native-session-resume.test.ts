@@ -1641,7 +1641,24 @@ const recoveryFakeCodex = resolve(
 );
 
 describe("rebindNativeSessionCheckpoint", () => {
-  it.each(["instructions", "aggregateDigest"])("rebinds changed Pi runtime context (%s) only under continuous", key => {
+  it.each(["instructions", "mcp", "skills"])("workspace continuation still checks current Pi context (%s)", key => {
+    const prior = execution(previousRunId), current = execution(currentRunId, "/workspace-next");
+    for (const value of [prior, current]) {
+      value.provider = { kind: "pi_rpc", model: "provider/model" };
+      value.session.driverKind = "pi_rpc";
+    }
+    const source = previousRun({ nativeExecutionInput: prior });
+    source.runnerProfileJson.sessionCheckpoint.driverKind = "pi_rpc";
+    if (key === "instructions") current.runtimeContext.instructions.bundle.digest = "b".repeat(64);
+    if (key === "mcp") current.runtimeContext.mcp.digest = "d".repeat(64);
+    if (key === "skills") current.runtimeContext.skills.push({ key: "fixture-skill", runtimeName: "fixture-skill", versionId: "next", bundle: structuredClone(current.runtimeContext.instructions.bundle) });
+    current.runtimeContext.aggregateDigest = canonicalNativeRuntimeContextDigest(current.runtimeContext);
+    const rebound = rebindNativeSessionCheckpoint({ previousRun: source, currentExecution: current, sessionContinuity: "continuous" });
+    if (key === "instructions") expect(rebound).toMatchObject({ sessionId: "provider-thread-123", workingDirectory: "/workspace-next" });
+    else expect(rebound).toBeNull();
+  });
+
+  it.each(["instructions", "prompt", "mcp", "skills", "connectionInstructions", "aggregateDigest", "instructions-and-mcp"])("limits changed Pi runtime context (%s) to instruction and pack prompt continuity", key => {
     const prior = execution(previousRunId), current = execution(currentRunId);
     for (const sessionContinuity of [undefined, "continuous", "paperclip"] as const) {
       for (const value of [prior, current]) {
@@ -1650,12 +1667,16 @@ describe("rebindNativeSessionCheckpoint", () => {
       }
       const source = previousRun({ nativeExecutionInput: prior });
       source.runnerProfileJson.sessionCheckpoint.driverKind = "pi_rpc";
-      if (key === "instructions") current.runtimeContext.instructions.bundle.digest = "b".repeat(64);
-      current.runtimeContext.aggregateDigest = key === "instructions"
-        ? canonicalNativeRuntimeContextDigest(current.runtimeContext) : "c".repeat(64);
+      if (key === "instructions" || key === "instructions-and-mcp") current.runtimeContext.instructions.bundle.digest = "b".repeat(64);
+      if (key === "prompt") current.runtimeContext.prompt.revision = "next-pack";
+      if (key === "mcp" || key === "instructions-and-mcp") current.runtimeContext.mcp.digest = "d".repeat(64);
+      if (key === "skills") current.runtimeContext.skills.push({ key: "fixture-skill", runtimeName: "fixture-skill", versionId: "next", bundle: structuredClone(current.runtimeContext.instructions.bundle) });
+      if (key === "connectionInstructions") current.runtimeContext.connectionInstructions = { text: "Changed account policy", digest: "e".repeat(64) };
+      current.runtimeContext.aggregateDigest = key === "aggregateDigest" ? "c".repeat(64) : canonicalNativeRuntimeContextDigest(current.runtimeContext);
       const result = buildNativeExecutionWithCheckpoint({ previousRun: source, normalizedSessionId, buildExecution: () => current });
-      expect(result.normalizedSessionId === normalizedSessionId).toBe(sessionContinuity !== "paperclip");
-      expect(!!result.checkpoint).toBe(sessionContinuity !== "paperclip");
+      const retain = sessionContinuity !== "paperclip" && (key === "instructions" || key === "prompt");
+      expect(result.normalizedSessionId === normalizedSessionId).toBe(retain);
+      expect(!!result.checkpoint).toBe(retain);
       const wrongOwner = structuredClone(current);
       wrongOwner.binding.agentId = randomUUID();
       expect(rebindNativeSessionCheckpoint({ previousRun: source, currentExecution: wrongOwner })).toBeNull();

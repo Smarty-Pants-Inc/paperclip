@@ -656,10 +656,17 @@ export function nativeRuntimeContextsMatch(
   current: NativeRuntimeContextSnapshot,
   toolRefreshOnResume?: boolean,
   instructionRefreshOnResume = false,
+  packPromptRefreshOnResume = false,
 ): boolean {
   return previous.aggregateDigest === current.aggregateDigest ||
-    (instructionRefreshOnResume && canonicalNativeRuntimeContextDigest({ ...previous, instructions: current.instructions }) === current.aggregateDigest) ||
-    (toolRefreshOnResume === true && canonicalNativeRuntimeContextDigest({ ...previous, mcp: current.mcp }) === current.aggregateDigest);
+    ((instructionRefreshOnResume || packPromptRefreshOnResume || toolRefreshOnResume === true) && canonicalNativeRuntimeContextDigest({
+      ...previous,
+      ...(instructionRefreshOnResume ? { instructions: current.instructions } : {}),
+      // Pack-owned execution framing may advance; skills, account instructions
+      // and tool assignments are still retained-session compatibility inputs.
+      ...(packPromptRefreshOnResume ? { prompt: current.prompt } : {}),
+      ...(toolRefreshOnResume === true ? { mcp: current.mcp } : {}),
+    }) === current.aggregateDigest);
 }
 
 /**
@@ -704,6 +711,8 @@ export function rebindNativeSessionCheckpoint(input: {
   const checkpointIdentity = record(rawCheckpoint.identity);
   const current = input.currentExecution;
   const normalizedSessionId = current.session.normalizedSessionId;
+  const continuousPi = current.provider.kind === "pi_rpc" &&
+    resolveSessionContinuity(current.provider.kind, current.provider.sessionContinuity) === "continuous";
   if (
     !isNativeSessionId(normalizedSessionId) ||
     input.previousRun.companyId !== current.binding.companyId ||
@@ -747,9 +756,8 @@ export function rebindNativeSessionCheckpoint(input: {
     !nativeSessionProvidersMatch(previousExecution.provider, current.provider) ||
     previousExecution.schema !== current.schema ||
     ("homeMode" in previousExecution ? previousExecution.homeMode : "isolated") !== ("homeMode" in current ? current.homeMode : "isolated") ||
-    (!(current.provider.kind === "pi_rpc" && resolveSessionContinuity(current.provider.kind, current.provider.sessionContinuity) === "continuous") &&
-      "runtimeContext" in previousExecution && "runtimeContext" in current &&
-      !nativeRuntimeContextsMatch(previousExecution.runtimeContext, current.runtimeContext, input.toolRefreshOnResume))
+    ("runtimeContext" in previousExecution && "runtimeContext" in current &&
+      !nativeRuntimeContextsMatch(previousExecution.runtimeContext, current.runtimeContext, input.toolRefreshOnResume, continuousPi, continuousPi))
   )
     return null;
 
