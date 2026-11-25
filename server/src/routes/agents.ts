@@ -2416,7 +2416,7 @@ export function agentRoutes(
       || (adapterType === "paperclip_runner" && adapterConfig.provider === "codex");
     const claude = adapterType === "claude_local";
     if (!codex && !claude) return adapterConfig;
-    const model = requestedConfig.model ?? adapterConfig.model;
+    const model = requestedConfig.model;
     // Preserve named models and let admission reject invalid non-string values.
     if (model != null && (typeof model !== "string" || model.trim())) return adapterConfig;
     return {
@@ -2444,7 +2444,7 @@ export function agentRoutes(
       return {
         ...nativeConfig,
         piRpcThinkingLevel: piRpcThinking({ ...requested, piRpcThinkingLevel: level }),
-        model: asNonEmptyString(adapterConfig.model) ? adapterConfig.model : "paperclip/claude-opus-5-5",
+        model: asNonEmptyString(requestedConfig.model) ? requestedConfig.model : "paperclip/claude-opus-5-5",
       };
     }
     const codex = native ? adapterConfig.provider === "codex" : adapterType === "codex_local";
