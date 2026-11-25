@@ -125,7 +125,7 @@ export type NativeProviderConfig =
   | { kind: "cursor_cloud"; model: string; cursorCloud: NativeCursorCloudConfig }
   | { kind: "codex"; model: string | null; approvalPolicy?: NativeCodexApprovalPolicy }
   | { kind: "opencode"; model: string; permissionMode?: NativeOpenCodePermissionMode }
-  | { kind: "pi_rpc"; model: string; conversationMode?: true; piRpcThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" }
+  | { kind: "pi_rpc"; model: string; conversationMode?: true; sessionContinuity?: "continuous" | "paperclip"; piRpcThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" }
   | {
       kind: "claude_managed";
       model: string;
@@ -603,7 +603,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
       : provider.kind === "codex" && isV4
         ? ["kind", "model", "approvalPolicy", ...(isV5 ? ["reasoningEffort", "webSearch"] : [])]
         : provider.kind === "pi_rpc"
-          ? ["kind", "model", "piRpcThinkingLevel", "conversationMode"]
+          ? ["kind", "model", "piRpcThinkingLevel", "conversationMode", "sessionContinuity"]
         : provider.kind === "opencode" && isV4
           ? ["kind", "model", "permissionMode"]
           : ["kind", "model"],
@@ -807,8 +807,10 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
     };
   } else if (provider.kind === "pi_rpc") {
     if (provider.conversationMode !== undefined && provider.conversationMode !== true) throw new NativeExecutionInputError("input.provider.conversationMode must be true when present");
+    if (provider.sessionContinuity !== undefined && provider.sessionContinuity !== "continuous" && provider.sessionContinuity !== "paperclip") throw new NativeExecutionInputError("input.provider.sessionContinuity must be continuous or paperclip");
     parsedProvider = { kind: "pi_rpc", model: providerModel!,
       ...(provider.conversationMode === true ? { conversationMode: true as const } : {}),
+      ...(provider.sessionContinuity === undefined ? {} : { sessionContinuity: provider.sessionContinuity }),
       ...(provider.piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel: provider.piRpcThinkingLevel as Extract<NativeProviderConfig, { kind: "pi_rpc" }>["piRpcThinkingLevel"] }) };
   } else if (provider.kind === "opencode") {
     if (isV4 && provider.permissionMode !== "allow" && provider.permissionMode !== "ask" && provider.permissionMode !== "deny") {
