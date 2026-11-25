@@ -22,9 +22,7 @@ async function transferArchive(target: RemoteWorkspaceTarget, direction: "syncIn
   operations: SandboxSyncOperation[], byteSize: number) {
   if (!Number.isSafeInteger(byteSize) || byteSize <= 0) throw new Error("remote_workspace_archive_size_invalid");
   const timeoutMs = Math.min(MAX_SANDBOX_SYNC_TIMEOUT_MS, 60_000 + Math.ceil(byteSize / 1024 ** 2) * 1_000);
-  return timeoutMs > 300_000
-    ? target.runner![direction]!(operations, { minimumTimeoutMs: timeoutMs })
-    : target.runner![direction]!(operations);
+  return target.runner![direction]!(operations, { minimumTimeoutMs: timeoutMs });
 }
 
 const checkoutConfiguredRefScript = String.raw`if(input.ref){const remoteRef=input.ref.replace(/^refs\/heads\//,'');
