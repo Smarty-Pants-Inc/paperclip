@@ -649,7 +649,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   const effectiveConfig = isCreate ? props.values.adapterSchemaValues ?? {} : { ...config, ...overlay.adapterConfig };
   const harnessType = agentHarnessType(adapterType, effectiveConfig);
   const isCodexHarness = harnessType === "codex_local";
-  const runnerProfile = paperclipRunnerProfileForHarness(harnessType);
+  const runnerProfile = paperclipRunnerProfileForHarness(adapterType === "paperclip_runner" && effectiveConfig.provider === "pi_rpc" ? "pi_rpc" : harnessType);
   const isRunnerHarness = Boolean(runnerProfile);
   const rawCurrentDefaultEnvironmentId = isCreate
     ? props.values.defaultEnvironmentId ?? ""
