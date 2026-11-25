@@ -13707,6 +13707,9 @@ export function issueService(db: Db) {
         authorizationReason?: string | null;
         /** Server-only final assistant response, never a tool/progress comment. */
         completionReply?: boolean;
+        /** Server-only plugin ingress: another agent's authored input, not the
+         * conversation agent's assistant output. Interaction ACLs still apply. */
+        allowConversationAgentInput?: boolean;
         sourceTrust?: typeof issueComments.$inferInsert.sourceTrust;
         createdAt?: Date | string | null;
         clientRequestId?: string;
@@ -13785,10 +13788,13 @@ export function issueService(db: Db) {
       if (options?.metadata?.chatMessage && !options.proactiveChatMessage) {
         throw forbidden("Chat message provenance is server-owned");
       }
-      if (issue.conversationAgentId && actor.agentId && issue.conversationAgentId !== actor.agentId) {
+      // Plugin tool calls carrying a run remain run-authored output and must
+      // pass cancellation/session fences. Only run-less ingress is input.
+      const conversationAgentInput = options?.allowConversationAgentInput === true && Boolean(actor.agentId) && !actor.runId;
+      if (issue.conversationAgentId && actor.agentId && issue.conversationAgentId !== actor.agentId && !conversationAgentInput) {
         throw forbidden("Only this conversation's agent can post agent messages");
       }
-      if (issue.conversationAgentId && actor.agentId && !actor.runId) {
+      if (issue.conversationAgentId && actor.agentId && !actor.runId && !conversationAgentInput) {
         throw forbidden("Agent chat messages require an authenticated run");
       }
       if (issue.conversationAgentId && actor.runId) {
