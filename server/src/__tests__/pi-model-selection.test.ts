@@ -46,6 +46,15 @@ describe("Pi issue model selection at run build", () => {
     expect(normalizePiIssueModelSelection(saved, null)).toBeNull();
     expect(piRpcThinking(saved.adapterConfig)).toBe("medium");
   });
+  it("validates the normalized runtime projection before accepting a bare chat model", () => {
+    const saved = { ...agent, adapterConfig: { provider: "pi_rpc", model: "paperclip/model", effort: "ultra" } };
+    const overrides = { adapterConfig: { model: "model" } };
+    expect(() => normalizePiIssueModelSelection(saved, overrides)).toThrowError(expect.objectContaining({
+      status: 422,
+      message: 'Pi cannot use reasoning level "ultra": choose off, minimal, low, medium, high, xhigh or max',
+    }));
+    expect(overrides).toEqual({ adapterConfig: { model: "model" } });
+  });
   it("rejects an old stored invalid reasoning override at run normalization with a plain error", () => {
     const stored = { adapterConfig: { piRpcThinkingLevel: "ultra" } };
     expect(() => normalizePiIssueModelSelection(agent, stored)).toThrow(

@@ -139,7 +139,7 @@ describe("Paperclip Runner native provider configuration", () => {
     expect(resolve({ ...base, [key]: "ultra" })).toMatchObject({ piRpcThinkingLevel: "ultra" });
     expect(resolve(projectPaperclipRunnerTaskConfig("pi_rpc", base, { [key]: "low" }))).toMatchObject({ piRpcThinkingLevel: "low" });
     expect(resolve(projectPaperclipRunnerTaskConfig("pi_rpc", { ...base, piRpcThinkingLevel: "xhigh" }, { [key]: "low" }))).toMatchObject({ piRpcThinkingLevel: "low" });
-    expect(resolve(projectPaperclipRunnerTaskConfig("pi_rpc", base, { model: "openai/other" }))).toMatchObject({ piRpcThinkingLevel: "medium" });
+    expect(resolve(projectPaperclipRunnerTaskConfig("pi_rpc", base, { model: "openai/other" }))).toMatchObject({ piRpcThinkingLevel: "high" });
   });
   it.each([undefined, null, "", " \t "])("records medium Pi reasoning when the saved level is unset: %j", piRpcThinkingLevel => {
     expect(resolvePaperclipRunnerNativeProviderInput({ backend: "pi_rpc", adapterConfig: { provider: "pi_rpc", model: "openai/gpt-6.1-sol", piRpcThinkingLevel } })).toMatchObject({ piRpcThinkingLevel: "medium" });
@@ -147,6 +147,19 @@ describe("Paperclip Runner native provider configuration", () => {
   it.each([null, "", " \t "])("inherits the agent level for an unset task override: %j", piRpcThinkingLevel => {
     const projected = projectPaperclipRunnerTaskConfig("pi_rpc", { provider: "pi_rpc", model: "openai/gpt-6.1-sol", piRpcThinkingLevel: "high" }, { piRpcThinkingLevel });
     expect(resolvePaperclipRunnerNativeProviderInput({ backend: "pi_rpc", adapterConfig: projected })).toMatchObject({ piRpcThinkingLevel: "high" });
+  });
+
+  it.each(["modelReasoningEffort", "reasoningEffort", "effort"])("inherits alias-derived %s across a model change with an unset task level", key => {
+    for (const piRpcThinkingLevel of [undefined, null, "", " \t "]) {
+      const base = { provider: "pi_rpc", model: "paperclip/model", [key]: "high" };
+      const projected = projectPaperclipRunnerTaskConfig("pi_rpc", base, { model: "paperclip/other", piRpcThinkingLevel });
+      expect(projected).not.toHaveProperty(key);
+      expect(resolvePaperclipRunnerNativeProviderInput({ backend: "pi_rpc", adapterConfig: projected }))
+        .toMatchObject({ model: "paperclip/other", piRpcThinkingLevel: "high" });
+      const unset = projectPaperclipRunnerTaskConfig("pi_rpc", { ...base, [key]: null }, { model: "paperclip/other", piRpcThinkingLevel });
+      expect(resolvePaperclipRunnerNativeProviderInput({ backend: "pi_rpc", adapterConfig: unset }))
+        .toMatchObject({ piRpcThinkingLevel: "medium" });
+    }
   });
 
   it("uses only task model and effort overrides without changing the Runner provider", () => {
