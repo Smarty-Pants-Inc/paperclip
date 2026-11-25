@@ -7,6 +7,8 @@ import { agents, agentWakeupRequests, chatCompletionDeliveries as deliveries, ch
 import { extractIssueReferenceMatches } from "@paperclipai/shared";
 import { appendHeartbeatRunEventBatch } from "./heartbeat-run-events.js";
 import { conflict, forbidden, notFound } from "../errors.js";
+import { parseNativeExecutionInput } from "../vendor/paperclip-runner/index.js";
+import type { NativeRestartRecoveryClaim } from "./native-runtime/native-restart-recovery.js";
 
 export const CHAT_COMPLETION_WAKE_REASON = "chat_task_completed";
 /** Run event: the conversation agent read its handed-off task after it was done. */
@@ -225,10 +227,29 @@ export async function settleReportedChatCompletions(tx: Connection, input: { com
   return reported > 0 && remaining === 0;
 }
 
-/** Freeze the input at turn start. New completions cannot be consumed by an already-running turn. */
-export async function prepareChatCompletionTurn(db: Db, run: Run): Promise<Run> {
+/** Only server-owned same-run reattachment can reuse a durable admitted input.
+ * Caller wake context and a lease owner alone are not admission evidence. */
+function admittedCompletionReattach(run: Run, claim?: NativeRestartRecoveryClaim): boolean {
+  if (run.runtimeMode !== "native" || run.status !== "running" || claim?.runId !== run.id ||
+      (claim.kind !== "reattach_remote_runner" && claim.kind !== "reattach_existing_runner") ||
+      ids(run).length === 0 || !Array.isArray(run.contextSnapshot?.chatCompletionUpdates) ||
+      run.contextSnapshot.chatCompletionUpdates.length === 0) return false;
+  try {
+    const frozen = parseNativeExecutionInput(run.runnerProfileJson?.nativeExecutionInput);
+    return frozen.binding.runId === run.id && frozen.binding.companyId === run.companyId &&
+      frozen.binding.agentId === run.agentId && frozen.binding.issueId === run.contextSnapshot?.issueId &&
+      frozen.binding.issueId === run.nativeIssueId && frozen.session.normalizedSessionId === run.nativeSessionId;
+  } catch {
+    return false;
+  }
+}
+
+/** Freeze once at turn start. Reattachment reuses the admitted input and reply receipts;
+ * it must neither reselect delivered completions nor absorb later pending completions.
+ * The caller still validates the conversation generation/ownership before dispatch. */
+export async function prepareChatCompletionTurn(db: Db, run: Run, restartRecovery?: NativeRestartRecoveryClaim): Promise<Run> {
   const issueId = run.contextSnapshot?.issueId;
-  if (typeof issueId !== "string") return run;
+  if (typeof issueId !== "string" || admittedCompletionReattach(run, restartRecovery)) return run;
   return db.transaction(async tx => {
     const [source] = await tx.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId))).for("update");
     if (!source) return run;
