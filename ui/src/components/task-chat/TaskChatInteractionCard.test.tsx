@@ -9,6 +9,8 @@ vi.mock("@/hooks/useCoordinatorWorkspaceEnabled", () => ({
   useCoordinatorWorkspaceEnabled: () => ({ enabled: false, loaded: true }),
 }));
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { issuesApi } from "@/api/issues";
+import { queryKeys } from "@/lib/queryKeys";
 import type { IssueDocument } from "@paperclipai/shared";
 import type {
   IssueThreadInteraction,
@@ -124,6 +126,43 @@ describe("TaskChatInteractionCard", () => {
   afterEach(() => {
     flushSync(() => root.unmount());
     container.remove();
+  });
+
+  it.each([undefined, false, true].flatMap(canResumeReview =>
+    (["timeline", "takeover"] as const).map(presentation => ({ canResumeReview, presentation }))))(
+    "shows Resume review only with the server capability ($canResumeReview, $presentation)", ({ canResumeReview, presentation }) => {
+    const interaction = createRequestConfirmation({ title: "Review requested", canResumeReview,
+      payload: { version: 1, prompt: "Review the completed work.", target: { type: "custom", key: "native_completion_review", revisionId: "decision-1" } } });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    flushSync(() => root.render(<QueryClientProvider client={client}><TooltipProvider><ThemeProvider>
+      <TaskChatInteractionCard item={interactionItem(interaction)} presentation={presentation} showPendingRequest />
+    </ThemeProvider></TooltipProvider></QueryClientProvider>));
+    expect(Array.from(container.querySelectorAll("button")).some(button => button.textContent === "Resume review")).toBe(canResumeReview === true);
+  });
+
+  it.each(["timeline", "takeover"] as const)("resumes the same review from its %s page card without resolving the card", async presentation => {
+    const request = vi.spyOn(issuesApi, "resumeReview").mockResolvedValue({ wakeId: "resume-wake" });
+    onTestFinished(() => request.mockRestore());
+    const accept = vi.fn(), reject = vi.fn();
+    const interaction = createRequestConfirmation({ canResumeReview: true, title: "Review requested" });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    client.setQueryData(queryKeys.auth.session, { user: { id: "review-operator" } });
+    flushSync(() => root.render(<QueryClientProvider client={client}><TooltipProvider><ThemeProvider>
+      <TaskChatInteractionCard item={interactionItem(interaction)} presentation={presentation} showPendingRequest onAcceptInteraction={accept} onRejectInteraction={reject} />
+    </ThemeProvider></TooltipProvider></QueryClientProvider>));
+    const button = Array.from(container.querySelectorAll("button")).find(button => button.textContent === "Resume review")!;
+    await act(async () => { button.click(); });
+    await act(async () => { await vi.waitFor(() => expect(request).toHaveBeenCalledWith(interaction.issueId, interaction.id)); });
+    expect(accept).not.toHaveBeenCalled();
+    expect(reject).not.toHaveBeenCalled();
+  });
+
+  it("hides Resume review on a resolved card even if a stale capability is present", () => {
+    const interaction = createRequestConfirmation({ status: "accepted", canResumeReview: true });
+    flushSync(() => root.render(<TooltipProvider><ThemeProvider>
+      <TaskChatInteractionCard item={interactionItem(interaction)} presentation="timeline" />
+    </ThemeProvider></TooltipProvider>));
+    expect(container.textContent).not.toContain("Resume review");
   });
 
   it("opens the real tool review and reveals the proposal tail before approval", async () => {
