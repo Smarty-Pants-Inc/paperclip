@@ -69,7 +69,7 @@ import type { NativeRestartRecoveryClaim } from "../services/native-runtime/nati
     };
     return { companyId, agentId, sourceId, runId, task, create, finish, rows, due, wakeup, service, run };
   }
-  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21380 (SMA-716 held report repeated after release)
+  // catch: a held completion report repeated after release
   it.each(["continuous", "legacy", "paperclip", "refused"])("reports a held completion once, without a hold-end successor (%s)", async mode => {
     const f = await seed(), sessionId = randomUUID(); heldCompletion.refused = mode === "refused";
     await db.insert(authUsers).values({ id: "operator", name: "Operator", email: "operator@example.test", createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
@@ -148,7 +148,7 @@ import type { NativeRestartRecoveryClaim } from "../services/native-runtime/nati
       runId: f.runId, agentId: f.agentId }, provider: { kind: "pi_rpc" as const } }, event };
     return { ...f, publication };
   }
-  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21380 (RFL first-final ACK counterexample)
+  // catch: an earlier frozen final incorrectly acknowledging a later completion report
   it.each(["answer", "stop"])("keeps B owed when B is steered after A's frozen final is persisted but before publication (%s)", async outcome => {
     const f = await heldFixture(), b = await f.create();
     await f.finish();
@@ -183,7 +183,7 @@ import type { NativeRestartRecoveryClaim } from "../services/native-runtime/nati
       itemId: "B-final", sourceEventId: "B-final", payload: { ...f.publication.event.payload, text: "B is complete.", answers: [late.id] } } });
     expect((await f.rows()).find(row => row.id === late.id)).toMatchObject({ status: "delivered", responseCommentId: expect.any(String) });
   });
-  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21380 (RFL older-person FIFO counterexample)
+  // catch: a completion report overtaking an older person message
   it.each(["release", "worker"])("keeps an older person wake ahead of a completion through the %s door", async door => {
     vi.stubEnv("PAPERCLIP_AGENT_CHAT_STEERING", "true");
     onTestFinished(() => { vi.unstubAllEnvs(); });

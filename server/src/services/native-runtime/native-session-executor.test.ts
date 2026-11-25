@@ -11268,7 +11268,7 @@ describe("native session same-turn steering", () => {
     }, 60_000);
     afterAll(async () => { await pg?.cleanup(); });
 
-    // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21380
+    // catch: fencing a held turn before offering its pending completion report
     // Real release owner + real live-delivery SQL; only the provider and outer
     // execution lifecycle are doubled. Completion attribution uses real PG too.
     it.each(["continuous", "legacy"] as const)("offers before fencing the held turn (%s)", async mode => {
@@ -11339,7 +11339,7 @@ describe("native session same-turn steering", () => {
     });
   });
 
-  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21380
+  // catch: concurrent close requests losing the single release owner while completion I/O yields
   it.each(["offered", "cleanup-only", "configuration-during-offer"] as const)("keeps one release owner while completion I/O yields (%s)", async mode => {
     const result: Record<string, unknown> = {};
     vi.spyOn(continuousReply, "publishContinuousNativeReply").mockResolvedValue(true);
@@ -11379,7 +11379,7 @@ describe("native session same-turn steering", () => {
     } finally { release(); state.release?.(); await running; vi.restoreAllMocks(); }
   });
 
-  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21380 (RFL lost-close-intent probes)
+  // catch: a transient read or offer exception losing close intent until another final arrives
   it.each(["read", "offer"])("retains close intent after a transient %s exception without another final", async failure => {
     const heldWork = await import("./held-native-turn.js");
     vi.spyOn(continuousReply, "publishContinuousNativeReply").mockResolvedValue(true);
