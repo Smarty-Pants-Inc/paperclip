@@ -331,7 +331,7 @@ import {
 } from "../services/native-runtime/provider-profile.js";
 import { managedAgentProfileService } from "../services/managed-agent-profiles.js";
 import { remoteAgentProfileService } from "../services/remote-agent-profiles.js";
-import { validatePiReasoningSelection } from "../adapters/pi-model-selection.js";
+import { validatePiGatewayModelSelection, validatePiReasoningSelection } from "../adapters/pi-model-selection.js";
 
 const AGENT_SKILL_ASSIGNMENT_MODES = ["add", "remove", "replace"] as const;
 
@@ -5855,6 +5855,9 @@ export function agentRoutes(
         );
       }
       validatePiReasoningSelection({ adapterType: requestedAdapterType, adapterConfig: rawEffectiveAdapterConfig });
+      await validatePiGatewayModelSelection(db, { ...existing, adapterType: requestedAdapterType,
+        adapterConfig: rawEffectiveAdapterConfig, runtimeConfig: requestedRuntimeConfig ?? existing.runtimeConfig,
+      }, responsibleUserForAiRequest(req));
       const existingRunnerProvider =
         existing.adapterType === "paperclip_runner"
           ? existingAdapterConfig.provider
