@@ -5,8 +5,9 @@ import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
+const coordinator = vi.hoisted(() => ({ enabled: false }));
 vi.mock("@/hooks/useCoordinatorWorkspaceEnabled", () => ({
-  useCoordinatorWorkspaceEnabled: () => ({ enabled: false, loaded: true }),
+  useCoordinatorWorkspaceEnabled: () => ({ enabled: coordinator.enabled, loaded: true }),
 }));
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { issuesApi } from "@/api/issues";
@@ -120,6 +121,7 @@ describe("TaskChatInteractionCard", () => {
   let root: Root;
 
   beforeEach(() => {
+    coordinator.enabled = false;
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);
@@ -157,6 +159,49 @@ describe("TaskChatInteractionCard", () => {
     await act(async () => { await vi.waitFor(() => expect(request).toHaveBeenCalledWith(interaction.issueId, interaction.id)); });
     expect(accept).not.toHaveBeenCalled();
     expect(reject).not.toHaveBeenCalled();
+  });
+
+  // catch: rfl-0481v2-READ.md MUST 1 — the pending body kept its band,
+  // but switching the real parent to a closed receipt removed it entirely.
+  it.each([false, true].flatMap(enabled =>
+    (["timeline", "takeover", "classic"] as const).flatMap(presentation =>
+      (["accepted", "rejected", "cancelled", "expired"] as const).map(status => ({ enabled, presentation, status })))))(
+    "keeps one native resume band across pending → $status and remount ($presentation, coordinator=$enabled)",
+    ({ enabled, presentation, status }) => {
+      coordinator.enabled = enabled;
+      const interaction = createRequestConfirmation({ canResumeReview: true,
+        payload: { version: 1, prompt: "Review the work", target: { type: "custom", key: "native_completion_review", revisionId: "decision-1" } } });
+      const client = new QueryClient();
+      const render = (card: RequestConfirmationInteraction, version = 0) => flushSync(() => root.render(
+        <QueryClientProvider client={client}><TooltipProvider><ThemeProvider>
+          <section key={version}>
+            {presentation === "classic" ? <IssueThreadInteractionCard interaction={card} />
+              : <TaskChatInteractionCard item={interactionItem(card)} presentation={presentation} showPendingRequest />}
+          </section>
+          <p data-following-log>Following log content</p>
+        </ThemeProvider></TooltipProvider></QueryClientProvider>));
+      render(interaction);
+      expect(container.querySelectorAll('[data-resume-review-slot]')).toHaveLength(1);
+      const footprint = container.querySelector('[data-resume-review-slot]')!.className;
+      const resolved = { ...interaction, status, canResumeReview: false };
+      render(resolved);
+      for (const version of [0, 1]) {
+        render(resolved, version);
+        expect(container.querySelectorAll('[data-resume-review-slot]')).toHaveLength(1);
+        const slot = container.querySelector('[data-resume-review-slot]')!;
+        expect(slot.className).toBe(footprint);
+        expect(slot.closest("details")).toBeNull(); // closed receipts cannot hide the band
+        expect(slot.textContent).toBe("");
+        expect(container.querySelector('[data-following-log]')!.compareDocumentPosition(slot) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy();
+      }
+    },
+  );
+
+  it("keeps non-native resolved confirmations free of resume bands", () => {
+    flushSync(() => root.render(<TooltipProvider><ThemeProvider>
+      <TaskChatInteractionCard item={interactionItem(createRequestConfirmation({ status: "accepted" }))} />
+    </ThemeProvider></TooltipProvider>));
+    expect(container.querySelector('[data-resume-review-slot]')).toBeNull();
   });
 
   it("keeps the native review action footprint through eligibility changes and reload", () => {
