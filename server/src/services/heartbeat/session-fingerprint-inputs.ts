@@ -154,19 +154,23 @@ export function paperclipRunnerRetainedAdapterConfig(config: Record<string, unkn
 }
 
 const CONTINUOUS_PI_MODEL_KEYS = ["model", "piRpcThinkingLevel", "piThinkingLevel", "thinkingLevel", "modelReasoningEffort", "reasoningEffort", "effort", "variant"];
+// These are next-turn inputs, not retained-thread compatibility boundaries.
+// Pack prompt identity lives in the native runtime context, not adapterConfig;
+// its refresh and capability-gated MCP refresh remain owned by that boundary.
+const CONTINUOUS_PI_ADAPTER_CONFIG_KEYS = [...CONTINUOUS_PI_MODEL_KEYS, "env"];
 
-export function paperclipRunnerSessionAdapterConfig(config: Record<string, unknown>): Record<string, unknown> {
+export function paperclipRunnerSessionAdapterConfig(config: Record<string, unknown>, retainEnvironment = false): Record<string, unknown> {
   const retained = paperclipRunnerRetainedAdapterConfig(config);
   return config.provider === "pi_rpc" && resolveSessionContinuity(config.provider, config.sessionContinuity) === "continuous"
-    ? omitKeys(retained, CONTINUOUS_PI_MODEL_KEYS) : retained;
+    ? omitKeys(retained, retainEnvironment ? CONTINUOUS_PI_MODEL_KEYS : CONTINUOUS_PI_ADAPTER_CONFIG_KEYS) : retained;
 }
 
 /** Issue settings reach both the effective config and their own fingerprint category. */
-export function paperclipRunnerSessionIssueOverrides(overrides: unknown, config: Record<string, unknown>): unknown {
+export function paperclipRunnerSessionIssueOverrides(overrides: unknown, config: Record<string, unknown>, retainEnvironment = false): unknown {
   if (!isRecord(overrides) || config.provider !== "pi_rpc" || resolveSessionContinuity(config.provider, config.sessionContinuity) !== "continuous") return overrides;
   const result = { ...overrides };
   if (isRecord(result.adapterConfig)) {
-    const adapterConfig = omitKeys(result.adapterConfig, CONTINUOUS_PI_MODEL_KEYS);
+    const adapterConfig = omitKeys(result.adapterConfig, retainEnvironment ? CONTINUOUS_PI_MODEL_KEYS : CONTINUOUS_PI_ADAPTER_CONFIG_KEYS);
     result.adapterConfig = Object.keys(adapterConfig).length ? adapterConfig : null;
   }
   return Object.values(result).every(value => value == null) ? null : result;
