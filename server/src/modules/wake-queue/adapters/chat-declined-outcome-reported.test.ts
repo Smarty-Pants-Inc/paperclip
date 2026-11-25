@@ -1,4 +1,9 @@
 import { randomUUID } from "node:crypto";
+import { appendFileSync } from "node:fs";
+import express from "express";
+import request from "supertest";
+import { errorHandler } from "../../../middleware/index.js";
+import { issueRoutes } from "../../../routes/issues.js";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueComments, issueThreadInteractions, issues } from "@paperclipai/db";
@@ -6,6 +11,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { createReleaseIssueExecution } from "../application/use-cases.js";
 import { ALREADY_REPORTED_WAKE_REASON, createPostgresWakeQueueAdapter } from "./postgres.js";
 import { recordDeclinedInteractionRead } from "../../../services/chat-interaction-outcome-report.js";
+import { readQueuedInteractionResponse } from "../../../services/queued-interaction-response.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 
@@ -66,6 +72,61 @@ describe.skipIf(!support.supported)("release of a decline continuation an earlie
       payload: { ...context, mutation: "interaction", _paperclipWakeContext: context } }).returning();
     return { issue, run, wake, reply };
   }
+
+  // SMA-421: the answer arrives after this run starts, and is read through
+  // the real authorized tool/API door before the run releases its queue.
+  it.each([
+    { read: true, done: false }, { read: false, done: false },
+    { read: true, done: true }, { read: false, done: true },
+  ])("settles exactly a mid-run answer consumed by its live run: %j", async ({ read, done }) => {
+    const [issue] = await db.insert(issues).values({ companyId, title: "Mid-run card answer", status: "in_progress", assigneeAgentId: agentId }).returning();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId, invocationSource: "automation", status: "running",
+      responsibleUserId: "person", startedAt: new Date(Date.now() - 60_000), contextSnapshot: { issueId: issue.id } }).returning();
+    const [card] = await db.insert(issueThreadInteractions).values({ companyId, issueId: issue.id, kind: "ask_user_questions", status: "answered",
+      sourceRunId: run.id, createdByAgentId: agentId, resolvedByUserId: "person", resolvedAt: new Date(),
+      payload: { version: 1, questions: [{ id: "price", prompt: "Price?", selectionMode: "single", options: [{ id: "custom", label: "Price", freeText: true }] }] } as never,
+      result: { version: 1, answers: [{ questionId: "price", optionIds: [], otherText: "$90" }] } as never }).returning();
+    const context = { issueId: issue.id, taskId: issue.id, interactionId: card.id, interactionKind: card.kind,
+      interactionStatus: card.status, mutation: "interaction", source: "issue.interaction.respond", wakeReason: "issue_commented" };
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation", triggerDetail: "system",
+      reason: "issue_commented", status: "deferred_issue_execution", requestedByActorType: "user", requestedByActorId: "person",
+      payload: { ...context, _paperclipWakeContext: context } }).returning();
+    if (read) {
+      const app = express(); app.use(express.json());
+      app.use((req, _res, next) => { (req as any).actor = { type: "agent", source: "agent_key", companyId, agentId, runId: run.id }; next(); });
+      app.use("/api", issueRoutes(db, {} as never, {})); app.use(errorHandler);
+      const response = await request(app).get(`/api/issues/${issue.id}/interactions`).expect(200);
+      expect(response.body.find((row: { id: string }) => row.id === card.id).result.answers[0].otherText).toBe("$90");
+    }
+    // Reading never barges in or removes the person's live Steer/Interrupt.
+    expect(await readQueuedInteractionResponse(db, companyId, issue.id, wake.payload)).not.toBeNull();
+    await db.insert(issueComments).values({ companyId, issueId: issue.id, authorAgentId: agentId, createdByRunId: run.id,
+      body: read ? "The answer is $90." : "Still working; I have not read the answer." });
+    await db.update(issues).set({ status: done ? "done" : "in_progress", completedAt: done ? new Date() : null,
+      executionRunId: run.id, executionLockedAt: new Date() }).where(eq(issues.id, issue.id));
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
+    const releaseQueue = createReleaseIssueExecution({
+      issueLock: createPostgresWakeQueueAdapter(db, { resolveResponsibleUserId: async () => "person",
+        getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }), resolveSessionBeforeForWakeup: async () => null }),
+      recovery: { escalateStrandedAssignedIssue: async () => {}, escalateStrandedRecoveryIssueInPlace: async () => {} } as never,
+    });
+    const result = await releaseQueue({ companyId, runId: run.id, now: new Date() });
+    const [saved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id));
+    const runs = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).filter(row => row.contextSnapshot?.issueId === issue.id);
+    const replies = await db.select().from(issueComments).where(eq(issueComments.createdByRunId, run.id));
+    const evidence = { read, done, issueId: issue.id, runId: run.id, wakeId: saved.id, wakeStatus: saved.status,
+      successorRunId: saved.runId, runIds: runs.map(row => row.id), replies: replies.map(row => row.body), outcome: result.outcome.kind };
+    console.info("CARDSETTLE_ROW", JSON.stringify(evidence));
+    if (process.env.CARDSETTLE_EVIDENCE_FILE) appendFileSync(process.env.CARDSETTLE_EVIDENCE_FILE, `${JSON.stringify(evidence)}\n`);
+    expect.soft(saved.status).toBe(read ? "cancelled" : "queued");
+    expect.soft(runs).toHaveLength(read ? 1 : 2);
+    expect.soft(result.outcome.kind).toBe(read ? "released" : "promoted");
+    expect(replies).toHaveLength(1);
+    if (!read) {
+      await releaseQueue({ companyId, runId: run.id, now: new Date() });
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).filter(row => row.contextSnapshot?.issueId === issue.id)).toHaveLength(2);
+    }
+  });
 
   function release(promotion: () => never) {
     return createReleaseIssueExecution({

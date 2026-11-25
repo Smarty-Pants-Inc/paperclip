@@ -175,6 +175,27 @@ async function runReleaseDrain(
       continue;
     }
 
+    // Settle only the exact response this successful live run already read.
+    // Completion of the task is independent of delivery of its answer. Keep
+    // unrelated input coalesced into the receipt, and explicit resume intent.
+    const sourceCommentId = readNonEmptyString(candidate.payload.sourceCommentId);
+    const interactionIds = candidate.payload.interactionIds;
+    if (
+      run.status === "succeeded" &&
+      run.agentId === issue.assigneeAgentId && candidate.agentId === run.agentId &&
+      run.contextSnapshot.issueId === issue.id && !candidate.authorizedFailedChatRetry &&
+      candidate.payload.mutation === "interaction" &&
+      candidate.payload.resumeIntent !== true && candidate.deferredContextSeed.resumeIntent !== true &&
+      (!Array.isArray(interactionIds) || interactionIds.every(id => id === candidate.payload.interactionId)) &&
+      [...candidate.queuedCommentIds, ...candidate.deferredCommentIds].every(id => id === sourceCommentId) &&
+      await ports.transaction.hasConsumedInteractionResponse({ companyId: run.companyId, issueId: issue.id,
+        runId: run.id, agentId: run.agentId, payload: candidate.payload })
+    ) {
+      await ports.transaction.cancelDeferredWake({ companyId: run.companyId, wakeId: candidate.id, agentId: candidate.agentId,
+        reason: "Interaction response consumed by the successful live run", now: input.now });
+      continue;
+    }
+
     // An earlier reply in this conversation already reported this wake's
     // outcome. Settle it here so a duplicate report never becomes a run.
     if (await ports.transaction.skipAlreadyReportedChatWake({ companyId: run.companyId, issueId: issue.id, wake: candidate, now: input.now })) {
