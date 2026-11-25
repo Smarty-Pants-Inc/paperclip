@@ -212,6 +212,8 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     const { buildHostServices } = await import("../plugin-host-services.js");
     const { readBoardQueuedComments } = await import("../../modules/wake-queue/adapters/queued-comment-board-postgres.js");
     const flag = process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+    const bridgeIds = process.env.PAPERCLIP_CONVERSATION_INPUT_PLUGIN_IDS;
+    process.env.PAPERCLIP_CONVERSATION_INPUT_PLUGIN_IDS = "plugin-record-id";
     process.env.PAPERCLIP_AGENT_CHAT_STEERING = "true";
     heldSteering.available = true; heldSteering.sent = [];
     const observer = createDb(external ?? database!.connectionString);
@@ -222,8 +224,21 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
         const [sender] = await db.insert(agents).values({ companyId: scope.companyId, name: "Bridge author", adapterType: "process" }).returning();
         await expect(issueService(db).addComment(scope.issueId, "Untrusted assistant output", { agentId: sender.id }))
           .rejects.toThrow("Only this conversation's agent can post agent messages");
+        const [chat] = await db.select().from(issues).where(eq(issues.id, scope.issueId));
+        const userId = chat.conversationUserId!;
+        await db.insert(companyMemberships).values({ companyId: scope.companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "owner" });
+        const { attentionService } = await import("../attention.js");
+        const personAttention = () => attentionService(db).list(scope.companyId, { userId, view: "mine",
+          actor: { type: "board", source: "session", userId, companyIds: [scope.companyId], isInstanceAdmin: false } });
+        expect((await personAttention()).items).toEqual([]);
         const services = buildHostServices(db, "plugin-record-id", "paperclip.gateway", { forPlugin: () => ({ emit: async () => {}, subscribe: () => {} }) } as never,
           undefined, { heartbeatRuntimeEnv: {} });
+        const unrelated = buildHostServices(db, "unrelated-plugin-id", "paperclip.gateway", { forPlugin: () => ({ emit: async () => {}, subscribe: () => {} }) } as never,
+          undefined, { heartbeatRuntimeEnv: {} });
+        await expect(unrelated.issues.createComment({ companyId: scope.companyId, issueId: scope.issueId,
+          authorAgentId: sender.id, body: "Unapproved plugin input" })).rejects.toThrow("Only this conversation's agent");
+        expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, scope.agentId))).toEqual([]);
+        expect(heldSteering.sent).toEqual([]);
         heldSteering.onSend = async commentId => {
           // An independent PostgreSQL connection can see neither an uncommitted
           // comment nor admission wake. This runs INSIDE the delivery callback.
@@ -255,14 +270,20 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
         const board = await readBoardQueuedComments({ executor: db, issue, activeRun: run,
           actor: { actorType: "agent", actorId: sender.id, agentId: sender.id, runId: null, agentApiKeyId: null } });
         expect(board.entries).toEqual([]);
+        const personTray = await personAttention();
+        expect(personTray.items).toEqual([]);
+        expect((await personAttention()).items).toEqual([]); // Fresh read, not cached sender queue state.
         expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, scope.agentId))).toHaveLength(1);
         process.stdout.write(`PLUGIN_HELD ${JSON.stringify({ runId: scope.runId, commentId: comment.id, wakeId: wake.id,
-          wakeStatus: wake.status, replies: replies.map(reply => reply.id), tray: board.entries, sent: heldSteering.sent, commitObservedAtDelivery })}\n`);
+          wakeStatus: wake.status, replies: replies.map(reply => reply.id), tray: board.entries, personTray: personTray.items,
+          sent: heldSteering.sent, commitObservedAtDelivery })}\n`);
       } });
     } finally {
       heldSteering.onSend = undefined;
       heldSteering.available = false;
       await observer.$client.end();
+      if (bridgeIds === undefined) delete process.env.PAPERCLIP_CONVERSATION_INPUT_PLUGIN_IDS;
+      else process.env.PAPERCLIP_CONVERSATION_INPUT_PLUGIN_IDS = bridgeIds;
       if (flag === undefined) delete process.env.PAPERCLIP_AGENT_CHAT_STEERING;
       else process.env.PAPERCLIP_AGENT_CHAT_STEERING = flag;
     }
