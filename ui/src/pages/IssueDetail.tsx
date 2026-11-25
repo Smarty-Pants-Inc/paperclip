@@ -435,7 +435,6 @@ import { taskStatusIconProps } from "@/lib/task-status-presentation";
 // depend on it. Reusing one shared reference keeps those values stable.
 const EMPTY_ISSUES: Issue[] = [];
 const EMPTY_PROJECTS: Project[] = [];
-const restoredStoppedCommentIds = new Set<string>();
 
 type StopAndFinalizeRunError = Error & {
   runCancelledBeforeStatusUpdateFailed?: boolean;
@@ -5831,23 +5830,23 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     },
   });
 
-  // The text goes back into the input box FIRST (a failure can only duplicate it, never lose it), then
-  // the person's own delete takes it out of the thread and every hand-over (deleted comments are never handed on).
+  // Transfer the whole batch before deleting anything. Only the composer's
+  // durable per-comment receipts authorize deletion; text equality and an old
+  // in-memory acknowledgment are not custody of this message.
   const restoreStoppedMessages = useCallback(async (commentIds: readonly string[]) => {
-    for (const id of commentIds) {
-      const comment = threadComments.find((candidate) => candidate.id === id && !candidate.deletedAt);
-      if (!comment) continue;
-      if (!commentComposerRef.current) return false; // no box to take the text: restore nothing, delete nothing, try again later
-      const restoreKey = `${issueId}:${id}`;
-      if (!restoredStoppedCommentIds.has(restoreKey)) {
-        // Marked only once the text is kept: a box that could not keep it leaves the message in the thread.
-        if (commentComposerRef.current.restoreDraft(comment.body) === false) return false;
-        restoredStoppedCommentIds.add(restoreKey);
-      }
-      await issuesApi.deleteComment(issueId!, id).then(upsertCommentInCache).catch(() => undefined);
-    }
-    return true;
-  }, [threadComments, issueId, upsertCommentInCache]);
+    const comments = [...new Set(commentIds)].flatMap((id) => {
+      const comment = threadComments.find((item) => item.id === id && !item.deletedAt && item.authorUserId === currentUserId);
+      return comment ? [comment] : [];
+    });
+    if (comments.length === 0) return true;
+    const restoredIds = new Set(commentComposerRef.current?.restoreStoppedMessages?.(comments) ?? []);
+    // Start every acknowledged delete in this turn: do not retain a receipt
+    // across an await during which the person could edit or clear the draft.
+    const deleted = await Promise.all(comments.map((comment) => restoredIds.has(comment.id)
+      ? issuesApi.deleteComment(issueId!, comment.id).then(upsertCommentInCache).then(() => true).catch(() => false)
+      : false));
+    return deleted.every(Boolean);
+  }, [threadComments, issueId, currentUserId, upsertCommentInCache]);
   const deleteComment = useMutation({
     mutationFn: async ({ commentId }: { commentId: string }) =>
       issuesApi.deleteComment(issueId!, commentId),
