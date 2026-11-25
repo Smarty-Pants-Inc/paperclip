@@ -268,6 +268,7 @@ export function projectPaperclipRunnerTaskConfig(
     delete config.modelReasoningEffort;
     delete config.reasoningEffort;
     delete config.effort;
+    if (backend === "pi_rpc" && effortKey !== undefined) delete config.piRpcThinkingLevel;
   }
   if (model !== null) config.model = model;
   if (effortKey !== undefined) config[grok ? "reasoningEffort" : "modelReasoningEffort"] = task[effortKey];
@@ -276,7 +277,7 @@ export function projectPaperclipRunnerTaskConfig(
 }
 
 // doc/runner-internals.md: native Pi defaults to low thinking.
-function piRpcThinking(config: Record<string, unknown>): unknown {
+export function piRpcThinking(config: Record<string, unknown>): unknown {
   const effort = config.modelReasoningEffort ?? config.reasoningEffort ?? config.effort ?? "low";
   return config.piRpcThinkingLevel !== undefined ? config.piRpcThinkingLevel : effort === "auto" ? "low" : effort === "none" ? "off" : effort;
 }
