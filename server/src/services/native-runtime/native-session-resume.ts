@@ -257,9 +257,9 @@ const INHERITED_CHECKPOINT_SOURCE_FIELDS = ["backendKind", "driverKind", "sessio
 export async function findNativeSessionResumeRun(db: Db, input: NativeSessionResumeSelection) {
   if (!isNativeSessionId(input.normalizedSessionId)) return null;
   const barrier = await selectNativeSessionResumeBarrier(db, input, []);
-  // A follow-up that failed before any provider or controller work holds only
-  // the checkpoint it inherited. Select its source instead, but only when
-  // every skipped run proves that and inherited exactly that source session.
+  // A failed follow-up may have started a process/controller without a turn.
+  // Select its inherited source only when every skipped run has no own
+  // checkpoint, result or provider progress and inherited that exact session.
   const skipped: NonNullable<typeof barrier>[] = [];
   let selected = barrier;
   while (selected && skipped.length < NATIVE_RESUME_CANDIDATE_WINDOW &&
@@ -279,8 +279,8 @@ export async function findNativeSessionResumeRun(db: Db, input: NativeSessionRes
   return inherited ? selected : barrier;
 }
 
-/** The run row, its coordinator, and the absence of controller checkpoints,
- * results and provider events together prove no provider work started. */
+/** A process/controller startup is not a committed turn. Keep all provider
+ * progress fences and prove no controller checkpoint parts belong to this run. */
 async function isUnstartedInheritedFollowUp(
   db: Db,
   input: NativeSessionResumeSelection,
@@ -289,21 +289,21 @@ async function isUnstartedInheritedFollowUp(
 ): Promise<boolean> {
   const checkpoint = record(run.runnerProfileJson.sessionCheckpoint);
   const identity = record(checkpoint.identity);
-  if (run.runtimeMode !== "native" || !["failed", "cancelled"].includes(run.status) || run.processPid !== null ||
-      run.processGroupId !== null || run.processStartedAt !== null ||
+  if (run.runtimeMode !== "native" || !["failed", "cancelled"].includes(run.status) ||
       record(run.runnerProfileJson.nativeControllerRecovery).schema === "paperclip.native-controller-recovery.v1" ||
       identity.companyId !== input.companyId || identity.agentId !== input.agentId || identity.issueId !== input.issueId ||
       identity.sessionId !== input.normalizedSessionId || typeof identity.runId !== "string" ||
       checkpoint.activeTurnId != null || (Array.isArray(checkpoint.pendingRuntimeRequests) && checkpoint.pendingRuntimeRequests.length > 0)) return false;
-  return nativeRunHasNoProviderWork(db, input, run.id, { allowDispatchHandoff: true });
+  return nativeRunHasNoProviderWork(db, input, run.id, { allowDispatchHandoff: true, allowProcessStartup: true });
 }
 
 /** Shared negative-work proof for inherited-source selection and the preparation
  * owner's Stop settlement. A cancellation label or lease release alone is not proof.
- * Only source selection may allow dispatch handoff; Stop must still prove no handoff. */
+ * Only source selection may allow dispatch/process/controller startup; Stop must
+ * still prove no handoff or process/controller ownership. Neither may skip a turn. */
 export async function nativeRunHasNoProviderWork(db: Db,
   input: Pick<NativeSessionResumeSelection, "companyId" | "agentId" | "issueId">, runId: string,
-  options: { allowDispatchHandoff?: boolean } = {}): Promise<boolean> {
+  options: { allowDispatchHandoff?: boolean; allowProcessStartup?: boolean } = {}): Promise<boolean> {
   const [evidence] = await db.select({
     processPid: heartbeatRuns.processPid, processGroupId: heartbeatRuns.processGroupId,
     processStartedAt: heartbeatRuns.processStartedAt, profile: heartbeatRuns.runnerProfileJson,
@@ -316,6 +316,9 @@ export async function nativeRunHasNoProviderWork(db: Db,
     processStart: sql<boolean>`exists (select 1 from ${heartbeatRunEvents}
       where ${heartbeatRunEvents.companyId} = ${heartbeatRuns.companyId} and ${heartbeatRunEvents.runId} = ${heartbeatRuns.id}
         and ${heartbeatRunEvents.eventType} in (${sql.join(OWN_PROCESS_START_EVENT_TYPES.map(type => sql`${type}`), sql`, `)}))`,
+    committedTurn: sql<boolean>`exists (select 1 from ${heartbeatRunEvents}
+      where ${heartbeatRunEvents.companyId} = ${heartbeatRuns.companyId} and ${heartbeatRunEvents.runId} = ${heartbeatRuns.id}
+        and (${heartbeatRunEvents.eventType} in ('turn.started', 'turn.completed') or ${heartbeatRunEvents.eventType} like 'item.%'))`,
     controllerCheckpoint: sql<boolean>`exists (select 1 from ${nativeRunnerCheckpoints}
       where ${nativeRunnerCheckpoints.companyId} = ${heartbeatRuns.companyId} and ${nativeRunnerCheckpoints.runId} = ${heartbeatRuns.id})`,
     result: sql<boolean>`exists (select 1 from ${nativeRunResults}
@@ -330,15 +333,15 @@ export async function nativeRunHasNoProviderWork(db: Db,
   // record at all. Absence of actual work, not the failure label, is the proof.
   const recovery = record(evidence?.executionRecovery);
   const checkpoint = record(evidence?.profile?.sessionCheckpoint);
-  return Boolean(evidence && evidence.processPid === null && evidence.processGroupId === null &&
-    evidence.processStartedAt === null && (options.allowDispatchHandoff || evidence.dispatchHandedOffAt == null) &&
+  return Boolean(evidence && (options.allowProcessStartup || (evidence.processPid === null && evidence.processGroupId === null &&
+    evidence.processStartedAt === null && evidence.leaseOwner === null && evidence.controllerPid === null && !evidence.processStart)) &&
+    (options.allowDispatchHandoff || evidence.dispatchHandedOffAt == null) &&
     record(evidence.profile?.nativeControllerRecovery).schema !== "paperclip.native-controller-recovery.v1" &&
     checkpoint.activeTurnId == null &&
     (!Array.isArray(checkpoint.pendingRuntimeRequests) || checkpoint.pendingRuntimeRequests.length === 0) &&
     recovery.providerWorkStarted !== true &&
     (evidence.phase === null || ["observed", "terminal_failure"].includes(evidence.phase)) &&
-    evidence.resultId === null && evidence.leaseOwner === null && evidence.controllerPid === null &&
-    !evidence.processStart && !evidence.controllerCheckpoint && !evidence.result &&
+    evidence.resultId === null && !evidence.committedTurn && !evidence.controllerCheckpoint && !evidence.result &&
     !(await nativeSessionProviderEvidence(db, [runId])).has(runId));
 }
 
