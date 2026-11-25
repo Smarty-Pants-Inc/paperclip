@@ -16,7 +16,7 @@ import { sql } from "drizzle-orm";
 import { materializeIsolatedTaskDirectory } from "../isolated-task-directory.js";
 import { readConnectionFailure, type GitConnectionFailure } from "@paperclipai/adapter-utils/connection-failure";
 import { managedAiSessionFingerprintConfig } from "../ai-connection-runtime.js";
-import { paperclipRunnerSessionAdapterConfig, paperclipRunnerSessionIssueOverrides, sessionAgentRuntimeConfig, sessionEnvironment } from "./session-fingerprint-inputs.js";
+import { paperclipRunnerRetainedAdapterConfig, paperclipRunnerSessionAdapterConfig, paperclipRunnerSessionIssueOverrides, sessionAgentRuntimeConfig, sessionEnvironment } from "./session-fingerprint-inputs.js";
 import {
   PROJECT_REPOSITORIES_DIR,
   readGitWorkspaceSnapshot,
@@ -2798,7 +2798,7 @@ export function buildSessionConfigCategoryValues(input: {
   agentConfigRevision: unknown;
   agentIdentityKeyId?: string;
   legacyComposition?: boolean;
-  retainIssueOverrideModelKeys?: boolean;
+  continuousPiFingerprintComposition?: "issue_overrides" | "model_inputs";
 }) {
   const sanitizedSecretManifest = sanitizeSecretManifestForConfigFingerprint(
     input.secretManifest,
@@ -2830,10 +2830,12 @@ export function buildSessionConfigCategoryValues(input: {
     },
     adapterConfig: legacy || input.adapterType !== "paperclip_runner"
       ? input.effectiveAdapterConfig
-      : paperclipRunnerSessionAdapterConfig(input.effectiveAdapterConfig),
+      : input.continuousPiFingerprintComposition === "model_inputs"
+        ? paperclipRunnerRetainedAdapterConfig(input.effectiveAdapterConfig)
+        : paperclipRunnerSessionAdapterConfig(input.effectiveAdapterConfig),
     agentRuntimeConfig: legacy ? input.agentRuntimeConfig : sessionAgentRuntimeConfig(input.agentRuntimeConfig),
     instructions: input.instructions,
-    issueOverrides: legacy || input.retainIssueOverrideModelKeys || input.adapterType !== "paperclip_runner"
+    issueOverrides: legacy || input.continuousPiFingerprintComposition || input.adapterType !== "paperclip_runner"
       ? input.issueOverrides
       : paperclipRunnerSessionIssueOverrides(input.issueOverrides, input.effectiveAdapterConfig),
     workspaceConfig,
@@ -2866,7 +2868,7 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
   agentConfigRevision?: unknown;
   agentIdentityKeyId?: string;
   legacyComposition?: boolean;
-  retainIssueOverrideModelKeys?: boolean;
+  continuousPiFingerprintComposition?: "issue_overrides" | "model_inputs";
 }): Promise<EffectiveRunSessionConfigMetadata> {
   const secretManifest = input.secretManifest ?? [];
   const instructions = input.managedInstructions ? {
@@ -2913,7 +2915,7 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
     agentConfigRevision: input.agentConfigRevision ?? null,
     agentIdentityKeyId: input.agentIdentityKeyId,
     legacyComposition: input.legacyComposition,
-    retainIssueOverrideModelKeys: input.retainIssueOverrideModelKeys,
+    continuousPiFingerprintComposition: input.continuousPiFingerprintComposition,
   });
   const fingerprints = createEffectiveRunConfigFingerprints({
     session: categoryValues,

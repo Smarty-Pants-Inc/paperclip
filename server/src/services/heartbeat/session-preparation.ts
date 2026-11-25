@@ -183,10 +183,13 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
   const continuousPi = runtimeConfig.provider === "pi_rpc" &&
     resolveSessionContinuity(runtimeConfig.provider, runtimeConfig.sessionContinuity) === "continuous";
   if (storedFingerprintDiffers && agent.adapterType === "paperclip_runner" && continuousPi) {
-    // Older fingerprints retained the chip's model and level in issue overrides.
-    compatibleInputs.push(...[sessionConfigMetadataInput, ...compatibleInputs].map(candidate => ({
-      ...candidate, retainIssueOverrideModelKeys: true,
-    })));
+    // Accept either previous composition only by an exact fingerprint match:
+    // the chip-only shape, or re-cut 3's retained adapter and chip model inputs.
+    compatibleInputs.push(...[sessionConfigMetadataInput, ...compatibleInputs].flatMap(candidate =>
+      (["issue_overrides", "model_inputs"] as const).map(continuousPiFingerprintComposition => ({
+        ...candidate, continuousPiFingerprintComposition,
+      })),
+    ));
   }
   const legacyInputs = storedFingerprintDiffers
     ? [sessionConfigMetadataInput, ...compatibleInputs].map(candidate => ({ ...candidate, legacyComposition: true }))
