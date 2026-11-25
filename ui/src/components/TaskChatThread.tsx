@@ -2951,10 +2951,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     ? liveRun.status
     : isTerminalIssueStatus(issueStatus) ? (issueStatus === "cancelled" ? "cancelled" : "succeeded")
     : (runs.find((run) => run.id === settlingRun?.id)?.status ?? "succeeded"));
-  const tailStartedAtMs = paperclipRunnerTail && tailTimelineAnchors.length > 0 ? tailAnswerStartMs :
+  // Admission is not execution, and a pending send must not inherit the last run's clock.
+  const tailStartedAtMs = !tailRunId ? null : paperclipRunnerTail && tailTimelineAnchors.length > 0 ? tailAnswerStartMs :
     (liveRun
-      ? ((liveRun.startedAt ? toMs(liveRun.startedAt) : null) ??
-        toMs(liveRun.createdAt))
+      ? (liveRun.startedAt ? toMs(liveRun.startedAt) : null)
       : (settlingRun?.startedAtMs ?? null));
   const tailRunFinishedAtMs = liveRun
     ? liveRun.finishedAt
