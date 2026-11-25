@@ -168,6 +168,7 @@ export interface WakeQueueTransaction {
     reason: string | null;
     releasePolicy: unknown;
   }>;
+  hasConsumedInteractionResponse(input: { companyId: string; issueId: string; runId: string; agentId: string; payload: Record<string, unknown> }): Promise<boolean>;
   /**
    * Whether the wake carries a person's saved answer to an interaction on this task that no run has received yet and
    * that was saved before the task was completed. Such an answer is owed input, like the person's own queued message.
