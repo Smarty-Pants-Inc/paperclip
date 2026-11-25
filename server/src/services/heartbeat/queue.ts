@@ -5141,6 +5141,19 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           },
           async executeIssueActions() {
             await executeIssuePostCommitActions(db, issuePostCommitActions);
+            // One server-side door for every comment author/API caller. Never
+            // steer under admission's issue lock: the existing use case owns it.
+            if (wakeCommentId && enrichedContextSnapshot.forceFreshSession !== true &&
+                ["issue_commented", "issue_reopened_via_comment", "issue_comment_mentioned"].includes(String(enrichedContextSnapshot.wakeReason ?? reason))) {
+              try {
+                const { steerCommittedQueuedComment } = await import("../../modules/wake-queue/index.js");
+                await steerCommittedQueuedComment(db, { companyId: agent.companyId, issueId: issueId!, agentId, commentId: wakeCommentId });
+              } catch (err) {
+                // Closing/Stop/configuration and delivery races retain the exact
+                // durable wake, just as a failed page steer does.
+                logger.warn({ err, issueId, commentId: wakeCommentId }, "automatic comment steering left message queued");
+              }
+            }
             if (!oldestPersonWake) return;
             // The newer receipt is committed before retrying the oldest. Normal
             // admission rechecks ownership/recovery and consumes that exact
