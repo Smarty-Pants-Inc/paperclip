@@ -362,7 +362,7 @@ export function TaskChatRunnerTurn({
           />
         </div>
       ) : null}
-      {(!final || final.streaming) && currentActivityItems.length === 0 && (!waitingLabel || (preparationLabel && !execution?.cause)) && !agentQueueWaitFor({ status, execution })
+      {(!final || final.streaming) && currentActivityItems.length === 0 && !waitingLabel && !agentQueueWaitFor({ status, execution })
         ? <RunnerCurrentActivityTail status={status} waitingLabel={waitingLabel} /> : null}
     </div></ToolCallProgressRunProvider></TaskChatShimmerScope></RunnerReasoningDisplay>
   );
