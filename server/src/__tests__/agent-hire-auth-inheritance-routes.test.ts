@@ -28,6 +28,9 @@ import { agentRoutes } from "../routes/agents.js";
 import { secretService } from "../services/secrets.js";
 import { piRpcThinking, resolvePaperclipRunnerNativeProviderInput } from "../services/native-runtime/provider-profile.js";
 import * as providerPack from "../services/native-runtime/remote-provider-pack.js";
+import { fingerprintEnvironmentSandboxProviderConfig, SANDBOX_PLATFORM_PROBE_METADATA_KEY } from "../services/environment-custom-image-runtime.js";
+import { resolveEnvironmentDriverConfigForRuntime } from "../services/environment-config.js";
+import { environmentService } from "../services/environments.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -867,6 +870,38 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(404);
     expect(res.body.error).toBe(`${label} profile not found`);
     expect(await db.select().from(agents).where(eq(agents.companyId, companyId))).toHaveLength(1);
+  });
+
+  it.each([
+    ["agent", "pi_local", undefined], ["agent", "codex_local", undefined],
+    ["board", "codex_local", undefined], ["agent", "codex_local", null], ["agent", "codex_local", "explicit"],
+  ] as const)("plain create environment: %s %s %s", async (actor, adapterType, selection) => {
+    const companyId = await seedCompany();
+    const parent = await seedParentAgent(companyId, "paperclip_runner", {});
+    const environmentId = randomUUID();
+    const config = { provider: "daytona", image: `example/runner@sha256:${"a".repeat(64)}`, reuseLease: false };
+    await db.insert(environments).values({ id: environmentId, name: "Creator sandbox", driver: "sandbox", config });
+    const environment = (await environmentService(db).getById(environmentId))!;
+    const runtime = await resolveEnvironmentDriverConfigForRuntime(db, companyId, environment, { applyCustomImageTemplate: true, readOnlyCustomImageTemplate: true });
+    await db.update(environments).set({ metadata: { [SANDBOX_PLATFORM_PROBE_METADATA_KEY]: { [companyId]: {
+      v: 1, companyId, image: config.image, template: null, baseConfigFingerprint: fingerprintEnvironmentSandboxProviderConfig(config),
+      runtimeConfigFingerprint: fingerprintEnvironmentSandboxProviderConfig(runtime.config as typeof config),
+      facts: { platform: "linux", architecture: "x64", libc: "glibc", glibcVersion: "2.39" },
+    } } } }).where(eq(environments.id, environmentId));
+    await db.update(agents).set({ defaultEnvironmentId: environmentId, adapterConfig: { provider: "pi_rpc" } }).where(eq(agents.id, parent.id));
+    const explicitEnvironmentId = randomUUID();
+    if (selection === "explicit") await db.insert(environments).values({ id: explicitEnvironmentId, name: "Explicit local", driver: "local" });
+    const defaultEnvironmentId = selection === "explicit" ? explicitEnvironmentId : selection;
+    const res = await request(createApp(db, actor === "agent" ? agentActor(companyId, parent.id) : userActor()))
+      .post(`/api/companies/${companyId}/agents`).send({ name: "Plain child", adapterType,
+        ...(adapterType === "pi_local" ? { adapterConfig: { model: "paperclip/claude-opus-5-5" } } : {}),
+        ...(selection === undefined ? {} : { defaultEnvironmentId }) });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const [child] = await db.select().from(agents).where(eq(agents.id, res.body.id));
+    const expectedEnvironmentId = actor === "agent" && selection === undefined ? environmentId : defaultEnvironmentId ?? null;
+    expect(child!.defaultEnvironmentId).toBe(expectedEnvironmentId);
+    expect(res.body.defaultEnvironmentId).toBe(expectedEnvironmentId);
+    expect(child!.adapterType).toBe("paperclip_runner");
   });
 
   it("validates and preserves an inherited caller default environment", async () => {
