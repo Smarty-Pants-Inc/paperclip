@@ -33,13 +33,13 @@ export async function withConversationReadState<T extends { id: string }>(db: Db
   const redactions = createRunSecretRedactionRegistry(db);
   const previews = new Map(await Promise.all(rows.map(async row => {
     try {
-      // Match comment reads: mask, then registry. A raw-text cut can split a secret
-      // or Markdown construct, so flatten the complete newest body before cutting.
+      // Stock's notification order: exact registry values on the untouched body, then the
+      // username mask; flatten the complete text before cutting (a cut can split a secret).
       const settings = await general;
       if (!settings) return [row.issueId, null] as const;
-      const masked = redactCurrentUserText(row.latestMessageBody ?? "", { enabled: settings.censorUsernameInLogs });
-      const redacted = await redactions.redactForIssueNotification(companyId, row.issueId, masked);
-      const plain = markdownToPlainText(redacted).replace(/\s+/g, " ").trim();
+      const redacted = await redactions.redactForIssueNotification(companyId, row.issueId, row.latestMessageBody ?? "");
+      const masked = redactCurrentUserText(redacted, { enabled: settings.censorUsernameInLogs });
+      const plain = markdownToPlainText(masked).replace(/\s+/g, " ").trim();
       return [row.issueId, [...plain].slice(0, 240).join("")] as const;
     } catch {
       // No raw fallback when masking, registry resolution or flattening fails.
