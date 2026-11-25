@@ -1080,17 +1080,19 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // Retries of one request join runs; session continuity across new messages does not.
   const runChainIdsById = useMemo(() => {
     const predecessors = new Map<string, string | null | undefined>();
-    for (const run of linkedRuns ?? []) predecessors.set(run.runId, run.retryOfRunId ?? run.execution?.predecessorRunId);
+    const explicitRetries = new Map<string, string>();
+    for (const run of linkedRuns ?? []) {
+      predecessors.set(run.runId, run.retryOfRunId ?? run.execution?.predecessorRunId);
+      if (run.retryOfRunId) explicitRetries.set(run.runId, run.retryOfRunId);
+    }
     for (const run of [...(liveRuns ?? []), ...(activeRun ? [activeRun] : [])]) {
-      predecessors.set(run.id, "retryOfRunId" in run && typeof run.retryOfRunId === "string"
-        ? run.retryOfRunId : run.execution?.predecessorRunId ?? predecessors.get(run.id));
+      if ("retryOfRunId" in run && typeof run.retryOfRunId === "string") explicitRetries.set(run.id, run.retryOfRunId);
+      predecessors.set(run.id, explicitRetries.get(run.id) ?? run.execution?.predecessorRunId ?? predecessors.get(run.id));
     }
     for (const [runId, predecessorId] of predecessors) {
       const request = requestCommentByRun.get(runId);
       const previousRequest = predecessorId && requestCommentByRun.get(predecessorId);
-      const explicitRetry = linkedRunMetaById.get(runId)?.retryOfRunId === predecessorId ||
-        [...(liveRuns ?? []), ...(activeRun ? [activeRun] : [])].some(run => run.id === runId &&
-          "retryOfRunId" in run && run.retryOfRunId === predecessorId);
+      const explicitRetry = explicitRetries.get(runId) === predecessorId;
       if (!(request && request === previousRequest) && (!explicitRetry || (request && previousRequest))) {
         predecessors.delete(runId);
       }
@@ -1099,7 +1101,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     for (const run of [...runs].sort((a, b) => toMs(a.createdAt) - toMs(b.createdAt))) {
       const commentId = requestCommentByRun.get(run.id);
       if (!commentId || !comments.some(comment => comment.id === commentId && comment.authorUserId && !comment.authorAgentId)) continue;
-      if (previousByComment.has(commentId)) predecessors.set(run.id, previousByComment.get(commentId));
+      if (previousByComment.has(commentId) && !explicitRetries.has(run.id)) predecessors.set(run.id, previousByComment.get(commentId));
       previousByComment.set(commentId, run.id);
     }
     // A failed continuous run may have taken this request by Steer, not at admission.
@@ -1110,18 +1112,27 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         Object.prototype.hasOwnProperty.call(candidate.resultJson?.queuedSteeringAcknowledgements ?? {}, request));
       if (previous && !predecessors.get(run.id)) predecessors.set(run.id, previous.runId);
     }
+    // A post-card wake can name the same request as the completed run. That
+    // is continuation, not a retry: importing its transcript into the new
+    // tail would draw its saved reply a second time and remove its old slot.
+    const answerComments = projectedComments.filter(comment => comment.presentation?.kind !== "system_notice");
+    const replyOwners = new Set(runs.filter(run => hasVisibleRunAnswer(
+      answerComments, run.id, linkedRunMetaById.get(run.id)?.resultJson,
+    )).map(run => run.id));
+    const completedRuns = new Set(runs.filter(run => run.status === "succeeded").map(run => run.id));
     const chains = new Map<string, string[]>();
     for (const run of runs) {
       const ids = [run.id];
       let predecessor = predecessors.get(run.id);
-      while (predecessor && !ids.includes(predecessor) && !isUserStop(predecessor)) {
+      while (predecessor && !ids.includes(predecessor) && !isUserStop(predecessor) &&
+        (explicitRetries.get(ids[0]!) === predecessor || (!completedRuns.has(predecessor) && !replyOwners.has(predecessor)))) {
         ids.unshift(predecessor);
         predecessor = predecessors.get(predecessor);
       }
       chains.set(run.id, ids);
     }
     return chains;
-  }, [runs, linkedRuns, liveRuns, activeRun, requestCommentByRun, linkedRunMetaById, comments, isUserStop]);
+  }, [runs, linkedRuns, liveRuns, activeRun, requestCommentByRun, linkedRunMetaById, comments, projectedComments, isUserStop]);
 
   // Pi's Stop (Esc): the messages it hadn't taken go back into the stopping person's input box, once.
   // Keyed on state (his returned messages still exist), so a reload or another of his devices restores too.
@@ -1365,6 +1376,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // they settle. Runs already terminal at mount collapse instantly.
   const liveSeenRef = useRef<Set<string>>(new Set());
   const drawnRunnerSegments = useRef(new Set<string>());
+  const runnerRequestAnchors = useRef(new Map<string, string | null>());
   useEffect(() => {
     if (liveRun) liveSeenRef.current.add(liveRun.id);
   }, [liveRun]);
@@ -1426,6 +1438,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   } : emptyQueuedCommentQueue, [queuedMessageQueue, emptyQueuedCommentQueue, steeringAnchorByCommentId, returnedCommentIds]);
 
   const continuousReplyPlacements = useMemo(() => {
+    const commentsById = new Map(projectedComments.map(comment => [comment.id, comment]));
     const placements = new Map<string, { byItem: Map<string, number>; bySegment: Map<number, string>; questionsBySegment: Map<number, string[]> }>();
     for (const run of linkedRuns ?? []) {
       const replies = run.resultJson?.continuousReplies;
@@ -1439,15 +1452,15 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         const reply = value as { questionCommentIds?: unknown; commentId?: unknown };
         if (!Array.isArray(reply.questionCommentIds) || typeof reply.commentId !== "string") continue;
         const first = transcriptByRun.get(run.runId)?.find(entry => entry.kind === "assistant" && entry.itemId === itemId);
-        // ACK is queue admission, not consumption: several steers can precede
-        // the first output. Their reply receipts, not that timestamp, own it.
         const questionSegment = Math.max(0, ...reply.questionCommentIds.map(id =>
           anchors.indexOf(steeringAnchorByCommentId.get(String(id)) ?? NaN) + 1));
-        // A later steer cannot claim text already streaming before its ACK.
-        // Keep that first slot (also on reload), but not a later timestamp slot
-        // that would put an earlier question's answer below a second question.
-        const segmentIndex = first && toMs(first.ts) < (anchors[questionSegment - 1] ?? -Infinity)
-          ? anchors.filter(anchor => anchor <= toMs(first.ts)).length : questionSegment;
+        // Question receipts can be stale after a steer/card continuation. An
+        // authored item keeps its first timestamp slot, in either direction;
+        // a saved reply without that item uses its own creation time instead.
+        // Never move already-streaming words to the time they were persisted.
+        const replyAt = first?.ts ?? commentsById.get(reply.commentId)?.createdAt;
+        const segmentIndex = replyAt && Number.isFinite(toMs(replyAt))
+          ? anchors.filter(anchor => anchor <= toMs(replyAt)).length : questionSegment;
         byItem.set(itemId, segmentIndex);
         bySegment.set(segmentIndex, reply.commentId);
         if (first?.kind === "assistant" && first.channel === "final" && first.text.trim()) {
@@ -1457,7 +1470,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       placements.set(run.runId, { byItem, bySegment, questionsBySegment });
     }
     return placements;
-  }, [linkedRuns, steeringAnchorsByRun, steeringAnchorByCommentId, transcriptByRun]);
+  }, [linkedRuns, steeringAnchorsByRun, steeringAnchorByCommentId, transcriptByRun, projectedComments]);
 
   // A native-runner Plan is part of the turn that wrote its current revision.
   // Legacy adapters do not expose the semantic write_document boundary needed
@@ -2482,6 +2495,28 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           allowFallback: sourceAllowSummaryFallback,
         });
       };
+      const admissionMs = toMs(meta?.createdAt ?? source.createdAt) || segments[0]!.startMs;
+      let requestAnchorId: string | null = null;
+      if (sourceIsPaperclipRunner) {
+        if (drawnRunnerSegments.current.has(`${source.id}:turn:0`) && runnerRequestAnchors.current.has(source.id)) {
+          requestAnchorId = runnerRequestAnchors.current.get(source.id)!;
+        } else {
+          const requestId = requestCommentByRun.get(source.id);
+          const requestAnchor = orderedEntries.find(entry => entry.id === requestId);
+          // A completed owner already consumed this request, even if its card
+          // arrives later. A continuation starts at its own durable admission.
+          const continuedRequest = requestId && linkedRuns?.some(run => run.runId !== source.id &&
+            run.status === "succeeded" && toMs(run.createdAt) < admissionMs &&
+            (requestCommentByRun.get(run.runId) === requestId || Object.prototype.hasOwnProperty.call(
+              run.resultJson?.queuedSteeringAcknowledgements ?? {}, requestId)));
+          requestAnchorId = requestAnchor && !continuedRequest && !orderedEntries.some(entry =>
+            entry.ms > requestAnchor.ms && entry.ms <= admissionMs &&
+            (entry.item.kind === "interaction" || (entry.item.kind === "message" && entry.item.author === "human")),
+          ) ? requestAnchor.id : null;
+          // Before paint this can refine; after paint late history cannot move it.
+          runnerRequestAnchors.current.set(source.id, requestAnchorId);
+        }
+      }
       for (const [segmentIndex, projected] of projectedSegments.entries()) {
         const { segment, parsed } = projected;
         const personStopped = isUserStop(source.id) && segmentIndex === segments.length - 1;
@@ -2599,14 +2634,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           },
           // Admission already owns a response slot under this request. Starting
           // the provider later must not move that slot past a newer question.
-          anchorCommentId: sourceIsPaperclipRunner && segmentIndex === 0 &&
-            orderedEntries.some(entry => entry.id === requestCommentByRun.get(source.id))
-            ? requestCommentByRun.get(source.id)!
+          anchorCommentId: sourceIsPaperclipRunner && segmentIndex === 0
+            ? requestAnchorId
             : segmented ? null : (lastCommentIdByRun.get(source.id) ?? null),
           // Later segments follow their acknowledged human boundary. Without
           // request provenance, admission time is stable across queued → running.
           startMs: sourceIsPaperclipRunner && segmentIndex === 0
-            ? toMs(meta?.createdAt ?? source.createdAt) || segment.startMs
+            ? admissionMs
             : segment.startMs,
         });
       }
