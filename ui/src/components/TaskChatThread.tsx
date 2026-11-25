@@ -3417,18 +3417,22 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   });
   const requestStopped = latestRun && isUserStop(latestRun.id) && latestUserComment &&
     toMs(latestUserComment.createdAt) <= toMs(linkedRunMetaById.get(latestRun.id)?.finishedAt ?? latestRun.createdAt);
-  // A resolved projection is silent, not evidence that this saved question was answered.
-  const blockedChat = conversationMode && issueStatus === "blocked" && latestUserComment &&
-    latestUserComment.body.trim() !== "/new" && !requestStopped && !requestAnswered && !savedAnswer &&
-    !failureNoticeIds.has(requestRun?.id ?? "") && !failureNoticeIds.has(latestRun?.id ?? "") &&
+  // The backend's saved-input receipt beats inferred transcript answers and
+  // resource-only recovery. It names the exact current-session person message.
+  const owedMessage = props.interruption?.state === "failed" && props.interruption.canRetry &&
+    props.interruption.unansweredCommentId === latestUserComment?.id;
+  const blockedChat = conversationMode && (issueStatus === "blocked" || (owedMessage && !isTerminalIssueStatus(issueStatus))) && latestUserComment &&
+    latestUserComment.body.trim() !== "/new" && !requestStopped && (owedMessage || (!requestAnswered && !savedAnswer)) &&
+    (owedMessage || (!failureNoticeIds.has(requestRun?.id ?? "") && !failureNoticeIds.has(latestRun?.id ?? ""))) &&
     !liveRun && !runs.some(run => ["queued", "running", "scheduled_retry"].includes(terminalStatuses.get(run.id) ?? run.status)) &&
     !props.retryPreparing && !props.scheduledRetry && !composerPause &&
     !interactions?.some(interaction => interaction.status === "pending") &&
-    (!props.interruption || props.interruption.state === "resolved");
-  const blockedRetry = blockedChat && canRetryFailedRun
-    ? onTryAgainNoLiveExecutionPath ?? (latestRun && ["failed", "timed_out"].includes(latestRunStatus ?? "") &&
-      linkedRunMetaById.get(latestRun.id)?.errorCode !== "native_session_cleanup_quarantined"
-      ? () => retryFailedRunHandler!(latestRun.id) : undefined) : undefined;
+    (owedMessage || !props.interruption || props.interruption.state === "resolved");
+  const blockedRetry = blockedChat && owedMessage ? onTryAgainNoLiveExecutionPath
+    : blockedChat && canRetryFailedRun
+      ? onTryAgainNoLiveExecutionPath ?? (latestRun && ["failed", "timed_out"].includes(latestRunStatus ?? "") &&
+        linkedRunMetaById.get(latestRun.id)?.errorCode !== "native_session_cleanup_quarantined"
+        ? () => retryFailedRunHandler!(latestRun.id) : undefined) : undefined;
   const blockedChatNotice = blockedChat ? <ExecutionBlockerNotice savedMessageBlocked conversationMode presentation={null}
     canRetry={!!blockedRetry} onRetry={() => { void Promise.resolve().then(blockedRetry).catch(() => undefined); }}
     optimistic={tryAgainNoLiveExecutionPathPending || retryFailedRunId === latestRun?.id} /> : null;
