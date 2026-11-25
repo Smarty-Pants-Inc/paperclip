@@ -340,6 +340,54 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     } finally { mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true }); }
   });
 
+  it.each([
+    { continuity: "continuous", conversation: true, retain: true },
+    { continuity: "continuous", conversation: false, retain: true },
+    { continuity: "paperclip", conversation: true, retain: false },
+    { continuity: "paperclip", conversation: false, retain: false },
+  ])("idle issue override: model then level in $continuity (agent chat=$conversation) retains session: $retain", async ({ continuity, conversation, retain }) => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "issue-config-continuation-"));
+    const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
+    const config = { provider: "pi_rpc", model: "fixture/model-a", piRpcThinkingLevel: "low", sessionContinuity: continuity, cwd };
+    try {
+      await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: config }).where(eq(agents.id, f.agentId));
+      if (conversation) await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: f.userId, conversationState: "active" }).where(eq(issues.id, f.issueId));
+      await execute(f);
+      const [saved] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId));
+      for (const adapterConfig of [
+        { model: "fixture/model-b", piRpcThinkingLevel: "low" },
+        { model: "fixture/model-b", piRpcThinkingLevel: "high" },
+      ]) {
+        const [idle] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+        expect(idle.status).toBe("idle");
+        await db.update(issues).set({ assigneeAdapterOverrides: { adapterConfig }, updatedAt: new Date() }).where(eq(issues.id, f.issueId));
+        const [before] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId));
+        expect(before.id).toBe(saved.id);
+        const next = await execute(f);
+        expect(next.input.config).toMatchObject(adapterConfig);
+        expect(next.input.runtime.sessionId).toBe(retain ? "saved-session" : null);
+        expect(next.input.runtime.sessionParams).toEqual(retain ? { sessionId: "saved-session", adapterState: "preserved" } : null);
+        expect(next.finished.sessionIdBefore).toBe(retain ? "saved-session" : null);
+        expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: {
+          reset: !retain, taskSessionAvailable: true, taskSessionReused: retain,
+        } } });
+      }
+      await db.update(issues).set({ assigneeAdapterOverrides: { adapterConfig: {
+        model: "fixture/model-b", piRpcThinkingLevel: "high", fixtureOption: "changed",
+      } } }).where(eq(issues.id, f.issueId));
+      const unrelated = await execute(f);
+      expect(unrelated.input.runtime.sessionId).toBeNull();
+      expect(unrelated.finished.resultJson).toMatchObject({ configFreshness: { session: {
+        reset: true, taskSessionAvailable: true, taskSessionReused: false,
+        changedCategories: expect.arrayContaining(["issueOverrides"]),
+      } } });
+      const [unchanged] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+      expect(unchanged.adapterConfig).toEqual(config);
+    } finally { mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true }); }
+  });
+
   it.each(["continuous", "paperclip"])("held configuration: an INSTRUCTIONS save continues Pi only in continuous mode (%s)", async sessionContinuity => {
     const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "pi-instructions-freshness-"));
     const { resolveManagedInstructionsRoot } = await import("../services/agent-instructions.js");
