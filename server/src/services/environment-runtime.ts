@@ -1,4 +1,5 @@
 import { readPluginLoginCredential } from "./plugin-login-credential.js";
+import { sandboxRestartMetadata } from "./sandbox-snapshot-restore.js";
 import { nativeRunHasNoProviderWork } from "./native-runtime/native-session-resume.js";
 import { ENVIRONMENT_LEASE_CONTROLLER_KEY } from "./environment-lease-controller.js";
 import { RetainedSandboxAbsentError, resumeReplyConfirmsAbsence } from "./retained-sandbox-absent-error.js";
@@ -72,6 +73,7 @@ import type {
   PluginEnvironmentLease,
   PluginEnvironmentLeaseObservation,
   PluginEnvironmentRealizeWorkspaceResult,
+  PluginEnvironmentResumeLeaseResult,
   PluginEnvironmentSyncResult,
   PluginSyncOperation,
 } from "@paperclipai/plugin-sdk";
@@ -1365,6 +1367,18 @@ function createSandboxEnvironmentDriver(
   );
   const environmentsSvc = environmentService(db);
 
+  async function recordSnapshotRestoredResume(lease: EnvironmentLease, resumed: PluginEnvironmentResumeLeaseResult) {
+    const metadata = sandboxRestartMetadata(lease, resumed);
+    if (Object.keys(metadata).length === 0) return resumed;
+    // Persist only process-loss provenance. Preserve the disk, session files,
+    // workspace metadata and ordinary resumed acquisition semantics.
+    await db.update(environmentLeases).set({
+      metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify(metadata)}::jsonb`,
+    }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, lease.companyId),
+      sql`not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) @> ${JSON.stringify(metadata)}::jsonb)`));
+    return { ...resumed, metadata: { ...resumed.metadata, ...metadata } };
+  }
+
   const deferredOrphanCleanups: DeferredOrphanCleanupRecord[] = [];
   // Keep the token through queue splices, failed flushes and buffer overflow.
   // Release only when the database durably owns cleanup of this exact orphan.
@@ -1918,7 +1932,7 @@ function createSandboxEnvironmentDriver(
             let idleStartWaitExtended = false;
             let everyResumeTimedOut = true;
             const lastRun = await resumeLeaseLastRun(db, reusableLease);
-            let resumed: PluginEnvironmentLease;
+            let resumed: PluginEnvironmentResumeLeaseResult;
             while (true) {
               try {
                 resumed = await pluginWorkerManager.call(
@@ -1964,7 +1978,7 @@ function createSandboxEnvironmentDriver(
             }
             providerLease =
               typeof resumed.providerLeaseId === "string" && resumed.providerLeaseId.length > 0
-                ? resumed
+                ? await recordSnapshotRestoredResume(reusableLease, resumed)
                 : null;
             if (!providerLease) {
               const sentinel = isRecord(resumed.metadata?.workspaceSentinel)
@@ -2104,9 +2118,7 @@ function createSandboxEnvironmentDriver(
           ...sandboxConfigForLeaseMetadata(storedConfig),
           ...sanitizedProviderMetadata,
           sandboxLeaseAcquisition: providerLease
-            ? {
-                outcome: "resumed",
-              }
+            ? { outcome: "resumed", ...sandboxRestartMetadata(providerLease) }
             : reusableLease?.providerLeaseId
               ? {
                   outcome: "replacement",
@@ -2776,8 +2788,8 @@ function createSandboxEnvironmentDriver(
         || (hasStopOnlyCleanup(input.lease) && !pluginWorkerVerifiesLifecycleMethod(pluginId, "environmentStopLease"))) {
         throw new Error("The exact sandbox lease cannot be resumed by its verified provider.");
       }
-      // This is a lifecycle resume, never acquisition: no replacement, host
-      // seed, lease mutation, or provider turn is allowed at this boundary.
+      // This is a lifecycle resume, never acquisition: no new allocation, host
+      // seed or provider turn. Snapshot-restore provenance is the only mutation.
       const config = {
         ...stripSandboxProviderEnvelope(await resolvePluginSandboxRuntimeConfig({
           environment: input.environment, lease: input.lease, provider: providerKey,
@@ -2798,7 +2810,7 @@ function createSandboxEnvironmentDriver(
         if (resumeReplyConfirmsAbsence(resumed)) throw new RetainedSandboxAbsentError();
         throw new Error("The provider did not confirm the exact retained sandbox. No replacement was acquired.");
       }
-      return resumed;
+      return await recordSnapshotRestoredResume(input.lease, resumed);
     },
 
     async execute(input) {

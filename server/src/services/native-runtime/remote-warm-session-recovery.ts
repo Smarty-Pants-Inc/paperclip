@@ -210,7 +210,10 @@ export async function inspectRemoteWarmSessionRecovery(input: {
   // sandbox (for example after a restart or deploy replaced the controller)
   // holds no Runner to adopt, so live adoption steps aside. Ordinary admission
   // then retires the finished owner or keeps it held with a named reason.
-  if (!input.portableSourceTaskId && target.transport === "sandbox" && ["created", "replacement"].includes(target.sandboxLeaseAcquisition?.outcome ?? "")) {
+  if (!input.portableSourceTaskId && target.transport === "sandbox" && (
+    ["created", "replacement"].includes(target.sandboxLeaseAcquisition?.outcome ?? "")
+    || target.sandboxLeaseAcquisition?.restoredFromSnapshotAt || target.sandboxLeaseAcquisition?.rebootedAt
+  )) {
     return null;
   }
   if (target.transport !== "sandbox" || !target.leaseId || !target.environmentId ||

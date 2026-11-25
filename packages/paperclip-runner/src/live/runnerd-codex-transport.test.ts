@@ -20,6 +20,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { PrpEvent } from "../protocol/replay-contract.js";
 import { PRP_PROTOCOL_VERSION } from "../protocol/replay-contract.js";
 import { redactCapabilityEvidenceData } from "./evidence-redaction.js";
+import { NativeRunnerClosedBeforeAttachmentError } from "../contracts/harness-driver.js";
 import { NativeSessionCloseUnrecoverableError } from "../contracts/native-session-backend.js";
 import { parsePaperclipQuestionSet } from "../contracts/question-set.js";
 import { SANDBOX_DISK_FULL_FAILURE_CODE } from "../contracts/sandbox-disk-full.js";
@@ -79,6 +80,18 @@ import {
   fakeCodexArgs,
   assignedRuntimeContext,
 } from "../../test/support/runnerd-transport.js";
+
+it("types an already-closed cached transport before any run attachment command", async () => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "closed-before-attachment-"));
+  const bundle = createCapabilityRunnerdCodexTransport({ stateDirectory });
+  try {
+    await bundle.transport.close("the prior sandbox process is gone");
+    await expect(bundle.transport.attachRun!({ runId: "same-incoming-run", turnId: "turn", itemId: "item" }))
+      .rejects.toBeInstanceOf(NativeRunnerClosedBeforeAttachmentError);
+    // The refusal itself must not create a journal or launch a replacement.
+    expect(await readdir(stateDirectory)).toEqual([]);
+  } finally { await rm(stateDirectory, { recursive: true, force: true }); }
+});
 
 describe("committedEventWindowComplete", () => {
   const events = (...seqs: number[]) => seqs.map(sourceSeq => ({ sourceSeq }));
