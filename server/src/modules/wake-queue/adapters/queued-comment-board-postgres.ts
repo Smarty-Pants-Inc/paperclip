@@ -1,6 +1,7 @@
 import { agentWakeupRequests, agents, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import type { IssueQueuedCommentQueue } from "@paperclipai/shared";
 import { isConversationReset } from "../../../services/agent-conversations.js";
+import { agentRunWritesRevoked } from "../../../agent-run-cancellation.js";
 import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { assertQueuedCommentInteractionDelivery, recheckQueuedCommentInteractionDelivery } from "../../../services/agent-interaction-delivery.js";
 import { deliverSteeredMessage, steeringDeliveryIsUncertain } from "../../../services/queued-comment-steering.js";
@@ -23,7 +24,8 @@ import { queuedInteractionId, readQueuedInteractionResponse, type QueuedInteract
 import type { QueuedCommentActor, QueuedCommentSteeringPort, SteerQueuedCommentInput } from "../application/queued-comment-ports.js";
 import { QueuedCommentMutationError } from "../application/queued-comment-use-cases.js";
 import { parseObject } from "../domain/values.js";
-import { isAutomaticSteeringComment } from "../domain/policy.js";
+import { isAutomaticSteeringComment, isAutomaticSteeringWake } from "../domain/policy.js";
+import { resolveSessionContinuity } from "../../../services/native-runtime/continued-session.js";
 
 type IssueQueueDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 type IssueQueueTx = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -181,10 +183,11 @@ async function queueCommentsForWake(
 /** Release an idle hold for deferred work that cannot be person-message steering.
  * Keep every wake untouched: ordinary terminal cleanup/admission delivers it. */
 export async function closeConversationResetHold(executor: Db, scope: { companyId: string; issueId: string }): Promise<boolean> {
-  const [current] = await executor.select({ issue: issues, runId: heartbeatRuns.id }).from(issues)
+  const [current] = await executor.select({ issue: issues, runId: heartbeatRuns.id, run: heartbeatRuns, config: agents.adapterConfig, agentStatus: agents.status }).from(issues)
     .innerJoin(heartbeatRuns, and(eq(heartbeatRuns.id, issues.executionRunId),
       eq(heartbeatRuns.companyId, issues.companyId), eq(heartbeatRuns.agentId, issues.conversationAgentId),
       eq(heartbeatRuns.status, "running"), eq(heartbeatRuns.runtimeMode, "native")))
+    .innerJoin(agents, and(eq(agents.id, heartbeatRuns.agentId), eq(agents.companyId, issues.companyId)))
     .where(and(eq(issues.id, scope.issueId), eq(issues.companyId, scope.companyId))).limit(1);
   if (!current?.issue.conversationAgentId || current.issue.conversationState !== "active") return false;
   // The board snapshot intentionally hides automation wakes and prefers person
@@ -200,9 +203,27 @@ export async function closeConversationResetHold(executor: Db, scope: { companyI
     if (queuedInteractionId(wake.payload)) return closeHeldNativeTurn(current.runId);
     const comments = await queueCommentsForWake(executor, scope.issueId, wake, null);
     const head = comments[0];
-    // Ordinary messages from people and other agents belong to the drain.
+    // Transfer agent input only when the continuous drain can actually take it.
+    // Otherwise stock close/release admission owns this unchanged wake.
     if (head && isAutomaticSteeringComment(head, current.issue.conversationAgentId) &&
-        parseObject(wake.payload?._paperclipWakeContext).forceFreshSession !== true) continue;
+        isAutomaticSteeringWake(wake.reason, parseObject(wake.payload?._paperclipWakeContext))) {
+      if (!head.authorAgentId) continue;
+      if (current.issue.assigneeAgentId === current.issue.conversationAgentId &&
+          current.run.contextSnapshot?.conversationSessionGeneration === current.issue.conversationSessionGeneration &&
+          !agentRunWritesRevoked(current.run) && !current.run.resultJson?.personStop &&
+          Object.keys((current.run.resultJson?.continuousReplies ?? {}) as object).length > 0 &&
+          current.config.provider === "pi_rpc" &&
+          resolveSessionContinuity("pi_rpc", current.config.sessionContinuity) === "continuous" &&
+          !["paused", "terminated", "pending_approval", "error"].includes(current.agentStatus)) {
+        const board = await readBoardQueuedComments({ executor, issue: current.issue, activeRun: current.run,
+          actor: { actorType: "agent", actorId: head.authorAgentId, agentId: head.authorAgentId,
+            runId: head.createdByRunId ?? null, agentApiKeyId: null },
+          queueState: { wake, state: "deferred", queueRun: null } });
+        if (board.steeringDisposition === "available" &&
+            (!board.executionWait || board.executionWait.reason === "execution_recovery") &&
+            !board.entries.some(entry => entry.source?.requiresFreshSession)) continue;
+      }
+    }
     return closeHeldNativeTurn(current.runId);
   }
   return false;
@@ -420,7 +441,7 @@ async function readLockedBoardQueue(
   return { activeRun, wake, queueRun, state, queue, queueState };
 }
 
-export function createQueuedCommentSteeringAdapter(db: Db): QueuedCommentSteeringPort<RunIdentityContext> {
+export function createQueuedCommentSteeringAdapter(db: Db, options: { requireQueueHead?: boolean } = {}): QueuedCommentSteeringPort<RunIdentityContext> {
   return {
     async reserveIdentity({ issue, queueId, commentId, targetRunId }) {
       const [wake] = await db.select({ agentId: agentWakeupRequests.agentId, payload: agentWakeupRequests.payload })
@@ -459,6 +480,18 @@ export function createQueuedCommentSteeringAdapter(db: Db): QueuedCommentSteerin
           }),
           async readPendingQueue() {
             const { queue } = await readLockedBoardQueue({ ...input, tx, issue }, wake, run);
+            // Admission also takes this issue lock. Recheck the global FIFO
+            // after locking, not just the optimistic snapshot: a concurrent
+            // older person wake must not be overtaken by automatic delivery.
+            if (options.requireQueueHead) {
+              const first = await findQueuedCommentWake(tx, issue);
+              if (first?.wake.id !== input.queueId || queue.entries[0]?.comment.id !== commentId) {
+                throw new QueuedCommentMutationError("queued_comment_order_mismatch", "Older queued input must be delivered first");
+              }
+              if (!wake || !isAutomaticSteeringWake(wake.reason, parseObject(wake.payload?._paperclipWakeContext))) {
+                throw new QueuedCommentMutationError("steering_unsupported", "This wake needs ordinary admission");
+              }
+            }
             // Recheck under the queue lock against edits and later-row delivery.
             if (issue.conversationAgentId && queue.entries.some(({ comment }) => isConversationReset(comment.body))) {
               throw new QueuedCommentMutationError("queued_response_requires_fresh_session", "/new needs a new session and cannot be steered into this turn");
