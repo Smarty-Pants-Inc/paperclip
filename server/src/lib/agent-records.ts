@@ -80,6 +80,8 @@ export interface UpdateAgentOptions {
   recordRevision?: RevisionMetadata;
   allowBuiltInAgentMetadata?: boolean;
   allowPendingApprovalConfigUpdate?: boolean;
+  /** Instruction writer already classified bytes; managed-path adoption is not new input. */
+  instructionEntryBindingOnly?: boolean;
   claudeLogin?: ClaudeLoginContext;
 }
 
