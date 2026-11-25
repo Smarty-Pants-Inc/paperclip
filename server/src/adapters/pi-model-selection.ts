@@ -1,6 +1,6 @@
 import { unprocessable } from "../errors.js";
 import { parseObject } from "./utils.js";
-import { piRpcThinking, projectPaperclipRunnerTaskConfig } from "../services/native-runtime/provider-profile.js";
+import { PaperclipRunnerProviderProfileError, piRpcThinking, projectPaperclipRunnerTaskConfig } from "../services/native-runtime/provider-profile.js";
 
 export const PI_MODEL_PROVIDER_REQUIRED = "pi_model_provider_required";
 
@@ -11,14 +11,14 @@ export function validatePiReasoningSelection(
 ): void {
   const saved = parseObject(agent.adapterConfig);
   if (agent.adapterType !== "paperclip_runner" || saved.provider !== "pi_rpc") return;
-  const config = overrides === undefined ? saved : projectPaperclipRunnerTaskConfig(
-    "pi_rpc", saved, parseObject(parseObject(overrides).adapterConfig),
-  );
-  const level = piRpcThinking(config);
-  if (typeof level !== "string" || !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(level)) {
-    throw unprocessable(
-      `Pi cannot use reasoning level ${JSON.stringify(level)}: choose off, minimal, low, medium, high, xhigh or max`,
+  try {
+    const config = overrides === undefined ? saved : projectPaperclipRunnerTaskConfig(
+      "pi_rpc", saved, parseObject(parseObject(overrides).adapterConfig),
     );
+    piRpcThinking(config);
+  } catch (error) {
+    if (error instanceof PaperclipRunnerProviderProfileError) throw unprocessable(error.message);
+    throw error;
   }
 }
 

@@ -51,15 +51,21 @@ describe("Pi issue model selection at run build", () => {
     const overrides = { adapterConfig: { model: "model" } };
     expect(() => normalizePiIssueModelSelection(saved, overrides)).toThrowError(expect.objectContaining({
       status: 422,
-      message: 'Pi cannot use reasoning level "ultra": choose off, minimal, low, medium, high, xhigh or max',
+      message: expect.stringContaining('pi_thinking_level_invalid: "ultra"'),
     }));
     expect(overrides).toEqual({ adapterConfig: { model: "model" } });
   });
   it("rejects an old stored invalid reasoning override at run normalization with a plain error", () => {
     const stored = { adapterConfig: { piRpcThinkingLevel: "ultra" } };
     expect(() => normalizePiIssueModelSelection(agent, stored)).toThrow(
-      'Pi cannot use reasoning level "ultra": choose off, minimal, low, medium, high, xhigh or max',
+      'pi_thinking_level_invalid: "ultra"',
     );
+  });
+  it.each(["modelReasoningEffort", "reasoningEffort", "effort"])("rejects a masked invalid task %s before projection", key => {
+    const overrides = { adapterConfig: { model: "other", piRpcThinkingLevel: "medium", modelReasoningEffort: "medium", [key]: "ultra" } };
+    expect(() => normalizePiIssueModelSelection(agent, overrides)).toThrowError(expect.objectContaining({
+      status: 422, message: expect.stringContaining('pi_thinking_level_invalid: "ultra"'),
+    }));
   });
   it("maps Pi's none selection to off", () => {
     const overrides = { adapterConfig: { piRpcThinkingLevel: "none" } };
