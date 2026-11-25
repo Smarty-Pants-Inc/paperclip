@@ -14,6 +14,9 @@ import { INBOX_MINE_ISSUE_STATUS_FILTER, latestFailedRunsByAgent } from "@paperc
 import { getHeartbeatRunReadDecisions, redactHeartbeatRunListRow } from "../services/heartbeat-run-privacy.js";
 import { taskInterruptionPresentation, taskInterruptionPresentations, taskRetryRefusal } from "../services/task-interruption-presentation.js";
 import { parseObject } from "../adapters/utils.js";
+import { normalizePiIssueModelSelection } from "../adapters/pi-model-selection.js";
+import { requestHeldNativeConfigurationEnd } from "../services/native-runtime/held-native-turn.js";
+import { piRpcThinking, projectPaperclipRunnerTaskConfig } from "../services/native-runtime/provider-profile.js";
 import { prepareRestrictedWorkspaceRetry } from "../services/restricted-workspace-retry.js";
 import { ISSUE_SUMMARIES_MAX_IDS, issueChatBootstrapQuerySchema, issueSummariesQuerySchema, type IssueSummary } from "@paperclipai/shared";
 import { readIssueChatBootstrapItems } from "../services/issue-chat-bootstrap.js";
@@ -14729,6 +14732,25 @@ export function issueRoutes(
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
         ...updateFields
       } = req.body;
+      const modelAssigneeId = normalizedAssigneeAgentId === undefined
+        ? existing.assigneeAgentId : normalizedAssigneeAgentId;
+      let endPiHeldTurn = false;
+      if (updateFields.assigneeAdapterOverrides !== undefined && modelAssigneeId) {
+        const modelAgent = await agentsSvc.getById(modelAssigneeId);
+        if (modelAgent?.companyId === existing.companyId) {
+          updateFields.assigneeAdapterOverrides = normalizePiIssueModelSelection(modelAgent, updateFields.assigneeAdapterOverrides);
+          if (modelAgent.adapterType === "paperclip_runner" && parseObject(modelAgent.adapterConfig).provider === "pi_rpc") {
+            let previous = existing.assigneeAdapterOverrides;
+            // Invalid old rows must remain repairable with a qualified pick.
+            try { previous = normalizePiIssueModelSelection(modelAgent, previous); } catch { /* compare the invalid old value */ }
+            const selection = (overrides: unknown) => {
+              const config = projectPaperclipRunnerTaskConfig("pi_rpc", modelAgent.adapterConfig, parseObject(parseObject(overrides).adapterConfig));
+              return JSON.stringify([config.model ?? null, piRpcThinking(config)]);
+            };
+            endPiHeldTurn = selection(previous) !== selection(updateFields.assigneeAdapterOverrides);
+          }
+        }
+      }
       if (commentBody && req.actor.type === "agent") {
         await assertAgentInteraction(db, { companyId: existing.companyId, actorAgentId: req.actor.agentId,
           operation: "comment", issueId: existing.id, texts: [commentBody] });
@@ -15774,6 +15796,7 @@ export function issueRoutes(
         Boolean(commentAttachmentIds?.length) ||
         agentCommentUpdate ||
         commentWithAdapterOverrides ||
+        endPiHeldTurn ||
         Boolean(decision) ||
         shouldRelayStop ||
         persistReviewActivityTransactionally ||
@@ -15792,6 +15815,9 @@ export function issueRoutes(
               return null;
             const updated = await updateIssue(tx);
             if (!updated) return null;
+            if (endPiHeldTurn) await requestHeldNativeConfigurationEnd(tx as unknown as Db, {
+              companyId: updated.companyId, agentId: modelAssigneeId!, issueId: id,
+            });
             if (commentAttachmentIds?.length || commentWithAdapterOverrides || agentCommentUpdate) {
               // Adapter settings, reassignment, comment and upload binding commit together.
               // A failed comment or invalid receipt rolls back the issue update.
