@@ -16,7 +16,11 @@ export class RunnerdTraceFrameIndex {
   #partialBytes = 0;
   #discardUntilNewline = false;
   #frames = new Map<string, Frame>();
-  #unreadBytes = false;
+  #unreadBytes = 0;
+  #nativeChannelCaptured = false;
+
+  get unreadBytes() { return this.#unreadBytes; }
+  get nativeChannelCaptured() { return this.#nativeChannelCaptured; }
 
   locate(tracePath: string, sourceEventId: string) {
     this.refresh(tracePath);
@@ -44,7 +48,7 @@ export class RunnerdTraceFrameIndex {
         const opened = fstatSync(fd);
         // Do not mix a replacement file with the prefix we already indexed.
         if (`${opened.dev}:${opened.ino}` !== identity) {
-          this.#unreadBytes = true;
+          this.#unreadBytes = stat.size - this.#offset;
           return true;
         }
         const buffer = Buffer.allocUnsafe(Math.min(READ_BUDGET_BYTES, stat.size - this.#offset));
@@ -60,7 +64,7 @@ export class RunnerdTraceFrameIndex {
         closeSync(fd);
       }
     }
-    this.#unreadBytes = this.#offset < stat.size;
+    this.#unreadBytes = stat.size - this.#offset;
     return true;
   }
 
@@ -87,7 +91,8 @@ export class RunnerdTraceFrameIndex {
     this.#partialBytes = 0;
     this.#discardUntilNewline = false;
     this.#frames.clear();
-    this.#unreadBytes = false;
+    this.#unreadBytes = 0;
+    this.#nativeChannelCaptured = false;
   }
 
   #consume(part: Buffer, terminated: boolean) {
@@ -123,6 +128,7 @@ export class RunnerdTraceFrameIndex {
     }
     if (!entry || typeof entry !== "object") return;
     this.#record += 1;
+    if (entry.debugChannel === "rust_native") this.#nativeChannelCaptured = true;
     if (entry.kind === "trace_status" && entry.debugChannel === "rust_native") {
       this.#settledAt = this.#record;
     }
