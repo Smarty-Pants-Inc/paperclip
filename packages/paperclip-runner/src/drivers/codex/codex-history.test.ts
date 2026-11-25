@@ -4,11 +4,25 @@ import {
   readCodexThreadState,
   readCodexTurnMetadata,
   readCodexTurnItems,
+  readCodexUserMessages,
 } from "./codex-history.js";
 
 const unsupported = (method: string) => new CodexRpcError(`${method} is not supported`, CODEX_METHOD_NOT_FOUND);
 
 describe("Codex paginated history", () => {
+  it("reads retained user entries, including failed-turn steering, not assistant echoes", async () => {
+    const request = vi.fn().mockResolvedValueOnce({ data: [{ id: "one", status: "failed" }] })
+      .mockResolvedValueOnce({ data: [
+        { turnId: "one", item: { id: "c", type: "userMessage", content: [{ type: "text", text: "C" }] } },
+        { turnId: "one", item: { id: "a", type: "agentMessage", text: "D" } },
+      ] });
+    expect(await readCodexUserMessages({ request }, "thread")).toEqual(["C"]);
+  });
+  it("does not infer a user entry from incomplete provider history", async () => {
+    const request = vi.fn().mockResolvedValueOnce({ data: [{ id: "one", status: "failed" }] })
+      .mockResolvedValueOnce({ data: [{ turnId: "one", item: { id: "c", type: "userMessage" } }] });
+    expect(await readCodexUserMessages({ request }, "thread")).toBeNull();
+  });
   it("reads state without hydrating history", async () => {
     const request = vi.fn().mockResolvedValue({ thread: { id: "thread" } });
     await readCodexThreadState({ request }, "thread");
