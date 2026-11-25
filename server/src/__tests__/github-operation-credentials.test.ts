@@ -240,6 +240,30 @@ process.stdout.write(process.env.GH_TOKEN || '');
         if (kind !== "delegated") expect(await resolveGitHubOperationCredentials(db, input)).toMatchObject({ status: "available", grantId: working.id });
       }
     });
+    it.each(["app", "no-app", "no-dedicated"] as const)("keeps a disabled dedicated identity off personal credentials (%s)", async mode => {
+      const input = await seed();
+      const personal = await grant(input, "A");
+      const dedicated = mode !== "no-dedicated" ? await grant(input, "robot", true) : null;
+      const app = mode !== "no-app" ? await sharedApp(input, "example-org/app") : null;
+      for (const state of [{ enabled: false, status: "active" }, { enabled: true, status: "draft" }] as const) {
+        if (dedicated) await db.update(toolConnections).set(state).where(eq(toolConnections.id, dedicated.connectionId));
+        const selection = await resolveManagedGitHubIdentitySelection(db, input.companyId, { agentId: input.agentId, responsibleUserId: "A" });
+        const credentials = await resolveGitHubOperationCredentials(db, input);
+        const auth = createGitRemoteAuthProvider(db, input.companyId, { agentId: input.agentId, responsibleUserId: "A" });
+        if (mode === "no-app") {
+          expect(selection).toMatchObject({ configured: true, error: "No managed GitHub identity is available for this run" });
+          expect(selection.grant).toBeUndefined();
+          expect(credentials).toMatchObject({ status: "unavailable", env: {} });
+          await expect(auth("https://github.com/example-org/app.git")).rejects.toThrow("No managed GitHub identity");
+        } else {
+          const selected = dedicated ? app! : personal;
+          const token = dedicated ? `app-token-${app!.connectionId}` : "test-token-A";
+          expect(selection).toMatchObject({ grant: { id: selected.id } });
+          expect(credentials).toMatchObject({ status: "available", grantId: selected.id, env: { GH_TOKEN: token } });
+          expect((await auth("https://github.com/example-org/app.git"))?.env.GH_TOKEN).toBe(token);
+        }
+      }
+    });
     it("does not fall through to legacy tokens when every installed connection is disabled", async () => {
       const input = await seed();
       const personal = await grant(input, "A");
@@ -741,7 +765,7 @@ process.stdout.write(process.env.GH_TOKEN || '');
         env: {},
       });
     });
-    it("honors dedicated overrides and revoked grants, but excludes disabled connections", async () => {
+    it("honors dedicated overrides and revoked grants, and never falls back to a person when disabled", async () => {
       const input = await seed();
       await grant(input, "A");
       const dedicated = await grant(input, "robot", true);
@@ -768,9 +792,8 @@ process.stdout.write(process.env.GH_TOKEN || '');
         .set({ enabled: false })
         .where(eq(toolConnections.id, dedicated.connectionId));
       expect(await resolveGitHubOperationCredentials(db, input)).toMatchObject({
-        status: "available",
-        source: "personal",
-        env: { GH_TOKEN: "test-token-A" },
+        status: "unavailable",
+        env: {},
       });
     });
     it("does not resolve the company default person's GitHub", async () => {

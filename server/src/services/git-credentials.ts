@@ -430,12 +430,14 @@ export async function resolveManagedGitHubIdentitySelection(
   // make unrelated agents fail before their adapter starts and would also
   // suppress their otherwise-eligible legacy credential fallback.
   if (eligibleConnectionIds.size === 0) return { configured: false };
-  const grants = await db.select().from(connectionGrants).where(and(
+  const installedGrants = await db.select().from(connectionGrants).where(and(
     eq(connectionGrants.companyId, companyId),
-    inArray(connectionGrants.connectionId, [...eligibleConnectionIds].filter(id => connectionsById.has(id))),
+    inArray(connectionGrants.connectionId, [...eligibleConnectionIds]),
     context.explicitGrantId ? eq(connectionGrants.id, context.explicitGrantId) : undefined,
     or(eq(connectionGrants.kind, "agent"), eq(connectionGrants.kind, "user"), eq(connectionGrants.kind, "organization")),
   ));
+  const grants = installedGrants.filter(grant => connectionsById.has(grant.connectionId));
+  const disabledDedicated = installedGrants.some(grant => grant.kind === "agent" && grant.subjectAgentId === context.agentId && !connectionsById.has(grant.connectionId));
   const dedicated = context.agentId
     ? grants.filter((grant) => grant.kind === "agent" && grant.subjectAgentId === context.agentId)
     : [];
@@ -469,7 +471,7 @@ export async function resolveManagedGitHubIdentitySelection(
   const shared = sharedGrants.filter(grant => (!context.responsibleUserId || members.length > 0) &&
     (!audience.some(member => member.grantId === grant.id) || audience.some(member =>
       member.grantId === grant.id && member.subjectType === "user" && member.subjectId === context.responsibleUserId)));
-  let candidates = dedicated.length > 0 ? dedicated : personal.length > 0 ? personal : delegated.length > 0 ? delegated : shared;
+  let candidates = dedicated.length > 0 ? dedicated : disabledDedicated ? shared : personal.length > 0 ? personal : delegated.length > 0 ? delegated : shared;
   const identitySource = dedicated.length > 0 || (shared.length > 0 && candidates === shared) ? "dedicated" as const : "personal" as const;
   // Shared App installations authorize repositories, not GitHub user identities.
   // Restrict this exception to one grant per connection; personal, dedicated and
