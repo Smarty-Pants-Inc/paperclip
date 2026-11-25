@@ -12,7 +12,7 @@ export async function installedNativePiDriverAvailable(): Promise<boolean> {
   // Reuse execution's manifest reader: this checks selection identity, not the
   // multi-gigabyte pack contents. Execution still owns full artifact admission.
   const { resolveRemoteProviderPackSource } = await import("./native-session-executor.js");
-  const { manifest } = resolveRemoteProviderPackSource(packRoot);
+  const { manifest } = resolveRemoteProviderPackSource(packRoot, "pi_rpc");
   const pi = manifest.payload.pi_rpc;
   if (pi === undefined) return false;
   if (!pi || typeof pi.version !== "string" || !pi.version.trim()) {
