@@ -143,6 +143,20 @@ export async function publishContinuousNativeReply(input: {
       interactionOwnsResponse: Boolean(issue.conversationAgentId) && await hasChatRunOwnedProviderInteraction(tx, { companyId, issueId, runId }),
     });
     if (!resolved.text || resolved.decision.commentAction !== "create") return;
+    const normalizedText = resolved.text.trim().replace(/\s+/g, " ");
+    const receipt = { questionCommentIds, sourceEventId: input.event.sourceEventId,
+      turnId: input.event.turnId ?? null, cursor: input.cursor, normalizedText };
+    // Different items can repeat one final. Only a newly answered input earns
+    // another identical comment; keep every item in the ledger for replay.
+    const previous = input.event.turnId ? Object.values(replies).map(parseObject)
+      .filter(reply => reply.turnId === input.event.turnId && reply.publishedByReference !== true && typeof reply.cursor === "number")
+      .sort((a, b) => Number(b.cursor) - Number(a.cursor))[0] : undefined;
+    if (!questionCommentIds.length && previous?.normalizedText === normalizedText && typeof previous.commentId === "string") {
+      await tx.update(heartbeatRuns).set({ resultJson: { ...result, continuousReplies: { ...replies,
+        [input.event.itemId!]: { ...receipt, commentId: previous.commentId, publishedByReference: true },
+      } } }).where(eq(heartbeatRuns.id, runId));
+      return true;
+    }
     const authorizationReason = await resolveChatRunPresentationAuthorizationReason(tx, { companyId, issueId, runId });
     const comment = await issueService(input.db).addComment(issueId, resolved.text, { agentId, runId }, {
       authorizationReason, clientRequestId,
@@ -155,7 +169,7 @@ export async function publishContinuousNativeReply(input: {
     if (explicitAnswers && answers.length)
       await acknowledgeChatCompletionReply(tx, runId, comment.id, answers.filter((id): id is string => typeof id === "string"));
     await tx.update(heartbeatRuns).set({ resultJson: { ...result, continuousReplies: { ...replies,
-      [input.event.itemId!]: { questionCommentIds, commentId: comment.id, sourceEventId: input.event.sourceEventId },
+      [input.event.itemId!]: { ...receipt, commentId: comment.id },
     } } }).where(eq(heartbeatRuns.id, runId));
     // Reply attribution and queue settlement commit together. A claim alone is
     // not consumption: before this final, failed starts still owe every answer.
