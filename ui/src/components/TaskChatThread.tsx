@@ -425,6 +425,12 @@ export type TaskChatThreadProps = ComponentProps<typeof IssueChatThread> & {
   onFailureNoticeChange?: (runId: string | null) => void;
   /** A person's Stop hands back the messages the agent hadn't taken (resultJson.personStop.returned). */
   onRestoreStoppedMessages?: (commentIds: readonly string[]) => Promise<boolean>;
+  /** Placement belongs to the page; hidden queue entries still drive delivery. */
+  sentCommentIds?: ReadonlySet<string>;
+  hiddenThreadCommentIds?: ReadonlySet<string>;
+  hiddenQueuedCommentIds?: ReadonlySet<string>;
+  onRetainedSubmissionChange?: (requestId: string | null) => void;
+  onRestoreReady?: () => void;
   conversationMode?: boolean;
   creationActivity?: ActivityEvent[];
   createdTasks?: Issue[];
@@ -592,6 +598,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     onRetryFailedRun,
     retryFailedRunId = null,
     queuedCommentQueue,
+    sentCommentIds,
+    hiddenThreadCommentIds,
+    hiddenQueuedCommentIds,
+    onRetainedSubmissionChange,
+    onRestoreReady,
     onEditQueuedComment,
     onReorderQueuedComments,
     onSteerQueuedComment,
@@ -723,33 +734,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   );
 
   const attemptedAutoSteer = useRef(new Set<string>());
-  // Polls of comments, wakes and receipts are independent. Once painted, a
-  // person's message cannot go back to either queue without a Stop return.
-  const drawnComments = useRef({ issueId, ids: new Set<string>() });
-  if (drawnComments.current.issueId !== issueId) drawnComments.current = { issueId, ids: new Set() };
-  const { drawnCommentIds, returnedCommentIds, queuedMessageQueue } = useMemo(() => {
-    const drawnCommentIds = new Set(drawnComments.current.ids);
-    for (const comment of comments) {
-      if (comment.clientId && drawnCommentIds.has(comment.clientId)) drawnCommentIds.add(comment.id);
-    }
-    const returnedCommentIds = new Set((linkedRuns ?? []).flatMap(run => {
-      const stop = run.resultJson?.personStop as { returned?: unknown } | undefined;
-      return Array.isArray(stop?.returned) ? stop.returned.filter((id): id is string => typeof id === "string") : [];
-    }));
-    for (const comment of comments) {
-      if (returnedCommentIds.has(comment.id) && comment.clientId) returnedCommentIds.add(comment.clientId);
-    }
-    for (const id of returnedCommentIds) drawnCommentIds.delete(id);
-    const queuedMessageQueue = queuedCommentQueue ? {
-      ...queuedCommentQueue,
-      entries: queuedCommentQueue.entries.filter(entry => !drawnCommentIds.has(entry.comment.id)),
-      pendingQueue: queuedCommentQueue.pendingQueue ? {
-        ...queuedCommentQueue.pendingQueue,
-        entries: queuedCommentQueue.pendingQueue.entries.filter(entry => !drawnCommentIds.has(entry.comment.id)),
-      } : null,
-    } : null;
-    return { drawnCommentIds, returnedCommentIds, queuedMessageQueue };
-  }, [issueId, comments, linkedRuns, queuedCommentQueue]);
+  const queuedMessageQueue = queuedCommentQueue;
+  const returnedCommentIds = useMemo(() => new Set((linkedRuns ?? []).flatMap(run => {
+    const stop = run.resultJson?.personStop as { returned?: unknown } | undefined;
+    return Array.isArray(stop?.returned) ? stop.returned.filter((id): id is string => typeof id === "string") : [];
+  })), [linkedRuns]);
   const emptyQueuedCommentQueue = useMemo<IssueQueuedCommentQueue>(
     () => ({
       issueId: issueId ?? "",
@@ -767,9 +756,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     () =>
       new Set(
         [...(queuedMessageQueue?.entries ?? []), ...(queuedMessageQueue?.pendingQueue?.entries ?? [])]
+          .filter(entry => !sentCommentIds?.has(entry.comment.id))
           .map((entry) => entry.comment.id),
       ),
-    [queuedMessageQueue],
+    [queuedMessageQueue, sentCommentIds],
   );
   const [queuedEdit, setQueuedEdit] = useState<{
     commentId: string;
@@ -959,13 +949,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   );
   const projectedComments = useMemo(
     () => {
-      const byId = new Map(comments.map(comment => [comment.id, comment]));
-      // A queue refresh can precede the comment-history page containing it.
-      for (const entry of [...(queuedCommentQueue?.entries ?? []), ...(queuedCommentQueue?.pendingQueue?.entries ?? [])]) {
-        if (drawnCommentIds.has(entry.comment.id) && !byId.has(entry.comment.id)) byId.set(entry.comment.id, entry.comment);
-      }
-      return [...byId.values()].flatMap((comment) => {
-        if (imageReceipts.has(comment.id)) return [];
+      return comments.flatMap((comment) => {
+        if (hiddenThreadCommentIds?.has(comment.id) || imageReceipts.has(comment.id)) return [];
         if (comment.authorType === "system" && comment.metadata?.recoveryResponsibility === "system") return [];
         if (statusRelevance.isHistoricalNotice(comment) && !nativeFailureNoticeRunId(comment)) return [];
         if (isRedundantAiRecoveryNotice(comment, interactions)) return [];
@@ -982,7 +967,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         return [summary ? { ...comment, body: summary } : comment];
       });
     },
-    [comments, queuedCommentQueue, drawnCommentIds, interactions, linkedRunMetaById, statusRelevance, imageReceipts],
+    [comments, hiddenThreadCommentIds, interactions, linkedRunMetaById, statusRelevance, imageReceipts],
   );
 
   const failureNoticeIds = useMemo(() => new Map(projectedComments.flatMap(comment => {
@@ -1132,16 +1117,23 @@ export function TaskChatThread(props: TaskChatThreadProps) {
 
   // Pi's Stop (Esc): the messages it hadn't taken go back into the stopping person's input box, once.
   // Keyed on state (his returned messages still exist), so a reload or another of his devices restores too.
-  const restoredStopRunIds = useRef(new Set<string>());
-  useEffect(() => {
-    for (const [runId, meta] of linkedRunMetaById) {
+  const restoredStopCommentIds = useRef(new Set<string>());
+  useLayoutEffect(() => {
+    const availableIds = new Set(comments.filter(comment => !comment.deletedAt && comment.authorUserId === currentUserId).map(comment => comment.id));
+    for (const meta of linkedRunMetaById.values()) {
       const stop = meta.resultJson?.personStop as { userId?: unknown; returned?: unknown } | undefined;
-      const returned = Array.isArray(stop?.returned) ? stop.returned.filter((id): id is string => typeof id === "string" && comments.some((comment) => comment.id === id && !comment.deletedAt && comment.authorUserId === currentUserId)) : [];
-      if (!onRestoreStoppedMessages || !currentUserId || stop?.userId !== currentUserId || returned.length === 0 || restoredStopRunIds.current.has(runId)) continue;
-      restoredStopRunIds.current.add(runId);
-      void onRestoreStoppedMessages(returned).then((done) => { if (!done) restoredStopRunIds.current.delete(runId); });
+      if (!onRestoreStoppedMessages || !currentUserId || stop?.userId !== currentUserId) continue;
+      const returned = Array.isArray(stop?.returned) ? stop.returned.filter((id): id is string =>
+        typeof id === "string" && availableIds.has(id) && !restoredStopCommentIds.current.has(`${issueId}:${id}`)) : [];
+      if (!returned.length) continue;
+      // Track IDs, not runs: [a] arriving first must not complete receipt [a,b].
+      const keys = returned.map(id => `${issueId}:${id}`);
+      keys.forEach(key => restoredStopCommentIds.current.add(key));
+      void onRestoreStoppedMessages(returned).then(done => {
+        if (!done) keys.forEach(key => restoredStopCommentIds.current.delete(key));
+      }, () => { keys.forEach(key => restoredStopCommentIds.current.delete(key)); });
     }
-  }, [linkedRunMetaById, comments, currentUserId, onRestoreStoppedMessages]);
+  }, [issueId, linkedRunMetaById, comments, currentUserId, onRestoreStoppedMessages]);
   const openedAt = useMemo(() => Date.now(), [issueId]);
   const scrollNavigation = useTaskChatScrollNavigation();
   const requestedTranscripts = useRef({ issueId, ids: new Set<string>() });
@@ -1405,8 +1397,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     const steeringAnchorByCommentId = new Map<string, number>();
     for (const comment of comments) {
       if (comment.deletedAt || comment.authorType !== "user") continue;
-      // A queued input is not in the conversation yet. Its durable delivery
-      // receipt fixes ONE boundary; later provider consumption never re-splits.
+      // The receipt splits agent output, not the person's immediate Send echo.
+      // It fixes ONE boundary; later provider consumption never re-splits.
       const run = runs.find(run => Object.prototype.hasOwnProperty.call(
         linkedRunMetaById.get(run.id)?.resultJson?.queuedSteeringAcknowledgements ?? {}, comment.id));
       const receipt = run ? (linkedRunMetaById.get(run.id)?.resultJson?.queuedSteeringAcknowledgements as
@@ -1423,14 +1415,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     return { steeringAnchorsByRun, steeringAnchorByCommentId };
   }, [comments, runs, linkedRunMetaById]);
 
-  const visibleQueuedMessageQueue = useMemo(() => queuedMessageQueue ? {
-    ...queuedMessageQueue,
-    entries: queuedMessageQueue.entries.filter(entry => returnedCommentIds.has(entry.comment.id) || !steeringAnchorByCommentId.has(entry.comment.id)),
-    pendingQueue: queuedMessageQueue.pendingQueue ? {
-      ...queuedMessageQueue.pendingQueue,
-      entries: queuedMessageQueue.pendingQueue.entries.filter(entry => returnedCommentIds.has(entry.comment.id) || !steeringAnchorByCommentId.has(entry.comment.id)),
-    } : null,
-  } : emptyQueuedCommentQueue, [queuedMessageQueue, emptyQueuedCommentQueue, steeringAnchorByCommentId, returnedCommentIds]);
+  const visibleQueuedMessageQueue = queuedMessageQueue ?? emptyQueuedCommentQueue;
 
   const continuousReplyPlacements = useMemo(() => {
     const placements = new Map<string, { byItem: Map<string, number>; bySegment: Map<number, string>; questionsBySegment: Map<number, string[]> }>();
@@ -3789,15 +3774,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const [revealedHistoryKey, setRevealedHistoryKey] = useState<string | null | undefined>(undefined);
   const revealCachedHeader = connectionStatus !== "online" && Boolean(threadHeader);
   const historyRevealed = revealedHistoryKey === historyKey || revealCachedHeader;
-  useLayoutEffect(() => {
-    if (!historyRevealed) return;
-    for (const id of returnedCommentIds) drawnComments.current.ids.delete(id);
-    for (const item of threadItems) {
-      if (item.kind !== "message" || item.author !== "human" || returnedCommentIds.has(item.id)) continue;
-      drawnComments.current.ids.add(item.id);
-      if (item.renderKey) drawnComments.current.ids.add(item.renderKey);
-    }
-  });
   useEffect(() => {
     if (revealCachedHeader) setRevealedHistoryKey(historyKey);
   }, [revealCachedHeader, historyKey]);
@@ -4160,6 +4136,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                           )}
                           key={issueId}
                           queue={visibleQueuedMessageQueue}
+                          hiddenCommentIds={hiddenQueuedCommentIds}
                           onEdit={beginQueuedEdit}
                           editingCommentId={queuedEdit?.commentId ?? null}
                           autoSteerDelayMs={stopPending || stoppingReply ? null : queuedMessageAutoSteerDelayMs}
@@ -4205,9 +4182,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                         <TaskChatComposer
                           composerRef={composerRef}
                           onAdd={handleThreadAdd}
+                          onRetainedSubmissionChange={onRetainedSubmissionChange}
+                          onRestoreReady={onRestoreReady}
                           confirmedSubmissionIds={new Set(comments.filter((comment) =>
                             comment.authorUserId === currentUserId && comment.clientRequestId &&
-                            !("clientStatus" in comment && comment.clientStatus)
+                            !comment.id.startsWith("optimistic-")
                           ).map((comment) => comment.clientRequestId!))}
                           onStop={liveRun && !tailEnded && !tailHasFinalResponse && onCancelRun ? () => { stoppedRunIds.current.add(liveRun.id); return onCancelRun(); } : undefined}
                           confirmedStoppedRunIds={confirmedStoppedRunIds}
