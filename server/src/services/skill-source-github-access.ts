@@ -91,7 +91,11 @@ export function skillSourceGitHubReader(db: Db, companyId: string, actor: Reques
     throw lastError ?? forbidden('Reconnect an active GitHub authorization to read this repository.');
   };
   const read = (async (apiPath: string, signal?: AbortSignal) => {
-    if (!apiPath.startsWith('/repos/') || apiPath.includes('://') || apiPath.startsWith('//')) throw unprocessable('Invalid GitHub repository request.');
+    let segments: string[] = [];
+    try { segments = decodeURIComponent(apiPath.split(/[?#]/)[0]).replace(/\/+/g, '/').split('/'); } catch { /* Refuse malformed encoding below. */ }
+    const repository = segments[1] === 'repos' ? gitHubRepositoryHint(segments.slice(2, 4).join('/')) : undefined;
+    if (!apiPath.startsWith('/') || apiPath.includes('://') || apiPath.startsWith('//') || !repository
+      || segments.some(segment => segment === '.' || segment === '..')) throw unprocessable('Invalid GitHub repository request.');
     return authorized(async authorization => {
       const timeout = AbortSignal.timeout(30_000);
       const response = await fetch(`https://api.github.com${apiPath}`, {
@@ -115,7 +119,7 @@ export function skillSourceGitHubReader(db: Db, companyId: string, actor: Reques
           ...(limited && Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? { retryAfterMs } : {}) });
       }
       return response.json();
-    }, signal, gitHubRepositoryHint(apiPath.split('/').slice(2, 4).join('/')));
+    }, signal, repository);
   }) as GitHubRead;
   const callerId = actor.type === 'agent' ? `agent:${actor.agentId}` : `board:${actor.userId ?? actor.source}`;
   let scanLease: ReturnType<typeof limitScans> | undefined;
