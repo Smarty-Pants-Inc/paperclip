@@ -711,6 +711,33 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
     await expect(inspect({ readControlState })).rejects.toThrow("warm_recovery_refused=owner_unsettled");
   });
 
+  it.each([
+    { conversationMode: true, completed: true, settled: true },
+    { conversationMode: true, completed: false, settled: false },
+    { conversationMode: false, completed: true, settled: false },
+  ])("settles a held turn after an earlier Runner terminal only for a completed Pi conversation: %j", async row => {
+    const { identity, checkpoint, inspect, recordOwner } = await seedWarmFollowUpOnOldServer({
+      kind: "pi_rpc", model: "example/model", ...(row.conversationMode ? { conversationMode: true } : {}),
+    });
+    await recordOwner({ controllerPid: 2147483647, controllerHostHash: currentProcessSpaceHash(),
+      controllerProcessStartedAt: new Date(Date.now() - 600_000) });
+    const event = (eventType: string) => ({ eventType, envelope: { ...identity, payload: {
+      schema: "paperclip.prp.event.v1", eventType, runId: identity.runId, normalizedSessionId: identity.normalizedSessionId,
+      sourceInstanceId: identity.runnerInstanceId, sourceKind: "runner", payload: {},
+    } } });
+    const committedEvents = [event("run.terminal"), event("turn.started"),
+      ...(row.completed ? [event("turn.completed")] : [])];
+    const readControlState = () => ({ identity, commands: [{ type: "turn.start", status: "completed" }], committedEvents });
+    if (!row.settled) {
+      await expect(inspect({ readControlState })).rejects.toThrow("warm_recovery_refused=journal_unsettled");
+      return;
+    }
+    const recovered = await inspect({ readControlState });
+    expect(recovered?.identity).toEqual(identity);
+    expect(recovered?.checkpoint).toBe(checkpoint);
+    expect(recovered?.reuseProcess).toBe(true);
+  });
+
   it("waits while the outgoing server that ran the finished turn still holds its warm session, then takes it over once that server exits", async () => {
     const oldServer = spawn(process.execPath, ["-e", "setInterval(() => {}, 60_000)"], { stdio: "ignore" });
     try {
