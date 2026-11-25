@@ -12906,10 +12906,27 @@ async function executePaperclipNativeSessionAttempt(
         if (executionContext) await finishStartupContextForFallback();
       }
     }
-    let runnerdBackend =
-      input.useRunnerd && input.backend === undefined
-        ? await timeController("backend_setup", () => executionContext ? executionContext.wait(createExecutionBackend) : createExecutionBackend())
-        : null;
+    let runnerdBackend: ManagedRunnerdBackend | null = null;
+    if (input.useRunnerd && input.backend === undefined) {
+      try {
+        runnerdBackend = await timeController("backend_setup", () => executionContext ? executionContext.wait(createExecutionBackend) : createExecutionBackend());
+      } catch (error) {
+        if (!(error instanceof RemoteWarmRunnerSuspendedError) || !remoteWarmRecovery || remoteWarmRecovery.portableSourceTaskId) throw error;
+        // The box, not the older server checkpoint, owns its lifecycle. It is
+        // settled but no longer live-adoptable: use the ordinary no-owner
+        // restore/resume path without abandoning this provider session.
+        await remoteWarmRecovery.revalidate(leaseOwner);
+        const previousConfigDigest = nativeSessionConfigDigest(remoteWarmRecovery.previousExecution, "remote");
+        remoteWarmRecovery = undefined;
+        remoteWarmRecoveryPending = false;
+        if (executionContext) await finishStartupContextForFallback();
+        await migrateRunnerdStateRootForExecution({ ...input, allowVerifiedBackup: true,
+          allowLocalRecovery: false, bootstrapRetryLeaseOwner: leaseOwner });
+        persistedWarmSession = loadWarmNativeCheckpoint(input.execution, previousConfigDigest, "remote");
+        if (!persistedWarmSession) throw new Error("native_runner_checkpoint_missing_after_suspension");
+        runnerdBackend = await createExecutionBackend();
+      }
+    }
     if (remoteWarmRecovery) {
       const recovery = remoteWarmRecovery;
       if (executionContext) await executionContext.wait(() => recovery.revalidate(leaseOwner));
@@ -16088,6 +16105,14 @@ function remoteRunnerStateDirectory(remoteCwd: string, normalizedSessionId: stri
     createHash("sha256").update(normalizedSessionId).digest("hex"), "runner");
 }
 
+/** A settled box may have suspended after the server saved its warm checkpoint. */
+class RemoteWarmRunnerSuspendedError extends Error {
+  constructor() {
+    super("runner_state_identity_mismatch: remote_warm_session_not_idle");
+    this.name = "RemoteWarmRunnerSuspendedError";
+  }
+}
+
 /** Verify remote ownership before exposing the transport's authenticated adoption path. */
 export async function verifyRemoteRunnerReattachment(input: {
   claim: Pick<Extract<
@@ -16122,6 +16147,11 @@ export async function verifyRemoteRunnerReattachment(input: {
   const runnerState = await readRemoteRunnerState({ runner, stateDirectory, recoveryDeadline: probeDeadline, stall });
   if (input.requireIdle && (runnerState.lifecycle !== "ready" ||
       !Array.isArray(runnerState.outbox) || runnerState.outbox.length !== 0 || runnerState.pendingTerminalDelivery !== null)) {
+    if (runnerState.lifecycle === "suspended" && Array.isArray(runnerState.outbox) && runnerState.outbox.length === 0
+      && runnerState.pendingTerminalDelivery === null && REMOTE_RUNNER_IDENTITY_FIELDS.every(field =>
+        typeof identity[field] === "string" && !!identity[field] && runnerState[field] === identity[field])) {
+      throw new RemoteWarmRunnerSuspendedError();
+    }
     throw new Error("runner_state_identity_mismatch: remote_warm_session_not_idle");
   }
   for (const field of REMOTE_RUNNER_IDENTITY_FIELDS) {
