@@ -174,6 +174,17 @@ require Legacy. Switching back to Legacy rejects native `max`
 thinking, nondefault permission policy, or warm lifecycle instead of discarding
 them. Existing Pi agents retain their saved runner and native policies.
 
+Pi chat-override and agent-configuration PATCHes also check the selected model
+against the managed gateway connection's OpenAI-compatible `/v1/models` list.
+The connection's own URL and authentication are used, not model hints saved in
+its configuration. A model absent from a successfully loaded list returns 422
+before any settings, comments, or audit records are saved. Lists are cached in
+memory for five minutes per gateway URL; concurrent checks share a request.
+The request has a three-second deadline. If the gateway is unavailable or its
+list is invalid, saving remains available (fail open), with one warning per
+cached outage. Unmanaged providers and router-owned model selection retain
+their existing validation.
+
 Agent configuration uses the same section layout across adapters: model and
 provider belong to **Adapter**, environment variables have their own section,
 and command/extra arguments are folded under **Configuration → Advanced**.
