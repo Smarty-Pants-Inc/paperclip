@@ -91,6 +91,14 @@ export function isGitHubHttpsRemoteUrl(remoteUrl: string): boolean {
   return isGitHubDotCom(parsed.hostname);
 }
 
+/** Normalize a GitHub remote or credential path into the repository selection key. */
+export function gitHubRepositoryHint(value: string): string | undefined {
+  const path = value.replace(/^git@(?:www\.)?github\.com:/i, "")
+    .replace(/^(?:https?|ssh):\/\/(?:git@)?(?:www\.)?github\.com\//i, "")
+    .replace(/\.git\/?$/i, "").replace(/\/$/, "");
+  return /^[a-z0-9][a-z0-9-]*\/[a-z0-9_.-]+$/i.test(path) ? path.toLowerCase() : undefined;
+}
+
 function isSupportedGitHubRemoteUrl(remoteUrl: string): boolean {
   if (isGitHubHttpsRemoteUrl(remoteUrl)) return true;
   if (/^git@(?:www\.)?github\.com:[^\s]+$/i.test(remoteUrl)) return true;
@@ -290,19 +298,24 @@ export function createGitRemoteAuthProvider(
   const secrets: GitCredentialSecretsDeps = deps?.secrets ?? secretService(db);
   const env = deps?.env ?? process.env;
   const secretNames = deps?.secretNames ?? DEFAULT_GITHUB_TOKEN_SECRET_NAMES;
-  let credentialPromise: Promise<GitCredential | null> | null = null;
+  const credentialPromises = new Map<string, Promise<GitCredential | null>>();
+  let legacyCredentialPromise: Promise<GitCredential | null> | null = null;
 
-  const resolveCredential = async (): Promise<GitCredential | null> => {
+  const resolveCredential = async (repository?: string): Promise<GitCredential | null> => {
     // Unit callers historically pass a null DB through the typed test seam. Production
     // always supplies a real DB and therefore always checks managed identities before
     // considering legacy secrets or process environment credentials.
     const managed = db
-      ? await resolveManagedGitHubCredential(db, secrets, companyId, context ?? {})
+      ? await resolveManagedGitHubCredential(db, secrets, companyId, { ...context, repository })
       : { configured: false as const };
     if (managed.configured) {
       if (!managed.credential) throw new Error(managed.error ?? "Managed GitHub connection is unavailable");
       return managed.credential;
     }
+    return legacyCredentialPromise ??= resolveLegacyCredential();
+  };
+
+  const resolveLegacyCredential = async (): Promise<GitCredential | null> => {
     for (const secretName of secretNames) {
       const secret = await Promise.resolve(secrets.getByName(companyId, secretName)).catch(() => null);
       if (!secret) continue;
@@ -330,6 +343,7 @@ export function createGitRemoteAuthProvider(
 
   return async (remoteUrl: string) => {
     if (!isSupportedGitHubRemoteUrl(remoteUrl)) return null;
+    const repository = gitHubRepositoryHint(remoteUrl);
     if (db && context?.heartbeatRunId && context.agentId) {
       const [run] = await db.select({ contextId: heartbeatRuns.activeIdentityContextId }).from(heartbeatRuns).where(and(
         eq(heartbeatRuns.id, context.heartbeatRunId), eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, context.agentId),
@@ -337,10 +351,10 @@ export function createGitRemoteAuthProvider(
       if (run?.contextId) {
         const { resolveGitHubOperationCredentials } = await import("./github-operation-credentials.js");
         const result = await resolveGitHubOperationCredentials(db, {
-          companyId, runId: context.heartbeatRunId, agentId: context.agentId,
+          companyId, runId: context.heartbeatRunId, agentId: context.agentId, repository,
         });
         if (result.status === "absent") {
-          const credential = await resolveCredential();
+          const credential = await resolveCredential(repository);
           return credential ? buildGitAuthInvocation(credential) : null;
         }
         const anonymous = buildGitAuthInvocation({ token: "", source: "managed_connection", secretName: null });
@@ -351,9 +365,10 @@ export function createGitRemoteAuthProvider(
         } };
       }
     }
-    credentialPromise ??= resolveCredential();
-    const credential = await credentialPromise.catch((error: unknown) => { credentialPromise = null; throw error; });
-    if (credential?.refreshPerOperation) credentialPromise = null;
+    const key = repository ?? "";
+    if (!credentialPromises.has(key)) credentialPromises.set(key, resolveCredential(repository));
+    const credential = await credentialPromises.get(key)!.catch((error: unknown) => { credentialPromises.delete(key); throw error; });
+    if (credential?.refreshPerOperation) credentialPromises.delete(key);
     if (!credential) return null;
     return buildGitAuthInvocation(credential);
   };
@@ -368,6 +383,7 @@ export async function resolveManagedGitHubIdentitySelection(
     allowStandingDelegation?: boolean;
     excludeGrantId?: string;
     explicitGrantId?: string;
+    repository?: string;
   },
 ): Promise<{
   configured: boolean;
@@ -445,8 +461,29 @@ export async function resolveManagedGitHubIdentitySelection(
   const shared = sharedGrants.filter(grant => (!context.responsibleUserId || members.length > 0) &&
     (!audience.some(member => member.grantId === grant.id) || audience.some(member =>
       member.grantId === grant.id && member.subjectType === "user" && member.subjectId === context.responsibleUserId)));
-  const candidates = dedicated.length > 0 ? dedicated : personal.length > 0 ? personal : delegated.length > 0 ? delegated : shared;
+  let candidates = dedicated.length > 0 ? dedicated : personal.length > 0 ? personal : delegated.length > 0 ? delegated : shared;
   const identitySource = dedicated.length > 0 || (shared.length > 0 && candidates === shared) ? "dedicated" as const : "personal" as const;
+  // Shared App installations authorize repositories, not GitHub user identities.
+  // Restrict this exception to one grant per connection; personal, dedicated and
+  // delegated account ambiguity continues through the stock resolver below.
+  if (candidates === shared && candidates.length > 0
+    && new Set(candidates.map(grant => grant.connectionId)).size === candidates.length) {
+    const repository = context.repository?.trim().toLowerCase();
+    const matching = candidates.filter(grant => {
+      if (!repository) return true;
+      const connection = githubConnections.find(connection => connection.id === grant.connectionId)!;
+      const config = connection.config.methodConfig as Record<string, unknown> | undefined;
+      return typeof config?.repositories === "string"
+        && config.repositories.split(/[,\n]/).some(repo => repo.trim().toLowerCase() === repository);
+    });
+    if (repository && matching.length === 0) return { configured: true, identitySource,
+      error: `No managed GitHub identity is available for this run for repository ${repository}` };
+    candidates = matching.filter(grant => grant.id !== context.excludeGrantId).sort((a, b) => {
+      const left = githubConnections.find(connection => connection.id === a.connectionId)!;
+      const right = githubConnections.find(connection => connection.id === b.connectionId)!;
+      return left.createdAt.getTime() - right.createdAt.getTime() || left.id.localeCompare(right.id);
+    }).slice(0, 1);
+  }
   // Reconnecting can create another connection/grant for the same GitHub
   // account. Ambiguity is about provider identities, not the number of rows.
   // Only trust GitHub's stable account ID; equal logins or missing metadata
@@ -557,6 +594,7 @@ export async function resolveManagedGitHubCredential(
     agentId?: string | null;
     allowStandingDelegation?: boolean;
     explicitGrantId?: string;
+    repository?: string;
   },
 ): Promise<{ configured: boolean; identitySource?: "personal" | "dedicated"; credential?: GitCredential; error?: string }> {
   const selection = await resolveManagedGitHubIdentitySelection(db, companyId, context);

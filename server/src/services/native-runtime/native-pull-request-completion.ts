@@ -62,8 +62,8 @@ export function nativePullRequestCompletionKey(reference: { owner: string; repo:
   return `${reference.owner.toLowerCase()}/${reference.repo.toLowerCase()}#${reference.number}`;
 }
 
-async function resolveCompletionCredential(db: Db, binding: Binding): Promise<GitHubApiCredential | null> {
-  const credential = await resolveGitHubCompletionCredentials(db, binding);
+async function resolveCompletionCredential(db: Db, binding: Binding, repository: string): Promise<GitHubApiCredential | null> {
+  const credential = await resolveGitHubCompletionCredentials(db, { ...binding, repository });
   if (credential.status !== "absent") {
     const token = credential.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]?.trim();
     if (credential.status !== "available" || !token) {
@@ -87,12 +87,16 @@ export async function verifyNativePullRequestCompletion(db: Db, binding: Binding
   }
   const references = await nativePullRequestCompletionReferences(db, binding, result);
   if (references.length === 0) return new Set();
-  let credential: Promise<GitHubApiCredential | null> | undefined;
-  const resolve = createPullRequestMergeStateResolver(db, {
-    credentialProvider: () => credential ??= resolveCompletionCredential(db, binding),
-  });
+  const credentials = new Map<string, Promise<GitHubApiCredential | null>>();
   const signal = AbortSignal.timeout(10_000);
   const states = await Promise.all(references.map(async reference => {
+    const repository = `${reference.owner}/${reference.repo}`.toLowerCase();
+    const resolve = createPullRequestMergeStateResolver(db, {
+      credentialProvider: () => {
+        if (!credentials.has(repository)) credentials.set(repository, resolveCompletionCredential(db, binding, repository));
+        return credentials.get(repository)!;
+      },
+    });
     try { return await resolve(binding.companyId, reference, signal); } catch { return "unknown"; }
   }));
   const pending = references.filter((_, index) => states[index] !== "merged");

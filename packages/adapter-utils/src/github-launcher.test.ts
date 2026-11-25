@@ -12,6 +12,29 @@ afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) awai
 
 describe("managed GitHub launchers", () => {
 
+  it("sends the current Git remote as a repository hint for implicit gh operations", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-repository-hint-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed"), real = path.join(root, "real");
+    await mkdir(bin); await mkdir(real);
+    await exec("git", ["init", "-q", root]);
+    await exec("git", ["-C", root, "remote", "add", "origin", "git@github.com:Second-Org/App.git"]);
+    await writeFile(path.join(bin, "gh"), githubLauncherSource(), { mode: 0o700 });
+    await writeFile(path.join(real, "gh"), `#!${process.execPath}\nprocess.stdout.write(process.env.GH_TOKEN || '');\n`, { mode: 0o700 });
+    const hints: unknown[] = [];
+    const server = createServer((req, res) => {
+      hints.push(req.headers["x-paperclip-github-repository"]);
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "available", env: { GH_TOKEN: "selected-installation" } }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const { port } = server.address() as { port: number };
+    const env = { ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "run-capability" }), PATH: `${bin}:${real}:${process.env.PATH}` };
+    expect((await exec(path.join(bin, "gh"), ["pr", "list"], { cwd: root, env })).stdout).toBe("selected-installation");
+    expect(hints).toEqual(["second-org/app"]);
+  });
+
   it("uses a private interpreter without selecting Node from PATH", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-interpreter-"));
     cleanups.push(() => rm(root, { recursive: true, force: true }));
