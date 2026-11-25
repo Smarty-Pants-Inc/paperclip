@@ -183,6 +183,8 @@ export interface SandboxLeaseAcquisition {
   restoredFromSnapshotAt?: string;
   /** The provider rebooted the same allocation after its bound run ended. */
   rebootedAt?: string;
+  /** This process-loss generation already has a successfully started successor Runner. */
+  handledProcessRestartKey?: string;
   reason?: "not_found" | "expired" | "identity_mismatch" | "resume_failed";
 }
 
