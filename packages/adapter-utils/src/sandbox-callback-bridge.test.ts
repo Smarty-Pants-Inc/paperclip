@@ -418,6 +418,7 @@ describe("sandbox callback bridge", () => {
         authorization: `Bearer ${bridgeToken}`,
         "content-type": "application/json",
         "x-paperclip-github-capability": "test-run-scoped-capability",
+        "x-paperclip-github-repository": "second-org/x",
       },
       body: "{}",
     });
@@ -425,7 +426,7 @@ describe("sandbox callback bridge", () => {
     await githubResponse.arrayBuffer();
     expect(seenRequests[2]).toMatchObject({
       method: "POST", path: "/runtime-tools/github/credentials", body: "{}",
-      headers: { "x-paperclip-github-capability": "test-run-scoped-capability" },
+      headers: { "x-paperclip-github-capability": "test-run-scoped-capability", "x-paperclip-github-repository": "second-org/x" },
     });
     expect(seenRequests[2]?.headers.authorization).toBeUndefined();
 
