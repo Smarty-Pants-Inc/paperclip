@@ -13,6 +13,7 @@ import { ALREADY_REPORTED_WAKE_REASON, createPostgresWakeQueueAdapter } from "./
 import { recordDeclinedInteractionRead } from "../../../services/chat-interaction-outcome-report.js";
 import { readQueuedInteractionResponse, INTERACTION_RESPONSE_READ_EVENT } from "../../../services/queued-interaction-response.js";
 import * as runEvents from "../../../services/heartbeat-run-events.js";
+import * as responseReads from "../../../services/queued-interaction-response.js";
 import { issueService } from "../../../services/issues.js";
 import { createHeartbeatLifecycle, type HeartbeatLifecycleDependencies } from "../../../services/heartbeat/run-lifecycle.js";
 import { createHeartbeatRunPreparation } from "../../../services/heartbeat/run-preparation.js";
@@ -84,7 +85,7 @@ describe.skipIf(!support.supported)("release of a decline continuation an earlie
     { read: true, done: false, mode: "reply" }, { read: false, done: false, mode: "reply" },
     { read: true, done: true, mode: "reply" }, { read: false, done: true, mode: "reply" },
     { read: true, done: false, mode: "atomic" }, { read: true, done: false, mode: "source_comment" },
-    { read: true, done: false, mode: "silent" },
+    { read: true, done: false, mode: "silent" }, { read: true, done: false, mode: "aborted" },
   ])("settles exactly a mid-run answer consumed by its live run: %j", async ({ read, done, mode }) => {
     const settle = read && mode === "reply";
     const [issue] = await db.insert(issues).values({ companyId, title: "Mid-run card answer", status: "in_progress", assigneeAgentId: agentId }).returning();
@@ -114,20 +115,28 @@ describe.skipIf(!support.supported)("release of a decline continuation an earlie
     if (read) {
       const app = express(); app.use(express.json());
       app.use((req, _res, next) => { (req as any).actor = { type: "agent", source: "agent_key", companyId, agentId, runId: run.id }; next(); });
+      // Close the real HTTP response after a partial write, without emitting finish.
+      if (mode === "aborted") app.use((_req, res, next) => {
+        res.json = () => { res.write("["); res.destroy(); return res; }; next();
+      });
       app.use("/api", issueRoutes(db, {} as never, {})); app.use(errorHandler);
+      const receipt = vi.spyOn(responseReads, "recordInteractionResponseRead");
       const append = runEvents.appendHeartbeatRunEvent;
       const fault = mode === "atomic" ? vi.spyOn(runEvents, "appendHeartbeatRunEvent")
         .mockImplementationOnce(append).mockRejectedValueOnce(new Error("read receipt append failed")) : null;
       try {
-        const response = await request(app).get(`/api/issues/${issue.id}/interactions`).expect(fault ? 500 : 200);
-        if (!fault) expect(response.body.find((row: { id: string }) => row.id === card.id).result.answers[0].otherText).toBe("$90");
-        else expect(response.body).not.toBeInstanceOf(Array);
-      } finally { fault?.mockRestore(); }
+        const response = request(app).get(`/api/issues/${issue.id}/interactions`);
+        if (mode === "aborted") await expect(response).rejects.toThrow(/aborted|socket hang up|ECONNRESET/i);
+        else expect((await response.expect(200)).body.find((row: { id: string }) => row.id === card.id).result.answers[0].otherText).toBe("$90");
+        await Promise.allSettled(receipt.mock.results.map(result => result.value));
+      } finally { receipt.mockRestore(); fault?.mockRestore(); }
+      if (mode === "aborted") expect.soft((await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, run.id)))
+        .filter(row => row.eventType === INTERACTION_RESPONSE_READ_EVENT)).toHaveLength(0);
     }
     // Reading never barges in or removes the person's live Steer/Interrupt.
     expect(await readQueuedInteractionResponse(db, companyId, issue.id, wake.payload)).not.toBeNull();
     if (mode !== "silent") await db.insert(issueComments).values({ companyId, issueId: issue.id, authorAgentId: agentId, createdByRunId: run.id,
-      body: read && mode !== "atomic" ? "The answer is $90." : "Still working; I have not read the answer." });
+      body: read && !["atomic", "aborted"].includes(mode) ? "The answer is $90." : "Still working; I have not read the answer." });
     await db.update(issues).set({ status: done ? "done" : "in_progress", completedAt: done ? new Date() : null,
       executionRunId: run.id, executionLockedAt: new Date() }).where(eq(issues.id, issue.id));
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
