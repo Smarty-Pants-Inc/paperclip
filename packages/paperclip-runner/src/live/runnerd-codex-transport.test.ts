@@ -3779,8 +3779,11 @@ it.each(["installed", "explicit"] as const)("records the selected %s Codex comma
   }
 });
 
-it.each(["reuse", "large-instructions", "rotated-recovery", "removed-context", "omitted-context", "close-attachment", "timeout-attachment"] as const)("runs an environment-prepared descriptor without Core filesystem preparation (%s)", async mode => {
+it.each(["reuse", "large-instructions", "rotated-recovery", "removed-context", "omitted-context", "close-attachment", "timeout-attachment", "pi-current-instructions", "pi-stock-current-instructions", "codex-current-instructions"] as const)("runs an environment-prepared descriptor without Core filesystem preparation (%s)", async mode => {
+  const provider = mode.startsWith("pi-") ? "pi_rpc" : "codex";
+  const changedInstructions = mode.endsWith("current-instructions");
   const root = await mkdtemp(join(tmpdir(), "runner-environment-launch-"));
+  const providerArgs = fakeCodexArgs(root, ...(changedInstructions ? ["--request-log", join(root, "provider-requests.jsonl")] : []));
   const binary = defaultCapabilityRunnerdBinary();
   const artifact = { version: "0.3.0", digest: `sha256:${createHash("sha256").update(await readFile(binary)).digest("hex")}` };
   const context = assignedRuntimeContext("/controller-only/skill", "/controller-only/instructions");
@@ -3803,11 +3806,12 @@ it.each(["reuse", "large-instructions", "rotated-recovery", "removed-context", "
   const checkpoint = vi.fn();
   const releaseRoute = vi.fn();
   let currentRun = () => "";
-  const create = (closeGraceMs?: number, runId = "run-prepared") => createCapabilityRunnerdCodexTransport({ provider: "codex", runnerArtifact: artifact,
+  const create = (closeGraceMs?: number, runId = "run-prepared", baseInstructions?: string) => createCapabilityRunnerdCodexTransport({ provider, runnerArtifact: artifact, baseInstructions,
     ...(closeGraceMs === undefined ? {} : { closeGraceMs }),
+    environment: mode === "pi-current-instructions" ? { PAPERCLIP_PI_CONTINUOUS: "1" } : {},
     stateDirectory: root, runtimeContext: runId === "run-prepared" ? context
       : mode === "removed-context" ? null : mode === "omitted-context" ? undefined : context,
-    ...(mode === "rotated-recovery" || mode === "removed-context" || mode === "omitted-context" ? {
+    ...(mode === "rotated-recovery" || mode === "removed-context" || mode === "omitted-context" || changedInstructions ? {
       readRunnerState: async () => JSON.parse(await readFile(join(root, "runner/runner-state.json"), "utf8")),
       prepareExternalRunnerState: async () => undefined,
       archiveExternalRunnerState: async () => {
@@ -3830,11 +3834,11 @@ it.each(["reuse", "large-instructions", "rotated-recovery", "removed-context", "
       if (recovery) { recovered = true; return recovery; }
       return { configurationId: `owned-${requirements.identity.runId}`,
       requirementsDigest: runnerLaunchRequirementsDigest(requirements),
-      provider: createRunnerProviderLaunch(requirements.runtimeContext === null ? requirements : bindRunnerLaunchResources(requirements, resolved), {
-        options: { codexArgs: fakeCodexArgs(root) }, root, cwd: root, codexHome: "/guest/.codex",
+      provider: { ...createRunnerProviderLaunch(requirements.runtimeContext === null ? requirements : bindRunnerLaunchResources(requirements, resolved), {
+        options: { codexArgs: providerArgs }, root, cwd: root, codexHome: "/guest/.codex",
         codexCommand: fakeCodex, providerNodeCommand: process.execPath,
-        opencodeProxyPath: "", acpxSidecarPath: "",
-      }),
+        piProxyPath: fakeCodex, opencodeProxyPath: "", acpxSidecarPath: "",
+      }), ...(provider === "pi_rpc" ? { args: providerArgs } : {}) },
     }; },
     controlPlaneRegistration: async authority => {
       configuration = authority.store.state.runAttachTemplate;
@@ -3855,7 +3859,7 @@ it.each(["reuse", "large-instructions", "rotated-recovery", "removed-context", "
   });
   const { transport } = create();
   try {
-    const opened = await transport.request("thread/start", { cwd: "/controller-only/workspace", model: "selected-model",
+    const opened = await transport.request("thread/start", { cwd: "/controller-only/workspace", model: provider === "pi_rpc" ? "provider/selected-model" : "selected-model",
       baseInstructions: coreInstructions, dynamicTools: codexSemanticToolSpecs() });
     expect(opened.thread).toHaveProperty("id");
     expect(configuration).toMatchObject({ provider: { command: fakeCodex, cwd: root,
@@ -3871,6 +3875,26 @@ it.each(["reuse", "large-instructions", "rotated-recovery", "removed-context", "
     await expect(stat(join(root, "codex-home"))).rejects.toHaveProperty("code", "ENOENT");
     await expect(stat(join(root, "runtime-context.json"))).rejects.toHaveProperty("code", "ENOENT");
     await transport.close();
+    if (changedInstructions) {
+      const previousConfig = JSON.parse(await readFile(join(root, "runner/codex-provider-state.json"), "utf8")).config;
+      const path = join(root, "launch-preparation.json");
+      const saved = JSON.parse(await readFile(path, "utf8"));
+      const next = structuredClone(saved.entries[0]);
+      next.requirements.identity.runId = "run-prepared-next";
+      next.prepared.requirementsDigest = runnerLaunchRequirementsDigest(next.requirements);
+      await writeFile(path, JSON.stringify({ ...saved, entries: [next, ...saved.entries] }), { mode: 0o600 });
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const resumed = create(undefined, "run-prepared-next", composeNativeSystemInstructions(context, "End every reply with the word BANANA."));
+        try {
+          await resumed.transport.request("thread/read", { threadId: (opened.thread as { id: string }).id });
+          const state = JSON.parse(await readFile(join(root, "runner/codex-provider-state.json"), "utf8"));
+          expect(state.config).toEqual({ ...previousConfig, instructions: mode === "pi-current-instructions" ? composeNativeSystemInstructions(resolved, "End every reply with the word BANANA.") : previousConfig.instructions });
+          const frames = (await readFile(join(root, "provider-requests.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+          expect(frames.findLast(frame => frame.method === "thread/resume").params[provider === "pi_rpc" ? "baseInstructions" : "developerInstructions"]).toContain(state.config.instructions);
+        } finally { await resumed.transport.close(); }
+      }
+      return;
+    }
     if (mode === "removed-context") {
       const rotated = create(undefined, "run-prepared-removed");
       try {
