@@ -90,11 +90,15 @@ export async function publishContinuousNativeReply(input: {
     const explicitAnswers = Array.isArray(answers);
     const sealed = readFirstTurnQueuedInputReceipt(row.run);
     const sealedIds = [...(sealed?.commentIds ?? []), ...(sealed?.interactionIds ?? [])];
-    const firstInputIds = Object.keys(replies).length === 0 ? [
+    // These IDs name the submitted user message for the whole run, even if
+    // earlier finals answered nothing (or answered another input). Reply count
+    // only gates the legacy implicit fallback, never this explicit alias.
+    const submittedInputIds = [
       ...(Array.isArray(row.run.contextSnapshot?.wakeCommentIds) ? row.run.contextSnapshot.wakeCommentIds : []),
       ...(typeof wakeId === "string" ? [wakeId] : []),
-      ...sealedIds,
-    ].filter((id): id is string => typeof id === "string" && !answered.has(id)) : [];
+    ].filter((id): id is string => typeof id === "string");
+    const firstInputIds = Object.keys(replies).length === 0
+      ? [...submittedInputIds, ...sealedIds].filter(id => !answered.has(id)) : [];
     const continued = parseObject(result.continuedSessionInput);
     const impliedInputIds = Object.keys(replies).length === 0 && continued.runId === runId &&
       continued.sessionId === row.run.nativeSessionId && Array.isArray(continued.commentIds)
@@ -103,7 +107,7 @@ export async function publishContinuousNativeReply(input: {
       ? [...answers.filter((id): id is string => typeof id === "string" && !answered.has(id)),
         // These inputs were appended to the very same submitted user message.
         // Pi attributes that message by its opening id, not by ids in its text.
-        ...(answers.some(id => firstInputIds.includes(id)) ? sealedIds.filter(id => !answered.has(id)) : [])]
+        ...(answers.some(id => submittedInputIds.includes(id)) ? sealedIds.filter(id => !answered.has(id)) : [])]
       : [...impliedInputIds, ...firstInputIds])];
     const clientRequestId = `${nativeFinalReplyKey(runId, input.event.itemId!)}:${questionCommentIds.join(",") || "opening"}`;
     const [existing] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
