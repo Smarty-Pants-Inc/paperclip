@@ -58,6 +58,18 @@ import {
 } from "./codex-session-terminal.js";
 import { boundedText, record, text, userInput } from "./codex-driver-values.js";
 
+function preserveRunnerCommandResult(error: unknown, wrapped: Error): Error {
+  if (error && typeof error === "object" && "runnerCommandResult" in error) {
+    const envelope = record(error.runnerCommandResult);
+    const result = record("result" in envelope ? envelope.result : envelope);
+    Object.defineProperty(wrapped, "runnerCommandResult", { value: {
+      code: typeof result.code === "string" ? result.code : null,
+      message: typeof result.message === "string" ? redactCodexDiagnostic(result.message) : "",
+    }, enumerable: false });
+  }
+  return wrapped;
+}
+
 /** TurnStartParams.summary: provider-written reasoning summaries for every turn. */
 export const CODEX_REASONING_SUMMARY = "auto";
 
@@ -456,12 +468,12 @@ export class CodexHarnessSession
       this.rethrowProtocolIntegrity(error);
       const detail = redactCodexDiagnostic(String(error));
       if (/unsupported|unavailable|capability|method not found/i.test(detail)) {
-        throw this.unsupported("steering", detail);
+        throw preserveRunnerCommandResult(error, this.unsupported("steering", detail));
       }
       // Steering rejection is a retryable operation failure, not evidence
       // that the provider lacks the capability. Preserve that distinction for
       // the control plane while keeping provider diagnostics redacted.
-      throw new Error(detail);
+      throw preserveRunnerCommandResult(error, new Error(detail));
     }
   }
 
@@ -526,7 +538,7 @@ export class CodexHarnessSession
       );
     } catch (error) {
       if (error instanceof HarnessOperationAlreadyTerminalError) throw error;
-      throw this.unsupported("interruption", error);
+      throw preserveRunnerCommandResult(error, this.unsupported("interruption", error));
     }
   }
 
