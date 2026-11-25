@@ -1,10 +1,17 @@
+import { publishContinuousNativeReply } from "../services/native-runtime/native-continuous-reply.js";
+const heldCompletion = vi.hoisted(() => ({ refused: false }));
+vi.mock("../services/native-runtime/native-session-executor.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../services/native-runtime/native-session-executor.js")>(),
+  getNativeSessionSteeringState: async () => ({ disposition: "available", activeTurnId: "held-turn" }),
+  steerNativeSession: async () => { if (heldCompletion.refused) throw new Error("steer refused"); return { turnId: "held-turn" }; },
+}));
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { subscribeDeliveryWork, DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
 import { randomUUID } from "node:crypto";
 import { and, asc, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { agents, agentWakeupRequests, chatCompletionDeliveries as deliveries, chatTaskHandoffs as handoffs,
-  companies, createDb, documents, environmentLeases, executionWorkspaces, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues, workspaceOperations } from "@paperclipai/db";
+  authUsers, companies, createDb, documents, environmentLeases, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues, workspaceOperations } from "@paperclipai/db";
 import { recoveryPostgresSupport as support, startRecoveryPostgres } from "./helpers/recovery-postgres.js";
 import { settleInterruptedNativeBootstrap, terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
@@ -57,6 +64,65 @@ import { ALREADY_REPORTED_WAKE_REASON, createPostgresWakeQueueAdapter } from "..
     };
     return { companyId, agentId, sourceId, runId, task, create, finish, rows, due, wakeup, service, run };
   }
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21380 (SMA-716 held report repeated after release)
+  it.each(["continuous", "legacy", "paperclip", "refused"])("reports a held completion once, without a hold-end successor (%s)", async mode => {
+    const f = await seed(), sessionId = randomUUID(); heldCompletion.refused = mode === "refused";
+    await db.insert(authUsers).values({ id: "operator", name: "Operator", email: "operator@example.test", createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: mode === "paperclip" ? "paperclip" : "continuous" } }).where(eq(agents.id, f.agentId));
+    await db.update(issues).set({ executionRunId: f.runId, conversationState: "active" }).where(eq(issues.id, f.sourceId));
+    await db.update(heartbeatRuns).set({ status: "running", runtimeMode: "native", nativeIssueId: f.sourceId, nativeSessionId: sessionId }).where(eq(heartbeatRuns.id, f.runId));
+    await f.finish(); const [delivery] = await f.rows();
+    f.wakeup.mockImplementation(async (_agentId, options) => {
+      await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "automation",
+        reason: "issue_execution_deferred", status: "deferred_issue_execution", idempotencyKey: options.idempotencyKey,
+        payload: { ...options.payload, _paperclipWakeContext: options.contextSnapshot } });
+      return null as never;
+    });
+    const report = `Finished: [${f.task.identifier}](/issues/${f.task.identifier}).`;
+    const event = { eventType: "item.completed" as const, runId: f.runId, normalizedSessionId: sessionId,
+      sourceEventId: "completion-final", itemId: "held:completion", payload: { kind: "agentMessage", channel: "final", text: report } };
+    const publication = { db, cursor: 171, execution: { binding: { companyId: f.companyId, issueId: f.sourceId, runId: f.runId, agentId: f.agentId }, provider: { kind: "pi_rpc" as const } }, event };
+    const unrelated = { ...event, sourceEventId: "person-final", itemId: "held:person", payload: { ...event.payload, text: "Your unrelated question is answered.", ...(mode === "legacy" ? {} : { answers: [] }) } };
+    await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, runId: f.runId, agentId: f.agentId, seq: 170, eventType: event.eventType, payload: { prpEvent: unrelated } });
+    await publishContinuousNativeReply({ ...publication, event: unrelated, cursor: 170 });
+    await f.service.deliver(delivery.id);
+    await publishContinuousNativeReply({ ...publication, event: { ...unrelated, itemId: "held:another-person" } });
+    if (mode === "paperclip") await issueService(db).addComment(f.sourceId, report, { agentId: f.agentId, runId: f.runId });
+    else if (mode !== "legacy") {
+      const answer = { ...publication, cursor: 172, event: { ...event, payload: { ...event.payload, answers: [delivery.id, "not-a-delivery"] } } };
+      await publishContinuousNativeReply(answer); await publishContinuousNativeReply(answer);
+    }
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+    const release = createReleaseIssueExecution({
+      issueLock: createPostgresWakeQueueAdapter(db, { resolveResponsibleUserId: async () => "operator",
+        getRoutineEnv: async () => ({ routineId: null, env: {}, responsibleUserId: null }), resolveSessionBeforeForWakeup: async () => sessionId }),
+      recovery: { escalateStrandedAssignedIssue: vi.fn(), escalateStrandedRecoveryIssueInPlace: vi.fn() } as never,
+    });
+    const released = await release({ companyId: f.companyId, runId: f.runId, now: new Date(), suppressImmediateRecovery: true });
+    if (released.outcome.kind === "promoted") {
+      const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, released.outcome.run.id));
+      await prepareChatCompletionTurn(db, successor);
+      if (mode === "legacy") {
+        await db.update(heartbeatRuns).set({ status: "running", runtimeMode: "native", nativeIssueId: f.sourceId, nativeSessionId: sessionId }).where(eq(heartbeatRuns.id, successor.id));
+        await publishContinuousNativeReply({ ...publication, event: { ...event, runId: successor.id }, execution: { ...publication.execution, binding: { ...publication.execution.binding, runId: successor.id } } });
+      } else await issueService(db).addComment(f.sourceId, report, { agentId: f.agentId, runId: successor.id }, { completionReply: true });
+    }
+    await f.due(); await f.service.sweepPending();
+    const reports = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.sourceId))).filter(c => c.body === report);
+    console.info("held-completion-row", { mode, heldRunId: f.runId, sessionId, reportRunIds: reports.map(c => c.createdByRunId), outbox: await f.rows() });
+    expect(reports.map(c => c.createdByRunId)).toEqual(mode === "continuous" ? [f.runId] : mode === "legacy" ? [expect.any(String)] : [f.runId, expect.any(String)]);
+    if (mode === "legacy") {
+      expect(reports[0].createdByRunId).not.toBe(f.runId);
+      expect(await f.rows()).toMatchObject([{ status: "delivered", targetRunId: reports[0].createdByRunId, responseCommentId: reports[0].id, attempts: 0 }]);
+    }
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    if (mode === "continuous") {
+      expect(wake).toMatchObject({ status: "coalesced", runId: f.runId });
+      expect(await f.rows()).toMatchObject([{ status: "delivered", targetRunId: f.runId, responseCommentId: reports[0].id, attempts: 0 }]);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toMatchObject([{ id: f.runId, nativeSessionId: sessionId }]);
+    }
+    heldCompletion.refused = false;
+  });
   /** The person's own message woke a turn that read the task done and linked it in its reply. */
   async function reportedByEarlierTurn(f: Awaited<ReturnType<typeof seed>>, read = true) {
     const identifier = `CHAT-${Math.floor(Math.random() * 1e6)}`;
