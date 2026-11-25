@@ -5176,6 +5176,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
             freshIssue.assigneeAdapterOverrides,
             (conversation?.agent ?? agentMap.get(issue.conversationAgentId))?.adapterType,
             runSettings,
+            false,
+            (conversation?.agent ?? agentMap.get(issue.conversationAgentId))?.adapterConfig,
           ),
         });
         assertCurrentAccount();
@@ -5605,6 +5607,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                 agentMap.get(reassignment?.assigneeAgentId ?? freshIssue?.assigneeAgentId ?? "")?.adapterType,
                 runSettings,
                 Boolean(reassignment),
+                agentMap.get(reassignment?.assigneeAgentId ?? freshIssue?.assigneeAgentId ?? "")?.adapterConfig,
               )
             : null,
         } : {}),
