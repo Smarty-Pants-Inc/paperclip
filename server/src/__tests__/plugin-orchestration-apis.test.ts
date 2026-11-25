@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { and, eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   authUsers,
@@ -87,6 +87,7 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     // hand-maintained subset. Writers have quiesced before this fence.
     await db.execute(sql`TRUNCATE TABLE companies CASCADE`);
     await db.delete(plugins);
+    vi.unstubAllEnvs();
   });
 
   afterAll(async () => {
@@ -115,6 +116,13 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       permissions: {},
     });
     return { companyId, agentId };
+  }
+
+  async function seedChatOwner(companyId: string) {
+    const userId = randomUUID();
+    await db.insert(authUsers).values({ id: userId, name: "Chat owner", email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "owner" });
+    return userId;
   }
 
   async function makeLocalRoot() {
@@ -871,7 +879,75 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     expect(run).toMatchObject({ agentId, companyId, status: "queued" });
   });
 
+  it.each(["unset", "empty", "different-plugin", "owner", "foreign-company", "denied-interaction"])("refuses unauthorized conversation input with no comment or wake (%s)", async scenario => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const [sender] = await db.insert(agents).values({ companyId, name: "Bridge author", adapterType: "process",
+      permissions: scenario === "denied-interaction" ? { interactions: { canCommentOnOtherTasks: false } } : {} }).returning();
+    const userId = await seedChatOwner(companyId);
+    const [issue] = await db.insert(issues).values({ companyId, title: "Bridge authorization", status: "in_progress",
+      responsibleUserId: userId, assigneeAgentId: agentId, conversationAgentId: agentId, conversationUserId: userId, conversationState: "active" }).returning();
+    vi.stubEnv("PAPERCLIP_CONVERSATION_INPUT_PLUGIN_IDS", scenario === "unset" ? undefined : scenario === "empty" ? "" : " approved-bridge-id , another-approved-id ");
+    const services = buildHostServices(db, scenario === "different-plugin" ? "unrelated-plugin-id" : "approved-bridge-id",
+      "paperclip.fleet-bridge", createEventBusStub(), undefined, { heartbeatRuntimeEnv: {} });
+    const authorAgentId = scenario === "owner" ? agentId : scenario === "foreign-company" ? (await seedCompanyAndAgent()).agentId : sender.id;
+    await expect(services.issues.createComment({ companyId, issueId: issue.id, authorAgentId, body: "Must not be admitted" }))
+      .rejects.toThrow(scenario === "owner" ? "authenticated run" : scenario === "foreign-company" ? "Agent not found" : scenario === "denied-interaction" ? "Agent interaction is disabled" : "Only this conversation's agent");
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issue.id))).toEqual([]);
+    expect(await db.select().from(agentWakeupRequests)).toEqual([]);
+  });
+
+  it.each(["agent", "user"])("uses stored owner/run identity for plugin tool output naming another %s and never self-wakes", async attribution => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const { withPluginInteractionOrigin } = await import("../services/plugin-interaction-context.js");
+    const [sender] = await db.insert(agents).values({ companyId, name: "Not the authenticated author", adapterType: "process" }).returning();
+    const userId = await seedChatOwner(companyId);
+    const [issue] = await db.insert(issues).values({ companyId, title: "Owner tool call", status: "in_progress",
+      responsibleUserId: userId, assigneeAgentId: agentId, conversationAgentId: agentId, conversationUserId: userId,
+      conversationState: "active", conversationSessionGeneration: 0 }).returning();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "running", invocationSource: "assignment",
+      contextSnapshot: { issueId: issue.id, conversationSessionGeneration: 0 } }).returning();
+    vi.stubEnv("PAPERCLIP_CONVERSATION_INPUT_PLUGIN_IDS", "approved-bridge-id");
+    const services = buildHostServices(db, "approved-bridge-id", "paperclip.fleet-bridge", createEventBusStub(), undefined, { heartbeatRuntimeEnv: {} });
+    const comment = await withPluginInteractionOrigin({ companyId, agentId, runId: run.id }, () =>
+      services.issues.createComment({ companyId, issueId: issue.id, authorAgentId: sender.id,
+        ...(attribution === "user" ? { actorUserId: userId } : {}), body: "Authenticated owner output" }));
+    expect(comment).toMatchObject({ authorAgentId: agentId, authorUserId: null, createdByRunId: run.id });
+    expect(await db.select().from(agentWakeupRequests)).toEqual([]);
+    const [activity] = await db.select().from(activityLog).where(eq(activityLog.entityId, issue.id));
+    expect(activity).toMatchObject({ actorType: "plugin", actorId: "approved-bridge-id", agentId, runId: run.id,
+      details: { initiatingActorId: agentId, initiatingRunId: run.id } });
+    process.stdout.write(`PLUGIN_OWNER_IDENTITY ${JSON.stringify({ commentId: comment.id, authorAgentId: comment.authorAgentId,
+      createdByRunId: comment.createdByRunId, activityPluginId: activity.actorId, activityAgentId: activity.agentId,
+      activityRunId: activity.runId, wakes: [] })}\n`);
+  });
+
+  it("attributes a peer wake and activity to the stored tool-call agent/run, not supplied author", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const { withPluginInteractionOrigin } = await import("../services/plugin-interaction-context.js");
+    const [author] = await db.insert(agents).values({ companyId, name: "Authenticated author", adapterType: "process" }).returning();
+    const userId = await seedChatOwner(companyId);
+    const [issue] = await db.insert(issues).values({ companyId, title: "Peer wake", status: "in_progress",
+      responsibleUserId: userId, assigneeAgentId: agentId }).returning();
+    const [sourceRun] = await db.insert(heartbeatRuns).values({ companyId, agentId: author.id, status: "running", invocationSource: "assignment", contextSnapshot: {} }).returning();
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, agentId));
+    await db.insert(heartbeatRuns).values({ companyId, agentId, status: "running", invocationSource: "assignment", contextSnapshot: {} });
+    // No ingress allowlist is necessary on an ordinary task. The supplied
+    // author is the recipient, but the authenticated stored author is a peer.
+    vi.stubEnv("PAPERCLIP_CONVERSATION_INPUT_PLUGIN_IDS", "");
+    const services = buildHostServices(db, "unapproved-plugin", "paperclip.tool", createEventBusStub(), undefined, { heartbeatRuntimeEnv: {} });
+    const comment = await withPluginInteractionOrigin({ companyId, agentId: author.id, runId: sourceRun.id }, () =>
+      services.issues.createComment({ companyId, issueId: issue.id, authorAgentId: agentId, body: "Peer input" }));
+    expect(comment).toMatchObject({ authorAgentId: author.id, createdByRunId: sourceRun.id });
+    const wakes = await db.select().from(agentWakeupRequests);
+    expect(wakes).toEqual([expect.objectContaining({ agentId, requestedByActorType: "agent", requestedByActorId: author.id,
+      payload: expect.objectContaining({ _paperclipWakeContext: expect.objectContaining({ sourceRunId: sourceRun.id }) }) })]);
+    const [activity] = await db.select().from(activityLog).where(eq(activityLog.entityId, issue.id));
+    expect(activity).toMatchObject({ agentId: author.id, runId: sourceRun.id,
+      details: { initiatingActorId: author.id, initiatingRunId: sourceRun.id } });
+  });
+
   it("plugin agent input on an idle chat wakes one run, answers once, and self output never wakes", async () => {
+    vi.stubEnv("PAPERCLIP_CONVERSATION_INPUT_PLUGIN_IDS", " other-plugin , plugin-record-id ");
     const { companyId, agentId } = await seedCompanyAndAgent();
     const { getServerAdapter, registerServerAdapter } = await import("../adapters/index.js");
     const { issueService } = await import("../services/issues.js");
@@ -890,8 +966,8 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       return { exitCode: 0, signal: null, timedOut: false, resultJson: {}, summary: "Bridge reply" };
     } });
     try {
-      const self = await services.issues.createComment({ companyId, issueId: issue.id, authorAgentId: agentId, body: "Own output" });
-      expect(self.authorAgentId).toBe(agentId);
+      await expect(services.issues.createComment({ companyId, issueId: issue.id, authorAgentId: agentId, body: "Own output" }))
+        .rejects.toThrow("Agent chat messages require an authenticated run");
       expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toEqual([]);
       const comment = await services.issues.createComment({ companyId, issueId: issue.id, authorAgentId: sender.id, body: "Bridge idle question" });
       await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
