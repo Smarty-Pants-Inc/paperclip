@@ -98,10 +98,15 @@ describePostgres("agent configuration save latency", () => {
   it.each([
     { provider: "pi_rpc", config: { piRpcThinkingLevel: "ultra" }, status: 422 },
     { provider: "pi_rpc", config: { effort: "ultra" }, status: 422 },
+    { provider: "pi_rpc", config: { piRpcThinkingLevel: 5 }, status: 422 },
+    { provider: "pi_rpc", config: { piRpcThinkingLevel: "high" }, status: 200 },
     { provider: "pi_rpc", config: { piRpcThinkingLevel: "max" }, status: 200 },
-    { provider: "pi_rpc", config: { piRpcThinkingLevel: null }, status: 200 },
-    { provider: "pi_rpc", config: { piRpcThinkingLevel: "" }, status: 200 },
-    { provider: "pi_rpc", config: { piRpcThinkingLevel: " \t " }, status: 200 },
+    ...["modelReasoningEffort", "reasoningEffort", "effort"].flatMap(key => [
+      { provider: "pi_rpc", config: { piRpcThinkingLevel: "medium", [key]: 5 }, status: 422 },
+      { provider: "pi_rpc", config: { piRpcThinkingLevel: "medium", [key]: "ultra" }, status: 422 },
+    ]),
+    ...[null, "", " \t ", "auto", "none"].map(level => ({ provider: "pi_rpc", config: { piRpcThinkingLevel: level }, status: 200 })),
+
     { provider: "pi_rpc", config: { effort: "none" }, status: 200 },
     { provider: "codex", config: { piRpcThinkingLevel: "ultra" }, status: 200 },
   ])("validates Pi agent reasoning before persisting: %j", async ({ provider, config, status }) => {
@@ -111,7 +116,7 @@ describePostgres("agent configuration save latency", () => {
     expect(response.status, JSON.stringify(response.body)).toBe(status);
     const saved = await readAgent();
     if (status === 422) {
-      expect(response.body.error).toBe('Pi cannot use reasoning level "ultra": choose off, minimal, low, medium, high, xhigh or max');
+      expect(response.body.error).toContain("pi_thinking_level_invalid:");
       expect(saved).toEqual(before);
       expect(await db.select().from(agentConfigRevisions).where(eq(agentConfigRevisions.agentId, agent.id))).toHaveLength(0);
       expect(await db.select().from(activityLog).where(eq(activityLog.entityId, agent.id))).toHaveLength(0);
