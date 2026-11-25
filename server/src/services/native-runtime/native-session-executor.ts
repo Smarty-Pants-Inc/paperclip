@@ -5610,7 +5610,7 @@ async function verifyPriorRunnerdStateForSessionScope(input: {
       nativeSessionProvidersMatch(admittedSource.provider, input.execution.provider) &&
       canonicalJson(priorExecution) === canonicalJson(admittedSource);
     const sameScope = priorExecution.binding.runId === input.identity.runId &&
-      (nativeSessionScopeKey(priorExecution) === nativeSessionScopeKey(input.execution) || admittedPrior);
+      (admittedSource ? admittedPrior : nativeSessionScopeKey(priorExecution) === nativeSessionScopeKey(input.execution));
     if (!sameScope) return "scope_mismatch";
     const lifecycle = runnerdAuthorityLifecycleWithVerifiedBackup({ ...input, execution: admittedPrior ? priorExecution : input.execution });
     if (lifecycle === "suspended") return "verified";
@@ -6584,6 +6584,34 @@ async function migrateRunnerdStateRootForExecution(input: {
   admittedPreviousExecution?: NativeExecutionInput;
 }): Promise<VerifiedWarmTransitionBinding | undefined> {
   const scoped = scopedRunnerdStateRoot(input.execution);
+  const previousRoot = input.admittedPreviousExecution ? scopedRunnerdStateRoot(input.admittedPreviousExecution) : undefined;
+  if (previousRoot && previousRoot !== scoped && existsSync(scoped)) {
+    // An occupied destination is not permission to skip the admitted source.
+    // Check before restoration or quarantine can change either authority root.
+    const conflict = () => new NativeProviderStateIncompatibleError("workspace_continuation_target_conflict");
+    if (existsSync(previousRoot) || !isSafeNativeStateDirectory(scoped)) throw conflict();
+    const identity = readRunnerdDurableIdentity(scoped);
+    if (!identity || !durableIdentityMatchesSession(identity, input.execution)) throw conflict();
+    if (identity.runId === input.admittedPreviousExecution!.binding.runId) {
+      const verification = await verifyPriorRunnerdStateForSessionScope({ ...input, root: scoped, identity });
+      if (verification !== "verified" && verification !== "retained_warm_runner") throw conflict();
+    } else if (durableIdentityMatchesExecution(identity, input.execution)) {
+      // A retry must have this exact execution persisted, not merely a matching
+      // session name. Normal lifecycle/recovery verification still runs below.
+      try {
+        const [run] = await input.db.select({ runnerProfileJson: heartbeatRuns.runnerProfileJson }).from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.id, identity.runId), eq(heartbeatRuns.companyId, input.execution.binding.companyId),
+            eq(heartbeatRuns.agentId, input.execution.binding.agentId))).limit(1);
+        const persisted = parseNativeExecutionInput(record(run?.runnerProfileJson).nativeExecutionInput);
+        if (canonicalJson(persisted) !== canonicalJson(input.execution)) throw conflict();
+      } catch { throw conflict(); }
+    } else throw conflict();
+  }
+  if (input.admittedPreviousExecution) await retireSupersededWarmNativeSessions(
+    nativeSessionOwnerScope(input.admittedPreviousExecution, input.runnerExecutionTarget?.environmentId ?? null),
+    nativeSessionScopeKey(input.execution), nativeSessionKey(input.execution), input.execution.binding.runId,
+    undefined, input.runnerExecutionTarget,
+  );
   await restoreWarmRunnerdController(input);
   await restorePerTurnRunnerdController(input);
   // A crash can leave a source archive intent before/after its rename. Until
@@ -6780,7 +6808,6 @@ async function migrateRunnerdStateRootForExecution(input: {
     }
     return;
   }
-  const previousRoot = input.admittedPreviousExecution ? scopedRunnerdStateRoot(input.admittedPreviousExecution) : undefined;
   if (previousRoot && previousRoot !== scoped && !existsSync(previousRoot)) {
     throw new NativeProviderStateIncompatibleError("workspace_continuation_source_missing");
   }
@@ -11490,11 +11517,6 @@ async function executePaperclipNativeSessionAttempt(
     }
   }
   if (input.useRunnerd) {
-    if (input.workspaceContinuationSource) await retireSupersededWarmNativeSessions(
-      nativeSessionOwnerScope(input.workspaceContinuationSource, input.runnerExecutionTarget?.environmentId ?? null),
-      nativeSessionScopeKey(input.execution), nativeSessionKey(input.execution), input.execution.binding.runId,
-      undefined, input.runnerExecutionTarget,
-    );
     retainedTransition = await timeController("state_migration", () => migrateRunnerdStateRootForExecution({
       db: input.db,
       execution: input.execution,
