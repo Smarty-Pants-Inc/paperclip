@@ -8472,14 +8472,21 @@ describe("executeNativeSession recovery", () => {
     });
   });
 
-  it.each([false, true])("keeps held Pi original-input resubmission fenced after provider output (prepared: %s)", async (prepared) => {
-    const executionInput = {
-      ...(prepared ? preparedInput() : input),
-      session: { ...input.session, driverKind: "pi_rpc" as const },
-      provider: { kind: "pi_rpc" as const, model: "fixture-model", conversationMode: true as const },
-    };
+  it.each([false, true].flatMap(prepared => [
+    { prepared, name: "held Pi conversation", provider: { kind: "pi_rpc" as const, model: "fixture-model", conversationMode: true as const }, fenced: true },
+    { prepared, name: "continuous Pi task (omitted default)", provider: { kind: "pi_rpc" as const, model: "fixture-model" }, fenced: true },
+    { prepared, name: "continuous Pi task (explicit)", provider: { kind: "pi_rpc" as const, model: "fixture-model", sessionContinuity: "continuous" as const }, fenced: true },
+    { prepared, name: "paperclip Pi task", provider: { kind: "pi_rpc" as const, model: "fixture-model", sessionContinuity: "paperclip" as const }, fenced: false },
+    { prepared, name: "paperclip Pi conversation", provider: { kind: "pi_rpc" as const, model: "fixture-model", conversationMode: true as const, sessionContinuity: "paperclip" as const }, fenced: false },
+    { prepared, name: "stock non-Pi task", provider: prepared ? preparedInput().provider : input.provider, fenced: false },
+  ]))("uses the original-input recovery fence after provider output without a terminal ($name; prepared: $prepared)", async ({ prepared, provider, fenced }) => {
+    const executionInput = structuredClone(prepared ? preparedInput() : input);
+    if (provider.kind === "pi_rpc") {
+      executionInput.provider = provider;
+      executionInput.session.driverKind = "pi_rpc";
+    }
     const checkpoint: PersistedNativeSession = {
-      backendKind: "mock", driverKind: "pi_rpc", sessionId: "driver-held", identity,
+      backendKind: "mock", driverKind: executionInput.session.driverKind, sessionId: "driver-held", identity,
       providerSessionId: "provider-held", cursor: "1", activeTurnId: null,
       terminalTurns: [], pendingRuntimeRequests: [], lineage: [],
     };
@@ -8494,7 +8501,7 @@ describe("executeNativeSession recovery", () => {
       async close() {},
     };
     const output = runnerEvent(1, "item.delta", { kind: "agentMessage", text: "Already answering the held input" });
-    await expect(executeNativeSession({
+    const failure = await executeNativeSession({
       input: executionInput,
       backend: {
         async descriptor() { return { kind: "mock", name: "held-replay-fence", version: "1", runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" }, capabilities: await session.capabilities() }; },
@@ -8508,8 +8515,17 @@ describe("executeNativeSession recovery", () => {
       },
       persistedSession: checkpoint,
       runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery",
-    })).rejects.toThrow("native_provider_output_without_result");
-    expect(startTurn).not.toHaveBeenCalled();
+    }).then(() => null, (error: unknown) => error);
+    if (fenced) {
+      expect(startTurn).not.toHaveBeenCalled();
+    } else {
+      expect(startTurn).toHaveBeenCalledOnce();
+      const envelope = JSON.parse(startTurn.mock.calls[0]![0].message.text);
+      expect(envelope.task.prompt).toBe(executionInput.task.prompt);
+    }
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain(fenced
+      ? "native_provider_output_without_result" : "native event stream closed before a turn terminal fact");
   });
 
   it.each([false, true])("only replays the original ACPX envelope for a proven effect-free initial turn (prepared: %s)", async (prepared) => {
