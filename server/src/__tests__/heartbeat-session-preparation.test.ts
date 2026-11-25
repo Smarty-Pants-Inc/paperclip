@@ -14,6 +14,11 @@ import { agents, agentTaskSessions, authUsers, companies, companyMemberships, cr
 import { getServerAdapter, registerServerAdapter, unregisterServerAdapter, type AdapterExecutionContext } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import * as sessionMetadata from "../services/heartbeat/workspaces.js";
+import { previousSessionMetadata } from "./helpers/previous-session-fingerprint.js";
+import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
+import { buildNativeExecutionWithCheckpoint, nativeToolContractFingerprintForTarget } from "../services/native-runtime/native-session-resume.js";
+import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
 import { requestTaskRetry } from "../services/task-retry.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import * as environmentOrchestrator from "../services/environment-run-orchestrator.js";
@@ -94,6 +99,85 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       expect(next.input.runtime.sessionId).toBe(sessionContinuity === "continuous" ? "saved-session" : null);
       expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: { reset: sessionContinuity !== "continuous" } } });
     } finally { mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    { conversation: true, chip: false, held: false },
+    { conversation: true, chip: true, held: false },
+    { conversation: false, chip: false, held: false },
+    { conversation: false, chip: true, held: false },
+    { conversation: true, chip: true, held: true },
+    { conversation: false, chip: true, held: true },
+  ])("previous-release Pi swap: agent chat=$conversation chip=$chip held=$held", async ({ conversation, chip, held }) => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "previous-release-continuation-"));
+    const sessionId = randomUUID();
+    const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    const metadataInputs: Parameters<typeof sessionMetadata.buildEffectiveRunSessionConfigMetadata>[0][] = [];
+    const buildMetadata = sessionMetadata.buildEffectiveRunSessionConfigMetadata;
+    const captureMetadata = vi.spyOn(sessionMetadata, "buildEffectiveRunSessionConfigMetadata").mockImplementation(async input => {
+      metadataInputs.push(input);
+      return buildMetadata(input);
+    });
+    registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
+    try {
+      const config = { provider: "pi_rpc", model: "fixture/model-a", piRpcThinkingLevel: "low", sessionContinuity: "continuous", cwd, fixtureSessionId: sessionId };
+      await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: config }).where(eq(agents.id, f.agentId));
+      await db.update(issues).set({
+        status: "todo",
+        ...(conversation ? { conversationAgentId: f.agentId, conversationUserId: f.userId, conversationState: "active" as const } : {}),
+        ...(chip ? { assigneeAdapterOverrides: { adapterConfig: { model: "fixture/model-b", piRpcThinkingLevel: "high" } } } : {}),
+      }).where(eq(issues.id, f.issueId));
+      const first = await execute(f);
+      const metadataInput = metadataInputs[0];
+      expect(metadataInput.effectiveAdapterConfig.provider).toBe("pi_rpc");
+      if (chip) expect(metadataInput.issueOverrides).toMatchObject({ adapterConfig: { model: "fixture/model-b", piRpcThinkingLevel: "high" } });
+      const old = previousSessionMetadata(metadataInput);
+      const current = await buildMetadata(metadataInput);
+      const changed = current.categories.filter(category => old.categoryFingerprints[category] !== current.categoryFingerprints[category]);
+      expect(changed).toEqual(chip ? ["adapterConfig", "issueOverrides"] : ["adapterConfig"]);
+      const [stored] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId));
+      const storedParams = sessionMetadata.attachPaperclipSessionMetadataToSessionParams({ sessionId, adapterState: "preserved" }, first.input.config.model as string, old);
+      await db.update(agentTaskSessions).set({ sessionParamsJson: storedParams }).where(eq(agentTaskSessions.id, stored.id));
+      const resumed = await execute(f);
+      expect(resumed.finished.resultJson).toMatchObject({ configFreshness: { session: { reset: false, taskSessionAvailable: true, taskSessionReused: true } } });
+      expect(resumed.input.runtime).toMatchObject({ sessionId, sessionDisplayId: sessionId, sessionParams: { sessionId, adapterState: "preserved" } });
+      expect(resumed.finished.sessionIdBefore).toBe(sessionId);
+
+      // Both releases ship the same runtime-context builder and prompt bytes.
+      // Build the saved and next context separately, as at a release boundary.
+      const makeExecution = (runId: string) => buildNativeExecutionInput({
+        companyId: f.companyId, agentId: f.agentId, runId,
+        issue: { id: f.issueId, identifier: "FIX-1", title: "Continue the thread", description: null, workMode: "standard", ...(conversation ? { conversationAgentId: f.agentId } : {}) },
+        conversationMode: conversation,
+        taskPrompt: "The next message", normalizedSessionId: sessionId,
+        workspace: { id: "stable-workspace", cwd, repoUrl: null, repoRef: null, branchName: null },
+        provider: "pi_rpc", model: first.input.config.model as string, piRpcThinkingLevel: chip ? "high" : "low",
+        runtimeContext: nativeRuntimeContextFixture(),
+        completionContract: { id: randomUUID(), sha256: `sha256:${"a".repeat(64)}`, schemaVersion: "paperclip.run-result.v1",
+          contract: { revision: "1", objective: "Continue the thread", criteria: [{ id: "reply", requirement: "Answer the next message" }] } },
+      });
+      const priorExecution = makeExecution(first.finished.id);
+      const source = { id: first.finished.id, companyId: f.companyId, agentId: f.agentId, nativeSessionId: sessionId,
+        runnerProfileJson: { nativeToolContractFingerprint: nativeToolContractFingerprintForTarget("local", "pi_rpc"), nativeExecutionInput: priorExecution,
+          sessionCheckpoint: { backendKind: "runner", driverKind: "pi_rpc", sessionId: "provider-thread-saved-before-upgrade", providerSessionId: "provider-thread-saved-before-upgrade",
+            identity: { runId: first.finished.id, sessionId, companyId: f.companyId, issueId: f.issueId, agentId: f.agentId },
+            ...(held ? { goal: { status: "paused", objective: "Continue after the held turn" } } : {}) } } };
+      const rebound = buildNativeExecutionWithCheckpoint({ previousRun: source, normalizedSessionId: resumed.input.runtime.sessionId!, sessionContinuity: "continuous",
+        buildExecution: ({ normalizedSessionId }) => { const next = makeExecution(resumed.finished.id); next.session.normalizedSessionId = normalizedSessionId; return next; } });
+      expect(rebound.normalizedSessionId).toBe(sessionId);
+      expect(rebound.checkpoint).toMatchObject({ sessionId: "provider-thread-saved-before-upgrade", providerSessionId: "provider-thread-saved-before-upgrade" });
+      if (held) expect(rebound.checkpoint?.providerRecoveryPolicy).toBe("same_session_only");
+      if (chip && !conversation && !held) {
+        await db.update(agentTaskSessions).set({ sessionParamsJson: storedParams }).where(eq(agentTaskSessions.id, stored.id));
+        await db.update(issues).set({ assigneeAdapterOverrides: { adapterConfig: {
+          model: "fixture/model-b", piRpcThinkingLevel: "high", fixtureOption: "changed",
+        } } }).where(eq(issues.id, f.issueId));
+        const unrelated = await execute(f);
+        expect(unrelated.input.runtime.sessionId).toBeNull();
+        expect(unrelated.finished.resultJson).toMatchObject({ configFreshness: { session: { reset: true, taskSessionReused: false } } });
+      }
+    } finally { captureMetadata.mockRestore(); mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true }); }
   });
 
   it("keeps a workspace source refusal typed before provider startup", async () => {
