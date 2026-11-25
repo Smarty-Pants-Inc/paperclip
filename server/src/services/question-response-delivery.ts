@@ -390,20 +390,8 @@ function issueIdFromRun(
 }
 
 function sourceCommentIdFromRun(
-  run: Pick<typeof heartbeatRuns.$inferSelect, "contextSnapshot" | "resultJson"> | null,
-  askedAt: Date,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "contextSnapshot"> | null,
 ) {
-  // The initial wake is not the asking input after a steer. Freeze inference
-  // at card creation: an ACK received while the card waits must not re-anchor
-  // its answer. An explicit interaction.sourceCommentId still wins below.
-  const acknowledged = Object.entries(record(record(run?.resultJson).queuedSteeringAcknowledgements))
-    .filter(([id, value]) => {
-      const receipt = record(value);
-      const at = Date.parse(compactLine(receipt.acknowledgedAt) ?? "");
-      return Boolean(compactLine(id)) && receipt.status === "acknowledged" && at <= askedAt.getTime();
-    })
-    .sort((a, b) => Date.parse(String(record(a[1]).acknowledgedAt)) - Date.parse(String(record(b[1]).acknowledgedAt)))
-    .at(-1)?.[0];
   const context = record(run?.contextSnapshot);
   const batched = Array.isArray(context.wakeCommentIds)
     ? context.wakeCommentIds
@@ -411,7 +399,6 @@ function sourceCommentIdFromRun(
         .filter((value): value is string => Boolean(value))
     : [];
   return (
-    acknowledged ??
     batched.at(-1) ??
     compactLine(context.wakeCommentId) ??
     compactLine(context.commentId)
@@ -892,7 +879,7 @@ export function questionResponseDeliveryService(
     const assigneeAgentId = issue.assigneeAgentId;
     const inferredSourceCommentId =
       sourceRun && issueIdFromRun(sourceRun) === interaction.issueId
-        ? sourceCommentIdFromRun(sourceRun, interaction.createdAt)
+        ? sourceCommentIdFromRun(sourceRun)
         : null;
     const sourceCommentCandidate =
       interaction.sourceCommentId ?? inferredSourceCommentId;
