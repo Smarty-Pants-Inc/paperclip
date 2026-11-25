@@ -8,10 +8,21 @@ products, or agent run traces should be limited to named participants.
 
 Company task/project creation, child creation, accepted-plan decomposition, and
 task/project PATCH routes require a person to request `visibility: "private"`.
-A decomposition is refused before creating any child if any child requests privacy.
-Agent requests return HTTP `403`, with the message
-"Only a person can make a task private" or "Only a person can make a project private".
-This also applies when the agent acts on behalf of a person.
+An agent may make that request through its authenticated current run when the
+active run identity records that person's own action: their instruction, accepted
+steering or queued-interrupt comment, an interaction they resolved, or their manual
+wake. That person must still be an active company member. Inherited responsibility,
+a company default, timer/routine wakes and agent-authored steering do not authorize
+privacy. The server reads the existing active identity and saved message author,
+not a user ID from the request body or the agent's owner. New private tasks belong
+to that responsible user; private projects
+record that person as privacy owner and access member.
+
+An agent run without such a person receives HTTP `403` explaining that "a person
+must ask for it". A decomposition is checked before creating any child or claim.
+Updates also require the same task/project privacy-owner or administrator
+authority that the person would need themselves. This delegation applies only to
+making work private, not publishing it or managing access grants.
 
 Omitting visibility keeps the ordinary open default. A task created under a
 person's private parent or in a private project still inherits that privacy;
