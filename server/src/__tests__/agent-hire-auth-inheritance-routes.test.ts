@@ -632,7 +632,7 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     expect(responseAgent.adapterConfig).not.toHaveProperty("dangerouslyBypassApprovalsAndSandbox");
   });
 
-  it.each(["gpt-6.1-sol", undefined])("caller-runtime Codex keeps caller model %s but defaults its level", async model => {
+  it.each(["gpt-6.1-sol", undefined])("caller-runtime Codex defaults model and level regardless of caller model %s", async model => {
     const companyId = await seedCompany();
     const parent = await seedParentAgent(companyId, "paperclip_runner", {});
     const environmentId = randomUUID();
@@ -646,7 +646,7 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     const [child] = await db.select().from(agents).where(eq(agents.id, res.body.agent.id));
     expect(child!.adapterConfig.modelReasoningEffort).toBe("medium");
-    expect(child!.adapterConfig.model).toBe(model ?? "claude-opus-5-5");
+    expect(child!.adapterConfig.model).toBe("claude-opus-5-5");
     expect(child!.defaultEnvironmentId).toBe(environmentId);
   });
 
@@ -684,6 +684,7 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     const [child] = await db.select().from(agents).where(eq(agents.id, res.body.agent.id));
     expect(child!.adapterConfig.piRpcThinkingLevel).toBe(expectedLevel);
+    expect(child!.adapterConfig.model).toBe("openai-codex/gpt-5.6");
     expect(res.body.agent.adapterConfig.piRpcThinkingLevel).toBe(expectedLevel);
   });
 
@@ -784,7 +785,7 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     expect(responseAgent.adapterConfig).toMatchObject(expected);
   });
 
-  it.each([undefined, null, "", " \t", "openai-codex/gpt-5.6"])("pi_rpc caller-runtime hire defaults level and resolves model %j", async callerModel => {
+  it.each([undefined, null, "", " \t", "fable/gpt-6.1-sol"])("pi_rpc caller-runtime hire defaults model and level regardless of caller model %j", async callerModel => {
     const companyId = await seedCompany();
     await db.update(companies).set({ requireBoardApprovalForNewAgents: true }).where(eq(companies.id, companyId));
     const parent = await seedParentAgent(companyId, "paperclip_runner", {});
@@ -796,7 +797,7 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     });
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     const [child] = await db.select().from(agents).where(eq(agents.id, res.body.agent.id));
-    const expected = { piRpcThinkingLevel: "medium", model: callerModel?.trim() ? callerModel : "paperclip/claude-opus-5-5" };
+    const expected = { piRpcThinkingLevel: "medium", model: "paperclip/claude-opus-5-5" };
     expect(child!.adapterConfig).toMatchObject(expected);
     expect(res.body.agent.adapterConfig).toMatchObject(expected);
     expect(res.body.approval.payload.adapterConfig).toMatchObject(expected);
@@ -937,7 +938,7 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
       version: 3,
     });
     // The response body carries the reference only, never a token value.
-    expect(JSON.stringify(res.body)).not.toContain("sk-");
+    expect(JSON.stringify(res.body).replaceAll(process.env.PAPERCLIP_HOME!, "<home>")).not.toContain("sk-");
 
     const declarations = await db
       .select()
