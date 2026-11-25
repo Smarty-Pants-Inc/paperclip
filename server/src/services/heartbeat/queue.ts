@@ -213,6 +213,7 @@ import type { HeartbeatRetryDependencies } from "./retries.js";
 import type { HeartbeatRecoveryDependencies, createHeartbeatRecovery } from "./recovery.js";
 import { HEARTBEAT_RUN_TERMINAL_STATUSES } from "./recovery.js";
 import { executeIssuePostCommitActions, type IssuePostCommitAction, type issueService } from "../issues.js";
+import { isAutomaticSteeringWake } from "../../modules/wake-queue/domain/policy.js";
 import type { issueTreeControlService } from "../issue-tree-control.js";
 import type { budgetService } from "../budgets.js";
 import { isBoardOwnedBudgetBlock } from "../budget-block-ownership.js";
@@ -5141,10 +5142,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           },
           async executeIssueActions() {
             await executeIssuePostCommitActions(db, issuePostCommitActions);
-            // One server-side door for every comment author/API caller. Never
-            // steer under admission's issue lock: the existing use case owns it.
-            if (wakeCommentId && enrichedContextSnapshot.forceFreshSession !== true &&
-                ["issue_commented", "issue_reopened_via_comment", "issue_comment_mentioned"].includes(String(enrichedContextSnapshot.wakeReason ?? reason))) {
+            // Agent-authored comments from either HTTP or plugin callers use
+            // one post-commit door. admitIssueWake awaits its transaction before
+            // executing these effects; comment creation has already committed.
+            // Never steer under admission's issue lock: this use case owns it.
+            if (wakeCommentId && isAutomaticSteeringWake(reason, enrichedContextSnapshot)) {
               try {
                 const { steerCommittedQueuedComment } = await import("../../modules/wake-queue/index.js");
                 await steerCommittedQueuedComment(db, { companyId: agent.companyId, issueId: issueId!, agentId, commentId: wakeCommentId });
