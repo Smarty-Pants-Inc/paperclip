@@ -391,6 +391,10 @@ export function projectRoutes(db: Db) {
   router.post("/companies/:companyId/projects", validate(createProjectSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    // Check before creation, principal grants, or idempotent receipt replay.
+    if (req.actor.type === "agent" && req.body.visibility === "private") {
+      throw forbidden("Only a person can make a project private");
+    }
     type CreateProjectPayload = Parameters<typeof svc.create>[1] & {
       workspace?: Parameters<typeof svc.createWorkspace>[1];
       repositoryIds?: string[];
@@ -525,6 +529,10 @@ export function projectRoutes(db: Db) {
     if (!(await assertProjectReadAllowed(req, res, existing))) return;
     const body = { ...req.body };
     if (body.visibility !== undefined) {
+      // Publishing still requires the existing privacy-owner/admin authority.
+      if (req.actor.type === "agent" && body.visibility === "private") {
+        throw forbidden("Only a person can make a project private");
+      }
       if (!(await assertCanManageProjectPrivacy(req, res, existing))) return;
     }
     if (body.visibility === "private") await addActorAsPrivateProjectPrincipal(req, existing);
