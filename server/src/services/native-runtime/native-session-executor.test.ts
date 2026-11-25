@@ -18918,6 +18918,100 @@ describe("runnerd provider runtime wiring", () => {
     } finally { restore.mockRestore(); header.mockRestore(); verify.mockRestore(); await controller.stop(); }
   });
 
+  it.each(["suspended", "ready", "identity-mismatch", "pending-outbox", "pending-terminal"] as const)(
+    "cold-restores only a settled suspended warm box after live admission: %s", async mode => {
+      const first = scopedNativeExecution(`suspended-live-adoption-${mode}`);
+      first.session.lifecyclePolicy = { mode: "warm", idleTimeoutMs: 60_000 };
+      const next = { ...first, binding: { ...first.binding, runId: `${first.binding.runId}-next` } };
+      const identity = { runId: first.binding.runId, normalizedSessionId: first.session.normalizedSessionId!,
+        runnerInstanceId: "retained-runner", environmentLeaseId: "retained-lease", turnId: "prior-turn", itemId: "prior-item" };
+      const root = await initializeScopedRunnerRoot(first, identity.runnerInstanceId);
+      await writeRunnerAuthority(root, identity, "ready");
+      const snapshot = { backendKind: "runner", driverKind: first.session.driverKind,
+        identity: { ...first.binding, sessionId: identity.normalizedSessionId }, providerSessionId: "same-provider-session",
+        activeTurnId: null, pendingRuntimeRequests: [] };
+      const previousSession = { close: vi.fn(async () => undefined) };
+      const adoptedSession = { close: vi.fn(async () => undefined) };
+      const result = { result: { summary: "completed" }, terminal: { runTerminalState: "succeeded" }, turnId: "provider-turn",
+        normalizedSessionId: identity.normalizedSessionId, providerSessionId: snapshot.providerSessionId,
+        driverKind: "test", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+      state.execute.mockReset().mockImplementationOnce(async options => {
+        await options.onCheckpoint?.(snapshot);
+        await options.onSession?.(previousSession);
+        return result;
+      }).mockImplementationOnce(async options => {
+        expect(options.existingSession).toBe(mode === "ready" ? adoptedSession : undefined);
+        if (mode === "suspended") expect(options.persistedSession).toMatchObject({
+          identity: { sessionId: identity.normalizedSessionId }, providerSessionId: snapshot.providerSessionId });
+        return result;
+      });
+      const target = { kind: "remote" as const, transport: "sandbox" as const, environmentId: "retained-environment",
+        remoteCwd: "/workspace", runner: { execute: vi.fn() } };
+      const revalidate = vi.fn(async () => undefined);
+      const createBackend = state.createBackend.getMockImplementation()!;
+      const inspect = vi.spyOn(remoteWarmRecoveryRuntime, "inspectRemoteWarmSessionRecovery").mockImplementation(async request => ({
+        identity, checkpoint: request.loadCheckpoint(first)!, previousExecution: first, reuseProcess: true,
+        remote: { providerLeaseId: "retained-sandbox", remoteCwd: target.remoteCwd }, revalidate,
+      }));
+      const retainedBinding = vi.spyOn(controllerRecovery, "assertNativeRetainedSandboxBinding")
+        .mockResolvedValue({ remoteCwd: target.remoteCwd } as never);
+      const restore = vi.spyOn(runnerCheckpoint, "restoreNativeRunnerCheckpoint").mockResolvedValue(null);
+      const issueProjection = vi.spyOn(issueServiceModule, "issueService")
+        .mockReturnValue({ update: vi.fn(async () => null) } as never);
+      try {
+        await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: identity.runnerInstanceId,
+          useRunnerd: true, runnerExecutionTarget: target as never });
+        await closeIdleWarmNativeSessionsForRestart();
+        // The server checkpoint has no suspension receipt. Its two ordinary
+        // restoration probes still see ready; only the live-adoption probe
+        // observes the box's later suspension (the restart/idle-close race).
+        await rm(join(root, "runner/runner-state.json"));
+        let reads = 0;
+        target.runner.execute.mockImplementation(async (request: { args: string[] }) => {
+          const script = request.args[1]!;
+          if (script.includes("base64")) {
+            const late = ++reads > 2;
+            return { exitCode: 0, timedOut: false, stderr: "", stdout: Buffer.from(JSON.stringify({
+              ...durableRunnerState(identity, late && mode !== "ready" ? "suspended" : "ready"),
+              outbox: late && mode === "pending-outbox" ? [{ sourceSeq: 1 }] : [],
+              pendingTerminalDelivery: late && mode === "pending-terminal" ? { commandId: "pending" } : null,
+              ...(late && mode === "identity-mismatch" ? { runnerInstanceId: "foreign-runner" } : {}),
+            })).toString("base64") };
+          }
+          return { exitCode: 0, timedOut: false, stderr: "", stdout: script.includes("cat --")
+            ? "nonce\n123\n2026-09-19T10:00:00.000Z\nretained-runner\nlinux:abcd-1234:100\n" : "" };
+        });
+        const db = leaseDb(next), select = db.select.bind(db);
+        db.select = ((fields?: Record<string, unknown>) => fields?.status === heartbeatRuns.status
+          && fields?.runnerProfileJson === heartbeatRuns.runnerProfileJson
+          ? priorNativeRunDb(first).select(fields as never) : select(fields as never)) as Db["select"];
+        const recoverSession = vi.fn(async () => ({ recovered: true, session: adoptedSession }));
+        state.createBackend.mockReturnValueOnce({ kind: "test", recoverSession } as never);
+        const following = executePaperclipNativeSession({ db, execution: next, runnerInstanceId: identity.runnerInstanceId,
+          useRunnerd: true, runnerExecutionTarget: { ...target, providerKey: "daytona", leaseId: "next-lease",
+            sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "retained-sandbox" } } as never });
+        if (mode === "ready" || mode === "suspended") {
+          await expect(following).resolves.toMatchObject({ exitCode: 0, sessionId: identity.normalizedSessionId });
+          expect(state.execute).toHaveBeenCalledTimes(2);
+          expect(recoverSession).toHaveBeenCalledTimes(mode === "ready" ? 1 : 0);
+          if (mode === "suspended") {
+            expect(JSON.parse(await readFile(join(root, "plugin-runner-state.json"), "utf8")))
+              .toMatchObject({ ...identity, lifecycle: "suspended" });
+            expect(revalidate.mock.calls.length).toBeGreaterThanOrEqual(2);
+          }
+        } else {
+          await expect(following).rejects.toThrow("remote_warm_session_not_idle");
+          expect(state.execute).toHaveBeenCalledOnce();
+          expect(recoverSession).not.toHaveBeenCalled();
+          expect(existsSync(join(root, "plugin-runner-state.json"))).toBe(false);
+        }
+      } finally {
+        await closeIdleWarmNativeSessionsForRestart();
+        inspect.mockRestore(); retainedBinding.mockRestore(); restore.mockRestore(); issueProjection.mockRestore();
+        state.createBackend.mockReset().mockImplementation(createBackend);
+      }
+    });
+
   it("passes the run checkpoint active turn into restart recovery", async () => {
     state.createBackend.mockClear();
     state.createTransport.mockClear();
