@@ -6,7 +6,7 @@ import { logActivity } from "../../../services/activity-log.js";
 import { createSteerQueuedComment } from "../application/queued-comment-use-cases.js";
 import { createQueuedCommentSteeringAdapter, readBoardQueuedComments } from "./queued-comment-board-postgres.js";
 import { parseObject } from "../domain/values.js";
-import { isAutomaticSteeringComment } from "../domain/policy.js";
+import { isAutomaticSteeringComment, isAutomaticSteeringWake } from "../domain/policy.js";
 
 /** Called only after comment and wake admission commit. The page and this path
  * share the same delivery, identity, ACK and wake-consumption transaction. */
@@ -19,22 +19,19 @@ export async function steerCommittedQueuedComment(db: Db, scope: { companyId: st
     .where(and(eq(issues.id, scope.issueId), eq(issues.companyId, scope.companyId), eq(issues.assigneeAgentId, scope.agentId)));
   if (!row || row.comment.authorType !== "agent" || !row.comment.authorAgentId || row.run.status !== "running" || row.comment.deletedAt || agentRunWritesRevoked(row.run) || row.run.resultJson?.personStop ||
       !isAutomaticSteeringComment(row.comment, row.run.agentId)) return;
-  const actor = row.comment.authorAgentId
-    ? { actorType: "agent" as const, actorId: row.comment.authorAgentId, agentId: row.comment.authorAgentId,
-        runId: row.comment.createdByRunId, agentApiKeyId: null }
-    : { actorType: "user" as const, actorId: row.comment.authorUserId!, agentId: null, runId: null, agentApiKeyId: null };
-  if (!actor.actorId) return;
+  const actor = { actorType: "agent" as const, actorId: row.comment.authorAgentId, agentId: row.comment.authorAgentId,
+    runId: row.comment.createdByRunId, agentApiKeyId: null };
   const board = await readBoardQueuedComments({ executor: db, issue: row.issue, activeRun: row.run, actor });
-  const entry = board.entries.find(({ comment }) => comment.id === scope.commentId);
+  const entry = board.entries[0];
   if (board.state !== "deferred" || board.steeringDisposition !== "available" || !board.queueId ||
-      board.targetRunId !== row.run.id || !entry || entry.source?.requiresFreshSession ||
+      board.targetRunId !== row.run.id || !entry || entry.comment.id !== scope.commentId || entry.source?.requiresFreshSession ||
       board.entries.some(({ comment }) => isConversationReset(comment.body)) ||
       (board.executionWait && board.executionWait.reason !== "execution_recovery")) return;
-  const [wake] = await db.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
+  const [wake] = await db.select({ payload: agentWakeupRequests.payload, reason: agentWakeupRequests.reason }).from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.id, board.queueId), eq(agentWakeupRequests.companyId, scope.companyId),
     eq(agentWakeupRequests.agentId, scope.agentId), eq(agentWakeupRequests.status, "deferred_issue_execution")));
-  if (!wake || parseObject(wake.payload?._paperclipWakeContext).forceFreshSession === true) return;
-  const accepted = await createSteerQueuedComment(createQueuedCommentSteeringAdapter(db))({
+  if (!wake || !isAutomaticSteeringWake(wake.reason, parseObject(wake.payload?._paperclipWakeContext))) return;
+  const accepted = await createSteerQueuedComment(createQueuedCommentSteeringAdapter(db, { requireQueueHead: true }))({
     issue: row.issue, actor, queueId: board.queueId, revision: board.revision, targetRunId: row.run.id, commentId: scope.commentId,
   });
   await logActivity(db, { companyId: scope.companyId, ...actor, action: "issue.queued_comment_steered",
