@@ -9935,9 +9935,10 @@ export async function steerNativeSession(input: {
       "The active native session is not attached.",
     );
   }
-  if (active.holdEndPending || active.holdCloseRequested || active.taskClaimed) {
-    throw new NativeSessionSteeringError("steering_stale_turn", "This held turn is closing. Your message stays queued for the next run.");
-  }
+  const closingTurn = () => new NativeSessionSteeringError("steering_stale_turn", active.taskClaimed
+    ? "This task run has finished its work; your message will start the next run."
+    : "This held turn is closing. Your message stays queued for the next run.");
+  if (active.holdEndPending || active.holdCloseRequested || active.taskClaimed) throw closingTurn();
   // Reserve work before any asynchronous capability/snapshot reads. An old
   // published final must not make a newly delivered follow-up look idle.
   const idleBeforeReservation = active.heldIdle || (active.holdIdlePublicationVersion !== undefined &&
@@ -9951,7 +9952,6 @@ export async function steerNativeSession(input: {
   const reservation = reservations.get(input.correlationId) ?? { preparing: 0, dispatched: false };
   reservation.preparing++;
   reservations.set(input.correlationId, reservation);
-  const closingTurn = () => new NativeSessionSteeringError("steering_stale_turn", "This held turn is closing. Your message stays queued for the next run.");
   let delivery: Promise<{ turnId: string }>;
   try {
     await active.refreshHeldTurnWork?.();
@@ -12064,10 +12064,11 @@ async function executePaperclipNativeSessionAttempt(
       },
       onCommittedEvent: async (event, cursor) => {
         // Proposed is the task claim boundary; accepted arrives at finalization.
-        if (event.eventType === "run.result.proposed" && input.conversationMode !== true &&
-            !(input.execution.provider.kind === "pi_rpc" && input.execution.provider.conversationMode === true)) {
+        if (input.execution.provider.kind === "pi_rpc" && input.conversationMode !== true &&
+            input.execution.provider.conversationMode !== true &&
+            (event.eventType === "run.result.proposed" || event.eventType === "run.result.rejected")) {
           const claiming = activeNativeSessions.get(input.execution.binding.runId);
-          if (claiming) claiming.taskClaimed = true;
+          if (claiming) claiming.taskClaimed = event.eventType === "run.result.proposed";
         }
         const active = input.execution.provider.kind === "pi_rpc" && input.execution.provider.conversationMode === true
           ? activeNativeSessions.get(input.execution.binding.runId) : undefined;
@@ -13262,14 +13263,14 @@ async function executePaperclipNativeSessionAttempt(
               }
               if (session) {
                 const active: ActiveNativeSession = { session, cancelRequested: false, admissionAbort: new AbortController() };
-                if (input.conversationMode !== true &&
-                    !(input.execution.provider.kind === "pi_rpc" && input.execution.provider.conversationMode === true)) {
-                  // Reattachment preserves the committed claim fence before publication.
+                if (input.execution.provider.kind === "pi_rpc" && input.conversationMode !== true &&
+                    input.execution.provider.conversationMode !== true) {
+                  // Reattachment restores only the latest unrejected claim before publication.
                   const [claim] = await input.db.select({ eventType: heartbeatRunEvents.eventType }).from(heartbeatRunEvents).where(and(
                     eq(heartbeatRunEvents.companyId, input.execution.binding.companyId),
                     eq(heartbeatRunEvents.runId, input.execution.binding.runId),
-                    eq(heartbeatRunEvents.eventType, "run.result.proposed"),
-                  )).limit(1);
+                    inArray(heartbeatRunEvents.eventType, ["run.result.proposed", "run.result.rejected"]),
+                  )).orderBy(desc(heartbeatRunEvents.seq)).limit(1);
                   active.taskClaimed = claim?.eventType === "run.result.proposed";
                 }
                 activeNativeSessions.set(input.execution.binding.runId, active);
