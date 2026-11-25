@@ -4,6 +4,19 @@ import { record, text } from "./codex-driver-values.js";
 
 type Requester = Pick<CodexAppServerTransport, "request">;
 
+/** Provider-owned entries only: never derive presence from a submitted command. */
+export async function readCodexUserMessages(transport: Requester, threadId: string): Promise<string[] | null> {
+  const messages: string[] = [];
+  for (const turn of await readCodexTurnMetadata(transport, threadId)) {
+    for (const item of await readCodexTurnItems(transport, threadId, text(turn.id))) {
+      if (item.type !== "userMessage") continue;
+      if (!Array.isArray(item.content)) return null;
+      messages.push(item.content.map(part => text(record(part).text)).join("\n"));
+    }
+  }
+  return messages;
+}
+
 const TURN_STATUSES = ["inProgress", "completed", "failed", "interrupted", "cancelled"];
 
 class CodexPaginatedHistoryUnsupported extends HarnessReconciliationError {}
