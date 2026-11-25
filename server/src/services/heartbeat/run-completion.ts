@@ -1,3 +1,5 @@
+import { PI_MODEL_PROVIDER_REQUIRED } from "../../adapters/pi-model-selection.js";
+import { ensurePiModelSelectionFailureNotice } from "../pi-model-selection-failure.js";
 import { resolveSessionContinuity } from "../native-runtime/continued-session.js";
 import { preserveAcceptedRunUsageProjectionSql } from "../usage-receipts.js";
 import { isContextCompactionRun } from "../context-compaction.js";
@@ -1765,6 +1767,8 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     const connectionFailure = readGitConnectionFailure(outerErr);
     const setupFailureResultJson = {
       ...setupFailureDetails,
+      ...(nonRetryablePreflightCode === PI_MODEL_PROVIDER_REQUIRED && outerErr instanceof HttpError
+        ? { modelSelection: { model: parseObject(outerErr.details).model, retryability: "requires_action" } } : {}),
       ...(failureCause ? { failureCause } : {}),
       ...(repositoryCatalogUnavailable ? { errorFamily: "transient_upstream",
         ...(repositoryCatalogUnavailable.retryAt ? { retryNotBefore: new Date(repositoryCatalogUnavailable.retryAt).toISOString() } : {}),
@@ -1851,6 +1855,13 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         parseObject(livenessRun.contextSnapshot).issueId,
       );
       if (setupFailureIssueId) {
+        if (livenessRun.errorCode === PI_MODEL_PROVIDER_REQUIRED) {
+          // The terminal failure is durable authority to park the turn. Notice
+          // publication is repairable and must never prevent settle/release.
+          await ensurePiModelSelectionFailureNotice(db, livenessRun, issuesSvc.addComment)
+            .catch((noticeError) => logger.warn({ err: noticeError, runId }, "Pi selection notice deferred to recovery"));
+          await settleConversationTurn(db, livenessRun);
+        }
         await completeSkillTestRunForHeartbeatOutcome({
           run: livenessRun,
           issueId: setupFailureIssueId,

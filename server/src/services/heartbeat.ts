@@ -1,3 +1,4 @@
+import { normalizePiIssueModelSelection, validatePiRunSelection } from "../adapters/pi-model-selection.js";
 import { registerHeldPreparationResumer } from "./interrupted-preparation-hold-settlement.js";
 import { settlePreDispatchStopRecovery } from "./heartbeat/pre-dispatch-stop-settlement.js";
 import { registerCompletedTurnCleanupResumer } from "./native-runtime/completed-turn-cleanup-hold-settlement.js";
@@ -2494,9 +2495,10 @@ export function heartbeatService(
       let issueAssigneeOverrides =
         issueContext && issueContext.assigneeAgentId === agent.id
           ? parseIssueAssigneeAdapterOverrides(
-              issueContext.assigneeAdapterOverrides,
+              normalizePiIssueModelSelection(agent, issueContext.assigneeAdapterOverrides),
             )
           : null;
+      validatePiRunSelection(agent, issueAssigneeOverrides);
       const experimentalInstanceSettings =
         await timePreparation("instance_settings", () => instanceSettings.getExperimental());
       const isolatedWorkspacesEnabled =

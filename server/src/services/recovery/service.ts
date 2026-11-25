@@ -1,4 +1,5 @@
 import { wakeWaitersOfStalledIssues, type BlockerStallWakeup } from "./blocker-stall-wakeups.js";
+import { ensurePiModelSelectionFailureNotice } from "../pi-model-selection-failure.js";
 import { INTERACTION_DELIVERY_DENIED, isInteractionDeliveryDeniedRun } from "../agent-interaction-delivery.js";
 import { notifyScheduledRetryDispatch } from "../run-dispatch-notifications.js";
 import { OWNER_UNPROVABLE_CAUSE } from "./owner-gone-attestation.js";
@@ -617,6 +618,7 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   INTERACTION_DELIVERY_DENIED,
   "project_access_denied",
+  "pi_model_provider_required",
   "native_provider_model_rejected",
   "provider_tool_definition_invalid",
   NATIVE_SANDBOX_DISK_FULL,
@@ -4917,7 +4919,13 @@ export function recoveryService(
       }
       if (issue.conversationAgentId) {
         const lastRun = await getLatestIssueRun(issue.companyId, issue.id);
-        if (lastRun?.status === "succeeded") {
+        if (lastRun?.errorCode === "pi_model_provider_required") {
+          // Also runs for an already parked turn: a previous notice insert may
+          // have failed after terminal commit, or the executor may have died.
+          await ensurePiModelSelectionFailureNotice(db, { ...lastRun, companyId: issue.companyId }, issuesSvc.addComment)
+            .catch((err) => logger.warn({ err, runId: lastRun.id }, "Pi selection notice repair deferred"));
+        }
+        if (lastRun?.status === "succeeded" || lastRun?.errorCode === "pi_model_provider_required") {
           if (await settleConversationTurnForRun(db, issue.companyId, lastRun.id)) {
             const [current] = await db.select().from(issues).where(eq(issues.id, issue.id));
             if (current) Object.assign(issue, current);
@@ -4972,6 +4980,16 @@ export function recoveryService(
         ? await terminalRunSettlingUntil(issue.companyId, latestRun.id, latestRun) : null;
       if (settlingUntil) {
         opts?.onDeferredDeadline?.(settlingUntil.getTime());
+        result.skipped += 1;
+        continue;
+      }
+      // Repair the run-keyed notice before excluding this non-retryable run.
+      // Conversations already repaired above, before the waiting-state skip.
+      if (latestRun?.errorCode === "pi_model_provider_required") {
+        if (!issue.conversationAgentId) {
+          await ensurePiModelSelectionFailureNotice(db, { ...latestRun, companyId: issue.companyId }, issuesSvc.addComment)
+            .catch((err) => logger.warn({ err, runId: latestRun?.id }, "Pi selection notice repair deferred"));
+        }
         result.skipped += 1;
         continue;
       }
