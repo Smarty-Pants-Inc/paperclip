@@ -419,6 +419,48 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     }
   });
 
+  it.each([
+    { category: "instructions", retain: true },
+    { category: "adapterConfig", retain: true },
+    { category: "environment", retain: true },
+    { category: "envBindings", retain: true },
+    { category: "runtimeSkills", retain: false },
+    { category: "agentRuntimeConfig", retain: false },
+    { category: "workspaceConfig", retain: false },
+    { category: "secrets", retain: false },
+    { category: "issueOverrides", retain: false },
+    { category: "adapter", retain: false },
+    { category: "instructions,runtimeSkills", retain: false },
+    { category: "instructions", retain: true, workspaceChanged: true },
+    { category: "environment", retain: true, workspaceChanged: true },
+    { category: "runtimeSkills", retain: false, workspaceChanged: true },
+    { category: "missing", retain: false },
+    { category: "version", retain: false },
+  ])("continuous Pi freshness $category (workspace changed=$workspaceChanged) retains session: $retain", async ({ category, retain, workspaceChanged }) => {
+    const f = await seed(), sessionId = randomUUID();
+    const cwd = workspaceChanged ? await mkdtemp(join(tmpdir(), "workspace-freshness-")) : undefined;
+    const mode = workspaceChanged ? vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({ kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION }) : undefined;
+    if (workspaceChanged) registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
+    try {
+      await db.update(agents).set({ ...(workspaceChanged ? { adapterType: "paperclip_runner" } : {}), adapterConfig: { provider: "pi_rpc", model: "fixture/model", fixtureSessionId: sessionId, ...(cwd ? { cwd } : {}) } }).where(eq(agents.id, f.agentId));
+      await execute(f);
+      const [saved] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId));
+      const params = structuredClone(saved.sessionParamsJson!);
+      params.__paperclipConfigFingerprint = "old-config";
+      if (category === "missing") delete params.__paperclipConfigFingerprintVersion;
+      else if (category === "version") params.__paperclipConfigFingerprintVersion = 999;
+      else for (const key of category.split(",")) (params.__paperclipConfigCategoryFingerprints as Record<string, string>)[key] = "old-category";
+      await db.update(agentTaskSessions).set({ sessionParamsJson: params }).where(eq(agentTaskSessions.id, saved.id));
+      const next = await execute(f, { workspaceSelectionChanged: workspaceChanged === true });
+      expect(next.input.runtime.sessionId).toBe(retain ? sessionId : null);
+      expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: { reset: !retain, taskSessionReused: retain } } });
+    } finally {
+      mode?.mockRestore();
+      if (workspaceChanged) unregisterServerAdapter("paperclip_runner");
+      if (cwd) await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("starts fresh when effective model configuration changes and persists the reason", async () => {
     const f = await seed();
     await execute(f);
