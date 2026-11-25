@@ -137,7 +137,7 @@ describe("agent-created hires use managed AI connections", () => {
       name: "Native pool teammate", role: "engineer", adapterType: "paperclip_runner", inheritRuntimeFrom: "caller",
     }));
     expect(agent.runtimeConfig.aiConnection).toEqual(p.binding);
-    expect(agent.adapterConfig).toMatchObject({ provider: "codex", model: "gpt-5.6-sol", lifecycleMode: "per_turn" });
+    expect(agent.adapterConfig).toMatchObject({ provider: "codex", model: "claude-opus-5-5", lifecycleMode: "per_turn" });
   });
 
   it("rejects an inherited pool with no compatible harness instead of dropping its binding", async () => {
@@ -534,7 +534,7 @@ describe("agent-created hires use managed AI connections", () => {
     const agent = hired(await request(f.app).post(`/api/companies/${f.companyId}/agent-hires`).send({
       name: "Inherited teammate", role: "engineer", adapterType: "paperclip_runner", inheritRuntimeFrom: "caller",
     }));
-    expect(agent.adapterConfig).toMatchObject(parentConfig);
+    expect(agent.adapterConfig).toMatchObject({ ...parentConfig, model: parentConfig.provider === "codex" ? "claude-opus-5-5" : parentConfig.model });
     expect(agent.adapterConfig).not.toHaveProperty("cwd");
     expect(agent.adapterConfig).not.toHaveProperty("env");
     expect(agent.adapterConfig.instructionsFilePath).not.toBe("/private/parent-instructions.md");
