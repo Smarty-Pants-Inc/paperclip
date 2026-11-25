@@ -8,6 +8,7 @@ import {
   forwardRef,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useImperativeHandle,
   useMemo,
   useRef,
@@ -1054,7 +1055,9 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
     return all;
   }, [hasImageUpload]);
 
-  useEffect(() => {
+  // External transfers (Send/Stop) must reach the editor before the same paint
+  // removes their source row or draws their thread echo.
+  useLayoutEffect(() => {
     if (editorValue !== latestValueRef.current) {
       if (ref.current) {
         // Pair with onChange echo suppression (echoIgnoreMarkdownRef).
