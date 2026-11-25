@@ -486,6 +486,35 @@ describe("issue update comment wakeups", () => {
   });
 
   it.each([
+    { provider: "pi_rpc", config: { piRpcThinkingLevel: "ultra" }, status: 422 },
+    { provider: "pi_rpc", config: { modelReasoningEffort: "ultra" }, status: 422 },
+    { provider: "pi_rpc", config: { reasoningEffort: "ultra" }, status: 422 },
+    { provider: "pi_rpc", config: { effort: "ultra" }, status: 422 },
+    { provider: "pi_rpc", config: { piRpcThinkingLevel: "max" }, status: 200 },
+    { provider: "pi_rpc", config: { effort: "max" }, status: 200 },
+    { provider: "pi_rpc", config: { effort: "none" }, status: 200 },
+    { provider: "codex", config: { modelReasoningEffort: "ultra" }, status: 200 },
+  ])("validates Pi chat reasoning before saving: %j", async ({ provider, config, status }) => {
+    const existing = makeIssue({ assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null });
+    mockModelAgent.mockResolvedValue({ id: ASSIGNEE_AGENT_ID, companyId: existing.companyId,
+      adapterType: "paperclip_runner", adapterConfig: { provider, model: "paperclip/gpt-6.1-sol", piRpcThinkingLevel: "high" } });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockImplementation(async (_id, fields) => ({ ...existing, ...fields }));
+    const res = await request(await createApp()).patch(`/api/issues/${existing.id}`).send({
+      assigneeAdapterOverrides: { adapterConfig: config },
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(status);
+    if (status === 422) {
+      expect(res.body.error).toBe('Pi cannot use reasoning level "ultra": choose off, minimal, low, medium, high, xhigh or max');
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockHeldEnd).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    } else {
+      expect(res.body.assigneeAdapterOverrides.adapterConfig).toEqual(config);
+    }
+  });
+
+  it.each([
     { previous: null, next: { model: "gpt-6.2-sol" }, end: true },
     { previous: { adapterConfig: { model: "gpt-6.2-sol" } }, next: { model: "paperclip/gpt-6.2-sol" }, end: false },
     { previous: null, next: { modelReasoningEffort: "low" }, end: true },
