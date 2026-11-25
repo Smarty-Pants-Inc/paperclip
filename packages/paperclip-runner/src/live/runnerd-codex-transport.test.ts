@@ -6637,7 +6637,7 @@ it("cancels startup readiness before releasing the route that settles its ready 
   }
 }, 30_000);
 
-it("surfaces a runner exit while provider-ingress readiness is still pending", async () => {
+it("types a failed cached transport after a runner exit while provider-ingress readiness is pending", async () => {
   const neverReady = new Promise<void>(() => undefined);
   const bundle = createCapabilityRunnerdCodexTransport({
     // The external process launcher owns execution in this test. Point the
@@ -6683,6 +6683,10 @@ it("surfaces a runner exit while provider-ingress readiness is still pending", a
     ).rejects.toThrow(
       "runner_ingress_unavailable: runnerd exited unexpectedly with code 1: restored runner could not start",
     );
+    // #failTransport records #failure, not #closed. No explicit close has run:
+    // another attachment must still take the bounded same-run recovery door.
+    await expect(bundle.transport.attachRun!({ runId: "same-incoming-run", turnId: "turn", itemId: "item" }))
+      .rejects.toBeInstanceOf(NativeRunnerClosedBeforeAttachmentError);
   } finally {
     await bundle.transport.close();
   }
