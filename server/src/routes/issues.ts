@@ -37,6 +37,7 @@ import { hasRequiredWorkspaceRecovery, LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "
 import { hasUnverifiedNativeWorkspaceFinalizationOwner } from "../services/native-runtime/native-workspace-finalization-recovery-state.js";
 import { monitorPoliciesEqual, applyActorMonitorScheduledBy, assertCanManageIssueMonitor, summarizeIssueMonitor } from "../services/issue-monitors.js";
 import type { IssuePrivacyConstraints, WithdrawIssueThreadInteraction } from "@paperclipai/shared";
+import { canResumeNativeReview, resumeNativeReview } from "../services/native-runtime/resume-native-review.js";
 import { canActorReadHeartbeatRun } from "../services/heartbeat-run-privacy.js";
 import {
   childCreatedByRequest,
@@ -8551,7 +8552,7 @@ export function issueRoutes(
       ...recentCommentsAndFacts,
       recentActivity,
       recentRuns,
-      interactions,
+      interactions: await projectResumeReviewActions(req, issue, interactions),
       attachments,
       liveRuns,
       activeRun,
@@ -17820,6 +17821,59 @@ export function issueRoutes(
     }));
   });
 
+  async function personCanActOnResumeReview(
+    req: Request,
+    issue: Parameters<typeof resolvePendingReviewInteractionRestriction>[0] & {
+      conversationAgentId?: string | null; conversationUserId?: string | null;
+    },
+    interaction: Parameters<typeof evaluateIssueThreadInteractionResolverAudience>[0]["interaction"] & {
+      id: string; kind: string; status: string;
+    },
+  ) {
+    if (req.actor.type !== "board" || (issue.conversationAgentId && req.actor.userId !== issue.conversationUserId)) return false;
+    const restriction = await resolvePendingReviewInteractionRestriction(issue, interaction);
+    return evaluateIssueThreadInteractionResolverAudience({
+      actor: { type: "user", userId: getActorInfo(req).actorId }, interaction,
+      additionalRestriction: restriction?.restriction,
+    }).allowed;
+  }
+
+  async function projectResumeReviewActions(
+    req: Request,
+    issue: NonNullable<Awaited<ReturnType<typeof svc.getById>>>,
+    interactions: Awaited<ReturnType<ReturnType<typeof issueThreadInteractionService>["listForIssue"]>>,
+  ) {
+    return Promise.all(interactions.map(async interaction => {
+      if (interaction.kind !== "request_confirmation") return interaction;
+      const target = interaction.payload.target;
+      if (target?.type !== "custom" || target.key !== "native_completion_review") return interaction;
+      const allowed = await personCanActOnResumeReview(req, issue, interaction);
+      return { ...interaction, canResumeReview: allowed && await canResumeNativeReview(db, {
+        companyId: issue.companyId, issueId: issue.id, interactionId: interaction.id,
+      }) };
+    }));
+  }
+
+  router.post("/issues/:id/interactions/:interactionId/resume_review", async (req, res) => {
+    assertBoard(req);
+    const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+    if (!issue) return;
+    const authorization = await getIssueThreadInteractionResolutionAuthorization(req, res, issue, req.params.interactionId as string);
+    if (!authorization) return;
+    const result = await resumeNativeReview(db, {
+      companyId: issue.companyId, issueId: issue.id, interactionId: authorization.current.id,
+      // Re-read audience/conversation authority while the issue and card are locked.
+      authorize: current => personCanActOnResumeReview(req, current.issue, current.interaction),
+    });
+    const actor = getActorInfo(req);
+    await logActivity(db, { companyId: issue.companyId, actorType: actor.actorType, actorId: actor.actorId,
+      action: "issue.review_resumed", entityType: "issue", entityId: issue.id,
+      details: { interactionId: authorization.current.id, wakeId: result.wakeId } });
+    // The durable intent is already committed; ordinary dispatch/claim revalidates its authority.
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: issue.companyId, requestId: result.wakeId });
+    res.json(result);
+  });
+
   router.get("/issues/:id/interactions", async (req, res) => {
     const id = req.params.id as string;
     const issue = await getAccessibleResource(
@@ -17852,7 +17906,7 @@ export function issueRoutes(
         issue, interactions: interactions as Parameters<typeof recordDeclinedInteractionRead>[1]["interactions"] })
         .catch(error => logger.warn({ err: error, runId: req.actor.runId }, "could not record the declined actions a run read"));
     }
-    res.json(interactions);
+    res.json(await projectResumeReviewActions(req, issue, interactions));
   });
 
   router.post(
