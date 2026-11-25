@@ -268,7 +268,11 @@ export function projectPaperclipRunnerTaskConfig(
     delete config.modelReasoningEffort;
     delete config.reasoningEffort;
     delete config.effort;
-    if (backend === "pi_rpc" && effortKey !== undefined) delete config.piRpcThinkingLevel;
+    if (backend === "pi_rpc") {
+      if (effortKey !== undefined) delete config.piRpcThinkingLevel;
+      // Changing only the model must retain the agent's effective alias-derived level.
+      else config.piRpcThinkingLevel = piRpcThinking(base);
+    }
   }
   if (model !== null) config.model = model;
   if (effortKey !== undefined) config[grok ? "reasoningEffort" : "modelReasoningEffort"] = task[effortKey];
