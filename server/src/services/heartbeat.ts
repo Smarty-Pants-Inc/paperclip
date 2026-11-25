@@ -2255,7 +2255,7 @@ export function heartbeatService(
         resumingAdmittedRun: !!runOptions.nativeLeaseOwner,
         conversation: isConversation(conversationIdentity),
       })) return;
-      run = await timePreparation("chat_completion", () => prepareChatCompletionTurn(db, run));
+      run = await timePreparation("chat_completion", () => prepareChatCompletionTurn(db, run, runOptions.nativeRestartRecovery));
       if (chatCompletionAlreadyReported(run)) {
         // An earlier reply in this conversation already reported each completion.
         await setRunStatus(run.id, "succeeded", { finishedAt: new Date(), resultJson: { chatCompletionAlreadyReported: true }, issueCommentStatus: "not_applicable" });
