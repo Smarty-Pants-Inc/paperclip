@@ -123,6 +123,39 @@ function resolvePiRunnerConfig(config: Record<string, unknown>): Record<string, 
   };
 }
 
+function resolveNativePiRunnerConfig(config: Record<string, unknown>, setupOnly?: boolean): Record<string, unknown> {
+  const unsupported = ["extraArgs", "args", "modelReasoningEffort", "reasoningEffort", "effort"]
+    .filter(key => config[key] !== undefined && config[key] !== "" && !(Array.isArray(config[key]) && config[key].length === 0));
+  if (config.command && config.command !== "pi") unsupported.push("command");
+  if (config.model !== undefined && typeof config.model !== "string") unsupported.push("model");
+  if (config.stdoutLogMode !== undefined && config.stdoutLogMode !== "compact") unsupported.push("stdoutLogMode");
+  // Normalize the card and persisted native aliases before any ACPX defaults.
+  // An explicit, conflicting choice is an error, never a silent downgrade.
+  const levels = ["piThinkingLevel", "piRpcThinkingLevel", "thinking"].flatMap(key => {
+    const value = config[key];
+    if (value == null || (typeof value === "string" && !value.trim())) return [];
+    if (typeof value !== "string" || !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value.trim())) unsupported.push(key);
+    return [{ key, value: typeof value === "string" ? value.trim() : value }];
+  });
+  if (new Set(levels.map(level => level.value)).size > 1) unsupported.push(...levels.map(level => level.key));
+  if (unsupported.length) incompatible(unsupported);
+  const translated = { ...config };
+  for (const key of ["command", "extraArgs", "args", "stdoutLogMode", "thinking", "piThinkingLevel", "acpxAgent", "acpxPermissionMode", "acpxSessionMode", "codexPermissionMode"]) delete translated[key];
+  const model = typeof config.model === "string" ? config.model.trim() : "";
+  if (!(setupOnly && !model) && !/^[^/\s]+\/\S+$/.test(model)) throw unprocessable(
+    "Pi requires an explicit provider/model. Select a model before testing or hiring.",
+    { code: "agent_runner_config_incompatible", fields: ["model"] },
+  );
+  const nativeConfig = { ...translated, ...paperclipRunnerProfileForHarness("pi_rpc"), model,
+    piRpcThinkingLevel: levels[0]?.value ?? "medium", lifecycleMode: config.lifecycleMode ?? "per_turn" };
+  try { resolvePaperclipRunnerNativeProviderInput({ backend: "pi_rpc", adapterConfig: nativeConfig }); }
+  catch (error) {
+    if (error instanceof PaperclipRunnerProviderProfileError) throw unprocessable(error.message, { code: error.code });
+    throw error;
+  }
+  return nativeConfig;
+}
+
 function resolveOpenCodeRunnerConfig(config: Record<string, unknown>): Record<string, unknown> {
   const unsupported = ["extraArgs", "args", "variant", "modelReasoningEffort", "reasoningEffort", "effort"]
     .filter(key => config[key] !== undefined && config[key] !== "" && !(Array.isArray(config[key]) && config[key].length === 0));
@@ -396,19 +429,13 @@ export async function resolveNewAgentRunnerForCompany(db: Db, companyId: string,
     if (nativePi && !installed) throw unavailable();
     if (installed) {
       const target = await resolveAgentRunnerTargetForCompany(db, companyId, input.defaultEnvironmentId, disabledTypes);
-      const selected = resolveNewAgentRunner({ ...input, target });
-      if (selected.adapterType !== "paperclip_runner") throw unprocessable(
-        "The installed native Pi driver requires Paperclip Runner in a supported environment. Choose a supported Computer or explicitly select Legacy.",
+      // Keep the common disabled/registry/environment checks, but choose the
+      // installed provider before the stock Pi path can validate or default it.
+      if (!agentRunnerAvailability("pi_local", target, disabledTypes).supportedRunners.includes("paperclip")) throw unprocessable(
+        "The installed native Pi driver requires Paperclip Runner in a supported environment. Enable its adapters, choose a supported Computer or explicitly select Legacy.",
         { code: "agent_runner_unavailable" },
       );
-      const config = { ...selected.adapterConfig };
-      const thinking = config.piThinkingLevel ?? config.piRpcThinkingLevel;
-      for (const key of ["acpxAgent", "acpxPermissionMode", "acpxSessionMode", "piThinkingLevel", "codexPermissionMode"]) delete config[key];
-      // The card's instance-specific choice lives here, beside server-owned
-      // runner resolution. Shared harness defaults remain unchanged.
-      return { adapterType: "paperclip_runner", adapterConfig: {
-        ...config, ...paperclipRunnerProfileForHarness("pi_rpc"), piRpcThinkingLevel: thinking,
-      } };
+      return { adapterType: "paperclip_runner", adapterConfig: resolveNativePiRunnerConfig(input.adapterConfig ?? {}, input.setupOnly) };
     }
   }
   const cursor = agentHarnessType(input.adapterType ?? "process", input.adapterConfig) === "cursor_cloud";
