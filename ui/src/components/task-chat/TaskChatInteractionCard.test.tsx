@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 vi.mock("@/hooks/useCoordinatorWorkspaceEnabled", () => ({
   useCoordinatorWorkspaceEnabled: () => ({ enabled: false, loaded: true }),
 }));
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { issuesApi } from "@/api/issues";
 import { queryKeys } from "@/lib/queryKeys";
 import type { IssueDocument } from "@paperclipai/shared";
@@ -26,6 +26,8 @@ import {
   pendingRequestItemVerdictsInteraction,
 } from "@/fixtures/issueThreadInteractionFixtures";
 import { TaskChatInteractionCard } from "./TaskChatInteractionCard";
+import { IssueThreadInteractionCard } from "../IssueThreadInteractionCard";
+import { ResumeReviewAction } from "../ResumeReviewAction";
 vi.mock("@/lib/router", async importOriginal => ({
   ...await importOriginal<typeof import("@/lib/router")>(),
   Link: ({ to, children }: { to: string; children: React.ReactNode }) => <a href={to}>{children}</a>,
@@ -155,6 +157,86 @@ describe("TaskChatInteractionCard", () => {
     await act(async () => { await vi.waitFor(() => expect(request).toHaveBeenCalledWith(interaction.issueId, interaction.id)); });
     expect(accept).not.toHaveBeenCalled();
     expect(reject).not.toHaveBeenCalled();
+  });
+
+  it("keeps the native review action footprint through eligibility changes and reload", () => {
+    const interaction = createRequestConfirmation({ canResumeReview: true,
+      payload: { version: 1, prompt: "Review the work", target: { type: "custom", key: "native_completion_review", revisionId: "decision-1" } } });
+    const client = new QueryClient();
+    const render = (canResumeReview: boolean | undefined) => flushSync(() => root.render(
+      <QueryClientProvider client={client}><ResumeReviewAction interaction={{ ...interaction, canResumeReview }} /></QueryClientProvider>));
+    render(undefined);
+    const slot = container.querySelector('[data-resume-review-slot]');
+    expect(slot).not.toBeNull();
+    const footprint = slot!.className;
+    for (const capability of [true, false, undefined, true]) {
+      render(capability);
+      expect(container.querySelector('[data-resume-review-slot]')).toBe(slot);
+      expect(slot!.className).toBe(footprint);
+      expect(container.querySelectorAll('button')).toHaveLength(capability === true ? 1 : 0);
+    }
+  });
+
+  it("shares pending resume work between timeline and open-card views, including same-turn presses", async () => {
+    let finish!: (result: { wakeId: string }) => void;
+    const request = vi.spyOn(issuesApi, "resumeReview").mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    onTestFinished(() => request.mockRestore());
+    const interaction = createRequestConfirmation({ canResumeReview: true });
+    const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    client.setQueryData(queryKeys.auth.session, { user: { id: "review-operator" } });
+    flushSync(() => root.render(<QueryClientProvider client={client}><TooltipProvider><ThemeProvider>
+      <TaskChatInteractionCard item={interactionItem(interaction)} presentation="timeline" showPendingRequest />
+      <TaskChatInteractionCard item={interactionItem(interaction)} presentation="takeover" showPendingRequest />
+    </ThemeProvider></TooltipProvider></QueryClientProvider>));
+    const buttons = Array.from(container.querySelectorAll("button")).filter(button => button.textContent === "Resume review");
+    expect(buttons).toHaveLength(2);
+    try {
+      await act(async () => { buttons[0].click(); buttons[1].click(); });
+      await act(async () => { await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(1)); });
+      await act(async () => { await vi.waitFor(() => expect(buttons.every(button => button.disabled)).toBe(true)); });
+    } finally {
+      await act(async () => { finish?.({ wakeId: "resume-wake" }); });
+    }
+  });
+
+  it("keeps the slot after success and reload, and enables a later Stop of the same review", async () => {
+    const request = vi.spyOn(issuesApi, "resumeReview").mockResolvedValue({ wakeId: "resume-wake" });
+    onTestFinished(() => request.mockRestore());
+    const interaction = createRequestConfirmation({ canResumeReview: true,
+      payload: { version: 1, prompt: "Review the work", target: { type: "custom", key: "native_completion_review", revisionId: "decision-1" } } });
+    const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    client.setQueryData(queryKeys.auth.session, { user: { id: "review-operator" } });
+    const key = queryKeys.issues.interactions(interaction.issueId);
+    client.setQueryData(key, [interaction]);
+    function CachedCard() {
+      const { data = [] } = useQuery<RequestConfirmationInteraction[]>({ queryKey: key, enabled: false });
+      return data[0] ? <ResumeReviewAction interaction={data[0]} /> : null;
+    }
+    const render = (version: number) => flushSync(() => root.render(<QueryClientProvider client={client}><CachedCard key={version} /></QueryClientProvider>));
+    render(0);
+    const slot = container.querySelector('[data-resume-review-slot]')!;
+    await act(async () => { container.querySelector('button')!.click(); });
+    await act(async () => { await vi.waitFor(() => expect(container.querySelector('button')).toBeNull()); });
+    expect(container.querySelector('[data-resume-review-slot]')).toBe(slot);
+    render(1); // Reload/remount using the authoritative post-resume capability.
+    expect(container.querySelector('button')).toBeNull();
+    expect(container.querySelector('[data-resume-review-slot]')?.className).toBe(slot.className);
+    await act(async () => { client.setQueryData(key, [{ ...interaction, canResumeReview: true }]); });
+    await act(async () => { await vi.waitFor(() => expect(container.querySelector('button')?.disabled).toBe(false)); });
+    await act(async () => { container.querySelector('button')!.click(); });
+    await act(async () => { await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(2)); });
+  });
+
+  it("renders only one resume action when classic Revise is open", async () => {
+    const interaction = createRequestConfirmation({ canResumeReview: true });
+    const client = new QueryClient();
+    flushSync(() => root.render(<QueryClientProvider client={client}><TooltipProvider><ThemeProvider>
+      <IssueThreadInteractionCard interaction={interaction} onAcceptInteraction={vi.fn()} onRejectInteraction={vi.fn()} />
+    </ThemeProvider></TooltipProvider></QueryClientProvider>));
+    const revise = Array.from(container.querySelectorAll("button")).find(button => button.textContent?.includes("Revise"));
+    expect(revise).toBeDefined();
+    await act(async () => { revise!.click(); });
+    expect(Array.from(container.querySelectorAll("button")).filter(button => button.textContent === "Resume review")).toHaveLength(1);
   });
 
   it("hides Resume review on a resolved card even if a stale capability is present", () => {
