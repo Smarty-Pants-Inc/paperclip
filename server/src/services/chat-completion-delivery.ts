@@ -318,11 +318,7 @@ export async function acknowledgeChatCompletionReply(tx: Connection, runId: stri
       answers ? inArray(sql<string>`${deliveries.id}::text`, answers) : undefined));
 }
 
-export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentId: string, options: {
-  source: "automation"; triggerDetail: "system"; reason: string; idempotencyKey: string; allowRunCoalescing: boolean;
-  requestedByActorType: "system"; requestedByActorId: string; payload: Record<string, unknown>; contextSnapshot: Record<string, unknown>;
-}): Promise<{ id: string } | null> }) {
-  async function deliverIntoLiveTurn(claimed: typeof deliveries.$inferSelect, key: string) {
+export async function deliverIntoLiveTurn(db: Db, claimed: typeof deliveries.$inferSelect, key: string, expectedRunId?: string) {
     return db.transaction(async tx => {
       // Match status writers' task-first order; promotion and publication own the chat lock.
       await tx.select({ id: issues.id }).from(issues).where(and(eq(issues.id, claimed.taskId),
@@ -337,6 +333,7 @@ export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentI
       const context = parseObject(wake?.payload?._paperclipWakeContext);
       if (!source?.conversationAgentId || source.conversationAgentId !== audience.handoff.agentId ||
           source.assigneeAgentId !== source.conversationAgentId || source.conversationState !== "active" || !source.executionRunId ||
+          (expectedRunId !== undefined && source.executionRunId !== expectedRunId) ||
           !wake || wake.payload?.issueId !== source.id || (context.wakeReason ?? wake.reason) !== CHAT_COMPLETION_WAKE_REASON ||
           context.conversationSessionGeneration !== source.conversationSessionGeneration || context.forceFreshSession === true ||
           !Array.isArray(context.chatCompletionDeliveryIds) || context.chatCompletionDeliveryIds.length !== 1 || context.chatCompletionDeliveryIds[0] !== claimed.id) return false;
@@ -388,6 +385,37 @@ export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentI
       return true;
     });
   }
+
+/** The native hold owner offers completion wakes before fencing steering. A
+ * concurrent delivery can consume a sampled wake; re-read it before closing. */
+export async function offerHeldChatCompletions(db: Db, scope: { companyId: string; issueId: string; agentId: string; runId: string }) {
+  const wakes = await db.select().from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, scope.companyId), eq(agentWakeupRequests.agentId, scope.agentId),
+    eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    sql`${agentWakeupRequests.payload}->>'issueId' = ${scope.issueId}`,
+  )).orderBy(asc(agentWakeupRequests.requestedAt));
+  let offered = false;
+  for (const wake of wakes) {
+    const context = parseObject(wake.payload?._paperclipWakeContext);
+    if ((context.wakeReason ?? wake.reason) !== CHAT_COMPLETION_WAKE_REASON) continue;
+    const ids = context.chatCompletionDeliveryIds;
+    const [delivery] = Array.isArray(ids) && ids.length === 1 && typeof ids[0] === "string"
+      ? await db.select().from(deliveries).where(and(eq(deliveries.companyId, scope.companyId),
+        eq(sql<string>`${deliveries.id}::text`, ids[0]))) : [];
+    if (delivery && wake.idempotencyKey === `chat-completion:${delivery.id}:${delivery.attempts}` &&
+        await deliverIntoLiveTurn(db, delivery, wake.idempotencyKey, scope.runId)) { offered = true; continue; }
+    const [latest] = await db.select({ status: agentWakeupRequests.status }).from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, scope.companyId)));
+    if (latest?.status === "deferred_issue_execution") return false;
+    offered = true;
+  }
+  return offered;
+}
+
+export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentId: string, options: {
+  source: "automation"; triggerDetail: "system"; reason: string; idempotencyKey: string; allowRunCoalescing: boolean;
+  requestedByActorType: "system"; requestedByActorId: string; payload: Record<string, unknown>; contextSnapshot: Record<string, unknown>;
+}): Promise<{ id: string } | null> }) {
   async function deliver(id: string): Promise<void> {
     // Lease outbox work before leaving the transaction; recovery reuses the same wake key.
     const claimed = await db.update(deliveries).set({ nextAttemptAt: new Date(Date.now() + LEASE_MS) })
@@ -454,7 +482,7 @@ export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentI
         if (advanced && claimed.attempts + 1 < MAX_ATTEMPTS) await deliver(id);
         return;
       }
-      if (wakes.some(w => w.status === "deferred_issue_execution") && await deliverIntoLiveTurn(claimed, key)) return;
+      if (wakes.some(w => w.status === "deferred_issue_execution") && await deliverIntoLiveTurn(db, claimed, key)) return;
       if (wakes.some(w => ["queued", "claimed", "deferred_issue_execution", "coalesced"].includes(w.status))) return;
       if (wakes.length) {
         // Terminal receipts must advance the key; reusing them collides forever.
@@ -495,7 +523,7 @@ export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentI
         const receipts = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
           .where(and(eq(agentWakeupRequests.companyId, claimed.companyId), eq(agentWakeupRequests.idempotencyKey, key)));
         if (!receipts.length) throw new Error("Completion wake returned no run or durable receipt");
-        await deliverIntoLiveTurn(claimed, key);
+        await deliverIntoLiveTurn(db, claimed, key);
       }
       if (run) await db.update(deliveries).set({ targetRunId: run.id, status: "queued" })
         .where(and(eq(deliveries.id, id), inArray(deliveries.status, [...pending]), sql`${deliveries.targetRunId} is null`));

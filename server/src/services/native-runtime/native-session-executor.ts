@@ -405,6 +405,9 @@ type ActiveNativeSession = {
   holdEndPending?: boolean;
   holdSteeredInputs?: Map<string, { preparing: number; dispatched: boolean }>;
   refreshHeldTurnWork?: () => Promise<boolean>;
+  /** The release owner offers live completions before it fences new steering. */
+  offerHeldCompletion?: () => Promise<boolean>;
+  holdCompletionOffering?: boolean;
   admissionAbort?: AbortController;
   cancellationSettled?: Promise<void>;
   restartDetach?: Promise<void>;
@@ -10052,7 +10055,19 @@ export async function steerNativeSession(input: {
  * release the hold. No personStop state or cancel/requeue machinery. */
 export async function closeHeldNativeTurn(runId: string): Promise<boolean> {
   const active = activeNativeSessions.get(runId);
-  if (!active || active.cancelRequested || active.holdCloseRequested) return false;
+  if (!active || active.cancelRequested || active.holdCloseRequested || active.holdCompletionOffering) return false;
+  // Do not set the close fence until completion delivery had its existing live
+  // transaction. Its provider ACK needs this attachment's normal steering door.
+  // Configuration/reset intents already latched by 0447 retain their fence.
+  active.holdCompletionOffering = true;
+  try {
+    await active.refreshHeldTurnWork?.();
+    if (!active.holdEndPending) {
+      const offered = await active.offerHeldCompletion?.();
+      if (offered && !active.holdEndPending) return false;
+    }
+  } finally { active.holdCompletionOffering = false; }
+  if (activeNativeSessions.get(runId) !== active || active.cancelRequested || active.holdCloseRequested) return false;
   active.holdEndPending = true;
   active.holdCloseRequested = true;
   try {
@@ -13313,6 +13328,10 @@ async function executePaperclipNativeSessionAttempt(
                 }
                 activeNativeSessions.set(input.execution.binding.runId, active);
                 if (input.execution.provider.kind === "pi_rpc" && input.execution.provider.conversationMode === true) {
+                  active.offerHeldCompletion = async () => {
+                    const { offerHeldChatCompletions } = await import("../chat-completion-delivery.js");
+                    return offerHeldChatCompletions(input.db, input.execution.binding);
+                  };
                   active.refreshHeldTurnWork = async () => {
                     const work = await readHeldNativeTurnWork(input.db, input.execution.binding);
                     if (!work) return true;

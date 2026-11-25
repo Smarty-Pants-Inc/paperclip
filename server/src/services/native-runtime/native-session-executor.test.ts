@@ -1,5 +1,14 @@
 import type { NativeSession } from "../../vendor/paperclip-runner/index.js";
 import * as continuousReply from "./native-continuous-reply.js";
+import { recoveryPostgresSupport, startRecoveryPostgres } from "../../__tests__/helpers/recovery-postgres.js";
+import { createReleaseIssueExecution } from "../../modules/wake-queue/application/use-cases.js";
+import { createPostgresWakeQueueAdapter } from "../../modules/wake-queue/adapters/postgres.js";
+import { instanceSettingsService } from "../instance-settings.js";
+const heldCompletionOffers = vi.hoisted(() => ({ invoke: vi.fn() }));
+vi.mock("../chat-completion-delivery.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../chat-completion-delivery.js")>(),
+  offerHeldChatCompletions: heldCompletionOffers.invoke,
+}));
 import * as resetWakeQueue from "../../modules/wake-queue/index.js";
 import { closeHeldNativeTurn } from "./native-session-executor.js";
 import { currentControllerProcess } from "../controller-process-identity.js";
@@ -23,7 +32,7 @@ import { environmentTaskOperationSchema } from "@paperclipai/plugin-sdk";
 import { trace } from "@opentelemetry/api";
 import { InMemorySpanExporter, SimpleSpanProcessor, TracerProvider } from "@opentelemetry/sdk-trace";
 import { configuredEnvironment, configuredEnvironmentProjection } from "../../vendor/paperclip-runner/index.js";
-import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { TOOL_CALL_LOOP_REFUSAL_LIMIT, ToolCallLoopError, toolCallLoopContinuationKey } from "./repeated-tool-failure-guard.js";
 import { enableReattachPhase, isReattachPhaseActive, joinReattachPhase, onReattachPhaseEnd, resetReattachPhaseForTests, type ReattachPhaseSummary } from "../heartbeat/run-admission.js";
 import { createSystemRecovery, failSystemRecovery, reserveSystemRecoveryAttempt, SystemRecoveryFailure } from "../system-recovery-state.js";
@@ -31,7 +40,7 @@ import { registerRunStartHandover } from "../run-start-handover.js";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { once } from "node:events";
 import { PgDialect } from "drizzle-orm/pg-core";
-import type { SQL } from "drizzle-orm";
+import { eq, type SQL } from "drizzle-orm";
 import {
   access,
   chmod,
@@ -57,6 +66,12 @@ import { basename, dirname, join, relative } from "node:path";
 import { resolvePaperclipInstanceRoot } from "../../home-paths.js";
 import {
   activityLog,
+  agents,
+  authUsers,
+  companies,
+  createDb,
+  chatCompletionDeliveries,
+  chatTaskHandoffs,
   agentWakeupRequests,
   issueComments,
   budgetReservations,
@@ -11154,6 +11169,7 @@ describe("native session same-turn steering", () => {
 
   beforeEach(() => {
     state.release = null;
+    heldCompletionOffers.invoke.mockReset().mockResolvedValue(false);
     capabilities.mockReset().mockResolvedValue({ steering: true });
     snapshot.mockReset().mockResolvedValue({ activeTurnId: "provider-turn-1" });
     steer.mockReset().mockResolvedValue(undefined);
@@ -11225,6 +11241,116 @@ describe("native session same-turn steering", () => {
       }
       expect((await getNativeSessionSteeringState(execution.binding.runId)).disposition).toBe(refused ? "temporarily_unavailable" : "available");
     } finally { state.release?.(); await running; vi.restoreAllMocks(); }
+  });
+
+  describe.skipIf(!recoveryPostgresSupport.supported)("completion hold-release PostgreSQL row", () => {
+    let pg: Awaited<ReturnType<typeof startRecoveryPostgres>>, db: Db;
+    beforeAll(async () => {
+      pg = await startRecoveryPostgres("completion-hold-release-"); db = createDb(pg.connectionString);
+      await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
+    }, 60_000);
+    afterAll(async () => { await pg?.cleanup(); });
+
+    // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21380
+    // Real release owner + real live-delivery SQL; only the provider and outer
+    // execution lifecycle are doubled. Completion attribution uses real PG too.
+    it.each(["continuous", "legacy"] as const)("offers before fencing the held turn (%s)", async mode => {
+      const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
+      const sessionId = randomUUID(), taskId = randomUUID(), userId = randomUUID(), wakeId = randomUUID();
+      const scope = { companyId, agentId, issueId, runId };
+      await db.insert(authUsers).values({ id: userId, name: "Operator", email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
+      await db.insert(companies).values({ id: companyId, name: "Hold release", issuePrefix: companyId.slice(0, 8) });
+      await db.insert(agents).values({ id: agentId, companyId, name: "Lead", status: "idle", adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } });
+      await db.insert(issues).values([{ id: issueId, companyId, title: "Chat", status: "in_progress", assigneeAgentId: agentId,
+        conversationAgentId: agentId, conversationUserId: userId, conversationState: "active" },
+        { id: taskId, companyId, title: "Completed subtask", identifier: `TASK-${taskId.slice(0, 8)}`, status: "done" }]);
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: issueId, nativeSessionId: sessionId,
+        status: "running", runtimeMode: "native", contextSnapshot: { issueId, conversationSessionGeneration: 0 } });
+      await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+      await db.insert(chatTaskHandoffs).values({ companyId, taskId, conversationId: issueId, agentId, sessionGeneration: 0 });
+      // Admission races the delivery worker after it acquired its JS-timestamp lease.
+      const [delivery] = await db.insert(chatCompletionDeliveries).values({ companyId, taskId, statusVersion: 0, nextAttemptAt: new Date(Date.now() + 60_000) }).returning();
+      await db.insert(agentWakeupRequests).values({ id: wakeId, companyId, agentId, source: "automation", reason: "issue_execution_deferred", status: "deferred_issue_execution",
+        idempotencyKey: `chat-completion:${delivery.id}:0`, payload: { issueId, _paperclipWakeContext: { issueId, wakeReason: "chat_task_completed", conversationSessionGeneration: 0, chatCompletionDeliveryIds: [delivery.id] } } });
+      const final: PrpEvent = { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "runner", sourceSeq: 1,
+        priority: 0, emittedAt: new Date().toISOString(), sourceInstanceId: "runner", normalizedSessionId: sessionId,
+        eventType: "item.completed", runId, itemId: "opening", sourceEventId: "opening",
+        payload: { kind: "agentMessage", channel: "final", text: "Your question is answered.", ...(mode === "continuous" ? { answers: [] } : {}) } };
+      await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId, seq: 170, eventType: final.eventType, payload: { prpEvent: final } });
+      const publish = continuousReply.publishContinuousNativeReply;
+      await publish({ db, execution: { binding: scope, provider: { kind: "pi_rpc" } }, event: final, cursor: 170 });
+      vi.spyOn(continuousReply, "publishContinuousNativeReply").mockResolvedValue(true);
+      vi.spyOn(resetWakeQueue, "closeConversationResetHold").mockResolvedValue(false);
+      const completions = await vi.importActual<typeof import("../chat-completion-delivery.js")>("../chat-completion-delivery.js");
+      heldCompletionOffers.invoke.mockImplementation((_db, offeredScope) => completions.offerHeldChatCompletions(db, offeredScope));
+      const result: Record<string, unknown> = {};
+      const piExecution = { ...execution, binding: scope, provider: { kind: "pi_rpc", model: "openai/gpt-5", conversationMode: true },
+        session: { ...execution.session, driverKind: "pi_rpc", normalizedSessionId: sessionId } } as NativeExecutionInputV1;
+      const { running } = await startActiveSession(piExecution, leaseDb(piExecution, {}, result));
+      try {
+        await accountingEvents.committed!(final);
+        const closed = await closeHeldNativeTurn(runId);
+        console.info("A-release-offer", { mode, closed, offerCalls: heldCompletionOffers.invoke.mock.calls.length,
+          offers: await Promise.all(heldCompletionOffers.invoke.mock.results.map(r => r.value)),
+          steering: await getNativeSessionSteeringState(runId),
+          outbox: await db.select().from(chatCompletionDeliveries).where(eq(chatCompletionDeliveries.id, delivery.id)) });
+        expect(closed).toBe(mode === "legacy");
+        expect(interrupt).toHaveBeenCalledTimes(mode === "legacy" ? 1 : 0);
+        expect(steer).toHaveBeenCalledTimes(mode === "continuous" ? 1 : 0);
+        if (mode === "continuous") {
+          expect(steer).toHaveBeenCalledWith(expect.objectContaining({ correlationId: delivery.id }));
+          const answer = { ...final, itemId: "completion-report", sourceEventId: "completion-report",
+            payload: { ...final.payload, text: `Finished: [TASK-${taskId.slice(0, 8)}](/issues/${taskId}).`, answers: [delivery.id] } };
+          await publish({ db, execution: { binding: scope, provider: { kind: "pi_rpc" } }, event: answer, cursor: 171 });
+          await publish({ db, execution: { binding: scope, provider: { kind: "pi_rpc" } }, event: answer, cursor: 171 });
+          const [outbox] = await db.select().from(chatCompletionDeliveries).where(eq(chatCompletionDeliveries.id, delivery.id));
+          const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+          expect(outbox).toMatchObject({ status: "delivered", targetRunId: runId, attempts: 0 });
+          expect(wake).toMatchObject({ status: "coalesced", runId });
+          const reports = await db.select().from(issueComments).where(eq(issueComments.id, outbox.responseCommentId!));
+          expect(reports).toMatchObject([{ createdByRunId: runId, body: answer.payload.text }]);
+        }
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+        const release = createReleaseIssueExecution({ issueLock: createPostgresWakeQueueAdapter(db, { resolveResponsibleUserId: async () => userId,
+          getRoutineEnv: async () => ({ routineId: null, env: {}, responsibleUserId: null }), resolveSessionBeforeForWakeup: async () => sessionId }),
+          recovery: { escalateStrandedAssignedIssue: vi.fn(), escalateStrandedRecoveryIssueInPlace: vi.fn() } as never });
+        const released = await release({ companyId, runId, now: new Date(), suppressImmediateRecovery: true });
+        expect(released.outcome.kind === "promoted").toBe(mode === "legacy");
+        console.info("A-completion-release-row", { mode, ...scope, wakeId, deliveryId: delivery.id, outcome: released.outcome.kind,
+          runs: (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).map(r => r.id) });
+      } finally { state.release?.(); await running; vi.restoreAllMocks(); }
+    });
+  });
+
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21380
+  it.each(["offered", "configuration-during-offer"] as const)("keeps one release owner while completion I/O yields (%s)", async mode => {
+    const result: Record<string, unknown> = {};
+    vi.spyOn(continuousReply, "publishContinuousNativeReply").mockResolvedValue(true);
+    vi.spyOn(resetWakeQueue, "closeConversationResetHold").mockResolvedValue(false);
+    const piExecution = { ...execution, provider: { kind: "pi_rpc", model: "openai/gpt-5", conversationMode: true },
+      session: { ...execution.session, driverKind: "pi_rpc" } } as NativeExecutionInputV1;
+    const { running } = await startActiveSession(piExecution, leaseDb(piExecution, {}, result));
+    let release!: () => void;
+    const offered = new Promise<boolean>(resolve => { release = () => resolve(true); });
+    heldCompletionOffers.invoke.mockReturnValue(offered);
+    try {
+      await accountingEvents.committed!({ schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "runner", sourceSeq: 1,
+        priority: 0, emittedAt: new Date().toISOString(), sourceInstanceId: "runner", normalizedSessionId: "session-native-cancel",
+        eventType: "item.completed", runId: execution.binding.runId, itemId: "opening", sourceEventId: "opening",
+        payload: { kind: "agentMessage", channel: "final", text: "Opening done" } });
+      const closing = closeHeldNativeTurn(execution.binding.runId);
+      await vi.waitFor(() => expect(heldCompletionOffers.invoke).toHaveBeenCalledOnce());
+      expect(await closeHeldNativeTurn(execution.binding.runId)).toBe(false);
+      expect(interrupt).not.toHaveBeenCalled();
+      if (mode === "configuration-during-offer") {
+        result.heldNativeConfigurationEnd = true;
+        await getNativeSessionSteeringState(execution.binding.runId);
+      }
+      release();
+      expect(await closing).toBe(mode === "configuration-during-offer");
+      expect(interrupt).toHaveBeenCalledTimes(mode === "configuration-during-offer" ? 1 : 0);
+      if (mode === "offered") expect(await getNativeSessionSteeringState(execution.binding.runId)).toMatchObject({ disposition: "available" });
+    } finally { release(); state.release?.(); await running; vi.restoreAllMocks(); }
   });
 
   it.each(["held", "held-70000", "held-300000", "working", "steered", "question", "pending-tool"])("closes a reset hold only when idle: %s", async mode => {
