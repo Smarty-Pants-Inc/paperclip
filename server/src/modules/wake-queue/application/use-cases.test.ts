@@ -116,6 +116,7 @@ function createFakeTransaction(overrides: Partial<WakeQueueTransaction> = {}): W
     })),
     getCommentSelfAuthorship: vi.fn(async () => ({ allSelfAuthored: false, includesPersonComment: false })),
     isWatcherCommentDuringFinishingRun: vi.fn(async () => false),
+    hasConsumedInteractionResponse: vi.fn(async () => false),
     owedInteractionAnswer: vi.fn(async (): Promise<"deliver" | "blocked" | null> => null),
     isCompletedDelegationMention: vi.fn(async () => false),
     reopenIssue: vi.fn(async () => null),
