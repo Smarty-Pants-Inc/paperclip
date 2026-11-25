@@ -483,6 +483,24 @@ type IssueDetailComment = (IssueComment | OptimisticIssueComment) & {
   conversationAnchorSequence?: number;
 };
 
+// First snapshot wins; authoritative rows replace echoes, never their render keys.
+function reconcileThreadComments(comments: readonly IssueDetailComment[]): IssueDetailComment[] {
+  const byId = new Map<string, IssueDetailComment>();
+  const byRequest = new Map<string, IssueDetailComment>();
+  for (const comment of comments) {
+    const key = comment.clientRequestId ? JSON.stringify([comment.authorUserId, comment.clientRequestId]) : null;
+    const previous = byId.get(comment.id) ?? (key ? byRequest.get(key) : undefined);
+    const saved = previous && !previous.id.startsWith("optimistic-") ? previous : comment;
+    const echo = "clientId" in comment && comment.clientId ? comment : previous;
+    const clientId = echo && "clientId" in echo ? echo.clientId : undefined;
+    const canonical = { ...saved, ...(clientId ? { clientId, createdAt: echo!.createdAt } : {}) };
+    if (previous) byId.delete(previous.id);
+    byId.set(canonical.id, canonical);
+    if (key) byRequest.set(key, canonical);
+  }
+  return [...byId.values()];
+}
+
 function isPlanConfirmationInteraction(
   interaction: IssueThreadInteraction,
 ): interaction is RequestConfirmationInteraction {
@@ -1345,7 +1363,9 @@ type IssueDetailChatTabProps = {
   onDeleteComment?: (commentId: string) => Promise<void> | void;
   onPauseWorkRun?: (runId: string, feedback?: "composer") => Promise<void>;
   onStopResponse?: (runId: string) => Promise<void>;
-  onRestoreStoppedMessages?: (commentIds: readonly string[]) => Promise<boolean>;
+  onRestoreStoppedMessages?: (commentIds: readonly string[], availableComments?: readonly IssueDetailComment[]) => Promise<boolean>;
+  restoredStoppedCommentIds: ReadonlySet<string>;
+  onRestoreReady?: () => void;
   stopResponsePending?: boolean;
   pauseWorkPending?: boolean;
   pauseWorkScope?: "leaf" | "subtree";
@@ -1483,6 +1503,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   onPauseWorkRun,
   onStopResponse,
   onRestoreStoppedMessages,
+  restoredStoppedCommentIds,
+  onRestoreReady,
   stopResponsePending,
   pauseWorkPending,
   pauseWorkScope,
@@ -2288,53 +2310,76 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     locallyQueuedCommentRunIds,
     queuedCommentQueueEnabled,
   ]);
-  const visibleQueuedCommentQueue = useMemo(() => {
-    // The POST can finish before the durable receipt refetch. Keep these inputs
-    // in the tray rather than inventing a client-clock conversation boundary.
-    const pendingComments = [...localSteeringPlacements].flatMap(([id, placement]) =>
-      placement.comment && !commentsWithRunMeta.some(comment => comment.id === id && comment.steeredIntoRunId)
-        ? [{ comment: placement.comment, targetRunId: placement.targetRunId }] : []);
-    const queue = pendingComments.length ? mergePendingIssueQueuedComments({ issueId, authoritativeQueue: effectiveQueuedCommentQueue,
-      pendingComments, fallbackProtocol: "paperclip_runner_v1" }) : effectiveQueuedCommentQueue;
-    if (!queue) return null;
-    const pendingIds = new Set(pendingComments.map(({ comment }) => comment.id));
-    const entries = queue.entries.filter(entry => !startingCommentIds.has(entry.comment.id))
-      .map((entry, position) => ({ ...entry, position, canDiscard: entry.canDiscard && !pendingIds.has(entry.comment.id) }));
-    return entries.length || queue.pendingQueue?.entries.length ? { ...queue, entries } : null;
-  }, [effectiveQueuedCommentQueue, startingCommentIds, localSteeringPlacements, commentsWithRunMeta, issueId]);
-  const commentsForThread = useMemo(
-    () =>
-      [...commentsWithRunMeta, ...(authoritativeQueuedCommentQueue?.entries ?? [])
-        .filter(entry => startingCommentIds.has(entry.comment.id) &&
-          !commentsWithRunMeta.some(comment => comment.id === entry.comment.id))
-        .map((entry): IssueDetailComment => entry.comment)].flatMap((comment) => {
-        if (discardedQueuedCommentIds.has(comment.id)) return [];
-        if (!consumedQueuedCommentIds.has(comment.id) && !startingCommentIds.has(comment.id)) return [comment];
-        return [
-          {
-            ...comment,
-            ...(!comment.consumedByRunId && localInterruptPlacements.has(comment.id)
-              ? {
-                  conversationAnchorAt: localInterruptPlacements.get(comment.id)!.anchorAt,
-                  conversationAnchorSequence: localInterruptPlacements.get(comment.id)!.sequence,
-                }
-              : {}),
-            clientStatus: undefined,
-            queueState: undefined,
-            queueTargetRunId: null,
-            queueReason: undefined,
-          },
-        ];
-      }),
-    [
-      commentsWithRunMeta,
-      consumedQueuedCommentIds,
-      discardedQueuedCommentIds,
-      localInterruptPlacements,
-      authoritativeQueuedCommentQueue,
-      startingCommentIds,
-    ],
-  );
+  const [retainedSubmissionId, setRetainedSubmissionId] = useState<string | null>(null);
+  // Retain committed rows independently of queue/history refresh order.
+  const paintedComments = useRef({ issueId, rows: [] as IssueDetailComment[] });
+  if (paintedComments.current.issueId !== issueId) paintedComments.current = { issueId, rows: [] };
+  // One placement projection. A queue record is transport state, not a request
+  // to wait: this composer offers Send, not Wait. Ordinary human sends belong
+  // in the thread; interaction queues retain their existing tray controls.
+  // Keep transport entries for auto-steer, without letting either child infer
+  // placement from clientStatus. Only this owner retains committed thread rows.
+  const { visibleQueuedCommentQueue, commentsForThread, sentCommentIds, hiddenThreadCommentIds, hiddenQueuedCommentIds } = useMemo(() => {
+    // Stop asks for restoration; only the box's durable receipt hides a row.
+    const returnedIds = new Set<string>();
+    const deliveredIds = new Set(resolvedLinkedRuns.flatMap(run => Object.keys(run.resultJson?.queuedSteeringAcknowledgements ?? {})));
+    const queueEntries = [...(effectiveQueuedCommentQueue?.entries ?? []), ...(effectiveQueuedCommentQueue?.pendingQueue?.entries ?? [])];
+    const retained = paintedComments.current.rows;
+    const canonicalComments = reconcileThreadComments([
+      ...commentsWithRunMeta, ...queueEntries.map(entry => entry.comment), ...retained,
+    ]);
+    for (const comment of canonicalComments) {
+      if (restoredStoppedCommentIds.has(`${issueId}:${comment.id}`)) returnedIds.add(comment.id);
+    }
+    const queuedIds = new Set(queueEntries.map(entry => entry.comment.id));
+    // The tray is part of THIS person's composer, never an agent/bridge inbox.
+    const hiddenQueuedCommentIds = new Set(queueEntries.filter(entry =>
+      entry.comment.authorType !== "user" || !currentUserId || entry.comment.authorUserId !== currentUserId).map(entry => entry.comment.id));
+    const byId = new Map(canonicalComments.map(comment => [comment.id, comment]));
+    const interactionIds = new Set(queueEntries.filter(entry => entry.source).map(entry => entry.comment.id));
+    const sentCommentIds = new Set<string>();
+    const hiddenThreadCommentIds = new Set<string>();
+    const commentsForThread = [...byId.values()].flatMap((comment): IssueDetailComment[] => {
+      // Send ownership is a property of the message, not its viewer or whether
+      // this mount has painted it. Identical queue/history snapshots must give
+      // the same thread after reload and in another person's tab.
+      const sent = (comment.authorType === "user" &&
+        !interactionIds.has(comment.id) && !comment.id.startsWith("interaction-response:")) ||
+        deliveredIds.has(comment.id) || consumedQueuedCommentIds.has(comment.id) || startingCommentIds.has(comment.id) || Boolean(comment.steeredIntoRunId);
+      if (sent) { sentCommentIds.add(comment.id); hiddenQueuedCommentIds.add(comment.id); }
+      if (discardedQueuedCommentIds.has(comment.id)) return [];
+      if (returnedIds.has(comment.id) || (!sent && queuedIds.has(comment.id)) ||
+        (comment.id.startsWith("optimistic-") && comment.clientRequestId === retainedSubmissionId)) hiddenThreadCommentIds.add(comment.id);
+      if (!sent) return [comment];
+      const placement = localInterruptPlacements.get(comment.id);
+      return [{ ...comment,
+        ...(!comment.consumedByRunId && placement ? {
+          conversationAnchorAt: placement.anchorAt, conversationAnchorSequence: placement.sequence,
+        } : {}),
+        clientStatus: undefined, queueState: undefined, queueTargetRunId: null, queueReason: undefined,
+      }];
+    });
+    const keepEntry = (entry: (typeof queueEntries)[number]) => byId.has(entry.comment.id) && !returnedIds.has(entry.comment.id) && !deliveredIds.has(entry.comment.id) &&
+      !discardedQueuedCommentIds.has(entry.comment.id) && !startingCommentIds.has(entry.comment.id) &&
+      (!classicTaskInterfaceEnabled || !hiddenQueuedCommentIds.has(entry.comment.id));
+    const visibleQueuedCommentQueue = effectiveQueuedCommentQueue ? {
+      ...effectiveQueuedCommentQueue,
+      entries: effectiveQueuedCommentQueue.entries.filter(keepEntry),
+      pendingQueue: effectiveQueuedCommentQueue.pendingQueue ? {
+        ...effectiveQueuedCommentQueue.pendingQueue,
+        entries: effectiveQueuedCommentQueue.pendingQueue.entries.filter(keepEntry),
+      } : null,
+    } : null;
+    return { visibleQueuedCommentQueue, commentsForThread, sentCommentIds, hiddenThreadCommentIds, hiddenQueuedCommentIds };
+  }, [effectiveQueuedCommentQueue, commentsWithRunMeta, resolvedLinkedRuns, discardedQueuedCommentIds,
+    consumedQueuedCommentIds, startingCommentIds, localInterruptPlacements, retainedSubmissionId, currentUserId, classicTaskInterfaceEnabled, issueId, restoredStoppedCommentIds]);
+  useLayoutEffect(() => {
+    paintedComments.current.rows = commentsForThread.filter(comment =>
+      !comment.id.startsWith("optimistic-") && !comment.deletedAt && !hiddenThreadCommentIds.has(comment.id));
+  }, [commentsForThread, hiddenThreadCommentIds]);
+  const restoreVisibleStoppedMessages = useCallback((ids: readonly string[]) =>
+    onRestoreStoppedMessages?.(ids, commentsForThread) ?? Promise.resolve(false),
+  [onRestoreStoppedMessages, commentsForThread]);
 
   const storeQueuedCommentQueue = useCallback(
     (value: unknown) => {
@@ -2477,6 +2522,14 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
           next.delete(commentId);
           return next;
         });
+        // A definitive refusal returns the person's send through the existing
+        // cancel/restore door. Conflicts may mean delivery won the race.
+        const refusal = error instanceof ApiError ? error.body as { code?: string; details?: { code?: string } } | null : null;
+        const refusedSteering = (refusal?.code ?? refusal?.details?.code) === "steering_unsupported";
+        if (queuedComment.authorUserId === currentUserId && sentCommentIds.has(commentId) && error instanceof ApiError &&
+          error.status >= 400 && error.status < 500 && (error.status !== 409 || refusedSteering)) {
+          onCancelQueued(commentId);
+        }
         await refreshQueueAfterConflict(error);
       }
     },
@@ -2487,6 +2540,9 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       queryClient,
       refreshQueueAfterConflict,
       storeQueuedCommentQueue,
+      sentCommentIds,
+      currentUserId,
+      onCancelQueued,
     ],
   );
 
@@ -2500,17 +2556,17 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       const ids = queuedComments.map((comment) => comment.id);
       const anchorAt = new Date().toISOString();
       setClassicQueuedDeliveryError(null);
-      setConsumedQueuedCommentIds((current) => new Set([...current, ...ids]));
-      setLocalInterruptPlacements((current) => {
-        const next = new Map(current);
-        queuedComments.forEach((comment, sequence) => {
-          next.set(comment.id, { anchorAt, sequence, comment });
-        });
-        return next;
-      });
       try {
         const updatedQueue = await onInterruptQueued(runId);
-        if (updatedQueue?.state === "deferred" && !isQueuedInterruptHandoff(updatedQueue)) {
+        setConsumedQueuedCommentIds((current) => new Set([...current, ...ids]));
+        setLocalInterruptPlacements((current) => {
+          const next = new Map(current);
+          queuedComments.forEach((comment, sequence) => {
+            next.set(comment.id, { anchorAt, sequence, comment });
+          });
+          return next;
+        });
+        if ((updatedQueue?.state === "queued" || updatedQueue?.state === "deferred") && !isQueuedInterruptHandoff(updatedQueue)) {
           const remaining = new Set(updatedQueue.entries.map(entry => entry.comment.id));
           setConsumedQueuedCommentIds(current => new Set([...current].filter(id => !remaining.has(id))));
           setLocalInterruptPlacements(current => new Map([...current].filter(([id]) => !remaining.has(id))));
@@ -2727,7 +2783,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
               if (activeRunQueryEnabled) void refetchActiveRun();
             }}
             composerRef={composerRef}
-            onRestoreStoppedMessages={onRestoreStoppedMessages}
+            onRestoreStoppedMessages={restoreVisibleStoppedMessages}
             composerAccessory={<><WorkspaceRetryControl />{composerAccessory}</>}
             threadHeader={
               !classicTaskInterfaceEnabled &&
@@ -2739,7 +2795,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
               ) : null
             }
             issueBrief={issueBrief}
-            comments={commentsForThread}
+            comments={classicTaskInterfaceEnabled ? commentsForThread.filter(comment => !hiddenThreadCommentIds.has(comment.id)) : commentsForThread}
             interactions={interactions}
             documents={documents}
             workProducts={workProducts}
@@ -2810,6 +2866,11 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             onAttachImage={onAttachImage}
             onInterruptQueued={interruptQueuedComments}
             queuedCommentQueue={visibleQueuedCommentQueue}
+            sentCommentIds={sentCommentIds}
+            hiddenThreadCommentIds={hiddenThreadCommentIds}
+            hiddenQueuedCommentIds={hiddenQueuedCommentIds}
+            onRetainedSubmissionChange={setRetainedSubmissionId}
+            onRestoreReady={onRestoreReady}
             onEditQueuedComment={editQueuedComment}
             onReorderQueuedComments={reorderQueuedComments}
             onSteerQueuedComment={steerQueuedComment}
@@ -4346,15 +4407,20 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   );
 
   const threadComments = useMemo(
-    () =>
-      mergeIssueComments(comments ?? [], optimisticComments)
+    () => {
+      const merged = reconcileThreadComments([
+        ...mergeIssueComments(comments ?? [], optimisticComments.filter(comment => !comment.clientRequestId)),
+        ...optimisticComments.filter(comment => comment.clientRequestId),
+      ]);
+      return merged.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
       .filter(comment => !(comment.authorType === "system" && comment.metadata?.recoveryResponsibility === "system"))
       .map((comment) => {
         if ("clientId" in comment && comment.clientId)
           commentRenderKeys.current.set(comment.id, comment.clientId);
         const clientId = commentRenderKeys.current.get(comment.id);
         return clientId ? { ...comment, clientId, createdAt: commentSubmissionTimes.current.get(clientId) ?? comment.createdAt } : comment;
-      }),
+      });
+    },
     [comments, optimisticComments],
   );
   const breadcrumbTitle = issue?.title ?? issueHeaderSeed?.title ?? "";
@@ -4536,8 +4602,48 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     [issueCacheRefs, queryClient],
   );
 
+  const [restoredStoppedCommentIds, setRestoredStoppedCommentIds] = useState<ReadonlySet<string>>(new Set());
+  const restoredStoppedCommentIdsRef = useRef(restoredStoppedCommentIds);
+  const acknowledgeRestoredComments = useCallback((comments: readonly IssueDetailComment[]) => {
+    if (!comments.length) return;
+    const next = new Set(restoredStoppedCommentIdsRef.current);
+    for (const comment of comments) next.add(`${comment.issueId}:${comment.id}`);
+    if (next.size === restoredStoppedCommentIdsRef.current.size) return;
+    restoredStoppedCommentIdsRef.current = next;
+    setRestoredStoppedCommentIds(next);
+  }, []);
+
+  const forgetRestoredComments = useCallback((comments: readonly IssueDetailComment[]) => {
+    const next = new Set(restoredStoppedCommentIdsRef.current);
+    for (const comment of comments) next.delete(`${comment.issueId}:${comment.id}`);
+    if (next.size === restoredStoppedCommentIdsRef.current.size) return;
+    restoredStoppedCommentIdsRef.current = next;
+    setRestoredStoppedCommentIds(next);
+  }, []);
+
+  // A cancel receipt requests a return; it is not a composer receipt. Keep
+  // failed transfers here until the existing composer can accept them.
+  const pendingCancelledReturns = useRef(new Map<string, IssueDetailComment>());
+  const restoreCancelledComment = useCallback((comment: IssueDetailComment) => {
+    const restored = commentComposerRef.current?.restoreStoppedMessages?.([comment]).includes(comment.id) === true;
+    if (restored) {
+      pendingCancelledReturns.current.delete(comment.id);
+      acknowledgeRestoredComments([comment]);
+    } else {
+      pendingCancelledReturns.current.set(comment.id, comment);
+      forgetRestoredComments([comment]);
+    }
+    return restored;
+  }, [acknowledgeRestoredComments, forgetRestoredComments]);
+  const retryCancelledReturns = useCallback(() => {
+    for (const comment of pendingCancelledReturns.current.values()) {
+      if (comment.issueId !== (issue?.id ?? issueId) || comment.authorUserId !== currentUserId) continue;
+      if (restoreCancelledComment(comment)) void removeCommentFromCache(comment.id);
+    }
+  }, [issue?.id, issueId, currentUserId, restoreCancelledComment, removeCommentFromCache]);
+
   const restoreQueuedCommentDraft = useCallback((body: string) => {
-    commentComposerRef.current?.restoreDraft(body);
+    return Boolean(commentComposerRef.current) && commentComposerRef.current!.restoreDraft(body) !== false;
   }, []);
 
   const invalidateIssueCollections = useCallback(() => {
@@ -5188,7 +5294,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       }
       return issuesApi.addComment(writableIssueId, body, reopen, interrupt, attachmentIds, clientRequestId ?? createUuid());
     },
-    onMutate: async ({ body, reopen, interrupt }) => {
+    onMutate: async ({ body, reopen, interrupt, clientRequestId }) => {
       // Start cache cancellation immediately but do not put it in front of the
       // optimistic echo. The new-runner startup placeholder must paint in the
       // same frame as send, even when an in-flight comments query is slow to
@@ -5220,7 +5326,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
 
       if (optimisticComment) {
         commentSubmissionTimes.current.set(optimisticComment.clientId, optimisticComment.createdAt);
-        setOptimisticComments((current) => [...current, optimisticComment]);
+        setOptimisticComments((current) => [...current, { ...optimisticComment, clientRequestId }]);
       }
       if (previousIssue) {
         queryClient.setQueryData(
@@ -5238,6 +5344,11 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       };
     },
     onSuccess: async (comment, _variables, context) => {
+      // A return can beat the POST response. It must not resurrect the bubble.
+      if (restoredStoppedCommentIdsRef.current.has(`${comment.issueId}:${comment.id}`)) {
+        setOptimisticComments(current => current.filter(entry => entry.clientId !== context?.optimisticCommentId));
+        return;
+      }
       if (
         context?.optimisticCommentId &&
         cancelledQueuedOptimisticCommentIdsRef.current.has(
@@ -5283,7 +5394,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       if (context?.optimisticCommentId) {
         commentRenderKeys.current.set(comment.id, context.optimisticCommentId);
       }
-      if (paginatedConversation) retainComment(comment);
+      retainComment(comment);
       queryClient.setQueryData<InfiniteData<IssueComment[], string | null>>(
         queryKeys.issues.comments(issueId ?? comment.issueId),
         (current) =>
@@ -5618,7 +5729,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         ...(interrupt ? { interrupt } : {}),
       });
     },
-    onMutate: async ({ body, reopen, reassignment, interrupt }) => {
+    onMutate: async ({ body, reopen, reassignment, interrupt, clientRequestId }) => {
       // Cache cancellation can wait on an active request for several seconds.
       // Start it now, but paint the optimistic echo before awaiting it so a
       // reassignment never clears the composer into an empty thread.
@@ -5649,7 +5760,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
 
       if (optimisticComment) {
         commentSubmissionTimes.current.set(optimisticComment.clientId, optimisticComment.createdAt);
-        setOptimisticComments((current) => [...current, optimisticComment]);
+        setOptimisticComments((current) => [...current, { ...optimisticComment, clientRequestId }]);
       }
       if (previousIssue) {
         queryClient.setQueryData(
@@ -5672,6 +5783,10 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     onSuccess: async (result, _variables, context) => {
       const { comment, ...nextIssue } = result;
       queryClient.setQueryData(queryKeys.issues.detail(issueId!), nextIssue);
+      if (comment && restoredStoppedCommentIdsRef.current.has(`${comment.issueId}:${comment.id}`)) {
+        setOptimisticComments(current => current.filter(entry => entry.clientId !== context?.optimisticCommentId));
+        return;
+      }
       if (
         comment &&
         context?.optimisticCommentId &&
@@ -5716,7 +5831,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         });
       }
       if (comment) {
-        if (paginatedConversation) retainComment(comment);
+        retainComment(comment);
         if (context?.optimisticCommentId)
           commentRenderKeys.current.set(
             comment.id,
@@ -5809,10 +5924,14 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         next.delete(comment.id);
         return next;
       });
-      await removeCommentFromCache(comment.id);
-      // Never lose the person's words: with no box to take them, show them.
-      const restored = Boolean(commentComposerRef.current);
-      restoreQueuedCommentDraft(comment.body);
+      // A refused hidden steer may return before its original save responds.
+      // Retire that echo and fence the late response using the same return door.
+      setOptimisticComments(current => current.filter(entry => !comment.clientRequestId || entry.clientRequestId !== comment.clientRequestId));
+      // The paint fence is not custody: an explicit discard may have released
+      // the durable copy while cancel was in flight. Ask the box afresh.
+      const restored = restoreCancelledComment(comment);
+      if (restored) await removeCommentFromCache(comment.id);
+      else await upsertCommentInCache(comment); // No fresh receipt: keep the returned text visible.
       invalidateIssueDetail();
       invalidateIssueThreadLazily();
       invalidateIssueCollections();
@@ -5837,20 +5956,24 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   // Transfer the whole batch before deleting anything. Only the composer's
   // durable per-comment receipts authorize deletion; text equality and an old
   // in-memory acknowledgment are not custody of this message.
-  const restoreStoppedMessages = useCallback(async (commentIds: readonly string[]) => {
-    const comments = [...new Set(commentIds)].flatMap((id) => {
-      const comment = threadComments.find((item) => item.id === id && !item.deletedAt && item.authorUserId === currentUserId);
-      return comment ? [comment] : [];
+  const restoreStoppedMessages = useCallback(async (commentIds: readonly string[], availableComments: readonly IssueDetailComment[] = []) => {
+    const byId = new Map([...availableComments, ...threadComments].map(comment => [comment.id, comment]));
+    const ids = [...new Set(commentIds)];
+    const comments = ids.flatMap(id => {
+      const comment = byId.get(id);
+      return comment && comment.issueId === (issue?.id ?? issueId) && !comment.deletedAt && comment.authorUserId === currentUserId ? [comment] : [];
     });
-    if (comments.length === 0) return true;
+    // Missing text cannot complete a return. The caller retries individual IDs.
+    if (comments.length !== ids.length || !comments.length) return false;
     const restoredIds = new Set(commentComposerRef.current?.restoreStoppedMessages?.(comments) ?? []);
-    // Start every acknowledged delete in this turn: do not retain a receipt
-    // across an await during which the person could edit or clear the draft.
-    const deleted = await Promise.all(comments.map((comment) => restoredIds.has(comment.id)
+    acknowledgeRestoredComments(comments.filter(comment => restoredIds.has(comment.id)));
+    // Hide accepted IDs in the same paint as the box. Re-read custody on each
+    // deletion attempt: the UI fence alone is never a durable receipt.
+    const deleted = await Promise.all(comments.map(comment => restoredIds.has(comment.id)
       ? issuesApi.deleteComment(issueId!, comment.id).then(upsertCommentInCache).then(() => true).catch(() => false)
       : false));
     return deleted.every(Boolean);
-  }, [threadComments, issueId, currentUserId, upsertCommentInCache]);
+  }, [threadComments, issueId, issue?.id, currentUserId, upsertCommentInCache, acknowledgeRestoredComments]);
   const deleteComment = useMutation({
     mutationFn: async ({ commentId }: { commentId: string }) =>
       issuesApi.deleteComment(issueId!, commentId),
@@ -8918,6 +9041,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                       .then(() => undefined)
                   }
                   onRestoreStoppedMessages={restoreStoppedMessages}
+                  restoredStoppedCommentIds={restoredStoppedCommentIds}
+                  onRestoreReady={retryCancelledReturns}
                   onStopResponse={canManageTreeControl
                     ? (runId) => stopResponse.mutateAsync(runId)
                     : undefined}
