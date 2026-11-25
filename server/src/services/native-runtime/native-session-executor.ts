@@ -1,4 +1,5 @@
 import { currentControllerProcess } from "../controller-process-identity.js";
+import { resolveSessionContinuity } from "./continued-session.js";
 import { settleStartupStop } from "../person-stop-before-turn.js";
 import { settleReattachRun } from "../heartbeat/run-admission.js";
 import { remoteRecoveryLeaseMismatch } from "./remote-recovery-lease-mismatch.js";
@@ -17074,7 +17075,13 @@ async function createRunnerdBackendWithinSessionClaim(
   if (preparedEnvironment.status === "rejected") throw preparedEnvironment.reason;
   if (preparedAssignedMcp.status === "rejected") throw preparedAssignedMcp.reason;
   if (preparedPluginTaskOwner.status === "rejected") throw preparedPluginTaskOwner.reason;
-  const runnerEnvironment = preparedEnvironment.value;
+  const runnerEnvironment = { ...preparedEnvironment.value };
+  // Server-owned launch flag, never an agent's environment-binding override.
+  delete runnerEnvironment.PAPERCLIP_PI_CONTINUOUS;
+  if (input.execution.provider.kind === "pi_rpc" &&
+    resolveSessionContinuity(input.execution.provider.kind, input.execution.provider.sessionContinuity) === "continuous") {
+    runnerEnvironment.PAPERCLIP_PI_CONTINUOUS = "1";
+  }
   const assignedMcpTools = preparedAssignedMcp.value;
   const dotAttachmentActor = input.execution.schema === "paperclip.native-execution-input.v6"
     ? await input.db.select({ config: agents.adapterConfig }).from(agents).where(and(

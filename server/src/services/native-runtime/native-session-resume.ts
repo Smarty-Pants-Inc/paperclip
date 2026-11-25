@@ -650,8 +650,10 @@ export function nativeRuntimeContextsMatch(
   previous: NativeRuntimeContextSnapshot,
   current: NativeRuntimeContextSnapshot,
   toolRefreshOnResume?: boolean,
+  instructionRefreshOnResume = false,
 ): boolean {
   return previous.aggregateDigest === current.aggregateDigest ||
+    (instructionRefreshOnResume && canonicalNativeRuntimeContextDigest({ ...previous, instructions: current.instructions }) === current.aggregateDigest) ||
     (toolRefreshOnResume === true && canonicalNativeRuntimeContextDigest({ ...previous, mcp: current.mcp }) === current.aggregateDigest);
 }
 
@@ -740,7 +742,8 @@ export function rebindNativeSessionCheckpoint(input: {
     ("homeMode" in previousExecution ? previousExecution.homeMode : "isolated") !== ("homeMode" in current ? current.homeMode : "isolated") ||
     ("runtimeContext" in previousExecution &&
       "runtimeContext" in current &&
-      !nativeRuntimeContextsMatch(previousExecution.runtimeContext, current.runtimeContext, input.toolRefreshOnResume))
+      !nativeRuntimeContextsMatch(previousExecution.runtimeContext, current.runtimeContext, input.toolRefreshOnResume,
+        current.provider.kind === "pi_rpc" && resolveSessionContinuity(current.provider.kind, current.provider.sessionContinuity) === "continuous"))
   )
     return null;
 
