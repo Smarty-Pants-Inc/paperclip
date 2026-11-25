@@ -4357,6 +4357,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #traceRehydrationSpoolOverflow = false;
   #traceRehydrationUnmatched = false;
   #traceCorrelationsDirty = false;
+  #nextTraceRefreshAt = 0;
+  #traceRefreshSourceSeq = -1;
   readonly #traceFrameIndex = new RunnerdTraceFrameIndex();
   /** Clock of the startup, recovery, or turn-start admission in progress, if any. */
   #admissionClock: RunnerStallLedger | null = null;
@@ -5484,19 +5486,15 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
 
   recordTraceInterpretation(input: CodexTraceInterpretation): void {
     const tracePath = this.options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH;
-    // pi_rpc does not emit the Rust native trace frames these stages correlate.
-    if (!tracePath || this.options.provider === "pi_rpc") return;
-    const traceResult = appendCodexDriverInterpretationTrace(
-      this.#traceFrameIndex, tracePath, input, this.#nextTraceDebugSequence,
-    );
-    if (traceResult === "written") this.#nextTraceDebugSequence += 1;
-    else if (traceResult === "retry" || traceResult === "write_retry") {
-      if (this.#pendingDriverTraceInterpretations.length < 4_096) {
-        this.#pendingDriverTraceInterpretations.push({ ...structuredClone(input), enqueuedAt: Date.now() });
-        this.#traceCorrelationsDirty = true;
-        this.#wakePump();
-      } else this.#traceRehydrationSpoolOverflow = true;
-    }
+    if (!tracePath || (this.options.provider === "pi_rpc" && !this.#traceFrameIndex.nativeChannelCaptured)) return;
+    // Driver ingress can follow a native append after the last delivery pass.
+    // Always resolve against that pass's fresh index, never its cached prefix.
+    if (this.#pendingDriverTraceInterpretations.length < 4_096) {
+      this.#pendingDriverTraceInterpretations.push({ ...structuredClone(input), enqueuedAt: Date.now() });
+      this.#traceCorrelationsDirty = true;
+      this.#nextTraceRefreshAt = 0;
+      this.#wakePump();
+    } else this.#traceRehydrationSpoolOverflow = true;
   }
 
   processInfo(): CodexTransportProcessInfo {
@@ -6069,7 +6067,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         this.#diagnostic(`runner shutdown failed: ${String(error)}`);
       }
     }
-    this.#flushPendingTraceRehydrations();
+    this.#flushPendingTraceRehydrations(false, true);
     const tracePath = this.options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH;
     if (tracePath) {
       const incomplete =
@@ -8543,9 +8541,11 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     )
       return "none";
     const events = core.store.state.committedEvents;
-    this.#flushPendingTraceRehydrations(
-      this.#deferredTurnStartEvents.length > 0 || (events.at(-1)?.sourceSeq ?? 0) > this.#eventSourceSeq,
-    );
+    const traceSourceSeq = events.at(-1)?.sourceSeq ?? 0;
+    // A held event is not new ingress on every 5ms retry. Only newly committed
+    // events bypass the trace-only cadence; visible delivery itself stays eager.
+    this.#flushPendingTraceRehydrations(traceSourceSeq !== this.#traceRefreshSourceSeq);
+    this.#traceRefreshSourceSeq = traceSourceSeq;
     for (;;) {
       const deferredEvent =
         !this.#recoveryTurnBindingPending &&
@@ -8928,7 +8928,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             : {}),
         });
       }
-      if (this.options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH && this.options.provider !== "pi_rpc") {
+      if (this.options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH &&
+        (this.options.provider !== "pi_rpc" || this.#traceFrameIndex.nativeChannelCaptured)) {
         const pending = {
           enqueuedAt: Date.now(),
           sourceEventId: event.sourceEventId,
@@ -9098,25 +9099,49 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     this.#diagnostic(`confirmed adopted provider identity against ${source}`);
   }
 
-  #flushPendingTraceRehydrations(refreshForDelivery = false): void {
+  #flushPendingTraceRehydrations(refreshForDelivery = false, closing = false): void {
     const tracePath = this.options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH;
-    if (!tracePath || this.options.provider === "pi_rpc") return;
+    // Pi writes its own raw/driver trace, not the runner's native channel.
+    // Unread bytes (or our own interpretations) must never opt it into scans,
+    // including the synchronous close-time backlog drain below.
+    if (!tracePath || (this.options.provider === "pi_rpc" && !this.#traceFrameIndex.nativeChannelCaptured)) return;
+    if (!refreshForDelivery && this.#pendingTraceRehydrations.length === 0 && this.#pendingDriverTraceInterpretations.length === 0) return;
     const now = Date.now();
+    if (!closing && !refreshForDelivery && now < this.#nextTraceRefreshAt) return;
+    // Throttle attempts too: a missing/unreadable file must not stat every held pass.
+    this.#nextTraceRefreshAt = now + TRACE_CORRELATION_RETRY_MS;
+    let refreshed = false;
+    try {
+      // One bounded refresh per live pass. At close, keep the incremental cursor
+      // and finish an already-arrived suffix while each read makes progress.
+      let unreadBytes = Infinity;
+      for (;;) {
+        refreshed = this.#traceFrameIndex.refresh(tracePath) || refreshed || this.#traceCorrelationsDirty;
+        const remaining = this.#traceFrameIndex.unreadBytes;
+        if (!closing || remaining === 0 || remaining >= unreadBytes) break;
+        unreadBytes = remaining;
+      }
+      this.#traceCorrelationsDirty = false;
+    } catch {
+      // Missing/unreadable files still expire, but never use their stale index.
+      refreshed = false;
+    }
+    // pi_rpc normally captures no native channel. A captured channel, not the
+    // provider's name alone, decides whether native correlations are applicable.
+    if (this.options.provider === "pi_rpc" && !this.#traceFrameIndex.nativeChannelCaptured) {
+      this.#pendingTraceRehydrations = [];
+      this.#pendingDriverTraceInterpretations = [];
+      return;
+    }
     const unexpired = (pending: { enqueuedAt: number }) => {
-      if (now - pending.enqueuedAt < TRACE_CORRELATION_MAX_AGE_MS) return true;
-      // Keep the existing incomplete/unmatched status even after retiring work.
+      if (now - pending.enqueuedAt < TRACE_CORRELATION_MAX_AGE_MS || (refreshed && this.#traceFrameIndex.unreadBytes > 0)) return true;
       this.#traceRehydrationUnmatched = true;
       return false;
     };
-    this.#pendingTraceRehydrations = this.#pendingTraceRehydrations.filter(unexpired);
-    this.#pendingDriverTraceInterpretations = this.#pendingDriverTraceInterpretations.filter(unexpired);
-    if (!refreshForDelivery && this.#pendingTraceRehydrations.length === 0 && this.#pendingDriverTraceInterpretations.length === 0) return;
-    try {
-      // One path stat per pass, not per item. Unchanged files have no new matches.
-      if (!this.#traceFrameIndex.refresh(tracePath) && !this.#traceCorrelationsDirty) return;
-      this.#traceCorrelationsDirty = false;
-    } catch {
-      return; // Missing/unreadable files still expire at the same deadline.
+    if (!refreshed) {
+      this.#pendingTraceRehydrations = this.#pendingTraceRehydrations.filter(unexpired);
+      this.#pendingDriverTraceInterpretations = this.#pendingDriverTraceInterpretations.filter(unexpired);
+      return;
     }
     const retry: PendingTraceRehydration[] = [];
     for (const pending of this.#pendingTraceRehydrations) {
@@ -9134,7 +9159,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         if (traceResult === "write_retry") this.#traceCorrelationsDirty = true;
       }
     }
-    this.#pendingTraceRehydrations = retry;
+    this.#pendingTraceRehydrations = retry.filter(unexpired);
 
     const driverRetry: PendingDriverTraceInterpretation[] = [];
     for (const pending of this.#pendingDriverTraceInterpretations) {
@@ -9150,7 +9175,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         if (traceResult === "write_retry") this.#traceCorrelationsDirty = true;
       }
     }
-    this.#pendingDriverTraceInterpretations = driverRetry;
+    this.#pendingDriverTraceInterpretations = driverRetry.filter(unexpired);
   }
 
   #pumpEventsSafely(): void {

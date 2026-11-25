@@ -64,6 +64,20 @@ describe("runnerd trace frame index", () => {
     expect(statSync).toHaveBeenCalledTimes(3);
   });
 
+  it("recognizes native capture only from the runner's rust_native channel", () => {
+    writeFileSync(path, JSON.stringify({
+      kind: "interpretation", debugChannel: "typescript_codex_driver",
+      frameId: 1, emittedEventIds: ["driver"],
+    }) + "\n");
+    index.refresh(path);
+    expect(index.nativeChannelCaptured).toBe(false);
+    appendFileSync(path, JSON.stringify({ kind: "frame", debugChannel: "rust_native", frameId: 2 }) + "\n");
+    index.refresh(path);
+    expect(index.nativeChannelCaptured).toBe(true);
+    index.clear();
+    expect(index.nativeChannelCaptured).toBe(false);
+  });
+
   it("retains partial lines and split UTF-8 until the append is complete", () => {
     const line = Buffer.from(interpretation(9, "event-🔎"));
     const split = line.indexOf(Buffer.from("🔎")) + 2;
