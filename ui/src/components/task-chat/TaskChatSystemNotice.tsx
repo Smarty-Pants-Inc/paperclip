@@ -1,7 +1,7 @@
 import { useWorkspaceBaseRefRecovery, useWorkspaceRetry } from "@/components/WorkspaceBaseRefRecovery";
 import { WorkspaceBaseRefRecoveryNotice } from "@/components/WorkspaceBaseRefRecoveryNotice";
 import { DispositionRecoveryNotice, useDispositionRecoverySnapshot } from "@/components/DispositionRecoveryNotice";
-import { useId, useState } from "react";
+import { useId, useState, type ReactNode } from "react";
 import { useProviderLimitMessage } from "@/hooks/useProviderLimitMessage";
 import {
   ChevronDown,
@@ -52,10 +52,12 @@ const TONE_ICON_CLASS: Record<SystemNoticeTone, string> = {
  */
 export function TaskChatSystemNotice({
   item,
+  actions,
   onTryAgainNoLiveExecutionPath,
   tryAgainNoLiveExecutionPathPending = false,
 }: {
   item: TaskChatMessageItem;
+  actions?: ReactNode;
   onTryAgainNoLiveExecutionPath?: () => Promise<void> | void;
   tryAgainNoLiveExecutionPathPending?: boolean;
 }) {
@@ -126,6 +128,7 @@ export function TaskChatSystemNotice({
             aria-hidden
           />
         </button>
+        {actions}
         {showTryAgain && !open ? (
           <Button
             type="button"
