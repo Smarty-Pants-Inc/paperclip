@@ -138,7 +138,7 @@ describe("Paperclip Runner native provider configuration", () => {
     expect(resolve({ ...base, piRpcThinkingLevel: "off", [key]: "ultra" })).toMatchObject({ piRpcThinkingLevel: "off" });
     expect(resolve({ ...base, [key]: "ultra" })).toMatchObject({ piRpcThinkingLevel: "ultra" });
     expect(resolve(projectPaperclipRunnerTaskConfig("pi_rpc", base, { [key]: "low" }))).toMatchObject({ piRpcThinkingLevel: "low" });
-    expect(resolve(projectPaperclipRunnerTaskConfig("pi_rpc", { ...base, piRpcThinkingLevel: "max" }, { [key]: "low" }))).toMatchObject({ piRpcThinkingLevel: "max" });
+    expect(resolve(projectPaperclipRunnerTaskConfig("pi_rpc", { ...base, piRpcThinkingLevel: "xhigh" }, { [key]: "low" }))).toMatchObject({ piRpcThinkingLevel: "low" });
     expect(resolve(projectPaperclipRunnerTaskConfig("pi_rpc", base, { model: "openai/other" }))).toMatchObject({ piRpcThinkingLevel: "low" });
   });
   it("records the documented low Pi default when no effort is configured", () => {
