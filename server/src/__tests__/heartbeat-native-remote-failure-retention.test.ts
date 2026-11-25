@@ -156,7 +156,7 @@ describeEmbeddedPostgres("heartbeat native remote preparation failure retention"
         resumeLease: async ({ lease }) => lease, execute: reached,
       });
       const { f, db, heartbeat, userId, leaseId, readyAllocation, acquireAllocation } = arranged;
-      await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, agentId));
+      await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", model: "paperclip/gpt-6.1-sol", sessionContinuity: "continuous" } }).where(eq(agents.id, agentId));
       await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: userId,
         conversationState: "active", conversationSessionGeneration: 0 }).where(eq(issues.id, f.issueId));
       const [task] = await db.insert(issues).values({ companyId, title: "Finished delegated task", status: "done" }).returning();
