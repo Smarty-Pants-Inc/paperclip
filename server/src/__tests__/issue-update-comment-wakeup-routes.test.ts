@@ -497,7 +497,7 @@ describe("issue update comment wakeups", () => {
       comment: "use this model", assigneeAdapterOverrides: { adapterConfig: { model: "model" } },
     });
     expect(res.status, JSON.stringify(res.body)).toBe(422);
-    expect(res.body.error).toBe('Pi cannot use reasoning level "ultra": choose off, minimal, low, medium, high, xhigh or max');
+    expect(res.body.error).toContain('pi_thinking_level_invalid: "ultra"');
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
     expect(mockHeldEnd).not.toHaveBeenCalled();
@@ -527,7 +527,7 @@ describe("issue update comment wakeups", () => {
     });
     expect(res.status, JSON.stringify(res.body)).toBe(status);
     if (status === 422) {
-      expect(res.body.error).toBe('Pi cannot use reasoning level "ultra": choose off, minimal, low, medium, high, xhigh or max');
+      expect(res.body.error).toContain('pi_thinking_level_invalid: "ultra"');
       expect(mockIssueService.update).not.toHaveBeenCalled();
       expect(mockHeldEnd).not.toHaveBeenCalled();
       expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();

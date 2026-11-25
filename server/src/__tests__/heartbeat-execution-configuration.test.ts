@@ -215,6 +215,21 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
     return { finished, input: captured.get(run!.id) };
   }
 
+  it.each(["piRpcThinkingLevel", "modelReasoningEffort", "reasoningEffort", "effort"].flatMap(key =>
+    [5, "ultra"].map(level => ({ key, level })),
+  ))("fails a real run with stored invalid Pi thinking $key=$level before provider dispatch", async ({ key, level }) => {
+    const f = await seed();
+    await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: {
+      provider: "pi_rpc", model: "example/model", piRpcThinkingLevel: "medium", [key]: level,
+    } }).where(eq(agents.id, f.agentId));
+    await db.update(issues).set({ assigneeAdapterOverrides: null }).where(eq(issues.id, f.issueId));
+    const { finished, input } = await execute(f);
+    expect(finished).toMatchObject({ status: "failed" });
+    expect(finished.error).toContain(`pi_thinking_level_invalid: ${JSON.stringify(level)}`);
+    expect(input).toBeUndefined();
+    expect((await db.select().from(agents).where(eq(agents.id, f.agentId)))[0].adapterConfig[key]).toBe(level);
+  });
+
   it.each([
     { model: undefined, policy: {}, workMode: "standard" },
     { model: "gpt-6.1-sol", policy: {}, workMode: "standard" },
@@ -254,7 +269,7 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
       .where(eq(issues.id, f.issueId));
     const { finished, input } = await execute(f);
     expect(finished.status).toBe("failed");
-    expect(finished.error).toBe('Pi cannot use reasoning level "ultra": choose off, minimal, low, medium, high, xhigh or max');
+    expect(finished.error).toContain('pi_thinking_level_invalid: "ultra"');
     expect(input).toBeUndefined();
     expect(finished.nativeSessionId).toBeNull();
   });
