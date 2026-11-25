@@ -2427,12 +2427,26 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     await db.update(heartbeatRuns).set({ runnerProfileJson: originalProfile }).where(eq(heartbeatRuns.id, seeded.runId));
     await db.update(issues).set({ assigneeAdapterOverrides: { model: "gpt-6-sol", reasoningEffort: "xhigh" } })
       .where(eq(issues.id, seeded.issueId));
+    let ackSeq!: number;
     steerNativeSessionMock.mockImplementationOnce(async () => {
       await db.transaction(async tx => {
         await tx.execute(sql`set local lock_timeout = '1000ms'`);
-        await appendHeartbeatRunEvent(tx as unknown as typeof db, {
+        const acknowledgement = await appendHeartbeatRunEvent(tx as unknown as typeof db, {
           companyId: seeded.companyId, agentId: seeded.agentId, runId: seeded.runId,
           eventType: "item.completed", payload: { kind: "steering_acknowledgement" },
+        });
+        ackSeq = acknowledgement.row.seq;
+        // Validated native ACK and a later provider item can both commit before
+        // the steering transaction resumes. Neither the pre-dispatch cursor nor
+        // the latest run cursor identifies the ACK's actual place in the stream.
+        await tx.update(heartbeatRunEvents).set({ sourceEventId: "steer-ack-cursor", payload: { prpEvent: {
+          sourceEventId: "steer-ack-cursor", turnId: "turn-before-model-change",
+          itemId: `turn-before-model-change:steer:${seeded.commentIds[0]}`,
+          payload: { kind: "steering_acknowledgement" },
+        } } }).where(eq(heartbeatRunEvents.id, acknowledgement.row.id));
+        await appendHeartbeatRunEvent(tx as unknown as typeof db, {
+          companyId: seeded.companyId, agentId: seeded.agentId, runId: seeded.runId,
+          eventType: "item.delta", payload: { text: "A later provider item" },
         });
         await tx.update(heartbeatRuns).set({ resultJson: { concurrentProviderReceipt: "preserve" } })
           .where(eq(heartbeatRuns.id, seeded.runId));
@@ -2450,7 +2464,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     expect(steerNativeSessionMock).toHaveBeenCalledWith(expect.objectContaining({ runId: seeded.runId,
       message: "First queued message", correlationId: seeded.commentIds[0] }));
     expect(run.resultJson).toMatchObject({ concurrentProviderReceipt: "preserve", queuedSteeringAcknowledgements: {
-      [seeded.commentIds[0]]: { status: "acknowledged", turnId: "turn-before-model-change" },
+      [seeded.commentIds[0]]: { status: "acknowledged", turnId: "turn-before-model-change", afterEventSeq: ackSeq },
     } });
     expect(steered.body.entries.map((entry: any) => entry.comment.id)).toEqual([seeded.commentIds[1]]);
   });
