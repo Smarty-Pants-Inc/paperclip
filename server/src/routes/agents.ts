@@ -2400,6 +2400,19 @@ export function agentRoutes(
     };
   }
 
+  function applyPiRpcCreateDefaults(
+    adapterType: string | null | undefined,
+    adapterConfig: Record<string, unknown> = {},
+    requestedConfig: Record<string, unknown> = adapterConfig,
+  ): Record<string, unknown> {
+    if (adapterType !== "paperclip_runner" || adapterConfig.provider !== "pi_rpc") return adapterConfig;
+    return {
+      ...adapterConfig,
+      piRpcThinkingLevel: asNonEmptyString(requestedConfig.piRpcThinkingLevel) ? requestedConfig.piRpcThinkingLevel : "medium",
+      model: asNonEmptyString(adapterConfig.model) ? adapterConfig.model : "paperclip/claude-opus-5-5",
+    };
+  }
+
   function applyCreateDefaultsByAdapterType(
     adapterType: string | null | undefined,
     adapterConfig: Record<string, unknown>,
@@ -4599,23 +4612,12 @@ export function agentRoutes(
       }
       hireInput.adapterConfig = inheritNativeRunnerAdapterConfig(caller.adapterConfig);
       hireInput.defaultEnvironmentId = caller.defaultEnvironmentId ?? null;
-    } else if (
-      req.actor.type === "agent" && req.actor.agentId
-      && hireInput.adapterType === "paperclip_runner"
-      && requestedHireConfig.provider === "pi_rpc"
-      && requestedHireConfig.piRpcThinkingLevel === undefined
-    ) {
-      const caller = await svc.getById(req.actor.agentId);
-      const callerConfig = asRecord(caller?.adapterConfig);
-      if (caller?.companyId === companyId && caller.adapterType === "paperclip_runner"
-        && callerConfig?.provider === "pi_rpc" && asNonEmptyString(callerConfig.piRpcThinkingLevel)) {
-        hireInput.adapterConfig = { ...requestedHireConfig, piRpcThinkingLevel: callerConfig.piRpcThinkingLevel };
-      }
     }
     if (inheritRuntimeFrom === "caller" && hireRunner !== undefined) throw unprocessable("inheritRuntimeFrom=caller cannot be combined with runner");
     let configurationWarnings: AgentConfigurationWarning[] = [];
     Object.assign(hireInput, await resolveNewAgentRunnerForCompany(db, companyId, { ...hireInput, runner: hireRunner,
       onConfigurationWarnings: warnings => { configurationWarnings = warnings; } }));
+    hireInput.adapterConfig = applyPiRpcCreateDefaults(hireInput.adapterType, hireInput.adapterConfig, requestedHireConfig);
     hireInput.adapterType = await assertSelectableAdapterType(hireInput.adapterType, hireInput.adapterConfig, companyId);
     const rawHireAdapterConfig = (hireInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertProviderTraceSettingTransition(req, hireInput.runtimeConfig);
@@ -4948,6 +4950,7 @@ export function agentRoutes(
     let configurationWarnings: AgentConfigurationWarning[] = [];
     Object.assign(createInput, await resolveNewAgentRunnerForCompany(db, companyId, { ...createInput, runner: createRunner, setupOnly: Boolean(setupId),
       onConfigurationWarnings: warnings => { configurationWarnings = warnings; } }));
+    createInput.adapterConfig = applyPiRpcCreateDefaults(createInput.adapterType, createInput.adapterConfig);
     createInput.adapterType = await assertSelectableAdapterType(createInput.adapterType, createInput.adapterConfig, companyId);
     const rawCreateAdapterConfig = (createInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertProviderTraceSettingTransition(req, createInput.runtimeConfig);
