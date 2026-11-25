@@ -1364,7 +1364,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // Runs observed non-terminal while mounted: their turns ANIMATE the fold when
   // they settle. Runs already terminal at mount collapse instantly.
   const liveSeenRef = useRef<Set<string>>(new Set());
-  const liveSegmentClock = useRef({ liveKey: "", ends: new Map<string, number>() });
   const drawnRunnerSegments = useRef(new Set<string>());
   useEffect(() => {
     if (liveRun) liveSeenRef.current.add(liveRun.id);
@@ -2238,7 +2237,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           sourceAllowSummaryFallback
         ) {
           const startedAtMs = toMs(meta?.startedAt ?? meta?.createdAt);
-          const finishedAtMs = toMs(meta?.finishedAt);
+          const finishedAtMs = toMs(source.status === "succeeded" && sourcePresentationItem?.createdAtIso
+            ? sourcePresentationItem.createdAtIso : meta?.finishedAt);
           const durationMs =
             startedAtMs > 0 && finishedAtMs > 0
               ? Math.max(0, finishedAtMs - startedAtMs)
@@ -2530,10 +2530,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         const turnId = segmented
           ? `${source.id}:turn:${segmentIndex}`
           : `${source.id}:turn`;
-        const segmentKey = `${source.id}:${segmentIndex}`;
         const answerComplete = finalResponse && !finalStreaming;
-        if (answerComplete && liveSegmentClock.current.liveKey === segmentKey && !liveSegmentClock.current.ends.has(segmentKey)) liveSegmentClock.current.ends.set(segmentKey, Math.max(finalResponse.atMs ?? 0, Date.now()));
-        const segmentFinishedMs = liveSegmentClock.current.ends.get(segmentKey) ?? (segmented && answerComplete ? finalResponse.atMs : undefined) ?? (Number.isFinite(segment.endMs)
+        // The answer owns its end, even while its run remains held or replays.
+        const segmentFinishedMs = (segmented && answerComplete
+          ? finalResponse.atMs ?? (!failed && finalResponse.createdAtIso ? toMs(finalResponse.createdAtIso) : undefined)
+          : undefined) ?? (Number.isFinite(segment.endMs)
           ? segment.endMs
           : finished);
         const answerStartMs = sourceIsPaperclipRunner ? segments[segments.slice(0, segmentIndex).findLastIndex(({ entries }) =>
@@ -3078,12 +3079,12 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   )) tailFinalRef.current = { runId: tailSegmentKey };
   if (tailFinalResponse && !tailFinalStreaming) tailFinalRef.current.item = tailFinalResponse;
   const tailHasFinalResponse = Boolean(tailFinalRef.current.item) && !tailFinalStreaming;
-  if (liveRun && paperclipRunnerTail && !tailHasFinalResponse) liveSegmentClock.current.liveKey = `${tailRunId}:${tailSegments.length - 1}`;
   const tailTerminal = tailEntries.findLast((entry) => entry.kind === "run_terminal");
   const tailEndStatus = isTerminalRunStatus(tailRunStatus) ? tailRunStatus :
     tailTerminal?.runState ?? (tailHasFinalResponse ? "succeeded" : tailRunStatus);
   const tailStatus = tailEndStatus === "succeeded" && isUserStop(tailRunId ?? "") ? "cancelled" : tailEndStatus;
-  const tailFinishedAtMs = tailRunFinishedAtMs ?? (tailTerminal ? toMs(tailTerminal.ts) : tailFinalRef.current.item?.atMs ?? null);
+  const tailFinishedAtMs = (tailStatus === "succeeded" && tailHasFinalResponse ? tailFinalRef.current.item?.atMs : undefined)
+    ?? tailRunFinishedAtMs ?? (tailTerminal ? toMs(tailTerminal.ts) : tailFinalRef.current.item?.atMs ?? null);
   const tailTurnStatus = useMemo(
     () =>
       isTerminalRunStatus(tailStatus)
