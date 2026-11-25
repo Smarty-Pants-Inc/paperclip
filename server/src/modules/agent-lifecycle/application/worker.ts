@@ -83,14 +83,15 @@ export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDr
         if (changed && !isLifecycleWorkPending(changed.lifecycleState)) return;
       } catch (error) {
         // Claims can defer before runHost. Only a failed host test spends this budget.
+        const failureCode = lifecycleFailureCode(error);
         const verificationFailures = failureContext.stage === "host" && agent.lifecycleState === "verifying"
-          && lifecycleFailureCode(error) === "harness_test_failed"
+          && failureCode === "harness_test_failed"
           ? (agent.lifecycleOperation?.verificationFailures ?? 0) + 1 : undefined;
         failureContext = { ...failureContext, verificationFailures };
         const message = lifecycleFailureMessage(failureContext, error);
         const retryRequired = lifecycleVerificationNeedsRetry(failureContext, error);
         if (!await runStep("defer", () => retryRequired || verificationFailures !== undefined
-          ? store.defer(agent, owner, message, new Date(), { retryRequired, ...(verificationFailures !== undefined ? { verificationFailures } : {}) })
+          ? store.defer(agent, owner, message, new Date(), { retryRequired, ...(retryRequired && failureCode ? { failureCode } : {}), ...(verificationFailures !== undefined ? { verificationFailures } : {}) })
           : store.defer(agent, owner, message, new Date()))) continue;
         return;
       } finally {
