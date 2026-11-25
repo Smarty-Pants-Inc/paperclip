@@ -237,6 +237,56 @@ describeEmbeddedPostgres("native question bridge", () => {
     } } };
   }
 
+  it.each(["valid", "cross-turn", "other-person", "equal-timestamp"])("freezes Pi card source to the same person's consumed input in cursor order (%s)", async scenario => {
+    await seed();
+    const database = db;
+    await database.transaction(async transaction => {
+    const db = transaction as unknown as typeof database;
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, agentId));
+    await db.insert(authUsers).values({ id: "operator-2", name: "Other operator", email: "operator-2@example.test",
+      createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
+    const ids = Array.from({ length: 5 }, () => randomUUID());
+    // PostgreSQL now() is stable across this transaction, including the nested
+    // card insert: ACK, event and card creation timestamps are genuinely equal.
+    const [clock] = await db.execute<{ instant: Date }>(sql`select now() as instant`);
+    const sameTime = new Date(clock.instant);
+    await db.insert(issueComments).values(ids.map((id, index) => ({ id, companyId, issueId,
+      authorUserId: index === 3 ? "operator-2" : "operator-1", body: `Person input ${index}`, createdAt: sameTime })));
+    const acknowledgements = {
+      [ids[1]]: { status: "acknowledged", turnId: "turn-1", afterEventSeq: 10, acknowledgedAt: sameTime.toISOString() },
+      [ids[2]]: { status: "acknowledged", turnId: "another-turn", afterEventSeq: 19, acknowledgedAt: sameTime.toISOString() },
+      [ids[3]]: { status: "acknowledged", turnId: "turn-1", afterEventSeq: 18, acknowledgedAt: sameTime.toISOString() },
+      [ids[4]]: { status: "acknowledged", turnId: "turn-1", afterEventSeq: 21, acknowledgedAt: sameTime.toISOString() },
+    };
+    // Cross-turn and other-person rows have no eligible same-person steer.
+    if (scenario === "cross-turn") acknowledgements[ids[1]].turnId = "another-turn";
+    if (scenario === "other-person") await db.update(issueComments).set({ authorUserId: "operator-2" }).where(eq(issueComments.id, ids[1]));
+    if (scenario === "equal-timestamp") {
+      acknowledgements[ids[2]].turnId = "turn-1";
+      // All Dates are identical; cursor 19, not insertion/key order, wins.
+      acknowledgements[ids[1]].afterEventSeq = 12;
+    }
+    const event = runtimeRequestEvent();
+    await db.insert(heartbeatRunEvents).values([
+      { companyId, runId, agentId, seq: 1, eventType: "turn.started", createdAt: sameTime,
+        payload: { prpEvent: { turnId: "turn-1" } } },
+      { companyId, runId, agentId, seq: 20, eventType: event.eventType, createdAt: sameTime, payload: { prpEvent: event } },
+    ]);
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, wakeCommentId: ids[0] }, nextEventSeq: 23,
+      resultJson: { queuedSteeringAcknowledgements: acknowledgements } }).where(eq(heartbeatRuns.id, runId));
+    const interaction = await projectNativeRuntimeRequest({ db, binding: binding(), event });
+    const expected = scenario === "cross-turn" || scenario === "other-person" ? ids[0] : scenario === "equal-timestamp" ? ids[2] : ids[1];
+    expect(interaction!.sourceCommentId).toBe(expected);
+    expect(new Date(interaction!.createdAt).getTime()).toBe(sameTime.getTime());
+    // Projection replay after another ACK must preserve the frozen source.
+    await db.update(heartbeatRuns).set({ resultJson: { queuedSteeringAcknowledgements: {
+      ...acknowledgements, [ids[4]]: { ...acknowledgements[ids[4]], afterEventSeq: 24 },
+    } } }).where(eq(heartbeatRuns.id, runId));
+    expect((await projectNativeRuntimeRequest({ db, binding: binding(), event }))!.sourceCommentId).toBe(expected);
+    expect((await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interaction!.id)))[0].sourceCommentId).toBe(expected);
+    });
+  });
+
   it("commits and acknowledges an ACP permission, then queues only an admin's exact turn-bound decision", async () => {
     await seed();
     const event = permissionRequestEvent();
