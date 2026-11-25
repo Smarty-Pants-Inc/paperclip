@@ -1,3 +1,4 @@
+import { sandboxRestartKey } from "../sandbox-snapshot-restore.js";
 import { resolveSessionContinuity } from "./continued-session.js";
 import { currentControllerProcess } from "../controller-process-identity.js";
 import { settleStartupStop } from "../person-stop-before-turn.js";
@@ -880,10 +881,8 @@ function warmSandboxRunner(target?: AdapterExecutionTarget | null): WarmNativeSe
 }
 
 function sandboxProcessRestartKey(target?: AdapterExecutionTarget | null): string | undefined {
-  if (target?.kind !== "remote" || target.transport !== "sandbox") return undefined;
-  const receipt = target.sandboxLeaseAcquisition;
-  return receipt?.restoredFromSnapshotAt || receipt?.rebootedAt
-    ? JSON.stringify([receipt.restoredFromSnapshotAt ?? null, receipt.rebootedAt ?? null]) : undefined;
+  return target?.kind === "remote" && target.transport === "sandbox"
+    ? sandboxRestartKey(target.sandboxLeaseAcquisition) : undefined;
 }
 
 function sandboxProviderLeaseId(target?: AdapterExecutionTarget | null): string | null {
@@ -13079,6 +13078,7 @@ async function executePaperclipNativeSessionAttempt(
       pluginTaskDescription = description;
       await finishStartupContextForFallback();
       persistedWarmSession = loadWarmNativeCheckpoint(input.execution, warmConfigDigest, target.kind);
+      if (!persistedWarmSession) throw new Error("native_runner_checkpoint_missing_after_unavailable_reuse");
       runnerdBackend = await createExecutionBackend();
       remoteCleanupLease = await readRemoteCleanupLease();
       return true;
@@ -13359,6 +13359,19 @@ async function executePaperclipNativeSessionAttempt(
               );
             },
             onSession: async (session) => {
+              // Publication proves that the successor Runner started successfully.
+              // Persist before a held run can survive another server restart. A new
+              // provider generation differs from this exact key and remains a loss.
+              const restartTarget = input.runnerExecutionTarget;
+              const handledProcessRestartKey = sandboxProcessRestartKey(restartTarget);
+              if (session && !cleanupOnly && handledProcessRestartKey && restartTarget?.kind === "remote"
+                && restartTarget.transport === "sandbox" && restartTarget.leaseId) {
+                await input.db.update(environmentLeases).set({
+                  metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ handledProcessRestartKey })}::jsonb`,
+                }).where(and(eq(environmentLeases.id, restartTarget.leaseId),
+                  eq(environmentLeases.companyId, input.execution.binding.companyId),
+                  eq(environmentLeases.providerLeaseId, restartTarget.sandboxLeaseAcquisition!.providerLeaseId)));
+              }
               if (session) settleReattachRun(input.execution.binding.runId, "reached");
               if (session && relaunchReleased) relaunchReleased.published = true;
               input.bindAttachmentSession?.(session);
