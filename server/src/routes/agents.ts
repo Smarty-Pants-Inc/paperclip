@@ -198,6 +198,8 @@ import { redactCurrentUserValue } from "../log-redaction.js";
 import {
   HarnessRuntimeRequestResolutionError,
   parseHarnessRuntimeRequestResolution,
+  resolveClaudeEffort,
+  resolveGrokEffort,
   type HarnessRuntimeRequestKind,
   type HarnessRuntimeRequestResolution,
 } from "../vendor/paperclip-runner/index.js";
@@ -224,6 +226,8 @@ import {
   resolveWorktreeRunExecutionActivationState,
 } from "../services/instance-settings.js";
 import { runClaudeLogin } from "@paperclipai/adapter-claude-local/server";
+import { claudeLocalReasoningEffortsForModel, DEFAULT_CLAUDE_LOCAL_MODEL } from "@paperclipai/adapter-claude-local";
+import { grokLocalReasoningEffortsForModel, DEFAULT_GROK_LOCAL_MODEL } from "@paperclipai/adapter-grok-local";
 import { createInviteRateLimiter } from "../services/invite-rate-limit.js";
 import {
   SetupTokenSessionService,
@@ -320,6 +324,7 @@ import {
 import {
   PaperclipRunnerProviderProfileError,
   piRpcThinking,
+  resolvePaperclipRunnerNativeProviderInput,
   resolvePaperclipRunnerProviderProfile,
   validatePaperclipRunnerDotConfig,
   validatePaperclipRunnerGrokConfig,
@@ -2402,18 +2407,73 @@ export function agentRoutes(
     };
   }
 
-  function applyPiRpcCreateDefaults(
+  function applyReasoningCreateDefaults(
     adapterType: string | null | undefined,
     adapterConfig: Record<string, unknown> = {},
     requestedConfig: Record<string, unknown> = adapterConfig,
   ): Record<string, unknown> {
-    if (adapterType !== "paperclip_runner" || adapterConfig.provider !== "pi_rpc") return adapterConfig;
-    validatePiReasoningSelection({ adapterType, adapterConfig: { ...requestedConfig, provider: "pi_rpc" } });
-    return {
-      ...adapterConfig,
-      piRpcThinkingLevel: piRpcThinking(requestedConfig),
-      model: asNonEmptyString(adapterConfig.model) ? adapterConfig.model : "paperclip/claude-opus-5-5",
-    };
+    const native = adapterType === "paperclip_runner";
+    if (native && adapterConfig.provider === "pi_rpc") {
+      const requested = { ...requestedConfig, provider: "pi_rpc" };
+      for (const key of ["piThinkingLevel", "thinking"]) {
+        const value = requestedConfig[key];
+        validatePiReasoningSelection({ adapterType, adapterConfig: { ...requested, piRpcThinkingLevel: value } });
+      }
+      validatePiReasoningSelection({ adapterType, adapterConfig: requested });
+      const level = ["piRpcThinkingLevel", "piThinkingLevel", "thinking", "modelReasoningEffort", "reasoningEffort", "effort"]
+        .map(key => requestedConfig[key]).find(value => value != null && value !== "" && value !== "auto");
+      const { piThinkingLevel, thinking, ...nativeConfig } = adapterConfig;
+      return {
+        ...nativeConfig,
+        piRpcThinkingLevel: piRpcThinking({ ...requested, piRpcThinkingLevel: level }),
+        model: asNonEmptyString(adapterConfig.model) ? adapterConfig.model : "paperclip/claude-opus-5-5",
+      };
+    }
+    const codex = native ? adapterConfig.provider === "codex" : adapterType === "codex_local";
+    const claude = native
+      ? adapterConfig.provider === "acpx" && adapterConfig.acpxAgent === "claude"
+      : adapterType === "claude_local";
+    const grok = native
+      ? adapterConfig.provider === "acpx" && adapterConfig.acpxAgent === "grok"
+      : adapterType === "grok_local";
+    if (!codex && !claude && !grok) return adapterConfig;
+    const ownKey = grok ? "reasoningEffort" : claude && !native ? "effort" : "modelReasoningEffort";
+    const keys = native ? ["modelReasoningEffort", "reasoningEffort", "effort"]
+      : [ownKey, ...["modelReasoningEffort", "reasoningEffort", "effort"].filter(key => key !== ownKey)];
+    let selected: string | undefined;
+    for (const key of keys) {
+      const value = requestedConfig[key];
+      if (value === undefined || value === null || (typeof value === "string" && !value.trim())) continue;
+      const level = typeof value === "string" ? value.trim() : value;
+      if (level === "auto") continue;
+      try {
+        if (codex) {
+          resolvePaperclipRunnerNativeProviderInput({ backend: "codex_app_server", adapterConfig: {
+            provider: "codex", model: adapterConfig.model, modelReasoningEffort: level,
+          } });
+        } else if (claude) {
+          resolveClaudeEffort("claude", level);
+          if (!native && !claudeLocalReasoningEffortsForModel(asNonEmptyString(adapterConfig.model) ?? DEFAULT_CLAUDE_LOCAL_MODEL).includes(level as string)) {
+            throw new Error("Claude reasoning effort is not supported for this model");
+          }
+        } else {
+          resolveGrokEffort("grok", level);
+          if (!native && !grokLocalReasoningEffortsForModel(asNonEmptyString(adapterConfig.model) ?? DEFAULT_GROK_LOCAL_MODEL).includes(level as string)) {
+            throw new Error("Grok reasoning effort is not supported for this model");
+          }
+        }
+      } catch (error) {
+        throw unprocessable(`Invalid reasoning level ${JSON.stringify(value)} (${key}): ${error instanceof Error ? error.message : String(error)}`);
+      }
+      selected ??= level as string;
+    }
+    if (claude && !native && !claudeLocalReasoningEffortsForModel(asNonEmptyString(adapterConfig.model) ?? DEFAULT_CLAUDE_LOCAL_MODEL).includes(selected ?? "medium")) {
+      throw unprocessable("Claude reasoning effort is not supported for this model");
+    }
+    const next = { ...adapterConfig };
+    for (const key of keys) delete next[key];
+    next[ownKey] = selected ?? "medium";
+    return next;
   }
 
   function applyCreateDefaultsByAdapterType(
@@ -4615,12 +4675,19 @@ export function agentRoutes(
       }
       hireInput.adapterConfig = inheritNativeRunnerAdapterConfig(caller.adapterConfig);
       hireInput.defaultEnvironmentId = caller.defaultEnvironmentId ?? null;
+    } else if (hireInput.defaultEnvironmentId === undefined && req.actor.type === "agent" && req.actor.agentId) {
+      const caller = await svc.getById(req.actor.agentId);
+      if (!caller || caller.companyId !== companyId) throw forbidden("The caller agent is not in this company");
+      hireInput.defaultEnvironmentId = caller.defaultEnvironmentId ?? null;
     }
     if (inheritRuntimeFrom === "caller" && hireRunner !== undefined) throw unprocessable("inheritRuntimeFrom=caller cannot be combined with runner");
     let configurationWarnings: AgentConfigurationWarning[] = [];
+    if (hireInput.adapterType === "paperclip_runner" && hireInput.adapterConfig?.provider === "pi_rpc") {
+      hireInput.adapterConfig = applyReasoningCreateDefaults(hireInput.adapterType, hireInput.adapterConfig, requestedHireConfig);
+    }
     Object.assign(hireInput, await resolveNewAgentRunnerForCompany(db, companyId, { ...hireInput, runner: hireRunner,
       onConfigurationWarnings: warnings => { configurationWarnings = warnings; } }));
-    hireInput.adapterConfig = applyPiRpcCreateDefaults(hireInput.adapterType, hireInput.adapterConfig, requestedHireConfig);
+    hireInput.adapterConfig = applyReasoningCreateDefaults(hireInput.adapterType, hireInput.adapterConfig, requestedHireConfig);
     hireInput.adapterType = await assertSelectableAdapterType(hireInput.adapterType, hireInput.adapterConfig, companyId);
     const rawHireAdapterConfig = (hireInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertProviderTraceSettingTransition(req, hireInput.runtimeConfig);
@@ -4951,9 +5018,12 @@ export function agentRoutes(
     assertNoAgentProcessAdapterMutation(req, createInput.adapterType ?? "process", Object.keys(requestedCreateConfig).length > 0);
     assertExternalInstructionsAdmin(req, { id: agentId, companyId, name: createInput.name, adapterConfig: requestedCreateConfig });
     let configurationWarnings: AgentConfigurationWarning[] = [];
+    if (createInput.adapterType === "paperclip_runner" && createInput.adapterConfig?.provider === "pi_rpc") {
+      createInput.adapterConfig = applyReasoningCreateDefaults(createInput.adapterType, createInput.adapterConfig, requestedCreateConfig);
+    }
     Object.assign(createInput, await resolveNewAgentRunnerForCompany(db, companyId, { ...createInput, runner: createRunner, setupOnly: Boolean(setupId),
       onConfigurationWarnings: warnings => { configurationWarnings = warnings; } }));
-    createInput.adapterConfig = applyPiRpcCreateDefaults(createInput.adapterType, createInput.adapterConfig);
+    createInput.adapterConfig = applyReasoningCreateDefaults(createInput.adapterType, createInput.adapterConfig, requestedCreateConfig);
     createInput.adapterType = await assertSelectableAdapterType(createInput.adapterType, createInput.adapterConfig, companyId);
     const rawCreateAdapterConfig = (createInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertProviderTraceSettingTransition(req, createInput.runtimeConfig);
