@@ -512,6 +512,28 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     expect(Object.keys(childEnvOf(res))).toHaveLength(0);
   });
 
+  it.each([
+    { name: "inherits the caller level when omitted", board: false, callerLevel: "xhigh", requestedLevel: undefined, expectedLevel: "xhigh" },
+    { name: "keeps an explicitly named level", board: false, callerLevel: "xhigh", requestedLevel: "medium", expectedLevel: "medium" },
+    { name: "leaves a board hire unchanged", board: true, callerLevel: "xhigh", requestedLevel: undefined, expectedLevel: undefined },
+    { name: "adds nothing when the caller has no level", board: false, callerLevel: undefined, requestedLevel: undefined, expectedLevel: undefined },
+  ])("pi_rpc hire thinking level: $name", async ({ board, callerLevel, requestedLevel, expectedLevel }) => {
+    const companyId = await seedCompany();
+    const parent = await seedParentAgent(companyId, "paperclip_runner", {});
+    await db.update(agents).set({ adapterConfig: {
+      provider: "pi_rpc", model: "openai-codex/gpt-5.6", ...(callerLevel ? { piRpcThinkingLevel: callerLevel } : {}),
+    } }).where(eq(agents.id, parent.id));
+    const res = await hire(board ? userActor() : agentActor(companyId, parent.id), companyId, {
+      name: "Pi Child", role: "engineer", adapterType: "paperclip_runner",
+      adapterConfig: { provider: "pi_rpc", model: "openai-codex/gpt-5.6", ...(requestedLevel ? { piRpcThinkingLevel: requestedLevel } : {}) },
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const [child] = await db.select().from(agents).where(eq(agents.id, res.body.agent.id));
+    expect(child!.adapterConfig.piRpcThinkingLevel).toBe(expectedLevel);
+    expect(res.body.agent.adapterConfig.piRpcThinkingLevel).toBe(expectedLevel);
+    if (expectedLevel === undefined) expect(child!.adapterConfig).not.toHaveProperty("piRpcThinkingLevel");
+  });
+
   it("rejects native runtime inheritance for a board actor", async () => {
     const companyId = await seedCompany();
     const parent = await seedParentAgent(companyId, "paperclip_runner", {});
