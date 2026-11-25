@@ -45,11 +45,16 @@ import {
 import { closeConversationResetHold } from "../modules/wake-queue/index.js";
 const closeHeldNativeTurnMock = vi.hoisted(() => vi.fn());
 const steerNativeSessionMock = vi.hoisted(() => vi.fn());
+const automaticSteeringAvailable = vi.hoisted(() => ({ value: false }));
 vi.mock("../services/native-runtime/native-session-executor.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/native-runtime/native-session-executor.js")>();
   steerNativeSessionMock.mockImplementation(actual.steerNativeSession);
   closeHeldNativeTurnMock.mockImplementation(actual.closeHeldNativeTurn);
-  return { ...actual, steerNativeSession: steerNativeSessionMock, closeHeldNativeTurn: closeHeldNativeTurnMock };
+  return { ...actual, steerNativeSession: steerNativeSessionMock, closeHeldNativeTurn: closeHeldNativeTurnMock,
+    getNativeSessionSteeringState: (runId: string) => automaticSteeringAvailable.value
+      ? Promise.resolve({ disposition: "available", activeTurnId: "automatic-comment-turn" })
+      : actual.getNativeSessionSteeringState(runId),
+  };
 });
 const { NativeSessionSteeringError } = await import("../services/native-runtime/native-session-executor.js");
 
@@ -2224,6 +2229,55 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
       .where(eq(heartbeatRuns.id, seeded.runId));
     return identity!;
   }
+
+  it.each(["agent"] as const)("automatically acknowledges a %s API comment with broker identity, preserving the receiver's authority", async author => {
+    const seeded = await seedQueue();
+    await seedDispatchIdentity(seeded);
+    let caller = app(seeded.companyId);
+    if (author === "agent") {
+      const [sender] = await db.insert(agents).values({ companyId: seeded.companyId, name: "Agent A", status: "idle", adapterType: "process" }).returning();
+      const [senderIssue] = await db.insert(issues).values({ companyId: seeded.companyId, title: "Agent A's work", status: "in_progress", assigneeAgentId: sender.id }).returning();
+      const [senderRun] = await db.insert(heartbeatRuns).values({ companyId: seeded.companyId, agentId: sender.id, status: "running",
+        runtimeMode: "legacy", contextSnapshot: { issueId: senderIssue.id } }).returning();
+      caller = app(seeded.companyId, "queue-owner", { agentId: sender.id, runId: senderRun.id });
+    }
+    const pageSnapshot = await request(app(seeded.companyId)).get(`/api/issues/${seeded.issueId}/queued-comments`);
+    automaticSteeringAvailable.value = true;
+    steerNativeSessionMock.mockResolvedValueOnce({ turnId: "automatic-comment-turn" });
+    const callsBefore = steerNativeSessionMock.mock.calls.length;
+    try {
+      const posted = await request(caller).post(`/api/issues/${seeded.issueId}/comments`)
+        .send({ body: `${author} API message delivered without a page countdown` });
+      expect(posted.status, JSON.stringify(posted.body)).toBe(201);
+      await vi.waitFor(async () => {
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+        expect(run.resultJson?.queuedSteeringAcknowledgements).toMatchObject({ [posted.body.id]: {
+          status: "acknowledged", turnId: "automatic-comment-turn",
+        } });
+      }, { timeout: 5_000 });
+      for (const queueId of [pageSnapshot.body.queueId]) {
+        const replay = await request(app(seeded.companyId))
+          .post(`/api/issues/${seeded.issueId}/queued-comments/${posted.body.id}/steer`)
+          .send({ queueId, targetRunId: seeded.runId, revision: pageSnapshot.body.revision });
+        expect(replay.status, JSON.stringify(replay.body)).toBe(200);
+      }
+      expect(steerNativeSessionMock.mock.calls.length - callsBefore).toBe(1);
+      const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+      expect(Object.keys(saved.resultJson!.queuedSteeringAcknowledgements as object)).toEqual([posted.body.id]);
+      const replayActivities = await db.select().from(activityLog).where(eq(activityLog.action, "issue.queued_comment_steered"));
+      expect(replayActivities.filter(row => row.details?.duplicate === true)).toHaveLength(1);
+      const identities = await db.select().from(runIdentityContexts).where(eq(runIdentityContexts.messageId, posted.body.id));
+      expect(identities).toHaveLength(1);
+      expect(identities[0].status).toBe("accepted");
+      process.stdout.write(`AUTO_STEER_PAGE_REPLAY ${JSON.stringify({ author, runId: seeded.runId, commentId: posted.body.id,
+        acknowledgement: saved.resultJson!.queuedSteeringAcknowledgements, httpStatuses: [200], duplicateActivities: 1,
+        providerTurns: 1, acceptedIdentities: identities.length })}\n`);
+    } finally {
+      automaticSteeringAvailable.value = false;
+      const actual = await vi.importActual<typeof import("../services/native-runtime/native-session-executor.js")>("../services/native-runtime/native-session-executor.js");
+      steerNativeSessionMock.mockReset().mockImplementation(actual.steerNativeSession);
+    }
+  });
 
   it("writes the identity acceptance, the wake payload, the run acknowledgement, and the activity row on a successful steering transaction", async () => {
     const seeded = await seedQueue();
