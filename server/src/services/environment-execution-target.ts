@@ -104,6 +104,10 @@ function sandboxLeaseAcquisitionFromMetadata(
       ? { previousProviderLeaseId: candidate.previousProviderLeaseId }
       : {}),
     ...(reason ? { reason } : {}),
+    ...(typeof candidate.restoredFromSnapshotAt === "string" && Number.isFinite(Date.parse(candidate.restoredFromSnapshotAt))
+      ? { restoredFromSnapshotAt: candidate.restoredFromSnapshotAt } : {}),
+    ...(typeof candidate.rebootedAt === "string" && Number.isFinite(Date.parse(candidate.rebootedAt))
+      ? { rebootedAt: candidate.rebootedAt } : {}),
   };
 }
 

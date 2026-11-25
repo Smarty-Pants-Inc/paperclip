@@ -727,6 +727,14 @@ export interface PluginEnvironmentResumeLeaseParams extends PluginEnvironmentDri
   requestedCwd?: string;
 }
 
+/** A resume may rebuild a dead allocation from older filesystem state. */
+export interface PluginEnvironmentResumeLeaseResult extends PluginEnvironmentLease {
+  /** ISO 8601 time of the restore. Set on every snapshot-restoring resume (also
+   * accepted in metadata). The host cold-resumes the existing provider session
+   * with a new Runner instead of adopting the restored Runner's stale journal. */
+  restoredFromSnapshotAt?: string;
+}
+
 export interface PluginEnvironmentReleaseLeaseParams extends PluginEnvironmentDriverBaseParams {
   /** Stop the exact allocation while preserving its files, regardless of its
    * ordinary release policy. A failed stop must throw, never fall back to delete. */
@@ -1500,7 +1508,7 @@ export interface HostToWorkerMethods {
   ];
   environmentResumeLease: [
     params: PluginEnvironmentResumeLeaseParams,
-    result: PluginEnvironmentLease,
+    result: PluginEnvironmentResumeLeaseResult,
   ];
   environmentReleaseLease: [
     params: PluginEnvironmentReleaseLeaseParams,

@@ -24,6 +24,7 @@ import type {
 import type { NativeSessionRecoveryResult, PersistedNativeSession } from "./contracts/native-session-backend.js";
 import {
   PROVIDER_ATTACH_REFUSED,
+  NativeRunnerClosedBeforeAttachmentError,
   PROVIDER_SIDE_EFFECT_PENDING,
   PROVIDER_STATE_INCOMPATIBLE,
   type HarnessThreadGoal,
@@ -2723,6 +2724,10 @@ export async function executeNativeSession(
       });
       else await attach();
     } catch (error) {
+      // This typed refusal proves no attachment command ran. Leave eviction and
+      // its single checkpoint retry to the host; quarantining would try to
+      // suspend the already-dead process and discard the cached owner first.
+      if (error instanceof NativeRunnerClosedBeforeAttachmentError) throw error;
       // attachRun has no transactional guarantee: a provider may bind the new
       // run before reporting a later failure. Conservatively quarantine the
       // session so neither the old nor partially attached run can reuse it.
