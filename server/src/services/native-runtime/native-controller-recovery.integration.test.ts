@@ -86,12 +86,19 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
   }
 
   // Gate 7: idle saved session, message + Stop before Pi starts, then two messages.
-  it.each(["pre-dispatch", "staged"] as const)("selects the committed idle session past %s Stop and failed admissions for two messages", async stage => {
-    const fixture = await seed(stage === "staged" ? "7" : undefined);
+  it.each(["pre-dispatch", "staged", "handed-off-once", "handed-off-twice"] as const)("selects the committed idle session past %s Stop and failed admissions for two messages", async stage => {
+    const handedOff = stage.startsWith("handed-off");
+    const fixture = await seed(handedOff ? "14" : stage === "staged" ? "7" : undefined);
+    if (handedOff) {
+      Object.assign(fixture.snapshot, { backendKind: "runner", driverKind: "pi_rpc", providerSessionId: "retained-provider-session",
+        activeTurnId: null, pendingRuntimeRequests: [] });
+      await db.update(heartbeatRuns).set({ runnerProfileJson: fixture.profile }).where(eq(heartbeatRuns.id, fixture.scope.runId));
+    }
     expect(await importNativeControllerRecovery(db, { ...fixture.scope,
       expectedConfigDigest: compatibility.configDigest, supervisor: fixture.supervisor })).toEqual({ kind: "imported" });
     const baseTime = Date.now();
-    for (const [index, status] of ["cancelled", "failed", "failed"].entries()) {
+    const statuses = handedOff ? Array<string>(stage === "handed-off-once" ? 1 : 2).fill("failed") : ["cancelled", "failed", "failed"];
+    for (const [index, status] of statuses.entries()) {
       const id = randomUUID();
       await db.insert(heartbeatRuns).values({ id, companyId, agentId, nativeIssueId: fixture.scope.issueId,
         nativeSessionId: fixture.scope.normalizedSessionId, runtimeMode: "native", status,
@@ -100,8 +107,13 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
           nativeExecutionInput: { staged: true }, sessionCheckpoint: { ...fixture.snapshot,
           cursor: stage === "staged" ? fixture.snapshot.cursor : null,
           identity: { ...fixture.snapshot.identity, runId: id } } },
-        resultJson: status === "cancelled" ? { nativeCancellation: { beforeStart: true } } : {},
+        resultJson: status === "cancelled" ? { nativeCancellation: { beforeStart: true } }
+          : handedOff ? { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } : {},
+        ...(handedOff ? { usageJson: { budgetDispatch: { handedOffAt: new Date().toISOString() } },
+          errorCode: "runner_state_identity_mismatch", error: "runner_state_identity_mismatch: journal_unsettled" } : {}),
       });
+      if (handedOff) await db.insert(nativeRunFinalizations).values({ companyId, issueId: fixture.scope.issueId,
+        runId: id, phase: "terminal_failure" });
     }
     for (let message = 0; message < 2; message++) {
       const currentRunId = randomUUID();
