@@ -255,6 +255,7 @@ export function projectPaperclipRunnerTaskConfig(
 ): Record<string, unknown> {
   const base = asRecord(agentConfig);
   const task = asRecord(taskOverrides);
+  if (backend === "pi_rpc") piRpcThinking(task);
   const config = { ...base };
   // The server resolves a connection's model namespace after task overrides.
   // Carry that model into durable input without allowing routing to change the harness.
@@ -285,12 +286,18 @@ function isPresentPiReasoning(value: unknown): boolean {
 }
 
 /** Unset Pi reasoning inherits the agent selection, or defaults to medium. */
-export function piRpcThinking(config: Record<string, unknown>): unknown {
-  if (isPresentPiReasoning(config.piRpcThinkingLevel)) {
-    return config.piRpcThinkingLevel === "none" ? "off" : config.piRpcThinkingLevel;
+export function piRpcThinking(config: Record<string, unknown>): "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" {
+  let selected: ReturnType<typeof piRpcThinking> | undefined;
+  for (const key of ["piRpcThinkingLevel", "modelReasoningEffort", "reasoningEffort", "effort"]) {
+    const value = config[key];
+    if (!isPresentPiReasoning(value)) continue;
+    const level = value === "auto" ? "medium" : value === "none" ? "off" : value;
+    if (level !== "off" && level !== "minimal" && level !== "low" && level !== "medium" && level !== "high" && level !== "xhigh" && level !== "max") {
+      throw new PaperclipRunnerProviderProfileError("pi_thinking_level_invalid", `pi_thinking_level_invalid: ${JSON.stringify(value)} (${key}); choose off, minimal, low, medium, high, xhigh or max`);
+    }
+    selected ??= level;
   }
-  const effort = [config.modelReasoningEffort, config.reasoningEffort, config.effort].find(isPresentPiReasoning) ?? "medium";
-  return effort === "auto" ? "medium" : effort === "none" ? "off" : effort;
+  return selected ?? "medium";
 }
 
 function positiveNumberOrNull(
@@ -555,6 +562,7 @@ export function resolvePaperclipRunnerProviderProfile(
   }
 
   if (candidate === "pi_rpc") {
+    piRpcThinking(config);
     if (config.homeMode === "preconfigured") {
       throw new PaperclipRunnerProviderProfileError("paperclip_runner_pi_rpc_policy_invalid", "Pi requires a fresh isolated resource home and does not support per-tool permission modes. Refused homeMode=preconfigured.");
     }
