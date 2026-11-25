@@ -35,12 +35,46 @@ describe("managed GitHub launchers", () => {
     expect(hints).toEqual(["second-org/app"]);
   });
 
-  it.each([
+  it.each<[string, string[], string, string]>([
+    ...[["run", "view", "7", "--log-failed"], ["run", "watch", "7", "--exit-status"], ["pr", "review", "7", "--approve"],
+      ["pr", "edit", "7", "--add-label", "x"], ["workflow", "run", "ci.yml", "--ref", "main"]]
+      .map<[string, string[], string, string]>(args => ["gh", args, "", "example-org/fetch"]),
+    ...[["merge", "-s"], ["merge", "-m"], ["merge", "-r"], ["review", "-a"], ["review", "-r"]]
+      .map<[string, string[], string, string]>(([command, flag]) => ["gh", ["pr", command, flag, "https://github.com/second-org/other/pull/42"], "", "second-org/other"]),
     ["gh", ["api", "repos/{owner}/{repo}/pulls"], "second-org/env", "second-org/env"],
     ["gh", ["api", "repos/{owner}/{repo}/pulls"], "github.com/second-org/other", "second-org/other"],
-    ["gh", ["api", "repos/second-org/other/pulls", "-R", "example-org/fetch"], "example-org/fetch", "second-org/other"],
-    ["gh", ["pr", "view", "https://github.com/second-org/other/pull/42", "-R", "example-org/fetch"], "example-org/fetch", "second-org/other"],
+    ["gh", ["api", "repos/second-org/other/pulls", "-R", "example-org/fetch"], "example-org/fetch", "example-org/fetch"],
+    ["gh", ["pr", "view", "https://github.com/second-org/other/pull/42", "-R", "example-org/fetch"], "example-org/fetch", "example-org/fetch"],
     ["gh", ["api", "repos/{owner}/{repo}/pulls"], "", "example-org/fetch"],
+    ["gh", ["api", "https://api.github.com:443/repos/second-org/other"], "", "second-org/other"],
+    ["gh", ["api", "orgs/second-org/repos"], "", "second-org"],
+    ["gh", ["api", "users/second-org/repos?per_page=100"], "example-org/fetch", "second-org"],
+    ["gh", ["repo", "clone", "--", "second-org/other"], "", "second-org/other"],
+    ["gh", ["api", "--method", "GET", "/%72epos/%73econd-org//other?per_page=100", "--input", "/tmp/request.json"], "invalid", "second-org/other"],
+    ["gh", ["api", "-f", "unused=repos/example-org/fetch", "https://api.github.com:8443//repos/second-org/other/issues"], "", "second-org/other"],
+    ["gh", ["api", "--", "repos/second-org/other"], "", "second-org/other"],
+    ["gh", ["api", "repos/second-org/other", "--input", "-"], "", "second-org/other"],
+    ["gh", ["issue", "view", "https://github.com:443/second-org/other/issues/42", "--repo=example-org/fetch"], "invalid", "example-org/fetch"],
+    ["gh", ["pr", "list", "--repo", "second-org/other"], "invalid", "second-org/other"],
+    ["gh", ["pr", "diff", "https://github.com/example-org/work/pull/42", "--patch"], "second-org/other", "example-org/work"],
+    ["gh", ["pr", "view", "https://github.com/example-org/work/pull/42", "--json", "title,body"], "second-org/other", "example-org/work"],
+    ["gh", ["pr", "checks", "https://github.com/example-org/work/pull/42"], "second-org/other", "example-org/work"],
+    ["gh", ["issue", "view", "https://github.com/example-org/work/issues/42", "--comments"], "second-org/other", "example-org/work"],
+    ["gh", ["pr", "diff", "https://github.com/second-org/other/pull/42", "--patch"], "example-org/fetch", "second-org/other"],
+    ["gh", ["pr", "view", "https://github.com/second-org/other/pull/42", "--json", "title,body"], "example-org/fetch", "second-org/other"],
+    ["gh", ["pr", "checks", "https://github.com/second-org/other/pull/42"], "example-org/fetch", "second-org/other"],
+    ["gh", ["issue", "view", "https://github.com/second-org/other/issues/42", "--comments"], "example-org/fetch", "second-org/other"],
+    ["gh", ["pr", "diff", "--name-only", "https://github.com/second-org/other/pull/42"], "invalid", "second-org/other"],
+    ["gh", ["pr", "view", "--web", "https://github.com/second-org/other/pull/42"], "invalid", "second-org/other"],
+    ["gh", ["pr", "view", "--json=title,body", "-q", ".body", "https://github.com/second-org/other/pull/42"], "invalid", "second-org/other"],
+    ["gh", ["issue", "view", "--comments", "--json", "body", "--jq", ".body", "https://github.com/second-org/other/issues/42"], "invalid", "second-org/other"],
+    ["gh", ["pr", "diff", "--color", "never", "--exclude", "docs/*", "-e", "*.md", "https://github.com/second-org/other/pull/42", "--patch", "-R", "example-org/fetch"], "invalid", "example-org/fetch"],
+    ["gh", ["pr", "checks", "--required", "--watch", "--fail-fast", "-i", "5", "https://github.com/second-org/other/pull/42"], "invalid", "second-org/other"],
+    ["gh", ["pr", "checks", "--interval=5", "https://github.com/example-org/work/pull/42", "--repo", "second-org/other"], "invalid", "second-org/other"],
+    ["gh", ["issue", "view", "-c", "https://github.com/second-org/other/issues/42"], "invalid", "second-org/other"],
+    ["gh", ["pr", "create", "--title", "A title", "--body", "https://github.com/second-org/other"], "", "second-org/other"],
+    ["gh", ["pr", "list", "--unknown", "second-org/other"], "", "example-org/fetch"],
+    ["gh", ["pr", "view", "--", "--repo", "second-org/other"], "", "example-org/fetch"],
     ["git", ["push", "other", "main"], "", "second-org/other"],
     ["git", ["push", "--force", "other", "main"], "", "second-org/other"],
     ["git", ["push", "origin", "main"], "", "second-org/push"],
@@ -122,9 +156,18 @@ process.stdout.write(process.env.GH_TOKEN || '');
   });
 
   it.each([
+    ["pr", "merge", "https://github.com/example-org/work/pull/7", "https://github.com/second-org/other/pull/42"],
     ["api", "graphql", "-f", 'query={repository(owner:"second-org",name:"other"){name}}'],
     ["api", "graphql", "-F", "owner=second-org", "-F", "name=other", "-f", "query=query($owner:String!,$name:String!){repository(owner:$owner,name:$name){name}}"],
     ["api", "graphql", "--input", "query.json"],
+    ["api", "https://api.github.com:443/graphql", "-f", 'query={repository(owner:"second-org",name:"other"){name}}'],
+    ["api", "https://api.github.com:8443//%67raphql?unused=1", "--input", "query.json"],
+    ["api", "-X", "POST", "--", "graphql"],
+    ["api", "search/repositories?q=second-org"],
+    ["api", "repos/%zz/other"],
+    ["api", "repos/second-org/../other"],
+    ["repo", "clone", "--", "not-a-repository"],
+    ["pr", "list", "--repo"],
     ["pr", "view", "https://github.com/%73econd-org/other/pull/42"],
     ["repo", "clone", "https://github.com:443/%73econd-org/other.git"],
   ])("refuses unsupported explicit targets instead of using origin: %j", async (...args) => {
