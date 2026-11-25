@@ -1662,6 +1662,21 @@ describe("rebindNativeSessionCheckpoint", () => {
     }
   });
 
+  it.each(["continuous", "paperclip"] as const)("rebinds changed Pi instruction bytes without a new session only in continuous mode (%s)", sessionContinuity => {
+    const prior = execution(previousRunId), current = execution(currentRunId);
+    for (const value of [prior, current]) {
+      value.provider = { kind: "pi_rpc", model: "provider/model", sessionContinuity };
+      value.session.driverKind = "pi_rpc";
+    }
+    const source = previousRun({ nativeExecutionInput: prior });
+    source.runnerProfileJson.sessionCheckpoint.driverKind = "pi_rpc";
+    current.runtimeContext.instructions.bundle.digest = "b".repeat(64);
+    current.runtimeContext.aggregateDigest = canonicalNativeRuntimeContextDigest(current.runtimeContext);
+    const result = buildNativeExecutionWithCheckpoint({ previousRun: source, normalizedSessionId, buildExecution: () => current });
+    expect(result.normalizedSessionId === normalizedSessionId).toBe(sessionContinuity === "continuous");
+    expect(!!result.checkpoint).toBe(sessionContinuity === "continuous");
+  });
+
   it.each([
     { key: "model", continuous: true, conversation: true, retain: true },
     { key: "piRpcThinkingLevel", continuous: true, conversation: true, retain: true },
