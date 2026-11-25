@@ -179,6 +179,10 @@ export interface SandboxLeaseAcquisition {
   outcome: "created" | "resumed" | "replacement";
   providerLeaseId: string;
   previousProviderLeaseId?: string;
+  /** This allocation was restored from older disk state: cold-resume, never adopt its old Runner. */
+  restoredFromSnapshotAt?: string;
+  /** The provider rebooted the same allocation after its bound run ended. */
+  rebootedAt?: string;
   reason?: "not_found" | "expired" | "identity_mismatch" | "resume_failed";
 }
 

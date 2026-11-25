@@ -287,6 +287,33 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
     expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "resumed" });
   });
 
+  it.each([
+    ["reply", "restoredFromSnapshotAt"], ["metadata", "restoredFromSnapshotAt"], ["lease", "restoredFromSnapshotAt"],
+    ["metadata", "rebootedAt"], ["lease", "rebootedAt"],
+  ] as const)("records process loss from %s.%s at both resume doors without replacing the disk", async (source, marker) => {
+    const seeded = await seed();
+    const restoredFromSnapshotAt = "2026-11-25T12:00:00.000Z";
+    const signal = { [marker]: restoredFromSnapshotAt };
+    if (source === "lease") seeded.lease.metadata = { ...seeded.lease.metadata, ...signal };
+    const { call, runtime } = worker(seeded, async () => ({ providerLeaseId: seeded.providerLeaseId,
+      ...(source === "reply" ? { restoredFromSnapshotAt } : {}),
+      metadata: { remoteCwd: "/home/daytona/paperclip-workspace", ...(source === "metadata" ? signal : {}) } }));
+    if (source === "lease") await environmentService(db).updateLeaseMetadata(seeded.lease.id, seeded.lease.metadata!);
+    const expected = { outcome: "resumed", ...signal };
+    const resumed = await runtime.resumeRunLease({ environment: seeded.environment, lease: seeded.lease });
+    expect(resumed).toMatchObject({ providerLeaseId: seeded.providerLeaseId, metadata: signal });
+    const recorded = await environmentService(db).getLeaseById(seeded.lease.id);
+    expect(recorded?.metadata).toMatchObject({ ...seeded.lease.metadata, ...signal });
+    // Repeated notification keeps the same provenance, workspace and backup.
+    await runtime.resumeRunLease({ environment: seeded.environment, lease: recorded! });
+    expect((await environmentService(db).getLeaseById(seeded.lease.id))?.metadata).toEqual(recorded?.metadata);
+    const acquired = await acquire(seeded, runtime);
+    expect(acquired.lease.providerLeaseId).toBe(seeded.providerLeaseId);
+    expect(acquired.lease.metadata).toMatchObject({ ...signal, sandboxLeaseAcquisition: expected,
+      nativeHarnessBackup: seeded.lease.metadata!.nativeHarnessBackup });
+    expect(call.mock.calls.every(([, method]) => method === "environmentResumeLease")).toBe(true);
+  });
+
   it("retries a sandbox state change inside the run and resumes the same sandbox", async () => {
     const seeded = await seed();
     const { call, runtime } = worker(seeded, async (attempt) => {

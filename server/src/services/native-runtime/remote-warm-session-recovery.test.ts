@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { describeFailedAttachment, describeOwnFailedAttachment, isSettledRemoteWarmControlState, summarizePostTerminalEvents } from "./remote-warm-session-recovery.js";
+import { describe, expect, it, vi } from "vitest";
+import { inspectRemoteWarmSessionRecovery, describeFailedAttachment, describeOwnFailedAttachment, isSettledRemoteWarmControlState, summarizePostTerminalEvents } from "./remote-warm-session-recovery.js";
 
 const identity = { runId: "run", normalizedSessionId: "session", runnerInstanceId: "runner", environmentLeaseId: "lease", turnId: "turn", itemId: "item" };
 const terminal = { eventType: "run.terminal", envelope: { ...identity } };
@@ -12,6 +12,23 @@ const notice = { schema: "paperclip.provider.notice.v1", noticeId: "codex-warnin
 const noticeNotification = { ...notification, eventType: "provider.notice.recorded", payload: notice };
 const lateNotice = { eventType: "provider.notice.recorded", envelope: { ...identity, payload: noticeNotification } };
 const state = (events: unknown[]) => ({ identity, commands: [{ status: "completed" }], committedEvents: events });
+
+describe("process loss skips live adoption without changing session identity", () => {
+  it.each(["restoredFromSnapshotAt", "rebootedAt", "healthy"] as const)("steps aside only for a process-loss signal: %s", async signal => {
+    const select = vi.fn(() => { throw new Error("ordinary_live_adoption_probe"); });
+    const input = {
+      db: { select }, execution: { binding: { runId: "next-run" }, session: { normalizedSessionId: identity.normalizedSessionId } },
+      target: { kind: "remote", transport: "sandbox", leaseId: "lease", environmentId: "environment", providerKey: "boat",
+        sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "same-box", ...(signal === "healthy" ? {} : { [signal]: "2026-11-25T12:00:00.000Z" }) } },
+      identity, readControlState: vi.fn(), matchesExecution: vi.fn(), loadCheckpoint: vi.fn(), canReuseProcess: vi.fn(),
+    };
+    const inspect = () => inspectRemoteWarmSessionRecovery(input as unknown as Parameters<typeof inspectRemoteWarmSessionRecovery>[0]);
+    if (signal === "healthy") { await expect(inspect()).rejects.toThrow("ordinary_live_adoption_probe"); expect(select).toHaveBeenCalledOnce(); }
+    else { expect(await inspect()).toBeNull(); expect(select).not.toHaveBeenCalled(); }
+    expect(input.execution.session.normalizedSessionId).toBe("session");
+    expect(input.loadCheckpoint).not.toHaveBeenCalled();
+  });
+});
 
 describe("settled remote warm control evidence", () => {
   const completed = { eventType: "turn.completed", envelope: { ...identity, payload: {
