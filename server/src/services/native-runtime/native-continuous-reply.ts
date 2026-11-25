@@ -1,4 +1,4 @@
-import { and, asc, eq, lt, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, lt, sql } from "drizzle-orm";
 import { agentWakeupRequests, agents, heartbeatRunEvents, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import type { NativeExecutionInput, PrpEvent } from "../../vendor/paperclip-runner/index.js";
 import { completedPlanProposalIds, nativeFinalReplyKey, readCompletedAssistantMessageCandidate, resolveHeartbeatRunResponse } from "../heartbeat-run-summary.js";
@@ -14,6 +14,8 @@ import { logger } from "../../middleware/logger.js";
 import { drainContinuousPersonMessages } from "./native-continuous-drain.js";
 import { readFirstTurnQueuedInputReceipt } from "./first-turn-queued-input.js";
 import { readContinuousSessionInput, settleContinuousSessionInput } from "./continuous-session-input.js";
+import { queuedCommentIdsFromWakePayload, withQueuedCommentIdsInWakePayload } from "../issue-queued-comment-queue.js";
+import { queuedInteractionId } from "../queued-interaction-response.js";
 
 /** Replay the ingestion/publication crash gap before terminal presentation or queue release. */
 export async function recoverContinuousNativeReplies(db: Db, scope: { id: string; companyId: string }) {
@@ -95,18 +97,25 @@ export async function publishContinuousNativeReply(input: {
     // an unqualified late ACK proves delivery, never consumption by this final.
     const answers = input.event.payload.answers;
     const explicitAnswers = Array.isArray(answers);
-    const firstInputIds = Object.keys(replies).length === 0 ? [
+    const sealed = readFirstTurnQueuedInputReceipt(row.run);
+    const sealedIds = [...(sealed?.commentIds ?? []), ...(sealed?.interactionIds ?? [])];
+    // These IDs name the submitted user message for the whole run, even if
+    // earlier finals answered nothing (or answered another input). Reply count
+    // only gates the legacy implicit fallback, never this explicit alias.
+    const submittedInputIds = [
       ...(Array.isArray(row.run.contextSnapshot?.wakeCommentIds) ? row.run.contextSnapshot.wakeCommentIds : []),
       ...(typeof wakeId === "string" ? [wakeId] : []),
-      ...(readFirstTurnQueuedInputReceipt(row.run)?.commentIds ?? []),
-    ].filter((id): id is string => typeof id === "string" && !answered.has(id)) : [];
+    ].filter((id): id is string => typeof id === "string");
+    const firstInputIds = Object.keys(replies).length === 0
+      ? [...submittedInputIds, ...sealedIds].filter(id => !answered.has(id)) : [];
     const continued = parseObject(result.continuedSessionInput);
     const impliedInputIds = Object.keys(replies).length === 0 && continued.runId === runId &&
       continued.sessionId === row.run.nativeSessionId && Array.isArray(continued.commentIds)
       ? continued.commentIds.filter((id): id is string => typeof id === "string" && !answered.has(id)) : [];
     const questionCommentIds = [...new Set([
       ...(explicitAnswers
-        ? answers.filter((id): id is string => typeof id === "string" && !answered.has(id))
+        ? [...answers.filter((id): id is string => typeof id === "string" && !answered.has(id)),
+          ...(answers.some(id => submittedInputIds.includes(id)) ? sealedIds.filter(id => !answered.has(id)) : [])]
         : [...impliedInputIds, ...firstInputIds]),
       ...(input.event.turnId ? firstInputIds : []),
       ...sameTurnAcknowledgements,
@@ -132,6 +141,26 @@ export async function publishContinuousNativeReply(input: {
     await tx.update(heartbeatRuns).set({ resultJson: { ...result, continuousReplies: { ...replies,
       [input.event.itemId!]: { questionCommentIds, commentId: comment.id, sourceEventId: input.event.sourceEventId },
     } } }).where(eq(heartbeatRuns.id, runId));
+    // Reply attribution and queue settlement commit together. A claim alone is
+    // not consumption: before this final, failed starts still owe every answer.
+    if (sealed?.wakeupRequestIds.length) {
+      const wakes = await tx.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId),
+        inArray(agentWakeupRequests.id, sealed.wakeupRequestIds), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+      )).for("update");
+      const consumed = new Set(questionCommentIds), now = new Date();
+      for (const wake of wakes) {
+        const interactionId = queuedInteractionId(wake.payload);
+        const ids = queuedCommentIdsFromWakePayload(wake.payload);
+        const remaining = ids.filter(id => !consumed.has(id));
+        if (interactionId ? !sealed.interactionIds?.includes(interactionId) || !consumed.has(interactionId)
+          : remaining.length === ids.length) continue;
+        await tx.update(agentWakeupRequests).set({ ...(remaining.length
+          ? { payload: withQueuedCommentIdsInWakePayload(wake.payload, remaining) }
+          : { status: "cancelled", finishedAt: now }), updatedAt: now }).where(eq(agentWakeupRequests.id, wake.id));
+      }
+    }
     await logActivity(tx, { companyId, actorType: "agent", actorId: agentId, agentId, runId, issueId,
       action: "issue.comment_added", entityType: "issue", entityId: issueId,
       details: { commentId: comment.id, bodySnippet: comment.body.slice(0, 120), identifier: issue.identifier,
