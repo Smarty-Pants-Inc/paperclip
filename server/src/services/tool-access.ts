@@ -4596,7 +4596,7 @@ export function toolAccessService(
       localTrusted = false,
       options?: { requiredRepositoryIds: readonly string[] },
     ) => measureRunPhase("connectors.github.catalog", async () => {
-      const [connections, grants, members, memberships] = await Promise.all([
+      const [connections, grants, members, memberships, installs] = await Promise.all([
         measureRunPhase("connectors.github.connections", () => db
           .select()
           .from(toolConnections)
@@ -4627,7 +4627,11 @@ export function toolAccessService(
                 ),
               ))
           : Promise.resolve([]),
+        db.select({ connectionId: toolConnectionInstalls.connectionId })
+          .from(toolConnectionInstalls)
+          .where(eq(toolConnectionInstalls.companyId, companyId)),
       ]);
+      const installedConnectionIds = new Set(installs.map(install => install.connectionId));
       const repositories = new Map<
         string,
         import("@paperclipai/shared").ProjectRepository
@@ -4639,7 +4643,8 @@ export function toolAccessService(
       for (const connection of connections) {
         if (
           connection.status !== "active" ||
-          asRecord(connection.config).sourceTemplateKey !== "github"
+          asRecord(connection.config).sourceTemplateKey !== "github" ||
+          (isGitHubAppConnection(connection) && !installedConnectionIds.has(connection.id))
         )
           continue;
         const connectionGrants = grants.filter(
