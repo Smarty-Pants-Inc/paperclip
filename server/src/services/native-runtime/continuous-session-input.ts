@@ -1,5 +1,5 @@
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
-import { agentWakeupRequests, agents, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
+import { agentWakeupRequests, agents, heartbeatRuns, issueComments, issueQuestionResponseDeliveries, issues, type Db } from "@paperclipai/db";
 import { parseObject } from "../../adapters/utils.js";
 import { queuedCommentIdsFromRunContext, queuedCommentIdsFromWakePayload, withQueuedCommentIdsInWakePayload } from "../issue-queued-comment-queue.js";
 import { resolveSessionContinuity } from "./continued-session.js";
@@ -117,9 +117,19 @@ export async function answeredContinuousHeldRun(db: Db, scope: Scope): Promise<b
   ]);
   const wakes = await db.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.companyId, scope.companyId), eq(agentWakeupRequests.agentId, row.run.agentId),
-    eq(agentWakeupRequests.status, "deferred_issue_execution"), sql`${agentWakeupRequests.payload}->>'issueId' = ${scope.issueId}`));
-  for (const wake of wakes) for (const id of queuedCommentIdsFromWakePayload(wake.payload)) pending.add(id);
-  return [...pending].every(id => answered.has(id));
+    inArray(agentWakeupRequests.status, ["deferred_issue_execution", "queued"]),
+    sql`${agentWakeupRequests.payload}->>'issueId' = ${scope.issueId}`));
+  for (const wake of wakes) {
+    // Card/question responses are distinct input, never settled by a comment
+    // attribution. Keep ordinary failure arbitration while their wake is pending.
+    const payload = parseObject(wake.payload), wakeContext = parseObject(payload._paperclipWakeContext);
+    if (payload.interactionId || wakeContext.interactionId) return false;
+    for (const id of queuedCommentIdsFromWakePayload(wake.payload)) pending.add(id);
+  }
+  const [response] = await db.select({ id: issueQuestionResponseDeliveries.id }).from(issueQuestionResponseDeliveries).where(and(
+    eq(issueQuestionResponseDeliveries.companyId, scope.companyId), eq(issueQuestionResponseDeliveries.issueId, scope.issueId),
+    inArray(issueQuestionResponseDeliveries.status, ["pending", "delivering"]))).limit(1);
+  return !response && [...pending].every(id => answered.has(id));
 }
 
 export async function reconcileContinuousSessionInput(db: Db, scope: Scope) {
