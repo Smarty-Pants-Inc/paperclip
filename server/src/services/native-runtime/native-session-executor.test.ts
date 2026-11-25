@@ -19085,15 +19085,17 @@ describe("runnerd provider runtime wiring", () => {
     } finally { restore.mockRestore(); header.mockRestore(); verify.mockRestore(); await controller.stop(); }
   });
 
-  it.each(["suspended", "ready", "identity-mismatch", "pending-outbox", "pending-terminal",
-    "recoverable_failure", "recoverable_failure-identity-mismatch", "recoverable_failure-pending-outbox",
+  it.each(["suspended", "suspended-github", "ready", "identity-mismatch", "pending-outbox", "pending-terminal",
+    "recoverable_failure", "recoverable_failure-github", "recoverable_failure-identity-mismatch", "recoverable_failure-pending-outbox",
     "recoverable_failure-pending-terminal", "recoverable_failure-pending-cleanup", "recoverable_failure-pid-alive",
     "recoverable_failure-warm-transition", "recoverable_failure-empty-reason", "recoverable_failure-changed-receipt",
     "recoverable_failure-changed-identity"] as const)(
-    "cold-restores only a settled inert warm box after live admission: %s", async mode => {
+    "cold-restores only a settled inert warm box after live admission: %s", async scenario => {
+      const managedGitHub = scenario.endsWith("-github");
+      const mode = scenario.replace(/-github$/, "");
       const coldRestore = mode === "suspended" || mode === "recoverable_failure";
       const lifecycle = mode.startsWith("recoverable_failure") ? "recoverable_failure" : "suspended";
-      const first = scopedNativeExecution(`suspended-live-adoption-${mode}`);
+      const first = scopedNativeExecution(`suspended-live-adoption-${scenario}`);
       first.session.lifecyclePolicy = { mode: "warm", idleTimeoutMs: 60_000 };
       const next = { ...first, binding: { ...first.binding, runId: `${first.binding.runId}-next` } };
       const identity = { runId: first.binding.runId, normalizedSessionId: first.session.normalizedSessionId!,
@@ -19177,11 +19179,27 @@ describe("runnerd provider runtime wiring", () => {
           expect(existsSync(join(root, "plugin-runner-state.json"))).toBe(false);
           reads = 0;
         }
+        // Mirror the real access handle's single-active-run contract: cold
+        // fallback must release the first activation, not recreate the handle.
+        const githubLifecycle: string[] = [];
+        const activate = vi.fn((binding: { runId: string }) => {
+          if (githubLifecycle.at(-1) === "activate") throw new Error("GitHub session is closed or busy");
+          expect(binding).toEqual(next.binding);
+          githubLifecycle.push("activate");
+          return () => { githubLifecycle.push("release"); };
+        });
+        if (managedGitHub) githubAccess.create.mockImplementationOnce(async () => ({
+          env: {}, ready: true, duplexRequested: false, activate, stop: vi.fn(async () => undefined),
+        }));
         const following = executePaperclipNativeSession({ db, execution: next, runnerInstanceId: identity.runnerInstanceId,
-          useRunnerd: true, runnerExecutionTarget: followingTarget as never });
+          useRunnerd: true, managedGitHub, runnerExecutionTarget: followingTarget as never });
         if (mode === "ready" || coldRestore) {
           await expect(following).resolves.toMatchObject({ exitCode: 0, sessionId: identity.normalizedSessionId });
           expect(state.execute).toHaveBeenCalledTimes(2);
+          if (managedGitHub) {
+            expect(activate).toHaveBeenCalledTimes(2);
+            expect(githubLifecycle).toEqual(["activate", "release", "activate", "release"]);
+          }
           expect(recoverSession).toHaveBeenCalledTimes(mode === "ready" ? 1 : 0);
           if (coldRestore) {
             expect(JSON.parse(await readFile(join(root, "plugin-runner-state.json"), "utf8")))
