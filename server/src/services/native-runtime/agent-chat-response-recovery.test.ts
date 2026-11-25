@@ -17,6 +17,7 @@ import { compactRunLogChunk } from "../heartbeat/run-log.js";
 import { publishContinuousNativeReply } from "./native-continuous-reply.js";
 import { answeredContinuousHeldRun, readContinuousSessionInput } from "./continuous-session-input.js";
 import { requeueContinuousUnanswered } from "./native-continuous-unanswered.js";
+import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 import { drainContinuousPersonMessages } from "./native-continuous-drain.js";
 import { readBoardQueuedComments } from "../../modules/wake-queue/adapters/queued-comment-board-postgres.js";
 import { claimFirstTurnQueuedInput } from "./first-turn-queued-input.js";
@@ -1295,6 +1296,142 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     expect(await comments(f.runId)).toHaveLength(3);
   });
 
+  it("answers opening and its sealed companions without taking a later same-turn steered ACK", async () => {
+    heldSteering.available = false;
+    await fixture(true, { beforeFinalize: async scope => {
+      const s = await seamInputs(scope);
+      const named = await s.queueComment("Explicitly answered steer");
+      const unnamed = await s.queueComment("Same-turn steer left pending");
+      const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      await db.update(heartbeatRuns).set({ resultJson: { ...current.resultJson, queuedSteeringAcknowledgements: {
+        [named.comment.id]: { status: "acknowledged", turnId: "exclusive-turn", afterEventSeq: 170,
+          acknowledgedAt: new Date().toISOString() },
+        [unnamed.comment.id]: { status: "acknowledged", turnId: "exclusive-turn", afterEventSeq: 170,
+          acknowledgedAt: new Date().toISOString() },
+      } } }).where(eq(heartbeatRuns.id, scope.runId));
+      const publish = async (itemId: string, answers: string[], cursor: number) => publishContinuousNativeReply({ db, cursor,
+        execution: { binding: scope, provider: { kind: "pi_rpc" } },
+        event: { eventType: "item.completed", runId: scope.runId, normalizedSessionId: s.run.nativeSessionId!,
+          turnId: "exclusive-turn", sourceEventId: itemId, itemId,
+          payload: { kind: "agentMessage", channel: "final", text: "Exact reply", answers } } });
+      await publish("exclusive-steer", [named.comment.id], 171);
+      await publish("exclusive-opening", [s.opening.id], 172);
+      const replies = (await s.readRun()).resultJson!.continuousReplies as Record<string, { questionCommentIds: string[] }>;
+      expect(replies["exclusive-steer"].questionCommentIds).toEqual([named.comment.id]);
+      expect(replies["exclusive-opening"].questionCommentIds).toEqual([s.opening.id, s.c.comment.id, s.card.id]);
+      expect(Object.values(replies).flatMap(reply => reply.questionCommentIds)).not.toContain(unnamed.comment.id);
+      await publish("exclusive-sealed", [s.c.comment.id, s.card.id], 173);
+      expect((await s.readRun()).resultJson?.continuousReplies).toMatchObject({
+        "exclusive-sealed": { questionCommentIds: [] },
+      });
+      expect((await s.wakes()).filter(w => [s.c.wake.id, s.cardWake.id].includes(w.id)).every(w =>
+        w.status === "cancelled")).toBe(true);
+    } });
+  });
+
+  it.each(["explicit", "empty", "absent", "late-ack"])("owns each ACK by its exact final or the first following cursor (%s)", async scenario => {
+    await fixture(true, { beforeFinalize: async scope => {
+      await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, scope.agentId));
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      const openingId = run.contextSnapshot!.wakeCommentId as string;
+      const [opening] = await db.select().from(issueComments).where(eq(issueComments.id, openingId));
+      const [steered] = await db.insert(issueComments).values({ companyId: scope.companyId, issueId: scope.issueId,
+        authorUserId: opening.authorUserId, body: "G-2: ask a question after counting" }).returning();
+      const firstAnswerIds = [openingId];
+      const firstSteerId = randomUUID();
+      if (scenario === "explicit") {
+        await db.insert(issueComments).values({ id: firstSteerId, companyId: scope.companyId, issueId: scope.issueId,
+          authorUserId: opening.authorUserId, body: "An earlier steer answered only by the first final" });
+        firstAnswerIds.push(firstSteerId);
+      }
+      await db.update(heartbeatRuns).set({ resultJson: { queuedSteeringAcknowledgements: {
+        ...(scenario === "explicit" ? { [firstSteerId]: { status: "acknowledged", turnId: "count-turn",
+          acknowledgedAt: new Date().toISOString(), afterEventSeq: 169 } } : {}),
+        [steered.id]: { status: "acknowledged", turnId: "count-turn", acknowledgedAt: new Date().toISOString(),
+          afterEventSeq: scenario === "late-ack" ? 172 : 170 },
+      } } }).where(eq(heartbeatRuns.id, scope.runId));
+      for (let index = 0; index < 2; index++) await publishContinuousNativeReply({ db, cursor: 171 + index * 2,
+        execution: { binding: scope, provider: { kind: "pi_rpc" } },
+        event: { eventType: "item.completed", runId: scope.runId, normalizedSessionId: run.nativeSessionId!,
+          turnId: "count-turn", sourceEventId: `ownership-${index}`, itemId: `ownership-${index}`,
+          payload: { kind: "agentMessage", channel: "final", text: index === 0 ? "1, 2, 3" : "Which color?",
+            ...(scenario === "explicit" ? { answers: index === 0 ? firstAnswerIds : [steered.id] }
+              : scenario === "absent" ? {} : { answers: [] }) } } });
+      const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      const replies = saved.resultJson!.continuousReplies as Record<string, { questionCommentIds: string[] }>;
+      const onLater = scenario === "explicit" || scenario === "late-ack";
+      expect(replies["ownership-0"].questionCommentIds).toEqual(onLater ? firstAnswerIds : [openingId, steered.id]);
+      expect(replies["ownership-1"].questionCommentIds).toEqual(onLater ? [steered.id] : []);
+    } });
+  });
+
+  it.each(["before-count", "after-count", "plain"])("persists the native card's causal input through its answer reply (%s)", async scenario => {
+    let askingId!: string, interactionId!: string;
+    const f = await fixture(true, { beforeFinalize: async scope => {
+      await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, scope.agentId));
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      const openingId = run.contextSnapshot!.wakeCommentId as string;
+      const [opening] = await db.select().from(issueComments).where(eq(issueComments.id, openingId));
+      await db.insert(companyMemberships).values({ companyId: scope.companyId, principalId: opening.authorUserId!,
+        principalType: "user", status: "active", membershipRole: "member" });
+      askingId = openingId;
+      if (scenario !== "plain") {
+        const [asking] = await db.insert(issueComments).values({ companyId: scope.companyId, issueId: scope.issueId,
+          authorUserId: opening.authorUserId, body: "G-2: when done, ask me a question with your card tool" }).returning();
+        askingId = asking.id;
+        await db.update(heartbeatRuns).set({ resultJson: { queuedSteeringAcknowledgements: {
+          [askingId]: { status: "acknowledged", turnId: "count-turn", acknowledgedAt: new Date().toISOString(),
+            afterEventSeq: scenario === "before-count" ? 170 : 172 },
+        } } }).where(eq(heartbeatRuns.id, scope.runId));
+      }
+      await publishContinuousNativeReply({ db, cursor: 171, execution: { binding: scope, provider: { kind: "pi_rpc" } },
+        event: { eventType: "item.completed", runId: scope.runId, normalizedSessionId: run.nativeSessionId!,
+          turnId: "count-turn", sourceEventId: "count-final", itemId: "count-final",
+          payload: { kind: "agentMessage", channel: "final", text: "1, 2, 3, 4, 5", answers: [] } } });
+      // Tool authority uses the asking turn's committed cursor, not wall time or
+      // the answer-delivery run's original wake comment.
+      await db.insert(heartbeatRunEvents).values({ companyId: scope.companyId, runId: scope.runId, agentId: scope.agentId,
+        seq: 173, eventType: "turn.started", payload: { prpEvent: { turnId: "count-turn" } } });
+      await db.update(heartbeatRuns).set({ nextEventSeq: 174 }).where(eq(heartbeatRuns.id, scope.runId));
+      const authority = new PaperclipRunnerToolAuthority(db, scope);
+      try {
+        const result = await authority.execute({ tool: "request_human_input", callId: randomUUID(), arguments: {
+          interactionKind: "questions", idempotencyKey: "color-card", title: "Choose a color", prompt: "Which color?",
+          continuationPolicy: "wake_assignee", payload: { version: 1, questions: [{ id: "color", prompt: "Which color?",
+            selectionMode: "single", required: true, options: [{ id: "blue", label: "Blue" }] }] },
+        } }) as { interaction: { id: string; sourceCommentId: string } };
+        interactionId = result.interaction.id;
+        expect(result.interaction.sourceCommentId).toBe(askingId);
+      } finally { authority.close(); }
+      const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      expect((saved.resultJson!.continuousReplies as Record<string, { questionCommentIds: string[] }>)["count-final"].questionCommentIds)
+        .toEqual(scenario === "before-count" ? [openingId, askingId] : [openingId]);
+    } });
+    await issueThreadInteractionService(db).answerQuestions({ id: f.issueId, companyId: f.companyId, status: "in_progress" },
+      interactionId, { answers: [{ questionId: "color", optionIds: ["blue"] }] }, { userId: f.userId });
+    const wakeup = vi.fn<QuestionResponseDeliveryServiceOptions["heartbeat"]["wakeup"]>(async (_agentId, options) => {
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+        nativeIssueId: f.issueId, nativeSessionId: randomUUID(), runtimeMode: "native", status: "running",
+        contextSnapshot: { ...options!.contextSnapshot, conversationSessionGeneration: 0 } }).returning();
+      await db.update(issues).set({ executionRunId: run.id }).where(eq(issues.id, f.issueId));
+      return run;
+    });
+    const delivered = await questionResponseDeliveryService(db, { heartbeat: { wakeup } as never }).deliver(interactionId);
+    expect(delivered).toMatchObject({ status: "fallback_queued" });
+    const [answerRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, delivered!.targetRunId!));
+    await publishContinuousNativeReply({ db, cursor: 1, execution: { binding: { ...f, runId: answerRun.id }, provider: { kind: "pi_rpc" } },
+      event: { eventType: "item.completed", runId: answerRun.id, normalizedSessionId: answerRun.nativeSessionId!,
+        turnId: "answer-turn", sourceEventId: "blue-final", itemId: "blue-final",
+        payload: { kind: "agentMessage", channel: "final", text: "Blue it is.", answers: [] } } });
+    const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, answerRun.id));
+    const blue = (saved.resultJson!.continuousReplies as Record<string, { questionCommentIds: string[]; commentId: string }>)["blue-final"];
+    expect(blue.questionCommentIds).toEqual([askingId]);
+    const [comment] = await db.select().from(issueComments).where(eq(issueComments.id, blue.commentId));
+    expect(comment.body).toBe("Blue it is.");
+    console.log(JSON.stringify({ proof: "replymap2-card-answer", scenario, runId: f.runId, answerRunId: answerRun.id,
+      g1: f.wakeId, askingId, interactionId, answerQuestionCommentIds: blue.questionCommentIds }));
+  });
+
   it.each([true, false])("maps held finals by explicit answers, or only opening input when absent (answers=%s)", async explicit => {
     const ids = [randomUUID(), randomUUID(), randomUUID(), randomUUID(), randomUUID()];
     const f = await fixture(true, { beforeFinalize: async scope => {
@@ -1336,7 +1473,7 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     expect(wake.payload).toMatchObject({ _paperclipWakeContext: { wakeCommentIds: explicit ? [ids[4]] : ids } });
   });
 
-  it.each(["steered-explicit", "steered-legacy", "plain"])("keeps the count, question card and answer attached to their person input (%s)", async scenario => {
+  it.each(["steered-explicit", "steered-legacy", "plain"])("keeps the count, native question card and answer attached to their person input (%s)", async scenario => {
     const steered = scenario !== "plain";
     let askingCommentId!: string;
     let interactionId!: string;
@@ -1366,12 +1503,19 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
       const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
       countCommentIds = (saved.resultJson!.continuousReplies as Record<string, { questionCommentIds: string[] }>)["count-final"].questionCommentIds;
       expect(countCommentIds).toEqual(steered ? [opening.id, askingCommentId] : [opening.id]);
-      const card = await issueThreadInteractionService(db).create({ id: scope.issueId, companyId: scope.companyId }, {
-        kind: "ask_user_questions", continuationPolicy: "wake_assignee", sourceRunId: scope.runId,
-        payload: { version: 1, questions: [{ id: "color", prompt: "Which color?", selectionMode: "single", required: true,
-          options: [{ id: "blue", label: "Blue" }] }] },
-      }, { agentId: scope.agentId, runId: scope.runId });
-      interactionId = card.id;
+      await db.insert(heartbeatRunEvents).values({ companyId: scope.companyId, runId: scope.runId, agentId: scope.agentId,
+        seq: 173, eventType: "turn.started", payload: { prpEvent: { turnId: "count-turn" } } });
+      await db.update(heartbeatRuns).set({ nextEventSeq: 174 }).where(eq(heartbeatRuns.id, scope.runId));
+      const authority = new PaperclipRunnerToolAuthority(db, scope);
+      try {
+        const card = await authority.execute({ tool: "request_human_input", callId: randomUUID(), arguments: {
+          interactionKind: "questions", idempotencyKey: "count-color-card", title: "Choose a color", prompt: "Which color?",
+          continuationPolicy: "wake_assignee", payload: { version: 1, questions: [{ id: "color", prompt: "Which color?",
+            selectionMode: "single", required: true, options: [{ id: "blue", label: "Blue" }] }] },
+        } }) as { interaction: { id: string; sourceCommentId: string } };
+        interactionId = card.interaction.id;
+        expect(card.interaction.sourceCommentId).toBe(askingCommentId);
+      } finally { authority.close(); }
     } });
     await issueThreadInteractionService(db).answerQuestions({ id: f.issueId, companyId: f.companyId, status: "in_progress" },
       interactionId, { answers: [{ questionId: "color", optionIds: ["blue"] }] }, { userId: f.userId });
