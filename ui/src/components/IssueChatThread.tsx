@@ -526,6 +526,8 @@ export interface IssueChatComposerHandle {
   focus: () => void;
   /** false when the text could not be kept in the draft store (the caller must not delete its source). */
   restoreDraft: (submittedBody: string) => boolean | void;
+  /** IDs whose own copies were written and read back from durable storage. */
+  restoreStoppedMessages?: (comments: readonly { id: string; body: string }[]) => readonly string[];
 }
 
 interface IssueChatComposerProps {
