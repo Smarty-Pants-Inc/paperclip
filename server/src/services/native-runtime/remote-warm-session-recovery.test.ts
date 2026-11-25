@@ -23,7 +23,15 @@ describe("settled remote warm control evidence", () => {
     expect(isSettledRemoteWarmControlState(state([completed]), identity, true)).toBe(true);
     expect(isSettledRemoteWarmControlState(state([completed, snapshot]), identity, true)).toBe(true);
     expect(isSettledRemoteWarmControlState(state([snapshot]), identity, true)).toBe(false);
-    expect(isSettledRemoteWarmControlState(state([terminal, { ...completed, eventType: "turn.started" }, completed]), identity, true)).toBe(false);
+  });
+
+  it("uses a later completed conversation turn after a Runner terminal, but holds unfinished work and tasks", () => {
+    const started = { eventType: "turn.started", envelope: { ...identity, payload: {
+      ...notification, eventType: "turn.started", payload: {},
+    } } };
+    expect(isSettledRemoteWarmControlState(state([terminal, started, completed]), identity, true)).toBe(true);
+    expect(isSettledRemoteWarmControlState(state([terminal, started]), identity, true)).toBe(false);
+    expect(isSettledRemoteWarmControlState(state([terminal, started, completed]), identity)).toBe(false);
   });
 
   it.each(Object.keys(identity))("authenticates the completed boundary's %s", key => {
