@@ -396,6 +396,7 @@ type ActiveNativeSession = {
   holdActivityVersion?: number;
   holdPendingItems?: Set<string>;
   holdCloseRequested?: boolean;
+  taskClaimed?: boolean;
   /** Once dispatched, an interrupt's uncertain outcome must never cause a resend. */
   holdInterruptSent?: boolean;
   holdIdlePublicationVersion?: number;
@@ -9871,7 +9872,7 @@ export async function getNativeSessionSteeringState(
   if (!active)
     return { disposition: "temporarily_unavailable", activeTurnId: null };
   await active.refreshHeldTurnWork?.();
-  if (active.holdEndPending || active.holdCloseRequested) {
+  if (active.holdEndPending || active.holdCloseRequested || active.taskClaimed) {
     reconcileHeldTurn(runId, active);
     return { disposition: "temporarily_unavailable", activeTurnId: null };
   }
@@ -9881,7 +9882,7 @@ export async function getNativeSessionSteeringState(
   }
   const snapshot = await active.session.snapshot();
   return {
-    disposition: snapshot.activeTurnId
+    disposition: snapshot.activeTurnId && !active.taskClaimed
       ? "available"
       : "temporarily_unavailable",
     activeTurnId: snapshot.activeTurnId ?? null,
@@ -9942,7 +9943,7 @@ export async function steerNativeSession(input: {
       "The active native session is not attached.",
     );
   }
-  if (active.holdEndPending || active.holdCloseRequested) {
+  if (active.holdEndPending || active.holdCloseRequested || active.taskClaimed) {
     throw new NativeSessionSteeringError("steering_stale_turn", "This held turn is closing. Your message stays queued for the next run.");
   }
   // Reserve work before any asynchronous capability/snapshot reads. An old
@@ -9962,7 +9963,7 @@ export async function steerNativeSession(input: {
   let delivery: Promise<{ turnId: string }>;
   try {
     await active.refreshHeldTurnWork?.();
-    if (active.holdEndPending || active.holdCloseRequested) throw closingTurn();
+    if (active.holdEndPending || active.holdCloseRequested || active.taskClaimed) throw closingTurn();
     const capabilities = await active.session.capabilities();
     if (!capabilities.steering || !active.session.steer) {
       throw new NativeSessionSteeringError("steering_unsupported", "This provider does not support same-turn steering.");
@@ -9972,7 +9973,7 @@ export async function steerNativeSession(input: {
     if (!turnId) throw new NativeSessionSteeringError("steering_stale_turn", "The target turn is no longer active.");
     // A close can commit while either provider read is awaiting; never dispatch past it.
     await active.refreshHeldTurnWork?.();
-    if (activeNativeSessions.get(input.runId) !== active || active.holdEndPending || active.holdCloseRequested) throw closingTurn();
+    if (activeNativeSessions.get(input.runId) !== active || active.holdEndPending || active.holdCloseRequested || active.taskClaimed) throw closingTurn();
     const deliveryKey = `${input.runId}:${input.correlationId}`;
     const cached = steeringDeliveries.get(deliveryKey);
     if (cached) delivery = cached;
@@ -12070,6 +12071,12 @@ async function executePaperclipNativeSessionAttempt(
         }
       },
       onCommittedEvent: async (event, cursor) => {
+        // Proposed is the task claim boundary; accepted arrives at finalization.
+        if (event.eventType === "run.result.proposed" && input.conversationMode !== true &&
+            !(input.execution.provider.kind === "pi_rpc" && input.execution.provider.conversationMode === true)) {
+          const claiming = activeNativeSessions.get(input.execution.binding.runId);
+          if (claiming) claiming.taskClaimed = true;
+        }
         const active = input.execution.provider.kind === "pi_rpc" && input.execution.provider.conversationMode === true
           ? activeNativeSessions.get(input.execution.binding.runId) : undefined;
         if (active && (event.eventType === "turn.started" || event.eventType === "item.started" || event.eventType === "item.delta")) {
@@ -13263,6 +13270,16 @@ async function executePaperclipNativeSessionAttempt(
               }
               if (session) {
                 const active: ActiveNativeSession = { session, cancelRequested: false, admissionAbort: new AbortController() };
+                if (input.conversationMode !== true &&
+                    !(input.execution.provider.kind === "pi_rpc" && input.execution.provider.conversationMode === true)) {
+                  // Reattachment preserves the committed claim fence before publication.
+                  const [claim] = await input.db.select({ eventType: heartbeatRunEvents.eventType }).from(heartbeatRunEvents).where(and(
+                    eq(heartbeatRunEvents.companyId, input.execution.binding.companyId),
+                    eq(heartbeatRunEvents.runId, input.execution.binding.runId),
+                    eq(heartbeatRunEvents.eventType, "run.result.proposed"),
+                  )).limit(1);
+                  active.taskClaimed = claim?.eventType === "run.result.proposed";
+                }
                 activeNativeSessions.set(input.execution.binding.runId, active);
                 if (input.execution.provider.kind === "pi_rpc" && input.execution.provider.conversationMode === true) {
                   active.refreshHeldTurnWork = async () => {
