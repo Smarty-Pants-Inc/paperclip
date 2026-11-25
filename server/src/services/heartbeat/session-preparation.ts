@@ -6,7 +6,7 @@ import { getServerAdapter } from "../../adapters/index.js";
 import type { prepareManagedAiRuntime } from "../ai-connection-runtime.js";
 import { aiConnectionSessionCompatibilityInputs, managedAiSessionIdentityCompatible } from "../ai-connection-session.js";
 import { createNativeSessionHandoffLoader } from "../native-runtime/native-session-handoff.js";
-import { decideNativeContinuation } from "../native-runtime/continued-session.js";
+import { decideNativeContinuation, resolveSessionContinuity } from "../native-runtime/continued-session.js";
 import { deriveTaskKey } from "./run-preparation.js";
 import { queuedCommentIdsFromRunContext } from "../../lib/queued-comment-context.js";
 import { agentInstructionsService } from "../agent-instructions.js";
@@ -197,6 +197,7 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
   const sessionConfigFreshness = resolveTaskSessionConfigFreshness({
     hasTaskSession: taskSession != null,
     configuredModel,
+    preserveSessionOnModelChange: runtimeConfig.provider === "pi_rpc" && resolveSessionContinuity(runtimeConfig.provider, runtimeConfig.sessionContinuity) === "continuous",
     taskSessionParams:
       taskSession?.sessionParamsJson ?? taskSessionDecodedParams,
     configMetadata: sessionConfigMetadata,
