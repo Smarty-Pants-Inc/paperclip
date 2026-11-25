@@ -94,7 +94,7 @@ export function readComposerRunSettings(overrides: IssueAssigneeAdapterOverrides
   const rawEffort = effortKey && (config[effortKey]
     ?? (adapterType === "codex_local" || adapterType === "paperclip_runner" ? config.modelReasoningEffort ?? config.reasoningEffort ?? config.effort : undefined));
   const effortValue = effortKey === "piRpcThinkingLevel" && config.piRpcThinkingLevel === undefined
-    ? rawEffort === "auto" ? "low" : rawEffort === "none" ? "off" : rawEffort : rawEffort;
+    ? rawEffort === "auto" ? "medium" : rawEffort === "none" ? "off" : rawEffort : rawEffort;
   return {
     model: typeof config.model === "string" ? config.model : null,
     effort: typeof effortValue === "string" ? effortValue : null,
