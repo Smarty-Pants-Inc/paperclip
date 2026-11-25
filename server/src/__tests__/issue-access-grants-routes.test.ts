@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import { eq } from "drizzle-orm";
+import { documents, documentRevisions, issueDocuments, issuePlanDecompositions, issueThreadInteractions } from "@paperclipai/db";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -215,15 +216,24 @@ describeEmbeddedPostgres("issue access grant and locked edge routes", { concurre
     };
   }
 
-  it.each(["issues", "projects"] as const)("refuses explicit agent-private %s on create", async (resource) => {
+  it.each(["issues", "projects", "children", "accepted-plan-decompositions"] as const)("refuses explicit agent-private %s on create", async (resource) => {
     const f = await seedFixture();
+    const documentId = randomUUID(), revisionId = randomUUID();
+    if (resource === "accepted-plan-decompositions") {
+      await db.insert(documents).values({ id: documentId, companyId: f.companyId, title: "Plan", format: "markdown", latestBody: "Plan", latestRevisionId: revisionId, latestRevisionNumber: 1 });
+      await db.insert(documentRevisions).values({ id: revisionId, companyId: f.companyId, documentId, revisionNumber: 1, title: "Plan", format: "markdown", body: "Plan" });
+      await db.insert(issueDocuments).values({ companyId: f.companyId, issueId: f.openIssue.id, documentId, key: "plan" });
+      await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.openIssue.id, kind: "request_confirmation", status: "accepted", continuationPolicy: "wake_assignee", payload: { version: 1, prompt: "Approve plan?", target: { type: "issue_document", issueId: f.openIssue.id, documentId, key: "plan", revisionId, revisionNumber: 1 } }, result: { version: 1, outcome: "accepted" }, resolvedAt: new Date(), createdByUserId: f.ownerId, resolvedByUserId: f.ownerId });
+    }
     const app = await createApp(db, { ...agentActor(f.companyId, f.assignedAgent.id), onBehalfOfUserId: f.ownerId, onBehalfOfMemberships: [{ companyId: f.companyId, status: "active", membershipRole: "owner" }] });
-    const readRows = () => resource === "issues" ? db.select().from(issues) : db.select().from(projects);
+    const readRows = () => resource === "projects" ? db.select().from(projects) : db.select().from(issues);
     const before = await readRows();
-    const result = await request(app).post(`/api/companies/${f.companyId}/${resource}`).send({ [resource === "issues" ? "title" : "name"]: "Agent request", visibility: "private" });
+    const child = { title: "Agent request", visibility: "private", status: "backlog" };
+    const result = await request(app).post(resource === "issues" || resource === "projects" ? `/api/companies/${f.companyId}/${resource}` : `/api/issues/${f.openIssue.id}/${resource}`).send(resource === "accepted-plan-decompositions" ? { acceptedPlanRevisionId: revisionId, children: [{ title: "Open child", status: "backlog" }, child] } : resource === "projects" ? { name: child.title, visibility: child.visibility } : child);
     expect(result.status).toBe(403);
-    expect(result.body.error).toBe(`Only a person can make a ${resource === "issues" ? "task" : "project"} private`);
+    expect(result.body.error).toBe(`Only a person can make a ${resource === "projects" ? "project" : "task"} private`);
     expect(await readRows()).toEqual(before);
+    expect(await db.select().from(issuePlanDecompositions)).toEqual([]);
   });
   it.each(["issues", "projects"] as const)("refuses explicit agent-private %s on update without changing it", async (resource) => {
     const f = await seedFixture();
@@ -244,6 +254,7 @@ describeEmbeddedPostgres("issue access grant and locked edge routes", { concurre
     const app = await createApp(db, { ...agentActor(f.companyId, f.assignedAgent.id), onBehalfOfUserId: f.ownerId, onBehalfOfMemberships: [{ companyId: f.companyId, status: "active", membershipRole: "owner" }] });
     expect((await request(app).post(`/api/companies/${f.companyId}/issues`).send({ title: "Open default" }).expect(201)).body.visibility).toBe("open");
     expect((await request(app).post(`/api/companies/${f.companyId}/issues`).send({ title: "Inherited", parentId: f.openIssue.id }).expect(201)).body.visibility).toBe("private");
+    expect((await request(app).post(`/api/issues/${f.openIssue.id}/children`).send({ title: "Inherited child", status: "backlog" }).expect(201)).body.visibility).toBe("private");
   });
 
   it("requires explicit owner/admin break-glass and records both audit evidence and an owner-visible notice", async () => {
