@@ -216,7 +216,45 @@ describeEmbeddedPostgres("issue access grant and locked edge routes", { concurre
     };
   }
 
-  it.each(["issues", "projects", "children", "accepted-plan-decompositions"] as const)("refuses explicit agent-private %s on create", async (resource) => {
+  async function privacyRun(f: Awaited<ReturnType<typeof seedFixture>>, person: boolean, userId = f.ownerId): Promise<Express.Request["actor"]> {
+    const [comment] = person ? await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.openIssue.id, authorUserId: userId, body: "Please make this work private" }).returning() : [];
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.assignedAgent.id, issueId: f.openIssue.id, status: "running", contextSnapshot: { issueId: f.openIssue.id } }).returning();
+    const { initializeRunIdentity } = await import("../services/run-identity.js");
+    await initializeRunIdentity(db, { companyId: f.companyId, runId: run!.id, responsibleUserId: null, issueId: f.openIssue.id, messageIds: comment ? [comment.id] : [], cause: person ? "instruction" : "timer" });
+    return { ...agentActor(f.companyId, f.assignedAgent.id), runId: run!.id, onBehalfOfUserId: person ? userId : null, onBehalfOfMemberships: person ? [{ companyId: f.companyId, status: "active", membershipRole: userId === f.ownerId ? "owner" : "operator" }] : [] } satisfies Express.Request["actor"];
+  }
+
+  it.each(["timer", "routine", "company_default", "no-context", "agent-steering", "person-comment", "person-steering", "person-interaction", "manual-wake"])("requires the person's own current act: %s", async cause => {
+    const f = await seedFixture();
+    await db.update(issues).set({ responsibleUserId: f.ownerId }).where(eq(issues.id, f.openIssue.id));
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.assignedAgent.id, issueId: f.openIssue.id, status: "running", responsibleUserId: f.ownerId, contextSnapshot: { issueId: f.openIssue.id } }).returning();
+    const { initializeRunIdentity, reserveSteeredIdentity, acceptSteeredIdentity } = await import("../services/run-identity.js");
+    const [comment] = ["agent-steering", "person-comment", "person-steering"].includes(cause) ? await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.openIssue.id, body: "Please make this work private", ...(cause === "agent-steering" ? { authorType: "agent", authorAgentId: f.sharedAgent.id } : { authorUserId: f.ownerId }) }).returning() : [];
+    if (cause === "manual-wake") {
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.assignedAgent.id, runId: run!.id, source: "on_demand", requestedByActorType: "user", requestedByActorId: f.ownerId, payload: { manualUserWake: true } }).returning();
+      await db.update(heartbeatRuns).set({ wakeupRequestId: wake!.id }).where(eq(heartbeatRuns.id, run!.id));
+    }
+    if (cause !== "no-context") await initializeRunIdentity(db, { companyId: f.companyId, runId: run!.id, responsibleUserId: f.ownerId, issueId: f.openIssue.id, messageIds: cause === "person-comment" ? [comment!.id] : [], cause: ["routine", "company_default"].includes(cause) ? cause : "timer" });
+    if (["agent-steering", "person-steering", "person-interaction"].includes(cause)) {
+      const [interaction] = cause === "person-interaction" ? await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.openIssue.id, kind: "request_confirmation", status: "accepted", payload: { version: 1, prompt: "Make it private?" }, result: { version: 1, outcome: "accepted" }, resolvedAt: new Date(), createdByAgentId: f.assignedAgent.id, resolvedByUserId: f.ownerId }).returning() : [];
+      const pending = await reserveSteeredIdentity(db, { companyId: f.companyId, runId: run!.id, issueId: f.openIssue.id, messageId: interaction?.id ?? comment!.id, source: interaction ? "interaction" : "comment" });
+      await db.transaction(tx => acceptSteeredIdentity(tx, pending!));
+    }
+    const actor = { ...agentActor(f.companyId, f.assignedAgent.id), runId: run!.id, onBehalfOfUserId: f.ownerId, onBehalfOfMemberships: [{ companyId: f.companyId, status: "active", membershipRole: "owner" }] } satisfies Express.Request["actor"];
+    const before = await db.select().from(issues);
+    const result = await request(await createApp(db, actor)).post(`/api/companies/${f.companyId}/issues`).send({ title: "Private request", visibility: "private" });
+    const personAsked = ["person-comment", "person-steering", "person-interaction", "manual-wake"].includes(cause);
+    expect(result.status, JSON.stringify(result.body)).toBe(personAsked ? 201 : 403);
+    if (personAsked) {
+      expect(result.body).toMatchObject({ visibility: "private", responsibleUserId: f.ownerId });
+      expect(await db.select().from(issues).where(eq(issues.id, result.body.id))).toEqual([expect.objectContaining({ visibility: "private", responsibleUserId: f.ownerId })]);
+    } else {
+      expect(result.body.error).toContain("a person must ask for it");
+      expect(await db.select().from(issues)).toEqual(before);
+    }
+  });
+
+  it.each(["issues", "projects", "children", "accepted-plan-decompositions"].flatMap(resource => [false, true].map(person => ({ resource, person }))))("agent-private $resource creation, person=$person", async ({ resource, person }) => {
     const f = await seedFixture();
     const documentId = randomUUID(), revisionId = randomUUID();
     if (resource === "accepted-plan-decompositions") {
@@ -225,30 +263,57 @@ describeEmbeddedPostgres("issue access grant and locked edge routes", { concurre
       await db.insert(issueDocuments).values({ companyId: f.companyId, issueId: f.openIssue.id, documentId, key: "plan" });
       await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.openIssue.id, kind: "request_confirmation", status: "accepted", continuationPolicy: "wake_assignee", payload: { version: 1, prompt: "Approve plan?", target: { type: "issue_document", issueId: f.openIssue.id, documentId, key: "plan", revisionId, revisionNumber: 1 } }, result: { version: 1, outcome: "accepted" }, resolvedAt: new Date(), createdByUserId: f.ownerId, resolvedByUserId: f.ownerId });
     }
-    const app = await createApp(db, { ...agentActor(f.companyId, f.assignedAgent.id), onBehalfOfUserId: f.ownerId, onBehalfOfMemberships: [{ companyId: f.companyId, status: "active", membershipRole: "owner" }] });
+    const app = await createApp(db, await privacyRun(f, person));
     const readRows = () => resource === "projects" ? db.select().from(projects) : db.select().from(issues);
     const before = await readRows();
     const child = { title: "Agent request", visibility: "private", status: "backlog" };
     const result = await request(app).post(resource === "issues" || resource === "projects" ? `/api/companies/${f.companyId}/${resource}` : `/api/issues/${f.openIssue.id}/${resource}`).send(resource === "accepted-plan-decompositions" ? { acceptedPlanRevisionId: revisionId, children: [{ title: "Open child", status: "backlog" }, child] } : resource === "projects" ? { name: child.title, visibility: child.visibility } : child);
-    expect(result.status).toBe(403);
-    expect(result.body.error).toBe(`Only a person can make a ${resource === "projects" ? "project" : "task"} private`);
-    expect(await readRows()).toEqual(before);
-    expect(await db.select().from(issuePlanDecompositions)).toEqual([]);
+    expect(result.status, JSON.stringify(result.body)).toBe(person ? (resource === "accepted-plan-decompositions" ? 200 : 201) : 403);
+    if (person) {
+      const added = (await readRows()).filter(row => !before.some(old => old.id === row.id));
+      const privateRow = added.find(row => row.visibility === "private")!;
+      expect(privateRow).toMatchObject(resource === "projects" ? { privacyOwnerUserId: f.ownerId } : { responsibleUserId: f.ownerId });
+      expect(await db.select().from(projectAccessMembers)).toEqual(expect.arrayContaining([expect.objectContaining({ subjectType: "user", subjectId: f.ownerId })]));
+    } else {
+      expect(result.body.error).toContain("a person must ask for it");
+      expect(await readRows()).toEqual(before);
+      expect(await db.select().from(issuePlanDecompositions)).toEqual([]);
+    }
   });
-  it.each(["issues", "projects"] as const)("refuses explicit agent-private %s on update without changing it", async (resource) => {
+  it.each(["issues", "projects"].flatMap(resource => [false, true].map(person => ({ resource, person }))))("agent-private $resource update, person=$person", async ({ resource, person }) => {
     const f = await seedFixture();
-    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.assignedAgent.id, issueId: f.openIssue.id, status: "running", responsibleUserId: f.ownerId, contextSnapshot: { issueId: f.openIssue.id } }).returning();
-    const app = await createApp(db, { ...agentActor(f.companyId, f.assignedAgent.id), runId: run!.id, onBehalfOfUserId: f.ownerId, onBehalfOfMemberships: [{ companyId: f.companyId, status: "active", membershipRole: "owner" }] });
+    const app = await createApp(db, await privacyRun(f, person));
     const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Open project" }).returning();
     const [before] = resource === "issues" ? await db.update(issues).set({ projectId: project!.id, responsibleUserId: f.ownerId, assigneeAgentId: f.assignedAgent.id }).where(eq(issues.id, f.openIssue.id)).returning() : [project!];
     const result = await request(app).patch(`/api/${resource}/${before!.id}`).send({ visibility: "private" });
-    expect({ status: result.status, error: result.body.error }).toEqual({ status: 403, error: `Only a person can make a ${resource === "issues" ? "task" : "project"} private` });
-    expect((resource === "issues" ? await db.select().from(issues).where(eq(issues.id, before!.id)) : await db.select().from(projects).where(eq(projects.id, before!.id)))[0]).toEqual(before);
+    expect(result.status, JSON.stringify(result.body)).toBe(person ? 200 : 403);
+    const [saved] = resource === "issues" ? await db.select().from(issues).where(eq(issues.id, before!.id)) : await db.select().from(projects).where(eq(projects.id, before!.id));
+    if (person) {
+      expect(saved).toMatchObject(resource === "projects" ? { visibility: "private", privacyOwnerUserId: f.ownerId } : { visibility: "private", responsibleUserId: f.ownerId });
+      if (resource === "projects") expect(await db.select().from(projectAccessMembers)).toEqual(expect.arrayContaining([expect.objectContaining({ projectId: saved!.id, subjectType: "user", subjectId: f.ownerId })]));
+    }
+    else { expect(result.body.error).toContain("a person must ask for it"); expect(saved).toEqual(before); }
+  });
+
+  it.each(["no-run", "forged-person", "inactive-person", "not-owner"])("rejects agent privacy without current person authority: %s", async reason => {
+    const f = await seedFixture();
+    const actor = await privacyRun(f, reason !== "forged-person", reason === "not-owner" ? f.memberId : f.ownerId);
+    if (reason === "no-run") delete actor.runId;
+    if (reason === "forged-person") actor.onBehalfOfUserId = f.ownerId;
+    if (reason === "inactive-person") await db.update(companyMemberships).set({ status: "suspended" }).where(eq(companyMemberships.principalId, f.ownerId));
+    const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Other person's project", privacyOwnerUserId: f.sharedUserId }).returning();
+    const result = reason === "not-owner"
+      ? await request(await createApp(db, actor)).patch(`/api/issues/${f.openIssue.id}`).send({ visibility: "private" })
+      : await request(await createApp(db, actor)).post(`/api/companies/${f.companyId}/projects`).send({ name: "Private", visibility: "private" });
+    expect(result.status, JSON.stringify(result.body)).toBe(403);
+    if (reason === "not-owner") await request(await createApp(db, actor)).patch(`/api/projects/${project!.id}`).send({ visibility: "private" }).expect(403);
+    expect((await db.select().from(projects)).find(row => row.id === project!.id)?.visibility).toBe("open");
   });
 
   it("preserves a person's privacy choice, agent defaults and inherited private subtasks", async () => {
     const f = await seedFixture();
     const board = await createApp(db, boardActor(f.companyId, f.ownerId));
+    expect((await request(board).post(`/api/companies/${f.companyId}/issues`).send({ title: "Person's private task", visibility: "private" }).expect(201)).body).toMatchObject({ visibility: "private", responsibleUserId: f.ownerId });
     await request(board).patch(`/api/issues/${f.openIssue.id}`).send({ visibility: "private" }).expect(200);
     await request(board).post(`/api/issues/${f.openIssue.id}/access-grants`).send({ subjectType: "agent", subjectId: f.assignedAgent.id }).expect(201);
     const app = await createApp(db, { ...agentActor(f.companyId, f.assignedAgent.id), onBehalfOfUserId: f.ownerId, onBehalfOfMemberships: [{ companyId: f.companyId, status: "active", membershipRole: "owner" }] });
