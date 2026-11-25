@@ -116,9 +116,9 @@ export function buildSessionConfigCategoryValues(input: {
 }
 
 
-/** The old metadata builder's no-instruction-path fixture branch. */
-export function previousSessionMetadata(input: Parameters<typeof buildEffectiveRunSessionConfigMetadata>[0]): EffectiveRunSessionConfigMetadata {
-  if (input.effectiveAdapterConfig.instructionsFilePath || input.effectiveAdapterConfig.instructionsRootPath || input.managedAiHome || input.managedInstructions) throw new Error("Fixture requires unmanaged, unconfigured instruction paths");
+/** The old metadata composition, with an independently supplied instruction snapshot. */
+export function previousSessionMetadata(input: Parameters<typeof buildEffectiveRunSessionConfigMetadata>[0], instructions: unknown = null): EffectiveRunSessionConfigMetadata {
+  if ((!instructions && (input.effectiveAdapterConfig.instructionsFilePath || input.effectiveAdapterConfig.instructionsRootPath)) || input.managedAiHome || input.managedInstructions) throw new Error("Fixture requires unmanaged instructions and a snapshot for configured paths");
   const effectiveAdapterConfig = { ...input.effectiveAdapterConfig };
   if (input.adapterType === "paperclip_runner" && effectiveAdapterConfig.lifecycleMode === undefined) effectiveAdapterConfig.lifecycleMode = "per_turn";
   const versionedSkills = (value: unknown) => Array.isArray(value) ? value.map(entry => {
@@ -127,7 +127,7 @@ export function previousSessionMetadata(input: Parameters<typeof buildEffectiveR
   }) : value;
   if (effectiveAdapterConfig.paperclipRuntimeSkills !== undefined) effectiveAdapterConfig.paperclipRuntimeSkills = versionedSkills(effectiveAdapterConfig.paperclipRuntimeSkills);
   const secretManifest = input.secretManifest ?? [];
-  const categoryValues = buildSessionConfigCategoryValues({ ...input, effectiveAdapterConfig, secretManifest, instructions: null, runtimeSkills: versionedSkills(input.runtimeSkills), agentConfigRevision: input.agentConfigRevision ?? null });
+  const categoryValues = buildSessionConfigCategoryValues({ ...input, effectiveAdapterConfig, secretManifest, instructions, runtimeSkills: versionedSkills(input.runtimeSkills), agentConfigRevision: input.agentConfigRevision ?? null });
   const categories = Object.keys(categoryValues) as EffectiveRunSessionConfigMetadata["categories"];
   const fingerprints = createEffectiveRunConfigFingerprints({ session: categoryValues, secretManifest });
   return { version: 1, fingerprint: fingerprints.sessionFingerprint.fingerprint, categories, categoryFingerprints: createEffectiveRunConfigSubcategoryFingerprints({ category: "session", value: categoryValues, subcategories: categories, secretManifest }), fingerprints };

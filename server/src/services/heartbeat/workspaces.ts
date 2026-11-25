@@ -2799,6 +2799,7 @@ export function buildSessionConfigCategoryValues(input: {
   agentIdentityKeyId?: string;
   legacyComposition?: boolean;
   continuousPiFingerprintComposition?: "issue_overrides" | "model_inputs";
+  retainAdapterConfigEnvironment?: boolean;
 }) {
   const sanitizedSecretManifest = sanitizeSecretManifestForConfigFingerprint(
     input.secretManifest,
@@ -2832,12 +2833,12 @@ export function buildSessionConfigCategoryValues(input: {
       ? input.effectiveAdapterConfig
       : input.continuousPiFingerprintComposition === "model_inputs"
         ? paperclipRunnerRetainedAdapterConfig(input.effectiveAdapterConfig)
-        : paperclipRunnerSessionAdapterConfig(input.effectiveAdapterConfig),
+        : paperclipRunnerSessionAdapterConfig(input.effectiveAdapterConfig, input.retainAdapterConfigEnvironment),
     agentRuntimeConfig: legacy ? input.agentRuntimeConfig : sessionAgentRuntimeConfig(input.agentRuntimeConfig),
     instructions: input.instructions,
     issueOverrides: legacy || input.continuousPiFingerprintComposition || input.adapterType !== "paperclip_runner"
       ? input.issueOverrides
-      : paperclipRunnerSessionIssueOverrides(input.issueOverrides, input.effectiveAdapterConfig),
+      : paperclipRunnerSessionIssueOverrides(input.issueOverrides, input.effectiveAdapterConfig, input.retainAdapterConfigEnvironment),
     workspaceConfig,
     environment: legacy ? input.environment : sessionEnvironment(input.environment),
     envBindings: {
@@ -2869,6 +2870,7 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
   agentIdentityKeyId?: string;
   legacyComposition?: boolean;
   continuousPiFingerprintComposition?: "issue_overrides" | "model_inputs";
+  retainAdapterConfigEnvironment?: boolean;
 }): Promise<EffectiveRunSessionConfigMetadata> {
   const secretManifest = input.secretManifest ?? [];
   const instructions = input.managedInstructions ? {
@@ -2916,6 +2918,7 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
     agentIdentityKeyId: input.agentIdentityKeyId,
     legacyComposition: input.legacyComposition,
     continuousPiFingerprintComposition: input.continuousPiFingerprintComposition,
+    retainAdapterConfigEnvironment: input.retainAdapterConfigEnvironment,
   });
   const fingerprints = createEffectiveRunConfigFingerprints({
     session: categoryValues,
@@ -3247,6 +3250,7 @@ export function resolveTaskSessionConfigFreshness(input: {
   taskSessionParams: Record<string, unknown> | null | undefined;
   configMetadata: EffectiveRunSessionConfigMetadata | null;
   compatibleConfigMetadata?: readonly EffectiveRunSessionConfigMetadata[];
+  compatibleCategoryMetadata?: readonly EffectiveRunSessionConfigMetadata[];
   wakeResetReason?: string | null;
   preserveLegacySessionWithoutConfigMetadata?: boolean;
   preserveSessionOnModelChange?: boolean;
@@ -3298,11 +3302,18 @@ export function resolveTaskSessionConfigFreshness(input: {
       storedConfig.fingerprint !== input.configMetadata.fingerprint &&
       !input.compatibleConfigMetadata?.some(candidate => candidate.version === storedConfig.version && candidate.fingerprint === storedConfig.fingerprint)
     ) {
-      changedCategories = changedEffectiveRunSessionConfigCategories({
+      const changed = changedEffectiveRunSessionConfigCategories({
         previous: storedConfig.categoryFingerprints,
         next: input.configMetadata.categoryFingerprints,
       });
-      reasons.push(
+      changedCategories = changed.filter(category =>
+        // These two categories changed composition across releases. Compare
+        // their old forms independently when another category also changed.
+        !(category === "adapterConfig" || category === "issueOverrides") ||
+        !input.compatibleCategoryMetadata?.some(candidate => candidate.version === storedConfig.version &&
+          candidate.categoryFingerprints[category] === storedConfig.categoryFingerprints?.[category]),
+      );
+      if (changedCategories.length || !changed.length) reasons.push(
         `effective run configuration changed: ${describeEffectiveRunConfigCategories(changedCategories)}`,
       );
     }

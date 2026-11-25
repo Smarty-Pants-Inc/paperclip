@@ -4,7 +4,7 @@ import * as nativeRuntimeMode from "../services/native-runtime/runtime-mode.js";
 import * as sessionFingerprintInputs from "../services/heartbeat/session-fingerprint-inputs.js";
 import * as aiRuntime from "../services/ai-connection-runtime.js";
 import { aiConnectionService } from "../services/ai-connections.js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -102,13 +102,14 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
   });
 
   it.each([
-    { conversation: true, chip: false, held: false },
-    { conversation: true, chip: true, held: false },
-    { conversation: false, chip: false, held: false },
-    { conversation: false, chip: true, held: false },
-    { conversation: true, chip: true, held: true },
-    { conversation: false, chip: true, held: true },
-  ])("previous-release Pi swap: agent chat=$conversation chip=$chip held=$held", async ({ conversation, chip, held }) => {
+    { conversation: true, chip: false, held: false, instructionsChanged: false },
+    { conversation: true, chip: true, held: false, instructionsChanged: false },
+    { conversation: false, chip: false, held: false, instructionsChanged: false },
+    { conversation: false, chip: true, held: false, instructionsChanged: false },
+    { conversation: true, chip: true, held: true, instructionsChanged: false },
+    { conversation: false, chip: true, held: true, instructionsChanged: false },
+    { conversation: true, chip: true, held: false, instructionsChanged: true },
+  ])("previous-release Pi swap: agent chat=$conversation chip=$chip held=$held instructions changed=$instructionsChanged", async ({ conversation, chip, held, instructionsChanged }) => {
     const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "previous-release-continuation-"));
     const sessionId = randomUUID();
     const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
@@ -121,7 +122,11 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     });
     registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
     try {
-      const config = { provider: "pi_rpc", model: "fixture/model-a", piRpcThinkingLevel: "low", sessionContinuity: "continuous", cwd, fixtureSessionId: sessionId };
+      const instructionsPath = join(cwd, "AGENTS.md");
+      if (instructionsChanged) await writeFile(instructionsPath, "Original instructions\n");
+      const config = { provider: "pi_rpc", model: "fixture/model-a", piRpcThinkingLevel: "low", sessionContinuity: "continuous", cwd, fixtureSessionId: sessionId,
+        ...(instructionsChanged ? { instructionsRootPath: cwd, instructionsEntryFile: "AGENTS.md", instructionsFilePath: instructionsPath } : {}),
+      };
       await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: config }).where(eq(agents.id, f.agentId));
       await db.update(issues).set({
         status: "todo",
@@ -132,17 +137,22 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       const metadataInput = metadataInputs[0];
       expect(metadataInput.effectiveAdapterConfig.provider).toBe("pi_rpc");
       if (chip) expect(metadataInput.issueOverrides).toMatchObject({ adapterConfig: { model: "fixture/model-b", piRpcThinkingLevel: "high" } });
-      const old = previousSessionMetadata(metadataInput);
+      const old = previousSessionMetadata(metadataInput, instructionsChanged ? {
+        configured: true, bundleMode: null, entryFile: "AGENTS.md", pathKind: "absolute", readPolicy: "root_bound", readable: true,
+        contentHash: `sha256:${createHash("sha256").update("Original instructions\n").digest("hex")}`,
+      } : null);
       const current = await buildMetadata(metadataInput);
       const changed = current.categories.filter(category => old.categoryFingerprints[category] !== current.categoryFingerprints[category]);
       expect(changed).toEqual(chip ? ["adapterConfig", "issueOverrides"] : ["adapterConfig"]);
       const [stored] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId));
       const storedParams = sessionMetadata.attachPaperclipSessionMetadataToSessionParams({ sessionId, adapterState: "preserved" }, first.input.config.model as string, old);
       await db.update(agentTaskSessions).set({ sessionParamsJson: storedParams }).where(eq(agentTaskSessions.id, stored.id));
+      if (instructionsChanged) await writeFile(instructionsPath, "Updated instructions\n");
       const resumed = await execute(f);
       expect(resumed.finished.resultJson).toMatchObject({ configFreshness: { session: { reset: false, taskSessionAvailable: true, taskSessionReused: true } } });
       expect(resumed.input.runtime).toMatchObject({ sessionId, sessionDisplayId: sessionId, sessionParams: { sessionId, adapterState: "preserved" } });
       expect(resumed.finished.sessionIdBefore).toBe(sessionId);
+      if (instructionsChanged) expect(resumed.finished.resultJson).toMatchObject({ configFreshness: { session: { changedCategories: ["instructions"] } } });
 
       // Both releases ship the same runtime-context builder and prompt bytes.
       // Build the saved and next context separately, as at a release boundary.
@@ -168,7 +178,7 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       expect(rebound.normalizedSessionId).toBe(sessionId);
       expect(rebound.checkpoint).toMatchObject({ sessionId: "provider-thread-saved-before-upgrade", providerSessionId: "provider-thread-saved-before-upgrade" });
       if (held) expect(rebound.checkpoint?.providerRecoveryPolicy).toBe("same_session_only");
-      if (chip && !conversation && !held) {
+      if (chip && ((!conversation && !held) || instructionsChanged)) {
         await db.update(agentTaskSessions).set({ sessionParamsJson: storedParams }).where(eq(agentTaskSessions.id, stored.id));
         await db.update(issues).set({ assigneeAdapterOverrides: { adapterConfig: {
           model: "fixture/model-b", piRpcThinkingLevel: "high", fixtureOption: "changed",
@@ -444,6 +454,7 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       for (const adapterConfig of [
         { model: "fixture/model-b", piRpcThinkingLevel: "low" },
         { model: "fixture/model-b", piRpcThinkingLevel: "high" },
+        { model: "fixture/model-b", piRpcThinkingLevel: "high", env: { CONTEXT_NOTE: "new" } },
       ]) {
         const [idle] = await db.select().from(agents).where(eq(agents.id, f.agentId));
         expect(idle.status).toBe("idle");
@@ -581,24 +592,94 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       messages: ids.map(id => expect.objectContaining({ id })) });
   });
 
-  it("continues Pi across a changed config fingerprint only in continuous mode", async () => {
+  it.each([
+    { key: "env", before: { CONTEXT_NOTE: "old" }, after: { CONTEXT_NOTE: "new" }, retain: true },
+    { key: "lifecycleMode", before: "per_turn", after: "warm", retain: false },
+    { key: "idleTimeoutMs", before: 60_000, after: 120_000, retain: false },
+    { key: "fixtureOption", before: "old", after: "new", retain: false },
+    { key: "fixtureOption", before: "old", after: "new", retain: false, environmentChanged: true },
+    { key: "instructionsFilePath", before: "old.md", after: "new.md", retain: false },
+  ])("per-key Pi freshness: $key retains session only when allowed ($retain, environment changed=$environmentChanged)", async ({ key, before, after, retain, environmentChanged }) => {
     for (const sessionContinuity of ["continuous", "paperclip"]) {
-      const f = await seed(), sessionId = randomUUID();
-      const adapterConfig = { provider: "pi_rpc", model: "model-a", sessionContinuity, fixtureSessionId: sessionId, env: { PACK_NOTE: "old" } };
-      await db.update(agents).set({ adapterConfig }).where(eq(agents.id, f.agentId));
-      await execute(f);
-      await db.update(agents).set({ adapterConfig: { ...adapterConfig, env: { PACK_NOTE: "new" } } }).where(eq(agents.id, f.agentId));
-      const next = await execute(f);
-      expect(next.input.runtime.sessionId).toBe(sessionContinuity === "continuous" ? sessionId : null);
-      expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: {
-        reset: sessionContinuity !== "continuous", taskSessionReused: sessionContinuity === "continuous", changedCategories: ["adapterConfig"],
-      } } });
+      const f = await seed(), sessionId = randomUUID(), cwd = await mkdtemp(join(tmpdir(), "pi-key-freshness-"));
+      const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+        kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+      registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
+      try {
+        const adapterConfig = { provider: "pi_rpc", model: "fixture/model", sessionContinuity, fixtureSessionId: sessionId, cwd, [key]: before };
+        await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig }).where(eq(agents.id, f.agentId));
+        await execute(f);
+        await db.update(agents).set({ adapterConfig: { ...adapterConfig, [key]: after,
+          ...(environmentChanged ? { env: { CONTEXT_NOTE: "new" } } : {}),
+        } }).where(eq(agents.id, f.agentId));
+        const next = await execute(f);
+        const continued = sessionContinuity === "continuous" && retain;
+        if (key === "env") expect((next.input.config.env as Record<string, unknown>).CONTEXT_NOTE).toBe("new");
+        else expect(next.input.config[key]).toEqual(after);
+        expect(next.input.runtime.sessionId).toBe(continued ? sessionId : null);
+        expect(next.finished.sessionIdBefore).toBe(continued ? sessionId : null);
+        expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: {
+          reset: !continued, taskSessionAvailable: true, taskSessionReused: continued,
+        } } });
+      } finally { mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true }); }
     }
+  });
+
+  it.each(["environment", "environmentEnv", "projectEnv"])("continues actual %s changes only for continuous Pi", async key => {
+    for (const sessionContinuity of ["continuous", "paperclip"]) {
+      const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "pi-environment-freshness-"));
+      const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+        kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+      registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
+      const [environment] = await db.select().from(environments).where(eq(environments.driver, "local"));
+      try {
+        await db.update(environments).set({ config: { image: "old" }, envVars: { CONTEXT_NOTE: "old" } }).where(eq(environments.id, environment.id));
+        const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Session project", env: { PROJECT_NOTE: "old" } }).returning();
+        await db.update(issues).set({ projectId: project.id }).where(eq(issues.id, f.issueId));
+        await db.update(agents).set({ adapterType: "paperclip_runner", defaultEnvironmentId: environment.id,
+          adapterConfig: { provider: "pi_rpc", model: "fixture/model", sessionContinuity, cwd },
+        }).where(eq(agents.id, f.agentId));
+        await execute(f);
+        if (key === "projectEnv") await db.update(projects).set({ env: { PROJECT_NOTE: "new" } }).where(eq(projects.id, project.id));
+        else await db.update(environments).set(key === "environment" ? { config: { image: "new" } } : { envVars: { CONTEXT_NOTE: "new" } })
+          .where(eq(environments.id, environment.id));
+        const next = await execute(f), retain = sessionContinuity === "continuous";
+        expect(next.input.runtime.sessionId).toBe(retain ? "saved-session" : null);
+        expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: {
+          reset: !retain, taskSessionAvailable: true, taskSessionReused: retain,
+          changedCategories: expect.arrayContaining([key === "environment" ? "environment" : "envBindings"]),
+        } } });
+      } finally {
+        await db.update(environments).set({ config: environment.config, envVars: environment.envVars }).where(eq(environments.id, environment.id));
+        mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it.each([false, true])("pre-filter environment fingerprint preserves unchanged inputs, not unknown changes (%s)", async changed => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "pi-env-fingerprint-compat-"));
+    const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
+    const adapterConfig = { provider: "pi_rpc", model: "fixture/model", cwd, env: { CONTEXT_NOTE: "original" } };
+    try {
+      await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig }).where(eq(agents.id, f.agentId));
+      const currentFilter = sessionFingerprintInputs.paperclipRunnerSessionAdapterConfig;
+      const oldFilter = vi.spyOn(sessionFingerprintInputs, "paperclipRunnerSessionAdapterConfig")
+        .mockImplementation(config => currentFilter(config, true));
+      try { await execute(f); } finally { oldFilter.mockRestore(); }
+      if (changed) await db.update(agents).set({ adapterConfig: { ...adapterConfig, fixtureOption: "changed" } }).where(eq(agents.id, f.agentId));
+      const next = await execute(f);
+      expect(next.input.runtime.sessionId).toBe(changed ? null : "saved-session");
+      expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: {
+        reset: changed, taskSessionAvailable: true, taskSessionReused: !changed,
+      } } });
+    } finally { mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true }); }
   });
 
   it.each([
     { category: "instructions", retain: true },
-    { category: "adapterConfig", retain: true },
+    { category: "adapterConfig", retain: false },
     { category: "environment", retain: true },
     { category: "envBindings", retain: true },
     { category: "runtimeSkills", retain: false },
@@ -613,6 +694,7 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     { category: "runtimeSkills", retain: false, workspaceChanged: true },
     { category: "missing", retain: false },
     { category: "version", retain: false },
+    { category: "fingerprint", retain: false, workspaceChanged: true },
   ])("continuous Pi freshness $category (workspace changed=$workspaceChanged) retains session: $retain", async ({ category, retain, workspaceChanged }) => {
     const f = await seed(), sessionId = randomUUID();
     const cwd = workspaceChanged ? await mkdtemp(join(tmpdir(), "workspace-freshness-")) : undefined;
@@ -626,7 +708,7 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       params.__paperclipConfigFingerprint = "old-config";
       if (category === "missing") delete params.__paperclipConfigFingerprintVersion;
       else if (category === "version") params.__paperclipConfigFingerprintVersion = 999;
-      else for (const key of category.split(",")) (params.__paperclipConfigCategoryFingerprints as Record<string, string>)[key] = "old-category";
+      else if (category !== "fingerprint") for (const key of category.split(",")) (params.__paperclipConfigCategoryFingerprints as Record<string, string>)[key] = "old-category";
       await db.update(agentTaskSessions).set({ sessionParamsJson: params }).where(eq(agentTaskSessions.id, saved.id));
       const next = await execute(f, { workspaceSelectionChanged: workspaceChanged === true });
       expect(next.input.runtime.sessionId).toBe(retain ? sessionId : null);
