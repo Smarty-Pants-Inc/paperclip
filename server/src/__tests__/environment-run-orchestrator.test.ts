@@ -994,6 +994,19 @@ describe("live remote runner lease reattachment", () => {
     expect(result.leaseContext.executionWorkspaceId).toBe("ew-1");
     expect(result.environment.config.reuseLease).toBe(false);
   });
+  it.each(["reply", "metadata", "lease"] as const)("carries a %s snapshot restore into the replacement/cold-resume target", async source => {
+    const restoredFromSnapshotAt = "2026-11-25T12:00:00.000Z";
+    const lease = originalLease();
+    if (source === "lease") lease.metadata!.restoredFromSnapshotAt = restoredFromSnapshotAt;
+    mockGetLease.mockResolvedValue(lease);
+    const runtime = makeMockRuntime({ resumeRunLease: vi.fn(async () => ({ providerLeaseId: "original-sandbox",
+      ...(source === "reply" ? { restoredFromSnapshotAt } : {}),
+      metadata: source === "metadata" ? { restoredFromSnapshotAt } : {} })) });
+    const result = await environmentRunOrchestrator({} as never, { environmentRuntime: runtime }).acquireForRun(input);
+    expect(result.sandboxLeaseAcquisition).toEqual({ outcome: "resumed", providerLeaseId: "original-sandbox", restoredFromSnapshotAt });
+    expect(result.lease.metadata).toMatchObject({ restoredFromSnapshotAt, remoteCwd: "/remote/workspace" });
+    expect(runtime.acquireRunLease).not.toHaveBeenCalled();
+  });
   it.each(["created", "replacement", "resumed"] as const)(
     "reports exact-lease reattachment as resumed after historical %s acquisition", async outcome => {
       const savedLease = originalLease();
