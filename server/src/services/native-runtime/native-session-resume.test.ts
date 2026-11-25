@@ -264,7 +264,7 @@ describe("capability-gated connection tool refresh", () => {
     else expect(result).toMatchObject({ sessionId: "provider-thread-123" });
   });
 
-  it("retains the exact provider session for an MCP-only change when the harness supports it", () => {
+  it("retains the exact provider session for capability-gated MCP refresh", () => {
     const current = execution(currentRunId);
     current.runtimeContext.mcp.digest = "b".repeat(64);
     current.runtimeContext.aggregateDigest = canonicalNativeRuntimeContextDigest(current.runtimeContext);
@@ -1659,7 +1659,7 @@ describe("rebindNativeSessionCheckpoint", () => {
     else expect(rebound).toBeNull();
   });
 
-  it.each(["instructions", "prompt", "mcp", "skills", "connectionInstructions", "aggregateDigest", "instructions-and-mcp"])("limits changed Pi runtime context (%s) to instruction and pack prompt continuity", key => {
+  it.each(["instructions", "prompt", "promptDigest", "mcp", "skills", "connectionInstructions", "aggregateDigest", "instructions-and-mcp"])("limits changed Pi runtime context (%s) to instruction and pack prompt continuity", key => {
     const prior = execution(previousRunId), current = execution(currentRunId);
     for (const sessionContinuity of [undefined, "continuous", "paperclip"] as const) {
       for (const value of [prior, current]) {
@@ -1670,18 +1670,34 @@ describe("rebindNativeSessionCheckpoint", () => {
       source.runnerProfileJson.sessionCheckpoint.driverKind = "pi_rpc";
       if (key === "instructions" || key === "instructions-and-mcp") current.runtimeContext.instructions.bundle.digest = "b".repeat(64);
       if (key === "prompt") current.runtimeContext.prompt.revision = "next-pack";
+      if (key === "promptDigest") current.runtimeContext.prompt.digest = "f".repeat(64);
       if (key === "mcp" || key === "instructions-and-mcp") current.runtimeContext.mcp.digest = "d".repeat(64);
       if (key === "skills") current.runtimeContext.skills.push({ key: "fixture-skill", runtimeName: "fixture-skill", versionId: "next", bundle: structuredClone(current.runtimeContext.instructions.bundle) });
       if (key === "connectionInstructions") current.runtimeContext.connectionInstructions = { text: "Changed account policy", digest: "e".repeat(64) };
       current.runtimeContext.aggregateDigest = key === "aggregateDigest" ? "c".repeat(64) : canonicalNativeRuntimeContextDigest(current.runtimeContext);
       const result = buildNativeExecutionWithCheckpoint({ previousRun: source, normalizedSessionId, buildExecution: () => current });
-      const retain = sessionContinuity !== "paperclip" && (key === "instructions" || key === "prompt");
+      const retain = sessionContinuity !== "paperclip" && (key === "instructions" || key === "prompt" || key === "promptDigest");
       expect(result.normalizedSessionId === normalizedSessionId).toBe(retain);
       expect(!!result.checkpoint).toBe(retain);
       const wrongOwner = structuredClone(current);
       wrongOwner.binding.agentId = randomUUID();
       expect(rebindNativeSessionCheckpoint({ previousRun: source, currentExecution: wrongOwner })).toBeNull();
     }
+  });
+
+  it.each([false, true])("continuous Pi MCP remains a capability-gated refresh (%s)", toolRefreshOnResume => {
+    const prior = execution(previousRunId), current = execution(currentRunId);
+    for (const value of [prior, current]) {
+      value.provider = { kind: "pi_rpc", model: "fixture/model" };
+      value.session.driverKind = "pi_rpc";
+    }
+    const source = previousRun({ nativeExecutionInput: prior });
+    source.runnerProfileJson.sessionCheckpoint.driverKind = "pi_rpc";
+    current.runtimeContext.mcp.digest = "d".repeat(64);
+    current.runtimeContext.aggregateDigest = canonicalNativeRuntimeContextDigest(current.runtimeContext);
+    const rebound = rebindNativeSessionCheckpoint({ previousRun: source, currentExecution: current, toolRefreshOnResume });
+    expect(Boolean(rebound)).toBe(toolRefreshOnResume);
+    if (rebound) expect(rebound.sessionId).toBe("provider-thread-123");
   });
 
   it.each(["continuous", "paperclip"] as const)("rebinds changed Pi instruction bytes without a new session only in continuous mode (%s)", sessionContinuity => {
