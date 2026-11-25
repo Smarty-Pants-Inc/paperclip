@@ -6,6 +6,8 @@ import { buildNativeSessionHandoff, createNativeSessionHandoffLoader, NATIVE_HAN
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { buildNativeModelEnvelope } from "@paperclipai/paperclip-runner";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
+import { buildExecutionContinuation } from "../execution-continuation.js";
+import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 
 describe("bounded fresh-session handoff", () => {
   it("marks omissions and stays within its byte budget for huge Unicode histories", () => {
@@ -26,6 +28,27 @@ describe("bounded fresh-session handoff", () => {
     expect(rendered.length).toBeLessThanOrEqual(400_000);
     expect(rendered.split("\n")[0]).toBe("2 earlier messages were not handed over.");
     expect(packet.entries.map((entry: { body: string }) => entry.body)).toEqual(entries.slice(2).map(entry => entry.body));
+  });
+
+  it("reserves the original request while rendering the newest whole messages", () => {
+    const origin = { kind: "original_request", id: "origin", body: "Keep the original objective" };
+    const newer = Array.from({ length: 70 }, (_, i) => ({ kind: "message", id: String(i), body: `${i}:` + "x".repeat(100_000) }));
+    const rendered = renderNativeSessionHandoff({ issueId: "task", generation: null, mode: "whole",
+      entries: [origin, ...newer], omittedEntriesAtLeast: 0 });
+    const packet = JSON.parse(rendered.split("\n").at(-1)!);
+    expect(rendered.length).toBeLessThanOrEqual(400_000);
+    expect(packet.entries.map((entry: { id: string }) => entry.id)).toEqual(["origin", "67", "68", "69"]);
+    expect(packet.entries[0].body).toBe(origin.body);
+    expect(packet.omittedMessages).toBe(67);
+  });
+
+  it("keeps a marked original excerpt when that request alone exceeds the whole budget", () => {
+    const rendered = renderNativeSessionHandoff({ issueId: "task", generation: null, mode: "whole", omittedEntriesAtLeast: 0,
+      entries: [{ kind: "original_request", id: "origin", body: "START" + "x".repeat(500_000) + "END" }] });
+    const packet = JSON.parse(rendered.split("\n").at(-1)!);
+    expect(rendered.length).toBeLessThanOrEqual(400_000);
+    expect(packet.entries[0]).toMatchObject({ id: "origin", truncated: true });
+    expect(packet.entries[0].body).toMatch(/^START.*END$/s);
   });
 
   it("counts support-only omissions separately from messages", () => {
@@ -314,7 +337,56 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(packet.omittedMessages).toBe(71 - retained.length);
     expect(result.length).toBeLessThanOrEqual(400_000);
     expect(retained.at(-1).body).toBe(rows.at(-1)!.body);
-    expect(retained.every((entry: { body: string }) => entry.body.length > 100_000)).toBe(true);
+    expect(retained[0]).toMatchObject({ kind: "original_request", body: "old request" });
+    expect(retained.slice(1).map((entry: { body: string }) => entry.body)).toEqual(rows.slice(-3).map(row => row.body));
+  });
+
+  it.each(["full", "partial", "foreign"] as const)("dedupes comments only against full same-task continuation coverage (%s)", async coverage => {
+    const taskId = randomUUID(), runId = randomUUID(), savedId = randomUUID();
+    await db.insert(issues).values({ id: taskId, companyId, title: "Continue the review", status: "in_progress", assigneeAgentId: agentId });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: taskId, status: "succeeded",
+      createdAt: new Date(30_000), resultJson: { continuousReplies: { saved: { commentId: savedId } } } });
+    const comments = [
+      { id: randomUUID(), body: "ORIGINAL-COMMENT-CANARY", authorUserId: "user" },
+      { id: savedId, body: "SAVED-FINAL-CANARY", authorAgentId: agentId },
+      { id: randomUUID(), body: "LATEST-COMMENT-CANARY", authorUserId: "user" },
+    ];
+    await db.insert(issueComments).values(comments.map((row, i) => ({ ...row, companyId, issueId: taskId, createdAt: new Date(31_000 + i * 1_000) })));
+    await db.insert(heartbeatRunEvents).values(["saved", "distinct"].map((itemId, i) => ({ companyId, agentId, runId, seq: i + 1,
+      eventType: "item.completed", createdAt: new Date(35_000 + i * 1_000),
+      payload: { prpEvent: { itemId, payload: { kind: "agentMessage", channel: "final", text: i === 0 ? comments[1].body : "UNMATCHED-FINAL-CANARY" } } } })));
+    await db.insert(issueThreadInteractions).values({ companyId, issueId: taskId, kind: "ask_user_questions", status: "answered",
+      createdByAgentId: agentId, createdAt: new Date(34_000), resolvedAt: new Date(35_000),
+      payload: { version: 1, questions: [] }, result: { version: 1, summaryMarkdown: "INTERACTION-CANARY" } });
+    const continuation = await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId,
+      context: {}, summary: null, exposeLowTrustRaw: false });
+    if (coverage === "partial") continuation.coverage.kind = "task_history_delta";
+    if (coverage === "foreign") continuation.issueId = randomUUID();
+    const load = createNativeSessionHandoffLoader({ db, companyId, issueId: taskId, agentId, before: new Date(40_000),
+      mode: "whole", continuation, excludeCommentIds: coverage === "full" ? [savedId] : [] });
+    const handoff = (await load())!;
+    const packet = JSON.parse(handoff.split("\n").at(-1)!);
+    expect(packet.entries.filter((entry: { kind: string }) => ["message", "original_request"].includes(entry.kind))).toHaveLength(coverage === "full" ? 0 : 3);
+    expect(handoff).toContain("UNMATCHED-FINAL-CANARY");
+    expect(handoff).toContain("INTERACTION-CANARY");
+    expect(packet.omittedMessages).toBe(0);
+    if (coverage === "full") {
+      const prompt = `${handoff}\n\n${renderPaperclipWakePrompt({ issue: { id: taskId }, executionContinuation: continuation })}`;
+      for (const comment of comments) expect(prompt.split(comment.body).length - 1).toBe(1);
+    }
+  });
+
+  it("bounds hydration of an oversized original without dropping its slot", async () => {
+    const taskId = randomUUID();
+    await db.insert(issues).values({ id: taskId, companyId, title: "Long original", assigneeAgentId: agentId });
+    await db.insert(issueComments).values({ companyId, issueId: taskId, authorUserId: "user", createdAt: new Date(30_000),
+      body: "START" + "x".repeat(500_000) + "END" });
+    const rendered = (await buildNativeSessionHandoff({ db, companyId, issueId: taskId, agentId, before: new Date(40_000), mode: "whole" }))!;
+    const packet = JSON.parse(rendered.split("\n").at(-1)!);
+    expect(rendered.length).toBeLessThanOrEqual(400_000);
+    expect(packet.entries[0]).toMatchObject({ kind: "original_request", truncated: true });
+    expect(packet.entries[0].body).toMatch(/^START.*END$/s);
+    expect(packet.omittedMessages).toBe(0);
   });
 
   it("loads and redacts history once only when a fresh attempt requests it", async () => {
