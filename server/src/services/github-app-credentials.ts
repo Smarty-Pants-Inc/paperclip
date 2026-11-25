@@ -17,6 +17,33 @@ export function isGitHubAppConnection(connection: Pick<Connection, "config">) {
   return connection.config.sourceTemplateKey === "github" && connection.config.connectionMethodKey === "app-installation";
 }
 
+type Installation = { account?: { login?: string }; repository_selection?: "all" | "selected"; suspended_at?: string | null };
+const installations = new Map<string, { value: Installation; expiresAt: number }>();
+
+/** Reuse the installation account across selection and minting, not a saved repository snapshot. */
+export async function resolveGitHubAppInstallation(db: Db, connection: Connection, grant: Grant, jwt?: string) {
+  const config = connection.config.methodConfig as Record<string, unknown> | undefined;
+  if (!config || !/^[1-9]\d*$/.test(String(config.installationId ?? "")))
+    throw unprocessable("The GitHub App installation configuration is invalid");
+  const key = JSON.stringify([connection.companyId, connection.id, config, grant.id, grant.credentialSecretRefs]);
+  const cached = installations.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  if (!jwt) {
+    const ref = grant.credentialSecretRefs.find(ref => ref.configPath === "credentials.privateKey");
+    if (!ref) throw unprocessable("The GitHub App private key is unavailable");
+    const secret = await resolveConnectionGrantSecret(db, connection, grant, ref, { actorType: "system", consumerType: "tool_connection", consumerId: connection.id });
+    jwt = githubAppJwt(String(config.appId), secret.value);
+  }
+  const installation = await githubBotRequest<Installation>(fetch, jwt, `/app/installations/${config.installationId}`);
+  if (installation.suspended_at || !installation.account?.login
+    || !["all", "selected"].includes(installation.repository_selection ?? ""))
+    throw unprocessable("The GitHub App installation is unavailable");
+  for (const [entry, value] of installations) if (value.expiresAt <= Date.now()) installations.delete(entry);
+  if (installations.size >= 128) installations.delete(installations.keys().next().value!);
+  installations.set(key, { value: installation, expiresAt: Date.now() + margin });
+  return installation;
+}
+
 /** Callers select/authorize the grant; stock vault ownership checks also run on cache hits. */
 export async function resolveGitHubAppCredential(db: Db, connection: Connection, grant: Grant, options: { forceRefresh?: boolean; allowDraft?: boolean } = {}) {
   const config = connection.config.methodConfig as Record<string, unknown> | undefined;
@@ -46,11 +73,11 @@ export async function resolveGitHubAppCredential(db: Db, connection: Connection,
   let jwt: string;
   try { jwt = githubAppJwt(String(config.appId), secret.value); }
   catch { throw unprocessable("The GitHub App private key is invalid"); }
-  const installation = await githubBotRequest<{ account?: { login?: string }; suspended_at?: string | null }>(fetch, jwt, `/app/installations/${config.installationId}`);
-  if (installation.suspended_at || !installation.account?.login || repositories.some(repo => repo.split("/")[0] !== installation.account!.login!.toLowerCase()))
+  const installation = await resolveGitHubAppInstallation(db, connection, grant, jwt);
+  if (repositories.some(repo => repo.split("/")[0] !== installation.account!.login!.toLowerCase()))
     throw unprocessable("The GitHub App installation does not match the selected repositories");
   const minted = await githubBotRequest<{ token?: string; expires_at?: string }>(fetch, jwt, `/app/installations/${config.installationId}/access_tokens`, {
-    method: "POST", body: { repositories: repositories.map(repo => repo.split("/")[1]), permissions },
+    method: "POST", body: { ...(installation.repository_selection === "all" ? {} : { repositories: repositories.map(repo => repo.split("/")[1]) }), permissions },
   });
   const credential = { token: minted.token ?? "", expiresAt: Date.parse(minted.expires_at ?? "") };
   if (!credential.token.trim() || !Number.isFinite(credential.expiresAt) || credential.expiresAt <= Date.now() + margin)
