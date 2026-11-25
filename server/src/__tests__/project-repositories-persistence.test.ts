@@ -4,7 +4,7 @@ import express from "express";
 import request from "supertest";
 import { projectRoutes } from "../routes/projects.js";
 import { errorHandler } from "../middleware/index.js";
-import { companies, companyMemberships, companySecrets, connectionGrants, connectionGrantMembers, toolApplications, toolConnections, createDb, projects as projectTable, userSecretDefinitions } from "@paperclipai/db";
+import { agents, companies, companyMemberships, companySecrets, connectionGrants, connectionGrantMembers, toolApplications, toolConnections, toolConnectionInstalls, createDb, projects as projectTable, userSecretDefinitions } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import { toolAccessService } from "../services/tool-access.js";
 import { projectService } from "../services/projects.js";
@@ -154,11 +154,12 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(request).toHaveBeenCalledTimes(3);
   });
 
-  it("lists both App installations, keeps PAT and OAuth discovery, and attaches a private second-org repository", async () => {
+  it("lists only installed App connections, keeps PAT and OAuth discovery, and attaches an agent-installed private repository", async () => {
     const [company] = await db.insert(companies).values({ name: "App repositories", issuePrefix: "APPREPO" }).returning();
     const owner = randomUUID();
     await db.insert(companyMemberships).values({ companyId: company.id, principalType: "user", principalId: owner, membershipRole: "admin" });
     const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    const connectionIds = new Map<string, string>();
     for (const [index, name] of ["example-org", "second-org", "pat", "oauth"].entries()) {
       const app = index < 2;
       const [application] = await db.insert(toolApplications).values({ companyId: company.id, name, type: "mcp_http" }).returning();
@@ -172,7 +173,9 @@ const support = await getEmbeddedPostgresTestSupport();
         } } : {}) } }).returning();
       await db.insert(connectionGrants).values({ companyId: company.id, connectionId: connection.id, kind: "user", subjectUserId: owner,
         credentialSecretRefs: [{ secretId: secret.id, configPath: app ? "credentials.privateKey" : name === "oauth" ? "oauth.access_token" : "credentials.authorization", versionSelector: "latest" }] });
+      connectionIds.set(name, connection.id);
     }
+    await db.insert(toolConnectionInstalls).values({ companyId: company.id, connectionId: connectionIds.get("example-org")!, targetType: "company", targetId: company.id });
     const calls: Array<{ path: string; token: string }> = [];
     vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (url, init) => {
       const parsed = new URL(String(url));
@@ -181,7 +184,7 @@ const support = await getEmbeddedPostgresTestSupport();
       const installation = parsed.pathname.match(/^\/app\/installations\/([12])(\/access_tokens)?$/);
       if (installation) return Response.json(installation[2]
         ? { token: `installation-${installation[1]}`, expires_at: new Date(Date.now() + 3600_000).toISOString() }
-        : { account: { login: installation[1] === "1" ? "example-org" : "second-org" }, suspended_at: null });
+        : { account: { login: installation[1] === "1" ? "example-org" : "second-org" }, repository_selection: "selected", suspended_at: null });
       if (parsed.pathname === "/user/repos") {
         if (token.startsWith("installation-")) return Response.json({ message: "Resource not accessible by integration" }, { status: 403 });
         expect(["pat-token", "oauth-token"]).toContain(token);
@@ -193,7 +196,14 @@ const support = await getEmbeddedPostgresTestSupport();
       const name = token === "installation-1" ? "example-org" : "second-org";
       return Response.json({ total_count: 1, repositories: [{ id: token === "installation-1" ? 10 : 20, full_name: `${name}/private`, private: true, owner: { type: "Organization" } }] });
     }));
-    const catalog = await toolAccessService(db).listProjectRepositories(company.id, owner, false, { requiredRepositoryIds: ["20"] });
+    const beforeAgentInstall = await toolAccessService(db).listProjectRepositories(company.id, owner);
+    expect(beforeAgentInstall.repositories.map(repository => repository.fullName)).toEqual(["example-org/private", "oauth/repo", "pat/repo"]);
+    expect(beforeAgentInstall).toMatchObject({ connectionCount: 3, failedConnectionCount: 0 });
+    expect(beforeAgentInstall.connections.map(connection => connection.name).sort()).toEqual(["example-org", "oauth", "pat"]);
+    expect(calls.some(call => call.path.startsWith("/app/installations/2") || call.token === "installation-2")).toBe(false);
+    const [agent] = await db.insert(agents).values({ companyId: company.id, name: "Repository reader", adapterType: "process" }).returning();
+    await db.insert(toolConnectionInstalls).values({ companyId: company.id, connectionId: connectionIds.get("second-org")!, targetType: "agent", targetId: agent.id });
+    const catalog = await toolAccessService(db).listGitHubRepositories(company.id, owner, false, { requiredRepositoryIds: ["20"] });
     expect(catalog).toMatchObject({ connectionCount: 4, failedConnectionCount: 0 });
     expect(catalog.repositories.map(repository => repository.fullName).sort()).toEqual(["example-org/private", "oauth/repo", "pat/repo", "second-org/private"]);
     expect(catalog.repositories.filter(repository => repository.private)).toHaveLength(2);
@@ -209,7 +219,7 @@ const support = await getEmbeddedPostgresTestSupport();
       repoUrl: "https://github.com/second-org/private", metadata: expect.objectContaining({ githubRepositoryId: "20", githubRepositoryPrivate: true }),
     })]);
     expect(calls.filter(call => call.token.startsWith("installation-")).every(call => call.path === "/installation/repositories")).toBe(true);
-    for (const token of ["pat-token", "oauth-token"]) expect(calls.filter(call => call.token === token).map(call => call.path)).toEqual(["/user/repos", "/user/repos"]);
+    for (const token of ["pat-token", "oauth-token"]) expect(calls.filter(call => call.token === token).map(call => call.path)).toEqual(["/user/repos", "/user/repos", "/user/repos"]);
   });
 
   it("rolls back the project if a later repository insert fails", async () => {
