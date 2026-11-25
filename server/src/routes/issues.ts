@@ -368,6 +368,7 @@ import { stalledReviewDecisionService } from "../services/stalled-review-decisio
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { ensurePersonalPrivateProject } from "../services/projects.js";
+import { privateRequestActor } from "./private-request-actor.js";
 import { redactSensitiveText } from "../redaction.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import {
@@ -5504,7 +5505,7 @@ export function issueRoutes(
   }
 
   async function assertCanManageIssuePrivacy(
-    req: Request,
+    req: Pick<Request, "actor">,
     res: Response,
     issue: { companyId: string; responsibleUserId: string | null; createdByUserId: string | null; assigneeUserId: string | null },
   ) {
@@ -5553,9 +5554,10 @@ export function issueRoutes(
       responsibleUserId: string | null;
       createdByUserId: string | null;
     },
+    privacyActor = req.actor,
   ) {
     if (!(await assertIssueReadAllowed(req, res, issue))) return null;
-    if (!(await assertCanManageIssuePrivacy(req, res, issue))) return null;
+    if (!(await assertCanManageIssuePrivacy({ actor: privacyActor }, res, issue))) return null;
     // Management is scoped to this exact task; an ancestor privacy root is
     // inheritance provenance, never authority to mutate its grants.
     return issue;
@@ -12962,10 +12964,9 @@ export function issueRoutes(
     async (req, res) => {
       const companyId = req.params.companyId as string;
       assertCompanyAccess(req, companyId);
-      // Refuse only an explicit request; a person's private parent or project
-      // still governs inherited visibility in the issue service.
-      if (req.actor.type === "agent" && req.body.visibility === "private") {
-        throw forbidden("Only a person can make a task private");
+      // Inherited privacy remains the issue service's responsibility.
+      if (req.body.visibility === "private") {
+        await privateRequestActor(db, req.actor, companyId, "task");
       }
       if (isSkillTestScopedActor(req)) {
         res.status(403).json({
@@ -13543,13 +13544,6 @@ export function issueRoutes(
     applyCreateIssueStatusDefault,
     validateIssueMutationBody(createChildIssueSchema),
     async (req, res) => {
-      // Reject explicit privacy requests, not privacy inherited from the parent.
-      if (
-        req.actor.type === "agent" &&
-        req.body.visibility === "private"
-      ) {
-        throw forbidden("Only a person can make a task private");
-      }
       const parentId = req.params.id as string;
       const parent = await getAccessibleResource(
         req,
@@ -13558,6 +13552,9 @@ export function issueRoutes(
         "Parent issue not found",
       );
       if (!parent) return;
+      if (req.body.visibility === "private") {
+        await privateRequestActor(db, req.actor, parent.companyId, "task");
+      }
       if (
         !isTaskBridgeKeyActor(req) &&
         !(await assertIssueWriteInfluenceAllowed(req, res, parent))
@@ -13841,16 +13838,6 @@ export function issueRoutes(
     "/issues/:id/accepted-plan-decompositions",
     validateIssueMutationBody(createAcceptedPlanDecompositionSchema),
     async (req, res) => {
-      // Preflight the whole set before creating any child or decomposition claim.
-      // Omitted visibility still inherits the person's private parent or project.
-      if (
-        req.actor.type === "agent" &&
-        req.body.children.some(
-          (child: { visibility?: string }) => child.visibility === "private",
-        )
-      ) {
-        throw forbidden("Only a person can make a task private");
-      }
       const sourceIssueId = req.params.id as string;
       const sourceIssue = await getAccessibleResource(
         req,
@@ -13859,6 +13846,10 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!sourceIssue) return;
+      // Preflight the whole set before creating any child or decomposition claim.
+      if (req.body.children.some((child: { visibility?: string }) => child.visibility === "private")) {
+        await privateRequestActor(db, req.actor, sourceIssue.companyId, "task");
+      }
       if (!(await assertAgentIssueMutationAllowed(req, res, sourceIssue)))
         return;
 
@@ -14674,12 +14665,10 @@ export function issueRoutes(
           return;
         }
       }
-      // Privacy choices require a person even when the agent may otherwise edit the task.
-      if (req.actor.type === "agent" && req.body.visibility === "private") {
-        throw forbidden("Only a person can make a task private");
-      }
+      const privacyActor = req.body.visibility === "private"
+        ? await privateRequestActor(db, req.actor, existing.companyId, "task") : req.actor;
       if (req.body.visibility !== undefined
-        && !(await resolveManagedIssueForPrivacy(req, res, existing))) return;
+        && !(await resolveManagedIssueForPrivacy(req, res, existing, privacyActor))) return;
       // MCP task changes cannot stop a run or implicitly decide a pending review.
       const mcpParticipationChange = req.actor.source === "mcp_oauth" &&
         ["status", "assigneeAgentId", "assigneeUserId", "blockedByIssueIds", "parentId", "projectId"].some(key => req.body[key] !== undefined);
