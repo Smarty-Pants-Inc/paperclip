@@ -13546,6 +13546,13 @@ export function issueRoutes(
     applyCreateIssueStatusDefault,
     validateIssueMutationBody(createChildIssueSchema),
     async (req, res) => {
+      // Reject explicit privacy requests, not privacy inherited from the parent.
+      if (
+        req.actor.type === "agent" &&
+        req.body.visibility === "private"
+      ) {
+        throw forbidden("Only a person can make a task private");
+      }
       const parentId = req.params.id as string;
       const parent = await getAccessibleResource(
         req,
@@ -13837,6 +13844,16 @@ export function issueRoutes(
     "/issues/:id/accepted-plan-decompositions",
     validateIssueMutationBody(createAcceptedPlanDecompositionSchema),
     async (req, res) => {
+      // Preflight the whole set before creating any child or decomposition claim.
+      // Omitted visibility still inherits the person's private parent or project.
+      if (
+        req.actor.type === "agent" &&
+        req.body.children.some(
+          (child: { visibility?: string }) => child.visibility === "private",
+        )
+      ) {
+        throw forbidden("Only a person can make a task private");
+      }
       const sourceIssueId = req.params.id as string;
       const sourceIssue = await getAccessibleResource(
         req,
