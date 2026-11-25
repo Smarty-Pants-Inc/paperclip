@@ -98,7 +98,9 @@ async function findQueuedCommentWake(
   };
   const pendingMessages = async (state: IssueQueueState) => {
     if (await hasPersonMessage(state.wake)) return state;
-    agentOnly = state;
+    // An agent-only remainder is a fallback, not a reason to stop looking
+    // for later person messages. Preserve FIFO among fallback wakes too.
+    agentOnly ??= state;
     return null;
   };
   for (const wake of rows) {
@@ -118,7 +120,6 @@ async function findQueuedCommentWake(
       continue;
     }
     if (isReceipt && receipt) continue;
-    if (!isReceipt && agentOnly) continue;
     const readReceipt = () => readQueuedInteractionResponse(executor as Db, wake.companyId, issue.id, wake.payload);
     if (wake.status === "deferred_issue_execution") {
       if (isReceipt) {
