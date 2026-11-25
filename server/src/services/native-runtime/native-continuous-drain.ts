@@ -6,6 +6,7 @@ import { createSteerQueuedComment } from "../../modules/wake-queue/application/q
 import { createQueuedCommentSteeringAdapter, readBoardQueuedComments } from "../../modules/wake-queue/adapters/queued-comment-board-postgres.js";
 import { logActivity } from "../activity-log.js";
 import { resolveSessionContinuity } from "./continued-session.js";
+import { isAutomaticSteeringComment } from "../../modules/wake-queue/index.js";
 
 // Final publication can be replayed or observed concurrently. The queue mutation
 // still owns durable idempotence; this only serializes local drain attempts.
@@ -53,14 +54,19 @@ async function drain(db: Db, scope: { companyId: string; issueId: string; runId:
     // guards remain authoritative; consume saved person input through its ACK.
     if (board.state !== "deferred" || (board.executionWait && board.executionWait.reason !== "execution_recovery") ||
         board.steeringDisposition !== "available" || !board.queueId ||
-        !head || head.comment.authorType !== "user" || !head.comment.authorUserId ||
+        !head || !isAutomaticSteeringComment(head.comment, scope.agentId) ||
         head.comment.body.trim() === "/new" || head.source?.requiresFreshSession) return;
     const [wake] = await db.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.id, board.queueId), eq(agentWakeupRequests.companyId, scope.companyId),
       eq(agentWakeupRequests.agentId, scope.agentId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
     ));
     if (!wake || parseObject(wake.payload?._paperclipWakeContext).forceFreshSession === true) return;
-    const accepted = await steer({ issue: row.issue, actor,
+    const author = head.comment.authorAgentId
+      ? { actorType: "agent" as const, actorId: head.comment.authorAgentId, agentId: head.comment.authorAgentId,
+          runId: head.comment.createdByRunId ?? null, agentApiKeyId: null }
+      : { actorType: "user" as const, actorId: head.comment.authorUserId!, agentId: null, runId: null, agentApiKeyId: null };
+    if (!author.actorId) return;
+    const accepted = await steer({ issue: row.issue, actor: author,
       queueId: board.queueId, commentId: head.comment.id, targetRunId: scope.runId, revision: board.revision });
     if (accepted.duplicate) return;
     await logActivity(db, { companyId: scope.companyId, actorType: "system", actorId: "continuous-person-drain",
@@ -69,6 +75,6 @@ async function drain(db: Db, scope: { companyId: string; issueId: string; runId:
       details: { commentId: head.comment.id, queueId: board.queueId, targetRunId: scope.runId,
         turnId: accepted.turnId, automatic: true } });
     // Re-read after each ACK: edits, Stop, a reset head, or a competing sender
-    // must take effect before the next person message is delivered.
+    // must take effect before the next message is delivered.
   }
 }

@@ -23,6 +23,7 @@ import { queuedInteractionId, readQueuedInteractionResponse, type QueuedInteract
 import type { QueuedCommentActor, QueuedCommentSteeringPort, SteerQueuedCommentInput } from "../application/queued-comment-ports.js";
 import { QueuedCommentMutationError } from "../application/queued-comment-use-cases.js";
 import { parseObject } from "../domain/values.js";
+import { isAutomaticSteeringComment } from "../domain/policy.js";
 
 type IssueQueueDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 type IssueQueueTx = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -84,17 +85,27 @@ async function findQueuedCommentWake(
   // messages, which are separately queued and remain editable and sendable.
   let receipt: IssueQueueState | null = null;
   let agentOnly: IssueQueueState | null = null;
-  const hasPersonMessage = async (wake: { payload: unknown }) => {
+  const hasMessage = async (wake: { payload: unknown }) => {
     const ids = queuedCommentIdsFromWakePayload(wake.payload);
     if (ids.length === 0) return false;
     const [row] = await executor.select({ id: issueComments.id }).from(issueComments).where(and(
       eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
-      inArray(issueComments.id, ids), eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt),
+      inArray(issueComments.id, ids), isNull(issueComments.deletedAt),
     )).limit(1);
     return Boolean(row);
   };
   const pendingMessages = async (state: IssueQueueState) => {
-    if (await hasPersonMessage(state.wake)) return state;
+    if (await hasMessage(state.wake)) {
+      if (receipt?.response?.source.requiresFreshSession) {
+        const [person] = await executor.select({ id: issueComments.id }).from(issueComments).where(and(
+          eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+          inArray(issueComments.id, queuedCommentIdsFromWakePayload(state.wake.payload)),
+          eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt),
+        )).limit(1);
+        if (!person) return receipt;
+      }
+      return state;
+    }
     agentOnly = state;
     return null;
   };
@@ -189,8 +200,9 @@ export async function closeConversationResetHold(executor: Db, scope: { companyI
     if (queuedInteractionId(wake.payload)) return closeHeldNativeTurn(current.runId);
     const comments = await queueCommentsForWake(executor, scope.issueId, wake, null);
     const head = comments[0];
-    // Ordinary person messages remain the drain's responsibility, not a close.
-    if (head?.authorType === "user" && !isConversationReset(head.body)) continue;
+    // Ordinary messages from people and other agents belong to the drain.
+    if (head && isAutomaticSteeringComment(head, current.issue.conversationAgentId) &&
+        parseObject(wake.payload?._paperclipWakeContext).forceFreshSession !== true) continue;
     return closeHeldNativeTurn(current.runId);
   }
   return false;

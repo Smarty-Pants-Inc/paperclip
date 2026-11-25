@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { contextCompactionService } from "../context-compaction.js";
 import { claimNativeSessionResumptions } from "../native-runtime/native-finalization-reconciler.js";
 import type { Db } from "@paperclipai/db";
-import { authUsers, agents, agentTaskSessions, agentWakeupRequests, budgetIncidents, budgetPolicies, caseHandoffs, cases, chatCompletionDeliveries, companies, companyMemberships, costEvents, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, routines, routineRuns } from "@paperclipai/db";
+import { activityLog, authUsers, agents, agentTaskSessions, agentWakeupRequests, budgetIncidents, budgetPolicies, caseHandoffs, cases, chatCompletionDeliveries, companies, companyMemberships, costEvents, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, routines, routineRuns } from "@paperclipai/db";
 import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
@@ -23,6 +23,21 @@ import { callbacks as runControlCallbacks } from "./__tests__/run-control-fixtur
 
 import { createHeartbeatQueueTestDependencies as callbacks } from "../../__tests__/helpers/heartbeat-queue.js";
 import { DELIVERY_QUEUES, subscribeDeliveryWork } from "../delivery-work-notifications.js";
+
+// Only the provider transport is substituted; admission, locks, identity, ACKs
+// and deferred wake consumption below all execute against real PostgreSQL.
+const automaticSteering = vi.hoisted(() => ({ available: false, closing: false, sent: [] as string[] }));
+vi.mock("../native-runtime/native-session-executor.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../native-runtime/native-session-executor.js")>();
+  return { ...actual,
+    getNativeSessionSteeringState: async () => ({ disposition: automaticSteering.available ? "available" : "temporarily_unavailable" }),
+    steerNativeSession: async (input: { correlationId: string }) => {
+      if (automaticSteering.closing) throw new actual.NativeSessionSteeringError("steering_stale_turn", "Held turn is closing");
+      automaticSteering.sent.push(input.correlationId);
+      return { turnId: "automatic-comment-turn" };
+    },
+  };
+});
 
 function guardedDatabase() {
   const access = vi.fn(() => { throw new Error("Unexpected queue database access"); });
@@ -239,6 +254,71 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
     return { user, company, agent, issue, deps, queue: createHeartbeatQueue(db, deps) };
   }
+
+  it.each(["agent", "self", "person", "unavailable", "stopped", "reset", "fresh", "closing", "chat-disabled", "chat-enabled",
+    "system", "notice", "presentation", "completion", "stage", "unsupported"] as const)(
+    "automatically steers committed comments through the existing ACK path (%s)", async scenario => {
+      const f = await waitingConversationFixture();
+      const [recipient] = await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } })
+        .where(eq(agents.id, f.agent.id)).returning();
+      f.deps.getAgent.mockResolvedValue(recipient);
+      const [sender] = await db.insert(agents).values({ companyId: f.company.id, name: "Agent A", status: "idle", adapterType: "process" }).returning();
+      await db.update(issues).set({ conversationAgentId: scenario.startsWith("chat-") ? recipient.id : null,
+        conversationUserId: scenario.startsWith("chat-") ? f.user.id : null,
+        conversationState: scenario.startsWith("chat-") ? "active" : null, status: "in_progress" }).where(eq(issues.id, f.issue.id));
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: recipient.id, nativeIssueId: f.issue.id,
+        status: "running", runtimeMode: scenario === "unsupported" ? "legacy" : "native", contextSnapshot: { issueId: f.issue.id },
+        resultJson: scenario === "stopped" ? { personStop: { requestedAt: new Date().toISOString() } } : {},
+      }).returning();
+      await db.update(issues).set({ executionRunId: run.id }).where(eq(issues.id, f.issue.id));
+      const person = scenario === "person";
+      const actorId = person ? f.user.id : scenario === "self" ? recipient.id : sender.id;
+      const [comment] = await db.insert(issueComments).values({ companyId: f.company.id, issueId: f.issue.id,
+        authorType: scenario === "system" ? "system" : person ? "user" : "agent",
+        authorAgentId: person ? null : actorId, authorUserId: person ? actorId : null,
+        body: scenario === "reset" ? "/new" : "Please use this update in your current run.",
+        ...(scenario === "notice" ? { presentation: { kind: "system_notice" as const, tone: "info" as const, detailsDefaultOpen: false } } : {}),
+        ...(scenario === "presentation" ? { metadata: { version: 1 as const, authorizationReason: "allow_chat_run_presentation", sections: [] } } : {}),
+      }).returning();
+      const flag = process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+      if (scenario === "chat-enabled") process.env.PAPERCLIP_AGENT_CHAT_STEERING = "true";
+      else delete process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+      automaticSteering.available = scenario !== "unavailable";
+      automaticSteering.closing = scenario === "closing";
+      automaticSteering.sent = [];
+      try {
+        await f.queue.enqueueWakeup(recipient.id, { source: "on_demand",
+          reason: scenario === "completion" ? "issue_children_completed" : scenario === "stage" ? "execution_review_requested" : "issue_commented",
+          requestedByActorType: person ? "user" : "agent", requestedByActorId: actorId,
+          payload: { issueId: f.issue.id, commentId: comment.id },
+          contextSnapshot: { issueId: f.issue.id, wakeCommentId: comment.id, wakeCommentIds: [comment.id],
+            ...(scenario === "fresh" ? { forceFreshSession: true } : {}) },
+        });
+        const expected = scenario === "agent" || scenario === "chat-enabled";
+        const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+        const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, recipient.id));
+        expect(automaticSteering.sent).toEqual(expected ? [comment.id] : []);
+        expect(wakes).toHaveLength(1);
+        expect(wakes[0].status).toBe(expected ? "cancelled" : "deferred_issue_execution");
+        if (expected) {
+          expect(saved.resultJson?.queuedSteeringAcknowledgements).toMatchObject({ [comment.id]: {
+            status: "acknowledged", queueId: wakes[0].id, turnId: "automatic-comment-turn",
+          } });
+          expect(wakes.filter(wake => wake.status === "deferred_issue_execution")).toEqual([]);
+          expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, recipient.id))).toHaveLength(1);
+          const activities = await db.select().from(activityLog).where(eq(activityLog.action, "issue.queued_comment_steered"));
+          expect(activities).toEqual([expect.objectContaining({ actorType: person ? "user" : "agent", actorId })]);
+          expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).toHaveLength(1);
+        } else expect(saved.resultJson?.queuedSteeringAcknowledgements).toBeUndefined();
+        process.stdout.write(`AUTO_STEER_PG ${JSON.stringify({ scenario, runId: run.id, commentId: comment.id,
+          wakeId: wakes[0].id, wakeStatus: wakes[0].status, acknowledged: saved.resultJson?.queuedSteeringAcknowledgements ?? null,
+          providerTurns: automaticSteering.sent.length })}\n`);
+      } finally {
+        automaticSteering.available = false; automaticSteering.closing = false;
+        if (flag === undefined) delete process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+        else process.env.PAPERCLIP_AGENT_CHAT_STEERING = flag;
+      }
+    });
 
   async function waitingCompactionFixture() {
     const f = await waitingConversationFixture();
