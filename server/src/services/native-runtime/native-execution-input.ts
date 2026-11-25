@@ -2,7 +2,7 @@ import type { PaperclipTurnContext } from "@paperclipai/adapter-utils/server-uti
 import { resolvePaperclipRunnerCursorMode, resolvePaperclipRunnerPiThinkingLevel } from "@paperclipai/adapter-utils";
 import { createHash } from "node:crypto";
 import { buildNativeContinuationPrompt } from "./native-continuation.js";
-import { decideNativeContinuation } from "./continued-session.js";
+import { decideNativeContinuation, resolveSessionContinuity } from "./continued-session.js";
 import {
   caseExecutionMarkdown,
   caseProjectionBootstrapPrefix,
@@ -262,6 +262,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
       ? readCaseProjectionMarker(previousExecution) : null;
   const workflowCase = input.caseContext && previousCaseProjection
     ? projectCaseContinuation(input.caseContext, previousCaseProjection) : null;
+  const continuity = resolveSessionContinuity(input.provider, input.sessionContinuity);
   const piConversation = input.provider === "pi_rpc" && input.conversationMode === true && input.issue.conversationAgentId === input.agentId;
   const continuation = decideNativeContinuation({ ...input, hasSession: input.resumedSession === true && !!input.previousTurn,
     taskChanged: !!input.previousTurn && (input.issue.title !== input.previousTurn.task.title || input.issue.description !== input.previousTurn.task.description),
@@ -380,6 +381,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
         }
       : input.provider === "pi_rpc"
         ? { kind: "pi_rpc", model: input.model, ...(piConversation ? { conversationMode: true } : {}),
+            ...(continuity === "paperclip" ? { sessionContinuity: "paperclip" } : {}),
             ...(input.piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel: input.piRpcThinkingLevel }) }
       : input.provider === "opencode"
         ? {
