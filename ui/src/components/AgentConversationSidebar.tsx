@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Link, useNavigate } from "@/lib/router";
 import { agentRouteRef, cn, relativeTime } from "@/lib/utils";
+import { markdownToPlainText } from "@/lib/markdown-plain-text";
 
 export interface AgentConversationSidebarProps {
   agents: Agent[];
@@ -121,7 +122,7 @@ export function AgentConversationSidebar({ agents, compact = false, existingChat
                 {relativeTime(activity.at)}
               </span>}
             </span>
-            <span className={cn("text-xs text-muted-foreground", activity ? "line-clamp-2" : "truncate")}>{agent.status === "terminated" ? "Terminated" : previews[agent.id] ?? agent.title ?? agent.role}</span>
+            <span className={cn("text-xs text-muted-foreground", activity ? "line-clamp-2 h-8 leading-4 wrap-anywhere" : "truncate")}>{markdownToPlainText(previews[agent.id] ?? "") || (agent.status === "terminated" ? "Terminated" : agent.title ?? agent.role)}</span>
           </span>
           {unreadCount > 0 ? <Badge variant="ghost" aria-label={`${unreadCount} unread ${unreadCount === 1 ? "message" : "messages"} from ${agent.name}`} className="shrink-0 bg-primary font-mono tabular-nums text-primary-foreground">{unreadCount}</Badge>
             : unreadIds.has(agent.id) && <span role="img" aria-label={`Unread messages from ${agent.name}`} className="size-2 shrink-0 rounded-full bg-primary" />}
