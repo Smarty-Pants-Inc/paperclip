@@ -13677,6 +13677,72 @@ describe("native warm session supervision", () => {
       expect(nextLog).toHaveBeenCalledWith("stderr", expect.stringContaining("synthetic attachment failed before onSession"));
     });
 
+    it.each(["closed", "rebootedAt", "restoredFromSnapshotAt", "healthy"] as const)("cold-recovers a dead cached owner in the SAME run and session: %s", async mode => {
+      const actual = await vi.importActual<typeof import("../../vendor/paperclip-runner/index.js")>("../../vendor/paperclip-runner/index.js");
+      const { base } = fixture(`dead-owner-${mode}`);
+      const next = { ...base, binding: { ...base.binding, runId: `dead-owner-${mode}-second` } };
+      const detach = vi.fn(async () => undefined), close = vi.fn(async () => undefined);
+      const snapshot = vi.fn(async () => ({ schema: "test", retained: "conversation" }));
+      const owner = { close, detachControllerForRestart: detach, snapshot,
+        identity: () => ({ ...base.binding, sessionId: base.session.normalizedSessionId }),
+        attachRun: vi.fn(async () => { throw new actual.NativeRunnerClosedBeforeAttachmentError(); }) };
+      const target = (signal = false) => ({ kind: "remote" as const, transport: "sandbox" as const,
+        environmentId: "environment", leaseId: "lease", providerKey: "boat", remoteCwd: isolatedHome,
+        sandboxLeaseAcquisition: { outcome: signal ? "resumed" as const : "created" as const, providerLeaseId: "same-box",
+          ...(signal && mode !== "closed" && mode !== "healthy" ? { [mode]: "2026-11-25T12:00:00.000Z" } : {}) },
+        runner: { execute: vi.fn(async () => ({ exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "", pid: null, startedAt: new Date().toISOString() })) } });
+      const restore = vi.spyOn(controllerRecovery, "resolveNativeControllerRecovery").mockResolvedValue({ kind: "no_prior_execution" });
+      onTestFinished(() => restore.mockRestore());
+      let attachmentAttempts = 0;
+      state.execute.mockReset().mockImplementationOnce(async options => {
+        state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+        const factory = state.createTransport.mock.calls.at(-1)![0];
+        const identity = { ...factory.prpIdentity, normalizedSessionId: base.session.normalizedSessionId };
+        await mkdir(join(factory.stateDirectory!, "control-plane"), { recursive: true });
+        await mkdir(join(factory.stateDirectory!, "runner"), { recursive: true });
+        await writeFile(join(factory.stateDirectory!, "control-plane", "control-plane-state.json"), JSON.stringify(durableControlPlaneState(identity)));
+        await writeFile(join(factory.stateDirectory!, "runner", "runner-state.json"), JSON.stringify(durableRunnerState(identity, "suspended")));
+        await options.onSession?.(owner);
+        return { ...result, normalizedSessionId: base.session.normalizedSessionId };
+      }).mockImplementationOnce(async options => {
+        expect(options.input.binding.runId).toBe(next.binding.runId);
+        expect(options.input.session.normalizedSessionId).toBe(base.session.normalizedSessionId);
+        if (mode === "closed" || mode === "healthy") {
+          expect(options.existingSession).toBe(owner);
+          attachmentAttempts++;
+          if (mode === "closed") {
+            Object.assign(options.backend, { descriptor: () => ({ kind: "test", name: "closed transport fixture" }) });
+            return actual.executeNativeSession(options as never);
+          }
+        } else {
+          expect(options.existingSession).toBeUndefined();
+          expect(detach).toHaveBeenCalledOnce();
+          expect(restore).toHaveBeenCalled();
+        }
+        return { ...result, normalizedSessionId: base.session.normalizedSessionId };
+      }).mockImplementationOnce(async options => {
+        expect(mode).toBe("closed");
+        expect(options.input.binding.runId).toBe(next.binding.runId);
+        expect(options.input.session.normalizedSessionId).toBe(base.session.normalizedSessionId);
+        expect(options.existingSession).toBeUndefined();
+        expect(detach).toHaveBeenCalledOnce();
+        expect(restore).toHaveBeenCalled();
+        return { ...result, normalizedSessionId: base.session.normalizedSessionId };
+      });
+      await executePaperclipNativeSession({ db: leaseDb(base), execution: base, runnerInstanceId: "runner", useRunnerd: true, runnerExecutionTarget: target() });
+      restore.mockClear();
+      const currentDb = leaseDb(next);
+      const nextDb = { ...currentDb, select: (columns?: Record<string, unknown>) => columns?.status && columns?.runnerProfileJson
+        ? { from: () => ({ where: () => ({ limit: () => Promise.resolve([{ status: "succeeded", runnerProfileJson: { nativeExecutionInput: base } }]) }) }) }
+        : currentDb.select(columns as never) } as unknown as Db;
+      const answer = await executePaperclipNativeSession({ db: nextDb, execution: next, runnerInstanceId: "runner", useRunnerd: true, runnerExecutionTarget: target(true) });
+      expect(answer.summary).toBe("completed");
+      expect(state.execute).toHaveBeenCalledTimes(mode === "closed" ? 3 : 2);
+      expect(attachmentAttempts).toBe(mode === "closed" || mode === "healthy" ? 1 : 0);
+      expect(close).not.toHaveBeenCalled();
+      if (mode === "healthy") expect(detach).not.toHaveBeenCalled();
+    });
+
     it.each([false, true])("compares export process compatibility without changing conversation identity (changed: %s)", async changed => {
       const { base } = fixture(`observability-${changed}`);
       const next = { ...base, binding: { ...base.binding, runId: `observability-${changed}-next` } };
