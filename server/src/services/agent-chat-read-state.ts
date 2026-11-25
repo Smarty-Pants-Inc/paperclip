@@ -28,13 +28,16 @@ export async function withConversationReadState<T extends { id: string }>(db: Db
     unreadMessageCount: readState.unreadMessageCount, latestMessageBody: newest.body,
   }).from(readState).leftJoinLateral(newest, sql`true`);
   const byId = new Map(rows.map(row => [row.issueId, row]));
-  const { censorUsernameInLogs } = await instanceSettingsService(db).getGeneral();
+  // Settled once; a failed settings read only omits previews (inside the fail-closed try below).
+  const general = instanceSettingsService(db).getGeneral().then(settings => settings, () => null);
   const redactions = createRunSecretRedactionRegistry(db);
   const previews = new Map(await Promise.all(rows.map(async row => {
     try {
       // Match comment reads: mask, then registry. A raw-text cut can split a secret
       // or Markdown construct, so flatten the complete newest body before cutting.
-      const masked = redactCurrentUserText(row.latestMessageBody ?? "", { enabled: censorUsernameInLogs });
+      const settings = await general;
+      if (!settings) return [row.issueId, null] as const;
+      const masked = redactCurrentUserText(row.latestMessageBody ?? "", { enabled: settings.censorUsernameInLogs });
       const redacted = await redactions.redactForIssueNotification(companyId, row.issueId, masked);
       const plain = markdownToPlainText(redacted).replace(/\s+/g, " ").trim();
       return [row.issueId, [...plain].slice(0, 240).join("")] as const;
