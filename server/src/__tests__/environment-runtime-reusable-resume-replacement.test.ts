@@ -314,6 +314,25 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
     expect(call.mock.calls.every(([, method]) => method === "environmentResumeLease")).toBe(true);
   });
 
+  it.each(["restoredFromSnapshotAt", "rebootedAt"] as const)("carries handled %s through a later reusable lease and recognizes the next loss", async marker => {
+    const seeded = await seed();
+    const first = "2026-11-25T12:00:00.000Z";
+    const handledProcessRestartKey = JSON.stringify(marker === "rebootedAt" ? [null, first] : [first, null]);
+    seeded.lease.metadata = { ...seeded.lease.metadata, [marker]: first, handledProcessRestartKey };
+    await environmentService(db).updateLeaseMetadata(seeded.lease.id, seeded.lease.metadata);
+    let current = first;
+    const { runtime } = worker(seeded, async () => ({ providerLeaseId: seeded.providerLeaseId,
+      ...(marker === "restoredFromSnapshotAt" ? { restoredFromSnapshotAt: current } : {}),
+      metadata: { remoteCwd: "/home/daytona/paperclip-workspace", [marker]: current } }));
+    const acquired = await acquire(seeded, runtime);
+    expect(acquired.lease.metadata?.handledProcessRestartKey).toBe(handledProcessRestartKey);
+    expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "resumed", handledProcessRestartKey });
+    current = "2026-11-25T13:00:00.000Z";
+    const resumed = await runtime.resumeRunLease({ environment: seeded.environment, lease: acquired.lease });
+    expect(resumed?.metadata).toMatchObject({ [marker]: current, handledProcessRestartKey });
+    expect((await environmentService(db).getLeaseById(acquired.lease.id))?.metadata).toMatchObject({ [marker]: current, handledProcessRestartKey });
+  });
+
   it("retries a sandbox state change inside the run and resumes the same sandbox", async () => {
     const seeded = await seed();
     const { call, runtime } = worker(seeded, async (attempt) => {
