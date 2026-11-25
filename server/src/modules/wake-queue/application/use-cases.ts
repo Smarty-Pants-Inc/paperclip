@@ -139,7 +139,7 @@ async function runReleaseDrain(
   input: ReleaseIssueExecutionInput,
 ): Promise<ReleaseTransactionResult> {
   const { run } = locked;
-  const issue = locked.primaryIssue;
+  let issue = locked.primaryIssue;
   const postCommitEffects: PostCommitEffect[] = [];
 
   if (locked.recoveryOnly) {
@@ -205,6 +205,20 @@ async function runReleaseDrain(
         retainDeliveredCommentBindings: true,
       }) : null;
       if (commentIds.every(id => sourceDelivery?.deliveredCommentIds?.includes(id))) {
+        // Consuming the answer replaces its continuation's checkout as well as
+        // its delivery. Otherwise the answered card leaves a false review wait.
+        if (issue.status === "in_review") {
+          let resumed;
+          try {
+            resumed = await ports.transaction.resumeConsumedInteractionIssue({ companyId: run.companyId, issueId: issue.id, agentId: run.agentId });
+          } catch {
+            // A checkout refusal must not wedge release or discard the continuation.
+            preservedWakeIds.push(candidate.id);
+            continue;
+          }
+          if (!resumed) throw new Error("Consumed interaction issue disappeared under its execution lock");
+          issue = resumed;
+        }
         await ports.transaction.cancelDeferredWake({ companyId: run.companyId, wakeId: candidate.id, agentId: candidate.agentId,
           reason: "Interaction response consumed by the successful live run", now: input.now });
         continue;
