@@ -26,6 +26,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { errorHandler } from "../middleware/index.js";
 import { agentRoutes } from "../routes/agents.js";
 import { secretService } from "../services/secrets.js";
+import { piRpcThinking, resolvePaperclipRunnerNativeProviderInput } from "../services/native-runtime/provider-profile.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -531,6 +532,38 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     const [child] = await db.select().from(agents).where(eq(agents.id, res.body.agent.id));
     expect(child!.adapterConfig.piRpcThinkingLevel).toBe(expectedLevel);
     expect(res.body.agent.adapterConfig.piRpcThinkingLevel).toBe(expectedLevel);
+  });
+
+  it.each((["agents", "agent-hires"] as const).flatMap(endpoint =>
+    ["piRpcThinkingLevel", "modelReasoningEffort", "reasoningEffort", "effort"].flatMap(key =>
+      ["high", "low", "off", 5, "unknown"].map(level => ({ endpoint, key, level })),
+    ),
+  ))("pi_rpc $endpoint honors or refuses $key=$level", async ({ endpoint, key, level }) => {
+    const companyId = await seedCompany();
+    const res = await request(createApp(db, userActor()))
+      .post(`/api/companies/${companyId}/${endpoint}`).send({
+        name: "Pi Child", role: "engineer", adapterType: "paperclip_runner",
+        adapterConfig: { provider: "pi_rpc", [key]: level },
+      });
+    if (typeof level !== "string" || level === "unknown") {
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.error).toContain(key);
+      expect(await db.select().from(agents).where(eq(agents.companyId, companyId))).toHaveLength(0);
+      return;
+    }
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const responseAgent = endpoint === "agents" ? res.body : res.body.agent;
+    const [child] = await db.select().from(agents).where(eq(agents.id, responseAgent.id));
+    expect(child!.adapterConfig.piRpcThinkingLevel).toBe(level);
+    expect(responseAgent.adapterConfig.piRpcThinkingLevel).toBe(level);
+    expect(resolvePaperclipRunnerNativeProviderInput({
+      backend: "pi_rpc", adapterConfig: child!.adapterConfig,
+    })).toMatchObject({ provider: "pi_rpc", piRpcThinkingLevel: level });
+  });
+
+  it("pi_rpc defaults absent and auto effort to medium in native projection", () => {
+    expect(piRpcThinking({})).toBe("medium");
+    expect(piRpcThinking({ effort: "auto" })).toBe("medium");
   });
 
   it.each((["agents", "agent-hires"] as const).flatMap(endpoint =>
