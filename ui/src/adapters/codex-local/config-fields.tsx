@@ -144,8 +144,8 @@ export function CodexLocalConfigFields({
       ? (values!.adapterSchemaValues?.[key] ?? fallback)
       : eff("adapterConfig", key, config[key] ?? fallback);
   const piThinkingKey = runnerProvider === "pi_rpc" ? "piRpcThinkingLevel" : "piThinkingLevel";
-  const piEffort = runnerSchemaValue("modelReasoningEffort", runnerSchemaValue("reasoningEffort", runnerSchemaValue("effort", "low")));
-  const piThinkingLevel = String(runnerSchemaValue(piThinkingKey, runnerProvider === "pi_rpc" ? piEffort === "auto" ? "low" : piEffort === "none" ? "off" : piEffort : "low"));
+  const piEffort = runnerSchemaValue("modelReasoningEffort", runnerSchemaValue("reasoningEffort", runnerSchemaValue("effort", runnerProvider === "pi_rpc" ? "medium" : "low")));
+  const piThinkingLevel = String(runnerSchemaValue(piThinkingKey, runnerProvider === "pi_rpc" ? piEffort === "auto" ? "medium" : piEffort === "none" ? "off" : piEffort : "low"));
   const piThinkingLevels = runnerProvider === "pi_rpc" ? ["off", "minimal", "low", "medium", "high", "xhigh", "max"] : ["off", "low", "high", "max"];
   const updateRunnerSchemaValue = (key: string, value: unknown): void => {
     if (isCreate) {

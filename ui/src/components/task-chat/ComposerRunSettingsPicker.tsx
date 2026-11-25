@@ -156,7 +156,7 @@ export function ComposerRunSettingsPicker({
   const effort = selected.effort && choices.includes(selected.effort) ? selected.effort : null;
   const effortIndex = effort ? choices.indexOf(effort) + 1 : 0;
   const piLevel = agent?.adapterType === "pi_local" || provider === "pi_rpc";
-  const defaultEffort = readComposerRunSettings({ adapterConfig: agent?.adapterConfig }, agent?.adapterType, agent?.adapterConfig).effort ?? (provider === "pi_rpc" ? "low" : null);
+  const defaultEffort = readComposerRunSettings({ adapterConfig: agent?.adapterConfig }, agent?.adapterType, agent?.adapterConfig).effort ?? (provider === "pi_rpc" ? "medium" : null);
   const effectiveEffort = piLevel ? selected.effort ?? defaultEffort : effort;
   const effectiveEffortLabel = effectiveEffort ? EFFORT_LABELS[effectiveEffort] ?? effectiveEffort : "Default";
   const effortLabel = effort ? EFFORT_LABELS[effort] ?? effort : piLevel ? `Default (${effectiveEffortLabel})` : "Default";
