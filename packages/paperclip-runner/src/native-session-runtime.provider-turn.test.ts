@@ -30,6 +30,12 @@ const input: NativeExecutionInputV1 = {
   credentialBindings: [],
 };
 
+const heldInput: NativeExecutionInputV1 = {
+  ...input,
+  session: { ...input.session, driverKind: "pi_rpc" },
+  provider: { kind: "pi_rpc", model: "test/pi", conversationMode: true },
+};
+
 const result: PrpStructuredRunResult = {
   schema: "paperclip.run_result.v1",
   reportedWorkDisposition: "done",
@@ -242,22 +248,23 @@ describe("the controller consumer with provider-started turn sequences", () => {
     ["file-edit-only", "tool.execution.completed", { output: "", operation: "edit", fileChanges: [{ path: "answer.txt" }] }],
     ["native-file-edit", "item.completed", { kind: "fileChange", changes: [{ path: "answer.txt" }] }],
     ["over-frame-final", "item.completed", { kind: "agentMessage", channel: "detail", transcriptOverflow: true, truncated: true }],
-  ] as const)("never re-submits after provider output with no saved semantic result (%s)", async (_name, eventType, payload) => {
+  ] as const)("does not resubmit resultless output; only transcript overflow is a permanent failure (%s)", async (_name, eventType, payload) => {
     const outcome = await run({ stream: [
       event("turn-1", "turn.started", { status: "inProgress" }),
       event("turn-1", eventType, payload),
       event("turn-1", "turn.completed", { status: "completed", error: null }),
     ] });
-    expect(outcome.outcome).toContain("native_provider_output_without_result:");
-    expect(outcome.outcome).toContain("question remains unanswered");
+    expect(outcome.outcome).toContain(_name === "over-frame-final"
+      ? "native_provider_output_without_result:" : "native_finalization_missing:");
     expect(outcome.startTurn).toHaveBeenCalledTimes(1);
     expect(outcome.completeRun).not.toHaveBeenCalled();
   });
 
-  it("refuses old saved stub output before a fresh recovery submission", async () => {
+  it("refuses old saved stub output before held Pi original-input resubmission", async () => {
     const stub = event("old-turn", "item.completed", { answers: [], byteSize: 66888, truncated: true });
-    const outcome = await run({ stream: [], restart: { recovery: {
-      checkpoint: restartCheckpoint, snapshot: { ...restartCheckpoint, dispositionOnlyRecoveryConsumed: false }, replay: [stub],
+    const checkpoint = { ...restartCheckpoint, driverKind: "pi_rpc" as const, terminalTurns: [] };
+    const outcome = await run({ stream: [], executionInput: heldInput, restart: { recovery: {
+      checkpoint, snapshot: { ...checkpoint, dispositionOnlyRecoveryConsumed: false }, replay: [stub],
     } } });
     expect(outcome.outcome).toContain("native_provider_output_without_result:");
     expect(outcome.startTurn).not.toHaveBeenCalled();
@@ -278,23 +285,32 @@ describe("the controller consumer with provider-started turn sequences", () => {
     expect(outcome.resolveMissingResult).toHaveBeenCalledOnce();
   });
 
-  it.each(["tool.execution.completed", "item.completed"] as const)("refuses saved tool/file-only output before recovery (%s)", async eventType => {
+  it.each(["tool.execution.completed", "item.completed"] as const)("refuses saved tool/file-only output before held Pi original-input resubmission (%s)", async eventType => {
     const saved = event("old-turn", eventType, eventType === "item.completed"
       ? { kind: "fileChange", changes: [{ path: "answer.txt" }] } : { output: "", operation: "edit" });
-    const outcome = await run({ stream: [], restart: { recovery: {
-      checkpoint: restartCheckpoint, snapshot: { ...restartCheckpoint, dispositionOnlyRecoveryConsumed: false }, replay: [saved],
+    const checkpoint = { ...restartCheckpoint, driverKind: "pi_rpc" as const, terminalTurns: [] };
+    const outcome = await run({ stream: [], executionInput: heldInput, restart: { recovery: {
+      checkpoint, snapshot: { ...checkpoint, dispositionOnlyRecoveryConsumed: false }, replay: [saved],
     } } });
     expect(outcome.outcome).toContain("native_provider_output_without_result:");
     expect(outcome.startTurn).not.toHaveBeenCalled();
     expect(outcome.completeRun).not.toHaveBeenCalled();
   });
 
-  it("does not spend a borrowed-turn disposition after a tool-only continuation", async () => {
-    const outcome = await run({ stream: [], restart: { output: event("turn-continuation", "tool.execution.completed",
-      { output: "", operation: "edit", fileChanges: [{ path: "once.txt" }] }) }, providerTurnWait: { capMs: 20 } });
-    expect(outcome.outcome).toContain("native_provider_output_without_result:");
-    expect(outcome.startTurn).toHaveBeenCalledOnce();
-    expect(outcome.completeRun).not.toHaveBeenCalled();
+  it("allows stock disposition after a tool-only continuation without resending the task", async () => {
+    const outcome = await run({ stream: [], restart: {
+      output: event("turn-continuation", "tool.execution.completed",
+        { output: "", operation: "edit", fileChanges: [{ path: "once.txt" }] }),
+      onDisposition: push => push(event("turn-disposition", "turn.started"),
+        event("turn-disposition", "run.result.proposed", result as unknown as Record<string, unknown>),
+        event("turn-disposition", "turn.completed", { status: "completed", error: null })),
+    }, providerTurnWait: { capMs: 20 } });
+    expect(outcome.outcome).toBe("finalized");
+    expect(outcome.startTurn).toHaveBeenCalledTimes(2);
+    const disposition = JSON.parse(outcome.startTurn.mock.calls[1]![0].message.text);
+    expect(disposition.task.prompt).toContain("Do not repeat completed work");
+    expect(disposition.task.prompt).not.toContain(input.task.prompt);
+    expect(outcome.completeRun).toHaveBeenCalledOnce();
   });
 
   it.each([70_000, 300_000])("settles a complete large answer without a recovery submission (%i)", async size => {
