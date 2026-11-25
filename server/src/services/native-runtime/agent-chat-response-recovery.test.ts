@@ -206,7 +206,8 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     }
   });
 
-  it.each(["drain", "reset", "non-pi", "paperclip", "unavailable", "agent"])("consumes deferred person wakes only at a steerable continuous final (%s)", async scenario => {
+  it.each(["drain", "reset", "non-pi", "paperclip", "unavailable", "agent", "other-agent"])("consumes deferred messages only at a steerable continuous final (%s)", async scenario => {
+    const shouldDrain = scenario === "drain" || scenario === "other-agent";
     const ids = [randomUUID(), randomUUID(), randomUUID()];
     const wakeIds = [randomUUID(), randomUUID()];
     heldSteering.sent = [];
@@ -219,9 +220,12 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
         await db.update(agents).set({ adapterConfig: { provider, sessionContinuity: scenario === "paperclip" ? "paperclip" : "continuous" } }).where(eq(agents.id, scope.agentId));
         const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
         const [opening] = await db.select().from(issueComments).where(eq(issueComments.id, run.contextSnapshot!.wakeCommentId as string));
+        const fromAgent = scenario === "agent" || scenario === "other-agent";
+        const [sender] = await db.insert(agents).values({ companyId: scope.companyId, name: "Agent A", adapterType: "process" }).returning();
         await db.insert(issueComments).values(ids.map((id, index) => ({ id, companyId: scope.companyId, issueId: scope.issueId,
-          authorType: scenario === "agent" ? "agent" as const : "user" as const, authorUserId: scenario === "agent" ? null : opening.authorUserId,
-          authorAgentId: scenario === "agent" ? scope.agentId : null, body: scenario === "reset" && index === 0 ? "/new" : `Queued question ${index}` })));
+          authorType: fromAgent ? "agent" as const : "user" as const, authorUserId: fromAgent ? null : opening.authorUserId,
+          authorAgentId: fromAgent ? scenario === "agent" ? scope.agentId : sender.id : null,
+          body: scenario === "reset" && index === 0 ? "/new" : `Queued question ${index}` })));
         await db.insert(agentWakeupRequests).values(wakeIds.map((id, index) => ({ id, companyId: scope.companyId, agentId: scope.agentId,
           source: "on_demand", reason: "issue_execution_deferred", status: "deferred_issue_execution", requestedByActorType: "user",
           requestedByActorId: opening.authorUserId, requestedAt: new Date(1000 + index),
@@ -231,9 +235,9 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
           sourceEventId: "drain-final", itemId: "drain:m1:b0", payload: { kind: "agentMessage", channel: "final", text: "Opening answer." } };
         await Promise.all([publishContinuousNativeReply({ db, execution, event, cursor: 171 }), publishContinuousNativeReply({ db, execution, event, cursor: 171 })]);
         const wakes = await db.select().from(agentWakeupRequests).where(sql`${agentWakeupRequests.id} in (${sql.join(wakeIds.map(id => sql`${id}`), sql`, `)})`);
-        expect(wakes.map(wake => wake.status)).toEqual(wakeIds.map(() => scenario === "drain" ? "cancelled" : "deferred_issue_execution"));
-        expect(heldSteering.sent).toEqual(scenario === "drain" ? ids : []);
-        if (scenario === "drain") {
+        expect(wakes.map(wake => wake.status)).toEqual(wakeIds.map(() => shouldDrain ? "cancelled" : "deferred_issue_execution"));
+        expect(heldSteering.sent).toEqual(shouldDrain ? ids : []);
+        if (shouldDrain) {
           const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
           expect(Object.keys(saved.resultJson!.queuedSteeringAcknowledgements as object).sort()).toEqual([...ids].sort());
           // A new message admitted while held must first consume an older head.
@@ -252,7 +256,7 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
       await finalizeNativeRun({ db, runId: f.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: false });
       await requeueContinuousUnanswered(db, { id: f.runId, companyId: f.companyId });
       expect(heldSteering.sent).toEqual(before);
-      if (scenario === "drain") expect(await db.select().from(agentWakeupRequests).where(and(
+      if (shouldDrain) expect(await db.select().from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.companyId, f.companyId), eq(agentWakeupRequests.status, "deferred_issue_execution")))).toEqual([]);
     } finally {
       heldSteering.available = false;
