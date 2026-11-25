@@ -1136,7 +1136,6 @@ function ConfirmationCard({
             >
               {interaction.payload.rejectLabel ?? "Reject"}
             </Button>
-            <ResumeReviewAction interaction={interaction} disabled={working !== null} />
             <Button
               type="button"
               size="sm"
@@ -1151,6 +1150,7 @@ function ConfirmationCard({
           </>
         )}
       </ActionRow>
+      <ResumeReviewAction interaction={interaction} disabled={working !== null} />
     </div>
   );
 }
