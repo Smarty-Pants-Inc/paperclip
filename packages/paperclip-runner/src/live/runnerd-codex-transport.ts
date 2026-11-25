@@ -589,6 +589,7 @@ function rotatedRunAttachPayload(
     { revision: string; criterionIds: readonly string[] } | undefined,
   runtimeContext?: NativeRuntimeContextSnapshot | null,
   currentInstructions?: { text: string; context: NativeRuntimeContextSnapshot | null },
+  refreshPiInstructions = false,
 ): Record<string, unknown> {
   const commands = Array.isArray(state.commands)
     ? state.commands.map(record)
@@ -616,6 +617,7 @@ function rotatedRunAttachPayload(
     completionContract,
     runtimeContext,
     currentInstructions,
+    refreshPiInstructions,
   );
 }
 
@@ -627,6 +629,7 @@ function retargetRunAttachPayload(
     { revision: string; criterionIds: readonly string[] } | undefined,
   runtimeContext?: NativeRuntimeContextSnapshot | null,
   currentInstructions?: { text: string; context: NativeRuntimeContextSnapshot | null },
+  refreshPiInstructions = false,
 ): Record<string, unknown> {
   const payload = structuredClone(seedPayload);
   const provider = record(payload.provider);
@@ -651,7 +654,7 @@ function retargetRunAttachPayload(
       provider.runtimeContext = structuredClone(runtimeContext);
     }
     payload.provider = provider;
-  } else if (provider.kind === "cursor_cloud" && currentInstructions !== undefined) {
+  } else if ((provider.kind === "cursor_cloud" || (provider.kind === "pi_rpc" && refreshPiInstructions)) && currentInstructions !== undefined) {
     provider.instructions = currentInstructions.context && runtimeContext !== undefined
       ? retargetComposedInstructions(currentInstructions.text, currentInstructions.context, runtimeContext)
       : currentInstructions.text;
@@ -5285,6 +5288,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             input.completionContract ?? this.options.resumeCompletionContract,
             currentRunGrant?.runtimeContext,
             currentRunGrant ? { text: currentRunGrant.instructions, context: currentRunGrant.runtimeContext } : undefined,
+            this.options.environment?.PAPERCLIP_PI_CONTINUOUS === "1",
           )
         : rotatedRunAttachPayload(
             core.store.state,
@@ -5294,6 +5298,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             input.completionContract ?? this.options.resumeCompletionContract,
             currentRunGrant?.runtimeContext,
             currentRunGrant ? { text: currentRunGrant.instructions, context: currentRunGrant.runtimeContext } : undefined,
+            this.options.environment?.PAPERCLIP_PI_CONTINUOUS === "1",
           );
       if (this.options.prepareLaunch && !staged) {
         const priorProvider = record(runAttachTemplate.provider);
@@ -7348,6 +7353,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         this.options.baseInstructions === undefined
           ? undefined
           : { text: this.options.baseInstructions, context: sourceRuntimeContext },
+        this.options.environment?.PAPERCLIP_PI_CONTINUOUS === "1",
       );
       if (!this.options.prepareLaunch && provider === "codex") {
         // These controller-owned, token-free paths belong to the new run.
