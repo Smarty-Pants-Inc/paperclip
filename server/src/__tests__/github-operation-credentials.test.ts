@@ -7,6 +7,11 @@ import { runtimeConnectionIntentRoutes } from "../routes/connection-intents.js";
 import { createRuntimeToolsToken } from "../runtime-tools-token.js";
 import { errorHandler } from "../middleware/index.js";
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import { eq } from "drizzle-orm";
 import { createFullDatabaseResponseCapture, installDatabaseResponseCapture } from "./helpers/full-database-response-capture.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -16,6 +21,7 @@ import {
   companyMemberships,
   companySecrets,
   connectionGrants,
+  connectionGrantDelegations,
   createDb,
   heartbeatRuns,
   issueComments,
@@ -38,11 +44,13 @@ import {
 } from "../services/run-identity.js";
 import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
 import {
+  createGitRemoteAuthProvider,
   filterResolvedGitHubConnectionsForRun,
   resolveManagedGitHubIdentitySelection,
 } from "../services/git-credentials.js";
 
 const vault = vi.hoisted(() => ({
+  installations: new Map<string, { account: { login: string }; repository_selection: "all" | "selected" }>(),
   resolveUserSecretValue: vi.fn(
     async (_company: string, input: { responsibleUserId: string }) => ({
       value: `test-token-${input.responsibleUserId}`,
@@ -51,6 +59,11 @@ const vault = vi.hoisted(() => ({
   resolveSecretValue: vi.fn(async () => "test-dedicated-token"),
 }));
 vi.mock("../services/secrets.js", () => ({ secretService: () => vault }));
+vi.mock("../services/github-app-credentials.js", async (original) => ({
+  ...await original<typeof import("../services/github-app-credentials.js")>(),
+  resolveGitHubAppCredential: vi.fn(async (_db, connection) => ({ token: `app-token-${connection.id}`, expiresAt: Date.now() + 3_600_000 })),
+  resolveGitHubAppInstallation: vi.fn(async (_db, connection) => vault.installations.get(connection.id)!),
+}));
 const external = resolveExternalTestDatabaseUrl("PAPERCLIP_GITHUB_CREDENTIAL_TEST_DATABASE_URL");
 const support = external ? { supported: true } : await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)(
@@ -74,6 +87,206 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
       vi.unstubAllEnvs();
     }, 60_000);
     const { seed, grant, switchTo } = githubCredentialsFixture(() => db);
+    async function sharedApp(input: Awaited<ReturnType<typeof seed>>, repositories: string, createdAt = new Date("2026-01-01")) {
+      const selected = await grant(input, "App", true);
+      vault.installations.set(selected.connectionId, { account: { login: repositories.trim().split("/")[0] }, repository_selection: "all" });
+      await db.update(toolConnections).set({ credentialPolicy: "shared", createdAt,
+        config: { sourceTemplateKey: "github", connectionMethodKey: "app-installation", methodConfig: { repositories } },
+      }).where(eq(toolConnections.id, selected.connectionId));
+      await db.update(connectionGrants).set({ kind: "organization", subjectAgentId: null, providerTenant: {},
+        credentialSecretRefs: [{ secretId: selected.secretId, configPath: "credentials.privateKey", versionSelector: "latest" }],
+      }).where(eq(connectionGrants.id, selected.id));
+      await db.update(toolConnectionInstalls).set({ targetType: "company", targetId: input.companyId })
+        .where(eq(toolConnectionInstalls.connectionId, selected.connectionId));
+      return selected;
+    }
+    it("selects the oldest connection for two company-wide shared Apps without a repository hint", async () => {
+      const input = await seed();
+      await sharedApp(input, "second-org/app", new Date("2026-02-01"));
+      const oldest = await sharedApp(input, "example-org/app");
+      expect(await resolveManagedGitHubIdentitySelection(db, input.companyId, { agentId: input.agentId, responsibleUserId: "A" }))
+        .toMatchObject({ configured: true, grant: { id: oldest.id } });
+      expect(await resolveGitHubOperationCredentials(db, input)).toMatchObject({ status: "available", grantId: oldest.id });
+    });
+    it("routes consecutive managed checkouts to each shared App's repository list", async () => {
+      const input = await seed();
+      const a = await sharedApp(input, " Example-Org/app,example-org/tools\nExample-Org/Other ");
+      const b = await sharedApp(input, "second-org/app", new Date("2026-02-01"));
+      for (const context of [input, { agentId: input.agentId, heartbeatRunId: input.runId, responsibleUserId: "A" }]) {
+        const auth = createGitRemoteAuthProvider(db, input.companyId, context);
+        expect((await auth("https://github.com/Example-Org/App.git"))?.env.GH_TOKEN).toBe(`app-token-${a.connectionId}`);
+        expect((await auth("git@github.com:second-org/app.git"))?.env.GH_TOKEN).toBe(`app-token-${b.connectionId}`);
+        expect((await auth("ssh://git@github.com/Example-Org/Other.git"))?.env.GH_TOKEN).toBe(`app-token-${a.connectionId}`);
+      }
+    });
+    it("never selects another company's shared App for the same repository owner", async () => {
+      const input = await seed(), other = await seed();
+      const own = await sharedApp(input, "example-org/app");
+      const foreign = await sharedApp(other, "second-org/app");
+      expect(await resolveGitHubOperationCredentials(db, { ...input, repository: "example-org/new" }))
+        .toMatchObject({ status: "available", grantId: own.id });
+      const denied = await resolveGitHubOperationCredentials(db, { ...input, repository: "second-org/app" });
+      expect(denied).toMatchObject({ status: "unavailable", env: {} });
+      expect(denied.grantId).not.toBe(foreign.id);
+      expect(await resolveGitHubOperationCredentials(db, { ...other, repository: "second-org/app" }))
+        .toMatchObject({ status: "available", grantId: foreign.id });
+    });
+    it("fails closed naming a repository outside both shared App lists", async () => {
+      const input = await seed();
+      await sharedApp(input, "example-org/app");
+      await sharedApp(input, "second-org/app");
+      const selection = await resolveManagedGitHubIdentitySelection(db, input.companyId, { agentId: input.agentId, repository: "elsewhere/missing" });
+      expect(selection.grant).toBeUndefined();
+      expect(selection.error).toBe("No managed GitHub identity is available for this run for repository elsewhere/missing");
+      await expect(createGitRemoteAuthProvider(db, input.companyId, { agentId: input.agentId })("https://github.com/elsewhere/missing.git"))
+        .rejects.toThrow("for repository elsewhere/missing");
+    });
+    it("routes runtime credential requests by repository and Git credential host/path", async () => {
+      const input = await seed();
+      const a = await sharedApp(input, "example-org/app");
+      const b = await sharedApp(input, "second-org/app");
+      const app = express();
+      app.use(express.json(), runtimeConnectionIntentRoutes(db), errorHandler);
+      const token = createRuntimeToolsToken({ ...input, responsibleUserId: "A", scope: "github_credentials" })!.token;
+      for (const [body, selected] of [
+        [{ repository: "Example-Org/App" }, a],
+        [{ repository: "second-org" }, b],
+        [{ protocol: "https", host: "github.com", path: "second-org/app.git" }, b],
+      ] as const) {
+        const response = await request(app).post("/runtime-tools/github/credentials").set("Authorization", `Bearer ${token}`).send(body);
+        expect(response.status).toBe(200);
+        expect(response.body).toMatchObject({ status: "available", grantId: selected.id, env: { GH_TOKEN: `app-token-${selected.connectionId}` } });
+      }
+      const missing = await request(app).post("/runtime-tools/github/credentials").set("Authorization", `Bearer ${token}`).send({ repository: "other/missing" });
+      expect(missing.body).toMatchObject({ status: "unavailable", env: {}, reason: expect.stringContaining("for repository other/missing") });
+    });
+    it("routes real gh and git launchers through the native broker to each shared App", async () => {
+      const input = await seed();
+      const a = await sharedApp(input, "example-org/app");
+      const b = await sharedApp(input, "second-org/app", new Date("2026-02-01"));
+      const directory = await mkdtemp(join(tmpdir(), "github-app-launcher-"));
+      const printToken = `#!${process.execPath}\nprocess.stdout.write(process.env.GH_TOKEN || '');\n`;
+      await promisify(execFile)("git", ["init", "-q", directory]);
+      await promisify(execFile)("git", ["-C", directory, "remote", "add", "origin", "https://github.com/example-org/app.git"]);
+      await writeFile(join(directory, "gh"), printToken, { mode: 0o700 });
+      await writeFile(join(directory, "git"), `#!${process.execPath}
+if (process.argv.includes('credential') || process.argv.includes('get-url')) {
+  const result = require('node:child_process').spawnSync('/usr/bin/git', process.argv.slice(2), { env: process.env, stdio: 'inherit' });
+  process.exit(result.status ?? 1);
+}
+process.stdout.write(process.env.GH_TOKEN || '');
+`, { mode: 0o700 });
+      const broker = await createNativeGitHubAccess({
+        scope: input, target: null, cwd: directory, env: { PATH: `${directory}:${process.env.PATH}` },
+        resolveCredentials: binding => resolveGitHubOperationCredentials(db, binding),
+      });
+      const release = broker.activate(input);
+      try {
+        for (const [program, args, selected] of [
+          ["gh", ["pr", "list", "-R", "Example-Org/App"], a],
+          ["gh", ["api", "repos/second-org/app/pulls"], b],
+          ["gh", ["api", "repos/{owner}/{repo}/pulls"], b],
+          ["gh", ["repo", "view", "second-org/app"], b],
+          ["gh", ["pr", "view", "https://github.com/second-org/app/pull/42"], b],
+          ["gh", ["api", "https://api.github.com/repos/second-org/app/pulls"], b],
+          ["gh", ["api", "https://api.github.com:443/repos/second-org/app"], b],
+          ["gh", ["api", "orgs/second-org/repos"], b],
+          ["gh", ["api", "users/second-org/repos"], b],
+          ["gh", ["repo", "clone", "--", "second-org/app"], b],
+          ["gh", ["pr", "list", "--repo=example-org/app"], a],
+          ["git", ["clone", "git@github.com:second-org/app.git"], b],
+          ["git", ["clone", "https://github.com:443/second-org/app.git"], b],
+        ] as const) {
+          const { stdout } = await promisify(execFile)(program, [...args], { cwd: directory, env: { ...process.env, ...broker.env, GH_REPO: "second-org/app" } });
+          expect(stdout).toBe(`app-token-${selected.connectionId}`);
+        }
+        await expect(promisify(execFile)("gh", ["api", "https://api.github.com:443/graphql", "-f", 'query={repository(owner:"second-org",name:"app"){name}}'], {
+          cwd: directory, env: { ...process.env, ...broker.env },
+        })).rejects.toMatchObject({ code: 1, stdout: "", stderr: expect.stringContaining("repository_target_required") });
+        // Real Git, the native broker, company-scoped selection and the server helper.
+        for (const [requestedPath, selected] of [["example-org/app.git", a], ["second-org/new.git", b]] as const) {
+          const result = await new Promise<{ error: Error | null; stdout: string }>(resolve => {
+            const child = execFile("git", ["credential", "fill"], { cwd: directory, env: { ...process.env, ...broker.env }, timeout: 5000 }, (error, stdout) => resolve({ error, stdout }));
+            child.stdin!.end(`protocol=https\nhost=github.com\npath=${requestedPath}\n\n`);
+          });
+          expect(result.error).toBeNull();
+          expect(result.stdout).toContain(`password=app-token-${selected.connectionId}`);
+        }
+      } finally { release(); await broker.stop(); await rm(directory, { recursive: true, force: true }); }
+    });
+    it("breaks equal App connection ages by connection id but retains duplicate-grant ambiguity", async () => {
+      const input = await seed();
+      const a = await sharedApp(input, "example-org/app");
+      const b = await sharedApp(input, "second-org/app");
+      const expected = a.connectionId.localeCompare(b.connectionId) < 0 ? a : b;
+      expect(await resolveManagedGitHubIdentitySelection(db, input.companyId, { agentId: input.agentId }))
+        .toMatchObject({ grant: { id: expected.id } });
+      const [original] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, a.id));
+      await db.insert(connectionGrants).values({ ...original, id: randomUUID() });
+      expect(await resolveManagedGitHubIdentitySelection(db, input.companyId, { agentId: input.agentId }))
+        .toMatchObject({ error: "More than one managed GitHub identity matches this run" });
+    });
+    it.each(["personal", "dedicated", "delegated", "shared"])("ignores disabled or inactive %s connections before selection", async kind => {
+      const input = await seed();
+      const disabled = kind === "shared" ? await sharedApp(input, "disabled-org/app") : await grant(input, "A", kind === "dedicated");
+      const working = await sharedApp(input, "example-org/app", new Date("2026-02-01"));
+      if (kind === "delegated") await db.insert(connectionGrantDelegations).values({
+        companyId: input.companyId, agentId: input.agentId, grantId: disabled.id, createdByUserId: "A",
+      });
+      for (const state of [{ enabled: false, status: "active" }, { enabled: true, status: "draft" }] as const) {
+        await db.update(toolConnections).set(state).where(eq(toolConnections.id, disabled.connectionId));
+        const context = { agentId: input.agentId, responsibleUserId: kind === "delegated" ? null : "A" };
+        expect(await resolveManagedGitHubIdentitySelection(db, input.companyId, context)).toMatchObject({ grant: { id: working.id } });
+        if (kind !== "delegated") expect(await resolveGitHubOperationCredentials(db, input)).toMatchObject({ status: "available", grantId: working.id });
+      }
+    });
+    it("does not fall through to legacy tokens when every installed connection is disabled", async () => {
+      const input = await seed();
+      const personal = await grant(input, "A");
+      await db.update(toolConnections).set({ enabled: false }).where(eq(toolConnections.id, personal.connectionId));
+      const auth = createGitRemoteAuthProvider(db, input.companyId, { agentId: input.agentId, responsibleUserId: "A" }, {
+        env: { GH_TOKEN: "legacy-must-not-be-used" },
+        secrets: { getByName: async () => null, resolveSecretValue: vault.resolveSecretValue },
+      });
+      await expect(auth("https://github.com/example-org/app.git")).rejects.toThrow(/managed GitHub/i);
+    });
+    it("routes a new repository by installation account, preferring saved matches within that owner", async () => {
+      const input = await seed();
+      await sharedApp(input, "example-org/app");
+      const b = await sharedApp(input, "second-org/app", new Date("2026-02-01"));
+      const sameOwner = await sharedApp(input, "second-org/tools", new Date("2026-03-01"));
+      for (const [repository, expected] of [["second-org/new-repo", b], ["second-org/tools", sameOwner]] as const) {
+        expect(await resolveGitHubOperationCredentials(db, { ...input, repository })).toMatchObject({ status: "available", grantId: expected.id });
+      }
+      expect((await createGitRemoteAuthProvider(db, input.companyId, { agentId: input.agentId })("https://github.com:443/second-org/new-repo.git"))?.env.GH_TOKEN)
+        .toBe(`app-token-${b.connectionId}`);
+    });
+    it("uses the installation account as owner authority and keeps selected installations repo-scoped", async () => {
+      const input = await seed();
+      const selected = await sharedApp(input, "example-org/saved");
+      vault.installations.set(selected.connectionId, { account: { login: "actual-org" }, repository_selection: "all" });
+      expect(await resolveManagedGitHubIdentitySelection(db, input.companyId, { agentId: input.agentId, repository: "actual-org/new" }))
+        .toMatchObject({ grant: { id: selected.id } });
+      expect(await resolveManagedGitHubIdentitySelection(db, input.companyId, { agentId: input.agentId, repository: "example-org/saved" }))
+        .toMatchObject({ error: expect.stringContaining("example-org/saved") });
+      vault.installations.set(selected.connectionId, { account: { login: "example-org" }, repository_selection: "selected" });
+      expect(await resolveManagedGitHubIdentitySelection(db, input.companyId, { agentId: input.agentId, repository: "example-org/saved" }))
+        .toMatchObject({ grant: { id: selected.id } });
+      expect(await resolveManagedGitHubIdentitySelection(db, input.companyId, { agentId: input.agentId, repository: "example-org/new" }))
+        .toMatchObject({ error: expect.stringContaining("example-org/new") });
+      expect(await resolveManagedGitHubIdentitySelection(db, input.companyId, { agentId: input.agentId, repository: "example-org" }))
+        .toMatchObject({ grant: { id: selected.id } });
+    });
+    it("preserves single App selection and personal priority over shared Apps", async () => {
+      const input = await seed();
+      const app = await sharedApp(input, "example-org/app");
+      expect(await resolveManagedGitHubIdentitySelection(db, input.companyId, { agentId: input.agentId }))
+        .toMatchObject({ grant: { id: app.id } });
+      const personal = await grant(input, "A");
+      await sharedApp(input, "second-org/app");
+      expect(await resolveManagedGitHubIdentitySelection(db, input.companyId, { agentId: input.agentId, responsibleUserId: "A", repository: "second-org/app" }))
+        .toMatchObject({ identitySource: "personal", grant: { id: personal.id } });
+    });
     it.each(["config", "transportConfig"] as const)("reads only current GitHub identity connections via %s", async location => {
       const input = await seed(), selected = await grant(input, "A");
       const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, selected.connectionId));
@@ -528,7 +741,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
         env: {},
       });
     });
-    it("honors dedicated overrides and never substitutes personal credentials when revoked or disabled", async () => {
+    it("honors dedicated overrides and revoked grants, but excludes disabled connections", async () => {
       const input = await seed();
       await grant(input, "A");
       const dedicated = await grant(input, "robot", true);
@@ -555,9 +768,9 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
         .set({ enabled: false })
         .where(eq(toolConnections.id, dedicated.connectionId));
       expect(await resolveGitHubOperationCredentials(db, input)).toMatchObject({
-        status: "unavailable",
-        source: "dedicated",
-        env: {},
+        status: "available",
+        source: "personal",
+        env: { GH_TOKEN: "test-token-A" },
       });
     });
     it("does not resolve the company default person's GitHub", async () => {

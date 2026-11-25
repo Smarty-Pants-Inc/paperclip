@@ -14,7 +14,7 @@ export function githubLauncherSource(options: { brokerFile?: boolean; interprete
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 // A PATH shim can capture this launcher's absolute path and call it again.
 // Reject that cycle before resolving another executable or capturing authority.
 if (process.env.PAPERCLIP_GITHUB_OPERATION_ACTIVE) {
@@ -80,6 +80,7 @@ ${options.brokerFile ? String.raw`
 `}
   const diagnostic = (code) => process.stderr.write('Paperclip: GitHub ' + code + '; continuing without managed credentials.\n');
   let connected = false;
+  let credentialInput;
   const configRoot = env.GH_CONFIG_DIR || os.tmpdir();
   // A missing/unwritable scratch directory must not break local Git. The
   // fallback deliberately cannot load the host's gh authentication files.
@@ -97,7 +98,7 @@ ${options.brokerFile ? String.raw`
   } catch { diagnostic('configuration_directory_unavailable'); }
   {
     for (const key of Object.keys(env)) {
-      if (/^(GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN|PAPERCLIP_GIT_TOKEN|GIT_AUTHOR_.*|GIT_COMMITTER_.*|GIT_CONFIG_.*|GIT_ASKPASS|SSH_ASKPASS|SSH_AUTH_SOCK|GIT_SSH.*)$/.test(key)) delete env[key];
+      if (/^(GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN|PAPERCLIP_GIT_(TOKEN|REPOSITORY)|GIT_AUTHOR_.*|GIT_COMMITTER_.*|GIT_CONFIG_.*|GIT_ASKPASS|SSH_ASKPASS|SSH_AUTH_SOCK|GIT_SSH.*)$/.test(key)) delete env[key];
     }
     Object.assign(env, {
       GH_CONFIG_DIR: configDirectory, SSH_AUTH_SOCK: '',
@@ -110,7 +111,113 @@ ${options.brokerFile ? String.raw`
       GIT_CONFIG_KEY_4: 'user.useConfigOnly', GIT_CONFIG_VALUE_4: 'true',
     });
     const base = env.PAPERCLIP_GITHUB_BROKER_URL || env.PAPERCLIP_API_URL;
-    const askBroker = !isLocalGit(process.argv.slice(2));
+    const args = process.argv.slice(2);
+    const normalizeRepo = value => {
+      if (typeof value !== 'string') return undefined;
+      const repo = value.replace(/^github\.com\//i, '').replace(/^git@(?:www\.)?github\.com:/i, '')
+        .replace(/^(?:https?|ssh):\/\/(?:git@)?(?:www\.)?github\.com(?::\d+)?\//i, '')
+        .replace(/\.git\/?$/i, '').replace(/\/$/, '');
+      return /^[a-z0-9][a-z0-9-]*\/[a-z0-9_.-]+$/i.test(repo) ? repo.toLowerCase() : undefined;
+    };
+    const refuseTarget = () => {
+      process.stderr.write('Paperclip: GitHub repository_target_required; supply a supported repository target, not an implicit origin. GraphQL must use the connection tools.\n');
+      process.exit(1);
+    };
+    // Git credential descriptions belong to the request, never the checkout origin.
+    let commandIndex = 0;
+    if (program === 'git') for (; commandIndex < args.length; commandIndex++) {
+      const arg = args[commandIndex];
+      if (gitValueOptions.includes(arg)) { commandIndex++; continue; }
+      if (gitValueOptions.some(option => arg.startsWith(option + '=')) || gitFlagOptions.includes(arg)) continue;
+      break;
+    }
+    const credentialFill = program === 'git' && args[commandIndex] === 'credential' && args[commandIndex + 1] === 'fill';
+    let credentialRepository;
+    if (credentialFill) {
+      credentialInput = fs.readFileSync(0, 'utf8');
+      const fields = Object.fromEntries(credentialInput.split(/\r?\n/).filter(Boolean).map(line => {
+        const equal = line.indexOf('=');
+        return [line.slice(0, equal), line.slice(equal + 1)];
+      }));
+      credentialRepository = normalizeRepo(fields.path);
+      if (fields.protocol !== 'https' || !/^(?:www\.)?github\.com$/i.test(fields.host || '') || !credentialRepository) refuseTarget();
+    }
+    const repositoryHint = () => {
+      if (credentialFill) return credentialRepository;
+      const git = program === 'git' ? executable : originalPath.map(p => path.join(p, 'git')).find(p => {
+        try { fs.accessSync(p, fs.constants.X_OK); return fs.statSync(p).isFile(); } catch { return false; }
+      });
+      const prefix = [];
+      let commandIndex = 0;
+      if (program === 'git') for (; commandIndex < args.length; commandIndex++) {
+        const arg = args[commandIndex];
+        if (gitValueOptions.includes(arg)) { prefix.push(arg, args[++commandIndex]); continue; }
+        if (gitValueOptions.some(option => arg.startsWith(option + '=')) || gitFlagOptions.includes(arg)) { prefix.push(arg); continue; }
+        break;
+      }
+      const remoteRepository = () => {
+        if (!git) return undefined;
+        const command = program === 'git' ? args[commandIndex] : '';
+        let remote = 'origin';
+        if (['fetch', 'push', 'pull'].includes(command)) for (let index = commandIndex + 1; index < args.length; index++) {
+          const arg = args[index];
+          if (['-o', '--push-option', '--receive-pack', '--upload-pack', '--exec', '--depth', '--shallow-since', '--shallow-exclude', '--deepen', '--jobs', '-j'].includes(arg)) { index++; continue; }
+          if (arg === '--repo') { remote = args[index + 1]; break; }
+          if (arg.startsWith('--repo=')) { remote = arg.slice(7); break; }
+          if (arg === '--' || arg.startsWith('-')) continue;
+          remote = arg; break;
+        }
+        const result = spawnSync(git, [...prefix, 'remote', 'get-url', ...(command === 'push' ? ['--push'] : []), remote], { env, encoding: 'utf8', timeout: 2000, maxBuffer: 65536 });
+        return result.status === 0 ? normalizeRepo(result.stdout.trim()) : undefined;
+      };
+      if (program === 'gh') {
+        let explicitRepository, urlRepository;
+        for (let index = 0; index < args.length && args[index] !== '--'; index++) {
+          const arg = args[index];
+          if (arg === '-R' || arg === '--repo' || arg.startsWith('--repo=') || /^-R./.test(arg)) {
+            const value = arg === '-R' || arg === '--repo' ? args[++index] : arg.slice(arg.startsWith('--') ? 7 : 2);
+            explicitRepository = normalizeRepo(value) || refuseTarget();
+          }
+        }
+        if (explicitRepository) return explicitRepository;
+        // URLs are targets regardless of command-specific option arity.
+        for (const value of args) if (/^https?:\/\/(?:www\.)?github\.com(?::\d+)?(?:\/|$)/i.test(value)) {
+          let url;
+          try { url = new URL(value); } catch { refuseTarget(); }
+          const segments = url.pathname.split('/').slice(1), owner = segments[0].toLowerCase();
+          if (!/^[a-z0-9][a-z0-9-]*$/.test(owner) || (urlRepository && urlRepository.split('/')[0] !== owner)) refuseTarget();
+          urlRepository = normalizeRepo(segments.slice(0, 2).join('/')) || urlRepository || owner;
+        }
+        if (urlRepository) return urlRepository;
+        const contextRepository = () => env.GH_REPO ? normalizeRepo(env.GH_REPO) || refuseTarget() : remoteRepository();
+        if (args[0] === 'api') {
+          const endpoints = args.slice(1).map(value => {
+            try { return decodeURIComponent((/^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? new URL(value).pathname : value.split(/[?#]/)[0])).replace(/\/+/g, '/'); }
+            catch { return ''; }
+          }).filter(endpoint => /^\/?(?:repos|orgs|users|graphql)(?:\/|$)/.test(endpoint));
+          if (endpoints.length !== 1) refuseTarget();
+          const endpoint = endpoints[0];
+          // Templates deliberately use CLI context; literal owners never fall back.
+          const context = /\{(?:owner|repo)\}/.test(endpoint) ? contextRepository()?.split('/') : [];
+          const segments = endpoint.replace(/\{owner\}/g, context?.[0] || '').replace(/\{repo\}/g, context?.[1] || '').replace(/^\//, '').split('/');
+          if (segments.some(segment => segment === '.' || segment === '..')) refuseTarget();
+          if (segments[0] === 'repos') return normalizeRepo(segments.slice(1, 3).join('/')) || refuseTarget();
+          if (['orgs', 'users'].includes(segments[0]) && /^[a-z0-9][a-z0-9-]*$/i.test(segments[1] || '')) return segments[1].toLowerCase();
+          // GraphQL, aliases and unresolved endpoints cannot borrow origin's token.
+          refuseTarget();
+        }
+        if (args[0] === 'repo') {
+          const separator = args.indexOf('--'), target = separator < 0 ? args.slice(2).find(arg => normalizeRepo(arg)) : args[separator + 1];
+          if (target) return normalizeRepo(target) || refuseTarget();
+        }
+        return contextRepository();
+      }
+      const remoteUrl = args.find(arg => /^(?:https?:\/\/|ssh:\/\/|git@)(?:git@)?(?:www\.)?github\.com[:/]/i.test(arg));
+      if (remoteUrl) return normalizeRepo(remoteUrl) || refuseTarget();
+      return remoteRepository();
+    };
+    const askBroker = !isLocalGit(args);
+    const repository = askBroker ? repositoryHint() : undefined;
     try {
     let response;
     if (askBroker && base && env.PAPERCLIP_GITHUB_BROKER_TOKEN) {
@@ -129,8 +236,9 @@ ${options.brokerFile ? String.raw`
           response = await fetch(url, {
             method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10000),
             headers: { authorization: 'Bearer ' + (env.PAPERCLIP_GITHUB_BRIDGE_TOKEN || env.PAPERCLIP_API_KEY || env.PAPERCLIP_GITHUB_BROKER_TOKEN),
-              'x-paperclip-github-capability': env.PAPERCLIP_GITHUB_BROKER_TOKEN, 'content-type': 'application/json' },
-            body: '{}',
+              'x-paperclip-github-capability': env.PAPERCLIP_GITHUB_BROKER_TOKEN, 'content-type': 'application/json',
+              ...(repository ? { 'x-paperclip-github-repository': repository } : {}) },
+            body: JSON.stringify(repository ? { repository } : {}),
           });
           // A sandbox gateway that outlived its controller answers 503 until
           // the replacement broker is published, so it waits like a refusal.
@@ -170,7 +278,7 @@ ${options.brokerFile ? String.raw`
       connected = result.status === 'available';
       if (result.status === 'available' && configReady) {
         for (const [key, value] of Object.entries(result.env || {})) {
-          if (/^(GH_TOKEN|GITHUB_TOKEN|PAPERCLIP_GIT_TOKEN|GIT_TERMINAL_PROMPT|GIT_AUTHOR_(NAME|EMAIL)|GIT_COMMITTER_(NAME|EMAIL)|GIT_CONFIG_COUNT|GIT_CONFIG_(KEY|VALUE)_\d+)$/.test(key) && typeof value === 'string') env[key] = value;
+          if (/^(GH_TOKEN|GITHUB_TOKEN|PAPERCLIP_GIT_(TOKEN|REPOSITORY)|GIT_TERMINAL_PROMPT|GIT_AUTHOR_(NAME|EMAIL)|GIT_COMMITTER_(NAME|EMAIL)|GIT_CONFIG_COUNT|GIT_CONFIG_(KEY|VALUE)_\d+)$/.test(key) && typeof value === 'string') env[key] = value;
         }
       }
       }
@@ -185,6 +293,11 @@ ${options.brokerFile ? String.raw`
     process.exitCode = 1;
     return;
   }
+  // Keep paths in Git's credential protocol even when a connection supplies config.
+  const configCount = Number(env.GIT_CONFIG_COUNT || 0);
+  env['GIT_CONFIG_KEY_' + configCount] = 'credential.useHttpPath';
+  env['GIT_CONFIG_VALUE_' + configCount] = 'true';
+  env.GIT_CONFIG_COUNT = String(configCount + 1);
   // Only this invocation and its children inherit the captured credential.
   env.PAPERCLIP_GITHUB_OPERATION_ACTIVE = '1';
   // Its Git children use the real binary, so steering cannot split a gh operation.
@@ -194,7 +307,11 @@ ${options.brokerFile ? String.raw`
   env.ZDOTDIR = configDirectory;
   env.BASH_ENV = '/dev/null';
   env.GIT_SSH_COMMAND = 'ssh -F /dev/null -o IdentityAgent=none -o IdentitiesOnly=yes -o IdentityFile=none -o BatchMode=yes';
-  const child = spawn(executable, process.argv.slice(2), { env, stdio: 'inherit' });
+  const child = spawn(executable, process.argv.slice(2), { env, stdio: credentialInput === undefined ? 'inherit' : ['pipe', 'inherit', 'inherit'] });
+  if (credentialInput !== undefined) {
+    child.stdin.on('error', () => {});
+    child.stdin.end(credentialInput);
+  }
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => child.kill(signal));
   child.once('error', () => { process.stderr.write('Paperclip: GitHub command could not start.\n'); process.exitCode = 1; });
   child.once('exit', (code, signal) => { process.exitCode = code === null ? 128 : code; });
