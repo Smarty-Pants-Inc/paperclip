@@ -130,6 +130,27 @@ describeDatabase("agent runtime synchronization hooks", () => {
     expect((await f.read()).resultJson?.heldNativeConfigurationEnd).not.toBe(true);
   });
 
+  it("hold seam v3: a chat model change ends only that issue's held run, after commit", async () => {
+    const { heartbeatRuns, issues } = await import("@paperclipai/db");
+    const { requestHeldNativeConfigurationEnd } = await import("../services/native-runtime/held-native-turn.js");
+    const { issueService } = await import("../services/issues.js");
+    const f = await heldConfigurationRun();
+    const [otherIssue] = await db.insert(issues).values({ companyId, title: "Other held chat", assigneeAgentId: agentId }).returning();
+    const [otherRun] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "running", runtimeMode: "native",
+      nativeIssueId: otherIssue.id, resultJson: { retained: "other receipt" } }).returning();
+    const change = async (tx: Db) => {
+      await issueService(db).update(f.run.nativeIssueId!, { assigneeAdapterOverrides: { adapterConfig: { model: "paperclip/gpt-6.2-sol" } } }, tx);
+      await requestHeldNativeConfigurationEnd(tx, { companyId, agentId, issueId: f.run.nativeIssueId! });
+    };
+    await expect(db.transaction(async tx => { await change(tx as unknown as Db); throw new Error("rollback chip change"); }))
+      .rejects.toThrow("rollback chip change");
+    expect((await f.read()).resultJson?.heldNativeConfigurationEnd).not.toBe(true);
+    await db.transaction(tx => change(tx as unknown as Db));
+    expect((await f.read()).resultJson).toEqual({ retained: "receipt", heldNativeConfigurationEnd: true });
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, otherRun.id)))[0]!.resultJson)
+      .toEqual({ retained: "other receipt" });
+  });
+
   it("hold seam v2: the configuration producer waits on issue before owning run", async () => {
     const { heartbeatRuns, issues } = await import("@paperclipai/db");
     const { requestHeldNativeConfigurationEnd } = await import("../services/native-runtime/held-native-turn.js");
