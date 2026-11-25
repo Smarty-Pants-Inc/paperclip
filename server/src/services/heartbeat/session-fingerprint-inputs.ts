@@ -153,10 +153,23 @@ export function paperclipRunnerRetainedAdapterConfig(config: Record<string, unkn
   return omitKeys(result, [...inactivePermissionKeys, ...(provider === "codex" ? [] : CODEX_ONLY_KEYS)]);
 }
 
+const CONTINUOUS_PI_MODEL_KEYS = ["model", "piRpcThinkingLevel", "piThinkingLevel", "thinkingLevel", "modelReasoningEffort", "reasoningEffort", "effort", "variant"];
+
 export function paperclipRunnerSessionAdapterConfig(config: Record<string, unknown>): Record<string, unknown> {
   const retained = paperclipRunnerRetainedAdapterConfig(config);
   return config.provider === "pi_rpc" && resolveSessionContinuity(config.provider, config.sessionContinuity) === "continuous"
-    ? omitKeys(retained, ["model", "piRpcThinkingLevel", "piThinkingLevel", "thinkingLevel", "modelReasoningEffort", "reasoningEffort", "effort", "variant"]) : retained;
+    ? omitKeys(retained, CONTINUOUS_PI_MODEL_KEYS) : retained;
+}
+
+/** Issue settings reach both the effective config and their own fingerprint category. */
+export function paperclipRunnerSessionIssueOverrides(overrides: unknown, config: Record<string, unknown>): unknown {
+  if (!isRecord(overrides) || config.provider !== "pi_rpc" || resolveSessionContinuity(config.provider, config.sessionContinuity) !== "continuous") return overrides;
+  const result = { ...overrides };
+  if (isRecord(result.adapterConfig)) {
+    const adapterConfig = omitKeys(result.adapterConfig, CONTINUOUS_PI_MODEL_KEYS);
+    result.adapterConfig = Object.keys(adapterConfig).length ? adapterConfig : null;
+  }
+  return Object.values(result).every(value => value == null) ? null : result;
 }
 
 /** Classify saved live inputs without changing next-run session compatibility. */
