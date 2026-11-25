@@ -129,19 +129,22 @@ describe("Paperclip Runner native provider configuration", () => {
   });
 
   // catch: (Pi R5)
-  it.each(["modelReasoningEffort", "reasoningEffort", "effort"])("maps Pi generic %s and forwards the exact selection for driver admission", key => {
+  it.each(["modelReasoningEffort", "reasoningEffort", "effort"])("maps Pi generic %s and rejects invalid stored selections", key => {
     const base = { provider: "pi_rpc", model: "openai/gpt-6.1-sol", [key]: "high" };
     const resolve = (adapterConfig: Record<string, unknown>) => resolvePaperclipRunnerNativeProviderInput({ backend: "pi_rpc", adapterConfig });
     expect(resolve(base)).toMatchObject({ piRpcThinkingLevel: "high" });
     for (const [effort, level] of [["auto", "medium"], ["none", "off"], ["off", "off"]]) expect(resolve({ ...base, [key]: effort })).toMatchObject({ piRpcThinkingLevel: level });
-    expect(resolve({ ...base, piRpcThinkingLevel: "auto" })).toMatchObject({ piRpcThinkingLevel: "auto" });
-    expect(resolve({ ...base, piRpcThinkingLevel: "off", [key]: "ultra" })).toMatchObject({ piRpcThinkingLevel: "off" });
-    expect(resolve({ ...base, [key]: "ultra" })).toMatchObject({ piRpcThinkingLevel: "ultra" });
+    expect(resolve({ ...base, piRpcThinkingLevel: "auto" })).toMatchObject({ piRpcThinkingLevel: "medium" });
+    for (const value of [5, "ultra"]) {
+      for (const config of [{ ...base, piRpcThinkingLevel: "off", [key]: value }, { ...base, [key]: value }]) {
+        expect(() => resolve(config)).toThrow(expect.objectContaining({ code: "pi_thinking_level_invalid" }));
+      }
+    }
     expect(resolve(projectPaperclipRunnerTaskConfig("pi_rpc", base, { [key]: "low" }))).toMatchObject({ piRpcThinkingLevel: "low" });
     expect(resolve(projectPaperclipRunnerTaskConfig("pi_rpc", { ...base, piRpcThinkingLevel: "xhigh" }, { [key]: "low" }))).toMatchObject({ piRpcThinkingLevel: "low" });
     expect(resolve(projectPaperclipRunnerTaskConfig("pi_rpc", base, { model: "openai/other" }))).toMatchObject({ piRpcThinkingLevel: "high" });
   });
-  it.each([undefined, null, "", " \t "])("records medium Pi reasoning when the saved level is unset: %j", piRpcThinkingLevel => {
+  it.each([undefined, null, "", " \t ", "auto"])("records medium Pi reasoning when the saved level is unset: %j", piRpcThinkingLevel => {
     expect(resolvePaperclipRunnerNativeProviderInput({ backend: "pi_rpc", adapterConfig: { provider: "pi_rpc", model: "openai/gpt-6.1-sol", piRpcThinkingLevel } })).toMatchObject({ piRpcThinkingLevel: "medium" });
   });
   it.each([null, "", " \t "])("inherits the agent level for an unset task override: %j", piRpcThinkingLevel => {
