@@ -13050,6 +13050,7 @@ async function executePaperclipNativeSessionAttempt(
       await finishStartupContextForFallback();
       await restoreWarmRunnerdController(input);
       persistedWarmSession = loadWarmNativeCheckpoint(input.execution, warmConfigDigest, "remote");
+      if (!persistedWarmSession) throw new Error("native_runner_checkpoint_missing_after_closed_owner");
       runnerdBackend = await createExecutionBackend();
       remoteCleanupLease = await readRemoteCleanupLease();
       return true;
