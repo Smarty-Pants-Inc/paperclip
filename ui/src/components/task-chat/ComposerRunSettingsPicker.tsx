@@ -49,7 +49,7 @@ interface Props {
 
 const HARNESS_LABELS: Record<string, string> = {
   claude_local: "Claude Code", codex_local: "Codex", opencode_local: "OpenCode",
-  pi_local: "Pi", kimi_local: "Kimi Code", gemini_local: "Gemini CLI",
+  pi_local: "Pi", pi_rpc: "Pi", kimi_local: "Kimi Code", gemini_local: "Gemini CLI",
   cursor: "Cursor", cursor_cloud: "Cursor Cloud", grok_local: "Grok CLI",
   hermes_local: "Hermes CLI", paperclip_runner: "Paperclip Runner",
   process: "Process", http: "HTTP", openclaw_gateway: "OpenClaw Gateway",
@@ -153,7 +153,7 @@ export function ComposerRunSettingsPicker({
     ?? (connectionOnlyCatalog ? connectionModels?.models ?? [] : fetchedModels);
   const catalogPending = (connectionOnlyCatalog ? connectionModelsLoading || connectionModels?.isLoading : modelsPending) && !modelOptionsOverride;
   const base = assigneeValue === currentAssigneeValue
-    ? readComposerRunSettings(overrides, agent?.adapterType)
+    ? readComposerRunSettings(overrides, agent?.adapterType, agent?.adapterConfig)
     : DEFAULT_COMPOSER_RUN_SETTINGS;
   const selected = settings ?? base;
   const configuredModel = composerDefaultModel(agent);
@@ -162,17 +162,21 @@ export function ComposerRunSettingsPicker({
   const choices = composerEfforts(agent, model, models.map((item) => item.id));
   const effort = selected.effort && choices.includes(selected.effort) ? selected.effort : null;
   const effortIndex = effort ? choices.indexOf(effort) + 1 : 0;
-  const effortLabel = effort ? EFFORT_LABELS[effort] ?? effort : "Default";
+  const piLevel = agent?.adapterType === "pi_local" || provider === "pi_rpc";
+  const defaultEffort = readComposerRunSettings({ adapterConfig: agent?.adapterConfig }, agent?.adapterType, agent?.adapterConfig).effort ?? (provider === "pi_rpc" ? "low" : null);
+  const effectiveEffort = piLevel ? selected.effort ?? defaultEffort : effort;
+  const effectiveEffortLabel = effectiveEffort ? EFFORT_LABELS[effectiveEffort] ?? effectiveEffort : "Default";
+  const effortLabel = effort ? EFFORT_LABELS[effort] ?? effort : piLevel ? `Default (${effectiveEffortLabel})` : "Default";
   const fastAvailable = composerFastAvailable(agent, model);
   const effortChoicesKey = choices.join(",");
   useEffect(() => {
     // Explicit drafts and task overrides take precedence over remembered effort.
-    if (settings !== null || base.effort || !modelSupported) return;
+    if (piLevel || settings !== null || base.effort || !modelSupported) return;
     const remembered = getLastComposerEffort(companyId);
     if (remembered && effortChoicesKey.split(",").includes(remembered)) {
       onSettingsChange({ ...base, effort: remembered });
     }
-  }, [companyId, agentId, model, modelSupported, settings, base.model, base.effort, base.fast, effortChoicesKey, onSettingsChange]);
+  }, [companyId, agentId, model, modelSupported, piLevel, settings, base.model, base.effort, base.fast, effortChoicesKey, onSettingsChange]);
   const changed = Boolean(selected.model || selected.effort || selected.fast);
   const assigneeOptions = [{ id: "", label: "No assignee", searchText: "Unassigned" }, ...options.filter((item) => item.id !== "")];
   const filteredAgents = assigneeOptions.filter((item) => {
@@ -209,7 +213,7 @@ export function ComposerRunSettingsPicker({
   };
   const chooseModel = (value: string | null) => {
     const nextChoices = composerEfforts(agent, value ?? configuredModel, models.map((item) => item.id));
-    const preferred = selected.effort ?? getLastComposerEffort(companyId);
+    const preferred = selected.effort ?? (piLevel ? null : getLastComposerEffort(companyId));
     onSettingsChange({ model: value, effort: preferred && nextChoices.includes(preferred) ? preferred : null, fast: false });
     setView("settings");
     setModelSearch("");
@@ -222,8 +226,8 @@ export function ComposerRunSettingsPicker({
   const Trigger = mobile ? DialogTrigger : PopoverTrigger;
   const modelTrigger = <button ref={allowAssigneeChange ? undefined : triggerRef} type="button" disabled={disabled} aria-label="Select model and effort" aria-haspopup="dialog" aria-expanded={open && view !== "agents"} onClick={() => { setView("settings"); if (allowAssigneeChange) setOpen(true); }}
     className="flex h-8 min-w-0 max-w-full items-center gap-1.5 rounded-full px-2.5 text-muted-foreground hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50">
-    <span data-testid="task-chat-composer-model-label" className="min-w-0 truncate text-foreground/70">{open ? "Select model" : modelName || "Default"}</span>
-    {!open && effort ? <span className="hidden shrink-0 sm:inline">{effortLabel}</span> : null}
+    <span data-testid="task-chat-composer-model-label" className="min-w-0 truncate text-foreground/70">{open && !piLevel ? "Select model" : modelName || "Default"}</span>
+    {piLevel || (!open && effort) ? <span className={cn("shrink-0", !piLevel && "hidden sm:inline")} title={piLevel ? `Reasoning level: ${effectiveEffortLabel} (${selected.effort ? "chat override" : "agent default"})` : undefined}>{piLevel ? `· ${effectiveEffortLabel}` : effortLabel}</span> : null}
     <ChevronDown className="size-3 shrink-0" aria-hidden />
   </button>;
   const AssigneeHeader = allowAssigneeChange ? "button" : "div";
@@ -258,10 +262,10 @@ export function ComposerRunSettingsPicker({
       {choices.length ? <div className="mt-3">
         <div className="flex items-center gap-2">
           {fastAvailable ? <button type="button" aria-label="Fast mode" aria-pressed={selected.fast} title="Fast mode" onClick={() => onSettingsChange({ ...selected, fast: !selected.fast })} className={cn("grid size-8 shrink-0 place-items-center rounded-md hover:bg-accent", selected.fast ? "composer-run-settings-accent bg-accent" : "text-muted-foreground")}><Zap className="size-4" /></button> : <span className="size-8 shrink-0" aria-hidden />}
-          <label htmlFor="composer-run-effort" data-testid="selected-effort" className="composer-run-settings-accent min-w-0 flex-1 text-center text-sm font-medium">{effortLabel}</label>
+          <label htmlFor="composer-run-effort" data-testid="selected-effort" className="composer-run-settings-accent min-w-0 flex-1 text-center text-sm font-medium">{piLevel ? "Reasoning level · " : ""}{effortLabel}</label>
           <button type="button" aria-label="Reset to agent default" title="Reset to agent default" disabled={!changed} onClick={reset} className="grid size-8 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-accent disabled:opacity-40"><RotateCcw className="size-4" /></button>
         </div>
-        <input id="composer-run-effort" type="range" min={0} max={choices.length} step={1} value={effortIndex} aria-label={agent?.adapterType === "pi_local" ? "Thinking" : "Effort"} aria-valuetext={effortLabel}
+        <input id="composer-run-effort" type="range" min={0} max={choices.length} step={1} value={effortIndex} aria-label={piLevel ? "Reasoning level" : "Effort"} aria-valuetext={effortLabel}
           onChange={(event) => {
             const nextEffort = Number(event.target.value) === 0 ? null : choices[Number(event.target.value) - 1]!;
             rememberComposerEffort(companyId, nextEffort);
@@ -269,9 +273,10 @@ export function ComposerRunSettingsPicker({
           }}
           className="composer-run-effort-range mt-3 w-full" style={{ "--fill": `${effortIndex / choices.length * 100}%` } as CSSProperties} />
       </div> : null}
+      {piLevel ? <p role="status" className="mt-3 px-1 text-xs text-muted-foreground">Takes effect at your next message</p> : null}
     </> : agent ? <div className="mt-3 rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground" data-testid="model-unavailable">{unavailableModelReason(agent)}</div> : null}
     {reasoning.supported ? <label className="mt-3 flex items-center gap-2 px-1 text-sm">
-      <span className="flex-1 text-muted-foreground">Reasoning</span>
+      <span className="flex-1 text-muted-foreground">Reasoning display</span>
       <select aria-label="Reasoning display" value={reasoning.display} disabled={!reasoning.canSave}
         onChange={event => reasoning.setDisplay(event.target.value as ReasoningDisplay)}
         className="rounded-md border border-border bg-background px-2 py-1 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
