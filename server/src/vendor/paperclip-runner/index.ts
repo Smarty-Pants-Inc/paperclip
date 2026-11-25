@@ -121,6 +121,7 @@ export const inspectStagedRunAttachmentHeader = runner.inspectStagedRunAttachmen
 export type StagedRunAttachment = import("@paperclipai/paperclip-runner").StagedRunAttachment;
 export const readRunnerdArtifactBinding = runner.readRunnerdArtifactBinding;
 export const readLinuxProcessStartedAt = runner.readLinuxProcessStartedAt;
+export const NativeRunnerClosedBeforeAttachmentError = runner.NativeRunnerClosedBeforeAttachmentError;
 export const NativeSessionCloseUnrecoverableError =
   runner.NativeSessionCloseUnrecoverableError;
 export const NativeSessionCleanupQuarantinedError =

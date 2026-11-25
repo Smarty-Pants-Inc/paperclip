@@ -532,6 +532,16 @@ const RUNNER_RECOVERY_FAILURE_CLASSES: ReadonlySet<string> = new Set([
   PROVIDER_SIDE_EFFECT_PENDING,
 ]);
 
+/** No attachment has started: the cached controller's process is already gone.
+ * The host may evict only this owner and retry once from its saved checkpoint. */
+export class NativeRunnerClosedBeforeAttachmentError extends Error {
+  readonly code = "native_runner_closed_before_attachment";
+  constructor() {
+    super("native_runner_closed_before_attachment");
+    this.name = "NativeRunnerClosedBeforeAttachmentError";
+  }
+}
+
 /** A predecessor's semantic tool call or bridged runtime input has no settled
  * result, so the source runner cannot hand its session to a new run. */
 export class NativeRunnerSourceReconciliationRequiredError extends Error {
