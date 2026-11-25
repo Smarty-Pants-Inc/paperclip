@@ -27,6 +27,13 @@ export function isAutomaticSteeringComment(comment: {
     !comment.metadata?.chatMessage && !comment.metadata?.attachmentPreparation && !comment.metadata?.recovery;
 }
 
+/** Only ordinary comment wakes may join a live turn; completion/review paths
+ * retain their independent admission contract, even when they name a comment. */
+export function isAutomaticSteeringWake(reason: unknown, context: Record<string, unknown>): boolean {
+  return context.forceFreshSession !== true &&
+    ["issue_commented", "issue_reopened_via_comment", "issue_comment_mentioned"].includes(String(context.wakeReason ?? reason));
+}
+
 /** The error a saved wake records when a completed run already received all of its messages. */
 export const QUEUED_MESSAGES_DELIVERED_REASON = "Queued messages were already delivered to a completed run";
 
