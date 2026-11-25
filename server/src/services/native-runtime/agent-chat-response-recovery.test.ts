@@ -21,13 +21,15 @@ import { deliverConversationComments } from "../agent-conversations.js";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import type { PrpEvent } from "../../vendor/paperclip-runner/index.js";
 
-const heldSteering = vi.hoisted(() => ({ available: false, reject: false, sent: [] as string[], ack: undefined as Promise<void> | undefined }));
+const heldSteering = vi.hoisted(() => ({ available: false, reject: false, sent: [] as string[], ack: undefined as Promise<void> | undefined,
+  onSend: undefined as ((commentId: string) => Promise<void>) | undefined }));
 vi.mock("./native-session-executor.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./native-session-executor.js")>();
   return { ...actual,
     getNativeSessionSteeringState: async () => ({ disposition: heldSteering.available ? "available" : "temporarily_unavailable", activeTurnId: heldSteering.available ? "held-turn" : null }),
     steerNativeSession: async (input: { correlationId: string }) => {
       if (heldSteering.reject) throw new actual.NativeSessionSteeringError("steering_stale_turn", "This held turn is closing. Your message stays queued for the next run.");
+      await heldSteering.onSend?.(input.correlationId);
       heldSteering.sent.push(input.correlationId); await heldSteering.ack; return { turnId: "held-turn" };
     },
   };
@@ -206,34 +208,100 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     }
   });
 
-  it.each(["drain", "reset", "non-pi", "paperclip", "unavailable", "agent", "other-agent"])("consumes deferred messages only at a steerable continuous final (%s)", async scenario => {
-    const shouldDrain = scenario === "drain" || scenario === "other-agent";
+  it("plugin agent comment commits, steers into the held chat, and is answered once without tray residue", async () => {
+    const { buildHostServices } = await import("../plugin-host-services.js");
+    const { readBoardQueuedComments } = await import("../../modules/wake-queue/adapters/queued-comment-board-postgres.js");
+    const flag = process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+    process.env.PAPERCLIP_AGENT_CHAT_STEERING = "true";
+    heldSteering.available = true; heldSteering.sent = [];
+    const observer = createDb(external ?? database!.connectionString);
+    let commitObservedAtDelivery = false;
+    try {
+      await fixture(true, { beforeFinalize: async scope => {
+        await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, scope.agentId));
+        const [sender] = await db.insert(agents).values({ companyId: scope.companyId, name: "Bridge author", adapterType: "process" }).returning();
+        await expect(issueService(db).addComment(scope.issueId, "Untrusted assistant output", { agentId: sender.id }))
+          .rejects.toThrow("Only this conversation's agent can post agent messages");
+        const services = buildHostServices(db, "plugin-record-id", "paperclip.gateway", { forPlugin: () => ({ emit: async () => {}, subscribe: () => {} }) } as never,
+          undefined, { heartbeatRuntimeEnv: {} });
+        heldSteering.onSend = async commentId => {
+          // An independent PostgreSQL connection can see neither an uncommitted
+          // comment nor admission wake. This runs INSIDE the delivery callback.
+          expect((await observer.select().from(issueComments).where(eq(issueComments.id, commentId)))[0].authorAgentId).toBe(sender.id);
+          const wakes = await observer.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, scope.agentId));
+          expect(wakes).toEqual([expect.objectContaining({ status: "deferred_issue_execution", requestedByActorId: sender.id })]);
+          expect(JSON.stringify(wakes[0].payload)).toContain(commentId);
+          commitObservedAtDelivery = true;
+        };
+        const comment = await services.issues.createComment({ companyId: scope.companyId, issueId: scope.issueId,
+          authorAgentId: sender.id, body: "Bridge agent asks for a held reply" });
+        // Separate root-DB reads prove both authored comment and admission are
+        // committed, not visible only inside a comment/admission transaction.
+        expect((await db.select().from(issueComments).where(eq(issueComments.id, comment.id)))[0].authorAgentId).toBe(sender.id);
+        expect(heldSteering.sent).toEqual([comment.id]);
+        const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, scope.agentId));
+        expect(wake).toMatchObject({ status: "cancelled", requestedByActorType: "agent", requestedByActorId: sender.id });
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+        expect(run.resultJson?.queuedSteeringAcknowledgements).toMatchObject({ [comment.id]: { status: "acknowledged" } });
+        const event = { eventType: "item.completed" as const, runId: scope.runId, normalizedSessionId: run.nativeSessionId!,
+          sourceEventId: "plugin-held-answer", itemId: "plugin-held-answer", payload: { kind: "agentMessage", channel: "final",
+            text: "Bridge held reply answered once.", answers: [comment.id] } };
+        const execution = { binding: scope, provider: { kind: "pi_rpc" as const } };
+        await publishContinuousNativeReply({ db, execution, event, cursor: 171 });
+        await publishContinuousNativeReply({ db, execution, event, cursor: 171 });
+        const replies = await db.select().from(issueComments).where(and(eq(issueComments.issueId, scope.issueId), eq(issueComments.body, event.payload.text)));
+        expect(replies).toHaveLength(1);
+        const [issue] = await db.select().from(issues).where(eq(issues.id, scope.issueId));
+        const board = await readBoardQueuedComments({ executor: db, issue, activeRun: run,
+          actor: { actorType: "agent", actorId: sender.id, agentId: sender.id, runId: null, agentApiKeyId: null } });
+        expect(board.entries).toEqual([]);
+        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, scope.agentId))).toHaveLength(1);
+        process.stdout.write(`PLUGIN_HELD ${JSON.stringify({ runId: scope.runId, commentId: comment.id, wakeId: wake.id,
+          wakeStatus: wake.status, replies: replies.map(reply => reply.id), tray: board.entries, sent: heldSteering.sent, commitObservedAtDelivery })}\n`);
+      } });
+    } finally {
+      heldSteering.onSend = undefined;
+      heldSteering.available = false;
+      await observer.$client.end();
+      if (flag === undefined) delete process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+      else process.env.PAPERCLIP_AGENT_CHAT_STEERING = flag;
+    }
+  });
+
+  it.each(["drain", "reset", "non-pi", "paperclip", "unavailable", "agent", "other-agent", "mixed", "flag-off", "issue_children_completed", "execution_review_requested", "issue_completed", "system", "notice", "fresh"])("consumes deferred messages only at a steerable continuous final (%s)", async scenario => {
+    const shouldDrain = scenario === "drain" || scenario === "other-agent" || scenario === "mixed";
     const ids = [randomUUID(), randomUUID(), randomUUID()];
     const wakeIds = [randomUUID(), randomUUID()];
     heldSteering.sent = [];
     const steeringFlag = process.env.PAPERCLIP_AGENT_CHAT_STEERING;
     process.env.PAPERCLIP_AGENT_CHAT_STEERING = "true";
     heldSteering.available = scenario !== "unavailable";
+    if (scenario === "flag-off") process.env.PAPERCLIP_AGENT_CHAT_STEERING = "false";
     try {
       const f = await fixture(true, { beforeFinalize: async scope => {
         const provider = scenario === "non-pi" ? "codex" : "pi_rpc";
         await db.update(agents).set({ adapterConfig: { provider, sessionContinuity: scenario === "paperclip" ? "paperclip" : "continuous" } }).where(eq(agents.id, scope.agentId));
         const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
         const [opening] = await db.select().from(issueComments).where(eq(issueComments.id, run.contextSnapshot!.wakeCommentId as string));
-        const fromAgent = scenario === "agent" || scenario === "other-agent";
+        const fromAgent = !["drain", "reset", "mixed"].includes(scenario);
         const [sender] = await db.insert(agents).values({ companyId: scope.companyId, name: "Agent A", adapterType: "process" }).returning();
         await db.insert(issueComments).values(ids.map((id, index) => ({ id, companyId: scope.companyId, issueId: scope.issueId,
-          authorType: fromAgent ? "agent" as const : "user" as const, authorUserId: fromAgent ? null : opening.authorUserId,
-          authorAgentId: fromAgent ? scenario === "agent" ? scope.agentId : sender.id : null,
+          authorType: scenario === "system" ? "system" as const : fromAgent || (scenario === "mixed" && index === 1) ? "agent" as const : "user" as const,
+          authorUserId: fromAgent || (scenario === "mixed" && index === 1) ? null : opening.authorUserId,
+          authorAgentId: fromAgent || (scenario === "mixed" && index === 1) ? scenario === "agent" ? scope.agentId : sender.id : null,
+          ...(scenario === "notice" ? { metadata: { version: 1 as const, sections: [], authorizationReason: "allow_chat_run_presentation" } } : {}),
           body: scenario === "reset" && index === 0 ? "/new" : `Queued question ${index}` })));
         await db.insert(agentWakeupRequests).values(wakeIds.map((id, index) => ({ id, companyId: scope.companyId, agentId: scope.agentId,
           source: "on_demand", reason: "issue_execution_deferred", status: "deferred_issue_execution", requestedByActorType: "user",
           requestedByActorId: opening.authorUserId, requestedAt: new Date(1000 + index),
-          payload: { issueId: scope.issueId, _paperclipWakeContext: { wakeCommentIds: index === 0 ? ids.slice(0, 2) : ids.slice(2) } } })));
+          payload: { issueId: scope.issueId, _paperclipWakeContext: { wakeReason: ["issue_children_completed", "execution_review_requested", "issue_completed"].includes(scenario) ? scenario : "issue_commented",
+            forceFreshSession: scenario === "fresh", wakeCommentIds: index === 0 ? ids.slice(0, 2) : ids.slice(2) } } })));
         const execution = { binding: scope, provider: { kind: provider as "pi_rpc" | "codex" } };
         const event = { eventType: "item.completed" as const, runId: scope.runId, normalizedSessionId: run.nativeSessionId!,
           sourceEventId: "drain-final", itemId: "drain:m1:b0", payload: { kind: "agentMessage", channel: "final", text: "Opening answer." } };
-        await Promise.all([publishContinuousNativeReply({ db, execution, event, cursor: 171 }), publishContinuousNativeReply({ db, execution, event, cursor: 171 })]);
+        const { steerCommittedQueuedComment } = await import("../../modules/wake-queue/index.js");
+        await Promise.all([publishContinuousNativeReply({ db, execution, event, cursor: 171 }), publishContinuousNativeReply({ db, execution, event, cursor: 171 }),
+          ...(scenario === "mixed" ? [steerCommittedQueuedComment(db, { ...scope, commentId: ids[1] })] : [])]);
         const wakes = await db.select().from(agentWakeupRequests).where(sql`${agentWakeupRequests.id} in (${sql.join(wakeIds.map(id => sql`${id}`), sql`, `)})`);
         expect(wakes.map(wake => wake.status)).toEqual(wakeIds.map(() => shouldDrain ? "cancelled" : "deferred_issue_execution"));
         expect(heldSteering.sent).toEqual(shouldDrain ? ids : []);
@@ -246,7 +314,7 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
             authorType: "user" as const, authorUserId: opening.authorUserId, body: "A later held message" })));
           await db.insert(agentWakeupRequests).values(lateIds.map((id, index) => ({ companyId: scope.companyId, agentId: scope.agentId,
             source: "on_demand", reason: "issue_execution_deferred", status: "deferred_issue_execution", requestedAt: new Date(2000 + index),
-            payload: { issueId: scope.issueId, _paperclipWakeContext: { wakeCommentIds: [id] } } })));
+            payload: { issueId: scope.issueId, _paperclipWakeContext: { wakeReason: "issue_commented", wakeCommentIds: [id] } } })));
           await deliverConversationComments(db, { id: scope.issueId, companyId: scope.companyId, conversationAgentId: scope.agentId }, async () => null);
           expect(heldSteering.sent).toEqual([...ids, ...lateIds]);
         }
@@ -281,7 +349,7 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
         await db.insert(agentWakeupRequests).values({ id: wakeId, companyId: scope.companyId, agentId: scope.agentId,
           source: "on_demand", reason: "issue_execution_deferred", status: "deferred_issue_execution",
           requestedByActorType: "user", requestedByActorId: opening.authorUserId,
-          payload: { issueId: scope.issueId, _paperclipWakeContext: { wakeCommentIds: [commentId] } } });
+          payload: { issueId: scope.issueId, _paperclipWakeContext: { wakeReason: "issue_commented", wakeCommentIds: [commentId] } } });
         const execution = { binding: scope, provider: { kind: "pi_rpc" as const } };
         const port = new PaperclipControlPlanePort(db, { ...scope, sessionId: run.nativeSessionId!,
           sourceInstanceId: run.runnerInstanceId!, controlPlaneSourceInstanceId: "cold-start-control",
