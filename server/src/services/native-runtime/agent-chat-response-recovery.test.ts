@@ -135,7 +135,7 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     let restoreMode: (() => void) | undefined;
     try {
       const f = await fixture(true, { beforeFinalize: async scope => {
-        await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, scope.agentId));
+        await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", model: "paperclip/gpt-6.1-sol", sessionContinuity: "continuous" } }).where(eq(agents.id, scope.agentId));
         const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
         const [issue] = await db.select().from(issues).where(eq(issues.id, scope.issueId));
         const [opening] = await db.select().from(issueComments).where(eq(issueComments.id, run.contextSnapshot!.wakeCommentId as string));
@@ -149,7 +149,7 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
         const actor = { actorType: "agent" as const, actorId: scope.agentId, agentId: scope.agentId, runId: scope.runId, agentApiKeyId: null };
         const before = await readBoardQueuedComments({ executor: db, issue, activeRun: run, actor });
         await agentService(db).update(scope.agentId, { adapterConfig: {
-          provider: "pi_rpc", sessionContinuity: "continuous", piRpcThinkingLevel: "high",
+          provider: "pi_rpc", model: "paperclip/gpt-6.1-sol", sessionContinuity: "continuous", piRpcThinkingLevel: "high",
         } });
         // Eligibility was read before the commit; the actual delivery now refuses.
         const steer = createSteerQueuedComment(createQueuedCommentSteeringAdapter(db));
