@@ -1,5 +1,7 @@
 import { wakeWaitersOfStalledIssues, type BlockerStallWakeup } from "./blocker-stall-wakeups.js";
 import { ensurePiModelSelectionFailureNotice } from "../pi-model-selection-failure.js";
+import { hasCommittedIssueDeliveryOwner } from "../conversation-owed-input.js";
+import { readRunFailureStage } from "../run-failure-stage.js";
 import { INTERACTION_DELIVERY_DENIED, isInteractionDeliveryDeniedRun } from "../agent-interaction-delivery.js";
 import { notifyScheduledRetryDispatch } from "../run-dispatch-notifications.js";
 import { OWNER_UNPROVABLE_CAUSE } from "./owner-gone-attestation.js";
@@ -4409,13 +4411,16 @@ export function recoveryService(
           input.successfulRunHandoffEvidence.missingDisposition,
       });
     }
+    const deliveryOwned = await hasCommittedIssueDeliveryOwner(tx, input.issue.companyId, input.issue.id);
+    const failureStage = input.latestRun?.errorCode === "native_session_interrupted"
+      ? await readRunFailureStage(tx, input.issue.companyId, input.latestRun.id) : undefined;
     const escalationNotice = buildStrandedRecoveryEscalationNotice({
       seed: input.notice,
       fallbackBody: input.comment,
       recoveryCause,
       recoveryActionId: recoveryAction.id,
       retryOffered,
-      continuesAutomatically: Boolean(input.latestRun) && recoveryAction.kind === STRANDED_KIND
+      continuesAutomatically: deliveryOwned && Boolean(input.latestRun) && recoveryAction.kind === STRANDED_KIND
         && recoveryAction.ownerType === "board" && input.latestRun?.agentId === input.issue.assigneeAgentId
         && strandedRunCauseIsTemporary({
           status: input.latestRun?.status ?? "",
@@ -4437,6 +4442,7 @@ export function recoveryService(
             agentId: input.latestRun.agentId,
             status: input.latestRun.status,
             errorCode: input.latestRun.errorCode,
+            ...failureStage,
             errorSummary: input.latestRun.error
               ? redactSensitiveText(input.latestRun.error)
               : null,

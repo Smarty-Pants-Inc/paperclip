@@ -2244,6 +2244,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         eq(agentWakeupRequests.companyId, hinted.companyId), eq(agentWakeupRequests.agentId, hinted.agentId),
         eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId),
         eq(agentWakeupRequests.requestedByActorType, "user"),
+        sql`coalesce(${agentWakeupRequests.payload}->'preDispatchInputOnly', 'false'::jsonb) <> 'true'::jsonb`,
         sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`))
         .orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id));
       const undelivered = new Set(await undeliveredLegacyUserCommentIds(db, hinted.companyId, issueId,
@@ -2331,6 +2332,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         scope.requestId ? eq(agentWakeupRequests.id, scope.requestId) : undefined,
         eq(agentWakeupRequests.status, "deferred_issue_execution"),
         isNull(issues.executionRunId),
+        sql`coalesce(${agentWakeupRequests.payload}->'preDispatchInputOnly', 'false'::jsonb) <> 'true'::jsonb`,
         or(and(
           sql`jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'`,
           sql`${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
@@ -5063,6 +5065,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               eq(agentWakeupRequests.requestedByActorType, "user"),
               sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
               lt(agentWakeupRequests.requestedAt, incomingRequestedAt),
+              // Input-only handbacks join this run's first turn; they do not
+              // block a new person's request behind an exhausted retry budget.
+              sql`coalesce(${agentWakeupRequests.payload}->'preDispatchInputOnly', 'false'::jsonb) <> 'true'::jsonb`,
               executionWaitRequestId ? ne(agentWakeupRequests.id, executionWaitRequestId) : undefined,
               receiptRequest ? ne(agentWakeupRequests.id, receiptRequest.id) : undefined,
             )).orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id));

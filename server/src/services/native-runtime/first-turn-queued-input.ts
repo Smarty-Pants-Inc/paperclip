@@ -295,18 +295,28 @@ export async function claimFirstTurnQueuedInput(
     // message too. Only later arrivals belong to the live-turn steer path.
     const ownsIssue = ownsFirstTurnIssue(issue, run);
     const joining = !ownsIssue ? [] : wakes.filter(wake => deferredWakeJoinsFirstTurn(wake, run) &&
-      record(record(wake.payload)[DEFERRED_WAKE_CONTEXT_KEY]).forceFreshSession !== true);
+      record(record(wake.payload)[DEFERRED_WAKE_CONTEXT_KEY]).forceFreshSession !== true &&
+      (wake.payload?.preDispatchInputOnly !== true || !issue?.conversationAgentId ||
+        record(wake.payload?._paperclipWakeContext).conversationSessionGeneration === issue.conversationSessionGeneration));
+    // Passive pre-dispatch receipts join the next admitted turn; ordinary
+    // conversation input retains its existing first-turn and interaction rules.
+    const handback = joining.some(wake => wake.payload?.preDispatchInputOnly === true);
+    const ownInput = new Set([
+      ...queuedCommentIdsFromWakePayload({ _paperclipWakeContext: run.contextSnapshot }),
+      record(run.contextSnapshot).wakeCommentId,
+    ]);
     const interactions: Array<QueuedMessage & { wakeId: string }> = [];
     if (ownsIssue) for (const wake of wakes) {
       const response = await readFirstTurnInteraction(tx as unknown as Db, binding, wake, run.responsibleUserId);
       if (response) interactions.push({ ...response, wakeId: wake.id });
     }
-    const commentIds = [...new Set(joining.flatMap(wake => queuedCommentIdsFromWakePayload(wake.payload)))];
+    const commentIds = [...new Set(joining.flatMap(wake => queuedCommentIdsFromWakePayload(wake.payload)))].filter(id => !ownInput.has(id));
     const pressedAt = nonEmptyString(record(record(run.resultJson).personStopHeld).pressedAt);
     const taken = (await readQueuedMessages(tx as unknown as Db, { ...binding, responsibleUserId: run.responsibleUserId,
       commentIds, excludeDelivered: true })).filter(message => !pressedAt || message.createdAt.getTime() <= Date.parse(pressedAt));
     // Render before sealing: once the receipt commits, nothing can fail
     // between it and the turn input that the receipt describes.
+    if (handback) taken.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
     const takenInteractions = interactions.filter(message => !pressedAt || message.createdAt.getTime() <= Date.parse(pressedAt));
     const text = await render([...taken, ...takenInteractions]);
     // Seal even when nothing joined: later messages wait for the turn boundary.
@@ -320,7 +330,8 @@ export async function claimFirstTurnQueuedInput(
       claimedAt: new Date().toISOString(),
     };
     await tx.update(heartbeatRuns).set({
-      contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ [FIRST_TURN_QUEUED_INPUT_KEY]: sealed })}::jsonb`,
+      contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ [FIRST_TURN_QUEUED_INPUT_KEY]: sealed,
+        ...(handback ? { preDispatchInputHandback: true } : {}) })}::jsonb`,
       updatedAt: new Date(),
     }).where(eq(heartbeatRuns.id, run.id));
     return text;
