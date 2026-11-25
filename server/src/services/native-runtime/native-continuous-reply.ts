@@ -79,14 +79,11 @@ export async function publishContinuousNativeReply(input: {
       const ids = parseObject(value).questionCommentIds;
       return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : [];
     }));
-    const pending = Object.entries(parseObject(result.queuedSteeringAcknowledgements))
-      .filter(([id, receipt]) => !answered.has(id) && parseObject(receipt).status === "acknowledged" &&
-        (typeof parseObject(receipt).afterEventSeq !== "number" || Number(parseObject(receipt).afterEventSeq) < input.cursor))
-      .sort((a, b) => String(parseObject(a[1]).acknowledgedAt).localeCompare(String(parseObject(b[1]).acknowledgedAt)));
     const wakeId = row.run.contextSnapshot?.wakeCommentId;
     // Pi knows which inputs entered the model before this final. An explicit
     // empty list is authoritative too: do not shift the next question onto it.
-    // Older packs omit answers and retain the original FIFO behavior.
+    // Older packs omit answers: only the opening/inherited turn input is
+    // implied. A later steering ACK proves delivery, not consumption by this final.
     const answers = input.event.payload.answers;
     const explicitAnswers = Array.isArray(answers);
     const firstInputIds = Object.keys(replies).length === 0 ? [
@@ -98,13 +95,9 @@ export async function publishContinuousNativeReply(input: {
     const impliedInputIds = Object.keys(replies).length === 0 && continued.runId === runId &&
       continued.sessionId === row.run.nativeSessionId && Array.isArray(continued.commentIds)
       ? continued.commentIds.filter((id): id is string => typeof id === "string" && !answered.has(id)) : [];
-    const questionCommentIds = [...new Set([
-      ...impliedInputIds,
-      ...firstInputIds,
-      ...(explicitAnswers
-        ? answers.filter((id): id is string => typeof id === "string" && !answered.has(id))
-        : pending[0] ? [pending[0][0]] : []),
-    ])];
+    const questionCommentIds = [...new Set(explicitAnswers
+      ? answers.filter((id): id is string => typeof id === "string" && !answered.has(id))
+      : [...impliedInputIds, ...firstInputIds])];
     const clientRequestId = `${nativeFinalReplyKey(runId, input.event.itemId!)}:${questionCommentIds.join(",") || "opening"}`;
     const [existing] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
       eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),

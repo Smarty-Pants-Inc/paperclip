@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, authUsers, companies, companyMemberships, completionContracts, createDb, heartbeatRunEvents, heartbeatRuns, issueComments, issues, nativeRunFinalizations, nativeRunResults, issueThreadInteractions, chatTaskHandoffs, chatCompletionDeliveries, agentWakeupRequests, statusDecisions, type Db, approvals, issueApprovals } from "@paperclipai/db";
+import { agents, authUsers, companies, companyMemberships, completionContracts, createDb, heartbeatRunEvents, heartbeatRuns, issueComments, issues, nativeRunFinalizations, nativeRunResults, issueThreadInteractions, chatTaskHandoffs, chatCompletionDeliveries, agentWakeupRequests, statusDecisions, type Db, approvals, issueApprovals, issueQuestionResponseDeliveries } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
 import { NativeRunCoordinatorStore } from "./native-run-coordinator-store.js";
@@ -15,6 +15,7 @@ import { issueService } from "../issues.js";
 import * as nativeResponseNotifications from "../native-response-presentation-notifications.js";
 import { compactRunLogChunk } from "../heartbeat/run-log.js";
 import { publishContinuousNativeReply } from "./native-continuous-reply.js";
+import { answeredContinuousHeldRun } from "./continuous-session-input.js";
 import { requeueContinuousUnanswered } from "./native-continuous-unanswered.js";
 import { drainContinuousPersonMessages } from "./native-continuous-drain.js";
 import { readBoardQueuedComments } from "../../modules/wake-queue/adapters/queued-comment-board-postgres.js";
@@ -327,7 +328,7 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
           payload: { kind: "agentMessage", channel: "final", text: "Opening answer including your startup message." } });
         expect(heldSteering.sent).toEqual([commentId]);
         const [answered] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
-        expect(answered.resultJson?.continuousReplies).toMatchObject({ "cold-final:m1:b0": { questionCommentIds: [opening.id, commentId] } });
+        expect(answered.resultJson?.continuousReplies).toMatchObject({ "cold-final:m1:b0": { questionCommentIds: [opening.id] } });
       } });
     } finally {
       heldSteering.available = false;
@@ -365,7 +366,7 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     expect(events.some(event => event.message?.includes("without a semantic result"))).toBe(false);
   });
 
-  it.each(["same", "same-legacy", "same-final-first", "fresh", "missing-entry", "unreadable"] as const)("does not re-steer ACKed input into the same Pi session (%s retry)", async mode => {
+  it.each(["same", "same-legacy", "same-explicit-empty", "same-late-ack", "same-final-first", "fresh", "missing-entry", "unreadable"] as const)("does not re-steer ACKed input into the same Pi session (%s retry)", async mode => {
     const f = await fixture();
     const commentId = randomUUID(), queueId = randomUUID(), retryId = randomUUID();
     const steeringFlag = process.env.PAPERCLIP_AGENT_CHAT_STEERING;
@@ -424,18 +425,40 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
       const board = await readBoardQueuedComments({ executor: db, issue, activeRun: retry,
         actor: { actorType: "user", actorId: f.userId, agentId: null, runId: null, agentApiKeyId: null } });
       expect(board.entries.map(entry => entry.comment.id)).toEqual(mode === "same-final-first" ? [commentId] : []);
+      const lateId = mode === "same-late-ack" ? randomUUID() : null;
+      if (lateId) {
+        // C was inherited at the resumed turn's start; D is only ACKed later.
+        await db.insert(issueComments).values({ id: lateId, companyId: f.companyId, issueId: f.issueId,
+          authorType: "user", authorUserId: f.userId, body: "D: answer this after C" });
+        await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+          source: "issue", reason: "issue_commented", status: "deferred_issue_execution",
+          payload: { issueId: f.issueId, _paperclipWakeContext: { wakeCommentIds: [lateId] } } });
+        await drainContinuousPersonMessages(db, scope, { beforeFirstReply: true });
+        expect(heldSteering.sent).toEqual([lateId]);
+      }
       const event = { eventType: "item.completed" as const, runId: retryId, normalizedSessionId: sessionId,
         sourceEventId: "retry-final", itemId: "retry:m1:b0", payload: { kind: "agentMessage", channel: "final", text: "265",
           // Same-session resumed Pi has no new command correlation for C.
-          ...(mode === "same-legacy" ? {} : { answers: inherited ? [] : [commentId] }) } };
+          ...(mode === "same-legacy" || mode === "same-late-ack" ? {} : { answers: mode === "same-explicit-empty" ? [] : [commentId] }) } };
       for (let replay = 0; replay < 2; replay++) await publishContinuousNativeReply({ db, execution: { binding: scope,
         provider: { kind: "pi_rpc" } }, event, cursor: 200 });
       expect((await comments(retryId)).map(c => c.body)).toEqual(["265"]);
       const [answered] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retryId));
-      expect(answered.resultJson?.continuousReplies).toMatchObject({ "retry:m1:b0": { questionCommentIds: [commentId, ...(openingId ? [openingId] : [])] } });
+      expect(answered.resultJson?.continuousReplies).toMatchObject({ "retry:m1:b0": {
+        questionCommentIds: mode === "same-explicit-empty" ? [] : [commentId, ...(openingId ? [openingId] : [])] } });
       expect(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
         eq(agentWakeupRequests.status, "deferred_issue_execution")))).toEqual([]);
-      expect(heldSteering.sent).toEqual(inherited ? [] : [commentId]);
+      expect(heldSteering.sent).toEqual(lateId ? [lateId] : inherited ? [] : [commentId]);
+      if (lateId || mode === "same-explicit-empty") {
+        expect(await answeredContinuousHeldRun(db, scope)).toBe(false);
+        await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_failed" }).where(eq(heartbeatRuns.id, retryId));
+        await requeueContinuousUnanswered(db, { id: retryId, companyId: f.companyId });
+        const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, `continuous-unanswered:${retryId}`));
+        expect(wake).toMatchObject({ status: "deferred_issue_execution",
+          payload: { _paperclipWakeContext: { wakeCommentIds: [lateId ?? commentId] } } });
+        console.info("LATE_ACK_PROOF", JSON.stringify({ retryId, inheritedC: commentId, lateD: lateId,
+          replies: answered.resultJson?.continuousReplies, requeued: wake.payload }));
+      }
       console.info("RESTEER_PROOF", JSON.stringify({ mode, sourceRunId: f.runId, retryRunId: retryId,
         sourceSessionId: r1.nativeSessionId, retrySessionId: sessionId, commentId,
         additionalDeliveries: heldSteering.sent.length, answerBodies: (await comments(retryId)).map(c => c.body),
@@ -467,6 +490,50 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     expect((await comments(f.runId)).map(comment => comment.body)).toEqual(["265"]);
     console.info("HELD_CRASH_PROOF", JSON.stringify({ sourceRunId: f.runId, reasonCode: decision.reasonCode, newRuns: 0, newReplies: 0 }));
   });
+
+  it.each(["deferred", "queued", "pending", "delivering", "fallback_queued"] as const)(
+    "keeps the failed held-run retry when a card response remains pending (%s)", async mode => {
+      const interactionId = randomUUID();
+      const f = await fixture(true, { failed: true, succeed: false, disposition: "needs_review", beforeFinalize: async scope => {
+        await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, scope.agentId));
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+        await publishContinuousNativeReply({ db, cursor: 170, execution: { binding: scope, provider: { kind: "pi_rpc" } },
+          event: { eventType: "item.completed", runId: scope.runId, normalizedSessionId: run.nativeSessionId!,
+            sourceEventId: "answered-comments", itemId: "answered-comments", payload: { kind: "agentMessage", channel: "final", text: "All comments answered",
+              answers: [String(run.contextSnapshot!.wakeCommentId)] } } });
+        await db.insert(issueThreadInteractions).values({ id: interactionId, companyId: scope.companyId, issueId: scope.issueId,
+          kind: "ask_user_questions", status: "answered", sourceRunId: scope.runId, createdByAgentId: scope.agentId,
+          payload: { version: 1, questions: [{ id: "color", prompt: "Which color?", selectionMode: "single", required: true,
+            options: [{ id: "green", label: "Green" }] }] }, resolvedAt: new Date(), resolvedByUserId: run.responsibleUserId,
+          result: { version: 1, answers: [{ questionId: "color", optionIds: ["green"] }] } });
+        if (mode === "deferred" || mode === "queued" || mode === "fallback_queued") {
+          await db.insert(agentWakeupRequests).values({ companyId: scope.companyId, agentId: scope.agentId,
+            source: "issue", reason: "issue_commented", status: mode === "deferred" ? "deferred_issue_execution" : "queued",
+            payload: { issueId: scope.issueId, mutation: "interaction", interactionId, interactionStatus: "answered" } });
+        }
+        if (mode !== "deferred" && mode !== "queued") {
+          await db.insert(issueQuestionResponseDeliveries).values({ companyId: scope.companyId, issueId: scope.issueId,
+            interactionId, sourceRunId: scope.runId, correlationId: `question-response:${interactionId}`,
+            payloadSha256: "test-response-digest", status: mode });
+        }
+        expect(await answeredContinuousHeldRun(db, scope)).toBe(false);
+        await db.update(heartbeatRuns).set({ errorCode: "adapter_failed", error: "Native session failed" }).where(eq(heartbeatRuns.id, scope.runId));
+      } });
+      const [decision] = await db.select().from(statusDecisions).where(eq(statusDecisions.runId, f.runId));
+      expect(decision.reasonCode).toBe("run_failed_partial_evidence_preserved");
+      const retries = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
+        eq(agentWakeupRequests.idempotencyKey, `native-status:${decision.id}:retry`)));
+      expect(retries).toHaveLength(1);
+      console.info("CARD_RETRY_PROOF", JSON.stringify({ mode, runId: f.runId, interactionId,
+        reasonCode: decision.reasonCode, retryWakeId: retries[0].id, retryStatus: retries[0].status }));
+      // A terminal outbox receipt alone is not pending input. In particular,
+      // fallback_queued remains terminal after its ordinary wake has completed.
+      await db.update(agentWakeupRequests).set({ status: "completed" }).where(and(
+        eq(agentWakeupRequests.companyId, f.companyId), sql`${agentWakeupRequests.payload}->>'interactionId' = ${interactionId}`));
+      await db.update(issueQuestionResponseDeliveries).set({ status: mode === "fallback_queued" ? mode : "delivered" })
+        .where(eq(issueQuestionResponseDeliveries.interactionId, interactionId));
+      expect(await answeredContinuousHeldRun(db, { ...f.input, agentId: f.agentId })).toBe(true);
+    });
 
   it("retains ACKed unanswered follow-ups as one failed delivery receipt, never automatic resubmission", async () => {
     const f = await fixture();
@@ -575,7 +642,7 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     expect(await comments(f.runId)).toHaveLength(3);
   });
 
-  it.each([true, false])("maps held finals by explicit answers, or legacy FIFO when absent (answers=%s)", async explicit => {
+  it.each([true, false])("maps held finals by explicit answers, or only opening input when absent (answers=%s)", async explicit => {
     const ids = [randomUUID(), randomUUID(), randomUUID(), randomUUID(), randomUUID()];
     const f = await fixture(true, { beforeFinalize: async scope => {
       await db.update(agents).set({ adapterConfig: { provider: "pi_rpc" } }).where(eq(agents.id, scope.agentId));
@@ -594,7 +661,9 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
           publishContinuousNativeReply({ db, execution, event, cursor: 171 + index })]);
         const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
         const replies = saved.resultJson!.continuousReplies as Record<string, { questionCommentIds: string[]; commentId: string }>;
-        expect(replies[event.itemId].questionCommentIds).toEqual(index === 0 ? [opening.id, ids[0]] : [ids[index]]);
+        expect(replies[event.itemId].questionCommentIds).toEqual(explicit
+          ? index === 0 ? [opening.id, ids[0]] : [ids[index]]
+          : index === 0 ? [opening.id] : []);
         const [reply] = await db.select().from(issueComments).where(eq(issueComments.id, replies[event.itemId].commentId));
         expect(reply.body).toBe(`Reply ${index}`);
       }
@@ -611,10 +680,10 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, f.runId));
     await requeueContinuousUnanswered(db, { id: f.runId, companyId: f.companyId });
     const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, `continuous-unanswered:${f.runId}`));
-    expect(wake.payload).toMatchObject({ _paperclipWakeContext: { wakeCommentIds: [ids[4]] } });
+    expect(wake.payload).toMatchObject({ _paperclipWakeContext: { wakeCommentIds: explicit ? [ids[4]] : ids } });
   });
 
-  it("maps every coalesced and sealed first-turn input even when answers is empty", async () => {
+  it("does not add coalesced or sealed first-turn inputs to explicit empty answers", async () => {
     const ids = [randomUUID(), randomUUID(), randomUUID(), randomUUID()];
     await fixture(false, { beforeFinalize: async scope => {
       await db.update(agents).set({ adapterConfig: { provider: "pi_rpc" } }).where(eq(agents.id, scope.agentId));
@@ -639,7 +708,7 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
       }
       const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
       const replies = saved.resultJson!.continuousReplies as Record<string, { questionCommentIds: string[] }>;
-      expect(replies["sealed-0"].questionCommentIds).toEqual([opening.id, ...ids.slice(0, 3)]);
+      expect(replies["sealed-0"].questionCommentIds).toEqual([]);
       expect(replies["sealed-1"].questionCommentIds).toEqual([ids[3]]);
     } });
   });
@@ -663,7 +732,7 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
       }
       const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
       const replies = saved.resultJson!.continuousReplies as Record<string, { questionCommentIds: string[] }>;
-      expect(replies["exact-0"].questionCommentIds).toEqual([openingId, ids[1]]);
+      expect(replies["exact-0"].questionCommentIds).toEqual([ids[1]]);
       expect(replies["exact-1"].questionCommentIds).toEqual([]);
       expect(replies["exact-2"].questionCommentIds).toEqual([ids[0]]);
       expect(replies["exact-3"].questionCommentIds).toEqual([ids[3], ids[2]]);
@@ -671,7 +740,7 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     } });
   });
 
-  it.each(["succeeded", "failed", "cancelled", "timed_out", "interrupted"])("maps delivery FIFO and requeues only unanswered receipts at %s, once", async status => {
+  it.each(["succeeded", "failed", "cancelled", "timed_out", "interrupted"])("maps explicit delivery answers and requeues only unanswered receipts at %s, once", async status => {
     const ids = [randomUUID(), randomUUID(), randomUUID()];
     const f = await fixture(true, { beforeFinalize: async scope => {
       await db.update(agents).set({ adapterConfig: { provider: "pi_rpc" } }).where(eq(agents.id, scope.agentId));
@@ -684,7 +753,8 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
       for (let index = 0; index < 2; index++) await publishContinuousNativeReply({ db, cursor: 171 + index,
         execution: { binding: scope, provider: { kind: "pi_rpc" } },
         event: { eventType: "item.completed", runId: scope.runId, normalizedSessionId: run.nativeSessionId!,
-          sourceEventId: `fifo-${index}`, itemId: `fifo:m${index}:b0`, payload: { kind: "agentMessage", channel: "final", text: "OK" } } });
+          sourceEventId: `fifo-${index}`, itemId: `fifo:m${index}:b0`, payload: { kind: "agentMessage", channel: "final", text: "OK",
+            answers: index === 0 ? [opening.id, ids[0]] : [ids[1]] } } });
       const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
       const replies = saved.resultJson!.continuousReplies as Record<string, { questionCommentIds: string[] }>;
       expect(replies["fifo:m0:b0"].questionCommentIds).toEqual([opening.id, ids[0]]);
