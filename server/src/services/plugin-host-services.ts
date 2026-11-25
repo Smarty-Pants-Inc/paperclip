@@ -2669,14 +2669,20 @@ export function buildHostServices(
           params.issueId,
           params.body,
           { agentId: params.actorUserId ? undefined : params.authorAgentId, userId: params.actorUserId },
-          { allowConversationAgentInput: !params.actorUserId && Boolean(params.authorAgentId) },
+          {
+            // Installation identity comes from the authenticated host context,
+            // never from plugin-supplied comment attribution. Default deny.
+            allowConversationAgentInput: !params.actorUserId && Boolean(params.authorAgentId)
+              && (process.env.PAPERCLIP_CONVERSATION_INPUT_PLUGIN_IDS ?? "")
+                .split(",").map(id => id.trim()).filter(Boolean).includes(pluginId),
+          },
         )) as IssueComment;
         await logPluginActivity({
           companyId,
           action: "issue.comment.created",
           entityType: "issue",
           entityId: issue.id,
-          actor: { actorAgentId: params.actorUserId ? null : params.authorAgentId ?? null, actorUserId: params.actorUserId ?? null },
+          actor: { actorAgentId: comment.authorAgentId, actorUserId: comment.authorUserId, actorRunId: comment.createdByRunId },
           details: {
             identifier: issue.identifier,
             commentId: comment.id,
@@ -2699,7 +2705,9 @@ export function buildHostServices(
         // falls back to the in-hand snapshot rather than rejecting
         // createComment — a rejection would surface to the caller as a failed
         // write and invite a retry that inserts a duplicate comment.
-        if (params.actorUserId || params.authorAgentId) {
+        // addComment may replace supplied attribution with the authenticated
+        // tool-call origin. Only persisted identity can authorize/attribute wake.
+        if (comment.authorUserId || comment.authorAgentId) {
           const postCommentIssue = (await issues.getById(issue.id).catch((err) => {
             logger.warn(
               { err, issueId: issue.id, commentId: comment.id },
@@ -2709,7 +2717,7 @@ export function buildHostServices(
           })) ?? issue;
           if (
             postCommentIssue.assigneeAgentId
-            && (params.actorUserId || params.authorAgentId !== postCommentIssue.assigneeAgentId)
+            && (comment.authorUserId || comment.authorAgentId !== postCommentIssue.assigneeAgentId)
             && postCommentIssue.status !== "done"
             && postCommentIssue.status !== "cancelled"
           ) {
@@ -2722,8 +2730,8 @@ export function buildHostServices(
                 commentId: comment.id,
                 mutation: "comment",
               },
-              requestedByActorType: params.actorUserId ? "user" : "agent",
-              requestedByActorId: params.actorUserId ?? params.authorAgentId,
+              requestedByActorType: comment.authorUserId ? "user" : "agent",
+              requestedByActorId: comment.authorUserId ?? comment.authorAgentId ?? undefined,
               contextSnapshot: {
                 issueId: issue.id,
                 taskId: issue.id,
@@ -2731,6 +2739,7 @@ export function buildHostServices(
                 wakeCommentId: comment.id,
                 wakeReason: "issue_commented",
                 source: `plugin:${pluginKey}`,
+                ...(comment.createdByRunId ? { sourceRunId: comment.createdByRunId } : {}),
               },
             }).catch((err) => logger.warn({
               err,
