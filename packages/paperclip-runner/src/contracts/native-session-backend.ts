@@ -313,6 +313,8 @@ export interface NativeSession {
     terminal: PrpTerminalState;
     turnId: string | null;
   } | null>;
+  /** Read the provider's own retained user entries; null means unavailable. */
+  readUserMessages?(): Promise<string[] | null>;
   usage?(): Promise<Record<string, unknown> | null>;
   snapshot(
     options?: NativeSessionSnapshotOptions,
