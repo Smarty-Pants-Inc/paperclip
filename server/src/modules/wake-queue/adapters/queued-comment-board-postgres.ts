@@ -24,6 +24,7 @@ import { queuedInteractionId, readQueuedInteractionResponse, type QueuedInteract
 import type { QueuedCommentActor, QueuedCommentSteeringPort, SteerQueuedCommentInput } from "../application/queued-comment-ports.js";
 import { QueuedCommentMutationError } from "../application/queued-comment-use-cases.js";
 import { parseObject } from "../domain/values.js";
+import { continuousSessionAcknowledgedCommentIds, reconcileContinuousSessionInput } from "../../../services/native-runtime/continuous-session-input.js";
 import { isAutomaticSteeringComment, isAutomaticSteeringWake } from "../domain/policy.js";
 import { resolveSessionContinuity } from "../../../services/native-runtime/continued-session.js";
 
@@ -250,12 +251,16 @@ export async function readBoardQueuedComments(input: {
     : null;
   // Messages the active run took into its first turn are no longer queued.
   const claimedByFirstTurn = queueState?.state === "deferred" ? firstTurnClaimedCommentIds(input.activeRun) : new Set<string>();
+  const acknowledgedBySession = input.activeRun && wake
+    ? await continuousSessionAcknowledgedCommentIds(input.executor, {
+      companyId: input.issue.companyId, issueId: input.issue.id, runId: input.activeRun.id,
+    }) : new Set<string>();
   const comments = (await queueCommentsForWake(
     input.executor,
     input.issue.id,
     wake,
     response,
-  )).filter((comment) => !claimedByFirstTurn.has(comment.id));
+  )).filter((comment) => !claimedByFirstTurn.has(comment.id) && !acknowledgedBySession.has(comment.id));
   const assignedAgent = input.issue.assigneeAgentId
     ? await input.executor
         .select({ adapterType: agents.adapterType })
@@ -461,7 +466,10 @@ export function createQueuedCommentSteeringAdapter(db: Db, options: { requireQue
     rejectIdentity: (identity) => rejectSteeredIdentity(db, identity),
     isDeliveryUncertain: steeringDeliveryIsUncertain,
 
-    withLockedTarget(input, apply) {
+    async withLockedTarget(input, apply) {
+      await reconcileContinuousSessionInput(db, {
+        companyId: input.issue.companyId, issueId: input.issue.id, runId: input.targetRunId,
+      });
       return db.transaction(async (tx) => {
         const { issue, wake } = await lockBoardQueueRows({ ...input, tx });
         const { companyId } = issue;
