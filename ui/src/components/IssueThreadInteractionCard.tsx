@@ -1,5 +1,6 @@
 import { Children, createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { Agent } from "@paperclipai/shared";
+import { ResumeReviewAction } from "./ResumeReviewAction";
 import { AlertTriangle, ArrowUpRight, Bot, Check, CheckCircle2, ChevronDown, ChevronRight, CircleDashed, Clock, ExternalLink, FileText, GitBranch, ImagePlus, KeyRound, Loader2, Lock, MessageSquareQuote, MinusCircle, ShieldAlert, ThumbsUp, TriangleAlert, Wrench, X, XCircle } from "lucide-react";
 import { Link } from "@/lib/router";
 import { appTabHref } from "@/pages/apps/app-tabs";
@@ -3217,7 +3218,7 @@ function RequestConfirmationCard({
 
       {interaction.status === "pending" ? (
         <ConfirmationActionRow
-          footerSlot={footerSlot}
+          footerSlot={<>{footerSlot}<ResumeReviewAction interaction={interaction} disabled={working !== null} /></>}
           resetKey={`${interaction.id}:${interaction.status}`}
           approveLabel={compact ? compactActions.approveLabel : interaction.payload.acceptLabel ?? CONFIRMATION_APPROVE_LABEL}
           rejectLabel={compact ? compactActions.rejectLabel : CONFIRMATION_REJECT_LABEL}
