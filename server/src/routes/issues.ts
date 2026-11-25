@@ -8549,10 +8549,6 @@ export function issueRoutes(
       issueRunPresence.liveRuns(issue),
       issueRunPresence.activeRun(issue),
     ]);
-    if (req.actor.type === "agent" && req.actor.agentId && req.actor.runId) {
-      await recordInteractionResponseRead(db, { companyId: issue.companyId, agentId: req.actor.agentId,
-        runId: req.actor.runId, issue, interactions });
-    }
     return {
       issue: issueCore,
       ...recentCommentsAndFacts,
@@ -17888,8 +17884,21 @@ export function issueRoutes(
     const interactions =
       await issueThreadInteractionService(db).listForIssue(issue.id, issue);
     if (req.actor.type === "agent" && req.actor.agentId && req.actor.runId) {
-      await recordInteractionResponseRead(db, { companyId: issue.companyId, agentId: req.actor.agentId, runId: req.actor.runId,
-        issue, interactions });
+      const { agentId, runId } = req.actor;
+      // A close without finish must not retire an answer the response never delivered.
+      // Receipt failures leave the answer owed, never fail an already-sent response.
+      res.once("finish", () => {
+        void recordInteractionResponseRead(db, {
+          companyId: issue.companyId,
+          agentId,
+          runId,
+          issue,
+          interactions,
+        }).catch(error => logger.warn(
+          { err: error, runId },
+          "could not record the interaction responses a run read",
+        ));
+      });
       await recordDeclinedInteractionRead(db, { companyId: issue.companyId, agentId: req.actor.agentId, runId: req.actor.runId,
         issue, interactions: interactions as Parameters<typeof recordDeclinedInteractionRead>[1]["interactions"] })
         .catch(error => logger.warn({ err: error, runId: req.actor.runId }, "could not record the declined actions a run read"));
