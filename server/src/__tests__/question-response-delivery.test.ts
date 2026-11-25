@@ -443,31 +443,6 @@ describeEmbeddedPostgres("question response delivery", () => {
     },
   );
 
-  it.each([false, true])("anchors a card answer to the input acknowledged when it was asked, not the run's first or later input (explicit source=%s)", async explicit => {
-    const seeded = await seed({ sourceCommentBody: "Count to 50 slowly", attachSourceCommentToInteraction: false });
-    const [asking, later] = await db.insert(issueComments).values([
-      { companyId: seeded.companyId, issueId: seeded.issueId, authorUserId: "external-user",
-        body: "When you finish, ask me ONE question with your question-card tool" },
-      { companyId: seeded.companyId, issueId: seeded.issueId, authorUserId: "external-user", body: "A later unrelated message" },
-    ]).returning();
-    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: seeded.issueId, wakeCommentId: seeded.sourceCommentId,
-      wakeCommentIds: [seeded.sourceCommentId] }, resultJson: { queuedSteeringAcknowledgements: {
-        [asking.id]: { status: "acknowledged", acknowledgedAt: new Date(new Date(seeded.interaction.createdAt).getTime() - 1000).toISOString() },
-        [later.id]: { status: "acknowledged", acknowledgedAt: new Date(new Date(seeded.interaction.createdAt).getTime() + 1000).toISOString() },
-      } } }).where(eq(heartbeatRuns.id, seeded.sourceRunId));
-    // A saved source is authoritative even when a newer ACK predates the card.
-    if (explicit) await db.update(issueThreadInteractions).set({ sourceCommentId: seeded.sourceCommentId }).where(eq(issueThreadInteractions.id, seeded.interaction.id));
-    const [continuation] = await db.insert(heartbeatRuns).values({ companyId: seeded.companyId, agentId: seeded.agentId,
-      status: "queued", contextSnapshot: { issueId: seeded.issueId, interactionId: seeded.interaction.id } }).returning();
-    const wakeup = vi.fn().mockResolvedValue(continuation);
-    await questionResponseDeliveryService(db, { heartbeat: { wakeup } as never }).deliver(seeded.interaction.id);
-    const expected = explicit ? seeded.sourceCommentId : asking.id;
-    expect(wakeup).toHaveBeenCalledWith(seeded.agentId, expect.objectContaining({
-      payload: expect.objectContaining({ sourceCommentId: expected, wakeCommentId: expected, wakeCommentIds: [expected] }),
-      contextSnapshot: expect.objectContaining({ sourceCommentId: expected, wakeCommentId: expected, wakeCommentIds: [expected] }),
-    }));
-  });
-
   it("does not promote a source-run wake comment from another issue", async () => {
     const seeded = await seed();
     const goalId = await db

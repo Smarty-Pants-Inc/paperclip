@@ -1,3 +1,4 @@
+import { nativeQuestionSourceCommentId } from "./native-question-source.js";
 import { assertAgentInteraction } from "../agent-interaction-policy.js";
 import { authorizationDeniedDetails } from "../authorization.js";
 import { budgetServiceInTransaction } from "../budgets.js";
@@ -3426,6 +3427,7 @@ export class PaperclipRunnerToolAuthority {
           kind,
           idempotencyKey,
           sourceRunId: this.binding.runId,
+          ...(kind === "ask_user_questions" ? { sourceCommentId: await nativeQuestionSourceCommentId(tx, this.binding) } : {}),
           title: requiredString(input.title),
           summary: prompt,
           ...(input.resolverPolicy === undefined ? {} : { resolverPolicy: input.resolverPolicy }),

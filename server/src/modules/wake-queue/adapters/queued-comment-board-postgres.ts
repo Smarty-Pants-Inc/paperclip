@@ -5,7 +5,7 @@ import { agentRunWritesRevoked } from "../../../agent-run-cancellation.js";
 import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { assertQueuedCommentInteractionDelivery, recheckQueuedCommentInteractionDelivery } from "../../../services/agent-interaction-delivery.js";
 import { deliverSteeredMessage, steeringDeliveryIsUncertain } from "../../../services/queued-comment-steering.js";
-import { acceptSteeredIdentity, rejectSteeredIdentity, reserveSteeredIdentity, type RunIdentityContext } from "../../../services/run-identity.js";
+import { acceptSteeredIdentity, rejectSteeredIdentity, reserveSteeredIdentity, storedSteeringAcknowledgement, type RunIdentityContext } from "../../../services/run-identity.js";
 import {
   buildQueuedCommentQueueSnapshot,
   decideQueuedCommentQueueSteering,
@@ -534,6 +534,7 @@ export function createQueuedCommentSteeringAdapter(db: Db, options: { requireQue
             )).for("update");
             if (!acknowledgedRun || !runTargetsIssue(acknowledgedRun, issue.id)) return null;
             const result = parseObject(acknowledgedRun.resultJson);
+            const providerAck = await storedSteeringAcknowledgement(tx, { companyId, runId: targetRunId, messageId: commentId });
             if (identity) await acceptSteeredIdentity(tx, identity);
 
             const now = new Date();
@@ -552,7 +553,7 @@ export function createQueuedCommentSteeringAdapter(db: Db, options: { requireQue
                 ...result,
                 queuedSteeringAcknowledgements: {
                   ...parseObject(result.queuedSteeringAcknowledgements),
-                  [commentId]: { status: "acknowledged", queueId: wake.id, turnId, acknowledgedAt: now.toISOString(), afterEventSeq: run!.nextEventSeq - 1 },
+                  [commentId]: { status: "acknowledged", queueId: wake.id, turnId, acknowledgedAt: now.toISOString(), afterEventSeq: providerAck?.afterEventSeq ?? acknowledgedRun.nextEventSeq - 1 },
                 },
               },
               updatedAt: now,
