@@ -456,6 +456,16 @@ queued for ordinary admission; `/new` is never sent as steering text. Active
 provider work is not interrupted, the run is not marked person-stopped, and no
 messages are returned to the draft by this idle-hold release.
 
+When a Pi turn fails before any runner/provider execution started, its saved
+person inputs remain pending. The next admitted turn takes these inputs through
+the first-turn queued-input claim, oldest first, including when a new message
+starts that turn. A deferred input-only receipt is not permission to start work:
+automatic starts retain their existing retry budget, and exhaustion leaves Retry
+available rather than silently discarding input. An operator-waiting recovery
+action without committed delivery does not hide Retry. Failures after provider
+work retain their existing recovery rules; Stop and `/new` still retire their
+own inputs.
+
 Document links labeled to open in the sidebar keep the conversation on screen
 and show the requested document revision. **Open source task** in the sidebar
 takes the reader to the owning task's detail page with its task breadcrumb.
