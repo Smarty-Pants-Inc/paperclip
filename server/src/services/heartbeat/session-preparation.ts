@@ -206,13 +206,21 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
     preserveLegacySessionWithoutConfigMetadata:
       acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision && !agentIdentity,
   });
+  const continuousPi = runtimeConfig.provider === "pi_rpc" &&
+    resolveSessionContinuity(runtimeConfig.provider, runtimeConfig.sessionContinuity) === "continuous";
+  // Only instruction content and pack/environment configuration may advance.
+  // Missing/versioned metadata and mixed changes still require stock reset.
+  const continuableConfigChange = continuousPi && sessionConfigFreshness.changedCategories.length > 0 &&
+    sessionConfigFreshness.changedCategories.every(category =>
+      ["instructions", "adapterConfig", "environment", "envBindings"].includes(category));
   let resetTaskSession =
     context.workspaceSelectionChanged === true || shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
   if (decideNativeContinuation({
     provider: runtimeConfig.provider, sessionContinuity: runtimeConfig.sessionContinuity, hasSession: taskSession != null, wakeReset: true,
     resetRequired: context.explicitFreshSession === true || context.conversationReset === true ||
       (context.workspaceSelectionChanged === true && (agent.adapterType !== "paperclip_runner" || runtimeConfig.provider !== "pi_rpc")) ||
-      (runtimeConfig.provider !== "pi_rpc" && sessionConfigFreshness.reasons.some(reason => reason !== wakeSessionResetReason)) ||
+      sessionConfigFreshness.reasons.some(reason => reason !== wakeSessionResetReason &&
+        !(continuableConfigChange && reason.startsWith("effective run configuration changed: "))) ||
       (context.wakeReason === "heartbeat_timer" && !deriveTaskKey(context, null)),
   }).continue) resetTaskSession = false;
   const sessionResetReason =
