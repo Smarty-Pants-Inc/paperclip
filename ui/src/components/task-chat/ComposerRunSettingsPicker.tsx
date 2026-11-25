@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { ArrowLeft, Check, ChevronDown, Plus, RotateCcw, Search, X, Zap } from "lucide-react";
 import { aiRuntimeConnectionBindingSchema, agentHarnessType, type Agent, type IssueAssigneeAdapterOverrides } from "@paperclipai/shared";
 import { agentsApi, type AdapterModel } from "@/api/agents";
+import { useConnectionModelsState } from "@/components/ai-connections/useConnectionModels";
 import { useCloudInstance } from "@/hooks/useCloudInstance";
 import { useCloudHarnessPolicy } from "@/hooks/useCloudHarnessPolicy";
 import { queryKeys } from "@/lib/queryKeys";
@@ -123,6 +124,12 @@ export function ComposerRunSettingsPicker({
   }, [isMuseRunner, settings, onSettingsChange]);
   const binding = aiRuntimeConnectionBindingSchema.safeParse(agent?.runtimeConfig?.aiConnection).data;
   const poolId = binding?.mode === "router" ? binding.connectionId : undefined;
+  // Pi RPC uses the same routed, provider-qualified catalog as AgentConfigForm.
+  const connectionOnlyCatalog = agent?.adapterType === "paperclip_runner" && provider === "pi_rpc";
+  const { connectionModels, loading: connectionModelsLoading } = useConnectionModelsState(
+    connectionOnlyCatalog && modelSupported && !modelOptionsOverride ? companyId : null,
+    binding?.mode === "router" ? undefined : binding, "pi_rpc",
+  );
   const nativeCatalog = nativeTaskModelCatalogOptions(agent);
   const acpxAgent = agent?.adapterType === "paperclip_runner" && provider === "acpx" && typeof agent.adapterConfig.acpxAgent === "string" ? agent.adapterConfig.acpxAgent : undefined;
   const nativeCatalogScope = JSON.stringify(nativeCatalog ?? null);
@@ -135,7 +142,7 @@ export function ComposerRunSettingsPicker({
       environmentId: agent!.defaultEnvironmentId ?? null, provider, poolId, acpxAgent, ...nativeCatalog,
     }),
     ...(nativeCatalog ? ACCOUNT_BOUND_MODEL_DISCOVERY_QUERY_OPTIONS : {}),
-    enabled: Boolean(agent && modelSupported && !modelOptionsOverride && (!nativeCatalog || requestNativeModels)),
+    enabled: Boolean(agent && modelSupported && !connectionOnlyCatalog && !modelOptionsOverride && (!nativeCatalog || requestNativeModels)),
   });
   useEffect(() => {
     if (requestNativeModels) void refreshModels();
@@ -143,8 +150,8 @@ export function ComposerRunSettingsPicker({
   // The server resolves instance-declared models first and otherwise returns the
   // adapter's curated catalog. Do not replace a declared Codex list locally.
   const models: readonly (AdapterModel & { detail?: string })[] = modelOptionsOverride
-    ?? fetchedModels;
-  const catalogPending = modelsPending && !modelOptionsOverride;
+    ?? (connectionOnlyCatalog ? connectionModels?.models ?? [] : fetchedModels);
+  const catalogPending = (connectionOnlyCatalog ? connectionModelsLoading || connectionModels?.isLoading : modelsPending) && !modelOptionsOverride;
   const base = assigneeValue === currentAssigneeValue
     ? readComposerRunSettings(overrides, agent?.adapterType)
     : DEFAULT_COMPOSER_RUN_SETTINGS;
@@ -178,7 +185,7 @@ export function ComposerRunSettingsPicker({
     `${item.label} ${item.id}`.toLowerCase().includes(query.toLowerCase()));
   const exactMatch = models.some((item) => item.id.toLowerCase() === query.toLowerCase());
   const needsProvider = agent && (["opencode_local", "pi_local", "kimi_local"].includes(agent.adapterType)
-    || (agent.adapterType === "paperclip_runner" && provider === "opencode"));
+    || (agent.adapterType === "paperclip_runner" && (provider === "opencode" || provider === "pi_rpc")));
   const manualValid = query.length > 0 && !/\s/.test(query)
     && (!needsProvider || /^[^/]+\/.+[^/]$/.test(query))
     && (provider !== "openrouter" || /^openrouter\/[^/]+\/.+[^/]$/.test(query));
@@ -290,7 +297,7 @@ export function ComposerRunSettingsPicker({
       {catalogPending ? <p className="px-2.5 py-2 text-xs text-muted-foreground">Loading models…</p> : null}
       {!catalogPending && !filteredModels.length && query ? <p className="px-2.5 py-2 text-xs text-muted-foreground">No catalog match.</p> : null}
     </div>
-    {query && !exactMatch ? <div className="mt-2 border-t border-border pt-2"><button type="button" disabled={!manualValid} onClick={() => chooseModel(query)} className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-sm hover:bg-accent disabled:opacity-40"><Plus className="size-4 shrink-0" aria-hidden /><span className="min-w-0 flex-1 truncate">Use exact ID <span className="font-mono font-semibold">{query}</span></span></button>{!manualValid ? <p className="px-2.5 text-xs text-destructive">{provider === "openrouter" ? "Use openrouter/provider/model with no spaces." : "Model IDs cannot contain spaces."}</p> : null}</div> : null}
+    {query && !exactMatch ? <div className="mt-2 border-t border-border pt-2"><button type="button" disabled={!manualValid} onClick={() => chooseModel(query)} className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-sm hover:bg-accent disabled:opacity-40"><Plus className="size-4 shrink-0" aria-hidden /><span className="min-w-0 flex-1 truncate">Use exact ID <span className="font-mono font-semibold">{query}</span></span></button>{!manualValid ? <p className="px-2.5 text-xs text-destructive">{provider === "openrouter" ? "Use openrouter/provider/model with no spaces." : needsProvider ? "Use provider/model with no spaces." : "Model IDs cannot contain spaces."}</p> : null}</div> : null}
     <p className="px-2.5 pb-1 pt-2 text-xs text-muted-foreground">{provider === "openrouter" ? "Custom IDs: openrouter/provider/model. Provider access is checked when the run starts." : "Custom model IDs can be pasted here. Provider access is checked when the run starts."}</p>
   </div>;
 
