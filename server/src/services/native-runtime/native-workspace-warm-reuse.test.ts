@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
-import { agents, agentWakeupRequests, applyPendingMigrations, companies, createDb, environmentLeases, environments, executionWorkspaces, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, plugins, workspaceOperations } from "@paperclipai/db";
+import { agents, agentWakeupRequests, applyPendingMigrations, companies, createDb, environmentLeases, environments, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, plugins, workspaceOperations } from "@paperclipai/db";
 import type { Environment } from "@paperclipai/shared";
 import type { PluginWorkerManager } from "../plugin-worker-manager.js";
 import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -12,6 +12,7 @@ import * as providers from "../sandbox-provider-runtime.js";
 import { createSystemRecovery, failSystemRecovery, reserveSystemRecoveryAttempt, SystemRecoveryFailure } from "../system-recovery-state.js";
 import { recoverRetainedWorkspace } from "../workspace-recovery.js";
 import { preserveLegacyWorkspaceRestoreSources } from "../legacy-workspace-restore-recovery.js";
+import { recordRequiredWorkspaceRestoreFailure } from "../legacy-execution-recovery.js";
 import { settleStopOnlyCleanup } from "../sandbox-stop-and-retain.js";
 import { settleRecoveredWorkspaceRestoreHolds } from "../workspace-restore-hold-settlement.js";
 import { nativeWorkspaceExportPendingForLease, nativeWorkspaceExportPendingForResource } from "./native-workspace-finalization-state.js";
@@ -77,6 +78,21 @@ describe("native workspace export warm reuse fence", () => {
     call.mockClear();
     return { runtime, input, runId, nextRunId, reference, lease: acquired.lease, call };
   }
+
+  it.each(["runner.ingress.acquire", "runner.transport.connect"])("keeps file safety without blaming saved files when %s failed", async span => {
+    const f = await seed(true, false);
+    const [failed] = await db.update(heartbeatRuns).set({ status: "failed", errorCode: "native_session_interrupted",
+      error: "Boat returned an invalid private preview URL.", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId)).returning();
+    await db.insert(heartbeatRunEvents).values({ companyId: f.input.companyId, agentId: f.input.agentId, runId: f.runId,
+      seq: 1, eventType: "run.performance.span", payload: { schema: "paperclip.run-performance-span.v1", span, outcome: "failed" } });
+    await recordRequiredWorkspaceRestoreFailure(db, failed, { workspaceRestoreFailure: "restore_failed" }, f.lease);
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.input.issueId));
+    expect(action.nextAction).toBe("Couldn't connect to the agent's machine. No agent work started. Your message is saved. Press Retry to start it again.");
+    expect(action.nextAction).not.toMatch(/saved files|saved work|Boat/i);
+    expect(action.evidence.workspaceRestoreRecovery).toMatchObject({ leaseIds: [f.lease.id] });
+    const [held] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+    expect(held).toMatchObject({ leasePolicy: "retain_on_failure", status: "pending_cleanup" });
+  });
 
   async function expectFreshAllocation(f: Awaited<ReturnType<typeof seed>>, runtime = f.runtime) {
     const [protectedLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));

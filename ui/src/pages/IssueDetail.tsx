@@ -9108,9 +9108,11 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                   }
                   resumeAssigneePending={resumeAssigneeAgent.isPending}
                   onTryAgainNoLiveExecutionPath={
-                    issue.status === "blocked" && !issue.interruption && issue.activeRecoveryAction
-                      ? handleTryAgainNoLiveExecutionPath
-                      : undefined
+                    canResolveBoardRecoveryAction && issue.interruption?.unansweredCommentId && issue.interruption.canRetry
+                      ? taskRetry.retry
+                      : issue.status === "blocked" && !issue.interruption && issue.activeRecoveryAction
+                        ? handleTryAgainNoLiveExecutionPath
+                        : undefined
                   }
                   tryAgainNoLiveExecutionPathPending={
                     resolveRecoveryAction.isPending &&

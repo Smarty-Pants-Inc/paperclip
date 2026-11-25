@@ -24,6 +24,8 @@ import { and, desc, eq, getTableColumns, inArray, isNull, or, sql, type SQL } fr
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { executionStartedEventPredicate, isPreDispatchResourceWait } from "./pre-dispatch-execution-evidence.js";
 import { readRunCancellation } from "./run-cancellation.js";
+import { readRunFailureStage } from "./run-failure-stage.js";
+import { classifiedRunFailure } from "./recovery/stranded-notice.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
@@ -40,6 +42,14 @@ type Run = typeof heartbeatRuns.$inferSelect;
 export const UNRESTORED_FILES_NEXT_ACTION = "The task's saved files could not be put back after the run stopped. "
   + "They are kept where they were and are not applied. Press Retry to continue from the last saved version in a new workspace.";
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
+
+async function workspaceRecoveryNextAction(db: Pick<Db, "select">, run: Pick<Run, "id" | "companyId" | "errorCode">) {
+  // Containing a prepared workspace does not mean its files caused the failure.
+  const failure = classifiedRunFailure({ errorCode: run.errorCode,
+    ...(run.errorCode === "native_session_interrupted" ? await readRunFailureStage(db, run.companyId, run.id) : undefined) });
+  return ["agent_machine_unreachable", "agent_machine_unavailable", "previous_session_unconfirmed"].includes(failure.code)
+    ? `${failure.title}. ${failure.detail} Press Retry to start it again.` : UNRESTORED_FILES_NEXT_ACTION;
+}
 
 const unusedReconciliationContextKeys = [
   "executionContinuation", "paperclipWake", "paperclipWakeComment",
@@ -324,7 +334,7 @@ export async function terminalizeLegacyExecution(input: {
       const values = { status: "resolved", outcome: "blocked", ownerType: "board", ownerAgentId: null,
         ownerUserId: null, returnOwnerAgentId: null, evidence, resolvedAt: now, updatedAt: now,
         wakePolicy: null, monitorPolicy: null,
-        nextAction: UNRESTORED_FILES_NEXT_ACTION,
+        nextAction: await workspaceRecoveryNextAction(tx, updated),
       };
       if (existing) await tx.update(issueRecoveryActions).set(values).where(eq(issueRecoveryActions.id, existing.id));
       else await tx.insert(issueRecoveryActions).values({ ...values, companyId: run.companyId,
@@ -361,7 +371,7 @@ export async function terminalizeLegacyExecution(input: {
           attempt: executionFailureRetryCount(run) + 1,
         },
         nextAction: hasRequiredWorkspaceRecovery(updated.resultJson)
-          || hasWorkspaceRestoreFailure(updated.resultJson) ? UNRESTORED_FILES_NEXT_ACTION
+          || hasWorkspaceRestoreFailure(updated.resultJson) ? await workspaceRecoveryNextAction(tx, updated)
           : "The run stopped before it finished, and Paperclip cannot tell which of its last actions took effect. "
             + "Press Retry to continue the task in a fresh run; the agent checks those actions before repeating any.",
         maxAttempts: 3,
