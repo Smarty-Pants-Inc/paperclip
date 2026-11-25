@@ -5,6 +5,7 @@ import {
   readCodexTurnMetadata,
   readCodexTurnItems,
   readCodexUserMessages,
+  readCodexUserInputIds,
 } from "./codex-history.js";
 
 const unsupported = (method: string) => new CodexRpcError(`${method} is not supported`, CODEX_METHOD_NOT_FOUND);
@@ -22,6 +23,21 @@ describe("Codex paginated history", () => {
     const request = vi.fn().mockResolvedValueOnce({ data: [{ id: "one", status: "failed" }] })
       .mockResolvedValueOnce({ data: [{ turnId: "one", item: { id: "c", type: "userMessage" } }] });
     expect(await readCodexUserMessages({ request }, "thread")).toBeNull();
+  });
+  it("certifies only provider-retained user correlation IDs, not matching text, item ids or assistant echoes", async () => {
+    const request = vi.fn().mockResolvedValueOnce({ data: [{ id: "one", status: "failed" }] })
+      .mockResolvedValueOnce({ data: [
+        { turnId: "one", item: { id: "entry-1", type: "userMessage", correlationId: "card-id", content: [{ type: "text", text: "K" }] } },
+        { turnId: "one", item: { id: "copy-id", type: "userMessage", content: [{ type: "text", text: "K" }] } },
+        { turnId: "one", item: { id: "one:steer:ack-only-id", type: "userMessage", content: [{ type: "text", text: "K" }] } },
+        { turnId: "one", item: { id: "assistant", type: "agentMessage", correlationId: "echo-id", text: "K" } },
+      ] });
+    expect(await readCodexUserInputIds({ request }, "thread")).toEqual(["card-id"]);
+  });
+  it("does not certify identity from legacy retained text alone", async () => {
+    const request = vi.fn().mockResolvedValueOnce({ data: [{ id: "one", status: "failed" }] })
+      .mockResolvedValueOnce({ data: [{ turnId: "one", item: { id: "c", type: "userMessage", content: [{ type: "text", text: "C" }] } }] });
+    expect(await readCodexUserInputIds({ request }, "thread")).toEqual([]);
   });
   it("reads state without hydrating history", async () => {
     const request = vi.fn().mockResolvedValue({ thread: { id: "thread" } });

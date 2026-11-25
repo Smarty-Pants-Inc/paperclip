@@ -9857,11 +9857,12 @@ export async function resolveNativeRuntimeRequest(input: {
   }
 }
 
-/** Called before taking issue/run locks; unreadable history must not lose input. */
-export async function readNativeSessionUserMessages(runId: string, normalizedSessionId: string): Promise<string[] | null> {
+/** Provider-retained identity only, never a submitted command or matching text.
+ * Called before issue/run locks; old packs without this read provide no proof. */
+export async function readNativeSessionUserInputIds(runId: string, normalizedSessionId: string): Promise<string[] | null> {
   const active = activeNativeSessions.get(runId);
   if (!active || active.session.identity().sessionId !== normalizedSessionId) return null;
-  try { return await active.session.readUserMessages?.() ?? null; }
+  try { return await active.session.readUserInputIds?.() ?? null; }
   catch { return null; }
 }
 
