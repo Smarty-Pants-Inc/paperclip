@@ -5,11 +5,12 @@ import { parseObject } from "../../adapters/utils.js";
 
 export const HELD_NATIVE_CONFIGURATION_TOPIC = "native-held-configuration";
 
-/** Durable, agent-scoped intent; observers act only after commit and re-read it.
+/** Durable agent-scoped (optionally issue-scoped) intent; observers act only after commit and re-read it.
  * Old runs without this additive flag keep their existing hold policy. No wakes,
  * cancellation state, or next-run session-compatibility policy are changed. */
-export async function requestHeldNativeConfigurationEnd(tx: Db, scope: { companyId: string; agentId: string }) {
+export async function requestHeldNativeConfigurationEnd(tx: Db, scope: { companyId: string; agentId: string; issueId?: string }) {
   const running = and(eq(heartbeatRuns.companyId, scope.companyId), eq(heartbeatRuns.agentId, scope.agentId),
+    scope.issueId ? eq(heartbeatRuns.nativeIssueId, scope.issueId) : undefined,
     eq(heartbeatRuns.runtimeMode, "native"), eq(heartbeatRuns.status, "running"));
   const runs = await tx.select({ id: heartbeatRuns.id, issueId: heartbeatRuns.nativeIssueId }).from(heartbeatRuns).where(running);
   const issueIds = [...new Set(runs.flatMap(run => run.issueId ? [run.issueId] : []))].sort();
