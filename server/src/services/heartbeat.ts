@@ -1,4 +1,5 @@
 import { normalizePiIssueModelSelection, validatePiRunSelection } from "../adapters/pi-model-selection.js";
+import { resolveSessionContinuity } from "./native-runtime/continued-session.js";
 import { registerHeldPreparationResumer } from "./interrupted-preparation-hold-settlement.js";
 import { settlePreDispatchStopRecovery } from "./heartbeat/pre-dispatch-stop-settlement.js";
 import { registerCompletedTurnCleanupResumer } from "./native-runtime/completed-turn-cleanup-hold-settlement.js";
@@ -2369,8 +2370,11 @@ export function heartbeatService(
           const released = run.processLossRetryCount > 0 || (readiness && readiness.mode !== "fresh_isolated_workspace") ? false
             : await executionWorkspacesSvc.releaseAncestorWorkspaceBindingAtAdmission({ companyId: agent.companyId, issueId, runId: run.id });
           if (changed || released) {
-            delete context.resumeSessionParams;
-            delete context.resumeSessionDisplayId;
+            if (!(agent.adapterType === "paperclip_runner" && parseObject(agent.adapterConfig).provider === "pi_rpc" &&
+              resolveSessionContinuity("pi_rpc", parseObject(agent.adapterConfig).sessionContinuity) === "continuous")) {
+              delete context.resumeSessionParams;
+              delete context.resumeSessionDisplayId;
+            }
             context.workspaceSelectionChanged = true;
           }
         }
@@ -2835,7 +2839,8 @@ export function heartbeatService(
         delete context.paperclipContinuationSummary;
       }
       const taskSessionDecodedParams = normalizeSessionParams(
-        sessionCodec.deserialize(context.workspaceSelectionChanged ? null : taskSession?.sessionParamsJson ?? null),
+        sessionCodec.deserialize(context.workspaceSelectionChanged && !(agent.adapterType === "paperclip_runner" &&
+          parseObject(agent.adapterConfig).provider === "pi_rpc" && resolveSessionContinuity("pi_rpc", parseObject(agent.adapterConfig).sessionContinuity) === "continuous") ? null : taskSession?.sessionParamsJson ?? null),
       );
       const explicitResumeSessionParams = normalizeResumeParamsForAdapter(
         agent.adapterType,
@@ -3719,6 +3724,7 @@ export function heartbeatService(
             getNativeFreshSessionHandoff,
             pluginTaskDescription: runtimeSelection.pluginTaskDescription,
             toolRefreshOnResume: runtimeSelection.toolRefreshOnResume,
+            workspaceContinuationSource: runtimeSelection.workspaceContinuationSource,
             getFreshSessionHandoff,
             runOptions,
           },
