@@ -2981,15 +2981,17 @@ function readPluginRunnerReceiptRunId(root: string): unknown {
   } catch { return null; }
 }
 
-type VerifiedRemoteRecoverableFailureReceipt = Readonly<{ stateJson: string }>;
+// Also covers a ready checkpoint, but only on a verified process-loss generation.
+type VerifiedRemoteRecoverableFailureReceipt = Readonly<{ stateJson: string; resumedProcessRestartKey?: string }>;
 
 function matchesVerifiedRecoverableFailureReceipt(
   state: Record<string, unknown>,
   receipt: VerifiedRemoteRecoverableFailureReceipt | undefined,
 ): boolean {
-  if (!receipt || state.lifecycle !== "recoverable_failure") return false;
+  if (!receipt) return false;
   const verified = record(JSON.parse(receipt.stateJson));
-  return verified.lifecycle === "recoverable_failure" && state.schema === verified.schema
+  return (verified.lifecycle === "recoverable_failure" || (verified.lifecycle === "ready" && !!receipt.resumedProcessRestartKey))
+    && state.lifecycle === verified.lifecycle && state.schema === verified.schema
     && REMOTE_RUNNER_IDENTITY_FIELDS.every(field => state[field] === verified[field]);
 }
 
@@ -6653,6 +6655,10 @@ async function migrateRunnerdStateRootForExecution(input: {
   );
   await restoreWarmRunnerdController(input);
   await restorePerTurnRunnerdController(input);
+  if (!input.verifiedRecoverableFailureReceipt && sandboxProcessRestartKey(input.runnerExecutionTarget)) {
+    const receipt = await restoreRemoteSuspendedRunnerCheckpoint(input, scoped);
+    if (receipt) input = { ...input, verifiedRecoverableFailureReceipt: receipt };
+  }
   // A crash can leave a source archive intent before/after its rename. Until
   // that exact maintenance is settled, absence of a canonical root is not
   // permission to bootstrap a replacement provider session.
@@ -7905,15 +7911,17 @@ export async function restoreRemoteSuspendedRunnerCheckpoint(input: {
   db: Db; execution: NativeExecutionInput;
   runnerExecutionTarget?: AdapterExecutionTarget | null;
   verifiedRecoverableFailureReceipt?: VerifiedRemoteRecoverableFailureReceipt;
-}, root: string): Promise<void> {
+}, root: string): Promise<VerifiedRemoteRecoverableFailureReceipt | undefined> {
   const target = input.runnerExecutionTarget;
   const prior = readRunnerdDurableIdentity(root);
   // PRP and lifecycle evidence have different owners. A failed remote read can
   // leave a valid PRP projection, so its presence must not suppress this retry.
   // Never overwrite contradictory local Runner evidence with a remote receipt.
   if (target?.kind !== "remote" || target.transport !== "sandbox" || target.sandboxLeaseAcquisition?.outcome !== "resumed"
-    || !durableIdentityMatchesSession(prior, input.execution) || prior.runId === input.execution.binding.runId
-    || runnerdAuthorityLifecycle(root, prior) !== "absent") return;
+    || !durableIdentityMatchesSession(prior, input.execution) || prior.runId === input.execution.binding.runId) return;
+  const localLifecycle = runnerdAuthorityLifecycle(root, prior);
+  if (localLifecycle !== "absent" && (localLifecycle !== "not_suspended" || !sandboxProcessRestartKey(target))) return;
+  const receipt = input.verifiedRecoverableFailureReceipt ?? await verifyResumedDeadRunnerCheckpoint(input, prior);
   let state: Record<string, unknown>;
   // A Runner left in an abandoned allocation is never adopted live: the new
   // execution restored the last save into its own root of the same sandbox.
@@ -7933,13 +7941,11 @@ export async function restoreRemoteSuspendedRunnerCheckpoint(input: {
     state = await readRemoteRunnerState({ runner: target.runner,
       stateDirectory: remoteRunnerStateDirectory(retained.remoteCwd, nativeSessionKey(input.execution)) });
   }
-  await reconcileControllerJournalWithRunner({ ...controllerProjectionInput(input, { runId: prior.runId, issueId: input.execution.binding.issueId }), runnerState: state });
-  // Only the typed step-aside can authorize this additional inert lifecycle.
-  // Bind the fresh box read to the exact receipt whose identity and dead pid
-  // were verified; ordinary callers still cache suspension only.
-  const verifiedFailure = matchesVerifiedRecoverableFailureReceipt(state, input.verifiedRecoverableFailureReceipt)
-    && canonicalJson(state) === input.verifiedRecoverableFailureReceipt!.stateJson;
-  if (input.verifiedRecoverableFailureReceipt && !verifiedFailure) {
+  // A typed dead-process proof, never the allocation outcome alone, authorizes
+  // an unsuspended checkpoint. Re-read byte equality precedes ALL journal/cache writes.
+  const verifiedFailure = matchesVerifiedRecoverableFailureReceipt(state, receipt)
+    && canonicalJson(state) === receipt!.stateJson;
+  if (receipt && !verifiedFailure) {
     throw new Error("native_controller_recovery_missing_evidence:runner_not_settled");
   }
   if (!movedAllocation && input.execution.session.lifecyclePolicy.mode === "warm" && state.lifecycle !== "suspended" && !verifiedFailure) return;
@@ -7948,7 +7954,53 @@ export async function restoreRemoteSuspendedRunnerCheckpoint(input: {
     || state.pendingProviderCleanup != null || state.warmTransition != null) {
     throw new Error("native_controller_recovery_missing_evidence:runner_not_settled");
   }
+  if (localLifecycle !== "absent") {
+    if (!verifiedFailure || runnerdAuthorityLifecycle(root, prior, receipt) !== "suspended") {
+      throw new Error("native_controller_recovery_missing_evidence:runner_not_settled");
+    }
+    return receipt;
+  }
+  await reconcileControllerJournalWithRunner({ ...controllerProjectionInput(input, { runId: prior.runId, issueId: input.execution.binding.issueId }), runnerState: state });
   savePluginRunnerCheckpoint(root, state, prior);
+  return receipt;
+}
+
+/** A provider's unhandled restore/reboot receipt selects a generation, not a
+ * Runner owner. Bind it to the recorded physical allocation, then prove the
+ * exact old identity/process dead and the checkpoint unchanged. No writes. */
+async function verifyResumedDeadRunnerCheckpoint(
+  input: { db: Db; execution: NativeExecutionInput; runnerExecutionTarget?: AdapterExecutionTarget | null },
+  identity: Record<string, unknown>,
+  inspectedStateDirectory?: string,
+): Promise<VerifiedRemoteRecoverableFailureReceipt | undefined> {
+  const target = input.runnerExecutionTarget;
+  const restartKey = sandboxProcessRestartKey(target);
+  if (!restartKey || target?.kind !== "remote" || target.transport !== "sandbox" || target.runnerTask
+    || !target.runner || target.sandboxLeaseAcquisition?.outcome !== "resumed"
+    || !durableIdentityMatchesSession(identity, input.execution)) return;
+  const retained = await assertNativeRetainedSandboxBinding(input.db, { ...input.execution.binding, runId: identity.runId, target });
+  // A host-preparation snapshot must belong to the very directory whose
+  // process marker we probe, not a copied journal in another workspace.
+  if (inspectedStateDirectory && retained.remoteCwd !== target.remoteCwd) return;
+  const boundTarget = { ...target, remoteCwd: retained.remoteCwd };
+  const stateDirectory = inspectedStateDirectory ?? remoteRunnerStateDirectory(retained.remoteCwd, identity.normalizedSessionId);
+  try {
+    await verifyRemoteRunnerReattachment({ target: boundTarget, identity, runId: identity.runId,
+      normalizedSessionId: identity.normalizedSessionId, requireIdle: true,
+      claim: { runId: identity.runId, remote: { kind: "sandbox",
+        providerLeaseId: target.sandboxLeaseAcquisition.providerLeaseId, remoteCwd: retained.remoteCwd } },
+      restoredAllocation: { restartKey, stateDirectory } });
+  } catch (error) {
+    if (!(error instanceof RemoteWarmRunnerSuspendedError)) throw error;
+    const receipt = error.verifiedRecoverableFailureReceipt;
+    if (!receipt) return;
+    const fresh = await readRemoteRunnerState({ runner: target.runner, stateDirectory });
+    if (canonicalJson(fresh) !== receipt.stateJson) {
+      throw new Error("native_controller_recovery_missing_evidence:runner_not_settled");
+    }
+    return receipt;
+  }
+  return;
 }
 
 /** The Runner saves `suspended` and a terminal fence for its suspend result
@@ -12930,8 +12982,9 @@ async function executePaperclipNativeSessionAttempt(
       session.beginRunAttachment?.({ identity: { runId: input.execution.binding.runId, sessionId: session.identity().sessionId,
         companyId: input.execution.binding.companyId, issueId: input.execution.binding.issueId, agentId: input.execution.binding.agentId } });
     };
-    const createExecutionBackend = () => createRunnerdBackend({
+    const createExecutionBackend = (verifiedRecoverableFailureReceipt?: VerifiedRemoteRecoverableFailureReceipt) => createRunnerdBackend({
       ...input,
+      verifiedRecoverableFailureReceipt,
       onDiagnosticLease: ownDiagnosticLease,
       providerPackAdmissionSource,
       recoveryPurpose: claimedStopCleanup ? "stop_cleanup" : "execution",
@@ -13003,7 +13056,7 @@ async function executePaperclipNativeSessionAttempt(
           releaseGitHubRun?.();
           releaseGitHubRun = undefined;
         }
-        runnerdBackend = await createExecutionBackend();
+        runnerdBackend = await createExecutionBackend(error.verifiedRecoverableFailureReceipt);
       }
     }
     if (remoteWarmRecovery) {
@@ -16244,6 +16297,8 @@ export async function verifyRemoteRunnerReattachment(input: {
   runId: string;
   normalizedSessionId: string;
   requireIdle?: boolean;
+  // Only verifyResumedDeadRunnerCheckpoint supplies this after allocation binding.
+  restoredAllocation?: { restartKey: string; stateDirectory: string };
   recoveryDeadline?: number;
   stall?: RemoteRunnerPluginStall;
 }) {
@@ -16264,9 +16319,22 @@ export async function verifyRemoteRunnerReattachment(input: {
     Date.now() + REMOTE_RUNNER_RECOVERY_PROBE_BUDGET_MS);
   const stall = input.stall ?? remoteRunnerPluginStall(input.recoveryDeadline);
   const stateDirectory = remoteRunnerStateDirectory(target.remoteCwd, input.normalizedSessionId);
-  const runnerState = await readRemoteRunnerState({ runner, stateDirectory, recoveryDeadline: probeDeadline, stall });
+  const restoredGeneration = input.requireIdle && input.restoredAllocation
+    && target.sandboxLeaseAcquisition?.outcome === "resumed"
+    && input.restoredAllocation.restartKey === sandboxProcessRestartKey(target) ? input.restoredAllocation : undefined;
+  const runnerState = await readRemoteRunnerState({ runner, stateDirectory: restoredGeneration?.stateDirectory ?? stateDirectory,
+    recoveryDeadline: probeDeadline, stall });
+  const restoredAllocation = runnerState.lifecycle === "suspended" ? undefined : restoredGeneration;
   let recoverableWarmRunner = false;
-  if (input.requireIdle && (runnerState.lifecycle !== "ready" ||
+  if (restoredAllocation) {
+    if (runnerState.schema !== RUNNERD_STATE_SCHEMA || !["ready", "recoverable_failure"].includes(String(runnerState.lifecycle))
+      || !Array.isArray(runnerState.outbox) || runnerState.outbox.length !== 0 || runnerState.pendingTerminalDelivery != null
+      || runnerState.pendingProviderCleanup != null || runnerState.warmTransition != null) {
+      throw new Error("runner_state_identity_mismatch: remote_warm_session_not_idle");
+    }
+    recoverableWarmRunner = true;
+  }
+  if (!restoredAllocation && input.requireIdle && (runnerState.lifecycle !== "ready" ||
       !Array.isArray(runnerState.outbox) || runnerState.outbox.length !== 0 || runnerState.pendingTerminalDelivery !== null)) {
     if ((runnerState.lifecycle === "suspended" || (runnerState.lifecycle === "recoverable_failure"
       && typeof runnerState.recoverableFailure === "string" && !!runnerState.recoverableFailure
@@ -16349,7 +16417,8 @@ export async function verifyRemoteRunnerReattachment(input: {
   };
   const verified = await check(undefined, probeDeadline, stall);
   if (recoverableWarmRunner) {
-    if (!verified.alive) throw new RemoteWarmRunnerSuspendedError(Object.freeze({ stateJson: canonicalJson(runnerState) }));
+    if (!verified.alive) throw new RemoteWarmRunnerSuspendedError(Object.freeze({ stateJson: canonicalJson(runnerState),
+      ...(restoredAllocation ? { resumedProcessRestartKey: restoredAllocation.restartKey } : {}) }));
     throw new Error("runner_state_identity_mismatch: remote_warm_session_not_idle");
   }
   if (!verified.alive) {
@@ -17044,6 +17113,8 @@ export async function createRunnerdBackend(input: {
   recoveryPurpose?: "execution" | "stop_cleanup";
   durableEnvironmentLeaseId?: string;
   remoteWarmRecovery?: Omit<RemoteWarmSessionRecovery, "revalidate"> & { revalidate: () => Promise<void> };
+  /** Only the verified warm step-aside catch carries this into its fresh backend. */
+  verifiedRecoverableFailureReceipt?: VerifiedRemoteRecoverableFailureReceipt;
   retainedPluginTaskOwner?: ReturnType<typeof createPluginRunnerTaskOwner>;
   relaunchReleased?: { source: DurableRecoveryIdentity; runner: { version: string; digest: string } };
   onPluginTaskOwner?: (owner: ReturnType<typeof createPluginRunnerTaskOwner>) => void;
@@ -18682,7 +18753,24 @@ async function createRunnerdBackendWithinSessionClaim(
                       !state.runnerState ||
                       !state.providerSessionIdentity
                     ) {
-                      const provenRestart = restartableBootstrapState(state) && !backupAvailable
+                      let deadResumedReceipt: VerifiedRemoteRecoverableFailureReceipt | undefined;
+                      if (state.incompleteReason === "not_suspended" && input.verifiedRecoverableFailureReceipt) {
+                        // Warm admission proved this exact owner exited. The second
+                        // backend still sees its unsuspended saved journal; validate
+                        // a fresh read before using that proof, never the lease outcome.
+                        const fresh = await readRemoteRunnerState({ runner: remoteCommandRunner!,
+                          stateDirectory: archivedRotationRunnerStatePath
+                            ? posix.dirname(archivedRotationRunnerStatePath) : remoteStateDirectory! });
+                        if (!matchesVerifiedRecoverableFailureReceipt(fresh, input.verifiedRecoverableFailureReceipt)
+                            || canonicalJson(fresh) !== input.verifiedRecoverableFailureReceipt.stateJson) {
+                          throw new Error("native_controller_recovery_missing_evidence:runner_not_settled");
+                        }
+                        deadResumedReceipt = input.verifiedRecoverableFailureReceipt;
+                      } else if (state.incompleteReason === "not_suspended" && durableIdentity) {
+                        deadResumedReceipt = await verifyResumedDeadRunnerCheckpoint(input, durableIdentity,
+                          archivedRotationRunnerStatePath ? posix.dirname(archivedRotationRunnerStatePath) : remoteStateDirectory ?? undefined);
+                      }
+                      const provenRestart = !deadResumedReceipt && restartableBootstrapState(state) && !backupAvailable
                         && await moveInterruptedBootstrapSessionAside()
                         && takeRemoteBootstrapRestartProof(input.execution.binding.runId);
                       // A resumed allocation that never held this session (for example
@@ -18691,7 +18779,9 @@ async function createRunnerdBackendWithinSessionClaim(
                       const restoresRetiredSource = !provenRestart && state.incompleteReason === "unavailable"
                         && backupAvailable && remoteTarget.reusableLeaseConfigured === true
                         && await retiredSourceBackupAuthorized();
-                      if (restoresRetiredSource) {
+                      if (deadResumedReceipt) {
+                        await input.onLog?.("stdout", "[paperclip-runner] Starting a new runner from the saved journal after the allocation restored with its prior runner dead.\n");
+                      } else if (restoresRetiredSource) {
                         await measureNativeRunnerSpan(input.trace, "sandbox.lease.replacement", restoreVerifiedHarnessBackup, {
                           attributes: { provider: remoteTarget.providerKey ?? "sandbox", harness: input.execution.session.driverKind,
                             lifecycleMode: input.execution.session.lifecyclePolicy.mode, outcome: "resumed", reason: "state_absent" },

@@ -130,6 +130,43 @@ describe("resolveEnvironmentExecutionTarget", () => {
     expect((await resolve()) as object).not.toHaveProperty(`sandboxLeaseAcquisition.${marker}`);
     metadata.sandboxLeaseAcquisition[marker] = "2026-11-25T13:00:00.000Z";
     expect(await resolve()).toMatchObject({ sandboxLeaseAcquisition: { [marker]: "2026-11-25T13:00:00.000Z" } });
+    // A repair/resume can persist provenance flat while the nested acquisition
+    // retains only its outcome. The shared normalizer must still fence it.
+    const flat = { [marker]: first, sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "same-box" } };
+    const resolveFlat = (providerLeaseId = "same-box", handled?: string) => resolveEnvironmentExecutionTarget({
+      db: {} as never, companyId: "company-1", adapterType: "paperclip_runner",
+      environment: { id: "env-1", driver: "sandbox", config: { provider: "fake-plugin" } },
+      leaseId: "lease-1", leaseMetadata: flat,
+      lease: { providerLeaseId, metadata: { ...flat, ...(handled ? { handledProcessRestartKey: handled } : {}) } } as never,
+      environmentRuntime: null,
+    });
+    expect(await resolveFlat()).toMatchObject({ sandboxLeaseAcquisition: { [marker]: first } });
+    expect(await resolveFlat("same-box", handledProcessRestartKey)).not.toHaveProperty(`sandboxLeaseAcquisition.${marker}`);
+    expect(await resolveFlat("different-box")).not.toHaveProperty(`sandboxLeaseAcquisition.${marker}`);
+  });
+
+  it("ignores a stale reply handled key and accepts only the same allocation's lease provenance", async () => {
+    mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({ driver: "sandbox",
+      config: { provider: "fake-plugin", reuseLease: true, timeoutMs: 30_000 } });
+    const restoredFromSnapshotAt = "2026-11-25T12:00:00.000Z";
+    const handledProcessRestartKey = JSON.stringify([restoredFromSnapshotAt, null]);
+    const replyMetadata = { sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "same-box",
+      restoredFromSnapshotAt, handledProcessRestartKey } };
+    const resolve = (providerLeaseId: string, metadata: Record<string, unknown>) => resolveEnvironmentExecutionTarget({
+      db: {} as never, companyId: "company-1", adapterType: "paperclip_runner",
+      environment: { id: "env-1", driver: "sandbox", config: { provider: "fake-plugin" } },
+      leaseId: "lease-1", leaseMetadata: replyMetadata,
+      lease: { providerLeaseId, metadata: { ...replyMetadata, ...metadata } } as never, environmentRuntime: null,
+    });
+    const unhandled = await resolve("same-box", {});
+    expect(unhandled).toMatchObject({ sandboxLeaseAcquisition: { restoredFromSnapshotAt } });
+    expect(unhandled).not.toHaveProperty("sandboxLeaseAcquisition.handledProcessRestartKey");
+    const handled = await resolve("same-box", { handledProcessRestartKey });
+    expect(handled).toMatchObject({ sandboxLeaseAcquisition: { handledProcessRestartKey } });
+    expect(handled).not.toHaveProperty("sandboxLeaseAcquisition.restoredFromSnapshotAt");
+    const foreign = await resolve("another-box", { handledProcessRestartKey });
+    expect(foreign).toMatchObject({ sandboxLeaseAcquisition: { restoredFromSnapshotAt } });
+    expect(foreign).not.toHaveProperty("sandboxLeaseAcquisition.handledProcessRestartKey");
   });
 
   it("uses a bounded default cwd for sandbox targets when lease metadata omits remoteCwd", async () => {

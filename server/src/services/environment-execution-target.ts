@@ -106,8 +106,9 @@ function sandboxLeaseAcquisitionFromMetadata(
       ? { previousProviderLeaseId: candidate.previousProviderLeaseId }
       : {}),
     ...(reason ? { reason } : {}),
-    ...sandboxRestartMetadata({ metadata: { ...candidate,
-      handledProcessRestartKey: leaseMetadata?.handledProcessRestartKey ?? candidate.handledProcessRestartKey } }),
+    ...sandboxRestartMetadata({ providerLeaseId, metadata: leaseMetadata }, {
+      providerLeaseId: resolvedProviderLeaseId, metadata: candidate,
+    }),
   };
 }
 

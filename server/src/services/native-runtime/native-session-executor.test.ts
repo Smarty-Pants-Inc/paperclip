@@ -17,6 +17,7 @@ import { activeNativeExecutionRunIds } from "./native-active-runs.js";
 import { onRetainedNativeSessionCleanupRelease } from "../retained-native-session-cleanup-notifications.js";
 import { readIdleLocalWork, markIdleStartupComplete, markIdleIngressTracked } from "../idle-local-work.js";
 import * as runnerCheckpoint from "./native-runner-checkpoint.js";
+import * as controllerJournal from "./warm-controller-journal.js";
 import * as harnessStorage from "./native-harness-backup-storage.js";
 import * as stagedAttachmentRecovery from "./native-staged-attachment-recovery.js";
 import * as controllerRecovery from "./native-controller-recovery.js";
@@ -19084,6 +19085,155 @@ describe("runnerd provider runtime wiring", () => {
       else { await expect(resume).rejects.toThrow("staged_attachment_recovery_unproven"); expect(verify).not.toHaveBeenCalled(); }
     } finally { restore.mockRestore(); header.mockRestore(); verify.mockRestore(); await controller.stop(); }
   });
+
+  // Unit fixture agreed: exercise both prior-owner admission and generic resumed
+  // preparation with the same saved session; process/read shell guards run locally.
+  it.each(["dead-ready", "pid-alive", "no-restore-receipt", "identity-mismatch", "pending-outbox", "changed-reread",
+    "recoverable_failure", "recoverable_failure-pid-alive", "recoverable_failure-changed-reread"] as const)(
+    "cold-restores a dead resumed allocation on its first ordinary follow-up only with proof: %s", async mode => {
+      const recoverable = mode.startsWith("recoverable_failure");
+      const succeeds = mode === "dead-ready" || mode === "recoverable_failure";
+      const first = scopedNativeExecution(`dead-resumed-${mode}`);
+      first.session.lifecyclePolicy = { mode: "warm", idleTimeoutMs: 60_000 };
+      const next = { ...first, binding: { ...first.binding, runId: `${first.binding.runId}-next` } };
+      const identity = { runId: first.binding.runId, normalizedSessionId: first.session.normalizedSessionId!,
+        runnerInstanceId: "dead-resumed-runner", environmentLeaseId: "retained-lease", turnId: "prior-turn", itemId: "prior-item" };
+      const root = await initializeScopedRunnerRoot(first, identity.runnerInstanceId);
+      await writeRunnerAuthority(root, identity, "ready");
+      const snapshot = { backendKind: "runner", driverKind: first.session.driverKind,
+        identity: { ...first.binding, sessionId: identity.normalizedSessionId }, providerSessionId: "same-provider-session",
+        activeTurnId: null, pendingRuntimeRequests: [] };
+      const result = { result: { summary: "completed" }, terminal: { runTerminalState: "succeeded" }, turnId: "provider-turn",
+        normalizedSessionId: identity.normalizedSessionId, providerSessionId: snapshot.providerSessionId,
+        driverKind: "test", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+      const remoteCwd = join(isolatedStateDirectory, "same-physical-allocation");
+      const remoteSession = join(remoteCwd, ".paperclip-runtime/paperclip-runner/sessions",
+        createHash("sha256").update(identity.normalizedSessionId).digest("hex"));
+      const remoteStatePath = join(remoteSession, "runner/runner-state.json");
+      const savedState = { ...durableRunnerState(identity, recoverable ? "recoverable_failure" : "ready"),
+        ...(recoverable ? { recoverableFailure: "lease_expired_requires_bootstrap",
+          pendingTerminalDelivery: null, pendingProviderCleanup: null, warmTransition: null } : {}),
+        ...(mode === "identity-mismatch" ? { itemId: "foreign-item" } : {}),
+        outbox: mode === "pending-outbox" ? [{ sourceSeq: 1 }] : [] };
+      await mkdir(dirname(remoteStatePath), { recursive: true });
+      await mkdir(join(remoteSession, "filesystem/codex-home"), { recursive: true });
+      await writeFile(remoteStatePath, JSON.stringify(savedState));
+      await writeFile(join(remoteSession, "runner/runner-process.identity"),
+        `nonce\n99999999\n2026-11-25T12:00:00.000Z\n${identity.runnerInstanceId}\nlinux:abcd-1234:100\n`);
+      const providerPath = join(remoteSession, "runner/codex-provider-state.json");
+      const providerBytes = JSON.stringify({ schema: "paperclip.runner.codex-provider-state.v1", lifecycle: "prepared",
+        threadId: snapshot.providerSessionId, providerSessionId: null, activeProviderTurnId: null,
+        config: { provider: "codex", driver: "codex_app_server" } });
+      await writeFile(providerPath, providerBytes);
+      const remoteExecute = vi.fn(async (command: { command: string; args?: string[] }) => {
+        if (command.args?.[0] === "--build-metadata") return { exitCode: 0, timedOut: false, stderr: "", stdout: JSON.stringify({
+          schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd",
+          packageName: "@paperclipai/paperclip-runner", binaryContractVersion: 2,
+          durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"],
+        }) };
+        if (command.args?.[0] === "--version") return { exitCode: 0, timedOut: false, stdout: "codex-cli 0.170.0", stderr: "" };
+        if (command.args?.[2] === "paperclip-runner-recovery-check") {
+          if (mode === "pid-alive" || mode === "recoverable_failure-pid-alive") return { exitCode: 0, timedOut: false, stdout: "", stderr: "" };
+          if (mode === "changed-reread") await writeFile(remoteStatePath, JSON.stringify({ ...savedState, reconnectCount: 99 }));
+        }
+        if (command.command === "sh") {
+          const actual = spawnSync("sh", command.args, { encoding: "utf8" });
+          // The second backend inspects the actual unsuspended harness, then
+          // the new receipt gate must read again before accepting it.
+          if (mode === "recoverable_failure-changed-reread" && command.args?.[1]?.includes("codex-provider-state.json")
+              && command.args[1].includes("base64")) {
+            await writeFile(join(remoteSession, "authority-epochs", `epoch-${"c".repeat(24)}`, "runner-state.json"),
+              JSON.stringify({ ...savedState, reconnectCount: 99 }));
+          }
+          return { exitCode: actual.status, timedOut: false, stdout: actual.stdout, stderr: actual.stderr };
+        }
+        return { exitCode: 0, timedOut: false, stdout: "", stderr: "" };
+      });
+      const target = { kind: "remote" as const, transport: "sandbox" as const, environmentId: "retained-environment",
+        remoteCwd, runner: { execute: remoteExecute, syncIn: vi.fn(async () => undefined) } };
+      const retained = vi.spyOn(controllerRecovery, "assertNativeRetainedSandboxBinding").mockResolvedValue({ remoteCwd });
+      const inspection = recoverable
+        ? vi.spyOn(remoteWarmRecoveryRuntime, "inspectRemoteWarmSessionRecovery").mockImplementation(async request => ({
+          identity, checkpoint: request.loadCheckpoint(first)!, previousExecution: first, reuseProcess: true,
+          remote: { providerLeaseId: "same-box", remoteCwd }, revalidate: vi.fn(async () => undefined),
+        }))
+        : mode === "no-restore-receipt"
+          ? vi.spyOn(remoteWarmRecoveryRuntime, "inspectRemoteWarmSessionRecovery").mockResolvedValue(null) : undefined;
+      const restore = vi.spyOn(runnerCheckpoint, "restoreNativeRunnerCheckpoint").mockResolvedValue(null);
+      const issueProjection = vi.spyOn(issueServiceModule, "issueService").mockReturnValue({ update: vi.fn(async () => null) } as never);
+      const reconcile = vi.spyOn(controllerJournal, "reconcileControllerJournalWithRunner");
+      const logs: string[] = [];
+      state.execute.mockReset().mockImplementationOnce(async options => {
+        await options.onCheckpoint?.(snapshot); await options.onSession?.({ close: vi.fn(async () => undefined) }); return result;
+      }).mockImplementationOnce(async options => {
+        expect(options.existingSession).toBeUndefined();
+        expect(options.persistedSession).toMatchObject({ identity: { sessionId: identity.normalizedSessionId },
+          providerSessionId: snapshot.providerSessionId });
+        state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+        const transport = state.createTransport.mock.calls.at(-1)![0] as RunnerTransportOptions & {
+          prepareExternalRunnerState: () => Promise<void>;
+          archiveExternalRunnerState: (input: { archiveKey: string; priorIdentity: typeof identity }) => Promise<Record<string, unknown>>;
+        };
+        await expect(transport.archiveExternalRunnerState({ archiveKey: "c".repeat(24), priorIdentity: identity })).resolves.toEqual(savedState);
+        await transport.prepareExternalRunnerState();
+        expect(transport.adoptExistingRunner).toBeUndefined();
+        expect(await readFile(providerPath, "utf8")).toBe(providerBytes);
+        return result;
+      });
+      try {
+        await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: identity.runnerInstanceId,
+          useRunnerd: true, runnerExecutionTarget: target as never });
+        await closeIdleWarmNativeSessionsForRestart();
+        await rm(join(root, "runner/runner-state.json"));
+        const journalBefore = await readFile(join(root, "control-plane/control-plane-state.json"), "utf8");
+        const db = leaseDb(next), select = db.select.bind(db);
+        db.select = ((fields?: Record<string, unknown>) => fields?.status === heartbeatRuns.status
+          && fields?.runnerProfileJson === heartbeatRuns.runnerProfileJson
+          ? priorNativeRunDb(first).select(fields as never) : select(fields as never)) as Db["select"];
+        const artifact = join(isolatedStateDirectory, "fixture-runnerd"); await writeFile(artifact, "fixture");
+        const followupInput = { db, execution: next, runnerInstanceId: identity.runnerInstanceId,
+          useRunnerd: true, runnerIngressAuthorized: true, runnerRemoteBinaryPath: artifact, runnerRemoteCodexPath: artifact,
+          onLog: async (_stream: "stdout" | "stderr", text: string) => { logs.push(text); },
+          runnerExecutionTarget: { ...target, providerKey: "daytona", leaseId: "next-lease",
+            effectiveCapabilities: { runnerWebSocketIngress: true },
+            sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "same-box", resumedFromState: "idle",
+              ...(mode === "no-restore-receipt" || recoverable ? {} : { restoredFromSnapshotAt: "2026-11-25T12:00:00.000Z" }) },
+            getRunnerIngressEndpoint: async () => ({ kind: "authenticated_websocket", websocketUrl: "wss://sandbox.invalid/runner",
+              secretHeaders: [], generation: "1", refresh: vi.fn(), close: vi.fn(async () => undefined) }),
+          } as never };
+        // Direct backend admission migrates without launching a process. The
+        // full execution below then migrates this exact same run a second time.
+        if (mode === "dead-ready") await createRunnerdBackend(followupInput);
+        const followup = executePaperclipNativeSession(followupInput);
+        if (succeeds) {
+          await expect(followup).resolves.toMatchObject({ exitCode: 0, sessionId: identity.normalizedSessionId });
+          expect(state.execute).toHaveBeenCalledTimes(2);
+          expect(logs.join("")).toContain("saved journal after the allocation restored");
+          expect(logs.join("")).not.toContain("sandbox_resumed");
+          expect(reconcile).toHaveBeenCalledOnce();
+          expect(reconcile).toHaveBeenCalledWith(expect.objectContaining({
+            binding: expect.objectContaining({ runId: first.binding.runId }), runnerState: savedState,
+          }));
+          expect(await readFile(join(root, "control-plane/control-plane-state.json"), "utf8")).toBe(journalBefore);
+          expect(JSON.parse(await readFile(join(root, "plugin-runner-state.json"), "utf8"))).toMatchObject({
+            ...identity, lifecycle: recoverable ? "recoverable_failure" : "ready" });
+        } else {
+          await expect(followup).rejects.toThrow(mode === "no-restore-receipt" ? "sandbox_resumed"
+            : mode === "identity-mismatch" ? "runner_remote_recovery_identity_mismatch"
+            : mode.endsWith("changed-reread") ? "runner_not_settled" : "remote_warm_session_not_idle");
+          expect(state.execute).toHaveBeenCalledTimes(mode === "recoverable_failure-changed-reread" ? 2 : 1);
+          // A second-backend refusal occurs after the already-proven migration.
+          expect(existsSync(join(root, "plugin-runner-state.json"))).toBe(mode === "recoverable_failure-changed-reread");
+          if (mode !== "no-restore-receipt") {
+            expect(await readFile(join(root, "control-plane/control-plane-state.json"), "utf8")).toBe(journalBefore);
+            expect(await readFile(providerPath, "utf8")).toBe(providerBytes);
+          }
+        }
+      } finally {
+        await closeIdleWarmNativeSessionsForRestart();
+        retained.mockRestore(); inspection?.mockRestore(); restore.mockRestore(); issueProjection.mockRestore(); reconcile.mockRestore();
+      }
+    });
 
   it.each(["suspended", "suspended-github", "ready", "identity-mismatch", "pending-outbox", "pending-terminal",
     "recoverable_failure", "recoverable_failure-github", "recoverable_failure-identity-mismatch", "recoverable_failure-pending-outbox",

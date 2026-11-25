@@ -21,7 +21,8 @@ export function sandboxRestartMetadata(
       ?? reply?.metadata?.[key] ?? leaseMetadata?.[key];
     if (typeof value === "string" && value.trim() && Number.isFinite(Date.parse(value))) result[key] = value;
   }
-  const handled = leaseMetadata?.handledProcessRestartKey ?? reply?.metadata?.handledProcessRestartKey;
+  // Only this allocation's persisted lease provenance can acknowledge a restart.
+  const handled = leaseMetadata?.handledProcessRestartKey;
   if (typeof handled === "string") result.handledProcessRestartKey = handled;
   if (restartKey(result) === handled) {
     delete result.restoredFromSnapshotAt;
