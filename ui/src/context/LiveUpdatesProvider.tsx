@@ -43,11 +43,11 @@ import type {
   LiveEvent,
 } from "@paperclipai/shared";
 import type { RunForIssue } from "../api/activity";
-import { heartbeatsApi, type ActiveRunForIssue, type LiveRunForIssue } from "../api/heartbeats";
+import type { ActiveRunForIssue, LiveRunForIssue } from "../api/heartbeats";
 import type { CompanyUserDirectoryResponse } from "../api/access";
 import type { CaseDetail, IssueCaseLink } from "../api/cases";
 import { issuesApi } from "../api/issues";
-import { detachInflightGet } from "../api/client";
+import { api } from "../api/client";
 import { authApi } from "../api/auth";
 import type { CompanyListResult } from "../api/companies-query";
 import { healthApi } from "../api/health";
@@ -2210,14 +2210,17 @@ function handleLiveEvent(
       if (toast && event.toastEligible === true && !suppressRunToast) {
         const notify = () => gatedPushToast(gate, pushToast, "run-status", toast);
         if (payload.status === "failed" || payload.status === "timed_out") {
-          // Status events precede retry projection and carry no retry linkage.
-          // Read the existing execution projection, not retryOf on this attempt:
-          // a final failed retry still needs its own notification.
-          detachInflightGet(`/heartbeat-runs/${readString(payload.runId)!}`);
-          void heartbeatsApi.get(readString(payload.runId)!).then((run) => {
-            if (!["failed", "timed_out"].includes(run.status)) return;
-            if (run.execution?.successorRunId || run.execution?.phase === "retry_scheduled" ||
-              (!run.retryExhaustedReason && run.execution?.phase === "reconnecting" && run.execution.recoveryOwner === "agent")) return;
+          // Recovery labels are provisional: only an existing successor can
+          // silence an automatic failure. Exhaustion and a person's run win.
+          // Use the shared bounded, fresh GET; errors and timeouts fail open.
+          void api.get<HeartbeatRun>(`/heartbeat-runs/${readString(payload.runId)!}`, {
+            fresh: true, timeoutMs: 5_000,
+          }).then((run) => {
+            const personStarted = payload.invocationSource === "on_demand" || payload.triggerDetail === "manual" ||
+              run.invocationSource === "on_demand" || run.triggerDetail === "manual" ||
+              (!run.retryOfRunId && (run.contextSnapshot?.triggeredBy === "board" ||
+                ["issue.comment", "issue.comment.reopen"].includes(readString(run.contextSnapshot?.source) ?? "")));
+            if (!personStarted && !run.retryExhaustedReason && run.execution?.successorRunId) return;
             notify();
           }, notify);
         } else {
