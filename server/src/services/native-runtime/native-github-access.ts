@@ -78,7 +78,7 @@ export async function createNativeGitHubAccess(input: {
     try {
       // Bind at receipt; body/headers cannot select a run or responsible user.
       const requested = req.headers["x-paperclip-github-repository"];
-      const repository = typeof requested === "string" ? gitHubRepositoryHint(requested) : undefined;
+      const repository = typeof requested === "string" ? gitHubRepositoryHint(requested, true) : undefined;
       if (requested !== undefined && !repository) {
         reply(403, { error: "Invalid GitHub repository hint" });
         return;
