@@ -513,10 +513,10 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
   });
 
   it.each([
-    { name: "inherits the caller level when omitted", board: false, callerLevel: "xhigh", requestedLevel: undefined, expectedLevel: "xhigh" },
-    { name: "keeps an explicitly named level", board: false, callerLevel: "xhigh", requestedLevel: "medium", expectedLevel: "medium" },
-    { name: "leaves a board hire unchanged", board: true, callerLevel: "xhigh", requestedLevel: undefined, expectedLevel: undefined },
-    { name: "adds nothing when the caller has no level", board: false, callerLevel: undefined, requestedLevel: undefined, expectedLevel: undefined },
+    { name: "defaults rather than copying the caller level", board: false, callerLevel: "xhigh", requestedLevel: undefined, expectedLevel: "medium" },
+    { name: "keeps an explicitly named level", board: false, callerLevel: "xhigh", requestedLevel: "low", expectedLevel: "low" },
+    { name: "defaults a board hire", board: true, callerLevel: "xhigh", requestedLevel: undefined, expectedLevel: "medium" },
+    { name: "defaults when the caller has no level", board: false, callerLevel: undefined, requestedLevel: undefined, expectedLevel: "medium" },
   ])("pi_rpc hire thinking level: $name", async ({ board, callerLevel, requestedLevel, expectedLevel }) => {
     const companyId = await seedCompany();
     const parent = await seedParentAgent(companyId, "paperclip_runner", {});
@@ -531,7 +531,47 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     const [child] = await db.select().from(agents).where(eq(agents.id, res.body.agent.id));
     expect(child!.adapterConfig.piRpcThinkingLevel).toBe(expectedLevel);
     expect(res.body.agent.adapterConfig.piRpcThinkingLevel).toBe(expectedLevel);
-    if (expectedLevel === undefined) expect(child!.adapterConfig).not.toHaveProperty("piRpcThinkingLevel");
+  });
+
+  it.each((["agents", "agent-hires"] as const).flatMap(endpoint =>
+    [undefined, null, "", " \t\n"].map(unset => ({ endpoint, unset })),
+  ))("pi_rpc $endpoint persists defaults for unset $unset", async ({ endpoint, unset }) => {
+    const companyId = await seedCompany();
+    const parent = await seedParentAgent(companyId, "paperclip_runner", {});
+    await db.update(agents).set({ adapterConfig: {
+      provider: "pi_rpc", model: "openai-codex/gpt-5.6", piRpcThinkingLevel: "xhigh",
+    } }).where(eq(agents.id, parent.id));
+    const actor = endpoint === "agents" ? userActor() : agentActor(companyId, parent.id);
+    const res = await request(createApp(db, actor))
+      .post(`/api/companies/${companyId}/${endpoint}`).send({
+        name: "Pi Child", role: "engineer", adapterType: "paperclip_runner",
+        adapterConfig: { provider: "pi_rpc", model: unset, piRpcThinkingLevel: unset },
+      });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const responseAgent = endpoint === "agents" ? res.body : res.body.agent;
+    const [child] = await db.select().from(agents).where(eq(agents.id, responseAgent.id));
+    const expected = { piRpcThinkingLevel: "medium", model: "paperclip/claude-opus-5-5" };
+    expect(child!.adapterConfig).toMatchObject(expected);
+    expect(responseAgent.adapterConfig).toMatchObject(expected);
+  });
+
+  it.each([undefined, null, "", " \t", "openai-codex/gpt-5.6"])("pi_rpc caller-runtime hire defaults level and resolves model %j", async callerModel => {
+    const companyId = await seedCompany();
+    await db.update(companies).set({ requireBoardApprovalForNewAgents: true }).where(eq(companies.id, companyId));
+    const parent = await seedParentAgent(companyId, "paperclip_runner", {});
+    await db.update(agents).set({ adapterConfig: {
+      provider: "pi_rpc", model: callerModel, piRpcThinkingLevel: "xhigh",
+    } }).where(eq(agents.id, parent.id));
+    const res = await hire(agentActor(companyId, parent.id), companyId, {
+      name: "Pi Tool Child", role: "engineer", adapterType: "paperclip_runner", inheritRuntimeFrom: "caller",
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const [child] = await db.select().from(agents).where(eq(agents.id, res.body.agent.id));
+    const expected = { piRpcThinkingLevel: "medium", model: callerModel?.trim() ? callerModel : "paperclip/claude-opus-5-5" };
+    expect(child!.adapterConfig).toMatchObject(expected);
+    expect(res.body.agent.adapterConfig).toMatchObject(expected);
+    expect(res.body.approval.payload.adapterConfig).toMatchObject(expected);
+    expect(res.body.approval.payload.requestedConfigurationSnapshot.adapterConfig).toMatchObject(expected);
   });
 
   it("rejects native runtime inheritance for a board actor", async () => {
