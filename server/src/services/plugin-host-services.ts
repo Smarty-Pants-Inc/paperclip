@@ -2669,6 +2669,7 @@ export function buildHostServices(
           params.issueId,
           params.body,
           { agentId: params.actorUserId ? undefined : params.authorAgentId, userId: params.actorUserId },
+          { allowConversationAgentInput: !params.actorUserId && Boolean(params.authorAgentId) },
         )) as IssueComment;
         await logPluginActivity({
           companyId,
@@ -2683,14 +2684,10 @@ export function buildHostServices(
           },
         });
 
-        // Human-attributed comments participate in the same "wake the
-        // assignee" behavior a board user's comment gets in the web app
-        // (routes/issues.ts's addComment route) — a plugin's own
-        // agent-attributed comments never do this. Deliberately narrower
-        // than the HTTP route: no reopen/resume/interrupt/scheduled-retry
-        // handling here, just the core wake. An assignee-less or
-        // closed-status issue is a silent no-op, matching the route's own
-        // guard.
+        // Authored plugin comments use the HTTP comment's ordinary wake door,
+        // including post-commit agent steering when admission defers to a live
+        // run. Self-authored output never wakes its own assignee. No separate
+        // delivery/ACK path, reopen, resume or interrupt semantics live here.
         //
         // The guard re-fetches the issue instead of trusting the pre-insert
         // `issue` snapshot: a concurrent close/unassign/reassign landing
@@ -2702,16 +2699,17 @@ export function buildHostServices(
         // falls back to the in-hand snapshot rather than rejecting
         // createComment — a rejection would surface to the caller as a failed
         // write and invite a retry that inserts a duplicate comment.
-        if (params.actorUserId) {
+        if (params.actorUserId || params.authorAgentId) {
           const postCommentIssue = (await issues.getById(issue.id).catch((err) => {
             logger.warn(
               { err, issueId: issue.id, commentId: comment.id },
-              "failed to re-fetch issue for plugin-relayed human comment wake; falling back to pre-insert snapshot",
+              "failed to re-fetch issue for plugin-relayed comment wake; falling back to pre-insert snapshot",
             );
             return null;
           })) ?? issue;
           if (
             postCommentIssue.assigneeAgentId
+            && (params.actorUserId || params.authorAgentId !== postCommentIssue.assigneeAgentId)
             && postCommentIssue.status !== "done"
             && postCommentIssue.status !== "cancelled"
           ) {
@@ -2724,12 +2722,13 @@ export function buildHostServices(
                 commentId: comment.id,
                 mutation: "comment",
               },
-              requestedByActorType: "user",
-              requestedByActorId: params.actorUserId,
+              requestedByActorType: params.actorUserId ? "user" : "agent",
+              requestedByActorId: params.actorUserId ?? params.authorAgentId,
               contextSnapshot: {
                 issueId: issue.id,
                 taskId: issue.id,
                 sourceCommentId: comment.id,
+                wakeCommentId: comment.id,
                 wakeReason: "issue_commented",
                 source: `plugin:${pluginKey}`,
               },
@@ -2738,7 +2737,7 @@ export function buildHostServices(
               issueId: issue.id,
               commentId: comment.id,
               agentId: postCommentIssue.assigneeAgentId,
-            }, "failed to wake assignee on plugin-relayed human comment"));
+            }, "failed to wake assignee on plugin-relayed comment"));
           }
         }
 
