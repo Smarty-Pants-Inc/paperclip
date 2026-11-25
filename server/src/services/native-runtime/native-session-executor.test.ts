@@ -11399,6 +11399,63 @@ describe("native session same-turn steering", () => {
     } finally { state.release?.(); await running; vi.restoreAllMocks(); }
   });
 
+  it("restores the latest committed task claim from PostgreSQL when the executor reattaches", async () => {
+    const tables = await import("@paperclipai/db");
+    const { eq } = await import("drizzle-orm");
+    const { startRecoveryPostgres } = await import("../../__tests__/helpers/recovery-postgres.js");
+    const { prepareNativeHeartbeatRun } = await import("./prepare-native-run.js");
+    const database = await startRecoveryPostgres("task-claim-reattach-");
+    const db = tables.createDb(database.connectionString);
+    try {
+      const companyId = randomUUID(), agentId = randomUUID();
+      await db.insert(tables.companies).values({ id: companyId, name: "Task claim recovery", issuePrefix: "CLAIM" });
+      await db.insert(tables.agents).values({ id: agentId, companyId, name: "Task worker", adapterType: "paperclip_runner", status: "active" });
+      for (const rejected of [false, true]) {
+        state.release = null;
+        steer.mockClear();
+        const runId = randomUUID(), issueId = randomUUID(), sessionId = randomUUID();
+        const [issue] = await db.insert(tables.issues).values({ id: issueId, companyId, title: "Resume task work",
+          status: "in_progress", assigneeAgentId: agentId }).returning();
+        const [run] = await db.insert(tables.heartbeatRuns).values({ id: runId, companyId, agentId,
+          status: "running", runtimeMode: "native", nativeIssueId: issueId, nativeSessionId: sessionId, runnerInstanceId: sessionId }).returning();
+        await db.update(tables.issues).set({ executionRunId: runId }).where(eq(tables.issues.id, issueId));
+        await db.insert(tables.nativeRunFinalizations).values({ runId, companyId, issueId, phase: "observed" });
+        await prepareNativeHeartbeatRun({ db, run: run!, issue: issue!, environmentLeaseId: randomUUID() });
+        const [contract] = await db.select().from(tables.completionContracts).where(eq(tables.completionContracts.issueId, issueId));
+        const current: NativeExecutionInputV1 = { ...execution, binding: { companyId, agentId, runId, issueId, executionWorkspaceId: runId },
+          provider: { kind: "pi_rpc", model: "fixture/model" }, session: { ...execution.session, driverKind: "pi_rpc", normalizedSessionId: sessionId },
+          completionContract: { id: contract!.id, sha256: contract!.canonicalSha256, schemaVersion: "paperclip.completion-contract.v1",
+            contract: contract!.contractJson as unknown as NativeExecutionInputV1["completionContract"]["contract"] } };
+        const committed: PrpEvent["eventType"][] = rejected ? ["run.result.proposed", "run.result.rejected"] : ["run.result.proposed"];
+        await db.transaction(async tx => {
+          for (const [index, eventType] of committed.entries()) {
+            const event: PrpEvent = { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "runner", priority: 0,
+              emittedAt: new Date().toISOString(), sourceInstanceId: sessionId, normalizedSessionId: sessionId, runId,
+              sourceSeq: index + 1, sourceEventId: randomUUID(), eventType, payload: {} };
+            await tx.insert(tables.heartbeatRunEvents).values({ companyId, agentId, runId, seq: index + 1, eventType,
+              sourceInstanceId: sessionId, sourceSeq: event.sourceSeq, sourceEventId: event.sourceEventId, payload: { prpEvent: event } });
+          }
+        });
+        expect((await db.select().from(tables.heartbeatRunEvents).where(eq(tables.heartbeatRunEvents.runId, runId)).orderBy(tables.heartbeatRunEvents.seq))
+          .map(event => event.eventType)).toEqual(committed);
+        // No live event callback is delivered: the replacement executor must read the committed journal.
+        const running = executePaperclipNativeSession({ db, execution: current, runnerInstanceId: sessionId });
+        try {
+          await vi.waitFor(() => expect(state.release).toBeTypeOf("function"));
+          const pending = steerNativeSession({ runId, message: "Continue the task", correlationId: randomUUID() });
+          if (rejected) {
+            await expect(pending).resolves.toEqual({ turnId: "provider-turn-1" });
+            expect(steer).toHaveBeenCalledWith({ turnId: "provider-turn-1", message: { role: "user", text: "Continue the task" }, correlationId: expect.any(String) });
+          } else {
+            await expect(pending).rejects.toMatchObject({ code: "steering_stale_turn",
+              message: "This task run has finished its work; your message will start the next run." });
+            expect(steer).not.toHaveBeenCalled();
+          }
+        } finally { (state.release as (() => void) | null)?.(); await running; }
+      }
+    } finally { await database.cleanup(); }
+  });
+
   it.each(["held", "held-70000", "held-300000", "working", "steered", "question", "pending-tool"])("closes a reset hold only when idle: %s", async mode => {
     const isHeld = mode.startsWith("held");
     vi.spyOn(continuousReply, "publishContinuousNativeReply").mockImplementation(async input => input.event.eventType === "item.completed" ? true : undefined);
