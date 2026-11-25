@@ -9,7 +9,6 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Link, useNavigate } from "@/lib/router";
 import { agentRouteRef, cn, relativeTime } from "@/lib/utils";
-import { markdownToPlainText } from "@/lib/markdown-plain-text";
 
 export interface AgentConversationSidebarProps {
   agents: Agent[];
@@ -18,7 +17,7 @@ export interface AgentConversationSidebarProps {
   existingChatAgentIds?: readonly string[];
   availableAgents?: Agent[];
   activeId?: string;
-  /** Per agent: the row's text line, up to two lines; the agent's role when absent. */
+  /** Per agent: server-projected plain text, up to two lines; the agent's role when absent. */
   previews?: Record<string, string>;
   /** Per agent with a chat: when it last changed, not whether a turn is running. */
   chatActivity?: Record<string, { at: Date | string }>;
@@ -118,11 +117,12 @@ export function AgentConversationSidebar({ agents, compact = false, existingChat
           <span className={cn("flex min-w-0 flex-1 flex-col gap-0.5", !activity && "agent-pin-text")}>
             <span className="flex min-w-0 flex-wrap items-baseline gap-x-2">
               <span className="truncate text-sm font-medium">{agent.name}</span>
+              {agent.status === "terminated" && <span className="shrink-0 text-xs text-muted-foreground">Terminated</span>}
               {activity && <span className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
                 {relativeTime(activity.at)}
               </span>}
             </span>
-            <span className={cn("text-xs text-muted-foreground", activity ? "line-clamp-2 h-8 leading-4 wrap-anywhere" : "truncate")}>{markdownToPlainText(previews[agent.id] ?? "") || (agent.status === "terminated" ? "Terminated" : agent.title ?? agent.role)}</span>
+            <span className={cn("text-xs text-muted-foreground", activity ? "line-clamp-2 h-8 leading-4 wrap-anywhere" : "truncate")}>{previews[agent.id] || (agent.title ?? agent.role)}</span>
           </span>
           {unreadCount > 0 ? <Badge variant="ghost" aria-label={`${unreadCount} unread ${unreadCount === 1 ? "message" : "messages"} from ${agent.name}`} className="shrink-0 bg-primary font-mono tabular-nums text-primary-foreground">{unreadCount}</Badge>
             : unreadIds.has(agent.id) && <span role="img" aria-label={`Unread messages from ${agent.name}`} className="size-2 shrink-0 rounded-full bg-primary" />}

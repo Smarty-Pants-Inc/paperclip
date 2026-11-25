@@ -1,27 +1,48 @@
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { issueComments, issueReadStates, type Db } from "@paperclipai/db";
+import { markdownToPlainText } from "chat";
+import { redactCurrentUserText } from "../log-redaction.js";
+import { instanceSettingsService } from "./instance-settings.js";
 import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
 
 export async function withConversationReadState<T extends { id: string }>(db: Db, companyId: string, userId: string, conversations: T[]) {
   if (!conversations.length) return [] as Array<T & { isUnreadForMe: boolean; unreadMessageCount: number; lastExternalCommentAt: Date | null; latestMessagePreview: string | null }>;
-  const rows = await db.select({
-    issueId: issueComments.issueId,
-    latest: sql<Date>`max(${issueComments.createdAt}) filter (where ${issueComments.authorAgentId} is not null)`,
-    latestMessageBody: sql<string | null>`(array_agg(left(${issueComments.body}, 2048) order by ${issueComments.createdAt} desc, ${issueComments.id} desc))[1]`,
-    unreadMessageCount: sql<number>`count(*) filter (where ${issueComments.authorAgentId} is not null and ${issueComments.createdAt} > coalesce(${issueReadStates.lastReadAt}, to_timestamp(0)))`.mapWith(Number),
-  }).from(issueComments).leftJoin(issueReadStates, and(
-    eq(issueReadStates.companyId, companyId), eq(issueReadStates.issueId, issueComments.issueId), eq(issueReadStates.userId, userId),
-  )).where(and(eq(issueComments.companyId, companyId), inArray(issueComments.issueId, conversations.map(chat => chat.id)),
+  const eligible = and(eq(issueComments.companyId, companyId), inArray(issueComments.issueId, conversations.map(chat => chat.id)),
     sql`${issueComments.deletedAt} is null`,
     sql`${issueComments.authorType} is distinct from 'system'`,
     sql`${issueComments.presentation} ->> 'kind' is distinct from 'system_notice'`,
     eq(issueComments.origin, "comment"),
-  )).groupBy(issueComments.issueId);
+  );
+  // Count history without reading its bodies; fetch only the newest eligible body below.
+  const readState = db.select({
+    issueId: issueComments.issueId,
+    latest: sql<Date>`max(${issueComments.createdAt}) filter (where ${issueComments.authorAgentId} is not null)`.as("latest"),
+    unreadMessageCount: sql<number>`count(*) filter (where ${issueComments.authorAgentId} is not null and ${issueComments.createdAt} > coalesce(${issueReadStates.lastReadAt}, to_timestamp(0)))`.mapWith(Number).as("unread_message_count"),
+  }).from(issueComments).leftJoin(issueReadStates, and(
+    eq(issueReadStates.companyId, companyId), eq(issueReadStates.issueId, issueComments.issueId), eq(issueReadStates.userId, userId),
+  )).where(eligible).groupBy(issueComments.issueId).as("read_state");
+  const newest = db.select({ body: issueComments.body }).from(issueComments)
+    .where(and(eligible, eq(issueComments.issueId, readState.issueId)))
+    .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1).as("newest");
+  const rows = await db.select({ issueId: readState.issueId, latest: readState.latest,
+    unreadMessageCount: readState.unreadMessageCount, latestMessageBody: newest.body,
+  }).from(readState).leftJoinLateral(newest, sql`true`);
   const byId = new Map(rows.map(row => [row.issueId, row]));
-  // Stock's notification rule: redact the WHOLE saved text, then cut; omit the preview if redaction fails.
+  const { censorUsernameInLogs } = await instanceSettingsService(db).getGeneral();
   const redactions = createRunSecretRedactionRegistry(db);
-  const previews = new Map(await Promise.all(rows.map(async row => [row.issueId, row.latestMessageBody == null ? null
-    : await redactions.redactForIssueNotification(companyId, row.issueId, row.latestMessageBody).then(text => [...text].slice(0, 240).join(""), () => null)] as const)));
+  const previews = new Map(await Promise.all(rows.map(async row => {
+    try {
+      // Match comment reads: mask, then registry. A raw-text cut can split a secret
+      // or Markdown construct, so flatten the complete newest body before cutting.
+      const masked = redactCurrentUserText(row.latestMessageBody ?? "", { enabled: censorUsernameInLogs });
+      const redacted = await redactions.redactForIssueNotification(companyId, row.issueId, masked);
+      const plain = markdownToPlainText(redacted).replace(/\s+/g, " ").trim();
+      return [row.issueId, [...plain].slice(0, 240).join("")] as const;
+    } catch {
+      // No raw fallback when masking, registry resolution or flattening fails.
+      return [row.issueId, null] as const;
+    }
+  })));
   return conversations.map(chat => ({ ...chat, isUnreadForMe: (byId.get(chat.id)?.unreadMessageCount ?? 0) > 0,
     unreadMessageCount: byId.get(chat.id)?.unreadMessageCount ?? 0,
     lastExternalCommentAt: byId.get(chat.id)?.latest ?? null,
