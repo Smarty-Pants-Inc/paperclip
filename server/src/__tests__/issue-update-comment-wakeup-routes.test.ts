@@ -485,12 +485,34 @@ describe("issue update comment wakeups", () => {
     }
   });
 
+  it("rejects saved ultra effort with the same bare chat model before any save or wake", async () => {
+    const existing = makeIssue({ assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null });
+    mockModelAgent.mockResolvedValue({ id: ASSIGNEE_AGENT_ID, companyId: existing.companyId,
+      adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: "paperclip/model", effort: "ultra" } });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockImplementation(async (_id, fields) => ({ ...existing, ...fields }));
+    mockIssueService.addComment.mockResolvedValue({ id: "model-comment", issueId: existing.id,
+      companyId: existing.companyId, body: "use this model" });
+    const res = await request(await createApp()).patch(`/api/issues/${existing.id}`).send({
+      comment: "use this model", assigneeAdapterOverrides: { adapterConfig: { model: "model" } },
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toBe('Pi cannot use reasoning level "ultra": choose off, minimal, low, medium, high, xhigh or max');
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockHeldEnd).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
   it.each([
     { provider: "pi_rpc", config: { piRpcThinkingLevel: "ultra" }, status: 422 },
     { provider: "pi_rpc", config: { modelReasoningEffort: "ultra" }, status: 422 },
     { provider: "pi_rpc", config: { reasoningEffort: "ultra" }, status: 422 },
     { provider: "pi_rpc", config: { effort: "ultra" }, status: 422 },
     { provider: "pi_rpc", config: { piRpcThinkingLevel: "max" }, status: 200 },
+    { provider: "pi_rpc", config: { piRpcThinkingLevel: null }, status: 200 },
+    { provider: "pi_rpc", config: { piRpcThinkingLevel: "" }, status: 200 },
+    { provider: "pi_rpc", config: { piRpcThinkingLevel: " \t " }, status: 200 },
     { provider: "pi_rpc", config: { effort: "max" }, status: 200 },
     { provider: "pi_rpc", config: { effort: "none" }, status: 200 },
     { provider: "codex", config: { modelReasoningEffort: "ultra" }, status: 200 },
@@ -519,6 +541,8 @@ describe("issue update comment wakeups", () => {
     { previous: { adapterConfig: { model: "gpt-6.2-sol" } }, next: { model: "paperclip/gpt-6.2-sol" }, end: false },
     { previous: null, next: { modelReasoningEffort: "low" }, end: true },
     { previous: null, next: { modelReasoningEffort: "xhigh" }, end: false },
+    { previous: null, next: { piRpcThinkingLevel: null }, end: false },
+    { previous: null, next: { piRpcThinkingLevel: " \t " }, end: false },
     { previous: { adapterConfig: { model: "paperclip/gpt-6.2-sol" } }, next: null, end: true },
   ])("ends only this chat's held turn on an effective Pi model/level change: %j", async ({ previous, next, end }) => {
     const existing = makeIssue({ assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null, assigneeAdapterOverrides: previous });
