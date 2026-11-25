@@ -2798,6 +2798,7 @@ export function buildSessionConfigCategoryValues(input: {
   agentConfigRevision: unknown;
   agentIdentityKeyId?: string;
   legacyComposition?: boolean;
+  retainIssueOverrideModelKeys?: boolean;
 }) {
   const sanitizedSecretManifest = sanitizeSecretManifestForConfigFingerprint(
     input.secretManifest,
@@ -2832,7 +2833,7 @@ export function buildSessionConfigCategoryValues(input: {
       : paperclipRunnerSessionAdapterConfig(input.effectiveAdapterConfig),
     agentRuntimeConfig: legacy ? input.agentRuntimeConfig : sessionAgentRuntimeConfig(input.agentRuntimeConfig),
     instructions: input.instructions,
-    issueOverrides: legacy || input.adapterType !== "paperclip_runner"
+    issueOverrides: legacy || input.retainIssueOverrideModelKeys || input.adapterType !== "paperclip_runner"
       ? input.issueOverrides
       : paperclipRunnerSessionIssueOverrides(input.issueOverrides, input.effectiveAdapterConfig),
     workspaceConfig,
@@ -2865,6 +2866,7 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
   agentConfigRevision?: unknown;
   agentIdentityKeyId?: string;
   legacyComposition?: boolean;
+  retainIssueOverrideModelKeys?: boolean;
 }): Promise<EffectiveRunSessionConfigMetadata> {
   const secretManifest = input.secretManifest ?? [];
   const instructions = input.managedInstructions ? {
@@ -2911,6 +2913,7 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
     agentConfigRevision: input.agentConfigRevision ?? null,
     agentIdentityKeyId: input.agentIdentityKeyId,
     legacyComposition: input.legacyComposition,
+    retainIssueOverrideModelKeys: input.retainIssueOverrideModelKeys,
   });
   const fingerprints = createEffectiveRunConfigFingerprints({
     session: categoryValues,
