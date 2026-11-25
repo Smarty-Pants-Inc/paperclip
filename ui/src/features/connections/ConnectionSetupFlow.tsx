@@ -73,6 +73,7 @@ import { ApiError } from "@/api/client";
 import { toolsApi } from "@/api/tools";
 import { agentsApi } from "@/api/agents";
 import { appCopyFor, credentialFieldLabel } from "@/lib/app-gallery-copy";
+import { ANALYTICS_NO_CAPTURE_CLASS } from "@/lib/analytics/privacy";
 import { JsonSchemaForm, validateJsonSchemaForm, type JsonSchemaNode } from "@/components/JsonSchemaForm";
 import { AgentMultiSelect, type AgentMultiSelectOption } from "@/components/AgentMultiSelect";
 import { describeError } from "@/api/errors";
@@ -3895,7 +3896,19 @@ function KeyStep({
               <label className="text-sm font-medium text-foreground">
                 {credentialFieldLabel(entry.name, field.label, fields.length)}
               </label>
-              <Input
+              {field.type === "textarea" ? (
+                <Textarea
+                  aria-label={credentialFieldLabel(entry.name, field.label, fields.length)}
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
+                  value={values[field.configPath] ?? ""}
+                  onChange={(e) => onChange({ ...values, [field.configPath]: e.target.value })}
+                  placeholder="••••••••••••••••"
+                  className={cn("mt-2 min-h-24 font-mono", field.secret !== false && "secret-value-masked", field.secret !== false && ANALYTICS_NO_CAPTURE_CLASS)}
+                />
+              ) : <Input
                 type={field.type === "text" && field.secret === false ? "text" : "password"}
                 aria-label={credentialFieldLabel(entry.name, field.label, fields.length)}
                 autoComplete="off"
@@ -3903,7 +3916,7 @@ function KeyStep({
                 onChange={(e) => onChange({ ...values, [field.configPath]: e.target.value })}
                 placeholder={field.type === "text" && field.secret === false ? field.placeholder : "••••••••••••••••"}
                 className="mt-2 h-11 font-mono"
-              />
+              />}
               {field.helperMd && <p className="mt-2 text-xs text-muted-foreground">
                 {field.helperMd}
               </p>}
