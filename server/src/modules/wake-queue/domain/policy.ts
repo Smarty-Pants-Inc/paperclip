@@ -13,6 +13,20 @@
 // This file only branches on that facts object; it never queries a
 // database, reads the clock, or reads the wake context payload directly.
 
+/** Automatic steering carries authored input, never a generated presentation or
+ * the target agent's own output. Completion/stage wakes keep their own routes. */
+export function isAutomaticSteeringComment(comment: {
+  authorType: string | null; authorAgentId: string | null; authorUserId: string | null; body: string;
+  origin?: string; presentation?: { kind: string } | null;
+  metadata?: { authorizationReason?: string | null; chatMessage?: unknown; attachmentPreparation?: unknown; recovery?: unknown } | null;
+}, targetAgentId: string): boolean {
+  return comment.authorType !== "system" && comment.authorAgentId !== targetAgentId &&
+    Boolean(comment.authorAgentId || comment.authorUserId) && comment.body.trim() !== "/new" &&
+    comment.origin !== "fast_response" && comment.presentation?.kind !== "system_notice" &&
+    comment.metadata?.authorizationReason !== "allow_chat_run_presentation" &&
+    !comment.metadata?.chatMessage && !comment.metadata?.attachmentPreparation && !comment.metadata?.recovery;
+}
+
 /** The error a saved wake records when a completed run already received all of its messages. */
 export const QUEUED_MESSAGES_DELIVERED_REASON = "Queued messages were already delivered to a completed run";
 
