@@ -17,6 +17,21 @@ export async function readCodexUserMessages(transport: Requester, threadId: stri
   return messages;
 }
 
+/** Identity must be returned on the provider's retained user item. In
+ * particular a runner's synthetic ACK item id or matching text is not proof.
+ * Old provider packs without correlationId safely return no certified input. */
+export async function readCodexUserInputIds(transport: Requester, threadId: string): Promise<string[] | null> {
+  const ids = new Set<string>();
+  for (const turn of await readCodexTurnMetadata(transport, threadId)) {
+    for (const item of await readCodexTurnItems(transport, threadId, text(turn.id))) {
+      if (item.type !== "userMessage") continue;
+      if (!Array.isArray(item.content)) return null;
+      if (typeof item.correlationId === "string" && item.correlationId) ids.add(item.correlationId);
+    }
+  }
+  return [...ids];
+}
+
 const TURN_STATUSES = ["inProgress", "completed", "failed", "interrupted", "cancelled"];
 
 class CodexPaginatedHistoryUnsupported extends HarnessReconciliationError {}
