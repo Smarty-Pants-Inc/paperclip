@@ -40,7 +40,7 @@ export async function publishContinuousNativeReply(input: {
     binding: Pick<NativeExecutionInput["binding"], "companyId" | "issueId" | "runId" | "agentId">;
     provider: Pick<NativeExecutionInput["provider"], "kind">;
   };
-  event: Pick<PrpEvent, "eventType" | "payload" | "sourceEventId" | "runId" | "normalizedSessionId" | "itemId">;
+  event: Pick<PrpEvent, "eventType" | "payload" | "sourceEventId" | "runId" | "normalizedSessionId" | "itemId" | "turnId">;
 }) {
   if (input.execution.provider.kind !== "pi_rpc" || input.event.eventType !== "item.completed") return;
   const finalAgentMessage = readCompletedAssistantMessageCandidate({ seq: 0, prpEvent: input.event });
@@ -81,9 +81,15 @@ export async function publishContinuousNativeReply(input: {
         (typeof parseObject(receipt).afterEventSeq !== "number" || Number(parseObject(receipt).afterEventSeq) < input.cursor))
       .sort((a, b) => String(parseObject(a[1]).acknowledgedAt).localeCompare(String(parseObject(b[1]).acknowledgedAt)));
     const wakeId = row.run.contextSnapshot?.wakeCommentId;
-    // Pi knows which inputs entered the model before this final. An explicit
-    // empty list is authoritative too: do not shift the next question onto it.
-    // Older packs omit answers and retain the original FIFO behavior.
+    // A steer ACK binds its person input to the accepting provider turn. Pi's
+    // answers can omit a steer accepted while this final was already streaming;
+    // include that same-turn receipt, never an ACK for a different/later turn.
+    const sameTurnAcknowledgements = input.event.turnId ? pending
+      .filter(([, receipt]) => parseObject(receipt).turnId === input.event.turnId)
+      .map(([id]) => id) : [];
+    const legacyPending = pending.find(([, receipt]) => !input.event.turnId || !parseObject(receipt).turnId);
+    // Explicit empty answers still cannot consume the next turn's FIFO head.
+    // Older receipts without turn identity retain the original FIFO behavior.
     const answers = input.event.payload.answers;
     const explicitAnswers = Array.isArray(answers);
     const firstInputIds = Object.keys(replies).length === 0 ? [
@@ -95,7 +101,8 @@ export async function publishContinuousNativeReply(input: {
       ...(explicitAnswers ? firstInputIds : typeof wakeId === "string" && !answered.has(wakeId) ? [wakeId] : []),
       ...(explicitAnswers
         ? answers.filter((id): id is string => typeof id === "string" && !answered.has(id))
-        : pending[0] ? [pending[0][0]] : []),
+        : sameTurnAcknowledgements.length ? sameTurnAcknowledgements : legacyPending ? [legacyPending[0]] : []),
+      ...(explicitAnswers ? sameTurnAcknowledgements : []),
     ])];
     const clientRequestId = `${nativeFinalReplyKey(runId, input.event.itemId!)}:${questionCommentIds.join(",") || "opening"}`;
     const [existing] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
