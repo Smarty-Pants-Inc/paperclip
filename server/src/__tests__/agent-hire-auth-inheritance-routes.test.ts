@@ -603,6 +603,32 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     }
   });
 
+  it.each((["agents", "agent-hires"] as const).flatMap(endpoint =>
+    [undefined, "auto", "legacy"].flatMap(runner => ["sandbox", "local"].map(driver => ({ endpoint, runner, driver }))),
+  ))("Codex card $endpoint on $driver with runner $runner", async ({ endpoint, runner, driver }) => {
+    const companyId = await seedCompany();
+    const parent = await seedParentAgent(companyId, "paperclip_runner", {});
+    const environmentId = randomUUID();
+    await db.insert(environments).values({ id: environmentId, name: "Plugin computer", driver,
+      config: driver === "sandbox" ? { provider: "example-sandbox" } : {} });
+    await db.update(agents).set({ defaultEnvironmentId: environmentId }).where(eq(agents.id, parent.id));
+    const res = await request(createApp(db, endpoint === "agents" ? userActor() : agentActor(companyId, parent.id)))
+      .post(`/api/companies/${companyId}/${endpoint}`).send({
+        name: "Codex card child", role: "engineer", adapterType: "codex_local", runner,
+        adapterConfig: { dangerouslyBypassApprovalsAndSandbox: true },
+        ...(endpoint === "agents" ? { defaultEnvironmentId: environmentId } : {}),
+      });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const responseAgent = endpoint === "agents" ? res.body : res.body.agent;
+    const [child] = await db.select().from(agents).where(eq(agents.id, responseAgent.id));
+    expect(child).toMatchObject({ defaultEnvironmentId: environmentId,
+      adapterType: runner === "legacy" ? "codex_local" : "paperclip_runner", adapterConfig: { modelReasoningEffort: "medium" } });
+    if (runner === "legacy") return expect(child!.adapterConfig.dangerouslyBypassApprovalsAndSandbox).toBe(true);
+    expect(child!.adapterConfig).toMatchObject({ provider: "codex", model: expect.stringMatching(/\S/) });
+    expect(child!.adapterConfig).not.toHaveProperty("dangerouslyBypassApprovalsAndSandbox");
+    expect(responseAgent.adapterConfig).not.toHaveProperty("dangerouslyBypassApprovalsAndSandbox");
+  });
+
   it.each(["gpt-6.1-sol", undefined])("caller-runtime Codex defaults model and level regardless of caller model %s", async model => {
     const companyId = await seedCompany();
     const parent = await seedParentAgent(companyId, "paperclip_runner", {});
