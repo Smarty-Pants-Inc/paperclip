@@ -1332,7 +1332,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     setSettlingRun({
       id: prev.id,
       startedAtMs:
-        (prev.startedAt ? toMs(prev.startedAt) : null) ?? toMs(prev.createdAt),
+        prev.startedAt ? toMs(prev.startedAt) : null,
     });
   }, [liveRun]);
 
