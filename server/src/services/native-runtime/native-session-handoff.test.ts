@@ -28,6 +28,24 @@ describe("bounded fresh-session handoff", () => {
     expect(packet.entries.map((entry: { body: string }) => entry.body)).toEqual(entries.slice(2).map(entry => entry.body));
   });
 
+  it("counts support-only omissions separately from messages", () => {
+    const result = renderNativeSessionHandoff({ issueId: "task", generation: null, mode: "whole", omittedEntriesAtLeast: 1,
+      entries: [{ kind: "message", id: "message", body: "retained" }] });
+    expect(result).not.toContain("earlier messages were not handed over");
+    expect(result).toContain("At least 1 supporting entries were not handed over.");
+  });
+
+  it("counts mixed budget evictions by message and supporting entry", () => {
+    const result = renderNativeSessionHandoff({ issueId: "task", generation: null, mode: "whole", omittedEntriesAtLeast: 1,
+      entries: [{ kind: "message", id: "old", body: "x".repeat(250_000) }, { kind: "message", id: "new", body: "y".repeat(250_000) },
+        { kind: "document", id: "doc", body: "support" }] });
+    expect(result.split("\n")[0]).toBe("1 earlier messages were not handed over.");
+    expect(result).toContain("At least 2 supporting entries were not handed over.");
+    const packet = JSON.parse(result.split("\n").at(-1)!);
+    expect(packet.omittedMessages).toBe(1);
+    expect(packet.entries.map((entry: { id: string }) => entry.id)).toEqual(["new"]);
+  });
+
   it("restores the handoff on fresh bootstrap and resume failure, without replaying it on resume", () => {
     const input = buildNativeExecutionInput({
       companyId: "company", runId: "run", agentId: "agent", normalizedSessionId: "session", conversationMode: true,
@@ -238,6 +256,65 @@ const support = await getEmbeddedPostgresTestSupport();
     const packet = JSON.parse(result!.split("\n").at(-1)!);
     expect(packet.entries.map((entry: { body: string }) => entry.body)).toEqual(["PROGRESS: investigating", "SAVED FINAL", "DISTINCT FINAL"]);
     expect(packet.omittedEntriesAtLeast).toBe(0);
+  });
+
+  it("counts zero omitted messages with thirty supporting interactions", async () => {
+    const taskId = randomUUID();
+    await db.insert(issues).values({ id: taskId, companyId, title: "Budgeted history", assigneeAgentId: agentId });
+    await db.insert(issueComments).values({ companyId, issueId: taskId, authorUserId: "user", body: "retained", createdAt: new Date(30_000) });
+    await db.insert(issueThreadInteractions).values(Array.from({ length: 30 }, () => ({ companyId, issueId: taskId,
+      kind: "ask_user_questions", status: "answered", createdByAgentId: agentId, createdAt: new Date(30_000), resolvedAt: new Date(31_000),
+      payload: { version: 1 as const, questions: [] }, result: { version: 1 as const, summaryMarkdown: "resolved" } })));
+    const args = { db, companyId, issueId: taskId, agentId, before: new Date(100_000), mode: "whole" as const };
+    const supportOnly = await buildNativeSessionHandoff(args);
+    expect(supportOnly).not.toContain("earlier messages were not handed over");
+    expect(supportOnly).toContain("supporting entries were not handed over");
+  });
+
+  it.each(["comments", "finals"] as const)("loads full %s bodies only within the whole-message budget", async kind => {
+    const taskId = randomUUID();
+    await db.insert(issues).values({ id: taskId, companyId, title: "Large history", assigneeAgentId: agentId });
+    await db.insert(issueComments).values({ companyId, issueId: taskId, authorUserId: "user", body: "old request", createdAt: new Date(30_000) });
+    const args = { db, companyId, issueId: taskId, agentId, before: new Date(200_000), mode: "whole" as const };
+    const rows = Array.from({ length: 70 }, (_, i) => ({ id: randomUUID(), companyId, issueId: taskId, authorUserId: "user",
+      body: `${i}:` + "x".repeat(100_000), createdAt: new Date(32_000 + i * 1_000) }));
+    if (kind === "comments") await db.insert(issueComments).values(rows);
+    else {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: taskId, status: "succeeded", createdAt: new Date(31_000) });
+      await db.insert(heartbeatRunEvents).values(rows.map((row, i) => ({ companyId, agentId, runId, seq: i + 1,
+        eventType: "item.completed", createdAt: new Date(50_000),
+        payload: { prpEvent: { itemId: String(i), payload: { kind: "agentMessage", channel: "final", text: row.body } } } })).reverse());
+    }
+    let loadedBodyChars = 0;
+    const originalSelect = db.select.bind(db);
+    const select = vi.spyOn(db, "select");
+    select.mockImplementation(((...selectArgs: Parameters<typeof db.select>) => {
+      const builder = originalSelect(...selectArgs);
+      const originalFrom = builder.from.bind(builder);
+      builder.from = ((...fromArgs: Parameters<typeof builder.from>) => {
+        const query = originalFrom(...fromArgs);
+        const execute = query.execute.bind(query);
+        query.execute = (async (...executeArgs: Parameters<typeof query.execute>) => {
+          const result = await execute(...executeArgs);
+          for (const row of result) if (typeof row.body === "string") loadedBodyChars += row.body.length;
+          return result;
+        }) as typeof query.execute;
+        return query;
+      }) as typeof builder.from;
+      return builder;
+    }) as typeof db.select);
+    let result: string;
+    try { result = (await buildNativeSessionHandoff({ ...args, before: new Date(200_000) }))!; }
+    finally { select.mockRestore(); }
+    expect(loadedBodyChars).toBeLessThan(400_000);
+    expect(loadedBodyChars).toBeGreaterThan(100_000);
+    const packet = JSON.parse(result.split("\n").at(-1)!);
+    const retained = packet.entries.filter((entry: { kind: string }) => ["original_request", "message", "agent_reply"].includes(entry.kind));
+    expect(packet.omittedMessages).toBe(71 - retained.length);
+    expect(result.length).toBeLessThanOrEqual(400_000);
+    expect(retained.at(-1).body).toBe(rows.at(-1)!.body);
+    expect(retained.every((entry: { body: string }) => entry.body.length > 100_000)).toBe(true);
   });
 
   it("loads and redacts history once only when a fresh attempt requests it", async () => {
