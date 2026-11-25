@@ -3610,10 +3610,18 @@ impl CodexCommandExecutor {
                 next_state.config.include_skill_instructions = config.include_skill_instructions;
                 upgraded_skill_config = true;
             }
-            if next_state.config.provider == "cursor_cloud"
-                && config.provider == "cursor_cloud"
+            if matches!(
+                next_state.config.provider.as_str(),
+                "cursor_cloud" | "pi_rpc"
+            ) && config.provider == next_state.config.provider
                 && self.provider.is_none()
-                && next_state.lifecycle == "prepared"
+                && (next_state.lifecycle == "prepared"
+                    || (config.provider == "pi_rpc"
+                        && self.awaiting_new_run_attach
+                        && matches!(
+                            next_state.lifecycle.as_str(),
+                            "session_open" | "provider_exited"
+                        )))
             {
                 next_state.config.instructions = config.instructions.clone();
             }

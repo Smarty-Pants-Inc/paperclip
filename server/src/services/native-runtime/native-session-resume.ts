@@ -655,8 +655,10 @@ export function nativeRuntimeContextsMatch(
   previous: NativeRuntimeContextSnapshot,
   current: NativeRuntimeContextSnapshot,
   toolRefreshOnResume?: boolean,
+  instructionRefreshOnResume = false,
 ): boolean {
   return previous.aggregateDigest === current.aggregateDigest ||
+    (instructionRefreshOnResume && canonicalNativeRuntimeContextDigest({ ...previous, instructions: current.instructions }) === current.aggregateDigest) ||
     (toolRefreshOnResume === true && canonicalNativeRuntimeContextDigest({ ...previous, mcp: current.mcp }) === current.aggregateDigest);
 }
 
