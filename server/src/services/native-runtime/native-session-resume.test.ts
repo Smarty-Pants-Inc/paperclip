@@ -260,7 +260,8 @@ describe("capability-gated connection tool refresh", () => {
     const result = rebindNativeSessionCheckpoint({ previousRun: source, currentExecution: current,
       sessionContinuity: mode === "paperclip" ? "paperclip" : "continuous", executionTargetKind: targetKind });
     if (mode === "continuous") expect(result).toMatchObject({ workingDirectory: "/workspace-Y" });
-    else expect(result).toBeNull();
+    else if (mode === "unfinished-goal") expect(result).toBeNull();
+    else expect(result).toMatchObject({ sessionId: "provider-thread-123" });
   });
 
   it("retains the exact provider session for an MCP-only change when the harness supports it", () => {
