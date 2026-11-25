@@ -1,4 +1,5 @@
 import { currentPluginInteractionOrigin } from "./plugin-interaction-context.js";
+import { requestHeldNativeConfigurationEnd } from "./native-runtime/held-native-turn.js";
 import { extractAgentMentionIds } from "@paperclipai/shared";
 import { assertAgentInteraction } from "./agent-interaction-policy.js";
 import { updateAgentConfigurationInTransaction } from "./agent-configuration-transaction.js";
@@ -335,7 +336,7 @@ export function agentInstructionRevisionService(db: Db) {
               instructionsEntryFile: state.entryFile,
               instructionsFilePath: `${state.root}/${state.entryFile}`,
             },
-          }, { allowPendingApprovalConfigUpdate: true });
+          }, { allowPendingApprovalConfigUpdate: true, instructionEntryBindingOnly: true });
         }
       };
       // An exact replay can safely return the durable receipt even after its base
@@ -365,6 +366,7 @@ export function agentInstructionRevisionService(db: Db) {
           },
         );
       }
+      await requestHeldNativeConfigurationEnd(tx as unknown as Db, input);
       await invalidateAgentFileProjection(state.root);
       await materializeInstructionBytes(state.root, state.entryFile, candidate);
       await persistDurableAgentFiles(tx, state.agent, state.root);
