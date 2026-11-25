@@ -175,6 +175,42 @@ async function runReleaseDrain(
       continue;
     }
 
+    // Settle only the exact response this successful live run already read.
+    // Completion of the task is independent of delivery of its answer. Keep
+    // unrelated input coalesced into the receipt, and explicit resume intent.
+    // A card read is not delivery proof for its person's source comment.
+    const sourceCommentId = readNonEmptyString(candidate.payload.sourceCommentId);
+    const interactionIds = candidate.payload.interactionIds;
+    if (
+      run.status === "succeeded" &&
+      run.agentId === issue.assigneeAgentId && candidate.agentId === run.agentId &&
+      run.contextSnapshot.issueId === issue.id && !candidate.authorizedFailedChatRetry &&
+      candidate.payload.mutation === "interaction" &&
+      candidate.payload.resumeIntent !== true && candidate.deferredContextSeed.resumeIntent !== true &&
+      (!Array.isArray(interactionIds) || interactionIds.every(id => id === candidate.payload.interactionId)) &&
+      [...candidate.queuedCommentIds, ...candidate.deferredCommentIds].every(id => id === sourceCommentId) &&
+      await ports.transaction.hasConsumedInteractionResponse({ companyId: run.companyId, issueId: issue.id,
+        runId: run.id, agentId: run.agentId, payload: candidate.payload })
+    ) {
+      const commentIds = [...new Set([
+        ...(sourceCommentId ? [sourceCommentId] : []), ...candidate.queuedCommentIds, ...candidate.deferredCommentIds,
+      ])];
+      const sourceDelivery = commentIds.length ? await ports.transaction.getQueuedCommentLiveness({
+        companyId: run.companyId,
+        issueId: issue.id,
+        wakeAgentId: candidate.agentId,
+        finishingRunId: run.id,
+        finishingRunAgentId: run.agentId,
+        queuedCommentIds: commentIds,
+        retainDeliveredCommentBindings: true,
+      }) : null;
+      if (commentIds.every(id => sourceDelivery?.deliveredCommentIds?.includes(id))) {
+        await ports.transaction.cancelDeferredWake({ companyId: run.companyId, wakeId: candidate.id, agentId: candidate.agentId,
+          reason: "Interaction response consumed by the successful live run", now: input.now });
+        continue;
+      }
+    }
+
     // An earlier reply in this conversation already reported this wake's
     // outcome. Settle it here so a duplicate report never becomes a run.
     if (await ports.transaction.skipAlreadyReportedChatWake({ companyId: run.companyId, issueId: issue.id, wake: candidate, now: input.now })) {
