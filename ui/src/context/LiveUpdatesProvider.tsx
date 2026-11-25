@@ -1367,8 +1367,10 @@ function buildRunStatusToast(
 
   let body: string | undefined;
   if (error || errorCode) {
-    // Use the chat's classified titles, never diagnostic text from the runner.
-    const code = (errorCode ?? error ?? "").split(":", 1)[0]!;
+    // Keep known classifications; preserve an unknown failure's readable cause.
+    const code = (errorCode ?? error ?? "").split(":", 1)[0]!.toLowerCase();
+    // Show a cause only when it is plain words: paths, URLs, credentials and long ids stay in the run.
+    const cause = error ?? errorCode ?? "";
     body = ({
       provider_quota: "Error: usage limit reached",
       claude_auth_required: "Error: not logged in to Claude",
@@ -1380,7 +1382,10 @@ function buildRunStatusToast(
       sandbox_disk_full: "Disk full",
     } as Record<string, string>)[code] ?? (code.startsWith("native_controller_recovery_")
       ? "Automatic recovery blocked"
-      : "Open the run for details.");
+      : /[/@=]|[A-Za-z0-9]{20,}/.test(cause) ? "Open the run for details." : truncate(cause.replace(
+          /\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+(?::[a-z0-9]+(?:_[a-z0-9]+)*)*\b/gi,
+          token => token.toLowerCase().replaceAll("_", " ").replaceAll(":", ": "),
+        ), 100));
   } else if (triggerDetail) {
     body = `Trigger: ${triggerDetail}`;
   }
