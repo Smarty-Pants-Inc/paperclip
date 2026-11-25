@@ -432,6 +432,251 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     }
   });
 
+  // RFL 0462 exact probes: real PostgreSQL claims, board selection and publication.
+  async function seamInputs(scope: { companyId: string; issueId: string; runId: string; agentId: string }) {
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, scope.agentId));
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+    const [opening] = await db.select().from(issueComments).where(eq(issueComments.id, run.contextSnapshot!.wakeCommentId as string));
+    const queueComment = async (body: string, agent = false) => {
+      const [comment] = await db.insert(issueComments).values({ companyId: scope.companyId, issueId: scope.issueId,
+        authorType: agent ? "agent" : "user", authorUserId: agent ? null : opening.authorUserId,
+        authorAgentId: agent ? scope.agentId : null, body }).returning();
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId: scope.companyId, agentId: scope.agentId,
+        source: "on_demand", reason: "issue_execution_deferred", status: "deferred_issue_execution",
+        requestedByActorType: "user", requestedByActorId: opening.authorUserId,
+        payload: { issueId: scope.issueId, _paperclipWakeContext: { wakeReason: "issue_commented", wakeCommentIds: [comment.id] } } }).returning();
+      return { comment, wake };
+    };
+    const c = await queueComment("C: also check production");
+    const [card] = await db.insert(issueThreadInteractions).values({ companyId: scope.companyId, issueId: scope.issueId,
+      kind: "ask_user_questions", status: "answered", sourceRunId: scope.runId, createdByAgentId: scope.agentId,
+      resolvedByUserId: opening.authorUserId, resolvedAt: new Date(), title: "Choose environment",
+      payload: { version: 1, questions: [{ id: "env", prompt: "Which environment?", selectionMode: "single", required: true,
+        options: [{ id: "production", label: "Production" }] }] },
+      result: { version: 1, answers: [{ questionId: "env", optionIds: ["production"] }] } }).returning();
+    const [cardWake] = await db.insert(agentWakeupRequests).values({ companyId: scope.companyId, agentId: scope.agentId,
+      source: "on_demand", reason: "issue_commented", status: "deferred_issue_execution",
+      requestedByActorType: "user", requestedByActorId: opening.authorUserId,
+      payload: { issueId: scope.issueId, mutation: "interaction", interactionId: card.id, interactionStatus: "answered" } }).returning();
+    const input = await claimFirstTurnQueuedInput(db, scope);
+    expect(input).toContain(c.comment.id); expect(input).toContain(card.id);
+    const readRun = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId)))[0];
+    const wakes = () => db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, scope.companyId));
+    const board = async () => {
+      const [issue] = await db.select().from(issues).where(eq(issues.id, scope.issueId));
+      return readBoardQueuedComments({ executor: db, issue, activeRun: await readRun(),
+        actor: { actorType: "user", actorId: opening.authorUserId!, agentId: null, runId: null, agentApiKeyId: null } });
+    };
+    const publish = async (itemId: string, answers: string[], cursor = 180) => publishContinuousNativeReply({ db, cursor,
+      execution: { binding: scope, provider: { kind: "pi_rpc" } }, event: { eventType: "item.completed", runId: scope.runId,
+        normalizedSessionId: run.nativeSessionId!, sourceEventId: itemId, itemId,
+        payload: { kind: "agentMessage", channel: "final", text: `Reply ${itemId}`, answers } } });
+    return { run, opening, c, card, cardWake, input, queueComment, readRun, wakes, board, publish };
+  }
+
+  it.each(["empty", "other", "opening-first"] as const)("0462 RFL: retains submitted-input aliases until actually answered (%s first final)", async mode => {
+    heldSteering.available = false;
+    await fixture(true, { beforeFinalize: async scope => {
+      const s = await seamInputs(scope);
+      const other = await s.queueComment("Unrelated question");
+      if (mode !== "opening-first") {
+        await s.publish("rfl-F1", mode === "empty" ? [] : [other.comment.id]);
+        const first = (await s.readRun()).resultJson!.continuousReplies as Record<string, { questionCommentIds: string[] }>;
+        expect(first["rfl-F1"].questionCommentIds).toEqual(mode === "empty" ? [] : [other.comment.id]);
+        expect((await s.wakes()).filter(w => [s.c.wake.id, s.cardWake.id].includes(w.id)).map(w => w.status))
+          .toEqual(["deferred_issue_execution", "deferred_issue_execution"]);
+        // Claimed but unanswered input stays hidden, not consumed.
+        expect((await s.board()).entries.map(e => e.comment.id)).not.toContain(s.card.id);
+      }
+      await s.publish("rfl-F2", [s.opening.id], 181);
+      const saved = await s.readRun();
+      const replies = saved.resultJson!.continuousReplies as Record<string, { questionCommentIds: string[] }>;
+      expect(replies["rfl-F2"].questionCommentIds).toEqual([s.opening.id, s.c.comment.id, s.card.id]);
+      expect((await s.wakes()).filter(w => [s.c.wake.id, s.cardWake.id].includes(w.id)).every(w => w.status === "cancelled" && w.finishedAt)).toBe(true);
+      await s.publish("rfl-F2", [s.opening.id], 181); // Event replay creates no second comment.
+      await s.publish("rfl-F3", [s.opening.id], 182); // Already answered IDs are never reassigned.
+      const after = (await s.readRun()).resultJson!.continuousReplies as Record<string, { questionCommentIds: string[] }>;
+      expect(after["rfl-F3"].questionCommentIds).toEqual([]);
+      expect((await comments(scope.runId)).map(c => c.body).sort()).toEqual(mode === "opening-first"
+        ? ["Reply rfl-F2", "Reply rfl-F3"] : ["Reply rfl-F1", "Reply rfl-F2", "Reply rfl-F3"]);
+      console.info("0462_RFL_ALIAS", JSON.stringify({ mode, runId: scope.runId, replies: after,
+        wakes: (await s.wakes()).map(w => ({ id: w.id, status: w.status })) }));
+    } });
+  });
+
+  it.each(["before-acceptance", "after-acceptance", "after-final-ingest"] as const)("0462 RFL: finalization recovers a failed sealed turn without losing its card (%s)", async stage => {
+    heldSteering.available = false;
+    let s!: Awaited<ReturnType<typeof seamInputs>>;
+    const f = await fixture(true, { failed: true, succeed: false, beforeFinalize: async scope => {
+      s = await seamInputs(scope);
+      if (stage !== "before-acceptance") await db.insert(heartbeatRunEvents).values({ companyId: scope.companyId,
+        runId: scope.runId, agentId: scope.agentId, seq: 171, eventType: "turn.accepted", payload: {} });
+      if (stage === "after-final-ingest") for (const [index, answers] of [[], [s.opening.id]].entries()) {
+        // Ingestion committed; publication never ran. The normal finalizer must
+        // recover both finals before release, not infer consumption from claim.
+        await db.insert(heartbeatRunEvents).values({ companyId: scope.companyId, runId: scope.runId, agentId: scope.agentId,
+          seq: 172 + index, eventType: "item.completed", payload: { prpEvent: { runId: scope.runId,
+            normalizedSessionId: s.run.nativeSessionId, sourceEventId: `crash-F${index}`, itemId: `crash-F${index}`,
+            payload: { kind: "agentMessage", channel: "final", text: `Recovered F${index}`, answers } } } });
+      }
+      expect(await comments(scope.runId)).toHaveLength(0);
+      expect((await s.wakes()).every(w => w.status === "deferred_issue_execution")).toBe(true);
+    } });
+    // Use the production terminal projection, not a manual status update.
+    await finalizeNativeRun({ db, runId: f.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+    expect((await s.readRun()).status).toBe("failed");
+    const answered = stage === "after-final-ingest";
+    const recoveredWakes = await s.wakes();
+    const sealedWakes = recoveredWakes.filter(w => [s.c.wake.id, s.cardWake.id].includes(w.id));
+    expect(sealedWakes).toHaveLength(2);
+    expect(sealedWakes.every(w => w.status === (answered ? "cancelled" : "deferred_issue_execution"))).toBe(true);
+    expect(recoveredWakes.some(w => w.status === "queued" && w.payload?.retryCause === "native_run_failed")).toBe(!answered);
+    if (answered) {
+      for (let replay = 0; replay < 2; replay++) await recoverCommittedNativeChatResponse(db, f.input);
+      expect((await comments(f.runId)).map(c => c.body).sort()).toEqual(["Recovered F0", "Recovered F1"]);
+      expect((await s.readRun()).resultJson?.continuousReplies).toMatchObject({ "crash-F0": { questionCommentIds: [] },
+        "crash-F1": { questionCommentIds: [s.opening.id, s.c.comment.id, s.card.id] } });
+    }
+    const nextRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: nextRunId, companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+      nativeSessionId: randomUUID(), runtimeMode: "native", status: "running", responsibleUserId: f.userId,
+      retryOfRunId: f.runId, contextSnapshot: (await s.readRun()).contextSnapshot });
+    await db.update(issues).set({ executionRunId: nextRunId }).where(eq(issues.id, f.issueId));
+    const nextInput = await claimFirstTurnQueuedInput(db, { ...f.input, agentId: f.agentId, runId: nextRunId });
+    if (answered) expect(nextInput).toBeNull();
+    else { expect(nextInput).toContain(s.card.id); expect(nextInput).toContain('"optionIds": ['); }
+    console.info("0462_RFL_RECOVERY", JSON.stringify({ stage, runId: f.runId, nextRunId, nextInput,
+      wakes: (await s.wakes()).map(w => ({ id: w.id, status: w.status })) }));
+  });
+
+  it("0462 RFL: mixed claimed C plus unclaimed agent A cannot hide later person P from board or drain", async () => {
+    const flag = process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+    process.env.PAPERCLIP_AGENT_CHAT_STEERING = "true";
+    heldSteering.available = true; heldSteering.sent = [];
+    try {
+      await fixture(true, { beforeFinalize: async scope => {
+        const s = await seamInputs(scope);
+        const a = await s.queueComment("A: automated report", true);
+        await db.update(agentWakeupRequests).set({ status: "cancelled" }).where(eq(agentWakeupRequests.id, a.wake.id));
+        await db.update(agentWakeupRequests).set({ requestedAt: new Date(1000), payload: { issueId: scope.issueId,
+          _paperclipWakeContext: { wakeReason: "issue_commented", wakeCommentIds: [s.c.comment.id, a.comment.id] } } })
+          .where(eq(agentWakeupRequests.id, s.c.wake.id));
+        await s.queueComment("A2: later automated report", true);
+        const p = await s.queueComment("P: later human question");
+        expect((await s.board()).entries.map(e => e.comment.id)).toEqual([p.comment.id]);
+        await drainContinuousPersonMessages(db, scope, { beforeFirstReply: true });
+        expect(heldSteering.sent).toEqual([p.comment.id]);
+        await drainContinuousPersonMessages(db, scope, { beforeFirstReply: true });
+        expect(heldSteering.sent).toEqual([p.comment.id]);
+        expect((await s.board()).entries.map(e => e.comment.id)).toEqual([a.comment.id]);
+        console.info("0462_RFL_SELECTOR", JSON.stringify({ runId: scope.runId, claimedC: s.c.comment.id,
+          agentA: a.comment.id, personP: p.comment.id, steers: heldSteering.sent }));
+      } });
+    } finally {
+      heldSteering.available = false;
+      if (flag === undefined) delete process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+      else process.env.PAPERCLIP_AGENT_CHAT_STEERING = flag;
+    }
+  });
+
+  it.each(["comment-before", "card-before", "card-after", "comment-before-card-after", "card-before-card-after", "comment-window", "card-window"] as const)("seals pending held-conversation input into the submitted turn (%s)", async scenario => {
+    const steeringFlag = process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+    process.env.PAPERCLIP_AGENT_CHAT_STEERING = "true";
+    heldSteering.available = true; heldSteering.sent = [];
+    try {
+      await fixture(true, { beforeFinalize: async scope => {
+        await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, scope.agentId));
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+        const [opening] = await db.select().from(issueComments).where(eq(issueComments.id, run.contextSnapshot!.wakeCommentId as string));
+        const queue = async (card = !scenario.startsWith("comment")) => {
+          const id = randomUUID();
+          if (card) await db.insert(issueThreadInteractions).values({ id, companyId: scope.companyId, issueId: scope.issueId,
+            kind: "ask_user_questions", status: "answered", createdByAgentId: scope.agentId, sourceRunId: scope.runId,
+            resolvedByUserId: opening.authorUserId, resolvedAt: new Date(), title: "Which environment?",
+            payload: { version: 1, questions: [{ id: "environment", prompt: "Which environment?", selectionMode: "single", required: true,
+              options: [{ id: "production", label: "Production" }] }] },
+            result: { version: 1, answers: [{ questionId: "environment", optionIds: ["production"] }] } });
+          else await db.insert(issueComments).values({ id, companyId: scope.companyId, issueId: scope.issueId,
+            authorType: "user", authorUserId: opening.authorUserId, body: "Also check production before replying." });
+          const [wake] = await db.insert(agentWakeupRequests).values({ companyId: scope.companyId, agentId: scope.agentId,
+            source: "on_demand", reason: "issue_execution_deferred", status: "deferred_issue_execution",
+            requestedByActorType: "user", requestedByActorId: opening.authorUserId,
+            payload: { issueId: scope.issueId, ...(card ? { mutation: "interaction", interactionId: id, interactionStatus: "answered" } : {}),
+              _paperclipWakeContext: { wakeReason: "issue_commented", ...(card ? {} : { wakeCommentIds: [id] }) } } }).returning();
+          return { id, wakeId: wake.id };
+        };
+        const inWindow = scenario.endsWith("-window");
+        const before = scenario !== "card-after" && !inWindow;
+        let pending = before ? await queue() : undefined;
+        const input = await claimFirstTurnQueuedInput(db, scope);
+        if (before) { expect(input).toContain(pending!.id); expect(input).toContain("production"); }
+        else expect(input).toBeNull();
+        if (inWindow) {
+          // RFL race concern: commit AFTER the seal but BEFORE turn.submitted.
+          // This is intentionally later steering, not part of the submitted text.
+          pending = await queue();
+          expect(await claimFirstTurnQueuedInput(db, scope)).toBe(input);
+          const events = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, scope.runId),
+            eq(heartbeatRunEvents.eventType, "turn.submitted")));
+          expect(events).toEqual([]);
+          const [issue] = await db.select().from(issues).where(eq(issues.id, scope.issueId));
+          const [sealedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+          const board = await readBoardQueuedComments({ executor: db, issue, activeRun: sealedRun,
+            actor: { actorType: "user", actorId: opening.authorUserId!, agentId: null, runId: null, agentApiKeyId: null } });
+          expect(board.entries.map(e => e.comment.id)).toEqual([pending.id]);
+        }
+        await db.insert(heartbeatRunEvents).values({ companyId: scope.companyId, runId: scope.runId, agentId: scope.agentId,
+          seq: 171, eventType: "turn.submitted", payload: {} });
+        if (!before && !inWindow) pending = await queue();
+        const late = before && scenario.endsWith("card-after") ? await queue(true) : undefined;
+        if (before) {
+          // A restart reuses the sealed input, never the newly queued answer.
+          expect(await claimFirstTurnQueuedInput(db, scope)).toBe(input);
+          if (late) expect(input).not.toContain(late.id);
+        }
+        // The committed provider-start hook must not steer input already sealed,
+        // nor let its receipt hide an answer that arrived after submission.
+        await drainContinuousPersonMessages(db, { ...scope }, { beforeFirstReply: true });
+        const steers = late ? [late.id] : before ? [] : [pending!.id];
+        expect(heldSteering.sent).toEqual(steers);
+        await publishContinuousNativeReply({ db, execution: { binding: scope, provider: { kind: "pi_rpc" } }, cursor: 172,
+          event: { eventType: "item.completed", runId: scope.runId, normalizedSessionId: run.nativeSessionId!,
+            sourceEventId: `sealed-${scenario}`, itemId: `sealed-${scenario}`, payload: { kind: "agentMessage", channel: "final",
+              text: "Production checked.", answers: [opening.id] } } });
+        const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+        expect(saved.resultJson?.continuousReplies).toMatchObject({ [`sealed-${scenario}`]: {
+          questionCommentIds: before ? [opening.id, pending!.id] : [opening.id],
+        } });
+        const savedReplies = await comments(scope.runId);
+        expect(savedReplies).toHaveLength(1);
+        expect(heldSteering.sent).toEqual(steers);
+        const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, pending!.wakeId));
+        expect(wake.status).toBe("cancelled");
+        expect(wake.finishedAt).not.toBeNull();
+        if (inWindow) {
+          // The opening final must not claim the early follow-up. Its own exact
+          // answer settles once, without a second delivery, even on event replay.
+          const event = { eventType: "item.completed" as const, runId: scope.runId, normalizedSessionId: run.nativeSessionId!,
+            sourceEventId: `window-${scenario}`, itemId: `window-${scenario}`, payload: { kind: "agentMessage", channel: "final",
+              text: "Follow-up answered.", answers: [pending!.id] } };
+          for (let replay = 0; replay < 2; replay++) await publishContinuousNativeReply({ db,
+            execution: { binding: scope, provider: { kind: "pi_rpc" } }, cursor: 173, event });
+          const [answered] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+          expect(answered.resultJson?.continuousReplies).toMatchObject({ [`window-${scenario}`]: { questionCommentIds: [pending!.id] } });
+          expect(await comments(scope.runId)).toHaveLength(2);
+          expect(heldSteering.sent).toEqual([pending!.id]);
+        }
+        console.info("FIRST_TURN_SEAM_ROW", JSON.stringify({ scenario, runId: scope.runId, inputId: pending!.id,
+          lateInputId: late?.id, firstTurnInput: input, wakeStatus: wake.status, savedReplies: savedReplies.length,
+          steers: heldSteering.sent, replies: saved.resultJson?.continuousReplies }));
+      } });
+    } finally {
+      heldSteering.available = false;
+      if (steeringFlag === undefined) delete process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+      else process.env.PAPERCLIP_AGENT_CHAT_STEERING = steeringFlag;
+    }
+  });
+
   it.each([70_000, 300_000])("stores and publishes one complete held final past diagnostic caps (%i chars)", async size => {
     const answer = "word ".repeat(size / 5);
     const f = await fixture(true, { reply: answer, beforeFinalize: async scope => {
