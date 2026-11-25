@@ -14,7 +14,7 @@ import { INBOX_MINE_ISSUE_STATUS_FILTER, latestFailedRunsByAgent } from "@paperc
 import { getHeartbeatRunReadDecisions, redactHeartbeatRunListRow } from "../services/heartbeat-run-privacy.js";
 import { taskInterruptionPresentation, taskInterruptionPresentations, taskRetryRefusal } from "../services/task-interruption-presentation.js";
 import { parseObject } from "../adapters/utils.js";
-import { normalizePiIssueModelSelection } from "../adapters/pi-model-selection.js";
+import { normalizePiIssueModelSelection, validatePiGatewayModelSelection } from "../adapters/pi-model-selection.js";
 import { requestHeldNativeConfigurationEnd } from "../services/native-runtime/held-native-turn.js";
 import { piRpcThinking, projectPaperclipRunnerTaskConfig } from "../services/native-runtime/provider-profile.js";
 import { prepareRestrictedWorkspaceRetry } from "../services/restricted-workspace-retry.js";
@@ -14761,6 +14761,8 @@ export function issueRoutes(
         const modelAgent = await agentsSvc.getById(modelAssigneeId);
         if (modelAgent?.companyId === existing.companyId) {
           updateFields.assigneeAdapterOverrides = normalizePiIssueModelSelection(modelAgent, updateFields.assigneeAdapterOverrides);
+          await validatePiGatewayModelSelection(db, modelAgent,
+            existing.responsibleUserId ?? authenticatedActorResponsibleUserId(req) ?? null, updateFields.assigneeAdapterOverrides);
           if (modelAgent.adapterType === "paperclip_runner" && parseObject(modelAgent.adapterConfig).provider === "pi_rpc") {
             let previous = existing.assigneeAdapterOverrides;
             // Invalid old rows must remain repairable with a qualified pick.
