@@ -2,10 +2,11 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   activityLog,
+  authUsers,
   agentWakeupRequests,
   agents,
   approvals,
@@ -70,31 +71,6 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     db = createDb(tempDb.connectionString);
   }, 20_000);
 
-  function isHeartbeatRunDependentFkError(error: unknown) {
-    const message = error instanceof Error ? `${error.message} ${String(error.cause ?? "")}` : String(error);
-    return (
-      message.includes("heartbeat_run_events_run_id_heartbeat_runs_id_fk")
-      || message.includes("activity_log_run_id_heartbeat_runs_id_fk")
-    );
-  }
-
-  // A real (fire-and-forget) heartbeat run may still be executing in the
-  // background when a test's own createComment-triggered wakeup completes —
-  // retry deletion so that race doesn't fail cleanup with an FK violation.
-  async function deleteHeartbeatRunsWithDependents() {
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await db.delete(heartbeatRunEvents);
-      await db.delete(activityLog);
-      try {
-        await db.delete(heartbeatRuns);
-        return;
-      } catch (error) {
-        if (!isHeartbeatRunDependentFkError(error) || attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 25));
-      }
-    }
-  }
-
   afterEach(async () => {
     await Promise.all(tempRoots.map((root) => fs.rm(root, { recursive: true, force: true })));
     tempRoots.length = 0;
@@ -106,26 +82,15 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     // promises in module state shared across service instances, so a fresh
     // instance here drains the runs the per-test host services dispatched.
     await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
-    await db.delete(costEvents);
-    await deleteHeartbeatRunsWithDependents();
-    await db.delete(agentWakeupRequests);
-    await db.delete(issueRelations);
-    await db.delete(issueComments);
-    await db.delete(issueThreadInteractions);
-    await db.delete(issueAttachments);
-    await db.delete(assets);
-    await db.delete(approvals);
-    await db.delete(issues);
-    await db.delete(executionWorkspaces);
-    await db.delete(pluginManagedResources);
-    await db.delete(projects);
+    // This suite owns the disposable database. Real completed runs also leave
+    // identity/runtime/session rows; clean their whole FK graph, not a growing
+    // hand-maintained subset. Writers have quiesced before this fence.
+    await db.execute(sql`TRUNCATE TABLE companies CASCADE`);
     await db.delete(plugins);
-    await db.delete(companyMemberships);
-    await db.delete(agents);
-    await db.delete(companies);
   });
 
   afterAll(async () => {
+    await db?.$client.end();
     await tempDb?.cleanup();
   });
 
@@ -904,6 +869,47 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, wakeupRequest!.runId!));
     expect(run).toMatchObject({ agentId, companyId, status: "queued" });
+  });
+
+  it("plugin agent input on an idle chat wakes one run, answers once, and self output never wakes", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const { getServerAdapter, registerServerAdapter } = await import("../adapters/index.js");
+    const { issueService } = await import("../services/issues.js");
+    const savedAdapter = getServerAdapter("process");
+    const [sender] = await db.insert(agents).values({ companyId, name: "Bridge author", adapterType: "process" }).returning();
+    const userId = randomUUID();
+    await db.insert(authUsers).values({ id: userId, name: "Chat owner", email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "owner" });
+    const [issue] = await db.insert(issues).values({ companyId, title: "Idle bridge chat", status: "in_progress",
+      responsibleUserId: userId, assigneeAgentId: agentId, conversationAgentId: agentId, conversationUserId: userId, conversationState: "active" }).returning();
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.gateway", createEventBusStub(), undefined, { heartbeatRuntimeEnv: {} });
+    const dispatched: string[] = [];
+    registerServerAdapter({ ...savedAdapter, execute: async input => {
+      dispatched.push(input.runId);
+      await issueService(db).addComment(issue.id, "Idle bridge reply answered once.", { agentId, runId: input.runId });
+      return { exitCode: 0, signal: null, timedOut: false, resultJson: {}, summary: "Bridge reply" };
+    } });
+    try {
+      const self = await services.issues.createComment({ companyId, issueId: issue.id, authorAgentId: agentId, body: "Own output" });
+      expect(self.authorAgentId).toBe(agentId);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toEqual([]);
+      const comment = await services.issues.createComment({ companyId, issueId: issue.id, authorAgentId: sender.id, body: "Bridge idle question" });
+      await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      const replies = await db.select().from(issueComments).where(and(eq(issueComments.issueId, issue.id), eq(issueComments.body, "Idle bridge reply answered once.")));
+      expect(wakes).toHaveLength(1);
+      expect(wakes[0]).toMatchObject({ reason: "issue_commented", requestedByActorType: "agent", requestedByActorId: sender.id });
+      expect(runs).toHaveLength(1);
+      expect(dispatched).toEqual([runs[0].id]);
+      expect(replies).toHaveLength(1);
+      expect(wakes[0].status).not.toBe("deferred_issue_execution");
+      process.stdout.write(`PLUGIN_IDLE ${JSON.stringify({ commentId: comment.id, wakes: wakes.map(wake => ({ id: wake.id, status: wake.status })),
+        runs: runs.map(run => ({ id: run.id, status: run.status })), replies: replies.map(reply => reply.id), dispatched })}\n`);
+    } finally {
+      await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+      registerServerAdapter(savedAdapter);
+    }
   });
 
   it("skips the assignee wakeup when the issue is cancelled concurrently with the comment being written", async () => {
