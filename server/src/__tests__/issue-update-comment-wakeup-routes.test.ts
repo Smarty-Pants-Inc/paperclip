@@ -491,6 +491,9 @@ describe("issue update comment wakeups", () => {
     { provider: "pi_rpc", config: { reasoningEffort: "ultra" }, status: 422 },
     { provider: "pi_rpc", config: { effort: "ultra" }, status: 422 },
     { provider: "pi_rpc", config: { piRpcThinkingLevel: "max" }, status: 200 },
+    { provider: "pi_rpc", config: { piRpcThinkingLevel: null }, status: 200 },
+    { provider: "pi_rpc", config: { piRpcThinkingLevel: "" }, status: 200 },
+    { provider: "pi_rpc", config: { piRpcThinkingLevel: " \t " }, status: 200 },
     { provider: "pi_rpc", config: { effort: "max" }, status: 200 },
     { provider: "pi_rpc", config: { effort: "none" }, status: 200 },
     { provider: "codex", config: { modelReasoningEffort: "ultra" }, status: 200 },
@@ -519,6 +522,8 @@ describe("issue update comment wakeups", () => {
     { previous: { adapterConfig: { model: "gpt-6.2-sol" } }, next: { model: "paperclip/gpt-6.2-sol" }, end: false },
     { previous: null, next: { modelReasoningEffort: "low" }, end: true },
     { previous: null, next: { modelReasoningEffort: "xhigh" }, end: false },
+    { previous: null, next: { piRpcThinkingLevel: null }, end: false },
+    { previous: null, next: { piRpcThinkingLevel: " \t " }, end: false },
     { previous: { adapterConfig: { model: "paperclip/gpt-6.2-sol" } }, next: null, end: true },
   ])("ends only this chat's held turn on an effective Pi model/level change: %j", async ({ previous, next, end }) => {
     const existing = makeIssue({ assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null, assigneeAdapterOverrides: previous });

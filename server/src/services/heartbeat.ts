@@ -2256,9 +2256,11 @@ export function heartbeatService(
         conversation: isConversation(conversationIdentity),
       })) return;
       run = await timePreparation("chat_completion", () => prepareChatCompletionTurn(db, run, runOptions.nativeRestartRecovery));
-      if (chatCompletionAlreadyReported(run)) {
-        // An earlier reply in this conversation already reported each completion.
-        await setRunStatus(run.id, "succeeded", { finishedAt: new Date(), resultJson: { chatCompletionAlreadyReported: true }, issueCommentStatus: "not_applicable" });
+      if (chatCompletionAlreadyReported(run) || run.contextSnapshot?.chatCompletionSuperseded === true) {
+        // Already reported or superseded completions need no provider turn.
+        const resultJson = run.contextSnapshot?.chatCompletionSuperseded === true
+          ? { chatCompletionSuperseded: true } : { chatCompletionAlreadyReported: true };
+        await setRunStatus(run.id, "succeeded", { finishedAt: new Date(), resultJson, issueCommentStatus: "not_applicable" });
         await setWakeupStatus(run.wakeupRequestId, "completed", { finishedAt: new Date() });
         await releaseIssueExecutionAndPromote((await getRun(run.id))!, { suppressImmediateRecovery: true });
         await finalizeAgentStatus(agent.id, "succeeded");

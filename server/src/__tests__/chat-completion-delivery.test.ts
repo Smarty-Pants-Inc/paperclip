@@ -127,10 +127,10 @@ import type { NativeRestartRecoveryClaim } from "../services/native-runtime/nati
         binding: { ...f.execution.binding, runId: randomUUID() } } };
       if (mode === "no_updates") run.contextSnapshot = { ...run.contextSnapshot, chatCompletionUpdates: [] };
       if (mode === "context_claim") { run.contextSnapshot = { ...run.contextSnapshot, nativeRestartRecovery: claim }; claim = undefined; }
-      await expect(prepareChatCompletionTurn(db, run, claim)).rejects.toThrow("chat_completion_superseded");
+      expect((await prepareChatCompletionTurn(db, run, claim)).contextSnapshot?.chatCompletionSuperseded).toBe(true);
       expect((await f.rows())[0].status).toBe("delivered");
     });
-  it("still rejects a genuine bootstrap completion wake with no pending completion", async () => {
+  it("quietly supersedes a genuine bootstrap completion wake with no pending completion", async () => {
     const f = await seed();
     const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
       status: "running", runtimeMode: "native", nativeIssueId: f.sourceId,
@@ -138,8 +138,30 @@ import type { NativeRestartRecoveryClaim } from "../services/native-runtime/nati
     const claim: NativeRestartRecoveryClaim = { kind: "bootstrap_incomplete", runId: run.id,
       leaseOwner: "server-bootstrap-owner", controllerGeneration: 1, providerAttempt: 1,
       restartKind: "graceful", recoveryRequestId: null };
-    await expect(prepareChatCompletionTurn(db, run, claim)).rejects.toThrow("chat_completion_superseded");
+    expect((await prepareChatCompletionTurn(db, run, claim)).contextSnapshot?.chatCompletionSuperseded).toBe(true);
     expect(await f.rows()).toEqual([]);
+  });
+  it.each([0, 1])("quietly succeeds a completion wake whose delivery was taken (generation %s)", async generation => {
+    const f = await seed();
+    await f.finish();
+    const [delivery] = await f.rows();
+    // A competing completion turn has already claimed this delivery.
+    await db.update(deliveries).set({ status: "queued", targetRunId: f.runId }).where(eq(deliveries.id, delivery.id));
+    await db.update(issues).set({ responsibleUserId: "operator", conversationSessionGeneration: generation }).where(eq(issues.id, f.sourceId));
+    const heartbeat = heartbeatService(db);
+    const run = await heartbeat.wakeup(f.agentId, { source: "automation", triggerDetail: "system", reason: "chat_task_completed",
+      requestedByActorType: "system", requestedByActorId: "chat_completion_delivery",
+      payload: { issueId: f.sourceId }, contextSnapshot: { issueId: f.sourceId, wakeReason: "chat_task_completed",
+        chatCompletionDeliveryIds: [delivery.id], conversationSessionGeneration: 0 } });
+    expect(run).not.toBeNull();
+    await heartbeat.drainActiveRunExecutions();
+    const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id));
+    expect(finished).toMatchObject({ status: "succeeded", error: null, errorCode: null,
+      resultJson: { chatCompletionSuperseded: true }, issueCommentStatus: "not_applicable" });
+    expect((await db.select().from(agents).where(eq(agents.id, f.agentId)))[0].status).toBe("idle");
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, finished.wakeupRequestId!)))[0].status).toBe("completed");
+    expect((await f.rows())[0]).toMatchObject({ status: "queued", targetRunId: f.runId });
+    expect(await db.select().from(issueComments).where(eq(issueComments.createdByRunId, finished.id))).toHaveLength(0);
   });
   it("still rejects a changed conversation generation after reusing admitted completion input", async () => {
     const f = await heldCompletion();
