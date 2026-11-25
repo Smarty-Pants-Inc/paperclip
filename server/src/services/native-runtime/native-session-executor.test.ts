@@ -11159,7 +11159,7 @@ describe("native session same-turn steering", () => {
     steer.mockReset().mockResolvedValue(undefined);
     interrupt.mockReset().mockResolvedValue(undefined);
     state.execute.mockReset().mockImplementation(async (options) => {
-      options.onSession?.({ capabilities, snapshot, steer, interrupt, cancel: vi.fn() });
+      await options.onSession?.({ capabilities, snapshot, steer, interrupt, cancel: vi.fn() });
       await new Promise<void>((resolve) => {
         state.release = resolve;
       });
@@ -11178,15 +11178,54 @@ describe("native session same-turn steering", () => {
     });
   });
 
-  async function startActiveSession(input = execution, db = leaseDb(input)) {
+  async function startActiveSession(input = execution, db = leaseDb(input), conversationMode = false) {
     const running = executePaperclipNativeSession({
       db,
       execution: input,
+      conversationMode,
       runnerInstanceId: "runner",
     });
     await vi.waitFor(() => expect(state.release).toBeTypeOf("function"));
     return { running };
   }
+
+  it.each(["task", "chat", "conversation"].flatMap(mode => ["before", "capabilities", "snapshot", "reattached", "unclaimed"].map(when => ({ mode, when }))))("task claim fences new steering ($mode, $when)", async ({ mode, when }) => {
+    const pi = { ...execution, provider: { kind: "pi_rpc", model: "openai/gpt-5", conversationMode: mode === "chat" } } as NativeExecutionInputV1;
+    const claim: PrpEvent = { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "runner", sourceSeq: 1,
+      priority: 0, emittedAt: new Date().toISOString(), sourceInstanceId: "runner", normalizedSessionId: "session-native-cancel",
+      eventType: "run.result.proposed", runId: execution.binding.runId, sourceEventId: "claim", payload: {} };
+    const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+    const result = { queuedSteeringAcknowledgements: {} };
+    vi.spyOn(continuousReply, "publishContinuousNativeReply").mockResolvedValue(undefined);
+    let reservations: Map<string, unknown> | undefined;
+    const set = Map.prototype.set;
+    vi.spyOn(Map.prototype, "set").mockImplementation(function (this: Map<string, unknown>, key, value) {
+      if (key === "queued-after-claim" && value && typeof value === "object" && "preparing" in value) reservations = this;
+      return set.call(this, key, value);
+    });
+    const { running } = await startActiveSession(pi, leaseDb(pi, {}, result, updates, {}, "running", when === "reattached" ? [claim] : []), mode === "conversation");
+    try {
+      if (when === "before") await accountingEvents.committed!(claim);
+      if (when === "capabilities") capabilities.mockImplementationOnce(async () => { await accountingEvents.committed!(claim); return { steering: true }; });
+      if (when === "snapshot") snapshot.mockImplementationOnce(async () => { await accountingEvents.committed!(claim); return { activeTurnId: "provider-turn-1" }; });
+      const acknowledged = vi.fn();
+      const pending = steerNativeSession({ runId: execution.binding.runId, message: "Still queued", correlationId: "queued-after-claim", onAcknowledged: acknowledged });
+      const refused = mode === "task" && when !== "unclaimed";
+      if (refused) {
+        await expect(pending).rejects.toMatchObject({ code: "steering_stale_turn" });
+        expect(steer).not.toHaveBeenCalled();
+        expect(acknowledged).not.toHaveBeenCalled();
+        if (when === "capabilities" || when === "snapshot") expect(reservations).toBeDefined();
+        expect(reservations?.size ?? 0).toBe(0);
+        expect(result.queuedSteeringAcknowledgements).toEqual({});
+      } else {
+        await expect(pending).resolves.toEqual({ turnId: "provider-turn-1" });
+        expect(steer).toHaveBeenCalledOnce();
+        expect(reservations?.size).toBe(1);
+      }
+      expect((await getNativeSessionSteeringState(execution.binding.runId)).disposition).toBe(refused ? "temporarily_unavailable" : "available");
+    } finally { state.release?.(); await running; vi.restoreAllMocks(); }
+  });
 
   it.each(["held", "held-70000", "held-300000", "working", "steered", "question", "pending-tool"])("closes a reset hold only when idle: %s", async mode => {
     const isHeld = mode.startsWith("held");
