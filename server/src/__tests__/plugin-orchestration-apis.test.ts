@@ -921,7 +921,7 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       activityRunId: activity.runId, wakes: [] })}\n`);
   });
 
-  it("attributes a peer wake and activity to the stored tool-call agent/run, not supplied author", async () => {
+  it.each(["", "other-plugin", " other-plugin , plugin-record-id "])("saves stored peer attribution and gates automatic ordinary-task wake on the installation allow-list (%s)", async allowList => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const { withPluginInteractionOrigin } = await import("../services/plugin-interaction-context.js");
     const [author] = await db.insert(agents).values({ companyId, name: "Authenticated author", adapterType: "process" }).returning();
@@ -931,16 +931,20 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     const [sourceRun] = await db.insert(heartbeatRuns).values({ companyId, agentId: author.id, status: "running", invocationSource: "assignment", contextSnapshot: {} }).returning();
     await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, agentId));
     await db.insert(heartbeatRuns).values({ companyId, agentId, status: "running", invocationSource: "assignment", contextSnapshot: {} });
-    // No ingress allowlist is necessary on an ordinary task. The supplied
-    // author is the recipient, but the authenticated stored author is a peer.
-    vi.stubEnv("PAPERCLIP_CONVERSATION_INPUT_PLUGIN_IDS", "");
-    const services = buildHostServices(db, "unapproved-plugin", "paperclip.tool", createEventBusStub(), undefined, { heartbeatRuntimeEnv: {} });
+    // The supplied author is the recipient, but the authenticated stored
+    // author is a peer. Only an approved installation may wake on its input.
+    vi.stubEnv("PAPERCLIP_CONVERSATION_INPUT_PLUGIN_IDS", allowList);
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.tool", createEventBusStub(), undefined, { heartbeatRuntimeEnv: {} });
     const comment = await withPluginInteractionOrigin({ companyId, agentId: author.id, runId: sourceRun.id }, () =>
       services.issues.createComment({ companyId, issueId: issue.id, authorAgentId: agentId, body: "Peer input" }));
     expect(comment).toMatchObject({ authorAgentId: author.id, createdByRunId: sourceRun.id });
     const wakes = await db.select().from(agentWakeupRequests);
-    expect(wakes).toEqual([expect.objectContaining({ agentId, requestedByActorType: "agent", requestedByActorId: author.id,
-      payload: expect.objectContaining({ _paperclipWakeContext: expect.objectContaining({ sourceRunId: sourceRun.id }) }) })]);
+    expect(wakes).toEqual(allowList.includes("plugin-record-id")
+      ? [expect.objectContaining({ agentId, requestedByActorType: "agent", requestedByActorId: author.id,
+        payload: expect.objectContaining({ _paperclipWakeContext: expect.objectContaining({ sourceRunId: sourceRun.id }) }) })]
+      : []);
+    expect(await db.select().from(issueComments).where(eq(issueComments.id, comment.id)))
+      .toEqual([expect.objectContaining({ body: "Peer input", authorAgentId: author.id, createdByRunId: sourceRun.id })]);
     const [activity] = await db.select().from(activityLog).where(eq(activityLog.entityId, issue.id));
     expect(activity).toMatchObject({ agentId: author.id, runId: sourceRun.id,
       details: { initiatingActorId: author.id, initiatingRunId: sourceRun.id } });
