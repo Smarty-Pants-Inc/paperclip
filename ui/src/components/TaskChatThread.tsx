@@ -3744,7 +3744,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const transcriptHistoryPending = pendingTranscriptRuns.length > 0;
   // Only these may stop holding the reveal after the budget. See
   // selectBudgetedTranscriptRuns for the live, steered and settled rules.
-  const budgetedTranscriptRuns = selectBudgetedTranscriptRuns(pendingTranscriptRuns, {
+  // Finished native turns are visible history, not deferrable diagnostics.
+  // Wait for their own records; a newer success must never evict their activity.
+  const budgetedTranscriptRuns = selectBudgetedTranscriptRuns(pendingTranscriptRuns.filter(run =>
+    run.runtimeMode !== "native" || !isTerminalRunStatus(run.status)), {
     compactDeferral: compactTranscriptDeferral,
     hasTimelineAnchors: (run) => ((isNativePaperclipRunnerRun(run)
       ? steeringAnchorsByRun.get(run.id)
