@@ -2384,6 +2384,17 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         const mappedReplyId = continuousReplyPlacements.get(source.id)?.bySegment.get(segmentIndex);
         const mappedReply = commentItems.find((item): item is TaskChatMessageItem => item.kind === "message" && item.id === mappedReplyId);
         const final = paperclipRunnerFinalResponse(parsed, { ...yieldedOptions, yielded: sourceYielded });
+        const finalEntry = final?.transcriptIndex == null ? undefined : segments[segmentIndex]!.entries[final.transcriptIndex];
+        const finalItemId = finalEntry?.kind === "assistant" ? finalEntry.itemId : undefined;
+        const receipt = finalItemId ? (meta?.resultJson?.continuousReplies as Record<string, { commentId?: string }> | undefined)?.[finalItemId] : undefined;
+        const replyKey = finalItemId ? `native-final:${source.id}:${finalItemId}` : null;
+        // Saving can rewrite links or redact text. The native item receipt owns
+        // that saved reply even while the final event or run metadata is lagging.
+        const ownedReply = finalItemId ? projectedComments.find(comment => !comment.deletedAt && comment.authorType === "agent" &&
+          (comment.createdByRunId ?? comment.runId) === source.id && (comment.id === receipt?.commentId ||
+            (replyKey && (comment.clientRequestId === replyKey || comment.clientRequestId?.startsWith(`${replyKey}:`))))) : undefined;
+        const ownedItem = commentItems.find((item): item is TaskChatMessageItem => item.kind === "message" && item.id === ownedReply?.id);
+        if (ownedItem) return { ...ownedItem, atMs: final?.atMs ?? ownedItem.atMs };
         // A continuous run can resume with only the new turn's transcript.
         // Its old placement map is not proof that this segment draws that reply.
         if (mappedReply && final && normalizedMessageText(mappedReply.text) === normalizedMessageText(final.text)) {
@@ -2435,8 +2446,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         if (segment.entries.length === 0 && !stableRunnerSegment) continue;
         const finalResponse = settledSegmentFinalResponse(segmentIndex, parsed);
         const finalEntry = segment.entries.findLast(entry => entry.kind === "assistant" && entry.channel === "final");
+        // A committed reply is complete even if event history still has its partial stream.
+        const savedFinal = finalResponse && commentItems.some(item => item.kind === "message" && item.id === finalResponse.id);
+        const finalStreaming = finalEntry?.kind === "assistant" && finalEntry.delta === true && !savedFinal;
         const segmentStreaming = openSegments && segmentIndex === segments.length - 1 &&
-          (!finalResponse || (finalEntry?.kind === "assistant" && finalEntry.delta === true));
+          (!finalResponse || finalStreaming);
         const runHealth = {
           failures: projectedSegments[segmentIndex]?.mcpStartupFailures ?? [],
           rest: partitionRunHealthItems(omitProgressRepeatedByResponseAcrossSegments(
@@ -2473,7 +2487,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           ? `${source.id}:turn:${segmentIndex}`
           : `${source.id}:turn`;
         const segmentKey = `${source.id}:${segmentIndex}`;
-        const answerComplete = finalResponse && !(finalEntry?.kind === "assistant" && finalEntry.delta);
+        const answerComplete = finalResponse && !finalStreaming;
         if (answerComplete && liveSegmentClock.current.liveKey === segmentKey && !liveSegmentClock.current.ends.has(segmentKey)) liveSegmentClock.current.ends.set(segmentKey, Math.max(finalResponse.atMs ?? 0, Date.now()));
         const segmentFinishedMs = liveSegmentClock.current.ends.get(segmentKey) ?? (segmented && answerComplete ? finalResponse.atMs : undefined) ?? (Number.isFinite(segment.endMs)
           ? segment.endMs
