@@ -268,18 +268,29 @@ export function projectPaperclipRunnerTaskConfig(
     delete config.modelReasoningEffort;
     delete config.reasoningEffort;
     delete config.effort;
-    if (backend === "pi_rpc" && effortKey !== undefined) delete config.piRpcThinkingLevel;
+    if (backend === "pi_rpc") {
+      if (effortKey !== undefined) delete config.piRpcThinkingLevel;
+      // Changing only the model must retain the agent's effective alias-derived level.
+      else config.piRpcThinkingLevel = piRpcThinking(base);
+    }
   }
   if (model !== null) config.model = model;
   if (effortKey !== undefined) config[grok ? "reasoningEffort" : "modelReasoningEffort"] = task[effortKey];
-  if (backend === "pi_rpc" && "piRpcThinkingLevel" in task) config.piRpcThinkingLevel = task.piRpcThinkingLevel;
+  if (backend === "pi_rpc" && isPresentPiReasoning(task.piRpcThinkingLevel)) config.piRpcThinkingLevel = task.piRpcThinkingLevel;
   return config;
 }
 
-// Native Pi deliberately defaults to medium thinking when no level is set.
+function isPresentPiReasoning(value: unknown): boolean {
+  return value !== undefined && value !== null && !(typeof value === "string" && value.trim() === "");
+}
+
+/** Unset Pi reasoning inherits the agent selection, or defaults to medium. */
 export function piRpcThinking(config: Record<string, unknown>): unknown {
-  const effort = config.modelReasoningEffort ?? config.reasoningEffort ?? config.effort ?? "medium";
-  return config.piRpcThinkingLevel !== undefined ? config.piRpcThinkingLevel : effort === "auto" ? "medium" : effort === "none" ? "off" : effort;
+  if (isPresentPiReasoning(config.piRpcThinkingLevel)) {
+    return config.piRpcThinkingLevel === "none" ? "off" : config.piRpcThinkingLevel;
+  }
+  const effort = [config.modelReasoningEffort, config.reasoningEffort, config.effort].find(isPresentPiReasoning) ?? "medium";
+  return effort === "auto" ? "medium" : effort === "none" ? "off" : effort;
 }
 
 function positiveNumberOrNull(
