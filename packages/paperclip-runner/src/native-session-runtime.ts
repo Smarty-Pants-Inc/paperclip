@@ -3403,10 +3403,12 @@ export async function executeNativeSession(
             !conversationTerminal &&
             !dispositionRecoveryStillOwned &&
             !resumedProviderTurnWait));
-        // Our held Pi path re-submits the person's input, unlike stock's
-        // disposition-only task recovery. Fence only that original-input replay;
-        // durable same-run finals above still settle without a new turn.
-        if (isNativePiConversation(input) && recovered && shouldStartFreshTurn && !options.sessionCompaction
+        // Every continuous Pi run can re-submit the original input after a
+        // crash without a checkpointed terminal, including task chats. Omitted
+        // continuity is continuous; paperclip-policy Pi and non-Pi providers
+        // retain stock recovery. Durable same-run finals above still settle.
+        if (input.provider.kind === "pi_rpc" && input.provider.sessionContinuity !== "paperclip"
+          && recovered && shouldStartFreshTurn && !options.sessionCompaction
           && await replayHasProviderOutput(options.controlPlane, input.binding.runId, options.runnerInstanceId)) {
           throw providerOutputWithoutResult();
         }
