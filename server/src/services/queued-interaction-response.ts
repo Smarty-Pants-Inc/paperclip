@@ -124,6 +124,20 @@ function consumedInteractionResponseExists(companyId: string, issueId: string, r
       ${agentId ? sql`AND consuming_run.agent_id = ${agentId}` : sql``})`;
 }
 
+/** Durable resolved inputs still owed an answer, independent of delivery/wake
+ * status. Exact response-read + successful attributed reply is also an answer. */
+export async function unansweredResolvedInteractionIds(db: Pick<Db, "select">, input: {
+  companyId: string; issueId: string; agentId: string;
+}): Promise<string[]> {
+  const rows = await db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
+    eq(issueThreadInteractions.companyId, input.companyId), eq(issueThreadInteractions.issueId, input.issueId),
+    inArray(issueThreadInteractions.status, ["accepted", "answered", "rejected"]),
+    sql`${issueThreadInteractions.resolvedAt} IS NOT NULL`,
+    sql`NOT ${consumedInteractionResponseExists(input.companyId, input.issueId, undefined, input.agentId)}`,
+  ));
+  return rows.map(row => row.id);
+}
+
 export async function hasConsumedInteractionResponse(db: Pick<Db, "select">, input: {
   companyId: string; issueId: string; runId: string; agentId: string; payload: unknown;
 }) {

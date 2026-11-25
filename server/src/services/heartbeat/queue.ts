@@ -4,6 +4,7 @@ import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
 import { CONTEXT_COMPACTION_WAKE_REASON, ContextCompactionError, isContextCompactionRun, readContextCompactionRequest } from "../context-compaction.js";
 import { isProcessRunAdmissionClosed, isReattachPhaseActive as isProcessReattachPhaseActive } from "./run-admission.js";
 import { continueFreshInTransaction, hasPendingFreshContinuation, isFreshIsolatedContinuationWake, settleCoalescedFreshContinuationHolds } from "../fresh-continuation-fallback.js";
+import { answeredContinuousHeldRun } from "../native-runtime/continuous-session-input.js";
 import { deliverContinuationAsRun, foldWaitingRetriesIntoContinuation, foldWaitingRetriesIntoRecordedContinuation, undeliveredContinuation,
   undeliveredContinuationContext } from "../fresh-continuation-retry-fold.js";
 import { refreshRunStartYieldIfStale } from "../run-start-handover.js";
@@ -4061,6 +4062,21 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             }
             if (action.evidence.continuationDelivery !== "pending")
               return { kind: "skipped" as const };
+            // Delivery released the issue lock before calling wake. Revalidate
+            // here for EVERY restoration, including historical actions without
+            // freshContinuation.recordedAt, before admitting any new run.
+            if (await answeredContinuousHeldRun(tx as unknown as Db, {
+              companyId: issue.companyId, issueId: issue.id, runId: sourceRunId,
+            })) {
+              await tx.update(issueRecoveryActions).set({ outcome: "cancelled", wakePolicy: null, monitorPolicy: null,
+                resolutionNote: "continuous_held_input_already_answered",
+                evidence: sql`${issueRecoveryActions.evidence} || '{"continuationDelivery":"invalidated"}'::jsonb`,
+              }).where(and(eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.id, action.id)));
+              await settleCoalescedFreshContinuationHolds(tx as unknown as Db, {
+                companyId: issue.companyId, primaryId: action.id, delivery: "invalidated",
+              });
+              return { kind: "skipped" as const };
+            }
             // Under the task lock: a fresh continuation is the task's next run
             // only while nothing else continued it. A run started since it was
             // recorded (active or already finished, from a person's Retry or
