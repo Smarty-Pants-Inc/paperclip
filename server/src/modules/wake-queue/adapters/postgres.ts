@@ -290,6 +290,9 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
             and(
               eq(agentWakeupRequests.companyId, companyId),
               eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+              // Pending input does not authorize another automatic attempt.
+              // The bounded retry/user-admitted successor claims it at turn start.
+              sql`coalesce(${agentWakeupRequests.payload}->'preDispatchInputOnly', 'false'::jsonb) <> 'true'::jsonb`,
               excludedWakeIds?.length ? notInArray(agentWakeupRequests.id, excludedWakeIds) : undefined,
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
               interruptQueueId ? eq(agentWakeupRequests.id, interruptQueueId) : undefined,
@@ -1074,6 +1077,9 @@ export function createWakeAdmissionReader(rawTx: IssueAdmissionDbTransaction, ad
             eq(agentWakeupRequests.agentId, agentId),
             eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
             sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+            // A passive handback cannot absorb a newly authorized request:
+            // it joins that request's first turn instead of inheriting its start.
+            sql`coalesce(${agentWakeupRequests.payload}->'preDispatchInputOnly', 'false'::jsonb) <> 'true'::jsonb`,
             // A saved card response (interaction receipt) never absorbs user
             // input. Skip it so a later message joins the existing message
             // wake instead of starting another one behind the receipt.
