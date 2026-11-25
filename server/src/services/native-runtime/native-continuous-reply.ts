@@ -13,6 +13,7 @@ import { parseObject } from "../../adapters/utils.js";
 import { logger } from "../../middleware/logger.js";
 import { drainContinuousPersonMessages } from "./native-continuous-drain.js";
 import { readFirstTurnQueuedInputReceipt } from "./first-turn-queued-input.js";
+import { readContinuousSessionInput, settleContinuousSessionInput } from "./continuous-session-input.js";
 
 /** Replay the ingestion/publication crash gap before terminal presentation or queue release. */
 export async function recoverContinuousNativeReplies(db: Db, scope: { id: string; companyId: string }) {
@@ -47,9 +48,11 @@ export async function publishContinuousNativeReply(input: {
   if (finalAgentMessage?.channel !== "final" || !input.event.itemId) return;
   const { companyId, issueId, runId, agentId } = input.execution.binding;
   if (input.event.runId !== runId) return;
+  const inheritedInput = await readContinuousSessionInput(input.db, { companyId, issueId, runId, agentId });
   let steerableFinal = false;
   const published = await input.db.transaction(async transaction => {
     const tx = transaction as unknown as Db;
+    await settleContinuousSessionInput(tx, { companyId, issueId, runId, agentId }, inheritedInput);
     const [issue] = await tx.select().from(issues).where(and(
       eq(issues.id, issueId), eq(issues.companyId, companyId),
     )).for("update");
@@ -91,8 +94,13 @@ export async function publishContinuousNativeReply(input: {
       ...(typeof wakeId === "string" ? [wakeId] : []),
       ...(readFirstTurnQueuedInputReceipt(row.run)?.commentIds ?? []),
     ].filter((id): id is string => typeof id === "string" && !answered.has(id)) : [];
+    const continued = parseObject(result.continuedSessionInput);
+    const impliedInputIds = Object.keys(replies).length === 0 && continued.runId === runId &&
+      continued.sessionId === row.run.nativeSessionId && Array.isArray(continued.commentIds)
+      ? continued.commentIds.filter((id): id is string => typeof id === "string" && !answered.has(id)) : [];
     const questionCommentIds = [...new Set([
-      ...(explicitAnswers ? firstInputIds : typeof wakeId === "string" && !answered.has(wakeId) ? [wakeId] : []),
+      ...impliedInputIds,
+      ...firstInputIds,
       ...(explicitAnswers
         ? answers.filter((id): id is string => typeof id === "string" && !answered.has(id))
         : pending[0] ? [pending[0][0]] : []),
