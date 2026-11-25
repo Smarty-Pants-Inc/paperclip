@@ -666,6 +666,8 @@ export interface HarnessSession {
   lineage?(): HarnessThreadLineageEntry[];
   read?(): Promise<Record<string, unknown>>;
   reconcile?(): Promise<Record<string, unknown>>;
+  /** Provider-owned conversation entries, not controller command receipts. */
+  readUserMessages?(): Promise<string[] | null>;
   usage?(): Promise<Record<string, unknown> | null>;
   transcript?(): Promise<HarnessTranscriptSnapshot>;
   snapshot(): Promise<PersistedHarnessSession>;
