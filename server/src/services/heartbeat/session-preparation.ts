@@ -227,6 +227,7 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
     taskSessionForRun.lastRunId !== run.id && isNativeSessionId(taskSessionId) ? taskSessionId : null;
   const getFreshSessionHandoff = issueRef ? createNativeSessionHandoffLoader({
     db, companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id, before: run.createdAt,
+    mode: resolveSessionContinuity(runtimeConfig.provider, runtimeConfig.sessionContinuity) === "continuous" ? "whole" : "bounded",
     throughCommentId: readNonEmptyString(context.conversationReplayThroughCommentId) ?? (context.interactionKind ? null : wakeCommentId),
     excludeCommentIds: [...new Set([...queuedCommentIdsFromRunContext(context),
       ...[wakeCommentId, readNonEmptyString(context.wakeCommentId), readNonEmptyString(context.commentId)]
