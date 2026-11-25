@@ -2407,6 +2407,24 @@ export function agentRoutes(
     };
   }
 
+  function applyModelCreateDefaults(
+    adapterType: string | null | undefined,
+    adapterConfig: Record<string, unknown> = {},
+    requestedConfig: Record<string, unknown> = adapterConfig,
+  ): Record<string, unknown> {
+    const codex = adapterType === "codex_local"
+      || (adapterType === "paperclip_runner" && adapterConfig.provider === "codex");
+    const claude = adapterType === "claude_local";
+    if (!codex && !claude) return adapterConfig;
+    const model = requestedConfig.model ?? adapterConfig.model;
+    // Preserve named models and let admission reject invalid non-string values.
+    if (model != null && (typeof model !== "string" || model.trim())) return adapterConfig;
+    return {
+      ...adapterConfig,
+      model: codex ? "claude-opus-5-5" : DEFAULT_CLAUDE_LOCAL_MODEL,
+    };
+  }
+
   function applyReasoningCreateDefaults(
     adapterType: string | null | undefined,
     adapterConfig: Record<string, unknown> = {},
@@ -4682,6 +4700,7 @@ export function agentRoutes(
     }
     if (inheritRuntimeFrom === "caller" && hireRunner !== undefined) throw unprocessable("inheritRuntimeFrom=caller cannot be combined with runner");
     let configurationWarnings: AgentConfigurationWarning[] = [];
+    hireInput.adapterConfig = applyModelCreateDefaults(hireInput.adapterType, hireInput.adapterConfig, requestedHireConfig);
     if (hireInput.adapterType === "paperclip_runner" && hireInput.adapterConfig?.provider === "pi_rpc") {
       hireInput.adapterConfig = applyReasoningCreateDefaults(hireInput.adapterType, hireInput.adapterConfig, requestedHireConfig);
     }
@@ -5018,6 +5037,7 @@ export function agentRoutes(
     assertNoAgentProcessAdapterMutation(req, createInput.adapterType ?? "process", Object.keys(requestedCreateConfig).length > 0);
     assertExternalInstructionsAdmin(req, { id: agentId, companyId, name: createInput.name, adapterConfig: requestedCreateConfig });
     let configurationWarnings: AgentConfigurationWarning[] = [];
+    createInput.adapterConfig = applyModelCreateDefaults(createInput.adapterType, createInput.adapterConfig, requestedCreateConfig);
     if (createInput.adapterType === "paperclip_runner" && createInput.adapterConfig?.provider === "pi_rpc") {
       createInput.adapterConfig = applyReasoningCreateDefaults(createInput.adapterType, createInput.adapterConfig, requestedCreateConfig);
     }
