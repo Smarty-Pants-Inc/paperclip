@@ -1,3 +1,4 @@
+import { resolveSessionContinuity } from "./continued-session.js";
 import { currentControllerProcess } from "../controller-process-identity.js";
 import { settleStartupStop } from "../person-stop-before-turn.js";
 import { settleReattachRun } from "../heartbeat/run-admission.js";
@@ -304,7 +305,7 @@ import {
   renderNativeRunnerStagedAttachmentPrompt,
   stageNativeRunnerWakeAttachments,
 } from "./native-runner-file-handoff.js";
-import { NATIVE_PROVIDER_SIDE_EFFECT_PENDING, NATIVE_PROVIDER_STATE_INCOMPATIBLE, nativeRuntimeContextsMatch, nativeRuntimeContractForProvider, nativeToolContractFingerprintForTarget } from "./native-session-resume.js";
+import { NATIVE_PROVIDER_SIDE_EFFECT_PENDING, NATIVE_PROVIDER_STATE_INCOMPATIBLE, nativeSessionProvidersMatch, nativeRuntimeContextsMatch, nativeRuntimeContractForProvider, nativeToolContractFingerprintForTarget } from "./native-session-resume.js";
 import { clearRunProviderStateUnsaved, markAcceptedRunProviderStateUnsaved } from "./native-provider-state-unsaved.js";
 import { verifyRetainedMaintenanceNoLaunch } from "./native-maintenance-no-launch.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
@@ -5562,6 +5563,7 @@ async function verifyPriorRunnerdStateForSessionScope(input: {
   identity: RunnerdDurableIdentity;
   execution: NativeExecutionInput;
   allowVerifiedBackup: boolean;
+  admittedPreviousExecution?: NativeExecutionInput;
   retainedWarmOwnerRunId?: string;
 }): Promise<PriorRunnerdStateVerification> {
   let priorRun: {
@@ -5597,12 +5599,16 @@ async function verifyPriorRunnerdStateForSessionScope(input: {
   if (persistedInput === undefined) return "authority_indeterminate";
   try {
     const priorExecution = parseNativeExecutionInput(persistedInput);
-    const sameScope =
-      priorExecution.binding.runId === input.identity.runId &&
-      nativeSessionScopeKey(priorExecution) ===
-        nativeSessionScopeKey(input.execution);
+    const admittedSource = input.admittedPreviousExecution;
+    const admittedPrior = admittedSource?.binding.runId === input.identity.runId &&
+      admittedSource.binding.companyId === input.execution.binding.companyId && admittedSource.binding.agentId === input.execution.binding.agentId &&
+      admittedSource.binding.issueId === input.execution.binding.issueId && nativeSessionKey(admittedSource) === nativeSessionKey(input.execution) &&
+      nativeSessionProvidersMatch(admittedSource.provider, input.execution.provider) &&
+      canonicalJson(priorExecution) === canonicalJson(admittedSource);
+    const sameScope = priorExecution.binding.runId === input.identity.runId &&
+      (nativeSessionScopeKey(priorExecution) === nativeSessionScopeKey(input.execution) || admittedPrior);
     if (!sameScope) return "scope_mismatch";
-    const lifecycle = runnerdAuthorityLifecycleWithVerifiedBackup(input);
+    const lifecycle = runnerdAuthorityLifecycleWithVerifiedBackup({ ...input, execution: admittedPrior ? priorExecution : input.execution });
     if (lifecycle === "suspended") return "verified";
     const directLifecycle = runnerdAuthorityLifecycle(
       input.root,
@@ -6571,6 +6577,7 @@ async function migrateRunnerdStateRootForExecution(input: {
   restartRecovery?: NativeRestartRecoveryClaim;
   runnerExecutionTarget?: AdapterExecutionTarget | null;
   bootstrapRetryLeaseOwner?: string;
+  admittedPreviousExecution?: NativeExecutionInput;
 }): Promise<VerifiedWarmTransitionBinding | undefined> {
   const scoped = scopedRunnerdStateRoot(input.execution);
   await restoreWarmRunnerdController(input);
@@ -6729,6 +6736,7 @@ async function migrateRunnerdStateRootForExecution(input: {
         root: scoped,
         identity,
         execution: input.execution,
+        admittedPreviousExecution: input.admittedPreviousExecution,
         allowVerifiedBackup: input.allowVerifiedBackup,
         retainedWarmOwnerRunId: input.retainedWarmOwnerRunId,
       });
@@ -6768,7 +6776,12 @@ async function migrateRunnerdStateRootForExecution(input: {
     }
     return;
   }
+  const previousRoot = input.admittedPreviousExecution ? scopedRunnerdStateRoot(input.admittedPreviousExecution) : undefined;
+  if (previousRoot && previousRoot !== scoped && !existsSync(previousRoot)) {
+    throw new NativeProviderStateIncompatibleError("workspace_continuation_source_missing");
+  }
   for (const legacy of [
+    ...(previousRoot && previousRoot !== scoped ? [previousRoot] : []),
     legacyCompanyRunnerdStateRoot(input.execution),
     legacyRunnerdStateRoot(input.execution),
   ]) {
@@ -6778,6 +6791,7 @@ async function migrateRunnerdStateRootForExecution(input: {
       !identity ||
       !durableIdentityMatchesSession(identity, input.execution)
     ) {
+      if (legacy === previousRoot) throw new NativeProviderStateIncompatibleError("workspace_continuation_source_unverifiable");
       // Unlike the full-scope target above, this legacy name can legitimately
       // belong to another scope. Leave it in place for its owner and fail the
       // attempted migration visibly.
@@ -6790,6 +6804,7 @@ async function migrateRunnerdStateRootForExecution(input: {
         root: legacy,
         identity,
         execution: input.execution,
+        admittedPreviousExecution: legacy === previousRoot ? input.admittedPreviousExecution : undefined,
         allowVerifiedBackup: input.allowVerifiedBackup,
         retainedWarmOwnerRunId: input.retainedWarmOwnerRunId,
       });
@@ -6797,6 +6812,10 @@ async function migrateRunnerdStateRootForExecution(input: {
         verification !== "verified" &&
         verification !== "retained_warm_runner"
       ) {
+        // Preserve the source and use the existing visible, typed fresh-task recovery.
+        if (legacy === previousRoot && verification !== "active") {
+          throw new NativeProviderStateIncompatibleError(`workspace_continuation_source_${verification}`);
+        }
         if (verification === "terminal_state_indeterminate") {
           // The database proves this ambiguous legacy path belongs to the same
           // full session scope and its owner is terminal, so it is now safe to
@@ -10742,6 +10761,8 @@ export async function executePaperclipNativeSession(input: {
   /** Retire a retained transport so recovery can replace provider tool declarations. */
   refreshTools?: boolean;
   toolRefreshOnResume?: boolean;
+  workspaceContinuationSource?: NativeExecutionInput;
+  sessionContinuity?: "continuous" | "paperclip";
   db: Db;
   execution: NativeExecutionInput;
   /** Private server preparation proof; never persisted or accepted from a tool. */
@@ -10825,6 +10846,10 @@ export async function executePaperclipNativeSession(input: {
     },
   ) => Promise<unknown>;
 }): Promise<AdapterExecutionResult> {
+  const piContinuous = input.execution.provider.kind === "pi_rpc" && resolveSessionContinuity("pi_rpc", input.sessionContinuity) === "continuous";
+  input = { ...input,
+    workspaceContinuationSource: piContinuous && input.runnerExecutionTarget?.kind !== "remote" &&
+      (!input.restartRecovery || input.restartRecovery.kind === "bootstrap_incomplete") ? input.workspaceContinuationSource : undefined };
   const agentKeyId = input.runnerEnvironment?.PAPERCLIP_AGENT_KEY_ID;
   if (agentKeyId) {
     // Recovered pre-upgrade inputs also need the current public identity marker
@@ -11444,6 +11469,11 @@ async function executePaperclipNativeSessionAttempt(
     }
   }
   if (input.useRunnerd) {
+    if (input.workspaceContinuationSource) await retireSupersededWarmNativeSessions(
+      nativeSessionOwnerScope(input.workspaceContinuationSource, input.runnerExecutionTarget?.environmentId ?? null),
+      nativeSessionScopeKey(input.execution), nativeSessionKey(input.execution), input.execution.binding.runId,
+      undefined, input.runnerExecutionTarget,
+    );
     retainedTransition = await timeController("state_migration", () => migrateRunnerdStateRootForExecution({
       db: input.db,
       execution: input.execution,
@@ -11455,6 +11485,7 @@ async function executePaperclipNativeSessionAttempt(
       restartRecovery: input.restartRecovery,
       runnerExecutionTarget: input.runnerExecutionTarget,
       bootstrapRetryLeaseOwner: input.leaseOwner,
+      admittedPreviousExecution: input.workspaceContinuationSource,
     }));
   }
   const durableRunnerBinding = input.useRunnerd
@@ -16734,6 +16765,8 @@ export async function createRunnerdBackend(input: {
   casesEnabled?: boolean;
   responsibilitiesEnabled?: boolean;
   toolRefreshOnResume?: boolean;
+  workspaceContinuationSource?: NativeExecutionInput;
+  sessionContinuity?: "continuous" | "paperclip";
   db: Db;
   providerPackAdmissionSource?: NativeProviderPackAdmissionSource;
   controllerPersistence?: { bootId: string; runnerArtifact?: { version: string; digest: string } };
@@ -16833,6 +16866,8 @@ export async function createRunnerdBackend(input: {
         preparedExecutionAdmission: input.preparedExecutionAdmission,
         allowVerifiedBackup: input.runnerExecutionTarget?.kind === "remote",
         retainedWarmOwnerRunId: undefined,
+        admittedPreviousExecution: input.execution.provider.kind === "pi_rpc" && resolveSessionContinuity("pi_rpc", input.sessionContinuity) === "continuous" &&
+          input.runnerExecutionTarget?.kind !== "remote" ? input.workspaceContinuationSource : undefined,
         allowLocalRecovery: input.runnerExecutionTarget?.kind !== "remote",
         onLog: input.onLog,
         restartRecovery: input.restartRecovery,
