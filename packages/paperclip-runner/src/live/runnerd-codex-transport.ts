@@ -122,6 +122,9 @@ const MAX_NOTIFICATION_COUNT = 2_048;
 const MAX_NOTIFICATION_BYTES = 4 * 1024 * 1024;
 // How often the event pump retries events that it is holding back itself.
 const PUMP_HELD_RETRY_MS = 5;
+const TRACE_CORRELATION_RETRY_MS = 250;
+// Debug correlation must never keep a warm transport polling indefinitely.
+const TRACE_CORRELATION_MAX_AGE_MS = 30_000;
 const RUNNER_CLIENT_VERSION = "0.3.0";
 const RUNNER_BOOTSTRAP_TICKET_TTL_MS = 60_000;
 const RUNNER_RESTORE_STABLE_MS = 60_000;
@@ -2238,12 +2241,13 @@ function appServerThreadGoal(
 }
 
 type PendingTraceRehydration = {
+  enqueuedAt: number;
   sourceEventId: string;
   eventType: string;
   visibleNotificationCount: number;
 };
 
-type PendingDriverTraceInterpretation = CodexTraceInterpretation;
+type PendingDriverTraceInterpretation = CodexTraceInterpretation & { enqueuedAt: number };
 
 function appendRunnerdRehydrationTrace(
   index: RunnerdTraceFrameIndex,
@@ -2252,14 +2256,10 @@ function appendRunnerdRehydrationTrace(
   eventType: string,
   visibleNotificationCount: number,
   debugSequence: number,
-): "written" | "retry" | "not_applicable" {
+): "written" | "retry" | "write_retry" | "not_applicable" {
   if (!tracePath) return "not_applicable";
-  if (!existsSync(tracePath)) return "retry";
   try {
-    const { frameId, nativeChannelSettled } = index.locate(
-      tracePath,
-      sourceEventId,
-    );
+    const { frameId, nativeChannelSettled } = index.lookup(sourceEventId);
     if (frameId === null)
       return nativeChannelSettled ? "not_applicable" : "retry";
     appendFileSync(
@@ -2303,23 +2303,19 @@ function appendRunnerdRehydrationTrace(
     return "written";
   } catch {
     // Debug delivery is deliberately outside run authority and never fails it.
-    return "retry";
+    return "write_retry";
   }
 }
 
 function appendCodexDriverInterpretationTrace(
   index: RunnerdTraceFrameIndex,
   tracePath: string | undefined,
-  input: PendingDriverTraceInterpretation,
+  input: CodexTraceInterpretation,
   debugSequence: number,
-): "written" | "retry" | "not_applicable" {
+): "written" | "retry" | "write_retry" | "not_applicable" {
   if (!tracePath) return "not_applicable";
-  if (!existsSync(tracePath)) return "retry";
   try {
-    const { frameId, nativeChannelSettled } = index.locate(
-      tracePath,
-      input.sourceEventId,
-    );
+    const { frameId, nativeChannelSettled } = index.lookup(input.sourceEventId);
     if (frameId === null) {
       return nativeChannelSettled ? "not_applicable" : "retry";
     }
@@ -2360,7 +2356,7 @@ function appendCodexDriverInterpretationTrace(
     return "written";
   } catch {
     // Debug delivery is deliberately outside run authority and never fails it.
-    return "retry";
+    return "write_retry";
   }
 }
 
@@ -4173,6 +4169,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #pumpActive = false;
   #pumpWake: NodeJS.Immediate | null = null;
   #pumpRetry: NodeJS.Timeout | null = null;
+  #pumpRetryMs = 0;
   #stopFollowingCore: (() => void) | null = null;
   #eventSourceSeq = 0;
   #eventIdentity: DurableRecoveryIdentity | null = null;
@@ -4351,6 +4348,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   readonly #controlPlaneQuiesces = new Set<() => void>();
   #nextTraceDebugSequence = 1;
   #traceRehydrationSpoolOverflow = false;
+  #traceRehydrationUnmatched = false;
+  #traceCorrelationsDirty = false;
   readonly #traceFrameIndex = new RunnerdTraceFrameIndex();
   /** Clock of the startup, recovery, or turn-start admission in progress, if any. */
   #admissionClock: RunnerStallLedger | null = null;
@@ -5473,23 +5472,18 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
 
   recordTraceInterpretation(input: CodexTraceInterpretation): void {
     const tracePath = this.options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH;
-    if (!tracePath) return;
+    // pi_rpc does not emit the Rust native trace frames these stages correlate.
+    if (!tracePath || this.options.provider === "pi_rpc") return;
     const traceResult = appendCodexDriverInterpretationTrace(
-      this.#traceFrameIndex,
-      tracePath,
-      input,
-      this.#nextTraceDebugSequence,
+      this.#traceFrameIndex, tracePath, input, this.#nextTraceDebugSequence,
     );
-    if (traceResult === "written") {
-      this.#nextTraceDebugSequence += 1;
-    } else if (
-      traceResult === "retry" &&
-      this.#pendingDriverTraceInterpretations.length < 4_096
-    ) {
-      this.#pendingDriverTraceInterpretations.push(structuredClone(input));
-      this.#retryPumpWhile(true);
-    } else if (traceResult === "retry") {
-      this.#traceRehydrationSpoolOverflow = true;
+    if (traceResult === "written") this.#nextTraceDebugSequence += 1;
+    else if (traceResult === "retry" || traceResult === "write_retry") {
+      if (this.#pendingDriverTraceInterpretations.length < 4_096) {
+        this.#pendingDriverTraceInterpretations.push({ ...structuredClone(input), enqueuedAt: Date.now() });
+        this.#traceCorrelationsDirty = true;
+        this.#wakePump();
+      } else this.#traceRehydrationSpoolOverflow = true;
     }
   }
 
@@ -6067,6 +6061,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const tracePath = this.options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH;
     if (tracePath) {
       const incomplete =
+        this.#traceRehydrationUnmatched ||
         this.#traceRehydrationSpoolOverflow ||
         this.#pendingTraceRehydrations.length > 0 ||
         this.#pendingDriverTraceInterpretations.length > 0;
@@ -8500,6 +8495,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       remaining === "held" ||
         this.#pendingTraceRehydrations.length > 0 ||
         this.#pendingDriverTraceInterpretations.length > 0,
+      remaining === "held" ? PUMP_HELD_RETRY_MS : TRACE_CORRELATION_RETRY_MS,
     );
   }
 
@@ -8517,8 +8513,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       !recoveryIdentityMatches(core.store.state.identity, this.#eventIdentity)
     )
       return "none";
-    this.#flushPendingTraceRehydrations();
     const events = core.store.state.committedEvents;
+    this.#flushPendingTraceRehydrations(
+      this.#deferredTurnStartEvents.length > 0 || (events.at(-1)?.sourceSeq ?? 0) > this.#eventSourceSeq,
+    );
     for (;;) {
       const deferredEvent =
         !this.#recoveryTurnBindingPending &&
@@ -8901,8 +8899,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             : {}),
         });
       }
-      if (this.options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH) {
+      if (this.options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH && this.options.provider !== "pi_rpc") {
         const pending = {
+          enqueuedAt: Date.now(),
           sourceEventId: event.sourceEventId,
           eventType: event.eventType,
           visibleNotificationCount: notifications.length,
@@ -8915,15 +8914,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           pending.visibleNotificationCount,
           this.#nextTraceDebugSequence,
         );
-        if (traceResult === "written") {
-          this.#nextTraceDebugSequence += 1;
-        } else if (
-          traceResult === "retry" &&
-          this.#pendingTraceRehydrations.length < 4_096
-        ) {
-          this.#pendingTraceRehydrations.push(pending);
-        } else if (traceResult === "retry") {
-          this.#traceRehydrationSpoolOverflow = true;
+        if (traceResult === "written") this.#nextTraceDebugSequence += 1;
+        else if (traceResult === "retry" || traceResult === "write_retry") {
+          if (this.#pendingTraceRehydrations.length < 4_096) {
+            this.#pendingTraceRehydrations.push(pending);
+            this.#traceCorrelationsDirty = true;
+          } else this.#traceRehydrationSpoolOverflow = true;
         }
       }
       // The strict Codex driver must bind the provider turn from the response
@@ -9073,9 +9069,26 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     this.#diagnostic(`confirmed adopted provider identity against ${source}`);
   }
 
-  #flushPendingTraceRehydrations(): void {
+  #flushPendingTraceRehydrations(refreshForDelivery = false): void {
     const tracePath = this.options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH;
-    if (!tracePath) return;
+    if (!tracePath || this.options.provider === "pi_rpc") return;
+    const now = Date.now();
+    const unexpired = (pending: { enqueuedAt: number }) => {
+      if (now - pending.enqueuedAt < TRACE_CORRELATION_MAX_AGE_MS) return true;
+      // Keep the existing incomplete/unmatched status even after retiring work.
+      this.#traceRehydrationUnmatched = true;
+      return false;
+    };
+    this.#pendingTraceRehydrations = this.#pendingTraceRehydrations.filter(unexpired);
+    this.#pendingDriverTraceInterpretations = this.#pendingDriverTraceInterpretations.filter(unexpired);
+    if (!refreshForDelivery && this.#pendingTraceRehydrations.length === 0 && this.#pendingDriverTraceInterpretations.length === 0) return;
+    try {
+      // One path stat per pass, not per item. Unchanged files have no new matches.
+      if (!this.#traceFrameIndex.refresh(tracePath) && !this.#traceCorrelationsDirty) return;
+      this.#traceCorrelationsDirty = false;
+    } catch {
+      return; // Missing/unreadable files still expire at the same deadline.
+    }
     const retry: PendingTraceRehydration[] = [];
     for (const pending of this.#pendingTraceRehydrations) {
       const traceResult = appendRunnerdRehydrationTrace(
@@ -9087,7 +9100,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         this.#nextTraceDebugSequence,
       );
       if (traceResult === "written") this.#nextTraceDebugSequence += 1;
-      else if (traceResult === "retry") retry.push(pending);
+      else if (traceResult === "retry" || traceResult === "write_retry") {
+        retry.push(pending);
+        if (traceResult === "write_retry") this.#traceCorrelationsDirty = true;
+      }
     }
     this.#pendingTraceRehydrations = retry;
 
@@ -9100,7 +9116,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         this.#nextTraceDebugSequence,
       );
       if (traceResult === "written") this.#nextTraceDebugSequence += 1;
-      else if (traceResult === "retry") driverRetry.push(pending);
+      else if (traceResult === "retry" || traceResult === "write_retry") {
+        driverRetry.push(pending);
+        if (traceResult === "write_retry") this.#traceCorrelationsDirty = true;
+      }
     }
     this.#pendingDriverTraceInterpretations = driverRetry;
   }
@@ -9149,9 +9168,14 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     });
   }
 
-  #retryPumpWhile(held: boolean): void {
+  #retryPumpWhile(held: boolean, retryMs = PUMP_HELD_RETRY_MS): void {
     if (held && this.#pumpActive) {
-      this.#pumpRetry ??= setInterval(() => this.#pumpEventsSafely(), PUMP_HELD_RETRY_MS);
+      if (this.#pumpRetry !== null && this.#pumpRetryMs !== retryMs) {
+        clearInterval(this.#pumpRetry);
+        this.#pumpRetry = null;
+      }
+      this.#pumpRetryMs = retryMs;
+      this.#pumpRetry ??= setInterval(() => this.#pumpEventsSafely(), retryMs);
     } else if (this.#pumpRetry !== null) {
       clearInterval(this.#pumpRetry);
       this.#pumpRetry = null;
