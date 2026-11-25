@@ -99,6 +99,9 @@ describePostgres("agent configuration save latency", () => {
     { provider: "pi_rpc", config: { piRpcThinkingLevel: "ultra" }, status: 422 },
     { provider: "pi_rpc", config: { effort: "ultra" }, status: 422 },
     { provider: "pi_rpc", config: { piRpcThinkingLevel: "max" }, status: 200 },
+    { provider: "pi_rpc", config: { piRpcThinkingLevel: null }, status: 200 },
+    { provider: "pi_rpc", config: { piRpcThinkingLevel: "" }, status: 200 },
+    { provider: "pi_rpc", config: { piRpcThinkingLevel: " \t " }, status: 200 },
     { provider: "pi_rpc", config: { effort: "none" }, status: 200 },
     { provider: "codex", config: { piRpcThinkingLevel: "ultra" }, status: 200 },
   ])("validates Pi agent reasoning before persisting: %j", async ({ provider, config, status }) => {
