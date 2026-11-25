@@ -4,6 +4,18 @@ Paperclip work is company-open by default. A task or project can instead be
 marked private when its title, discussion, documents, attachments, work
 products, or agent run traces should be limited to named participants.
 
+## Visibility requests on creation and update
+
+Company task/project creation and task/project PATCH routes require a person to
+request `visibility: "private"`. Agent requests return HTTP `403`, with the message
+"Only a person can make a task private" or "Only a person can make a project private".
+This also applies when the agent acts on behalf of a person.
+
+Omitting visibility keeps the ordinary open default. A task created under a
+person's private parent or in a private project still inherits that privacy;
+the agent did not request a new restriction. Publishing existing work retains
+its privacy-owner/administrator checks. Board-user permissions are unchanged.
+
 ## Who can read private work
 
 A private task is readable by its responsible user, creating user, current
