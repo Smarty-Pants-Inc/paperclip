@@ -585,10 +585,10 @@ describe("server-owned Codex runner selection", () => {
     expect(state.resolveEnvironment).not.toHaveBeenCalled();
     if (expected === "codex_local") await expect(resolveNewAgentRunnerForCompany({} as never, "company", { adapterType: "codex_local", runner: "paperclip", defaultEnvironmentId: "sandbox" })).rejects.toMatchObject({ status: 422 });
   });
-  it("does not infer a sandbox image architecture from its driver", async () => {
+  it("selects the Codex card on a plugin sandbox without inferring image architecture", async () => {
     state.getEnvironment.mockResolvedValue({ id: "sandbox", driver: "sandbox", status: "active", config: { provider: "daytona" } });
     const result = await resolveNewAgentRunnerForCompany({} as never, "company", { adapterType: "codex_local", defaultEnvironmentId: "sandbox" });
-    expect(result.adapterType).toBe("codex_local"); expect(state.ssh).not.toHaveBeenCalled();
+    expect(result.adapterType).toBe("paperclip_runner"); expect(state.ssh).not.toHaveBeenCalled();
     expect(state.sandboxQualification).toHaveBeenCalledWith({}, expect.objectContaining({ id: "sandbox" }), "company");
     await expect(resolveNewAgentRunnerForCompany({} as never, "company", { adapterType: "codex_local", runner: "paperclip", defaultEnvironmentId: "sandbox" })).rejects.toMatchObject({ status: 422, details: { code: "agent_runner_unavailable" } });
   });
