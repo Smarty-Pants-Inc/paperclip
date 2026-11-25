@@ -5176,7 +5176,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     currentRunGrant?: NativeRunRuntimeGrant;
     completionContract?: { revision: string; criterionIds: readonly string[] };
   }): Promise<void> {
-    if (this.#closed) return Promise.reject(new NativeRunnerClosedBeforeAttachmentError());
+    if (this.#closed || this.#failure !== null) return Promise.reject(new NativeRunnerClosedBeforeAttachmentError());
     const earlyClaim = this.#earlyClaim?.runId === input.runId ? this.#earlyClaim.operation : undefined;
     if (this.#attachmentOperation !== null && earlyClaim === undefined) {
       return Promise.reject(new Error("native_runner_run_attachment_in_progress"));
@@ -5184,7 +5184,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     this.#earlyClaim = null;
     const operation = Promise.resolve().then(() => {
       // Still before any attachment command, including the queued microtask.
-      if (this.#closed) throw new NativeRunnerClosedBeforeAttachmentError();
+      if (this.#closed || this.#failure !== null) throw new NativeRunnerClosedBeforeAttachmentError();
       this.#assertStartupOpen();
       return this.#attachRun(input, earlyClaim);
     }).finally(() => { this.#attachmentOperation = null; });

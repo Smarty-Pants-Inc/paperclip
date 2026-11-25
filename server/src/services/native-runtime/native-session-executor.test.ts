@@ -1,3 +1,4 @@
+import { sandboxRestartMetadata } from "../sandbox-snapshot-restore.js";
 import type { NativeSession } from "../../vendor/paperclip-runner/index.js";
 import * as continuousReply from "./native-continuous-reply.js";
 import { recoveryPostgresSupport, startRecoveryPostgres } from "../../__tests__/helpers/recovery-postgres.js";
@@ -10,7 +11,7 @@ vi.mock("../chat-completion-delivery.js", async importOriginal => ({
   offerHeldChatCompletions: heldCompletionOffers.invoke,
 }));
 import * as resetWakeQueue from "../../modules/wake-queue/index.js";
-import { closeHeldNativeTurn } from "./native-session-executor.js";
+import { closeHeldNativeTurn, forgetDestroyedWarmNativeSessions } from "./native-session-executor.js";
 import { currentControllerProcess } from "../controller-process-identity.js";
 import { activeNativeExecutionRunIds } from "./native-active-runs.js";
 import { onRetainedNativeSessionCleanupRelease } from "../retained-native-session-cleanup-notifications.js";
@@ -13677,6 +13678,75 @@ describe("native warm session supervision", () => {
       expect(nextLog).toHaveBeenCalledWith("stderr", expect.stringContaining("synthetic attachment failed before onSession"));
     });
 
+    it.each(["restoredFromSnapshotAt", "rebootedAt"] as const)("keeps the HELD run's live Runner after a handled %s and another server restart", async marker => {
+      const { base } = fixture(`sticky-restart-${marker}`);
+      const first = "2026-11-25T12:00:00.000Z";
+      let root: string;
+      let identity: Record<string, unknown>;
+      const owner = { close: vi.fn(async () => undefined), detachControllerForRestart: vi.fn(async () => undefined),
+        identity: () => ({ ...base.binding, sessionId: base.session.normalizedSessionId }),
+        snapshot: vi.fn(async () => ({ identity: { ...base.binding, sessionId: base.session.normalizedSessionId } })) };
+      const receipt = { outcome: "resumed" as const, providerLeaseId: "sticky-box", [marker]: first };
+      const runner = { execute: vi.fn(async (request: { args?: string[] }) => ({ exitCode: 0, signal: null, timedOut: false,
+        stdout: request.args?.[1]?.includes("base64") ? Buffer.from(JSON.stringify({ ...identity, lifecycle: "running" })).toString("base64")
+          : request.args?.[1]?.includes("cat --") ? "nonce\n123\n2026-09-19T10:00:00.000Z\nsticky-runner\nlinux:abcd-1234:100\n" : "",
+        stderr: "", pid: null, startedAt: first })) };
+      const target = { kind: "remote" as const, transport: "sandbox" as const, environmentId: "sticky-environment",
+        leaseId: "sticky-lease", remoteCwd: "/workspace", runner, sandboxLeaseAcquisition: receipt };
+      const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+      state.execute.mockReset().mockImplementationOnce(async options => {
+        expect(options.input.binding.runId).toBe(base.binding.runId);
+        state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+        const factory = state.createTransport.mock.calls.at(-1)![0];
+        root = factory.stateDirectory!;
+        identity = { ...factory.prpIdentity, normalizedSessionId: base.session.normalizedSessionId };
+        await mkdir(join(root, "control-plane"), { recursive: true });
+        await mkdir(join(root, "runner"), { recursive: true });
+        await writeFile(join(root, "control-plane/control-plane-state.json"), JSON.stringify(durableControlPlaneState(identity)));
+        await writeFile(join(root, "runner/runner-state.json"), JSON.stringify(durableRunnerState(identity, "running")));
+        await options.onSession?.(owner);
+        return { ...result, normalizedSessionId: base.session.normalizedSessionId };
+      });
+      await executePaperclipNativeSession({ db: leaseDb(base, {}, {}, updates), execution: base, runnerInstanceId: "sticky-runner",
+        useRunnerd: true, runnerExecutionTarget: target });
+      const persisted = updates.filter(update => update.table === environmentLeases && update.values.metadata)
+        .flatMap(update => new PgDialect().sqlToQuery(update.values.metadata as SQL).params)
+        .find(value => typeof value === "string" && value.includes("handledProcessRestartKey"));
+      expect(persisted).toBeTypeOf("string");
+      const metadata = { [marker]: first, ...JSON.parse(persisted as string) };
+      expect(metadata.handledProcessRestartKey).toBe(JSON.stringify(marker === "rebootedAt" ? [null, first] : [first, null]));
+      // Simulate losing only server-local owner bookkeeping: this forgetter
+      // detaches the local controller, and never closes the sandbox Runner.
+      await forgetDestroyedWarmNativeSessions({ companyId: base.binding.companyId,
+        environmentId: target.environmentId, providerLeaseId: receipt.providerLeaseId });
+      expect(owner.detachControllerForRestart).toHaveBeenCalledOnce();
+      const controller = await import("./native-restart-recovery.js").then(module => module.currentNativeControllerIdentity());
+      const leaseOwner = "sticky-controller";
+      const heldDb = leaseDb(base, { phase: "held", leaseOwner, leaseExpiresAt: new Date(Date.now() + 60_000),
+        controllerBootId: controller.bootId, controllerPid: controller.pid, controllerGeneration: 2, attempt: 1,
+        recoveryState: "awaiting_runner_reattach", recoveryHistory: [{ disposition: "reattach_remote_runner", controllerGeneration: 2, providerAttempt: 1 }] });
+      const restore = vi.spyOn(runnerCheckpoint, "restoreNativeRunnerCheckpoint").mockResolvedValue(null);
+      onTestFinished(() => restore.mockRestore());
+      state.execute.mockImplementationOnce(async options => {
+        expect(options.retainedRunnerReattachment).toBe(true);
+        expect(options.input.binding.runId).toBe(base.binding.runId);
+        expect(options.input.session.normalizedSessionId).toBe(base.session.normalizedSessionId);
+        await options.onSession?.(owner);
+        return { ...result, normalizedSessionId: base.session.normalizedSessionId };
+      });
+      const answer = await executePaperclipNativeSession({ db: heldDb, execution: base, runnerInstanceId: "sticky-runner",
+        useRunnerd: true, backend: {} as never, leaseOwner,
+        runnerExecutionTarget: { ...target, sandboxLeaseAcquisition: { ...receipt, ...sandboxRestartMetadata({ metadata }) } },
+        restartRecovery: { kind: "reattach_remote_runner", runId: base.binding.runId, leaseOwner, controllerGeneration: 2,
+          providerAttempt: 1, restartKind: "hard", recoveryRequestId: null,
+          remote: { providerLeaseId: "sticky-box", remoteCwd: "/workspace" } } });
+      expect(answer.summary).toBe("completed");
+      expect(state.execute).toHaveBeenCalledTimes(2);
+      expect(owner.close).not.toHaveBeenCalled();
+      expect(sandboxRestartMetadata({ metadata: { ...metadata, [marker]: "2026-11-25T13:00:00.000Z" } }))
+        .toMatchObject({ [marker]: "2026-11-25T13:00:00.000Z" });
+    });
+
     it.each(["closed", "closed-missing-checkpoint", "rebootedAt", "restoredFromSnapshotAt", "healthy"] as const)("handles a dead cached owner without silently starting a fresh session: %s", async mode => {
       const actual = await vi.importActual<typeof import("../../vendor/paperclip-runner/index.js")>("../../vendor/paperclip-runner/index.js");
       if (mode === "closed-missing-checkpoint") {
@@ -18373,11 +18443,11 @@ describe("runnerd provider runtime wiring", () => {
     },
   );
 
-  it.each((["codex", "claude"] as const).flatMap(provider => (["unchanged", "external-checkpoint", "suspension-receipt", "suspension-active-owner", "changed", "changed-external-checkpoint", "runtime-context", "retirement-failed", "stale-owner", "active-owner", "missing-owner", "foreign-environment", "plugin-replaced", "plugin-managed-github", "plugin-environment-upgrade", "plugin-environment-delivered"] as const).filter(scenario => provider === "codex" || scenario.startsWith("plugin-")).map(scenario => [provider, scenario] as const)))("rotates an owned warm %s remote runner before checking changed configuration: %s", async (provider, scenario) => {
+  it.each((["codex", "claude"] as const).flatMap(provider => (["unchanged", "external-checkpoint", "suspension-receipt", "suspension-active-owner", "changed", "changed-external-checkpoint", "runtime-context", "retirement-failed", "stale-owner", "active-owner", "missing-owner", "foreign-environment", "plugin-replaced", "plugin-managed-github", "plugin-environment-upgrade", "plugin-environment-delivered", "plugin-reuse-missing-checkpoint"] as const).filter(scenario => provider === "codex" || scenario.startsWith("plugin-")).map(scenario => [provider, scenario] as const)))("rotates an owned warm %s remote runner before checking changed configuration: %s", async (provider, scenario) => {
     const plugin = scenario.startsWith("plugin-");
     const configuredScenario = scenario === "plugin-environment-upgrade" || scenario === "plugin-environment-delivered";
     const suspensionReceipt = scenario.startsWith("suspension-");
-    const reusable = suspensionReceipt || ["unchanged", "external-checkpoint", "plugin-managed-github", "plugin-environment-delivered"].includes(scenario);
+    const reusable = suspensionReceipt || ["unchanged", "external-checkpoint", "plugin-managed-github", "plugin-environment-delivered", "plugin-reuse-missing-checkpoint"].includes(scenario);
     const { permissionPolicy: _permissionPolicy, ...claudeProfile } = QUALIFIED_ACPX_PROFILES.claude;
     const first = { ...scopedNativeExecution(`warm-admission-${provider}-${scenario}`),
       schema: "paperclip.native-execution-input.v5" as const,
@@ -18386,7 +18456,7 @@ describe("runnerd provider runtime wiring", () => {
     if (provider === "claude") first.session.driverKind = "acpx_runtime";
     first.session.lifecyclePolicy = { mode: "warm", idleTimeoutMs: 60_000 };
     const next = { ...first, binding: { ...first.binding, runId: `${first.binding.runId}-next` },
-      session: { ...first.session, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: suspensionReceipt || ["unchanged", "external-checkpoint", "runtime-context", "stale-owner", "missing-owner", "plugin-replaced", "plugin-managed-github", "plugin-environment-upgrade", "plugin-environment-delivered"].includes(scenario) ? 60_000 : 90_000 } } };
+      session: { ...first.session, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: suspensionReceipt || ["unchanged", "external-checkpoint", "runtime-context", "stale-owner", "missing-owner", "plugin-replaced", "plugin-managed-github", "plugin-environment-upgrade", "plugin-environment-delivered", "plugin-reuse-missing-checkpoint"].includes(scenario) ? 60_000 : 90_000 } } };
     if (scenario === "runtime-context") {
       next.runtimeContext = { ...first.runtimeContext,
         mcp: { ...first.runtimeContext.mcp, digest: "1".repeat(64) } };
@@ -18420,6 +18490,13 @@ describe("runnerd provider runtime wiring", () => {
     const rebind = vi.fn();
     if (scenario === "plugin-managed-github") owners!.mockImplementation(input => ({...createOwner(input),rebind}));
     if (scenario === "plugin-environment-delivered") owners!.mockImplementation(input => ({...createOwner(input),rebind,configuredEnvironmentDelivered:() => true}));
+    if (scenario === "plugin-reuse-missing-checkpoint") {
+      owners!.mockImplementation(input => ({ ...createOwner(input), rebind, retiredBeforeClaim: () => true }));
+      const issues = vi.spyOn(issueServiceModule, "issueService").mockReturnValue({
+        update: vi.fn(async () => ({ status: "blocked", statusVersion: 1 })),
+      } as unknown as ReturnType<typeof issueServiceModule.issueService>);
+      onTestFinished(() => issues.mockRestore());
+    }
 
     const root = await initializeScopedRunnerRoot(first, identity.runnerInstanceId);
     await writeRunnerAuthority(root, identity, "ready");
@@ -18482,6 +18559,10 @@ describe("runnerd provider runtime wiring", () => {
       return result;
     }).mockImplementationOnce(async options => {
       order.push("execute-next");
+      if (scenario === "plugin-reuse-missing-checkpoint") {
+        replacementPending = true;
+        throw new Error("native_runner_reuse_unavailable");
+      }
       if (scenario === "changed-external-checkpoint") {
         launchedJournal = (JSON.parse(await readFile(join(root, "control-plane/control-plane-state.json"), "utf8")).commands as
           Array<{ type: string }>).map(command => command.type);
@@ -18533,7 +18614,10 @@ describe("runnerd provider runtime wiring", () => {
         runnerInstanceId: `runner-next-${scenario}`, useRunnerd: true,
         runnerExecutionTarget: (scenario === "foreign-environment" ? { ...target, environmentId: `${environmentId}-other` }
           : plugin ? {...pluginTarget,leaseId:"next-core-lease"} : target) as never,...pluginOptions });
-      if (["stale-owner", "active-owner", "suspension-active-owner", "missing-owner", "foreign-environment"].includes(scenario)) {
+      if (scenario === "plugin-reuse-missing-checkpoint") {
+        await expect(continuation).rejects.toThrow("native_runner_checkpoint_missing_after_unavailable_reuse");
+        expect(state.execute).toHaveBeenCalledTimes(2); // No checkpoint means no fresh session.
+      } else if (["stale-owner", "active-owner", "suspension-active-owner", "missing-owner", "foreign-environment"].includes(scenario)) {
         await expect(continuation).rejects.toThrow(["active-owner", "suspension-active-owner"].includes(scenario)
           ? "prior_owner_active" : "prior_owner_terminal_state_indeterminate");
         expect(state.execute).toHaveBeenCalledOnce();
