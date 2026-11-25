@@ -1097,7 +1097,7 @@ export class PaperclipRunnerToolAuthority {
         return { comments: comments.reverse().map(({ updatedAt: _updatedAt, ...comment }) => {
           const visible = isLowTrustQuarantined(readerSourceTrust) ? comment : sanitizeQuarantinedCommentForHigherTrust(comment);
           return { ...visible, body: fastResponseHistoryBody(visible) };
-        }), ...taskHistoryHandlingGuidance(arrived) };
+        }), ...taskHistoryHandlingGuidance(arrived, context.run) };
       }
       case "search_tasks": {
         const tasks = await issueService(this.db).list(this.binding.companyId, { readCondition: await issueReadSqlCondition(this.db, this.#privacyActor(context.run)) });
