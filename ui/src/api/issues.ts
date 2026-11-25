@@ -639,6 +639,8 @@ export const issuesApi = {
           data ?? {},
         ),
     ),
+  resumeReview: (id: string, interactionId: string) =>
+    api.post<{ wakeId: string }>(`/issues/${id}/interactions/${interactionId}/resume_review`, {}),
   rejectInteraction: (id: string, interactionId: string, reason?: string) =>
     resolveInteractionOnce(
       id,
