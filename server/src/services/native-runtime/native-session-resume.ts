@@ -524,7 +524,7 @@ export function isUnusedLegacyNativeRetryReplacement(input: {
   );
 }
 
-function sameProvider(
+export function nativeSessionProvidersMatch(
   previous: NativeExecutionInput["provider"],
   current: NativeExecutionInput["provider"],
 ): boolean {
@@ -584,6 +584,7 @@ export function buildNativeExecutionWithCheckpoint(input: {
   previousRun:
     Parameters<typeof rebindNativeSessionCheckpoint>[0]["previousRun"] | null;
   normalizedSessionId: string;
+  sessionContinuity?: unknown;
   executionTargetKind?: NativeToolExecutionTargetKind;
   toolRefreshOnResume?: boolean;
   refreshTools?: boolean;
@@ -611,6 +612,7 @@ export function buildNativeExecutionWithCheckpoint(input: {
       const retainedCheckpoint = rebindNativeSessionCheckpoint({
         previousRun: input.previousRun,
         currentExecution: retainedFormat,
+        sessionContinuity: input.sessionContinuity,
         executionTargetKind: input.executionTargetKind,
         toolRefreshOnResume: input.toolRefreshOnResume,
         refreshTools: input.refreshTools,
@@ -622,6 +624,7 @@ export function buildNativeExecutionWithCheckpoint(input: {
     ? rebindNativeSessionCheckpoint({
         previousRun: input.previousRun,
         currentExecution: execution,
+        sessionContinuity: input.sessionContinuity,
         executionTargetKind: input.executionTargetKind,
         toolRefreshOnResume: input.toolRefreshOnResume,
         refreshTools: input.refreshTools,
@@ -670,6 +673,7 @@ export function rebindNativeSessionCheckpoint(input: {
     runnerProfileJson: unknown;
   };
   currentExecution: NativeExecutionInput;
+  sessionContinuity?: unknown;
   executionTargetKind?: NativeToolExecutionTargetKind;
   toolRefreshOnResume?: boolean;
   refreshTools?: boolean;
@@ -718,6 +722,11 @@ export function rebindNativeSessionCheckpoint(input: {
   } catch {
     return null;
   }
+  const workspaceChanged = !sameWorkspaceScope({ previousExecution, previousRunId: input.previousRun.id, currentExecution: current }) || previousExecution.workspace.cwd !== current.workspace.cwd;
+  const workspaceContinuation = workspaceChanged && current.provider.kind === "pi_rpc" &&
+    resolveSessionContinuity(current.provider.kind, input.sessionContinuity) === "continuous" &&
+    (input.executionTargetKind ?? "local") === "local" &&
+    (!rawCheckpoint.goal || record(rawCheckpoint.goal).status === "complete");
   if (
     previousExecution.binding.runId !== input.previousRun.id ||
     previousExecution.binding.companyId !== current.binding.companyId ||
@@ -725,17 +734,13 @@ export function rebindNativeSessionCheckpoint(input: {
     previousExecution.binding.agentId !== current.binding.agentId ||
     previousExecution.session.normalizedSessionId !== normalizedSessionId ||
     previousExecution.session.driverKind !== current.session.driverKind ||
-    !sameWorkspaceScope({
-      previousExecution,
-      previousRunId: input.previousRun.id,
-      currentExecution: current,
-    }) ||
+    (!workspaceContinuation && !sameWorkspaceScope({ previousExecution, previousRunId: input.previousRun.id, currentExecution: current })) ||
     previousExecution.task.workMode !== current.task.workMode ||
     ("executionMode" in previousExecution
       ? previousExecution.executionMode
       : "default") !==
       ("executionMode" in current ? current.executionMode : "default") ||
-    !sameProvider(previousExecution.provider, current.provider) ||
+    !nativeSessionProvidersMatch(previousExecution.provider, current.provider) ||
     previousExecution.schema !== current.schema ||
     ("homeMode" in previousExecution ? previousExecution.homeMode : "isolated") !== ("homeMode" in current ? current.homeMode : "isolated") ||
     ("runtimeContext" in previousExecution &&
@@ -767,6 +772,7 @@ export function rebindNativeSessionCheckpoint(input: {
       issueId: current.binding.issueId,
       agentId: current.binding.agentId,
     },
+    ...(workspaceContinuation ? { workingDirectory: current.workspace.cwd ?? undefined } : {}),
     cursor: null,
     semanticResult: null,
     terminal: null,
