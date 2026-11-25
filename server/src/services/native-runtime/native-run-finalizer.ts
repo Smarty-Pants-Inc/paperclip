@@ -46,6 +46,7 @@ import { conversationNativeDecision, isConversation, settleConversationTurnForRu
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { COMPLETION_REVIEW_STAGE_REASON, completionReviewStageEntry } from "../issue-execution-policy.js";
 import { randomUUID } from "node:crypto";
+import { answeredContinuousHeldRun } from "./continuous-session-input.js";
 import { preserveNativeWorkspaceExportLease } from "./native-workspace-export-resume.js";
 import { and, desc, eq, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -1795,6 +1796,8 @@ export async function finalizeNativeRun(input: {
       failureRetryCount: executionFailureRetryCount(run),
       // Only the task's current owner may turn its own failed continuation
       // into a blocker; the committer rechecks that under the issue lock.
+      continuousHeldInputAnswered: terminalState === "failed" && ownsProviderFailureDecision && !reviewContext &&
+        await answeredContinuousHeldRun(input.db, { companyId: run.companyId, issueId: authoritativeIssue.id, runId: run.id }),
       failedTurnContinuationUsed: terminalState === "failed" && ownsProviderFailureDecision && !reviewContext
         && await isFailedTurnContinuationRun(input.db, run, authoritativeIssue.id),
       toolCallLoopContinuation: assessment.reportedDisposition === "yielded"
