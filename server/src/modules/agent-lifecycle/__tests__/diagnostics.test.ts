@@ -126,7 +126,7 @@ describe("lifecycle failure diagnostics", () => {
     if (stage === "transition") store.change.mockRejectedValue(error);
     await worker.process(agent.id);
     expect(store.defer).toHaveBeenCalledWith(agent, expect.any(String), expect.stringContaining(expected), expect.any(Date),
-      ...(stage === "host" ? [{ retryRequired: true }] : []));
+      ...(stage === "host" ? [{ retryRequired: true, failureCode: code }] : []));
     expect(JSON.stringify(store.defer.mock.calls)).not.toContain("secret provider output");
     expect(JSON.stringify(store.defer.mock.calls)).not.toContain("unknown private code");
     await worker.stop();
