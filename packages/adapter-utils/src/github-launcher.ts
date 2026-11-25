@@ -142,10 +142,6 @@ ${options.brokerFile ? String.raw`
       credentialRepository = normalizeRepo(fields.path);
       if (fields.protocol !== 'https' || !/^(?:www\.)?github\.com$/i.test(fields.host || '') || !credentialRepository) refuseTarget();
     }
-    // Arbitrary queries, aliases, multiple repositories and --input are not safely
-    // inferred from CLI text. Refuse export rather than guessing from the origin.
-    if (program === 'gh' && args.includes('api') && args.some(arg => /^(?:https:\/\/api\.github\.com\/)?\/?graphql(?:[/?]|$)/i.test(arg))) refuseTarget();
-    if (program === 'gh' && env.GH_REPO && !normalizeRepo(env.GH_REPO)) refuseTarget();
     const repositoryHint = () => {
       if (credentialFill) return credentialRepository;
       const git = program === 'git' ? executable : originalPath.map(p => path.join(p, 'git')).find(p => {
@@ -175,30 +171,46 @@ ${options.brokerFile ? String.raw`
         return result.status === 0 ? normalizeRepo(result.stdout.trim()) : undefined;
       };
       if (program === 'gh') {
-        let explicitRepository;
-        for (let index = 0; index < args.length; index++) {
-          let value;
-          if (args[index] === '-R' || args[index] === '--repo') value = args[++index];
-          else if (args[index].startsWith('--repo=')) value = args[index].slice(7);
-          else if (args[index].startsWith('-R') && args[index].length > 2) value = args[index].slice(2);
-          else continue;
-          explicitRepository = normalizeRepo(value);
-          if (!explicitRepository) refuseTarget();
-        }
-        if (args.includes('api')) {
-          const endpoint = args.map(arg => arg.replace(/^https:\/\/api\.github\.com\//i, ''))
-            .find(arg => /^\/?repos\/[^/]+\/[^/?]+/.test(arg));
-          if (endpoint) {
-            const context = /\{(?:owner|repo)\}/.test(endpoint) ? (explicitRepository || normalizeRepo(env.GH_REPO) || remoteRepository())?.split('/') : [];
-            return normalizeRepo(endpoint.replace(/\{owner\}/g, context?.[0] || '').replace(/\{repo\}/g, context?.[1] || '')
-              .replace(/^\/?repos\//, '').split(/[/?]/).slice(0, 2).join('/')) || refuseTarget();
+        let explicitRepository, urlRepository;
+        for (let index = 0; index < args.length && args[index] !== '--'; index++) {
+          const arg = args[index];
+          if (arg === '-R' || arg === '--repo' || arg.startsWith('--repo=') || /^-R./.test(arg)) {
+            const value = arg === '-R' || arg === '--repo' ? args[++index] : arg.slice(arg.startsWith('--') ? 7 : 2);
+            explicitRepository = normalizeRepo(value) || refuseTarget();
           }
         }
-        if (args[0] === 'repo' && ['view', 'clone', 'fork'].includes(args[1]) && normalizeRepo(args[2])) return normalizeRepo(args[2]);
-        const url = args.find(arg => /^https:\/\/(?:www\.)?github\.com\//i.test(arg));
-        if (url) return normalizeRepo(new URL(url).pathname.split('/').slice(1, 3).join('/')) || refuseTarget();
         if (explicitRepository) return explicitRepository;
-        if (env.GH_REPO) return normalizeRepo(env.GH_REPO);
+        // URLs are targets regardless of command-specific option arity.
+        for (const value of args) if (/^https?:\/\/(?:www\.)?github\.com(?::\d+)?(?:\/|$)/i.test(value)) {
+          let url;
+          try { url = new URL(value); } catch { refuseTarget(); }
+          const segments = url.pathname.split('/').slice(1), owner = segments[0].toLowerCase();
+          if (!/^[a-z0-9][a-z0-9-]*$/.test(owner) || (urlRepository && urlRepository.split('/')[0] !== owner)) refuseTarget();
+          urlRepository = normalizeRepo(segments.slice(0, 2).join('/')) || urlRepository || owner;
+        }
+        if (urlRepository) return urlRepository;
+        const contextRepository = () => env.GH_REPO ? normalizeRepo(env.GH_REPO) || refuseTarget() : remoteRepository();
+        if (args[0] === 'api') {
+          const endpoints = args.slice(1).map(value => {
+            try { return decodeURIComponent((/^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? new URL(value).pathname : value.split(/[?#]/)[0])).replace(/\/+/g, '/'); }
+            catch { return ''; }
+          }).filter(endpoint => /^\/?(?:repos|orgs|users|graphql)(?:\/|$)/.test(endpoint));
+          if (endpoints.length !== 1) refuseTarget();
+          const endpoint = endpoints[0];
+          // Templates deliberately use CLI context; literal owners never fall back.
+          const context = /\{(?:owner|repo)\}/.test(endpoint) ? contextRepository()?.split('/') : [];
+          const segments = endpoint.replace(/\{owner\}/g, context?.[0] || '').replace(/\{repo\}/g, context?.[1] || '').replace(/^\//, '').split('/');
+          if (segments.some(segment => segment === '.' || segment === '..')) refuseTarget();
+          if (segments[0] === 'repos') return normalizeRepo(segments.slice(1, 3).join('/')) || refuseTarget();
+          if (['orgs', 'users'].includes(segments[0]) && /^[a-z0-9][a-z0-9-]*$/i.test(segments[1] || '')) return segments[1].toLowerCase();
+          // GraphQL, aliases and unresolved endpoints cannot borrow origin's token.
+          refuseTarget();
+        }
+        if (args[0] === 'repo') {
+          const separator = args.indexOf('--'), target = separator < 0 ? args.slice(2).find(arg => normalizeRepo(arg)) : args[separator + 1];
+          if (target) return normalizeRepo(target) || refuseTarget();
+        }
+        return contextRepository();
       }
       const remoteUrl = args.find(arg => /^(?:https?:\/\/|ssh:\/\/|git@)(?:git@)?(?:www\.)?github\.com[:/]/i.test(arg));
       if (remoteUrl) return normalizeRepo(remoteUrl) || refuseTarget();
