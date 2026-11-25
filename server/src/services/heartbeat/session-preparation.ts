@@ -18,7 +18,7 @@ import {
 import {
   buildEffectiveRunSessionConfigMetadata, readConfigFingerprintFromSessionParams,
   readConfiguredModelFromAdapterConfig, resolveTaskSessionConfigFreshness,
-  stripPaperclipSessionMetadataFromSessionParams, type EffectiveRunSessionConfigMetadata,
+  stripPaperclipSessionMetadataFromSessionParams,
 } from "./workspaces.js";
 import type { HeartbeatWorkspacePreparationInput, prepareHeartbeatWorkspace } from "./workspace-preparation.js";
 import type { prepareHeartbeatTaskContext } from "./task-context.js";
@@ -182,21 +182,27 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
   }
   const continuousPi = runtimeConfig.provider === "pi_rpc" &&
     resolveSessionContinuity(runtimeConfig.provider, runtimeConfig.sessionContinuity) === "continuous";
+  const historicalInputs: SessionMetadataInput[] = [];
   if (storedFingerprintDiffers && agent.adapterType === "paperclip_runner" && continuousPi) {
-    // Accept either previous composition only by an exact fingerprint match:
-    // the chip-only shape, or re-cut 3's retained adapter and chip model inputs.
-    compatibleInputs.push(...[sessionConfigMetadataInput, ...compatibleInputs].flatMap(candidate =>
-      (["issue_overrides", "model_inputs"] as const).map(continuousPiFingerprintComposition => ({
-        ...candidate, continuousPiFingerprintComposition,
-      })),
+    const previousCompositions = [
+      { retainAdapterConfigEnvironment: true },
+      { continuousPiFingerprintComposition: "issue_overrides" as const, retainAdapterConfigEnvironment: true },
+      { continuousPiFingerprintComposition: "model_inputs" as const },
+    ];
+    // Category compatibility uses only old shapes of the current inputs, never
+    // alternate account/revision candidates that could mask a real change.
+    historicalInputs.push(...previousCompositions.map(composition => ({ ...sessionConfigMetadataInput, ...composition })));
+    compatibleInputs.push(...compatibleInputs.flatMap(candidate =>
+      previousCompositions.map(composition => ({ ...candidate, ...composition })),
     ));
   }
   const legacyInputs = storedFingerprintDiffers
-    ? [sessionConfigMetadataInput, ...compatibleInputs].map(candidate => ({ ...candidate, legacyComposition: true }))
+    ? [sessionConfigMetadataInput, ...compatibleInputs, ...historicalInputs].map(candidate => ({ ...candidate, legacyComposition: true }))
     : [];
-  const compatibleConfigMetadata: EffectiveRunSessionConfigMetadata[] = await Promise.all(
-    [...compatibleInputs, ...legacyInputs].map(candidate => buildEffectiveRunSessionConfigMetadata(candidate)),
-  );
+  const [compatibleConfigMetadata, historicalConfigMetadata] = await Promise.all([
+    Promise.all([...compatibleInputs, ...legacyInputs].map(candidate => buildEffectiveRunSessionConfigMetadata(candidate))),
+    Promise.all(historicalInputs.map(candidate => buildEffectiveRunSessionConfigMetadata(candidate))),
+  ]);
   const configuredModel =
     readConfiguredModelFromAdapterConfig(runtimeConfig);
   if (context.refreshTools === true && agent.adapterType !== "paperclip_runner") {
@@ -212,16 +218,18 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
     taskSessionParams:
       taskSession?.sessionParamsJson ?? taskSessionDecodedParams,
     configMetadata: sessionConfigMetadata,
-    compatibleConfigMetadata,
+    compatibleConfigMetadata: [...compatibleConfigMetadata, ...historicalConfigMetadata],
+    compatibleCategoryMetadata: historicalConfigMetadata,
     wakeResetReason: wakeSessionResetReason,
     preserveLegacySessionWithoutConfigMetadata:
       acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision && !agentIdentity,
   });
-  // Only instruction content and pack/environment configuration may advance.
-  // Missing/versioned metadata and mixed changes still require stock reset.
+  // Adapter config exemptions are per-key in the fingerprint, never per-category.
+  // Only instruction content and environment changes may advance here;
+  // missing/versioned metadata and mixed changes still require stock reset.
   const continuableConfigChange = continuousPi && sessionConfigFreshness.changedCategories.length > 0 &&
     sessionConfigFreshness.changedCategories.every(category =>
-      ["instructions", "adapterConfig", "environment", "envBindings"].includes(category));
+      ["instructions", "environment", "envBindings"].includes(category));
   let resetTaskSession =
     context.workspaceSelectionChanged === true || shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
   if (decideNativeContinuation({
