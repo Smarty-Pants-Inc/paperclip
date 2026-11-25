@@ -95,6 +95,28 @@ describePostgres("agent configuration save latency", () => {
     expect(allocate).not.toHaveBeenCalled(); expect(probe).not.toHaveBeenCalled(); expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { provider: "pi_rpc", config: { piRpcThinkingLevel: "ultra" }, status: 422 },
+    { provider: "pi_rpc", config: { effort: "ultra" }, status: 422 },
+    { provider: "pi_rpc", config: { piRpcThinkingLevel: "max" }, status: 200 },
+    { provider: "pi_rpc", config: { effort: "none" }, status: 200 },
+    { provider: "codex", config: { piRpcThinkingLevel: "ultra" }, status: 200 },
+  ])("validates Pi agent reasoning before persisting: %j", async ({ provider, config, status }) => {
+    await db.update(agents).set({ adapterConfig: { provider, model: "paperclip/gpt-6.1-sol" } }).where(eq(agents.id, agent.id));
+    const before = await readAgent();
+    const response = await request(app).patch(`/api/agents/${agent.id}`).send({ adapterConfig: config });
+    expect(response.status, JSON.stringify(response.body)).toBe(status);
+    const saved = await readAgent();
+    if (status === 422) {
+      expect(response.body.error).toBe('Pi cannot use reasoning level "ultra": choose off, minimal, low, medium, high, xhigh or max');
+      expect(saved).toEqual(before);
+      expect(await db.select().from(agentConfigRevisions).where(eq(agentConfigRevisions.agentId, agent.id))).toHaveLength(0);
+      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, agent.id))).toHaveLength(0);
+    } else {
+      expect(saved.adapterConfig).toMatchObject(config);
+    }
+  });
+
   it("renames generated chat titles for each user while preserving custom titles and other tasks", async () => {
     const oldTitle = `Chat with ${agent.name}`;
     const [otherAgent] = await db.insert(agents).values({ companyId: agent.companyId, name: "Other agent" }).returning();
