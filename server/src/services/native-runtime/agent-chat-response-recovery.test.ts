@@ -1208,7 +1208,7 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     expect(await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system")))).toHaveLength(1);
   });
 
-  it("saves every held-turn final, including identical answers, and reuses the last at finalization", async () => {
+  it("coalesces identical held-turn finals only without new attribution, replays idempotently, and reuses the last at finalization", async () => {
     const f = await fixture(true, { beforeFinalize: async scope => {
       const [personRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
       const outbox = await completion(scope);
@@ -1216,21 +1216,38 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
       await db.update(agents).set({ adapterConfig: { provider: "pi_rpc" } }).where(eq(agents.id, scope.agentId));
       const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
       const execution = { binding: scope, provider: { kind: "pi_rpc" as const, model: null } };
+      const [followup] = await db.insert(issueComments).values({ companyId: scope.companyId, issueId: scope.issueId,
+        authorUserId: personRun.responsibleUserId, body: "Ask again: give me the same answer." }).returning();
       for (let index = 0; index < 4; index++) {
         const event = { eventType: "item.completed" as const, runId: scope.runId, normalizedSessionId: run.nativeSessionId!,
-          sourceEventId: `held-final-${index}`, itemId: `hire-turn:m${index}:b0`, payload: { kind: "agentMessage", channel: "final", text: index < 3 ? "Same answer." : "Last answer.", ...(index === 1 ? {} : { answers: index === 3 ? [outbox.deliveryId] : [] }) } };
+          turnId: "hire-turn", sourceEventId: `held-final-${index}`, itemId: `hire-turn:m${index + 1}:b${index === 0 ? 1 : 0}`,
+          payload: { kind: "agentMessage", channel: "final", text: index === 1 ? " \nSame  \tanswer. \n" : index < 3 ? "Same answer." : "Last answer.",
+            ...(index === 1 ? {} : { answers: index === 3 ? [outbox.deliveryId] : index === 2 ? [followup.id] : [] }) } };
         const cursor = 171 + index;
         await db.insert(heartbeatRunEvents).values({ companyId: scope.companyId, runId: scope.runId, agentId: scope.agentId, seq: cursor, eventType: event.eventType, payload: { prpEvent: event } });
         await Promise.all([publishContinuousNativeReply({ db, execution, event, cursor }), publishContinuousNativeReply({ db, execution, event, cursor })]);
         console.info("completion-attribution-row", { itemId: event.itemId, answers: event.payload.answers ?? "missing", delivery: await outbox.delivery() });
-        if (index < 3) expect(await outbox.delivery(), "a person's unrelated answer must not consume the completion report").toMatchObject({ status: "queued", responseCommentId: null });
+        if (index < 3) {
+          expect(await comments(scope.runId)).toHaveLength(index === 2 ? 2 : 1);
+          expect(await outbox.delivery(), "a person's unrelated answer must not consume the completion report").toMatchObject({ status: "queued", responseCommentId: null });
+        }
       }
-      expect((await comments(scope.runId)).map(c => c.body).sort()).toEqual(["Last answer.", "Same answer.", "Same answer.", "Same answer."]);
+      const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      const replies = saved.resultJson!.continuousReplies as Record<string, { questionCommentIds: string[]; commentId: string; publishedByReference?: boolean }>;
+      expect(Object.keys(replies)).toHaveLength(4);
+      expect(replies["hire-turn:m2:b0"]).toMatchObject({ questionCommentIds: [],
+        commentId: replies["hire-turn:m1:b1"].commentId, publishedByReference: true });
+      expect(replies["hire-turn:m3:b0"].questionCommentIds).toEqual([followup.id]);
+      expect(replies["hire-turn:m3:b0"].commentId).not.toBe(replies["hire-turn:m1:b1"].commentId);
+      expect((await comments(scope.runId)).map(c => c.body).sort()).toEqual(["Last answer.", "Same answer.", "Same answer."]);
+      console.info("DBLFINAL_PROOF", JSON.stringify({ runId: scope.runId, replies,
+        comments: (await comments(scope.runId)).map(({ id, body }) => ({ id, body })) }));
       expect(await outbox.delivery()).toMatchObject({ status: "delivered", targetRunId: scope.runId, attempts: 0,
         responseCommentId: (await comments(scope.runId)).find(c => c.body === "Last answer.")!.id });
     }, reply: "Last answer." });
     await recoverCommittedNativeChatResponse(db, f.input);
-    expect(await comments(f.runId)).toHaveLength(4);
+    await recoverCommittedNativeChatResponse(db, f.input);
+    expect(await comments(f.runId)).toHaveLength(3);
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0].nativeSessionId).toBe(f.prpEvent.normalizedSessionId);
   });
 
