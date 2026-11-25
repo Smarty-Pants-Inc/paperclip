@@ -17,14 +17,20 @@ import {
   activityLog,
   agents,
   agentWakeupRequests,
+  agentRuntimeState,
+  agentTaskSessions,
+  authUsers,
   companies,
   companyMemberships,
+  companySkills,
+  costEvents,
   createDb,
   applyPendingMigrations,
   environmentLeases,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
+  issueRecoveryActions,
   issueRelations,
   issueTreeHolds,
   issues,
@@ -35,7 +41,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
-import { runningProcesses } from "../adapters/index.js";
+import { runningProcesses, registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
 
 const externalTestDatabaseUrl = resolveExternalTestDatabaseUrl("PAPERCLIP_RETRY_CANCELLATION_TEST_DATABASE_URL");
@@ -777,6 +783,66 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
         scheduledRetryReason: "transient_failure",
       },
     });
+  });
+
+  it("starts exactly one run when the owner retries an unanswered chat after saved-work recovery settled", async () => {
+    const f = await seedIssueWithRetry();
+    await db.insert(authUsers).values({ id: "board-user", name: "Conversation owner", email: "owed@example.test",
+      createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
+    await db.update(issues).set({ status: "blocked", conversationAgentId: f.agentId, conversationUserId: "board-user",
+      conversationState: "active", conversationSessionGeneration: 2, executionRunId: null, executionLockedAt: null,
+      executionAgentNameKey: null }).where(eq(issues.id, f.issueId));
+    await db.update(agents).set({ status: "error" }).where(eq(agents.id, f.agentId));
+    await db.update(agentWakeupRequests).set({ status: "failed", finishedAt: new Date() })
+      .where(eq(agentWakeupRequests.companyId, f.companyId));
+    const [message] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorUserId: "board-user", authorType: "user", body: "Continue the work I asked for",
+      createdAt: new Date("2026-05-06T17:59:00Z") }).returning();
+    await db.update(heartbeatRuns).set({ status: "failed", runtimeMode: "native", nativeIssueId: f.issueId, scopeKind: "issue",
+      scheduledRetryAt: null, scheduledRetryReason: null, finishedAt: new Date(), errorCode: "native_predecessor_retirement_unproven",
+      contextSnapshot: { issueId: f.issueId, conversationSessionGeneration: 2, wakeCommentId: message.id },
+      resultJson: { failureCause: "native_predecessor_retirement_unproven", continuationScheduling: "refused" },
+      createdAt: new Date("2026-05-06T18:00:01Z") }).where(eq(heartbeatRuns.id, f.retryRunId));
+    await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "active_run_watchdog", status: "resolved", outcome: "restored", ownerType: "system",
+      returnOwnerAgentId: f.agentId, cause: "native_session_interrupted", fingerprint: randomUUID(),
+      nextAction: "Saved work recovered.", resolutionNote: "workspace_recovered_by_sibling_action",
+      evidence: { runId: f.retryRunId, continuationDelivery: "not_requested" } });
+    // Exercise the real route/admission/run rows without launching a model or
+    // requiring credentials. Drain the admitted execution before fixture teardown.
+    registerServerAdapter({ type: "codex_local", supportsLocalAgentJwt: false,
+      execute: async () => {
+        await db.update(issues).set({ status: "todo", conversationState: "waiting" }).where(eq(issues.id, f.issueId));
+        return { exitCode: 0, signal: null, timedOut: false, resultJson: {} };
+      },
+      testEnvironment: async () => ({ adapterType: "codex_local", status: "pass", checks: [], testedAt: new Date().toISOString() }),
+    });
+    try {
+      const app = createApp(boardActor(f.companyId));
+      const detail = await request(app).get(`/api/issues/${f.issueId}`);
+      expect(detail.status, JSON.stringify(detail.body)).toBe(200);
+      expect(detail.body.interruption).toMatchObject({ state: "failed", canRetry: true, unansweredCommentId: message.id });
+      const body = { idempotencyKey: randomUUID(), observedRunId: f.retryRunId };
+      const retry = await request(app).post(`/api/issues/${f.issueId}/retry`).send(body);
+      expect(retry.status, JSON.stringify(retry.body)).toBe(202);
+      expect(retry.body.accepted).toBe(true);
+      const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, retry.body.requestId));
+      expect(receipt.runId).toEqual(expect.any(String));
+      await heartbeatService(db).drainActiveRunExecutions();
+      const [started] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, receipt.runId!));
+      expect(started.status).toBe("succeeded");
+      const replay = await request(app).post(`/api/issues/${f.issueId}/retry`).send(body);
+      expect(replay.body.requestId).toBe(retry.body.requestId);
+      const allRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
+      expect(allRuns.filter(run => run.id !== f.sourceRunId && run.id !== f.retryRunId)).toHaveLength(1);
+    } finally {
+      await heartbeatService(db).drainActiveRunExecutions();
+      unregisterServerAdapter("codex_local");
+      await db.delete(agentTaskSessions).where(eq(agentTaskSessions.companyId, f.companyId));
+      await db.delete(agentRuntimeState).where(eq(agentRuntimeState.companyId, f.companyId));
+      await db.delete(companySkills).where(eq(companySkills.companyId, f.companyId));
+      await db.delete(costEvents).where(eq(costEvents.companyId, f.companyId));
+    }
   });
 
   it("starts a scheduled retry now when the task Retry is clicked during its countdown", async () => {

@@ -7,6 +7,43 @@ const run = { id: "run", agentId: "agent", status: "failed", scheduledRetryAt: n
   resultJson: { projectAccessDenied: { projectId: "22222222-2222-4222-8222-222222222222" } } };
 const agent = { status: "idle", pauseReason: null };
 
+// Unit test agreed in task: pure projection must name the failed stage without provider text.
+describe("classified failure of an unanswered message", () => {
+  const owedInput = { commentId: "message", createdAt: new Date(100), deliveryOwner: false };
+  const failed = { ...run, errorCode: "native_session_interrupted", resultJson: null,
+    createdAt: new Date(200), error: "Boat returned an invalid private preview URL. https://private.example/secret" };
+  const project = (change = {}) => projectTaskInterruption(issue, { run: { ...failed, ...change }, agent,
+    paused: false, approval: false, owedInput });
+
+  it.each(["runner.ingress.acquire", "runner.transport.connect"])("names the %s connection failure", failedStage => {
+    const presentation = project({ failedStage });
+    expect(presentation).toMatchObject({ state: "failed", canRetry: true, unansweredCommentId: "message",
+      failure: { code: "agent_machine_unreachable", title: "Couldn't connect to the agent's machine",
+        detail: "No agent work started. Your message is saved." } });
+    expect(JSON.stringify(presentation)).not.toMatch(/Boat|private\.example|saved files|saved work/i);
+  });
+  it.each(["environment.acquire", "environment.resume"])("names the %s availability failure", failedStage => {
+    expect(project({ failedStage })?.failure).toMatchObject({ code: "agent_machine_unavailable",
+      title: "The agent's machine was unavailable" });
+  });
+  it("keeps a predecessor fence distinct from an unavailable machine", () => {
+    expect(project({ failedStage: "environment.acquire", previousSessionUnconfirmed: true })?.failure)
+      .toMatchObject({ code: "previous_session_unconfirmed", title: "Couldn't confirm the previous session stopped" });
+    expect(project({ errorCode: "native_predecessor_retirement_unproven" })?.failure)
+      .toMatchObject({ code: "previous_session_unconfirmed" });
+  });
+  it("uses existing stock titles, and a safe fallback for an unmapped classified code", () => {
+    expect(project({ errorCode: "provider_quota" })?.failure).toMatchObject({ code: "provider_quota", title: "Error: usage limit reached" });
+    expect(project({ errorCode: "unmapped_error" })?.failure).toEqual({ code: "unmapped_error",
+      title: "The agent's run failed", detail: "This attempt did not finish. Your message is saved." });
+  });
+  it("does not borrow an old failure or expose one while a delivery owner is working", () => {
+    expect(project({ createdAt: new Date(0) })?.failure).toBeUndefined();
+    expect(projectTaskInterruption(issue, { run: failed, agent, paused: false, approval: false,
+      owedInput: { ...owedInput, deliveryOwner: true } })?.failure).toBeUndefined();
+  });
+});
+
 describe("pending question presentation", () => {
   const failed = { ...run, errorCode: "native_session_interrupted", resultJson: null };
   const input = { run: failed, agent, paused: false, approval: false, question: true };
