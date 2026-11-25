@@ -4,7 +4,7 @@ import request from "supertest";
 import { issueRoutes } from "../../routes/issues.js";
 import { errorHandler } from "../../middleware/index.js";
 import { ensureHumanRoleDefaultGrants } from "../principal-access-compatibility.js";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, agentWakeupRequests, authUsers, companyMemberships, companies, completionContracts, createDb, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, nativeRunResults, statusDecisions, workAssessments } from "@paperclipai/db";
 import type { ControlPlanePort, NativeExecutionInputV1, PrpEvent, PrpTerminalState } from "@paperclipai/paperclip-runner";
@@ -177,6 +177,84 @@ describe("native completed failure diagnostics", () => {
       await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.agentId, agentId));
       await db.update(agentWakeupRequests).set({ status: "completed" }).where(eq(agentWakeupRequests.agentId, agentId));
     }
+  }, 30_000);
+
+  it.each(["nativeIssueId", "contextIssueId"] as const)("denies GET and POST resume for a competing scheduled retry linked by %s without adding a wake", async link => {
+    const f = await stoppedReview();
+    const [competing] = await db.insert(heartbeatRuns).values({ companyId, agentId, runtimeMode: "native", status: "scheduled_retry",
+      nativeIssueId: link === "nativeIssueId" ? f.input.issueId : null,
+      contextSnapshot: link === "contextIssueId" ? { issueId: f.input.issueId } : {},
+    }).returning();
+    const url = `/api/issues/${f.input.issueId}/interactions`;
+    const app = reviewApp();
+    const wakesBefore = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    try {
+      const projection = await request(app).get(url);
+      expect(projection.status, JSON.stringify(projection.body)).toBe(200);
+      expect(projection.body).toMatchObject([{ id: f.input.interactionId, canResumeReview: false }]);
+      const post = await request(app).post(`${url}/${f.input.interactionId}/resume_review`).send({});
+      expect(post.status, JSON.stringify(post.body)).toBe(409);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toEqual(wakesBefore);
+    } finally {
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, competing.id));
+    }
+  });
+
+  it("serializes a Resume press behind an actual reviewer start paused at its run-row lock", async () => {
+    const f = await stoppedReview();
+    const intent = await resumeNativeReview(db, f.input);
+    const [queued] = await db.insert(heartbeatRuns).values({ companyId, agentId, nativeIssueId: f.input.issueId,
+      runtimeMode: "native", status: "queued", contextSnapshot: f.contextSnapshot, wakeupRequestId: intent.wakeId,
+    }).returning();
+    await db.update(agentWakeupRequests).set({ runId: queued.id, status: "queued" }).where(eq(agentWakeupRequests.id, intent.wakeId));
+    let release!: () => void;
+    let locked!: (pid: number) => void;
+    const runLocked = new Promise<number>(resolve => { locked = resolve; });
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    // Pause the real claim after it locks the issue and wake, before it locks
+    // the run. PostgreSQL's blocking graph, not a sleep, proves the interleaving.
+    const holder = db.transaction(async tx => {
+      const [backend] = await tx.execute<{ pid: number }>(sql`select pg_backend_pid() as pid`);
+      await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queued.id)).for("update");
+      locked(backend.pid);
+      await barrier;
+    });
+    const holderPid = await runLocked;
+    const starting = claimQueuedNativeReviewRun(db, { run: queued, agentNameKey: "reviewer", claimedAt: new Date(),
+      claimValues: { runtimeMode: "native", nativeIssueId: f.input.issueId } });
+    let press: Promise<request.Response> | undefined;
+    try {
+      let starterPid = 0;
+      await vi.waitFor(async () => {
+        const blocked = await db.execute<{ pid: number }>(sql`select pid from pg_stat_activity
+          where datname = current_database() and ${holderPid} = any(pg_blocking_pids(pid))`);
+        expect(blocked).toHaveLength(1);
+        starterPid = blocked[0].pid;
+      }, { timeout: 10_000 });
+      press = request(reviewApp()).post(`/api/issues/${f.input.issueId}/interactions/${f.input.interactionId}/resume_review`).send({}).then(response => response);
+      await vi.waitFor(async () => {
+        const blocked = await db.execute<{ pid: number }>(sql`select pid from pg_stat_activity
+          where datname = current_database() and ${starterPid} = any(pg_blocking_pids(pid))`);
+        expect(blocked).toHaveLength(1);
+      }, { timeout: 10_000 });
+    } finally {
+      release();
+      await holder;
+      // Always settle both operations, even when the barrier observation fails.
+      await Promise.allSettled([starting, ...(press ? [press] : [])]);
+    }
+    expect(await starting).toMatchObject({ id: queued.id, status: "running" });
+    expect((await press!).status).toBe(409);
+    const wakes = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId)))
+      .filter(wake => wake.payload?.nativeReviewInteractionId === f.input.interactionId);
+    expect(wakes).toHaveLength(2); // Original Stop wake plus the one explicit Resume.
+    const attempts = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+      .filter(run => run.contextSnapshot?.nativeReviewInteractionId === f.input.interactionId);
+    expect(attempts).toHaveLength(2); // Stopped attempt plus the one starting attempt.
+    expect((await request(reviewApp()).get(`/api/issues/${f.input.issueId}/interactions`)).body)
+      .toMatchObject([{ id: f.input.interactionId, canResumeReview: false }]);
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, queued.id));
+    await db.update(agentWakeupRequests).set({ status: "completed" }).where(eq(agentWakeupRequests.id, intent.wakeId));
   }, 30_000);
 
   it("denies agents and non-audience people the person-stopped native review action", async () => {
