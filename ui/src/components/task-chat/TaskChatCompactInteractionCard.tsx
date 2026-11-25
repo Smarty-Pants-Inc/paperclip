@@ -85,6 +85,7 @@ import {
 import { TaskChatPlanPreviewCard } from "./TaskChatPlanPreviewCard";
 import { TaskChatRichInput } from "./TaskChatRichInput";
 import { ANALYTICS_MASK_CLASS } from "@/lib/analytics/privacy";
+import { ResumeReviewAction } from "@/components/ResumeReviewAction";
 
 const TAKEOVER_TEXTAREA_CLASS =
   "min-h-16 resize-y border-0 bg-muted/35 text-sm shadow-none focus-visible:ring-0 focus-visible:ring-offset-0";
@@ -1135,6 +1136,7 @@ function ConfirmationCard({
             >
               {interaction.payload.rejectLabel ?? "Reject"}
             </Button>
+            <ResumeReviewAction interaction={interaction} disabled={working !== null} />
             <Button
               type="button"
               size="sm"
