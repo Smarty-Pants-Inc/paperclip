@@ -2049,7 +2049,10 @@ export function TaskChatCompactInteractionCard({
     && interaction.kind !== "connection_intent"
     && interaction.kind !== "request_item_verdicts"
     && !(interaction.kind === "request_confirmation" && (interaction.payload.toolAction || interaction.payload.secretProposal || interaction.payload.connectionAuthorization))) {
-    return <CoordinatorInteractionReceipt interaction={interaction} />;
+    return <>
+      <CoordinatorInteractionReceipt interaction={interaction} />
+      {interaction.kind === "request_confirmation" ? <ResumeReviewAction interaction={interaction} /> : null}
+    </>;
   }
 
   if (interaction.kind === "suggest_routine") {
@@ -2093,6 +2096,9 @@ export function TaskChatCompactInteractionCard({
           externalReferences={externalReferences}
           compact
         />
+        {/* The pending body is gone, but its native-review band must remain
+            outside the closed receipt so following log content keeps its space. */}
+        {interaction.kind === "request_confirmation" ? <ResumeReviewAction interaction={interaction} /> : null}
       </>
     );
   }
@@ -2159,6 +2165,8 @@ export function TaskChatCompactInteractionCard({
           draftKey={draftKey}
         />
       )}
+      {interaction.status !== "pending" && interaction.kind === "request_confirmation"
+        ? <ResumeReviewAction interaction={interaction} /> : null}
     </InteractionShell>
   );
 }
