@@ -9855,6 +9855,14 @@ export async function resolveNativeRuntimeRequest(input: {
   }
 }
 
+/** Called before taking issue/run locks; unreadable history must not lose input. */
+export async function readNativeSessionUserMessages(runId: string, normalizedSessionId: string): Promise<string[] | null> {
+  const active = activeNativeSessions.get(runId);
+  if (!active || active.session.identity().sessionId !== normalizedSessionId) return null;
+  try { return await active.session.readUserMessages?.() ?? null; }
+  catch { return null; }
+}
+
 export async function getNativeSessionSteeringState(
   runId: string,
 ): Promise<NativeSessionSteeringState> {

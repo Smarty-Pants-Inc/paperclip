@@ -1,0 +1,128 @@
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { agentWakeupRequests, agents, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
+import { parseObject } from "../../adapters/utils.js";
+import { queuedCommentIdsFromRunContext, queuedCommentIdsFromWakePayload, withQueuedCommentIdsInWakePayload } from "../issue-queued-comment-queue.js";
+import { resolveSessionContinuity } from "./continued-session.js";
+
+type Scope = { companyId: string; issueId: string; runId: string; agentId?: string };
+type Evidence = { sessionId: string; commentIds: string[] };
+
+/** No runner/Boat call is permitted while the issue or run is locked. ACKs
+ * nominate candidates only; the provider's retained user entries prove input. */
+export async function readContinuousSessionInput(db: Pick<Db, "select">, scope: Scope): Promise<Evidence | null> {
+  const [row] = await db.select({ run: heartbeatRuns, config: agents.adapterConfig }).from(heartbeatRuns)
+    .innerJoin(agents, and(eq(agents.id, heartbeatRuns.agentId), eq(agents.companyId, scope.companyId)))
+    .where(and(eq(heartbeatRuns.id, scope.runId), eq(heartbeatRuns.companyId, scope.companyId),
+      eq(heartbeatRuns.nativeIssueId, scope.issueId)));
+  if (!row?.run.nativeSessionId || row.run.runtimeMode !== "native" || row.config.provider !== "pi_rpc" ||
+      resolveSessionContinuity("pi_rpc", row.config.sessionContinuity) !== "continuous") return null;
+  const prior = await db.select({ id: heartbeatRuns.id, result: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, scope.companyId), eq(heartbeatRuns.agentId, row.run.agentId),
+    eq(heartbeatRuns.nativeIssueId, scope.issueId), eq(heartbeatRuns.nativeSessionId, row.run.nativeSessionId),
+    eq(heartbeatRuns.runtimeMode, "native")));
+  const settled = new Set<string>();
+  for (const source of prior) {
+    const result = parseObject(source.result);
+    for (const reply of Object.values(parseObject(result.continuousReplies))) {
+      const ids = parseObject(reply).questionCommentIds;
+      if (Array.isArray(ids)) for (const id of ids) if (typeof id === "string") settled.add(id);
+    }
+    const returned = parseObject(result.personStop).returned;
+    if (Array.isArray(returned)) for (const id of returned) if (typeof id === "string") settled.add(id);
+  }
+  const candidates = [...new Set(prior.filter(source => source.id !== scope.runId).flatMap(source =>
+    Object.entries(parseObject(parseObject(source.result).queuedSteeringAcknowledgements))
+      .filter(([id, receipt]) => !settled.has(id) && parseObject(receipt).status === "acknowledged").map(([id]) => id)))];
+  if (!candidates.length) return null;
+  const { readNativeSessionUserMessages } = await import("./native-session-executor.js");
+  const entries = await readNativeSessionUserMessages(scope.runId, row.run.nativeSessionId);
+  if (!entries) return null; // Missing, truncated or unreadable history: deliver again.
+  const comments = await db.select({ id: issueComments.id, body: issueComments.body }).from(issueComments).where(and(
+    eq(issueComments.companyId, scope.companyId), eq(issueComments.issueId, scope.issueId), inArray(issueComments.id, candidates)));
+  // Legacy receipts contain no provider-entry id. Exact retained text is proof
+  // only when it identifies one issue comment; repeated text is ambiguous and
+  // must fail open rather than mistake an older user entry for the lost steer.
+  const sameText = comments.length ? await db.select({ body: issueComments.body }).from(issueComments).where(and(
+    eq(issueComments.companyId, scope.companyId), eq(issueComments.issueId, scope.issueId),
+    inArray(issueComments.body, comments.map(comment => comment.body)))) : [];
+  const counts = new Map<string, number>();
+  for (const comment of sameText) counts.set(comment.body, (counts.get(comment.body) ?? 0) + 1);
+  return { sessionId: row.run.nativeSessionId, commentIds: comments.filter(comment =>
+    counts.get(comment.body) === 1 && entries.includes(comment.body)).map(comment => comment.id) };
+}
+
+/** Board reads use only the receipt written atomically with queue settlement. */
+export async function continuousSessionAcknowledgedCommentIds(db: Pick<Db, "select">, scope: Scope): Promise<Set<string>> {
+  const [run] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, scope.runId), eq(heartbeatRuns.companyId, scope.companyId)));
+  const saved = parseObject(parseObject(run?.resultJson).continuedSessionInput);
+  return new Set(saved.runId === scope.runId && saved.sessionId === run?.nativeSessionId && Array.isArray(saved.commentIds)
+    ? saved.commentIds.filter((id): id is string => typeof id === "string") : []);
+}
+
+/** Issue -> deferred wakes -> run. Attribution and wake settlement are one
+ * transaction. Publication can join this transaction using its pre-read proof. */
+export async function settleContinuousSessionInput(tx: Db, scope: Scope, evidence: Evidence | null) {
+  if (!evidence?.commentIds.length) return;
+  const [issue] = await tx.select().from(issues).where(and(eq(issues.id, scope.issueId), eq(issues.companyId, scope.companyId))).for("update");
+  if (!issue?.assigneeAgentId || issue.executionRunId !== scope.runId ||
+      (scope.agentId && issue.assigneeAgentId !== scope.agentId)) return;
+  const wakes = await tx.select().from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, scope.companyId), eq(agentWakeupRequests.agentId, issue.assigneeAgentId),
+    eq(agentWakeupRequests.status, "deferred_issue_execution"), sql`${agentWakeupRequests.payload}->>'issueId' = ${scope.issueId}`,
+  )).orderBy(asc(agentWakeupRequests.id)).for("update");
+  const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, scope.runId),
+    eq(heartbeatRuns.companyId, scope.companyId), eq(heartbeatRuns.agentId, issue.assigneeAgentId),
+    eq(heartbeatRuns.nativeIssueId, scope.issueId))).for("update");
+  if (!run || run.status !== "running" || run.runtimeMode !== "native" || run.nativeSessionId !== evidence.sessionId) return;
+  const result = parseObject(run.resultJson), saved = parseObject(result.continuedSessionInput);
+  const ids = saved.runId === scope.runId && saved.sessionId === run.nativeSessionId && Array.isArray(saved.commentIds)
+    ? [...new Set([...saved.commentIds.filter((id): id is string => typeof id === "string"), ...evidence.commentIds])] : evidence.commentIds;
+  const consumed = new Set(ids), now = new Date();
+  for (const wake of wakes) {
+    const pending = queuedCommentIdsFromWakePayload(wake.payload), remaining = pending.filter(id => !consumed.has(id));
+    if (remaining.length === pending.length) continue;
+    await tx.update(agentWakeupRequests).set({ ...(remaining.length
+      ? { payload: withQueuedCommentIdsInWakePayload(wake.payload, remaining) } : { status: "cancelled", finishedAt: now }), updatedAt: now,
+    }).where(eq(agentWakeupRequests.id, wake.id));
+  }
+  await tx.update(heartbeatRuns).set({ resultJson: { ...result,
+    continuedSessionInput: { runId: scope.runId, sessionId: run.nativeSessionId, commentIds: ids } }, updatedAt: now,
+  }).where(eq(heartbeatRuns.id, scope.runId));
+}
+
+/** A failed held conversation is not itself a new question. Only a saved,
+ * unanswered person input can authorize its automatic failure continuation. */
+export async function answeredContinuousHeldRun(db: Db, scope: Scope): Promise<boolean> {
+  const [row] = await db.select({ run: heartbeatRuns, config: agents.adapterConfig }).from(heartbeatRuns)
+    .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId)).where(and(
+      eq(heartbeatRuns.id, scope.runId), eq(heartbeatRuns.companyId, scope.companyId), eq(heartbeatRuns.nativeIssueId, scope.issueId)));
+  if (!row || row.run.runtimeMode !== "native" || row.config.provider !== "pi_rpc" ||
+      resolveSessionContinuity("pi_rpc", row.config.sessionContinuity) !== "continuous") return false;
+  const result = parseObject(row.run.resultJson), replies = Object.values(parseObject(result.continuousReplies));
+  if (!replies.length) return false;
+  const answered = new Set(replies.flatMap(reply => {
+    const ids = parseObject(reply).questionCommentIds;
+    return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : [];
+  }));
+  const returned = parseObject(result.personStop).returned;
+  if (Array.isArray(returned)) for (const id of returned) if (typeof id === "string") answered.add(id);
+  const context = row.run.contextSnapshot;
+  const pending = new Set([
+    ...queuedCommentIdsFromRunContext(context),
+    ...(typeof context?.wakeCommentId === "string" ? [context.wakeCommentId] : []),
+    ...(Array.isArray(context?.wakeCommentIds) ? context.wakeCommentIds : []),
+    ...Object.keys(parseObject(result.queuedSteeringAcknowledgements)),
+    ...(Array.isArray(parseObject(context?.firstTurnQueuedInput).commentIds) ? parseObject(context?.firstTurnQueuedInput).commentIds as string[] : []),
+    ...(Array.isArray(parseObject(result.continuedSessionInput).commentIds) ? parseObject(result.continuedSessionInput).commentIds as string[] : []),
+  ]);
+  const wakes = await db.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, scope.companyId), eq(agentWakeupRequests.agentId, row.run.agentId),
+    eq(agentWakeupRequests.status, "deferred_issue_execution"), sql`${agentWakeupRequests.payload}->>'issueId' = ${scope.issueId}`));
+  for (const wake of wakes) for (const id of queuedCommentIdsFromWakePayload(wake.payload)) pending.add(id);
+  return [...pending].every(id => answered.has(id));
+}
+
+export async function reconcileContinuousSessionInput(db: Db, scope: Scope) {
+  const evidence = await readContinuousSessionInput(db, scope);
+  await db.transaction(tx => settleContinuousSessionInput(tx as unknown as Db, scope, evidence));
+}

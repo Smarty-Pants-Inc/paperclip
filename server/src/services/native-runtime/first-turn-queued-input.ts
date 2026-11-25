@@ -8,6 +8,7 @@ import { deliveredQueuedCommentIds } from "../queued-comment-delivery.js";
 import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
 import { sanitizeQuarantinedCommentForHigherTrust } from "../source-trust.js";
 import { PROVIDER_TURN_ACCEPTED_EVENT_TYPES } from "./provider-attempt-outcome.js";
+import { reconcileContinuousSessionInput } from "./continuous-session-input.js";
 
 /**
  * Queued input for a run's first provider turn.
@@ -215,6 +216,7 @@ export async function claimFirstTurnQueuedInput(
   db: Db,
   binding: { companyId: string; runId: string; issueId: string; agentId: string },
 ): Promise<string | null> {
+  await reconcileContinuousSessionInput(db, binding);
   return db.transaction(async (tx) => {
     // Redact on this transaction's own connection: a second pool connection
     // while the seal holds its locks can wait forever on a one-connection pool.
