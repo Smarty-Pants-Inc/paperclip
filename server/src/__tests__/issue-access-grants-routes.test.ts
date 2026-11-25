@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
+import { eq } from "drizzle-orm";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -213,6 +214,37 @@ describeEmbeddedPostgres("issue access grant and locked edge routes", { concurre
       openIssue,
     };
   }
+
+  it.each(["issues", "projects"] as const)("refuses explicit agent-private %s on create", async (resource) => {
+    const f = await seedFixture();
+    const app = await createApp(db, { ...agentActor(f.companyId, f.assignedAgent.id), onBehalfOfUserId: f.ownerId, onBehalfOfMemberships: [{ companyId: f.companyId, status: "active", membershipRole: "owner" }] });
+    const readRows = () => resource === "issues" ? db.select().from(issues) : db.select().from(projects);
+    const before = await readRows();
+    const result = await request(app).post(`/api/companies/${f.companyId}/${resource}`).send({ [resource === "issues" ? "title" : "name"]: "Agent request", visibility: "private" });
+    expect(result.status).toBe(403);
+    expect(result.body.error).toBe(`Only a person can make a ${resource === "issues" ? "task" : "project"} private`);
+    expect(await readRows()).toEqual(before);
+  });
+  it.each(["issues", "projects"] as const)("refuses explicit agent-private %s on update without changing it", async (resource) => {
+    const f = await seedFixture();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.assignedAgent.id, issueId: f.openIssue.id, status: "running", responsibleUserId: f.ownerId, contextSnapshot: { issueId: f.openIssue.id } }).returning();
+    const app = await createApp(db, { ...agentActor(f.companyId, f.assignedAgent.id), runId: run!.id, onBehalfOfUserId: f.ownerId, onBehalfOfMemberships: [{ companyId: f.companyId, status: "active", membershipRole: "owner" }] });
+    const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Open project" }).returning();
+    const [before] = resource === "issues" ? await db.update(issues).set({ projectId: project!.id, responsibleUserId: f.ownerId, assigneeAgentId: f.assignedAgent.id }).where(eq(issues.id, f.openIssue.id)).returning() : [project!];
+    const result = await request(app).patch(`/api/${resource}/${before!.id}`).send({ visibility: "private" });
+    expect({ status: result.status, error: result.body.error }).toEqual({ status: 403, error: `Only a person can make a ${resource === "issues" ? "task" : "project"} private` });
+    expect((resource === "issues" ? await db.select().from(issues).where(eq(issues.id, before!.id)) : await db.select().from(projects).where(eq(projects.id, before!.id)))[0]).toEqual(before);
+  });
+
+  it("preserves a person's privacy choice, agent defaults and inherited private subtasks", async () => {
+    const f = await seedFixture();
+    const board = await createApp(db, boardActor(f.companyId, f.ownerId));
+    await request(board).patch(`/api/issues/${f.openIssue.id}`).send({ visibility: "private" }).expect(200);
+    await request(board).post(`/api/issues/${f.openIssue.id}/access-grants`).send({ subjectType: "agent", subjectId: f.assignedAgent.id }).expect(201);
+    const app = await createApp(db, { ...agentActor(f.companyId, f.assignedAgent.id), onBehalfOfUserId: f.ownerId, onBehalfOfMemberships: [{ companyId: f.companyId, status: "active", membershipRole: "owner" }] });
+    expect((await request(app).post(`/api/companies/${f.companyId}/issues`).send({ title: "Open default" }).expect(201)).body.visibility).toBe("open");
+    expect((await request(app).post(`/api/companies/${f.companyId}/issues`).send({ title: "Inherited", parentId: f.openIssue.id }).expect(201)).body.visibility).toBe("private");
+  });
 
   it("requires explicit owner/admin break-glass and records both audit evidence and an owner-visible notice", async () => {
     const fixture = await seedFixture();
