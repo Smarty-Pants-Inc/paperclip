@@ -12999,6 +12999,8 @@ async function executePaperclipNativeSessionAttempt(
           verifiedRecoverableFailureReceipt: error.verifiedRecoverableFailureReceipt });
         persistedWarmSession = loadWarmNativeCheckpoint(input.execution, previousConfigDigest, "remote");
         if (!persistedWarmSession) throw new Error("native_runner_checkpoint_missing_after_suspension");
+        releaseGitHubRun?.();
+        releaseGitHubRun = undefined;
         runnerdBackend = await createExecutionBackend();
       }
     }
