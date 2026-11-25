@@ -16,7 +16,7 @@ import { sql } from "drizzle-orm";
 import { materializeIsolatedTaskDirectory } from "../isolated-task-directory.js";
 import { readConnectionFailure, type GitConnectionFailure } from "@paperclipai/adapter-utils/connection-failure";
 import { managedAiSessionFingerprintConfig } from "../ai-connection-runtime.js";
-import { paperclipRunnerSessionAdapterConfig, sessionAgentRuntimeConfig, sessionEnvironment } from "./session-fingerprint-inputs.js";
+import { paperclipRunnerSessionAdapterConfig, paperclipRunnerSessionIssueOverrides, sessionAgentRuntimeConfig, sessionEnvironment } from "./session-fingerprint-inputs.js";
 import {
   PROJECT_REPOSITORIES_DIR,
   readGitWorkspaceSnapshot,
@@ -2832,7 +2832,9 @@ export function buildSessionConfigCategoryValues(input: {
       : paperclipRunnerSessionAdapterConfig(input.effectiveAdapterConfig),
     agentRuntimeConfig: legacy ? input.agentRuntimeConfig : sessionAgentRuntimeConfig(input.agentRuntimeConfig),
     instructions: input.instructions,
-    issueOverrides: input.issueOverrides,
+    issueOverrides: legacy || input.adapterType !== "paperclip_runner"
+      ? input.issueOverrides
+      : paperclipRunnerSessionIssueOverrides(input.issueOverrides, input.effectiveAdapterConfig),
     workspaceConfig,
     environment: legacy ? input.environment : sessionEnvironment(input.environment),
     envBindings: {
