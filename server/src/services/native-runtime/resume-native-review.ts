@@ -26,10 +26,10 @@ export async function nativeReviewResumeFacts(db: Db, input: {
     || !latest.finishedAt || !latest.resultJson?.personStop || typeof latest.resultJson.personStop !== "object"
     || latest.nativeIssueId !== input.issueId
     || latest.contextSnapshot?.nativeReviewDecisionId !== target.revisionId
-    || runs.some(run => run.status === "queued" || run.status === "running")) return null;
+    || runs.some(run => run.status === "queued" || run.status === "running" || run.status === "scheduled_retry")) return null;
   const [live] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, interaction.addresseeAgentId),
-    sql`${heartbeatRuns.status} in ('queued', 'running')`,
+    sql`${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry')`,
     sql`(${heartbeatRuns.nativeIssueId} = ${input.issueId} or ${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId})`,
   )).limit(1);
   if (live) return null;
