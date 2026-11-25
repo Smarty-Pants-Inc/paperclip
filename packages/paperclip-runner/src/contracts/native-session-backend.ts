@@ -315,6 +315,8 @@ export interface NativeSession {
   } | null>;
   /** Read the provider's own retained user entries; null means unavailable. */
   readUserMessages?(): Promise<string[] | null>;
+  /** Correlation IDs on provider-retained user entries, not command receipts. */
+  readUserInputIds?(): Promise<string[] | null>;
   usage?(): Promise<Record<string, unknown> | null>;
   snapshot(
     options?: NativeSessionSnapshotOptions,
