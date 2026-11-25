@@ -166,9 +166,11 @@ Pi also requires an explicit `provider/model` before testing or hiring; inactive
 setup drafts may precede model selection. Install its pinned runtime on the
 execution host with `paperclipai runtime setup pi` before testing the connection.
 The native default uses `approve-all` permissions, `per_turn` lifecycle, and
-`low` thinking. Exact native thinking levels are `off`, `low`, `high`, and `max`.
-Legacy `minimal`, `medium`, and `xhigh` thinking, custom commands/arguments, and
-raw stdout mode require Legacy. Switching back to Legacy rejects native `max`
+`medium` thinking when reasoning is unset. Native thinking levels are `off`,
+`minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; `none` maps to `off`.
+Null, empty, and whitespace-only task levels inherit the agent's level; unset
+agent levels resolve to `medium`. Custom commands/arguments and raw stdout mode
+require Legacy. Switching back to Legacy rejects native `max`
 thinking, nondefault permission policy, or warm lifecycle instead of discarding
 them. Existing Pi agents retain their saved runner and native policies.
 
