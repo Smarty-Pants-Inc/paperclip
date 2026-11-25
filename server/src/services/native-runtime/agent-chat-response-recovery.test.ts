@@ -21,12 +21,15 @@ import { deliverConversationComments } from "../agent-conversations.js";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import type { PrpEvent } from "../../vendor/paperclip-runner/index.js";
 
-const heldSteering = vi.hoisted(() => ({ available: false, sent: [] as string[], ack: undefined as Promise<void> | undefined }));
+const heldSteering = vi.hoisted(() => ({ available: false, reject: false, sent: [] as string[], ack: undefined as Promise<void> | undefined }));
 vi.mock("./native-session-executor.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./native-session-executor.js")>();
   return { ...actual,
     getNativeSessionSteeringState: async () => ({ disposition: heldSteering.available ? "available" : "temporarily_unavailable", activeTurnId: heldSteering.available ? "held-turn" : null }),
-    steerNativeSession: async (input: { correlationId: string }) => { heldSteering.sent.push(input.correlationId); await heldSteering.ack; return { turnId: "held-turn" }; },
+    steerNativeSession: async (input: { correlationId: string }) => {
+      if (heldSteering.reject) throw new actual.NativeSessionSteeringError("steering_stale_turn", "This held turn is closing. Your message stays queued for the next run.");
+      heldSteering.sent.push(input.correlationId); await heldSteering.ack; return { turnId: "held-turn" };
+    },
   };
 });
 const runLogReads = vi.hoisted(() => [] as unknown[]);
@@ -113,6 +116,48 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     expect(run.finishedAt).not.toBeNull();
     expect(wake).toMatchObject({ status: "completed", runId: f.runId });
     expect(wake.finishedAt).not.toBeNull();
+  });
+
+  it("hold seam v2: a fenced steering race leaves the durable wake and visible queue intact", async () => {
+    const { createQueuedCommentSteeringAdapter, readBoardQueuedComments } = await import("../../modules/wake-queue/adapters/queued-comment-board-postgres.js");
+    const { createSteerQueuedComment } = await import("../../modules/wake-queue/application/queued-comment-use-cases.js");
+    const { requestHeldNativeConfigurationEnd } = await import("./held-native-turn.js");
+    const steeringFlag = process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+    process.env.PAPERCLIP_AGENT_CHAT_STEERING = "true";
+    heldSteering.available = true; heldSteering.reject = true; heldSteering.sent = [];
+    try {
+      await fixture(true, { beforeFinalize: async scope => {
+        await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, scope.agentId));
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+        const [issue] = await db.select().from(issues).where(eq(issues.id, scope.issueId));
+        const [opening] = await db.select().from(issueComments).where(eq(issueComments.id, run.contextSnapshot!.wakeCommentId as string));
+        const [comment] = await db.insert(issueComments).values({ companyId: scope.companyId, issueId: scope.issueId,
+          authorType: "user", authorUserId: opening.authorUserId, body: "Use the new level on the next run" }).returning();
+        const [wake] = await db.insert(agentWakeupRequests).values({ companyId: scope.companyId, agentId: scope.agentId,
+          source: "on_demand", reason: "issue_execution_deferred", status: "deferred_issue_execution",
+          requestedByActorType: "user", requestedByActorId: opening.authorUserId,
+          payload: { issueId: scope.issueId, _paperclipWakeContext: { wakeCommentIds: [comment.id] } } }).returning();
+        const actor = { actorType: "agent" as const, actorId: scope.agentId, agentId: scope.agentId, runId: scope.runId, agentApiKeyId: null };
+        const before = await readBoardQueuedComments({ executor: db, issue, activeRun: run, actor });
+        await db.transaction(tx => requestHeldNativeConfigurationEnd(tx as unknown as Db, scope));
+        // Eligibility was read before the commit; the actual delivery now refuses.
+        const steer = createSteerQueuedComment(createQueuedCommentSteeringAdapter(db));
+        await expect(steer({ issue, actor, queueId: wake.id, commentId: comment.id, targetRunId: run.id, revision: before.revision }))
+          .rejects.toMatchObject({ code: "steering_stale_turn", message: expect.stringContaining("stays queued for the next run") });
+        const [pending] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id));
+        expect(pending).toMatchObject({ status: "deferred_issue_execution", runId: null, payload: wake.payload });
+        const visible = await readBoardQueuedComments({ executor: db, issue, activeRun: run, actor });
+        expect(visible.entries.map(entry => entry.comment.id)).toEqual([comment.id]);
+        expect(visible.state).toBe("deferred");
+        const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+        expect(saved.resultJson?.queuedSteeringAcknowledgements).toBeUndefined();
+        expect(heldSteering.sent).toEqual([]);
+      } });
+    } finally {
+      heldSteering.available = false; heldSteering.reject = false;
+      if (steeringFlag === undefined) delete process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+      else process.env.PAPERCLIP_AGENT_CHAT_STEERING = steeringFlag;
+    }
   });
 
   it.each(["drain", "reset", "non-pi", "paperclip", "unavailable", "agent"])("consumes deferred person wakes only at a steerable continuous final (%s)", async scenario => {

@@ -11176,9 +11176,9 @@ describe("native session same-turn steering", () => {
     });
   });
 
-  async function startActiveSession(input = execution) {
+  async function startActiveSession(input = execution, db = leaseDb(input)) {
     const running = executePaperclipNativeSession({
-      db: leaseDb(),
+      db,
       execution: input,
       runnerInstanceId: "runner",
     });
@@ -11194,7 +11194,7 @@ describe("native session same-turn steering", () => {
       session: { ...execution.session, driverKind: "pi_rpc" } } as NativeExecutionInputV1;
     const { running } = await startActiveSession(piExecution);
     try {
-      expect(await closeHeldNativeTurn(execution.binding.runId)).toBe(false); // Before an answer, never interrupt work.
+      expect(interrupt).not.toHaveBeenCalled(); // Before an answer, never interrupt work.
       const final: PrpEvent = { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "runner", sourceSeq: 1,
         priority: 0, emittedAt: new Date().toISOString(), sourceInstanceId: "runner", normalizedSessionId: "session-native-cancel",
         eventType: "item.completed", runId: execution.binding.runId, itemId: "answer", sourceEventId: "answer",
@@ -11214,6 +11214,185 @@ describe("native session same-turn steering", () => {
           .rejects.toMatchObject({ code: "steering_stale_turn" });
       }
     } finally { state.release?.(); await running; vi.restoreAllMocks(); }
+  });
+
+  // Regression: an ACK is pending until continuousReplies attributes a published answer.
+  it("hold seam: latches reset past an earlier final until the ACKed steer is answered", async () => {
+    const result: Record<string, unknown> = { queuedSteeringAcknowledgements: {
+      m3: { status: "acknowledged", acknowledgedAt: "2026-11-24T19:21:33Z" },
+    }, continuousReplies: {} };
+    vi.spyOn(continuousReply, "publishContinuousNativeReply").mockResolvedValue(true);
+    vi.spyOn(resetWakeQueue, "closeConversationResetHold").mockResolvedValue(false);
+    const piExecution = { ...execution, provider: { kind: "pi_rpc", model: "openai/gpt-5", conversationMode: true },
+      session: { ...execution.session, driverKind: "pi_rpc" } } as NativeExecutionInputV1;
+    const { running } = await startActiveSession(piExecution, leaseDb(piExecution, {}, result));
+    const final = (id: string): PrpEvent => ({ schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "runner", sourceSeq: 1,
+      priority: 0, emittedAt: new Date().toISOString(), sourceInstanceId: "runner", normalizedSessionId: "session-native-cancel",
+      eventType: "item.completed", runId: execution.binding.runId, itemId: id, sourceEventId: id,
+      payload: { kind: "agentMessage", channel: "final", text: id === "m2-answer" ? "7" : "10" } });
+    try {
+      await steerNativeSession({ runId: execution.binding.runId, message: "M3", correlationId: "m3" });
+      result.continuousReplies = { earlier: { questionCommentIds: ["m2"], commentId: "published-7" } };
+      await accountingEvents.committed!(final("m2-answer"));
+      expect(await closeHeldNativeTurn(execution.binding.runId)).toBe(false);
+      expect(interrupt).not.toHaveBeenCalled();
+      await expect(steerNativeSession({ runId: execution.binding.runId, message: "Queued for next run", correlationId: "m4" }))
+        .rejects.toMatchObject({ code: "steering_stale_turn" });
+      result.continuousReplies = { earlier: { questionCommentIds: ["m2"] }, answer: { questionCommentIds: ["m3"], commentId: "published-10" } };
+      await accountingEvents.committed!(final("m3-answer"));
+      await vi.waitFor(() => expect(interrupt).toHaveBeenCalledOnce());
+      expect(await closeHeldNativeTurn(execution.binding.runId)).toBe(false);
+    } finally { state.release?.(); await running; vi.restoreAllMocks(); }
+  });
+
+  it.each(["idle", "working", "pending-tool", "question"])("hold seam: configuration close uses the idle-only door: %s", async mode => {
+    const { installDatabaseWorkSignals, publishDatabaseWorkSettled } = await import("@paperclipai/db/work-signals");
+    vi.spyOn(continuousReply, "publishContinuousNativeReply").mockResolvedValue(true);
+    vi.spyOn(resetWakeQueue, "closeConversationResetHold").mockResolvedValue(false);
+    const piExecution = { ...execution, provider: { kind: "pi_rpc", model: "openai/gpt-5", conversationMode: true },
+      session: { ...execution.session, driverKind: "pi_rpc" } } as NativeExecutionInputV1;
+    const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+    const result: Record<string, unknown> = {};
+    const raw = leaseDb(piExecution, {}, result, updates);
+    const transact = raw.transaction.bind(raw);
+    raw.transaction = ((operation: (tx: Db) => Promise<unknown>) => transact(async tx => {
+      const connected = Object.assign(Object.create(tx), { execute: async () => [{ xid: "1" }] });
+      return operation(connected);
+    })) as unknown as Db["transaction"];
+    const db = installDatabaseWorkSignals(raw);
+    const { running } = await startActiveSession(piExecution, db);
+    const final: PrpEvent = { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "runner", sourceSeq: 1,
+      priority: 0, emittedAt: new Date().toISOString(), sourceInstanceId: "runner", normalizedSessionId: "session-native-cancel",
+      eventType: "item.completed", runId: execution.binding.runId, itemId: "answer", sourceEventId: "answer",
+      payload: { kind: "agentMessage", channel: "final", text: "Done." } };
+    try {
+      if (mode === "idle") await accountingEvents.committed!(final);
+      if (mode === "pending-tool") await accountingEvents.committed!({ ...final, eventType: "item.started", itemId: "tool" });
+      if (mode === "question") snapshot.mockResolvedValue({ activeTurnId: "provider-turn-1", pendingRuntimeRequests: [{ requestId: "q" }] });
+      // The actual DB commit boundary delivers a scoped, content-changing config/instruction invalidation.
+      await db.transaction(async tx => {
+        publishDatabaseWorkSettled(tx, "native-held-configuration", JSON.stringify({ companyId: "another-company", agentId: execution.binding.agentId }));
+      });
+      expect(interrupt).not.toHaveBeenCalled();
+      await db.transaction(async tx => {
+        result.heldNativeConfigurationEnd = true;
+        publishDatabaseWorkSettled(tx, "native-held-configuration", JSON.stringify(execution.binding));
+        expect(interrupt).not.toHaveBeenCalled();
+      });
+      if (mode !== "idle") {
+        expect(interrupt).not.toHaveBeenCalled();
+        await expect(steerNativeSession({ runId: execution.binding.runId, message: "leave durable wake queued", correlationId: "next-config" }))
+          .rejects.toMatchObject({ code: "steering_stale_turn" });
+        if (mode === "pending-tool") await accountingEvents.committed!({ ...final, itemId: "tool" });
+        snapshot.mockResolvedValue({ activeTurnId: "provider-turn-1" });
+        await accountingEvents.committed!(final);
+      }
+      await vi.waitFor(() => expect(interrupt).toHaveBeenCalledOnce());
+      expect(interrupt).toHaveBeenCalledWith({ turnId: "provider-turn-1", reason: "person_stop" });
+      expect(updates.some(update => "personStop" in update.values || "nativeCancellation" in (update.values.resultJson as object ?? {}))).toBe(false);
+      await db.transaction(async tx => publishDatabaseWorkSettled(tx, "native-held-configuration", JSON.stringify(execution.binding)));
+      expect(interrupt).toHaveBeenCalledOnce();
+    } finally { state.release?.(); await running; vi.restoreAllMocks(); }
+  });
+
+  it.each(["eligibility", "snapshot"])("hold seam: a lost config signal discovered during %s cannot strand an idle hold", async when => {
+    const result: Record<string, unknown> = {};
+    vi.spyOn(continuousReply, "publishContinuousNativeReply").mockResolvedValue(true);
+    vi.spyOn(resetWakeQueue, "closeConversationResetHold").mockResolvedValue(false);
+    const piExecution = { ...execution, provider: { kind: "pi_rpc", model: "openai/gpt-5", conversationMode: true },
+      session: { ...execution.session, driverKind: "pi_rpc" } } as NativeExecutionInputV1;
+    const { running } = await startActiveSession(piExecution, leaseDb(piExecution, {}, result));
+    try {
+      await accountingEvents.committed!({ schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "runner", sourceSeq: 1,
+        priority: 0, emittedAt: new Date().toISOString(), sourceInstanceId: "runner", normalizedSessionId: "session-native-cancel",
+        eventType: "item.completed", runId: execution.binding.runId, itemId: "opening", sourceEventId: "opening",
+        payload: { kind: "agentMessage", channel: "final", text: "Opening done" } });
+      if (when === "eligibility") result.heldNativeConfigurationEnd = true;
+      else snapshot.mockImplementationOnce(async () => {
+        result.heldNativeConfigurationEnd = true;
+        return { activeTurnId: "provider-turn-1" };
+      });
+      await expect(steerNativeSession({ runId: execution.binding.runId, message: "new config only", correlationId: "queued-next" }))
+        .rejects.toMatchObject({ code: "steering_stale_turn" });
+      expect(steer).not.toHaveBeenCalled();
+      await vi.waitFor(() => expect(interrupt).toHaveBeenCalledOnce());
+    } finally { state.release?.(); await running; vi.restoreAllMocks(); }
+  });
+
+  it.each(["rejected", "sync-rejected", "prp-failed", "working-final-then-rejected", "timeout-then-rejected", "uncertain-transport", "timeout-then-ACK"])("hold seam v2: config after a steer outcome: %s", async outcome => {
+    const result: Record<string, unknown> = {};
+    vi.spyOn(continuousReply, "publishContinuousNativeReply").mockResolvedValue(true);
+    vi.spyOn(resetWakeQueue, "closeConversationResetHold").mockResolvedValue(false);
+    const piExecution = { ...execution, provider: { kind: "pi_rpc", model: "openai/gpt-5", conversationMode: true },
+      session: { ...execution.session, driverKind: "pi_rpc" } } as NativeExecutionInputV1;
+    const { running } = await startActiveSession(piExecution, leaseDb(piExecution, {}, result));
+    const final: PrpEvent = { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "runner", sourceSeq: 1,
+      priority: 0, emittedAt: new Date().toISOString(), sourceInstanceId: "runner", normalizedSessionId: "session-native-cancel",
+      eventType: "item.completed", runId: execution.binding.runId, itemId: "answer", sourceEventId: "answer",
+      payload: { kind: "agentMessage", channel: "final", text: "Done." } };
+    let resolve!: () => void, reject!: (error: Error) => void;
+    steer.mockReturnValue(new Promise<void>((yes, no) => { resolve = yes; reject = no; }));
+    const immediateRejection = ["rejected", "sync-rejected", "prp-failed"].includes(outcome);
+    if (outcome === "rejected") steer.mockRejectedValue(new Error("request rejected"));
+    if (outcome === "sync-rejected") steer.mockImplementation(() => { throw new Error("request rejected"); });
+    if (outcome === "prp-failed") steer.mockRejectedValue(new Error('PRP command turn.steer failed: {"message":"Provider request failed"}'));
+    if (outcome === "uncertain-transport") steer.mockRejectedValue(new Error("provider_transport_failed: connection closed"));
+    try {
+      if (outcome !== "working-final-then-rejected") await accountingEvents.committed!(final);
+      const delivered = steerNativeSession({ runId: execution.binding.runId, message: "Follow-up", correlationId: "v2-follow-up", timeoutMs: 5 })
+        .catch(error => error);
+      await vi.waitFor(() => expect(steer).toHaveBeenCalledOnce());
+      const error = await delivered;
+      expect(error.code).toBe(immediateRejection ? "steering_rejected" : "steering_timeout");
+      result.heldNativeConfigurationEnd = true;
+      await getNativeSessionSteeringState(execution.binding.runId);
+      if (outcome === "working-final-then-rejected") {
+        await accountingEvents.committed!(final);
+        expect(interrupt).not.toHaveBeenCalled();
+        reject(new Error("request rejected"));
+      }
+      if (outcome === "timeout-then-rejected") reject(new Error("request rejected"));
+      if (outcome === "timeout-then-ACK") {
+        resolve();
+        await Promise.resolve();
+        await accountingEvents.committed!(final); // Unattributed earlier final is not its answer.
+        expect(interrupt).not.toHaveBeenCalled();
+        result.continuousReplies = { answer: { questionCommentIds: ["v2-follow-up"], commentId: "published-answer" } };
+        await accountingEvents.committed!(final);
+      }
+      if (outcome === "uncertain-transport") {
+        expect(await closeHeldNativeTurn(execution.binding.runId)).toBe(false);
+        expect(interrupt).not.toHaveBeenCalled();
+      } else await vi.waitFor(() => expect(interrupt).toHaveBeenCalledOnce());
+    } finally { resolve(); state.release?.(); await running; vi.restoreAllMocks(); }
+  });
+
+  it("hold seam v2: an uncertain interrupt is sent only once per attachment", async () => {
+    vi.spyOn(continuousReply, "publishContinuousNativeReply").mockResolvedValue(true);
+    vi.spyOn(resetWakeQueue, "closeConversationResetHold").mockResolvedValue(false);
+    const piExecution = { ...execution, provider: { kind: "pi_rpc", model: "openai/gpt-5", conversationMode: true },
+      session: { ...execution.session, driverKind: "pi_rpc" } } as NativeExecutionInputV1;
+    const { running } = await startActiveSession(piExecution);
+    const final: PrpEvent = { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "runner", sourceSeq: 1,
+      priority: 0, emittedAt: new Date().toISOString(), sourceInstanceId: "runner", normalizedSessionId: "session-native-cancel",
+      eventType: "item.completed", runId: execution.binding.runId, itemId: "answer", sourceEventId: "answer",
+      payload: { kind: "agentMessage", channel: "final", text: "Done." } };
+    let finish!: () => void;
+    interrupt.mockReturnValue(new Promise<void>(resolve => { finish = resolve; }));
+    try {
+      await accountingEvents.committed!(final);
+      vi.useFakeTimers();
+      const closing = closeHeldNativeTurn(execution.binding.runId).catch(error => error);
+      await vi.advanceTimersByTimeAsync(10_001);
+      expect(await closing).toMatchObject({ message: "native_turn_interrupt_timeout" });
+      interrupt.mockResolvedValue(undefined);
+      expect(await closeHeldNativeTurn(execution.binding.runId)).toBe(false);
+      await accountingEvents.committed!(final);
+      expect(interrupt).toHaveBeenCalledOnce();
+      finish();
+      await Promise.resolve();
+      expect(await closeHeldNativeTurn(execution.binding.runId)).toBe(false);
+    } finally { vi.useRealTimers(); finish?.(); state.release?.(); await running; vi.restoreAllMocks(); }
   });
 
   it("correlates the queued comment with the active provider turn acknowledgement", async () => {

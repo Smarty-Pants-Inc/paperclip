@@ -1,3 +1,5 @@
+import { normalizePaperclipRunnerAdapterConfig } from "@paperclipai/adapter-utils/server-utils";
+import { resolveSessionContinuity } from "../native-runtime/continued-session.js";
 import {
   isPaperclipRunnerProvider,
   PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES,
@@ -138,7 +140,8 @@ function omitKeys(value: Record<string, unknown>, keys: Iterable<string>): Recor
   return result;
 }
 
-export function paperclipRunnerSessionAdapterConfig(config: Record<string, unknown>): Record<string, unknown> {
+/** Retained thread inputs, before any next-run continuity exemptions. */
+export function paperclipRunnerRetainedAdapterConfig(config: Record<string, unknown>): Record<string, unknown> {
   const result = omitKeys(config, RUNNER_EXCLUDED_KEYS);
   const provider = config.provider ?? "codex";
   if (!isPaperclipRunnerProvider(provider)) return result;
@@ -148,6 +151,23 @@ export function paperclipRunnerSessionAdapterConfig(config: Record<string, unkno
     .flatMap(capability => capability.configurable ? [capability.configKey] : [])
     .filter(key => key !== activeKey);
   return omitKeys(result, [...inactivePermissionKeys, ...(provider === "codex" ? [] : CODEX_ONLY_KEYS)]);
+}
+
+export function paperclipRunnerSessionAdapterConfig(config: Record<string, unknown>): Record<string, unknown> {
+  const retained = paperclipRunnerRetainedAdapterConfig(config);
+  return config.provider === "pi_rpc" && resolveSessionContinuity(config.provider, config.sessionContinuity) === "continuous"
+    ? omitKeys(retained, ["model", "piRpcThinkingLevel", "piThinkingLevel", "thinkingLevel", "modelReasoningEffort", "reasoningEffort", "effort", "variant"]) : retained;
+}
+
+/** Share the fingerprint classification, not a second model/reasoning allowlist. */
+export function heldNativeAgentConfigurationInputs(agent: Record<string, unknown>): Record<string, unknown> {
+  const inputs = Object.fromEntries(Object.entries(AGENT_REVISION_FIELD_SESSION_INPUTS)
+    .filter(([, classification]) => classification.kind === "kept").map(([key]) => [key, agent[key]]));
+  if (agent.adapterType === "paperclip_runner" && isRecord(inputs.adapterConfig)) {
+    inputs.adapterConfig = paperclipRunnerRetainedAdapterConfig(normalizePaperclipRunnerAdapterConfig("paperclip_runner", inputs.adapterConfig));
+  }
+  inputs.runtimeConfig = sessionAgentRuntimeConfig(inputs.runtimeConfig);
+  return inputs;
 }
 
 export function sessionAgentRuntimeConfig(runtimeConfig: unknown): unknown {

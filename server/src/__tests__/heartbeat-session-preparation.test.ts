@@ -268,6 +268,30 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     }
   });
 
+  it.each(["model", "piRpcThinkingLevel"])("hold seam v2: next run retains the Pi session and applies changed %s", async key => {
+    const { agentService } = await import("../services/agents.js");
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "hold-config-continuation-"));
+    const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
+    const config = { provider: "pi_rpc", model: "fixture/model-a", piRpcThinkingLevel: "low", sessionContinuity: "continuous", cwd };
+    try {
+      await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: config }).where(eq(agents.id, f.agentId));
+      await execute(f);
+      const [saved] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId));
+      expect(saved.sessionParamsJson?.sessionId).toBe("saved-session");
+      const nextConfig = { ...config, [key]: key === "model" ? "fixture/model-b" : "high" };
+      await agentService(db).update(f.agentId, { adapterConfig: nextConfig });
+      const [retained] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId));
+      expect(retained?.id).toBe(saved.id); // The model-change writer must not delete the pointer.
+      const next = await execute(f);
+      expect(next.input.runtime.sessionId).toBe("saved-session");
+      expect(next.input.config[key]).toBe(nextConfig[key as keyof typeof nextConfig]);
+      expect(next.finished.sessionIdBefore).toBe("saved-session");
+      expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: { reset: false, taskSessionReused: true } } });
+    } finally { mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true }); }
+  });
+
   it("starts fresh when effective model configuration changes and persists the reason", async () => {
     const f = await seed();
     await execute(f);
