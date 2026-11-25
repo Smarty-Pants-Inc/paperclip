@@ -1,7 +1,7 @@
 import { isNativeSessionId } from "../native-runtime/index.js";
 import { and, desc, eq } from "drizzle-orm";
 import { agentConfigRevisions, type Db, type agents, type agentTaskSessions, type heartbeatRuns, type issues, type projects } from "@paperclipai/db";
-import type { AiConnectionBinding, AiRuntimeConnectionBinding } from "@paperclipai/shared";
+import type { AiConnectionBinding, AiRuntimeConnectionBinding, ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { getServerAdapter } from "../../adapters/index.js";
 import type { prepareManagedAiRuntime } from "../ai-connection-runtime.js";
 import { aiConnectionSessionCompatibilityInputs, managedAiSessionIdentityCompatible } from "../ai-connection-session.js";
@@ -236,6 +236,7 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
     taskSessionForRun.lastRunId !== run.id && isNativeSessionId(taskSessionId) ? taskSessionId : null;
   const getFreshSessionHandoff = issueRef ? createNativeSessionHandoffLoader({
     db, companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id, before: run.createdAt,
+    continuation: context.executionContinuation as ExecutionContinuationEnvelope | undefined,
     mode: resolveSessionContinuity(runtimeConfig.provider, runtimeConfig.sessionContinuity) === "continuous" ? "whole" : "bounded",
     throughCommentId: readNonEmptyString(context.conversationReplayThroughCommentId) ?? (context.interactionKind ? null : wakeCommentId),
     excludeCommentIds: [...new Set([...queuedCommentIdsFromRunContext(context),
