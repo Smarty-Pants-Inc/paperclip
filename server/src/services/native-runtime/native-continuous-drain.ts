@@ -6,7 +6,7 @@ import { createSteerQueuedComment } from "../../modules/wake-queue/application/q
 import { createQueuedCommentSteeringAdapter, readBoardQueuedComments } from "../../modules/wake-queue/adapters/queued-comment-board-postgres.js";
 import { logActivity } from "../activity-log.js";
 import { resolveSessionContinuity } from "./continued-session.js";
-import { isAutomaticSteeringComment } from "../../modules/wake-queue/index.js";
+import { isAutomaticSteeringComment, isAutomaticSteeringWake } from "../../modules/wake-queue/domain/policy.js";
 
 // Final publication can be replayed or observed concurrently. The queue mutation
 // still owns durable idempotence; this only serializes local drain attempts.
@@ -28,7 +28,7 @@ export async function drainContinuousPersonMessages(db: Db, scope: { companyId: 
 
 async function drain(db: Db, scope: { companyId: string; issueId: string; runId: string; agentId: string },
   options: { beforeFirstReply?: boolean }) {
-  const steer = createSteerQueuedComment(createQueuedCommentSteeringAdapter(db));
+  const steer = createSteerQueuedComment(createQueuedCommentSteeringAdapter(db, { requireQueueHead: true }));
   const actor = { actorType: "agent" as const, actorId: scope.agentId, agentId: scope.agentId,
     runId: scope.runId, agentApiKeyId: null };
   for (;;) {
@@ -56,11 +56,11 @@ async function drain(db: Db, scope: { companyId: string; issueId: string; runId:
         board.steeringDisposition !== "available" || !board.queueId ||
         !head || !isAutomaticSteeringComment(head.comment, scope.agentId) ||
         head.comment.body.trim() === "/new" || head.source?.requiresFreshSession) return;
-    const [wake] = await db.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
+    const [wake] = await db.select({ payload: agentWakeupRequests.payload, reason: agentWakeupRequests.reason }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.id, board.queueId), eq(agentWakeupRequests.companyId, scope.companyId),
       eq(agentWakeupRequests.agentId, scope.agentId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
     ));
-    if (!wake || parseObject(wake.payload?._paperclipWakeContext).forceFreshSession === true) return;
+    if (!wake || !isAutomaticSteeringWake(wake.reason, parseObject(wake.payload?._paperclipWakeContext))) return;
     const author = head.comment.authorAgentId
       ? { actorType: "agent" as const, actorId: head.comment.authorAgentId, agentId: head.comment.authorAgentId,
           runId: head.comment.createdByRunId ?? null, agentApiKeyId: null }
