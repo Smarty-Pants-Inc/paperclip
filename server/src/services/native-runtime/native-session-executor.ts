@@ -9912,6 +9912,21 @@ function reconcileHeldTurn(runId: string, active: ActiveNativeSession) {
   }).catch(error => logger.warn({ error, runId }, "could not reconcile held turn"));
 }
 
+/** Only explicit non-delivery releases dispatched debt; capability checks happen before dispatch. */
+function rejectedTurnControl(error: unknown): "steering_stale_turn" | "steering_rejected" | null {
+  const value = record(error);
+  const detail = error instanceof Error && typeof error.message === "string" ? error.message : typeof error === "string" ? error : "";
+  let envelope = "runnerCommandResult" in value ? record(value.runnerCommandResult) : null;
+  const wire = detail.match(/PRP command turn\.(?:steer|interrupt) failed:\s*(\{.*)$/s);
+  if (!envelope && wire) try { envelope = record(JSON.parse(wire[1])); } catch { return null; }
+  const result = envelope && ("result" in envelope ? record(envelope.result) : envelope);
+  const message = result ? result.message : detail;
+  if (typeof message !== "string" || (result ? result.code !== "command_execution_failed"
+    : /timeout|timed out|deadline|transport|disconnect|connection|indeterminate/i.test(message))) return null;
+  if (message.includes("stale or inactive turn")) return "steering_stale_turn";
+  return message.includes("a person's Stop is ending this turn") || message.includes("raced the turn end; not delivered") ? "steering_rejected" : null;
+}
+
 /** Dispatches a true same-turn steering message and resolves only after ack. */
 export async function steerNativeSession(input: {
   runId: string;
@@ -9944,13 +9959,6 @@ export async function steerNativeSession(input: {
   reservation.preparing++;
   reservations.set(input.correlationId, reservation);
   const closingTurn = () => new NativeSessionSteeringError("steering_stale_turn", "This held turn is closing. Your message stays queued for the next run.");
-  // A transport failure/timeout is not proof of refusal. Unknown outcomes retain
-  // both the correlation reservation and cached delivery until attributed.
-  const rejected = (error: unknown) => {
-    const message = error instanceof Error ? error.message : String(error);
-    return !/timeout|timed out|transport|disconnect|connection|already terminal/i.test(message)
-      && /reject|unsupported|unavailable|capability|named a stale turn|PRP command turn[.]steer failed/i.test(message);
-  };
   let delivery: Promise<{ turnId: string }>;
   try {
     await active.refreshHeldTurnWork?.();
@@ -9975,7 +9983,7 @@ export async function steerNativeSession(input: {
       })).then(() => ({ turnId }));
       steeringDeliveries.set(deliveryKey, delivery);
       void delivery.catch(error => {
-        if (!rejected(error)) return; // An uncertain ACK still owes its answer.
+        if (!rejectedTurnControl(error)) return; // An uncertain ACK still owes its answer.
         if (steeringDeliveries.get(deliveryKey) === delivery) steeringDeliveries.delete(deliveryKey);
         releaseHeldSteeringInput(active, input.correlationId, "delivery");
         reconcileHeldTurn(input.runId, active);
@@ -10012,24 +10020,9 @@ export async function steerNativeSession(input: {
     return acknowledged;
   } catch (error) {
     if (error instanceof NativeSessionSteeringError) throw error;
-    const message = error instanceof Error ? error.message : String(error);
-    if (!rejected(error)) throw new NativeSessionSteeringError("steering_timeout", "Steering outcome is uncertain. Your message stays queued pending acknowledgement.");
-    if (/stale|terminal|active turn/i.test(message)) {
-      throw new NativeSessionSteeringError(
-        "steering_stale_turn",
-        "The target turn is no longer active.",
-      );
-    }
-    if (/unsupported|unavailable|capability/i.test(message)) {
-      throw new NativeSessionSteeringError(
-        "steering_unsupported",
-        "This provider does not support same-turn steering.",
-      );
-    }
-    throw new NativeSessionSteeringError(
-      "steering_rejected",
-      "The provider rejected the steering message.",
-    );
+    const code = rejectedTurnControl(error);
+    if (!code) throw new NativeSessionSteeringError("steering_timeout", "Steering outcome is uncertain. Your message stays queued pending acknowledgement.");
+    throw new NativeSessionSteeringError(code, code === "steering_stale_turn" ? "The target turn is no longer active." : "The provider rejected the steering message.");
   } finally {
     if (timeout) clearTimeout(timeout);
   }
@@ -10073,7 +10066,13 @@ export async function interruptNativeTurn(input: { runId: string; reason: string
   let timeout: ReturnType<typeof setTimeout> | null = null;
   try {
     await Promise.race([
-      active.session.interrupt({ turnId, reason: input.reason }),
+      Promise.resolve().then(() => active.session.interrupt!({ turnId, reason: input.reason })).catch(error => {
+        if (input.onlyIfHeldIdle && rejectedTurnControl(error)) {
+          active.holdInterruptSent = false;
+          active.holdCloseRequested = false;
+        }
+        throw error;
+      }),
       new Promise<never>((_resolve, reject) => {
         timeout = setTimeout(() => reject(new Error("native_turn_interrupt_timeout")), input.timeoutMs ?? 10_000);
       }),
