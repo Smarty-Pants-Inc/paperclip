@@ -1368,6 +1368,7 @@ function createSandboxEnvironmentDriver(
   const environmentsSvc = environmentService(db);
 
   async function recordSnapshotRestoredResume(lease: EnvironmentLease, resumed: PluginEnvironmentResumeLeaseResult) {
+    if (!resumed.providerLeaseId || resumed.providerLeaseId !== lease.providerLeaseId) throw new Error("sandbox_resume_provider_lease_mismatch");
     const metadata = sandboxRestartMetadata(lease, resumed);
     if (Object.keys(metadata).length === 0) return resumed;
     // Persist only process-loss provenance. Preserve the disk, session files,
@@ -1375,6 +1376,7 @@ function createSandboxEnvironmentDriver(
     await db.update(environmentLeases).set({
       metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify(metadata)}::jsonb`,
     }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, lease.companyId),
+      eq(environmentLeases.providerLeaseId, resumed.providerLeaseId),
       sql`not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) @> ${JSON.stringify(metadata)}::jsonb)`));
     return { ...resumed, metadata: { ...resumed.metadata, ...metadata } };
   }
@@ -2117,6 +2119,10 @@ function createSandboxEnvironmentDriver(
           sandboxProviderPlugin: true,
           ...sandboxConfigForLeaseMetadata(storedConfig),
           ...sanitizedProviderMetadata,
+          // A reused allocation carries its successfully handled process-loss
+          // generation even when the provider repeats the old reboot receipt.
+          ...(providerLease && reusableLease?.metadata?.handledProcessRestartKey
+            ? { handledProcessRestartKey: reusableLease.metadata.handledProcessRestartKey } : {}),
           sandboxLeaseAcquisition: providerLease
             ? { outcome: "resumed", ...sandboxRestartMetadata(providerLease) }
             : reusableLease?.providerLeaseId
