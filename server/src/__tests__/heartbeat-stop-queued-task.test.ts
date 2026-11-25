@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq, sql } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -45,6 +45,9 @@ import { settleUnrecoverableExecutions } from "../services/execution-recovery-re
 import * as deferredNotifications from "../services/deferred-execution-notifications.js";
 import * as nativeSession from "../services/native-runtime/native-session-executor.js";
 import { environmentService } from "../services/environments.js";
+import { settleProviderReturnedStopInput } from "../services/person-stop-before-turn.js";
+import { PaperclipControlPlanePort } from "../services/native-runtime/paperclip-control-plane-port.js";
+import type { PrpEvent } from "../vendor/paperclip-runner/index.js";
 
 const gates = vi.hoisted(() => new Map<string, (() => void) | null>());
 const preparation = vi.hoisted(() => ({
@@ -199,6 +202,7 @@ describeEmbeddedPostgres("Stop on a task whose run is still waiting in line", ()
     { identity: "plural", status: "running", stage: null, runtimeMode: "legacy", provider: "pi_rpc" },
     { identity: "singular", status: "running", stage: "staging", runtimeMode: "legacy", provider: "codex" },
     { identity: "plural", status: "running", stage: "staging", runtimeMode: "native", provider: "pi_rpc" },
+    { identity: "process_requested", status: "running", stage: "staging", runtimeMode: "native", provider: "pi_rpc" },
     { identity: "plural", status: "cancelled", stage: "staging", runtimeMode: "legacy", provider: "pi_rpc" },
   ])("returns $identity input on $status $runtimeMode/$provider $stage setup when the person pressed Stop, without replay", async ({ identity, status, stage, runtimeMode, provider }) => {
     const { companyId, agentId } = await seed();
@@ -224,6 +228,13 @@ describeEmbeddedPostgres("Stop on a task whose run is still waiting in line", ()
     if (stage === "staging") await db.insert(heartbeatRunEvents).values(["lifecycle", "staging"].map((eventType, seq) => ({
       companyId, runId: run.id, agentId, seq: seq + 1, eventType, message: eventType,
     })));
+    if (identity === "process_requested") {
+      await db.update(heartbeatRuns).set({ processPid: 987654321, processGroupId: 987654321, processStartedAt: new Date(),
+        usageJson: { budgetDispatch: { handedOffAt: new Date().toISOString() } }, nextEventSeq: 5 }).where(eq(heartbeatRuns.id, run.id));
+      await db.insert(heartbeatRunEvents).values(["native.process_start_requested", "run.attached"].map((eventType, index) => ({
+        companyId, agentId, runId: run.id, seq: index + 3, eventType, sourceEventId: `startup:${run.id}:${index}`,
+      })));
+    }
     const app = express(); app.use(express.json());
     app.use((req, _res, next) => { req.actor = { type: "board", source: "session", userId: "responsible-user", companyIds: [companyId],
       memberships: [{ companyId, membershipRole: "admin", status: "active" }], isInstanceAdmin: false }; next(); });
@@ -408,11 +419,22 @@ describeEmbeddedPostgres("Stop on a task whose run is still waiting in line", ()
     app.use((req, _res, next) => { req.actor = { type: "board", source: "session", userId: "responsible-user", companyIds: [companyId],
       memberships: [{ companyId, membershipRole: "admin", status: "active" }], isInstanceAdmin: false }; next(); });
     app.use("/api", agentRoutes(db, {})); app.use(errorHandler);
+    let firstPress: string | undefined;
     for (let repeat = 0; repeat < 2; repeat++) {
       const response = await request(app).post(`/api/heartbeat-runs/${run.id}/cancel`).send({});
       expect(response.status).toBe(200);
       expect(response.body.status).toBe("failed");
       expect(response.body.resultJson.personStop.returned).toEqual([mine.id]);
+      firstPress ??= response.body.resultJson.personStop.requestedAt;
+      expect(response.body.resultJson.personStop.requestedAt).toBe(firstPress);
+      if (repeat === 0) {
+        await new Promise(resolve => setTimeout(resolve, 10));
+        const [between] = await db.insert(issueComments).values({ companyId, issueId: issue.id, authorType: "user",
+          authorUserId: "responsible-user", body: "M2 between repeated Stop presses" }).returning();
+        ids.push(between.id);
+        await db.update(agentWakeupRequests).set({ payload: { issueId: issue.id, commentId: future.id,
+          _paperclipWakeContext: { wakeCommentIds: ids.slice(1) } } }).where(eq(agentWakeupRequests.id, wake.id));
+      }
     }
     const [remaining] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id));
     expect(remaining.status).toBe("deferred_issue_execution");
@@ -445,6 +467,81 @@ describeEmbeddedPostgres("Stop on a task whose run is still waiting in line", ()
     expect(response.body.status).toBe("failed");
     expect(response.body.resultJson).not.toHaveProperty("personStop");
     expect(response.body.resultJson).not.toHaveProperty("startupCancellation");
+  });
+
+  it("fixes provider-returned input at the Stop click and re-admits post-press M2 exactly once", async () => {
+    const { companyId, agentId } = await seed();
+    const [issue] = await db.insert(issues).values({ companyId, title: "Post-press returned input", assigneeAgentId: agentId }).returning();
+    const [m1] = await db.insert(issueComments).values({ companyId, issueId: issue.id, authorType: "user", authorUserId: "responsible-user", body: "M1 unseen" }).returning();
+    // Both comments round to the same JS millisecond. PostgreSQL must own
+    // comparison with the press's sub-millisecond cutoff.
+    const pressedAt = "2026-11-24T23:00:00.000500Z";
+    const [m2] = await db.insert(issueComments).values({ companyId, issueId: issue.id, authorType: "user", authorUserId: "responsible-user", body: "M2 after Stop" }).returning();
+    await db.update(issueComments).set({ createdAt: sql`'2026-11-24T23:00:00.000400Z'::timestamptz` }).where(eq(issueComments.id, m1.id));
+    await db.update(issueComments).set({ createdAt: sql`'2026-11-24T23:00:00.000600Z'::timestamptz` }).where(eq(issueComments.id, m2.id));
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId, nativeIssueId: issue.id, runtimeMode: "native", status: "succeeded",
+      resultJson: { personStop: { requestedAt: pressedAt, userId: "responsible-user" }, queuedSteeringAcknowledgements: { [m2.id]: { status: "acknowledged" } } } }).returning();
+    await db.insert(agentWakeupRequests).values({ companyId, agentId, runId: run.id, source: "issue", status: "completed",
+      payload: { issueId: issue.id, commentId: m2.id } });
+    const [otherIssue] = await db.insert(issues).values({ companyId, title: "Other issue, same agent", assigneeAgentId: agentId }).returning();
+    const [otherWake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "issue", status: "deferred_issue_execution",
+      payload: { issueId: otherIssue.id, commentId: randomUUID() } }).returning();
+    const sourceInstanceId = randomUUID(), sessionId = randomUUID();
+    const port = new PaperclipControlPlanePort(db, { companyId, agentId, issueId: issue.id, runId: run.id, sessionId,
+      sourceInstanceId, controlPlaneSourceInstanceId: "post-stop-test", completionContractId: randomUUID(), completionContractSha256: "test" });
+    const lateNotice: PrpEvent = { schema: "paperclip.prp.event.v1", sourceInstanceId, sourceEventId: "late-stop-return:1",
+      sourceSeq: 1, sourceKind: "runner", runId: run.id, normalizedSessionId: sessionId, turnId: "finished-turn",
+      eventType: "provider.notice.recorded", schemaVersion: 1, priority: 0, emittedAt: new Date().toISOString(),
+      payload: { schema: "paperclip.provider.notice.v1", noticeId: "late-stop-return", severity: "info", category: "pi_stop_returned_input",
+        scope: "turn", recoverable: true, userActionable: false, summary: "Returned unread Stop input",
+        details: [{ name: "returnedCommentIds", value: `${m1.id},${m2.id}` }] } };
+    const held = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const holder = db.transaction(async tx => {
+      await tx.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, otherWake.id)).for("update");
+      held.resolve(); await release.promise;
+    });
+    await held.promise;
+    let settlement: Promise<void> | undefined;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      // The provider notice arrives AFTER the run settled; the finalizer
+      // cannot see it retroactively. Exercise actual event intake, not a helper.
+      settlement = port.appendEvent(lateNotice).then(() => undefined);
+      await Promise.race([settlement, new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error("Stop settlement blocked on another issue's wake")), 2_000);
+      })]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      release.resolve(); await holder; await settlement;
+    }
+    await port.appendEvent(lateNotice); // exact durable notice replay
+    const settled = (await heartbeat.getRun(run.id))!;
+    expect(settled.resultJson?.personStop).toMatchObject({ returned: [m1.id] });
+    const readmitted = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id,
+      (settled.resultJson?.personStopReadmitted as Record<string, string>)[m2.id]));
+    expect(readmitted).toHaveLength(1); expect(readmitted[0].status).toBe("deferred_issue_execution");
+    expect(readmitted[0].runId).toBeNull(); expect(JSON.stringify(readmitted[0].payload)).toContain(m2.id);
+    expect((await db.select().from(issueComments).where(eq(issueComments.id, m2.id)))[0].deletedAt).toBeNull();
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, readmitted[0].id)))).toHaveLength(1);
+    // An already-bound replacement is not re-admitted, even with no answer
+    // receipt yet. A cancelled UNBOUND marker, however, proves no answer.
+    const [next] = await db.insert(heartbeatRuns).values({ companyId, agentId, nativeIssueId: issue.id, status: "succeeded" }).returning();
+    await db.update(agentWakeupRequests).set({ runId: next.id, status: "completed" }).where(eq(agentWakeupRequests.id, readmitted[0].id));
+    await settleProviderReturnedStopInput(db, run, [m1.id, m2.id]);
+    expect((await db.select().from(agentWakeupRequests).where(sql`${agentWakeupRequests.idempotencyKey} = ${`person-stop-postpress:${run.id}:${m2.id}`}`))).toHaveLength(1);
+    await db.update(agentWakeupRequests).set({ runId: null, status: "cancelled" }).where(eq(agentWakeupRequests.id, readmitted[0].id));
+    await settleProviderReturnedStopInput(db, run, [m1.id, m2.id]);
+    const retried = (await heartbeat.getRun(run.id))!.resultJson?.personStopReadmitted as Record<string, string>;
+    expect(retried[m2.id]).not.toBe(readmitted[0].id);
+    const [replacement] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, retried[m2.id]));
+    expect(replacement.status).toBe("deferred_issue_execution");
+    await settleProviderReturnedStopInput(db, run, [m1.id, m2.id]);
+    expect((await db.select().from(agentWakeupRequests).where(sql`${agentWakeupRequests.idempotencyKey} = ${`person-stop-postpress:${run.id}:${m2.id}`}`))).toHaveLength(2);
+    const databaseTimes = await db.select({ id: issueComments.id, createdAt: sql<string>`${issueComments.createdAt}::text` })
+      .from(issueComments).where(inArray(issueComments.id, [m1.id, m2.id]));
+    process.stdout.write(`POSTPRESS_STOP_PROOF ${JSON.stringify({ runId: run.id, pressedAt, m1: m1.id, m2: m2.id, databaseTimes,
+      personStop: settled.resultJson?.personStop, readmittedWakeId: readmitted[0].id, replacementWakeId: replacement.id,
+      status: readmitted[0].status, deleted: false, otherIssueLockDidNotBlock: true, lateNoticeReplayCount: 2 })}\n`);
   });
 
   it("returns the message after the real setup-failure handler records a 40P01", async () => {
