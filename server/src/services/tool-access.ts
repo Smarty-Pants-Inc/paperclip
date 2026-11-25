@@ -4717,7 +4717,7 @@ export function toolAccessService(
                     return { Authorization: `Bearer ${secret.value}` };
                   })()
                 : resolveCredentialHeaders(connection, actor));
-              rows = await measureRunPhase("connectors.github.repositories", () => loadGitHubTokenRepositories(headers));
+              rows = await measureRunPhase("connectors.github.repositories", () => loadGitHubTokenRepositories(headers, undefined, isGitHubAppConnection(connection) ? "installation" : "user"));
             }
             for (const row of rows) {
               mergeProjectRepository(repositories, row, connection.name, connection.id);
