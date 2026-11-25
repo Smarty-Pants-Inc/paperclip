@@ -936,6 +936,10 @@ class HarnessNativeSession implements NativeSession {
     return this.#session.readUserMessages?.() ?? null;
   }
 
+  async readUserInputIds(): Promise<string[] | null> {
+    return this.#session.readUserInputIds?.() ?? null;
+  }
+
   async usage(): Promise<Record<string, unknown> | null> {
     return this.#withProtocolIntegrity(() => this.#session.usage?.() ?? null);
   }
