@@ -4050,6 +4050,29 @@ describe("IssueDetail", () => {
     } finally { vi.unstubAllGlobals(); }
   });
 
+  it("wires the owed-message Retry to the guarded task endpoint rather than resource settlement", async () => {
+    const interruption: NonNullable<Issue["interruption"]> = { intentId: null, responsibility: "system", state: "failed",
+      nextRetryAt: null, canRetry: true, userAction: null, sourceRunIds: ["owed-run"], observedRunId: "owed-run",
+      unansweredCommentId: "owed-message" };
+    const issue = createIssue({ status: "blocked", assigneeAgentId: "agent-1", conversationAgentId: "agent-1",
+      conversationUserId: "chat-owner", conversationState: "active", interruption });
+    mockIssuesApi.get.mockResolvedValue(issue);
+    mockAuthApi.getSession.mockResolvedValue({ user: { id: "chat-owner" } });
+    mockAccessApi.getCurrentBoardAccess.mockResolvedValue({ userId: "chat-owner", source: "session",
+      isInstanceAdmin: false, companyIds: ["company-1"],
+      memberships: [{ companyId: "company-1", status: "active", membershipRole: "operator" }] });
+    mockIssuesApi.retryTask.mockResolvedValue({ requestId: "owed-retry", accepted: true, stale: false, presentation: interruption });
+    await act(async () => renderIssueView());
+    await waitForAssertion(() => expect(mockIssueChatThreadRender.mock.calls.at(-1)?.[0]?.onTryAgainNoLiveExecutionPath)
+      .toEqual(expect.any(Function)));
+    await act(async () => mockIssueChatThreadRender.mock.calls.at(-1)![0].onTryAgainNoLiveExecutionPath());
+    await waitForAssertion(() => expect(mockIssuesApi.retryTask).toHaveBeenCalledExactlyOnceWith(issue.id, {
+      idempotencyKey: expect.any(String), observedRunId: "owed-run",
+    }));
+    expect(mockIssuesApi.resolveRecoveryAction).not.toHaveBeenCalled();
+    expect(mockIssuesApi.update).not.toHaveBeenCalled();
+  });
+
   it("keeps the existing Retry path for exhausted legacy workspace restoration", async () => {
     const interruption: NonNullable<Issue["interruption"]> = { intentId: "legacy-input", responsibility: "system", state: "failed", nextRetryAt: null,
       canRetry: true, userAction: null, sourceRunIds: ["legacy-run"], observedRunId: "legacy-run" };
