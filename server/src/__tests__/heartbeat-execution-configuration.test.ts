@@ -245,6 +245,20 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
     expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].status).toBe("in_review");
   });
 
+  it("fails an old stored ultra override before session setup with the plain Pi error", async () => {
+    const f = await seed();
+    await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: {
+      provider: "pi_rpc", model: "paperclip/gpt-6.1-sol", piRpcThinkingLevel: "high",
+    } }).where(eq(agents.id, f.agentId));
+    await db.update(issues).set({ assigneeAdapterOverrides: { adapterConfig: { piRpcThinkingLevel: "ultra" } } })
+      .where(eq(issues.id, f.issueId));
+    const { finished, input } = await execute(f);
+    expect(finished.status).toBe("failed");
+    expect(finished.error).toBe('Pi cannot use reasoning level "ultra": choose off, minimal, low, medium, high, xhigh or max');
+    expect(input).toBeUndefined();
+    expect(finished.nativeSessionId).toBeNull();
+  });
+
   // Regression: a notice insert failure after the terminal commit must not strand a plain turn.
   it("cleans up after a committed Pi failure even when addComment fails, and repairs its notice exactly once", async () => {
     const f = await seed();
