@@ -519,6 +519,7 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
 
   it.each((["agents", "agent-hires"] as const).flatMap(endpoint =>
     [
+      { provider: "codex", model: undefined, key: "modelReasoningEffort" },
       { provider: "codex", model: "gpt-6.1-sol", key: "modelReasoningEffort" },
       { provider: "acpx", acpxAgent: "claude", key: "modelReasoningEffort" },
       { provider: "acpx", acpxAgent: "grok", key: "reasoningEffort" },
@@ -540,6 +541,10 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     const expected = level === "high" ? "high" : "medium";
     expect(child!.adapterConfig[key]).toBe(expected);
     expect(responseAgent.adapterConfig[key]).toBe(expected);
+    if (kind.provider === "codex") {
+      expect(child!.adapterConfig.model).toBe(kind.model ?? "claude-opus-5-5");
+      expect(responseAgent.adapterConfig.model).toBe(kind.model ?? "claude-opus-5-5");
+    }
     const native = resolvePaperclipRunnerNativeProviderInput({ backend: kind.provider === "codex" ? "codex_app_server" : "acpx_runtime", adapterConfig: child!.adapterConfig });
     const nativeKey = kind.acpxAgent === "claude" ? "claudeEffort" : kind.acpxAgent === "grok" ? "grokEffort" : "codexReasoningEffort";
     expect(native).toMatchObject({ [nativeKey]: expected });
@@ -564,6 +569,10 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     const responseAgent = endpoint === "agents" ? res.body : res.body.agent;
     const [child] = await db.select().from(agents).where(eq(agents.id, responseAgent.id));
     expect(child!.adapterConfig[key]).toBe(level ?? "medium");
+    if (adapterType === "codex_local" || adapterType === "claude_local") {
+      expect(child!.adapterConfig.model).toBe("claude-opus-5-5");
+      expect(responseAgent.adapterConfig.model).toBe("claude-opus-5-5");
+    }
   });
 
   it.each(["codex", "pi_rpc"] as const)("%s explicit hires inherit only an omitted environment", async provider => {
@@ -578,7 +587,7 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
       }
       const res = await hire(agentActor(companyId, parent.id), companyId, {
         name: "Environment Child", role: "engineer", adapterType: "paperclip_runner",
-        adapterConfig: { provider, ...(requestedEnvironment === environmentId
+        adapterConfig: { provider, ...(provider === "codex" && requestedEnvironment === environmentId ? { model: "gpt-6.1-sol" } : {}), ...(requestedEnvironment === environmentId
           ? { [provider === "codex" ? "modelReasoningEffort" : "piRpcThinkingLevel"]: "high" } : {}) },
         defaultEnvironmentId: requestedEnvironment,
       });
@@ -587,18 +596,20 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
       const expectedEnvironment = requestedEnvironment === undefined ? environmentId : requestedEnvironment;
       expect(child!.defaultEnvironmentId).toBe(expectedEnvironment);
       expect(res.body.agent.defaultEnvironmentId).toBe(expectedEnvironment);
+      if (provider === "codex") expect(child!.adapterConfig.model)
+        .toBe(requestedEnvironment === environmentId ? "gpt-6.1-sol" : "claude-opus-5-5");
       expect(child!.adapterConfig[provider === "codex" ? "modelReasoningEffort" : "piRpcThinkingLevel"])
         .toBe(requestedEnvironment === environmentId ? "high" : "medium");
     }
   });
 
-  it("defaults a caller-runtime Codex hire instead of copying the caller's named level", async () => {
+  it.each(["gpt-6.1-sol", undefined])("caller-runtime Codex keeps caller model %s but defaults its level", async model => {
     const companyId = await seedCompany();
     const parent = await seedParentAgent(companyId, "paperclip_runner", {});
     const environmentId = randomUUID();
     await db.insert(environments).values({ id: environmentId, name: "Caller local", driver: "local" });
     await db.update(agents).set({ adapterConfig: {
-      provider: "codex", model: "gpt-6.1-sol", modelReasoningEffort: "high",
+      provider: "codex", model, modelReasoningEffort: "high",
     }, defaultEnvironmentId: environmentId }).where(eq(agents.id, parent.id));
     const res = await hire(agentActor(companyId, parent.id), companyId, {
       name: "Inherited Codex Child", role: "engineer", adapterType: "paperclip_runner", inheritRuntimeFrom: "caller",
@@ -606,6 +617,7 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     const [child] = await db.select().from(agents).where(eq(agents.id, res.body.agent.id));
     expect(child!.adapterConfig.modelReasoningEffort).toBe("medium");
+    expect(child!.adapterConfig.model).toBe(model ?? "claude-opus-5-5");
     expect(child!.defaultEnvironmentId).toBe(environmentId);
   });
 
