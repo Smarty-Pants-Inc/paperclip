@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
+import { resolveSessionContinuity } from "./continued-session.js";
 import { OWN_PROCESS_START_EVENT_TYPES } from "../native-process-start-events.js";
 import { and, desc, eq, exists, inArray, isNotNull, ne, not, notInArray, or, sql } from "drizzle-orm";
 import {
@@ -529,6 +530,11 @@ function sameProvider(
   previous: NativeExecutionInput["provider"],
   current: NativeExecutionInput["provider"],
 ): boolean {
+  if (previous.kind === "pi_rpc" && current.kind === "pi_rpc" &&
+      resolveSessionContinuity(previous.kind, previous.sessionContinuity) === "continuous" &&
+      resolveSessionContinuity(current.kind, current.sessionContinuity) === "continuous")
+    return isDeepStrictEqual({ ...previous, model: undefined, piRpcThinkingLevel: undefined, sessionContinuity: undefined },
+      { ...current, model: undefined, piRpcThinkingLevel: undefined, sessionContinuity: undefined });
   return JSON.stringify(previous) === JSON.stringify(current);
 }
 
