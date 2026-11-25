@@ -1,6 +1,7 @@
 import { NativeProviderStateIncompatibleError } from "../vendor/paperclip-runner/index.js";
 import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES, PluginWorkspaceOperationError, workspaceOperationErrorData } from "@paperclipai/plugin-sdk";
 import * as nativeRuntimeMode from "../services/native-runtime/runtime-mode.js";
+import * as sessionFingerprintInputs from "../services/heartbeat/session-fingerprint-inputs.js";
 import * as aiRuntime from "../services/ai-connection-runtime.js";
 import { aiConnectionService } from "../services/ai-connections.js";
 import { randomUUID } from "node:crypto";
@@ -385,6 +386,44 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       } } });
       const [unchanged] = await db.select().from(agents).where(eq(agents.id, f.agentId));
       expect(unchanged.adapterConfig).toEqual(config);
+    } finally { mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true }); }
+  });
+
+  it.each([false, true])("old-shape chip fingerprint: changed non-model override=%s resets only when changed", async changed => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "chip-fingerprint-compat-"));
+    const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
+    const adapterConfig = { model: "fixture/model-b", piRpcThinkingLevel: "high", fixtureOption: "original" };
+    try {
+      await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: {
+        provider: "pi_rpc", model: "fixture/model-a", sessionContinuity: "continuous", cwd,
+      } }).where(eq(agents.id, f.agentId));
+      await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: f.userId, conversationState: "active",
+        assigneeAdapterOverrides: { adapterConfig },
+      }).where(eq(issues.id, f.issueId));
+      // The previous release hashed issue overrides without dropping model and level.
+      const oldShape = vi.spyOn(sessionFingerprintInputs, "paperclipRunnerSessionIssueOverrides").mockImplementation(overrides => overrides);
+      try { await execute(f); } finally { oldShape.mockRestore(); }
+      const [saved] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId));
+      if (changed) await db.update(issues).set({ assigneeAdapterOverrides: {
+        adapterConfig: { ...adapterConfig, fixtureOption: "different" },
+      } }).where(eq(issues.id, f.issueId));
+      const next = await execute(f);
+      expect(next.input.config).toMatchObject({ ...adapterConfig, fixtureOption: changed ? "different" : "original" });
+      expect(next.input.runtime.sessionId).toBe(changed ? null : "saved-session");
+      expect(next.finished.sessionIdBefore).toBe(changed ? null : "saved-session");
+      expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: {
+        reset: changed, taskSessionAvailable: true, taskSessionReused: !changed,
+        changedCategories: changed ? expect.arrayContaining(["issueOverrides"]) : [],
+      } } });
+      const [updated] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId));
+      expect(updated.sessionParamsJson?.__paperclipConfigFingerprint).not.toBe(saved.sessionParamsJson?.__paperclipConfigFingerprint);
+      if (!changed) {
+        const followup = await execute(f);
+        expect(followup.input.runtime.sessionId).toBe("saved-session");
+        expect(followup.finished.resultJson).toMatchObject({ configFreshness: { session: { reset: false, taskSessionReused: true } } });
+      }
     } finally { mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true }); }
   });
 
