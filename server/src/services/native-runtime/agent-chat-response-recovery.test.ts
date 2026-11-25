@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, authUsers, companies, completionContracts, createDb, heartbeatRunEvents, heartbeatRuns, issueComments, issues, nativeRunFinalizations, nativeRunResults, issueThreadInteractions, chatTaskHandoffs, chatCompletionDeliveries, agentWakeupRequests, statusDecisions, type Db, approvals, issueApprovals } from "@paperclipai/db";
+import { agents, authUsers, companies, companyMemberships, completionContracts, createDb, heartbeatRunEvents, heartbeatRuns, issueComments, issues, nativeRunFinalizations, nativeRunResults, issueThreadInteractions, chatTaskHandoffs, chatCompletionDeliveries, agentWakeupRequests, statusDecisions, type Db, approvals, issueApprovals } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
 import { NativeRunCoordinatorStore } from "./native-run-coordinator-store.js";
@@ -21,12 +21,15 @@ import { deliverConversationComments } from "../agent-conversations.js";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import type { PrpEvent } from "../../vendor/paperclip-runner/index.js";
 
-const heldSteering = vi.hoisted(() => ({ available: false, sent: [] as string[], ack: undefined as Promise<void> | undefined }));
+const heldSteering = vi.hoisted(() => ({ available: false, reject: false, sent: [] as string[], ack: undefined as Promise<void> | undefined }));
 vi.mock("./native-session-executor.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./native-session-executor.js")>();
   return { ...actual,
     getNativeSessionSteeringState: async () => ({ disposition: heldSteering.available ? "available" : "temporarily_unavailable", activeTurnId: heldSteering.available ? "held-turn" : null }),
-    steerNativeSession: async (input: { correlationId: string }) => { heldSteering.sent.push(input.correlationId); await heldSteering.ack; return { turnId: "held-turn" }; },
+    steerNativeSession: async (input: { correlationId: string }) => {
+      if (heldSteering.reject) throw new actual.NativeSessionSteeringError("steering_stale_turn", "This held turn is closing. Your message stays queued for the next run.");
+      heldSteering.sent.push(input.correlationId); await heldSteering.ack; return { turnId: "held-turn" };
+    },
   };
 });
 const runLogReads = vi.hoisted(() => [] as unknown[]);
@@ -113,6 +116,94 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     expect(run.finishedAt).not.toBeNull();
     expect(wake).toMatchObject({ status: "completed", runId: f.runId });
     expect(wake.finishedAt).not.toBeNull();
+  });
+
+  it("hold seam v2: a fenced steering race preserves the wake for an answered next run at the new level", async () => {
+    const { createQueuedCommentSteeringAdapter, readBoardQueuedComments } = await import("../../modules/wake-queue/adapters/queued-comment-board-postgres.js");
+    const { createSteerQueuedComment } = await import("../../modules/wake-queue/application/queued-comment-use-cases.js");
+    const { agentService } = await import("../agents.js");
+    const steeringFlag = process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+    process.env.PAPERCLIP_AGENT_CHAT_STEERING = "true";
+    heldSteering.available = true; heldSteering.reject = true; heldSteering.sent = [];
+    let queued!: { id: string; commentId: string };
+    const { getServerAdapter, registerServerAdapter } = await import("../../adapters/index.js");
+    const nativeMode = await import("./runtime-mode.js");
+    const savedAdapter = getServerAdapter("paperclip_runner");
+    let heartbeat: ReturnType<typeof import("../heartbeat.js").heartbeatService> | undefined;
+    let worker: ReturnType<NonNullable<typeof heartbeat>["registerDeferredReceiptWork"]> | undefined;
+    let coordinator: ReturnType<typeof createDeliveryWorkCoordinator> | undefined;
+    let restoreMode: (() => void) | undefined;
+    try {
+      const f = await fixture(true, { beforeFinalize: async scope => {
+        await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, scope.agentId));
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+        const [issue] = await db.select().from(issues).where(eq(issues.id, scope.issueId));
+        const [opening] = await db.select().from(issueComments).where(eq(issueComments.id, run.contextSnapshot!.wakeCommentId as string));
+        const [comment] = await db.insert(issueComments).values({ companyId: scope.companyId, issueId: scope.issueId,
+          authorType: "user", authorUserId: opening.authorUserId, body: "Use the new level on the next run" }).returning();
+        const [wake] = await db.insert(agentWakeupRequests).values({ companyId: scope.companyId, agentId: scope.agentId,
+          source: "on_demand", reason: "issue_execution_deferred", status: "deferred_issue_execution",
+          requestedByActorType: "user", requestedByActorId: opening.authorUserId,
+          payload: { issueId: scope.issueId, _paperclipWakeContext: { wakeReason: "issue_commented", wakeCommentIds: [comment.id] } } }).returning();
+        queued = { id: wake.id, commentId: comment.id };
+        const actor = { actorType: "agent" as const, actorId: scope.agentId, agentId: scope.agentId, runId: scope.runId, agentApiKeyId: null };
+        const before = await readBoardQueuedComments({ executor: db, issue, activeRun: run, actor });
+        await agentService(db).update(scope.agentId, { adapterConfig: {
+          provider: "pi_rpc", sessionContinuity: "continuous", piRpcThinkingLevel: "high",
+        } });
+        // Eligibility was read before the commit; the actual delivery now refuses.
+        const steer = createSteerQueuedComment(createQueuedCommentSteeringAdapter(db));
+        await expect(steer({ issue, actor, queueId: wake.id, commentId: comment.id, targetRunId: run.id, revision: before.revision }))
+          .rejects.toMatchObject({ code: "steering_stale_turn", message: expect.stringContaining("stays queued for the next run") });
+        const [pending] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id));
+        expect(pending).toMatchObject({ status: "deferred_issue_execution", runId: null, payload: wake.payload });
+        const visible = await readBoardQueuedComments({ executor: db, issue, activeRun: run, actor });
+        expect(visible.entries.map(entry => entry.comment.id)).toEqual([comment.id]);
+        expect(visible.state).toBe("deferred");
+        const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+        expect(saved.resultJson?.heldNativeConfigurationEnd).toBe(true);
+        expect(saved.resultJson?.queuedSteeringAcknowledgements).toBeUndefined();
+        expect(heldSteering.sent).toEqual([]);
+      } });
+      await db.insert(companyMemberships).values({ companyId: f.companyId, principalId: f.userId,
+        principalType: "user", status: "active", membershipRole: "member" });
+      // The fixture commits finalization without the executor's release callback.
+      await db.update(issues).set({ responsibleUserId: f.userId, executionRunId: null }).where(eq(issues.id, f.issueId));
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.agentId));
+      const dispatched: string[] = [];
+      registerServerAdapter({ ...savedAdapter, execute: async input => {
+        dispatched.push(input.runId);
+        expect(input.context.wakeCommentIds).toContain(queued.commentId);
+        expect(input.config.piRpcThinkingLevel).toBe("high");
+        await issueService(db).addComment(f.issueId, "The queued message was answered with the new level.", { agentId: f.agentId, runId: input.runId });
+        return { exitCode: 0, signal: null, timedOut: false, resultJson: {}, summary: "Queued message answered" };
+      } });
+      const mode = vi.spyOn(nativeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({ kind: "legacy",
+        reason: "persisted_legacy_selection", resolverVersion: nativeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+      restoreMode = () => mode.mockRestore();
+      heartbeat = (await import("../heartbeat.js")).heartbeatService(db);
+      const errors: unknown[] = [];
+      coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, canReconcile: () => true, onError: error => errors.push(error) });
+      worker = heartbeat.registerDeferredReceiptWork(coordinator, () => true);
+      await worker.ready;
+      await vi.waitFor(async () => {
+        const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, queued.id));
+        expect(wake, JSON.stringify({ errors, dispatched })).toMatchObject({ status: "completed", runId: dispatched[0] });
+        expect(wake.runId).not.toBe(f.runId);
+      }, { timeout: 8_000 });
+      await heartbeat.drainActiveRunExecutions();
+      const replies = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+        eq(issueComments.createdByRunId, dispatched[0]), eq(issueComments.body, "The queued message was answered with the new level.")));
+      expect(replies).toHaveLength(1);
+      expect(dispatched).toHaveLength(1);
+    } finally {
+      worker?.stop(); await coordinator?.stop();
+      await heartbeat?.drainActiveRunExecutions();
+      restoreMode?.(); registerServerAdapter(savedAdapter);
+      heldSteering.available = false; heldSteering.reject = false;
+      if (steeringFlag === undefined) delete process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+      else process.env.PAPERCLIP_AGENT_CHAT_STEERING = steeringFlag;
+    }
   });
 
   it.each(["drain", "reset", "non-pi", "paperclip", "unavailable", "agent"])("consumes deferred person wakes only at a steerable continuous final (%s)", async scenario => {
