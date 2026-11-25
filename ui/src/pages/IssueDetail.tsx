@@ -32,7 +32,7 @@ import { AgentIdentity } from "@/components/AgentIdentity";
 import { clearLegacyChatMessageRequests } from "@/lib/chat-message-request";
 import { agentChatDraft } from "@/lib/agent-chat-draft";
 import { trackRecentProject } from "@/lib/recent-projects";
-import { ExecutionBlockerNotice } from "../components/ExecutionBlockerNotice";
+import { ExecutionBlockerNotice, isConversationRecovery } from "../components/ExecutionBlockerNotice";
 import { WorkspaceReconstructionRecovery } from "../components/WorkspaceReconstructionRecovery";
 import type { TaskComposerPause } from "../components/task-chat/TaskChatPausedTakeover";
 import { TaskDetailTasksPanel } from "@/components/task-detail/TaskDetailTasksPanel";
@@ -1225,6 +1225,7 @@ function InboxMobileToolbar({
 }
 
 type IssueDetailChatTabProps = {
+  onFailureNoticeChange?: (runId: string | null) => void;
   queuedMessageAutoSteerDelayMs?: number | null;
   executionBlocked?: boolean;
   interruption?: Issue["interruption"];
@@ -1505,6 +1506,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   resumeAssigneePending,
   onTryAgainNoLiveExecutionPath,
   tryAgainNoLiveExecutionPathPending,
+  onFailureNoticeChange,
   externalReferences,
   linkCaseReferences,
 }: IssueDetailChatTabProps) {
@@ -2078,7 +2080,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         return nextComment;
       }
       if (
-        isQueuedIssueComment({
+        nextComment.authorType !== "system" && isQueuedIssueComment({
           comment: nextComment,
           activeRunStartedAt,
           activeRunAgentId: interruptibleIssueRun?.agentId ?? null,
@@ -2676,6 +2678,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             queuedMessageAutoSteerDelayMs={queuedMessageAutoSteerDelayMs}
             {...(!classicTaskInterfaceEnabled ? {
               compactHistory: !historyExpanded,
+              onFailureNoticeChange,
               onExpandHistory: conversationMode ? undefined : onExpandHistory,
               scrollingHistory,
               historyControl: conversationMode ? null : !historyExpanded && (hasEarlierMessages || hasEarlierRuns) ? (
@@ -3714,6 +3717,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     ? shouldTrackIssueActiveRun(issue) && hasActiveRun
     : hasActiveRun;
   const hasLiveRuns = liveRunCount > 0 || resolvedHasActiveRun;
+  const [failureNoticeRunId, setFailureNoticeRunId] = useState<string | null>(null);
   const interruptionRunId = issue?.executionBlocker?.workspaceRepairRequired
     ? issue.executionBlocker.runId ?? issue.interruption?.observedRunId
     : issue?.interruption?.observedRunId;
@@ -8392,7 +8396,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
               onRecoveryControlChange={setRetainedRecoveryOwnsRetry}
               action={issue.activeRecoveryAction ?? null} />
           )}
-          {resolvedDetailTab === "chat" && (
+          {resolvedDetailTab === "chat" && !(failureNoticeRunId && failureNoticeRunId === interruptionRunId &&
+            issue.interruption?.state === "failed" && isConversationRecovery(issue.interruption, interruptionRun?.status)) && (
             <ExecutionBlockerNotice className={shellSectionClass} presentation={issue.interruption} blockers={issue.blockedBy} conversationMode={!!issue.conversationAgentId}
               observedStatus={interruptionRun?.status} observedResultJson={interruptionRun?.resultJson} observedErrorCode={interruptionRun?.errorCode}
               blocker={retainedRecoveryOwnsRetry ? null : issue.executionBlocker}
@@ -8717,6 +8722,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                     void queryClient.invalidateQueries({ queryKey: queryKeys.issues.runs(issueId!) });
                   }} />
                 <IssueDetailChatTab
+                  onFailureNoticeChange={setFailureNoticeRunId}
                   queuedMessageAutoSteerDelayMs={instanceExperimentalSettings?.enableQueuedMessageSteerCountdown === true ? QUEUED_MESSAGE_AUTO_STEER_DELAY_MS : 0}
                   executionBlocked={Boolean(issue.executionBlocker)}
                   interruption={issue.interruption}
