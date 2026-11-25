@@ -1,4 +1,7 @@
 import { spawn } from "node:child_process";
+import { generateKeyPairSync, randomUUID } from "node:crypto";
+import * as connectionCredentials from "../services/connection-credentials.js";
+import { resolveGitHubAppCredential, resolveGitHubAppInstallation } from "../services/github-app-credentials.js";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -17,6 +20,39 @@ import {
 } from "../services/git-credentials.ts";
 
 const fakeDb = null as unknown as Db;
+
+describe("GitHub App installation routing metadata and token scope", () => {
+  it.each(["all", "selected"] as const)("reuses the installation account and mints %s repository access", async selection => {
+    const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048, privateKeyEncoding: { type: "pkcs8", format: "pem" }, publicKeyEncoding: { type: "spki", format: "pem" } });
+    const secret = vi.spyOn(connectionCredentials, "resolveConnectionGrantSecret").mockResolvedValue({ value: privateKey, latestVersion: 1 });
+    const connection = { id: randomUUID(), companyId: "example-company", enabled: true, status: "active", credentialPolicy: "shared",
+      config: { sourceTemplateKey: "github", connectionMethodKey: "app-installation",
+        methodConfig: { appId: "123", installationId: "456", repositories: "second-org/saved", permissionProfile: "author" } },
+    } as unknown as Parameters<typeof resolveGitHubAppCredential>[1];
+    const grant = { id: randomUUID(), companyId: connection.companyId, connectionId: connection.id, kind: "organization", status: "active",
+      credentialSecretRefs: [{ secretId: "key", configPath: "credentials.privateKey", versionSelector: "latest" }],
+    } as Parameters<typeof resolveGitHubAppCredential>[2];
+    const requests: Array<{ url: string; body: unknown }> = [];
+    vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+      requests.push({ url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      return Response.json(url.endsWith("/access_tokens")
+        ? { token: "installation-token", expires_at: new Date(Date.now() + 3_600_000).toISOString() }
+        : { account: { login: "Second-Org" }, repository_selection: selection });
+    });
+    try {
+      expect(await resolveGitHubAppInstallation(fakeDb, connection, grant)).toMatchObject({ account: { login: "Second-Org" }, repository_selection: selection });
+      expect((await resolveGitHubAppCredential(fakeDb, connection, grant)).token).toBe("installation-token");
+      expect((await resolveGitHubAppCredential(fakeDb, connection, grant)).token).toBe("installation-token");
+      expect(requests).toEqual([
+        { url: "https://api.github.com/app/installations/456", body: undefined },
+        { url: "https://api.github.com/app/installations/456/access_tokens", body: {
+          ...(selection === "selected" ? { repositories: ["saved"] } : {}),
+          permissions: { contents: "write", pull_requests: "write", issues: "read" },
+        } },
+      ]);
+    } finally { secret.mockRestore(); vi.unstubAllGlobals(); }
+  });
+});
 
 function buildSecretsFake(byName: Record<string, string | Error>) {
   const getByName = vi.fn(async (_companyId: string, name: string) => {
@@ -253,14 +289,14 @@ describe("buildGitAuthInvocation", () => {
 });
 
 describe("credential helper execution (real git, no network)", () => {
-  async function runCredentialFill(description: string) {
+  async function runCredentialFill(description: string, repository?: string) {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-cred-fill-"));
     try {
       const invocation = buildGitAuthInvocation({
         token: "abc123",
         source: "company_secret",
         secretName: "GITHUB_TOKEN",
-      });
+      }, repository);
       return await new Promise<{ code: number | null; stdout: string; stderr: string }>(
         (resolve, reject) => {
           const child = spawn("git", [...invocation.configArgs, "credential", "fill"], {
@@ -282,6 +318,19 @@ describe("credential helper execution (real git, no network)", () => {
       await fs.rm(cwd, { recursive: true, force: true });
     }
   }
+
+  it.each(["second-org/other.git", ""])("never exports a repository-bound token for path %j", async requestedPath => {
+    const result = await runCredentialFill(`protocol=https\nhost=github.com\n${requestedPath ? `path=${requestedPath}\n` : ""}\n`, "example-org/app");
+    expect(result.code).not.toBe(0);
+    expect(result.stdout + result.stderr).not.toContain("abc123");
+  });
+
+  it("keeps the Git path and answers only the bound repository, case-insensitively", async () => {
+    const result = await runCredentialFill("protocol=https\nhost=github.com\npath=Example-Org/App.git\n\n", "example-org/app");
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("path=Example-Org/App.git");
+    expect(result.stdout).toContain("password=abc123");
+  });
 
   it("answers a github.com https request with the env-carried token", async () => {
     const result = await runCredentialFill("protocol=https\nhost=github.com\n\n");
