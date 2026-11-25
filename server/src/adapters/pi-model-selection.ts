@@ -45,19 +45,25 @@ export function normalizePiIssueModelSelection<T>(
 ): T {
   const config = parseObject(agent.adapterConfig);
   if (agent.adapterType !== "paperclip_runner" || config.provider !== "pi_rpc") return overrides;
-  validatePiReasoningSelection(agent, overrides);
+  let normalized = overrides;
   const parsed = parseObject(overrides);
   const overrideConfig = parseObject(parsed.adapterConfig);
-  if (!("model" in overrideConfig)) return overrides;
-  const model = overrideConfig.model;
-  if (typeof model === "string" && /^[^/\s]+\/\S+$/.test(model)) return overrides;
-  const savedModel = config.model;
-  if (typeof model === "string" && model.length > 0 && !/[\s/]/.test(model)
-    && typeof savedModel === "string" && /^[^/\s]+\/\S+$/.test(savedModel)) {
-    return { ...parsed, adapterConfig: { ...overrideConfig, model: `${savedModel.slice(0, savedModel.indexOf("/"))}/${model}` } } as T;
+  if ("model" in overrideConfig) {
+    const model = overrideConfig.model;
+    if (!(typeof model === "string" && /^[^/\s]+\/\S+$/.test(model))) {
+      const savedModel = config.model;
+      if (typeof model === "string" && model.length > 0 && !/[\s/]/.test(model)
+        && typeof savedModel === "string" && /^[^/\s]+\/\S+$/.test(savedModel)) {
+        normalized = { ...parsed, adapterConfig: { ...overrideConfig, model: `${savedModel.slice(0, savedModel.indexOf("/"))}/${model}` } } as T;
+      } else {
+        throw unprocessable(
+          `Pi cannot use chat model ${JSON.stringify(model)}: pick a provider/model, or clear the chat's model to use the agent default.`,
+          { code: PI_MODEL_PROVIDER_REQUIRED, model, retryability: "requires_action" },
+        );
+      }
+    }
   }
-  throw unprocessable(
-    `Pi cannot use chat model ${JSON.stringify(model)}: pick a provider/model, or clear the chat's model to use the agent default.`,
-    { code: PI_MODEL_PROVIDER_REQUIRED, model, retryability: "requires_action" },
-  );
+  // Validate the normalized projection that runtime admission will actually use.
+  validatePiReasoningSelection(agent, normalized);
+  return normalized;
 }
