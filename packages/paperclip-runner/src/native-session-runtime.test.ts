@@ -619,7 +619,7 @@ describe("executeNativeSession recovery", () => {
       return;
     }
     if (["other turn", "newer turn"].includes(scenario)) {
-      await expect(execution).rejects.toThrow("native_provider_output_without_result");
+      await expect(execution).rejects.toThrow("native_finalization_missing");
       expect(completeRun).not.toHaveBeenCalled();
       expect(recoveredTransport.calls.filter(call => call.method === "turn/start")).toEqual([]);
       return;
@@ -1090,12 +1090,14 @@ describe("executeNativeSession recovery", () => {
       async *events() {
         yield runnerEvent(1, "turn.failed", { status: "failed", error: failure });
         if (!startTurn.mock.calls.length) return;
+        // Visible progress must not close the stock disposition-only door.
+        yield { ...runnerEvent(2, "item.delta", { kind: "agentMessage", text: "Checking the background command." }), turnId: "turn-continuation" };
         // The agent ends the continuation saying it will wait for a
         // background command, without paperclip_finish.
         continuationDone = true;
-        yield { ...runnerEvent(2, "turn.completed", { status: "completed", error: null }), turnId: "turn-continuation" };
+        yield { ...runnerEvent(3, "turn.completed", { status: "completed", error: null }), turnId: "turn-continuation" };
         if (startTurn.mock.calls.length < 2) return;
-        yield { ...runnerEvent(3, "turn.completed", { status: "completed", error: null }), turnId: "turn-disposition" };
+        yield { ...runnerEvent(4, "turn.completed", { status: "completed", error: null }), turnId: "turn-disposition" };
       },
       startTurn,
       async result() { return startTurn.mock.calls.length >= 2 ? { result, terminal, turnId: "turn-disposition" } : null; },
@@ -8470,6 +8472,46 @@ describe("executeNativeSession recovery", () => {
     });
   });
 
+  it.each([false, true])("keeps held Pi original-input resubmission fenced after provider output (prepared: %s)", async (prepared) => {
+    const executionInput = {
+      ...(prepared ? preparedInput() : input),
+      session: { ...input.session, driverKind: "pi_rpc" as const },
+      provider: { kind: "pi_rpc" as const, model: "fixture-model", conversationMode: true as const },
+    };
+    const checkpoint: PersistedNativeSession = {
+      backendKind: "mock", driverKind: "pi_rpc", sessionId: "driver-held", identity,
+      providerSessionId: "provider-held", cursor: "1", activeTurnId: null,
+      terminalTurns: [], pendingRuntimeRequests: [], lineage: [],
+    };
+    const startTurn = vi.fn<NativeSession["startTurn"]>(async () => ({ turnId: "must-not-resubmit" }));
+    const session: NativeSession = {
+      identity: () => identity,
+      async capabilities() { return { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true }; },
+      async *events() {},
+      startTurn,
+      async result() { return null; },
+      async snapshot() { return structuredClone(checkpoint); },
+      async close() {},
+    };
+    const output = runnerEvent(1, "item.delta", { kind: "agentMessage", text: "Already answering the held input" });
+    await expect(executeNativeSession({
+      input: executionInput,
+      backend: {
+        async descriptor() { return { kind: "mock", name: "held-replay-fence", version: "1", runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" }, capabilities: await session.capabilities() }; },
+        async openSession() { throw new Error("must retain the held session"); },
+        async recoverSession() { return { recovered: true, session }; },
+      },
+      controlPlane: {
+        async openRun() {}, async checkpointSession() {}, async completeRun() {},
+        async appendEvent(event: PrpEvent) { return { cursor: event.sourceSeq, highestContiguousSourceSeq: event.sourceSeq, disposition: "committed" }; },
+        async replayEvents(query) { return { events: query.afterSourceSeq < 1 ? [output] : [], highestContiguousSourceSeq: 1 }; },
+      },
+      persistedSession: checkpoint,
+      runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery",
+    })).rejects.toThrow("native_provider_output_without_result");
+    expect(startTurn).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])("only replays the original ACPX envelope for a proven effect-free initial turn (prepared: %s)", async (prepared) => {
     const executionInput = prepared ? preparedInput() : input;
     const checkpoint: PersistedNativeSession = {
@@ -8705,10 +8747,24 @@ describe("executeNativeSession recovery", () => {
         runnerInstanceId: "runner-recovery",
         controlPlaneInstanceId: "control-recovery",
       }),
-    ).rejects.toThrow("native_provider_output_without_result");
-    // Output is not an effect-free turn: even disposition-only resubmission
-    // could repeat its tool effects. Keep the first half's no-output recovery.
-    expect(startTurn).not.toHaveBeenCalled();
+    ).resolves.toMatchObject({
+      turnId: "turn-continuation",
+      providerSessionId: "provider-recovery",
+    });
+    const dispositionEnvelope = JSON.parse(
+      startTurn.mock.calls[0]![0].message.text,
+    ) as { task: { prompt: string } };
+    expect(dispositionEnvelope.task.prompt).toContain(
+      "semantic-result recovery for a prior completed provider turn",
+    );
+    expect(dispositionEnvelope.task.prompt).toContain(
+      "Do not repeat implementation, tests, research, or the final answer",
+    );
+    expect(dispositionEnvelope.task.prompt).not.toContain(input.task.prompt);
+
+    expect(dispositionEnvelope).toHaveProperty("completionContract", input.completionContract.contract);
+    expect(dispositionEnvelope).not.toHaveProperty("constraints");
+    if (prepared) expect(dispositionEnvelope).toHaveProperty("requestedSkills", []);
 
     checkpoint.dispositionOnlyRecoveryTurnId = undefined;
     recoveredSnapshot.dispositionOnlyRecoveryTurnId = undefined;
@@ -9616,7 +9672,7 @@ describe("executeNativeSession recovery", () => {
         async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; }, completeRun,
       }, runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery", timeoutMs: 1000,
       resolveMissingResult: async () => null,
-    })).rejects.toThrow("native_provider_output_without_result");
+    })).rejects.toThrow("native_finalization_missing");
     expect(completeRun).not.toHaveBeenCalled();
     expect(events.some(event => event.eventType === "item.completed")).toBe(true);
     expect(events.some(event => event.eventType === "run.result.accepted")).toBe(false);
