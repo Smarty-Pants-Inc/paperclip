@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { normalizePiIssueModelSelection, validatePiRunSelection } from "../adapters/pi-model-selection.js";
 import { buildExecutionWorkspaceAdapterConfig } from "../services/execution-workspace-policy.js";
+import { piRpcThinking, projectPaperclipRunnerTaskConfig } from "../services/native-runtime/provider-profile.js";
 
 const agent = { adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: "paperclip/gpt-6.1-sol" } };
 
@@ -31,6 +32,39 @@ describe("Pi issue model selection at run build", () => {
   it("accepts a normalized selection with the supported default policy", () => {
     expect(() => validatePiRunSelection(agent, normalizePiIssueModelSelection(agent,
       { adapterConfig: { model: "gpt-6.2-sol" } }))).not.toThrow();
+  });
+  it.each([null, "", " \t "])("treats an unset task reasoning level %j as inheriting the agent", level => {
+    const saved = { ...agent, adapterConfig: { ...agent.adapterConfig, piRpcThinkingLevel: "high" } };
+    const overrides = { adapterConfig: { piRpcThinkingLevel: level } };
+    expect(normalizePiIssueModelSelection(saved, overrides)).toBe(overrides);
+    const config = projectPaperclipRunnerTaskConfig("pi_rpc", saved.adapterConfig, overrides.adapterConfig);
+    expect(piRpcThinking(config)).toBe("high");
+    expect(config.piRpcThinkingLevel).toBe("high");
+  });
+  it.each([undefined, null, "", " \t "])("runs an agent with unset saved reasoning %j at medium", level => {
+    const saved = { ...agent, adapterConfig: { ...agent.adapterConfig, piRpcThinkingLevel: level } };
+    expect(normalizePiIssueModelSelection(saved, null)).toBeNull();
+    expect(piRpcThinking(saved.adapterConfig)).toBe("medium");
+  });
+  it("validates the normalized runtime projection before accepting a bare chat model", () => {
+    const saved = { ...agent, adapterConfig: { provider: "pi_rpc", model: "paperclip/model", effort: "ultra" } };
+    const overrides = { adapterConfig: { model: "model" } };
+    expect(() => normalizePiIssueModelSelection(saved, overrides)).toThrowError(expect.objectContaining({
+      status: 422,
+      message: 'Pi cannot use reasoning level "ultra": choose off, minimal, low, medium, high, xhigh or max',
+    }));
+    expect(overrides).toEqual({ adapterConfig: { model: "model" } });
+  });
+  it("rejects an old stored invalid reasoning override at run normalization with a plain error", () => {
+    const stored = { adapterConfig: { piRpcThinkingLevel: "ultra" } };
+    expect(() => normalizePiIssueModelSelection(agent, stored)).toThrow(
+      'Pi cannot use reasoning level "ultra": choose off, minimal, low, medium, high, xhigh or max',
+    );
+  });
+  it("maps Pi's none selection to off", () => {
+    const overrides = { adapterConfig: { piRpcThinkingLevel: "none" } };
+    expect(normalizePiIssueModelSelection(agent, overrides)).toBe(overrides);
+    expect(piRpcThinking(projectPaperclipRunnerTaskConfig("pi_rpc", agent.adapterConfig, overrides.adapterConfig))).toBe("off");
   });
   it("allows clearing the override and leaves other adapters untouched", () => {
     expect(normalizePiIssueModelSelection(agent, null)).toBeNull();
