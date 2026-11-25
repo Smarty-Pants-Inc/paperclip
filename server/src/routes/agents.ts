@@ -4599,6 +4599,18 @@ export function agentRoutes(
       }
       hireInput.adapterConfig = inheritNativeRunnerAdapterConfig(caller.adapterConfig);
       hireInput.defaultEnvironmentId = caller.defaultEnvironmentId ?? null;
+    } else if (
+      req.actor.type === "agent" && req.actor.agentId
+      && hireInput.adapterType === "paperclip_runner"
+      && requestedHireConfig.provider === "pi_rpc"
+      && requestedHireConfig.piRpcThinkingLevel === undefined
+    ) {
+      const caller = await svc.getById(req.actor.agentId);
+      const callerConfig = asRecord(caller?.adapterConfig);
+      if (caller?.companyId === companyId && caller.adapterType === "paperclip_runner"
+        && callerConfig?.provider === "pi_rpc" && asNonEmptyString(callerConfig.piRpcThinkingLevel)) {
+        hireInput.adapterConfig = { ...requestedHireConfig, piRpcThinkingLevel: callerConfig.piRpcThinkingLevel };
+      }
     }
     if (inheritRuntimeFrom === "caller" && hireRunner !== undefined) throw unprocessable("inheritRuntimeFrom=caller cannot be combined with runner");
     let configurationWarnings: AgentConfigurationWarning[] = [];
