@@ -86,22 +86,20 @@ export async function publishContinuousNativeReply(input: {
         (typeof parseObject(receipt).afterEventSeq !== "number" || Number(parseObject(receipt).afterEventSeq) < input.cursor))
       .sort((a, b) => String(parseObject(a[1]).acknowledgedAt).localeCompare(String(parseObject(b[1]).acknowledgedAt)));
     const wakeId = row.run.contextSnapshot?.wakeCommentId;
-    // A steer ACK binds its person input to the accepting provider turn. Pi's
-    // answers can omit a steer accepted while this final was already streaming;
-    // include that same-turn receipt, never an ACK for a different/later turn.
+    // Nonempty answers own only the ACKs they name. Otherwise the first final
+    // after an ACK's cursor in the accepting turn owns it, never an earlier
+    // final or one from another turn. Unqualified legacy ACKs are not implied.
     const sameTurnAcknowledgements = input.event.turnId ? pending
-      .filter(([, receipt]) => parseObject(receipt).turnId === input.event.turnId)
+      .filter(([, receipt]) => parseObject(receipt).turnId === input.event.turnId &&
+        typeof parseObject(receipt).afterEventSeq === "number")
       .map(([id]) => id) : [];
-    // Older packs omit answers: only opening/inherited input is implied.
-    // A provider-turn-qualified ACK remains authoritative on newer packs;
-    // an unqualified late ACK proves delivery, never consumption by this final.
     const answers = input.event.payload.answers;
     const explicitAnswers = Array.isArray(answers);
     const sealed = readFirstTurnQueuedInputReceipt(row.run);
     const sealedIds = [...(sealed?.commentIds ?? []), ...(sealed?.interactionIds ?? [])];
-    // These IDs name the submitted user message for the whole run, even if
-    // earlier finals answered nothing (or answered another input). Reply count
-    // only gates the legacy implicit fallback, never this explicit alias.
+    // Submitted IDs alias the sealed first-turn inputs even after earlier
+    // finals answered nothing or something else. Only steer-ACK ownership is
+    // restricted by a nonempty explicit answers list.
     const submittedInputIds = [
       ...(Array.isArray(row.run.contextSnapshot?.wakeCommentIds) ? row.run.contextSnapshot.wakeCommentIds : []),
       ...(typeof wakeId === "string" ? [wakeId] : []),
@@ -113,14 +111,17 @@ export async function publishContinuousNativeReply(input: {
       continued.sessionId === row.run.nativeSessionId && Array.isArray(continued.commentIds)
       ? continued.commentIds.filter((id): id is string => typeof id === "string" && !answered.has(id)) : [];
     const handback = row.run.contextSnapshot?.preDispatchInputHandback === true;
-    let questionCommentIds = [...new Set([
-      ...(explicitAnswers
-        ? [...answers.filter((id): id is string => typeof id === "string" && !answered.has(id)),
-          ...(answers.some(id => submittedInputIds.includes(id)) ? sealedIds.filter(id => !answered.has(id)) : [])]
-        : [...impliedInputIds, ...firstInputIds]),
-      ...(input.event.turnId ? firstInputIds : []),
-      ...sameTurnAcknowledgements,
-    ])];
+    const nonemptyExplicitAnswers = explicitAnswers && answers.length > 0;
+    let questionCommentIds = [...new Set(nonemptyExplicitAnswers
+      ? [
+        ...answers.filter((id): id is string => typeof id === "string" && !answered.has(id)),
+        ...(answers.some(id => submittedInputIds.includes(id)) ? sealedIds.filter(id => !answered.has(id)) : []),
+      ]
+      : [
+        ...(!explicitAnswers ? [...impliedInputIds, ...firstInputIds] : []),
+        ...(input.event.turnId ? firstInputIds : []),
+        ...sameTurnAcknowledgements,
+      ])];
     if (handback && questionCommentIds.length) {
       const chronological = (await tx.select({ id: issueComments.id }).from(issueComments).where(and(
         eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, questionCommentIds),
