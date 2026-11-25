@@ -75,7 +75,7 @@ import type {
   HarnessRuntimeRequestResolution,
   PersistedHarnessProviderIdentity,
 } from "../contracts/harness-driver.js";
-import { NativeRunnerResumeStateUnavailableError, NativeRunnerSourceReconciliationRequiredError } from "../contracts/harness-driver.js";
+import { NativeRunnerClosedBeforeAttachmentError, NativeRunnerResumeStateUnavailableError, NativeRunnerSourceReconciliationRequiredError } from "../contracts/harness-driver.js";
 import {
   DurablePrpControlPlane,
   inspectStagedRunAttachment,
@@ -5176,12 +5176,15 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     currentRunGrant?: NativeRunRuntimeGrant;
     completionContract?: { revision: string; criterionIds: readonly string[] };
   }): Promise<void> {
+    if (this.#closed) return Promise.reject(new NativeRunnerClosedBeforeAttachmentError());
     const earlyClaim = this.#earlyClaim?.runId === input.runId ? this.#earlyClaim.operation : undefined;
     if (this.#attachmentOperation !== null && earlyClaim === undefined) {
       return Promise.reject(new Error("native_runner_run_attachment_in_progress"));
     }
     this.#earlyClaim = null;
     const operation = Promise.resolve().then(() => {
+      // Still before any attachment command, including the queued microtask.
+      if (this.#closed) throw new NativeRunnerClosedBeforeAttachmentError();
       this.#assertStartupOpen();
       return this.#attachRun(input, earlyClaim);
     }).finally(() => { this.#attachmentOperation = null; });
