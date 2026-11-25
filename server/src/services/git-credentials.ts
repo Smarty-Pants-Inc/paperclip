@@ -93,12 +93,12 @@ export function isGitHubHttpsRemoteUrl(remoteUrl: string): boolean {
   return isGitHubDotCom(parsed.hostname);
 }
 
-/** Normalize a GitHub remote or credential path into the repository selection key. */
-export function gitHubRepositoryHint(value: string): string | undefined {
+/** Normalize a GitHub remote or credential path; brokers may also select by owner. */
+export function gitHubRepositoryHint(value: string, allowOwner = false): string | undefined {
   const path = value.replace(/^git@(?:www\.)?github\.com:/i, "")
     .replace(/^(?:https?|ssh):\/\/(?:git@)?(?:www\.)?github\.com(?::\d+)?\//i, "")
     .replace(/\.git\/?$/i, "").replace(/\/$/, "");
-  return /^[a-z0-9][a-z0-9-]*\/[a-z0-9_.-]+$/i.test(path) ? path.toLowerCase() : undefined;
+  return (allowOwner ? /^[a-z0-9][a-z0-9-]*(?:\/[a-z0-9_.-]+)?$/i : /^[a-z0-9][a-z0-9-]*\/[a-z0-9_.-]+$/i).test(path) ? path.toLowerCase() : undefined;
 }
 
 function isSupportedGitHubRemoteUrl(remoteUrl: string): boolean {
@@ -487,7 +487,7 @@ export async function resolveManagedGitHubIdentitySelection(
           && config.repositories.split(/[,\n]/).some(repo => repo.trim().toLowerCase() === repository);
         const installation = await resolveGitHubAppInstallation(db, connection, grant).catch(() => null);
         return { grant, listed, eligible: installation?.account?.login?.toLowerCase() === owner
-          && (installation.repository_selection === "all" || listed) };
+          && (!repository.includes("/") || installation.repository_selection === "all" || listed) };
       }));
       const eligible = matches.filter(match => match.eligible);
       const hasSavedMatch = eligible.some(match => match.listed);
