@@ -1019,8 +1019,9 @@ describe("agent routes adapter validation", () => {
     expect(mockAgentService.create.mock.calls.at(-1)?.[1]).toMatchObject({ adapterType: runner === "legacy" ? "pi_local" : "paperclip_runner", adapterConfig: runner === "legacy" ? { model } : { provider: "acpx", acpxAgent: "pi", model, piThinkingLevel: "low", acpxPermissionMode: "approve-all" } });
   });
 
-  it.each(["native", "native draft", "native default", "native null", "native blank", "native whitespace", "native rpc high", "native hire", "native invalid", "native conflict", "native missing model", "native disabled", "native unsupported", "saved native", "stock", "stock default", "stock stale pins", "absent", "missing driver", "missing runtime", "missing resources", "removed pack", "damaged manifest", "legacy",
-    ...["off", "minimal", "low", "medium", "high", "xhigh", "max"].map(level => `native level ${level}`)])("the Pi card uses the installed provider pack: %s", async installation => {
+  it.each(["native", "native draft", "native default", "native null", "native blank", "native whitespace", "native rpc high", "native hire", "native invalid", "native conflict", "native missing model", "native disabled", "native unsupported", "saved native", "saved native disabled", "stock", "stock default", "stock stale pins", "absent", "missing driver", "missing runtime", "missing resources", "removed pack", "damaged manifest", "legacy",
+    ...["off", "minimal", "low", "medium", "high", "xhigh", "max"].flatMap(level => [`native level ${level}`,
+      ...["enabled", "disabled"].flatMap(availability => ["unset", "auto", "paperclip"].map(runner => `saved edit ${availability} ${level} ${runner}`))])])("the Pi card uses the installed provider pack: %s", async installation => {
     const root = await mkdtemp(path.join(os.tmpdir(), "pi-card-"));
     const { QUALIFIED_ACPX_PROFILES: profiles, QUALIFIED_ACPX_VERSION: acpx } = await import("../vendor/paperclip-runner/index.js");
     const { canonicalProviderPackJson } = await import("../services/native-runtime/remote-provider-pack-verification.js");
@@ -1053,14 +1054,14 @@ describe("agent routes adapter validation", () => {
       vi.stubEnv("PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH", ["absent", "removed pack"].includes(installation) ? "" : root);
       const platform = await import("../lib/agent-runner-platform.js");
       vi.spyOn(platform, "localAgentRunnerTarget").mockReturnValue({ driver: "local", platform: installation === "native unsupported" ? "win32" : "linux", architecture: "x64", libc: "glibc", glibcVersion: "2.39" });
-      if (installation === "native disabled") mockAdapterPluginStore.getDisabledAdapterTypes.mockReturnValue(["pi_local"]);
+      if (["native disabled", "saved native disabled"].includes(installation)) mockAdapterPluginStore.getDisabledAdapterTypes.mockReturnValue(["pi_local"]);
       const level = installation.startsWith("native level ") ? installation.slice("native level ".length) : undefined;
       const config: Record<string, unknown> = { model: "openrouter/test-model", piThinkingLevel: "high" };
       if (["native draft", "native missing model"].includes(installation)) delete config.model;
       if (installation === "native rpc high") { delete config.piThinkingLevel; config.provider = "pi_rpc"; config.piRpcThinkingLevel = "high"; }
       else if (installation === "native conflict") config.piRpcThinkingLevel = "low";
       else if (installation.startsWith("native") && installation !== "native") config.piThinkingLevel = level ?? ({ "native null": null, "native blank": "", "native whitespace": "  ", "native invalid": "ultra" } as Record<string, unknown>)[installation];
-      if (["saved native", "removed pack"].includes(installation)) { delete config.piThinkingLevel; config.provider = "pi_rpc"; config.piRpcThinkingLevel = "high"; }
+      if (installation.startsWith("saved native") || installation === "removed pack") { delete config.piThinkingLevel; config.provider = "pi_rpc"; config.piRpcThinkingLevel = "high"; }
       if (installation === "stock default") delete config.piThinkingLevel;
       const hire = installation === "native hire";
       const originalCreate = mockAgentService.create.getMockImplementation()!;
@@ -1070,8 +1071,29 @@ describe("agent routes adapter validation", () => {
         return agent;
       });
       const app = await createApp();
+      if (installation.startsWith("saved edit ")) {
+        const [availability, level, runner] = installation.slice("saved edit ".length).split(" ");
+        mockAdapterPluginStore.getDisabledAdapterTypes.mockReturnValue(availability === "disabled" ? ["pi_local"] : []);
+        let saved = { ...(await mockAgentService.getById()), adapterType: "paperclip_runner",
+          adapterConfig: { provider: "pi_rpc", model: "openrouter/test-model", piRpcThinkingLevel: "medium" } };
+        mockAgentService.getById.mockImplementation(async () => saved);
+        mockAgentService.update.mockImplementation(async (_id, patch) => (saved = { ...saved, ...patch }));
+        const endpoint = `/api/agents/${saved.id}`;
+        const patch = (level: string) => requestApp(app, base => request(base).patch(endpoint).send({
+          ...(runner === "unset" ? {} : { runner }), adapterConfig: { piRpcThinkingLevel: level },
+        }));
+        const edited = await patch(level);
+        expect(edited.status, JSON.stringify(edited.body)).toBe(200);
+        const loaded = await requestApp(app, base => request(base).get(`${endpoint}/configuration`));
+        expect(loaded.status, JSON.stringify(loaded.body)).toBe(200);
+        expect(loaded.body.adapterConfig).toMatchObject({ provider: "pi_rpc", model: "openrouter/test-model", piRpcThinkingLevel: level });
+        const restored = await patch("medium");
+        expect(restored.status, JSON.stringify(restored.body)).toBe(200);
+        expect(restored.body.adapterConfig.piRpcThinkingLevel).toBe("medium");
+        return;
+      }
       const response = await requestApp(app, base => request(base).post(`/api/companies/company-1/${hire ? "agent-hires" : "agents"}`).send({
-        name: "Pi", adapterType: ["saved native", "removed pack"].includes(installation) ? "paperclip_runner" : "pi_local",
+        name: "Pi", adapterType: installation.startsWith("saved native") || installation === "removed pack" ? "paperclip_runner" : "pi_local",
         runner: installation === "legacy" ? "legacy" : "auto", ...(!hire && installation !== "native missing model" ? { setupId: "00000000-0000-4000-8000-000000000092" } : {}), adapterConfig: config,
       }));
       const broken = ["missing driver", "missing runtime", "missing resources", "removed pack", "damaged manifest"].includes(installation);
@@ -1083,8 +1105,8 @@ describe("agent routes adapter validation", () => {
       } else {
         const agent = hire ? response.body.agent : response.body;
         expect(agent).toMatchObject({ adapterType: installation === "legacy" ? "pi_local" : "paperclip_runner",
-          adapterConfig: installation.startsWith("native") || installation === "saved native"
-            ? { provider: "pi_rpc", piRpcThinkingLevel: level ?? (["native", "native rpc high", "saved native"].includes(installation) ? "high" : "medium") }
+          adapterConfig: installation.startsWith("native") || installation.startsWith("saved native")
+            ? { provider: "pi_rpc", piRpcThinkingLevel: level ?? (["native", "native rpc high"].includes(installation) || installation.startsWith("saved native") ? "high" : "medium") }
             : installation === "legacy" ? { model: "openrouter/test-model" } : { provider: "acpx", acpxAgent: "pi", piThinkingLevel: installation === "stock default" ? "low" : "high" },
         });
         if (installation !== "native draft") expect(agent.adapterConfig.model).toBe("openrouter/test-model");
