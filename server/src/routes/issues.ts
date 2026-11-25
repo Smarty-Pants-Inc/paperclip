@@ -12965,6 +12965,11 @@ export function issueRoutes(
     async (req, res) => {
       const companyId = req.params.companyId as string;
       assertCompanyAccess(req, companyId);
+      // Refuse only an explicit request; a person's private parent or project
+      // still governs inherited visibility in the issue service.
+      if (req.actor.type === "agent" && req.body.visibility === "private") {
+        throw forbidden("Only a person can make a task private");
+      }
       if (isSkillTestScopedActor(req)) {
         res.status(403).json({
           error: "Skill-test run tokens cannot create issues.",
@@ -14655,8 +14660,11 @@ export function issueRoutes(
           return;
         }
       }
-      // An authorized agent may restrict a task; widening access remains an owner/admin action.
-      if (req.body.visibility !== undefined && !(req.actor.type === "agent" && req.body.visibility === "private")
+      // Privacy choices require a person even when the agent may otherwise edit the task.
+      if (req.actor.type === "agent" && req.body.visibility === "private") {
+        throw forbidden("Only a person can make a task private");
+      }
+      if (req.body.visibility !== undefined
         && !(await resolveManagedIssueForPrivacy(req, res, existing))) return;
       // MCP task changes cannot stop a run or implicitly decide a pending review.
       const mcpParticipationChange = req.actor.source === "mcp_oauth" &&
