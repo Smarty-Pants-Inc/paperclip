@@ -11447,7 +11447,7 @@ describe("native session same-turn steering", () => {
     } finally { state.release?.(); await running; vi.restoreAllMocks(); }
   });
 
-  it.each(["rejected", "sync-rejected", "prp-failed", "working-final-then-rejected", "timeout-then-rejected", "uncertain-transport", "timeout-then-ACK"])("hold seam v2: config after a steer outcome: %s", async outcome => {
+  it.each(["rejected", "sync-rejected", "prp-failed", "turn-end-not-delivered", "working-final-then-rejected", "timeout-then-rejected", "uncertain-transport", "uncertain-deadline", "uncertain-follow-up-deadline", "uncertain-indeterminate", "uncertain-prp-unknown", "timeout-then-deadline", "timeout-then-ACK"])("hold seam v2: config after a steer outcome: %s", async outcome => {
     const result: Record<string, unknown> = {};
     vi.spyOn(continuousReply, "publishContinuousNativeReply").mockResolvedValue(true);
     vi.spyOn(resetWakeQueue, "closeConversationResetHold").mockResolvedValue(false);
@@ -11460,26 +11460,46 @@ describe("native session same-turn steering", () => {
       payload: { kind: "agentMessage", channel: "final", text: "Done." } };
     let resolve!: () => void, reject!: (error: Error) => void;
     steer.mockReturnValue(new Promise<void>((yes, no) => { resolve = yes; reject = no; }));
-    const immediateRejection = ["rejected", "sync-rejected", "prp-failed"].includes(outcome);
-    if (outcome === "rejected") steer.mockRejectedValue(new Error("request rejected"));
-    if (outcome === "sync-rejected") steer.mockImplementation(() => { throw new Error("request rejected"); });
-    if (outcome === "prp-failed") steer.mockRejectedValue(new Error('PRP command turn.steer failed: {"message":"Provider request failed"}'));
+    const immediateRejection = ["rejected", "sync-rejected", "prp-failed", "turn-end-not-delivered"].includes(outcome);
+    const uncertain = outcome.startsWith("uncertain-") || outcome === "timeout-then-deadline";
+    const notDelivered = "a person's Stop is ending this turn";
+    if (outcome === "rejected") steer.mockRejectedValue(new Error(notDelivered));
+    if (outcome === "sync-rejected") steer.mockImplementation(() => { throw new Error(notDelivered); });
+    if (outcome === "prp-failed") steer.mockRejectedValue(new Error('PRP command turn.steer failed: {"result":{"code":"command_execution_failed","message":"turn.steer named a stale or inactive turn"},"status":"failed"}'));
+    if (outcome === "turn-end-not-delivered") steer.mockRejectedValue(new Error("steering raced the turn end; not delivered"));
     if (outcome === "uncertain-transport") steer.mockRejectedValue(new Error("provider_transport_failed: connection closed"));
+    if (outcome === "uncertain-deadline") steer.mockRejectedValue(new Error("Pi steer deadline exceeded"));
+    if (outcome === "uncertain-follow-up-deadline") steer.mockRejectedValue(new Error("Pi follow_up deadline exceeded"));
+    if (outcome === "uncertain-indeterminate") steer.mockRejectedValue(new Error('PRP command turn.steer failed: {"result":{"code":"execution_indeterminate","message":"runner recovered after journaling this command; it will not execute twice"},"status":"failed"}'));
+    if (outcome === "uncertain-prp-unknown") steer.mockRejectedValue(new Error('PRP command turn.steer failed: {"result":{"code":"command_execution_failed","message":"Provider request failed"},"status":"failed"}'));
+    if (outcome === "timeout-then-deadline") vi.useFakeTimers();
     try {
       if (outcome !== "working-final-then-rejected") await accountingEvents.committed!(final);
-      const delivered = steerNativeSession({ runId: execution.binding.runId, message: "Follow-up", correlationId: "v2-follow-up", timeoutMs: 5 })
+      const delivered = steerNativeSession({ runId: execution.binding.runId, message: "Follow-up", correlationId: "v2-follow-up", timeoutMs: outcome === "timeout-then-deadline" ? 10_000 : 5 })
         .catch(error => error);
       await vi.waitFor(() => expect(steer).toHaveBeenCalledOnce());
+      if (outcome === "timeout-then-deadline") await vi.advanceTimersByTimeAsync(10_001);
       const error = await delivered;
-      expect(error.code).toBe(immediateRejection ? "steering_rejected" : "steering_timeout");
+      expect(error.code).toBe(outcome === "prp-failed" ? "steering_stale_turn" : immediateRejection ? "steering_rejected" : "steering_timeout");
+      if (outcome === "timeout-then-deadline") {
+        reject(new Error('PRP command turn.steer failed: {"result":{"code":"command_execution_failed","message":"Pi steer deadline exceeded"},"status":"failed"}'));
+        await Promise.resolve();
+        vi.useRealTimers();
+      }
+      if (uncertain) {
+        const retried = await steerNativeSession({ runId: execution.binding.runId, message: "Follow-up", correlationId: "v2-follow-up", timeoutMs: 5 })
+          .catch(error => error);
+        expect(steer).toHaveBeenCalledOnce(); // The uncertain delivery stays cached, never redispatched.
+        expect(retried).toMatchObject({ code: "steering_timeout", message: "Steering outcome is uncertain. Your message stays queued pending acknowledgement." });
+      }
       result.heldNativeConfigurationEnd = true;
       await getNativeSessionSteeringState(execution.binding.runId);
       if (outcome === "working-final-then-rejected") {
         await accountingEvents.committed!(final);
         expect(interrupt).not.toHaveBeenCalled();
-        reject(new Error("request rejected"));
+        reject(new Error(notDelivered));
       }
-      if (outcome === "timeout-then-rejected") reject(new Error("request rejected"));
+      if (outcome === "timeout-then-rejected") reject(new Error(notDelivered));
       if (outcome === "timeout-then-ACK") {
         resolve();
         await Promise.resolve();
@@ -11488,11 +11508,11 @@ describe("native session same-turn steering", () => {
         result.continuousReplies = { answer: { questionCommentIds: ["v2-follow-up"], commentId: "published-answer" } };
         await accountingEvents.committed!(final);
       }
-      if (outcome === "uncertain-transport") {
+      if (uncertain) {
         expect(await closeHeldNativeTurn(execution.binding.runId)).toBe(false);
         expect(interrupt).not.toHaveBeenCalled();
       } else await vi.waitFor(() => expect(interrupt).toHaveBeenCalledOnce());
-    } finally { resolve(); state.release?.(); await running; vi.restoreAllMocks(); }
+    } finally { vi.useRealTimers(); resolve(); state.release?.(); await running; vi.restoreAllMocks(); }
   });
 
   it("hold seam v2: an uncertain interrupt is sent only once per attachment", async () => {
@@ -11562,7 +11582,7 @@ describe("native session same-turn steering", () => {
     },
     {
       label: "provider rejection",
-      prepare: () => steer.mockRejectedValue(new Error("request rejected")),
+      prepare: () => steer.mockRejectedValue(new Error("a person's Stop is ending this turn")),
       code: "steering_rejected",
     },
   ])("keeps $label retryable with a stable code", async ({ prepare, code }) => {

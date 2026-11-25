@@ -9940,7 +9940,7 @@ export async function steerNativeSession(input: {
   const rejected = (error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
     return !/timeout|timed out|transport|disconnect|connection|already terminal/i.test(message)
-      && /reject|unsupported|unavailable|capability|named a stale turn|PRP command turn[.]steer failed/i.test(message);
+      && /stale or inactive turn|a person's Stop is ending this turn|raced the turn end; not delivered|unsupported|capability/i.test(message);
   };
   let delivery: Promise<{ turnId: string }>;
   try {
