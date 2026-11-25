@@ -619,6 +619,62 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     expect(created).toMatchObject({ kind: "ask_user_questions", status: "pending" });
   });
 
+  it.each([
+    ["acknowledged steering", true],
+    ["queued steering", false],
+    ["malformed steering receipt", false],
+    ["first-turn claim", true],
+    ["copied first-turn claim", false],
+    ["continued session input", true],
+    ["copied continued session input", false],
+    ["acknowledged steering with another queued comment", false],
+  ] as const)("checks source-run question delivery for %s", async (evidence, allowed) => {
+    const fixture = await seedSourceQuestionFixture({ paperclipWake: { comments: [] } });
+    const commentId = randomUUID();
+    const queuedCommentId = randomUUID();
+    const commentIds = evidence === "acknowledged steering with another queued comment"
+      ? [commentId, queuedCommentId] : [commentId];
+    await db.insert(issueComments).values(commentIds.map(id => ({
+      id, companyId: fixture.companyId, issueId: fixture.issueId,
+      authorType: "user" as const, authorUserId: "board-user", body: "Choose phase one.",
+      createdAt: new Date("2026-07-25T12:01:00.000Z"),
+      updatedAt: new Date("2026-07-25T12:01:00.000Z"),
+    })));
+    const copied = evidence.startsWith("copied");
+    const receiptRunId = copied ? randomUUID() : fixture.runId;
+    if (evidence.includes("first-turn claim")) {
+      await db.update(heartbeatRuns).set({ contextSnapshot: {
+        issueId: fixture.issueId, paperclipWake: { comments: [] },
+        firstTurnQueuedInput: { schema: "paperclip.first-turn-queued-input.v1", runId: receiptRunId,
+          commentIds: [commentId], wakeupRequestIds: [randomUUID()], claimedAt: "2026-07-25T12:01:01.000Z" },
+      } }).where(eq(heartbeatRuns.id, fixture.runId));
+    } else {
+      const resultJson = evidence.includes("continued session input")
+        ? { continuedSessionInput: { runId: receiptRunId, commentIds: [commentId] } }
+        : { queuedSteeringAcknowledgements: {
+          [commentId]: evidence === "malformed steering receipt" ? "acknowledged"
+            : { status: evidence === "queued steering" ? "queued" : "acknowledged" },
+          ...(commentIds.length > 1 ? { [queuedCommentId]: { status: "queued" } } : {}),
+        } };
+      await db.update(heartbeatRuns).set({ resultJson }).where(eq(heartbeatRuns.id, fixture.runId));
+    }
+    const create = interactionsSvc.create(
+      { id: fixture.issueId, companyId: fixture.companyId }, questionCreateInput(fixture.runId),
+      { agentId: fixture.agentId, runId: fixture.runId },
+    );
+    if (allowed) {
+      const created = await create;
+      expect(created).toMatchObject({ kind: "ask_user_questions", status: "pending" });
+      expect(await interactionsSvc.listForIssue(fixture.issueId)).toHaveLength(1);
+    } else {
+      await expect(create).rejects.toMatchObject({ status: 409, details: {
+        reason: "newer_comment_not_delivered",
+        commentIds: evidence === "acknowledged steering with another queued comment" ? [queuedCommentId] : [commentId],
+      } });
+      expect(await interactionsSvc.listForIssue(fixture.issueId)).toEqual([]);
+    }
+  });
+
   it("keeps legacy source snapshots compatible when delivered comments are unknown", async () => {
     const fixture = await seedSourceQuestionFixture({});
     await db.insert(issueComments).values({
