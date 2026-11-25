@@ -126,7 +126,12 @@ export async function publishContinuousNativeReply(input: {
     const comment = await issueService(input.db).addComment(issueId, resolved.text, { agentId, runId }, {
       authorizationReason, clientRequestId,
     }, tx);
-    await acknowledgeChatCompletionReply(tx, runId, comment.id);
+    // Only the first final owns this run's frozen completion input. Later
+    // steered completions require the final's explicit delivery-id attribution.
+    if (Object.keys(replies).length === 0 && Array.isArray(row.run.contextSnapshot?.chatCompletionDeliveryIds) && row.run.contextSnapshot.chatCompletionDeliveryIds.length)
+      await acknowledgeChatCompletionReply(tx, runId, comment.id);
+    if (explicitAnswers && answers.length)
+      await acknowledgeChatCompletionReply(tx, runId, comment.id, answers.filter((id): id is string => typeof id === "string"));
     await tx.update(heartbeatRuns).set({ resultJson: { ...result, continuousReplies: { ...replies,
       [input.event.itemId!]: { questionCommentIds, commentId: comment.id, sourceEventId: input.event.sourceEventId },
     } } }).where(eq(heartbeatRuns.id, runId));
