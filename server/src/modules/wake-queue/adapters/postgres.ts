@@ -593,6 +593,15 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       return isCompletedOnboardingHandoffWake(tx, input);
     },
 
+    async resumeConsumedInteractionIssue({ companyId, issueId, agentId }) {
+      const [issue] = await tx.select({ id: issues.id }).from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)));
+      if (!issue) return null;
+      // Match answer-continuation admission without reclaiming a terminal run.
+      const updated = await issuesSvc.checkout(issueId, agentId, ["in_review"], null);
+      return toIssueSnapshot(updated as unknown as IssueRow);
+    },
+
     async reopenIssue({ companyId, issueId, status = "todo" }) {
       const updated = await issuesSvc.updateForCompany(issueId, companyId, { status, executionState: null }, tx);
       return updated ? toIssueSnapshot(updated as unknown as IssueRow) : null;
