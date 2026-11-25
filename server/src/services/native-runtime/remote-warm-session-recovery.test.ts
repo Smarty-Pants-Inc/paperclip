@@ -1,3 +1,4 @@
+import { sandboxRestartMetadata } from "../sandbox-snapshot-restore.js";
 import { describe, expect, it, vi } from "vitest";
 import { inspectRemoteWarmSessionRecovery, describeFailedAttachment, describeOwnFailedAttachment, isSettledRemoteWarmControlState, summarizePostTerminalEvents } from "./remote-warm-session-recovery.js";
 
@@ -14,16 +15,28 @@ const lateNotice = { eventType: "provider.notice.recorded", envelope: { ...ident
 const state = (events: unknown[]) => ({ identity, commands: [{ status: "completed" }], committedEvents: events });
 
 describe("process loss skips live adoption without changing session identity", () => {
-  it.each(["restoredFromSnapshotAt", "rebootedAt", "healthy"] as const)("steps aside only for a process-loss signal: %s", async signal => {
+  it("never transfers another allocation's restart receipt or handled generation", () => {
+    const first = "2026-11-25T12:00:00.000Z";
+    const lease = { providerLeaseId: "box-a", metadata: { rebootedAt: first,
+      handledProcessRestartKey: JSON.stringify([null, first]) } };
+    expect(sandboxRestartMetadata(lease, { providerLeaseId: "box-b" })).toEqual({});
+    expect(sandboxRestartMetadata(lease, { providerLeaseId: "box-b", metadata: { rebootedAt: first } }))
+      .toEqual({ rebootedAt: first });
+  });
+  it.each(["restoredFromSnapshotAt", "rebootedAt", "healthy", "handled", "new-generation"] as const)("steps aside only for a process-loss signal: %s", async signal => {
     const select = vi.fn(() => { throw new Error("ordinary_live_adoption_probe"); });
     const input = {
       db: { select }, execution: { binding: { runId: "next-run" }, session: { normalizedSessionId: identity.normalizedSessionId } },
       target: { kind: "remote", transport: "sandbox", leaseId: "lease", environmentId: "environment", providerKey: "boat",
-        sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "same-box", ...(signal === "healthy" ? {} : { [signal]: "2026-11-25T12:00:00.000Z" }) } },
+        sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "same-box",
+          ...(signal === "healthy" ? {} : signal === "handled" || signal === "new-generation"
+            ? { rebootedAt: signal === "handled" ? "2026-11-25T12:00:00.000Z" : "2026-11-25T13:00:00.000Z",
+                handledProcessRestartKey: JSON.stringify([null, "2026-11-25T12:00:00.000Z"]) }
+            : { [signal]: "2026-11-25T12:00:00.000Z" }) } },
       identity, readControlState: vi.fn(), matchesExecution: vi.fn(), loadCheckpoint: vi.fn(), canReuseProcess: vi.fn(),
     };
     const inspect = () => inspectRemoteWarmSessionRecovery(input as unknown as Parameters<typeof inspectRemoteWarmSessionRecovery>[0]);
-    if (signal === "healthy") { await expect(inspect()).rejects.toThrow("ordinary_live_adoption_probe"); expect(select).toHaveBeenCalledOnce(); }
+    if (signal === "healthy" || signal === "handled") { await expect(inspect()).rejects.toThrow("ordinary_live_adoption_probe"); expect(select).toHaveBeenCalledOnce(); }
     else { expect(await inspect()).toBeNull(); expect(select).not.toHaveBeenCalled(); }
     expect(input.execution.session.normalizedSessionId).toBe("session");
     expect(input.loadCheckpoint).not.toHaveBeenCalled();
