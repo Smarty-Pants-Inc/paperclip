@@ -765,7 +765,7 @@ export async function storedSteeringAcknowledgement(
 ) {
   if (!context.messageId) return null;
   const [receipt] = await executor
-    .select({ payload: heartbeatRunEvents.payload })
+    .select({ payload: heartbeatRunEvents.payload, seq: heartbeatRunEvents.seq })
     .from(heartbeatRunEvents)
     .where(
       and(
@@ -779,5 +779,5 @@ export async function storedSteeringAcknowledgement(
     )
     .limit(1);
   const event = receipt?.payload?.prpEvent as { turnId?: string } | undefined;
-  return typeof event?.turnId === "string" ? { turnId: event.turnId } : null;
+  return typeof event?.turnId === "string" ? { turnId: event.turnId, afterEventSeq: receipt!.seq } : null;
 }
