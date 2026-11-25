@@ -687,15 +687,30 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     if (!issueId) return;
     const currentRun = run.runtimeMode === "native" ? await readNativeStopExecutionEvidence(db, run.companyId, run.id) : null;
     const [coordinator] = currentRun ? await db.select({ phase: nativeRunFinalizations.phase,
-      leaseOwner: nativeRunFinalizations.leaseOwner }).from(nativeRunFinalizations).where(and(
+      resultId: nativeRunFinalizations.resultId, leaseOwner: nativeRunFinalizations.leaseOwner }).from(nativeRunFinalizations).where(and(
       eq(nativeRunFinalizations.companyId, run.companyId), eq(nativeRunFinalizations.runId, run.id),
     )) : [];
-    // The ordinary path still enforces task holds, ownership, and native session
-    // cleanup before starting a provider.
+    // A Pi startup Stop can retain its idle session without terminating a
+    // process. Once its executor has unwound, the durable admission fence and
+    // absence of turn events prove that no input was dispatched. Re-enter
+    // ordinary admission for post-press input, not execution-recovery admission
+    // (which requires a terminated process and would strand that saved input).
+    const [startup] = currentRun ? await db.select({ beforeFirstTurn: sql<boolean>`
+      ${heartbeatRuns.status} = 'cancelled' and ${heartbeatRuns.finishedAt} is not null
+      and ${heartbeatRuns.resultJson}->'personStop' is not null
+      and ${heartbeatRuns.resultJson}#>>'{startupCancellation,requestedAt}' is not null
+      and ${heartbeatRuns.resultJson}->'firstTurnDispatchCommitted' is null
+      and ${heartbeatRuns.runnerProfileJson}#>>'{nativeExecutionInput,provider,kind}' = 'pi_rpc'
+      and not exists (select 1 from ${heartbeatRunEvents} where ${heartbeatRunEvents.companyId} = ${run.companyId}
+        and ${heartbeatRunEvents.runId} = ${run.id} and ${heartbeatRunEvents.eventType} like 'turn.%')` })
+      .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id))) : [];
+    const stoppedBeforeFirstTurn = startup?.beforeFirstTurn && !coordinator?.resultId;
+    // Ordinary admission still enforces task holds, ownership and session
+    // cleanup. Neither branch may promote while the old executor owns work.
     const stoppedNativeExecution = currentRun && isAcknowledgedNativeStop(currentRun) &&
       !activeRunExecutions.has(run.id) && !coordinator?.leaseOwner &&
       ["terminal_failure", "applied"].includes(coordinator?.phase ?? "") &&
-      await acknowledgedNativeStopExecutionHasStopped(db, currentRun);
+      (stoppedBeforeFirstTurn || await acknowledgedNativeStopExecutionHasStopped(db, currentRun));
     if (stoppedNativeExecution) await observeStoppedWorkspaceRecovery(db, { companyId: run.companyId, issueId, runId: run.id });
     const stoppedNativeContinuation = stoppedNativeExecution && !(await getExecutionBlocker(db, run.companyId, issueId));
     const legacyContinuation = run.runtimeMode === "legacy" &&
@@ -772,7 +787,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           sql`${issueComments.id}::text = ${commentId}`, eq(issueComments.authorType, "user"),
           eq(issueComments.authorUserId, requestedByActorId), isNull(issueComments.deletedAt),
           isNull(issueComments.createdByRunId),
-          gt(issueComments.createdAt, userStopBoundaryAt(run)!),
+          sql`${issueComments.createdAt} > coalesce(${typeof parseObject(run.resultJson?.personStop).requestedAt === "string"
+            ? parseObject(run.resultJson?.personStop).requestedAt : null}::timestamptz, ${userStopBoundaryAt(run)?.toISOString() ?? null}::timestamptz)`,
         ));
         if (!comment?.body.trim()) continue;
       } else {

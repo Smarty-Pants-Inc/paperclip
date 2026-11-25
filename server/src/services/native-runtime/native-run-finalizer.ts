@@ -1,4 +1,5 @@
 import { recoverContinuousNativeReplies } from "./native-continuous-reply.js";
+import { settleProviderReturnedStopInput } from "../person-stop-before-turn.js";
 import { notifyNativeEnvironmentSettlement } from "../native-environment-settlement-notifications.js";
 import { isContextCompactionRun } from "../context-compaction.js";
 import { REMOTE_WORKSPACE_SANDBOX_DISK_FULL_CODE } from "../remote-workspace-transport.js";
@@ -1874,13 +1875,16 @@ export async function finalizeNativeRun(input: {
     }
     // Seam 0237 (+0269): the comment ids our Pi driver handed back at a person's Stop arrive as the runner's provider notice
     // (category pi_stop_returned_input, details returnedCommentIds) and ride the run's personStop mark (the page restores them).
-    const [returned] = record(run.resultJson?.personStop).requestedAt === undefined ? [] : await input.db.select({ payload: heartbeatRunEvents.payload })
+    const returned = record(run.resultJson?.personStop).requestedAt === undefined ? [] : await input.db.select({ payload: heartbeatRunEvents.payload })
       .from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, run.id), eq(heartbeatRunEvents.eventType, "provider.notice.recorded"),
-        sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,category}' = 'pi_stop_returned_input'`)).limit(1);
-    const returnedDetails = record(record(record(returned?.payload).prpEvent).payload).details;
+        sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,category}' = 'pi_stop_returned_input'`));
+    const returnedDetails = returned.flatMap(event => {
+      const details = record(record(record(event.payload).prpEvent).payload).details;
+      return Array.isArray(details) ? details : [];
+    });
     const returnedIds = (Array.isArray(returnedDetails) ? returnedDetails : []).filter(detail => record(detail).name === "returnedCommentIds")
       .flatMap(detail => String(record(detail).value ?? "").split(",")).map(id => id.trim()).filter(id => id.length > 0);
-    if (returnedIds.length) await input.db.update(heartbeatRuns).set({ resultJson: sql`jsonb_set(coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb), '{personStop,returned}', coalesce(${heartbeatRuns.resultJson}->'personStop'->'returned', '[]'::jsonb) || ${JSON.stringify(returnedIds)}::jsonb)` }).where(eq(heartbeatRuns.id, run.id));
+    if (returnedIds.length) await settleProviderReturnedStopInput(input.db, run, returnedIds);
     // A person's Stop (seam 0236) never completes or closes the task: the turn ended, the task waits for the person.
     if (record(run.resultJson?.personStop).requestedAt !== undefined && authoritativeIssue.status === "in_progress"
       && ["done", "in_review"].includes(proposedDecision.statusAction))
