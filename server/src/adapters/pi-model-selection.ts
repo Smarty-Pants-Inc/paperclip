@@ -1,7 +1,26 @@
 import { unprocessable } from "../errors.js";
 import { parseObject } from "./utils.js";
+import { piRpcThinking, projectPaperclipRunnerTaskConfig } from "../services/native-runtime/provider-profile.js";
 
 export const PI_MODEL_PROVIDER_REQUIRED = "pi_model_provider_required";
+
+/** Validate the same effective reasoning selection that the Pi runtime consumes. */
+export function validatePiReasoningSelection(
+  agent: { adapterType: string; adapterConfig: unknown },
+  overrides?: unknown,
+): void {
+  const saved = parseObject(agent.adapterConfig);
+  if (agent.adapterType !== "paperclip_runner" || saved.provider !== "pi_rpc") return;
+  const config = overrides === undefined ? saved : projectPaperclipRunnerTaskConfig(
+    "pi_rpc", saved, parseObject(parseObject(overrides).adapterConfig),
+  );
+  const level = piRpcThinking(config);
+  if (typeof level !== "string" || !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(level)) {
+    throw unprocessable(
+      `Pi cannot use reasoning level ${JSON.stringify(level)}: choose off, minimal, low, medium, high, xhigh or max`,
+    );
+  }
+}
 
 /** Reject an unqualified Pi model before allocating a runtime. */
 export function validatePiRunSelection(
@@ -26,6 +45,7 @@ export function normalizePiIssueModelSelection<T>(
 ): T {
   const config = parseObject(agent.adapterConfig);
   if (agent.adapterType !== "paperclip_runner" || config.provider !== "pi_rpc") return overrides;
+  validatePiReasoningSelection(agent, overrides);
   const parsed = parseObject(overrides);
   const overrideConfig = parseObject(parsed.adapterConfig);
   if (!("model" in overrideConfig)) return overrides;
