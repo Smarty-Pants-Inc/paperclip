@@ -1641,6 +1641,27 @@ const recoveryFakeCodex = resolve(
 );
 
 describe("rebindNativeSessionCheckpoint", () => {
+  it.each(["instructions", "aggregateDigest"])("rebinds changed Pi runtime context (%s) only under continuous", key => {
+    const prior = execution(previousRunId), current = execution(currentRunId);
+    for (const sessionContinuity of [undefined, "continuous", "paperclip"] as const) {
+      for (const value of [prior, current]) {
+        value.provider = { kind: "pi_rpc", model: "provider/model", ...(sessionContinuity ? { sessionContinuity } : {}) };
+        value.session.driverKind = "pi_rpc";
+      }
+      const source = previousRun({ nativeExecutionInput: prior });
+      source.runnerProfileJson.sessionCheckpoint.driverKind = "pi_rpc";
+      if (key === "instructions") current.runtimeContext.instructions.bundle.digest = "b".repeat(64);
+      current.runtimeContext.aggregateDigest = key === "instructions"
+        ? canonicalNativeRuntimeContextDigest(current.runtimeContext) : "c".repeat(64);
+      const result = buildNativeExecutionWithCheckpoint({ previousRun: source, normalizedSessionId, buildExecution: () => current });
+      expect(result.normalizedSessionId === normalizedSessionId).toBe(sessionContinuity !== "paperclip");
+      expect(!!result.checkpoint).toBe(sessionContinuity !== "paperclip");
+      const wrongOwner = structuredClone(current);
+      wrongOwner.binding.agentId = randomUUID();
+      expect(rebindNativeSessionCheckpoint({ previousRun: source, currentExecution: wrongOwner })).toBeNull();
+    }
+  });
+
   it.each([
     { key: "model", continuous: true, conversation: true, retain: true },
     { key: "piRpcThinkingLevel", continuous: true, conversation: true, retain: true },
