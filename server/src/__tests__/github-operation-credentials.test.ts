@@ -160,7 +160,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
       const missing = await request(app).post("/runtime-tools/github/credentials").set("Authorization", `Bearer ${token}`).send({ repository: "other/missing" });
       expect(missing.body).toMatchObject({ status: "unavailable", env: {}, reason: expect.stringContaining("for repository other/missing") });
     });
-    it("routes real gh and git launchers through the native broker to each shared App", async () => {
+    it.each([false, true])("routes real gh and git launchers through the native broker to each shared App (sandbox bridge: %s)", async remote => {
       const input = await seed();
       const a = await sharedApp(input, "example-org/app");
       const b = await sharedApp(input, "second-org/app", new Date("2026-02-01"));
@@ -176,17 +176,27 @@ if (process.argv.includes('credential') || process.argv.includes('get-url')) {
 }
 process.stdout.write(process.env.GH_TOKEN || '');
 `, { mode: 0o700 });
+      const target = remote ? { kind: "remote" as const, transport: "sandbox" as const, providerKey: "test", remoteCwd: directory,
+        runner: { execute: async (command: { command: string; args?: string[]; cwd?: string; env?: Record<string, string>; stdin?: string }) => {
+          const startedAt = new Date().toISOString();
+          const child = promisify(execFile)(command.command, command.args ?? [], {
+            cwd: command.cwd ?? directory, env: { ...process.env, ...command.env }, timeout: 15_000, maxBuffer: 4 * 1024 * 1024,
+          });
+          child.child.stdin?.on("error", () => undefined);
+          child.child.stdin?.end(command.stdin ?? "");
+          return { ...await child, startedAt, exitCode: 0, signal: null, timedOut: false, pid: null };
+        } }, streamRunLogs: false } : null;
       const broker = await createNativeGitHubAccess({
-        scope: input, target: null, cwd: directory, env: { PATH: `${directory}:${process.env.PATH}` },
+        scope: input, target, cwd: directory, env: { PATH: `${directory}:${process.env.PATH}` },
         resolveCredentials: binding => resolveGitHubOperationCredentials(db, binding),
       });
       const release = broker.activate(input);
       try {
         for (const [program, args, selected] of [
-          ["gh", ["pr", "list", "-R", "Example-Org/App"], a],
+          ["gh", ["repo", "view", "second-org/x", "--json", "name"], b],
+          ["gh", ["pr", "list", "-R", "example-org/y"], a],
           ["gh", ["api", "repos/second-org/app/pulls"], b],
           ["gh", ["api", "repos/{owner}/{repo}/pulls"], b],
-          ["gh", ["repo", "view", "second-org/app"], b],
           ["gh", ["pr", "view", "https://github.com/second-org/app/pull/42"], b],
           ["gh", ["api", "https://api.github.com/repos/second-org/app/pulls"], b],
           ["gh", ["api", "https://api.github.com:443/repos/second-org/app"], b],
@@ -197,9 +207,15 @@ process.stdout.write(process.env.GH_TOKEN || '');
           ["git", ["clone", "git@github.com:second-org/app.git"], b],
           ["git", ["clone", "https://github.com:443/second-org/app.git"], b],
         ] as const) {
-          const { stdout } = await promisify(execFile)(program, [...args], { cwd: directory, env: { ...process.env, ...broker.env, GH_REPO: "second-org/app" } });
-          expect(stdout).toBe(`app-token-${selected.connectionId}`);
+          const { stdout } = await promisify(execFile)(program, [...args], { cwd: directory, env: { ...process.env, ...broker.env,
+            GH_REPO: args[0] === "repo" ? "example-org/app" : "second-org/app" } });
+          expect(stdout, `${program} ${args.join(" ")}`).toBe(`app-token-${selected.connectionId}`);
         }
+        const unmatched = await promisify(execFile)("gh", ["repo", "view", "unmatched-org/x", "--json", "name"], {
+          cwd: directory, env: { ...process.env, ...broker.env },
+        });
+        expect(unmatched.stdout).toBe("");
+        expect(unmatched.stderr).toContain("for repository unmatched-org/x");
         await expect(promisify(execFile)("gh", ["api", "https://api.github.com:443/graphql", "-f", 'query={repository(owner:"second-org",name:"app"){name}}'], {
           cwd: directory, env: { ...process.env, ...broker.env },
         })).rejects.toMatchObject({ code: 1, stdout: "", stderr: expect.stringContaining("repository_target_required") });
@@ -213,7 +229,7 @@ process.stdout.write(process.env.GH_TOKEN || '');
           expect(result.stdout).toContain(`password=app-token-${selected.connectionId}`);
         }
       } finally { release(); await broker.stop(); await rm(directory, { recursive: true, force: true }); }
-    });
+    }, 30_000);
     it("breaks equal App connection ages by connection id but retains duplicate-grant ambiguity", async () => {
       const input = await seed();
       const a = await sharedApp(input, "example-org/app");
