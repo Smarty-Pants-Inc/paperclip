@@ -14461,6 +14461,36 @@ describe("native warm session supervision", () => {
     expect(onGoalCheckpoint).toHaveBeenCalledOnce();
   });
 
+  it("visits most-recently-used owners first and stops a retirement sweep between owners after abort", async () => {
+    await closeIdleWarmNativeSessionsForRestart();
+    const abort = new AbortController();
+    const closes: ReturnType<typeof vi.fn>[] = [];
+    vi.useFakeTimers();
+    try {
+      for (let index = 0; index < 3; index++) {
+        vi.advanceTimersByTime(1);
+        const name = `restart-abort-${index}`;
+        const current = { ...execution, binding: { ...execution.binding, runId: name,
+          agentId: "restart-abort-agent", issueId: name, executionWorkspaceId: name },
+          session: { ...execution.session, normalizedSessionId: name,
+            lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } } } as NativeExecutionInputV1;
+        const close = vi.fn(async () => { abort.abort(); });
+        closes.push(close);
+        state.execute.mockReset().mockImplementationOnce(async options => {
+          await options.onSession?.({ close });
+          return { result: { summary: "Completed" }, terminal: { runTerminalState: "succeeded" },
+            turnId: name, normalizedSessionId: name, providerSessionId: name, driverKind: "test", driverVersion: "1",
+            nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+        });
+        await executePaperclipNativeSession({ db: leaseDb(current), execution: current, runnerInstanceId: name });
+      }
+      expect(await closeIdleWarmNativeSessionsForRestart({ abort: abort.signal })).toMatchObject({ closed: 1 });
+      expect(closes[2]).toHaveBeenCalledOnce();
+      expect(closes[1]).not.toHaveBeenCalled();
+      expect(closes[0]).not.toHaveBeenCalled();
+    } finally { await closeIdleWarmNativeSessionsForRestart(); vi.useRealTimers(); }
+  });
+
   it("closes idle warm sessions of different agents in parallel and one at a time within an agent", async () => {
     await closeIdleWarmNativeSessionsForRestart();
     const owners = [["agent-close-a", "first"], ["agent-close-a", "second"], ["agent-close-b", "only"]] as const;
