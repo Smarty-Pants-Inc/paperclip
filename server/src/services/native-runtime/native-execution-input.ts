@@ -2,7 +2,7 @@ import type { PaperclipTurnContext } from "@paperclipai/adapter-utils/server-uti
 import { resolvePaperclipRunnerCursorMode, resolvePaperclipRunnerPiThinkingLevel } from "@paperclipai/adapter-utils";
 import { createHash } from "node:crypto";
 import { buildNativeContinuationPrompt } from "./native-continuation.js";
-import { decideNativeContinuation } from "./continued-session.js";
+import { decideNativeContinuation, resolveSessionContinuity } from "./continued-session.js";
 import {
   caseExecutionMarkdown,
   caseProjectionBootstrapPrefix,
@@ -380,6 +380,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
         }
       : input.provider === "pi_rpc"
         ? { kind: "pi_rpc", model: input.model, ...(piConversation ? { conversationMode: true } : {}),
+            sessionContinuity: resolveSessionContinuity(input.provider, input.sessionContinuity),
             ...(input.piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel: input.piRpcThinkingLevel }) }
       : input.provider === "opencode"
         ? {

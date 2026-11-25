@@ -1612,6 +1612,36 @@ const recoveryFakeCodex = resolve(
 );
 
 describe("rebindNativeSessionCheckpoint", () => {
+  it.each([
+    { key: "model", continuous: true, conversation: true, retain: true },
+    { key: "piRpcThinkingLevel", continuous: true, conversation: true, retain: true },
+    { key: "model", continuous: true, conversation: false, retain: true },
+    { key: "piRpcThinkingLevel", continuous: true, conversation: false, retain: true },
+    { key: "model", continuous: false, conversation: false, retain: false },
+    { key: "piRpcThinkingLevel", continuous: false, conversation: false, retain: false },
+    { key: "model", continuous: false, conversation: true, retain: false },
+    { key: "piRpcThinkingLevel", continuous: false, conversation: true, retain: false },
+    { key: "kind", continuous: true, conversation: true, retain: false },
+    { key: "conversationMode", continuous: true, conversation: true, retain: false },
+    { key: "sessionContinuity", continuous: true, conversation: false, retain: false },
+  ])("rebinds changed $key with continuous Pi=$continuous (agent chat=$conversation): $retain", ({ key, continuous, conversation, retain }) => {
+    const priorExecution: NativeExecutionInput = execution(previousRunId);
+    priorExecution.provider = { kind: "pi_rpc", model: "fixture/model-a",
+      ...(conversation ? { conversationMode: true } : {}),
+      sessionContinuity: continuous ? "continuous" : "paperclip", piRpcThinkingLevel: "low" };
+    priorExecution.session.driverKind = "pi_rpc";
+    const currentExecution = { ...execution(currentRunId), session: { ...priorExecution.session },
+      provider: { ...priorExecution.provider,
+        [key]: key === "model" ? "fixture/model-b" : key === "kind" ? "codex" : key === "conversationMode" ? undefined : key === "sessionContinuity" ? "paperclip" : "high",
+      },
+    } as NativeExecutionInput;
+    const source = previousRun({ nativeExecutionInput: priorExecution });
+    source.runnerProfileJson.sessionCheckpoint.driverKind = "pi_rpc";
+    const rebound = rebindNativeSessionCheckpoint({ previousRun: source, currentExecution });
+    if (retain) expect(rebound).toMatchObject({ sessionId: "provider-thread-123", identity: { sessionId: normalizedSessionId } });
+    else expect(rebound).toBeNull();
+  });
+
   it("rotates a carried session id when no checkpoint source exists", () => {
     const calls: boolean[] = [];
     const result = buildNativeExecutionWithCheckpoint({

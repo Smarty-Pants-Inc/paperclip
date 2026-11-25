@@ -6,7 +6,7 @@ import { nativeCompletionSource, buildNativeCompletionContract } from "./complet
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
-import { buildNativeModelEnvelope, canonicalNativeRuntimeContextDigest } from "../../vendor/paperclip-runner/index.js";
+import { buildNativeModelEnvelope, canonicalNativeRuntimeContextDigest, parseNativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
 
 describe("LCA-05 explicit native work mode", () => {
   it.each(["standard", "planning", "ask", "skill_test"])("title and description cannot override %s mode", (workMode) => {
@@ -678,6 +678,22 @@ describe("Pi thinking native execution projection", () => {
     expect(result.provider).toMatchObject({ kind: "acpx", agent: "pi", piThinkingLevel: mode ?? "low", permissionMode: "deny-all" });
     expect(result.executionMode).toBe("default");
     expect(result.task.workMode).toBe("standard");
+  });
+  it.each([undefined, "continuous", "paperclip"] as const)("persists Pi RPC continuity %s independently of Agent Chat", sessionContinuity => {
+    for (const conversationMode of [false, true]) {
+      const f = fixture();
+      const result = buildNativeExecutionInput({ ...f, provider: "pi_rpc", acpxAgent: undefined,
+        piThinkingLevel: undefined, piRpcThinkingLevel: "low", sessionContinuity, conversationMode,
+        issue: { ...f.issue, conversationAgentId: conversationMode ? f.agentId : null } });
+      expect(parseNativeExecutionInput(result).provider).toMatchObject({ kind: "pi_rpc",
+        sessionContinuity: sessionContinuity ?? "continuous", piRpcThinkingLevel: "low" });
+      if (conversationMode) expect(result.provider).toHaveProperty("conversationMode", true);
+      else expect(result.provider).not.toHaveProperty("conversationMode");
+      const legacy = { ...result, provider: { ...result.provider, sessionContinuity: undefined } };
+      expect(parseNativeExecutionInput(legacy).provider).not.toHaveProperty("sessionContinuity");
+      expect(() => parseNativeExecutionInput({ ...result, provider: { ...result.provider, sessionContinuity: "invalid" } }))
+        .toThrow("input.provider.sessionContinuity must be continuous or paperclip");
+    }
   });
   it("rejects a Pi thinking level attached to another harness", () => {
     expect(() => buildNativeExecutionInput({ ...fixture("low"), acpxAgent: "copilot" })).toThrow("only for Pi");
