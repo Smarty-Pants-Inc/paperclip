@@ -6,6 +6,7 @@ import { createSteerQueuedComment } from "../../modules/wake-queue/application/q
 import { createQueuedCommentSteeringAdapter, readBoardQueuedComments } from "../../modules/wake-queue/adapters/queued-comment-board-postgres.js";
 import { logActivity } from "../activity-log.js";
 import { resolveSessionContinuity } from "./continued-session.js";
+import { reconcileContinuousSessionInput } from "./continuous-session-input.js";
 import { isAutomaticSteeringComment, isAutomaticSteeringWake } from "../../modules/wake-queue/domain/policy.js";
 
 // Final publication can be replayed or observed concurrently. The queue mutation
@@ -28,6 +29,7 @@ export async function drainContinuousPersonMessages(db: Db, scope: { companyId: 
 
 async function drain(db: Db, scope: { companyId: string; issueId: string; runId: string; agentId: string },
   options: { beforeFirstReply?: boolean }) {
+  await reconcileContinuousSessionInput(db, scope);
   const steer = createSteerQueuedComment(createQueuedCommentSteeringAdapter(db, { requireQueueHead: true }));
   const actor = { actorType: "agent" as const, actorId: scope.agentId, agentId: scope.agentId,
     runId: scope.runId, agentApiKeyId: null };
