@@ -11205,8 +11205,10 @@ describe("native session same-turn steering", () => {
     return { running };
   }
 
-  it.each(["task", "chat", "conversation"].flatMap(mode => ["before", "capabilities", "snapshot", "reattached", "unclaimed"].map(when => ({ mode, when }))))("task claim fences new steering ($mode, $when)", async ({ mode, when }) => {
-    const pi = { ...execution, provider: { kind: "pi_rpc", model: "openai/gpt-5", conversationMode: mode === "chat" } } as NativeExecutionInputV1;
+  it.each(["pi_rpc", "codex", "opencode"].flatMap(provider => ["task", "chat", "conversation"].flatMap(mode =>
+    ["before", "capabilities", "snapshot", "accepted", "rejected", "reattached", "reattached-rejected", "reattached-corrected", "unclaimed"]
+      .map(when => ({ provider, mode, when })))))("task claim fences new steering ($provider, $mode, $when)", async ({ provider, mode, when }) => {
+    const pi = { ...execution, provider: { kind: provider, model: "openai/gpt-5", conversationMode: mode === "chat" } } as NativeExecutionInputV1;
     const claim: PrpEvent = { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "runner", sourceSeq: 1,
       priority: 0, emittedAt: new Date().toISOString(), sourceInstanceId: "runner", normalizedSessionId: "session-native-cancel",
       eventType: "run.result.proposed", runId: execution.binding.runId, sourceEventId: "claim", payload: {} };
@@ -11219,16 +11221,30 @@ describe("native session same-turn steering", () => {
       if (key === "queued-after-claim" && value && typeof value === "object" && "preparing" in value) reservations = this;
       return set.call(this, key, value);
     });
-    const { running } = await startActiveSession(pi, leaseDb(pi, {}, result, updates, {}, "running", when === "reattached" ? [claim] : []), mode === "conversation");
+    const rejected: PrpEvent = { ...claim, eventType: "run.result.rejected", sourceEventId: "rejected", sourceSeq: 2 };
+    const accepted: PrpEvent = { ...claim, eventType: "run.result.accepted", sourceEventId: "accepted", sourceSeq: 2 };
+    const corrected: PrpEvent = { ...claim, sourceEventId: "corrected", sourceSeq: 3 };
+    const prior = when === "reattached" ? [claim] : when === "reattached-rejected" ? [claim, rejected]
+      : when === "reattached-corrected" ? [claim, rejected, corrected] : [];
+    const db = leaseDb(pi, {}, result, updates, {}, "running", prior);
+    const select = db.select.bind(db);
+    // Preserve the database's latest-first ordering for the claim projection.
+    db.select = ((fields?: Record<string, unknown>) => fields?.eventType === heartbeatRunEvents.eventType
+      ? { from: () => ({ where: () => ({ orderBy: () => ({ limit: async () => [...prior].reverse() }), limit: async () => prior }) }) }
+      : select(fields as never)) as Db["select"];
+    const { running } = await startActiveSession(pi, db, mode === "conversation");
     try {
-      if (when === "before") await accountingEvents.committed!(claim);
+      if (["before", "accepted", "rejected"].includes(when)) await accountingEvents.committed!(claim);
+      if (when === "accepted") await accountingEvents.committed!(accepted);
+      if (when === "rejected") await accountingEvents.committed!(rejected);
       if (when === "capabilities") capabilities.mockImplementationOnce(async () => { await accountingEvents.committed!(claim); return { steering: true }; });
       if (when === "snapshot") snapshot.mockImplementationOnce(async () => { await accountingEvents.committed!(claim); return { activeTurnId: "provider-turn-1" }; });
       const acknowledged = vi.fn();
       const pending = steerNativeSession({ runId: execution.binding.runId, message: "Still queued", correlationId: "queued-after-claim", onAcknowledged: acknowledged });
-      const refused = mode === "task" && when !== "unclaimed";
+      const refused = provider === "pi_rpc" && mode === "task" && !["unclaimed", "rejected", "reattached-rejected"].includes(when);
       if (refused) {
-        await expect(pending).rejects.toMatchObject({ code: "steering_stale_turn" });
+        await expect(pending).rejects.toMatchObject({ code: "steering_stale_turn",
+          message: "This task run has finished its work; your message will start the next run." });
         expect(steer).not.toHaveBeenCalled();
         expect(acknowledged).not.toHaveBeenCalled();
         if (when === "capabilities" || when === "snapshot") expect(reservations).toBeDefined();
