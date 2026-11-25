@@ -119,6 +119,7 @@ function createFakeTransaction(overrides: Partial<WakeQueueTransaction> = {}): W
     hasConsumedInteractionResponse: vi.fn(async () => false),
     owedInteractionAnswer: vi.fn(async (): Promise<"deliver" | "blocked" | null> => null),
     isCompletedDelegationMention: vi.fn(async () => false),
+    resumeConsumedInteractionIssue: vi.fn(async () => null),
     reopenIssue: vi.fn(async () => null),
     claimDeferredWakeForPromotion: vi.fn(async () => true),
     finalizePromotedWake: vi.fn(async (input) => runSummary(input.wakeId)),
