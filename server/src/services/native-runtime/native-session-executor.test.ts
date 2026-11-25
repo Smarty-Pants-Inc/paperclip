@@ -11,7 +11,7 @@ vi.mock("../chat-completion-delivery.js", async importOriginal => ({
   offerHeldChatCompletions: heldCompletionOffers.invoke,
 }));
 import * as resetWakeQueue from "../../modules/wake-queue/index.js";
-import { closeHeldNativeTurn, forgetDestroyedWarmNativeSessions } from "./native-session-executor.js";
+import { closeHeldNativeTurn, forgetDestroyedWarmNativeSessions, restoreRemoteSuspendedRunnerCheckpoint } from "./native-session-executor.js";
 import { currentControllerProcess } from "../controller-process-identity.js";
 import { activeNativeExecutionRunIds } from "./native-active-runs.js";
 import { onRetainedNativeSessionCleanupRelease } from "../retained-native-session-cleanup-notifications.js";
@@ -19085,8 +19085,14 @@ describe("runnerd provider runtime wiring", () => {
     } finally { restore.mockRestore(); header.mockRestore(); verify.mockRestore(); await controller.stop(); }
   });
 
-  it.each(["suspended", "ready", "identity-mismatch", "pending-outbox", "pending-terminal"] as const)(
-    "cold-restores only a settled suspended warm box after live admission: %s", async mode => {
+  it.each(["suspended", "ready", "identity-mismatch", "pending-outbox", "pending-terminal",
+    "recoverable_failure", "recoverable_failure-identity-mismatch", "recoverable_failure-pending-outbox",
+    "recoverable_failure-pending-terminal", "recoverable_failure-pending-cleanup", "recoverable_failure-pid-alive",
+    "recoverable_failure-warm-transition", "recoverable_failure-empty-reason", "recoverable_failure-changed-receipt",
+    "recoverable_failure-changed-identity"] as const)(
+    "cold-restores only a settled inert warm box after live admission: %s", async mode => {
+      const coldRestore = mode === "suspended" || mode === "recoverable_failure";
+      const lifecycle = mode.startsWith("recoverable_failure") ? "recoverable_failure" : "suspended";
       const first = scopedNativeExecution(`suspended-live-adoption-${mode}`);
       first.session.lifecyclePolicy = { mode: "warm", idleTimeoutMs: 60_000 };
       const next = { ...first, binding: { ...first.binding, runId: `${first.binding.runId}-next` } };
@@ -19108,7 +19114,7 @@ describe("runnerd provider runtime wiring", () => {
         return result;
       }).mockImplementationOnce(async options => {
         expect(options.existingSession).toBe(mode === "ready" ? adoptedSession : undefined);
-        if (mode === "suspended") expect(options.persistedSession).toMatchObject({
+        if (coldRestore) expect(options.persistedSession).toMatchObject({
           identity: { sessionId: identity.normalizedSessionId }, providerSessionId: snapshot.providerSessionId });
         return result;
       });
@@ -19139,13 +19145,20 @@ describe("runnerd provider runtime wiring", () => {
           if (script.includes("base64")) {
             const late = ++reads > 2;
             return { exitCode: 0, timedOut: false, stderr: "", stdout: Buffer.from(JSON.stringify({
-              ...durableRunnerState(identity, late && mode !== "ready" ? "suspended" : "ready"),
-              outbox: late && mode === "pending-outbox" ? [{ sourceSeq: 1 }] : [],
-              pendingTerminalDelivery: late && mode === "pending-terminal" ? { commandId: "pending" } : null,
-              ...(late && mode === "identity-mismatch" ? { runnerInstanceId: "foreign-runner" } : {}),
+              ...durableRunnerState(identity, late && mode !== "ready" ? lifecycle : "ready"),
+              ...(lifecycle === "recoverable_failure" ? { recoverableFailure: mode.endsWith("empty-reason") ? ""
+                : reads > 3 && mode.endsWith("changed-receipt") ? "changed_after_process_probe" : "transport_reconnect_grace_exceeded" } : {}),
+              warmTransition: late && mode.endsWith("warm-transition") ? { transitionId: "pending" } : null,
+              pendingProviderCleanup: late && mode.endsWith("pending-cleanup") ? { commandId: "pending" } : null,
+              outbox: late && mode.endsWith("pending-outbox") ? [{ sourceSeq: 1 }] : [],
+              pendingTerminalDelivery: late && mode.endsWith("pending-terminal") ? { commandId: "pending" } : null,
+              ...(late && mode.endsWith("identity-mismatch") || reads > 3 && mode.endsWith("changed-identity")
+                ? { runnerInstanceId: "foreign-runner" } : {}),
             })).toString("base64") };
           }
-          return { exitCode: 0, timedOut: false, stderr: "", stdout: script.includes("cat --")
+          return { exitCode: lifecycle === "recoverable_failure" && mode !== "recoverable_failure-pid-alive"
+            && !script.includes("cat --") ? 45 : 0,
+            timedOut: false, stderr: "", stdout: script.includes("cat --")
             ? "nonce\n123\n2026-09-19T10:00:00.000Z\nretained-runner\nlinux:abcd-1234:100\n" : "" };
         });
         const db = leaseDb(next), select = db.select.bind(db);
@@ -19154,20 +19167,30 @@ describe("runnerd provider runtime wiring", () => {
           ? priorNativeRunDb(first).select(fields as never) : select(fields as never)) as Db["select"];
         const recoverSession = vi.fn(async () => ({ recovered: true, session: adoptedSession }));
         state.createBackend.mockReturnValueOnce({ kind: "test", recoverSession } as never);
+        const followingTarget = { ...target, providerKey: "daytona", leaseId: "next-lease",
+          sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "retained-sandbox" } };
+        if (mode === "recoverable_failure") {
+          // The identical inert box read alone is NOT authority: the ordinary
+          // restore caller has no typed dead-process step-aside receipt.
+          reads = 2;
+          await restoreRemoteSuspendedRunnerCheckpoint({ db, execution: next, runnerExecutionTarget: followingTarget as never }, root);
+          expect(existsSync(join(root, "plugin-runner-state.json"))).toBe(false);
+          reads = 0;
+        }
         const following = executePaperclipNativeSession({ db, execution: next, runnerInstanceId: identity.runnerInstanceId,
-          useRunnerd: true, runnerExecutionTarget: { ...target, providerKey: "daytona", leaseId: "next-lease",
-            sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "retained-sandbox" } } as never });
-        if (mode === "ready" || mode === "suspended") {
+          useRunnerd: true, runnerExecutionTarget: followingTarget as never });
+        if (mode === "ready" || coldRestore) {
           await expect(following).resolves.toMatchObject({ exitCode: 0, sessionId: identity.normalizedSessionId });
           expect(state.execute).toHaveBeenCalledTimes(2);
           expect(recoverSession).toHaveBeenCalledTimes(mode === "ready" ? 1 : 0);
-          if (mode === "suspended") {
+          if (coldRestore) {
             expect(JSON.parse(await readFile(join(root, "plugin-runner-state.json"), "utf8")))
-              .toMatchObject({ ...identity, lifecycle: "suspended" });
+              .toMatchObject({ ...identity, lifecycle });
             expect(revalidate.mock.calls.length).toBeGreaterThanOrEqual(2);
           }
         } else {
-          await expect(following).rejects.toThrow("remote_warm_session_not_idle");
+          await expect(following).rejects.toThrow(mode.endsWith("changed-receipt") || mode.endsWith("changed-identity")
+            ? "native_controller_recovery_missing_evidence:runner_not_settled" : "remote_warm_session_not_idle");
           expect(state.execute).toHaveBeenCalledOnce();
           expect(recoverSession).not.toHaveBeenCalled();
           expect(existsSync(join(root, "plugin-runner-state.json"))).toBe(false);

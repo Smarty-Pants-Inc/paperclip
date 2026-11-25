@@ -2981,25 +2981,40 @@ function readPluginRunnerReceiptRunId(root: string): unknown {
   } catch { return null; }
 }
 
+type VerifiedRemoteRecoverableFailureReceipt = Readonly<{ stateJson: string }>;
+
+function matchesVerifiedRecoverableFailureReceipt(
+  state: Record<string, unknown>,
+  receipt: VerifiedRemoteRecoverableFailureReceipt | undefined,
+): boolean {
+  if (!receipt || state.lifecycle !== "recoverable_failure") return false;
+  const verified = record(JSON.parse(receipt.stateJson));
+  return verified.lifecycle === "recoverable_failure" && state.schema === verified.schema
+    && REMOTE_RUNNER_IDENTITY_FIELDS.every(field => state[field] === verified[field]);
+}
+
 function pluginRunnerdAuthorityLifecycle(
   root: string,
   identity: RunnerdDurableIdentity,
+  verifiedRecoverableFailureReceipt?: VerifiedRemoteRecoverableFailureReceipt,
 ): "absent" | "suspended" | "not_suspended" | "indeterminate" {
   try {
     const state = record(JSON.parse(readBoundedNativeFile(resolve(root, "plugin-runner-state.json"),
       NATIVE_RUNNER_STATE_MAX_BYTES, "runner_state_too_large").toString("utf8")));
     if (state.schema !== RUNNERD_STATE_SCHEMA || !RUNNERD_STATE_LIFECYCLES.has(String(state.lifecycle))
       || !Object.entries(identity).every(([key, value]) => state[key] === value)) return "indeterminate";
-    return state.lifecycle === "suspended" ? "suspended" : "not_suspended";
+    return state.lifecycle === "suspended" || matchesVerifiedRecoverableFailureReceipt(state, verifiedRecoverableFailureReceipt)
+      ? "suspended" : "not_suspended";
   } catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "indeterminate"; }
 }
 
 function runnerdAuthorityLifecycle(
   root: string,
   identity: RunnerdDurableIdentity,
+  verifiedRecoverableFailureReceipt?: VerifiedRemoteRecoverableFailureReceipt,
 ): "absent" | "suspended" | "not_suspended" | "indeterminate" {
   const runnerRoot = resolve(root, "runner");
-  if (!existsSync(runnerRoot)) return pluginRunnerdAuthorityLifecycle(root, identity);
+  if (!existsSync(runnerRoot)) return pluginRunnerdAuthorityLifecycle(root, identity, verifiedRecoverableFailureReceipt);
   if (!isSafeNativeStateDirectory(runnerRoot)) return "indeterminate";
   const statePath = resolve(runnerRoot, "runner-state.json");
   if (!existsSync(statePath)) {
@@ -3008,7 +3023,8 @@ function runnerdAuthorityLifecycle(
       // though runner state was owned by the sandbox. It carries no authority,
       // so a verified plugin receipt or failover backup may be consulted. Any non-empty direct
       // directory remains indeterminate and therefore blocks fallback.
-      return readdirSync(runnerRoot).length === 0 ? pluginRunnerdAuthorityLifecycle(root, identity) : "indeterminate";
+      return readdirSync(runnerRoot).length === 0
+        ? pluginRunnerdAuthorityLifecycle(root, identity, verifiedRecoverableFailureReceipt) : "indeterminate";
     } catch {
       return "indeterminate";
     }
@@ -3050,8 +3066,9 @@ function runnerdAuthorityLifecycleWithVerifiedBackup(input: {
   identity: RunnerdDurableIdentity;
   execution: NativeExecutionInput;
   allowVerifiedBackup: boolean;
+  verifiedRecoverableFailureReceipt?: VerifiedRemoteRecoverableFailureReceipt;
 }): "suspended" | "not_suspended" | "indeterminate" {
-  const direct = runnerdAuthorityLifecycle(input.root, input.identity);
+  const direct = runnerdAuthorityLifecycle(input.root, input.identity, input.verifiedRecoverableFailureReceipt);
   if (direct !== "absent") return direct;
   if (!input.allowVerifiedBackup) return "indeterminate";
   const backup = verifyNativeHarnessBackup({
@@ -5589,6 +5606,7 @@ async function verifyPriorRunnerdStateForSessionScope(input: {
   allowVerifiedBackup: boolean;
   admittedPreviousExecution?: NativeExecutionInput;
   retainedWarmOwnerRunId?: string;
+  verifiedRecoverableFailureReceipt?: VerifiedRemoteRecoverableFailureReceipt;
 }): Promise<PriorRunnerdStateVerification> {
   let priorRun: {
     status: string;
@@ -6602,6 +6620,7 @@ async function migrateRunnerdStateRootForExecution(input: {
   runnerExecutionTarget?: AdapterExecutionTarget | null;
   bootstrapRetryLeaseOwner?: string;
   admittedPreviousExecution?: NativeExecutionInput;
+  verifiedRecoverableFailureReceipt?: VerifiedRemoteRecoverableFailureReceipt;
 }): Promise<VerifiedWarmTransitionBinding | undefined> {
   const scoped = scopedRunnerdStateRoot(input.execution);
   const previousRoot = input.admittedPreviousExecution ? scopedRunnerdStateRoot(input.admittedPreviousExecution) : undefined;
@@ -6789,6 +6808,7 @@ async function migrateRunnerdStateRootForExecution(input: {
         identity,
         execution: input.execution,
         admittedPreviousExecution: input.admittedPreviousExecution,
+        verifiedRecoverableFailureReceipt: input.verifiedRecoverableFailureReceipt,
         allowVerifiedBackup: input.allowVerifiedBackup,
         retainedWarmOwnerRunId: input.retainedWarmOwnerRunId,
       });
@@ -7884,6 +7904,7 @@ async function refreshFinishedPerTurnRunnerdProjection(
 export async function restoreRemoteSuspendedRunnerCheckpoint(input: {
   db: Db; execution: NativeExecutionInput;
   runnerExecutionTarget?: AdapterExecutionTarget | null;
+  verifiedRecoverableFailureReceipt?: VerifiedRemoteRecoverableFailureReceipt;
 }, root: string): Promise<void> {
   const target = input.runnerExecutionTarget;
   const prior = readRunnerdDurableIdentity(root);
@@ -7913,10 +7934,16 @@ export async function restoreRemoteSuspendedRunnerCheckpoint(input: {
       stateDirectory: remoteRunnerStateDirectory(retained.remoteCwd, nativeSessionKey(input.execution)) });
   }
   await reconcileControllerJournalWithRunner({ ...controllerProjectionInput(input, { runId: prior.runId, issueId: input.execution.binding.issueId }), runnerState: state });
-  // A running warm source keeps the existing live-adoption identity, idle,
-  // controller-fencing and physical-process checks. Only suspension is cached.
-  if (!movedAllocation && input.execution.session.lifecyclePolicy.mode === "warm" && state.lifecycle !== "suspended") return;
-  if (state.lifecycle !== "suspended" || !Array.isArray(state.outbox) || state.outbox.length !== 0
+  // Only the typed step-aside can authorize this additional inert lifecycle.
+  // Bind the fresh box read to the exact receipt whose identity and dead pid
+  // were verified; ordinary callers still cache suspension only.
+  const verifiedFailure = matchesVerifiedRecoverableFailureReceipt(state, input.verifiedRecoverableFailureReceipt)
+    && canonicalJson(state) === input.verifiedRecoverableFailureReceipt!.stateJson;
+  if (input.verifiedRecoverableFailureReceipt && !verifiedFailure) {
+    throw new Error("native_controller_recovery_missing_evidence:runner_not_settled");
+  }
+  if (!movedAllocation && input.execution.session.lifecyclePolicy.mode === "warm" && state.lifecycle !== "suspended" && !verifiedFailure) return;
+  if ((state.lifecycle !== "suspended" && !verifiedFailure) || !Array.isArray(state.outbox) || state.outbox.length !== 0
     || (state.pendingTerminalDelivery != null && !isUndeliveredSuspendReceipt(state, root))
     || state.pendingProviderCleanup != null || state.warmTransition != null) {
     throw new Error("native_controller_recovery_missing_evidence:runner_not_settled");
@@ -7970,6 +7997,7 @@ async function restoreWarmRunnerdController(input: {
   db: Db; execution: NativeExecutionInput;
   runnerExecutionTarget?: AdapterExecutionTarget | null;
   restartRecovery?: NativeRestartRecoveryClaim;
+  verifiedRecoverableFailureReceipt?: VerifiedRemoteRecoverableFailureReceipt;
 }): Promise<void> {
   if (input.restartRecovery || input.runnerExecutionTarget?.kind !== "remote" ||
       input.execution.session.lifecyclePolicy.mode !== "warm") return;
@@ -12967,7 +12995,8 @@ async function executePaperclipNativeSessionAttempt(
         remoteWarmRecoveryPending = false;
         if (executionContext) await finishStartupContextForFallback();
         await migrateRunnerdStateRootForExecution({ ...input, allowVerifiedBackup: true,
-          allowLocalRecovery: false, bootstrapRetryLeaseOwner: leaseOwner });
+          allowLocalRecovery: false, bootstrapRetryLeaseOwner: leaseOwner,
+          verifiedRecoverableFailureReceipt: error.verifiedRecoverableFailureReceipt });
         persistedWarmSession = loadWarmNativeCheckpoint(input.execution, previousConfigDigest, "remote");
         if (!persistedWarmSession) throw new Error("native_runner_checkpoint_missing_after_suspension");
         runnerdBackend = await createExecutionBackend();
@@ -16192,9 +16221,9 @@ function remoteRunnerStateDirectory(remoteCwd: string, normalizedSessionId: stri
     createHash("sha256").update(normalizedSessionId).digest("hex"), "runner");
 }
 
-/** A settled box may have suspended after the server saved its warm checkpoint. */
+/** A settled box may have become inert after the server saved its warm checkpoint. */
 class RemoteWarmRunnerSuspendedError extends Error {
-  constructor() {
+  constructor(readonly verifiedRecoverableFailureReceipt?: VerifiedRemoteRecoverableFailureReceipt) {
     super("runner_state_identity_mismatch: remote_warm_session_not_idle");
     this.name = "RemoteWarmRunnerSuspendedError";
   }
@@ -16232,14 +16261,20 @@ export async function verifyRemoteRunnerReattachment(input: {
   const stall = input.stall ?? remoteRunnerPluginStall(input.recoveryDeadline);
   const stateDirectory = remoteRunnerStateDirectory(target.remoteCwd, input.normalizedSessionId);
   const runnerState = await readRemoteRunnerState({ runner, stateDirectory, recoveryDeadline: probeDeadline, stall });
+  let recoverableWarmRunner = false;
   if (input.requireIdle && (runnerState.lifecycle !== "ready" ||
       !Array.isArray(runnerState.outbox) || runnerState.outbox.length !== 0 || runnerState.pendingTerminalDelivery !== null)) {
-    if (runnerState.lifecycle === "suspended" && Array.isArray(runnerState.outbox) && runnerState.outbox.length === 0
+    if ((runnerState.lifecycle === "suspended" || (runnerState.lifecycle === "recoverable_failure"
+      && typeof runnerState.recoverableFailure === "string" && !!runnerState.recoverableFailure
+      && runnerState.pendingProviderCleanup == null && runnerState.warmTransition == null))
+      && Array.isArray(runnerState.outbox) && runnerState.outbox.length === 0
       && runnerState.pendingTerminalDelivery === null && REMOTE_RUNNER_IDENTITY_FIELDS.every(field =>
         typeof identity[field] === "string" && !!identity[field] && runnerState[field] === identity[field])) {
-      throw new RemoteWarmRunnerSuspendedError();
+      if (runnerState.lifecycle === "suspended") throw new RemoteWarmRunnerSuspendedError();
+      recoverableWarmRunner = true;
+    } else {
+      throw new Error("runner_state_identity_mismatch: remote_warm_session_not_idle");
     }
-    throw new Error("runner_state_identity_mismatch: remote_warm_session_not_idle");
   }
   for (const field of REMOTE_RUNNER_IDENTITY_FIELDS) {
     if (
@@ -16309,6 +16344,10 @@ export async function verifyRemoteRunnerReattachment(input: {
     return { alive, reason };
   };
   const verified = await check(undefined, probeDeadline, stall);
+  if (recoverableWarmRunner) {
+    if (!verified.alive) throw new RemoteWarmRunnerSuspendedError(Object.freeze({ stateJson: canonicalJson(runnerState) }));
+    throw new Error("runner_state_identity_mismatch: remote_warm_session_not_idle");
+  }
   if (!verified.alive) {
     throw new RemoteRunnerRecoveryError({ stage: "process_verification", reason: verified.reason,
       ...(verified.reason === "process_not_running" ? {
