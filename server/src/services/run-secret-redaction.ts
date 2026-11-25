@@ -25,6 +25,10 @@ const REGISTRY_KEY = "paperclipSecretRedactions";
 const OUTPUT_SECRET_KEY = "paperclipOutputSecretRedactions";
 // Project only the registry: run contexts can contain megabytes of prompt data.
 const registrySnapshot = sql`jsonb_build_object('paperclipSecretRedactions', ${heartbeatRuns.contextSnapshot} -> 'paperclipSecretRedactions')`;
+// Only runs with registered values belong to issue redaction history. Ordinary
+// chat turns must not consume the bounded notification lookup's run budget.
+const hasRegisteredSecrets = sql`jsonb_typeof(${heartbeatRuns.contextSnapshot} -> 'paperclipSecretRedactions') = 'array'
+  and ${heartbeatRuns.contextSnapshot} -> 'paperclipSecretRedactions' <> '[]'::jsonb`;
 
 export function runSecretRedactionVersionSql() {
   return sql<string>`md5(coalesce((${heartbeatRuns.contextSnapshot}->${REGISTRY_KEY})::text, ''))`;
@@ -159,6 +163,7 @@ export function createRunSecretRedactionRegistry(db: Db) {
       .from(heartbeatRuns)
       .where(and(
         eq(heartbeatRuns.companyId, companyId),
+        hasRegisteredSecrets,
         or(
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
           sql`${heartbeatRuns.contextSnapshot} -> 'paperclipIssue' ->> 'id' = ${issueId}`,
@@ -179,7 +184,7 @@ export function createRunSecretRedactionRegistry(db: Db) {
       [sql`${heartbeatRuns.contextSnapshot}->'paperclipIssue'->>'id' = ${issueId}`, sql`${heartbeatRuns.createdAt} desc nulls last`],
     ]) {
       const rows = await db.select({ id: heartbeatRuns.id, contextSnapshot: boundedSnapshot }).from(heartbeatRuns)
-        .where(and(eq(heartbeatRuns.companyId, companyId), binding))
+        .where(and(eq(heartbeatRuns.companyId, companyId), binding, hasRegisteredSecrets))
         .orderBy(order).limit(maxRuns + 1);
       if (rows.length > maxRuns || rows.some(row => row.contextSnapshot === null)) throw new Error("Task notification redaction budget exceeded");
       for (const row of rows) rowsById.set(row.id, row);
