@@ -668,6 +668,8 @@ export interface HarnessSession {
   reconcile?(): Promise<Record<string, unknown>>;
   /** Provider-owned conversation entries, not controller command receipts. */
   readUserMessages?(): Promise<string[] | null>;
+  /** Correlation IDs on provider-retained user entries; old packs may omit it. */
+  readUserInputIds?(): Promise<string[] | null>;
   usage?(): Promise<Record<string, unknown> | null>;
   transcript?(): Promise<HarnessTranscriptSnapshot>;
   snapshot(): Promise<PersistedHarnessSession>;

@@ -15,7 +15,7 @@ import { issueService } from "../issues.js";
 import * as nativeResponseNotifications from "../native-response-presentation-notifications.js";
 import { compactRunLogChunk } from "../heartbeat/run-log.js";
 import { publishContinuousNativeReply } from "./native-continuous-reply.js";
-import { answeredContinuousHeldRun } from "./continuous-session-input.js";
+import { answeredContinuousHeldRun, readContinuousSessionInput } from "./continuous-session-input.js";
 import { requeueContinuousUnanswered } from "./native-continuous-unanswered.js";
 import { drainContinuousPersonMessages } from "./native-continuous-drain.js";
 import { readBoardQueuedComments } from "../../modules/wake-queue/adapters/queued-comment-board-postgres.js";
@@ -28,11 +28,12 @@ import type { PrpEvent } from "../../vendor/paperclip-runner/index.js";
 
 const heldSteering = vi.hoisted(() => ({ available: false, reject: false, sent: [] as string[], ack: undefined as Promise<void> | undefined,
   onSend: undefined as ((commentId: string) => Promise<void>) | undefined,
-  userMessages: null as string[] | null }));
+  userMessages: null as string[] | null, userInputIds: null as string[] | null }));
 vi.mock("./native-session-executor.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./native-session-executor.js")>();
   return { ...actual,
     readNativeSessionUserMessages: async () => heldSteering.userMessages,
+    readNativeSessionUserInputIds: async () => heldSteering.userInputIds,
     getNativeSessionSteeringState: async () => ({ disposition: heldSteering.available ? "available" : "temporarily_unavailable", activeTurnId: heldSteering.available ? "held-turn" : null }),
     steerNativeSession: async (input: { correlationId: string }) => {
       if (heldSteering.reject) throw new actual.NativeSessionSteeringError("steering_stale_turn", "This held turn is closing. Your message stays queued for the next run.");
@@ -742,6 +743,7 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
       // committed turn-start drain, before its first final or board re-steer.
       heldSteering.sent = [];
       heldSteering.userMessages = mode === "unreadable" ? null : mode === "missing-entry" ? [] : ["C: what is 260 plus 5?"];
+      heldSteering.userInputIds = mode === "unreadable" ? null : mode === "missing-entry" ? [] : [commentId];
       const inherited = mode.startsWith("same");
       if (mode !== "same-final-first") {
         await drainContinuousPersonMessages(db, scope, { beforeFirstReply: true });
@@ -804,9 +806,175 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
         additionalDeliveries: heldSteering.sent.length, answerBodies: (await comments(retryId)).map(c => c.body),
         replies: answered.resultJson?.continuousReplies }));
     } finally {
-      heldSteering.available = false;
+      heldSteering.available = false; heldSteering.userInputIds = null;
       if (steeringFlag === undefined) delete process.env.PAPERCLIP_AGENT_CHAT_STEERING;
       else process.env.PAPERCLIP_AGENT_CHAT_STEERING = steeringFlag;
+    }
+  });
+
+  it.each(["retained", "missing", "unreadable", "ambiguous", "legacy-text"] as const)("0458: inherits the exact ACKed card answer in a same-session retry (%s)", async mode => {
+    const f = await fixture();
+    const interactionId = randomUUID(), queueId = randomUUID(), retryId = randomUUID();
+    const steeringFlag = process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+    process.env.PAPERCLIP_AGENT_CHAT_STEERING = "true";
+    heldSteering.available = true; heldSteering.sent = []; heldSteering.userMessages = null;
+    try {
+      await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, f.agentId));
+      await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, f.runId));
+      const [interaction] = await db.insert(issueThreadInteractions).values({ id: interactionId, companyId: f.companyId, issueId: f.issueId,
+        kind: "ask_user_questions", status: "answered", sourceRunId: f.runId, createdByAgentId: f.agentId,
+        title: "Choose a color", payload: { version: 1, questions: [{ id: "color", prompt: "Which color?", selectionMode: "single",
+          required: true, options: [{ id: "green", label: "Green" }] }] }, resolvedAt: new Date(), resolvedByUserId: f.userId,
+        result: { version: 1, answers: [{ questionId: "color", optionIds: ["green"] }] } }).returning();
+      const { queuedInteractionSteeringBody } = await import("../queued-interaction-response.js");
+      const text = queuedInteractionSteeringBody(interaction);
+      await db.insert(agentWakeupRequests).values({ id: queueId, companyId: f.companyId, agentId: f.agentId,
+        source: "issue", reason: "issue_commented", status: "deferred_issue_execution", requestedByActorType: "user", requestedByActorId: f.userId,
+        payload: { issueId: f.issueId, mutation: "interaction", interactionId, interactionStatus: "answered" } });
+      await drainContinuousPersonMessages(db, { ...f.input, agentId: f.agentId }, { beforeFirstReply: true });
+      expect(heldSteering.sent).toEqual([interactionId]);
+      const [r1] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      expect(r1.resultJson?.queuedSteeringAcknowledgements).toMatchObject({ [interactionId]: { status: "acknowledged" } });
+      await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_failed", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+      // Reconciliation has restored the typed response wake after R1 failed.
+      await db.update(agentWakeupRequests).set({ status: "deferred_issue_execution", finishedAt: null }).where(eq(agentWakeupRequests.id, queueId));
+      await db.insert(heartbeatRuns).values({ id: retryId, companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+        nativeSessionId: r1.nativeSessionId, retryOfRunId: f.runId, runtimeMode: "native", status: "running", responsibleUserId: f.userId,
+        contextSnapshot: { issueId: f.issueId, conversationSessionGeneration: 0 } });
+      await db.update(issues).set({ executionRunId: retryId }).where(eq(issues.id, f.issueId));
+      if (mode === "ambiguous") await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+        authorType: "user", authorUserId: f.userId, body: text });
+      heldSteering.sent = [];
+      heldSteering.userMessages = mode === "unreadable" ? null : mode === "missing" ? [] : [text];
+      heldSteering.userInputIds = mode === "unreadable" || mode === "legacy-text" ? null : mode === "retained" ? [interactionId] : [];
+      const scope = { ...f.input, runId: retryId, agentId: f.agentId };
+      await drainContinuousPersonMessages(db, scope, { beforeFirstReply: true });
+      await drainContinuousPersonMessages(db, scope, { beforeFirstReply: true });
+      expect(heldSteering.sent).toEqual(mode === "retained" ? [] : [interactionId]);
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, queueId));
+      expect(wake.status).toBe("cancelled");
+      const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retryId));
+      if (mode === "retained") expect(retry.resultJson?.continuedSessionInput).toMatchObject({ commentIds: [interactionId] });
+      await publishContinuousNativeReply({ db, cursor: 200, execution: { binding: scope, provider: { kind: "pi_rpc" } },
+        event: { eventType: "item.completed", runId: retryId, normalizedSessionId: r1.nativeSessionId!, sourceEventId: "card-retry-final",
+          itemId: "card-retry-final", payload: { kind: "agentMessage", channel: "final", text: "Green it is.", answers: [interactionId] } } });
+      expect((await comments(retryId)).map(comment => comment.body)).toEqual(["Green it is."]);
+      console.info("0458_CARD_PROOF", JSON.stringify({ mode, sourceRunId: f.runId, retryId, interactionId,
+        additionalSteers: heldSteering.sent.length, wakeStatus: wake.status, inherited: retry.resultJson?.continuedSessionInput }));
+    } finally {
+      heldSteering.available = false; heldSteering.userMessages = null; heldSteering.userInputIds = null;
+      if (steeringFlag === undefined) delete process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+      else process.env.PAPERCLIP_AGENT_CHAT_STEERING = steeringFlag;
+    }
+  });
+
+  it.each(["answered", "unanswered", "restored"] as const)("0458: reconciliation does not wake an answered held crash (%s)", async mode => {
+    const f = await fixture(true, { failed: true, succeed: false, disposition: "needs_review", beforeFinalize: async scope => {
+      await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, scope.agentId));
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      await publishContinuousNativeReply({ db, cursor: 170, execution: { binding: scope, provider: { kind: "pi_rpc" } },
+        event: { eventType: "item.completed", runId: scope.runId, normalizedSessionId: run.nativeSessionId!, sourceEventId: "sweep-held-answer",
+          itemId: "sweep-held-answer", payload: { kind: "agentMessage", channel: "final", text: "265", answers: [String(run.contextSnapshot!.wakeCommentId)] } } });
+      await db.update(heartbeatRuns).set({ errorCode: "adapter_failed", error: "Native session failed" }).where(eq(heartbeatRuns.id, scope.runId));
+    } });
+    const [decision] = await db.select().from(statusDecisions).where(eq(statusDecisions.runId, f.runId));
+    expect(decision.reasonCode).toBe("continuous_held_input_already_answered");
+    const [committedIssue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    expect(committedIssue).toMatchObject({ executionRunId: null, checkoutRunId: null });
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(),
+      contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || '{"retryReason":"held_session_reconnected"}'::jsonb`,
+    }).where(eq(heartbeatRuns.id, f.runId));
+    let unansweredId: string | undefined;
+    if (mode === "unanswered") {
+      const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+        authorType: "user", authorUserId: f.userId, body: "And what is 265 plus 1?" }).returning();
+      unansweredId = comment.id;
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, conversationSessionGeneration: 0,
+        wakeCommentIds: [f.wakeId, unansweredId], retryReason: "held_session_reconnected" } }).where(eq(heartbeatRuns.id, f.runId));
+    }
+    const { issueRecoveryActions } = await import("@paperclipai/db");
+    if (mode === "restored") await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "active_run_watchdog", status: "resolved", outcome: "restored", ownerType: "system", returnOwnerAgentId: f.agentId,
+      cause: "fresh_continuation", fingerprint: `fresh-continuation:${f.runId}`, resolvedAt: new Date(), nextAction: "Continue from saved work.",
+      evidence: { runId: f.runId, continuationDelivery: "pending", executionReconciliation: { runId: f.runId,
+        providerStopped: true, actionOutcome: "mixed", outcomeEvidence: "Historical automatic restoration after a held crash." } } });
+    // Also exercise the watchdog against stale ownership from the earlier
+    // build, before system recovery adoption and fresh-continuation sweep.
+    const { createPostgresWakeQueueAdapter } = await import("../../modules/wake-queue/adapters/postgres.js");
+    const adapter = createPostgresWakeQueueAdapter(db, {
+      resolveResponsibleUserId: async () => f.userId,
+      getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+      resolveSessionBeforeForWakeup: async () => null,
+    });
+    await db.update(issues).set({ executionRunId: f.runId, checkoutRunId: f.runId }).where(eq(issues.id, f.issueId));
+    await adapter.withIssueExecutionLock({ companyId: f.companyId, runId: f.runId, now: new Date() },
+      async () => { throw new Error("the terminal recovery producer owns this release"); });
+    const [released] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    expect(released.status).toBe(mode === "unanswered" ? "blocked" : "in_progress");
+    const { settleUnrecoverableExecutions } = await import("../execution-recovery-resolution.js");
+    const { continueHeldExecutions } = await import("../fresh-continuation-fallback.js");
+    const reconciliationNow = new Date(Date.now() + 16 * 60_000);
+    await settleUnrecoverableExecutions(db, reconciliationNow);
+    await continueHeldExecutions(db, reconciliationNow);
+    const { continueSweepTaskFromSavedWork } = await import("../recovery/sweep-saved-work-continuation.js");
+    const sweep = await continueSweepTaskFromSavedWork(db, { companyId: f.companyId, issueId: f.issueId,
+      latestRun: { id: f.runId, status: "failed", errorCode: "adapter_failed", finishedAt: new Date(), settlingUntil: null, operatorStopped: false } },
+      reconciliationNow);
+    const { deliverReconciledExecutions } = await import("../execution-recovery-resolution.js");
+    const wake = vi.fn<Parameters<typeof deliverReconciledExecutions>[1]>(async (agentId, options) => {
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId, nativeIssueId: f.issueId,
+        status: "queued", contextSnapshot: options?.contextSnapshot }).returning();
+      return run;
+    });
+    await deliverReconciledExecutions(db, wake);
+    expect(wake).toHaveBeenCalledTimes(mode === "unanswered" ? 1 : 0);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(mode === "unanswered" ? 2 : 1);
+    const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId));
+    if (mode === "answered") expect(actions).toEqual([]);
+    if (mode === "restored") expect(actions[0].evidence.continuationDelivery).toBe("invalidated");
+    if (unansweredId) expect(JSON.stringify(wake.mock.calls[0])).toContain(unansweredId);
+    const [after] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    expect(after.status).not.toBe("blocked");
+    expect((await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId)))
+      .some(comment => comment.body.includes("New session"))).toBe(false);
+    console.info("0458_SWEEP_PROOF", JSON.stringify({ mode, sourceRunId: f.runId, reasonCode: decision.reasonCode,
+      sweep, committedOwnership: { executionRunId: committedIssue.executionRunId, checkoutRunId: committedIssue.checkoutRunId },
+      issueStatus: after.status, wakes: wake.mock.calls.length, newRuns: mode === "unanswered" ? 1 : 0, actions: actions.map(a => ({ id: a.id, delivery: a.evidence.continuationDelivery })) }));
+    if (mode === "answered") {
+      // A new person's message still uses ordinary wake admission and runs.
+      const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+        authorType: "user", authorUserId: f.userId, body: "Now tell me 265 plus 1." }).returning();
+      await db.insert(companyMemberships).values({ companyId: f.companyId, principalId: f.userId,
+        principalType: "user", status: "active", membershipRole: "member" });
+      await db.update(issues).set({ responsibleUserId: f.userId }).where(eq(issues.id, f.issueId));
+      await db.update(agents).set({ status: "idle", adapterConfig: {
+        provider: "pi_rpc", sessionContinuity: "continuous", model: "test/model",
+      } }).where(eq(agents.id, f.agentId));
+      const { getServerAdapter, registerServerAdapter } = await import("../../adapters/index.js");
+      const nativeMode = await import("./runtime-mode.js"), savedAdapter = getServerAdapter("paperclip_runner");
+      const dispatched: string[] = [];
+      registerServerAdapter({ ...savedAdapter, execute: async input => {
+        dispatched.push(input.runId);
+        expect(input.context.wakeCommentIds).toContain(comment.id);
+        await issueService(db).addComment(f.issueId, "266", { agentId: f.agentId, runId: input.runId });
+        return { exitCode: 0, signal: null, timedOut: false, resultJson: {}, summary: "New question answered" };
+      } });
+      const resolver = vi.spyOn(nativeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({ kind: "legacy",
+        reason: "persisted_legacy_selection", resolverVersion: nativeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+      const heartbeat = (await import("../heartbeat.js")).heartbeatService(db);
+      try {
+        await heartbeat.wakeup(f.agentId, { source: "on_demand", triggerDetail: "manual", reason: "issue_commented",
+          requestedByActorType: "user", requestedByActorId: f.userId,
+          payload: { issueId: f.issueId, commentId: comment.id },
+          contextSnapshot: { issueId: f.issueId, wakeCommentIds: [comment.id] } });
+        await heartbeat.drainActiveRunExecutions();
+        expect(dispatched).toHaveLength(1);
+        expect((await comments(dispatched[0])).map(row => row.body)).toEqual(["266"]);
+        console.info("0458_LATER_PERSON_PROOF", JSON.stringify({ sourceRunId: f.runId, commentId: comment.id, newRunId: dispatched[0], answer: "266" }));
+      } finally {
+        await heartbeat.drainActiveRunExecutions();
+        resolver.mockRestore(); registerServerAdapter(savedAdapter);
+      }
     }
   });
 
@@ -831,7 +999,7 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     console.info("HELD_CRASH_PROOF", JSON.stringify({ sourceRunId: f.runId, reasonCode: decision.reasonCode, newRuns: 0, newReplies: 0 }));
   });
 
-  it.each(["deferred", "queued", "pending", "delivering", "fallback_queued"] as const)(
+  it.each(["deferred", "queued", "pending", "delivering", "fallback_queued", "delivered"] as const)(
     "keeps the failed held-run retry when a card response remains pending (%s)", async mode => {
       const interactionId = randomUUID();
       const f = await fixture(true, { failed: true, succeed: false, disposition: "needs_review", beforeFinalize: async scope => {
@@ -866,14 +1034,152 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
       expect(retries).toHaveLength(1);
       console.info("CARD_RETRY_PROOF", JSON.stringify({ mode, runId: f.runId, interactionId,
         reasonCode: decision.reasonCode, retryWakeId: retries[0].id, retryStatus: retries[0].status }));
-      // A terminal outbox receipt alone is not pending input. In particular,
-      // fallback_queued remains terminal after its ordinary wake has completed.
+      // RFL 0463: terminal transport receipts are not agent answers. The durable
+      // card remains owed even when every wake/outbox receipt is terminal.
       await db.update(agentWakeupRequests).set({ status: "completed" }).where(and(
         eq(agentWakeupRequests.companyId, f.companyId), sql`${agentWakeupRequests.payload}->>'interactionId' = ${interactionId}`));
       await db.update(issueQuestionResponseDeliveries).set({ status: mode === "fallback_queued" ? mode : "delivered" })
         .where(eq(issueQuestionResponseDeliveries.interactionId, interactionId));
+      expect(await answeredContinuousHeldRun(db, { ...f.input, agentId: f.agentId })).toBe(false);
+      const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      const [successor] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+        nativeIssueId: f.issueId, nativeSessionId: source.nativeSessionId, runtimeMode: "native", status: "running",
+        contextSnapshot: { issueId: f.issueId, conversationSessionGeneration: 0 } }).returning();
+      await db.update(issues).set({ executionRunId: successor.id }).where(eq(issues.id, f.issueId));
+      await publishContinuousNativeReply({ db, cursor: 180,
+        execution: { binding: { ...f.input, runId: successor.id, agentId: f.agentId }, provider: { kind: "pi_rpc" } },
+        event: { eventType: "item.completed", runId: successor.id, normalizedSessionId: source.nativeSessionId!,
+          sourceEventId: "terminal-card-answer", itemId: "terminal-card-answer", payload: { kind: "agentMessage", channel: "final",
+            text: "Green it is.", answers: [interactionId] } } });
+      expect((await comments(successor.id)).map(comment => comment.body)).toEqual(["Green it is."]);
       expect(await answeredContinuousHeldRun(db, { ...f.input, agentId: f.agentId })).toBe(true);
+      console.info("0463_TERMINAL_CARD_PROOF", JSON.stringify({ mode, sourceRunId: f.runId, interactionId, answerRunId: successor.id }));
     });
+
+  it.each(["old-card-only", "copied-comment"] as const)("0463 RFL: retained identity distinguishes an old answered card from a later copied comment (%s)", async mode => {
+    const f = await fixture();
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, f.agentId));
+    const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+      kind: "ask_user_questions", status: "answered", sourceRunId: f.runId, createdByAgentId: f.agentId,
+      resolvedAt: new Date(), resolvedByUserId: f.userId,
+      payload: { version: 1, questions: [{ id: "color", prompt: "Which color?", selectionMode: "single", required: true,
+        options: [{ id: "green", label: "Green" }] }] },
+      result: { version: 1, answers: [{ questionId: "color", optionIds: ["green"] }] } }).returning();
+    const { queuedInteractionSteeringBody } = await import("../queued-interaction-response.js");
+    const text = queuedInteractionSteeringBody(card);
+    const [copy] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorType: "user", authorUserId: f.userId, body: text }).returning();
+    const retryId = randomUUID();
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(heartbeatRuns).set({ resultJson: { continuousReplies: { old: { questionCommentIds: [card.id, f.wakeId] } },
+      queuedSteeringAcknowledgements: { [card.id]: { status: "acknowledged" }, [copy.id]: { status: "acknowledged" } } } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(heartbeatRuns).values({ id: retryId, companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+      nativeSessionId: source.nativeSessionId, runtimeMode: "native", status: "running", responsibleUserId: f.userId,
+      contextSnapshot: { issueId: f.issueId, conversationSessionGeneration: 0 } });
+    heldSteering.userMessages = [text]; // Text is identical in both histories.
+    heldSteering.userInputIds = [mode === "old-card-only" ? card.id : copy.id];
+    const steeringFlag = process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+    process.env.PAPERCLIP_AGENT_CHAT_STEERING = "true";
+    heldSteering.available = true; heldSteering.sent = [];
+    try {
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+        source: "issue", reason: "issue_commented", status: "deferred_issue_execution",
+        payload: { issueId: f.issueId, _paperclipWakeContext: { wakeCommentIds: [copy.id] } } }).returning();
+      await db.update(issues).set({ executionRunId: retryId }).where(eq(issues.id, f.issueId));
+      const scope = { ...f.input, runId: retryId, agentId: f.agentId };
+      const evidence = await readContinuousSessionInput(db, scope);
+      expect(evidence?.commentIds).toEqual(mode === "old-card-only" ? [] : [copy.id]);
+      await drainContinuousPersonMessages(db, scope, { beforeFirstReply: true });
+      expect(heldSteering.sent).toEqual(mode === "old-card-only" ? [copy.id] : []);
+      const [settledWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id));
+      expect(settledWake.status).toBe("cancelled");
+      console.info("0463_CROSS_TYPE_PROOF", JSON.stringify({ mode, runId: retryId, cardId: card.id, copyId: copy.id, evidence, additionalSteers: heldSteering.sent }));
+    } finally {
+      heldSteering.available = false; heldSteering.userMessages = null; heldSteering.userInputIds = null;
+      if (steeringFlag === undefined) delete process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+      else process.env.PAPERCLIP_AGENT_CHAT_STEERING = steeringFlag;
+    }
+  });
+
+  it.each(["absent", "completed"] as const)("0463 RFL: durable person comment remains unanswered with %s wake", async mode => {
+    const f = await fixture(true, { beforeFinalize: async scope => {
+      await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, scope.agentId));
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      await publishContinuousNativeReply({ db, cursor: 170, execution: { binding: scope, provider: { kind: "pi_rpc" } },
+        event: { eventType: "item.completed", runId: scope.runId, normalizedSessionId: run.nativeSessionId!,
+          sourceEventId: "inventory-opening", itemId: "inventory-opening", payload: { kind: "agentMessage", channel: "final",
+            text: "Opening answered", answers: [String(run.contextSnapshot!.wakeCommentId)] } } });
+    } });
+    const [person] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorType: "user", authorUserId: f.userId, body: "A durable question without a pending transport receipt" }).returning();
+    if (mode === "completed") await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+      source: "issue", status: "completed", payload: { issueId: f.issueId, commentId: person.id } });
+    expect(await answeredContinuousHeldRun(db, f.input)).toBe(false);
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const [successor] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      nativeIssueId: f.issueId, nativeSessionId: source.nativeSessionId, runtimeMode: "native", status: "succeeded",
+      resultJson: { continuousReplies: { answer: { questionCommentIds: [person.id] } } } }).returning();
+    expect(await answeredContinuousHeldRun(db, f.input)).toBe(true);
+    console.info("0463_DURABLE_INPUT_PROOF", JSON.stringify({ mode, sourceRunId: f.runId, inputId: person.id, answerRunId: successor.id }));
+  });
+
+  it("0463 RFL: revalidates a historical restoration after the delivery lock is released", async () => {
+    const lateId = randomUUID();
+    const f = await fixture(true, { beforeFinalize: async scope => {
+      await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, scope.agentId));
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      await publishContinuousNativeReply({ db, cursor: 170, execution: { binding: scope, provider: { kind: "pi_rpc" } },
+        event: { eventType: "item.completed", runId: scope.runId, normalizedSessionId: run.nativeSessionId!,
+          sourceEventId: "race-opening", itemId: "race-opening", payload: { kind: "agentMessage", channel: "final",
+            text: "Opening answered", answers: [String(run.contextSnapshot!.wakeCommentId)] } } });
+    } });
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_failed", finishedAt: new Date(),
+      contextSnapshot: { issueId: f.issueId, conversationSessionGeneration: 0, wakeCommentIds: [f.wakeId, lateId] } }).where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(issueComments).values({ id: lateId, companyId: f.companyId, issueId: f.issueId,
+      authorType: "user", authorUserId: f.userId, body: "Answer this before the delayed recovery wakes" });
+    await db.insert(companyMemberships).values({ companyId: f.companyId, principalId: f.userId,
+      principalType: "user", status: "active", membershipRole: "member" });
+    await db.update(issues).set({ responsibleUserId: f.userId, executionRunId: null, checkoutRunId: null }).where(eq(issues.id, f.issueId));
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.agentId));
+    const { issueRecoveryActions } = await import("@paperclipai/db");
+    const [action] = await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "active_run_watchdog", status: "resolved", outcome: "restored", ownerType: "system", returnOwnerAgentId: f.agentId,
+      cause: "fresh_continuation", fingerprint: `historical-race:${f.runId}`, resolvedAt: new Date(), nextAction: "Continue saved work",
+      evidence: { continuationDelivery: "pending", executionReconciliation: { runId: f.runId, providerStopped: true,
+        actionOutcome: "mixed", outcomeEvidence: "Historical restoration with no freshContinuation.recordedAt" } } }).returning();
+    const { heartbeatService } = await import("../heartbeat.js");
+    const heartbeat = heartbeatService(db);
+    const { deliverReconciledExecutions } = await import("../execution-recovery-resolution.js");
+    let successorId: string | undefined;
+    let attempted = false;
+    try {
+      await deliverReconciledExecutions(db, async (agentId, options) => {
+        attempted = true;
+        // Exact RFL window: delivery's locked verdict was false, then the
+        // ordinary person's run answers before the real wake admission lock.
+        const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+        const [successor] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+          nativeIssueId: f.issueId, nativeSessionId: source.nativeSessionId, runtimeMode: "native", status: "running",
+          contextSnapshot: { issueId: f.issueId, conversationSessionGeneration: 0, wakeCommentIds: [lateId] } }).returning();
+        successorId = successor.id;
+        await db.update(issues).set({ executionRunId: successor.id }).where(eq(issues.id, f.issueId));
+        await publishContinuousNativeReply({ db, cursor: 180, execution: { binding: { ...f.input, runId: successor.id, agentId: f.agentId }, provider: { kind: "pi_rpc" } },
+          event: { eventType: "item.completed", runId: successor.id, normalizedSessionId: source.nativeSessionId!,
+            sourceEventId: "race-person-answer", itemId: "race-person-answer", payload: { kind: "agentMessage", channel: "final", text: "Answered normally", answers: [lateId] } } });
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, successor.id));
+        await db.update(issues).set({ executionRunId: null, checkoutRunId: null }).where(eq(issues.id, f.issueId));
+        return heartbeat.wakeup(agentId, options);
+      });
+      expect(attempted).toBe(true);
+      expect(successorId).toBeTruthy();
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(2);
+      const [saved] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+      expect(saved.evidence.continuationDelivery).toBe("invalidated");
+      expect(saved.resolutionNote).toBe("continuous_held_input_already_answered");
+      console.info("0463_ADMISSION_RACE_PROOF", JSON.stringify({ sourceRunId: f.runId, successorId, actionId: action.id, evidence: saved.evidence }));
+    } finally { await heartbeat.drainActiveRunExecutions(); }
+  });
 
   it("retains ACKed unanswered follow-ups as one failed delivery receipt, never automatic resubmission", async () => {
     const f = await fixture();

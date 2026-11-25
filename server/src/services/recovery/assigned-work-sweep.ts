@@ -700,6 +700,13 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
       await settleContinuationActivity(claimed, claimed.reason, "not_started", { waitingUntil: fresh.retryAt.toISOString() });
       return { verdict: claimed.verdict, outcome: fresh.kind === "backoff" ? "deferred_cap" : "waiting_on_recovery", retryAt: fresh.retryAt };
     }
+    // The continuation owner checked this under the issue lock. Do not turn
+    // its answered-held verdict into a generic empty-input fallback wake.
+    if (fresh?.kind === "person_owned" && fresh.reason === "continuous_held_input_already_answered") {
+      if (claimed.restoredTo) await revertRestoredBlock(issue, claimed);
+      await settleContinuationActivity(claimed, claimed.reason, "not_started", { waitingFor: fresh.reason });
+      return { verdict: claimed.verdict, outcome: "left_person_work", retryAt: null };
+    }
     const slot = facts.latestRun
       ? await reserveAutomaticRunCreation(db, issue.companyId, { issueId: issue.id, sourceRunId: facts.latestRun.id }) : null;
     if (slot?.heldUntil) {
