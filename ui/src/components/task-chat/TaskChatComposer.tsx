@@ -26,6 +26,8 @@ import {
   loadDraftAttachments,
   saveDraft,
   saveRestoredDraft,
+  restoreStoppedCommentDrafts,
+  discardStoppedCommentDrafts,
   saveDraftAttachments,
   loadDraftSubmission,
   replayableRequest,
@@ -546,6 +548,14 @@ export function TaskChatComposer({
   }
   useImperativeHandle(composerRef, () => ({
     focus: () => editorRef.current?.focus(),
+    restoreStoppedMessages: (comments) => {
+      if (!draftKey || creation || queuedEdit || submittingRef.current || uncertainSubmission) return [];
+      const restored = restoreStoppedCommentDrafts(draftKey, bodyRef.current, comments);
+      if (!restored) return [];
+      changeBody(restored.body);
+      requestAnimationFrame(() => editorRef.current?.focus());
+      return restored.commentIds;
+    },
     restoreDraft: (submittedBody: string) => {
       if (!submittedBody) return;
       const next = bodyRef.current.includes(submittedBody) ? bodyRef.current : bodyRef.current ? `${bodyRef.current}\n\n${submittedBody}` : submittedBody;
@@ -1451,7 +1461,11 @@ export function TaskChatComposer({
             <MarkdownEditor
               ref={editorRef}
               value={body}
-              onChange={changeBody}
+              onChange={(value) => {
+                if (!value && bodyRef.current && draftKey && !queuedEdit && !submittingRef.current && !uncertainSubmission)
+                  discardStoppedCommentDrafts(draftKey);
+                changeBody(value);
+              }}
               placeholder={
                 disabled
                   ? (disabledReason ?? "Composer disabled")
