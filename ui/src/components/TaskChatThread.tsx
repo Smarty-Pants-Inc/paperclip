@@ -625,6 +625,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     requiresExecutionReconciliation(props.recoveryAction?.cause) ||
     props.scheduledRetry ||
     linkedRuns?.some((run) => {
+      // A terminal diagnostic is not a live executor. Honor the current
+      // interruption's explicit Retry permission, never an unresolved hold.
+      if (run.runtimeMode === "native" && ["failed", "timed_out", "interrupted"].includes(run.status) &&
+        run.execution?.phase === "recovery_needed" && !requiresExecutionReconciliation(run.execution.cause) &&
+        !requiresExecutionReconciliation(run.errorCode) && props.interruption?.state === "failed" &&
+        props.interruption.canRetry && props.interruption.observedRunId === run.runId &&
+        isConversationRecovery(props.interruption, run.status)) return false;
       // The server accepts explicit new attempts for these stopped legacy
       // conversations. It still proves process/lease termination and ownership;
       // offering Retry does not certify prior action outcomes or resume them.
@@ -2019,14 +2026,16 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               .reverse()
               .find(
                 (comment) =>
-                  !comment.deletedAt &&
+                  !comment.deletedAt && comment.authorType === "agent" &&
+                  comment.presentation?.kind !== "system_notice" &&
                   comment.runId === source.id &&
                   !progressCommentIds.has(comment.id),
               )?.id ?? null)
           : decidedCommentId !== null &&
               projectedComments.some(
                 (comment) =>
-                  !comment.deletedAt &&
+                  !comment.deletedAt && comment.authorType === "agent" &&
+                  comment.presentation?.kind !== "system_notice" &&
                   comment.runId === source.id &&
                   comment.id === decidedCommentId,
               )
@@ -2426,7 +2435,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       ): TaskChatMessageItem | undefined => {
         if (!sourceIsPaperclipRunner) return undefined;
         const mappedReplyId = continuousReplyPlacements.get(source.id)?.bySegment.get(segmentIndex);
-        const mappedReply = commentItems.find((item): item is TaskChatMessageItem => item.kind === "message" && item.id === mappedReplyId);
+        const mappedReply = commentItems.find((item): item is TaskChatMessageItem => item.kind === "message" && item.author === "agent" && item.presentation?.kind !== "system_notice" && item.id === mappedReplyId);
         const final = paperclipRunnerFinalResponse(parsed, { ...yieldedOptions, yielded: sourceYielded });
         // A continuous run can resume with only the new turn's transcript.
         // Its old placement map is not proof that this segment draws that reply.
@@ -2442,7 +2451,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           const occurrence = final ? projectedSegments.slice(0, segmentIndex).filter(({ parsed }) =>
             sameText(paperclipRunnerFinalResponse(parsed, { ...yieldedOptions, yielded: sourceYielded })?.text ?? "")).length : 0;
           const reply = projectedComments.filter(comment => !comment.deletedAt && comment.authorType === "agent" &&
-            (comment.createdByRunId ?? comment.runId) === source.id && !progressCommentIds.has(comment.id) &&
+            comment.presentation?.kind !== "system_notice" && (comment.createdByRunId ?? comment.runId) === source.id && !progressCommentIds.has(comment.id) &&
             (final ? sameText(comment.body) : !authoredFinalTexts.has(normalizedMessageText(comment.body)) &&
               toMs(comment.createdAt) >= segment.startMs && toMs(comment.createdAt) < segment.endMs))
             .sort((a, b) => toMs(a.createdAt) - toMs(b.createdAt))[occurrence];
@@ -3050,7 +3059,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const tailReadReceipt = useMemo(() => {
     if (!tailReplyKey) return undefined;
     const reply = projectedComments.find(comment => !comment.deletedAt && comment.authorType === "agent" &&
-      (comment.createdByRunId ?? comment.runId) === tailRunId &&
+      comment.presentation?.kind !== "system_notice" && (comment.createdByRunId ?? comment.runId) === tailRunId &&
       (comment.clientRequestId === tailReplyKey || comment.clientRequestId?.startsWith(`${tailReplyKey}:`)) &&
       normalizedMessageText(comment.body) === normalizedMessageText(tailFinalResponse?.text ?? ""));
     return commentItems.find((item): item is TaskChatMessageItem => item.kind === "message" && item.id === reply?.id);
@@ -3402,7 +3411,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // Saved replies have createdAt, not the streaming item's atMs. Progress is not an answer.
   const savedAnswer = latestUserComment && projectedComments.some(comment => {
     const runId = comment.createdByRunId ?? comment.runId ?? comment.derivedCreatedByRunId;
-    return toMs(comment.createdAt) > toMs(latestUserComment.createdAt) && comment.authorType === "agent" &&
+    return toMs(comment.createdAt) > toMs(latestUserComment.createdAt) && comment.authorType === "agent" && comment.presentation?.kind !== "system_notice" &&
       !comment.deletedAt && (runId ? hasVisibleRunAnswer([comment], runId, linkedRunMetaById.get(runId)?.resultJson)
         : Boolean(comment.body.trim()) && comment.body !== LEGACY_WITHHELD_RUN_COMMENT);
   });
@@ -3411,7 +3420,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // A resolved projection is silent, not evidence that this saved question was answered.
   const blockedChat = conversationMode && issueStatus === "blocked" && latestUserComment &&
     latestUserComment.body.trim() !== "/new" && !requestStopped && !requestAnswered && !savedAnswer &&
-    !failureNoticeIds.has(requestRun?.id ?? "") &&
+    !failureNoticeIds.has(requestRun?.id ?? "") && !failureNoticeIds.has(latestRun?.id ?? "") &&
     !liveRun && !runs.some(run => ["queued", "running", "scheduled_retry"].includes(terminalStatuses.get(run.id) ?? run.status)) &&
     !props.retryPreparing && !props.scheduledRetry && !composerPause &&
     !interactions?.some(interaction => interaction.status === "pending") &&
@@ -3448,7 +3457,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       const failedRunId = [...failureNoticeIds].find(([, id]) => id === item.id)?.[0];
       const retryAnswered = failedRunId && [...runChainIdsById].some(([id, chain]) => id !== failedRunId && chain.includes(failedRunId) &&
         linkedRunMetaById.get(id)?.status === "succeeded" && settledReplyRunIds.has(id));
-      if (failedRunId && onRetryFailedRun && !retryAnswered && !(latestUserComment && toMs(latestUserComment.createdAt) > toMs(item.createdAtIso))) return <Button type="button" variant="outline" size="xs"
+      if (failedRunId && onRetryFailedRun && !retryAnswered) return <Button type="button" variant="outline" size="xs"
         disabled={!canRetryFailedRun || !!liveRun || !!retryFailedRunId || props.retryPreparing}
         onClick={() => { void Promise.resolve().then(() => retryFailedRunHandler?.(failedRunId)).catch(() => undefined); }}>
         {retryFailedRunId === failedRunId ? "Retrying…" : "Retry"}</Button>;
@@ -3471,7 +3480,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       );
     },
     [
-      failureNoticeIds, onRetryFailedRun, canRetryFailedRun, liveRun, retryFailedRunId, props.retryPreparing, retryFailedRunHandler, latestUserComment,
+      failureNoticeIds, onRetryFailedRun, canRetryFailedRun, liveRun, retryFailedRunId, props.retryPreparing, retryFailedRunHandler,
       runChainIdsById, linkedRunMetaById, settledReplyRunIds,
       onVote,
       feedbackVoteByTargetId,
