@@ -5,6 +5,7 @@ import { AgentAvatar } from "../AgentAvatar";
 import type { IssueChatComposerHandle } from "@/components/IssueChatThread";
 import {
   useEffect,
+  useLayoutEffect,
   useId,
   useImperativeHandle,
   useRef,
@@ -143,6 +144,8 @@ interface TaskChatComposerProps {
     onRunSettingsChange: (settings: ComposerRunSettings | null) => void;
   };
   confirmedSubmissionIds?: ReadonlySet<string>;
+  onRetainedSubmissionChange?: (requestId: string | null) => void;
+  onRestoreReady?: () => void;
   onStop?: () => Promise<void>;
   confirmedStoppedRunIds?: ReadonlySet<string>;
   stopPending?: boolean;
@@ -400,6 +403,8 @@ export function TaskChatComposer({
   onAdd,
   creation,
   confirmedSubmissionIds,
+  onRetainedSubmissionChange,
+  onRestoreReady,
   onStop,
   confirmedStoppedRunIds,
   stopPending = false,
@@ -566,6 +571,12 @@ export function TaskChatComposer({
       return !draftKey || loadDraft(draftKey).includes(submittedBody);
     },
   }));
+  // A cancellation can return while the original POST is still settling.
+  // Its page owner keeps the text visible and retries custody when this box
+  // becomes available; never acknowledge it while a submission owns the draft.
+  useLayoutEffect(() => {
+    if (draftKey && !creation && !queuedEdit && !submitting && !uncertainSubmission) onRestoreReady?.();
+  }, [draftKey, creation, queuedEdit, submitting, uncertainSubmission, onRestoreReady]);
   const draftTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const queuedEditRef = useRef(queuedEdit);
   queuedEditRef.current = queuedEdit;
@@ -1140,10 +1151,18 @@ export function TaskChatComposer({
         changeBody(bodyRef.current);
       }
       sentModeChoice.current = { attemptId, generation: submittedModeGeneration };
-      if (runSettings) {
-        await onAdd(fullBody, reopen, reassignment, attachmentIds.length ? attachmentIds : undefined, attemptId, runSettings);
-      } else {
-        await onAdd(fullBody, reopen, reassignment, attachmentIds.length ? attachmentIds : undefined, attemptId);
+      try {
+        if (runSettings) {
+          await onAdd(fullBody, reopen, reassignment, attachmentIds.length ? attachmentIds : undefined, attemptId, runSettings);
+        } else {
+          await onAdd(fullBody, reopen, reassignment, attachmentIds.length ? attachmentIds : undefined, attemptId);
+        }
+      } catch (error) {
+        // The queue/history receipt can beat a lost POST response. Use that
+        // existing receipt, rather than restore then remove the same text.
+        const confirmed = (mountedTaskKey.current === draftKey && confirmedSubmissionIdsRef.current?.has(attemptId)) ||
+          settledSubmissionIds.current.has(JSON.stringify([draftKey, attemptId]));
+        if (!confirmed) throw error;
       }
       // Navigation does not invalidate the server receipt. Settle the captured
       // task before checking whether this composer is still on screen.
@@ -1201,6 +1220,8 @@ export function TaskChatComposer({
 
   /** A confirmed receipt for the retained send: drop its text, keep any next draft. */
   const settledSubmissionIds = useRef(new Set<string>());
+  const confirmedSubmissionIdsRef = useRef(confirmedSubmissionIds);
+  confirmedSubmissionIdsRef.current = confirmedSubmissionIds;
   function settleUncertainSubmission(submission: ComposerDraftSubmission) {
     const settlementKey = JSON.stringify([draftKey, submission.attemptId]);
     if (settledSubmissionIds.current.has(settlementKey)) return;
@@ -1219,10 +1240,13 @@ export function TaskChatComposer({
       : []);
   }
 
-  useEffect(() => {
-    if (!uncertainSubmission || !confirmedSubmissionIds?.has(uncertainSubmission.attemptId)) return;
-    settleUncertainSubmission(uncertainSubmission);
-  }, [confirmedSubmissionIds, draftKey, uncertainSubmission]);
+  useLayoutEffect(() => {
+    const confirmed = uncertainSubmission && confirmedSubmissionIds?.has(uncertainSubmission.attemptId);
+    onRetainedSubmissionChange?.(confirmed ? null : uncertainSubmission?.attemptId ?? null);
+    // The receipt can arrive via the queue poll before the POST response.
+    // Transfer box -> thread before paint, never through a second tray row.
+    if (confirmed) settleUncertainSubmission(uncertainSubmission);
+  }, [confirmedSubmissionIds, draftKey, uncertainSubmission, onRetainedSubmissionChange]);
 
   async function resendUncertainSubmission(): Promise<SendOutcome> {
     if (!isCurrentAccount()) return "pending";
