@@ -1,3 +1,4 @@
+import { PI_MODEL_PROVIDER_REQUIRED } from "../adapters/pi-model-selection.js";
 import { RESPONSIBILITIES_OFF_GUIDANCE } from "./responsibilities-disabled.js";
 import { isContextCompactionRun } from "./context-compaction.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
@@ -327,12 +328,13 @@ export async function prepareConversationTurn(
   return result;
 }
 
-/** Finalizers only park a turn with a durable response, interaction, or processed /new. */
+/** Park a turn with a durable response, interaction, /new, or terminal model-selection refusal. */
 export async function settleConversationTurn(
   db: Db,
-  run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "status" | "contextSnapshot">,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "status" | "contextSnapshot"> & { errorCode?: string | null },
 ) {
-  if (run.status !== "succeeded") return false;
+  const modelSelectionFailed = run.status === "failed" && run.errorCode === PI_MODEL_PROVIDER_REQUIRED;
+  if (run.status !== "succeeded" && !modelSelectionFailed) return false;
   const context = run.contextSnapshot ?? {};
   const issueId = typeof context.issueId === "string" ? context.issueId : null;
   if (!issueId) return false;
@@ -361,7 +363,8 @@ export async function settleConversationTurn(
           eq(issueComments.issueId, issueId),
           eq(issueComments.createdByRunId, run.id),
           eq(issueComments.origin, "comment"),
-          eq(issueComments.authorAgentId, issue.conversationAgentId!),
+          modelSelectionFailed ? eq(issueComments.authorType, "system")
+            : eq(issueComments.authorAgentId, issue.conversationAgentId!),
           isNull(issueComments.deletedAt),
         ),
       )
@@ -380,7 +383,10 @@ export async function settleConversationTurn(
           ))
           .limit(1)
       : [];
-    if (!response && !interaction && context.conversationReset !== true) return false;
+    // A deterministic model refusal already committed on the run. Its system
+    // notice can be repaired independently; a failed insert must not strand
+    // this turn or prevent claim cleanup.
+    if (!response && !interaction && context.conversationReset !== true && !modelSelectionFailed) return false;
     if (
       context.conversationSessionGeneration !==
       issue.conversationSessionGeneration
@@ -472,7 +478,7 @@ export async function settleConversationTurnForRun(
   runId: string,
 ) {
   const [run] = await db.select({
-    id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, status: heartbeatRuns.status,
+    id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode,
     contextSnapshot: sql<Record<string, unknown> | null>`case when jsonb_typeof(${heartbeatRuns.contextSnapshot}) = 'object'
       then jsonb_build_object(
         'issueId', ${heartbeatRuns.contextSnapshot}->'issueId',
