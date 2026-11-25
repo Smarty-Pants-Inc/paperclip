@@ -11622,7 +11622,7 @@ describe("native session same-turn steering", () => {
     finally { await session.close({ reason: "fixture complete" }); }
   }
 
-  it.each(["rejected", "sync-rejected", "prp-failed", "turn-end-not-delivered", "working-final-then-rejected", "timeout-then-rejected", "uncertain-transport", "uncertain-deadline", "uncertain-follow-up-deadline", "uncertain-indeterminate", "uncertain-prp-unknown", "uncertain-typed-indeterminate", "uncertain-typed-unknown", "uncertain-typed-deadline", "uncertain-typed-array", "uncertain-typed-deadline-capability", "uncertain-deadline-capability", "uncertain-typed-indeterminate-capability", "uncertain-indeterminate-capability", "uncertain-typed-malformed", "uncertain-typed-unsupported-text", "typed-stale", "typed-stop", "uncertain-typed-unsupported", "wrapped-stale", "wrapped-stop", "wrapped-raced", "timeout-then-deadline", "timeout-then-ACK"])("hold seam v2: config after a steer outcome: %s", async outcome => {
+  it.each(["rejected", "sync-rejected", "prp-failed", "turn-end-not-delivered", "working-final-then-rejected", "timeout-then-rejected", "uncertain-transport", "uncertain-deadline", "uncertain-follow-up-deadline", "uncertain-indeterminate", "uncertain-prp-unknown", "uncertain-typed-indeterminate", "uncertain-typed-unknown", "uncertain-typed-deadline", "uncertain-typed-array", "uncertain-typed-deadline-capability", "uncertain-deadline-capability", "uncertain-typed-indeterminate-capability", "uncertain-indeterminate-capability", "uncertain-typed-malformed", "uncertain-typed-unsupported-text", "typed-stale", "typed-stop", "uncertain-typed-unsupported", "wrapped-stale", "wrapped-stop", "wrapped-raced", "timeout-then-deadline", "timeout-then-ACK", "prefixed", "prefixed-stale", "prefixed-typed", "uncertain-typed-prefixed-indeterminate"])("hold seam v2: config after a steer outcome: %s", async outcome => {
     const result: Record<string, unknown> = {};
     vi.spyOn(continuousReply, "publishContinuousNativeReply").mockResolvedValue(true);
     vi.spyOn(resetWakeQueue, "closeConversationResetHold").mockResolvedValue(false);
@@ -11635,9 +11635,14 @@ describe("native session same-turn steering", () => {
       payload: { kind: "agentMessage", channel: "final", text: "Done." } };
     let resolve!: () => void, reject!: (error: Error) => void;
     steer.mockReturnValue(new Promise<void>((yes, no) => { resolve = yes; reject = no; }));
-    const immediateRejection = ["rejected", "sync-rejected", "prp-failed", "turn-end-not-delivered", "typed-stale", "typed-stop", "wrapped-stale", "wrapped-stop", "wrapped-raced"].includes(outcome);
+    const immediateRejection = ["rejected", "sync-rejected", "prp-failed", "turn-end-not-delivered", "typed-stale", "typed-stop", "wrapped-stale", "wrapped-stop", "wrapped-raced", "prefixed", "prefixed-stale", "prefixed-typed"].includes(outcome);
     const uncertain = outcome.startsWith("uncertain-") || outcome === "timeout-then-deadline";
     const notDelivered = "a person's Stop is ending this turn";
+    if (outcome === "prefixed") steer.mockRejectedValue(new Error("pi_steer_not_delivered: refusal wording changed"));
+    if (outcome === "prefixed-stale") steer.mockRejectedValue(new Error("pi_steer_not_delivered: Pi steering refers to a stale or inactive turn"));
+    if (outcome === "prefixed-typed" || outcome === "uncertain-typed-prefixed-indeterminate") steer.mockRejectedValue(await wrappedControlFailure(Object.defineProperty(new Error("Provider request failed"), "runnerCommandResult", {
+      value: { result: { code: outcome === "prefixed-typed" ? "command_execution_failed" : "execution_indeterminate", message: "pi_steer_not_delivered: refusal wording changed" } },
+    })));
     if (outcome === "rejected") steer.mockRejectedValue(new Error(notDelivered));
     if (outcome === "sync-rejected") steer.mockImplementation(() => { throw new Error(notDelivered); });
     if (outcome === "prp-failed") steer.mockRejectedValue(new Error('PRP command turn.steer failed: {"result":{"code":"command_execution_failed","message":"turn.steer named a stale or inactive turn"},"status":"failed"}'));
@@ -11650,7 +11655,7 @@ describe("native session same-turn steering", () => {
     if (outcome === "uncertain-deadline-capability") steer.mockRejectedValue(new Error("Pi steer deadline exceeded while checking capability"));
     if (outcome === "uncertain-indeterminate-capability") steer.mockRejectedValue(await wrappedControlFailure(new Error('PRP command turn.steer failed: {"result":{"code":"execution_indeterminate","message":"unsupported capability"},"status":"failed"}')));
     if (outcome.startsWith("wrapped-")) steer.mockRejectedValue(await wrappedControlFailure(new Error(outcome === "wrapped-stale" ? "turn.steer named a stale or inactive turn" : outcome === "wrapped-stop" ? notDelivered : "steering raced the turn end; not delivered")));
-    const typed = outcome.includes("typed-") ? {
+    const typed = outcome.includes("typed-") && outcome !== "uncertain-typed-prefixed-indeterminate" ? {
       code: outcome.includes("indeterminate") ? "execution_indeterminate" : outcome === "uncertain-typed-unknown" ? "unknown_failure" : outcome === "uncertain-typed-deadline" ? "deadline" : outcome === "uncertain-typed-malformed" ? null : "command_execution_failed",
       message: outcome === "uncertain-typed-array" ? ["stale or inactive turn", "unsupported capability"] : outcome === "uncertain-typed-deadline-capability" ? "Pi steer deadline exceeded while checking capability" : ["typed-stale", "uncertain-typed-malformed", "uncertain-typed-indeterminate", "uncertain-typed-deadline", "uncertain-typed-unknown"].includes(outcome) ? "turn.steer named a stale or inactive turn" : outcome === "typed-stop" ? notDelivered : "unsupported capability failed",
     } : null;
@@ -11677,7 +11682,7 @@ describe("native session same-turn steering", () => {
         expect(steer).toHaveBeenCalledOnce(); // The uncertain delivery stays cached, never redispatched.
         expect(retried).toMatchObject({ code: "steering_timeout", message: "Steering outcome is uncertain. Your message stays queued pending acknowledgement." });
       }
-      expect(error.code).toBe(outcome === "prp-failed" || outcome === "typed-stale" || outcome === "wrapped-stale" ? "steering_stale_turn" : immediateRejection ? "steering_rejected" : "steering_timeout");
+      expect(error.code).toBe(outcome === "prp-failed" || outcome === "typed-stale" || outcome === "wrapped-stale" || outcome === "prefixed-stale" ? "steering_stale_turn" : immediateRejection ? "steering_rejected" : "steering_timeout");
       result.heldNativeConfigurationEnd = true;
       await getNativeSessionSteeringState(execution.binding.runId);
       if (outcome === "working-final-then-rejected") {
@@ -11701,7 +11706,7 @@ describe("native session same-turn steering", () => {
     } finally { vi.useRealTimers(); resolve(); state.release?.(); await running; vi.restoreAllMocks(); }
   });
 
-  it.each(["uncertain", "uncertain-provider", "definitive", "definitive-stale", "definitive-raced", "late-definitive"])("hold seam v2: interrupt outcome: %s", async outcome => {
+  it.each(["uncertain", "uncertain-provider", "definitive", "definitive-stale", "definitive-raced", "definitive-prefixed", "late-definitive"])("hold seam v2: interrupt outcome: %s", async outcome => {
     vi.spyOn(continuousReply, "publishContinuousNativeReply").mockResolvedValue(true);
     vi.spyOn(resetWakeQueue, "closeConversationResetHold").mockResolvedValue(false);
     const piExecution = { ...execution, provider: { kind: "pi_rpc", model: "openai/gpt-5", conversationMode: true },
@@ -11715,7 +11720,7 @@ describe("native session same-turn steering", () => {
     interrupt.mockReturnValue(new Promise<void>((resolve, reject) => { finish = resolve; refuse = reject; }));
     const refusal = await wrappedControlFailure(outcome === "uncertain-provider"
       ? Object.defineProperty(new Error("Provider request failed"), "runnerCommandResult", { value: { result: { code: "command_execution_failed", message: "Provider request failed" } } })
-      : new Error(outcome === "definitive-stale" ? "turn.interrupt named a stale or inactive turn" : outcome === "definitive-raced" ? "steering raced the turn end; not delivered" : "a person's Stop is ending this turn"), "interrupt") as Error;
+      : new Error(outcome === "definitive-prefixed" ? "pi_steer_not_delivered: refusal wording changed" : outcome === "definitive-stale" ? "turn.interrupt named a stale or inactive turn" : outcome === "definitive-raced" ? "steering raced the turn end; not delivered" : "a person's Stop is ending this turn"), "interrupt") as Error;
     try {
       await accountingEvents.committed!(final);
       vi.useFakeTimers();
@@ -11796,6 +11801,29 @@ describe("native session same-turn steering", () => {
 
     state.release?.();
     await running;
+  });
+
+  it.each(["codex", "opencode", "acpx"].flatMap(provider => [
+    { label: "rejection", detail: "Provider rejected the steering message", code: "steering_rejected" },
+    { label: "unsupported", detail: "unsupported capability", code: "steering_unsupported" },
+    { label: "stale", detail: "target turn is stale", code: "steering_stale_turn" },
+    { label: "unknown", detail: "Provider request failed", code: "steering_rejected" },
+    { label: "deadline", detail: "Provider deadline exceeded", code: "steering_rejected" },
+    { label: "transport", detail: "transport connection closed", code: "steering_rejected" },
+    { label: "indeterminate", detail: 'PRP command turn.steer failed: {"result":{"code":"execution_indeterminate","message":"not executed twice"},"status":"failed"}', code: "steering_rejected" },
+  ].map(row => ({ ...row, provider }))))("stock $provider steering keeps $label classification and permits retry", async ({ provider, detail, code }) => {
+    const failure = await wrappedControlFailure(new Error(detail));
+    steer.mockRejectedValueOnce(failure);
+    const stockExecution = { ...execution, provider: provider === "acpx"
+      ? { kind: "acpx", agent: "claude", model: "fixture-model" }
+      : { kind: provider, model: "fixture-model" } } as NativeExecutionInputV1;
+    const { running } = await startActiveSession(stockExecution);
+    const input = { runId: execution.binding.runId, message: "Follow-up", correlationId: "stock-retry" };
+    try {
+      await expect(steerNativeSession(input)).rejects.toMatchObject({ code });
+      await expect(steerNativeSession(input)).resolves.toEqual({ turnId: "provider-turn-1" });
+      expect(steer).toHaveBeenCalledTimes(2);
+    } finally { state.release?.(); await running; }
   });
 
   it("bounds the provider acknowledgement wait", async () => {

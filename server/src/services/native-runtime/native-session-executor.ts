@@ -391,6 +391,7 @@ import { observeHeldNativeConfiguration, readHeldNativeTurnWork } from "./held-n
 
 type ActiveNativeSession = {
   session: NativeSession;
+  providerKind: NativeProviderKind;
   cancelRequested: boolean;
   /** A continuous Pi final was published, with no later provider work or steer. */
   heldIdle?: boolean;
@@ -9967,8 +9968,21 @@ function reconcileHeldTurn(runId: string, active: ActiveNativeSession) {
   }).catch(error => logger.warn({ error, runId }, "could not reconcile held turn"));
 }
 
-/** Only explicit non-delivery releases dispatched debt; capability checks happen before dispatch. */
-function rejectedTurnControl(error: unknown): "steering_stale_turn" | "steering_rejected" | null {
+// The separate paperclip-pi-driver package's src/drivers/pi/pi-rpc-driver.ts steer() emits the prefix.
+// Keep its three legacy phrases for one release while installed packs roll forward.
+const PI_STEER_NOT_DELIVERED = {
+  prefix: "pi_steer_not_delivered",
+  legacy: ["stale or inactive turn", "a person's Stop is ending this turn", "raced the turn end; not delivered"],
+} as const;
+
+/** Pi releases dispatched debt only for explicit non-delivery; other providers keep stock classification. */
+function rejectedTurnControl(active: ActiveNativeSession, error: unknown): "steering_stale_turn" | "steering_rejected" | "steering_unsupported" | null {
+  if (active.providerKind !== "pi_rpc") {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/stale|terminal|active turn/i.test(message)) return "steering_stale_turn";
+    if (/unsupported|unavailable|capability/i.test(message)) return "steering_unsupported";
+    return "steering_rejected";
+  }
   const value = record(error);
   const detail = error instanceof Error && typeof error.message === "string" ? error.message : typeof error === "string" ? error : "";
   let envelope = "runnerCommandResult" in value ? record(value.runnerCommandResult) : null;
@@ -9978,8 +9992,8 @@ function rejectedTurnControl(error: unknown): "steering_stale_turn" | "steering_
   const message = result ? result.message : detail;
   if (typeof message !== "string" || (result ? result.code !== "command_execution_failed"
     : /timeout|timed out|deadline|transport|disconnect|connection|indeterminate/i.test(message))) return null;
-  if (message.includes("stale or inactive turn")) return "steering_stale_turn";
-  return message.includes("a person's Stop is ending this turn") || message.includes("raced the turn end; not delivered") ? "steering_rejected" : null;
+  if (message.includes(PI_STEER_NOT_DELIVERED.legacy[0])) return "steering_stale_turn";
+  return message.includes(PI_STEER_NOT_DELIVERED.prefix) || PI_STEER_NOT_DELIVERED.legacy.slice(1).some(phrase => message.includes(phrase)) ? "steering_rejected" : null;
 }
 
 /** Dispatches a true same-turn steering message and resolves only after ack. */
@@ -10038,7 +10052,7 @@ export async function steerNativeSession(input: {
       })).then(() => ({ turnId }));
       steeringDeliveries.set(deliveryKey, delivery);
       void delivery.catch(error => {
-        if (!rejectedTurnControl(error)) return; // An uncertain ACK still owes its answer.
+        if (!rejectedTurnControl(active, error)) return; // An uncertain Pi ACK still owes its answer.
         if (steeringDeliveries.get(deliveryKey) === delivery) steeringDeliveries.delete(deliveryKey);
         releaseHeldSteeringInput(active, input.correlationId, "delivery");
         reconcileHeldTurn(input.runId, active);
@@ -10075,9 +10089,9 @@ export async function steerNativeSession(input: {
     return acknowledged;
   } catch (error) {
     if (error instanceof NativeSessionSteeringError) throw error;
-    const code = rejectedTurnControl(error);
+    const code = rejectedTurnControl(active, error);
     if (!code) throw new NativeSessionSteeringError("steering_timeout", "Steering outcome is uncertain. Your message stays queued pending acknowledgement.");
-    throw new NativeSessionSteeringError(code, code === "steering_stale_turn" ? "The target turn is no longer active." : "The provider rejected the steering message.");
+    throw new NativeSessionSteeringError(code, code === "steering_stale_turn" ? "The target turn is no longer active." : code === "steering_unsupported" ? "This provider does not support same-turn steering." : "The provider rejected the steering message.");
   } finally {
     if (timeout) clearTimeout(timeout);
   }
@@ -10134,7 +10148,7 @@ export async function interruptNativeTurn(input: { runId: string; reason: string
   try {
     await Promise.race([
       Promise.resolve().then(() => active.session.interrupt!({ turnId, reason: input.reason })).catch(error => {
-        if (input.onlyIfHeldIdle && rejectedTurnControl(error)) {
+        if (input.onlyIfHeldIdle && active.providerKind === "pi_rpc" && rejectedTurnControl(active, error)) {
           active.holdInterruptSent = false;
           active.holdCloseRequested = false;
         }
@@ -13342,7 +13356,7 @@ async function executePaperclipNativeSessionAttempt(
                 }
               }
               if (session) {
-                const active: ActiveNativeSession = { session, cancelRequested: false, admissionAbort: new AbortController() };
+                const active: ActiveNativeSession = { session, providerKind: input.execution.provider.kind, cancelRequested: false, admissionAbort: new AbortController() };
                 if (input.conversationMode !== true &&
                     !(input.execution.provider.kind === "pi_rpc" && input.execution.provider.conversationMode === true)) {
                   // Reattachment preserves the committed claim fence before publication.
