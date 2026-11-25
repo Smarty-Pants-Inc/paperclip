@@ -1,4 +1,5 @@
 import { currentControllerProcess } from "../controller-process-identity.js";
+import { settleStartupStop } from "../person-stop-before-turn.js";
 import { settleReattachRun } from "../heartbeat/run-admission.js";
 import { remoteRecoveryLeaseMismatch } from "./remote-recovery-lease-mismatch.js";
 import { isGovernancePauseStop } from "../governance-pause-stop.js";
@@ -12908,18 +12909,39 @@ async function executePaperclipNativeSessionAttempt(
             // turn boundary instead of failing this run before its turn.
             prepareWakeAttachmentPrompt: input.prepareAttachmentPrompt,
             getFirstTurnQueuedInput: async () => {
-              // Reserve dispatch under the same run-row lock as pre-turn Stop.
-              const [admitted] = await input.db.update(heartbeatRuns).set({
-                resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || '{"firstTurnDispatchCommitted":true}'::jsonb`,
-              }).where(and(
-                eq(heartbeatRuns.id, input.execution.binding.runId),
-                eq(heartbeatRuns.companyId, input.execution.binding.companyId),
-                eq(heartbeatRuns.agentId, input.execution.binding.agentId),
-                eq(heartbeatRuns.status, "running"),
-                sql`${heartbeatRuns.resultJson}->'startupCancellation' is null`,
-                sql`not (coalesce(${heartbeatRuns.resultJson}#>>'{nativeCancellation,scope}', '') = 'run'
-                  and coalesce(${heartbeatRuns.resultJson}#>>'{nativeCancellation,dispatchState}', '') in ('pending', 'acknowledged'))`,
-              )).returning({ id: heartbeatRuns.id });
+              // Stop and dispatch share issue -> run ownership. This reservation
+              // commit, NOT turn.submitted, is the delivery boundary: after it,
+              // Stop interrupts the reserved turn. claimFirstTurnQueuedInput seals
+              // durable input before runtime startTurn; revoking only the fence
+              // afterwards would strand that receipt. No provider I/O under locks.
+              // Commit settlement before throwing so returned input survives.
+              const admitted = await input.db.transaction(async tx => {
+                const binding = input.execution.binding;
+                await tx.select({ id: issues.id }).from(issues).where(and(
+                  eq(issues.id, binding.issueId), eq(issues.companyId, binding.companyId))).for("update");
+                const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, binding.runId),
+                  eq(heartbeatRuns.companyId, binding.companyId), eq(heartbeatRuns.agentId, binding.agentId))).for("update");
+                const person = record(run?.resultJson?.personStop), held = record(run?.resultJson?.personStopHeld);
+                if (run && (run.resultJson?.personStopHeld || (run.resultJson?.personStop && !run.resultJson?.firstTurnDispatchCommitted))) {
+                  await settleStartupStop(tx as unknown as Db, run, {
+                    pressedAt: String(person.requestedAt ?? held.pressedAt),
+                    userId: typeof person.userId === "string" ? person.userId : typeof held.userId === "string" ? held.userId : null,
+                  });
+                  return null;
+                }
+                const [reserved] = await tx.update(heartbeatRuns).set({
+                  resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || '{"firstTurnDispatchCommitted":true}'::jsonb`,
+                }).where(and(
+                  eq(heartbeatRuns.id, binding.runId), eq(heartbeatRuns.companyId, binding.companyId),
+                  eq(heartbeatRuns.agentId, binding.agentId), eq(heartbeatRuns.status, "running"),
+                  sql`${heartbeatRuns.resultJson}->'startupCancellation' is null`,
+                  sql`${heartbeatRuns.resultJson}->'personStopHeld' is null`,
+                  sql`(${heartbeatRuns.resultJson}->'personStop' is null or ${heartbeatRuns.resultJson}->'firstTurnDispatchCommitted' = 'true'::jsonb)`,
+                  sql`not (coalesce(${heartbeatRuns.resultJson}#>>'{nativeCancellation,scope}', '') = 'run'
+                    and coalesce(${heartbeatRuns.resultJson}#>>'{nativeCancellation,dispatchState}', '') in ('pending', 'acknowledged'))`,
+                )).returning({ id: heartbeatRuns.id });
+                return reserved;
+              });
               if (!admitted) throw new NativeCancellationPendingRecoveryError();
               return claimFirstTurnQueuedInput(input.db, input.execution.binding).catch((error) => {
                 logger.warn({ err: error, runId: input.execution.binding.runId }, "first-turn queued input was not sealed");
