@@ -14,6 +14,38 @@ const lateNotice = { eventType: "provider.notice.recorded", envelope: { ...ident
 const state = (events: unknown[]) => ({ identity, commands: [{ status: "completed" }], committedEvents: events });
 
 describe("settled remote warm control evidence", () => {
+  const completed = { eventType: "turn.completed", envelope: { ...identity, payload: {
+    ...notification, eventType: "turn.completed", payload: {},
+  } } };
+
+  it("accepts a completed turn only with explicit finalized Pi conversation authority", () => {
+    expect(isSettledRemoteWarmControlState(state([completed]), identity)).toBe(false);
+    expect(isSettledRemoteWarmControlState(state([completed]), identity, true)).toBe(true);
+    expect(isSettledRemoteWarmControlState(state([completed, snapshot]), identity, true)).toBe(true);
+    expect(isSettledRemoteWarmControlState(state([snapshot]), identity, true)).toBe(false);
+    expect(isSettledRemoteWarmControlState(state([terminal, { ...completed, eventType: "turn.started" }, completed]), identity, true)).toBe(false);
+  });
+
+  it.each(Object.keys(identity))("authenticates the completed boundary's %s", key => {
+    const foreign = { ...completed, envelope: { ...completed.envelope, [key]: "other" } };
+    expect(isSettledRemoteWarmControlState(state([foreign]), identity, true)).toBe(false);
+  });
+
+  it.each([
+    ["pending command", { ...state([completed]), commands: [{ type: "turn.start", status: "pending" }] }],
+    ["failed suspend", { ...state([completed]), commands: [{ type: "runner.suspend", status: "failed" }] }],
+    ["new work", state([completed, { ...snapshot, eventType: "turn.started" }])],
+    ["pending request", state([completed, { ...snapshot, eventType: "runtime_request.created" }])],
+    ["active goal", state([completed, { ...snapshot, envelope: { ...snapshot.envelope, payload: { ...notification, payload: { ...goal, goal: { status: "active" } } } } }])],
+    ["foreign identity", { ...state([completed]), identity: { ...identity, turnId: "other" } }],
+    ["missing notification", state([{ ...completed, envelope: identity }])],
+    ["foreign source", state([{ ...completed, envelope: { ...completed.envelope, payload: { ...completed.envelope.payload, sourceInstanceId: "other" } } }])],
+    ["control-plane source", state([{ ...completed, envelope: { ...completed.envelope, payload: { ...completed.envelope.payload, sourceKind: "control_plane" } } }])],
+    ["wrong event type", state([{ ...completed, envelope: { ...completed.envelope, payload: notification } }])],
+  ])("still refuses %s at the completed conversation boundary", (_name, control) => {
+    expect(isSettledRemoteWarmControlState(control, identity, true)).toBe(false);
+  });
+
   it.each(["paperclip.prp.event.v1", "paperclip.prp.event.v2"])("accepts the terminal and an authenticated %s idle goal-read suffix without changing its order", schema => {
     const suffix = { ...snapshot, envelope: { ...snapshot.envelope, payload: { ...notification, schema } } };
     const control = state([terminal, suffix]);
