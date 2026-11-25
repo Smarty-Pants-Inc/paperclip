@@ -210,6 +210,7 @@ export function projectGitAuthorizationService(db: Db) {
           companyId: input.companyId,
           runId: scope.runId,
           agentId: scope.agentId,
+          repository: repo.fullName,
         });
         if (result.status !== "available") throw forbidden(result.reason ?? "Run GitHub authorization unavailable");
         return transientGitToken(result.env.PAPERCLIP_GIT_TOKEN);
@@ -244,6 +245,7 @@ export function projectGitAuthorizationService(db: Db) {
         responsibleUserId: row.gitAuthorizedByUserId,
         explicitGrantId: row.gitAuthorizationGrantId,
         allowStandingDelegation: false,
+        repository: repo.fullName,
       });
       if (!resolved.credential || resolved.credential.grantId !== row.gitAuthorizationGrantId)
         throw forbidden("Project GitHub credential unavailable; reconnect the selected authorization");
