@@ -1527,6 +1527,129 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     expect(wakes).toHaveLength(sessionContinuity === "continuous" ? 1 : 0);
   });
 
+  it.each(["native", "legacy"] as const)("hands three %s pre-dispatch chat openings to the next first turn, attributed once without resetting automatic retries", async runtimeMode => {
+    const f = await fixture(true);
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc" } }).where(eq(agents.id, f.agentId));
+    // Each new run fails at ingress before a session opens, with no steering
+    // ACKs or first-turn claim. The fixture's earlier answered turn stays intact.
+    const ids: string[] = [];
+    const runs: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const id = randomUUID();
+      const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+        authorType: "user", authorUserId: f.userId, body: `Outage message ${i}`, createdAt: new Date(Date.now() + i) }).returning();
+      ids.push(comment.id);
+      await db.insert(heartbeatRuns).values({ id, companyId: f.companyId, agentId: f.agentId,
+        ...(runtimeMode === "native" ? { nativeIssueId: f.issueId } : {}), runtimeMode, status: "failed", responsibleUserId: f.userId,
+        contextSnapshot: { issueId: f.issueId, conversationSessionGeneration: 0, wakeCommentId: comment.id } });
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+        status: "failed", source: "issue", reason: "issue_commented", runId: id,
+        requestedByActorType: "user", requestedByActorId: f.userId,
+        payload: { issueId: f.issueId, commentId: ids[i] } }).returning();
+      await db.update(heartbeatRuns).set({ status: "failed", wakeupRequestId: wake.id, finishedAt: new Date(),
+        errorCode: "setup_failed", error: "runner.ingress.acquire failed", sessionIdAfter: null,
+        scheduledRetryAttempt: 2, resultJson: runtimeMode === "native"
+          ? { nativePreDispatchFailure: { version: 1, providerWorkStarted: false } }
+          : { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } })
+        .where(eq(heartbeatRuns.id, id));
+      await requeueContinuousUnanswered(db, { id, companyId: f.companyId });
+      await requeueContinuousUnanswered(db, { id, companyId: f.companyId });
+      runs.push(id);
+    }
+    const pending = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution")));
+    expect(pending).toHaveLength(3);
+    expect(pending.every(w => w.payload?.preDispatchInputOnly === true && w.runId === null)).toBe(true);
+    const [next] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorType: "user", authorUserId: f.userId, body: "The environment is back; please answer all of these." }).returning();
+    ids.push(next.id);
+    const nextRunId = randomUUID(), sessionId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: nextRunId, companyId: f.companyId, agentId: f.agentId,
+      nativeIssueId: f.issueId, nativeSessionId: sessionId, runtimeMode: "native", status: "running", responsibleUserId: f.userId,
+      contextSnapshot: { issueId: f.issueId, conversationSessionGeneration: 0, wakeCommentId: next.id } });
+    await db.update(issues).set({ status: "in_progress", conversationState: "active", executionRunId: nextRunId }).where(eq(issues.id, f.issueId));
+    const input = await claimFirstTurnQueuedInput(db, { companyId: f.companyId, issueId: f.issueId, agentId: f.agentId, runId: nextRunId });
+    for (const id of ids.slice(0, 3)) expect(input).toContain(id);
+    expect(ids.slice(0, 3).map(id => input!.indexOf(id))).toEqual([...ids.slice(0, 3).map(id => input!.indexOf(id))].sort((a, b) => a - b));
+    // The old pack's FIFO final (no answers field) must attribute the sealed
+    // openings as well as the new wake, not only the newest question.
+    const event = { eventType: "item.completed" as const, runId: nextRunId, normalizedSessionId: sessionId,
+      sourceEventId: "handback-final", itemId: "handback-final", payload: { kind: "agentMessage", channel: "final", text: "All four messages answered." } };
+    const execution = { binding: { companyId: f.companyId, issueId: f.issueId, agentId: f.agentId, runId: nextRunId }, provider: { kind: "pi_rpc" as const } };
+    await publishContinuousNativeReply({ db, execution, event, cursor: 1 });
+    await publishContinuousNativeReply({ db, execution, event, cursor: 1 });
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, nextRunId));
+    const [answered] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, nextRunId));
+    const attributed = Object.values(answered.resultJson!.continuousReplies as Record<string, { questionCommentIds: string[] }>).flatMap(r => r.questionCommentIds);
+    expect(attributed).toEqual(ids);
+    expect(new Set(attributed).size).toBe(4);
+    expect(await comments(nextRunId)).toHaveLength(1);
+    console.info("pre-dispatch handback PG evidence", JSON.stringify({ runtimeMode, failedRunIds: runs,
+      questionCommentIds: ids, successorRunId: nextRunId, continuousReplies: answered.resultJson!.continuousReplies,
+      automaticRetryAttemptsPreserved: 2, providerInvokedByTest: false }));
+    const remaining = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution")));
+    expect(remaining).toHaveLength(0);
+    // Releasing failed predecessors after the answer cannot re-create debt.
+    for (const id of runs) await requeueContinuousUnanswered(db, { id, companyId: f.companyId });
+    for (const id of runs) {
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id));
+      expect(run.scheduledRetryAttempt).toBe(2);
+    }
+  });
+
+  it("hands wake, first-turn and steering inputs back once, unless a successor already owns them", async () => {
+    const f = await fixture(true);
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc" } }).where(eq(agents.id, f.agentId));
+    const ids = [randomUUID(), randomUUID(), randomUUID()];
+    await db.insert(issueComments).values(ids.map((id, index) => ({ id, companyId: f.companyId, issueId: f.issueId,
+      authorType: "user" as const, authorUserId: f.userId, body: `Unconsumed input ${index}`, createdAt: new Date(Date.now() + index) })));
+    const source = randomUUID(), successor = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: source, companyId: f.companyId, agentId: f.agentId,
+      nativeIssueId: f.issueId, runtimeMode: "native", status: "failed", responsibleUserId: f.userId,
+      contextSnapshot: { issueId: f.issueId, conversationSessionGeneration: 0, wakeCommentId: ids[0],
+        firstTurnQueuedInput: { schema: "paperclip.first-turn-queued-input.v1", runId: source, commentIds: [ids[1]],
+          wakeupRequestIds: [], claimedAt: new Date().toISOString() } },
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+        queuedSteeringAcknowledgements: { [ids[2]]: { status: "acknowledged", acknowledgedAt: new Date().toISOString() } } } });
+    await db.insert(heartbeatRuns).values({ id: successor, companyId: f.companyId, agentId: f.agentId,
+      nativeIssueId: f.issueId, runtimeMode: "native", status: "scheduled_retry", responsibleUserId: f.userId,
+      retryOfRunId: source, scheduledRetryAttempt: 2,
+      contextSnapshot: { issueId: f.issueId, conversationSessionGeneration: 0, wakeCommentId: ids[0] } });
+    await requeueContinuousUnanswered(db, { id: source, companyId: f.companyId });
+    const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, `continuous-unanswered:${source}`));
+    expect(receipt.payload).toMatchObject({ preDispatchInputOnly: true, _paperclipWakeContext: { wakeCommentIds: ids.slice(1) } });
+    // The scheduled successor owns the opening; if it also fails pre-dispatch,
+    // it hands that opening back without duplicating the already pending two.
+    await db.update(heartbeatRuns).set({ status: "failed", resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } })
+      .where(eq(heartbeatRuns.id, successor));
+    await requeueContinuousUnanswered(db, { id: successor, companyId: f.companyId });
+    await requeueContinuousUnanswered(db, { id: source, companyId: f.companyId });
+    const pending = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution")));
+    expect(pending).toHaveLength(2);
+    const handed = pending.flatMap(w => (w.payload?._paperclipWakeContext as { wakeCommentIds: string[] }).wakeCommentIds);
+    expect(handed.sort()).toEqual([...ids].sort());
+  });
+
+  it("does not hand a failed opening back after provider work, even with a stale no-work annotation", async () => {
+    const f = await fixture(true);
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc" } }).where(eq(agents.id, f.agentId));
+    const id = randomUUID();
+    const [message] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorType: "user", authorUserId: f.userId, body: "Provider already took this opening" }).returning();
+    await db.insert(heartbeatRuns).values({ id, companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+      runtimeMode: "native", status: "failed", responsibleUserId: f.userId,
+      contextSnapshot: { issueId: f.issueId, conversationSessionGeneration: 0, wakeCommentId: message.id },
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } });
+    await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, agentId: f.agentId, runId: id,
+      seq: 1, eventType: "turn.started", sourceEventId: "provider-started", payload: {} });
+    await requeueContinuousUnanswered(db, { id, companyId: f.companyId });
+    const pending = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution")));
+    expect(pending).toHaveLength(0);
+  });
+
   const comments = (runId: string) => db.select().from(issueComments).where(eq(issueComments.createdByRunId, runId));
   const issue = async (issueId: string) => (await db.select().from(issues).where(eq(issues.id, issueId)))[0];
 
