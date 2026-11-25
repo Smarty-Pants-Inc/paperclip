@@ -3218,7 +3218,7 @@ function RequestConfirmationCard({
 
       {interaction.status === "pending" ? (
         <ConfirmationActionRow
-          footerSlot={<>{footerSlot}<ResumeReviewAction interaction={interaction} disabled={working !== null} /></>}
+          footerSlot={footerSlot}
           resetKey={`${interaction.id}:${interaction.status}`}
           approveLabel={compact ? compactActions.approveLabel : interaction.payload.acceptLabel ?? CONFIRMATION_APPROVE_LABEL}
           rejectLabel={compact ? compactActions.rejectLabel : CONFIRMATION_REJECT_LABEL}
@@ -3308,6 +3308,9 @@ function RequestConfirmationCard({
       ) : (
         <RequestConfirmationResolution interaction={interaction} />
       )}
+      {/* ConfirmationActionRow can draw its footer twice while revising. This
+          card-owned slot is mounted once and remains reserved when unavailable. */}
+      <ResumeReviewAction interaction={interaction} disabled={working !== null} />
     </div>
   );
 }
