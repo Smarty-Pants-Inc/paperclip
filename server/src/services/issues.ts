@@ -13790,7 +13790,8 @@ export function issueService(db: Db) {
       }
       // Plugin tool calls carrying a run remain run-authored output and must
       // pass cancellation/session fences. Only run-less ingress is input.
-      const conversationAgentInput = options?.allowConversationAgentInput === true && Boolean(actor.agentId) && !actor.runId;
+      const conversationAgentInput = options?.allowConversationAgentInput === true
+        && Boolean(actor.agentId) && actor.agentId !== issue.conversationAgentId && !actor.runId;
       if (issue.conversationAgentId && actor.agentId && issue.conversationAgentId !== actor.agentId && !conversationAgentInput) {
         throw forbidden("Only this conversation's agent can post agent messages");
       }
