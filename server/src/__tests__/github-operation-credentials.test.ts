@@ -150,6 +150,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
       const token = createRuntimeToolsToken({ ...input, responsibleUserId: "A", scope: "github_credentials" })!.token;
       for (const [body, selected] of [
         [{ repository: "Example-Org/App" }, a],
+        [{ repository: "second-org" }, b],
         [{ protocol: "https", host: "github.com", path: "second-org/app.git" }, b],
       ] as const) {
         const response = await request(app).post("/runtime-tools/github/credentials").set("Authorization", `Bearer ${token}`).send(body);
@@ -188,6 +189,10 @@ process.stdout.write(process.env.GH_TOKEN || '');
           ["gh", ["repo", "view", "second-org/app"], b],
           ["gh", ["pr", "view", "https://github.com/second-org/app/pull/42"], b],
           ["gh", ["api", "https://api.github.com/repos/second-org/app/pulls"], b],
+          ["gh", ["api", "https://api.github.com:443/repos/second-org/app"], b],
+          ["gh", ["api", "orgs/second-org/repos"], b],
+          ["gh", ["api", "users/second-org/repos"], b],
+          ["gh", ["repo", "clone", "--", "second-org/app"], b],
           ["gh", ["pr", "list", "--repo=example-org/app"], a],
           ["git", ["clone", "git@github.com:second-org/app.git"], b],
           ["git", ["clone", "https://github.com:443/second-org/app.git"], b],
@@ -195,6 +200,9 @@ process.stdout.write(process.env.GH_TOKEN || '');
           const { stdout } = await promisify(execFile)(program, [...args], { cwd: directory, env: { ...process.env, ...broker.env, GH_REPO: "second-org/app" } });
           expect(stdout).toBe(`app-token-${selected.connectionId}`);
         }
+        await expect(promisify(execFile)("gh", ["api", "https://api.github.com:443/graphql", "-f", 'query={repository(owner:"second-org",name:"app"){name}}'], {
+          cwd: directory, env: { ...process.env, ...broker.env },
+        })).rejects.toMatchObject({ code: 1, stdout: "", stderr: expect.stringContaining("repository_target_required") });
         // Real Git, the native broker, company-scoped selection and the server helper.
         for (const [requestedPath, selected] of [["example-org/app.git", a], ["second-org/new.git", b]] as const) {
           const result = await new Promise<{ error: Error | null; stdout: string }>(resolve => {
@@ -266,6 +274,8 @@ process.stdout.write(process.env.GH_TOKEN || '');
         .toMatchObject({ grant: { id: selected.id } });
       expect(await resolveManagedGitHubIdentitySelection(db, input.companyId, { agentId: input.agentId, repository: "example-org/new" }))
         .toMatchObject({ error: expect.stringContaining("example-org/new") });
+      expect(await resolveManagedGitHubIdentitySelection(db, input.companyId, { agentId: input.agentId, repository: "example-org" }))
+        .toMatchObject({ grant: { id: selected.id } });
     });
     it("preserves single App selection and personal priority over shared Apps", async () => {
       const input = await seed();

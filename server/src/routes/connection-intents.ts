@@ -56,7 +56,7 @@ export function runtimeConnectionIntentRoutes(db: Db) {
     res.setHeader("Cache-Control", "no-store");
     const requested = req.header("x-paperclip-github-repository") ?? req.body?.repository
       ?? (req.body?.host === "github.com" || req.body?.host === "www.github.com" ? req.body?.path : undefined);
-    const repository = typeof requested === "string" ? gitHubRepositoryHint(requested) : undefined;
+    const repository = typeof requested === "string" ? gitHubRepositoryHint(requested, true) : undefined;
     if (requested !== undefined && !repository) throw forbidden("Invalid GitHub repository hint");
     res.json(await resolveGitHubOperationCredentials(db, {
       companyId: claims.company_id, agentId: claims.sub, runId: claims.run_id, repository,
