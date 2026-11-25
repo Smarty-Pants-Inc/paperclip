@@ -77,6 +77,13 @@ import { registerToolReviewExpiryWork } from "../services/tool-review-expiry-wor
 import { idleWorkSnapshot } from "../services/task-admission.js";
 import { grantLegacyPluginTools } from "./helpers/legacy-plugin-tools.js";
 
+vi.mock("../services/github-app-credentials.js", async original => ({
+  ...await original<typeof import("../services/github-app-credentials.js")>(),
+  resolveGitHubAppCredential: vi.fn(async (_db, connection) => ({ token: `app-token-${connection.id}`, expiresAt: Date.now() + 3_600_000 })),
+  resolveGitHubAppInstallation: vi.fn(async (_db, connection) => ({
+    account: { login: connection.config.methodConfig.repositories.trim().split("/")[0] }, repository_selection: "all",
+  })),
+}));
 const externalDatabaseUrl = resolveExternalTestDatabaseUrl("PAPERCLIP_TOOL_REVIEW_TEST_DATABASE_URL");
 const embeddedPostgresSupport = externalDatabaseUrl ? { supported: true } : await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -3561,6 +3568,38 @@ describeEmbeddedPostgres("tool gateway service", () => {
     expect(persisted).not.toContain("stale-provider-bearer");
     expect(persisted).not.toContain("fresh-provider-bearer");
     expect(storedGrant?.externalCredential).toMatchObject({ tokenId: "stk_fresh" });
+  });
+
+  it("dispatches repository-scoped tools with the matching company-wide shared App", async () => {
+    const { company, agent, issue, run } = await createRunFixture(db);
+    const first = await createRemoteMcpToolFixture(db, company.id);
+    await db.update(toolApplications).set({ name: "First GitHub App" }).where(eq(toolApplications.id, first.application.id));
+    const fixtures = [first, await createRemoteMcpToolFixture(db, company.id)];
+    for (const [index, { connection }] of fixtures.entries()) {
+      await db.update(toolConnections).set({ createdAt: new Date(index === 0 ? "2026-01-01" : "2026-02-01"),
+        config: { ...connection.config, sourceTemplateKey: "github", connectionMethodKey: "app-installation",
+          methodConfig: { repositories: index === 0 ? "example-org/app" : "second-org/app" } },
+      }).where(eq(toolConnections.id, connection.id));
+      await db.insert(toolConnectionInstalls).values({ companyId: company.id, connectionId: connection.id,
+        targetType: "company", targetId: company.id });
+    }
+    await db.insert(companyMemberships).values({ companyId: company.id, principalType: "user", principalId: "A", status: "active", membershipRole: "member" });
+    await initializeRunIdentity(db, { companyId: company.id, runId: run.id, issueId: issue.id, responsibleUserId: "A", cause: "instruction" });
+    await db.insert(toolPolicies).values(readPolicyRow(company, "Allow reads"));
+    const tokens: string[] = [];
+    const gateway = createTestToolGatewayService(db, { remoteHttpRequest: async (_url, init) => {
+      tokens.push(new Headers(init.headers).get("authorization") ?? "");
+      return Response.json({ jsonrpc: "2.0", id: JSON.parse(String(init.body)).id, result: { content: [{ type: "text", text: "ok" }] } });
+    } });
+    const session = await gateway.createSession(runSessionInput(company, agent, run));
+    const tool = (await gateway.listToolsForSession(session.token)).find(t => t.providerType === "mcp_remote_http")!;
+    for (const parameters of [{ owner: "second-org", repo: "app" }, { owner: "example-org", repo: "app" }]) {
+      expect((await gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters })).status).toBe("completed");
+    }
+    expect(tokens).toEqual([`Bearer app-token-${fixtures[1].connection.id}`, `Bearer app-token-${fixtures[0].connection.id}`]);
+    await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: { owner: "other", repo: "missing" } }))
+      .rejects.toMatchObject({ status: 409, message: expect.stringContaining("for repository other/missing") });
+    expect(tokens).toHaveLength(2);
   });
 
   it("keeps managed GitHub personal identity even under a legacy shared policy", async () => {
