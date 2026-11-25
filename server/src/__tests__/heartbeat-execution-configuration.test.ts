@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, authUsers, companies, companyMemberships, companySkills, companySkillTestRuns, createDb, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issues, projects, plugins, environments } from "@paperclipai/db";
+import { agents, authUsers, companies, companyMemberships, companySkills, companySkillTestRuns, createDb, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issueComments, issues, projects, plugins, environments } from "@paperclipai/db";
 import { companySkillService } from "../services/company-skills.js";
 import { skillVersionCachePaths, withSkillVersionCacheLock } from "../services/skill-version-cache.js";
 import { registerServerAdapter, unregisterServerAdapter, type AdapterExecutionContext } from "../adapters/index.js";
@@ -40,6 +40,18 @@ function deferred<T>() {
 
 const skillFailures = vi.hoisted(() => new Map<string, string>());
 const skillWaits = vi.hoisted(() => new Map<string, () => Promise<void>>());
+const commentFailures = vi.hoisted(() => new Map<string, () => Promise<void>>());
+
+vi.mock("../services/issues.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../services/issues.js")>();
+  return { ...actual, issueService: (...args: Parameters<typeof actual.issueService>) => {
+    const service = actual.issueService(...args);
+    return { ...service, addComment: async (...input: Parameters<typeof service.addComment>) => {
+      await commentFailures.get(input[0])?.();
+      return service.addComment(...input);
+    } };
+  } };
+});
 
 describe("SSH authentication before account routing", () => {
   it.each([
@@ -161,7 +173,7 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
       testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }),
     });
   }, 60_000);
-  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); skillFailures.clear(); skillWaits.clear(); });
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); skillFailures.clear(); skillWaits.clear(); commentFailures.clear(); });
   afterAll(async () => {
     await heartbeat?.drainActiveRunExecutions();
     unregisterServerAdapter(adapterType);
@@ -202,6 +214,74 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
     expect(finished).toBeDefined();
     return { finished, input: captured.get(run!.id) };
   }
+
+  it.each([
+    { model: undefined, policy: {}, workMode: "standard" },
+    { model: "gpt-6.1-sol", policy: {}, workMode: "standard" },
+  ] as const)("stops invalid Pi selection once, visibly, without poisoning the agent: %j", async ({ model, policy, workMode }) => {
+    const f = await seed();
+    await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: {
+      provider: "pi_rpc", model, homeMode: "preconfigured", ...policy,
+    } }).where(eq(agents.id, f.agentId));
+    await db.update(issues).set({ status: "in_progress", workMode, conversationAgentId: f.agentId,
+      conversationUserId: f.userId, conversationState: "active",
+      assigneeAdapterOverrides: { adapterConfig: { model: "gpt-6.2-sol" } },
+    }).where(eq(issues.id, f.issueId));
+    const { finished } = await execute(f);
+    expect(finished).toMatchObject({ status: "failed", errorCode: "pi_model_provider_required",
+      scheduledRetryAt: null, resultJson: { modelSelection: { retryability: "requires_action",
+        model: model?.includes("/") ? "paperclip/gpt-6.2-sol" : "gpt-6.2-sol" } } });
+    expect(finished.error).toContain("pick a provider/model, or clear the chat's model");
+    const [agent] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    expect(agent.status).toBe("idle");
+    expect(issue).toMatchObject({ status: "in_review", conversationState: "waiting", executionRunId: null });
+    const comments = await db.select().from(issueComments).where(eq(issueComments.createdByRunId, finished.id));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toMatchObject({ authorType: "system", body: finished.error });
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
+    expect(runs).toHaveLength(1);
+    expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].status).toBe("in_review");
+  });
+
+  // Regression: a notice insert failure after the terminal commit must not strand a plain turn.
+  it("cleans up after a committed Pi failure even when addComment fails, and repairs its notice exactly once", async () => {
+    const f = await seed();
+    await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: {
+      provider: "pi_rpc", model: "bare-model", homeMode: "preconfigured",
+    } }).where(eq(agents.id, f.agentId));
+    await db.update(issues).set({ status: "in_progress", conversationAgentId: f.agentId,
+      conversationUserId: f.userId, conversationState: "active",
+      assigneeAdapterOverrides: { adapterConfig: { model: "gpt-6.2-sol" } },
+    }).where(eq(issues.id, f.issueId));
+    let terminalRunId: string | undefined;
+    commentFailures.set(f.issueId, async () => {
+      const [terminal] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
+      expect(terminal).toMatchObject({ status: "failed", errorCode: "pi_model_provider_required" });
+      terminalRunId = terminal.id;
+      throw new Error("injected addComment failure after terminal commit");
+    });
+    const { finished } = await execute(f);
+    expect(terminalRunId).toBe(finished.id);
+    expect((await db.select().from(agents).where(eq(agents.id, f.agentId)))[0].status).toBe("idle");
+    expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0])
+      .toMatchObject({ status: "in_review", conversationState: "waiting", executionRunId: null, checkoutRunId: null });
+    expect(await db.select().from(issueComments).where(eq(issueComments.createdByRunId, finished.id))).toHaveLength(0);
+    commentFailures.delete(f.issueId);
+    // Both contenders can read the same missing notice; the issue lock fences the insert.
+    await Promise.all([
+      heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId }),
+      heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId }),
+    ]);
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+    const comments = await db.select().from(issueComments).where(eq(issueComments.createdByRunId, finished.id));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toMatchObject({ authorType: "system", body: finished.error });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(1);
+    expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0])
+      .toMatchObject({ status: "in_review", conversationState: "waiting", executionRunId: null });
+  });
 
   it.each([
     { saved: "isolated", managed: true, failure: "saved managed login required" },
