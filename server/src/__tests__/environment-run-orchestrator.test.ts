@@ -1007,6 +1007,25 @@ describe("live remote runner lease reattachment", () => {
     expect(result.lease.metadata).toMatchObject({ restoredFromSnapshotAt, remoteCwd: "/remote/workspace" });
     expect(runtime.acquireRunLease).not.toHaveBeenCalled();
   });
+  it.each(["restoredFromSnapshotAt", "rebootedAt"] as const)("does not replay handled %s on a held run after another server restart", async marker => {
+    const lease = originalLease();
+    const first = "2026-11-25T12:00:00.000Z";
+    const handledProcessRestartKey = JSON.stringify(marker === "rebootedAt" ? [null, first] : [first, null]);
+    lease.metadata = { ...lease.metadata, [marker]: first, handledProcessRestartKey,
+      sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "original-sandbox", [marker]: first } };
+    mockGetLease.mockResolvedValue(lease);
+    let current = first;
+    const runtime = makeMockRuntime({ resumeRunLease: vi.fn(async () => ({ providerLeaseId: "original-sandbox",
+      ...(marker === "restoredFromSnapshotAt" ? { restoredFromSnapshotAt: current } : {}), metadata: { [marker]: current } })) });
+    const orchestrator = environmentRunOrchestrator({} as never, { environmentRuntime: runtime });
+    const resumed = await orchestrator.acquireForRun(input);
+    expect(resumed.lease.id).toBe(lease.id);
+    expect(resumed.sandboxLeaseAcquisition).toEqual({ outcome: "resumed", providerLeaseId: "original-sandbox", handledProcessRestartKey });
+    current = "2026-11-25T13:00:00.000Z";
+    const rebooted = await orchestrator.acquireForRun(input);
+    expect(rebooted.sandboxLeaseAcquisition).toMatchObject({ [marker]: current });
+    expect(runtime.acquireRunLease).not.toHaveBeenCalled();
+  });
   it.each(["created", "replacement", "resumed"] as const)(
     "reports exact-lease reattachment as resumed after historical %s acquisition", async outcome => {
       const savedLease = originalLease();

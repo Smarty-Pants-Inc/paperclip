@@ -1,3 +1,4 @@
+import { sandboxRestartKey } from "../sandbox-snapshot-restore.js";
 import { and, eq } from "drizzle-orm";
 import { agents, companies, environmentLeases, heartbeatRuns, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
@@ -212,7 +213,7 @@ export async function inspectRemoteWarmSessionRecovery(input: {
   // then retires the finished owner or keeps it held with a named reason.
   if (!input.portableSourceTaskId && target.transport === "sandbox" && (
     ["created", "replacement"].includes(target.sandboxLeaseAcquisition?.outcome ?? "")
-    || target.sandboxLeaseAcquisition?.restoredFromSnapshotAt || target.sandboxLeaseAcquisition?.rebootedAt
+    || sandboxRestartKey(target.sandboxLeaseAcquisition)
   )) {
     return null;
   }
