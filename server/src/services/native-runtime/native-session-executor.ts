@@ -402,8 +402,13 @@ type ActiveNativeSession = {
   holdIdlePublicationVersion?: number;
   /** Latched until this exact attachment reaches a genuinely idle publication. */
   holdEndPending?: boolean;
+  /** Close at next idle, without fencing the completion offer's steering door. */
+  holdCloseIntent?: boolean;
   holdSteeredInputs?: Map<string, { preparing: number; dispatched: boolean }>;
   refreshHeldTurnWork?: () => Promise<boolean>;
+  /** The release owner offers live completions before it fences new steering. */
+  offerHeldCompletion?: () => Promise<boolean>;
+  holdCompletionOffering?: boolean;
   admissionAbort?: AbortController;
   cancellationSettled?: Promise<void>;
   restartDetach?: Promise<void>;
@@ -9910,7 +9915,7 @@ function releaseHeldSteeringInput(active: ActiveNativeSession, id: string, phase
 
 function reconcileHeldTurn(runId: string, active: ActiveNativeSession) {
   void active.refreshHeldTurnWork?.().then(() => {
-    if (activeNativeSessions.get(runId) === active && active.holdEndPending) return closeHeldNativeTurn(runId);
+    if (activeNativeSessions.get(runId) === active && (active.holdEndPending || active.holdCloseIntent)) return closeHeldNativeTurn(runId);
   }).catch(error => logger.warn({ error, runId }, "could not reconcile held turn"));
 }
 
@@ -10034,7 +10039,27 @@ export async function steerNativeSession(input: {
  * release the hold. No personStop state or cancel/requeue machinery. */
 export async function closeHeldNativeTurn(runId: string): Promise<boolean> {
   const active = activeNativeSessions.get(runId);
-  if (!active || active.cancelRequested || active.holdCloseRequested) return false;
+  if (!active || active.cancelRequested || active.holdCloseRequested || active.holdCompletionOffering) return false;
+  // Latch intent before I/O, separately from the steering fence. A real offer
+  // may defer close until its answer; cleanup-only success must not lose close.
+  // Configuration/reset intents already latched by 0447 retain their fence.
+  active.holdCloseIntent = true;
+  active.holdCompletionOffering = true;
+  try {
+    await active.refreshHeldTurnWork?.();
+    if (!active.holdEndPending) {
+      const offered = await active.offerHeldCompletion?.();
+      // The return value also includes cleanup/already-terminal wakes. Only
+      // an offer with actual unanswered work is reason to defer the fence.
+      if (offered && await active.refreshHeldTurnWork?.() && !active.holdEndPending) return false;
+    }
+  } catch (error) {
+    // Keep the intent and fall through to the fenced, fresh authority read.
+    // A transient offer/read failure needs no unrelated final or manual retry;
+    // the durable wake remains owed to the ordinary release path.
+    logger.warn({ error, runId }, "held completion offer deferred to release");
+  } finally { active.holdCompletionOffering = false; }
+  if (activeNativeSessions.get(runId) !== active || active.cancelRequested || active.holdCloseRequested) return false;
   active.holdEndPending = true;
   active.holdCloseRequested = true;
   try {
@@ -12099,7 +12124,7 @@ async function executePaperclipNativeSessionAttempt(
             active.holdActivityVersion === activityVersion && input.execution.provider.kind === "pi_rpc" &&
             input.execution.provider.conversationMode === true) {
           active.heldIdle = true;
-          if (active.holdEndPending) void closeHeldNativeTurn(input.execution.binding.runId).catch(error =>
+          if (active.holdEndPending || active.holdCloseIntent) void closeHeldNativeTurn(input.execution.binding.runId).catch(error =>
             logger.warn({ error, runId: input.execution.binding.runId }, "could not close latched held turn"));
           // Do not join a provider command from its event-persistence callback.
           // The same check also runs after enqueue, covering both arrival orders.
@@ -13284,6 +13309,10 @@ async function executePaperclipNativeSessionAttempt(
                 }
                 activeNativeSessions.set(input.execution.binding.runId, active);
                 if (input.execution.provider.kind === "pi_rpc" && input.execution.provider.conversationMode === true) {
+                  active.offerHeldCompletion = async () => {
+                    const { offerHeldChatCompletions } = await import("../chat-completion-delivery.js");
+                    return offerHeldChatCompletions(input.db, input.execution.binding);
+                  };
                   active.refreshHeldTurnWork = async () => {
                     const work = await readHeldNativeTurnWork(input.db, input.execution.binding);
                     if (!work) return true;
