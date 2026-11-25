@@ -429,9 +429,9 @@ export async function resolveNewAgentRunnerForCompany(db: Db, companyId: string,
     if (nativePi && !installed) throw unavailable();
     if (installed) {
       const target = await resolveAgentRunnerTargetForCompany(db, companyId, input.defaultEnvironmentId, disabledTypes);
-      // Keep the common disabled/registry/environment checks, but choose the
-      // installed provider before the stock Pi path can validate or default it.
-      if (!agentRunnerAvailability("pi_local", target, disabledTypes).supportedRunners.includes("paperclip")) throw unprocessable(
+      // Only fresh Pi-card selections need the legacy harness availability check.
+      // Saved native agents stay editable when the Pi adapter is disabled.
+      if (piCard && !agentRunnerAvailability("pi_local", target, disabledTypes).supportedRunners.includes("paperclip")) throw unprocessable(
         "The installed native Pi driver requires Paperclip Runner in a supported environment. Enable its adapters, choose a supported Computer or explicitly select Legacy.",
         { code: "agent_runner_unavailable" },
       );
