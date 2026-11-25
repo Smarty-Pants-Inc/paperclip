@@ -573,10 +573,16 @@ export async function deliverReconciledExecutions(
         const returned = parseObject(result.personStop).returned;
         const settled = new Set([...answered, ...(Array.isArray(returned) ? returned : [])]);
         const wakeId = retried?.contextSnapshot?.wakeCommentId;
+        const inherited = parseObject(result.continuedSessionInput);
+        const inheritedIds = inherited.runId === retried?.id && inherited.sessionId === retried?.nativeSessionId && Array.isArray(inherited.commentIds)
+          ? inherited.commentIds.filter((id): id is string => typeof id === "string") : [];
         const inputIds = [...new Set([
           ...queuedCommentIdsFromRunContext(retried?.contextSnapshot),
           ...(typeof wakeId === "string" ? [wakeId] : []),
           ...(retried ? readFirstTurnQueuedInputReceipt(retried)?.commentIds ?? [] : []),
+          ...Object.entries(parseObject(result.queuedSteeringAcknowledgements))
+            .filter(([, receipt]) => parseObject(receipt).status === "acknowledged").map(([id]) => id),
+          ...inheritedIds,
         ])].filter(id => !settled.has(id));
         const slot = await reserveAutomaticRunCreation(db, action.companyId, { issueId: task.id, sourceRunId: decision.runId });
         if (slot.heldUntil) { await deferRefusedContinuation(action); continue; }
