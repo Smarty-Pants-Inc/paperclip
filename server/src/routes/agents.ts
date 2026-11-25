@@ -319,6 +319,7 @@ import {
 } from "../services/heartbeat-run-privacy.js";
 import {
   PaperclipRunnerProviderProfileError,
+  piRpcThinking,
   resolvePaperclipRunnerProviderProfile,
   validatePaperclipRunnerDotConfig,
   validatePaperclipRunnerGrokConfig,
@@ -2407,18 +2408,10 @@ export function agentRoutes(
     requestedConfig: Record<string, unknown> = adapterConfig,
   ): Record<string, unknown> {
     if (adapterType !== "paperclip_runner" || adapterConfig.provider !== "pi_rpc") return adapterConfig;
-    let thinkingLevel: string | undefined;
-    for (const key of ["piRpcThinkingLevel", "modelReasoningEffort", "reasoningEffort", "effort"]) {
-      const value = requestedConfig[key];
-      if (value == null || (typeof value === "string" && !value.trim())) continue;
-      if (typeof value !== "string" || !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value)) {
-        throw unprocessable(`${key} must be a Pi thinking level: off, minimal, low, medium, high, xhigh, or max`);
-      }
-      thinkingLevel ??= value;
-    }
+    validatePiReasoningSelection({ adapterType, adapterConfig: { ...requestedConfig, provider: "pi_rpc" } });
     return {
       ...adapterConfig,
-      piRpcThinkingLevel: thinkingLevel ?? "medium",
+      piRpcThinkingLevel: piRpcThinking(requestedConfig),
       model: asNonEmptyString(adapterConfig.model) ? adapterConfig.model : "paperclip/claude-opus-5-5",
     };
   }
