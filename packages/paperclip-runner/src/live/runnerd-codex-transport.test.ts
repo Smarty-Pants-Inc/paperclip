@@ -32,7 +32,7 @@ import {
 import { DurablePrpControlPlane } from "../control-plane/durable-prp-control-plane.js";
 import * as durableControlPlane from "../control-plane/durable-prp-control-plane.js";
 import * as codexCommandRuntime from "../drivers/codex/codex-command.js";
-import { composeNativeSystemInstructions, type NativeRuntimeContextSnapshot } from "../contracts/runtime-context.js";
+import { canonicalNativeRuntimeContextDigest, composeNativeSystemInstructions, type NativeRuntimeContextSnapshot } from "../contracts/runtime-context.js";
 import { CODEX_SKILLLESS_BASE_INSTRUCTIONS, createCodexTaskEnvelope } from "../contracts/codex.js";
 import { PRP_BLOCK_TOOL_DESCRIPTION, PRP_COMPLETION_TOOL_DESCRIPTION } from "../contracts/completion-result.js";
 import { CodexAppServerDriver, codexSemanticToolSpecs } from "../drivers/codex/codex-app-server-driver.js";
@@ -1047,19 +1047,29 @@ it("reopens Copilot with the current registered files after collecting the previ
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-it.each(["local", "ssh"])("refreshes continuous Pi instructions on %s rotation without changing the pinned profile", target => {
+it.each(["local", "ssh"])("persists refreshed continuous Pi runtimeContext on %s rotation without changing the pinned profile", async target => {
   const identity = { runnerInstanceId: "runner", environmentLeaseId: "lease", runId: "next-run", normalizedSessionId: "session", turnId: "turn", itemId: "item" };
-  const prior = assignedRuntimeContext("/old/skills", "/old/instructions");
-  const current = assignedRuntimeContext("/new/skills", "/new/instructions");
-  const remote = target === "ssh" ? assignedRuntimeContext("/guest/skills", "/guest/instructions") : current;
-  const provider = { kind: "pi_rpc", instructions: composeNativeSystemInstructions(prior, "Old instruction bytes"), runtimeContext: prior,
-    command: "/pinned/node", args: ["/pinned/proxy.cjs"], model: "pinned-model" };
-  const payload = runnerdRecoveryInternals.rotatedRunAttachPayload({ runAttachTemplate: { provider } }, identity, null, undefined,
-    remote, { text: composeNativeSystemInstructions(current, "End every reply with BANANA."), context: current }, true);
-  expect(payload.provider).toEqual({ ...provider, instructions: composeNativeSystemInstructions(remote, "End every reply with BANANA.") });
-  expect(provider.instructions).toContain("Old instruction bytes");
-  expect(runnerdRecoveryInternals.rotatedRunAttachPayload({ runAttachTemplate: { provider } }, identity, null, undefined,
-    remote, { text: "New instructions", context: null }).provider).toEqual(provider);
+  const root = await mkdtemp(join(tmpdir(), "pi-durable-restamp-"));
+  const core = new DurablePrpControlPlane({ stateDirectory: root, identity,
+    expectedRunnerVersion: "fixture", expectedRunnerDigest: `sha256:${"0".repeat(64)}` });
+  try {
+    const prior = assignedRuntimeContext("/old/skills", "/old/instructions");
+    prior.instructions.bundle.digest = "1".repeat(64);
+    prior.aggregateDigest = canonicalNativeRuntimeContextDigest(prior);
+    const current = assignedRuntimeContext("/new/skills", "/new/instructions");
+    const remote = target === "ssh" ? assignedRuntimeContext("/guest/skills", "/guest/instructions") : current;
+    const provider = { kind: "pi_rpc", instructions: composeNativeSystemInstructions(prior, "Old instruction bytes"), runtimeContext: prior,
+      command: "/pinned/node", args: ["/pinned/proxy.cjs"], model: "pinned-model" };
+    const payload = runnerdRecoveryInternals.rotatedRunAttachPayload({ runAttachTemplate: { provider } }, identity, null, undefined,
+      remote, { text: composeNativeSystemInstructions(current, "End every reply with BANANA."), context: current }, true);
+    core.persistRunAttachTemplate(payload);
+    const durable = JSON.parse(await readFile(join(root, "control-plane-state.json"), "utf8"));
+    expect(durable.runAttachTemplate.provider.runtimeContext.aggregateDigest).toBe(remote.aggregateDigest);
+    expect(payload.provider).toEqual({ ...provider, instructions: composeNativeSystemInstructions(remote, "End every reply with BANANA."), runtimeContext: remote });
+    expect(provider.instructions).toContain("Old instruction bytes");
+    expect(runnerdRecoveryInternals.rotatedRunAttachPayload({ runAttachTemplate: { provider } }, identity, null, undefined,
+      remote, { text: "New instructions", context: null }).provider).toEqual(provider);
+  } finally { await core.stop(); await rm(root, { recursive: true, force: true }); }
 });
 
 it("refreshes Cloud instructions on cold rotation without replacing the pinned launch profile", () => {

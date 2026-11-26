@@ -661,6 +661,7 @@ function retargetRunAttachPayload(
     provider.instructions = currentInstructions.context && runtimeContext !== undefined
       ? retargetComposedInstructions(currentInstructions.text, currentInstructions.context, runtimeContext)
       : currentInstructions.text;
+    if (provider.kind === "pi_rpc" && runtimeContext !== undefined) provider.runtimeContext = structuredClone(runtimeContext);
     payload.provider = provider;
   }
   if (authorizedTools !== null) payload.authorizedTools = authorizedTools;
