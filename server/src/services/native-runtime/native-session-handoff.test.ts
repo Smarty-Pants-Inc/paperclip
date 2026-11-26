@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, companies, createDb, documents, heartbeatRunEvents, heartbeatRuns, issueComments, issueDocuments, issues, issueThreadInteractions } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
-import { buildNativeSessionHandoff, createNativeSessionHandoffLoader, NATIVE_HANDOFF_MAX_BYTES, renderNativeSessionHandoff } from "./native-session-handoff.js";
+import { buildNativeSessionHandoff, createNativeSessionHandoffLoader, NATIVE_HANDOFF_MAX_BYTES, NATIVE_WHOLE_HANDOFF_MAX_BYTES, renderNativeSessionHandoff } from "./native-session-handoff.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { buildNativeModelEnvelope } from "@paperclipai/paperclip-runner";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
@@ -26,8 +26,34 @@ describe("bounded fresh-session handoff", () => {
     const rendered = renderNativeSessionHandoff({ issueId: "task", generation: 1, mode: "whole", entries, omittedEntriesAtLeast: 0 });
     const packet = JSON.parse(rendered.split("\n").at(-1)!);
     expect(rendered.length).toBeLessThanOrEqual(400_000);
-    expect(rendered.split("\n")[0]).toBe("2 earlier messages were not handed over.");
-    expect(packet.entries.map((entry: { body: string }) => entry.body)).toEqual(entries.slice(2).map(entry => entry.body));
+    expect(rendered.split("\n")[0]).toBe("4 earlier messages were not handed over.");
+    expect(packet.entries.map((entry: { body: string }) => entry.body)).toEqual(entries.slice(4).map(entry => entry.body));
+  });
+
+  it("caps whole history by its bytes inside the journal command, including both escaping passes", () => {
+    const origin = { kind: "original_request", id: "origin", body: "Repair the journal overflow; preserve the original objective." };
+    const content = 'Review: "Résumé 日本語 🦖"\n```ts\nconst file = "C:\\work\\src";\nconsole.log({"ok": true});\n```\n';
+    const messages = Array.from({ length: 6 }, (_, i) => ({ kind: "message", id: String(i), body: `${i}:\n${content.repeat(530)}` }));
+    const entries = [origin, ...messages, { kind: "document", id: "support", body: "Existing plan" }];
+    const args = { issueId: "task", generation: 1, mode: "whole" as const, omittedEntriesAtLeast: 2, omittedMessages: 3 };
+    const empty = renderNativeSessionHandoff({ ...args, entries: [] }).split("\n");
+    const unsafe = [...empty.slice(0, -1), JSON.stringify({ ...JSON.parse(empty.at(-1)!), entries })].join("\n");
+    const commandBytes = (packet: string) => Buffer.byteLength(JSON.stringify({ type: "turn.start", payload: {
+      text: JSON.stringify({ task: { prompt: packet } }),
+    } }));
+    const maxCommandBytes = Math.floor((1024 * 1024 - 4096) / 2);
+    expect(unsafe.length).toBeLessThan(400_000);
+    expect(commandBytes(unsafe)).toBeGreaterThan(maxCommandBytes);
+    const rendered = renderNativeSessionHandoff({ ...args, entries });
+    const packet = JSON.parse(rendered.split("\n").at(-1)!);
+    expect(commandBytes(rendered) - commandBytes("")).toBeLessThanOrEqual(NATIVE_WHOLE_HANDOFF_MAX_BYTES);
+    expect(commandBytes(rendered)).toBeLessThanOrEqual(maxCommandBytes);
+    expect(packet.entries.map((entry: { body: string }) => entry.body)).toEqual([origin, ...messages.slice(3)].map(entry => entry.body));
+    expect(packet.omittedMessages).toBe(3 + messages.length - (packet.entries.length - 1));
+    expect(packet.omittedSupportingEntriesAtLeast).toBe(3);
+    expect(packet.omittedEntriesAtLeast).toBe(packet.omittedMessages + packet.omittedSupportingEntriesAtLeast);
+    expect(rendered).toContain(`${packet.omittedMessages} earlier messages were not handed over.`);
+    expect(rendered).toContain("At least 3 supporting entries were not handed over.");
   });
 
   it("reserves the original request while rendering the newest whole messages", () => {

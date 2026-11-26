@@ -7,7 +7,11 @@ import { fastResponseHistoryBody, type ExecutionContinuationEnvelope } from "@pa
 import { nativeFinalReplyKey } from "../heartbeat-run-summary.js";
 
 export const NATIVE_HANDOFF_MAX_BYTES = 24_000;
-export const NATIVE_WHOLE_HANDOFF_MAX_CHARS = 400_000;
+// The journal allows 522,240 bytes; reserve 154,240 for the wake/envelope and margin.
+export const NATIVE_WHOLE_HANDOFF_MAX_BYTES = 368_000;
+// Packet text is escaped in the model envelope, then again in command.payload.text.
+// Exclude the six bytes belonging to the two JSON string delimiters.
+const commandTextBytes = (text: string) => Buffer.byteLength(JSON.stringify(JSON.stringify(text)), "utf8") - 6;
 const ENTRY_MAX_CHARS = 4_000;
 const LIMIT = 10;
 
@@ -42,7 +46,7 @@ export function renderNativeSessionHandoff(input: {
   for (const entry of input.entries) {
     const complete = whole && isConversationEntry(entry);
     const oversizedOrigin = whole && entry.kind === "original_request" &&
-      JSON.stringify(entry).length > NATIVE_WHOLE_HANDOFF_MAX_CHARS - 8_000;
+      commandTextBytes(JSON.stringify(entry)) > NATIVE_WHOLE_HANDOFF_MAX_BYTES - 8_000;
     const clipped = oversizedOrigin || (!complete && entry.body.length > ENTRY_MAX_CHARS);
     // Preserve both the start and latest direction in exceptionally long messages.
     const body = clipped ? `${entry.body.slice(0, 2_900)}\n[content omitted]\n${entry.body.slice(-900)}` : entry.body;
@@ -61,19 +65,20 @@ export function renderNativeSessionHandoff(input: {
   if (whole) {
     // Drop supporting excerpts before conversation, then oldest non-origin messages.
     // Account for the growing visible note without re-serializing the history.
-    let overhead = render([]).length;
-    let size = overhead + entries.reduce((sum, entry, i) => sum + JSON.stringify(entry).length + Number(i > 0), 0);
+    const entryBytes = new Map(entries.map(entry => [entry, commandTextBytes(JSON.stringify(entry))]));
+    let overhead = commandTextBytes(render([]));
+    let size = overhead + entries.reduce((sum, entry, i) => sum + entryBytes.get(entry)! + Number(i > 0), 0);
     const evictionOrder = [...entries.filter(entry => !isConversationEntry(entry)).reverse(),
       ...entries.filter(entry => isConversationEntry(entry) && entry.kind !== "original_request")];
     const evicted = new Set<HandoffEntry>();
     for (const entry of evictionOrder) {
-      if (size <= NATIVE_WHOLE_HANDOFF_MAX_CHARS) break;
-      size -= JSON.stringify(entry).length + Number(entries.length - evicted.size > 1);
+      if (size <= NATIVE_WHOLE_HANDOFF_MAX_BYTES) break;
+      size -= entryBytes.get(entry)! + Number(entries.length - evicted.size > 1);
       evicted.add(entry);
       if (isConversationEntry(entry)) omittedMessages += 1;
       else omittedSupport += 1;
       truncated = true;
-      const nextOverhead = render([]).length;
+      const nextOverhead = commandTextBytes(render([]));
       size += nextOverhead - overhead;
       overhead = nextOverhead;
     }
@@ -218,7 +223,7 @@ export async function buildNativeSessionHandoff(input: {
       Number("sequence" in b.row ? b.row.sequence : 0) - Number("sequence" in a.row ? a.row.sequence : 0) || b.row.id.localeCompare(a.row.id));
     const selected = new Set<string>();
     const bodySizes = new Map(candidates.map(({ type, row }) => [`${type}:${row.id}`, Number(row.bodySize)]));
-    let remaining = NATIVE_WHOLE_HANDOFF_MAX_CHARS - 8_000;
+    let remaining = NATIVE_WHOLE_HANDOFF_MAX_BYTES - 8_000;
     // An individually oversized original keeps a marked stock excerpt rather
     // than disappearing or allocating an unbounded body during hydration.
     const oversizedOriginId = origin[0] && Number(origin[0].bodySize) + 1_024 > remaining ? origin[0].id : null;
