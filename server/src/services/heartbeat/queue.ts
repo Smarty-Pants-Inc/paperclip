@@ -2942,7 +2942,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       taskRetryActorId = retry.actorId;
       enrichedContextSnapshot.forceFreshSession = true;
       // A continuous session otherwise keeps a binding that can never be resumed.
-      if (!retry.initiatedBy && issueId && await retryStartsFresh(db, { companyId: receipt.companyId, issueId, sourceRunId: retry.sourceRunId })) {
+      if (!retry.initiatedBy && retry.personRetry?.userId === retry.actorId && issueId && await retryStartsFresh(db, { companyId: receipt.companyId, issueId, sourceRunId: retry.sourceRunId })) {
         enrichedContextSnapshot.explicitFreshSession = true;
       }
       enrichedContextSnapshot.previousRunId = retry.sourceRunId;

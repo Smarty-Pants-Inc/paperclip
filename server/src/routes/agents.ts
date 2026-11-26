@@ -1,3 +1,4 @@
+import { retryStartsNewSessionColumn } from "../services/run-retry-presentation.js";
 import { resolveLoginEnvironmentTarget } from "../services/login-environment.js";
 import { checkAgentProtectedEnvironmentKeys } from "../services/protected-environment-keys.js";
 import { assertProviderApiPlacementPolicy, managedCursorApiDefaultEnabled, resolveProviderApiPlacement } from "../services/native-runtime/provider-api-placement.js";
@@ -7366,6 +7367,7 @@ export function agentRoutes(
     const distinctTasks = req.query.distinctTasks === "true";
 
     const columns = {
+      retryStartsNewSession: retryStartsNewSessionColumn,
       id: heartbeatRuns.id,
       runtimeMode: heartbeatRuns.runtimeMode,
       companyId: heartbeatRuns.companyId,

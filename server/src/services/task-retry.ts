@@ -57,6 +57,7 @@ const taskRetryIntentSchema = z.object({
   chatActionId: z.string().uuid().optional(), canonicalIntentId: z.string().uuid().optional(),
   queuedChatRequestId: z.string().uuid().optional(),
   initiatedBy: z.enum(["restart_recovery", "provider_limit_reset"]).optional(),
+  personRetry: z.object({ userId: z.string().min(1) }).optional(),
   boardMessageOrigin: z.object({ commentId: z.string().uuid(), identityContextId: z.string().uuid() }).optional(),
 });
 export type TaskRetryIntent = z.infer<typeof taskRetryIntentSchema>;
@@ -247,6 +248,8 @@ type TaskRetryRequest = {
   /** Paperclip requests the user's Retry itself: after a restart lost an
    * unstarted turn, or once a provider usage limit it waited on has reset. */
   initiatedBy?: "restart_recovery" | "provider_limit_reset";
+  /** Set only by the authenticated person's Retry route, never by automation. */
+  personRetry?: { userId: string };
   prepareChatRetry?: (tx: Db, scope: { companyId: string; issueId: string; agentId: string;
     failedRunId: string; initiatedByUserId: string; retryIntentId?: string }) => Promise<{ actionId: string }>;
 };
@@ -425,7 +428,17 @@ function admitTaskRetry(input: TaskRetryRequest) {
       ...(active && activeIntent?.chatActionId ? { chatActionId: activeIntent.chatActionId } : {}),
       ...(active && activeIntent?.queuedChatRequestId ? { queuedChatRequestId: activeIntent.queuedChatRequestId } : {}),
       ...(active ? { canonicalIntentId: active.id } : {}),
-      ...(input.initiatedBy && !active ? { initiatedBy: input.initiatedBy } : {}) };
+      ...(input.initiatedBy && !active ? { initiatedBy: input.initiatedBy } : {}),
+      ...(!input.initiatedBy && input.personRetry?.userId === input.actorId
+        ? { personRetry: input.personRetry } : {}) };
+    // A real click can take over an unadmitted automatic intent for this
+    // same requester. Keep the positive authority on the canonical receipt.
+    if (intent.personRetry && active && !active.runId && activeIntent?.actorId === input.actorId) {
+      const { initiatedBy: _automatic, ...canonical } = activeIntent;
+      await tx.update(agentWakeupRequests).set({ payload: { ...active.payload,
+        taskRetry: { ...canonical, personRetry: intent.personRetry } }, updatedAt: new Date() })
+        .where(and(eq(agentWakeupRequests.id, active.id), isNull(agentWakeupRequests.runId)));
+    }
     // Preserve external chat authority through its existing admission owner.
     // Generic board Retry must never manufacture a chat-inbound request.
     const [chat] = await tx.select({ id: chatConversations.id }).from(chatConversations)

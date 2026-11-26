@@ -1,6 +1,6 @@
 import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import {
-  agentWakeupRequests, agents, approvals, companies, documentRevisions, documents, executionWorkspaces, heartbeatRuns, issueApprovals,
+  agentWakeupRequests, agents, approvals, chatConversations, companies, documentRevisions, documents, executionWorkspaces, heartbeatRuns, issueApprovals,
   issueComments, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, toolInvocations, type Db,
 } from "@paperclipai/db";
 import {
@@ -419,6 +419,8 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     .orderBy(asc(issueRecoveryActions.createdAt), asc(issueRecoveryActions.id)).for("update");
   const prior = holds.find(hold => object(hold.evidence.freshContinuation).sourceRunId === run.id);
   if (prior) {
+    if (holds.some(isOwnedReconciliationHold) && await isChatContinuation(tx, issue))
+      return { kind: "person_owned", reason: "chat_stop_requires_proof" };
     await settleLateHolds(tx, { companyId, issue, run, prior, holds: holds.filter(isOwnedReconciliationHold), now });
     return { kind: "already_continued", recoveryActionId: prior.id };
   }
@@ -592,6 +594,10 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
   // (the reaper or a Stop) settles it first, then the fallback continues.
   const aliveWait = writer === "alive" ? pending("previous_process_running", new Date(now.getTime() + step)) : null;
   if (aliveWait) return aliveWait;
+  // Isolation protects files, not a chat's live provider session. Never let
+  // this automatic fallback turn an unproven chat stop into continuation.
+  if ((remoteSource || writer !== "ended" || pastBound() || refused) && await isChatContinuation(tx, issue))
+    return { kind: "person_owned", reason: "chat_stop_requires_proof" };
   const fenced = await fenceSourceWorkspace(tx, run);
   // Never claim a stop that was not proven: record what isolates the successor.
   const isolation: FreshContinuationIsolation = fenced || remoteSource ? "remote_epoch"
@@ -718,7 +724,7 @@ export async function settleHoldIntoAbandonedEpochContinuation(db: Db, input: {
     const [issue] = await tx.select().from(issues).where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId))).for("update");
     const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId),
       eq(heartbeatRuns.id, input.runId)));
-    if (!issue || !run) return false;
+    if (!issue || !run || await isChatContinuation(tx, issue)) return false;
     const [hold] = await tx.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, input.companyId),
       eq(issueRecoveryActions.sourceIssueId, issue.id), eq(issueRecoveryActions.id, input.actionId))).for("update");
     if (!hold || !["active", "escalated"].includes(hold.status) || isHumanGate(hold) || hold.evidence.runId !== run.id
@@ -739,10 +745,17 @@ export async function settleHoldIntoAbandonedEpochContinuation(db: Db, input: {
   });
 }
 
+async function isChatContinuation(tx: Pick<Db, "select">, issue: typeof issues.$inferSelect) {
+  if (issue.conversationAgentId || issue.originKind === "chat_channel") return true;
+  const [binding] = await tx.select({ id: chatConversations.id }).from(chatConversations)
+    .where(and(eq(chatConversations.companyId, issue.companyId), eq(chatConversations.issueId, issue.id))).limit(1);
+  return Boolean(binding);
+}
+
 async function settleLateHolds(tx: Db, input: { companyId: string; issue: typeof issues.$inferSelect; run: typeof heartbeatRuns.$inferSelect;
   prior: typeof issueRecoveryActions.$inferSelect; holds: Array<typeof issueRecoveryActions.$inferSelect>; now: Date }) {
   const { companyId, issue, run, prior, holds, now } = input;
-  if (!holds.length) return;
+  if (!holds.length || await isChatContinuation(tx, issue)) return;
   await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionContinuation);
   await notifyStatusCardIssueChange(tx, companyId);
   await notifyRoutineExecutionStatus(tx, issue.id, companyId);

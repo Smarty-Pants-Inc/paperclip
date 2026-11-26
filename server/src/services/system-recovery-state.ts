@@ -61,6 +61,10 @@ export const systemRecoverySchema = z.object({
   nextAttemptAt: z.number().nullable(),
   deadlineAt: z.number().nullable(),
   providerCooldownAt: z.number().nullable().default(null),
+  /** One person-triggered stop check per persisted backoff step, not a retry. */
+  commentRecheck: z.object({
+    scheduledAt: z.number(), retriesUsed: z.number().int().nonnegative(), pending: z.boolean(),
+  }).optional(),
   failure: z.object({
     code: z.enum(recoveryFailureCodes),
     retryClass: z.enum(recoveryRetryClasses),
@@ -102,7 +106,9 @@ export function reserveSystemRecoveryAttempt(state: SystemRecoveryState, now = D
   if (state.state === "running" && state.attemptId) return { ...state, revision: state.revision + 1 };
   if ((state.deadlineAt !== null && now >= state.deadlineAt) ||
       (state.attempts > 0 && state.retriesUsed >= SYSTEM_RECOVERY_MAX_RETRIES)) return null;
-  return { ...state, revision: state.revision + 1, state: "running", attemptId: randomUUID(),
+  const forced = state.commentRecheck?.pending === true && now < state.commentRecheck.scheduledAt;
+  return { ...state, commentRecheck: forced ? state.commentRecheck : undefined,
+    revision: state.revision + 1, state: "running", attemptId: randomUUID(),
     attempts: state.attempts + 1, retriesUsed: state.retriesUsed + (state.attempts > 0 ? 1 : 0), nextAttemptAt: null };
 }
 
@@ -112,6 +118,15 @@ export function failSystemRecovery(
   options: { now?: number; retryAfterAt?: number; immediate?: boolean; evidenceFingerprint?: string; cause?: RecoveryFailureCause } = {},
 ): SystemRecoveryState {
   const now = options.now ?? Date.now();
+  // A comment grants observation, never retry budget or a new backoff step.
+  // Preserve the original absolute deadline even across worker restarts.
+  if (state.commentRecheck?.pending && failure.retryClass === "recheck_evidence"
+    && ["agent_stop_unconfirmed", "copyback_stop_unconfirmed"].includes(failure.code)) {
+    return { ...state, revision: state.revision + 1, state: "awaiting_evidence",
+      retriesUsed: state.commentRecheck.retriesUsed,
+      nextAttemptAt: state.commentRecheck.scheduledAt,
+      commentRecheck: { ...state.commentRecheck, pending: false } };
+  }
   const firstFailureAt = state.firstFailureAt ?? now;
   const deadlineAt = state.deadlineAt ?? firstFailureAt + SYSTEM_RECOVERY_WINDOW_MS;
   const retryNumber = state.retriesUsed + 1;
@@ -122,7 +137,7 @@ export function failSystemRecovery(
   const retry = retryable && retryNumber <= SYSTEM_RECOVERY_MAX_RETRIES && nextAttemptAt < deadlineAt;
   const sourceVerification = workspaceSourceVerificationFailureSchema.safeParse(failure.sourceVerification);
   const cause = recoveryFailureCauseSchema.safeParse(options.cause);
-  return { ...state, revision: state.revision + 1, firstFailureAt, deadlineAt,
+  return { ...state, commentRecheck: undefined, revision: state.revision + 1, firstFailureAt, deadlineAt,
     providerCooldownAt: options.retryAfterAt ?? null,
     state: retry ? failure.retryClass === "recheck_evidence" ? "awaiting_evidence" : "scheduled" : "exhausted",
     nextAttemptAt: retry ? nextAttemptAt : null,
@@ -184,7 +199,12 @@ export function stopProofRearmsSpent(evidence: Record<string, unknown> | null | 
 
 /** User-facing text for a spent recovery budget. It names what happens next and
  * never asks a person to inspect a sandbox or environment. The code stays for support. */
+export const CHAT_STOP_PROOF_WAIT_ACTION = "This chat is still blocked because Paperclip cannot confirm the previous run stopped. "
+  + "Send /new to request a new session; it can start only after Paperclip confirms the stop.";
+
 export function exhaustedSystemRecoveryAction(state: SystemRecoveryState, evidence?: Record<string, unknown> | null): string {
+  if (evidence?.chatStopRequiresProof === true && state.failure?.retryClass === "recheck_evidence")
+    return CHAT_STOP_PROOF_WAIT_ACTION;
   // Another Retry cannot release a copyback owner that stopped without reporting.
   if (state.failure?.code === "copyback_stop_unconfirmed")
     return "Recovery of saved work is waiting for the previous server's file copy to stop. "

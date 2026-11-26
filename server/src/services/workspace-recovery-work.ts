@@ -1,4 +1,5 @@
 import type { Db } from "@paperclipai/db";
+import { COMMENT_WORKSPACE_RECHECK_HINT } from "./system-recovery.js";
 import type { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";
 import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 import { executionControlSchedule, registerExecutionControlWork } from "./execution-control-work.js";
@@ -16,6 +17,7 @@ export function registerWorkspaceRecoveryWork(db: Db, coordinator: ReturnType<ty
   const schedule = executionControlSchedule(db);
   const worker = registerExecutionControlWork(coordinator, [{
     queue: DELIVERY_QUEUES.workspaceRecovery,
+    immediateHint: COMMENT_WORKSPACE_RECHECK_HINT,
     onSettled: () => { passiveSweep.restart = true; if (pending.size >= 2) wakeWhileBusy = true; },
     run: () => scan = (async () => {
       const sweep = passiveSweep, cursor = sweep.cursor;

@@ -192,10 +192,12 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
   });
 
   it.each([
-    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", fresh: true, org: "example-org", chat: false },
-    { failure: "ordinary provider failure", fresh: false, org: "second-org", chat: false },
-    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", fresh: false, org: "second-org", chat: true },
-  ])("a person's validated continuous-Pi Retry: $org, chat=$chat, fresh=$fresh", async ({ failure, fresh, org, chat }) => {
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", fresh: true, org: "example-org", chat: false, person: true, initiatedBy: undefined },
+    { failure: "ordinary provider failure", fresh: false, org: "second-org", chat: false, person: true, initiatedBy: undefined },
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", fresh: true, org: "second-org", chat: true, person: true, initiatedBy: undefined },
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", fresh: false, org: "budget_automatic", chat: true, person: false, initiatedBy: undefined },
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", fresh: false, org: "second-org", chat: true, person: false, initiatedBy: "restart_recovery" as const },
+  ])("validated continuous-Pi Retry: $org, chat=$chat, person=$person, initiatedBy=$initiatedBy, fresh=$fresh", async ({ failure, fresh, org, chat, person, initiatedBy }) => {
     const f = await seed(), sessionId = randomUUID();
     await db.update(companies).set({ name: org }).where(eq(companies.id, f.companyId));
     if (chat) await db.update(issues).set({ originKind: "chat_channel" }).where(eq(issues.id, f.issueId));
@@ -210,12 +212,14 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       await db.update(heartbeatRuns).set({ status: "failed", error: failure, errorCode: "native_continuation_requires_reconciliation" }).where(eq(heartbeatRuns.id, first.finished.id));
       await db.update(issues).set({ status: "todo" }).where(eq(issues.id, f.issueId));
       const receipt = await requestTaskRetry({ db, companyId: f.companyId, issueId: f.issueId, actorId: f.userId,
-        actorSource: "local_implicit", observedRunId: first.finished.id, idempotencyKey: randomUUID() });
+        actorSource: "local_implicit", observedRunId: first.finished.id, idempotencyKey: randomUUID(), initiatedBy,
+        personRetry: person ? { userId: f.userId } : undefined });
       expect(receipt).toMatchObject({ accepted: true, stale: false });
       await heartbeat.resumeTaskRetry(f.companyId, receipt.requestId!);
       await heartbeat.drainActiveRunExecutions();
       const retries = [...captured.values()].filter(input => input.context.taskRetryRequestId === receipt.requestId);
       expect(retries.map(input => input.runtime.sessionId)).toEqual([fresh ? null : sessionId]);
+      expect(retries.map(input => input.context.explicitFreshSession)).toEqual([fresh ? true : undefined]);
     } finally { await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false }); }
   });
   it("keeps a workspace source refusal typed before provider startup", async () => {

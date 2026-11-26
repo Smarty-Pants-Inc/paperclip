@@ -1,9 +1,9 @@
 import { notifyIssueRecovery } from "./issue-recovery-notifications.js";
 import { and, eq, sql } from "drizzle-orm";
-import { agents, issues, heartbeatRuns, issueComments, issueRecoveryActions, type Db } from "@paperclipai/db";
+import { agents, chatConversations, issues, heartbeatRuns, issueComments, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { writeExecutionControl } from "./execution-control-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
-import { createSystemRecovery, exhaustedSystemRecoveryAction, readSystemRecovery, type SystemRecoveryState } from "./system-recovery-state.js";
+import { createSystemRecovery, exhaustedSystemRecoveryAction, SYSTEM_RECOVERY_MAX_RETRIES, readSystemRecovery, type SystemRecoveryState } from "./system-recovery-state.js";
 import { workspaceRecoverySourceEligible, type WorkspaceRecoverySourceIdentity } from "./workspace-recovery-source.js";
 import { capturePolicyRearmDueAt, capturePolicyRearmPendingCondition, retainedSourceFallbackDueAt,
   retainedSourceFallbackPendingCondition, stopProofRearmDueAt, stopProofRearmPendingCondition } from "./workspace-recovery-fallback-discovery.js";
@@ -50,6 +50,7 @@ export async function adoptSystemRecovery(db: Db, source: WorkspaceRecoverySourc
 }
 
 export { exhaustedSystemRecoveryAction };
+export const COMMENT_WORKSPACE_RECHECK_HINT = "person-comment-recheck";
 
 /** CAS protects a newer manual generation from an old worker's late write.
  * This is bookkeeping authority only; physical writes still require ownership. */
@@ -107,9 +108,13 @@ export async function handOffExhaustedSystemRecovery(db: Db, source: WorkspaceRe
 }
 
 async function loadActionEvidence(db: Db, source: WorkspaceRecoverySourceIdentity) {
-  const [row] = await db.select({ evidence: issueRecoveryActions.evidence }).from(issueRecoveryActions).where(and(
+  const [row] = await db.select({ evidence: issueRecoveryActions.evidence,
+    chat: sql<boolean>`${issues.conversationAgentId} is not null or ${issues.originKind} = 'chat_channel'
+      or exists (select 1 from ${chatConversations} chat where chat.company_id = ${source.companyId} and chat.issue_id = ${source.issueId})`,
+  }).from(issueRecoveryActions).innerJoin(issues, and(eq(issues.companyId, issueRecoveryActions.companyId),
+    eq(issues.id, issueRecoveryActions.sourceIssueId))).where(and(
     eq(issueRecoveryActions.companyId, source.companyId), eq(issueRecoveryActions.id, source.actionId)));
-  return row?.evidence ?? null;
+  return row ? { ...row.evidence, chatStopRequiresProof: row.chat } : null;
 }
 
 export async function loadSystemRecovery(db: Db, source: WorkspaceRecoverySourceIdentity) {
@@ -117,6 +122,47 @@ export async function loadSystemRecovery(db: Db, source: WorkspaceRecoverySource
     eq(issueRecoveryActions.companyId, source.companyId), eq(issueRecoveryActions.sourceIssueId, source.issueId),
     eq(issueRecoveryActions.id, source.actionId)));
   return readSystemRecovery(row?.evidence);
+}
+
+/** Called only for a newly inserted human chat comment, in its issue-locked
+ * transaction. Duplicate client requests return before this hook. Concurrent
+ * comments coalesce while the attempt is due/running; neither grants a budget
+ * nor proves a stop. Only the existing preservation worker may release files. */
+export async function expediteCommentWorkspaceRecheck(db: Db, input: {
+  companyId: string; issueId: string; userId: string;
+}) {
+  const rows = await db.select({ actionId: issueRecoveryActions.id,
+    runId: heartbeatRuns.id, evidence: issueRecoveryActions.evidence })
+    .from(issueRecoveryActions).innerJoin(issues, and(
+      eq(issues.id, issueRecoveryActions.sourceIssueId), eq(issues.companyId, issueRecoveryActions.companyId)))
+    .innerJoin(heartbeatRuns, and(eq(heartbeatRuns.companyId, issueRecoveryActions.companyId),
+      sql`${heartbeatRuns.id}::text = ${issueRecoveryActions.evidence}->>'runId'`))
+    .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId),
+      eq(issues.status, "blocked"), eq(issues.conversationUserId, input.userId),
+      sql`${issues.conversationAgentId} is not null`,
+      workspaceRecoverySourceEligible()))
+    .for("update", { of: issueRecoveryActions });
+  for (const row of rows) {
+    const state = readSystemRecovery(row.evidence), now = Date.now();
+    if (!state || state.state !== "awaiting_evidence" || state.failure?.retryClass !== "recheck_evidence"
+      || state.retriesUsed >= SYSTEM_RECOVERY_MAX_RETRIES || state.deadlineAt !== null && state.deadlineAt <= now) continue;
+    // A person's input is not authority to bypass a provider's cooldown either.
+    const nextAttemptAt = Math.max(now, state.providerCooldownAt ?? 0);
+    if (state.nextAttemptAt === null || state.nextAttemptAt <= nextAttemptAt) continue;
+    const source = { ...input, actionId: row.actionId, runId: row.runId };
+    if (state.commentRecheck?.retriesUsed === state.retriesUsed) {
+      // Further comments in this step are coalesced. A NEW physical stop
+      // receipt may still advance recovery through the normal proof observer.
+      const { observeStoppedWorkspaceRecovery } = await import("./workspace-recovery.js");
+      if (await observeStoppedWorkspaceRecovery(db, source))
+        await notifyDeliveryWork(db, DELIVERY_QUEUES.workspaceRecovery, COMMENT_WORKSPACE_RECHECK_HINT);
+      continue;
+    }
+    await notifyDeliveryWork(db, DELIVERY_QUEUES.workspaceRecovery, COMMENT_WORKSPACE_RECHECK_HINT);
+    await updateSystemRecovery(db, { ...input, actionId: row.actionId, runId: row.runId }, state,
+      { ...state, revision: state.revision + 1, nextAttemptAt,
+        commentRecheck: { scheduledAt: state.nextAttemptAt, retriesUsed: state.retriesUsed, pending: true } });
+  }
 }
 
 export async function nextWorkspaceRecoveryAt(db: Db): Promise<number | null> {

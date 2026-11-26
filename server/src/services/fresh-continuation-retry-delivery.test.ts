@@ -95,7 +95,7 @@ suite("a person's Retry while a continuation waits for delivery", () => {
   async function deliver() { await deliveryPass(); await deliveryPass(); }
   async function requestRetry(issueId: string, observedRunId: string) {
     const receipt = await requestTaskRetry({ db, companyId, issueId, actorId: userId, observedRunId,
-      idempotencyKey: randomUUID(), actorSource: "local_implicit" });
+      idempotencyKey: randomUUID(), actorSource: "local_implicit", personRetry: { userId } });
     expect(receipt).toMatchObject({ accepted: true });
     return receipt.requestId!;
   }
@@ -159,6 +159,21 @@ suite("a person's Retry while a continuation waits for delivery", () => {
     const joined = await requestRetry(f.issueId, runs[0]!.id);
     expect(await wake(joined)).toMatchObject({ status: "coalesced", runId: runs[0]!.id });
     expect(await taskRuns(f)).toHaveLength(1);
+  }, 60_000);
+
+  it.each(["person", "budget_automatic", "restart_recovery"] as const)("freshens a folded chat Retry only for a positive person's choice (%s)", async caller => {
+    const f = await pendingContinuation("native");
+    await db.update(issues).set({ originKind: "chat_channel" }).where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ errorCode: "native_provider_state_incompatible" }).where(eq(heartbeatRuns.id, f.runId));
+    await occupySlot();
+    const receipt = await requestTaskRetry({ db, companyId, issueId: f.issueId, actorId: userId, observedRunId: f.runId,
+      idempotencyKey: randomUUID(), actorSource: "local_implicit",
+      ...(caller === "person" ? { personRetry: { userId } } : caller === "restart_recovery" ? { initiatedBy: caller } : {}) });
+    expect(receipt).toMatchObject({ accepted: true });
+    await deliver();
+    await heartbeatService(db).resumeTaskRetry(companyId, receipt.requestId!);
+    const run = await expectSingleContinuationRun(f, receipt.requestId!);
+    expect(run.contextSnapshot?.explicitFreshSession).toBe(caller === "person" ? true : undefined);
   }, 60_000);
 
   it.each(KINDS)("starts exactly one run when a Retry and the delivery pass race (%s)", async kind => {
