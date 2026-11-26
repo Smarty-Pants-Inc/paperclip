@@ -7303,15 +7303,24 @@ export function agentRoutes(
   });
 
   router.get("/companies/:companyId/provider-traces", async (req, res) => {
-    assertInstanceAdmin(req);
+    if (req.actor.type !== "agent") assertInstanceAdmin(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    if (req.actor.type === "agent" && !(await assertRunTelemetryReadAllowed(req, res, companyId))) return;
     const runIds = String(req.query.runIds ?? "")
       .split(",")
       .map((value) => value.trim())
       .filter(Boolean)
       .slice(0, 100);
-    const traces = await providerTraces.listMetadataForRuns(companyId, runIds);
+    let readableRunIds = runIds;
+    if (req.actor.type === "agent") {
+      const decisions = await Promise.all(runIds.map(async (runId) => {
+        const run = await heartbeat.getRunReadAccess(runId);
+        return run?.companyId === companyId && await actorCanReadRun(req, run);
+      }));
+      readableRunIds = runIds.filter((_, index) => decisions[index]);
+    }
+    const traces = await providerTraces.listMetadataForRuns(companyId, readableRunIds);
     const actor = getActorInfo(req);
     await logActivity(db, {
       companyId,
@@ -7877,7 +7886,7 @@ export function agentRoutes(
   });
 
   router.get("/heartbeat-runs/:runId/provider-trace", async (req, res) => {
-    assertInstanceAdmin(req);
+    if (req.actor.type !== "agent") assertInstanceAdmin(req);
     const runId = readHeartbeatRunId(req);
     const run = await getAccessibleResource(
       req,
@@ -7886,11 +7895,16 @@ export function agentRoutes(
       "Heartbeat run not found",
     );
     if (!run) return;
+    if (req.actor.type === "agent") {
+      if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
+      if (!(await assertRunReadAllowed(req, res, run))) return;
+    }
     const inspection = await providerTraces.inspect(run.id, run.companyId);
     await logActivity(db, {
       companyId: run.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "local-admin",
+      actorType: req.actor.type === "agent" ? "agent" : "user",
+      actorId: req.actor.type === "agent" ? getActorInfo(req).actorId : req.actor.userId ?? "local-admin",
+      ...(req.actor.type === "agent" ? { agentId: req.actor.agentId } : {}),
       action: "provider_trace.redacted_viewed",
       entityType: "heartbeat_run",
       entityId: run.id,
