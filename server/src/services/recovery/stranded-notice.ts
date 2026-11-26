@@ -275,6 +275,22 @@ export function buildConfigurationIncompleteRecoveryNoticeSeed(
       tone: "danger",
     };
   }
+  if (readNonEmptyStringField(configurationIncomplete, "reason") === "configuration_churn") {
+    return {
+      title: "Configuration kept changing",
+      body: "The agent did not start because its configuration changed during three automatic retries. No provider work was started.",
+      nextAction: "Wait for configuration changes to finish, then retry the task.",
+      tone: "danger",
+    };
+  }
+  if (["secret_deleted", "secret_inactive", "version_inactive"].includes(readNonEmptyStringField(configurationIncomplete, "reason") ?? "")) {
+    return {
+      title: "Required secret unavailable",
+      body: "The agent did not start because a required secret or its selected version was removed or revoked before launch.",
+      nextAction: "Restore an active secret binding in the agent's settings, then retry the task.",
+      tone: "danger",
+    };
+  }
   return {
     body:
       "The agent did not start because a secret it needs is not set. " +

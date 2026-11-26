@@ -247,6 +247,7 @@ export function createPostgresRunDispatchAdapter(
     operation: (tx: Db, run: HeartbeatRun, publications: ActivityPublication[]) => Promise<T>,
     mode: "accounting" | "ownership",
     isolation: "snapshot" | "read committed" = "snapshot",
+    configurationFence?: (transaction: unknown) => Promise<void>,
   ): Promise<T> {
     // Queue editing and claiming already use issue -> wake -> run. Read the
     // immutable issue reference without a lock first, then acquire issue ->
@@ -267,6 +268,9 @@ export function createPostgresRunDispatchAdapter(
         : readNonEmptyString(parseObject(hint.contextSnapshot).issueId);
 
       const locked = async (typedTx: Db, publications: ActivityPublication[]) => {
+        // Configuration writers own config -> issue -> run. Never wait for a
+        // save/rotation while holding its consumer issue or run lock.
+        await configurationFence?.(typedTx);
         if (mode === "accounting") {
           await lockBudgetAdmissionControls(typedTx, input.companyId, hint.projectId);
           await typedTx.select({ id: agents.id }).from(agents)
@@ -789,6 +793,8 @@ export function createPostgresRunDispatchAdapter(
           eq(heartbeatRuns.id, input.runId),
           eq(heartbeatRuns.companyId, input.companyId),
           eq(heartbeatRuns.status, "scheduled_retry"),
+          // General/manual retry cannot bypass supersession-owned teardown.
+          sql`coalesce(${heartbeatRuns.resultJson}#>>'{configurationSupersession,state}', '') <> 'cleanup_pending'`,
           lte(heartbeatRuns.scheduledRetryAt, input.now),
         ),
       )
@@ -1615,7 +1621,7 @@ export function createPostgresRunDispatchAdapter(
       catch (error) { resultPromise = Promise.reject(error); }
       void resultPromise.catch(() => {});
       return { dispatched: true as const, resultPromise };
-    }, "ownership");
+    }, "ownership", "read committed", input.configurationFence);
   }
 
   return {

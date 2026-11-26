@@ -46,6 +46,9 @@ export type DispatchResolvedInteractionInput<T> = CancelStaleQueuedRunInput & {
   reservationId: string;
   recoveryLeaseOwner?: string;
   enforceContinuationOwnership?: boolean;
+  /** Private configuration owner; acquire its read fences before issue/run locks.
+   * The opaque transaction must not escape or perform provider I/O. */
+  configurationFence?: (transaction: unknown) => Promise<void>;
   dispatch: (markDispatchStarted: () => void) => Promise<T>;
 };
 

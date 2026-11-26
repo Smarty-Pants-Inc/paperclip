@@ -5,8 +5,9 @@ import { agentObservabilityService, unavailableAgentObservability, type Resolved
 import { agentObservabilityLaunch } from "../agent-observability-launch.js";
 import { withSkillActor } from "../skill-access.js";
 import type { AuthorizationActor } from "../authorization.js";
+import { readExecutionConfigurationRows, assertExecutionConfigurationCurrent } from "./execution-configuration-fence.js";
 import { eq, sql } from "drizzle-orm";
-import { heartbeatRuns, type Db, type agents, type projects } from "@paperclipai/db";
+import { heartbeatRuns, projects, type Db, type agents } from "@paperclipai/db";
 import type { AiConnectionBinding } from "@paperclipai/shared";
 import { readPaperclipSkillSyncPreference, resolvePaperclipDesiredSkillNames, resolveLegacyPaperclipDesiredSkillNames,
   writePaperclipSkillSyncPreference } from "@paperclipai/adapter-utils/server-utils";
@@ -202,8 +203,14 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
       selectedEnvironmentForConfig?.driver ?? "local",
     );
 
-  const { resolvedConfig, configuredTaskEnvironment, secretKeys, secretManifest } =
-    await time("configuration_secrets", () => resolveExecutionRunAdapterConfig({
+  // Launch-time identity is immutable even when accepted steering later changes
+  // the run's responsibleUserId. Publish it before resolving user-secret values.
+  if (!persistedNativeExecutionInput) {
+    context.paperclipSecretIdentity = { responsibleUserId };
+    await db.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ paperclipSecretIdentity: context.paperclipSecretIdentity })}::jsonb` })
+      .where(eq(heartbeatRuns.id, run.id));
+  }
+  const resolveConfiguration = (environmentEnv: unknown, projectEnv: unknown) => resolveExecutionRunAdapterConfig({
       managedAiCredentials: Boolean(aiBinding),
       managedGitHubCredentials: !useHostGitHub,
       companyId: agent.companyId,
@@ -212,17 +219,30 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
       issueId,
       heartbeatRunId: run.id,
       environmentId: selectedEnvironmentForConfig?.id ?? null,
-      environmentEnv: aiBinding ? stripAiAuthBindings(selectedEnvironmentForConfig?.envVars) : selectedEnvironmentForConfig?.envVars ?? null,
+      environmentEnv: aiBinding ? stripAiAuthBindings(environmentEnv) : environmentEnv,
       environmentDriver: selectedEnvironmentForConfig?.driver ?? null,
       projectId: taskProjectContext?.id ?? null,
       routineId: routineEnvContext.routineId,
       responsibleUserId,
       executionRunConfig: aiBinding ? { ...executionRunConfig, env: stripAiAuthBindings(executionRunConfig.env) } : executionRunConfig,
-      projectEnv: aiBinding ? stripAiAuthBindings(taskProjectContext?.env) : taskProjectContext?.env ?? null,
+      projectEnv: aiBinding ? stripAiAuthBindings(projectEnv) : projectEnv,
       routineEnv: aiBinding ? stripAiAuthBindings(routineEnvContext.env) : routineEnvContext.env,
       secretsSvc,
       trustPreset,
-    }));
+    });
+  const configurationRows = !persistedNativeExecutionInput ? await readExecutionConfigurationRows(db, {
+    companyId: agent.companyId, environmentId: selectedEnvironmentForConfig?.id ?? null, projectId: taskProjectContext?.id ?? null,
+  }) : null;
+  // Fingerprinting and resolution must describe the same row revisions.
+  if (configurationRows?.environment && selectedEnvironmentForConfig) selectedEnvironmentForConfig.envVars = configurationRows.environment.env as typeof selectedEnvironmentForConfig.envVars;
+  if (configurationRows?.project && taskProjectContext) taskProjectContext.env = configurationRows.project.env;
+  const { resolvedConfig, configuredTaskEnvironment, secretKeys, secretManifest } =
+    await time("configuration_secrets", () => resolveConfiguration(selectedEnvironmentForConfig?.envVars ?? null, taskProjectContext?.env ?? null));
+  const assertConfigurationCurrent = async (transaction: unknown) => {
+    if (!configurationRows) return; // Recovery owns its saved execution contract.
+    const supersessions = Number(parseObject(run.resultJson?.configurationSupersession).attempt ?? 0);
+    await assertExecutionConfigurationCurrent(transaction as Db, configurationRows, secretManifest, supersessions);
+  };
   onFailureSecretsResolved(() => collectRunFailureSecretValues(resolvedConfig.env, secretKeys));
   identityRedactor.addSecretValues(secretEnvironmentValues(resolvedConfig.env, secretKeys));
   if (aiBinding) {
@@ -479,7 +499,7 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
   return {
     prepared: true as const,
     mergedConfig, configSnapshot, runScopedMentionedSkillKeys, githubSelection, useHostGitHub,
-    resolvedConfig, configuredTaskEnvironment, secretKeys, secretManifest,
+    resolvedConfig, configuredTaskEnvironment, secretKeys, secretManifest, assertConfigurationCurrent,
     runtimeSkillEntries, nativeRunnerPreparationSpans, runtimeConfig, agentIdentity, observability,
   };
 }

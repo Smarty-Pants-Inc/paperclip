@@ -67,6 +67,7 @@ import { authorizationDeniedDetails, authorizationService } from "./authorizatio
 import { findActiveServerAdapter } from "../adapters/index.js";
 import { logActivity } from "./activity-log.js";
 import { retireTailscaleSecret } from "./connectors/tailscale/deletion.js";
+import { requestHeldNativeConfigurationEndForTargets, type HeldNativeConfigurationTarget } from "./native-runtime/held-native-turn.js";
 import { isTailscaleNodeState } from "./connectors/tailscale/network.js";
 // Only a `local_encrypted` secret can hold a literal directory path, so only a
 // `local_encrypted` secret can ever name a Codex account-home directory. A
@@ -719,6 +720,14 @@ export type RuntimeSecretManifestEntry = {
   version: number;
   provider: SecretProvider;
   providerVersionRef?: string | null;
+  /** Metadata read with the admitted value, never a second provider resolution. */
+  dispatchRevision?: {
+    secretUpdatedAt: string;
+    versionId: string;
+    versionSelector: number | "latest";
+    bindingUpdatedAt: string | null;
+    bindingKind: "company" | "user";
+  };
   outcome: "success" | "failure";
   errorCode?: string | null;
 };
@@ -1482,6 +1491,13 @@ export function secretService(db: Db | DbTransaction) {
           version: resolvedVersion,
           provider: providerId,
           providerVersionRef: versionRow.providerVersionRef,
+          dispatchRevision: {
+            secretUpdatedAt: secret.updatedAt.toISOString(),
+            versionId: versionRow.id,
+            versionSelector: version,
+            bindingUpdatedAt: binding?.updatedAt.toISOString() ?? null,
+            bindingKind: "company",
+          },
           outcome: "success",
         },
       };
@@ -2661,6 +2677,18 @@ export function secretService(db: Db | DbTransaction) {
             eq(companySecretVersions.version, nextVersion),
           ));
 
+        const bindings = await tx.select({ targetType: companySecretBindings.targetType, targetId: companySecretBindings.targetId })
+          .from(companySecretBindings).where(and(eq(companySecretBindings.companyId, secret.companyId), eq(companySecretBindings.secretId, secret.id)));
+        const declarations = secret.userSecretDefinitionId ? await tx.select({ targetType: userSecretDeclarations.targetType, targetId: userSecretDeclarations.targetId })
+          .from(userSecretDeclarations).where(and(eq(userSecretDeclarations.companyId, secret.companyId),
+            eq(userSecretDeclarations.userSecretDefinitionId, secret.userSecretDefinitionId))) : [];
+        const targets: HeldNativeConfigurationTarget[] = [...bindings, ...declarations].flatMap(binding =>
+          binding.targetType === "environment" || binding.targetType === "project" || binding.targetType === "agent"
+            ? [{ targetType: binding.targetType, targetId: binding.targetId, companyId: secret.companyId,
+              ...(secret.scope === "user" && secret.ownerUserId ? { responsibleUserId: secret.ownerUserId, admittedSecretId: secret.id } : {}) }] : []);
+        // Commit the new revision and held-turn fence together. A subsequent
+        // message remains queued and resolves the current value on its next run.
+        await requestHeldNativeConfigurationEndForTargets(tx as unknown as Db, targets);
         return updated;
       });
     } catch (error) {
@@ -4409,6 +4437,11 @@ export function secretService(db: Db | DbTransaction) {
         manifestEntry: {
           ...resolution.manifestEntry,
           bindingId: declaration?.id ?? resolution.manifestEntry.bindingId ?? null,
+          ...(resolution.manifestEntry.dispatchRevision ? { dispatchRevision: {
+            ...resolution.manifestEntry.dispatchRevision,
+            bindingUpdatedAt: declaration?.updatedAt.toISOString() ?? null,
+            bindingKind: "user" as const,
+          } } : {}),
         },
       };
     },
