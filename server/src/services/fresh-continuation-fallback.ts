@@ -7,6 +7,7 @@ import {
   EXECUTION_RECONCILIATION_CAUSES, readRemoteWorkspaceAuthority, remoteWorkspaceRunReferenceSchema, type ExecutionReconciliation,
 } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
+import { continuousRecoveryDecision } from "./continuous-recovery-choice.js";
 import { answeredContinuousHeldRun } from "./native-runtime/continuous-session-input.js";
 import { logActivity } from "./activity-log.js";
 import { taskHistoryReadsForRun } from "./queued-comment-delivery.js";
@@ -557,6 +558,18 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     if (readiness.get(issue.id)?.isDependencyReady === false) return { kind: "dependency_wait" };
   }
 
+  // Decide before saved input can take over or a fresh continuation is recorded.
+  // A system wake targeting a person's conversation is not reset consent.
+  const [recoveryAgent] = await tx.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.id, run.agentId)));
+  let personFreshChoice = false;
+  if (recoveryAgent) {
+    const choice = await continuousRecoveryDecision(tx, { issue, agent: recoveryAgent,
+      context: run.contextSnapshot ?? {}, sourceRunId: run.id, create: true });
+    if (choice.kind === "blocked" || (choice.kind === "choice" && !choice.accepted))
+      return { kind: "person_owned", reason: choice.kind === "blocked" ? choice.reason : "continuous_recovery_choice_pending" };
+    personFreshChoice = choice.kind === "choice" && choice.accepted;
+  }
+
   // (c) Bounded per task: the restart lane's hourly cap, then back off.
   const attempts = await sharedContinuationAttempts(tx, companyId, issue.id, now);
   if (attempts.length >= FRESH_CONTINUATIONS_PER_HOUR) {
@@ -581,8 +594,8 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
       break;
     }
   }
-  let delivery: "recorded" | "caller_owns" | "saved_input" = input.delivery === "caller_owns" ? "caller_owns"
-    : savedInput ? "saved_input" : "recorded";
+  let delivery: "recorded" | "caller_owns" | "saved_input" = personFreshChoice ? "recorded"
+    : input.delivery === "caller_owns" ? "caller_owns" : savedInput ? "saved_input" : "recorded";
 
   // (d) Continue: fence the old workspace epoch, settle every hold of the run,
   // release the Blocked status this failure owns, and record one continuation.

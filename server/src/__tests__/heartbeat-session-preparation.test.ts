@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, agentTaskSessions, authUsers, companies, companyMemberships, createDb, executionWorkspaces, environments, heartbeatRuns, issueComments, issues, plugins, projects } from "@paperclipai/db";
+import { agents, agentTaskSessions, agentWakeupRequests, authUsers, chatConversations, chatEndpoints, chatMessageLinks, companies, companyMemberships, createDb, executionWorkspaces, environments, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues, plugins, projects, toolApplications, toolConnections } from "@paperclipai/db";
 import { getServerAdapter, registerServerAdapter, unregisterServerAdapter, type AdapterExecutionContext } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
@@ -20,6 +20,10 @@ import { buildNativeExecutionInput } from "../services/native-runtime/native-exe
 import { buildNativeExecutionWithCheckpoint, nativeToolContractFingerprintForTarget } from "../services/native-runtime/native-session-resume.js";
 import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
 import { requestTaskRetry } from "../services/task-retry.js";
+import { ensureFreshContinuation } from "../services/fresh-continuation-fallback.js";
+import { deliverReconciledExecutions } from "../services/execution-recovery-resolution.js";
+import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
+import { prepareContinuousRecoverySession } from "../services/continuous-recovery-choice.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import * as environmentOrchestrator from "../services/environment-run-orchestrator.js";
 import { createPluginWorkspaceFixture } from "./helpers/plugin-workspaces.js";
@@ -87,6 +91,222 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     expect(captured.has(run!.id)).toBe(true);
     return { input: captured.get(run!.id)!, finished };
   }
+
+  // Recovery policy needs the assembled admission -> saved decision -> adapter
+  // dispatch path; pure policy assertions cannot catch a retained-session retry.
+  async function recoveryFixture(person: boolean) {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "continuous-recovery-"));
+    const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION,
+    });
+    const adapter = getServerAdapter(adapterType);
+    registerServerAdapter({ ...adapter, type: "paperclip_runner", execute: async input => {
+      const result = await adapter.execute(input);
+      const sessionId = input.runtime.sessionId ?? randomUUID();
+      return { ...result, sessionId, sessionParams: { sessionId } };
+    } });
+    await db.update(companies).set({ name: "example-org" }).where(eq(companies.id, f.companyId));
+    await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: {
+      provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", cwd,
+    } }).where(eq(agents.id, f.agentId));
+    await db.update(issues).set(person ? {
+      conversationAgentId: f.agentId, conversationUserId: f.userId, conversationState: "active",
+    } : { createdByAgentId: f.agentId }).where(eq(issues.id, f.issueId));
+    const first = await execute(f);
+    const [stored] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId));
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "native_continuation_requires_reconciliation",
+      resultJson: {}, finishedAt: new Date() }).where(eq(heartbeatRuns.id, first.finished.id));
+    const [blocked] = await db.update(issues).set({ status: "blocked", blockedTransitionAt: new Date() }).where(eq(issues.id, f.issueId)).returning();
+    await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "active_run_watchdog", status: "active", ownerType: "board", returnOwnerAgentId: f.agentId,
+      cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${first.finished.id}`,
+      nextAction: "Automatic recovery is blocked.", evidence: { runId: first.finished.id,
+        nativeFailureBlock: { runId: first.finished.id, statusVersion: blocked.statusVersion } },
+    });
+    return { ...f, sourceRunId: first.finished.id, sessionId: stored.sessionParamsJson!.sessionId,
+      cleanup: async () => { await heartbeat.drainActiveRunExecutions(); mode.mockRestore();
+        unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true }); } };
+  }
+
+  it("a healthy continuous conversation keeps ordinary follow-ups and non-recovery refreshes in the same session", async () => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "healthy-continuous-"));
+    const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION,
+    });
+    registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
+    try {
+      await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: {
+        provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", cwd,
+      } }).where(eq(agents.id, f.agentId));
+      await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: f.userId, conversationState: "active" })
+        .where(eq(issues.id, f.issueId));
+      await execute(f);
+      for (const context of [{}, { forceFreshSession: true, workspaceRefreshReason: "accepted_plan_confirmation" },
+        { forceFreshSession: true, livenessContinuationSourceRunId: randomUUID(), livenessContinuationReason: "agent_tool_call_loop" }]) {
+        const next = await execute(f, context);
+        expect(next.input.runtime.sessionId).toBe("saved-session");
+        expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: { reset: false, taskSessionReused: true } } });
+      }
+      expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, f.issueId))).toHaveLength(0);
+    } finally { await heartbeat.drainActiveRunExecutions(); mode.mockRestore();
+      unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true }); }
+  });
+
+  it("stock fresh recovery isolates proven agent-only work instead of retaining its session", async () => {
+    const f = await recoveryFixture(false);
+    try {
+      expect((await ensureFreshContinuation(db, { companyId: f.companyId, runId: f.sourceRunId, trigger: "recovery_refused" })).kind).toBe("continued");
+      await deliverReconciledExecutions(db, heartbeat.wakeup);
+      await heartbeat.drainActiveRunExecutions();
+      const successors = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.sourceRunId));
+      expect(successors, JSON.stringify({
+        actions: await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId)),
+        wakes: await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId)),
+        issue: await db.select().from(issues).where(eq(issues.id, f.issueId)),
+      })).toHaveLength(1);
+      const next = successors[0]!;
+      expect(next.status, next.error ?? undefined).toBe("succeeded");
+      expect(captured.get(next.id)!.runtime.sessionId).toBeNull();
+      expect(next.sessionIdAfter).not.toBe(f.sessionId);
+      expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, f.issueId))).toHaveLength(0);
+    } finally { await f.cleanup(); }
+  }, 60_000);
+
+  it.each(["unknown_task", "connected_chat_retry"])("stock fresh recovery does not infer agent-only permission from %s", async provenance => {
+    const f = await recoveryFixture(false);
+    try {
+      if (provenance === "unknown_task") await db.update(issues).set({ createdByAgentId: null }).where(eq(issues.id, f.issueId));
+      else await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, chatFailedRunRetry: true, source: "chat:example" } })
+        .where(eq(heartbeatRuns.id, f.sourceRunId));
+      expect(await ensureFreshContinuation(db, { companyId: f.companyId, runId: f.sourceRunId, trigger: "recovery_refused" }))
+        .toMatchObject({ kind: "person_owned", reason: "continuous_recovery_person_unproven" });
+      await deliverReconciledExecutions(db, heartbeat.wakeup);
+      await heartbeat.drainActiveRunExecutions();
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.sourceRunId))).toHaveLength(0);
+      expect((await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId)))[0]!.sessionParamsJson!.sessionId).toBe(f.sessionId);
+    } finally { await f.cleanup(); }
+  }, 60_000);
+
+  it("connected-chat provenance addresses the authenticated speaker, not the task's responsible user", async () => {
+    const f = await recoveryFixture(false);
+    try {
+      const otherUserId = randomUUID();
+      await db.insert(authUsers).values({ id: otherUserId, name: "Endpoint owner", email: `${otherUserId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
+      await db.update(issues).set({ responsibleUserId: otherUserId }).where(eq(issues.id, f.issueId));
+      const applicationId = randomUUID(), connectionId = randomUUID();
+      await db.insert(toolApplications).values({ id: applicationId, companyId: f.companyId, name: "Example chat", type: "chat" });
+      await db.insert(toolConnections).values({ id: connectionId, companyId: f.companyId, applicationId, name: "Example chat",
+        uid: connectionId, transport: "chat_sdk", connectionPurpose: "channel" });
+      const [endpoint] = await db.insert(chatEndpoints).values({ companyId: f.companyId, connectionId, provider: "slack",
+        publicId: randomUUID(), assignedAgentId: f.agentId, sponsorUserId: otherUserId }).returning();
+      const [conversation] = await db.insert(chatConversations).values({ companyId: f.companyId, endpointId: endpoint.id,
+        issueId: f.issueId, externalConversationId: "example-thread", externalLabel: "Example conversation" }).returning();
+      const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+        authorType: "user", authorUserId: f.userId, body: "My conversation" }).returning();
+      await db.insert(chatMessageLinks).values({ companyId: f.companyId, endpointId: endpoint.id, conversationId: conversation.id,
+        commentId: comment.id, providerMessageId: "example-message", direction: "inbound" });
+      expect(await ensureFreshContinuation(db, { companyId: f.companyId, runId: f.sourceRunId, trigger: "recovery_refused" }))
+        .toMatchObject({ kind: "person_owned", reason: "continuous_recovery_choice_pending" });
+      const questions = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, f.issueId));
+      expect(questions).toHaveLength(1);
+      expect(questions[0]).toMatchObject({ status: "pending", addresseeUserId: f.userId, effectiveResolverPolicy: "human_only" });
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.sourceRunId))).toHaveLength(0);
+    } finally { await f.cleanup(); }
+  }, 60_000);
+
+  it("a recorded fresh choice cannot authorize a later conversation generation", async () => {
+    const f = await recoveryFixture(true);
+    try {
+      await ensureFreshContinuation(db, { companyId: f.companyId, runId: f.sourceRunId, trigger: "recovery_refused" });
+      const [question] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, f.issueId));
+      const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+      await issueThreadInteractionService(db).acceptInteraction(issue, question.id, {}, { userId: f.userId });
+      await db.update(issues).set({ conversationSessionGeneration: issue.conversationSessionGeneration + 1 }).where(eq(issues.id, f.issueId));
+      const [agent] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+      await expect(prepareContinuousRecoverySession(db, { companyId: f.companyId, issueId: f.issueId, agent,
+        effectiveConfig: agent.adapterConfig, runId: randomUUID(), context: {
+          issueId: f.issueId, forceFreshSession: true, previousRunId: f.sourceRunId, continuousRecoveryChoiceId: question.id,
+        } })).rejects.toThrow("Same-session continuation is blocked");
+      const questions = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, f.issueId));
+      expect(questions).toHaveLength(2);
+      expect(questions.filter(row => row.status === "pending")).toHaveLength(1);
+      expect((await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId)))[0]!.sessionParamsJson!.sessionId).toBe(f.sessionId);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.sourceRunId))).toHaveLength(0);
+    } finally { await f.cleanup(); }
+  }, 60_000);
+
+  it("a direct stock fresh caller leaves a durable person choice when preparation refuses dispatch", async () => {
+    const f = await recoveryFixture(true);
+    try {
+      const [agent] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+      await expect(prepareContinuousRecoverySession(db, { companyId: f.companyId, issueId: f.issueId, agent,
+        effectiveConfig: agent.adapterConfig, runId: randomUUID(), context: {
+          issueId: f.issueId, forceFreshSession: true, previousRunId: f.sourceRunId,
+        } })).rejects.toThrow("Same-session continuation is blocked");
+      const questions = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, f.issueId));
+      expect(questions).toHaveLength(1);
+      expect(questions[0]).toMatchObject({ status: "pending", addresseeUserId: f.userId });
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.sourceRunId))).toHaveLength(0);
+    } finally { await f.cleanup(); }
+  }, 60_000);
+
+  it("a person's stock recovery waits through an ordinary comment, then dispatches their fresh choice once", async () => {
+    const f = await recoveryFixture(true);
+    try {
+      const recover = () => ensureFreshContinuation(db, { companyId: f.companyId, runId: f.sourceRunId, trigger: "recovery_refused" });
+      expect(await recover()).toMatchObject({ kind: "person_owned", reason: "continuous_recovery_choice_pending" });
+      expect(await recover()).toMatchObject({ kind: "person_owned" });
+      await deliverReconciledExecutions(db, heartbeat.wakeup);
+      let questions = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, f.issueId));
+      expect(questions).toHaveLength(1);
+      const question = questions[0]!;
+      expect(question).toMatchObject({ kind: "request_confirmation", status: "pending", addresseeUserId: f.userId,
+        effectiveResolverPolicy: "human_only", payload: { acceptLabel: "Retry fresh / New session", supersedeOnUserComment: false } });
+      const [agent] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+      const defensivePrepare = (choiceId: string) => prepareContinuousRecoverySession(db, { companyId: f.companyId, issueId: f.issueId,
+        agent, effectiveConfig: agent.adapterConfig, runId: randomUUID(), context: {
+          issueId: f.issueId, forceFreshSession: true, previousRunId: f.sourceRunId, continuousRecoveryChoiceId: choiceId,
+        } });
+      // A context flag or guessed card id is not the person's persisted answer.
+      await expect(defensivePrepare(question.id)).rejects.toThrow("Same-session continuation is blocked");
+      const before = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issueId));
+      const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+        authorType: "user", authorUserId: f.userId, body: "Please keep my pending input." }).returning();
+      const ordinary = await heartbeat.wakeup(f.agentId, { source: "on_demand", reason: "issue_commented",
+        requestedByActorType: "user", requestedByActorId: f.userId,
+        payload: { issueId: f.issueId, commentId: comment.id }, contextSnapshot: { issueId: f.issueId, wakeCommentId: comment.id } });
+      await heartbeat.drainActiveRunExecutions();
+      expect(ordinary).toBeNull();
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issueId))).toHaveLength(before.length);
+      questions = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, f.issueId));
+      expect(questions).toHaveLength(1);
+      expect(questions[0]!.status).toBe("pending");
+      expect((await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId)))[0]!.sessionParamsJson!.sessionId).toBe(f.sessionId);
+      const issue = (await db.select().from(issues).where(eq(issues.id, f.issueId)))[0]!;
+      await issueThreadInteractionService(db).acceptInteraction(issue, question.id, {}, { userId: f.userId });
+      await expect(defensivePrepare(randomUUID())).rejects.toThrow("must be delivered through its recovery continuation");
+      const answer = { issueId: f.issueId, interactionId: question.id, interactionKind: "request_confirmation", interactionStatus: "accepted", mutation: "interaction" };
+      await heartbeat.wakeup(f.agentId, { source: "automation", reason: "issue_commented", payload: answer,
+        contextSnapshot: answer, requestedByActorType: "user", requestedByActorId: f.userId });
+      await deliverReconciledExecutions(db, heartbeat.wakeup);
+      await heartbeat.drainActiveRunExecutions();
+      await deliverReconciledExecutions(db, heartbeat.wakeup);
+      const successors = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.sourceRunId));
+      expect(successors, JSON.stringify({
+        actions: await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId)),
+        wakes: await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId)),
+        issue: await db.select().from(issues).where(eq(issues.id, f.issueId)),
+      })).toHaveLength(1);
+      const next = successors[0]!;
+      expect(next.status, next.error ?? undefined).toBe("succeeded");
+      expect(captured.get(next.id)!.runtime.sessionId).toBeNull();
+      expect(next.sessionIdAfter).not.toBe(f.sessionId);
+      expect((await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, question.id)))[0]).toMatchObject({
+        status: "accepted", resolvedByUserId: f.userId, result: { freshSessionDispatchRunId: next.id },
+      });
+      expect((await db.select().from(issueComments).where(eq(issueComments.id, comment.id)))[0]!.body).toBe("Please keep my pending input.");
+    } finally { await f.cleanup(); }
+  }, 60_000);
 
   it.each(["continuous", "paperclip"])("a Pi workspace change preserves resume fields only in %s mode", async sessionContinuity => {
     const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "workspace-continuation-"));

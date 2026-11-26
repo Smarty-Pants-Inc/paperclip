@@ -56,6 +56,7 @@ import { parseObject } from "../adapters/utils.js";
 import { queuedCommentIdsFromRunContext, withQueuedCommentIdsInRunContext, withQueuedCommentIdsInWakePayload } from "../lib/queued-comment-context.js";
 import { readFirstTurnQueuedInputReceipt } from "./native-runtime/first-turn-queued-input.js";
 import { answeredContinuousHeldRun } from "./native-runtime/continuous-session-input.js";
+import { continuousRecoveryDecision } from "./continuous-recovery-choice.js";
 
 export { RECOVERY_CONTINUATIONS_PER_COMPANY_PER_PASS, RECOVERY_CONTINUATION_DELIVERY_BOUND_MS,
   RECOVERY_CONTINUATION_MAX_HOLD_MS } from "./recovery-continuation-pacing.js";
@@ -585,6 +586,16 @@ export async function deliverReconciledExecutions(
           task.conversationAgentId ? sql`${heartbeatRuns.contextSnapshot}->>'conversationSessionGeneration'
             = ${String(task.conversationSessionGeneration)}` : undefined,
         ));
+        const choice = await db.transaction(async raw => {
+          const tx = raw as unknown as Db;
+          const [currentTask] = await tx.select().from(issues).where(and(
+            eq(issues.companyId, action.companyId), eq(issues.id, task.id))).for("update");
+          const [agent] = await tx.select().from(agents).where(and(
+            eq(agents.companyId, action.companyId), eq(agents.id, action.returnOwnerAgentId!)));
+          return currentTask && agent ? continuousRecoveryDecision(tx, { issue: currentTask, agent,
+            context: retried?.contextSnapshot ?? {}, sourceRunId: decision.runId, create: true }) : null;
+        });
+        if (choice?.kind === "blocked" || (choice?.kind === "choice" && !choice.accepted)) continue;
         const result = parseObject(retried?.resultJson);
         const answered = new Set(Object.values(parseObject(result.continuousReplies)).flatMap(reply => {
           const ids = parseObject(reply).questionCommentIds;
@@ -621,6 +632,7 @@ export async function deliverReconciledExecutions(
             previousRunId: decision.runId,
             retryOfRunId: decision.runId,
             forceFreshSession: true,
+            ...(choice?.kind === "choice" ? { continuousRecoveryChoiceId: choice.question.id } : {}),
             wakeReason: "issue_recovery_action_restored",
             source: "execution.reconciled",
             ...((action.evidence.freshContinuation as { isolation?: unknown } | undefined)?.isolation === "fresh_isolated_workspace"

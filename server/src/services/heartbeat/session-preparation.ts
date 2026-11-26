@@ -8,6 +8,7 @@ import { aiConnectionSessionCompatibilityInputs, managedAiSessionIdentityCompati
 import { createNativeSessionHandoffLoader } from "../native-runtime/native-session-handoff.js";
 import { decideNativeContinuation, resolveSessionContinuity } from "../native-runtime/continued-session.js";
 import { deriveTaskKey } from "./run-preparation.js";
+import { prepareContinuousRecoverySession } from "../continuous-recovery-choice.js";
 import { queuedCommentIdsFromRunContext } from "../../lib/queued-comment-context.js";
 import { agentInstructionsService } from "../agent-instructions.js";
 import {
@@ -230,11 +231,14 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
   const continuableConfigChange = continuousPi && sessionConfigFreshness.changedCategories.length > 0 &&
     sessionConfigFreshness.changedCategories.every(category =>
       ["instructions", "environment", "envBindings"].includes(category));
+  const recoveryResetRequired = continuousPi && issueRef ? await prepareContinuousRecoverySession(db, {
+    companyId: agent.companyId, issueId: issueRef.id, agent, context, runId: run.id, effectiveConfig: runtimeConfig,
+  }) : false;
   let resetTaskSession =
     context.workspaceSelectionChanged === true || shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
   if (decideNativeContinuation({
     provider: runtimeConfig.provider, sessionContinuity: runtimeConfig.sessionContinuity, hasSession: taskSession != null, wakeReset: true,
-    resetRequired: context.explicitFreshSession === true || context.conversationReset === true ||
+    resetRequired: recoveryResetRequired || context.explicitFreshSession === true || context.conversationReset === true ||
       (context.workspaceSelectionChanged === true && (agent.adapterType !== "paperclip_runner" || runtimeConfig.provider !== "pi_rpc")) ||
       sessionConfigFreshness.reasons.some(reason => reason !== wakeSessionResetReason &&
         !(continuableConfigChange && reason.startsWith("effective run configuration changed: "))) ||

@@ -4,6 +4,7 @@ import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
 import { CONTEXT_COMPACTION_WAKE_REASON, ContextCompactionError, isContextCompactionRun, readContextCompactionRequest } from "../context-compaction.js";
 import { isProcessRunAdmissionClosed, isReattachPhaseActive as isProcessReattachPhaseActive } from "./run-admission.js";
 import { continueFreshInTransaction, hasPendingFreshContinuation, isFreshIsolatedContinuationWake, settleCoalescedFreshContinuationHolds } from "../fresh-continuation-fallback.js";
+import { CONTINUOUS_RECOVERY_PROMPT, continuousRecoveryDecision, isStockFreshRecovery, recoveryChoiceSource } from "../continuous-recovery-choice.js";
 import { answeredContinuousHeldRun } from "../native-runtime/continuous-session-input.js";
 import { deliverContinuationAsRun, foldWaitingRetriesIntoContinuation, foldWaitingRetriesIntoRecordedContinuation, undeliveredContinuation,
   undeliveredContinuationContext } from "../fresh-continuation-retry-fold.js";
@@ -59,6 +60,7 @@ import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { isVerifiedDependencyInteractionResponse, readQueuedInteractionResponse } from "../queued-interaction-response.js";
 import {
   isConversation,
+  isConversationReset,
   isWaitingConversation,
 } from "../agent-conversations.js";
 import { onboardingGreetingNeeded } from "../onboarding-chat.js";
@@ -4158,6 +4160,36 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             } : undefined,
           });
           const { blocker: executionBlocker, ownsReconstruction: ownsReconstructionContinuation } = recovery;
+          const [choiceComment] = wakeCommentId ? await tx.select({ body: issueComments.body, authorUserId: issueComments.authorUserId })
+            .from(issueComments).where(and(eq(issueComments.companyId, issue.companyId),
+              eq(issueComments.issueId, issue.id), eq(issueComments.id, wakeCommentId))) : [];
+          const explicitFresh = enrichedContextSnapshot.explicitFreshSession === true || enrichedContextSnapshot.conversationReset === true ||
+            Boolean(choiceComment?.authorUserId && isConversationReset(choiceComment.body));
+          const [choiceTask] = !explicitFresh ? await tx.select().from(issues).where(and(
+            eq(issues.companyId, issue.companyId), eq(issues.id, issue.id))) : [];
+          const recoveryChoice = choiceTask ? await continuousRecoveryDecision(tx as unknown as Db, {
+            issue: choiceTask, agent, context: enrichedContextSnapshot,
+            create: await isStockFreshRecovery(tx as unknown as Db, choiceTask, enrichedContextSnapshot),
+            sourceRunId: readNonEmptyString(enrichedContextSnapshot.previousRunId) ?? readNonEmptyString(enrichedContextSnapshot.retryOfRunId) ?? undefined,
+          }) : null;
+          if (recoveryChoice?.kind === "choice" || recoveryChoice?.kind === "blocked") {
+            const question = recoveryChoice.kind === "choice" ? recoveryChoice.question : null;
+            if (recoveryChoice.kind === "choice" && recoveryChoice.accepted &&
+                enrichedContextSnapshot.interactionId === question!.id && !executionReconciliationWake) {
+              const sourceRunId = recoveryChoiceSource(question!);
+              if (sourceRunId) await continueFreshInTransaction(tx as unknown as Db, {
+                companyId: issue.companyId, runId: sourceRunId, trigger: "continuation_wake", delivery: "record",
+              });
+              return { kind: "skipped" as const };
+            }
+            if (!(recoveryChoice.kind === "choice" && recoveryChoice.accepted && executionReconciliationWake &&
+                enrichedContextSnapshot.continuousRecoveryChoiceId === question!.id &&
+                !parseObject(question!.result).freshSessionDispatchRunId)) {
+              continuationWait = { reason: "continuous_recovery_choice_pending", message: CONTINUOUS_RECOVERY_PROMPT };
+              return deferBlockedExecution({ recoveryActionId: null,
+                cause: "native_continuation_requires_reconciliation", nextAction: CONTINUOUS_RECOVERY_PROMPT });
+            }
+          }
           const continuationHold = () => executionBlocker ?? {
             recoveryActionId: null, cause: "native_continuation_requires_reconciliation" as const, nextAction: continuationWait.message,
           };
