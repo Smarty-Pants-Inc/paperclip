@@ -408,6 +408,7 @@ describe("IssuesList", () => {
   });
 
   it("waits for the initial tree but keeps loaded rows visible while new ancestors load", async () => {
+    localStorage.setItem("paperclip:test-issues:company-1", JSON.stringify({ showAgentCreatedTasks: false }));
     const first = createIssue({ id: "child-one", parentId: "parent-one", title: "First nested task" });
     const second = createIssue({ id: "child-two", parentId: "parent-two", title: "Second nested task" });
     let resolveAncestors: (rows: Issue[]) => void = () => undefined;
@@ -830,6 +831,7 @@ describe("IssuesList", () => {
   });
 
   it("offers hierarchy retry after a reachable first-read 429 while keeping matching tasks", async () => {
+    localStorage.setItem("paperclip:test-tree:company-1", JSON.stringify({ showAgentCreatedTasks: false }));
     const parent = createIssue({ id: "human-root", title: "Readable root task", createdByUserId: "person" });
     let failed = true;
     mockIssuesApi.list.mockImplementation(async (_company, filters) => {
@@ -1600,13 +1602,13 @@ describe("IssuesList", () => {
         displayStatus: "backlog",
         limit: 200,
         includeRoutineExecutions: true,
-        includeAgentCreatedTasks: false,
+        includeAgentCreatedTasks: true,
       }), { signal: expect.any(AbortSignal) });
       expect(mockIssuesApi.list).toHaveBeenCalledWith("company-1", expect.objectContaining({
         displayStatus: "done",
         limit: 200,
         includeRoutineExecutions: true,
-        includeAgentCreatedTasks: false,
+        includeAgentCreatedTasks: true,
       }), { signal: expect.any(AbortSignal) });
       expect(mockKanbanBoard).toHaveBeenLastCalledWith(expect.objectContaining({
         issues: expect.arrayContaining([
@@ -1799,6 +1801,7 @@ describe("IssuesList", () => {
   });
 
   it.each([true, false])("retains loaded context while revealing a large automated tree (streamlined=%s)", async (streamlined) => {
+    localStorage.setItem("paperclip:test-tree:company-1", JSON.stringify({ showAgentCreatedTasks: false }));
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableStreamlinedUi: streamlined });
     const parent = createIssue({ id: "human-root", createdByUserId: "person", originKind: "manual" });
     const children = Array.from({ length: 250 }, (_, index) => createIssue({
@@ -2332,7 +2335,26 @@ describe("IssuesList", () => {
     }
   });
 
+  it("shows agent-created tasks by default while retaining saved choices", async () => {
+    function PreferenceProbe() {
+      return <span>{String(useShowAgentCreatedTasks("example-org", "paperclip:project-issues-view"))}</span>;
+    }
+    const { root, queryClient } = renderWithQueryClient(<PreferenceProbe />, container);
+    try {
+      expect(container.textContent).toBe("true");
+      const key = taskCollectionPreferencesStorageKey({ companyId: "example-org", collectionKey: "paperclip:project-issues-view" });
+      for (const shown of [false, true]) {
+        await act(async () => {
+          localStorage.setItem(key, JSON.stringify({ version: 1, companyId: "example-org", collectionKey: "paperclip:project-issues-view", viewState: { showAgentCreatedTasks: shown }, columns: [] }));
+          window.dispatchEvent(new StorageEvent("storage", { key }));
+        });
+        expect(container.textContent).toBe(String(shown));
+      }
+    } finally { act(() => root.unmount()); queryClient.clear(); }
+  });
+
   it.each([true, false])("keeps visibility controls and fetching preferences synchronized (streamlined=%s)", async (streamlined) => {
+    localStorage.setItem("paperclip:test-issues:company-1", JSON.stringify({ showAgentCreatedTasks: false }));
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableStreamlinedUi: streamlined });
     function PreferenceProbe() {
       const included = useShowAgentCreatedTasks("company-1", "paperclip:test-issues");
@@ -2371,7 +2393,7 @@ describe("IssuesList", () => {
 
     await act(async () => {
       const filterButton = Array.from(document.body.querySelectorAll("button")).find(
-        (button) => button.getAttribute("title") === "Filter",
+        (button) => button.getAttribute("title")?.startsWith("Filter"),
       );
       filterButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       await Promise.resolve();
