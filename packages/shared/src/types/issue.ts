@@ -307,6 +307,7 @@ export interface AcceptedPlanDecompositionSummary extends AcceptedPlanDecomposit
 
 export interface IssueRelationIssueSummary {
   displayStatus?: IssueDisplayStatus;
+  unblockDescriptor?: IssueUnblockDescriptor | null;
   id: string;
   identifier: string | null;
   title: string;
@@ -904,7 +905,7 @@ export type IssueChanges = Record<string, IssueChangeReceiptEntry>;
 
 export type IssueSummary = Pick<
   Issue,
-  "id" | "companyId" | "title" | "identifier" | "status" | "displayStatus" | "updatedAt"
+  "id" | "companyId" | "title" | "identifier" | "status" | "displayStatus" | "unblockDescriptor" | "updatedAt"
 > & {
   externalConversationState: "active" | "waiting" | null;
   /** Present for blocked tasks so summary views resolve the same status glyph as detail views. */
@@ -1360,6 +1361,8 @@ export interface SuggestTasksResult {
 
 /** Server-recorded task creation in a standing chat's current session. */
 export interface ConversationTaskHandoff {
+  displayStatus?: IssueDisplayStatus;
+  unblockDescriptor?: IssueUnblockDescriptor | null;
   id: string;
   issueId: string;
   identifier: string | null;

@@ -8471,6 +8471,7 @@ export function issueRoutes(
         identifier: row.identifier,
         status: row.status as IssueSummary["status"],
         displayStatus: row.displayStatus,
+        unblockDescriptor: row.unblockDescriptor ?? null,
         updatedAt: row.updatedAt,
         externalConversationState: row.externalConversationState,
         ...(navigation ? { parentId: row.parentId, ...navigation.get(row.id) } : {}),

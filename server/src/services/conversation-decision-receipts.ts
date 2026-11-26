@@ -3,6 +3,7 @@ import { chatCompletionDeliveries, chatTaskHandoffs, issueComments, issues, issu
 import type { AttentionItem, ConversationTaskHandoff, ConversationTaskHandoffPage, DecisionHistoryPage, DecisionHistoryQuery } from "@paperclipai/shared";
 import { issueReadSqlCondition, type AuthorizationActor } from "./authorization.js";
 import { attentionService } from "./attention.js";
+import { issueStatusProjectionFields } from "./issue-display-status.js";
 import { decisionHistoryService, pageDecisionHistory } from "./decision-history.js";
 import { badRequest, notFound } from "../errors.js";
 import { z } from "zod";
@@ -74,7 +75,7 @@ export function conversationDecisionReceiptsService(db: Db) {
       }
       const readable = await issueReadSqlCondition(db, options.actor);
       const rows = await db.select({ issueId: issues.id, identifier: issues.identifier, title: issues.title,
-        status: issues.status, createdAt: chatTaskHandoffs.createdAt, sourceRunId: issues.originRunId,
+        status: issues.status, ...issueStatusProjectionFields(), createdAt: chatTaskHandoffs.createdAt, sourceRunId: issues.originRunId,
         createdAtCursor: sql<string>`${chatTaskHandoffs.createdAt}::text`,
         suggestionInteractionId: sql<string | null>`(select ${issueThreadInteractions.id} from ${issueThreadInteractions}
           where ${issueThreadInteractions.companyId} = ${companyId} and ${issueThreadInteractions.issueId} = ${conversationId}

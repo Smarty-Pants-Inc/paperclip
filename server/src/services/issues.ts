@@ -3,7 +3,7 @@ import { assertAgentInteraction } from "./agent-interaction-policy.js";
 import { instancePublicOrigin, mayContainInventedHostLink, relativizeInventedHostLinks } from "./agent-invented-host-links.js";
 import { currentPluginInteractionOrigin } from "./plugin-interaction-context.js";
 import type { IssueDisplayStatus, IssueInboxArchiveFilter } from "@paperclipai/shared";
-import { issueDisplayStatusSql } from "./issue-display-status.js";
+import { issueDisplayStatusSql, issueStatusProjectionFields } from "./issue-display-status.js";
 import { notifyStrandedAgentStatus, notifyActiveRunSilence } from "./live-run-recovery-notifications.js";
 import { finishedIdleWake } from "./idle-work-proof.js";
 import { notifyDeferredExecutionEligibility } from "./deferred-execution-notifications.js";
@@ -3759,6 +3759,7 @@ function appendBlockerAttentionEdges(
 
 type IssueRelationSummaryRow = {
   displayStatus?: IssueDisplayStatus;
+  unblockDescriptor?: typeof issues.$inferSelect.unblockDescriptor;
   relatedId: string;
   identifier: string | null;
   title: string;
@@ -3777,6 +3778,7 @@ function summarizeIssueRelationRow(
     title: row.title,
     status: row.status as IssueRelationIssueSummary["status"],
     displayStatus: row.displayStatus,
+    unblockDescriptor: row.unblockDescriptor ?? null,
     priority: row.priority as IssueRelationIssueSummary["priority"],
     assigneeAgentId: row.assigneeAgentId,
     assigneeUserId: row.assigneeUserId,
@@ -3892,7 +3894,7 @@ async function terminalExplicitBlockersByRoot(
           identifier: issues.identifier,
           title: issues.title,
           status: issues.status,
-          displayStatus: issueDisplayStatusSql(),
+          ...issueStatusProjectionFields(),
           priority: issues.priority,
           assigneeAgentId: issues.assigneeAgentId,
           assigneeUserId: issues.assigneeUserId,
@@ -7206,7 +7208,7 @@ export function issueService(db: Db) {
 
   async function getIssueByUuid(id: string) {
     const row = await retryIdempotentDatabaseOperation(() => db
-      .select({ ...getTableColumns(issues), displayStatus: issueDisplayStatusSql(), externalConversationState: externalConversationStateSql() })
+      .select({ ...getTableColumns(issues), ...issueStatusProjectionFields(), externalConversationState: externalConversationStateSql() })
       .from(issues)
       .where(eq(issues.id, id))
       .then((rows) => rows[0] ?? null));
@@ -7217,7 +7219,7 @@ export function issueService(db: Db) {
 
   async function getIssueByIdentifier(identifier: string) {
     const row = await retryIdempotentDatabaseOperation(() => db
-      .select({ ...getTableColumns(issues), displayStatus: issueDisplayStatusSql(), externalConversationState: externalConversationStateSql() })
+      .select({ ...getTableColumns(issues), ...issueStatusProjectionFields(), externalConversationState: externalConversationStateSql() })
       .from(issues)
       .where(eq(issues.identifier, identifier.toUpperCase()))
       .then((rows) => rows[0] ?? null));
@@ -7816,7 +7818,7 @@ export function issueService(db: Db) {
           identifier: issues.identifier,
           title: issues.title,
           status: issues.status,
-          displayStatus: issueDisplayStatusSql(),
+          ...issueStatusProjectionFields(),
           priority: issues.priority,
           assigneeAgentId: issues.assigneeAgentId,
           assigneeUserId: issues.assigneeUserId,
@@ -7837,7 +7839,7 @@ export function issueService(db: Db) {
           identifier: issues.identifier,
           title: issues.title,
           status: issues.status,
-          displayStatus: issueDisplayStatusSql(),
+          ...issueStatusProjectionFields(),
           priority: issues.priority,
           assigneeAgentId: issues.assigneeAgentId,
           assigneeUserId: issues.assigneeUserId,
