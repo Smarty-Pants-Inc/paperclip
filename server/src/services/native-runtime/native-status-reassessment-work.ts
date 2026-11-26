@@ -20,7 +20,10 @@ export function nativeStatusReassessmentWork(db: Db) {
     const matchesDecision = sql`coalesce(${issues.lastStatusDecisionId} = ${nativeRunFinalizations.decisionId}
       and ${statusDecisions.assessmentId} = ${workAssessments.id} and ${statusDecisions.toStatus} = ${issues.status}
       and ${projectedVersion} = ${issues.statusVersion}, false)`;
-    const statusChanged = and(not(matchesDecision), or(ne(workAssessments.priorIssueStatus, issues.status),
+    // A committed preserve decision is settled for status-only triggers (the evidence and review arms below still select it).
+    const preserveSettled = sql`coalesce(${nativeRunFinalizations.phase} = 'committed'
+      and ${statusDecisions.reasonCode} = 'prior_status_terminal_preserved', false)`;
+    const statusChanged = and(not(preserveSettled), not(matchesDecision), or(ne(workAssessments.priorIssueStatus, issues.status),
       ne(workAssessments.priorStatusVersion, issues.statusVersion)));
     const evidenceChanged = exists(db.select({ id: issueWorkProducts.id }).from(issueWorkProducts).where(and(
       eq(issueWorkProducts.companyId, nativeRunFinalizations.companyId), eq(issueWorkProducts.issueId, nativeRunFinalizations.issueId),
