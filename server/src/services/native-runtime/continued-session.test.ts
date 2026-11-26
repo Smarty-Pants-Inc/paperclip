@@ -2,7 +2,7 @@ import { expect, it } from "vitest";
 import type { Db } from "@paperclipai/db";
 import { buildPaperclipWakePayload } from "../heartbeat/run-preparation.js";
 import { shouldResetTaskSessionForWake } from "../heartbeat/run-state.js";
-import { decideNativeContinuation, NATIVE_FRESH_SESSION_MARKER, sessionCannotContinue, withPiOpenTurnDefault } from "./continued-session.js";
+import { decideNativeContinuation, isWarmRecoveryRefusal, NATIVE_FRESH_SESSION_MARKER, sessionCannotContinue, withPiOpenTurnDefault } from "./continued-session.js";
 import { configuredEnvironmentProjection } from "../../vendor/paperclip-runner/index.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
@@ -32,6 +32,25 @@ it("recognizes only an unrecoverable session's code or retained-binding refusal"
     resultJson: { nativeExactResumeRefusal: { refusal: "native_controller_recovery_missing_evidence:retained_sandbox_binding" } } })).toBe(true);
   expect(sessionCannotContinue({ errorCode: "adapter_failed", error: "ordinary provider failure" })).toBe(false);
   expect(sessionCannotContinue({ errorCode: "adapter_failed", error: "expected native_controller_recovery_missing_evidence:retained_sandbox_binding" })).toBe(false);
+});
+// Pure classifier regression: current refusal precedence and exact tokens have no cheaper isolated proof.
+it("classifies only the failed run's current warm-recovery refusal", () => {
+  const run = { status: "failed", errorCode: "native_continuation_requires_reconciliation", error: "ordinary model/tool failure" };
+  for (const error of [run.error, "expected remote_warm_session_not_idle in tool output", "remote_warm_session_not_idle_suffix",
+    "native_continuation_requires_reconciliation", "expected native_controller_recovery_missing_evidence:retained_sandbox_binding"]) {
+    expect(isWarmRecoveryRefusal({ ...run, error })).toBe(false);
+  }
+  expect(isWarmRecoveryRefusal({ ...run, error: null })).toBe(false);
+  expect(isWarmRecoveryRefusal({ ...run, status: "succeeded", error: "remote_warm_session_not_idle" })).toBe(false);
+  expect(isWarmRecoveryRefusal({ ...run, error: "remote_warm_session_not_idle", resultJson: {
+    nativeExactResumeRefusal: { refusal: "ordinary current provider failure" },
+  } })).toBe(false);
+  expect(isWarmRecoveryRefusal({ ...run, error: "ordinary earlier provider failure; exact checkpoint resume refused: remote_warm_session_not_idle", resultJson: {
+    nativeExactResumeRefusal: { refusal: "runner_state_identity_mismatch: remote_warm_session_not_idle" },
+  } })).toBe(true);
+  expect(isWarmRecoveryRefusal({ ...run, errorCode: "native_provider_state_incompatible" })).toBe(true);
+  expect(isWarmRecoveryRefusal({ ...run, error: "native_controller_recovery_missing_evidence:retained_sandbox_binding" })).toBe(true);
+  expect(isWarmRecoveryRefusal(undefined)).toBe(false);
 });
 it("honors explicit fresh-session resets under continuous", () => {
   const context = { forceFreshSession: true, explicitFreshSession: true };

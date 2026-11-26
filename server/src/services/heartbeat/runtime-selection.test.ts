@@ -150,6 +150,19 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     }
   });
 
+  it("does not rotate an incident's retained recovery session when its checkpoint is missing", async () => {
+    const { input, run, issue } = await fixture();
+    input.agent.adapterConfig = { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous" };
+    input.nativeRuntimeResolution = resolveHeartbeatNativeRuntimeMode({ persisted: run, enabled: true, runtimeConfig: {},
+      adapterConfig: input.agent.adapterConfig, agent: input.agent, issue, target: null, workspaceId: null });
+    const retained = randomUUID();
+    input.session.taskResumeSessionId = retained;
+    input.session.warmRecoveryRetainSessionId = retained;
+    await expect(selectHeartbeatRuntime(db, input)).rejects.toThrow("warm_recovery_fresh_session_already_attempted");
+    expect((await read(run.id)).nativeSessionId).toBeNull();
+    expect(await coordinators(run.id)).toEqual([]);
+  });
+
   it("rejects invalid local Runner configuration before native authority and retains the preparation owner", async () => {
     const f = await fixture();
     await claimPreparation(f);
