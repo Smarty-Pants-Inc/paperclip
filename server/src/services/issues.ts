@@ -277,6 +277,7 @@ import { buildIssueChanges } from "./issue-change-receipt.js";
 import { ensurePersonalPrivateProject } from "./projects.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
+import { readLimitFromEnv } from "./env-limits.js";
 
 const ALL_ISSUE_STATUSES = [
   "backlog",
@@ -288,7 +289,6 @@ const ALL_ISSUE_STATUSES = [
   "cancelled",
 ];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
-const MAX_CHAT_PRESENTATION_ATTACHMENTS = 20;
 export const ISSUE_LIST_DEFAULT_LIMIT = 500;
 export const ISSUE_LIST_MAX_LIMIT = 1000;
 export const ISSUE_BLOCKER_DIAGNOSTICS_MAX_BLOCKERS = 100;
@@ -10114,9 +10114,10 @@ export function issueService(db: Db) {
             notInArray(issues.status, ["done", "cancelled"]),
           ),
         );
-      if (childCount >= MAX_CHILD_ISSUES_CREATED_BY_HELPER) {
+      const maxChildIssues = readLimitFromEnv("PAPERCLIP_MAX_CHILD_TASKS_PER_PARENT", MAX_CHILD_ISSUES_CREATED_BY_HELPER);
+      if (childCount >= maxChildIssues) {
         throw unprocessable(
-          `Parent issue already has the maximum ${MAX_CHILD_ISSUES_CREATED_BY_HELPER} active child issues for this helper`,
+          `Parent issue already has the maximum ${maxChildIssues} active child issues for this helper`,
         );
       }
 
@@ -13719,6 +13720,7 @@ export function issueService(db: Db) {
       },
       dbOrTx: any = db,
     ): Promise<IssueComment> {
+      const maxChatAttachments = readLimitFromEnv("PAPERCLIP_MAX_CHAT_ATTACHMENTS", 20);
       const pluginOrigin = currentPluginInteractionOrigin();
       if (pluginOrigin) {
         actor = { ...actor, agentId: pluginOrigin.agentId, runId: pluginOrigin.runId ?? undefined, userId: undefined };
@@ -14152,12 +14154,12 @@ export function issueService(db: Db) {
             for (const attachmentId of attachmentIds) {
               selectedIds.add(attachmentId);
             }
-            if (selectedIds.size > MAX_CHAT_PRESENTATION_ATTACHMENTS) {
+            if (selectedIds.size > maxChatAttachments) {
               throw unprocessable(
-                `An agent run can select at most ${MAX_CHAT_PRESENTATION_ATTACHMENTS} attachments for one chat response`,
+                `An agent run can select at most ${maxChatAttachments} attachments for one chat response`,
                 {
                   code: "chat_attachment_selection_limit_exceeded",
-                  limit: MAX_CHAT_PRESENTATION_ATTACHMENTS,
+                  limit: maxChatAttachments,
                   selectedCount: selectedIds.size,
                 },
               );
@@ -14235,12 +14237,12 @@ export function issueService(db: Db) {
             originalFilename: attachment.originalFilename,
           });
         }
-        if (boundAttachments.length > MAX_CHAT_PRESENTATION_ATTACHMENTS) {
+        if (boundAttachments.length > maxChatAttachments) {
           throw unprocessable(
-            `An agent run can select at most ${MAX_CHAT_PRESENTATION_ATTACHMENTS} attachments for one chat response`,
+            `An agent run can select at most ${maxChatAttachments} attachments for one chat response`,
             {
               code: "chat_attachment_selection_limit_exceeded",
-              limit: MAX_CHAT_PRESENTATION_ATTACHMENTS,
+              limit: maxChatAttachments,
               selectedCount: boundAttachments.length,
             },
           );
@@ -14406,6 +14408,7 @@ export function issueService(db: Db) {
       createdByUserId?: string | null;
       createdByRunId?: string | null;
     }) => {
+      const maxChatAttachments = readLimitFromEnv("PAPERCLIP_MAX_CHAT_ATTACHMENTS", 20);
       const issue = await db
         .select({ id: issues.id, companyId: issues.companyId, createdByUserId: issues.createdByUserId, responsibleUserId: issues.responsibleUserId })
         .from(issues)
@@ -14515,12 +14518,12 @@ export function issueService(db: Db) {
                 agentId: input.createdByAgentId,
                 runId: registeredRunId,
               });
-            if (alreadySelected.length >= MAX_CHAT_PRESENTATION_ATTACHMENTS) {
+            if (alreadySelected.length >= maxChatAttachments) {
               throw unprocessable(
-                `An agent run can select at most ${MAX_CHAT_PRESENTATION_ATTACHMENTS} attachments for one chat response`,
+                `An agent run can select at most ${maxChatAttachments} attachments for one chat response`,
                 {
                   code: "chat_attachment_selection_limit_exceeded",
-                  limit: MAX_CHAT_PRESENTATION_ATTACHMENTS,
+                  limit: maxChatAttachments,
                   selectedCount: alreadySelected.length + 1,
                 },
               );
