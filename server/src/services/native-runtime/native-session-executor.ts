@@ -15964,30 +15964,82 @@ export function remoteRunnerStateNeverConnected(state: Record<string, unknown>):
     && state.pendingTerminalDelivery === null && empty(state.processedCommands);
 }
 
-async function readRemoteRunnerProviderState(input: {
+const REMOTE_RUNNER_PROVIDER_STATE_MAX_BYTES = 16 * 1024 * 1024;
+const REMOTE_RUNNER_PROVIDER_STATE_SYNC_MINIMUM_TIMEOUT_MS = 300_000;
+const REMOTE_RUNNER_PROVIDER_STATE_READ_TIMEOUT_MS = 60_000;
+
+export async function readRemoteRunnerProviderState(input: {
   runner: CommandManagedRuntimeRunner;
   stateDirectory: string;
   execution: NativeExecutionInput;
 }): Promise<Record<string, unknown>> {
-  const statePath = posix.join(
-    input.stateDirectory,
-    runnerProviderStateFilename(input.execution),
-  );
-  const escapedPath = statePath.replaceAll("'", "'\\''");
-  const result = await input.runner.execute({
-    command: "sh",
-    args: ["-c", `test -f '${escapedPath}' && base64 < '${escapedPath}'`],
-    bypassSession: true,
-    timeoutMs: 10_000,
-  });
-  if (result.exitCode !== 0 || result.timedOut) {
-    throw new Error("runner_remote_provider_state_unavailable");
+  if (!input.runner.syncOut) {
+    throw new Error("runner_remote_provider_state_unavailable: native_sync_out_required");
   }
-  return record(
-    JSON.parse(
-      Buffer.from(result.stdout.replace(/\s+/g, ""), "base64").toString("utf8"),
-    ),
-  );
+  const temporaryRoot = mkdtempSync(join(tmpdir(), "paperclip-provider-state-"));
+  const targetPath = join(temporaryRoot, "provider-state.json");
+  let readTimeout: ReturnType<typeof setTimeout> | undefined;
+  let syncOut: Promise<unknown> | undefined;
+  let timedOut = false;
+  const cleanup = () => rmSync(temporaryRoot, { recursive: true, force: true });
+  try {
+    // The host race is the bound; minimumTimeoutMs accommodates the plugin's
+    // 300s step floor. No abort signal is supported; fence timed-out transfers.
+    const timeout = new Promise<never>((_resolve, reject) => {
+      readTimeout = setTimeout(() => {
+        timedOut = true;
+        reject(new Error("runner_remote_provider_state_unavailable: sync_out_timeout"));
+      }, REMOTE_RUNNER_PROVIDER_STATE_READ_TIMEOUT_MS);
+    });
+    syncOut = input.runner.syncOut(
+      [{
+        operationId: `runner-provider-state-${randomUUID()}`,
+        files: [{
+          sourcePath: posix.join(input.stateDirectory, runnerProviderStateFilename(input.execution)),
+          targetPath,
+          kind: "file",
+          mode: 0o600,
+          followSymlinks: false,
+        }],
+      }],
+      { minimumTimeoutMs: REMOTE_RUNNER_PROVIDER_STATE_SYNC_MINIMUM_TIMEOUT_MS },
+    );
+    await Promise.race([syncOut, timeout]);
+    let bytes: Buffer;
+    try {
+      bytes = readBoundedNativeFile(targetPath, REMOTE_RUNNER_PROVIDER_STATE_MAX_BYTES, "file_exceeds_16_mib");
+    } catch (error) {
+      const reason = error instanceof Error && ["file_exceeds_16_mib", "native_state_file_changed"].includes(error.message)
+        ? error.message : "bounded_read_failed";
+      throw new Error(`runner_remote_provider_state_unavailable: ${reason}`, { cause: error });
+    }
+    return record(JSON.parse(bytes.toString("utf8")));
+  } finally {
+    clearTimeout(readTimeout);
+    if (timedOut && syncOut) {
+      // Keep the empty marker permanently: a settled RPC cannot fence a late publisher.
+      let fenceError: string | undefined;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const deadRoot = `${temporaryRoot}.dead-${randomUUID()}`;
+        try {
+          renameSync(temporaryRoot, deadRoot);
+          writeFileSync(temporaryRoot, "", { flag: "wx", mode: 0o400 });
+          fenceError = undefined; break;
+        } catch (error) {
+          fenceError = (error as NodeJS.ErrnoException).code ?? "UNKNOWN";
+          if (fenceError !== "EEXIST") break;
+        } finally { try { rmSync(deadRoot, { recursive: true, force: true }); } catch { /* Best effort. */ }
+          void syncOut.finally(() => rmSync(deadRoot, { recursive: true, force: true })).catch(() => undefined);
+        }
+      }
+      if (fenceError) {
+        logger.warn({ code: fenceError, root: basename(temporaryRoot) }, "provider-state timeout fence failed");
+        void syncOut.finally(cleanup).catch(() => undefined);
+      }
+    } else {
+      cleanup();
+    }
+  }
 }
 
 const REMOTE_RUNNER_PROCESS_IDENTITY_WAIT_MS = 20_000;
