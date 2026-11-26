@@ -46,6 +46,7 @@ import { lockNativeRunnerCheckpointOwner, nativeRunnerCheckpointOwnerLock, valid
 import { crashPoint } from "@paperclipai/shared/crash-points";
 import { NATIVE_PROVIDER_DURABLE_EVENT_TYPES } from "./native-retired-backup-source.js";
 import { recordRunEventCommitted } from "../server-metrics.js";
+import { NATIVE_FRESH_SESSION_MARKER } from "./continued-session.js";
 
 export interface PaperclipControlPlaneBinding {
   companyId: string;
@@ -524,7 +525,7 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
               companyId: issue.companyId, issueId: issue.id, authorType: "system",
               authorAgentId: null, authorUserId: null, createdByRunId: null,
               conversationSessionGeneration: issue.conversationSessionGeneration,
-              body: "New session · Earlier messages and files are still available.",
+              body: NATIVE_FRESH_SESSION_MARKER,
               presentation: { kind: "system_notice", tone: "neutral", detailsDefaultOpen: false },
               metadata: { version: 1, sourceRunId: run.id, sections: [] }, createdAt: run.createdAt,
             });
