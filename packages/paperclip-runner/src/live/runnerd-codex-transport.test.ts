@@ -7211,6 +7211,7 @@ describe("runnerd compaction turn payload", () => {
     const { runnerdCompactionTurnPayload } = await import("./runnerd-codex-transport.js");
     expect(runnerdCompactionTurnPayload("codex")).toEqual({ compact: true });
     expect(runnerdCompactionTurnPayload("acpx")).toEqual({ text: "/compact" });
+    expect(runnerdCompactionTurnPayload("pi_rpc")).toEqual({ text: "/compact" });
     expect(() => runnerdCompactionTurnPayload("opencode")).toThrow("not supported");
   });
 });

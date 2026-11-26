@@ -17,6 +17,7 @@ describe("context compaction support", () => {
     expect(contextCompactionSupport({ adapterType: "paperclip_runner", adapterConfig: { provider: "acpx", acpxAgent: "claude" } }).supported).toBe(true);
     expect(contextCompactionSupport({ adapterType: "paperclip_runner", adapterConfig: { provider: "acpx", acpxAgent: "pi" } }).supported).toBe(false);
     expect(contextCompactionSupport({ adapterType: "paperclip_runner", adapterConfig: { provider: "opencode" } }).supported).toBe(false);
+    expect(contextCompactionSupport({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc" } }).supported).toBe(true);
     expect(contextCompactionSupport({ adapterType: "codex_local", adapterConfig: {} }).supported).toBe(false);
   });
 
