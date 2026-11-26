@@ -1,4 +1,5 @@
 import { resolveLoginEnvironmentTarget } from "../services/login-environment.js";
+import { issueAttentionVisibilityService } from "../services/issue-attention-visibility.js";
 import { checkAgentProtectedEnvironmentKeys } from "../services/protected-environment-keys.js";
 import { assertProviderApiPlacementPolicy, managedCursorApiDefaultEnabled, resolveProviderApiPlacement } from "../services/native-runtime/provider-api-placement.js";
 import { isObjectJournalBusyError } from "../services/object-byte-journal.js";
@@ -4368,7 +4369,8 @@ export function agentRoutes(
       status: issue.status,
     })));
 
-    res.json(rows.filter((_, index) => decisions[index]?.allowed));
+    const visibleRows = rows.filter((_, index) => decisions[index]?.allowed);
+    res.json(await issueAttentionVisibilityService(db).redactRows(req.actor, req.actor.companyId, visibleRows));
   });
 
   router.get("/agents/:id/identity", async (req, res) => {

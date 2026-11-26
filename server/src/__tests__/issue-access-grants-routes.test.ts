@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import express from "express";
 import { eq } from "drizzle-orm";
 import { documents, documentRevisions, issueDocuments, issuePlanDecompositions, issueThreadInteractions } from "@paperclipai/db";
@@ -524,6 +524,98 @@ describeEmbeddedPostgres("issue access grant and locked edge routes", { concurre
         .not.toContain(fixture.privateProject.id);
     }
   }, 20_000);
+
+  async function attentionFixture() {
+    const f = await seedFixture();
+    await db.delete(issues).where(eq(issues.id, f.privateChild.id));
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, f.openIssue.id));
+    const [bridge] = await db.insert(issues).values({ companyId: f.companyId, identifier: "VISIBLE-982", title: "Readable bridge", status: "blocked" }).returning();
+    await db.insert(issueRelations).values([
+      { companyId: f.companyId, issueId: bridge!.id, relatedIssueId: f.openIssue.id, type: "blocks" },
+      { companyId: f.companyId, issueId: f.privateIssueId, relatedIssueId: bridge!.id, type: "blocks" },
+    ]);
+    return { ...f, bridge: bridge!, hidden: [f.privateIssueId, "PRV-1", "Confidential root"] };
+  }
+
+  function expectAttentionVisibility(body: any, hidden: string[], readable: boolean) {
+    const rows = Array.isArray(body) ? body : [body.issue ?? body];
+    // Relation locked stubs are a separate existing contract; no such stubs may appear inside attention.
+    const json = JSON.stringify(rows.map(row => [row.blockerAttention, row.blockedInboxAttention]));
+    for (const value of hidden) {
+      if (readable) expect(json).toContain(value);
+      else expect(json).not.toContain(value);
+    }
+  }
+
+  it("redacts nested attention on company lists before full, compact, rows, index and blocked serialization", async () => {
+    const f = await attentionFixture();
+    for (const userId of [f.memberId, f.ownerId]) {
+      const app = await createApp(db, boardActor(f.companyId, userId));
+      for (const query of [{}, { q: "Open issue" }, { view: "compact" }, { view: "rows" }, { view: "index" }, { attention: "blocked" }]) {
+        const res = await request(app).get(`/api/companies/${f.companyId}/issues`)
+          .query({ includeBlockedInboxAttention: true, ...query }).expect(200);
+        expect(res.body.find((row: { id: string }) => row.id === f.openIssue.id).blockerAttention.state).toBe("needs_attention");
+        if ("view" in query) expect(res.headers.etag).toBe(`"compact-issues:${createHash("sha256").update(JSON.stringify(res.body)).digest("base64url")}"`);
+        expectAttentionVisibility([res.body.find((row: { id: string }) => row.id === f.openIssue.id)], f.hidden, userId === f.ownerId);
+      }
+    }
+  }, 30_000);
+
+  it("redacts nested attention on issue detail without hiding readable terminal tasks", async () => {
+    const f = await attentionFixture();
+    for (const userId of [f.memberId, f.ownerId]) {
+      const res = await request(await createApp(db, boardActor(f.companyId, userId)))
+        .get(`/api/issues/${f.openIssue.id}`).expect(200);
+      expect(res.body.blockerAttention.state).toBe("needs_attention");
+      expectAttentionVisibility(res.body, f.hidden, userId === f.ownerId);
+    }
+  });
+
+  it("redacts the heartbeat context's nested issue attention for the authenticated viewer", async () => {
+    const f = await attentionFixture();
+    for (const userId of [f.memberId, f.ownerId]) {
+      const res = await request(await createApp(db, boardActor(f.companyId, userId)))
+        .get(`/api/issues/${f.openIssue.id}/heartbeat-context`).expect(200);
+      expect(res.body.issue.blockerAttention.state).toBe("needs_attention");
+      expectAttentionVisibility(res.body, f.hidden, userId === f.ownerId);
+    }
+  });
+
+  it("independently proves two-chain samples and source-only fallback provenance without mutating raw attention", async () => {
+    const f = await attentionFixture(), missing = randomUUID(), foreignId = randomUUID(), foreignCompany = randomUUID();
+    await db.insert(companies).values({ id: foreignCompany, name: "Foreign attention" });
+    await db.insert(issues).values({ id: foreignId, companyId: foreignCompany, identifier: "FOREIGN-981", title: "FOREIGN_ATTENTION" });
+    const { issueService } = await import("../services/issues.js");
+    const { issueAttentionVisibilityService } = await import("../services/issue-attention-visibility.js");
+    const raw = (await issueService(db).listBlockerAttention(f.companyId, [{ ...f.openIssue, status: "blocked" }])).get(f.openIssue.id)!;
+    const [otherChain] = await db.insert(issues).values({ companyId: f.companyId, identifier: "OTHER-983", title: "Readable second chain", status: "backlog" }).returning();
+    await db.insert(issueRelations).values({ companyId: f.companyId, issueId: otherChain!.id, relatedIssueId: f.openIssue.id, type: "blocks" });
+    const ref = (id: string, identifier: string | null, title: string) => ({ id, identifier, title, status: "backlog" as const, priority: "medium" as const, assigneeAgentId: null, assigneeUserId: null });
+    const inbox = { kind: "blocked" as const, state: "needs_attention" as const, reason: "blocked_chain_stalled" as const, severity: "high" as const,
+      sourceIssue: { ...ref(f.openIssue.id, "PRV-2", "Open issue"), status: "blocked" as const }, leafIssue: null, recoveryIssue: null, sampleIssueIdentifier: "PRV-1",
+      owner: { type: "user" as const, userId: f.ownerId, agentId: null, label: "Confidential root" }, action: { label: "Inspect blocker chain", detail: "PRV-1 Confidential root" },
+      stoppedSinceAt: "2026-11-01", approvalId: null, interactionId: null, redaction: { externalDetailsRedacted: false, secretFieldsOmitted: true as const } };
+    const blocker = { ...raw, terminalBlocker: { id: otherChain!.id, identifier: otherChain!.identifier, title: otherChain!.title }, directBlockerIssueId: missing, terminalBlockerIssueId: foreignId, sampleBlockerIdentifier: "OTHER-983", sampleStalledBlockerIdentifier: "PRV-1", pendingFinalizeBlockerIssueIds: [f.openIssue.id, f.privateIssueId, missing, foreignId] };
+    const rows = [{ id: f.openIssue.id, blockerAttention: blocker, blockedInboxAttention: inbox },
+      { id: "refs", blockerAttention: raw, blockedInboxAttention: { ...inbox, leafIssue: ref(f.privateIssueId, "PRV-1", "Confidential root"), recoveryIssue: ref(foreignId, "FOREIGN-981", "FOREIGN_ATTENTION") } },
+      { id: "missing", blockerAttention: null, blockedInboxAttention: { ...inbox, recoveryIssue: ref(missing, "MISSING-981", "MISSING_ATTENTION"), sampleIssueIdentifier: "UNRESOLVABLE-981" } },
+      { id: "unproven", blockerAttention: null, blockedInboxAttention: { ...inbox, sampleIssueIdentifier: null } }];
+    const authorization = await import("../services/authorization.js"), access = authorization.authorizationService(db);
+    const batchSpy = vi.spyOn(access, "decideReads"), factorySpy = vi.spyOn(authorization, "authorizationService").mockReturnValue(access);
+    const before = JSON.stringify(rows), redactor = issueAttentionVisibilityService(db);
+    try {
+      const denied = await redactor.redactRows(boardActor(f.companyId, f.memberId), f.companyId, rows);
+      for (const secret of [...f.hidden, missing, foreignId, "FOREIGN-981", "FOREIGN_ATTENTION", "MISSING-981", "MISSING_ATTENTION", "UNRESOLVABLE-981"]) expect(JSON.stringify(denied)).not.toContain(secret);
+      expect(denied[0].blockerAttention).toMatchObject({ state: raw.state, unresolvedBlockerCount: raw.unresolvedBlockerCount, sampleBlockerIdentifier: "OTHER-983", sampleStalledBlockerIdentifier: null, pendingFinalizeBlockerIssueIds: [f.openIssue.id], terminalBlocker: blocker.terminalBlocker, terminalBlockerIssueId: null, directBlockerIssueId: null });
+      for (const row of denied) expect(row.blockedInboxAttention).toMatchObject({ owner: { type: "unknown", userId: null, agentId: null, label: null }, action: { detail: null }, stoppedSinceAt: null, sampleIssueIdentifier: null });
+      const allowed = await redactor.redactRows(boardActor(f.companyId, f.ownerId), f.companyId, rows);
+      expect(allowed[0].blockerAttention?.sampleStalledBlockerIdentifier).toBe("PRV-1");
+      expect(allowed[0].blockedInboxAttention).toEqual(inbox);
+      expect(JSON.stringify(rows)).toBe(before);
+      expect(await redactor.redactRows(boardActor(f.companyId, f.memberId), f.companyId, [{ id: "empty", blockerAttention: null }])).toEqual([{ id: "empty", blockerAttention: null }]);
+      expect(batchSpy.mock.calls.map(([, resources]) => resources.length)).toEqual([4, 4]);
+    } finally { factorySpy.mockRestore(); batchSpy.mockRestore(); }
+  });
 
   it("returns exact locked stubs only through visible blocker and mention edges", async () => {
     const fixture = await seedFixture();
