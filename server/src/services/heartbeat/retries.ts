@@ -846,6 +846,8 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     delete retryContextSnapshot.skillSelectionSnapshot;
     delete retryContextSnapshot.shadowedSkills;
     delete retryContextSnapshot.retryWorkspaceRefusal;
+    // A person's fresh-session choice was for the run it admitted, not for automatic retries.
+    delete retryContextSnapshot.explicitFreshSession;
     if (retryReason !== ENVIRONMENT_PROVIDER_WAIT_RETRY_REASON) delete retryContextSnapshot[ENVIRONMENT_PROVIDER_WAIT_KEY];
     const responsibleUserId = await resolveResponsibleUserIdForRunContext(
       run,

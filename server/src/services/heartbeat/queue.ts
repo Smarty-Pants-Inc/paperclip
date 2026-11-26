@@ -6,7 +6,7 @@ import { isProcessRunAdmissionClosed, isReattachPhaseActive as isProcessReattach
 import { continueFreshInTransaction, hasPendingFreshContinuation, isFreshIsolatedContinuationWake, settleCoalescedFreshContinuationHolds } from "../fresh-continuation-fallback.js";
 import { answeredContinuousHeldRun } from "../native-runtime/continuous-session-input.js";
 import { deliverContinuationAsRun, foldWaitingRetriesIntoContinuation, foldWaitingRetriesIntoRecordedContinuation, undeliveredContinuation,
-  undeliveredContinuationContext } from "../fresh-continuation-retry-fold.js";
+  undeliveredContinuationContext, retryStartsFresh } from "../fresh-continuation-retry-fold.js";
 import { refreshRunStartYieldIfStale } from "../run-start-handover.js";
 import { deliveredQueuedCommentIds } from "../queued-comment-delivery.js";
 import { hasAutomaticInteractionDeliveryHold, INTERACTION_DELIVERY_DENIED, recheckQueuedRunInteractions, withInteractionDeliveryOrigin } from "../agent-interaction-delivery.js";
@@ -2941,6 +2941,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           opts.requestedByActorType !== "user" || retry.actorId !== opts.requestedByActorId) return null;
       taskRetryActorId = retry.actorId;
       enrichedContextSnapshot.forceFreshSession = true;
+      // A continuous session otherwise keeps a binding that can never be resumed.
+      if (!retry.initiatedBy && issueId && await retryStartsFresh(db, { companyId: receipt.companyId, issueId, sourceRunId: retry.sourceRunId })) {
+        enrichedContextSnapshot.explicitFreshSession = true;
+      }
       enrichedContextSnapshot.previousRunId = retry.sourceRunId;
       enrichedContextSnapshot.taskRetryRequestId = receipt.id;
       if (retry.boardMessageOrigin) enrichedContextSnapshot.boardMessageRetry = true;
