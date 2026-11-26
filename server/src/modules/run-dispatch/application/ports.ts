@@ -46,6 +46,11 @@ export type DispatchResolvedInteractionInput<T> = CancelStaleQueuedRunInput & {
   reservationId: string;
   recoveryLeaseOwner?: string;
   enforceContinuationOwnership?: boolean;
+  /** Acquire configuration fences before authority locks. When ownershipIssueId
+   * is supplied, defer that issue's content check: the returned callback runs
+   * immediately after the adapter's sole issue FOR UPDATE, before the run lock.
+   * The opaque transaction must not escape or perform provider I/O. */
+  configurationFence?: (transaction: unknown, ownershipIssueId?: string | null) => Promise<void | (() => Promise<void>)>;
   dispatch: (markDispatchStarted: () => void) => Promise<T>;
 };
 

@@ -480,9 +480,17 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
     }) };
   }
 
+  async function savedSshEnvironment(config: Record<string, unknown>): Promise<Environment> {
+    // Selection now certifies persisted content. A local row relabelled only
+    // in memory is stale by construction, not an SSH configuration fixture.
+    const [environment] = await db.insert(environments).values({ name: `SSH fixture ${randomUUID()}`,
+      driver: "ssh", config }).returning();
+    return environment as Environment;
+  }
+
   it.each([undefined, true, false])("defaults existing SSH environments to remote authentication and honors the saved choice (saved=%s)", async useHostAuth => {
     const f = await seed(true);
-    const environment = { ...await environmentService(db).ensureLocalEnvironment(), driver: "ssh", config: { ...(useHostAuth !== undefined ? { useHostAuth } : {}), host: "fixture.invalid", username: "fixture", remoteWorkspacePath: "/workspace" } } as Environment;
+    const environment = await savedSshEnvironment({ ...(useHostAuth !== undefined ? { useHostAuth } : {}), host: "fixture.invalid", username: "fixture", remoteWorkspacePath: "/workspace" });
     const binding = aiConnectionBindingSchema.parse((await db.select().from(agents).where(eq(agents.id, f.agentId)))[0]!.runtimeConfig!.aiConnection);
     const prepare = vi.spyOn(aiRuntime, "prepareManagedAiRuntime").mockRejectedValue(new Error("fixture managed account reached"));
     const opening = await configuration(f, { provider: "codex" }, {}, "paperclip_runner", false, "shared_workspace", environment, undefined, false, binding);
@@ -504,9 +512,9 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
     { provider: "acpx", acpxAgent: "claude", model: "claude-sonnet-4-6", acpxPermissionMode: "approve-reads" },
   ])("keeps native SSH provider home support during preparation: $provider $acpxAgent", async config => {
     const f = await seed();
-    const environment = { ...await environmentService(db).ensureLocalEnvironment(), driver: "ssh", config: {
+    const environment = await savedSshEnvironment({
       host: "fixture.invalid", username: "fixture", remoteWorkspacePath: "/workspace",
-    } } as Environment;
+    });
     const opening = await configuration(f, config, {}, "paperclip_runner", false, "shared_workspace", environment);
     const result = await opening.prepare();
     if (!result.prepared) throw new Error("SSH preparation failed");
@@ -515,7 +523,7 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
 
   it("requires an agent AI account for a new SSH environment when remote authentication is off", async () => {
     const f = await seed();
-    const environment = { ...await environmentService(db).ensureLocalEnvironment(), driver: "ssh", config: { useHostAuth: false } } as Environment;
+    const environment = await savedSshEnvironment({ useHostAuth: false });
     const opening = await configuration(f, { provider: "codex" }, {}, "paperclip_runner", false, "shared_workspace", environment);
     await expect(opening.prepare()).rejects.toMatchObject({ resultJson: { configurationIncomplete: { reason: "ssh_ai_connection_required" } } });
   });

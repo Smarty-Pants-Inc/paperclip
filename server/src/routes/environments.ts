@@ -67,6 +67,7 @@ import { SANDBOX_PLATFORM_PROBE_METADATA_KEY } from "../services/environment-cus
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { executionWorkspaceService } from "../services/execution-workspaces.js";
 import { closeWarmNativeSessionsForEnvironment } from "../services/native-runtime/native-session-executor.js";
+import { requestHeldNativeConfigurationEndForTargets } from "../services/native-runtime/held-native-turn.js";
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -1291,6 +1292,11 @@ export function environmentRoutes(
           updated.envVars,
           { db: tx },
         );
+        // Environment rows are instance-wide; include every admitted consumer,
+        // even those inheriting a default or using an execution override.
+        await requestHeldNativeConfigurationEndForTargets(tx as unknown as Db, [
+          { targetType: "environment", targetId: updated.id },
+        ]);
       }
       return updated;
     });

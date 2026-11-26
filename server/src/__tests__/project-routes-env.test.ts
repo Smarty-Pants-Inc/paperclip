@@ -16,10 +16,12 @@ const mockProjectService = vi.hoisted(() => ({
 }));
 const mockSecretService = vi.hoisted(() => ({
   normalizeEnvBindingsForPersistence: vi.fn(),
+  syncEnvBindingsForTarget: vi.fn(async () => {}),
 }));
 const mockEnvironmentService = vi.hoisted(() => ({
   getById: vi.fn(),
 }));
+const mockHeldConfigurationEnd = vi.hoisted(() => vi.fn(async () => {}));
 const mockWorkspaceOperationService = vi.hoisted(() => ({}));
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockProtectedKeyHolders = vi.hoisted(() => vi.fn());
@@ -55,6 +57,11 @@ vi.mock("../services/workspace-runtime.js", () => ({
 }));
 
 function registerModuleMocks() {
+  // Route wiring double only; durable consumer invalidation has real PG rows
+  // in heartbeat-session-preparation. The transaction here deliberately has no DB.
+  vi.doMock("../services/native-runtime/held-native-turn.js", () => ({
+    requestHeldNativeConfigurationEndForTargets: mockHeldConfigurationEnd,
+  }));
   vi.doMock("../services/protected-environment-keys.js", async () => ({
     ...await vi.importActual<typeof import("../services/protected-environment-keys.js")>("../services/protected-environment-keys.js"),
     listProtectedEnvironmentKeyHolders: mockProtectedKeyHolders,
@@ -185,6 +192,11 @@ describe("project env routes", () => {
     const res = await request(app).patch("/api/projects/project-1").send({ env });
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(mockProjectService.update).toHaveBeenCalledWith("project-1", expect.objectContaining({ env }));
+    expect(mockSecretService.syncEnvBindingsForTarget).toHaveBeenCalledWith("company-1",
+      { targetType: "project", targetId: "project-1" }, env);
+    expect(mockHeldConfigurationEnd).toHaveBeenCalledWith(expect.anything(), [
+      { companyId: "company-1", targetType: "project", targetId: "project-1" },
+    ]);
     expect(res.body.configurationWarnings).toEqual([{ code: "protected_environment_variable", field: "env.DESKTOP_SESSION",
       message: "DESKTOP_SESSION is set by Team Computer on its tasks. Agents running there may see the platform's value instead of this one." }]);
   });
@@ -198,6 +210,7 @@ describe("project env routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body).not.toHaveProperty("configurationWarnings");
     expect(mockProtectedKeyHolders).not.toHaveBeenCalled();
+    expect(mockHeldConfigurationEnd).not.toHaveBeenCalled();
   });
 
   it('requires workspace-write authority to attach a repository despite project read access', async () => {
