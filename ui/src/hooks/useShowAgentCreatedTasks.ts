@@ -12,7 +12,7 @@ export function useShowAgentCreatedTasks(companyId: string | null, collectionKey
       const valid = envelope?.version === TASK_COLLECTION_PREFERENCES_VERSION
         && envelope.companyId === (companyId ?? "__unscoped__") && envelope.collectionKey === collectionKey;
       const view = valid ? envelope.viewState : legacy ? JSON.parse(legacy) : null;
-      return view?.showAgentCreatedTasks !== false;
+      return view?.hideAgentCreatedTasks !== true;
     } catch {
       return true;
     }
