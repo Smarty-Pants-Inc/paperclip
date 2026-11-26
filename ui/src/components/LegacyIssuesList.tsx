@@ -1,6 +1,6 @@
 import { QueryErrorState } from "./QueryView";
 import { ISSUE_SORT_FIELDS, sortIssues, type IssueSort, type IssueSortField } from "../lib/issue-sort";
-import { saveTaskCollectionPreferences } from "../lib/task-collection-preferences";
+import { restoreTaskCollectionViewState, saveTaskCollectionPreferences } from "../lib/task-collection-preferences";
 import { useWarmTaskDetailCode } from "@/hooks/useWarmTaskDetailCode";
 import { topRenderedNavEntryRefs, usePreloadTaskChats } from "../hooks/usePreloadTaskChats";
 import { useShowAgentCreatedTasks } from "../hooks/useShowAgentCreatedTasks";
@@ -209,7 +209,7 @@ function getViewState(key: string): IssueViewState {
       return {
         ...defaultViewState,
         ...parsed,
-        ...normalizeIssueFilterState(parsed),
+        ...normalizeIssueFilterState(restoreTaskCollectionViewState(parsed)),
         workspaces: [],
         sortField: ISSUE_SORT_FIELDS.includes(parsed.sortField) ? parsed.sortField : defaultViewState.sortField,
         sortDir: parsed.sortDir === "asc" ? "asc" : "desc",
