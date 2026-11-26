@@ -6,23 +6,23 @@ describe("native harness backup expiration config parsing", () => {
     vi.unstubAllEnvs();
   });
 
-  it("is enabled for issues closed seven days by default", () => {
+  it("is off by default, with seven days when enabled", () => {
     vi.stubEnv("PAPERCLIP_NATIVE_HARNESS_BACKUP_EXPIRATION_ENABLED", undefined);
     vi.stubEnv("PAPERCLIP_NATIVE_HARNESS_BACKUP_EXPIRATION_DRY_RUN", undefined);
     vi.stubEnv("PAPERCLIP_NATIVE_HARNESS_BACKUP_EXPIRATION_DAYS", undefined);
     expect(loadConfig()).toMatchObject({
-      nativeHarnessBackupExpirationEnabled: true,
+      nativeHarnessBackupExpirationEnabled: false,
       nativeHarnessBackupExpirationDryRun: false,
       nativeHarnessBackupExpirationDays: 7,
     });
   });
 
   it("accepts explicit controls", () => {
-    vi.stubEnv("PAPERCLIP_NATIVE_HARNESS_BACKUP_EXPIRATION_ENABLED", "false");
+    vi.stubEnv("PAPERCLIP_NATIVE_HARNESS_BACKUP_EXPIRATION_ENABLED", "true");
     vi.stubEnv("PAPERCLIP_NATIVE_HARNESS_BACKUP_EXPIRATION_DRY_RUN", "true");
     vi.stubEnv("PAPERCLIP_NATIVE_HARNESS_BACKUP_EXPIRATION_DAYS", "3");
     expect(loadConfig()).toMatchObject({
-      nativeHarnessBackupExpirationEnabled: false,
+      nativeHarnessBackupExpirationEnabled: true,
       nativeHarnessBackupExpirationDryRun: true,
       nativeHarnessBackupExpirationDays: 3,
     });

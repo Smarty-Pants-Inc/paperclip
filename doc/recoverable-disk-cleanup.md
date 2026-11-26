@@ -112,7 +112,7 @@ The rest of the session directory, including its control-plane state, is kept.
 
 | Environment variable | Default | Effect |
 | --- | --- | --- |
-| `PAPERCLIP_NATIVE_HARNESS_BACKUP_EXPIRATION_ENABLED` | `true` | Set `false` to stop expiring copies |
+| `PAPERCLIP_NATIVE_HARNESS_BACKUP_EXPIRATION_ENABLED` | `false` | Set `true` to expire copies (agent session traces are kept by default) |
 | `PAPERCLIP_NATIVE_HARNESS_BACKUP_EXPIRATION_DRY_RUN` | `false` | Set `true` to report candidates without deleting copies or task sessions |
 | `PAPERCLIP_NATIVE_HARNESS_BACKUP_EXPIRATION_DAYS` | `7` | Days an issue must be closed before its sessions' copies expire (minimum `1`) |
 | `PAPERCLIP_NATIVE_RUNNER_EVIDENCE_RETENTION_DAYS` | `7` | Days continuity-break archives and quarantined session state are kept (minimum `1`) |
