@@ -2179,11 +2179,11 @@ const COMPACTION_TURN = "paperclipCompactionTurn";
 /**
  * Compaction runs as a provider turn so it keeps the normal turn binding.
  * Codex compacts through app-server `thread/compact/start`; Claude's ACP agent
- * compacts when prompted with its `/compact` command.
+ * and Pi compact when prompted with their `/compact` command.
  */
 export function runnerdCompactionTurnPayload(provider: string): Record<string, unknown> {
   if (provider === "codex") return { compact: true };
-  if (provider === "acpx") return { text: "/compact" };
+  if (provider === "acpx" || provider === "pi_rpc") return { text: "/compact" };
   throw new Error(`Context compaction is not supported by the ${provider} provider`);
 }
 
