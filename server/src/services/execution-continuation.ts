@@ -365,6 +365,10 @@ export async function buildExecutionContinuation(input: {
       updatedAt: row.updatedAt.toISOString(),
       deleted: row.deletedAt !== null,
       sourceTrust: row.sourceTrust,
+      // The page-only marker written when a native session starts fresh (paperclip-control-plane-port.ts).
+      ...(!row.authorUserId && !row.authorAgentId && row.conversationSessionGeneration !== null &&
+        row.presentation?.kind === "system_notice" && typeof (row.metadata as { sourceRunId?: unknown } | null)?.sourceRunId === "string"
+        ? { freshSessionMarker: true as const } : {}),
     };
   });
   const previousRun = input.previousContextRunId

@@ -27,6 +27,8 @@ export interface ExecutionContinuationEnvelope {
     updatedAt: string;
     deleted: boolean;
     sourceTrust: unknown;
+    /** The server's own fresh-session page marker; never task input. */
+    freshSessionMarker?: true;
   }>;
   /** Only direct human resolutions, projected from server-owned resolver columns. */
   humanResponses?: Array<{
