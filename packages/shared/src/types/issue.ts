@@ -1053,6 +1053,7 @@ export type IssueInboxArchiveFilter = "include" | "archived";
 export type CompactIssue = Pick<
   Issue,
   | "listProjection"
+  | "unblockDescriptor"
   | "externalConversationState"
   | "id"
   | "companyId"

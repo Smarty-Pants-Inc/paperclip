@@ -3081,6 +3081,9 @@ function toCompactIssue(issue: any): CompactIssue {
     title: issue.title,
     description: issue.description,
     status: issue.status,
+    // Preserve the detail projection's block contract for both compact and index.
+    displayStatus: issue.displayStatus,
+    unblockDescriptor: issue.unblockDescriptor ?? null,
     workMode: issue.workMode,
     priority: issue.priority,
     reviewPolicy: issue.reviewPolicy,
@@ -3146,6 +3149,8 @@ function toCompactIssue(issue: any): CompactIssue {
 }
 
 function compactIssueListEtag(issues: CompactIssue[]): string {
+  // Hash the complete projection, including displayStatus and unblockDescriptor,
+  // so block-field changes cannot reuse a client's previous representation.
   const hash = createHash("sha256")
     .update(JSON.stringify(issues))
     .digest("base64url");
@@ -3371,6 +3376,9 @@ function issueListRequestKey(input: {
     companyId: input.companyId,
     query: normalizedQuery,
     route,
+    // Version the cached projection as well as its query/actor scope. The body
+    // and compact ETag both carry displayStatus and unblockDescriptor.
+    responseShape: "issue-list-block-fields-v1",
   });
   return {
     actor,
