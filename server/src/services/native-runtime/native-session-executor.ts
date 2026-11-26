@@ -120,6 +120,7 @@ import { bindAntigravityCredentialTurn, bindAntigravityTransportRetirement, prep
 import { copyBackGrokAuth } from "@paperclipai/adapter-grok-local/server";
 
 import { inferOpenAiCompatibleBiller, type AdapterUsageCheckpoint } from "@paperclipai/adapter-utils";
+import { sandboxSyncMinimumTimeoutMs } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
 import { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
 import { redactNativeFailureError } from "./native-failure-redaction.js";
 import { parseCodexCliVersion } from "./codex-runtime-compatibility.js";
@@ -182,7 +183,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { lstat, readFile, readdir, readlink } from "node:fs/promises";
+import { lstat, readFile, readdir, readlink, stat } from "node:fs/promises";
 import { hostname, tmpdir, userInfo } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { NATIVE_CHECKPOINT_HEADER_INSPECTION_MAX_BYTES, loadNativeRunnerCheckpoint, loadNativeRunnerCheckpointHeader, loadNativeUnclaimedBootstrapCheckpoint, nativeRunnerCheckpointPersistence, nativeRunnerCheckpointRemoteBootstrapEvidence, nativeRunnerNeverAuthenticated, nativeRunnerCheckpointRegistration, restoreNativeRunnerCheckpoint } from "./native-runner-checkpoint.js";
@@ -15288,6 +15289,7 @@ export async function stageRemoteRunnerFile(input: {
 }): Promise<void> {
   const runner = input.runner;
   if (runner.syncIn) {
+    const byteSize = (await stat(input.sourcePath)).size;
     await runner.syncIn([
       {
         operationId: `runner-stage-${randomUUID()}`,
@@ -15300,7 +15302,7 @@ export async function stageRemoteRunnerFile(input: {
           },
         ],
       },
-    ]);
+    ], { minimumTimeoutMs: sandboxSyncMinimumTimeoutMs(byteSize) });
     return;
   }
   const bytes = await readFile(input.sourcePath);
@@ -15376,6 +15378,7 @@ export async function stageRemoteRunnerDirectory(input: {
   if (input.runner.syncIn) {
     let stagingRoot: string | null = null;
     let sourcePath = input.sourcePath;
+    let byteSize = 0; // No extra directory walk solely to estimate a transfer timeout.
     try {
       if (excludeArgs.length > 0) {
         stagingRoot = mkdtempSync(join(tmpdir(), "paperclip-runner-restore-"));
@@ -15387,6 +15390,7 @@ export async function stageRemoteRunnerDirectory(input: {
             env: { ...process.env, COPYFILE_DISABLE: "1" },
           },
         );
+        byteSize = archive.byteLength;
         await execFileBuffered("tar", ["-xzf", "-", "-C", stagingRoot], {
           input: archive,
           maxBuffer: 64 * 1024 * 1024,
@@ -15405,7 +15409,7 @@ export async function stageRemoteRunnerDirectory(input: {
             },
           ],
         },
-      ]);
+      ], { minimumTimeoutMs: sandboxSyncMinimumTimeoutMs(byteSize) });
     } finally {
       if (stagingRoot) rmSync(stagingRoot, { recursive: true, force: true });
     }
