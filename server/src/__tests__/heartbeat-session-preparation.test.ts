@@ -5,12 +5,22 @@ import * as sessionFingerprintInputs from "../services/heartbeat/session-fingerp
 import * as aiRuntime from "../services/ai-connection-runtime.js";
 import { aiConnectionService } from "../services/ai-connections.js";
 import { createHash, randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
+import { environmentRoutes } from "../routes/environments.js";
+import { projectRoutes } from "../routes/projects.js";
+import * as heldConfiguration from "../services/native-runtime/held-native-turn.js";
+import * as executionConfiguration from "../services/heartbeat/execution-configuration.js";
+import * as nativeExecutor from "../services/native-runtime/native-session-executor.js";
+import { errorHandler } from "../middleware/index.js";
+import { secretService } from "../services/secrets.js";
+import { initializeRunIdentity, reserveSteeredIdentity, acceptSteeredIdentity } from "../services/run-identity.js";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, agentTaskSessions, authUsers, companies, companyMemberships, createDb, executionWorkspaces, environments, heartbeatRuns, issueComments, issues, plugins, projects } from "@paperclipai/db";
+import { agents, agentTaskSessions, authUsers, companies, companyMemberships, companySecretBindings, createDb, executionWorkspaces, environments, heartbeatRuns, issueComments, issues, plugins, projects } from "@paperclipai/db";
 import { getServerAdapter, registerServerAdapter, unregisterServerAdapter, type AdapterExecutionContext } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
@@ -684,6 +694,270 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     }
   });
 
+  it.each(["environment", "project", "agent"] as const)("secret rotation ends held runs using its %s binding, not unrelated runs", async targetType => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "held-secret-binding-"));
+    const previousKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = join(cwd, "master.key");
+    try {
+      const secrets = secretService(db);
+      const secret = await secrets.create(f.companyId, { name: "Held revision", key: "HELD_REVISION", provider: "local_encrypted", value: randomUUID() });
+      const [environment] = await db.select().from(environments).where(eq(environments.driver, "local"));
+      const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Held project" }).returning();
+      await db.update(issues).set({ projectId: project.id }).where(eq(issues.id, f.issueId));
+      const targetId = targetType === "environment" ? environment.id : targetType === "project" ? project.id : f.agentId;
+      await secrets.syncEnvBindingsForTarget(f.companyId, { targetType, targetId }, {
+        HELD_REVISION: { type: "secret_ref", secretId: secret.id, version: "latest" },
+      });
+      const [otherAgent] = await db.insert(agents).values({ companyId: f.companyId, name: "Unrelated holder" }).returning();
+      const [otherIssue] = await db.insert(issues).values({ companyId: f.companyId, title: "Unrelated hold", assigneeAgentId: otherAgent.id }).returning();
+      const [held, other] = await db.insert(heartbeatRuns).values([
+        { companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId, runtimeMode: "native", status: "running",
+          contextSnapshot: { paperclipEnvironment: { id: environment.id }, paperclipWorkspace: { projectId: project.id } }, resultJson: { retained: "receipt" } },
+        { companyId: f.companyId, agentId: otherAgent.id, nativeIssueId: otherIssue.id, runtimeMode: "native", status: "running",
+          contextSnapshot: { paperclipEnvironment: { id: randomUUID() } }, resultJson: { retained: "other receipt" } },
+      ]).returning();
+      await secrets.rotate(secret.id, { value: randomUUID() });
+      expect((await heartbeat.getRun(held.id))?.resultJson).toEqual({ retained: "receipt", heldNativeConfigurationEnd: true });
+      expect((await heartbeat.getRun(other.id))?.resultJson).toEqual({ retained: "other receipt" });
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.companyId, f.companyId));
+    } finally {
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.companyId, f.companyId));
+      await db.delete(companySecretBindings).where(eq(companySecretBindings.companyId, f.companyId));
+      if (previousKey === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE; else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKey;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  // Real project PATCH, binding rewrite and durable fence must commit/roll back together.
+  it.each([false, true])("project environment save fences its held consumer atomically (rollback=%s)", async rollback => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "project-env-transaction-"));
+    const previousKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = join(cwd, "master.key");
+    let fail: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const secrets = secretService(db);
+      const secret = await secrets.create(f.companyId, { name: "Project revision", key: "PROJECT_REVISION", provider: "local_encrypted", value: randomUUID() });
+      const reference = { type: "secret_ref" as const, secretId: secret.id, version: "latest" as const };
+      const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Held project",
+        env: { CONTEXT_NOTE: "old", PROJECT_REVISION: reference } }).returning();
+      await secrets.syncEnvBindingsForTarget(f.companyId, { targetType: "project", targetId: project.id }, project.env);
+      const [beforeBinding] = await db.select().from(companySecretBindings).where(eq(companySecretBindings.targetId, project.id));
+      await db.update(issues).set({ projectId: project.id }).where(eq(issues.id, f.issueId));
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+        runtimeMode: "native", status: "running", contextSnapshot: { paperclipWorkspace: { projectId: project.id } } }).returning();
+      const app = express(); app.use(express.json());
+      app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: f.userId }; next(); });
+      app.use("/api", projectRoutes(db)); app.use(errorHandler);
+      const fence = heldConfiguration.requestHeldNativeConfigurationEndForTargets;
+      fail = rollback ? vi.spyOn(heldConfiguration, "requestHeldNativeConfigurationEndForTargets").mockImplementation(async (tx, targets) => {
+        await fence(tx, targets); throw new Error("injected fence rollback");
+      }) : undefined;
+      const response = await request(app).patch(`/api/projects/${project.id}`).send({ env: { CONTEXT_NOTE: "new", PROJECT_REVISION: reference } });
+      expect(response.status).toBe(rollback ? 500 : 200);
+      expect((await db.select().from(projects).where(eq(projects.id, project.id)))[0].env?.CONTEXT_NOTE).toEqual(rollback ? "old" : { type: "plain", value: "new" });
+      const bindings = await db.select().from(companySecretBindings).where(eq(companySecretBindings.targetId, project.id));
+      expect(bindings).toHaveLength(1);
+      expect(bindings[0].id === beforeBinding.id).toBe(rollback);
+      expect(bindings[0].secretId).toBe(secret.id);
+      expect((await heartbeat.getRun(run.id))?.resultJson?.heldNativeConfigurationEnd).toBe(rollback ? undefined : true);
+    } finally {
+      fail?.mockRestore();
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.companyId, f.companyId));
+      if (previousKey === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE; else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKey;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("environment save fences a running native consumer before its environment snapshot exists", async () => {
+    const f = await seed();
+    const [environment] = await db.select().from(environments).where(eq(environments.driver, "local"));
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+      runtimeMode: "native", status: "running", contextSnapshot: { issueId: f.issueId } }).returning();
+    const app = express(); app.use(express.json());
+    app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: f.userId }; next(); });
+    app.use("/api", environmentRoutes(db)); app.use(errorHandler);
+    try {
+      expect((await request(app).patch(`/api/environments/${environment.id}?companyId=${f.companyId}`)
+        .send({ envVars: { CONTEXT_NOTE: "current" } })).status).toBe(200);
+      expect((await heartbeat.getRun(run.id))?.resultJson?.heldNativeConfigurationEnd).toBe(true);
+    } finally {
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, run.id));
+      await db.update(environments).set({ envVars: environment.envVars }).where(eq(environments.id, environment.id));
+    }
+  });
+
+  it.each(["identity", "previous-release manifest"])("user secret rotation fences the admitted owner after steering changes the responsible user (%s)", async identitySource => {
+    const f = await seed(), other = await seed(), cwd = await mkdtemp(join(tmpdir(), "admitted-secret-owner-"));
+    const previousKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = join(cwd, "master.key");
+    try {
+      const secrets = secretService(db);
+      await secrets.createUserSecretDefinition(f.companyId, { key: "context_revision", name: "Context revision", provider: "local_encrypted" });
+      await secrets.syncEnvBindingsForTarget(f.companyId, { targetType: "agent", targetId: f.agentId }, {
+        CONTEXT_REVISION: { type: "user_secret_ref", key: "context_revision", version: "latest" },
+      });
+      const secret = await secrets.createCurrentUserSecretValue(f.companyId, f.userId, { definitionKey: "context_revision", value: randomUUID() });
+      const admitted = await secrets.resolveEnvBindings(f.companyId, {
+        CONTEXT_REVISION: { type: "user_secret_ref", key: "context_revision", version: "latest" },
+      }, { consumerType: "agent", consumerId: f.agentId, actorType: "agent", actorId: f.agentId, responsibleUserId: f.userId });
+      expect(admitted.manifest.map(entry => entry.secretId)).toEqual([secret.id]);
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+        runtimeMode: "native", status: "running", responsibleUserId: f.userId,
+        contextSnapshot: identitySource === "identity" ? { paperclipSecretIdentity: { responsibleUserId: f.userId } }
+          : { paperclipSecrets: { manifest: admitted.manifest } } }).returning();
+      await db.insert(companyMemberships).values({ companyId: f.companyId, principalId: other.userId, principalType: "user", status: "active", membershipRole: "member" });
+      await initializeRunIdentity(db, { companyId: f.companyId, runId: run.id, issueId: f.issueId, responsibleUserId: f.userId, cause: "instruction" });
+      const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+        authorType: "user", authorUserId: other.userId, body: "Continue with this instruction" }).returning();
+      const steered = await reserveSteeredIdentity(db, { companyId: f.companyId, runId: run.id, issueId: f.issueId, messageId: comment.id });
+      expect(steered).not.toBeNull();
+      await db.transaction(async tx => {
+        await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)).for("update");
+        await acceptSteeredIdentity(tx, steered!);
+      });
+      expect((await heartbeat.getRun(run.id))?.responsibleUserId).toBe(other.userId);
+      await secrets.rotate(secret.id, { value: randomUUID() });
+      expect((await heartbeat.getRun(run.id))?.resultJson?.heldNativeConfigurationEnd).toBe(true);
+    } finally {
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.companyId, f.companyId));
+      if (previousKey === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE; else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKey;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  // Pause the assembled heartbeat AFTER old-value resolution, before snapshot publication.
+  // The adapter substitutes provider I/O only; admission, resolution, save and follow-up are real.
+  it.each(["plain", "rotation"] as const)("preparation window: %s save fails closed, then the same session gets current values", async change => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "preparing-env-save-"));
+    let mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    const previousKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = join(cwd, "master.key");
+    registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
+    const [environment] = await db.select().from(environments).where(eq(environments.driver, "local"));
+    let resume: (() => void) | undefined;
+    let pause: ReturnType<typeof vi.spyOn> | undefined;
+    let providerGuard: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const secrets = secretService(db), previousValue = randomUUID(), currentValue = randomUUID();
+      const secret = await secrets.create(f.companyId, { name: "Preparing revision", key: "PREPARING_REVISION", provider: "local_encrypted", value: previousValue });
+      await db.update(agents).set({ adapterType: "paperclip_runner", defaultEnvironmentId: environment.id,
+        adapterConfig: { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", cwd } }).where(eq(agents.id, f.agentId));
+      await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: f.userId, conversationState: "active" }).where(eq(issues.id, f.issueId));
+      const app = express(); app.use(express.json());
+      app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: f.userId }; next(); });
+      app.use("/api", environmentRoutes(db)); app.use(errorHandler);
+      const envVars = { CONTEXT_NOTE: "old", PREPARING_REVISION: { type: "secret_ref", secretId: secret.id, version: "latest" } };
+      expect((await request(app).patch(`/api/environments/${environment.id}?companyId=${f.companyId}`).send({ envVars })).status).toBe(200);
+      const first = await execute(f);
+      // Only the opening/follow-up adapter I/O is substituted. The paused
+      // attempt takes real native selection; a guard prevents provider effects
+      // if the regression lets stale configuration through.
+      mode.mockRestore();
+      providerGuard = vi.spyOn(nativeExecutor, "executePaperclipNativeSession").mockImplementation(async () => {
+        throw new Error("stale provider dispatch reached");
+      });
+      let didResolve = false;
+      const gate = new Promise<void>(resolve => { resume = resolve; });
+      const prepare = executionConfiguration.prepareHeartbeatExecutionConfiguration;
+      pause = vi.spyOn(executionConfiguration, "prepareHeartbeatExecutionConfiguration").mockImplementationOnce(async (...args) => {
+        const result = await prepare(...args);
+        expect(result.prepared).toBe(true);
+        if (result.prepared) expect(result.configuredTaskEnvironment.PREPARING_REVISION === previousValue).toBe(true);
+        didResolve = true; await gate; return result;
+      });
+      const starting = await heartbeat.wakeup(f.agentId, { source: "on_demand", triggerDetail: "manual", reason: "manual",
+        payload: { issueId: f.issueId }, contextSnapshot: { issueId: f.issueId } });
+      await vi.waitFor(() => expect(didResolve).toBe(true), { timeout: 10_000 });
+      const preparing = await heartbeat.getRun(starting!.id);
+      expect(preparing?.status).toBe("running");
+      expect(preparing?.contextSnapshot?.paperclipEnvironment).toBeUndefined();
+      expect(preparing?.contextSnapshot?.paperclipSecretIdentity).toEqual({ responsibleUserId: f.userId });
+      if (change === "plain") expect((await request(app).patch(`/api/environments/${environment.id}?companyId=${f.companyId}`)
+        .send({ envVars: { ...envVars, CONTEXT_NOTE: "current" } })).status).toBe(200);
+      else await secrets.rotate(secret.id, { value: currentValue });
+      resume!(); await heartbeat.drainActiveRunExecutions();
+      const refused = await heartbeat.getRun(starting!.id);
+      expect(providerGuard).not.toHaveBeenCalled();
+      expect(captured.has(starting!.id)).toBe(false);
+      expect(refused?.runtimeMode).toBe("native");
+      expect(refused?.status).toBe("failed");
+      expect(refused?.error).toContain("configuration changed during preparation");
+      pause.mockRestore(); pause = undefined;
+      mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+        kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+      const next = await execute(f);
+      expect(next.finished.sessionIdBefore).toBe(first.finished.sessionIdAfter);
+      expect(next.input.runtime.sessionId).toBe("saved-session");
+      expect((next.input.config.env as Record<string, unknown>).CONTEXT_NOTE).toBe(change === "plain" ? "current" : "old");
+      expect((next.input.config.env as Record<string, unknown>).PREPARING_REVISION === (change === "rotation" ? currentValue : previousValue)).toBe(true);
+    } finally {
+      resume?.(); await heartbeat.drainActiveRunExecutions(); pause?.mockRestore(); providerGuard?.mockRestore();
+      await db.update(environments).set({ envVars: environment.envVars }).where(eq(environments.id, environment.id));
+      await db.delete(companySecretBindings).where(eq(companySecretBindings.companyId, f.companyId));
+      if (previousKey === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE; else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKey;
+      mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  // Real PATCH/reminted bindings and real secret resolution; only provider dispatch is substituted.
+  it.each([
+    { change: "plain", conversation: false }, { change: "rotation", conversation: false },
+    { change: "plain", conversation: true }, { change: "rotation", conversation: true },
+  ])("environment route: $change keeps the continuous Pi session and delivers current values (chat=$conversation)", async ({ change, conversation }) => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "pi-env-route-"));
+    const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    const previousKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = join(cwd, "master.key");
+    registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
+    const [environment] = await db.select().from(environments).where(eq(environments.driver, "local"));
+    try {
+      const secrets = secretService(db), previousValue = randomUUID(), currentValue = randomUUID(), plainValue = randomUUID();
+      const secret = await secrets.create(f.companyId, { name: "Environment revision", key: "ENV_REVISION", provider: "local_encrypted", value: previousValue });
+      await db.update(agents).set({ adapterType: "paperclip_runner", defaultEnvironmentId: environment.id,
+        adapterConfig: { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", cwd },
+      }).where(eq(agents.id, f.agentId));
+      if (conversation) await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: f.userId, conversationState: "active" }).where(eq(issues.id, f.issueId));
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: f.userId }; next(); });
+      app.use("/api", environmentRoutes(db)); app.use(errorHandler);
+      const envVars = { CONTEXT_NOTE: { type: "plain", value: "original" },
+        ENV_REVISION: { type: "secret_ref", secretId: secret.id, version: "latest" } };
+      expect((await request(app).patch(`/api/environments/${environment.id}?companyId=${f.companyId}`).send({ envVars })).status).toBe(200);
+      const first = await execute(f);
+      expect((first.input.config.env as Record<string, unknown>).ENV_REVISION === previousValue).toBe(true);
+      const [binding] = await db.select().from(companySecretBindings).where(and(eq(companySecretBindings.companyId, f.companyId), eq(companySecretBindings.targetId, environment.id)));
+      if (change === "plain") {
+        expect((await request(app).patch(`/api/environments/${environment.id}?companyId=${f.companyId}`)
+          .send({ envVars: { ...envVars, NEXT_NOTE: { type: "plain", value: plainValue } } })).status).toBe(200);
+        const [reminted] = await db.select().from(companySecretBindings).where(and(eq(companySecretBindings.companyId, f.companyId), eq(companySecretBindings.targetId, environment.id)));
+        expect(reminted.id).not.toBe(binding.id);
+      } else {
+        await secrets.rotate(secret.id, { value: currentValue });
+        expect((await secrets.getById(secret.id))?.latestVersion).toBe(2);
+      }
+      const next = await execute(f);
+      expect(next.input.runtime.sessionId).toBe("saved-session");
+      expect(next.finished.sessionIdBefore).toBe(first.finished.sessionIdAfter);
+      expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: {
+        reset: false, taskSessionAvailable: true, taskSessionReused: true,
+        changedCategories: expect.arrayContaining(["envBindings", "secrets"]),
+      } } });
+      const delivered = next.input.config.env as Record<string, unknown>;
+      if (change === "plain") expect(delivered.NEXT_NOTE === plainValue).toBe(true);
+      // Boolean-only assertions deliberately cannot dump secret bytes on failure.
+      expect(delivered.ENV_REVISION === (change === "rotation" ? currentValue : previousValue), "matches current revision").toBe(true);
+      if (change === "rotation") expect(delivered.ENV_REVISION === previousValue, "matches previous revision").toBe(false);
+    } finally {
+      await db.update(environments).set({ envVars: environment.envVars }).where(eq(environments.id, environment.id));
+      await db.delete(companySecretBindings).where(eq(companySecretBindings.companyId, f.companyId));
+      if (previousKey === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE; else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKey;
+      mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it.each([false, true])("pre-filter environment fingerprint preserves unchanged inputs, not unknown changes (%s)", async changed => {
     const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "pi-env-fingerprint-compat-"));
     const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
@@ -761,7 +1035,7 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     { category: "runtimeSkills", retain: true },
     { category: "agentRuntimeConfig", retain: false },
     { category: "workspaceConfig", retain: false },
-    { category: "secrets", retain: false },
+    { category: "secrets", retain: true },
     { category: "issueOverrides", retain: false },
     { category: "adapter", retain: false },
     { category: "instructions,runtimeSkills", retain: true },

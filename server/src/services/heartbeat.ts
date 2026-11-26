@@ -3705,6 +3705,10 @@ export function heartbeatService(
         if (!runtimeSelection.selected) return;
         const { nativeExecution, nativeRunnerInstanceId, getNativeFreshSessionHandoff } = runtimeSelection;
         nativeWorkspaceSync = runtimeSelection.nativeWorkspaceSync;
+        if (agent.adapterType === "paperclip_runner" && runtimeConfig.provider === "pi_rpc" &&
+            resolveSessionContinuity("pi_rpc", runtimeConfig.sessionContinuity) === "continuous") {
+          await timePreparation("configuration_dispatch_freshness", executionConfiguration.assertConfigurationCurrent);
+        }
         const execution = await measureRunPhase("execution.runtime", () => executeHeartbeatRuntime(db, {
           run, agent, options,
           task: {

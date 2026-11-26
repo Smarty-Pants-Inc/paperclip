@@ -11320,6 +11320,94 @@ describe("native session same-turn steering", () => {
     }, 60_000);
     afterAll(async () => { await pg?.cleanup(); });
 
+    // Real environment PATCH/rotation, durable hold read, steering refusal and release admission.
+    // The provider and outer executor lease are doubles; no secret bytes enter assertions/output.
+    it.each(["plain", "rotation"] as const)("environment freshness: %s fences the old held process and queues the next run", async change => {
+      const { default: express } = await import("express");
+      const { default: request } = await import("supertest");
+      const { environments, companyMemberships, companySecretBindings } = await import("@paperclipai/db");
+      const { environmentRoutes } = await import("../../routes/environments.js");
+      const { errorHandler } = await import("../../middleware/index.js");
+      const { secretService } = await import("../secrets.js");
+      const { deliverSteeredMessage } = await import("../queued-comment-steering.js");
+      const heldWork = await import("./held-native-turn.js");
+      const readHeld = heldWork.readHeldNativeTurnWork;
+      const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID(), userId = randomUUID(), sessionId = randomUUID();
+      const scope = { companyId, agentId, issueId, runId };
+      const cwd = await mkdtemp(join(tmpdir(), "held-env-freshness-"));
+      const previousKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+      process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = join(cwd, "master.key");
+      const [environment] = await db.select().from(environments).where(eq(environments.driver, "local"));
+      let running: Promise<unknown> | undefined;
+      try {
+        await db.insert(authUsers).values({ id: userId, name: "Environment owner", email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
+        await db.insert(companies).values({ id: companyId, name: "Environment freshness", issuePrefix: companyId.slice(0, 8) });
+        await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
+        await db.insert(agents).values({ id: agentId, companyId, name: "Environment reader", adapterType: "paperclip_runner", status: "idle", defaultEnvironmentId: environment.id,
+          adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } });
+        await db.insert(issues).values({ id: issueId, companyId, title: "Held environment chat", status: "in_progress", assigneeAgentId: agentId,
+          responsibleUserId: userId, conversationAgentId: agentId, conversationUserId: userId, conversationState: "active" });
+        const secrets = secretService(db);
+        const secret = await secrets.create(companyId, { name: "Held environment revision", key: "HELD_ENV_REVISION", provider: "local_encrypted", value: randomUUID() });
+        const app = express(); app.use(express.json());
+        app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId }; next(); });
+        app.use("/api", environmentRoutes(db)); app.use(errorHandler);
+        const envVars = { CONTEXT_NOTE: { type: "plain", value: "original" },
+          HELD_ENV_REVISION: { type: "secret_ref", secretId: secret.id, version: "latest" } };
+        expect((await request(app).patch(`/api/environments/${environment.id}?companyId=${companyId}`).send({ envVars })).status).toBe(200);
+        await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: issueId, nativeSessionId: sessionId,
+          responsibleUserId: userId, status: "running", runtimeMode: "native", startedAt: new Date(),
+          contextSnapshot: { issueId, conversationSessionGeneration: 0, paperclipEnvironment: { id: environment.id } } });
+        await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+        vi.spyOn(heldWork, "readHeldNativeTurnWork").mockImplementation((_db, input) => readHeld(db, input));
+        vi.spyOn(continuousReply, "publishContinuousNativeReply").mockResolvedValue(true);
+        vi.spyOn(resetWakeQueue, "closeConversationResetHold").mockResolvedValue(false);
+        const piExecution = { ...execution, binding: scope, provider: { kind: "pi_rpc", model: "fixture/model", conversationMode: true },
+          session: { ...execution.session, driverKind: "pi_rpc", normalizedSessionId: sessionId } } as NativeExecutionInputV1;
+        ({ running } = await startActiveSession(piExecution, leaseDb(piExecution, {}, {})));
+        await accountingEvents.committed!({ schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "runner", sourceSeq: 1,
+          priority: 0, emittedAt: new Date().toISOString(), sourceInstanceId: "runner", normalizedSessionId: sessionId,
+          eventType: "item.completed", runId, itemId: "opening", sourceEventId: "opening",
+          payload: { kind: "agentMessage", channel: "final", text: "Opening reply" } });
+        expect((await getNativeSessionSteeringState(runId)).disposition).toBe("available");
+        if (change === "plain") expect((await request(app).patch(`/api/environments/${environment.id}?companyId=${companyId}`)
+          .send({ envVars: { ...envVars, NEXT_NOTE: { type: "plain", value: randomUUID() } } })).status).toBe(200);
+        else await secrets.rotate(secret.id, { value: randomUUID() });
+        expect((await readHeld(db, scope))?.endRequested).toBe(true);
+        const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorUserId: userId, body: "Use the current environment" }).returning();
+        const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation", reason: "issue_commented",
+          status: "deferred_issue_execution", requestedByActorType: "user", requestedByActorId: userId,
+          payload: { issueId, commentId: comment.id, mutation: "comment", _paperclipWakeContext: {
+            issueId, taskId: issueId, wakeReason: "issue_commented", wakeCommentIds: [comment.id], conversationSessionGeneration: 0 } } }).returning();
+        await expect(deliverSteeredMessage(db, { companyId, runId, messageId: comment.id, message: comment.body, identity: null }))
+          .rejects.toMatchObject({ code: "steering_stale_turn" });
+        expect(steer).not.toHaveBeenCalled();
+        await vi.waitFor(() => expect(interrupt).toHaveBeenCalledOnce());
+        expect(interrupt).toHaveBeenCalledWith({ turnId: "provider-turn-1", reason: "configuration_changed" });
+        expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0].resultJson?.personStop).toBeUndefined();
+        expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id)))[0].status).toBe("deferred_issue_execution");
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(), sessionIdAfter: sessionId }).where(eq(heartbeatRuns.id, runId));
+        const release = createReleaseIssueExecution({ issueLock: createPostgresWakeQueueAdapter(db, { resolveResponsibleUserId: async () => userId,
+          getRoutineEnv: async () => ({ routineId: null, env: {}, responsibleUserId: null }), resolveSessionBeforeForWakeup: async () => sessionId }),
+          recovery: { escalateStrandedAssignedIssue: vi.fn(), escalateStrandedRecoveryIssueInPlace: vi.fn() } as never });
+        expect((await release({ companyId, runId, now: new Date(), suppressImmediateRecovery: true })).outcome.kind).toBe("promoted");
+        const [queuedWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id));
+        expect(queuedWake.status).toBe("queued");
+        expect(queuedWake.runId).not.toBe(runId);
+        const [nextRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queuedWake.runId!));
+        expect(nextRun.status).toBe("queued");
+        expect(nextRun.sessionIdBefore).toBe(sessionId);
+        expect(nextRun.contextSnapshot?.wakeCommentIds).toContain(comment.id);
+        expect(nextRun.resultJson?.heldNativeConfigurationEnd).not.toBe(true);
+      } finally {
+        state.release?.(); await running; vi.restoreAllMocks();
+        await db.update(environments).set({ envVars: environment.envVars }).where(eq(environments.id, environment.id));
+        await db.delete(companySecretBindings).where(eq(companySecretBindings.companyId, companyId));
+        if (previousKey === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE; else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKey;
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+
     // catch: fencing a held turn before offering its pending completion report
     // Real release owner + real live-delivery SQL; only the provider and outer
     // execution lifecycle are doubled. Completion attribution uses real PG too.
@@ -11532,7 +11620,7 @@ describe("native session same-turn steering", () => {
       expect(results).toEqual(isHeld ? [true, false] : [false, false]);
       expect(interrupt).toHaveBeenCalledTimes(isHeld ? 1 : 0);
       if (isHeld) {
-        expect(interrupt).toHaveBeenCalledWith({ turnId: "provider-turn-1", reason: "person_stop" });
+        expect(interrupt).toHaveBeenCalledWith({ turnId: "provider-turn-1", reason: "configuration_changed" });
         await expect(steerNativeSession({ runId: execution.binding.runId, message: "Late", correlationId: "late" }))
           .rejects.toMatchObject({ code: "steering_stale_turn" });
       }
@@ -11737,7 +11825,7 @@ describe("native session same-turn steering", () => {
         await accountingEvents.committed!(final);
       }
       await vi.waitFor(() => expect(interrupt).toHaveBeenCalledOnce());
-      expect(interrupt).toHaveBeenCalledWith({ turnId: "provider-turn-1", reason: "person_stop" });
+      expect(interrupt).toHaveBeenCalledWith({ turnId: "provider-turn-1", reason: "configuration_changed" });
       expect(updates.some(update => "personStop" in update.values || "nativeCancellation" in (update.values.resultJson as object ?? {}))).toBe(false);
       await db.transaction(async tx => publishDatabaseWorkSettled(tx, "native-held-configuration", JSON.stringify(execution.binding)));
       expect(interrupt).toHaveBeenCalledOnce();
@@ -12937,6 +13025,62 @@ describe("native warm session supervision", () => {
       if (replaced) expect(first.close).toHaveBeenCalledWith({ reason: "warm native session configuration changed" });
       await vi.advanceTimersByTimeAsync(20);
     } finally { vi.useRealTimers(); }
+  });
+
+  // A real long-lived child is the provider boundary: reading its process.env
+  // catches reuse of the old owner, not merely passing new config to a double.
+  it("native warm process receives the new configured value without changing session", async () => {
+    const name = `process-environment-${randomUUID()}`, before = randomUUID(), after = randomUUID();
+    const current = { ...execution, provider: { kind: "pi_rpc", model: "fixture/model" },
+      binding: { ...execution.binding, runId: `${name}-one`, executionWorkspaceId: name },
+      session: { ...execution.session, normalizedSessionId: name, driverKind: "pi_rpc", lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 20 } },
+    } as NativeExecutionInputV1;
+    let launchEnvironment: NodeJS.ProcessEnv | undefined;
+    const children: Array<ReturnType<typeof spawn>> = [];
+    const sessions: Array<{ child: ReturnType<typeof spawn>; close: () => Promise<void> }> = [];
+    const deliveries: boolean[] = [];
+    state.createBackend.mockImplementation((_input, options) => {
+      launchEnvironment = (options as BackendFactoryOptions & { environment?: NodeJS.ProcessEnv }).environment;
+      return { kind: "test" };
+    });
+    state.execute.mockReset().mockImplementation(async options => {
+      let session = options.existingSession as typeof sessions[number] | undefined;
+      if (!session) {
+        const child = spawn(process.execPath, ["-e", "process.on('message',()=>process.send({value:process.env.CONTEXT_REVISION}));"],
+          { env: launchEnvironment, stdio: ["ignore", "ignore", "ignore", "ipc"] });
+        children.push(child);
+        session = { child, close: vi.fn(async () => {
+          if (child.exitCode !== null || child.signalCode !== null) return;
+          const stopped = once(child, "exit"); child.kill(); await stopped;
+        }) };
+        sessions.push(session);
+      }
+      await options.onSession?.(session);
+      const response = once(session.child, "message"); session.child.send!("read environment");
+      const [message] = await response;
+      deliveries.push((message as { value?: string }).value === (deliveries.length === 0 ? before : after));
+      return { result: { summary: "done" }, terminal: { runTerminalState: "succeeded" }, turnId: name,
+        normalizedSessionId: name, providerSessionId: "retained-provider-thread", driverKind: "pi_rpc", driverVersion: "1",
+        nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      await executePaperclipNativeSession({ db: leaseDb(current), execution: current, runnerInstanceId: name,
+        runnerEnvironment: configuredEnvironmentProjection({ CONTEXT_REVISION: before }) });
+      const next = { ...current, binding: { ...current.binding, runId: `${name}-two` } };
+      const result = await executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: name,
+        runnerEnvironment: configuredEnvironmentProjection({ CONTEXT_REVISION: after }) });
+      expect(deliveries, "each process sees its admitted revision").toEqual([true, true]);
+      expect(sessions).toHaveLength(2);
+      expect(sessions[0].close).toHaveBeenCalledWith({ reason: "warm native session configuration changed" });
+      expect(children[0].pid).not.toBe(children[1].pid);
+      expect(result).toMatchObject({ sessionId: name, sessionDisplayId: "retained-provider-thread",
+        nativeFinalization: { normalizedSessionId: name, providerSessionId: "retained-provider-thread" } });
+      await vi.advanceTimersByTimeAsync(20);
+    } finally {
+      await Promise.all(sessions.map(session => session.close()));
+      vi.useRealTimers();
+    }
   });
 
   it.each([

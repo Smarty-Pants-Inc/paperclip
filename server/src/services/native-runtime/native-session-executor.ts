@@ -10148,7 +10148,7 @@ export async function closeHeldNativeTurn(runId: string): Promise<boolean> {
   try {
     const pending = await active.refreshHeldTurnWork?.();
     if (pending || !active.heldIdle) return false;
-    const outcome = await interruptNativeTurn({ runId, reason: "person_stop", onlyIfHeldIdle: true });
+    const outcome = await interruptNativeTurn({ runId, reason: "configuration_changed", onlyIfHeldIdle: true });
     return Boolean(outcome && outcome !== "no_turn");
   } finally {
     if (!active.holdInterruptSent) active.holdCloseRequested = false;
