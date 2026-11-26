@@ -2941,6 +2941,16 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           opts.requestedByActorType !== "user" || retry.actorId !== opts.requestedByActorId) return null;
       taskRetryActorId = retry.actorId;
       enrichedContextSnapshot.forceFreshSession = true;
+      // A person's Retry of a run whose session cannot be recovered must really
+      // start fresh; a continuous session otherwise keeps the unusable binding.
+      if (!retry.initiatedBy && retry.sourceRunId) {
+        const [source] = await db.select({ error: heartbeatRuns.error, errorCode: heartbeatRuns.errorCode })
+          .from(heartbeatRuns).where(eq(heartbeatRuns.id, retry.sourceRunId));
+        const failure = `${source?.errorCode ?? ""} ${source?.error ?? ""}`;
+        if (/native_controller_recovery_missing_evidence|native_continuation_requires_reconciliation/.test(failure)) {
+          enrichedContextSnapshot.explicitFreshSession = true;
+        }
+      }
       enrichedContextSnapshot.previousRunId = retry.sourceRunId;
       enrichedContextSnapshot.taskRetryRequestId = receipt.id;
       if (retry.boardMessageOrigin) enrichedContextSnapshot.boardMessageRetry = true;
