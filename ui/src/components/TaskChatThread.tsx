@@ -7,7 +7,7 @@ import {
 import { imagePreparationReceiptIds } from "./task-chat/image-resources";
 import type { ScrollingHistory } from "@/components/task-chat/TaskMessageScroller";
 import { TaskChatShimmerScope } from "@/components/task-chat/TaskChatShimmer";
-import { TaskChatStatusContext, TaskChatStatusLine, taskChatLineState, taskChatRunStartedAt } from "@/components/task-chat/TaskChatStatusLine";
+import { TaskChatStatusContext, TaskChatStatusLine, taskChatLineState, taskChatTurnStart } from "@/components/task-chat/TaskChatStatusLine";
 import { useRunnerSubmission } from "@/hooks/useRunnerSubmission";
 import { useCompanyLiveEvent } from "@/context/LiveUpdatesProvider";
 import { TaskChatLoadingShell } from "@/components/task-chat/TaskChatLoadingShell";
@@ -3090,22 +3090,25 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     !failureNoticeIds.has(liveRun.id) &&
     ["queued", "running"].includes(terminalStatuses.get(liveRun.id) ?? linkedRunMetaById.get(liveRun.id)?.status ?? liveRun.status)
     ? liveRun : null;
-  const statusLineStartedAt = useMemo(() => statusLineRun
-    ? taskChatRunStartedAt(statusLineRun, comments, requestCommentByRun.get(statusLineRun.id))
-    : null, [statusLineRun, comments, requestCommentByRun]);
-  // Use the whole run for activity, not a segment's post-Steer clock or slice.
+  const statusLineTurn = useMemo(() => statusLineRun
+    ? taskChatTurnStart(statusLineRun, comments, requestCommentByRun.get(statusLineRun.id), transcriptByRun.get(statusLineRun.id) ?? [])
+    : { startedAtMs: null, newTurn: false }, [statusLineRun, comments, requestCommentByRun, transcriptByRun]);
+  const statusLineStartedAt = statusLineTurn.startedAtMs;
+  // Activity of the CURRENT turn only: a new send after an answer reads 'Starting'.
   const statusLineItems = useMemo(() => statusLineRun
-    ? transcriptToTaskChatItems(transcriptByRun.get(statusLineRun.id) ?? [], {
+    ? transcriptToTaskChatItems((transcriptByRun.get(statusLineRun.id) ?? []).filter((entry) =>
+        !statusLineTurn.newTurn || statusLineStartedAt == null || new Date(entry.ts).getTime() >= statusLineStartedAt), {
         runId: statusLineRun.id, running: true,
       })
-    : [], [statusLineRun, transcriptByRun]);
+    : [], [statusLineRun, transcriptByRun, statusLineTurn, statusLineStartedAt]);
+  const statusLineFreshTurn = statusLineTurn.newTurn && statusLineItems.length === 0;
   const statusLine = statusLineRun ? <TaskChatStatusLine
-    clockKey={statusLineRun.id}
+    clockKey={`${statusLineRun.id}:${statusLineStartedAt ?? ""}`}
     startedAtMs={statusLineStartedAt}
     state={taskChatLineState({
-      status: statusLineRun.status,
+      status: statusLineFreshTurn ? "queued" : statusLineRun.status,
       execution: liveExecution,
-      activityLabel: nativeActivityLabelByRun.get(statusLineRun.id) ?? tailPreparationLabel,
+      activityLabel: statusLineFreshTurn ? undefined : nativeActivityLabelByRun.get(statusLineRun.id) ?? tailPreparationLabel,
       items: statusLineItems,
       stopping: stoppingReply,
       reconnecting: tailActivityUnavailable,

@@ -38,6 +38,35 @@ export function taskChatRunStartedAt(
   return Number.isFinite(startedAt) ? startedAt : null;
 }
 
+/** The current turn of an open run: a person's send after the run's last
+ * answer starts a new turn (clock + label reset); a send before any answer
+ * since the turn began is a steer and keeps both. */
+export function taskChatTurnStart(
+  run: { id: string; startedAt?: Date | string | null; createdAt: Date | string },
+  comments: readonly IssueChatComment[],
+  requestCommentId: string | null | undefined,
+  transcript: readonly { kind: string; ts: string; channel?: string }[],
+): { startedAtMs: number | null; newTurn: boolean } {
+  const first = taskChatRunStartedAt(run, comments, requestCommentId);
+  if (first == null) return { startedAtMs: null, newTurn: false };
+  const answers = transcript
+    .filter((entry) => entry.kind === "assistant" && entry.channel === "final")
+    .map((entry) => new Date(entry.ts).getTime())
+    .filter(Number.isFinite);
+  const sends = comments
+    .filter((comment) => comment.authorType === "user" && (
+      comment.id === requestCommentId || comment.consumedByRunId === run.id || comment.steeredIntoRunId === run.id ||
+      (!comment.consumedByRunId && !comment.steeredIntoRunId)))
+    .map((comment) => new Date(comment.createdAt).getTime())
+    .filter((at) => Number.isFinite(at) && at > first)
+    .sort((a, b) => a - b);
+  let turnStart = first;
+  for (const at of sends) {
+    if (answers.some((answerAt) => answerAt > turnStart && answerAt < at)) turnStart = at;
+  }
+  return { startedAtMs: turnStart, newTurn: turnStart !== first };
+}
+
 /** Reuse the page's tool taxonomy; command/file details remain in the thread. */
 export function taskChatActivityLabel(items: readonly TaskChatItem[]): string | undefined {
   for (let index = items.length - 1; index >= 0; index--) {
