@@ -8886,10 +8886,10 @@ export function issueService(db: Db) {
         blockerAttentionByIssueId,
         reviewAttentionByIssueId,
         blockedInboxAttentionByIssueId,
-      ] = filters?.listProjection === "index" && !includeBlockedInboxAttention
-        ? [new Map<string, IssueBlockerAttention>(), new Map<string, IssueReviewAttention>(), new Map<string, IssueBlockedInboxAttention>()]
-        : await timePhase("attention", () => Promise.all([
-          filters?.listProjection === "index" ? Promise.resolve(new Map<string, IssueBlockerAttention>()) : listIssueBlockerAttentionMap(db, companyId, withRuns),
+      ] = await timePhase("attention", () => Promise.all([
+          // Index rows use the same batched blocker projection as full/compact
+          // lists and detail, not one additional read per returned issue.
+          listIssueBlockerAttentionMap(db, companyId, withRuns),
           filters?.listProjection === "index" ? Promise.resolve(new Map<string, IssueReviewAttention>()) : listIssueReviewAttentionMap(db, companyId, withRuns, readExternalReviewWaits),
           includeBlockedInboxAttention
             ? listIssueBlockedInboxAttentionMap(db, companyId, withRuns, readExternalReviewWaits)
