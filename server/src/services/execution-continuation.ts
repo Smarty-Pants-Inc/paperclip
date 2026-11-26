@@ -4,6 +4,7 @@ import { z } from "zod";
 import {
   agentWakeupRequests,
   heartbeatRuns,
+  heartbeatRunEvents,
   issueComments,
   issueRecoveryActions,
   issueThreadInteractions,
@@ -19,6 +20,8 @@ import { childReviewOutcomes } from "./native-runtime/child-review-outcomes.js";
 import { isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
 import { githubRecoveryReceipts } from "./chat-channels/github/recovery-receipts.js";
 import { readTaskRetryIntent } from "./task-retry.js";
+import { readByEarlierTurnCommentIds } from "./queued-comment-delivery.js";
+import type { NativeContinuationReadState } from "./native-runtime/native-turn-budget.js";
 
 const retryWakeReasons = new Set(["task_retry", "retry_failed_run"]);
 const maxRequeueChain = 32;
@@ -231,11 +234,16 @@ export async function buildExecutionContinuation(input: {
   agentId: string;
   context: Record<string, unknown>;
   previousContextRunId?: string | null;
+  /** Selected native session: omitted revisions never cross a session reset. */
+  nativeSessionId?: string | null;
+  nativeProviderSessionId?: string | null;
   /** Server-owned current run identity when validating dispatch authority. */
   runId?: string;
   summary: string | null;
   exposeLowTrustRaw: boolean;
   prospectiveTaskStatus?: "todo";
+  /** Native-only preparation metadata, never serialized into the model prompt. */
+  onNativeReadState?: (state: NativeContinuationReadState) => void;
 }): Promise<ExecutionContinuationEnvelope> {
   const { db, companyId, issueId } = input;
   const [issue] = await db
@@ -370,7 +378,7 @@ export async function buildExecutionContinuation(input: {
   const previousRun = input.previousContextRunId
     ? (
         await db
-          .select({ context: heartbeatRuns.contextSnapshot })
+          .select({ context: heartbeatRuns.contextSnapshot, nativeSessionId: heartbeatRuns.nativeSessionId })
           .from(heartbeatRuns)
           .where(
             and(
@@ -386,6 +394,16 @@ export async function buildExecutionContinuation(input: {
   const deliveredMessages = Array.isArray(priorEnvelope.messages)
     ? priorEnvelope.messages.map(object)
     : null;
+  const [accepted] = input.previousContextRunId ? await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+    eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, input.previousContextRunId),
+    inArray(heartbeatRunEvents.eventType, ["turn.accepted", "turn.started"]))).limit(1) : [];
+  const priorCoverage = object(priorEnvelope.coverage);
+  const omitted = accepted && input.nativeSessionId && input.nativeSessionId === previousRun?.nativeSessionId
+    && priorCoverage.nativeSessionId === input.nativeSessionId
+    && input.nativeProviderSessionId && priorCoverage.providerSessionId === input.nativeProviderSessionId
+    && Array.isArray(priorCoverage.omitted)
+    ? priorCoverage.omitted.map(object) : [];
+  const omittedRevision = (message: ExecutionContinuationEnvelope["messages"][number]) => omitted.some(prior => prior.id === message.id && prior.updatedAt === message.updatedAt);
   const resumeDelta =
     deliveredMessages && input.previousContextRunId
       ? {
@@ -393,7 +411,7 @@ export async function buildExecutionContinuation(input: {
           messages: messages.filter(
             (message) =>
               originCommentIds.includes(message.id) ||
-              !deliveredMessages.some(
+              !(omittedRevision(message) || deliveredMessages.some(
                 (prior) =>
                   prior.id === message.id &&
                   prior.updatedAt === message.updatedAt &&
@@ -403,7 +421,7 @@ export async function buildExecutionContinuation(input: {
                   (prior.createdByRunId ?? null) === message.createdByRunId &&
                   JSON.stringify(prior.sourceTrust) ===
                     JSON.stringify(message.sourceTrust),
-              ),
+              )),
           ),
         }
       : undefined;
@@ -418,7 +436,8 @@ export async function buildExecutionContinuation(input: {
       ? { kind: "description" as const, id: issue.id, revision: hashObjectiveSource(issue.description) }
       : { kind: "title" as const, id: issue.id, revision: hashObjectiveSource(issue.title) };
   const priorRuns = await db
-    .select({ id: heartbeatRuns.id, result: historyResult, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, runtimeMode: heartbeatRuns.runtimeMode, retryOfRunId: heartbeatRuns.retryOfRunId })
+    .select({ id: heartbeatRuns.id, result: historyResult, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, runtimeMode: heartbeatRuns.runtimeMode, retryOfRunId: heartbeatRuns.retryOfRunId,
+      createdAt: heartbeatRuns.createdAt, startedAt: heartbeatRuns.startedAt })
     .from(heartbeatRuns)
     .where(
       and(
@@ -429,6 +448,19 @@ export async function buildExecutionContinuation(input: {
       ),
     )
     .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
+  if (input.onNativeReadState) {
+    const read = await readByEarlierTurnCommentIds(db, { companyId, issueId, agentId: input.agentId,
+      commentIds: messages.map(message => message.id), currentRunId: input.runId });
+    // A stored snapshot alone is not delivery proof: size refusal can precede
+    // acceptance. Only a prior accepted turn can make its exact revisions read.
+    if (accepted && deliveredMessages) for (const message of messages) {
+      if (omittedRevision(message) || deliveredMessages.some(prior => prior.id === message.id && prior.updatedAt === message.updatedAt && prior.body === message.body
+        && prior.deleted === message.deleted && prior.authorId === message.authorId
+        && (prior.createdByRunId ?? null) === message.createdByRunId && JSON.stringify(prior.sourceTrust) === JSON.stringify(message.sourceTrust))) read.add(message.id);
+    }
+    const lastRun = priorRuns.findLast(run => run.id !== input.runId);
+    input.onNativeReadState({ lastRunAt: (lastRun?.startedAt ?? lastRun?.createdAt)?.toISOString() ?? null, readCommentIds: [...read] });
+  }
   const completedActions = priorRuns.flatMap((run) =>
     Object.entries(object(object(run.result).apiToolReceipts)).flatMap(
       ([receiptId, receipt]) => {
