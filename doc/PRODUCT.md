@@ -219,11 +219,12 @@ and board-column membership keep their existing server order.
 Search and pagination apply the routine origin filter on the server. Creation-time
 sorting also runs before pagination, with task ID as a stable tie-breaker.
 
-Tasks and project lists hide agent-created and system-created tasks by default.
+Tasks and project lists show agent-created and system-created tasks by default
+unless a saved collection preference hides them.
 The Filters menu's **Show agent-created tasks** checkbox includes routine runs,
 recovery/watchdog tasks, chat-channel tasks, and other automation. Channel tasks
 remain bot-created for this filter even when a human starts the conversation. The choice is saved per company
-and collection; Clear filters restores the hidden default. Nested lists preserve
+and collection; unchecking the checkbox hides them, and Clear filters restores the shown default. Nested lists preserve
 ancestors and expandable subtasks as context without promoting unrelated automated
 work to independent results. Agent profiles, routine histories, and task-detail
 subtasks retain their full history.
