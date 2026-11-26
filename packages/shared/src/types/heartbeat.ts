@@ -167,6 +167,9 @@ export interface HeartbeatRun {
   status: HeartbeatRunStatus;
   responsibleUserId: string | null;
   activeIdentityContextId?: string | null;
+  /** Requester is separate from the responsible person's execution authority. */
+  retriedBy?: { kind: "person"; personName: string; summary: string }
+    | { kind: "agent"; agentId: string; runId: string; summary: string } | { kind: "automatic"; summary: string } | null;
   identityHistory?: Array<{
     id: string;
     revision: number;

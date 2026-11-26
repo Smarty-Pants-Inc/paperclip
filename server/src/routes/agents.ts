@@ -7491,7 +7491,8 @@ export function agentRoutes(
       run.companyId,
       run.id,
       redactCurrentUserValue(
-        { ...decoratedRun, execution: await executionProjectionForRun(db, run.companyId, run.id), identityHistory: await listRunIdentityContexts(db, run.companyId, run.id), retryExhaustedReason, outputSilence: await heartbeat.buildRunOutputSilence(run) },
+        { ...decoratedRun, execution: await executionProjectionForRun(db, run.companyId, run.id), identityHistory: await listRunIdentityContexts(db, run.companyId, run.id),
+          retriedBy: await runRetryProjection(db, run), retryExhaustedReason, outputSilence: await heartbeat.buildRunOutputSilence(run) },
         await getCurrentUserRedactionOptions(),
       ),
       req.actor.type === "board" ? getActorInfo(req).actorId : null,
@@ -8216,3 +8217,4 @@ export function agentRoutes(
   return router;
 }
 import { listRunIdentityContexts } from "../services/run-identity.js";
+import { runRetryProjection } from "../services/activity.js";

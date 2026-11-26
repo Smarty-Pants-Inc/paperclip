@@ -35,6 +35,7 @@ import { notifyChatResponseAvailability } from "../chat-response-availability.js
 import { notifyChatInboundWakeNotices } from "../chat-inbound-wake-notice-notifications.js";
 import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js";
 import { assertTaskRetryConversationAllowed, readTaskRetryIntent, readTaskRetryBoardMessageOrigin, retireSupersededTaskRetry, taskRetryMutationAllowed } from "../task-retry.js";
+import { agentTaskRetryPresserAllowed } from "../agent-task-retry.js";
 import { insertIssueComment } from "../issue-comment-writes.js";
 import { systemNoticePresentation } from "../recovery/notice-format.js";
 import { recordedUserStop, userStopBoundaryAt } from "../run-cancellation.js";
@@ -3657,6 +3658,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               if (!await taskRetryMutationAllowed(tx as unknown as Db, { companyId: agent.companyId, issueId,
                 actorId: retry.actorId, actorSource: retry.actorSource }))
                 return declineRetry("retry_authority_denied", "The user who requested Retry can no longer change this task.");
+              if (retry.agentRetry && (retry.agentRetry.companyId !== agent.companyId ||
+                  !await agentTaskRetryPresserAllowed(tx as unknown as Db, retry.agentRetry, retry.actorId)))
+                return declineRetry("presser_not_acting_for_original_person", "The pressing agent is no longer running for the original person.");
               if (retry.boardMessageOrigin) {
                 const origin = await readTaskRetryBoardMessageOrigin(tx as unknown as Db, { companyId: agent.companyId,
                   issueId, agentId, sourceRunId: retry.sourceRunId, actorId: retry.actorId });

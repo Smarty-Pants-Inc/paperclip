@@ -172,7 +172,6 @@ const mockObserveCrossIssueInfluence = vi.hoisted(() => vi.fn(async () => null))
 const mockRetryWorkspaceExport = vi.hoisted(() => vi.fn());
 const mockRequestWorkspaceRecovery = vi.hoisted(() => vi.fn());
 const mockRequestTaskRetry = vi.hoisted(() => vi.fn());
-const mockAgentTaskRetryActor = vi.hoisted(() => vi.fn());
 const mockOnboardingFirstTaskDependenciesAllowed = vi.hoisted(() => vi.fn(async () => undefined));
 const mockGetExperimental = vi.hoisted(() => vi.fn());
 const mockResumeWorkspaceFinalization = vi.hoisted(() => vi.fn());
@@ -187,7 +186,7 @@ function registerRouteMocks() {
   });
   vi.doMock("../services/task-retry.js", () => ({ requestTaskRetry: mockRequestTaskRetry }));
   vi.doMock("../services/agent-task-retry.js", () => ({ agentOwnsRun: async () => true,
-    agentTaskRetryActor: mockAgentTaskRetryActor, recordAgentTaskRetry: async () => undefined }));
+    recordAgentTaskRetry: async () => undefined }));
   vi.doMock("../services/onboarding-first-task-admission.js", async () => ({
     ...await vi.importActual<typeof import("../services/onboarding-first-task-admission.js")>("../services/onboarding-first-task-admission.js"),
     assertOnboardingFirstTaskDependenciesAllowed: mockOnboardingFirstTaskDependenciesAllowed,
@@ -545,7 +544,6 @@ describe("agent issue mutation checkout ownership", () => {
     mockChatRunRetries.prepareFailedChatRunRetry.mockReset();
     mockChatRunRetries.processFailedChatRunRetry.mockReset();
     mockRequestTaskRetry.mockReset().mockResolvedValue({ requestId: recoveryActionId, accepted: true, stale: false });
-    mockAgentTaskRetryActor.mockReset().mockResolvedValue(null);
     mockGetExperimental.mockReset().mockResolvedValue({ enableAgentChat: true });
     mockAccessService.canUser.mockReset();
     mockAccessService.decide.mockReset();
@@ -919,11 +917,17 @@ describe("agent issue mutation checkout ownership", () => {
     }));
   });
 
-  it("admits ordinary Retry only for a board actor with task mutation permission", async () => {
+  it("admits an agent Retry without a grant and preserves board mutation checks", async () => {
     const body = { idempotencyKey: recoveryActionId, observedRunId: ownerRunId };
-    const deniedAgent = await request(createApp(peerActor())).post(`/api/issues/${issueId}/retry`).send(body);
-    expect(deniedAgent.status, JSON.stringify(deniedAgent.body)).toBe(403);
-    expect(mockRequestTaskRetry).not.toHaveBeenCalled();
+    const agent = await request(createApp(peerActor({ source: "agent_jwt", onBehalfOfUserId: "board-user",
+      onBehalfOfMemberships: [{ companyId, membershipRole: "admin", status: "active" }] })))
+      .post(`/api/issues/${issueId}/retry`).send(body);
+    expect(agent.status, JSON.stringify(agent.body)).toBe(202);
+    expect(mockRequestTaskRetry).toHaveBeenCalledWith(expect.objectContaining({
+      actorId: peerAgentId, agentRetry: { companyId, agentId: peerAgentId, runId: peerActor().runId,
+        credentialSource: "agent_jwt", onBehalfOfUserId: "board-user" }, ...body,
+    }));
+    mockRequestTaskRetry.mockClear();
     mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
       allowed: input.action !== "issue:mutate", action: input.action, reason: "test_gate", explanation: "Task is read-only.",
     }));
@@ -938,18 +942,26 @@ describe("agent issue mutation checkout ownership", () => {
     }));
   });
 
-  it("keeps a granted agent's own write boundary on Retry", async () => {
-    mockAgentTaskRetryActor.mockResolvedValue({ ...boardActor(), source: "board_key",
-      memberships: [{ companyId, membershipRole: "owner", status: "active" }] });
+  it("keeps the pressing agent's own write boundary on Retry", async () => {
     mockAccessService.decide.mockImplementation(async (input: { action: string; actor: { type: string } }) =>
       input.actor.type === "agent" && input.action === "issue:mutate"
         ? { allowed: false, action: input.action, reason: "deny_low_trust_boundary", explanation: "Issue is outside this low-trust boundary." }
         : { allowed: true, action: input.action, reason: "allow_test", explanation: "Allowed." });
     const body = { idempotencyKey: recoveryActionId, observedRunId: ownerRunId };
 
-    const denied = await request(createApp(peerActor())).post(`/api/issues/${issueId}/retry`).send(body);
+    const denied = await request(createApp(peerActor({ source: "agent_jwt", onBehalfOfUserId: "board-user",
+      onBehalfOfMemberships: [{ companyId, membershipRole: "admin", status: "active" }] })))
+      .post(`/api/issues/${issueId}/retry`).send(body);
 
     expect(denied.status, JSON.stringify(denied.body)).toBe(403);
+    expect(mockRequestTaskRetry).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, peerActor().runId])("refuses a plain key even with an unsigned run header: %s", async runId => {
+    const res = await request(createApp(peerActor({ runId }))).post(`/api/issues/${issueId}/retry`)
+      .send({ idempotencyKey: recoveryActionId, observedRunId: ownerRunId });
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ details: { reason: "presser_not_acting_for_original_person" } });
     expect(mockRequestTaskRetry).not.toHaveBeenCalled();
   });
 

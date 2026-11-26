@@ -1,62 +1,76 @@
-import { and, count, eq, gt, sql } from "drizzle-orm";
+import { and, count, eq, gt, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { isUuidLike } from "@paperclipai/shared";
-import { activityLog, agentWakeupRequests, companyMemberships, heartbeatRuns, principalPermissionGrants } from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, companyMemberships, heartbeatRuns, type issues } from "@paperclipai/db";
+import { forbidden } from "../errors.js";
+import { readRunCancellation } from "./run-cancellation.js";
+import { issueTreeControlService } from "./issue-tree-control.js";
 import { HttpError } from "../errors.js";
 import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 
-/** Retries one granted agent may request on one task in a rolling day. */
+/** Agent presses on one task in a rolling day, across all agents. */
 export const AGENT_TASK_RETRY_DAILY_CAP = 3;
 export const AGENT_TASK_RETRY_ACTION = "issue.retry_requested_by_agent";
 
-/**
- * The board actor an agent presses Retry as: the active member whose
- * tasks:retry grant names this agent. Only a grant a board user saved counts;
- * a grant row written by an agent has no granting user. A grant saved with a
- * scope does not count, since the Retry runs with the person's full task
- * access and could reach outside that scope. The actor covers only
- * the agent's company, so every Retry gate the person meets applies unchanged.
- */
-export async function agentTaskRetryActor(db: Db, agent: { companyId: string; agentId: string; runId?: string }) {
-  const [grantor] = await db.select({ userId: companyMemberships.principalId, membershipRole: companyMemberships.membershipRole })
-    .from(principalPermissionGrants)
-    .innerJoin(companyMemberships, and(eq(companyMemberships.companyId, principalPermissionGrants.companyId),
-      eq(companyMemberships.principalType, "user"),
-      eq(companyMemberships.principalId, principalPermissionGrants.grantedByUserId),
-      eq(companyMemberships.status, "active")))
-    .where(and(
-      eq(principalPermissionGrants.companyId, agent.companyId),
-      eq(principalPermissionGrants.principalType, "agent"),
-      eq(principalPermissionGrants.principalId, agent.agentId),
-      eq(principalPermissionGrants.permissionKey, "tasks:retry"),
-      sql`coalesce(${principalPermissionGrants.scope}, '{}'::jsonb) = '{}'::jsonb`))
-    .limit(1);
-  if (!grantor) return null;
-  return {
-    type: "board", userId: grantor.userId, companyIds: [agent.companyId], isInstanceAdmin: false,
-    memberships: [{ companyId: agent.companyId, membershipRole: grantor.membershipRole, status: "active" }],
-    source: "board_key", runId: agent.runId,
-  } satisfies Express.Request["actor"];
+export type AgentTaskRetryPresser = {
+  agentId: string; runId: string; companyId: string;
+  credentialSource: "agent_jwt"; onBehalfOfUserId: string;
+};
+
+/** Rechecked at admission and dispatch. Only a signed, run-bound request may
+ * carry the original person's authority; an unsigned run header is not proof. */
+export async function agentTaskRetryPresserAllowed(db: Db, input: AgentTaskRetryPresser, person: string) {
+  if (input.credentialSource !== "agent_jwt" || input.onBehalfOfUserId !== person) return false;
+  const [presser] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId),
+    eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.status, "running"),
+    eq(heartbeatRuns.responsibleUserId, person))).limit(1);
+  return Boolean(presser);
 }
 
-/** Whether the run id the agent sent names one of its own runs in its company. */
-export async function agentOwnsRun(db: Db, input: { companyId: string; agentId: string; runId: string }) {
-  if (!isUuidLike(input.runId)) return false;
-  const [run] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.runId),
-    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId)));
-  return Boolean(run);
+/** Called under Retry's task lock, before joining or creating an intent.
+ * No unchanged-input alternative and no Retry grant supplies authority. */
+export async function agentTaskRetryOriginalPerson(db: Db, input: AgentTaskRetryPresser,
+  issue: typeof issues.$inferSelect, source: typeof heartbeatRuns.$inferSelect) {
+  const refuse = (reason: string, message: string): never => {
+    throw forbidden(message, { code: "agent_task_retry_refused", reason });
+  };
+  if (input.companyId !== issue.companyId || source.companyId !== issue.companyId)
+    refuse("company_mismatch", "Retry must stay in the agent's company.");
+  const [scheduled] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.status, "scheduled_retry"),
+    or(eq(heartbeatRuns.issueId, issue.id), eq(heartbeatRuns.nativeIssueId, issue.id),
+      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`))).limit(1);
+  if (source.status === "scheduled_retry" || scheduled)
+    refuse("automatic_retry_pending", "Paperclip already has an automatic retry scheduled for this task.");
+  const cancellation = readRunCancellation(source.resultJson);
+  if (!source.finishedAt || !["failed", "interrupted", "cancelled", "timed_out"].includes(source.status) ||
+      cancellation?.initiator.type === "user" || cancellation?.source === "operator" ||
+      (source.status === "cancelled" && cancellation?.expected !== false) || source.resultJson?.cancelledByUserId ||
+      ["user", "board"].includes(String(source.resultJson?.cancelledByActorType ?? source.resultJson?.interruptedByActorType)) ||
+      ["issue_paused", "operator_interrupted"].includes(source.errorCode ?? "") ||
+      await issueTreeControlService(db).getActivePauseHoldGate(issue.companyId, issue.id))
+    refuse("person_stopped_or_not_failed", "An agent cannot retry live work or work a person stopped or paused.");
+  const person = source.responsibleUserId;
+  if (!person) return refuse("original_person_missing", "The original run has no responsible person.");
+  const [member] = await db.select({ id: companyMemberships.id }).from(companyMemberships).where(and(
+    eq(companyMemberships.companyId, issue.companyId), eq(companyMemberships.principalType, "user"),
+    eq(companyMemberships.principalId, person), eq(companyMemberships.status, "active"))).limit(1);
+  if (!member) refuse("original_person_inactive", "The original run's person is missing or no longer an active member.");
+  if (!await agentTaskRetryPresserAllowed(db, input, person))
+    refuse("presser_not_acting_for_original_person", "The pressing agent must be running for the original person with run-bound credentials.");
+  return person;
 }
 
 /**
- * Count an agent's Retry toward its daily cap on the task. The activity row
- * names the agent and the grantor, and is written before the Retry so refused
+ * Count an agent's Retry toward the shared daily cap on the task. The activity row
+ * names the pressing agent and run, and is written before the Retry so refused
  * and failed attempts count too. A replay of an idempotency key that already
- * has a saved Retry receipt for this task and grantor, or was already counted
+ * has a saved Retry receipt for this task and presser, or was already counted
  * for this agent within the current 24-hour window, counts once; an old
  * unsaved attempt from outside the window cannot bypass today's cap.
  */
 export async function recordAgentTaskRetry(db: Db, input: {
-  companyId: string; issueId: string; agentId: string; runId: string; grantedByUserId: string; idempotencyKey: string;
+  companyId: string; issueId: string; agentId: string; runId: string; idempotencyKey: string;
 }) {
   const publications: ActivityPublication[] = [];
   await db.transaction(async tx => {
@@ -64,7 +78,7 @@ export async function recordAgentTaskRetry(db: Db, input: {
     const [savedReceipt] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, input.companyId),
       eq(agentWakeupRequests.idempotencyKey, `task-retry:${input.idempotencyKey}`),
-      eq(agentWakeupRequests.requestedByActorId, input.grantedByUserId),
+      sql`${agentWakeupRequests.payload}#>>'{taskRetry,agentRetry,agentId}' = ${input.agentId}`,
       sql`${agentWakeupRequests.payload}->>'issueId' = ${input.issueId}`)).limit(1);
     if (savedReceipt) return;
     const [recentReplay] = await tx.select({ id: activityLog.id }).from(activityLog).where(and(
@@ -76,13 +90,13 @@ export async function recordAgentTaskRetry(db: Db, input: {
     const [{ value: recent }] = await tx.select({ value: count() }).from(activityLog).where(and(
       eq(activityLog.companyId, input.companyId), eq(activityLog.entityType, "issue"),
       eq(activityLog.entityId, input.issueId), eq(activityLog.action, AGENT_TASK_RETRY_ACTION),
-      eq(activityLog.actorId, input.agentId), gt(activityLog.createdAt, sql`now() - interval '1 day'`)));
+      gt(activityLog.createdAt, sql`now() - interval '1 day'`)));
     if (recent >= AGENT_TASK_RETRY_DAILY_CAP)
-      throw new HttpError(429, `An agent can request at most ${AGENT_TASK_RETRY_DAILY_CAP} Retries on a task per day`,
+      throw new HttpError(429, `Agents can request at most ${AGENT_TASK_RETRY_DAILY_CAP} Retries in total on a task per day`,
         { code: "agent_task_retry_cap_reached" });
     await logActivity(tx as unknown as Db, { companyId: input.companyId, actorType: "agent", actorId: input.agentId,
       agentId: input.agentId, runId: input.runId, action: AGENT_TASK_RETRY_ACTION, entityType: "issue",
-      entityId: input.issueId, details: { grantedByUserId: input.grantedByUserId, idempotencyKey: input.idempotencyKey } },
+      entityId: input.issueId, details: { idempotencyKey: input.idempotencyKey } },
       publications);
   });
   for (const publication of publications) publishActivity(publication);

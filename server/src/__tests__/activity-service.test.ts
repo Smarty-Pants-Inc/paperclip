@@ -21,7 +21,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { activityService } from "../services/activity.ts";
+import { activityService, runRetryProjection } from "../services/activity.ts";
 import { issueReadSqlCondition } from "../services/authorization.ts";
 import { issueService } from "../services/issues.ts";
 import { documentService } from "../services/documents.ts";
@@ -135,9 +135,10 @@ describeEmbeddedPostgres("activity service", () => {
   // agent told the person "Paperclip retried automatically" about a run the
   // board started with Retry, because the run read gave only raw invocation
   // fields (on_demand, manual) and an owner id.
-  it("says who started each retry run: a named person's Retry or automatic recovery", async () => {
+  it("says who started each retry run: a named person's or agent's Retry, or automatic recovery", async () => {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), userId = `member-${companyId}`;
     const failedRunId = randomUUID(), boardRetryId = randomUUID(), memberRetryId = randomUUID(), autoRetryId = randomUUID(), unknownRetryId = randomUUID();
+    const agentRetryId = randomUUID(), agentIntentId = randomUUID(), presserRunId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Retries", issuePrefix: `R${companyId.slice(0, 6)}` });
     await db.insert(agents).values({ id: agentId, companyId, name: "Morgan", adapterType: "process" });
     await db.insert(authUsers).values({ id: userId, name: "Sam Rivera", email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
@@ -149,6 +150,11 @@ describeEmbeddedPostgres("activity service", () => {
     };
     const base = { companyId, agentId, issueId, scopeKind: "issue", contextSnapshot: { issueId } } as const;
     const memberTaskRetryId = await wake("task_retry", "user", userId), inheritedRetryId = randomUUID();
+    await db.insert(agentWakeupRequests).values({ id: agentIntentId, companyId, agentId, source: "on_demand",
+      reason: "task_retry", requestedByActorType: "user", requestedByActorId: userId, status: "coalesced",
+      payload: { issueId, taskRetry: { schema: "paperclip.task-retry.v1", generationId: agentIntentId,
+        sourceRunId: failedRunId, actorId: userId, strategy: "evaluate", agentRetry: { companyId, agentId,
+          runId: presserRunId, credentialSource: "agent_jwt", onBehalfOfUserId: userId } } } });
     const at = (seconds: number) => new Date(Date.UTC(2026, 10, 13, 18, 0, seconds));
     await db.insert(heartbeatRuns).values([
       { ...base, id: failedRunId, status: "failed", errorCode: "native_provider_model_rejected", invocationSource: "assignment", createdAt: at(0) },
@@ -167,6 +173,8 @@ describeEmbeddedPostgres("activity service", () => {
         wakeupRequestId: await wake("transient_failure_retry", null, null, "automation"),
         contextSnapshot: { issueId, previousRunId: failedRunId, taskRetryRequestId: memberTaskRetryId }, createdAt: at(5) },
       { ...base, id: unknownRetryId, status: "succeeded", invocationSource: "on_demand", triggerDetail: "manual", retryOfRunId: failedRunId, createdAt: at(4) },
+      { ...base, id: agentRetryId, status: "succeeded", invocationSource: "on_demand", triggerDetail: "manual", responsibleUserId: userId,
+        contextSnapshot: { issueId, taskRetryRequestId: agentIntentId, previousRunId: failedRunId }, createdAt: at(6) },
     ]);
 
     const rows = await activityService(db).runsForIssue(companyId, issueId);
@@ -180,6 +188,11 @@ describeEmbeddedPostgres("activity service", () => {
       summary: "Paperclip retried the failed run automatically; no person pressed Retry." });
     expect(byId.get(inheritedRetryId)).toMatchObject({ kind: "automatic" });
     expect(byId.get(unknownRetryId)).toBeNull();
+    expect(byId.get(agentRetryId)).toEqual({ kind: "agent", agentId, runId: presserRunId,
+      summary: "Morgan requested Retry on the failed run, continuing as Sam Rivera. No person pressed Retry." });
+    // Exact projection used by GET /heartbeat-runs/:runId and RunRetryDetails.
+    for (const run of await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId)))
+      expect(await runRetryProjection(db, run)).toEqual(run.id === agentRetryId ? byId.get(run.id) : null);
     expect(JSON.stringify([...byId.values()])).not.toMatch(/local-board|member-/);
     await db.delete(authUsers).where(eq(authUsers.id, userId));
   });

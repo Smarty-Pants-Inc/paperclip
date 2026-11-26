@@ -10098,35 +10098,22 @@ export function issueRoutes(
   });
 
   router.post("/issues/:id/retry", validate(taskRetrySchema), async (req, res) => {
-    // An agent holding a board user's tasks:retry grant presses Retry as that
-    // person, so the person's gates apply, within a per-task daily cap.
-    let agentRetry: { companyId: string; agentId: string; runId: string } | null = null;
+    // Any same-company agent may press; admission retains the source run's
+    // person or refuses. The presser is never impersonated as a board user.
+    let agentRetry: import("../services/agent-task-retry.js").AgentTaskRetryPresser | null = null;
     if (req.actor.type === "agent" && req.actor.agentId && req.actor.companyId) {
-      const { agentOwnsRun, agentTaskRetryActor } = await import("../services/agent-task-retry.js");
-      const grantor = await agentTaskRetryActor(db, { companyId: req.actor.companyId, agentId: req.actor.agentId,
-        runId: req.actor.runId });
-      if (grantor) {
-        // The agent's own limits apply first: scoped keys never use the grant,
-        // the run must be the agent's, and the agent's own issue:read and
-        // issue:mutate checks (trust boundary, company policy, interaction
-        // rules, and responsible-user ceiling) must pass. The grant lifts only
-        // the board-only gate and task-assignee ownership rule.
-        if (req.actor.keyScope && req.actor.keyScope.kind !== "standard")
-          throw forbidden("Scoped credentials cannot use the Retry grant");
-        const runId = requireAgentRunId(req, res);
-        if (!runId) return;
-        if (!(await agentOwnsRun(db, { companyId: req.actor.companyId, agentId: req.actor.agentId, runId })))
-          throw forbidden("Run does not belong to this agent");
-        const own = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
-        if (!own || !(await assertIssueReadAllowed(req, res, own))) return;
-        const ownWrite = await decideIssueAccess(req, own, "issue:mutate");
-        if (!ownWrite.allowed)
-          throw forbidden(ownWrite.explanation, authorizationDeniedDetails(ownWrite));
-        agentRetry = { companyId: req.actor.companyId, agentId: req.actor.agentId, runId };
-        req.actor = grantor;
-      }
+      // Keep the agent's own trust, company and responsible-user boundaries.
+      if (req.actor.keyScope && req.actor.keyScope.kind !== "standard")
+        throw forbidden("Scoped credentials cannot request Retry");
+      // auth.ts binds agent_jwt to signed run_id and resolves its current person.
+      // agent_key's runId is only an unsigned header and cannot admit Retry.
+      if (req.actor.source !== "agent_jwt" || !req.actor.runId || !isUuidLike(req.actor.runId) || !req.actor.onBehalfOfUserId)
+        throw forbidden("Retry requires a run-bound agent acting for the original person.",
+          { code: "agent_task_retry_refused", reason: "presser_not_acting_for_original_person" });
+      agentRetry = { companyId: req.actor.companyId, agentId: req.actor.agentId, runId: req.actor.runId,
+        credentialSource: "agent_jwt", onBehalfOfUserId: req.actor.onBehalfOfUserId };
     }
-    assertBoard(req);
+    if (!agentRetry) assertBoard(req);
     const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
     if (!issue || !(await assertIssueReadAllowed(req, res, issue))) return;
     if (agentRetry && issue.companyId !== agentRetry.companyId) throw notFound("Issue not found");
@@ -10140,7 +10127,7 @@ export function issueRoutes(
         .where(and(eq(chatConversations.companyId, issue.companyId), eq(chatConversations.issueId, issue.id))).limit(1);
       if (chatBinding) throw forbidden("Only a person can retry a chat run");
       const { recordAgentTaskRetry } = await import("../services/agent-task-retry.js");
-      await recordAgentTaskRetry(db, { issueId: issue.id, ...agentRetry, grantedByUserId: req.actor.userId!,
+      await recordAgentTaskRetry(db, { issueId: issue.id, ...agentRetry,
         idempotencyKey: req.body.idempotencyKey });
     }
     if (issue.conversationAgentId) {
@@ -10150,6 +10137,7 @@ export function issueRoutes(
     const { requestTaskRetry } = await import("../services/task-retry.js");
     const receipt = await requestTaskRetry({ db, companyId: issue.companyId, issueId: issue.id,
       ...req.body, actorId: getActorInfo(req).actorId, actorSource: req.actor.source,
+      ...(agentRetry ? { agentRetry } : {}),
       prepareChatRetry: opts.chatRunRetries?.prepareFailedChatRunRetry });
     const actor = getActorInfo(req);
     const scheduledRetryRunId = "scheduledRetryRunId" in receipt ? receipt.scheduledRetryRunId : undefined;

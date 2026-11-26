@@ -224,13 +224,17 @@ Saves a Retry request for the task's latest stopped run. The same `idempotencyKe
 
 Every answer includes `presentation`, the task's current interruption state.
 
-An agent can call this endpoint only when a board user granted it `tasks:retry` without a scope. A grant that an agent saved, or a grant with a scope, does not count. The agent's call must:
+An agent needs no Retry grant; the legacy `tasks:retry` permission key is unused. Its call must:
 
-- come from one of the agent's own runs in the company (`X-Paperclip-Run-Id` for an agent API key). Another run gives `403`.
-- use an unscoped key. A skill-test or task-bridge key gives `403`.
-- be on a task that the agent itself can read and that its own trust limits and company policy let it change. Only the rule about the task's assignee does not apply.
+- use a signed run-bound agent credential, not a plain API key plus `X-Paperclip-Run-Id`. The authenticated run must be running, belong to the pressing agent and company, and its current responsible person and the request's authenticated `onBehalfOfUserId` must both equal the failed source run's `responsibleUserId`. Otherwise `403` gives `details.code: "agent_task_retry_refused"` and `details.reason: "presser_not_acting_for_original_person"`.
+- use standard credential scope. A skill-test or task-bridge credential gives `403`.
+- target a task the agent itself may read and change within its trust boundary and company policy. Only the task-assignee restriction is waived.
 
-The Retry then runs as the user who granted it, with that user's access and Retry checks. Chat tasks give `403`. Each agent can save at most 3 Retry requests on one task in a rolling day. A replay of the same `idempotencyKey` counts once. The fourth request gives `429` with `details.code: "agent_task_retry_cap_reached"`. Each request is logged as `issue.retry_requested_by_agent`, with the agent, its run and the granting user.
+The Retry keeps the failed run's responsible person, who must still be an active member allowed to change the task. No grantor, current login or task owner replaces them. The intent records the pressing agent/run separately, and dispatch refuses with `presser_not_acting_for_original_person` if that run ended or changed person while queued. The run projection names the agent requester, not a person who never pressed. An agent cannot join a pending intent belonging to another person.
+
+Chat tasks and deliberate Stop/pause give `403`. An agent press while automatic Retry is scheduled gives `403` with reason `automatic_retry_pending`; it does not accelerate the automatic retry. Finished `timed_out` sources are allowed, as a person's Retry allows them. This interim rule has no unchanged-input alternative: even unchanged work is refused unless the pressing execution acts for the original person.
+
+Across all agents, at most 3 presses count on one task in a rolling 24 hours. Counted refusals also use the cap; authentication/access/chat refusals before counting do not. A replay of the same agent's `idempotencyKey` counts once. The fourth press gives `429` with `details.code: "agent_task_retry_cap_reached"`. Each counted press is logged as `issue.retry_requested_by_agent`, naming the pressing agent and run. The accepted `issue.retry_requested` row also names the original responsible person and source run.
 
 ## Comments
 

@@ -7,6 +7,7 @@ type RetryAwareRun = {
   scheduledRetryAttempt?: number | null;
   scheduledRetryReason?: string | null;
   retryExhaustedReason?: string | null;
+  retriedBy?: { summary: string } | null;
 };
 
 export type RunRetryStateSummary = {
@@ -60,7 +61,8 @@ export function describeRunRetryState(run: RetryAwareRun): RunRetryStateSummary 
     || Boolean(reasonLabel)
     || Boolean(dueAt)
     || Boolean(attemptLabel)
-    || Boolean(exhaustedReason);
+    || Boolean(exhaustedReason)
+    || Boolean(run.retriedBy);
 
   if (!hasRetryMetadata) return null;
 
@@ -95,7 +97,7 @@ export function describeRunRetryState(run: RetryAwareRun): RunRetryStateSummary 
     badgeLabel: isMaxTurnContinuation ? "Continued run" : "Retried run",
     tone: "border-slate-500/20 bg-slate-500/10 text-slate-700 dark:text-slate-300",
     detail: joinFragments([attemptLabel, reasonLabel]),
-    secondary: null,
+    secondary: run.retriedBy?.summary ?? null,
     retryOfRunId,
   };
 }

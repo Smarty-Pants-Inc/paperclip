@@ -42,6 +42,14 @@ describe("runRetryState", () => {
     });
   });
 
+  it("shows an agent requester separately from the person even without automatic-retry metadata", () => {
+    const summary = "Morgan requested Retry on the failed run, continuing as Kate. No person pressed Retry.";
+    expect(describeRunRetryState({ status: "queued", retriedBy: { summary } })).toMatchObject({
+      kind: "attempted", badgeLabel: "Retried run", secondary: summary,
+    });
+    expect(describeRunRetryState({ status: "queued" })).toBeNull();
+  });
+
   it("describes exhausted retries", () => {
     expect(
       describeRunRetryState({

@@ -3,12 +3,13 @@ import type { AddressInfo } from "node:net";
 import express from "express";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { activityLog, agents, agentTaskSessions, agentWakeupRequests, chatActions, chatConversations, chatEndpoints, companies, budgetPolicies, costEvents, createDb, type Db, environmentLeases, environments, executionWorkspaces, executionWorkspaceSnapshots, workspaceOperations, heartbeatRunEvents, heartbeatRuns, issueComments, issueRelations, issues, approvals, issueApprovals, issueRecoveryActions, nativeRunFinalizations, toolApplications, toolConnections, toolInvocations, applyPendingMigrations } from "@paperclipai/db";
+import { issueTreeHolds, companyMemberships, principalPermissionGrants, activityLog, agents, agentTaskSessions, agentWakeupRequests, chatActions, chatConversations, chatEndpoints, companies, budgetPolicies, costEvents, createDb, type Db, environmentLeases, environments, executionWorkspaces, executionWorkspaceSnapshots, workspaceOperations, heartbeatRunEvents, heartbeatRuns, issueComments, issueRelations, issues, approvals, issueApprovals, issueRecoveryActions, nativeRunFinalizations, toolApplications, toolConnections, toolInvocations, applyPendingMigrations } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { priorRecoveryApiReceipt, unresolvedRecoveryToolInvocation } from "./recovery-effect-receipts.js";
 import { recordRunnerApiOutcome, runnerCallOutcomeMiddleware } from "../middleware/runner-call-outcome.js";
 import { RUNNER_API_CALL_HEADER } from "./native-runtime/runner-api-client.js";
 import { requestTaskRetry } from "./task-retry.js";
+import { recordAgentTaskRetry, AGENT_TASK_RETRY_ACTION } from "./agent-task-retry.js";
 import { HttpError } from "../errors.js";
 import { NativeChatReviewPresentationContentionError } from "./native-runtime/native-chat-review-presentation.js";
 import { readFreshWorkspaceReadiness } from "./fresh-workspace-continuation.js";
@@ -49,6 +50,147 @@ describe("durable task Retry admission", () => {
       contextSnapshot: { issueId }, finishedAt: new Date() });
     return { db, companyId, issueId, actorId: "board", observedRunId: runId, idempotencyKey: randomUUID() };
   }
+  // Never-OK authority guard: an agent's Retry must never acquire another person's authority.
+  async function seedAgentRetry() {
+    const input = await seed(), person = `original-${randomUUID()}`, presserPerson = `presser-${randomUUID()}`;
+    const [source] = await db.update(heartbeatRuns).set({ responsibleUserId: person,
+      runtimeMode: "legacy", errorCode: "setup_failed", executionStage: "preparing",
+      runnerProfileJson: { adapterDispatch: { adapterType: "paperclip_runner" } },
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      finishedAt: new Date(Date.now() - 2000),
+    }).where(eq(heartbeatRuns.id, input.observedRunId)).returning();
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, input.issueId));
+    await db.insert(companyMemberships).values({ companyId: input.companyId, principalType: "user",
+      principalId: person, membershipRole: "owner", status: "active" });
+    const [presser] = await db.insert(agents).values({ companyId: input.companyId, name: "Peer", adapterType: "process", status: "running" }).returning();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: input.companyId, agentId: presser.id,
+      responsibleUserId: person, status: "running" }).returning();
+    const agentRetry = { companyId: input.companyId, agentId: presser.id, runId: run.id,
+      credentialSource: "agent_jwt" as const, onBehalfOfUserId: person };
+    return { input: { ...input, actorId: presser.id, agentRetry }, source, person, presserPerson, presser, run };
+  }
+  it.each([false, true])("admits a same-person authenticated run and records the presser separately (unrelated grant: %s)", async grant => {
+    const f = await seedAgentRetry();
+    // Neither no grant nor a grant stamped by somebody else changes Retry identity.
+    if (grant) await db.insert(principalPermissionGrants).values({ companyId: f.input.companyId, principalType: "agent",
+      principalId: f.presser.id, permissionKey: "tasks:retry", grantedByUserId: f.presserPerson });
+    await recordAgentTaskRetry(db, { ...f.input.agentRetry, issueId: f.input.issueId, idempotencyKey: f.input.idempotencyKey });
+    const receipt = await requestTaskRetry(f.input);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.requestId!));
+    expect(wake).toMatchObject({ requestedByActorType: "user", requestedByActorId: f.person,
+      payload: { taskRetry: { actorId: f.person, agentRetry: f.input.agentRetry } } });
+    const audit = await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.input.issueId), eq(activityLog.action, "issue.retry_requested")));
+    expect(audit).toEqual([expect.objectContaining({ actorType: "agent", actorId: f.presser.id, agentId: f.presser.id,
+      runId: f.run.id, responsibleUserId: f.person, details: expect.objectContaining({ presserAgentId: f.presser.id, presserRunId: f.run.id,
+        responsibleUserId: f.person, sourceRunId: f.source.id }) })]);
+    expect(await requestTaskRetry(f.input)).toMatchObject({ requestId: receipt.requestId });
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, f.source.agentId));
+    // Keep the worker occupied so dispatch creates a real queued successor without invoking a provider.
+    await db.insert(heartbeatRuns).values({ companyId: f.input.companyId, agentId: f.source.agentId, status: "running" });
+    await heartbeatService(db).resumeTaskRetry(f.input.companyId, receipt.requestId!);
+    const successors = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.input.companyId), eq(heartbeatRuns.status, "queued")));
+    expect(successors).toEqual([expect.objectContaining({ responsibleUserId: f.person,
+      contextSnapshot: expect.objectContaining({ responsibleUserId: f.person }) })]);
+  });
+  it.each(["different_person", "ended", "unsigned_credential", "wrong_authenticated_person"] as const)(
+    "refuses an ineligible presser even with unchanged inputs: %s", async kind => {
+      const f = await seedAgentRetry();
+      if (kind === "different_person") await db.update(heartbeatRuns).set({ responsibleUserId: f.presserPerson })
+        .where(eq(heartbeatRuns.id, f.run.id));
+      if (kind === "ended") await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.run.id));
+      if (kind === "unsigned_credential") Object.assign(f.input.agentRetry, { credentialSource: "agent_key" });
+      if (kind === "wrong_authenticated_person") f.input.agentRetry.onBehalfOfUserId = f.presserPerson;
+      await expect(requestTaskRetry(f.input)).rejects.toMatchObject({ status: 403,
+        details: { code: "agent_task_retry_refused", reason: "presser_not_acting_for_original_person" } });
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.input.companyId))).toHaveLength(0);
+    });
+  it.each(["succeeded", "different_person"])("refuses at dispatch if the admitted presser is now %s", async state => {
+    const f = await seedAgentRetry();
+    const receipt = await requestTaskRetry(f.input);
+    await db.update(heartbeatRuns).set(state === "succeeded" ? { status: "succeeded" } : { responsibleUserId: f.presserPerson })
+      .where(eq(heartbeatRuns.id, f.run.id));
+    await heartbeatService(db).resumeTaskRetry(f.input.companyId, receipt.requestId!);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.requestId!));
+    expect(wake).toMatchObject({ status: "deferred_issue_execution", runId: null,
+      payload: { executionWait: { reason: "presser_not_acting_for_original_person" } } });
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.source.agentId));
+    expect(runs.map(run => run.id)).toEqual([f.source.id]);
+  });
+  it("refuses an agent press while automatic retry is scheduled with its own reason", async () => {
+    const f = await seedAgentRetry();
+    await db.update(heartbeatRuns).set({ status: "scheduled_retry", finishedAt: null }).where(eq(heartbeatRuns.id, f.source.id));
+    await expect(requestTaskRetry(f.input)).rejects.toMatchObject({ status: 403,
+      details: { reason: "automatic_retry_pending" } });
+  });
+  it.each([false, true])("allows timed_out sources like a person's Retry (agent: %s)", async agent => {
+    const f = await seedAgentRetry();
+    await db.update(heartbeatRuns).set({ status: "timed_out" }).where(eq(heartbeatRuns.id, f.source.id));
+    await expect(requestTaskRetry({ ...f.input, ...(agent ? {} : { agentRetry: undefined, actorId: f.person }) }))
+      .resolves.toMatchObject({ accepted: true });
+  });
+  it("admits original-person changes and ignores Paperclip system entries", async () => {
+    const f = await seedAgentRetry();
+    await db.insert(issueComments).values([
+      { companyId: f.input.companyId, issueId: f.input.issueId, authorType: "user", authorUserId: f.person, body: "My update" },
+      { companyId: f.input.companyId, issueId: f.input.issueId, authorType: "system", body: "Recovery status" },
+    ]);
+    await db.insert(activityLog).values({ companyId: f.input.companyId, actorType: "system", actorId: "recovery",
+      action: "issue.updated", entityType: "issue", entityId: f.input.issueId, details: { description: "Status" } });
+    await expect(requestTaskRetry(f.input)).resolves.toMatchObject({ accepted: true });
+  });
+  it("admits changed input only when the presser's current run carries the same original person", async () => {
+    const f = await seedAgentRetry();
+    await db.insert(issueComments).values({ companyId: f.input.companyId, issueId: f.input.issueId,
+      authorType: "agent", authorAgentId: f.presser.id, body: "New instructions" });
+    await db.update(heartbeatRuns).set({ responsibleUserId: f.person, status: "succeeded" }).where(eq(heartbeatRuns.id, f.run.id));
+    await expect(requestTaskRetry(f.input)).rejects.toMatchObject({ details: { reason: "presser_not_acting_for_original_person" } });
+    await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, f.run.id));
+    const receipt = await requestTaskRetry(f.input);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.requestId!)))[0])
+      .toMatchObject({ requestedByActorId: f.person });
+  });
+  it("keeps a person's own Retry under that person's identity, not the source run's", async () => {
+    const f = await seedAgentRetry();
+    const receipt = await requestTaskRetry({ ...f.input, agentRetry: undefined, actorId: f.presserPerson });
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.requestId!)))[0])
+      .toMatchObject({ requestedByActorId: f.presserPerson, payload: { taskRetry: { actorId: f.presserPerson } } });
+  });
+  it.each(["inactive", "original_authority", "missing_person", "person_stop", "legacy_stop", "ambiguous_cancel", "pause", "other_run", "chat", "connected_chat", "other_intent"] as const)(
+    "refuses agent Retry before creating or joining work: %s", async kind => {
+      const f = await seedAgentRetry();
+      if (kind === "inactive" || kind === "original_authority") {
+        await db.update(heartbeatRuns).set({ responsibleUserId: f.person }).where(eq(heartbeatRuns.id, f.run.id));
+        await db.update(companyMemberships).set(kind === "inactive" ? { status: "inactive" } : { membershipRole: "viewer" })
+          .where(eq(companyMemberships.companyId, f.input.companyId));
+      }
+      if (kind === "missing_person") await db.update(heartbeatRuns).set({ responsibleUserId: null }).where(eq(heartbeatRuns.id, f.source.id));
+      if (kind === "person_stop" || kind === "legacy_stop") await db.update(heartbeatRuns).set({ resultJson: kind === "legacy_stop"
+        ? { cancelledByUserId: f.person } : { cancellation: { source: "operator", expected: true,
+          initiator: { type: "user", id: f.person }, reason: "Stop", recordedAt: new Date().toISOString() } } }).where(eq(heartbeatRuns.id, f.source.id));
+      if (kind === "ambiguous_cancel") await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, f.source.id));
+      if (kind === "pause") await db.insert(issueTreeHolds).values({ companyId: f.input.companyId,
+        rootIssueId: f.input.issueId, mode: "pause", createdByActorType: "user", createdByUserId: f.person });
+      if (kind === "other_run") f.input.agentRetry.runId = f.source.id;
+      if (kind === "chat") await db.update(issues).set({ conversationAgentId: f.source.agentId,
+        conversationUserId: f.person, conversationState: "active" }).where(eq(issues.id, f.input.issueId));
+      if (kind === "connected_chat") await db.update(issues).set({ originKind: "chat_channel" }).where(eq(issues.id, f.input.issueId));
+      if (kind === "other_intent") await requestTaskRetry({ ...f.input, agentRetry: undefined, actorId: f.presserPerson, idempotencyKey: randomUUID() });
+      await expect(requestTaskRetry(f.input)).rejects.toMatchObject({ status: 403 });
+    });
+  it("retains the three-per-task daily cap and records refused presses as agent/run activity", async () => {
+    const f = await seedAgentRetry();
+    const press = { ...f.input.agentRetry, issueId: f.input.issueId, idempotencyKey: randomUUID() };
+    await recordAgentTaskRetry(db, press);
+    await recordAgentTaskRetry(db, press); // one idempotent press, not two
+    const [peer] = await db.insert(agents).values({ companyId: f.input.companyId, name: "Another agent", adapterType: "process" }).returning();
+    await recordAgentTaskRetry(db, { ...press, agentId: peer.id, idempotencyKey: randomUUID() });
+    await recordAgentTaskRetry(db, { ...press, idempotencyKey: randomUUID() });
+    await expect(recordAgentTaskRetry(db, { ...press, agentId: peer.id, idempotencyKey: randomUUID() })).rejects.toMatchObject({ status: 429 });
+    const rows = await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.input.issueId), eq(activityLog.action, AGENT_TASK_RETRY_ACTION)));
+    expect(rows).toHaveLength(3);
+    expect(new Set(rows.map(row => row.actorId))).toEqual(new Set([f.presser.id, peer.id]));
+    expect(rows.every(row => row.runId === f.run.id)).toBe(true);
+  });
   it.each(["valid", "wrong_run", "wrong_actor", "wrong_source", "wrong_generation", "unadmitted", "missing_authorization"])(
     "dispatches a preparation Retry with no recovery-action row only from its exact admitted receipt: %s", async state => {
       const input = await seed();
