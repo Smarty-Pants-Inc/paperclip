@@ -977,6 +977,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
     }
   >();
   const completedAgentMessages = new Map<string, { payload: Record<string, unknown>; ts: string }>();
+  const streamedAgentMessages = new Map<string, string>();
   const completedReasoning = new Map<string, { payload: Record<string, unknown>; ts: string }>();
   const emittedCompletedItems = new Set<string>();
   const completionItemIdentityById = new Map<string, ItemIdentity>();
@@ -1039,6 +1040,9 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
       completionItemIdentityById.get(itemId),
     );
     if (identity.kind) completionItemIdentityById.set(itemId, identity);
+    if (event.eventType === "item.delta" && isAssistantItemKind(identity.kind)) {
+      streamedAgentMessages.set(itemId, (streamedAgentMessages.get(itemId) ?? "") + (normalizedItemText(payload) ?? ""));
+    }
     if (event.eventType !== "item.completed") continue;
     const kind = identity.kind;
     if (isAssistantItemKind(kind) && itemId && normalizedItemText(payload)) {
@@ -1129,7 +1133,12 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
       if (event.eventType === "item.delta" && !itemId) continue;
       const completion = itemId ? (itemKind === "reasoning" ? completedReasoning : completedAgentMessages).get(itemId) : undefined;
       if (completion && itemId && emittedCompletedItems.has(itemId)) continue;
-      const raw = normalizedItemText(completion?.payload ?? payload) ?? "";
+      let raw = normalizedItemText(completion?.payload ?? payload) ?? "";
+      const streamed = itemId ? streamedAgentMessages.get(itemId) ?? "" : "";
+      // Recover bounded stored text without dropping the completion's identity or time.
+      if (completion && isAssistantItemKind(itemKind) && raw.trimEnd().endsWith("…[truncated]") && streamed.length > raw.length) {
+        raw = streamed;
+      }
       const value = itemId && proposedMessageIds.has(itemId) ? withoutProposedPlanBlock(raw) : raw;
       if (!value) continue;
       if (completion && itemId) emittedCompletedItems.add(itemId);
