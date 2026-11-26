@@ -190,6 +190,33 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     } finally { captureMetadata.mockRestore(); mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true }); }
   });
 
+  it.each([
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", fresh: true, org: "example-org", chat: false },
+    { failure: "ordinary provider failure", fresh: false, org: "second-org", chat: false },
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", fresh: false, org: "second-org", chat: true },
+  ])("a person's validated continuous-Pi Retry: $org, chat=$chat, fresh=$fresh", async ({ failure, fresh, org, chat }) => {
+    const f = await seed(), sessionId = randomUUID();
+    await db.update(companies).set({ name: org }).where(eq(companies.id, f.companyId));
+    if (chat) await db.update(issues).set({ originKind: "chat_channel" }).where(eq(issues.id, f.issueId));
+    try {
+      await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", model: "fixture/model",
+        sessionContinuity: "continuous", fixtureSessionId: sessionId } }).where(eq(agents.id, f.agentId));
+      await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+      await db.update(issues).set({ workspaceSelection: { version: 1, source: "explicit", selection: { kind: "task_directory" } },
+        executionWorkspaceSettings: { mode: "isolated_workspace", workspaceStrategy: { type: "project_primary" } } }).where(eq(issues.id, f.issueId));
+      const first = await execute(f);
+      await db.update(executionWorkspaces).set({ status: "active", closedAt: null }).where(eq(executionWorkspaces.id, String(first.input.context.executionWorkspaceId)));
+      await db.update(heartbeatRuns).set({ status: "failed", error: failure, errorCode: "native_continuation_requires_reconciliation" }).where(eq(heartbeatRuns.id, first.finished.id));
+      await db.update(issues).set({ status: "todo" }).where(eq(issues.id, f.issueId));
+      const receipt = await requestTaskRetry({ db, companyId: f.companyId, issueId: f.issueId, actorId: f.userId,
+        actorSource: "local_implicit", observedRunId: first.finished.id, idempotencyKey: randomUUID() });
+      expect(receipt).toMatchObject({ accepted: true, stale: false });
+      await heartbeat.resumeTaskRetry(f.companyId, receipt.requestId!);
+      await heartbeat.drainActiveRunExecutions();
+      const retries = [...captured.values()].filter(input => input.context.taskRetryRequestId === receipt.requestId);
+      expect(retries.map(input => input.runtime.sessionId)).toEqual([fresh ? null : sessionId]);
+    } finally { await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false }); }
+  });
   it("keeps a workspace source refusal typed before provider startup", async () => {
     const f = await seed(), type = `${adapterType}_source_refusal`;
     registerServerAdapter({ ...getServerAdapter(adapterType), type,
