@@ -8,6 +8,7 @@ import { ToolCallProgressRunProvider } from "./tool-call-progress";
 import { useRef, type ReactNode } from "react";
 import type { ExecutionProjection } from "@paperclipai/shared";
 import { useSecondTick } from "@/hooks/useSecondTick";
+import { useTaskChatStatusLine } from "./TaskChatStatusLine";
 import { cn } from "@/lib/utils";
 import type {
   TaskChatItem,
@@ -74,6 +75,7 @@ function terminalStatusFailed(status: string): boolean {
 }
 
 function RunnerTurnStatus({
+  runId,
   status,
   startedAtMs,
   finishedAtMs,
@@ -82,6 +84,7 @@ function RunnerTurnStatus({
   working = false,
   personStopped = false,
 }: {
+  runId?: string | null;
   status: string;
   startedAtMs: number | null;
   finishedAtMs?: number | null;
@@ -92,7 +95,9 @@ function RunnerTurnStatus({
 }) {
   const shimmer = useTaskChatShimmer("working");
   const terminal = isTerminalRunStatus(status);
-  useSecondTick(!terminal && startedAtMs != null);
+  const clockRunId = useTaskChatStatusLine();
+  const clockInDock = !terminal && !!runId && clockRunId === runId;
+  useSecondTick(!terminal && !clockInDock && startedAtMs != null);
   const elapsedMs =
     startedAtMs == null
       ? null
@@ -104,7 +109,7 @@ function RunnerTurnStatus({
 
   const failed = terminalStatusFailed(status);
   const label = waitingLabel ?? (terminal ? (personStopped ? "Stopped" : failed ? "Couldn't finish" : "Worked") : "Working");
-  const suffix = waitingLabel ? "" : terminal
+  const suffix = waitingLabel || clockInDock ? "" : terminal
     ? elapsed ? ` ${failed ? "after" : "for"} ${elapsed}` : ""
     : elapsed ? `${waitingLabel ? " · " : " for "}${elapsed}` : "";
 
@@ -168,7 +173,7 @@ export function TaskChatRunnerHeader({ statusContent, ...props }: RunnerHeaderPr
   const waitingToStart = useRunnerWaitingToStart(props);
   return <div className="flex min-h-8 min-w-0 items-center gap-2 pb-1 pt-2" data-testid="task-chat-runner-identity-row">
     {props.agentName ? <TaskChatAgentIdentity agentName={props.agentName} agentIcon={props.agentIcon} agent={props.agent} /> : null}
-    {statusContent ?? (agentQueueWaitFor(props) ? <AgentQueueWait queue={agentQueueWaitFor(props)!} /> : null) ?? <RunnerTurnStatus status={props.status} startedAtMs={props.startedAtMs} finishedAtMs={props.finishedAtMs}
+    {statusContent ?? (agentQueueWaitFor(props) ? <AgentQueueWait queue={agentQueueWaitFor(props)!} /> : null) ?? <RunnerTurnStatus runId={props.runId} status={props.status} startedAtMs={props.startedAtMs} finishedAtMs={props.finishedAtMs}
       continuedAfterSteering={props.continuedAfterSteering} waitingLabel={runnerWaitingLabel(props, waitingToStart)} working={props.working === true} personStopped={props.personStopped} />}
   </div>;
 }

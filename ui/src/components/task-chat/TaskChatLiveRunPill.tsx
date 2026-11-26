@@ -3,6 +3,7 @@ import { Hourglass, Loader2 } from "lucide-react";
 import type { TranscriptEntry } from "../../adapters";
 import { cn } from "@/lib/utils";
 import { useSecondTick } from "@/hooks/useSecondTick";
+import { useTaskChatStatusLine } from "./TaskChatStatusLine";
 import { formatDurationWords } from "@/lib/issue-chat-messages";
 import { isCommandTool } from "@/lib/transcriptPresentation";
 import { isTerminalRunStatus } from "@/components/task-chat/transcript-adapter";
@@ -48,12 +49,14 @@ export function toolCountSummaryFromEntries(entries: readonly TranscriptEntry[])
  * via `.shimmer-text` (reduced-motion aware) exactly as the default view does.
  */
 export function TaskChatLiveRunPill({
+  runId,
   status,
   execution,
   startedAtMs,
   finishedAtMs,
   toolSummary,
 }: {
+  runId?: string | null;
   status: string;
   execution?: ExecutionProjection | null;
   /** Run start (startedAt, falling back to createdAt) in ms, or null if unknown. */
@@ -63,6 +66,8 @@ export function TaskChatLiveRunPill({
   toolSummary: string | null;
 }) {
   const active = !isTerminalRunStatus(status);
+  const clockRunId = useTaskChatStatusLine();
+  const clockInDock = active && !!runId && clockRunId === runId;
   const shimmer = useTaskChatShimmer("working");
   const agentQueue = status === "queued" ? agentQueueWaitOf(execution) : null;
   // A specific server hold (maintenance, agent setup) names the wait instead of "Working".
@@ -71,7 +76,7 @@ export function TaskChatLiveRunPill({
   const waitingToStart = useWaitingToStart(status === "queued" && !holdLabel && !agentQueue, startedAtMs);
   // One shared page-wide ticker drives the live elapsed readout, matching the
   // default view's `useLiveElapsed`.
-  useSecondTick(active && startedAtMs != null && !agentQueue);
+  useSecondTick(active && !clockInDock && startedAtMs != null && !agentQueue);
 
   const elapsedMs =
     startedAtMs == null ? null : (active ? Date.now() : finishedAtMs ?? Date.now()) - startedAtMs;
@@ -80,7 +85,7 @@ export function TaskChatLiveRunPill({
     : null;
   const failed = ["failed", "timed_out", "cancelled", "interrupted"].includes(status);
   const verb = active ? holdLabel ?? (waitingToStart ? WAITING_TO_START_LABEL : "Working") : failed ? "Stopped" : "Worked";
-  const suffix = elapsed ? `for ${elapsed}` : null;
+  const suffix = elapsed && !clockInDock ? `for ${elapsed}` : null;
 
   if (agentQueue) {
     return (
