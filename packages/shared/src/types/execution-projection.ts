@@ -25,6 +25,8 @@ export interface ExecutionBlocker {
     stage: "verifying_stop" | "restoring_files" | "saving_receipts";
     canRetry: boolean;
     message: string;
+    /** ISO timestamp for the next saved-work evidence re-check, not a new run. */
+    nextCheckAt?: string;
   };
 }
 

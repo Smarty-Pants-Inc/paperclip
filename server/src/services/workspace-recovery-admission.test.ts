@@ -1,5 +1,10 @@
 import { createWakeAdmissionReader, createWakeAdmissionWriter } from "../modules/wake-queue/adapters/postgres.js";
 import { heartbeatService } from "./heartbeat.js";
+import { issueService } from "./issues.js";
+import { deliverConversationComments } from "./agent-conversations.js";
+import { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";
+import { registerWorkspaceRecoveryWork } from "./workspace-recovery-work.js";
+import { activityLog } from "@paperclipai/db";
 import { mergeCoalescedContextSnapshot } from "./heartbeat/run-preparation.js";
 import { recoveryService } from "./recovery/index.js";
 import { inspectWorkspaceSource } from "./workspace-source-inspection.js";
@@ -2016,6 +2021,159 @@ describe("automatic retained workspace recovery", () => {
     const cleanup = () => { deps.activeRunExecutions.delete(f.runId); execution.finish(); adapterExecutionControls.delete(f.runId); };
     return { f, original, reset, wake, deps, control, execution, cleanup };
   }
+
+  async function commentBackoffFixture(stopProvable: boolean) {
+    const t = stopProvable ? await heldStoppedEvidence() : await stoppedEvidenceFixture();
+    if (!stopProvable) await recoverRetainedWorkspace(t.f.input);
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, t.wake.id));
+    await db.delete(issueComments).where(eq(issueComments.id, t.reset.id));
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, t.f.issueId));
+    await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
+    const before = readSystemRecovery((await action(t.f.actionId)).evidence)!;
+    const held = { ...before, revision: before.revision + 1, nextAttemptAt: Date.now() + 210_000 };
+    await updateSystemRecovery(db, t.f.input, before, held);
+    const add = (body = "/new", clientRequestId = randomUUID()) => issueService(db).addComment(t.f.issueId,
+      body, { userId: "operator" }, { clientRequestId });
+    return { ...t, held, add };
+  }
+
+  it("pulls a person's /new forward from 3.5 minutes through the real recovery worker and new-session admission", async () => {
+    const t = await commentBackoffFixture(true), { f, original } = t;
+    const [busy] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: original.agentId, status: "running" }).returning();
+    const heartbeat = heartbeatService(db, { environmentRuntime: f.environmentRuntime }), errors = vi.fn();
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: errors });
+    const worker = registerWorkspaceRecoveryWork(db, coordinator, f.environmentRuntime, heartbeat.resumeRemoteStopComments);
+    try {
+      await worker.ready;
+      expect(readSystemRecovery((await action(f.actionId)).evidence)?.nextAttemptAt).toBe(t.held.nextAttemptAt);
+      const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
+      const at = Date.now(), comment = await t.add();
+      await deliverConversationComments(db, { id: f.issueId, companyId: f.companyId, conversationAgentId: original.agentId }, heartbeat.wakeup);
+      const successors = () => db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${f.issueId}`, eq(heartbeatRuns.status, "queued")));
+      await expect.poll(async () => (await successors()).length, { timeout: 10_000 }).toBe(1);
+      expect(blocker?.workspaceRecovery).toMatchObject({ message: "Recovering saved work. Re-checking the previous run.",
+        nextCheckAt: new Date(t.held.nextAttemptAt!).toISOString() });
+      expect(readSystemRecovery((await action(f.actionId)).evidence)).toMatchObject({ state: "complete",
+        generationId: t.held.generationId, attempts: t.held.attempts + 1 });
+      expect(await readFile(path.join(f.host, "saved.txt"), "utf8")).toBe("finished work\n");
+      expect((await action(f.actionId)).evidence).toMatchObject({ automaticRecovery: { replay: "explicit_user_continuation" } });
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId, { conversationResetCommentId: comment.id })).toBeNull();
+      const events = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
+      expect(events.map(event => event.action)).toEqual(expect.arrayContaining(["issue.workspace_recovered", "issue.execution_recovery_settled"]));
+      const [successor] = await successors();
+      expect(successor.contextSnapshot).toMatchObject({ forceFreshSession: true, previousRunId: f.runId, wakeCommentIds: [comment.id] });
+      expect(successor.sessionIdBefore).toBeNull();
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, busy.id));
+      const deps = createHeartbeatQueueTestDependencies(db);
+      deps.getAgent.mockResolvedValue((await db.select().from(agents).where(eq(agents.id, original.agentId)))[0]);
+      deps.instanceSettings.getExperimental.mockResolvedValue({ enableAgentChat: true, enableNativeRunner: true } as Awaited<ReturnType<typeof deps.instanceSettings.getExperimental>>);
+      const claimed = await createHeartbeatQueue(db, deps).claimQueuedRun(successor);
+      expect(claimed).toMatchObject({ id: successor.id, status: "running" });
+      const elapsedMs = Date.now() - at;
+      expect(elapsedMs).toBeLessThan(10_000);
+      expect(errors).not.toHaveBeenCalled();
+      console.info("comment-recheck-proof", JSON.stringify({ scenario: "stop_proven", sourceRunId: f.runId,
+        recoveryActionId: f.actionId, commentId: comment.id, previousNextAttemptAt: t.held.nextAttemptAt,
+        elapsedMs, successorRunId: claimed!.id, successorStatus: claimed!.status,
+        forceFreshSession: successor.contextSnapshot?.forceFreshSession, sessionIdBefore: successor.sessionIdBefore }));
+    } finally { await coordinator.stop(); await worker.stop(); t.cleanup(); }
+  }, 30_000);
+
+  it("coalesces two quick human comments, keeps an unproven stop held, and resumes normal backoff without replay", async () => {
+    const t = await commentBackoffFixture(false), { f } = t;
+    try {
+      let wakes = 0;
+      const stop = subscribeDeliveryWork(db, DELIVERY_QUEUES.workspaceRecovery, () => { wakes += 1; });
+      const requestId = randomUUID(), errors = vi.fn();
+      const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: errors });
+      let worker: ReturnType<typeof registerWorkspaceRecoveryWork> | undefined;
+      let first: Awaited<ReturnType<typeof t.add>>;
+      try {
+        [first] = await Promise.all([t.add("/new", requestId), t.add("Please continue")]);
+        const advanced = readSystemRecovery((await action(f.actionId)).evidence)!;
+        expect(advanced).toEqual({ ...t.held, revision: t.held.revision + 1, nextAttemptAt: expect.any(Number) });
+        expect(advanced.nextAttemptAt!).toBeLessThanOrEqual(Date.now());
+        expect(wakes).toBe(1);
+        worker = registerWorkspaceRecoveryWork(db, coordinator, f.environmentRuntime, async () => {});
+        await worker.ready;
+        await expect.poll(async () => readSystemRecovery((await action(f.actionId)).evidence)?.attempts,
+          { timeout: 5_000 }).toBe(t.held.attempts + 1);
+        await expect.poll(async () => readSystemRecovery((await action(f.actionId)).evidence)?.state,
+          { timeout: 5_000 }).toBe("awaiting_evidence");
+        const failed = readSystemRecovery((await action(f.actionId)).evidence)!;
+        expect(failed).toMatchObject({ state: "awaiting_evidence", generationId: t.held.generationId,
+          attempts: t.held.attempts + 1, retriesUsed: t.held.retriesUsed + 1,
+          firstFailureAt: t.held.firstFailureAt, deadlineAt: t.held.deadlineAt,
+          failure: { code: "agent_stop_unconfirmed", retryClass: "recheck_evidence" } });
+        expect(failed.nextAttemptAt!).toBeGreaterThan(Date.now() + 40_000);
+        expect(await t.add("/new", requestId)).toMatchObject({ id: first.id });
+        await recoverRetainedWorkspace(f.input);
+        expect(readSystemRecovery((await action(f.actionId)).evidence)).toEqual(failed);
+        expect(await hasVerifiedWorkspaceRepair(db, await run(f.runId))).toBe(false);
+        await expect(readFile(path.join(f.host, "saved.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+        expect(await readFile(path.join(f.remote, "saved.txt"), "utf8")).toBe("finished work\n");
+        expect(await getExecutionBlocker(db, f.companyId, f.issueId)).not.toBeNull();
+        expect((await action(f.actionId)).evidence).toMatchObject({ automaticRecovery: { replay: "blocked" } });
+        expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "queued")))).toHaveLength(0);
+        expect((await getExecutionBlocker(db, f.companyId, f.issueId))?.workspaceRecovery?.nextCheckAt)
+          .toBe(new Date(failed.nextAttemptAt!).toISOString());
+        expect(errors).not.toHaveBeenCalled();
+        console.info("comment-recheck-proof", JSON.stringify({ scenario: "stop_unproven_two_comments", sourceRunId: f.runId,
+          recoveryActionId: f.actionId, forcedAttempts: failed.attempts - t.held.attempts,
+          generationId: failed.generationId, nextAttemptAt: failed.nextAttemptAt, retryDueInMs: failed.nextAttemptAt! - Date.now(),
+          state: failed.state, failureCode: failed.failure?.code }));
+      } finally { stop(); await coordinator.stop(); await worker?.stop(); }
+    } finally { t.cleanup(); }
+  });
+
+  it.each(["non_chat", "wrong_user", "not_blocked", "system_comment", "exhausted", "deadline", "budget", "other_failure", "already_due"] as const)(
+    "does not expedite comment recovery outside its scope or budget: %s", async fault => {
+      const t = await commentBackoffFixture(false), { f } = t;
+      try {
+        if (fault === "non_chat") await db.update(issues).set({ conversationAgentId: null, conversationUserId: null, conversationState: null }).where(eq(issues.id, f.issueId));
+        if (fault === "not_blocked") await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.issueId));
+        const changed = { ...t.held, revision: t.held.revision + 1,
+          ...(fault === "exhausted" ? { state: "exhausted" as const, nextAttemptAt: null } : {}),
+          ...(fault === "deadline" ? { deadlineAt: Date.now() - 1 } : {}),
+          ...(fault === "budget" ? { retriesUsed: 5 } : {}),
+          ...(fault === "other_failure" ? { failure: { ...t.held.failure!, retryClass: "retry_transient" as const } } : {}),
+          ...(fault === "already_due" ? { nextAttemptAt: Date.now() - 1 } : {}),
+        };
+        await updateSystemRecovery(db, f.input, t.held, changed);
+        const before = (await action(f.actionId)).evidence;
+        await issueService(db).addComment(f.issueId, "Continue", fault === "system_comment" ? {} : {
+          userId: fault === "wrong_user" ? "other-user" : "operator",
+        }, { clientRequestId: randomUUID() });
+        expect((await action(f.actionId)).evidence).toEqual(before);
+      } finally { t.cleanup(); }
+    });
+
+  it("keeps the provider cooldown and rolls back the comment and acceleration atomically", async () => {
+    const t = await commentBackoffFixture(false), { f } = t;
+    try {
+      const cooldown = Date.now() + 60_000;
+      const held = { ...t.held, revision: t.held.revision + 1, providerCooldownAt: cooldown };
+      await updateSystemRecovery(db, f.input, t.held, held);
+      let wakes = 0;
+      const stop = subscribeDeliveryWork(db, DELIVERY_QUEUES.workspaceRecovery, () => { wakes += 1; });
+      try {
+        await expect(db.transaction(async tx => {
+          await issueService(db).addComment(f.issueId, "/new", { userId: "operator" }, { clientRequestId: randomUUID() }, tx);
+          throw new Error("abort accepted input");
+        })).rejects.toThrow("abort accepted input");
+        expect(readSystemRecovery((await action(f.actionId)).evidence)).toEqual(held);
+        expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(0);
+        // Rollback still settles work-signal intent so a worker can reconcile
+        // uncertainty. It must find the original, future backoff and no input.
+        const settledRollback = wakes;
+        await t.add();
+        expect(readSystemRecovery((await action(f.actionId)).evidence)).toEqual({ ...held,
+          revision: held.revision + 1, nextAttemptAt: cooldown });
+        expect(wakes).toBe(settledRollback + 1);
+      } finally { stop(); }
+    } finally { t.cleanup(); }
+  });
 
   async function heldStoppedEvidence() {
     const prepared = await stoppedEvidenceFixture();

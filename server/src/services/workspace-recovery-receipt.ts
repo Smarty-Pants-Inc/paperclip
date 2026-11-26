@@ -80,9 +80,14 @@ export function workspaceRecoveryDisplay(evidence: Record<string, unknown>, runI
   run?: { status: string | null; retryOffered: boolean }): ExecutionBlocker["workspaceRecovery"] {
   const state = readWorkspaceRecovery(evidence);
   if (!state || state.runId !== runId) return undefined;
+  const system = readSystemRecovery(evidence);
+  const rechecking = system?.sourceRunId === runId && system.failure?.retryClass === "recheck_evidence"
+    && (system.state === "awaiting_evidence" || system.state === "running");
   return { status: state.status, stage: state.stage,
+    ...(rechecking && system.nextAttemptAt !== null ? { nextCheckAt: new Date(system.nextAttemptAt).toISOString() } : {}),
     canRetry: state.status === "blocked" && state.retryable === true,
-    message: state.status === "queued" || state.status === "recovering" ? "Recovering saved work…"
+    message: rechecking ? "Recovering saved work. Re-checking the previous run."
+      : state.status === "queued" || state.status === "recovering" ? "Recovering saved work…"
       : state.status === "recovered" ? recoveredWorkMessage(run?.status, run?.retryOffered ?? false)
         : blockedWorkspaceRecoveryMessage(evidence) ?? state.message ?? "Recovery of this task's saved work has not finished.",
   };
