@@ -30,6 +30,38 @@ const normalizeColumns = (value: unknown): Column[] => Array.isArray(value)
   : columns;
 
 describe("task collection preferences", () => {
+  it.each(["current", "legacy"])("ignores the old hidden default but retains the saved %s view and new choices", (source) => {
+    const storage = new MemoryStorage();
+    const location = {
+      companyId: "example-org", collectionKey: "tasks",
+      legacyViewStorageKey: "legacy:view", legacyColumnsStorageKey: "legacy:columns",
+    };
+    const viewState = { showAgentCreatedTasks: false, sort: "created", groupBy: "priority", filters: ["active"] };
+    const key = taskCollectionPreferencesStorageKey(location);
+    if (source === "current") {
+      storage.setItem(key, JSON.stringify({ version: 1, ...location, viewState, columns: ["id"] }));
+    } else {
+      storage.setItem("legacy:view", JSON.stringify(viewState));
+      storage.setItem("legacy:columns", JSON.stringify(["id"]));
+    }
+    const options = {
+      ...location, storage, defaultViewState: { ...viewState, showAgentCreatedTasks: true }, defaultColumns: columns,
+      normalizeViewState: (value: unknown) => value as typeof viewState, normalizeColumns,
+    };
+    const loaded = loadTaskCollectionPreferences(options);
+    expect(loaded.viewState).toMatchObject({ ...viewState, showAgentCreatedTasks: true });
+    expect(loaded.columns).toEqual(["id"]);
+    for (const shown of [false, true]) {
+      saveTaskCollectionPreferences(location, {
+        viewState: { ...loaded.viewState, showAgentCreatedTasks: shown }, columns: loaded.columns,
+      }, storage);
+      const reloaded = loadTaskCollectionPreferences(options);
+      expect(reloaded.viewState).toMatchObject({ ...viewState, showAgentCreatedTasks: shown });
+      expect(reloaded.columns).toEqual(["id"]);
+      expect(JSON.parse(storage.getItem(key)!).viewState.hideAgentCreatedTasks).toBe(!shown);
+    }
+  });
+
   it("migrates legacy view and column keys into a versioned company scope", () => {
     const storage = new MemoryStorage();
     storage.setItem("legacy:view", JSON.stringify({ sort: "created", filters: ["active"] }));
