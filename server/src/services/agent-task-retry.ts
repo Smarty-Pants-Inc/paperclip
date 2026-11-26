@@ -8,7 +8,7 @@ import { AGENT_PAUSE_STOP_REASON } from "./governance-pause-stop.js";
 import { HttpError } from "../errors.js";
 import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 
-/** Retries one agent may request on one task in a rolling day. */
+/** Retries all agents together may request on one task in a rolling day. */
 export const AGENT_TASK_RETRY_DAILY_CAP = 3;
 export const AGENT_TASK_RETRY_ACTION = "issue.retry_requested_by_agent";
 
@@ -45,23 +45,61 @@ async function readRetrySource(db: Db, input: { companyId: string; issueId: stri
   return source;
 }
 
+export type AgentRetryRequester = {
+  agentId: string; runId: string; credentialSource?: string; onBehalfOfUserId?: string;
+};
+
+const refusalMessages: Record<string, string> = {
+  retry_refused_unsigned_run: "Retry requires an authenticated run-bound agent carrying the original person.",
+  retry_refused_run_not_owned: "Retry refused: the pressing run does not belong to this agent.",
+  retry_presser_not_running: "Retry refused: the pressing agent's run has ended.",
+  retry_authority_unavailable: "Retry refused: the original person is missing or no longer active.",
+  retry_authority_denied: "Retry refused: the original person can no longer change this task.",
+  retry_refused_different_person: "Retry refused: the pressing and source runs must carry the same person.",
+  automatic_retry_pending: "Retry refused: an automatic retry is already pending for this task.",
+  retry_refused_run_not_stopped: "Retry refused: the source run must be stopped or failed.",
+  retry_refused_stop_unverified: "Retry refused: this cancelled run might have been deliberately stopped.",
+  retry_refused_person_stop: "Retry refused: a person deliberately stopped or paused this work.",
+  retry_refused_chat: "Retry refused: only a person can retry chat or connected-chat work.",
+  retry_refused_stale: "Retry refused: the observed run is no longer the current eligible attempt.",
+  retry_refused_receipt_mismatch: "Retry refused: the saved receipt belongs to another requester or request mode.",
+};
+export function agentTaskRetryMessage(reason: string) {
+  return refusalMessages[reason] ?? "Agent Retry was refused by an execution safety check.";
+}
+
+/** Service and route both require the retained signed credential context. */
+export async function agentTaskRetryPresserRefusal(db: Db, input: {
+  companyId: string; actorId: string; agentRequester: AgentRetryRequester;
+}): Promise<string | null> {
+  const requester = input.agentRequester;
+  if (requester.credentialSource !== "agent_jwt" || requester.onBehalfOfUserId !== input.actorId)
+    return "retry_refused_unsigned_run";
+  if (!await agentOwnsRun(db, { companyId: input.companyId, ...requester })) return "retry_refused_run_not_owned";
+  const [run] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, requester.runId)));
+  if (run?.status !== "running") return "retry_presser_not_running";
+  const authority = await agentTaskRetryActor(db, { companyId: input.companyId, ...requester });
+  return authority?.userId === input.actorId ? null : "retry_authority_unavailable";
+}
+
 /** Admission and dispatch both recheck the exact original authority. */
 export async function agentTaskRetryRefusal(db: Db, input: {
   companyId: string; issueId: string; sourceRunId: string; actorId: string;
-  agentRequester?: { agentId: string; runId: string };
+  agentRequester?: AgentRetryRequester;
 }): Promise<string | null> {
   if (!input.agentRequester) return null;
-  const authority = await agentTaskRetryActor(db, { companyId: input.companyId, ...input.agentRequester });
-  if (authority?.userId !== input.actorId) return "retry_authority_unavailable";
+  const presserRefusal = await agentTaskRetryPresserRefusal(db, { ...input, agentRequester: input.agentRequester });
+  if (presserRefusal) return presserRefusal;
   const source = await readRetrySource(db, input);
   if (!source?.person) return "retry_authority_unavailable";
   if (source.person !== input.actorId) return "retry_refused_different_person";
-  if (!source.finishedAt || !["failed", "cancelled", "timed_out", "interrupted"].includes(source.status)) return "retry_refused_run_not_stopped";
   const [scheduled] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.status, "scheduled_retry"),
     or(eq(heartbeatRuns.issueId, input.issueId), eq(heartbeatRuns.nativeIssueId, input.issueId),
       sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`))).limit(1);
-  if (scheduled) return "retry_refused_run_not_stopped";
+  if (scheduled || source.status === "scheduled_retry") return "automatic_retry_pending";
+  if (!source.finishedAt || !["failed", "cancelled", "timed_out", "interrupted"].includes(source.status)) return "retry_refused_run_not_stopped";
   const cancellation = readRunCancellation(source.result);
   if (source.status === "cancelled" && cancellation?.expected !== false) return "retry_refused_stop_unverified";
   const pause = source?.result?.pauseStop as { holds?: string[]; companyPauseReason?: string } | undefined;
@@ -102,7 +140,7 @@ export async function agentOwnsRun(db: Db, input: { companyId: string; agentId: 
 }
 
 /**
- * Count an agent's Retry toward its daily cap on the task. The activity row
+ * Count an agent's Retry toward the shared daily cap on the task. The activity row
  * names the pressing agent and the authority person, and is written before the Retry so refused
  * and failed attempts count too. A replay of an idempotency key that already
  * has a saved Retry receipt for this task and authority person, or was already counted
@@ -119,6 +157,11 @@ export async function recordAgentTaskRetry(db: Db, input: {
       eq(agentWakeupRequests.companyId, input.companyId),
       eq(agentWakeupRequests.idempotencyKey, `task-retry:${input.idempotencyKey}`),
       eq(agentWakeupRequests.requestedByActorId, input.authorityUserId),
+      eq(agentWakeupRequests.reason, "task_retry"),
+      sql`${agentWakeupRequests.payload}#>>'{taskRetry,agentRequester,agentId}' = ${input.agentId}`,
+      sql`${agentWakeupRequests.payload}#>>'{taskRetry,agentRequester,credentialSource}' = 'agent_jwt'`,
+      sql`${agentWakeupRequests.payload}#>>'{taskRetry,agentRequester,onBehalfOfUserId}' = ${input.authorityUserId}`,
+      sql`${agentWakeupRequests.payload}#>>'{taskRetry,actorId}' = ${input.authorityUserId}`,
       sql`${agentWakeupRequests.payload}->>'issueId' = ${input.issueId}`)).limit(1);
     if (savedReceipt) return;
     const [recentReplay] = await tx.select({ id: activityLog.id }).from(activityLog).where(and(
@@ -130,9 +173,9 @@ export async function recordAgentTaskRetry(db: Db, input: {
     const [{ value: recent }] = await tx.select({ value: count() }).from(activityLog).where(and(
       eq(activityLog.companyId, input.companyId), eq(activityLog.entityType, "issue"),
       eq(activityLog.entityId, input.issueId), eq(activityLog.action, AGENT_TASK_RETRY_ACTION),
-      eq(activityLog.actorId, input.agentId), gt(activityLog.createdAt, sql`now() - interval '1 day'`)));
+      gt(activityLog.createdAt, sql`now() - interval '1 day'`)));
     if (recent >= AGENT_TASK_RETRY_DAILY_CAP)
-      throw new HttpError(429, `An agent can request at most ${AGENT_TASK_RETRY_DAILY_CAP} Retries on a task per day`,
+      throw new HttpError(429, `Agents can request at most ${AGENT_TASK_RETRY_DAILY_CAP} Retries in total on a task per day`,
         { code: "agent_task_retry_cap_reached" });
     await logActivity(tx as unknown as Db, { companyId: input.companyId, actorType: "agent", actorId: input.agentId,
       agentId: input.agentId, runId: input.runId, action: AGENT_TASK_RETRY_ACTION, entityType: "issue",

@@ -29,7 +29,7 @@ import { PersistedExecutionWaitRefusal } from "./deferred-execution-wait.js";
 import { rearmExhaustedNativeFinalization } from "./native-runtime/exhausted-finalization-retry.js";
 import { NativeChatReviewPresentationContentionError } from "./native-runtime/native-chat-review-presentation.js";
 import { isExternalChatWaitAuthorizationContention } from "./native-runtime/chat-attachment-reuse.js";
-import { agentTaskRetryRefusal } from "./agent-task-retry.js";
+import { agentTaskRetryMessage, agentTaskRetryRefusal } from "./agent-task-retry.js";
 import { selectTaskRetryInput } from "./chat-channels/task-retry-input.js";
 
 export async function taskRetryMutationAllowed(db: Db, input: {
@@ -57,7 +57,10 @@ const taskRetryIntentSchema = z.object({
   actorId: z.string().min(1), actorSource: z.enum(["local_implicit", "session", "board_key", "cloud_tenant"]).default("session"), strategy: z.enum(["evaluate", "continue", "fresh_isolated_workspace", "finalize_result"]),
   chatActionId: z.string().uuid().optional(), canonicalIntentId: z.string().uuid().optional(),
   queuedChatRequestId: z.string().uuid().optional(),
-  agentRequester: z.object({ agentId: z.string().uuid(), runId: z.string().uuid() }).optional(),
+  // Keep legacy/malformed provenance parseable as agent-origin so dispatch
+  // refuses it explicitly instead of silently treating it as a person's Retry.
+  agentRequester: z.object({ agentId: z.string().uuid(), runId: z.string().uuid(),
+    credentialSource: z.string().optional(), onBehalfOfUserId: z.string().optional() }).optional(),
   initiatedBy: z.enum(["restart_recovery", "provider_limit_reset"]).optional(),
   boardMessageOrigin: z.object({ commentId: z.string().uuid(), identityContextId: z.string().uuid() }).optional(),
 });
@@ -68,7 +71,7 @@ export type TaskRetryIntent = z.infer<typeof taskRetryIntentSchema>;
  * with access replaces it. An edited saved board message
  * (`retry_source_changed`) is terminal: only new input continues. */
 export const DECLINED_TASK_RETRY_REASONS = ["retry_authority_denied",
-  "retry_authority_unavailable",
+  "retry_authority_unavailable", "retry_presser_not_running", "retry_refused_unsigned_run", "retry_refused_run_not_owned", "automatic_retry_pending",
   "retry_refused_person_stop", "retry_refused_different_person", "retry_refused_run_not_stopped", "retry_refused_chat", "retry_refused_stop_unverified",
 ] as const;
 export function isDeclinedTaskRetry(payload: Record<string, unknown> | null | undefined) {
@@ -305,8 +308,14 @@ function admitTaskRetry(input: TaskRetryRequest) {
     assertTaskRetryConversationAllowed(issue, input.actorId);
     if (input.agentRequester && input.retryAction === "move_forward")
       throw conflict("An agent cannot move a task forward through Retry.", { code: "retry_refused_move_forward" });
-    const refusal = await agentTaskRetryRefusal(db, { ...input, sourceRunId: input.observedRunId ?? "" });
-    if (refusal) throw conflict("Agent Retry cannot continue this source.", { code: refusal });
+    const checkAgentRetry = async (sourceRunId: string, agentRequester = input.agentRequester) => {
+      if (!agentRequester) return;
+      const refusal = await agentTaskRetryRefusal(db, { ...input, sourceRunId, agentRequester });
+      if (refusal) throw conflict(agentTaskRetryMessage(refusal), { code: refusal, retrySourceRunId: sourceRunId });
+      if (!await taskRetryMutationAllowed(db, { ...input, actorSource: input.actorSource ?? "session" }))
+        throw forbidden(agentTaskRetryMessage("retry_authority_denied"),
+          { code: "retry_authority_denied", retrySourceRunId: sourceRunId });
+    };
     const key = `task-retry:${input.idempotencyKey}`;
     const [sameRequest] = await tx.select().from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.idempotencyKey, key)));
@@ -314,6 +323,16 @@ function admitTaskRetry(input: TaskRetryRequest) {
       if (sameRequest.payload?.issueId !== issue.id || sameRequest.requestedByActorId !== input.actorId)
         throw conflict("This retry request belongs to a different task or user.");
       const intent = readTaskRetryIntent(sameRequest.payload);
+      if (Boolean(input.agentRequester) !== Boolean(intent?.agentRequester) ||
+          (input.agentRequester && (!intent || intent.actorId !== input.actorId ||
+            intent.agentRequester?.agentId !== input.agentRequester.agentId)))
+        throw conflict(agentTaskRetryMessage("retry_refused_receipt_mismatch"), { code: "retry_refused_receipt_mismatch" });
+      if (input.agentRequester && intent?.agentRequester) {
+        // Both the current presser and the saved presser must still qualify;
+        // a fresh supplied source/run cannot launder a stopped saved intent.
+        await checkAgentRetry(intent.sourceRunId);
+        await checkAgentRetry(intent.sourceRunId, intent.agentRequester);
+      }
       const [coalescedRun] = sameRequest.status === "coalesced" && sameRequest.runId
         ? await tx.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns)
           .where(and(eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, sameRequest.runId)))
@@ -322,6 +341,7 @@ function admitTaskRetry(input: TaskRetryRequest) {
         observedRunId: intent?.sourceRunId ?? null, chatActionId: intent?.chatActionId,
         ...(coalescedRun?.status === "scheduled_retry" ? { scheduledRetryRunId: coalescedRun.id } : {}) };
     }
+    await checkAgentRetry(input.observedRunId ?? "");
     const [latest] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, issue.companyId),
       or(eq(heartbeatRuns.issueId, issue.id), eq(heartbeatRuns.nativeIssueId, issue.id),
         sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`), taskAttemptCondition()))
@@ -330,6 +350,7 @@ function admitTaskRetry(input: TaskRetryRequest) {
         desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
     if (["done", "cancelled"].includes(issue.status) || !issue.assigneeAgentId || !latest ||
         latest.agentId !== issue.assigneeAgentId || input.observedRunId !== latest.id) {
+      if (input.agentRequester) throw conflict(agentTaskRetryMessage("retry_refused_stale"), { code: "retry_refused_stale" });
       return { requestId: null, accepted: false, stale: true, observedRunId: latest?.id ?? null, chatActionId: undefined };
     }
     if (input.retryAction === "move_forward" && !["queued", "running"].includes(latest.status) &&
@@ -529,8 +550,11 @@ function admitTaskRetry(input: TaskRetryRequest) {
       }
     }
     await persistActivity(db, { companyId: issue.companyId, ...automaticRetryActor(input),
-      action: "issue.retry_requested", entityType: "issue", entityId: issue.id, runId: latest.id,
+      action: "issue.retry_requested", entityType: "issue", entityId: issue.id,
+      runId: input.agentRequester?.runId ?? latest.id,
+      responsibleUserIdOverride: input.agentRequester ? input.actorId : undefined,
       details: { authorityUserId: input.agentRequester ? input.actorId : undefined,
+        ...(input.agentRequester ? { presserAgentId: input.agentRequester.agentId, presserRunId: input.agentRequester.runId } : {}),
         requestId: active?.id ?? id, sourceRunId: latest.id, attachedToExistingWork: Boolean(active || busy),
         ...(replacedRequestId ? { replacedRequestId } : {}),
         ...(input.initiatedBy ? { initiatedBy: input.initiatedBy, onBehalfOfUserId: input.actorId } : {}) } });

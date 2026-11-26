@@ -1082,19 +1082,31 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     }
     type Fixture = Awaited<ReturnType<typeof seedAgentRetry>>;
     async function press(f: Fixture, options: { actor?: Partial<Express.Request["actor"]>;
-      idempotencyKey?: string; retryAction?: "move_forward" } = {}) {
+      idempotencyKey?: string; observedRunId?: string; retryAction?: "move_forward" } = {}) {
       return request(createApp({ ...agentActor(f.companyId, f.presserId), runId: f.presserRunId,
         ...options.actor } as Express.Request["actor"])).post(`/api/issues/${f.issueId}/retry`)
-        .send({ observedRunId: f.retryRunId, idempotencyKey: options.idempotencyKey ?? randomUUID(),
+        .send({ observedRunId: options.observedRunId ?? f.retryRunId, idempotencyKey: options.idempotencyKey ?? randomUUID(),
           retryAction: options.retryAction });
     }
     async function legacyGrant(f: Fixture, grantedByUserId: string | null, scope: Record<string, unknown> | null = null) {
       await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "agent",
         principalId: f.presserId, permissionKey: "tasks:retry", grantedByUserId, scope });
     }
-    async function receipt(f: Fixture) {
+    function requester(f: Fixture) {
+      return { agentId: f.presserId, runId: f.presserRunId,
+        credentialSource: "agent_jwt", onBehalfOfUserId: "board-user" };
+    }
+    async function receipt(f: Fixture, idempotencyKey = randomUUID()) {
       return requestTaskRetry({ db, ...f, actorId: "board-user", observedRunId: f.retryRunId,
-        idempotencyKey: randomUUID(), agentRequester: { agentId: f.presserId, runId: f.presserRunId } });
+        idempotencyKey, agentRequester: requester(f) });
+    }
+    async function anotherPresser(f: Fixture) {
+      const presserId = randomUUID(), presserRunId = randomUUID();
+      await db.insert(agents).values({ id: presserId, companyId: f.companyId, name: "Another helper",
+        adapterType: "codex_local", status: "active" });
+      await db.insert(heartbeatRuns).values({ id: presserRunId, companyId: f.companyId, agentId: presserId,
+        status: "running", responsibleUserId: "board-user", contextSnapshot: {} });
+      return { ...f, presserId, presserRunId };
     }
     async function refusal(f: Fixture) {
       return db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issueId),
@@ -1111,8 +1123,10 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
         agentRequester: { agentId: f.presserId, runId: f.presserRunId } });
       const audit = await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issueId),
         eq(activityLog.action, "issue.retry_requested")));
-      expect(audit[0]).toMatchObject({ actorType: "agent", actorId: f.presserId,
-        details: { authorityUserId: "board-user" } });
+      expect(audit[0]).toMatchObject({ actorType: "agent", actorId: f.presserId, runId: f.presserRunId,
+        details: { authorityUserId: "board-user", sourceRunId: f.retryRunId, presserRunId: f.presserRunId } });
+      expect(wake.payload?.taskRetry).toMatchObject({ agentRequester: {
+        credentialSource: "agent_jwt", onBehalfOfUserId: "board-user" } });
     });
 
     it("rejects a different person's task with its reason, even with a legacy grant", async () => {
@@ -1128,7 +1142,7 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
         details: { authorityUserId: "other-person", reason: "retry_refused_different_person" } });
     });
 
-    it.each(["queued", "running", "scheduled_retry", "succeeded"])("rejects a source that is %s, not stopped/failed", async status => {
+    it.each(["queued", "running", "succeeded"])("rejects a source that is %s, not stopped/failed", async status => {
       const f = await seedAgentRetry();
       await db.update(heartbeatRuns).set({ status }).where(eq(heartbeatRuns.id, f.retryRunId));
       const res = await press(f);
@@ -1151,7 +1165,15 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
         issueId: f.issueId, status: "scheduled_retry", contextSnapshot: { issueId: f.issueId } });
       const res = await press(f);
       expect(res.status, JSON.stringify(res.body)).toBe(409);
-      expect(res.body.details.code).toBe("retry_refused_run_not_stopped");
+      expect(res.body.details.code).toBe("automatic_retry_pending");
+    });
+
+    it("refuses a scheduled source with the specific automatic-retry reason", async () => {
+      const f = await seedAgentRetry();
+      await db.update(heartbeatRuns).set({ status: "scheduled_retry" }).where(eq(heartbeatRuns.id, f.retryRunId));
+      const res = await press(f);
+      expect(res.status).toBe(409);
+      expect(res.body.details.code).toBe("automatic_retry_pending");
     });
 
     it("refuses a cancelled source whose Stop provenance is unknown", async () => {
@@ -1193,6 +1215,7 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
         if (change === "source-person") code = "retry_refused_different_person";
       } else if (change === "presser-stopped") {
         await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.presserRunId));
+        code = "retry_presser_not_running";
       } else if (change === "membership") {
         await db.update(companyMemberships).set({ status: "suspended" }).where(eq(companyMemberships.companyId, f.companyId));
       } else if (change === "status") {
@@ -1243,7 +1266,7 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
         details: { reason: state === "no-person" ? "retry_authority_unavailable" : "http_404" } });
     });
 
-    it("caps attempts per agent/task and counts a saved replay once", async () => {
+    it("caps attempts per task across agents and counts a saved replay once", async () => {
       const f = await seedAgentRetry();
       const key = randomUUID();
       for (let n = 0; n < 4; n++) expect((await press(f, { idempotencyKey: key })).status).toBe(202);
@@ -1255,6 +1278,138 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       const rows = await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issueId),
         eq(activityLog.action, "issue.retry_requested_by_agent")));
       expect(rows).toHaveLength(3);
+    });
+
+    it("shares the cap across agents, including refused source presses", async () => {
+      const f = await seedAgentRetry(), other = await anotherPresser(f);
+      await db.update(heartbeatRuns).set({ resultJson: { personStop: true } }).where(eq(heartbeatRuns.id, f.retryRunId));
+      expect((await press(f)).status).toBe(409);
+      expect((await press(other)).status).toBe(409);
+      expect((await press(f)).status).toBe(409);
+      expect((await press(other)).status).toBe(429);
+    });
+
+    it.each(["agent", "person"])("does not exempt another %s's saved receipt from counting", async mode => {
+      const f = await seedAgentRetry(), other = await anotherPresser(f), key = randomUUID();
+      if (mode === "agent") await receipt(f, key);
+      else await requestTaskRetry({ db, ...f, actorId: "board-user", observedRunId: f.retryRunId, idempotencyKey: key });
+      const { recordAgentTaskRetry } = await import("../services/agent-task-retry.js");
+      await recordAgentTaskRetry(db, { ...other, agentId: other.presserId, runId: other.presserRunId,
+        authorityUserId: "board-user", idempotencyKey: key });
+      const rows = await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issueId),
+        eq(activityLog.actorId, other.presserId), eq(activityLog.action, "issue.retry_requested_by_agent")));
+      expect(rows).toHaveLength(1);
+    });
+
+    it.each(["other-agent", "person-to-agent", "agent-to-person"])("binds replay mode and presser: %s", async mode => {
+      const f = await seedAgentRetry(), other = await anotherPresser(f), key = randomUUID();
+      const input = { db, ...f, actorId: "board-user", observedRunId: f.retryRunId, idempotencyKey: key };
+      await requestTaskRetry({ ...input, ...(mode === "person-to-agent" ? {} : { agentRequester: requester(f) }) });
+      await expect(requestTaskRetry({ ...input, ...(mode === "agent-to-person" ? {} : {
+        agentRequester: requester(mode === "other-agent" ? other : f) }) })).rejects.toMatchObject({
+        details: { code: "retry_refused_receipt_mismatch" } });
+    });
+
+    it.each(["saved-source-stop", "saved-person", "saved-presser-ended", "missing-intent"])("revalidates the saved receipt, not replacement input: %s", async change => {
+      const f = await seedAgentRetry(), key = randomUUID();
+      const saved = await receipt(f, key);
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, saved.requestId!));
+      if (change === "saved-source-stop") await db.update(heartbeatRuns).set({ resultJson: { personStop: true } })
+        .where(eq(heartbeatRuns.id, f.retryRunId));
+      if (change === "saved-person") await db.update(agentWakeupRequests).set({ payload: { ...wake.payload,
+        taskRetry: { ...(wake.payload!.taskRetry as object), actorId: "someone-else" } } }).where(eq(agentWakeupRequests.id, wake.id));
+      let currentRunId = f.presserRunId;
+      if (change === "saved-presser-ended") {
+        await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.presserRunId));
+        currentRunId = randomUUID();
+        await db.insert(heartbeatRuns).values({ id: currentRunId, companyId: f.companyId, agentId: f.presserId,
+          status: "running", responsibleUserId: "board-user" });
+      }
+      if (change === "missing-intent") await db.update(agentWakeupRequests).set({ payload: { issueId: f.issueId } })
+        .where(eq(agentWakeupRequests.id, wake.id));
+      const newerId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: newerId, companyId: f.companyId, agentId: f.agentId,
+        issueId: f.issueId, status: "failed", finishedAt: new Date(), responsibleUserId: "board-user" });
+      await expect(requestTaskRetry({ db, ...f, actorId: "board-user", observedRunId: newerId,
+        idempotencyKey: key, agentRequester: { ...requester(f), runId: currentRunId } })).rejects.toMatchObject({
+          details: { code: change === "saved-source-stop" ? "retry_refused_person_stop"
+            : change === "saved-presser-ended" ? "retry_presser_not_running" : "retry_refused_receipt_mismatch" } });
+    });
+
+    it("audits the saved source person when a replay supplies a different person's newer run", async () => {
+      const f = await seedAgentRetry(), key = randomUUID();
+      expect((await press(f, { idempotencyKey: key })).status).toBe(202);
+      await db.update(heartbeatRuns).set({ resultJson: { personStop: true } }).where(eq(heartbeatRuns.id, f.retryRunId));
+      const newerId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: newerId, companyId: f.companyId, agentId: f.agentId,
+        issueId: f.issueId, status: "failed", finishedAt: new Date(), responsibleUserId: "another-person" });
+      const res = await press(f, { idempotencyKey: key, observedRunId: newerId });
+      expect(res.status).toBe(409);
+      expect(res.body.details.code).toBe("retry_refused_person_stop");
+      expect(await refusal(f)).toMatchObject({ details: { authorityUserId: "board-user", reason: "retry_refused_person_stop" } });
+    });
+
+    it("checks the original person's mutation permission in locked direct-service admission", async () => {
+      const f = await seedAgentRetry();
+      await db.update(companyMemberships).set({ membershipRole: "viewer" }).where(eq(companyMemberships.companyId, f.companyId));
+      await expect(receipt(f)).rejects.toMatchObject({ details: { code: "retry_authority_denied" } });
+      expect(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
+        eq(agentWakeupRequests.reason, "task_retry")))).toHaveLength(0);
+    });
+
+    it.each(["missing", "wrong-source", "wrong-person"])("requires service-bound credential provenance: %s", async state => {
+      const f = await seedAgentRetry();
+      const agentRequester = state === "missing" ? { agentId: f.presserId, runId: f.presserRunId }
+        : { ...requester(f), ...(state === "wrong-source" ? { credentialSource: "agent_key" } : { onBehalfOfUserId: "other-person" }) };
+      await expect(requestTaskRetry({ db, ...f, actorId: "board-user", observedRunId: f.retryRunId,
+        idempotencyKey: randomUUID(), agentRequester })).rejects.toMatchObject({ details: { code: "retry_refused_unsigned_run" } });
+    });
+
+    it.each(["provenance", "scheduled"])("rechecks retained %s at dispatch", async state => {
+      const f = await seedAgentRetry(), saved = await receipt(f);
+      if (state === "provenance") {
+        const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, saved.requestId!));
+        await db.update(agentWakeupRequests).set({ payload: { ...wake.payload, taskRetry: {
+          ...(wake.payload!.taskRetry as object), agentRequester: { agentId: f.presserId, runId: f.presserRunId } } } })
+          .where(eq(agentWakeupRequests.id, wake.id));
+      } else {
+        await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, issueId: f.issueId,
+          status: "scheduled_retry", contextSnapshot: { issueId: f.issueId } });
+      }
+      stopTaskDrain();
+      await heartbeatService(db).resumeTaskRetry(f.companyId, saved.requestId!);
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, saved.requestId!));
+      expect(wake.runId).toBeNull();
+      expect(wake.payload?.executionWait).toMatchObject({ reason: state === "provenance" ? "retry_refused_unsigned_run" : "automatic_retry_pending" });
+    });
+
+    it("serializes concurrent same-key presses into one counted request", async () => {
+      const f = await seedAgentRetry(), key = randomUUID();
+      const results = await Promise.all([press(f, { idempotencyKey: key }), press(f, { idempotencyKey: key })]);
+      expect(results.map(r => r.status)).toEqual([202, 202]);
+      expect(results[0].body.requestId).toBe(results[1].body.requestId);
+      expect(await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issueId),
+        eq(activityLog.action, "issue.retry_requested_by_agent")))).toHaveLength(1);
+    });
+
+    it("counts an owned authenticated ended presser before refusing it", async () => {
+      const f = await seedAgentRetry();
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.presserRunId));
+      const res = await press(f);
+      expect(res.status).toBe(409);
+      expect(res.body.details.code).toBe("retry_presser_not_running");
+      expect(await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issueId),
+        eq(activityLog.action, "issue.retry_requested_by_agent")))).toHaveLength(1);
+    });
+
+    it("refuses a stale source with a distinct reason", async () => {
+      const f = await seedAgentRetry();
+      await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, issueId: f.issueId,
+        status: "failed", finishedAt: new Date(), responsibleUserId: "board-user" });
+      const res = await press(f);
+      expect(res.status).toBe(409);
+      expect(res.body.details.code).toBe("retry_refused_stale");
+      expect(res.body.error).toContain("current eligible attempt");
     });
 
     it("cannot reuse an old unsaved key to bypass today's cap", async () => {
@@ -1332,6 +1487,9 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       expect(page.status, JSON.stringify(page.body)).toBe(200);
       expect(page.body).toMatchObject({ responsibleUserId: "board-user",
         retryRequestedByAgent: { id: f.presserId, name: "Retry helper" } });
+      await db.update(agentWakeupRequests).set({ reason: "manual" }).where(eq(agentWakeupRequests.id, res.body.requestId));
+      expect((await request(app).get(`/api/heartbeat-runs/${f.retryRunId}`)).body.retryRequestedByAgent).toBeNull();
+      await db.update(agentWakeupRequests).set({ reason: "task_retry" }).where(eq(agentWakeupRequests.id, res.body.requestId));
       await db.update(heartbeatRuns).set({ invocationSource: "automation" }).where(eq(heartbeatRuns.id, f.retryRunId));
       expect((await request(app).get(`/api/heartbeat-runs/${f.retryRunId}`)).body.retryRequestedByAgent).toBeNull();
     });

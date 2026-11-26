@@ -7488,9 +7488,9 @@ export function agentRoutes(
     if (!(await assertRunReadAllowed(req, res, run))) return;
     const retryRequestId = run.contextSnapshot?.taskRetryRequestId;
     const [retryWake] = typeof retryRequestId === "string" && isUuidLike(retryRequestId) && run.invocationSource !== "automation"
-      ? await db.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests)
+      ? await db.select({ payload: agentWakeupRequests.payload, reason: agentWakeupRequests.reason }).from(agentWakeupRequests)
         .where(and(eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.id, retryRequestId))).limit(1) : [];
-    const requester = readTaskRetryIntent(retryWake?.payload)?.agentRequester;
+    const requester = retryWake?.reason === "task_retry" ? readTaskRetryIntent(retryWake.payload)?.agentRequester : undefined;
     const pressingAgent = requester ? await svc.getById(requester.agentId) : null;
     const retryRequestedByAgent = requester ? { id: requester.agentId,
       name: pressingAgent?.companyId === run.companyId ? pressingAgent.name : requester.agentId } : null;

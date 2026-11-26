@@ -194,7 +194,11 @@ const retryWaitMessages: Record<string, string> = {
   // A new click replaces a Retry declined for its requester's access with a
   // fresh attempt under the clicker's access, so Retry stays available.
   retry_authority_denied: "Retry could not start with the requesting user's access. Press Retry to start it with yours.",
-  retry_authority_unavailable: "Retry refused: the authenticated run's person is no longer active.",
+  retry_authority_unavailable: "Retry refused: the original person is missing or no longer active.",
+  retry_presser_not_running: "Retry refused: the pressing agent's run has ended.",
+  retry_refused_unsigned_run: "Retry refused: an authenticated run carrying the original person is required.",
+  retry_refused_run_not_owned: "Retry refused: the pressing run does not belong to this agent.",
+  automatic_retry_pending: "Retry refused: an automatic retry is already pending for this task.",
   retry_refused_different_person: "Retry refused: the pressing agent's run and the source run must carry the same person.",
   retry_refused_person_stop: "Retry refused: a person deliberately stopped or paused this work.",
   retry_refused_stop_unverified: "Retry refused: this cancelled run might have been deliberately stopped.",
