@@ -1,5 +1,6 @@
 import { useId, useState, type ReactNode } from "react";
 import { completedActivitySummary } from "./completed-activity-summary";
+import { useTaskChatStatusLine } from "./TaskChatStatusLine";
 import {
   Brain,
   ChevronDown,
@@ -253,6 +254,12 @@ function ActivityRowContent({
   taskLabel?: string;
 }) {
   const row = presentation(item, active, taskLabel);
+  const dockOwnsStatus = useTaskChatStatusLine() !== null;
+  if (row && dockOwnsStatus && item.kind === "tool" && !item.blockedReason &&
+      item.status !== "failed" && item.status !== "interrupted") {
+    row.label = row.target ? "" : toolPresentation(item).displayName;
+    row.target = row.target?.replace(/^\$ /, "");
+  }
   const shimmer = useTaskChatShimmer(item.id);
   if (!row) return null;
   const Icon = row.icon;
@@ -628,6 +635,7 @@ function FoldedActivityGroup({
   item: TaskChatActivityPhaseItem;
   defaultExpanded?: boolean;
 }) {
+  const dockOwnsStatus = useTaskChatStatusLine() !== null;
   const [expanded, setExpanded] = useTaskChatExpansion(
     item.id,
     defaultExpanded,
@@ -665,7 +673,9 @@ function FoldedActivityGroup({
           </MarkdownBody>
         </div>
       ) : null}
-      {latest ? (
+      {dockOwnsStatus ? <ol className="flex min-w-0 flex-col" aria-label="Activity history" data-testid="task-chat-runner-activity-list">
+        {activities.map((activity, index) => <ExpandedActivity key={activity.id} item={activity} active={item.active && index === activities.length - 1} />)}
+      </ol> : latest ? (
         <div className="min-w-0">
           <button
             type="button"

@@ -7,6 +7,7 @@ import { flattenSelfTalk } from "./transcript-adapter";
 import { TaskChatReasoningSummary } from "./TaskChatReasoningSummary";
 import { latestReasoningHeadline } from "./reasoning-summary";
 import { useTaskChatShimmer } from "./TaskChatShimmer";
+import { useTaskChatStatusLine } from "./TaskChatStatusLine";
 
 /** Provider-authored reasoning summaries and deltas; never reconstructed hidden reasoning. */
 export function TaskChatThinking({
@@ -28,6 +29,7 @@ export function TaskChatThinking({
 }) {
   const [open, setOpen] = useState(defaultOpen ?? false);
   const shimmer = useTaskChatShimmer(item.id);
+  const dockOwnsStatus = useTaskChatStatusLine() !== null;
   const body = item.lines.join("\n").trim();
   const preview = latestReasoningHeadline(body) ?? flattenSelfTalk(body);
   const baseLabel = item.channel === "detail" ? "Reasoning detail" : "Reasoning";
@@ -35,7 +37,7 @@ export function TaskChatThinking({
     ? body ? `${baseLabel}…` : "Thinking…"
     : item.summaryLabel ?? (body ? baseLabel : "Thought");
 
-  if (inline && body) {
+  if ((inline || dockOwnsStatus) && body) {
     return <div className="task-chat-reasoning-inline min-w-0 px-1 text-sm italic text-muted-foreground"
       data-testid="task-chat-thinking-inline" data-conversation-text="reasoning">
       <MarkdownBody className="task-chat-reasoning-markdown" softBreaks linkIssueReferences>{body}</MarkdownBody>
@@ -67,6 +69,7 @@ export function TaskChatThinking({
   }
 
   if (!body) {
+    if (dockOwnsStatus) return null;
     return (
       <div className={cn("-mx-1.5 flex min-w-0 items-center gap-2 px-1.5 py-0.5 text-xs font-normal text-muted-foreground", rowClassName)} data-testid="task-chat-thinking">
         <span className="flex w-5 shrink-0 items-center justify-center">

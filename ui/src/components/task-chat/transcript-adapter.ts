@@ -973,9 +973,7 @@ export function transcriptToTaskChatItems(
           if (existing.kind === "tool") {
             existing.status = entry.delta
               ? "in_progress"
-              : entry.isError
-                ? "failed"
-                : "completed";
+              : entry.toolOutcome ?? (entry.isError ? "failed" : "completed");
             if (
               isGenericToolName(existing.rawName) &&
               !isGenericToolName(entry.toolName)

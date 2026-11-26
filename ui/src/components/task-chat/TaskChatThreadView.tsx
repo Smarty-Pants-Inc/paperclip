@@ -30,7 +30,7 @@ import { TaskMessageScroller, type ScrollingHistory } from "./TaskMessageScrolle
 import { TaskChatProtocolCard } from "./TaskChatProtocolCard";
 import { TaskChatProtocolActivityRow } from "./TaskChatProtocolActivityRow";
 import { TaskChatPlanPreviewCard } from "./TaskChatPlanPreviewCard";
-import { compactAdjacentErrors, isRetryableFailureMarker } from "./adjacent-errors";
+import { isRetryableFailureMarker } from "./adjacent-errors";
 import { CoordinatorChatTaskHandoff } from "@/components/coordinator/CoordinatorChatTaskHandoffs";
 import { CoordinatorChatDecisionReceipt } from "@/components/coordinator/CoordinatorChatDecisionReceipts";
 import { CoordinatorChatPendingQuestion } from "@/components/coordinator/CoordinatorChatPendingQuestions";
@@ -345,15 +345,14 @@ export function TaskChatThreadView({
   onOpenBrowser,
 }: TaskChatThreadViewProps) {
   const streamlined = useStreamlinedTaskChatPresentation();
-  const { items: compactedItems, retryMarkers } = useMemo(() => compactAdjacentErrors(items), [items]);
-  const visibleItems = useMemo(() => groupImageResources(compactedItems), [compactedItems]);
+  const visibleItems = useMemo(() => groupImageResources(items), [items]);
   const retryableMarkerId =
     onRetryFailedRun || onTryAgainNoLiveExecutionPath
       ? [...visibleItems]
           .reverse()
           .find(
             (item) => {
-              const marker = item.kind === "marker" ? item : retryMarkers.get(item.id);
+              const marker = item.kind === "marker" ? item : undefined;
               return !!marker && isRetryableFailureMarker(marker);
             },
           )?.id
@@ -361,10 +360,9 @@ export function TaskChatThreadView({
   // Streaming tail and header updates must not rebuild settled markdown/tool trees.
   const history = useMemo(() => {
     const renderVisibleItem = (item: TaskChatItem) => {
-      if (executionNotice?.itemId === item.id) return executionNotice.content;
       const turn = item.kind === "turn" ? renderTurn?.(item) : undefined;
       if (turn !== undefined) return turn;
-      const marker = item.id === retryableMarkerId ? retryMarkers.get(item.id) : undefined;
+      const marker = item.id === retryableMarkerId && item.kind === "marker" ? item : undefined;
       const runId = marker?.retryable !== false ? marker?.runId : undefined;
       const runRetry = !onTryAgainNoLiveExecutionPath && onRetryFailedRun && runId
         ? () => onRetryFailedRun(runId)
@@ -428,7 +426,7 @@ export function TaskChatThreadView({
       </>
     );
   }, [
-    visibleItems, retryMarkers, streamlined, onApprovalDecision, onRuntimeRequestDecision,
+    visibleItems, streamlined, onApprovalDecision, onRuntimeRequestDecision,
     renderInteraction, renderBrief, renderMessageActions, renderQueuedAction, renderTurn, executionNotice,
     onTryAgainNoLiveExecutionPath, tryAgainNoLiveExecutionPathPending,
     retryableMarkerId, onRetryFailedRun, retryFailedRunId, attachments, onOpenSkill, onOpenBrowser,

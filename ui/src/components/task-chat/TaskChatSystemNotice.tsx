@@ -5,6 +5,7 @@ import { useId, useState, type ReactNode } from "react";
 import { useProviderLimitMessage } from "@/hooks/useProviderLimitMessage";
 import {
   ChevronDown,
+  CircleAlert,
   CircleCheck,
   Info,
   OctagonAlert,
@@ -24,6 +25,7 @@ import { mapCommentMetadataToSystemNoticeSections } from "@/lib/system-notice-co
 import { timeAgo } from "@/lib/timeAgo";
 import type { TaskChatMessageItem } from "./task-chat-model";
 import { isNoLiveExecutionPathNotice } from "./adjacent-errors";
+import { useTaskChatStatusLine } from "./TaskChatStatusLine";
 
 const TONE_ICON: Record<SystemNoticeTone, LucideIcon> = {
   neutral: Info,
@@ -53,11 +55,17 @@ const TONE_ICON_CLASS: Record<SystemNoticeTone, string> = {
 export function TaskChatSystemNotice({
   item,
   actions,
+  reason,
+  failure = false,
   onTryAgainNoLiveExecutionPath,
   tryAgainNoLiveExecutionPathPending = false,
 }: {
   item: TaskChatMessageItem;
   actions?: ReactNode;
+  /** Optional F1b copy shared with the preceding stock fallback, avoiding reflow. */
+  reason?: string;
+  /** Explicit attempt receipt, not inferred from a diagnostic's danger tone. */
+  failure?: boolean;
   onTryAgainNoLiveExecutionPath?: () => Promise<void> | void;
   tryAgainNoLiveExecutionPathPending?: boolean;
 }) {
@@ -65,6 +73,7 @@ export function TaskChatSystemNotice({
   const branchRecovery = useWorkspaceBaseRefRecovery(item.metadata);
   const workspaceRetry = useWorkspaceRetry(item.metadata);
   const streamlined = useStreamlinedTaskChatPresentation();
+  const dockOwnsStatus = useTaskChatStatusLine() !== null;
   const [open, setOpen] = useState(Boolean(item.presentation?.detailsDefaultOpen));
   const detailsId = useId();
   const body = useProviderLimitMessage(item.text);
@@ -83,7 +92,7 @@ export function TaskChatSystemNotice({
   const ToneIcon = TONE_ICON[tone];
   const relative = item.createdAtIso ? timeAgo(item.createdAtIso) : undefined;
   const showTryAgain =
-    Boolean(onTryAgainNoLiveExecutionPath) &&
+    !dockOwnsStatus && !actions && Boolean(onTryAgainNoLiveExecutionPath) &&
     isNoLiveExecutionPathNotice(item);
   const handleTryAgain = () => {
     void Promise.resolve()
@@ -92,12 +101,31 @@ export function TaskChatSystemNotice({
       .catch(() => undefined);
   };
 
-  if (item.author === "system" && workspaceRetry) return null;
-  if (item.author === "system" && branchRecovery) return <WorkspaceBaseRefRecoveryNotice key={`${branchRecovery.actionId}:${branchRecovery.runId}`} {...branchRecovery.props} />;
+  if (item.author === "system" && workspaceRetry && !(dockOwnsStatus && failure)) return null;
+  if (item.author === "system" && branchRecovery && !(dockOwnsStatus && failure)) return <WorkspaceBaseRefRecoveryNotice key={`${branchRecovery.actionId}:${branchRecovery.runId}`} {...branchRecovery.props} />;
 
-  if (item.author === "system" && recoverySnapshot) {
+  if (item.author === "system" && recoverySnapshot && !(dockOwnsStatus && failure)) {
     return <DispositionRecoveryNotice snapshot={recoverySnapshot} createdAt={item.createdAtIso} defaultExpanded={item.presentation?.detailsDefaultOpen} />;
   }
+
+  if (dockOwnsStatus && failure) return <div className="flex items-start gap-2 px-1 py-1 text-sm text-muted-foreground" data-testid="task-chat-failure-reason">
+    <CircleAlert className="mt-0.5 size-3.5 shrink-0 text-destructive" aria-hidden />
+    <div className="min-w-0 flex-1">
+      {reason ? <p className="break-words">{reason}</p> : <MarkdownBody softBreaks linkIssueReferences>{body}</MarkdownBody>}
+      <details className="mt-1 text-xs">
+        <summary className="w-fit cursor-pointer rounded-sm focus-visible:outline-2">Details</summary>
+        {/* Keep this disclosure's slot before run links hydrate. The readable
+            reason is inspectable; late diagnostics only fill the closed pane.
+            Do not reprint a stock machine-code fallback under Details. */}
+        {!actions && !sections.length && !branchRecovery && !recoverySnapshot
+          ? <MarkdownBody softBreaks linkIssueReferences>{reason ?? body}</MarkdownBody> : null}
+        {sections.length ? <SystemNoticeMetadataSections sections={sections} tone={tone} /> : null}
+        {branchRecovery ? <WorkspaceBaseRefRecoveryNotice {...branchRecovery.props} /> : null}
+        {recoverySnapshot ? <DispositionRecoveryNotice snapshot={recoverySnapshot} createdAt={item.createdAtIso} /> : null}
+        {actions ? <div className="flex flex-wrap gap-3 py-2">{actions}</div> : null}
+      </details>
+    </div>
+  </div>;
 
   return (
     <div

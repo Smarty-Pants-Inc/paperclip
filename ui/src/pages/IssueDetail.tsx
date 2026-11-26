@@ -32,7 +32,7 @@ import { AgentIdentity } from "@/components/AgentIdentity";
 import { clearLegacyChatMessageRequests } from "@/lib/chat-message-request";
 import { agentChatDraft } from "@/lib/agent-chat-draft";
 import { trackRecentProject } from "@/lib/recent-projects";
-import { ExecutionBlockerNotice, isConversationRecovery } from "../components/ExecutionBlockerNotice";
+import { ExecutionBlockerNotice, nativeFailureNoticeRunId } from "../components/ExecutionBlockerNotice";
 import { WorkspaceReconstructionRecovery } from "../components/WorkspaceReconstructionRecovery";
 import type { TaskComposerPause } from "../components/task-chat/TaskChatPausedTakeover";
 import { TaskDetailTasksPanel } from "@/components/task-detail/TaskDetailTasksPanel";
@@ -1242,7 +1242,8 @@ function InboxMobileToolbar({
 }
 
 type IssueDetailChatTabProps = {
-  onFailureNoticeChange?: (runId: string | null) => void;
+  recoveryControls?: ReactNode;
+  retryError?: Error | null;
   queuedMessageAutoSteerDelayMs?: number | null;
   executionBlocked?: boolean;
   interruption?: Issue["interruption"];
@@ -1363,6 +1364,7 @@ type IssueDetailChatTabProps = {
   onDeleteComment?: (commentId: string) => Promise<void> | void;
   onPauseWorkRun?: (runId: string, feedback?: "composer") => Promise<void>;
   onStopResponse?: (runId: string) => Promise<void>;
+  onStopPendingSubmission?: (clientRequestId: string) => Promise<void>;
   onRestoreStoppedMessages?: (commentIds: readonly string[], availableComments?: readonly IssueDetailComment[]) => Promise<boolean>;
   restoredStoppedCommentIds: ReadonlySet<string>;
   onRestoreReady?: () => void;
@@ -1502,6 +1504,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   onDeleteComment,
   onPauseWorkRun,
   onStopResponse,
+  onStopPendingSubmission,
   onRestoreStoppedMessages,
   restoredStoppedCommentIds,
   onRestoreReady,
@@ -1527,7 +1530,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   resumeAssigneePending,
   onTryAgainNoLiveExecutionPath,
   tryAgainNoLiveExecutionPathPending,
-  onFailureNoticeChange,
+  recoveryControls,
+  retryError,
   externalReferences,
   linkCaseReferences,
 }: IssueDetailChatTabProps) {
@@ -1690,7 +1694,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     placeholderData: historyExpanded ? queryClient.getQueryData<RecentIssueRunWindow>([...queryKeys.issues.runs(issueQueryRef), "recent-window"])?.runs : undefined,
   });
   const observedRunIds = useMemo(() => [...new Set([
-    ...comments.flatMap(comment => [comment.createdByRunId, comment.derivedCreatedByRunId]),
+    ...comments.flatMap(comment => [comment.createdByRunId, comment.derivedCreatedByRunId, nativeFailureNoticeRunId(comment)]),
     ...(inputFacts.data ?? []).flatMap(event => [event.runId, event.details?.targetRunId]),
   ].filter((id): id is string => typeof id === "string" && isUuidLike(id)))].sort(), [comments, inputFacts.data]);
   const commentRuns = useIssueIdBatches(
@@ -2733,7 +2737,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             queuedMessageAutoSteerDelayMs={queuedMessageAutoSteerDelayMs}
             {...(!classicTaskInterfaceEnabled ? {
               compactHistory: !historyExpanded,
-              onFailureNoticeChange,
+              recoveryControls,
+              retryError,
               onExpandHistory: conversationMode ? undefined : onExpandHistory,
               scrollingHistory,
               historyControl: conversationMode ? null : !historyExpanded && (hasEarlierMessages || hasEarlierRuns) ? (
@@ -2784,6 +2789,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             }}
             composerRef={composerRef}
             onRestoreStoppedMessages={restoreVisibleStoppedMessages}
+            onStopPendingSubmission={onStopPendingSubmission}
             composerAccessory={<><WorkspaceRetryControl />{composerAccessory}</>}
             threadHeader={
               !classicTaskInterfaceEnabled &&
@@ -3443,6 +3449,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   const commentComposerRef = useRef<IssueChatComposerHandle | null>(null);
   const cancelledQueuedOptimisticCommentIdsRef = useRef(new Set<string>());
   const commentRenderKeys = useRef(new Map<string, string>());
+  const acceptedSendReceipt = useRef<IssueComment | null>(null);
   const commentSubmissionTimes = useRef(new Map<string, Date>());
   const resolvedIssueDetailState = useMemo(
     () =>
@@ -3777,7 +3784,6 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     ? shouldTrackIssueActiveRun(issue) && hasActiveRun
     : hasActiveRun;
   const hasLiveRuns = liveRunCount > 0 || resolvedHasActiveRun;
-  const [failureNoticeRunId, setFailureNoticeRunId] = useState<string | null>(null);
   const interruptionRunId = issue?.executionBlocker?.workspaceRepairRequired
     ? issue.executionBlocker.runId ?? issue.interruption?.observedRunId
     : issue?.interruption?.observedRunId;
@@ -3935,7 +3941,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     recordRecentTask(loadedIssue, currentUserId, recentTaskVisit.current === visit ? undefined : Date.now());
     recentTaskVisit.current = visit;
   }, [loadedIssue, currentUserId, sessionResolved, streamlinedUiEnabled, coordinatorWorkspaceEnabled, conversation]);
-  const { data: boardAccess } = useQuery({
+  const { data: boardAccess, isPending: boardAccessPending, isError: boardAccessError } = useQuery({
     queryKey: queryKeys.access.currentBoardAccess,
     queryFn: () => accessApi.getCurrentBoardAccess(),
     enabled: !!session?.user?.id,
@@ -5344,6 +5350,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       };
     },
     onSuccess: async (comment, _variables, context) => {
+      acceptedSendReceipt.current = comment;
       // A return can beat the POST response. It must not resurrect the bubble.
       if (restoredStoppedCommentIdsRef.current.has(`${comment.issueId}:${comment.id}`)) {
         setOptimisticComments(current => current.filter(entry => entry.clientId !== context?.optimisticCommentId));
@@ -5395,6 +5402,11 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         commentRenderKeys.current.set(comment.id, context.optimisticCommentId);
       }
       retainComment(comment);
+      // Read admission at the Send receipt, not the delayed history refresh.
+      // The composer can expose the real Stop door as soon as the run exists.
+      for (const queryKey of [queryKeys.issues.activeRun(comment.issueId), queryKeys.issues.liveRuns(comment.issueId), queryKeys.issues.runs(comment.issueId)]) {
+        void queryClient.invalidateQueries({ queryKey });
+      }
       queryClient.setQueryData<InfiniteData<IssueComment[], string | null>>(
         queryKeys.issues.comments(issueId ?? comment.issueId),
         (current) =>
@@ -5782,6 +5794,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     },
     onSuccess: async (result, _variables, context) => {
       const { comment, ...nextIssue } = result;
+      if (comment) acceptedSendReceipt.current = comment;
       queryClient.setQueryData(queryKeys.issues.detail(issueId!), nextIssue);
       if (comment && restoredStoppedCommentIdsRef.current.has(`${comment.issueId}:${comment.id}`)) {
         setOptimisticComments(current => current.filter(entry => entry.clientId !== context?.optimisticCommentId));
@@ -7226,6 +7239,43 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     },
     [addComment, addCommentAndReassign, issue?.conversationAgentId],
   );
+  const stopPendingSubmission = async (clientRequestId: string) => {
+    const targetIssueId = issue?.id ?? issueId;
+    if (!targetIssueId) throw new Error("The task is still opening. Try Stop again.");
+    const receipt = acceptedSendReceipt.current?.clientRequestId === clientRequestId && acceptedSendReceipt.current.issueId === targetIssueId
+      ? acceptedSendReceipt.current
+      : (await issuesApi.listComments(targetIssueId, { order: "desc", limit: 50 })).find(comment => comment.clientRequestId === clientRequestId);
+    if (!receipt || receipt.authorUserId !== currentUserId) throw new Error("The saved message could not be confirmed. Refresh and try Stop again.");
+    const stopAdmittedRun = async () => {
+      // Resolve this request, not the newest run on the task. Read admission
+      // directly; delayed query invalidation is not the Stop door.
+      const runs = await activityApi.recentRunsForIssue(targetIssueId);
+      const run = runs.find(run => run.wakeCommentId === receipt.id || run.contextCommentId === receipt.id ||
+        run.wakeCommentIds?.includes(receipt.id) || run.firstTurnCommentIds?.includes(receipt.id));
+      if (!run) return false;
+      if (run.status === "running" || run.status === "queued") await stopResponse.mutateAsync(run.runId);
+      return true;
+    };
+    try {
+      if (await stopAdmittedRun()) return;
+      try {
+        const returned = await issuesApi.cancelComment(targetIssueId, receipt.id);
+        // Reuse the ordinary queued-return custody door; a failed draft write
+        // leaves the saved text visible instead of claiming it was restored.
+        const restored = restoreCancelledComment(returned);
+        if (restored) await removeCommentFromCache(returned.id);
+        else await upsertCommentInCache(returned);
+      } catch (error) {
+        // Admission may cross the queue cancellation. Resolve once more, never
+        // retry cancellation in a loop or substitute an unrelated active run.
+        if (!(error instanceof ApiError && error.status === 409) || !await stopAdmittedRun()) throw error;
+      }
+    } finally {
+      invalidateIssueRunState();
+      invalidateIssueDetail();
+      invalidateIssueThreadLazily();
+    }
+  };
   const handleCommentImageUpload = useCallback(
     async (file: File) => {
       const attachment = await uploadAttachment.mutateAsync(file);
@@ -8518,12 +8568,11 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
             <WorkspaceExportRecovery key={`workspace-export:${issue.activeRecoveryAction?.id ?? issue.id}`}
               className={shellSectionClass}
               issueId={issue.id} companyId={issue.companyId}
-              showStatus={!issue.interruption && !issue.executionBlocker?.workspaceRecovery}
+              showStatus={!taskChatShellEnabled && !issue.interruption && !issue.executionBlocker?.workspaceRecovery}
               onRecoveryControlChange={setRetainedRecoveryOwnsRetry}
               action={issue.activeRecoveryAction ?? null} />
           )}
-          {resolvedDetailTab === "chat" && !(failureNoticeRunId && failureNoticeRunId === interruptionRunId &&
-            issue.interruption?.state === "failed" && isConversationRecovery(issue.interruption, interruptionRun?.status)) && (
+          {resolvedDetailTab === "chat" && !taskChatShellEnabled && (
             <ExecutionBlockerNotice className={shellSectionClass} presentation={issue.interruption} blockers={issue.blockedBy} conversationMode={!!issue.conversationAgentId}
               observedStatus={interruptionRun?.status} observedResultJson={interruptionRun?.resultJson} observedErrorCode={interruptionRun?.errorCode}
               blocker={retainedRecoveryOwnsRetry ? null : issue.executionBlocker}
@@ -8848,7 +8897,10 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                     void queryClient.invalidateQueries({ queryKey: queryKeys.issues.runs(issueId!) });
                   }} />
                 <IssueDetailChatTab
-                  onFailureNoticeChange={setFailureNoticeRunId}
+                  retryError={taskRetry.error}
+                  recoveryControls={issue.interruption?.projectAccess || ["confirm_run_stopped", "confirm_owner_stop"].includes(issue.interruption?.userAction ?? "") ?
+                    <ExecutionBlockerNotice presentation={issue.interruption} blockers={issue.blockedBy} issueId={issue.id} companyId={issue.companyId}
+                      canRetry={canResolveBoardRecoveryAction} onRetry={taskRetry.retry} optimistic={taskRetry.optimistic} /> : null}
                   queuedMessageAutoSteerDelayMs={instanceExperimentalSettings?.enableQueuedMessageSteerCountdown === true ? QUEUED_MESSAGE_AUTO_STEER_DELAY_MS : 0}
                   executionBlocked={Boolean(issue.executionBlocker)}
                   interruption={issue.interruption}
@@ -9026,7 +9078,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                     } : undefined,
                     resumeHref: !activePauseHold.isRoot ? createIssueDetailPath(activePauseHoldRoot?.identifier ?? activePauseHold.rootIssueId) : undefined,
                   } : null}
-                  composerDisabledReason={issue.conversationAgentId && !instanceExperimentalSettings?.enableAgentChat ? "Agent Chat is disabled in Experimental settings." : treeControlStateError ? "Couldn’t check whether this task is paused. Refresh to try again." : null}
+                  composerDisabledReason={boardAccessPending ? "Checking message controls…" : boardAccessError ? "Couldn’t check message controls. Reload to try again." : issue.conversationAgentId && !instanceExperimentalSettings?.enableAgentChat ? "Agent Chat is disabled in Experimental settings." : treeControlStateError ? "Couldn’t check whether this task is paused. Refresh to try again." : null}
                   composerHint={composerHint}
                   queuedCommentReason={queuedCommentReason}
                   onVote={handleCommentVote}
@@ -9047,6 +9099,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                     ? (runId) => stopResponse.mutateAsync(runId)
                     : undefined}
                   stopResponsePending={stopResponse.isPending}
+                  onStopPendingSubmission={canManageTreeControl ? stopPendingSubmission : undefined}
                   pauseWorkPending={
                     executeTreeControl.isPending &&
                     executeTreeControl.variables?.mode === "pause"
@@ -9108,7 +9161,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                   }
                   resumeAssigneePending={resumeAssigneeAgent.isPending}
                   onTryAgainNoLiveExecutionPath={
-                    canResolveBoardRecoveryAction && issue.interruption?.unansweredCommentId && issue.interruption.canRetry
+                    canResolveBoardRecoveryAction && issue.interruption?.canRetry
                       ? taskRetry.retry
                       : issue.status === "blocked" && !issue.interruption && issue.activeRecoveryAction
                         ? handleTryAgainNoLiveExecutionPath

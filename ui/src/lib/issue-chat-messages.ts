@@ -47,6 +47,8 @@ export interface IssueChatComment extends IssueComment {
 }
 
 export interface IssueChatLinkedRun {
+  /** Optional public copy projected by the server for this saved attempt. */
+  failure?: { code: string; title: string; detail: string } | null;
   retryOfRunId?: string | null;
   execution?: ExecutionProjection | null;
   runId: string;
