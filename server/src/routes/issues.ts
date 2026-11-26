@@ -10134,6 +10134,11 @@ export function issueRoutes(
     if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
     if (agentRetry) {
       if (issue.conversationAgentId) throw forbidden("Only the conversation owner can retry a chat run");
+      // A connected chat (Slack, GitHub, other channels) is a person's conversation too.
+      const [chatBinding] = issue.originKind === "chat_channel" ? [{ id: issue.id }] : await db
+        .select({ id: chatConversations.id }).from(chatConversations)
+        .where(and(eq(chatConversations.companyId, issue.companyId), eq(chatConversations.issueId, issue.id))).limit(1);
+      if (chatBinding) throw forbidden("Only a person can retry a chat run");
       const { recordAgentTaskRetry } = await import("../services/agent-task-retry.js");
       await recordAgentTaskRetry(db, { issueId: issue.id, ...agentRetry, grantedByUserId: req.actor.userId!,
         idempotencyKey: req.body.idempotencyKey });
