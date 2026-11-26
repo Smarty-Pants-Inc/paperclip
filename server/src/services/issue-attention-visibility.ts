@@ -96,7 +96,11 @@ export function issueAttentionVisibilityService(db: Db) {
       return {
         ...row,
         ...(blocker ? { blockerAttention: {
-          ...blocker,
+          // Explicit allow-lists: new attention fields must not become visible by default.
+          state: blocker.state, reason: blocker.reason,
+          unresolvedBlockerCount: blocker.unresolvedBlockerCount, coveredBlockerCount: blocker.coveredBlockerCount,
+          stalledBlockerCount: blocker.stalledBlockerCount, attentionBlockerCount: blocker.attentionBlockerCount,
+          ...(blocker.blockingTreeLive !== undefined ? { blockingTreeLive: blocker.blockingTreeLive } : {}),
           terminalBlocker: terminal ? { id: terminal.id, identifier: terminal.identifier, title: terminal.title } : null,
           directBlockerIssueId: allowedId(blocker.directBlockerIssueId)?.id ?? null,
           terminalBlockerIssueId: allowedId(blocker.terminalBlockerIssueId)?.id ?? null,
@@ -105,17 +109,29 @@ export function issueAttentionVisibilityService(db: Db) {
           } : {}),
           sampleBlockerIdentifier: allowedSample(blocker.sampleBlockerIdentifier),
           sampleStalledBlockerIdentifier: allowedSample(blocker.sampleStalledBlockerIdentifier),
-        } } : {}),
+        } satisfies IssueBlockerAttention } : {}),
         ...(inbox ? { blockedInboxAttention: {
-          ...inbox,
+          kind: inbox.kind, state: inbox.state, reason: inbox.reason, severity: inbox.severity,
           sourceIssue: projectRef(inbox.sourceIssue),
           leafIssue: projectRef(inbox.leafIssue),
           recoveryIssue: projectRef(inbox.recoveryIssue),
           sampleIssueIdentifier: allowedSample(inbox.sampleIssueIdentifier),
-          owner: provenanceVisible ? { ...inbox.owner } : { type: "unknown" as const, agentId: null, userId: null, label: null },
-          action: { ...inbox.action, detail: provenanceVisible ? inbox.action.detail : null },
+          owner: {
+            type: provenanceVisible ? inbox.owner.type : "unknown",
+            agentId: provenanceVisible ? inbox.owner.agentId : null,
+            userId: provenanceVisible ? inbox.owner.userId : null,
+            label: provenanceVisible ? inbox.owner.label : null,
+          },
+          // issues.ts builds labels from fixed literals; only detail may contain task text.
+          action: { label: inbox.action.label, detail: provenanceVisible ? inbox.action.detail : null },
           stoppedSinceAt: provenanceVisible ? inbox.stoppedSinceAt : null,
-        } } : {}),
+          approvalId: provenanceVisible ? inbox.approvalId : null,
+          interactionId: provenanceVisible ? inbox.interactionId : null,
+          redaction: {
+            externalDetailsRedacted: inbox.redaction.externalDetailsRedacted,
+            secretFieldsOmitted: inbox.redaction.secretFieldsOmitted,
+          },
+        } satisfies IssueBlockedInboxAttention } : {}),
       };
     });
   }

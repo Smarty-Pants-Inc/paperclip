@@ -617,6 +617,31 @@ describeEmbeddedPostgres("issue access grant and locked edge routes", { concurre
     } finally { factorySpy.mockRestore(); batchSpy.mockRestore(); }
   });
 
+  it("hides approval and interaction handles on a readable root with a hidden leaf and drops unlisted fields", async () => {
+    // Keep reason: never-OK private task handles and future-field disclosure.
+    const f = await attentionFixture(), approvalId = randomUUID(), interactionId = randomUUID();
+    const { issueService } = await import("../services/issues.js");
+    const { issueAttentionVisibilityService } = await import("../services/issue-attention-visibility.js");
+    const blocker = (await issueService(db).listBlockerAttention(f.companyId, [{ ...f.openIssue, status: "blocked" }])).get(f.openIssue.id)!;
+    const ref = (id: string, identifier: string, title: string) => ({ id, identifier, title, status: "blocked" as const, priority: "medium" as const, assigneeAgentId: null, assigneeUserId: null });
+    const inbox = { kind: "blocked" as const, state: "awaiting_decision" as const, reason: "pending_board_decision" as const, severity: "medium" as const,
+      sourceIssue: ref(f.openIssue.id, "PRV-2", "Open issue"), leafIssue: { ...ref(f.privateIssueId, "PRV-1", "Confidential root"), status: "backlog" as const }, recoveryIssue: null,
+      owner: { type: "board" as const, agentId: null, userId: null, label: "Board" }, action: { label: "Decide approval", detail: "Private decision detail" },
+      stoppedSinceAt: "2026-11-01", approvalId, interactionId, sampleIssueIdentifier: "PRV-1", redaction: { externalDetailsRedacted: false, secretFieldsOmitted: true as const } };
+    const extra = { unlisted: "UNLISTED_PRIVATE_FIELD" };
+    const rows = [{ id: f.openIssue.id, blockerAttention: { ...blocker, ...extra }, blockedInboxAttention: { ...inbox, ...extra,
+      owner: { ...inbox.owner, ...extra }, action: { ...inbox.action, ...extra }, redaction: { ...inbox.redaction, ...extra } } }];
+    const before = JSON.stringify(rows), redactor = issueAttentionVisibilityService(db);
+    const [restricted] = await redactor.redactRows(boardActor(f.companyId, f.memberId), f.companyId, rows);
+    expect(restricted!.blockedInboxAttention).toMatchObject({ sourceIssue: { id: f.openIssue.id }, leafIssue: null, approvalId: null, interactionId: null,
+      state: inbox.state, reason: inbox.reason, severity: inbox.severity, action: { label: "Decide approval", detail: null } });
+    const [full] = await redactor.redactRows(boardActor(f.companyId, f.ownerId), f.companyId, rows);
+    expect(full!.blockedInboxAttention).toEqual(inbox);
+    expect(full!.blockerAttention).toEqual(blocker);
+    expect(JSON.stringify([restricted, full])).not.toContain(extra.unlisted);
+    expect(JSON.stringify(rows)).toBe(before);
+  });
+
   it("returns exact locked stubs only through visible blocker and mention edges", async () => {
     const fixture = await seedFixture();
     const visibleIssue = await db.insert(issues).values({
