@@ -185,8 +185,9 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
   const historicalInputs: SessionMetadataInput[] = [];
   if (storedFingerprintDiffers && agent.adapterType === "paperclip_runner" && continuousPi) {
     const previousCompositions = [
-      { retainAdapterConfigEnvironment: true },
-      { continuousPiFingerprintComposition: "issue_overrides" as const, retainAdapterConfigEnvironment: true },
+      { retainSkillKeys: true },
+      { retainAdapterConfigEnvironment: true, retainSkillKeys: true },
+      { continuousPiFingerprintComposition: "issue_overrides" as const, retainAdapterConfigEnvironment: true, retainSkillKeys: true },
       { continuousPiFingerprintComposition: "model_inputs" as const },
     ];
     // Category compatibility uses only old shapes of the current inputs, never
@@ -225,11 +226,11 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
       acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision && !agentIdentity,
   });
   // Adapter config exemptions are per-key in the fingerprint, never per-category.
-  // Only instruction content and environment changes may advance here;
+  // Only instruction content, environment and skill-list changes may advance here;
   // missing/versioned metadata and mixed changes still require stock reset.
   const continuableConfigChange = continuousPi && sessionConfigFreshness.changedCategories.length > 0 &&
     sessionConfigFreshness.changedCategories.every(category =>
-      ["instructions", "environment", "envBindings"].includes(category));
+      ["instructions", "environment", "envBindings", "runtimeSkills"].includes(category));
   let resetTaskSession =
     context.workspaceSelectionChanged === true || shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
   if (decideNativeContinuation({

@@ -1655,11 +1655,11 @@ describe("rebindNativeSessionCheckpoint", () => {
     if (key === "skills") current.runtimeContext.skills.push({ key: "fixture-skill", runtimeName: "fixture-skill", versionId: "next", bundle: structuredClone(current.runtimeContext.instructions.bundle) });
     current.runtimeContext.aggregateDigest = canonicalNativeRuntimeContextDigest(current.runtimeContext);
     const rebound = rebindNativeSessionCheckpoint({ previousRun: source, currentExecution: current, sessionContinuity: "continuous" });
-    if (key === "instructions") expect(rebound).toMatchObject({ sessionId: "provider-thread-123", workingDirectory: "/workspace-next" });
+    if (key === "instructions" || key === "skills") expect(rebound).toMatchObject({ sessionId: "provider-thread-123", workingDirectory: "/workspace-next" });
     else expect(rebound).toBeNull();
   });
 
-  it.each(["instructions", "prompt", "promptDigest", "mcp", "skills", "connectionInstructions", "aggregateDigest", "instructions-and-mcp"])("limits changed Pi runtime context (%s) to instruction and pack prompt continuity", key => {
+  it.each(["instructions", "prompt", "promptDigest", "mcp", "skills", "connectionInstructions", "aggregateDigest", "instructions-and-mcp"])("limits changed Pi runtime context (%s) to instruction, pack prompt and skill continuity", key => {
     const prior = execution(previousRunId), current = execution(currentRunId);
     for (const sessionContinuity of [undefined, "continuous", "paperclip"] as const) {
       for (const value of [prior, current]) {
@@ -1676,12 +1676,49 @@ describe("rebindNativeSessionCheckpoint", () => {
       if (key === "connectionInstructions") current.runtimeContext.connectionInstructions = { text: "Changed account policy", digest: "e".repeat(64) };
       current.runtimeContext.aggregateDigest = key === "aggregateDigest" ? "c".repeat(64) : canonicalNativeRuntimeContextDigest(current.runtimeContext);
       const result = buildNativeExecutionWithCheckpoint({ previousRun: source, normalizedSessionId, buildExecution: () => current });
-      const retain = sessionContinuity !== "paperclip" && (key === "instructions" || key === "prompt" || key === "promptDigest");
+      const retain = sessionContinuity !== "paperclip" && (key === "instructions" || key === "prompt" || key === "promptDigest" || key === "skills");
       expect(result.normalizedSessionId === normalizedSessionId).toBe(retain);
       expect(!!result.checkpoint).toBe(retain);
       const wrongOwner = structuredClone(current);
       wrongOwner.binding.agentId = randomUUID();
       expect(rebindNativeSessionCheckpoint({ previousRun: source, currentExecution: wrongOwner })).toBeNull();
+    }
+  });
+
+  it.each([
+    { provider: "pi_rpc", sessionContinuity: "continuous", retain: true },
+    { provider: "pi_rpc", sessionContinuity: undefined, retain: true },
+    { provider: "pi_rpc", sessionContinuity: "paperclip", retain: false },
+    { provider: "codex", sessionContinuity: "continuous", retain: false },
+  ] as const)("rebinds a changed skill version without silently rotating $provider/$sessionContinuity: $retain", ({ provider, sessionContinuity, retain }) => {
+    const prior = execution(previousRunId), current = execution(currentRunId);
+    for (const value of [prior, current]) {
+      value.provider = provider === "pi_rpc"
+        ? { kind: "pi_rpc", model: "provider/model", ...(sessionContinuity ? { sessionContinuity } : {}) }
+        : { kind: "codex", model: "provider/model", approvalPolicy: "never" };
+      value.session.driverKind = provider === "pi_rpc" ? "pi_rpc" : "codex_app_server";
+      value.runtimeContext.skills.push({ key: "shared-company-skill", runtimeName: "shared-company-skill", versionId: "version-one",
+        bundle: structuredClone(value.runtimeContext.instructions.bundle) });
+      value.runtimeContext.aggregateDigest = canonicalNativeRuntimeContextDigest(value.runtimeContext);
+    }
+    current.runtimeContext.skills[0]!.versionId = "version-two";
+    current.runtimeContext.aggregateDigest = canonicalNativeRuntimeContextDigest(current.runtimeContext);
+    expect(current.runtimeContext.aggregateDigest).not.toBe(prior.runtimeContext.aggregateDigest);
+    const source = previousRun({ nativeExecutionInput: prior });
+    source.runnerProfileJson.sessionCheckpoint.driverKind = prior.session.driverKind;
+    const checkpoint = rebindNativeSessionCheckpoint({ previousRun: source, currentExecution: current, sessionContinuity });
+    if (retain) expect(checkpoint).toMatchObject({ sessionId: "provider-thread-123", providerSessionId: "provider-thread-123", identity: { sessionId: normalizedSessionId } });
+    else expect(checkpoint).toBeNull();
+    const result = buildNativeExecutionWithCheckpoint({ previousRun: source, normalizedSessionId, sessionContinuity,
+      buildExecution: ({ normalizedSessionId: id }) => ({ ...current, session: { ...current.session, normalizedSessionId: id } }),
+    });
+    expect(result.execution.session.normalizedSessionId).toBe(result.normalizedSessionId);
+    if (retain) {
+      expect(result.normalizedSessionId).toBe(normalizedSessionId);
+      expect(result.checkpoint).toMatchObject({ sessionId: "provider-thread-123", identity: { sessionId: normalizedSessionId } });
+    } else {
+      expect(result.checkpoint).toBeNull();
+      expect(result.normalizedSessionId).not.toBe(normalizedSessionId);
     }
   });
 
