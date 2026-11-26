@@ -71,7 +71,8 @@ export type TaskRetryIntent = z.infer<typeof taskRetryIntentSchema>;
  * with access replaces it. An edited saved board message
  * (`retry_source_changed`) is terminal: only new input continues. */
 export const DECLINED_TASK_RETRY_REASONS = ["retry_authority_denied",
-  "retry_authority_unavailable", "retry_presser_not_running", "retry_refused_unsigned_run", "retry_refused_run_not_owned", "automatic_retry_pending",
+  "retry_authority_unavailable", "retry_authority_missing", "retry_authority_inactive", "retry_refused_company_mismatch",
+  "retry_presser_not_running", "retry_refused_unsigned_run", "retry_refused_run_not_owned", "automatic_retry_pending",
   "retry_refused_person_stop", "retry_refused_different_person", "retry_refused_run_not_stopped", "retry_refused_chat", "retry_refused_stop_unverified",
 ] as const;
 export function isDeclinedTaskRetry(payload: Record<string, unknown> | null | undefined) {

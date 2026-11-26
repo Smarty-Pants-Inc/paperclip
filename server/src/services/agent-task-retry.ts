@@ -53,7 +53,10 @@ const refusalMessages: Record<string, string> = {
   retry_refused_unsigned_run: "Retry requires an authenticated run-bound agent carrying the original person.",
   retry_refused_run_not_owned: "Retry refused: the pressing run does not belong to this agent.",
   retry_presser_not_running: "Retry refused: the pressing agent's run has ended.",
-  retry_authority_unavailable: "Retry refused: the original person is missing or no longer active.",
+  retry_authority_unavailable: "Retry refused: the original person is missing or no longer active.", // Legacy saved refusals.
+  retry_authority_missing: "Retry refused: the original person is missing.",
+  retry_authority_inactive: "Retry refused: the original person is no longer an active company member.",
+  retry_refused_company_mismatch: "Retry refused: the task is not available in the pressing agent's company.",
   retry_authority_denied: "Retry refused: the original person can no longer change this task.",
   retry_refused_different_person: "Retry refused: the pressing and source runs must carry the same person.",
   automatic_retry_pending: "Retry refused: an automatic retry is already pending for this task.",
@@ -76,11 +79,13 @@ export async function agentTaskRetryPresserRefusal(db: Db, input: {
   if (requester.credentialSource !== "agent_jwt" || requester.onBehalfOfUserId !== input.actorId)
     return "retry_refused_unsigned_run";
   if (!await agentOwnsRun(db, { companyId: input.companyId, ...requester })) return "retry_refused_run_not_owned";
-  const [run] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(and(
-    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, requester.runId)));
+  const [run] = await db.select({ status: heartbeatRuns.status, person: heartbeatRuns.responsibleUserId })
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, requester.runId)));
   if (run?.status !== "running") return "retry_presser_not_running";
+  if (!run.person) return "retry_authority_missing";
+  if (run.person !== input.actorId) return "retry_refused_different_person";
   const authority = await agentTaskRetryActor(db, { companyId: input.companyId, ...requester });
-  return authority?.userId === input.actorId ? null : "retry_authority_unavailable";
+  return authority?.userId === input.actorId ? null : "retry_authority_inactive";
 }
 
 /** Admission and dispatch both recheck the exact original authority. */
@@ -92,7 +97,7 @@ export async function agentTaskRetryRefusal(db: Db, input: {
   const presserRefusal = await agentTaskRetryPresserRefusal(db, { ...input, agentRequester: input.agentRequester });
   if (presserRefusal) return presserRefusal;
   const source = await readRetrySource(db, input);
-  if (!source?.person) return "retry_authority_unavailable";
+  if (!source?.person) return "retry_authority_missing";
   if (source.person !== input.actorId) return "retry_refused_different_person";
   const [scheduled] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.status, "scheduled_retry"),

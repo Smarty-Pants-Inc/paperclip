@@ -1129,6 +1129,53 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
         credentialSource: "agent_jwt", onBehalfOfUserId: "board-user" } });
     });
 
+    it("refuses a missing original person with its own reason", async () => {
+      const f = await seedAgentRetry();
+      await db.update(heartbeatRuns).set({ responsibleUserId: null }).where(eq(heartbeatRuns.id, f.retryRunId));
+      const res = await press(f);
+      expect(res.status).toBe(409);
+      expect(res.body.details.code).toBe("retry_authority_missing");
+      expect(await refusal(f)).toMatchObject({ details: { reason: "retry_authority_missing" } });
+    });
+
+    it("refuses inactive original authority at locked admission and deferred dispatch with its own reason", async () => {
+      const f = await seedAgentRetry();
+      const saved = await receipt(f);
+      await db.update(companyMemberships).set({ status: "suspended" }).where(eq(companyMemberships.companyId, f.companyId));
+      await expect(receipt(f)).rejects.toMatchObject({ status: 409,
+        details: { code: "retry_authority_inactive" } });
+      stopTaskDrain();
+      await heartbeatService(db).resumeTaskRetry(f.companyId, saved.requestId!);
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, saved.requestId!));
+      expect(wake.runId).toBeNull();
+      expect(wake.payload?.executionWait).toMatchObject({ reason: "retry_authority_inactive" });
+      const { isDeclinedTaskRetry } = await import("../services/task-retry.js");
+      const { taskRetryWaitMessage } = await import("../services/task-interruption-presentation.js");
+      expect(isDeclinedTaskRetry(wake.payload)).toBe(true);
+      expect(taskRetryWaitMessage("retry_authority_inactive"))
+        .toBe("Retry refused: the original person is no longer an active company member.");
+      expect(await refusal(f)).toMatchObject({ details: { reason: "retry_authority_inactive" } });
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(3);
+    });
+
+    it("names a company mismatch without revealing whether the other task exists", async () => {
+      const f = await seedAgentRetry(), other = await seedIssueWithRetry();
+      // Target a task outside the JWT's company, then an absent task: same public response.
+      const post = (issueId: string) => request(createApp({ ...agentActor(f.companyId, f.presserId), runId: f.presserRunId }))
+        .post(`/api/issues/${issueId}/retry`).send({ observedRunId: other.retryRunId, idempotencyKey: randomUUID() });
+      const denied = await post(other.issueId), absent = await post(randomUUID());
+      expect(denied.status).toBe(404);
+      expect(absent.status).toBe(404);
+      expect(denied.body).toEqual(absent.body);
+      expect(denied.body.details.code).toBe("retry_refused_company_mismatch");
+      const audit = await db.select().from(activityLog).where(and(eq(activityLog.companyId, f.companyId),
+        eq(activityLog.entityId, other.issueId), eq(activityLog.action, "issue.retry_refused_by_agent")));
+      expect(audit[0]).toMatchObject({ actorId: f.presserId,
+        details: { authorityUserId: null, reason: "retry_refused_company_mismatch" } });
+      expect(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
+        eq(agentWakeupRequests.reason, "task_retry")))).toHaveLength(0);
+    });
+
     it("rejects a different person's task with its reason, even with a legacy grant", async () => {
       const f = await seedAgentRetry();
       await legacyGrant(f, "board-user");
@@ -1206,13 +1253,13 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       const f = await seedAgentRetry();
       const saved = await receipt(f);
       expect(saved.accepted).toBe(true);
-      let code = "retry_authority_unavailable";
+      let code = "retry_authority_inactive";
       if (change === "source-person" || change === "presser-person") {
         await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user",
           principalId: "other-person", status: "active", membershipRole: "admin" });
         await db.update(heartbeatRuns).set({ responsibleUserId: "other-person" })
           .where(eq(heartbeatRuns.id, change === "source-person" ? f.retryRunId : f.presserRunId));
-        if (change === "source-person") code = "retry_refused_different_person";
+        code = "retry_refused_different_person";
       } else if (change === "presser-stopped") {
         await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.presserRunId));
         code = "retry_presser_not_running";
@@ -1261,9 +1308,9 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       else await db.update(companyMemberships).set({ status: "suspended" }).where(eq(companyMemberships.companyId, f.companyId));
       const res = await press(f);
       expect(res.status).toBe(state === "no-person" ? 409 : 404);
-      if (state === "no-person") expect(res.body.details.code).toBe("retry_authority_unavailable");
+      if (state === "no-person") expect(res.body.details.code).toBe("retry_authority_missing");
       expect(await refusal(f)).toMatchObject({ actorId: f.presserId,
-        details: { reason: state === "no-person" ? "retry_authority_unavailable" : "http_404" } });
+        details: { reason: state === "no-person" ? "retry_authority_missing" : "http_404" } });
     });
 
     it("caps attempts per task across agents and counts a saved replay once", async () => {

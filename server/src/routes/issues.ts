@@ -10121,7 +10121,10 @@ export function issueRoutes(
         // Throw instead of sending here: the awaited refusal audit must finish
         // before error middleware answers and callers can tear down this run.
         const own = await svc.getById(req.params.id as string);
-        if (!own || !hasCompanyAccess(req, own.companyId)) throw notFound("Issue not found");
+        // Do not disclose whether an out-of-company task exists: missing tasks
+        // have the identical status, message and reason code.
+        if (!own || !hasCompanyAccess(req, own.companyId))
+          throw notFound("Issue not found", { code: "retry_refused_company_mismatch" });
         assertCompanyAccess(req, own.companyId);
         if (!(await decideIssueAccess(req, own, "issue:read")).allowed) throw notFound("Issue not found");
         const ownWrite = await decideIssueAccess(req, own, "issue:mutate");
@@ -10140,8 +10143,11 @@ export function issueRoutes(
           actorId: req.actor.onBehalfOfUserId, agentRequester: agentRetry });
         if (presserRefusal) throw conflict(agentTaskRetryMessage(presserRefusal), { code: presserRefusal });
         const authority = await agentTaskRetryActor(db, agentRetry);
-        if (!authority || authority.userId !== req.actor.onBehalfOfUserId)
-          throw conflict(agentTaskRetryMessage("retry_authority_unavailable"), { code: "retry_authority_unavailable" });
+        if (!authority || authority.userId !== req.actor.onBehalfOfUserId) {
+          const reason = await agentTaskRetryPresserRefusal(db, { companyId: own.companyId,
+            actorId: req.actor.onBehalfOfUserId, agentRequester: agentRetry }) ?? "retry_authority_inactive";
+          throw conflict(agentTaskRetryMessage(reason), { code: reason });
+        }
         req.actor = authority;
     }
     assertBoard(req);
@@ -10149,7 +10155,8 @@ export function issueRoutes(
     if (!issue || !hasCompanyAccess(req, issue.companyId)) throw notFound("Issue not found");
     assertCompanyAccess(req, issue.companyId);
     if (!(await decideIssueAccess(req, issue, "issue:read")).allowed) throw notFound("Issue not found");
-    if (agentRetry && issue.companyId !== agentRetry.companyId) throw notFound("Issue not found");
+    if (agentRetry && issue.companyId !== agentRetry.companyId)
+      throw notFound("Issue not found", { code: "retry_refused_company_mismatch" });
     const decision = await decideIssueAccess(req, issue, "issue:mutate");
     if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
     if (issue.conversationAgentId) {
