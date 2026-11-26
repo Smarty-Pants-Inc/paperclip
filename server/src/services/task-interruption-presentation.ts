@@ -1,3 +1,4 @@
+import { NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND } from "./native-runtime/native-turn-budget.js";
 import { ENVIRONMENT_PROVIDER_WAIT_KEY, ENVIRONMENT_PROVIDER_WAIT_RETRY_REASON, environmentProviderWaitMessage } from "./environment-provider-wait.js";
 import { STORAGE_UNAVAILABLE_WAIT_RETRY_REASON } from "../storage/storage-unavailable.js";
 import { AGENT_DIRECTORY_WAIT_RETRY_REASON, INTERRUPTED_PREPARATION_RETRY_REASON } from "./execution-recovery-attempt.js";
@@ -270,11 +271,17 @@ export function projectTaskInterruption(issue: ProjectionIssue, input: Projectio
       nextRetryAt: null, sourceRunIds: input.run ? [input.run.id] : [], observedRunId: input.run?.id ?? null };
   if (presentation?.canRetry && input.run?.errorCode === NATIVE_SESSION_CLEANUP_QUARANTINED && input.cleanupSettling)
     presentation = { ...presentation, canRetry: false };
+  // An unchanged retry cannot make the same known input smaller. Carry a
+  // classified, safe reason even though ordinary failures attach it only when
+  // retryable; never let the owed-input fallback re-offer Retry for this code.
+  if (presentation?.state === "failed" && input.run?.errorCode === NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND)
+    return { ...presentation, canRetry: false, failure: classifiedRunFailure(input.run) };
   if (presentation?.state === "failed" && presentation.canRetry) {
     const failed = input.failureRun === undefined ? (input.run?.status === "failed"
       && (!owed || (input.run.createdAt ?? input.run.finishedAt ?? new Date(0)) >= owed.createdAt) ? input.run : undefined)
       : input.failureRun;
-    if (failed) presentation = { ...presentation, failure: classifiedRunFailure(failed) };
+    if (failed) presentation = { ...presentation, failure: classifiedRunFailure(failed),
+      ...(failed.errorCode === NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND ? { canRetry: false } : {}) };
   }
   return presentation;
 }
@@ -573,6 +580,7 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
         and ${heartbeatRuns.status} = 'scheduled_retry' and ${heartbeatRuns.retryOfRunId} is not null
         then ${heartbeatRuns.retryOfRunId} else ${heartbeatRuns.id} end`,
       resultJson: sql<Record<string, unknown>>`${runStopPresentationJson(heartbeatRuns.resultJson)} || jsonb_build_object('configurationIncomplete', ${heartbeatRuns.resultJson}->'configurationIncomplete',
+        'nativeTurnPromptRefusalCause', ${heartbeatRuns.resultJson}->'nativeTurnPromptRefusalCause',
         'stopReason', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'stopReason'`, 80)},
         'timeoutSource', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'timeoutSource'`, 80)},
         'timeoutFired', coalesce(${heartbeatRuns.resultJson}->'timeoutFired' = 'true'::jsonb, false),

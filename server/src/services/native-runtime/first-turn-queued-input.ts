@@ -11,6 +11,7 @@ import { PROVIDER_TURN_ACCEPTED_EVENT_TYPES } from "./provider-attempt-outcome.j
 import { reconcileContinuousSessionInput } from "./continuous-session-input.js";
 import { queuedInteractionId, readQueuedInteractionResponse } from "../queued-interaction-response.js";
 import { resolveSessionContinuity } from "./continued-session.js";
+import { commandTextBytes, FIRST_TURN_QUEUED_INPUT_MAX_BYTES, NativeTurnPromptExceedsCommandBoundError } from "./native-turn-budget.js";
 
 /**
  * Queued input for a run's first provider turn.
@@ -35,8 +36,6 @@ export const FIRST_TURN_QUEUED_INPUT_SCHEMA = "paperclip.first-turn-queued-input
 const DEFERRED_WAKE_STATUS = "deferred_issue_execution";
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const COMMENT_WAKE_REASONS = new Set(["issue_commented", "issue_reopened_via_comment", "issue_comment_mentioned"]);
-const MAX_COMMENT_CHARS = 16_000;
-const MAX_TOTAL_CHARS = 48_000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export type FirstTurnQueuedInputReceipt = {
@@ -185,25 +184,52 @@ function ownsFirstTurnIssue(issue: { executionRunId: string | null; assigneeAgen
       record(run.contextSnapshot).conversationSessionGeneration === issue.conversationSessionGeneration)));
 }
 
-export function renderFirstTurnQueuedInput(messages: readonly QueuedMessage[]): string | null {
+// A validator may decline an unmeasured composition without refusing the turn.
+type ValidateFirstTurnInput = (text: string | null) => void | false;
+
+function renderWholeFirstTurnQueuedInput(messages: readonly QueuedMessage[], validate?: ValidateFirstTurnInput): string | null {
   if (messages.length === 0) return null;
-  let remaining = MAX_TOTAL_CHARS;
-  const sections = messages.map((message, index) => {
-    const limit = Math.max(0, Math.min(MAX_COMMENT_CHARS, remaining));
-    // A card carries typed JSON, not a comment the model can read for the rest.
-    const truncated = message.kind !== "interaction" && message.body.length > limit;
-    const body = truncated ? message.body.slice(0, limit) : message.body;
-    remaining -= body.length;
-    return [
-      `[Message ${index + 1} of ${messages.length} · ${message.kind ?? "comment"} ${message.id} · ${message.createdAt.toISOString()}]`,
-      body,
-      ...(truncated ? [`(Truncated here. Read comment ${message.id} on the task for the rest.)`] : []),
-    ].join("\n");
-  });
-  return [
+  const text = [
     "New messages from the user arrived while this run was starting. They were not in the request above. Handle each of them in this turn, oldest first, together with that request:",
-    ...sections,
+    ...messages.map((message, index) => [
+      `[Message ${index + 1} of ${messages.length} · ${message.kind ?? "comment"} ${message.id} · ${message.createdAt.toISOString()}]`,
+      message.body,
+    ].join("\n")),
   ].join("\n\n");
+  // Decide whether this composition can claim anything before applying a size
+  // limit: even an oversized message stays owed on an unmeasured composition.
+  if (validate?.(text) === false) return null;
+  // A person's words are indivisible, including card answers.
+  const bytes = commandTextBytes(text);
+  if (bytes > FIRST_TURN_QUEUED_INPUT_MAX_BYTES)
+    throw new NativeTurnPromptExceedsCommandBoundError(messages.length === 1 && messages[0]!.kind === "interaction"
+      ? { kind: "human_response", bytes: Buffer.byteLength(messages[0]!.body) } : { kind: "queued_input", bytes });
+  return text;
+}
+
+function selectFirstTurnQueuedInput(messages: readonly QueuedMessage[], validate?: ValidateFirstTurnInput) {
+  let text: string | null = null, count = 0;
+  // No queued input needs no pre-seal bound. The final command is still guarded.
+  for (let end = 1; end <= messages.length; end++) {
+    try {
+      const candidate = renderWholeFirstTurnQueuedInput(messages.slice(0, end), validate);
+      if (candidate === null) break;
+      text = candidate;
+      count = end;
+    } catch (error) {
+      // A large later message must not stall earlier whole messages. Only a
+      // first message that cannot fit refuses; every unselected ID stays owed.
+      if (count === 0 && error instanceof NativeTurnPromptExceedsCommandBoundError && error.promptCause?.kind === "queued_input" && messages[0]?.kind === "interaction")
+        throw new NativeTurnPromptExceedsCommandBoundError({ kind: "human_response", bytes: Buffer.byteLength(messages[0].body) });
+      if (count === 0 || !(error instanceof NativeTurnPromptExceedsCommandBoundError)) throw error;
+      break;
+    }
+  }
+  return { text, messages: messages.slice(0, count) };
+}
+
+export function renderFirstTurnQueuedInput(messages: readonly QueuedMessage[]): string | null {
+  return selectFirstTurnQueuedInput(messages).text;
 }
 
 /**
@@ -252,14 +278,16 @@ async function readQueuedMessages(
 export async function claimFirstTurnQueuedInput(
   db: Db,
   binding: { companyId: string; runId: string; issueId: string; agentId: string },
+  validateTurnInput?: ValidateFirstTurnInput,
+  options: { finalGuardInstalled?: boolean } = {},
 ): Promise<string | null> {
   await reconcileContinuousSessionInput(db, binding);
   return db.transaction(async (tx) => {
     // Redact on this transaction's own connection: a second pool connection
     // while the seal holds its locks can wait forever on a one-connection pool.
-    const render = async (messages: QueuedMessage[]) => messages.length === 0 ? null : renderFirstTurnQueuedInput(
-      await createRunSecretRedactionRegistry(tx as unknown as Db).redactForIssue(binding.companyId, binding.issueId,
-        [...new Map(messages.map(message => [message.id, message])).values()].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())));
+    const redact = async (messages: QueuedMessage[]) => messages.length === 0 ? [] :
+      createRunSecretRedactionRegistry(tx as unknown as Db).redactForIssue(binding.companyId, binding.issueId,
+        [...new Map(messages.map(message => [message.id, message])).values()].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime()));
     // Lock in the queue routes' order (task, queue, run) so a concurrent
     // Interrupt and this seal serialize instead of deadlocking.
     const [issue] = await tx.select({ conversationAgentId: issues.conversationAgentId, executionRunId: issues.executionRunId,
@@ -289,7 +317,12 @@ export async function claimFirstTurnQueuedInput(
         const response = await readFirstTurnInteraction(tx as unknown as Db, binding, wake, run.responsibleUserId);
         if (response && receipt.interactionIds?.includes(response.id)) messages.push(response);
       }
-      return render(messages);
+      // Replay the whole receipt without a new pre-seal estimate. A receipt
+      // seals IDs, not bounded bytes: bodies, cwd and skills are re-read. This
+      // replay skip is safe on guarded backends because the final guard still
+      // measures the actual command before persistence/dispatch, NOT because
+      // the receipt proves today's command was already bounded.
+      return renderWholeFirstTurnQueuedInput(await redact(messages));
     }
     // Conversation input pending at this seal is part of the submitted user
     // message too. Only later arrivals belong to the live-turn steer path.
@@ -318,15 +351,34 @@ export async function claimFirstTurnQueuedInput(
     // between it and the turn input that the receipt describes.
     if (handback) taken.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
     const takenInteractions = interactions.filter(message => !pressedAt || message.createdAt.getTime() <= Date.parse(pressedAt));
-    const text = await render([...taken, ...takenInteractions]);
+    const candidates = await redact([...taken, ...takenInteractions]);
+    const validate: ValidateFirstTurnInput = text => {
+      const result = validateTurnInput?.(text);
+      // Only a positive signal from the backend that installed the final
+      // command guard permits whole-message admission without an estimate.
+      // Measured refusals still throw; the renderer still enforces its limit.
+      return result === false && options.finalGuardInstalled !== true ? false : undefined;
+    };
+    const { text, messages: selected } = selectFirstTurnQueuedInput(candidates, validate);
+    if (candidates.length > 0 && text === null) {
+      // An ordinary deferred wake keeps its independent next-run delivery.
+      // Do not seal an empty receipt: no queued input was admitted or claimed.
+      // Passive handbacks have ONLY this first-turn route. Without either a
+      // measured composition or a positively installed final guard, refuse
+      // truthfully without consuming input; never guess a backend is guarded.
+      if (handback) throw new NativeTurnPromptExceedsCommandBoundError({ kind: "unmeasured_composition", bytes: 0 });
+      return null;
+    }
+    const selectedComments = selected.filter(message => message.kind !== "interaction");
+    const selectedInteractions = takenInteractions.filter(message => selected.some(candidate => candidate.id === message.id));
     // Seal even when nothing joined: later messages wait for the turn boundary.
     const sealed: FirstTurnQueuedInputReceipt = {
       schema: FIRST_TURN_QUEUED_INPUT_SCHEMA,
       runId: run.id,
       wakeupRequestIds: joining.filter(wake => queuedCommentIdsFromWakePayload(wake.payload)
-        .some(id => taken.some(message => message.id === id))).map(wake => wake.id).concat(takenInteractions.map(message => message.wakeId)),
-      commentIds: taken.map(message => message.id),
-      interactionIds: [...new Set(takenInteractions.map(message => message.id))],
+        .some(id => selectedComments.some(message => message.id === id))).map(wake => wake.id).concat(selectedInteractions.map(message => message.wakeId)),
+      commentIds: selectedComments.map(message => message.id),
+      interactionIds: [...new Set(selectedInteractions.map(message => message.id))],
       claimedAt: new Date().toISOString(),
     };
     await tx.update(heartbeatRuns).set({

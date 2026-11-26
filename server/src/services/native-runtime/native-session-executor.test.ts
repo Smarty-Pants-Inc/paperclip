@@ -1,6 +1,11 @@
 import { sandboxRestartMetadata } from "../sandbox-snapshot-restore.js";
 import type { NativeSession } from "../../vendor/paperclip-runner/index.js";
 import * as continuousReply from "./native-continuous-reply.js";
+import { buildNativeExecutionInput } from "./native-execution-input.js";
+import { assertNativeQueuedTurnBound, nativeQueuedTurnCompositionMeasured, NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND } from "./native-turn-budget.js";
+import * as firstTurnInput from "./first-turn-queued-input.js";
+import { requeueContinuousUnanswered } from "./native-continuous-unanswered.js";
+import { deliveredQueuedCommentIds } from "../queued-comment-delivery.js";
 import { recoveryPostgresSupport, startRecoveryPostgres } from "../../__tests__/helpers/recovery-postgres.js";
 import { createReleaseIssueExecution } from "../../modules/wake-queue/application/use-cases.js";
 import { createPostgresWakeQueueAdapter } from "../../modules/wake-queue/adapters/postgres.js";
@@ -9313,6 +9318,202 @@ describe("native startup restart detachment", () => {
     state.execute.mockReset();
     await expect(executePaperclipNativeSession({ db: leaseDb(restarting), execution: restarting, runnerInstanceId: "runner" })).rejects.toBeInstanceOf(NativeControllerDetachedForRestartError);
     expect(state.execute).not.toHaveBeenCalled();
+  });
+});
+
+describe("native turn budget executor metadata", () => {
+  it.skipIf(!recoveryPostgresSupport.supported)("answers three successive own messages after a failed-start Pi agent's plugin handback through the executor's claim callback", async () => {
+    const pg = await startRecoveryPostgres("plugin-handback-budget-"), db = createDb(pg.connectionString);
+    const directory = await mkdtemp(join(tmpdir(), "native-plugin-handback-budget-")), previous = process.env.PAPERCLIP_RUNNER_STATE_DIR;
+    process.env.PAPERCLIP_RUNNER_STATE_DIR = directory;
+    const userId = randomUUID(), sessionId = randomUUID();
+    const launcher = vi.fn(), registration = vi.fn(async () => ({ release: async () => {} }));
+    const owner = vi.spyOn(pluginTaskRuntime, "createPluginRunnerTaskOwner").mockImplementation(() => ({ launcher, registration,
+      driver: { prepareLaunch: vi.fn(), runnerProcessLauncher: launcher, controlPlaneRegistration: registration },
+      readWorkspaceFile: vi.fn(), isRetired: () => false, rebind: vi.fn() }) as never);
+    const claim = firstTurnInput.claimFirstTurnQueuedInput;
+    const claimThroughExecutor = vi.spyOn(firstTurnInput, "claimFirstTurnQueuedInput").mockImplementation((_fixtureDb, binding, validate, options) =>
+      claim(db, binding, validate, options));
+    const task = vi.fn(async () => ({ kind: "description", launchPreparationVersion: 1, projectAuthCheckVersion: 1, taskId: "budget-task",
+      runner: { version: "fixture", digest: `sha256:${"a".repeat(64)}` } }));
+    const controls: DurablePrpControlPlane[] = [];
+    const retainedSession = {} as NativeSession;
+    const issueService = issueServiceModule.issueService;
+    const issueLifecycle = vi.spyOn(issueServiceModule, "issueService").mockImplementation(serviceDb => serviceDb === db ? issueService(db) :
+      { update: vi.fn(async () => null) } as unknown as ReturnType<typeof issueServiceModule.issueService>);
+    try {
+      await db.insert(authUsers).values({ id: userId, name: "Budget owner", email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
+      const [company] = await db.insert(companies).values({ name: "Guarded handback", issuePrefix: `G${randomUUID().slice(0, 4)}` }).returning();
+      const [agent] = await db.insert(agents).values({ companyId: company.id, name: "Pi", adapterType: "paperclip_runner",
+        adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).returning();
+      const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Whole plugin handback", status: "in_progress", assigneeAgentId: agent.id }).returning();
+      const scope = { companyId: company.id, agentId: agent.id, issueId: issue.id };
+      const [owed] = await db.insert(issueComments).values({ companyId: company.id, issueId: issue.id, authorType: "user", authorUserId: userId,
+        body: "Whole old user request $& $' $` $$ END" }).returning();
+      const [failed] = await db.insert(heartbeatRuns).values({ ...scope, status: "failed", runtimeMode: "native", nativeIssueId: issue.id,
+        responsibleUserId: userId, contextSnapshot: { issueId: issue.id, wakeCommentId: owed.id, wakeCommentIds: [owed.id] },
+        resultJson: { executionRecovery: { providerWorkStarted: false } } }).returning();
+      await db.update(issues).set({ executionRunId: failed.id }).where(eq(issues.id, issue.id));
+      await requeueContinuousUnanswered(db, { id: failed.id, companyId: company.id });
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, company.id)))[0].payload).toMatchObject({ preDispatchInputOnly: true });
+      let handbackDeliveries = 0;
+      for (let index = 1; index <= 3; index++) {
+        const [own] = await db.insert(issueComments).values({ companyId: company.id, issueId: issue.id, authorType: "user", authorUserId: userId,
+          body: `Fresh own request ${index}` }).returning();
+        const [run] = await db.insert(heartbeatRuns).values({ ...scope, status: "running", runtimeMode: "native", nativeIssueId: issue.id,
+          nativeSessionId: sessionId, responsibleUserId: userId, startedAt: new Date(),
+          contextSnapshot: { issueId: issue.id, wakeCommentId: own.id, wakeCommentIds: [own.id] } }).returning();
+        await db.update(issues).set({ executionRunId: run.id }).where(eq(issues.id, issue.id));
+        // The agent owns Pi's passive handback; a task harness override uses
+        // the plugin's supported Codex workspace harness (still unmeasured).
+        // Direct pi_rpc harnesses are rejected before the plugin-task branch.
+        const current = buildNativeExecutionInput({ ...scope, runId: run.id, provider: "codex", normalizedSessionId: sessionId,
+          issue: { id: issue.id, identifier: "BUDGET-1", title: issue.title, description: null, workMode: "standard" }, taskPrompt: own.body,
+          workspace: { id: randomUUID(), cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null }, runtimeContext: nativeRuntimeContextFixture(),
+          completionContract: { id: "contract", sha256: "a".repeat(64), schemaVersion: "paperclip.run-result.v1",
+            contract: { revision: "1", objective: "Answer", criteria: [{ id: "output", requirement: "Answer" }] } } });
+        const backend = await createRunnerdBackend({ db: leaseDb(current), execution: current, runnerInstanceId: "plugin-budget", runnerIngressAuthorized: true,
+          runnerExecutionTarget: { kind: "remote", transport: "sandbox", providerKey: "plugin", leaseId: randomUUID(), remoteCwd: "/unused", runnerTask: task } });
+        expect(backend.nativeTurnBudgetAdditions).toBeUndefined();
+        expect(backend.finalGuardInstalled).toBe(false);
+        if (index > 1) {
+          backend.bindManagedSession(retainedSession);
+          expect(backend.finalGuardInstalled).toBe(true);
+        }
+        state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+        const transport = state.createTransport.mock.calls.at(-1)![0] as RunnerTransportOptions & {
+          controlPlaneRegistration: NonNullable<import("../../vendor/paperclip-runner/index.js").RunnerExecutionDriver["controlPlaneRegistration"]>;
+        };
+        const control = new DurablePrpControlPlane({ stateDirectory: join(directory, `control-${index}`),
+          identity: { runnerInstanceId: "runner", environmentLeaseId: "lease", runId: run.id, normalizedSessionId: sessionId, turnId: `turn-${index}`, itemId: `item-${index}` },
+          expectedRunnerVersion: "0.3.0", expectedRunnerDigest: `sha256:${"a".repeat(64)}` });
+        controls.push(control);
+        await transport.controlPlaneRegistration(control);
+        expect(backend.finalGuardInstalled).toBe(true);
+        backend.bindManagedSession(retainedSession);
+        let queued: string | null = null;
+        const marker = `plugin-handback-reached-${index}`;
+        state.execute.mockReset().mockImplementationOnce(async options => {
+          // Execute the PRODUCT callback and its validator/options, swapping
+          // only the outer executor lifecycle DB for the real claim DB above.
+          queued = await options.getFirstTurnQueuedInput!();
+          const text = own.body + (queued ? "\n\n" + queued : "");
+          const command = control.queueCommand("turn.start", { text }, `guarded-command-${index}`);
+          expect(command.payload.text).toContain(own.body);
+          expect(() => control.queueCommand("turn.start", { text, late: "a".repeat(600000) }, `oversized-${index}`))
+            .toThrow(NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND);
+          throw new Error(marker);
+        });
+        await expect(executePaperclipNativeSession({ db: leaseDb(current), execution: current, backend, runnerInstanceId: `executor-${index}` }).catch(error => {
+          if (!(error instanceof Error) || !error.message.includes(marker)) console.error(error);
+          throw error;
+        })).rejects.toThrow(marker);
+        if (index === 1) { expect(queued).toContain(owed.body); handbackDeliveries++; }
+        else expect(queued).toBeNull();
+        const sealed = firstTurnInput.readFirstTurnQueuedInputReceipt((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0]);
+        expect(sealed?.commentIds).toEqual(index === 1 ? [owed.id] : []);
+        if (index === 1) expect([...await deliveredQueuedCommentIds(db, { ...scope, commentIds: [owed.id] })]).toEqual([]);
+        await runEventWriter.appendHeartbeatRunEvent(db, { companyId: company.id, runId: run.id, agentId: agent.id,
+          eventType: "turn.accepted", stream: "system", level: "info", message: "accepted" });
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
+        await continuousReply.publishContinuousNativeReply({ db, recoverTerminal: true, cursor: index,
+          execution: { binding: { ...scope, runId: run.id }, provider: { kind: "pi_rpc" } },
+          event: { eventType: "item.completed", runId: run.id, normalizedSessionId: sessionId, sourceEventId: `plugin-answer-${index}`,
+            itemId: `plugin-item-${index}`, turnId: `plugin-turn-${index}`, payload: { kind: "agentMessage", channel: "final", text: `Answered own request ${index}` } } });
+        expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0].resultJson?.continuousReplies).toHaveProperty(`plugin-item-${index}`);
+        expect([...await deliveredQueuedCommentIds(db, { ...scope, commentIds: [owed.id, own.id] })].sort()).toEqual([owed.id, own.id].sort());
+        console.info(JSON.stringify({ pluginHandbackExecutorRun: index, runId: run.id, finalGuardInstalled: backend.finalGuardInstalled,
+          handbackDelivered: index === 1, ownRequest: own.body, applicationReply: `Answered own request ${index}`, refused: false }));
+      }
+      expect(handbackDeliveries).toBe(1);
+    } finally {
+      claimThroughExecutor.mockRestore(); owner.mockRestore(); issueLifecycle.mockRestore();
+      for (const control of controls) await control.stop();
+      if (previous === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR; else process.env.PAPERCLIP_RUNNER_STATE_DIR = previous;
+      await db.$client.end(); await pg.cleanup(); await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("admits a plugin-task backend first turn with nothing queued through the real Runner", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-plugin-budget-")), previous = process.env.PAPERCLIP_RUNNER_STATE_DIR;
+    process.env.PAPERCLIP_RUNNER_STATE_DIR = directory;
+    const current = buildNativeExecutionInput({ companyId: "company", runId: "plugin-budget-run", agentId: "agent", provider: "codex", normalizedSessionId: "plugin-budget-session",
+      issue: { id: "issue", identifier: "BUDGET-1", title: "Plugin first turn", description: null, workMode: "standard" }, taskPrompt: "Whole plugin request",
+      workspace: { id: "plugin-budget-workspace", cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null }, runtimeContext: nativeRuntimeContextFixture(),
+      completionContract: { id: "contract", sha256: "a".repeat(64), schemaVersion: "paperclip.run-result.v1",
+        contract: { revision: "1", objective: "Continue", criteria: [{ id: "output", requirement: "Continue" }] } } });
+    const launcher = vi.fn(), registration = vi.fn();
+    const owner = vi.spyOn(pluginTaskRuntime, "createPluginRunnerTaskOwner").mockReturnValue({ launcher, registration,
+      driver: { authorityRunId: current.binding.runId, prepareLaunch: vi.fn(), runnerProcessLauncher: launcher, controlPlaneRegistration: registration },
+      readWorkspaceFile: vi.fn(), isRetired: () => false, rebind: vi.fn() } as never);
+    const task = vi.fn(async (operation: unknown) => {
+      environmentTaskOperationSchema.parse(operation);
+      return { kind: "description", launchPreparationVersion: 1, projectAuthCheckVersion: 1, taskId: "budget-task",
+        runner: { version: "fixture", digest: `sha256:${"a".repeat(64)}` } };
+    });
+    let admitted = false;
+    try {
+      const db = leaseDb(current);
+      const backend = await createRunnerdBackend({ db, execution: current, runnerInstanceId: "plugin-budget", runnerIngressAuthorized: true,
+        runnerExecutionTarget: { kind: "remote", transport: "sandbox", providerKey: "plugin", leaseId: "plugin-budget-lease", remoteCwd: "/unused", runnerTask: task } });
+      expect(backend.nativeTurnBudgetAdditions).toBeUndefined();
+      const { executeNativeSession: executeReal } = await import(new URL("../../../../packages/paperclip-runner/src/native-session-runtime.ts", import.meta.url).href) as Pick<typeof import("../../vendor/paperclip-runner/index.js"), "executeNativeSession">;
+      const identity = { ...current.binding, sessionId: "plugin-budget-session" };
+      const session = { identity: () => identity,
+        async capabilities() { return { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true }; },
+        async *events() {}, async result() { return null; }, async close() {},
+        async snapshot() { return { backendKind: "mock" as const, sessionId: "driver", identity, providerSessionId: "provider", cursor: "0", activeTurnId: null, pendingRuntimeRequests: [], lineage: [], workingDirectory: "/workspace" }; },
+        async startTurn() { admitted = true; throw new Error("plugin-first-turn-admitted"); } };
+      // Keep the actual plugin backend's missing metadata contract. Replace
+      // provider I/O only; use the real Runner's first-turn sequencing.
+      await expect(executeReal({ input: current, backend: { ...backend,
+        async descriptor() { return { kind: "mock", name: "plugin-budget", version: "1", capabilities: await session.capabilities(), runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" } }; },
+        async openSession() { return session; } },
+        controlPlane: { async openRun() {}, async checkpointSession() {}, async completeRun() {},
+          async appendEvent(event) { const seq = "sourceSeq" in event ? event.sourceSeq : 0; return { cursor: seq, highestContiguousSourceSeq: seq, disposition: "committed" }; },
+          async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; } },
+        getFirstTurnQueuedInput: async () => {
+          const additions = backend.nativeTurnBudgetAdditions?.();
+          assertNativeQueuedTurnBound(current.binding.runId, { task: current.task }, null,
+            { ...additions, unmeasuredPayload: !nativeQueuedTurnCompositionMeasured(current.provider.kind, current.schema, additions) });
+          return null;
+        }, runnerInstanceId: "runner", controlPlaneInstanceId: "controller",
+      })).rejects.toThrow("plugin-first-turn-admitted");
+      expect(admitted).toBe(true);
+    } finally {
+      owner.mockRestore();
+      if (previous === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR; else process.env.PAPERCLIP_RUNNER_STATE_DIR = previous;
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("reads the executor's own metadata producer before and after its observed session snapshot", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-producer-budget-")), previous = process.env.PAPERCLIP_RUNNER_STATE_DIR;
+    process.env.PAPERCLIP_RUNNER_STATE_DIR = directory;
+    const context = nativeRuntimeContextFixture();
+    context.skills = [{ key: "assigned", runtimeName: "assigned", versionId: null, bundle: { ...context.instructions.bundle, rootPath: "/assigned" } }];
+    context.aggregateDigest = canonicalNativeRuntimeContextDigest(context);
+    const current = { ...execution, schema: "paperclip.native-execution-input.v5", executionMode: "default", planningContext: null, runtimeContext: context,
+      binding: { ...execution.binding, runId: "producer-budget-run", executionWorkspaceId: "producer-budget-workspace" },
+      session: { ...execution.session, normalizedSessionId: "producer-budget-session" } } as NativeExecutionInput;
+    let snapshotCalls = 0;
+    const session = { async snapshot() { snapshotCalls++; return { workingDirectory: '/actual/"日本語"' }; } };
+    try {
+      const backend = await createRunnerdBackend({ db: leaseDb(current), execution: current, runnerInstanceId: "producer-budget" });
+      expect(backend.nativeTurnBudgetAdditions!()).toMatchObject({ unmeasuredPayload: true, workingDirectory: undefined });
+      backend.observeTurnBudgetSession!(session as never);
+      expect(snapshotCalls).toBe(0);
+      await session.snapshot();
+      const additions = backend.nativeTurnBudgetAdditions!();
+      expect(additions).toMatchObject({ unmeasuredPayload: false, workingDirectory: '/actual/"日本語"',
+        skillInputs: [{ type: "skill", name: "assigned", path: expect.stringContaining("/codex-home/skills/assigned/SKILL.md") }] });
+      expect(nativeQueuedTurnCompositionMeasured(current.provider.kind, current.schema, additions)).toBe(true);
+      expect(assertNativeQueuedTurnBound(current.binding.runId, { task: { prompt: "request" }, requestedSkills: ["assigned"] }, "whole queued input", additions)).toBeUndefined();
+      expect(snapshotCalls).toBe(1);
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR; else process.env.PAPERCLIP_RUNNER_STATE_DIR = previous;
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });
 
