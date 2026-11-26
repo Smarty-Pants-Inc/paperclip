@@ -1,5 +1,11 @@
 import { normalizePaperclipWakePayload } from "@paperclipai/adapter-utils/server-utils";
 
+/** A failed run whose own session can never be resumed: a person's Retry of it starts fresh. */
+export function sessionCannotContinue(run: { error?: string | null; errorCode?: string | null } | undefined) {
+  return /native_controller_recovery_missing_evidence|native_continuation_requires_reconciliation/
+    .test(`${run?.errorCode ?? ""} ${run?.error ?? ""}`);
+}
+
 export function resolveSessionContinuity(provider: unknown, setting: unknown) {
   return setting === "continuous" || setting === "paperclip" ? setting : provider === "pi_rpc" ? "continuous" : "paperclip";
 }

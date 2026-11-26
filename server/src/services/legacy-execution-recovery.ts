@@ -37,13 +37,18 @@ import { issueService } from "./issues.js";
 import { isInterruptedNativePreparation, isInterruptedNativePreparationCandidate } from "./cancelled-native-startup.js";
 import { hasVerifiedWorkspaceRepair } from "./workspace-recovery-receipt.js";
 import { recordLegacyShutdownBeforeDispatch, SERVER_SHUTDOWN_INTERRUPTED_CODE } from "./legacy-shutdown-before-dispatch.js";
+import { sessionCannotContinue } from "./native-runtime/continued-session.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 export const UNRESTORED_FILES_NEXT_ACTION = "The task's saved files could not be put back after the run stopped. "
   + "They are kept where they were and are not applied. Press Retry to continue from the last saved version in a new workspace.";
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 
-async function workspaceRecoveryNextAction(db: Pick<Db, "select">, run: Pick<Run, "id" | "companyId" | "errorCode">) {
+export const NEW_SESSION_RETRY_NEXT_ACTION = "This session can't pick up where it stopped. "
+  + "Press Retry to start a new session from what was saved; the old session is not resumed.";
+
+async function workspaceRecoveryNextAction(db: Pick<Db, "select">, run: Pick<Run, "id" | "companyId" | "errorCode" | "error">) {
+  if (sessionCannotContinue(run)) return NEW_SESSION_RETRY_NEXT_ACTION;
   // Containing a prepared workspace does not mean its files caused the failure.
   const failure = classifiedRunFailure({ errorCode: run.errorCode,
     ...(run.errorCode === "native_session_interrupted" ? await readRunFailureStage(db, run.companyId, run.id) : undefined) });

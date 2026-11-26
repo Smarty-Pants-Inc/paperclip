@@ -223,6 +223,7 @@ import type { createRunDispatch } from "../../modules/run-dispatch/index.js";
 import { hasRetainedExternalChatRetry, type IssueAttributionSnapshot, type PostCommitEffect as WakeQueuePostCommitEffect, type createWakeQueue } from "../../modules/wake-queue/index.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
 import { emitSystemTaskBlockedAfterCommit } from "../product-telemetry.js";
+import { sessionCannotContinue } from "../native-runtime/continued-session.js";
 
 type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
 type QueuedRunCandidate = Pick<HeartbeatRun, "id" | "companyId" | "agentId" | "status" | "invocationSource" | "createdAt"
@@ -2946,10 +2947,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       if (!retry.initiatedBy && retry.sourceRunId) {
         const [source] = await db.select({ error: heartbeatRuns.error, errorCode: heartbeatRuns.errorCode })
           .from(heartbeatRuns).where(eq(heartbeatRuns.id, retry.sourceRunId));
-        const failure = `${source?.errorCode ?? ""} ${source?.error ?? ""}`;
-        if (/native_controller_recovery_missing_evidence|native_continuation_requires_reconciliation/.test(failure)) {
-          enrichedContextSnapshot.explicitFreshSession = true;
-        }
+        if (sessionCannotContinue(source)) enrichedContextSnapshot.explicitFreshSession = true;
       }
       enrichedContextSnapshot.previousRunId = retry.sourceRunId;
       enrichedContextSnapshot.taskRetryRequestId = receipt.id;
