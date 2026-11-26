@@ -78,14 +78,14 @@ it("separates monitored waits from In Progress in task filters", () => {
 });
 
 describe("issue filters", () => {
-  it("hides automation by default while an opt-in includes every creation source", () => {
+  it("shows automation by default while hiding remains an opt-out", () => {
     const issues = [makeIssue({ id: "human", createdByUserId: "person" }), makeIssue({ id: "agent", createdByAgentId: "agent" }), makeIssue({ id: "routine", originKind: "routine_execution", createdByUserId: "person" }), makeIssue({ id: "system" })];
-    expect(applyIssueFilters(issues, defaultIssueFilterState, null, true).map((issue) => issue.id)).toEqual(["human"]);
-    expect(applyIssueFilters(issues, { ...defaultIssueFilterState, showAgentCreatedTasks: true }, null, true)).toEqual(issues);
+    expect(applyIssueFilters(issues, defaultIssueFilterState, null, true)).toEqual(issues);
+    expect(applyIssueFilters(issues, { ...defaultIssueFilterState, showAgentCreatedTasks: false }, null, true).map((issue) => issue.id)).toEqual(["human"]);
     // Membership and task-detail collections can explicitly bypass creation visibility.
     expect(applyIssueFilters(issues, defaultIssueFilterState, null, false)).toEqual(issues);
     expect(countActiveIssueFilters(defaultIssueFilterState, true)).toBe(0);
-    expect(countActiveIssueFilters({ ...defaultIssueFilterState, showAgentCreatedTasks: true }, true)).toBe(1);
+    expect(countActiveIssueFilters({ ...defaultIssueFilterState, showAgentCreatedTasks: false }, true)).toBe(1);
   });
 
   it("selects only routine executions even when automatic tasks are hidden", () => {
@@ -100,10 +100,10 @@ describe("issue filters", () => {
     expect(normalizeIssueFilterState({ routineTasksOnly: "true" }).routineTasksOnly).toBe(false);
   });
 
-  it("defaults legacy and invalid preferences to hidden without losing other filters", () => {
-    expect(normalizeIssueFilterState({ hideRoutineExecutions: false, statuses: ["todo"] })).toMatchObject({ showAgentCreatedTasks: false, statuses: ["todo"] });
-    expect(normalizeIssueFilterState({ showAgentCreatedTasks: "true" }).showAgentCreatedTasks).toBe(false);
-    expect(normalizeIssueFilterState({ showAgentCreatedTasks: true }).showAgentCreatedTasks).toBe(true);
+  it("defaults legacy and invalid preferences to shown without losing other filters", () => {
+    expect(normalizeIssueFilterState({ hideRoutineExecutions: false, statuses: ["todo"] })).toMatchObject({ showAgentCreatedTasks: true, statuses: ["todo"] });
+    expect(normalizeIssueFilterState({ showAgentCreatedTasks: "true" }).showAgentCreatedTasks).toBe(true);
+    expect(normalizeIssueFilterState({ showAgentCreatedTasks: false }).showAgentCreatedTasks).toBe(false);
   });
 
   it("searches filter options case-insensitively without mutating the source", () => {
