@@ -17,6 +17,7 @@ import { compactRunLogChunk } from "../heartbeat/run-log.js";
 import { publishContinuousNativeReply } from "./native-continuous-reply.js";
 import { answeredContinuousHeldRun, readContinuousSessionInput } from "./continuous-session-input.js";
 import { requeueContinuousUnanswered } from "./native-continuous-unanswered.js";
+import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 import { drainContinuousPersonMessages } from "./native-continuous-drain.js";
 import { readBoardQueuedComments } from "../../modules/wake-queue/adapters/queued-comment-board-postgres.js";
@@ -1180,6 +1181,67 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
       expect(saved.resolutionNote).toBe("continuous_held_input_already_answered");
       console.info("0463_ADMISSION_RACE_PROOF", JSON.stringify({ sourceRunId: f.runId, successorId, actionId: action.id, evidence: saved.evidence }));
     } finally { await heartbeat.drainActiveRunExecutions(); }
+  });
+
+  it("requeues a person-stopped run without deadlocking native event persistence's issue FK", async () => {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Stop lock compatibility", issuePrefix: companyId.slice(0, 8) });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Continuous Pi", adapterType: "paperclip_runner",
+      adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Stopped conversation", assigneeAgentId: agentId });
+    const personStop = { requestedAt: new Date().toISOString(), userId: null };
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, issueId, nativeIssueId: issueId,
+      status: "cancelled", runtimeMode: "native", resultJson: { personStop }, contextSnapshot: { issueId } });
+    const requeueDb = createDb(external ?? database!.connectionString, {
+      maxConnections: 1, applicationName: `stop-requeue-${runId}`, statementTimeoutMs: 8_000,
+    });
+    let release!: () => void, runOwned!: () => void;
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    const ready = new Promise<void>(resolve => { runOwned = resolve; });
+    let writerPid = 0;
+    const writer = db.transaction(async tx => {
+      await tx.execute(sql`set local deadlock_timeout = '5s'`);
+      await tx.execute(sql`set local statement_timeout = '8s'`);
+      const [backend] = await tx.execute(sql`select pg_backend_pid() as pid`);
+      writerPid = Number(backend.pid);
+      const sourceInstanceId = randomUUID();
+      const append = (sourceSeq: number) => appendHeartbeatRunEvent(tx as unknown as Db, {
+        companyId, runId, agentId, eventType: "test.stop_lock_compatibility",
+        nativeSource: { sourceInstanceId, sourceEventId: randomUUID(), sourceSeq,
+          protocolSchemaVersion: 1, canonicalPayload: { sourceSeq } },
+      });
+      // The uncursored event-batch fallback locks RUN and updates it once per event.
+      await append(1);
+      runOwned(); await hold;
+      // This second UPDATE really requests ISSUE KEY SHARE through issue_id's FK.
+      await append(2);
+    });
+    void writer.catch(() => undefined);
+    let requeued: ReturnType<typeof requeueContinuousUnanswered> | undefined;
+    try {
+      await Promise.race([ready, writer]);
+      // Make requeue the deadlock detector on the unfixed base, not the writer.
+      await requeueDb.execute(sql`set deadlock_timeout = '100ms'`);
+      requeued = requeueContinuousUnanswered(requeueDb, { id: runId, companyId });
+      void requeued.catch(() => undefined);
+      // A real lock-wait barrier, not a sleep: requeue already owns ISSUE and
+      // is waiting for the writer's RUN before the second event may proceed.
+      await expect.poll(async () => (await db.execute(sql`select 1 from pg_stat_activity
+        where application_name = ${`stop-requeue-${runId}`} and wait_event_type = 'Lock'
+          and ${writerPid}::int = any(pg_blocking_pids(pid))
+          and query like 'select "heartbeat_runs"%'`)).length, { timeout: 3_000 }).toBe(1);
+      release();
+      await Promise.all([writer, requeued]);
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(run).toMatchObject({ status: "cancelled", nextEventSeq: 3, resultJson: { personStop } });
+      expect(run.resultJson?.continuousUnansweredWakeId).toBeUndefined();
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toEqual([]);
+      expect((await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId))).map(event => event.seq).sort()).toEqual([1, 2]);
+    } finally {
+      release();
+      await Promise.allSettled([writer, ...(requeued ? [requeued] : [])]);
+      await requeueDb.$client.end();
+    }
   });
 
   it("retains ACKed unanswered follow-ups as one failed delivery receipt, never automatic resubmission", async () => {

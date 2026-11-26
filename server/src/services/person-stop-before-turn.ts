@@ -13,13 +13,14 @@ const asRecord = (value: unknown): Record<string, unknown> | null => value && ty
 type Run = typeof heartbeatRuns.$inferSelect;
 export type PersonStop = { pressedAt: string; userId: string | null };
 
-/** Shared with first-turn admission: issue -> run -> wake input, never run -> issue. */
+/** Shared with first-turn admission: issue -> run -> wake input, never run -> issue.
+ * Issue serialization must permit event persistence's FK KEY SHARE; no issue key changes. */
 export async function settleStartupStop(db: Db, existing: Run, stop: PersonStop) {
   const { pressedAt } = stop, runId = existing.id;
   return db.transaction(async tx => {
     const issueId = existing.nativeIssueId ?? existing.issueId ?? asRecord(existing.contextSnapshot)?.issueId;
     if (typeof issueId === "string") await tx.select({ id: issues.id }).from(issues)
-      .where(and(eq(issues.id, issueId), eq(issues.companyId, existing.companyId))).for("update");
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, existing.companyId))).for("no key update");
     const [current] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).for("update");
     if (!current || current.status === "queued") return null;
     const terminal = ["failed", "cancelled", "timed_out", "interrupted", "succeeded"].includes(current.status);
@@ -59,7 +60,7 @@ export async function settleProviderReturnedStopInput(db: Db, run: Run, returned
   const issueId = run.nativeIssueId ?? run.issueId ?? asRecord(run.contextSnapshot)?.issueId;
   if (typeof issueId !== "string") return;
   await db.transaction(async tx => {
-    await tx.select({ id: issues.id }).from(issues).where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId))).for("update");
+    await tx.select({ id: issues.id }).from(issues).where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId))).for("no key update");
     const [current] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId))).for("update");
     const stop = asRecord(current?.resultJson?.personStop);
     if (!current || typeof stop?.requestedAt !== "string") return;

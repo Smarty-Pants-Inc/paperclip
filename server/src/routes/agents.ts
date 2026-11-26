@@ -7532,7 +7532,7 @@ export function agentRoutes(
         if (typeof issueId !== "string" || !req.actor.userId) return;
         await db.transaction(async (tx) => {
           await tx.select({ id: issuesTable.id }).from(issuesTable)
-            .where(and(eq(issuesTable.id, issueId), eq(issuesTable.companyId, existing.companyId))).for("update");
+            .where(and(eq(issuesTable.id, issueId), eq(issuesTable.companyId, existing.companyId))).for("no key update");
           const [run] = await tx.select({ result: heartbeatRuns.resultJson, context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).for("update");
           const wakes = await tx.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, existing.companyId),
           eq(agentWakeupRequests.agentId, existing.agentId), inArray(agentWakeupRequests.status, ["deferred_issue_execution", "queued"]),
