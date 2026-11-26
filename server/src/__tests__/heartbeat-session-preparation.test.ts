@@ -190,6 +190,78 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     } finally { captureMetadata.mockRestore(); mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true }); }
   });
 
+  it.each([
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", initiatedBy: undefined, fresh: true },
+    { failure: "ordinary provider failure", initiatedBy: undefined, fresh: false },
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", initiatedBy: "restart_recovery" as const, fresh: false },
+  ])("validated continuous-Pi task Retry: $failure, initiatedBy=$initiatedBy, fresh=$fresh", async ({ failure, initiatedBy, fresh }) => {
+    const f = await seed();
+    await db.update(companies).set({ name: fresh ? "example-org" : "second-org" }).where(eq(companies.id, f.companyId));
+    const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner", execute: async input => {
+      captured.set(input.runId, input);
+      // Settle fixture work so automatic disposition repair cannot race Retry.
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+      const sessionId = input.runtime.sessionId ?? randomUUID();
+      return { exitCode: 0, signal: null, timedOut: false, sessionId,
+        sessionParams: { sessionId, adapterState: "preserved" }, summary: "Completed the fixture session turn.", resultJson: {} };
+    } });
+    try {
+      await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: {
+        provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous",
+      } }).where(eq(agents.id, f.agentId));
+      await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+      await db.update(issues).set({
+        workspaceSelection: { version: 1, source: "explicit", selection: { kind: "task_directory" } },
+        executionWorkspaceSettings: { mode: "isolated_workspace", workspaceStrategy: { type: "project_primary" } },
+      }).where(eq(issues.id, f.issueId));
+      const first = await execute(f);
+      const [stored] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId));
+      const sessionId = stored.sessionParamsJson?.sessionId;
+      expect(sessionId).toEqual(expect.any(String));
+      expect(stored.lastRunId).toBe(first.finished.id);
+      const workspaceId = String(first.input.context.executionWorkspaceId);
+      // Convert the settled setup run into the failed-source fixture, retaining
+      // the same task-owned files and saved provider session for all three rows.
+      const [workspace] = await db.update(executionWorkspaces).set({ status: "active", closedAt: null })
+        .where(eq(executionWorkspaces.id, workspaceId)).returning();
+      expect(workspace).toMatchObject({ sourceIssueId: f.issueId, mode: "isolated_workspace" });
+      await db.update(heartbeatRuns).set({ status: "failed", error: failure, errorCode: "adapter_failed" })
+        .where(eq(heartbeatRuns.id, first.finished.id));
+      await db.update(issues).set({ status: "todo" }).where(eq(issues.id, f.issueId));
+      const receipt = await requestTaskRetry({ db, companyId: f.companyId, issueId: f.issueId,
+        actorId: f.userId, actorSource: "local_implicit", observedRunId: first.finished.id,
+        idempotencyKey: randomUUID(), ...(initiatedBy ? { initiatedBy } : {}) });
+      expect(receipt).toMatchObject({ accepted: true, stale: false, observedRunId: first.finished.id });
+      expect(receipt.requestId).toEqual(expect.any(String));
+      await heartbeat.resumeTaskRetry(f.companyId, receipt.requestId!);
+      await heartbeat.drainActiveRunExecutions();
+      const retries = [...captured.values()].filter(input => input.context.issueId === f.issueId && input.runId !== first.finished.id);
+      expect(retries).toHaveLength(1);
+      const retry = retries[0];
+      expect(retry.context).toMatchObject({ taskRetryRequestId: receipt.requestId, previousRunId: first.finished.id, forceFreshSession: true });
+      expect(retry.runtime.sessionId).toBe(fresh ? null : sessionId);
+      expect(retry.runtime.sessionParams).toEqual(fresh ? null : { sessionId, adapterState: "preserved" });
+      if (fresh) expect(retry.context.explicitFreshSession).toBe(true);
+      else expect(retry.context.explicitFreshSession).toBeUndefined();
+      const finished = await heartbeat.getRun(retry.runId);
+      expect(finished?.status, finished?.error ?? undefined).toBe("succeeded");
+      expect(finished?.sessionIdBefore).toBe(fresh ? null : sessionId);
+      expect(finished?.resultJson).toMatchObject({ configFreshness: { session: {
+        reset: fresh, taskSessionAvailable: true, taskSessionReused: !fresh,
+      } } });
+      const [after] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId));
+      expect(after.lastRunId).toBe(retry.runId);
+      if (fresh) expect(after.sessionParamsJson?.sessionId).not.toBe(sessionId);
+      else expect(after.sessionParamsJson?.sessionId).toBe(sessionId);
+    } finally {
+      await heartbeat.drainActiveRunExecutions();
+      mode.mockRestore(); unregisterServerAdapter("paperclip_runner");
+      await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    }
+  });
+
   it("keeps a workspace source refusal typed before provider startup", async () => {
     const f = await seed(), type = `${adapterType}_source_refusal`;
     registerServerAdapter({ ...getServerAdapter(adapterType), type,
