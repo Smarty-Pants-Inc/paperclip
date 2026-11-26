@@ -12920,6 +12920,7 @@ async function executePaperclipNativeSessionAttempt(
       execution: input.execution,
       runnerInstanceId: effectiveRunnerInstanceId,
       pluginTaskDescription,
+      cachedWarmSession: existingWarmSession !== undefined,
       retainedPluginTaskOwner: existingWarmSession ? pluginTaskSessionOwners.get(existingWarmSession) : relaunchReleased?.owner,
       relaunchReleased: relaunchReleased ? { source: relaunchReleased.source, runner: relaunchReleased.runner } : undefined,
       onPluginTaskOwner: owner => { if (relaunchReleased && !relaunchReleased.owner) relaunchReleased.owner = owner; },
@@ -17001,6 +17002,8 @@ export async function createRunnerdBackend(input: {
   recoveryPurpose?: "execution" | "stop_cleanup";
   durableEnvironmentLeaseId?: string;
   remoteWarmRecovery?: Omit<RemoteWarmSessionRecovery, "revalidate"> & { revalidate: () => Promise<void> };
+  /** A live owner already loaded its pack; backend setup must not replace it. */
+  cachedWarmSession?: boolean;
   retainedPluginTaskOwner?: ReturnType<typeof createPluginRunnerTaskOwner>;
   relaunchReleased?: { source: DurableRecoveryIdentity; runner: { version: string; digest: string } };
   onPluginTaskOwner?: (owner: ReturnType<typeof createPluginRunnerTaskOwner>) => void;
@@ -17825,7 +17828,8 @@ async function createRunnerdBackendWithinSessionClaim(
   // state even when no daemon survived. Its launch profile binds the admitted
   // artifact bytes and paths just as a live reattachment does.
   const reattachProviderPack = input.restartRecovery?.kind === "reattach_remote_runner" || input.remoteWarmRecovery !== undefined;
-  let retainProviderPack = reattachProviderPack || ["opencode", "pi_rpc"].includes(input.execution.provider.kind) && durableBinding !== null &&
+  let retainProviderPack = input.cachedWarmSession === true || reattachProviderPack ||
+    ["opencode", "pi_rpc"].includes(input.execution.provider.kind) && durableBinding !== null &&
     !(continuousPi && !input.restartRecovery && !input.remoteWarmRecovery);
   if (requiresRemoteProviderPack && !retainProviderPack) resolveCurrentProviderPackManifest();
   // The transport hashes runnerBinary on the controller before an external
@@ -18026,6 +18030,14 @@ async function createRunnerdBackendWithinSessionClaim(
     )
       return;
     selectedRemoteMode = requiredMode;
+    // Cached attachment bypasses admission recording. Restaging here would
+    // change the live runner's pack without updating its receipt or authority.
+    // Nor restage the runner binary under it.
+    // Cold launches still follow the normal selection and staging path below.
+    if (input.cachedWarmSession && retainProviderPack && !artifactStorage && !input.restartRecovery && !input.remoteWarmRecovery) {
+      remotePrepared = true;
+      return;
+    }
     if (input.restartRecovery?.kind === "reattach_remote_runner" || input.remoteWarmRecovery) {
       if (input.controllerPersistence?.runnerArtifact && !relaunchesSettledRemoteRunner) {
         remotePrepared = true;
@@ -18046,6 +18058,13 @@ async function createRunnerdBackendWithinSessionClaim(
     await remoteNativeArtifacts?.prepare(requiredMode);
     if (artifactStorage && providerArtifacts) {
       providerPackVerified = true;
+      remotePrepared = true;
+      return;
+    }
+    // Cached attachment bypasses admission recording. Restaging here would
+    // change the live runner's pack without updating its receipt or authority.
+    // Cold launches still follow the normal selection and staging path below.
+    if (input.cachedWarmSession && retainProviderPack) {
       remotePrepared = true;
       return;
     }
