@@ -1,7 +1,7 @@
 import type { PaperclipTurnContext } from "@paperclipai/adapter-utils/server-utils";
 import { resolvePaperclipRunnerCursorMode, resolvePaperclipRunnerPiThinkingLevel } from "@paperclipai/adapter-utils";
 import { createHash } from "node:crypto";
-import { buildNativeContinuationPrompt } from "./native-continuation.js";
+import { buildNativeContinuationPrompt, nativeTaskChanges, type NativeTaskSnapshot } from "./native-continuation.js";
 import { decideNativeContinuation, resolveSessionContinuity } from "./continued-session.js";
 import {
   caseExecutionMarkdown,
@@ -60,6 +60,7 @@ export interface BuildNativeExecutionInput {
     conversationAgentId?: string | null;
   };
   taskPrompt: string;
+  taskSnapshot?: NativeTaskSnapshot | null;
   initialCommunicationGuidance?: string | null;
   /** Bounded, redacted background restored only after a fresh provider bootstrap. */
   freshSessionHandoff?: string | null;
@@ -78,7 +79,12 @@ export interface BuildNativeExecutionInput {
   sessionContinuity?: unknown;
   previousTurn?: {
     runId: string;
+    /** Exact-run evidence from the server, not from a provider checkpoint. */
+    status?: string;
+    acceptedResultId?: string | null;
+    wakePayload?: unknown;
     task: { title: string; description: string | null };
+    taskSnapshot?: NativeTaskSnapshot | null;
     githubReviewConfigurationKeys?: string[];
     nativeExecutionInput?: {
       binding: { companyId: string; runId: string; issueId: string; agentId: string };
@@ -265,7 +271,8 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
   const continuity = resolveSessionContinuity(input.provider, input.sessionContinuity);
   const piConversation = input.provider === "pi_rpc" && input.conversationMode === true && input.issue.conversationAgentId === input.agentId;
   const continuation = decideNativeContinuation({ ...input, hasSession: input.resumedSession === true && !!input.previousTurn,
-    taskChanged: !!input.previousTurn && (input.issue.title !== input.previousTurn.task.title || input.issue.description !== input.previousTurn.task.description),
+    taskChanged: !!input.previousTurn && (input.issue.title !== input.previousTurn.task.title || input.issue.description !== input.previousTurn.task.description ||
+      Object.keys(nativeTaskChanges(input.taskSnapshot, input.previousTurn.taskSnapshot) ?? {}).length > 0),
     wakeReset: input.conversationMode === true, previousRunId: input.previousTurn?.runId });
   const runtimeContext = piConversation ? structuredClone(input.runtimeContext) : input.runtimeContext;
   if (piConversation) {
@@ -284,7 +291,12 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
     ...(continuation.continue && input.previousTurn ? {
       continuationPrompt: buildNativeContinuationPrompt({
         wakePayload: input.wakePayload,
+        previousWakePayload: input.previousTurn.wakePayload,
         promptOnly: continuation.promptOnly,
+        continuousPi: input.provider === "pi_rpc" && continuity === "continuous",
+        taskSnapshot: input.taskSnapshot,
+        previousTaskSnapshot: input.previousTurn.taskSnapshot,
+        previousTurnDelivered: input.previousTurn.status === "succeeded" && !!input.previousTurn.acceptedResultId,
         previousRunId: input.previousTurn.runId,
         previousIssue: input.previousTurn.task,
         previousGitHubReviewConfigurationKeys: input.previousTurn.githubReviewConfigurationKeys,

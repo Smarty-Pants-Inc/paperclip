@@ -451,6 +451,27 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
       title: issueRef.title,
       description: isConversation(issueContext) ? null : issueRef.description,
       workMode: issueRef.workMode,
+      // Keep the canonical row even when conversation framing hides the brief.
+      // The registry below redacts this snapshot before it can reach a prompt.
+      ...(issueContext ? { continuationSnapshot: {
+        identifier: issueRef.identifier,
+        title: issueRef.title,
+        description: issueRef.description,
+        workMode: issueRef.workMode,
+        status: issueContext.status,
+        priority: issueContext.priority,
+        assigneeAgentId: issueContext.assigneeAgentId,
+        assigneeUserId: issueContext.assigneeUserId,
+        parentId: issueContext.parentId,
+        projectId: issueContext.projectId,
+        goalId: issueContext.goalId,
+        conversationAgentId: issueContext.conversationAgentId,
+        titleNeedsGeneration: issueContext.titleNeedsGeneration,
+        reviewPolicy: issueContext.reviewPolicy,
+        executionPolicy: issueContext.executionPolicy,
+        responsibleUserId: issueContext.responsibleUserId,
+        billingCode: issueContext.billingCode,
+      } } : {}),
     };
   } else {
     delete context.paperclipIssue;

@@ -6,7 +6,146 @@ import { nativeCompletionSource, buildNativeCompletionContract } from "./complet
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
+import { buildNativeContinuationPrompt, type NativeTaskSnapshot } from "./native-continuation.js";
 import { buildNativeModelEnvelope, canonicalNativeRuntimeContextDigest, parseNativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
+
+describe("continuous Pi task-field news without a comment", () => {
+  const before: NativeTaskSnapshot = {
+    identifier: "TASK-1", title: "Original task", description: null, workMode: "standard", status: "todo", priority: "medium",
+    assigneeAgentId: "agent", assigneeUserId: null, parentId: null, projectId: null, goalId: null, conversationAgentId: null,
+    reviewPolicy: null, responsibleUserId: null, billingCode: null, titleNeedsGeneration: false, executionPolicy: null,
+  };
+  const wake = (reason = "issue_updated_by_user") => ({ reason, executionContinuation: {
+    version: 1, messages: [{ id: "old", body: "OLD HISTORY", authorType: "user", authorId: "board" }],
+    resumeDelta: { baseRunId: "prior", messages: [] },
+  } });
+  const args = (taskSnapshot: NativeTaskSnapshot = before): Parameters<typeof buildNativeExecutionInput>[0] => ({
+    companyId: "company", runId: "next", agentId: "agent", issue: { id: "issue", ...before, ...taskSnapshot,
+      title: taskSnapshot.title!, workMode: taskSnapshot.workMode! },
+    taskSnapshot, taskPrompt: "FULL ORIGINAL BRIEF", provider: "pi_rpc", normalizedSessionId: "session", resumedSession: true,
+    previousTurn: { runId: "prior", status: "succeeded", acceptedResultId: "accepted-prior-result", wakePayload: wake(), task: { title: before.title!, description: before.description }, taskSnapshot: before }, wakePayload: wake(),
+    workspace: { id: "workspace", cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null }, runtimeContext: nativeRuntimeContextFixture(),
+    completionContract: { id: "contract", sha256: "a".repeat(64), schemaVersion: "paperclip.run-result.v1", contract: {
+      revision: "1", objective: "Continue", criteria: [{ id: "reply", requirement: "Reply" }],
+    } },
+  });
+  // Each independently mutable agent-visible field must survive a comment-free person wake.
+  it.each([
+    ["status", "in_review", "status: todo -> in_review"],
+    ["assigneeAgentId", "other-agent", "assigneeAgentId: agent -> other-agent"],
+    ["priority", "high", "priority: medium -> high"],
+    ["assigneeUserId", "board", "assigneeUserId: null -> board"],
+    ["title", "Changed task", "title: Original task -> Changed task"],
+    ["description", "New brief", "description: null -> New brief"],
+    ["workMode", "ask", "workMode: standard -> ask"],
+    ["identifier", "TASK-2", "identifier: TASK-1 -> TASK-2"],
+    ["parentId", "parent", "parentId: null -> parent"],
+    ["projectId", "project", "projectId: null -> project"],
+    ["goalId", "goal", "goalId: null -> goal"],
+    ["conversationAgentId", "agent", "conversationAgentId: null -> agent"],
+    ["reviewPolicy", "required", "reviewPolicy: null -> required"],
+    ["responsibleUserId", "board", "responsibleUserId: null -> board"],
+    ["billingCode", "cost-center", "billingCode: null -> cost-center"],
+    ["titleNeedsGeneration", true, "titleNeedsGeneration: false -> true"],
+    ["executionPolicy", { mode: "manual" }, 'executionPolicy: null -> {"mode":"manual"}'],
+  ] as const)("names changed %s and wake reason with old -> new values", (field, value, expected) => {
+    const current = { ...before, [field]: value };
+    const input = args(current);
+    const result = buildNativeExecutionInput(input);
+    expect(result.continuationPrompt).toContain("Wake reason: issue_updated_by_user");
+    expect(result.continuationPrompt).toContain(expected);
+    expect(result.continuationPrompt).not.toContain("nothing new");
+    expect(result.continuationPrompt).not.toContain("OLD HISTORY");
+    expect(result.continuationPrompt).not.toContain("FULL ORIGINAL BRIEF");
+    // The fast promptOnly branch must not swallow the same field changes either.
+    expect(buildNativeContinuationPrompt({ wakePayload: wake(), continuousPi: true, promptOnly: true,
+      previousRunId: "prior", previousTurnDelivered: true, issue: input.issue, previousIssue: input.previousTurn!.task,
+      taskSnapshot: current, previousTaskSnapshot: before })).toContain(expected);
+  });
+  it("reports all simultaneous changes, not just the field named by the wake", () => {
+    const input = args({ ...before, status: "in_review", priority: "urgent", assigneeAgentId: null });
+    input.wakePayload = wake("issue_status_changed");
+    const prompt = buildNativeExecutionInput(input).continuationPrompt!;
+    for (const text of ["Wake reason: issue_status_changed", "status: todo -> in_review", "priority: medium -> urgent", "assigneeAgentId: agent -> null"]) expect(prompt).toContain(text);
+  });
+  it("uses exactly the bare nothing-new line only for a truly unchanged task and empty delta", () => {
+    expect(buildNativeExecutionInput(args()).continuationPrompt).toBe("Continue the task; nothing new arrived since your last turn.");
+  });
+  it.each([undefined, null, { title: "Original task", description: null }])("falls back to the full prompt without a complete prior task snapshot: %j", taskSnapshot => {
+    const input = args();
+    input.previousTurn = { ...input.previousTurn!, taskSnapshot: taskSnapshot as NativeTaskSnapshot | null | undefined };
+    const result = buildNativeExecutionInput(input);
+    expect(result.continuationPrompt).toBeNull();
+    expect(result.task.prompt).toContain("FULL ORIGINAL BRIEF");
+  });
+  it.each([
+    ["reviewDecision", "changes_requested"], ["reviewDecision", null], ["notificationReason", "owner_attention"],
+    ["retryCause", "provider_busy"], ["retrySummary", "Try the unfinished work again"],
+    ["unblockAction", "resume"], ["monitor", { state: "needs_attention" }],
+  ] as const)("projects wake-owned %s even with an empty delta", (key, value) => {
+    const input = args();
+    input.wakePayload = { ...wake("arbitrary_future_reason"), [key]: value };
+    const prompt = buildNativeExecutionInput(input).continuationPrompt!;
+    expect(prompt).toContain("Wake reason: arbitrary_future_reason");
+    expect(prompt).toContain(`${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`);
+    expect(prompt).toContain("status: todo; assigneeAgentId: agent; assigneeUserId: null; priority: medium");
+    expect(prompt).not.toContain("nothing new");
+  });
+  it("names a new wake reason even when the row and messages did not change", () => {
+    const input = args();
+    input.wakePayload = wake("issue_continuation_needed");
+    const prompt = buildNativeExecutionInput(input).continuationPrompt!;
+    expect(prompt).toContain("Wake reason: issue_continuation_needed");
+    expect(prompt).toContain("status: todo;");
+    expect(prompt).not.toContain("nothing new");
+  });
+  it("names removal of the last blocker even without a row change", () => {
+    const input = args();
+    input.previousTurn = { ...input.previousTurn!, wakePayload: { ...wake(), unresolvedBlockerIssueIds: ["resolved-blocker"] } };
+    expect(buildNativeExecutionInput(input).continuationPrompt).toContain("unresolvedBlockerIssueIds: []");
+  });
+  // Force each short branch independently; a full comment must never override a guard.
+  it.each([
+    ["truncated", { truncated: true }], ["fallbackFetchNeeded", { fallbackFetchNeeded: true }],
+    ["interruptedRunId", { executionContinuation: { ...wake().executionContinuation, interruptedRunId: "interrupted" } }],
+    ["activeTreeHold", { activeTreeHold: { holdId: "hold", reason: "approval" } }],
+    ["blocker ids", { unresolvedBlockerIssueIds: ["blocker"] }],
+    ["MCP App context", { mcpAppContext: "Current selection (untrusted)" }],
+  ])("runs the %s specialized guard before BOTH compact forms", (_name, extra) => {
+    const input = args();
+    const payload = { ...wake(), commentIds: ["new"], comments: [{ id: "new", body: "New", fullBody: "New", author: { type: "user", id: "board" } }], ...extra };
+    input.wakePayload = payload;
+    expect(buildNativeExecutionInput(input).continuationPrompt).toBeNull();
+    expect(buildNativeExecutionInput(input).task.prompt).toContain("FULL ORIGINAL BRIEF");
+    for (const promptOnly of [true, false]) expect(buildNativeContinuationPrompt({
+      wakePayload: payload, promptOnly, continuousPi: true, previousTurnDelivered: true,
+      previousRunId: "prior", issue: input.issue, previousIssue: input.previousTurn!.task,
+      taskSnapshot: before, previousTaskSnapshot: before,
+    })).toBeNull();
+  });
+  it.each([
+    ["failed", "accepted-prior-result"], ["failed", null], ["succeeded", null], ["succeeded", undefined], [undefined, "accepted-prior-result"],
+  ])("keeps the full prompt after a failed or unaccepted previous turn (%s, %s)", (status, acceptedResultId) => {
+    const input = args();
+    input.previousTurn = { ...input.previousTurn!, status, acceptedResultId };
+    const result = buildNativeExecutionInput(input);
+    expect(result.continuationPrompt).toBeNull();
+    expect(result.task.prompt).toContain("FULL ORIGINAL BRIEF");
+  });
+  it("fails closed on an unknown wake payload key", () => {
+    const input = args();
+    input.wakePayload = { ...wake(), futureImportantNews: { decision: "do not lose this" } };
+    expect(buildNativeExecutionInput(input).continuationPrompt).toBeNull();
+    expect(buildNativeExecutionInput(input).task.prompt).toContain("FULL ORIGINAL BRIEF");
+  });
+  it("falls back to the full prompt if the current task snapshot is unavailable", () => {
+    const input = args();
+    delete input.taskSnapshot;
+    const result = buildNativeExecutionInput(input);
+    expect(result.continuationPrompt).toBeNull();
+    expect(result.task.prompt).toContain("FULL ORIGINAL BRIEF");
+  });
+});
 
 describe("LCA-05 explicit native work mode", () => {
   it.each(["standard", "planning", "ask", "skill_test"])("title and description cannot override %s mode", (workMode) => {
