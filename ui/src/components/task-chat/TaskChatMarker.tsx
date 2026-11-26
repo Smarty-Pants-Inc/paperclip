@@ -1,9 +1,12 @@
 import { useId, useState } from "react";
 import { cn } from "@/lib/utils";
-import { ChevronDown, CircleDot, FoldVertical, OctagonX, Square, Flag, KeyRound } from "lucide-react";
+import { ChevronDown, CircleDot, CircleAlert, RotateCw, FoldVertical, OctagonX, Square, Flag, KeyRound } from "lucide-react";
+import { useTaskChatStatusLine } from "./TaskChatStatusLine";
+import { TaskChatSystemNotice } from "./TaskChatSystemNotice";
 import { useStreamlinedTaskChatPresentation } from "./presentation-mode";
 import type { TaskChatMarkerItem } from "./task-chat-model";
 import { Button } from "@/components/ui/button";
+import { MarkdownBody } from "@/components/MarkdownBody";
 import { Link } from "@/lib/router";
 import { timeAgo } from "@/lib/timeAgo";
 import { useProviderLimitMessage } from "@/hooks/useProviderLimitMessage";
@@ -32,17 +35,25 @@ export function TaskChatMarker({
   const [open, setOpen] = useState(false);
   const detailsId = useId();
   const streamlined = useStreamlinedTaskChatPresentation();
+  const dockOwnsStatus = useTaskChatStatusLine() !== null;
   const Icon = item.tone === "neutral" ? Square : VARIANT_ICON[item.variant];
   const interrupted = item.variant === "interrupted" && item.tone !== "neutral";
+  const ReasonIcon = interrupted ? CircleAlert : RotateCw;
   const relative = item.createdAtIso ? timeAgo(item.createdAtIso) : undefined;
   const label = useProviderLimitMessage(item.label);
-  const detail = useProviderLimitMessage(item.detail ?? "", !item.collapsible || open);
+  const detail = useProviderLimitMessage(item.detail ?? "", dockOwnsStatus || !item.collapsible || open);
   const handleTryAgain = () => {
     void Promise.resolve()
       .then(() => onTryAgain?.())
       // The parent mutation owns visible error feedback.
       .catch(() => undefined);
   };
+
+  const diagnosticLinks = item.planHref || item.runHref ? <>
+    {item.planHref ? <Link className="underline underline-offset-2" to={item.planHref}>View saved plan</Link> : null}
+    {item.runHref ? <Link className="underline underline-offset-2" to={item.runHref}>View run</Link> : null}
+  </> : undefined;
+  if (item.notice) return <TaskChatSystemNotice item={item.notice} failure reason={detail || undefined} actions={diagnosticLinks} />;
 
   if (item.credentialAccess) {
     const { agentName, credentialName, deniedUser, settingsHref } = item.credentialAccess;
@@ -66,6 +77,18 @@ export function TaskChatMarker({
       </div>
     );
   }
+
+  if (dockOwnsStatus && item.variant === "interrupted") return <div className="flex items-start gap-2 px-1 py-1 text-sm text-muted-foreground" data-testid="task-chat-failure-reason">
+    <ReasonIcon className={cn("mt-0.5 size-3.5 shrink-0", interrupted && "text-destructive")} aria-hidden />
+    <div className="min-w-0 flex-1 break-words">
+      <MarkdownBody className="text-sm" softBreaks linkIssueReferences>{detail || label}</MarkdownBody>
+      {item.settingsHref ? <Link className="underline underline-offset-2" to={item.settingsHref}>Agent settings</Link> : null}
+      {item.runHref || item.planHref ? <details className="mt-1 text-xs">
+        <summary className="w-fit cursor-pointer rounded-sm focus-visible:outline-2">Details</summary>
+        <div className="flex flex-wrap gap-3 py-2">{diagnosticLinks}</div>
+      </details> : null}
+    </div>
+  </div>;
 
   if (item.collapsible) {
     return (

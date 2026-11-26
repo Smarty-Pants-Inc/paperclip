@@ -973,9 +973,7 @@ export function transcriptToTaskChatItems(
           if (existing.kind === "tool") {
             existing.status = entry.delta
               ? "in_progress"
-              : entry.isError
-                ? "failed"
-                : "completed";
+              : entry.toolOutcome ?? (entry.isError ? "failed" : "completed");
             if (
               isGenericToolName(existing.rawName) &&
               !isGenericToolName(entry.toolName)
@@ -2453,7 +2451,7 @@ export interface ThreadBackboneEntry {
 
 /**
  * Assemble the thread body (PAP-367): backbone entries in order, each followed
- * by the settled turns anchored to it (run → reply-comment linkage), with
+ * by its response and failure rows (durable request/reply identity), with
  * comment-less settled turns — stopped runs, or a reply not yet fetched —
  * interleaved chronologically at their run's start time instead of
  * bottom-appended under the newest message. Ties go after the backbone entry
@@ -2462,7 +2460,7 @@ export interface ThreadBackboneEntry {
  */
 export function assembleThreadItems(
   entries: readonly ThreadBackboneEntry[],
-  turnsByAnchor: ReadonlyMap<string, readonly TaskChatTurnItem[]>,
+  turnsByAnchor: ReadonlyMap<string, readonly TaskChatItem[]>,
   unanchored: readonly { turn: TaskChatTurnItem; startMs: number }[],
 ): TaskChatItem[] {
   const out: TaskChatItem[] = [];

@@ -5,6 +5,7 @@ type TranscriptToolDetail = NonNullable<Extract<TranscriptEntry, { kind: "tool_c
 import { isRunLogOnlyProviderEvent } from "./run-log-only-events";
 import { workspaceChangeEntry } from "@/adapters/paperclip-runner";
 import { createUnifiedDiffClassifier } from "@/components/task-chat/diff-lines";
+import { toolActivityPresentation } from "@/components/task-chat/tool-taxonomy";
 
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -829,11 +830,11 @@ export function nativeRunActivityLabel(events: readonly HeartbeatRunEvent[]): st
   for (const event of [...events].sort((a, b) => a.seq - b.seq)) {
     const outer = record(event.payload);
     if (event.eventType === "lifecycle" && ["snapshot.git", "snapshot.baseline", "pack", "stage.workspace"].includes(String(outer?.phase))) {
-      advance(1, "Preparing run…");
+      advance(1, "Preparing the workspace");
     }
     if (event.eventType === "run.startup.reuse" && outer?.schema === "paperclip.startup-reuse.v1"
       && outer.layer === "workspace" && ["fresh", "reused"].includes(String(outer.state))) {
-      advance(2, "Workspace ready");
+      advance(2, "Connecting to the model");
     }
     const envelope = record(outer?.prpEvent);
     if (!envelope || envelope.schema !== "paperclip.prp.event.v1" || envelope.schemaVersion !== 1
@@ -843,15 +844,18 @@ export function nativeRunActivityLabel(events: readonly HeartbeatRunEvent[]): st
     if (sourceId) seen.add(sourceId);
     const payload = record(envelope.payload);
     if (!payload) continue;
-    if (["session.started", "session.resumed", "run.attached"].includes(event.eventType)) advance(3, "Conversation ready");
-    // Submitted precedes the provider request; only accepted acknowledges it.
-    if (event.eventType === "turn.submitted") {
-      active.clear();
-      stage = 4;
-      label = "Sending message…";
+    if (["session.started", "session.resumed", "run.attached"].includes(event.eventType)) {
+      advance(3, event.eventType === "session.resumed" ? "Resuming your conversation" : "Connecting to the model");
     }
-    if (event.eventType === "turn.accepted") advance(5, "Message sent");
-    if (event.eventType === "turn.started") advance(6, "Working");
+    // Each turn owns new activity, but not a new run clock. Old tool/thinking
+    // state must not survive a steer or a resumed provider turn.
+    if (["turn.submitted", "turn.accepted", "turn.started"].includes(event.eventType)) {
+      stage = event.eventType === "turn.submitted" ? 4 : event.eventType === "turn.accepted" ? 5 : 6;
+      label = stage === 4 ? "Connecting to the model" : "Working";
+      active.clear();
+      requests.clear();
+      identities.clear();
+    }
     const id = normalizedItemId(envelope, payload);
     const identity = resolveItemIdentity(payload, id ? identities.get(id) : undefined);
     if (id && isItemIdentityEvent(event.eventType)) identities.set(id, identity);
@@ -862,7 +866,10 @@ export function nativeRunActivityLabel(events: readonly HeartbeatRunEvent[]): st
       if (event.eventType === "tool.execution.completed" || tool?.kind === "toolresult"
         || (event.eventType === "item.completed" && tool?.details.result !== undefined)) active.delete(`tool:${toolId}`);
       else if (["tool.execution.started", "tool.execution.progressed", "item.started", "item.delta"].includes(event.eventType)) {
-        active.set(`tool:${toolId}`, payload.operation === "edit" ? "Editing files" : "Running a tool");
+        const name = toolPresentation(payload, tool?.details).name;
+        const family = toolActivityPresentation({ name, operation: text(payload.operation) }).family;
+        active.set(`tool:${toolId}`, family === "terminal" ? "Running a command"
+          : family === "read" ? "Reading a file" : family === "edit" ? "Editing files" : "Using a tool");
       }
       stage = 6;
       label = [...active.values()].at(-1) ?? "Working";
@@ -873,7 +880,7 @@ export function nativeRunActivityLabel(events: readonly HeartbeatRunEvent[]): st
       label = [...active.values()].at(-1) ?? "Working";
     } else if (isAssistantItemKind(identity.kind) && ["item.delta", "item.completed"].includes(event.eventType) && normalizedItemText(payload)) {
       stage = 6;
-      label = "Writing an answer";
+      label = "Writing the answer";
     }
     if (event.eventType.startsWith("runtime_request.")) {
       const request = runtimeRequestEntry({ eventType: event.eventType, envelope, payload, ts: timestamp(event, envelope) });
@@ -884,7 +891,7 @@ export function nativeRunActivityLabel(events: readonly HeartbeatRunEvent[]): st
       }
     }
   }
-  return requests.size ? "Waiting for you" : label;
+  return requests.size ? "Waiting for your answer" : label;
 }
 
 export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]): TranscriptEntry[] {
@@ -1406,6 +1413,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
           toolName: presentation.name,
           content,
           isError: payload.status === "failed" || nativeToolItem?.isError === true,
+          ...(["interrupted", "cancelled"].includes(String(payload.status)) ? { toolOutcome: "interrupted" as const } : {}),
         });
       }
       continue;

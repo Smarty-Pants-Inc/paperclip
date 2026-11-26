@@ -1,4 +1,5 @@
 import { groupImageResources } from "./image-resources";
+import { formatTaskRunDuration, useTaskChatStatusLine } from "./TaskChatStatusLine";
 import { RunnerReasoningDisplay } from "./reasoning-display";
 import { AgentQueueWait } from "@/components/AgentQueueWait";
 import { agentQueueWaitOf } from "@/lib/agent-queue-wait";
@@ -57,11 +58,7 @@ function currentActivityStatusItems(
 
 function formatCompactDuration(ms: number | null): string | null {
   if (ms == null || !Number.isFinite(ms)) return null;
-  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
-  if (totalSeconds < 60) return `${totalSeconds}s`;
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return seconds === 0 ? `${minutes}m` : `${minutes}m ${seconds}s`;
+  return formatTaskRunDuration(ms);
 }
 
 function terminalStatusFailed(status: string): boolean {
@@ -105,7 +102,7 @@ function RunnerTurnStatus({
   const failed = terminalStatusFailed(status);
   const label = waitingLabel ?? (terminal ? (personStopped ? "Stopped" : failed ? "Couldn't finish" : "Worked") : "Working");
   const suffix = waitingLabel ? "" : terminal
-    ? elapsed ? ` ${failed ? "after" : "for"} ${elapsed}` : ""
+    ? elapsed ? ` ${failed || personStopped ? "after" : "for"} ${elapsed}` : ""
     : elapsed ? `${waitingLabel ? " · " : " for "}${elapsed}` : "";
 
   return (
@@ -164,11 +161,13 @@ function agentQueueWaitFor({ status, execution }: Pick<RunnerHeaderProps, "statu
 }
 
 /** One identity stays mounted while admission discovers the run's renderer. */
-export function TaskChatRunnerHeader({ statusContent, ...props }: RunnerHeaderProps & { statusContent?: ReactNode }) {
+export function TaskChatRunnerHeader({ statusContent, hideEndedReceipt, ...props }: RunnerHeaderProps & { statusContent?: ReactNode; hideEndedReceipt?: boolean }) {
   const waitingToStart = useRunnerWaitingToStart(props);
+  const dockStatus = useTaskChatStatusLine();
+  if (dockStatus && props.continuedAfterSteering) return null;
   return <div className="flex min-h-8 min-w-0 items-center gap-2 pb-1 pt-2" data-testid="task-chat-runner-identity-row">
     {props.agentName ? <TaskChatAgentIdentity agentName={props.agentName} agentIcon={props.agentIcon} agent={props.agent} /> : null}
-    {statusContent ?? (agentQueueWaitFor(props) ? <AgentQueueWait queue={agentQueueWaitFor(props)!} /> : null) ?? <RunnerTurnStatus status={props.status} startedAtMs={props.startedAtMs} finishedAtMs={props.finishedAtMs}
+    {dockStatus ? (!hideEndedReceipt && dockStatus.get(props.runId ?? "") ? <span className="min-w-0 truncate text-sm font-normal text-muted-foreground" data-testid="task-chat-ended-status">{dockStatus.get(props.runId ?? "")}</span> : null) : statusContent ?? (agentQueueWaitFor(props) ? <AgentQueueWait queue={agentQueueWaitFor(props)!} /> : null) ?? <RunnerTurnStatus status={props.status} startedAtMs={props.startedAtMs} finishedAtMs={props.finishedAtMs}
       continuedAfterSteering={props.continuedAfterSteering} waitingLabel={runnerWaitingLabel(props, waitingToStart)} working={props.working === true} personStopped={props.personStopped} />}
   </div>;
 }
@@ -228,6 +227,7 @@ export function TaskChatRunnerTurn({
     decision: TaskChatRuntimeRequestDecision,
   ) => void | Promise<void>;
 }) {
+  const dockOwnsStatus = useTaskChatStatusLine() !== null;
   const { failures: mcpStartupFailures, rest: turnItems } = partitionRunHealthItems(items);
   const terminal = isTerminalRunStatus(status);
   const waitingToStart = useRunnerWaitingToStart({ runId, status, execution, preparationLabel, startedAtMs });
@@ -301,7 +301,7 @@ export function TaskChatRunnerTurn({
         status={status} execution={execution} preparationLabel={preparationLabel} startedAtMs={startedAtMs}
         finishedAtMs={finishedAtMs} continuedAfterSteering={continuedAfterSteering} /> : null}
       <TaskChatRunHealthBanner failures={mcpStartupFailures} />
-      {activityUnavailable ? (
+      {activityUnavailable && !dockOwnsStatus ? (
         <div
           className="px-1 py-1 text-xs text-muted-foreground"
           role="status"
@@ -362,7 +362,7 @@ export function TaskChatRunnerTurn({
           />
         </div>
       ) : null}
-      {(!final || final.streaming) && currentActivityItems.length === 0 && !waitingLabel && !agentQueueWaitFor({ status, execution })
+      {!dockOwnsStatus && (!final || final.streaming) && currentActivityItems.length === 0 && !waitingLabel && !agentQueueWaitFor({ status, execution })
         ? <RunnerCurrentActivityTail status={status} waitingLabel={waitingLabel} /> : null}
     </div></ToolCallProgressRunProvider></TaskChatShimmerScope></RunnerReasoningDisplay>
   );

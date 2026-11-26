@@ -442,6 +442,7 @@ function TaskChatBubbleContent({
             {sentFromIMessage ? "Sent from iMessage" : null}
             {sentFromIMessage && timestamp ? " · " : null}
             {timestamp}
+            {item.addedToRun ? <span data-testid="task-chat-added-to-run">{timestamp ? " · " : ""}Added to this run</span> : null}
           </span>
         </div>
       ) : actions ? (

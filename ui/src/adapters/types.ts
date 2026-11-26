@@ -2,7 +2,7 @@ import type { ComponentType } from "react";
 import type { CreateConfigValues, TranscriptEntry as SharedTranscriptEntry } from "@paperclipai/adapter-utils";
 
 // Placement keeps the first visible timestamp; completion still owns the clock.
-export type TranscriptEntry = SharedTranscriptEntry & { completedAt?: string };
+export type TranscriptEntry = SharedTranscriptEntry & { completedAt?: string; toolOutcome?: "interrupted" };
 export type { StdoutLineParser, CreateConfigValues } from "@paperclipai/adapter-utils";
 
 export interface StatefulStdoutParser {
