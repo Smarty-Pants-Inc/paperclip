@@ -194,6 +194,7 @@ const retryWaitMessages: Record<string, string> = {
   // A new click replaces a Retry declined for its requester's access with a
   // fresh attempt under the clicker's access, so Retry stays available.
   retry_authority_denied: "Retry could not start with the requesting user's access. Press Retry to start it with yours.",
+  retry_original_authority_denied: "Retry refused: the original person can no longer change this task. A different presser cannot replace that authority.",
   retry_authority_unavailable: "Retry refused: the original person is missing or no longer active.",
   retry_presser_not_running: "Retry refused: the pressing agent's run has ended.",
   retry_refused_unsigned_run: "Retry refused: an authenticated run carrying the original person is required.",

@@ -34,6 +34,7 @@ import {
   issueRecoveryActions,
   issueRelations,
   issueTreeHolds,
+  instanceUserRoles,
   issues,
   principalPermissionGrants,
 } from "@paperclipai/db";
@@ -89,6 +90,7 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     await db.delete(principalPermissionGrants);
     await db.delete(agents);
     await db.delete(companyMemberships);
+    await db.delete(instanceUserRoles);
     await db.delete(authUsers);
     await db.delete(companies);
   });
@@ -1057,6 +1059,65 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       entityId: issueId,
       runId: retryRunId,
     });
+  });
+
+  it.each(["allowed", "missing", "local-viewer", "local-suspended", "cloud-stale-admin"])("a person's press retains original authority: %s", async state => {
+    const f = await seedIssueWithRetry();
+    await db.insert(authUsers).values({ id: "original-person", name: "Original", email: "original@example.test",
+      createdAt: new Date(), updatedAt: new Date() });
+    await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user",
+      principalId: "original-person", status: state === "local-suspended" ? "suspended" : "active",
+      membershipRole: state === "allowed" || state === "local-suspended" ? "admin" : "viewer" });
+    if (state === "cloud-stale-admin") await db.insert(instanceUserRoles).values({ userId: "original-person", role: "instance_admin" });
+    await db.update(issues).set({ responsibleUserId: "board-user", executionRunId: null,
+      executionLockedAt: null, executionAgentNameKey: null }).where(eq(issues.id, f.issueId));
+    await db.update(agentWakeupRequests).set({ status: "failed", finishedAt: new Date() })
+      .where(eq(agentWakeupRequests.companyId, f.companyId));
+    await db.update(heartbeatRuns).set({ status: "failed", responsibleUserId: state === "missing" ? null : "original-person",
+      runtimeMode: "native", nativeIssueId: f.issueId, scopeKind: "issue", scheduledRetryAt: null,
+      finishedAt: new Date(), errorCode: "native_predecessor_retirement_unproven",
+      resultJson: { failureCause: "native_predecessor_retirement_unproven", continuationScheduling: "refused" },
+      createdAt: new Date("2026-05-06T18:00:01Z") }).where(eq(heartbeatRuns.id, f.retryRunId));
+    await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "active_run_watchdog", status: "resolved", outcome: "restored", ownerType: "system",
+      returnOwnerAgentId: f.agentId, cause: "native_session_interrupted", fingerprint: randomUUID(),
+      nextAction: "Saved work recovered.", resolutionNote: "workspace_recovered_by_sibling_action",
+      evidence: { runId: f.retryRunId, continuationDelivery: "not_requested" } });
+    registerServerAdapter({ type: "codex_local", supportsLocalAgentJwt: false,
+      execute: async () => {
+        await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+        return { exitCode: 0, signal: null, timedOut: false, resultJson: {} };
+      },
+      testEnvironment: async () => ({ adapterType: "codex_local", status: "pass", checks: [], testedAt: new Date().toISOString() }),
+    });
+    try {
+      const actor = { ...boardActor(f.companyId), source: state.startsWith("local-") ? "local_implicit" as const
+        : state === "cloud-stale-admin" ? "cloud_tenant" as const : "session" as const };
+      const res = await request(createApp(actor)).post(`/api/issues/${f.issueId}/retry`)
+        .send({ idempotencyKey: randomUUID(), observedRunId: f.retryRunId });
+      // The durable receipt is accepted even when dispatch holds it. Assert
+      // the saved refusal and absence of execution below, not just HTTP status.
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, res.body.requestId));
+      expect(receipt.requestedByActorId).toBe("board-user"); // Press still authorized as the presser.
+      await heartbeatService(db).drainActiveRunExecutions();
+      if (state === "allowed") {
+        const [started] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, receipt.runId!));
+        expect(started, JSON.stringify(receipt)).toMatchObject({ responsibleUserId: "original-person", status: "succeeded" });
+        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(3);
+      } else {
+        expect(receipt.runId).toBeNull();
+        expect(receipt.payload?.executionWait).toMatchObject({ reason: state === "missing" ? "retry_authority_unavailable" : "retry_original_authority_denied" });
+        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(2);
+      }
+    } finally {
+      await heartbeatService(db).drainActiveRunExecutions();
+      unregisterServerAdapter("codex_local");
+      await db.delete(agentTaskSessions).where(eq(agentTaskSessions.companyId, f.companyId));
+      await db.delete(agentRuntimeState).where(eq(agentRuntimeState.companyId, f.companyId));
+      await db.delete(companySkills).where(eq(companySkills.companyId, f.companyId));
+      await db.delete(costEvents).where(eq(costEvents.companyId, f.companyId));
+    }
   });
 
   describe("same-person agent Retry (legacy grants do not confer authority)", () => {

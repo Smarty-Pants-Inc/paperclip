@@ -3,7 +3,7 @@ import type { AddressInfo } from "node:net";
 import express from "express";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { activityLog, agents, agentTaskSessions, agentWakeupRequests, chatActions, chatConversations, chatEndpoints, companies, budgetPolicies, costEvents, createDb, type Db, environmentLeases, environments, executionWorkspaces, executionWorkspaceSnapshots, workspaceOperations, heartbeatRunEvents, heartbeatRuns, issueComments, issueRelations, issues, approvals, issueApprovals, issueRecoveryActions, nativeRunFinalizations, toolApplications, toolConnections, toolInvocations, applyPendingMigrations } from "@paperclipai/db";
+import { activityLog, agents, agentTaskSessions, agentWakeupRequests, chatActions, chatConversations, chatEndpoints, companies, companyMemberships, budgetPolicies, costEvents, createDb, type Db, environmentLeases, environments, executionWorkspaces, executionWorkspaceSnapshots, workspaceOperations, heartbeatRunEvents, heartbeatRuns, issueComments, issueRelations, issues, approvals, issueApprovals, issueRecoveryActions, nativeRunFinalizations, toolApplications, toolConnections, toolInvocations, applyPendingMigrations } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { priorRecoveryApiReceipt, unresolvedRecoveryToolInvocation } from "./recovery-effect-receipts.js";
 import { recordRunnerApiOutcome, runnerCallOutcomeMiddleware } from "../middleware/runner-call-outcome.js";
@@ -43,9 +43,11 @@ describe("durable task Retry admission", () => {
   async function seed() {
     const companyId = randomUUID(), issueId = randomUUID(), agentId = randomUUID(), runId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Retry company", issuePrefix: `T${companyId.slice(0, 6)}` });
+    await db.insert(companyMemberships).values(["board", "local-board"].map(principalId => ({ companyId,
+      principalType: "user", principalId, status: "active", membershipRole: "admin" })));
     await db.insert(agents).values({ id: agentId, companyId, name: "Worker", adapterType: "paperclip_runner", status: "idle" });
     await db.insert(issues).values({ id: issueId, companyId, title: "Continue saved work", status: "blocked", assigneeAgentId: agentId });
-    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, issueId, status: "failed",
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, issueId, status: "failed", responsibleUserId: "board",
       contextSnapshot: { issueId }, finishedAt: new Date() });
     return { db, companyId, issueId, actorId: "board", observedRunId: runId, idempotencyKey: randomUUID() };
   }
@@ -544,7 +546,7 @@ describe("durable task Retry admission", () => {
       status: "resolved", outcome: "blocked", nextAction: "Continue after recovery.",
       evidence: { runId: source.id, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } } }).returning();
     const [refused] = await db.insert(heartbeatRuns).values({ companyId: input.companyId, agentId: source.agentId,
-      issueId: input.issueId, status: "cancelled", errorCode: "execution_reconciliation_required",
+      issueId: input.issueId, status: "cancelled", responsibleUserId: source.responsibleUserId, errorCode: "execution_reconciliation_required",
       retryOfRunId: source.id, createdAt: new Date(now - 1000), finishedAt: new Date(now - 500),
       contextSnapshot: { issueId: input.issueId, retryOfRunId: source.id },
       resultJson: { stopReason: "execution_reconciliation_required", timeoutSource: "stale_queued_run_gate",
@@ -639,7 +641,7 @@ describe("durable task Retry admission", () => {
         stage: "saving_receipts", attempt: 1, attemptLimit: 6, requestIds: [] } } }).where(eq(issueRecoveryActions.id, hold.id));
     let latest = refused;
     if (refusedCount === 2) [latest] = await db.insert(heartbeatRuns).values({ companyId: input.companyId,
-      agentId: source.agentId, issueId: input.issueId, status: "cancelled", errorCode: refused.errorCode,
+      agentId: source.agentId, issueId: input.issueId, status: "cancelled", responsibleUserId: source.responsibleUserId, errorCode: refused.errorCode,
       retryOfRunId: refused.id, createdAt: new Date(refused.finishedAt!.getTime() + 1), finishedAt: new Date(),
       contextSnapshot: { issueId: input.issueId, retryOfRunId: refused.id }, resultJson: refused.resultJson }).returning();
     expect(await hasVerifiedWorkspaceRepair(db, recoveredSource)).toBe(true);
@@ -981,6 +983,7 @@ describe("durable task Retry admission", () => {
   it.each(["owner", "feature"] as const)("rechecks Chat ownership and ignores retired $0 values after waiting for the issue lock", async gate => {
     const input = { ...await seed(), actorId: "local-board", actorSource: "local_implicit" };
     const settings = instanceSettingsService(db);
+    await db.update(heartbeatRuns).set({ responsibleUserId: input.actorId }).where(eq(heartbeatRuns.id, input.observedRunId));
     await settings.updateExperimental({ enableAgentChat: true, enableNativeRunner: true });
     const [issue] = await db.select().from(issues).where(eq(issues.id, input.issueId));
     await db.update(issues).set({ conversationAgentId: issue.assigneeAgentId, conversationUserId: input.actorId,
