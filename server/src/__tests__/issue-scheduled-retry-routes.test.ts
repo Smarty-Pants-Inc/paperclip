@@ -1349,6 +1349,40 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       expect(await refusal(f)).toMatchObject({ details: { authorityUserId: "board-user", reason: "retry_refused_person_stop" } });
     });
 
+    it("audits the saved source person on another agent's receipt-mismatch replay", async () => {
+      const f = await seedAgentRetry(), other = await anotherPresser(f), key = randomUUID();
+      expect((await press(f, { idempotencyKey: key })).status).toBe(202);
+      const newerId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: newerId, companyId: f.companyId, agentId: f.agentId,
+        issueId: f.issueId, status: "failed", finishedAt: new Date(), responsibleUserId: "unrelated-person" });
+      const res = await press(other, { idempotencyKey: key, observedRunId: newerId });
+      expect(res.status).toBe(409);
+      expect(res.body.details.code).toBe("retry_refused_receipt_mismatch");
+      expect(await refusal(f)).toMatchObject({ actorId: other.presserId,
+        details: { authorityUserId: "board-user", reason: "retry_refused_receipt_mismatch" } });
+    });
+
+    it.each(["task", "person"])("names %s receipt mismatches without disclosing the other receipt's source", async mismatch => {
+      const f = await seedAgentRetry(), key = randomUUID(), saved = await receipt(f, key);
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, saved.requestId!));
+      await db.update(agentWakeupRequests).set(mismatch === "task"
+        ? { payload: { ...wake.payload, issueId: randomUUID() } } : { requestedByActorId: "another-person" })
+        .where(eq(agentWakeupRequests.id, wake.id));
+      const res = await press(f, { idempotencyKey: key });
+      expect(res.status).toBe(409);
+      expect(res.body.details).toEqual({ code: "retry_refused_receipt_mismatch" });
+    });
+
+    it("distinguishes a known deliberate cancelled Stop from unknown cancellation", async () => {
+      const f = await seedAgentRetry();
+      await db.update(heartbeatRuns).set({ status: "cancelled", resultJson: {
+        cancellation: requestedRunCancellation({ cancelledByUserId: "board-user" }, "Stop") } })
+        .where(eq(heartbeatRuns.id, f.retryRunId));
+      const res = await press(f);
+      expect(res.status).toBe(409);
+      expect(res.body.details.code).toBe("retry_refused_person_stop");
+    });
+
     it("checks the original person's mutation permission in locked direct-service admission", async () => {
       const f = await seedAgentRetry();
       await db.update(companyMemberships).set({ membershipRole: "viewer" }).where(eq(companyMemberships.companyId, f.companyId));

@@ -321,12 +321,13 @@ function admitTaskRetry(input: TaskRetryRequest) {
       eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.idempotencyKey, key)));
     if (sameRequest) {
       if (sameRequest.payload?.issueId !== issue.id || sameRequest.requestedByActorId !== input.actorId)
-        throw conflict("This retry request belongs to a different task or user.");
+        throw conflict("This retry request belongs to a different task or user.", { code: "retry_refused_receipt_mismatch" });
       const intent = readTaskRetryIntent(sameRequest.payload);
       if (Boolean(input.agentRequester) !== Boolean(intent?.agentRequester) ||
           (input.agentRequester && (!intent || intent.actorId !== input.actorId ||
             intent.agentRequester?.agentId !== input.agentRequester.agentId)))
-        throw conflict(agentTaskRetryMessage("retry_refused_receipt_mismatch"), { code: "retry_refused_receipt_mismatch" });
+        throw conflict(agentTaskRetryMessage("retry_refused_receipt_mismatch"), { code: "retry_refused_receipt_mismatch",
+          ...(intent?.actorId === input.actorId ? { retrySourceRunId: intent.sourceRunId } : {}) });
       if (input.agentRequester && intent?.agentRequester) {
         // Both the current presser and the saved presser must still qualify;
         // a fresh supplied source/run cannot launder a stopped saved intent.

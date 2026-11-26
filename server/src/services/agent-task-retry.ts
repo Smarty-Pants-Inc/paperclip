@@ -101,7 +101,6 @@ export async function agentTaskRetryRefusal(db: Db, input: {
   if (scheduled || source.status === "scheduled_retry") return "automatic_retry_pending";
   if (!source.finishedAt || !["failed", "cancelled", "timed_out", "interrupted"].includes(source.status)) return "retry_refused_run_not_stopped";
   const cancellation = readRunCancellation(source.result);
-  if (source.status === "cancelled" && cancellation?.expected !== false) return "retry_refused_stop_unverified";
   const pause = source?.result?.pauseStop as { holds?: string[]; companyPauseReason?: string } | undefined;
   if (source.result?.personStop || source.result?.personStopHeld || source.result?.cancelledByUserId ||
       ["user", "board"].includes(String(source.result?.cancelledByActorType ?? source.result?.interruptedByActorType)) || cancellation?.source === "operator" ||
@@ -111,6 +110,7 @@ export async function agentTaskRetryRefusal(db: Db, input: {
       ["issue_paused", "operator_interrupted"].includes(source.errorCode ?? "") ||
       await issueTreeControlService(db).getActivePauseHoldGate(input.companyId, input.issueId))
     return "retry_refused_person_stop";
+  if (source.status === "cancelled" && cancellation?.expected !== false) return "retry_refused_stop_unverified";
   const [issue] = await db.select({ chat: issues.conversationAgentId, origin: issues.originKind }).from(issues)
     .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
   const [chat] = await db.select({ id: chatConversations.id }).from(chatConversations)
