@@ -206,7 +206,7 @@ describe("Coordinator task creation ordering", () => {
   it("follows the live tail and stays after the final reply when the turn settles", async () => {
     state.handoffs = [handoff()];
     const live: LiveRunForIssue = { id: "source-run", agentId: "agent", agentName: "Assistant", adapterType: "paperclip_runner",
-      runtimeMode: "native", status: "running", invocationSource: "on_demand", triggerDetail: null,
+      runModel: null, runtimeMode: "native", status: "running", invocationSource: "on_demand", triggerDetail: null,
       createdAt: at(0), startedAt: at(0), finishedAt: null };
     await paint({ comments: [], linkedRuns: [{ ...sourceRun, status: "running", finishedAt: null }], liveRuns: [live] });
     before(host.querySelector('[data-testid="task-chat-live-transcript"]')!, anchor("chat_handoff:task"));

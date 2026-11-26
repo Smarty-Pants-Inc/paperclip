@@ -190,7 +190,7 @@ async function settleThreadLayout() {
 
 describe.each(["legacy", "native"] as const)("historical %s system status", (runtimeMode) => {
   const run = (id: string, status: string, minute: number) => ({
-    runId: id, status, runtimeMode, agentId: "agent", agentName: "Assistant",
+    runModel: null, runId: id, status, runtimeMode, agentId: "agent", agentName: "Assistant",
     adapterType: runtimeMode === "native" ? "paperclip_runner" : "claude_local",
     createdAt: `2025-01-01T10:0${minute}:00Z`, startedAt: `2025-01-01T10:0${minute}:01Z`,
     finishedAt: `2025-01-01T10:0${minute}:30Z`,
@@ -1440,6 +1440,7 @@ function assistantEntry(ts: string, text: string, channel: string) {
 
 function nativeRunningRun() {
   return {
+    runModel: null,
     id: "native-run",
     runtimeMode: "native" as const,
     status: "running" as const,
@@ -1458,6 +1459,7 @@ function nativePlanRun(id: string): NonNullable<ComponentProps<typeof TaskChatTh
   return {
     id: id,
     status: "running",
+    runModel: null,
     invocationSource: "issue",
     triggerDetail: null,
     startedAt: "2026-08-25T18:00:00.000Z",
@@ -3117,7 +3119,7 @@ describe("TaskChatThread runtime transcript selection", () => {
       onAdd: async () => {},
       issueStatus: "in_progress",
       activeRun: {
-        id: runId, runtimeMode: "native", status: "running", invocationSource: "issue", triggerDetail: null,
+        runModel: null, id: runId, runtimeMode: "native", status: "running", invocationSource: "issue", triggerDetail: null,
         startedAt: "2026-08-25T18:00:00.000Z", finishedAt: null, createdAt: "2026-08-25T18:00:00.000Z",
         agentId: "agent-1", agentName: "Runner", adapterType: "paperclip_runner",
       },
@@ -3141,7 +3143,7 @@ describe("TaskChatThread runtime transcript selection", () => {
     const resolve = vi.spyOn(heartbeatsApi, "resolveRuntimeRequest").mockResolvedValue({} as never);
     const show = () => renderThread({
       issueId: "issue-1", currentUserId: "user-board", comments: [], onAdd: async () => {}, issueStatus: "in_progress",
-      activeRun: { id: runId, runtimeMode: "native", status: "running", invocationSource: "issue", triggerDetail: null,
+      activeRun: { runModel: null, id: runId, runtimeMode: "native", status: "running", invocationSource: "issue", triggerDetail: null,
         startedAt: "2026-08-25T18:00:00.000Z", finishedAt: null, createdAt: "2026-08-25T18:00:00.000Z",
         agentId: "agent-1", agentName: "Runner", adapterType: "paperclip_runner" },
     });
@@ -3200,6 +3202,7 @@ describe("TaskChatThread runtime transcript selection", () => {
         id: "native-live-steered",
         runtimeMode: "native",
         status: "running",
+        runModel: null,
         invocationSource: "issue",
         triggerDetail: null,
         startedAt: "2026-08-25T18:00:00.000Z",
@@ -3376,6 +3379,7 @@ describe("TaskChatThread runtime transcript selection", () => {
           id: runId,
           runtimeMode: "native",
           status: "running",
+          runModel: null,
           invocationSource: "issue",
           triggerDetail: null,
           agentId: "agent-1",
@@ -4099,6 +4103,7 @@ describe("TaskChatThread runtime transcript selection", () => {
           id: runId,
           runtimeMode: "legacy",
           status: "running",
+          runModel: null,
           invocationSource: "issue",
           triggerDetail: null,
           startedAt: "2026-08-25T18:00:00.000Z",
@@ -4193,6 +4198,7 @@ describe("TaskChatThread runtime transcript selection", () => {
             id: `empty-${adapterType}`,
             runtimeMode: "legacy",
             status: "running",
+            runModel: null,
             invocationSource: "issue",
             triggerDetail: null,
             currentStatusMessage: "Preparing direct runtime",
@@ -4237,6 +4243,7 @@ describe("TaskChatThread runtime transcript selection", () => {
             id: `question-run-${adapterType}`,
             runtimeMode: "legacy",
             status: "running",
+            runModel: null,
             invocationSource: "issue",
             triggerDetail: null,
             startedAt: "2026-08-25T18:00:00.000Z",
@@ -5509,7 +5516,7 @@ describe("TaskChatThread live transcript", () => {
       onAdd: async () => {},
       issueStatus: "in_progress",
       activeRun: {
-        id: "run-plan-approval", status: "running" as const, invocationSource: "issue" as const, triggerDetail: null,
+        runModel: null, id: "run-plan-approval", status: "running" as const, invocationSource: "issue" as const, triggerDetail: null,
         startedAt: "2026-08-24T12:00:00.000Z", finishedAt: null, createdAt: "2026-08-24T12:00:00.000Z",
         agentId: "agent-1", agentName: "Codex", adapterType: "paperclip_runner", runtimeMode: "native" as const,
       },
@@ -5562,6 +5569,7 @@ describe("TaskChatThread live transcript", () => {
     ]);
     const activeRun = {
       id: "run-status",
+      runModel: null,
       status: "running" as const,
       invocationSource: "issue" as const,
       triggerDetail: null,
@@ -5656,6 +5664,7 @@ describe("TaskChatThread live transcript", () => {
       issueStatus: "in_progress",
       activeRun: {
         id: "run-runner",
+        runModel: null,
         status: "running",
         invocationSource: "issue",
         triggerDetail: null,
@@ -5686,6 +5695,7 @@ describe("TaskChatThread live transcript", () => {
     // the run's runtime-progress status instead of an opaque wait message.
     const baseRun = {
       id: "run-prep",
+      runModel: null,
       status: "running" as const,
       invocationSource: "issue" as const,
       triggerDetail: null,
@@ -5729,7 +5739,7 @@ describe("TaskChatThread live transcript", () => {
   });
 
   it("does not send a workspace bootstrap failure to connection settings", () => {
-    const run = { id: "workspace-prep", status: "running" as const, invocationSource: "issue", triggerDetail: null,
+    const run = { runModel: null, id: "workspace-prep", status: "running" as const, invocationSource: "issue", triggerDetail: null,
       startedAt: "2026-09-15T10:00:00Z", finishedAt: null, createdAt: "2026-09-15T10:00:00Z",
       agentId: "agent-1", agentName: "Worker", adapterType: "process" };
     render(<TaskChatThread comments={[]} onAdd={async () => {}} issueStatus="in_progress" activeRun={run} />);
@@ -5786,6 +5796,7 @@ describe("TaskChatThread live transcript", () => {
       issueStatus: "in_progress",
       activeRun: {
         id: "run-1",
+        runModel: null,
         status: "running",
         invocationSource: "issue",
         triggerDetail: null,
@@ -5871,6 +5882,7 @@ describe("TaskChatThread live transcript", () => {
         issueStatus="in_progress"
         activeRun={{
           id: "run-input",
+          runModel: null,
           status: "running",
           invocationSource: "issue",
           triggerDetail: null,
@@ -5954,6 +5966,7 @@ describe("TaskChatThread live transcript", () => {
         id: runId,
         runtimeMode: "native" as const,
         status: "running",
+        runModel: null,
         invocationSource: "issue" as const,
         triggerDetail: null,
         startedAt: "2026-08-07T00:00:00Z",
@@ -6041,7 +6054,7 @@ describe("TaskChatThread live transcript", () => {
       { kind: "run_terminal", ts: "2026-11-06T15:14:26Z", turnState: "cancelled", runState: "cancelled", disposition: "blocked" },
     ]);
     const activeRun = {
-      id: runId, runtimeMode: "native" as const, status: "running", invocationSource: "issue" as const,
+      runModel: null, id: runId, runtimeMode: "native" as const, status: "running", invocationSource: "issue" as const,
       triggerDetail: null, startedAt: "2026-11-06T15:14:05Z", createdAt: "2026-11-06T15:14:05Z", finishedAt: null,
       agentId: "agent-1", agentName: "Researcher", adapterType: "paperclip_runner",
     };
@@ -6073,6 +6086,7 @@ describe("TaskChatThread live transcript", () => {
       issueStatus: "in_progress",
       activeRun: {
         id: "run-1",
+        runModel: null,
         status: "running",
         invocationSource: "issue" as const,
         triggerDetail: null,
@@ -6120,7 +6134,7 @@ describe("TaskChatThread composer execution controls", () => {
   it("reconciles a timed-out Stop from exact company-bound historical proof after its live action disappears", async () => {
     vi.useFakeTimers();
     try {
-      const run = { id: "stopped-run", status: "running", runtimeMode: "native" as const, invocationSource: "issue", triggerDetail: null,
+      const run = { runModel: null, id: "stopped-run", status: "running", runtimeMode: "native" as const, invocationSource: "issue", triggerDetail: null,
         startedAt: "2026-11-03T15:00:00Z", finishedAt: null, createdAt: "2026-11-03T15:00:00Z", agentId: "agent-1", agentName: "Alex", adapterType: "paperclip_runner" };
       const requested: Partial<HeartbeatRun> & { runtimeMode: "native" } = {
         id: run.id, companyId: "company", status: "cancelled", runtimeMode: "native",
@@ -6151,7 +6165,7 @@ describe("TaskChatThread composer execution controls", () => {
     const onStop = vi.fn(async () => {});
     const run = {
       id: "task-run", status: "running", runtimeMode: adapterType === "process" ? "legacy" as const : "native" as const,
-      invocationSource: "issue", triggerDetail: null, startedAt: "2026-09-09T12:00:00Z", finishedAt: null,
+      runModel: null, invocationSource: "issue", triggerDetail: null, startedAt: "2026-09-09T12:00:00Z", finishedAt: null,
       createdAt: "2026-09-09T12:00:00Z", agentId: "agent-1", agentName: "Alex", adapterType,
     };
     render(<TaskChatThread comments={[]} onAdd={async () => {}} issueStatus="in_progress" activeRun={run} onCancelRun={onStop} stopScope="subtree" />);
@@ -6164,7 +6178,7 @@ describe("TaskChatThread composer execution controls", () => {
   });
   it("offers Stop where a running task's Stop lives while its run is still waiting in line", async () => {
     const onStop = vi.fn(async () => {});
-    const waiting = { id: "waiting-run", status: "queued", invocationSource: "assignment", triggerDetail: null, startedAt: null,
+    const waiting = { runModel: null, id: "waiting-run", status: "queued", invocationSource: "assignment", triggerDetail: null, startedAt: null,
       finishedAt: null, createdAt: "2026-11-13T12:00:00Z", agentId: "agent-1", agentName: "Codie", adapterType: "codex_local" };
     render(<TaskChatThread comments={[]} onAdd={async () => {}} issueStatus="todo" liveRuns={[waiting]} onCancelRun={onStop} />);
     const button = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-composer-stop"]');

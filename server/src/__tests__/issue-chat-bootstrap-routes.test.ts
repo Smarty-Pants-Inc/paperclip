@@ -4,7 +4,7 @@ import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import {
-  activityLog, agents, assets, heartbeatRuns, issueAttachments, issueComments, issues, issueThreadInteractions,
+  activityLog, agents, assets, heartbeatRunEvents, heartbeatRuns, issueAttachments, issueComments, issues, issueThreadInteractions,
 } from "@paperclipai/db";
 import { issueRoutes } from "../routes/issues.js";
 import { activityRoutes } from "../routes/activity.js";
@@ -138,6 +138,76 @@ describeEmbeddedPostgres("task chat bootstrap", () => {
     expect(res.body.items[1].recentComments.comments).toHaveLength(7);
     expect(res.body.items[1].recentComments.oldestCommentId).toBeDefined();
     expect(res.body.items[0].recentComments).not.toHaveProperty("oldestCommentId");
+  });
+
+  // The brief permits launch-only until session events have an indexed latest-event lookup.
+  // Exercise the real HTTP builders, not a mock of the projection or current agent config.
+  it("projects null before selection and the saved launch model after agent configuration changes", async () => {
+    const f = await seedCompanyWithBoardAccess(ctx.db, "Run model");
+    const task = await seedTask(f.companyId, { userId: f.userId });
+    const server = app(f.actor);
+    const expectModel = async (expected: unknown) => {
+      const live = await request(server).get(`/api/issues/${task.issueId}/live-runs`).expect(200);
+      const active = await request(server).get(`/api/issues/${task.issueId}/active-run`).expect(200);
+      const bootstrap = await request(server).get(url(f.companyId)).query({ ids: task.issueId }).expect(200);
+      expect(live.body[0].runModel).toEqual(expected);
+      expect(active.body.runModel).toEqual(expected);
+      expect(bootstrap.body.items[0].liveRuns[0].runModel).toEqual(expected);
+      expect(bootstrap.body.items[0].activeRun.runModel).toEqual(expected);
+      // The company poll shares the same required UI run type.
+      const companyLive = await request(server).get(`/api/companies/${f.companyId}/live-runs`).expect(200);
+      expect(companyLive.body.find((run: { id: string }) => run.id === task.runId).runModel).toEqual(expected);
+    };
+    await expectModel(null);
+    await ctx.db.update(heartbeatRuns).set({ status: "queued", startedAt: null }).where(eq(heartbeatRuns.id, task.runId));
+    await expectModel(null);
+    for (const model of ["", "   ", " \t\n\r ", null, 42, { name: "not a model string" }]) {
+      await ctx.db.update(heartbeatRuns).set({ runnerProfileJson: { nativeExecutionInput: { provider: { model } } } })
+        .where(eq(heartbeatRuns.id, task.runId));
+      await expectModel(null);
+    }
+    await ctx.db.update(heartbeatRuns).set({
+      status: "running", startedAt: new Date("2026-11-09T11:59:00.000Z"),
+      runnerProfileJson: { nativeExecutionInput: { provider: { model: "saved-launch-model" } } },
+    }).where(eq(heartbeatRuns.id, task.runId));
+    await ctx.db.update(agents).set({ adapterConfig: { model: "new-agent-config-model" } }).where(eq(agents.id, task.agentId));
+    await expectModel({ name: "saved-launch-model", source: "launch" });
+    // Also exercise the active-run fallback through the same summary column set.
+    await ctx.db.update(issues).set({ executionRunId: null }).where(eq(issues.id, task.issueId));
+    await expectModel({ name: "saved-launch-model", source: "launch" });
+  });
+
+  it("does not claim provider confirmation without a cheap session-event lookup or leak a previous run's model", async () => {
+    const f = await seedCompanyWithBoardAccess(ctx.db, "Run-bound model");
+    const task = await seedTask(f.companyId, { userId: f.userId });
+    await ctx.db.update(heartbeatRuns).set({
+      runnerProfileJson: { nativeExecutionInput: { provider: { model: "this-run-launch" } } },
+    }).where(eq(heartbeatRuns.id, task.runId));
+    await ctx.db.insert(heartbeatRunEvents).values(["session.started", "session.resumed"].map((eventType, index) => ({
+      companyId: f.companyId, runId: task.runId, agentId: task.agentId, seq: index + 1, eventType,
+      payload: { prpEvent: { payload: { providerDescriptor: { effectiveModel: "observed-model" } } } },
+    })));
+    const server = app(f.actor);
+    const readModels = async () => {
+      const live = await request(server).get(`/api/issues/${task.issueId}/live-runs`).expect(200);
+      const active = await request(server).get(`/api/issues/${task.issueId}/active-run`).expect(200);
+      const bootstrap = await request(server).get(url(f.companyId)).query({ ids: task.issueId }).expect(200);
+      return [live.body[0].runModel, active.body.runModel,
+        bootstrap.body.items[0].liveRuns[0].runModel, bootstrap.body.items[0].activeRun.runModel];
+    };
+    expect(await readModels()).toEqual(Array(4).fill({ name: "this-run-launch", source: "launch" }));
+    await ctx.db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, task.runId));
+    const nextRunId = randomUUID();
+    await ctx.db.insert(heartbeatRuns).values({
+      id: nextRunId, companyId: f.companyId, agentId: task.agentId, issueId: task.issueId,
+      status: "running", runtimeMode: "native", contextSnapshot: { issueId: task.issueId },
+    });
+    await ctx.db.update(issues).set({ executionRunId: nextRunId }).where(eq(issues.id, task.issueId));
+    expect(await readModels()).toEqual(Array(4).fill(null));
+    await ctx.db.update(heartbeatRuns).set({
+      runnerProfileJson: { nativeExecutionInput: { provider: { model: "new-run-launch" } } },
+    }).where(eq(heartbeatRuns.id, nextRunId));
+    expect(await readModels()).toEqual(Array(4).fill({ name: "new-run-launch", source: "launch" }));
   });
 
   it("follows request order with mixed UUIDs and identifiers, and reads a task named twice once per ref", async () => {

@@ -8,6 +8,7 @@ function createLiveRun(overrides: Partial<LiveRunForIssue> = {}): LiveRunForIssu
   return {
     id: "run-1",
     status: "running",
+    runModel: null,
     invocationSource: "manual",
     triggerDetail: null,
     startedAt: "2026-04-08T21:00:00.000Z",
@@ -26,6 +27,7 @@ function createActiveRun(overrides: Partial<ActiveRunForIssue> = {}): ActiveRunF
     agentId: "agent-1",
     agentName: "CodexCoder",
     adapterType: "codex_local",
+    runModel: null,
     invocationSource: "on_demand",
     triggerDetail: null,
     status: "running",
