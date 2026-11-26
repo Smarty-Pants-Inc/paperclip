@@ -1773,6 +1773,7 @@ export interface CapabilityRunnerdCodexTransportOptions extends RunnerExecutionD
   acpxCandidateAdmission?: AcpxCandidateAdmission;
   acpxPermissionMode?: NativeAcpxPermissionMode;
   acpxMode?: string;
+  piRpcModel?: string;
   piRpcThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   piThinkingLevel?: "off" | "low" | "high" | "max";
   claudeEffort?: "low" | "medium" | "high" | "xhigh" | "max";
@@ -8154,6 +8155,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           ...(compactionPayload ?? { text: message }),
           ...(this.options.recordTimingReceipt ? {performance:true} : {}),
           ...((this.options.provider ?? "codex") === "codex" && params.effort !== undefined ? { effort: params.effort } : {}),
+          ...(this.options.provider === "pi_rpc" && !compactionTurn ? {
+            ...(this.options.piRpcModel === undefined ? {} : { model: this.options.piRpcModel }),
+            ...(this.options.piRpcThinkingLevel === undefined ? {} : { effort: this.options.piRpcThinkingLevel }),
+          } : {}),
           ...(reasoningMode === undefined ? {} : { reasoningMode }),
           ...(skills.length ? { skills } : {}),
           ...(!compactionTurn && this.#providerStartedTurns() ? { providerStartedTurns: true } : {}),
