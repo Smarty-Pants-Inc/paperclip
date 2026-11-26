@@ -16,7 +16,7 @@ vi.mock("../../realtime/runner-prp-outbound.js", () => ({ connectRunnerPrpIngres
 vi.mock("./native-runner-checkpoint.js", () => ({ nativeRunnerCheckpointRegistration: transport.checkpointRegistration }));
 
 const binding = { companyId: "company", issueId: "issue", agentId: "agent", runId: "run-a" };
-const authority = {} as Parameters<NonNullable<ReturnType<typeof createNativeRunnerExecutionDriver>["controlPlaneRegistration"]>>[0];
+const authority = { queueCommand: vi.fn() } as unknown as Parameters<NonNullable<ReturnType<typeof createNativeRunnerExecutionDriver>["controlPlaneRegistration"]>>[0];
 const ssh = { kind: "remote", transport: "ssh", remoteCwd: "/workspace", spec: {} } as AdapterExecutionTarget;
 const sandbox = (ingress = true): AdapterExecutionTarget => ({
   kind: "remote", transport: "sandbox", remoteCwd: "/workspace", leaseId: "lease",

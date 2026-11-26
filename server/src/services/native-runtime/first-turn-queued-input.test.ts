@@ -1,17 +1,50 @@
 import { randomUUID } from "node:crypto";
+import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
+import { buildNativeExecutionInput, budgetNativeFreshFallback } from "./native-execution-input.js";
+import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
+import { buildNativeModelEnvelope } from "../../vendor/paperclip-runner/index.js";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
-  agents, agentWakeupRequests, assets, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issueAttachments,
+  agents, agentWakeupRequests, assets, authUsers, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issueAttachments,
   issueComments, issues, issueThreadInteractions,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
+import { buildExecutionContinuation } from "../execution-continuation.js";
+import { publishContinuousNativeReply } from "./native-continuous-reply.js";
+import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
 import { undeliveredLegacyUserCommentIds } from "../explicit-native-continuation.js";
 import { deliveredQueuedCommentIds } from "../queued-comment-delivery.js";
 import {
-  claimFirstTurnQueuedInput, firstTurnClaimedCommentIds, firstTurnTakesAllQueuedComments, runAcceptsFirstTurnQueuedInput,
+  claimFirstTurnQueuedInput, readFirstTurnQueuedInputReceipt, firstTurnClaimedCommentIds, firstTurnTakesAllQueuedComments, runAcceptsFirstTurnQueuedInput, renderFirstTurnQueuedInput,
 } from "./first-turn-queued-input.js";
+
+import { assertNativeQueuedTurnBound, commandEnvelopeBytes, NATIVE_TURN_KNOWN_MAX_BYTES, nativePromptCauseFromError, commandTextBytes, FIRST_TURN_QUEUED_INPUT_MAX_BYTES, NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND } from "./native-turn-budget.js";
+
+describe("first-turn encoded byte budget", () => {
+  const message = (id: string, body: string, kind?: "interaction") => ({ id, body, kind, createdAt: new Date("2026-01-01Z") });
+  it.each([undefined, "interaction"] as const)("carries a long person's input whole or refuses before clipping (%s)", kind => {
+    const body = "🦖".repeat(8000) + " END OF PERSON'S WORDS";
+    const text = renderFirstTurnQueuedInput([message("person", body, kind)])!;
+    expect(text).toContain(body);
+    expect(commandTextBytes(text)).toBeLessThanOrEqual(FIRST_TURN_QUEUED_INPUT_MAX_BYTES);
+    expect(() => renderFirstTurnQueuedInput([message("person", '"'.repeat(40000), kind)]))
+      .toThrow(NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND);
+  });
+  it("takes the longest prefix of whole messages instead of clipping or stalling the batch", () => {
+    const bodies = [0, 1, 2].map(i => `PERSON ${i} ` + '"'.repeat(10000));
+    const text = renderFirstTurnQueuedInput(bodies.map((body, i) => message(`comment-${i}`, body)))!;
+    expect(text).toContain(bodies[0]);
+    expect(text).toContain(bodies[1]);
+    expect(text).not.toContain("PERSON 2");
+    expect(text).toContain("Message 2 of 2");
+  });
+  it("refuses oversized metadata instead of consuming invisible messages; preserves short output", () => {
+    expect(() => renderFirstTurnQueuedInput([message("x".repeat(100000), "hi")])).toThrow(NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND);
+    expect(renderFirstTurnQueuedInput([message("id", "hello")])).toBe("New messages from the user arrived while this run was starting. They were not in the request above. Handle each of them in this turn, oldest first, together with that request:\n\n[Message 1 of 1 · comment id · 2026-01-01T00:00:00.000Z]\nhello");
+  });
+});
 
 const support = await getEmbeddedPostgresTestSupport();
 const USER = "first-turn-user";
@@ -22,6 +55,7 @@ describe.skipIf(!support.supported)("first-turn queued input", () => {
   beforeAll(async () => {
     database = await startEmbeddedPostgresTestDatabase("paperclip-first-turn-queued-input-");
     db = createDb(database.connectionString);
+    await db.insert(authUsers).values({ id: USER, name: "Queued input owner", email: "queued-input-owner@example.test", createdAt: new Date(), updatedAt: new Date() });
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
   afterAll(async () => { await db?.$client.end(); await database?.cleanup(); });
 
@@ -76,6 +110,40 @@ describe.skipIf(!support.supported)("first-turn queued input", () => {
     companyId: f.companyId, runId, agentId: f.agentId, eventType: "turn.accepted", stream: "system", level: "info", message: "turn accepted" });
   const readRun = async (id: string) => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)))[0]!;
 
+  it.each([100, 900000])("budgets failed resume after the saved contextSnapshot makes a real JSONB round trip (%s)", async chars => {
+    const f = await seed();
+    const body = "Person's exact words: $& $' $` $$ END";
+    const messages = Array.from({ length: 31 }, (_, i) => ({ id: `message-${i}`, authorType: i === 30 ? "user" : "agent", authorId: "author", createdByRunId: null,
+      body: i === 30 ? body : "x".repeat(Math.floor(chars / 30)), createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z", deleted: false, sourceTrust: null }));
+    const continuation: ExecutionContinuationEnvelope = { version: 1, companyId: f.companyId, issueId: f.issueId, objective: "Preserve the objective.",
+      objectiveSource: { kind: "comment", id: "message-30", revision: "2026-01-01T00:00:00Z" }, trigger: { reason: "issue_commented", interactionId: null, sourceRunId: null },
+      originCommentIds: ["message-30"], messages, resumeDelta: { baseRunId: "previous", messages: [messages[30]!] },
+      completedActions: [{ runId: "old", receiptId: "receipt", operationId: "GET /api/issues/{id}/comments", result: { longerKeyFirst: "kept", a: "same receipt" } }],
+      humanResponses: [], interactionOutcomes: [], completedWork: null, unresolvedInteractionIds: [],
+      coverage: { kind: "full_task_history", throughCommentId: "message-30", summaryThroughCommentId: null } };
+    const wake = { reason: "issue_commented", commentIds: ["message-30"], executionContinuation: continuation };
+    const issue = { id: f.issueId, identifier: "BUDGET-1", title: "Continue", description: null, workMode: "standard" };
+    const input = buildNativeExecutionInput({ ...f, boundCommandBytes: true, wakePayload: wake, issue, taskPrompt: "Preserve the objective.",
+      normalizedSessionId: "session", resumedSession: true, provider: "pi_rpc", previousTurn: { runId: "previous", task: issue },
+      workspace: { id: "workspace", cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null }, runtimeContext: nativeRuntimeContextFixture(),
+      completionContract: { id: "contract", sha256: "a".repeat(64), schemaVersion: "paperclip.run-result.v1",
+        contract: { revision: "1", objective: "Continue", criteria: [{ id: "output", requirement: "Continue" }] } } });
+    const originalPrompt = input.task.prompt;
+    await db.update(heartbeatRuns).set({ contextSnapshot: { paperclipWake: wake } }).where(eq(heartbeatRuns.id, f.runId));
+    const savedWake = (await readRun(f.runId)).contextSnapshot!.paperclipWake;
+    expect(savedWake).toEqual(wake);
+    expect(JSON.stringify(savedWake)).not.toBe(JSON.stringify(wake));
+    const bounded = budgetNativeFreshFallback(input, savedWake, { lastRunAt: "2026-01-02T00:00:00Z", readCommentIds: messages.map(m => m.id) });
+    if (chars > 100) expect(bounded!.messages.length).toBeLessThan(messages.length);
+    else expect(input.task.prompt).toBe(originalPrompt);
+    expect(commandEnvelopeBytes(buildNativeModelEnvelope(input))).toBeLessThan(NATIVE_TURN_KNOWN_MAX_BYTES);
+    expect(input.task.prompt.split(body)).toHaveLength(2);
+    expect(input.task.prompt).toContain(body);
+    if (chars > 100) expect(input.task.prompt).toContain("History was cut");
+    expect(input.continuationPrompt).toBeNull();
+    console.info(JSON.stringify({ jsonbFallback: "fresh-cut", knownBytes: commandEnvelopeBytes(buildNativeModelEnvelope(input)), retainedMessages: bounded!.messages.length }));
+  });
+
   it("gives a message that arrived during preparation to the first turn, without a stop", async () => {
     const f = await seed();
     const message = await queueMessage(f, "oh i mean each of the ones that appeared within the last 24 hours");
@@ -95,6 +163,103 @@ describe.skipIf(!support.supported)("first-turn queued input", () => {
     expect(await claimFirstTurnQueuedInput(db, binding(f, f.runId))).not.toContain("one more thing");
     expect(firstTurnClaimedCommentIds(await readRun(f.runId)).has(later)).toBe(false);
     expect(sealMs).toBeLessThan(1_000);
+  });
+
+  it.each(["comment", "interaction"] as const)("refuses oversized queued person %s before claim and leaves its receipt unclaimed", async kind => {
+    const f = await seed(), body = "whole person's input: " + "🦖".repeat(150000);
+    const answer = kind === "interaction" ? await queueAnswer(f) : null;
+    const id = answer ? answer.card.id : await queueMessage(f, body);
+    if (answer) await db.update(issueThreadInteractions).set({ result: { version: 1,
+      answers: [{ questionId: "color", optionIds: [], otherText: body }] } }).where(eq(issueThreadInteractions.id, id));
+    await expect(claimFirstTurnQueuedInput(db, binding(f, f.runId))).rejects.toMatchObject({
+      code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: kind === "interaction" ? "human_response" : "queued_input", bytes: expect.any(Number) },
+    });
+    const run = await readRun(f.runId);
+    expect(readFirstTurnQueuedInputReceipt(run)).toBeNull();
+    expect([...firstTurnClaimedCommentIds(run)]).toEqual([]);
+    expect(await runAcceptsFirstTurnQueuedInput(db, run)).toBe(true);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    expect(wake).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    if (answer) {
+      expect((await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, id)))[0])
+        .toMatchObject({ status: "answered", result: { answers: [{ otherText: body }] } });
+    } else {
+      expect([...await deliveredQueuedCommentIds(db, { ...f, commentIds: [id] })]).toEqual([]);
+      expect(await undeliveredLegacyUserCommentIds(db, f.companyId, f.issueId, f.agentId, [id])).toEqual([id]);
+      expect((await db.select().from(issueComments).where(eq(issueComments.id, id)))[0]!.body).toBe(body);
+    }
+  });
+
+  it("refuses the composed turn before claim when whole queued input crosses its remaining room", async () => {
+    const f = await seed(), id = await queueMessage(f, "queued person's words ".repeat(1000));
+    const error = await claimFirstTurnQueuedInput(db, binding(f, f.runId), text => {
+      assertNativeQueuedTurnBound(f.runId, { task: { prompt: "request" } }, text,
+        { attachmentPrompt: "late attachments: " + "a".repeat(490000) });
+    }).catch(error => error);
+    expect(error).toMatchObject({ code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "queued_input" } });
+    expect(nativePromptCauseFromError(new Error(String(error)))).toEqual(error.promptCause);
+    const run = await readRun(f.runId);
+    expect(readFirstTurnQueuedInputReceipt(run)).toBeNull();
+    expect([...firstTurnClaimedCommentIds(run)]).toEqual([]);
+    expect(await undeliveredLegacyUserCommentIds(db, f.companyId, f.issueId, f.agentId, [id])).toEqual([id]);
+  });
+
+  it("refuses oversized attachment references before writing even an empty receipt", async () => {
+    const f = await seed();
+    await expect(claimFirstTurnQueuedInput(db, binding(f, f.runId), text =>
+      assertNativeQueuedTurnBound(f.runId, { task: { prompt: "request" } }, text, { attachmentPrompt: "a".repeat(600000) })))
+      .rejects.toMatchObject({ code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "command" } });
+    expect(readFirstTurnQueuedInputReceipt(await readRun(f.runId))).toBeNull();
+  });
+
+  it("delivers the first two whole messages and leaves the third owed for the next turn", async () => {
+    const f = await seed(), bodies = [0, 1, 2].map(i => `PERSON ${i} ` + '"'.repeat(10000));
+    const sessionId = randomUUID();
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, f.agentId));
+    await db.update(heartbeatRuns).set({ nativeSessionId: sessionId }).where(eq(heartbeatRuns.id, f.runId));
+    const ids: string[] = [];
+    for (const body of bodies) ids.push(await queueMessage(f, body));
+    const text = await claimFirstTurnQueuedInput(db, binding(f, f.runId));
+    expect(text).toContain(bodies[0]); expect(text).toContain(bodies[1]); expect(text).not.toContain("PERSON 2");
+    expect([...firstTurnClaimedCommentIds(await readRun(f.runId))]).toEqual(ids.slice(0, 2));
+    expect(await claimFirstTurnQueuedInput(db, binding(f, f.runId))).toBe(text);
+    await accept(f, f.runId);
+    expect([...await deliveredQueuedCommentIds(db, { ...f, commentIds: ids })].sort()).toEqual(ids.slice(0, 2).sort());
+    expect(await undeliveredLegacyUserCommentIds(db, f.companyId, f.issueId, f.agentId, ids)).toEqual([ids[2]]);
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.runId));
+    await publishContinuousNativeReply({ db, recoverTerminal: true, cursor: 100, execution: { binding: { ...f }, provider: { kind: "pi_rpc" } },
+      event: { eventType: "item.completed", runId: f.runId, normalizedSessionId: sessionId, sourceEventId: "prefix-final", itemId: "prefix-item", turnId: "prefix-turn",
+        payload: { kind: "agentMessage", channel: "final", text: "Handled the two delivered messages." } } });
+    const afterReply = await readRun(f.runId);
+    expect(afterReply.resultJson?.continuousReplies).toMatchObject({ "prefix-item": { questionCommentIds: ids.slice(0, 2) } });
+    const [remainingWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    expect(remainingWake!.status).toBe("deferred_issue_execution");
+    expect(queuedCommentIdsFromWakePayload(remainingWake!.payload)).toEqual([ids[2]]);
+    const next = await startRun(f.companyId, f.agentId, f.issueId);
+    let readIds: string[] = [];
+    const snapshot = await buildExecutionContinuation({ db, ...f, runId: next, previousContextRunId: f.runId, context: { wakeReason: "issue_commented" },
+      summary: null, exposeLowTrustRaw: false, onNativeReadState: state => { readIds = state.readCommentIds; } });
+    expect(readIds.sort()).toEqual(ids.slice(0, 2).sort());
+    expect(JSON.stringify((snapshot.coverage as { omitted?: unknown }).omitted ?? [])).not.toContain(ids[2]);
+    expect(snapshot.messages.find(message => message.id === ids[2])!.body).toBe(bodies[2]);
+    await db.update(issues).set({ executionRunId: next }).where(eq(issues.id, f.issueId));
+    const later = await claimFirstTurnQueuedInput(db, binding(f, next));
+    expect(later).toContain(bodies[2]); expect(later).not.toContain("PERSON 0");
+    expect([...firstTurnClaimedCommentIds(await readRun(next))]).toEqual([ids[2]]);
+    await accept(f, next);
+    expect([...await deliveredQueuedCommentIds(db, { ...f, commentIds: ids })].sort()).toEqual([...ids].sort());
+  });
+
+  it("also limits the whole-message prefix to the composed command's remaining room", async () => {
+    const f = await seed(), ids: string[] = [], bodies = [0, 1, 2].map(i => `PERSON ${i} ` + "a".repeat(30000));
+    for (const body of bodies) ids.push(await queueMessage(f, body));
+    const validate = (text: string | null) => assertNativeQueuedTurnBound(f.runId, { task: { prompt: "request" } }, text,
+      { attachmentPrompt: "a".repeat(420000) });
+    const text = await claimFirstTurnQueuedInput(db, binding(f, f.runId), validate);
+    expect(text).toContain(bodies[0]); expect(text).toContain(bodies[1]); expect(text).not.toContain("PERSON 2");
+    expect([...firstTurnClaimedCommentIds(await readRun(f.runId))]).toEqual(ids.slice(0, 2));
+    await accept(f, f.runId);
+    expect(await undeliveredLegacyUserCommentIds(db, f.companyId, f.issueId, f.agentId, ids)).toEqual([ids[2]]);
   });
 
   it("delivers two messages from preparation in their queued order", async () => {

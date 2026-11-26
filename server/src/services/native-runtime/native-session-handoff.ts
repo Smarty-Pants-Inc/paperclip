@@ -6,26 +6,8 @@ import { resolveCoreTrustPreset } from "../trust-preset-resolver.js";
 import { fastResponseHistoryBody, type ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { nativeFinalReplyKey } from "../heartbeat-run-summary.js";
 
-export const NATIVE_HANDOFF_MAX_BYTES = 24_000;
-export const NATIVE_WHOLE_HANDOFF_MAX_BYTES = 368_000;
-// durable-prp-control-plane.ts:65-67: floor((1 MiB - 4096) / 2).
-export const NATIVE_HANDOFF_COMMAND_MAX_BYTES = 522_240;
-// A 50-comment/128-attachment fixture measured 45,315 bytes of non-text overhead.
-// Reserve 64 KiB for runtime constraints, attachments, queued input, the command
-// wrapper and separators; this is not a bound on arbitrary supplemental input.
-export const NATIVE_HANDOFF_COMMAND_RESERVE_BYTES = 64 * 1024;
-// Packet text is escaped in the model envelope, then again in command.payload.text.
-// Exclude the six bytes belonging to the two JSON string delimiters.
-const commandTextBytes = (text: string) => Buffer.byteLength(JSON.stringify(JSON.stringify(text)), "utf8") - 6;
-export function nativeSessionHandoffMaxBytes(promptOrEnvelope: string | object): number {
-  // A prepared envelope already contains the prompt's first escaping pass, plus
-  // planning context and every other server-known field; only command escaping remains.
-  const knownBytes = typeof promptOrEnvelope === "string" ? commandTextBytes(promptOrEnvelope)
-    : Buffer.byteLength(JSON.stringify(JSON.stringify(promptOrEnvelope)), "utf8") - 2;
-  const room = NATIVE_HANDOFF_COMMAND_MAX_BYTES - NATIVE_HANDOFF_COMMAND_RESERVE_BYTES - knownBytes;
-  if (room < 0) throw new Error("native_turn_prompt_exceeds_command_bound");
-  return Math.min(NATIVE_WHOLE_HANDOFF_MAX_BYTES, room);
-}
+import { commandTextBytes, NATIVE_HANDOFF_MAX_BYTES, NATIVE_WHOLE_HANDOFF_MAX_BYTES, NativeTurnPromptExceedsCommandBoundError } from "./native-turn-budget.js";
+export { NATIVE_HANDOFF_MAX_BYTES, NATIVE_WHOLE_HANDOFF_MAX_BYTES, NATIVE_HANDOFF_COMMAND_MAX_BYTES, NATIVE_HANDOFF_COMMAND_RESERVE_BYTES, nativeSessionHandoffMaxBytes } from "./native-turn-budget.js";
 const ENTRY_MAX_CHARS = 4_000;
 const LIMIT = 10;
 
@@ -51,7 +33,7 @@ export function renderNativeSessionHandoff(input: {
     const messages = (input.omittedMessages ?? 0) + input.entries.filter(isConversationEntry).length;
     const support = input.omittedEntriesAtLeast + input.entries.filter(entry => !isConversationEntry(entry)).length;
     const note = `Fresh session handoff cut for room. At least ${messages} messages and ${support} supporting entries omitted. Retrieve scoped task history as needed.`;
-    if (commandTextBytes(note) > maxBytes) throw new Error("native_turn_prompt_exceeds_command_bound");
+    if (commandTextBytes(note) > maxBytes) throw new NativeTurnPromptExceedsCommandBoundError({ kind: "command", bytes: commandTextBytes(note) });
     return note;
   };
   if (maxBytes < 2_000) return cutForRoom();

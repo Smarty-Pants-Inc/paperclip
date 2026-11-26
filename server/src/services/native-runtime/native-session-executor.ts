@@ -305,6 +305,9 @@ import {
   resolveCurrentWakeCommentsBinding,
 } from "./current-wake-comments.js";
 import { claimFirstTurnQueuedInput } from "./first-turn-queued-input.js";
+import type { CaseExecutionContext } from "../case-context.js";
+import { budgetNativeFreshFallback } from "./native-execution-input.js";
+import { assertNativeQueuedTurnBound, clearNativeFreshFallback, registerNativeFreshFallback, guardNativeTurnCommands, nativeContinuationReadState, NativeTurnPromptExceedsCommandBoundError, NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND } from "./native-turn-budget.js";
 import {
   renderNativeRunnerStagedAttachmentPrompt,
   stageNativeRunnerWakeAttachments,
@@ -9199,7 +9202,8 @@ export function nativeSessionFailureDisposition(
     sourceFailureCode === NATIVE_PROVIDER_SESSION_CLOSED ||
     sourceFailureCode === NATIVE_PROVIDER_STARTUP_REJECTED ||
     sourceFailureCode === NATIVE_CONTROLLER_JOURNAL_BEHIND_RUNNER ||
-    sourceFailureCode === NATIVE_SANDBOX_DISK_FULL;
+    sourceFailureCode === NATIVE_SANDBOX_DISK_FULL ||
+    sourceFailureCode === NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND;
   const permissionDeclined = sourceFailureCode === "native_permission_declined";
   const exhausted = permanentFailure || permissionDeclined || attempt >= 3;
   return {
@@ -9389,6 +9393,7 @@ export function nativeSessionFailureSourceCode(error: unknown, runnerSandboxDisk
 function classifyNativeSessionFailure(
   error: unknown,
 ):
+  | typeof NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND
   | "native_permission_declined"
   | "native_provider_output_without_result"
   | "native_provider_terminal_failed"
@@ -9431,6 +9436,8 @@ function classifyNativeSessionFailure(
   | typeof NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE
   | typeof NATIVE_FAILED_BEFORE_PROVIDER_TURN_CODE
   | "native_session_interrupted" {
+  if (error instanceof NativeTurnPromptExceedsCommandBoundError) return error.code;
+  if (error instanceof Error && error.message.startsWith(`${NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND}:`)) return NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND;
   if (findNativePredecessorRetirementUnproven(error)) return NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE;
   if (findNativeFailedBeforeProviderTurn(error)) return NATIVE_FAILED_BEFORE_PROVIDER_TURN_CODE;
   if (error instanceof NativePermissionDeclinedError) return "native_permission_declined";
@@ -13113,6 +13120,8 @@ async function executePaperclipNativeSessionAttempt(
         trace.activate(runnerSessionStartupScope);
         const providerTurnWait = nativeProviderStartedTurns(input.execution.provider)
           ? await nativeProviderTurnWaitOptions(input.db, input.execution.binding) : undefined;
+        let turnBudgetBackend: NativeSessionBackend | undefined;
+        let turnAttachmentPrompt = "", turnHandoff = "";
         const runExecution = () =>
           executeNativeSession({
             resumeInterruptedTurn: input.restartRecovery?.kind === "resume_dead_runner"
@@ -13120,11 +13129,16 @@ async function executePaperclipNativeSessionAttempt(
             providerTurnWait,
             // Runtime requests history before attachments and the queued-input delivery commit.
             // Count the entire known envelope (including planning context); reserve the later additions.
-            getFreshSessionHandoff: input.getFreshSessionHandoff ? () => input.getFreshSessionHandoff!(
-              nativeSessionHandoffMaxBytes(buildNativeModelEnvelope(runnerExecution))) : undefined,
+            getFreshSessionHandoff: input.getFreshSessionHandoff ? async () => {
+              turnHandoff = await input.getFreshSessionHandoff!(nativeSessionHandoffMaxBytes(buildNativeModelEnvelope(runnerExecution))) ?? "";
+              return turnHandoff;
+            } : undefined,
             // A failed seal commits nothing: the messages stay queued for the
             // turn boundary instead of failing this run before its turn.
-            prepareWakeAttachmentPrompt: input.prepareAttachmentPrompt,
+            prepareWakeAttachmentPrompt: input.prepareAttachmentPrompt ? async () => {
+              turnAttachmentPrompt = await input.prepareAttachmentPrompt!();
+              return turnAttachmentPrompt;
+            } : undefined,
             getFirstTurnQueuedInput: async () => {
               // Stop and dispatch share issue -> run ownership. This reservation
               // commit, NOT turn.submitted, is the delivery boundary: after it,
@@ -13160,7 +13174,16 @@ async function executePaperclipNativeSessionAttempt(
                 return reserved;
               });
               if (!admitted) throw new NativeCancellationPendingRecoveryError();
-              return claimFirstTurnQueuedInput(input.db, input.execution.binding).catch((error) => {
+              return claimFirstTurnQueuedInput(input.db, input.execution.binding, queuedInput => {
+                const freshEnvelope = buildNativeModelEnvelope(runnerExecution);
+                const selectedEnvelope = persistedWarmSession
+                  ? buildNativeModelEnvelope(runnerExecution, { resumedSession: true }) : freshEnvelope;
+                assertNativeQueuedTurnBound(input.execution.binding.runId, selectedEnvelope, queuedInput, {
+                  freshEnvelope, attachmentPrompt: turnAttachmentPrompt, handoff: turnHandoff,
+                  constraints: turnBudgetBackend?.preparedTaskConstraints, workingDirectory: persistedWarmSession?.workingDirectory,
+                });
+              }).catch((error) => {
+                if (error instanceof NativeTurnPromptExceedsCommandBoundError) throw error;
                 logger.warn({ err: error, runId: input.execution.binding.runId }, "first-turn queued input was not sealed");
                 return null;
               });
@@ -13196,7 +13219,7 @@ async function executePaperclipNativeSessionAttempt(
             retainedRunnerReattachment: input.restartRecovery?.kind === "reattach_remote_runner"
               && input.restartRecovery.runId === input.execution.binding.runId,
             turnTimeoutMs: input.turnTimeoutMs,
-            backend:
+            backend: turnBudgetBackend =
               input.backend ??
               runnerdBackend ??
               createNativeSessionBackend(input.execution, {
@@ -13341,6 +13364,18 @@ async function executePaperclipNativeSessionAttempt(
               );
             },
             onContinuityBreak: async (continuity) => {
+              // Exact resume has failed; Runner will now render the full input.
+              // Re-budget that actual fresh fallback before it composes/dispatches it.
+              const [savedRun] = await input.db.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+                eq(heartbeatRuns.id, input.execution.binding.runId), eq(heartbeatRuns.companyId, input.execution.binding.companyId)));
+              const context = record(savedRun?.context);
+              const originalPrompt = runnerExecution.task.prompt;
+              const bounded = budgetNativeFreshFallback(runnerExecution, context.paperclipWake,
+                nativeContinuationReadState(context.nativeContinuationReadState), context.paperclipCase as CaseExecutionContext | undefined);
+              registerNativeFreshFallback(input.execution.binding.runId, originalPrompt, runnerExecution.task.prompt);
+              if (bounded) await input.db.update(heartbeatRuns).set({
+                contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ executionContinuation: bounded })}::jsonb`,
+              }).where(and(eq(heartbeatRuns.id, input.execution.binding.runId), eq(heartbeatRuns.companyId, input.execution.binding.companyId)));
               const atMs = Date.now();
               await trace.record({
                 name: "provider.session.continuity_break",
@@ -14522,6 +14557,7 @@ async function executePaperclipNativeSessionAttempt(
       if (protocolIntegrityFailure !== null) throw protocolIntegrityFailure;
     }
   } finally {
+    clearNativeFreshFallback(input.execution.binding.runId);
     releaseHeldConfigurationObserver?.();
     // The provider turn is over, whether it succeeded or threw: what follows is
     // release and hand-back, which a follow-up's admission may wait for
@@ -14737,6 +14773,12 @@ async function executePaperclipNativeSessionAttempt(
       logger.warn({ runId: input.execution.binding.runId }, "Native finalization claim release failed after an earlier error");
     }
   }
+  // Seal omission coverage to the actual provider generation, not merely the
+  // stable normalized Runner identity (which survives a failed-resume fallback).
+  await input.db.update(heartbeatRuns).set({ contextSnapshot: sql`jsonb_set(${heartbeatRuns.contextSnapshot},
+    '{executionContinuation,coverage,providerSessionId}', ${JSON.stringify(native.providerSessionId ?? native.normalizedSessionId)}::jsonb)`
+  }).where(and(eq(heartbeatRuns.id, input.execution.binding.runId), eq(heartbeatRuns.companyId, input.execution.binding.companyId),
+    sql`${heartbeatRuns.contextSnapshot} #> '{executionContinuation,coverage,omitted}' IS NOT NULL`));
   const finalization: NativeFinalizationResult = {
     schema: "paperclip.native-finalization.v1",
     runtimeMode: "native",
@@ -17642,8 +17684,9 @@ async function createRunnerdBackendWithinSessionClaim(
         recordTimingReceipt: process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim() ? recordRunnerTimingReceipt : undefined,
         ...owner.driver, get authorityRunId() { return owner.driver.authorityRunId; }, runnerArtifact: input.controllerPersistence?.runnerArtifact ?? description.runner,
         onCredentialsUpdated: event => owner.credentialsUpdated(event),
-        controlPlaneRegistration: input.controllerPersistence ? async (authority, identity, signal) => {
-          await nativeRunnerCheckpointRegistration({
+        controlPlaneRegistration: async (authority, identity, signal) => {
+          guardNativeTurnCommands(authority);
+          if (input.controllerPersistence) await nativeRunnerCheckpointRegistration({
             ...nativeRunnerCheckpointPersistence(input.db, input.controllerPersistence!.bootId,
               () => {
                 const current = sessionToolAuthorityEpochs.get(sessionScopeId);
@@ -17653,7 +17696,7 @@ async function createRunnerdBackendWithinSessionClaim(
             binding: input.execution.binding,
           })(authority, identity);
           return owner.driver.controlPlaneRegistration!(authority, identity, signal);
-        } : owner.driver.controlPlaneRegistration,
+        },
         recoverSemanticToolInput: input.controllerPersistence ? call => {
           const current = sessionToolAuthorityEpochs.get(sessionScopeId);
           if (!current || current.runId !== call.correlation.runId) throw new Error("native_tool_authority_epoch_revoked");
