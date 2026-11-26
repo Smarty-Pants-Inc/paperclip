@@ -1,4 +1,4 @@
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
 import { heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { databaseWorkScopeKey, signalDatabaseWork, subscribeDatabaseWork } from "@paperclipai/db/work-signals";
 import { parseObject } from "../../adapters/utils.js";
@@ -25,6 +25,55 @@ export async function requestHeldNativeConfigurationEnd(tx: Db, scope: { company
   }).where(and(running, inArray(heartbeatRuns.id, runs.filter(run => run.issueId).map(run => run.id))));
 }
 
+export type HeldNativeConfigurationTarget = {
+  targetType: "environment" | "project" | "agent";
+  targetId: string;
+  companyId?: string;
+  responsibleUserId?: string;
+  admittedSecretId?: string;
+};
+
+/** Resolve consumers from admitted runs, not agent defaults: an override or a
+ * forced environment may differ from today's default. Instance environment
+ * saves omit companyId; secret writes retain their binding's company scope.
+ * Reuse the durable close seam, never cancellation or session reset. */
+export async function requestHeldNativeConfigurationEndForTargets(tx: Db, targets: HeldNativeConfigurationTarget[]) {
+  if (!targets.length) return;
+  const consumers = await tx.select({ companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
+    issueId: heartbeatRuns.nativeIssueId }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.runtimeMode, "native"), eq(heartbeatRuns.status, "running"), isNotNull(heartbeatRuns.nativeIssueId),
+    or(...targets.map(target => and(
+      target.companyId ? eq(heartbeatRuns.companyId, target.companyId) : undefined,
+      target.responsibleUserId ? or(
+        sql`case when ${heartbeatRuns.contextSnapshot} ? 'paperclipSecretIdentity'
+          then ${heartbeatRuns.contextSnapshot} #>> '{paperclipSecretIdentity,responsibleUserId}' = ${target.responsibleUserId}
+          else ${heartbeatRuns.responsibleUserId} = ${target.responsibleUserId} end`,
+        // Previous releases already admitted exact secret IDs in the manifest.
+        // They too must survive a later steering identity change.
+        target.admittedSecretId ? sql`${heartbeatRuns.contextSnapshot} #> '{paperclipSecrets,manifest}' @> ${JSON.stringify([{ secretId: target.admittedSecretId }])}::jsonb` : undefined,
+      ) : undefined,
+      target.targetType === "agent" ? eq(heartbeatRuns.agentId, target.targetId)
+        // Preparation still has legacy runtimeMode. Only admitted, exact
+        // environment consumers belong to this held-turn fence; pre-launch
+        // freshness is checked separately, never inferred from a missing id.
+        : target.targetType === "environment" ? sql`${heartbeatRuns.contextSnapshot} #>> '{paperclipEnvironment,id}' = ${target.targetId}`
+        : or(sql`${heartbeatRuns.contextSnapshot} #>> '{paperclipWorkspace,projectId}' = ${target.targetId}`,
+          inArray(heartbeatRuns.nativeIssueId, tx.select({ id: issues.id }).from(issues).where(and(
+            eq(issues.projectId, target.targetId), eq(issues.companyId, heartbeatRuns.companyId))))),
+    ))),
+  )).orderBy(heartbeatRuns.nativeIssueId, heartbeatRuns.companyId, heartbeatRuns.agentId);
+  // Stable issue order preserves the existing issue -> run lock order even
+  // when a secret has bindings on several agents/projects/environments.
+  const seen = new Set<string>();
+  for (const consumer of consumers) {
+    if (!consumer.issueId) continue;
+    const key = `${consumer.companyId}:${consumer.agentId}:${consumer.issueId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    await requestHeldNativeConfigurationEnd(tx, { ...consumer, issueId: consumer.issueId });
+  }
+}
+
 /** Notifications are hints; bootstrap/reconnect and every idle/steering boundary
  * re-read the durable flag, so a rolled-back write cannot end a held turn. */
 export function observeHeldNativeConfiguration(db: Db, scope: { companyId: string; agentId: string }, onHint: () => void): () => void {
@@ -36,6 +85,17 @@ export function observeHeldNativeConfiguration(db: Db, scope: { companyId: strin
       catch { return false; }
     })) onHint();
   });
+}
+
+/** Server-only classification after the idle interrupt is accepted. This is not
+ * a person's Stop receipt, and is never sent as the provider interrupt reason. */
+export async function recordHeldNativeTurnClose(db: Db, scope: { companyId: string; agentId: string; issueId: string; runId: string }) {
+  await db.update(heartbeatRuns).set({ resultJson: sql`jsonb_set(
+    coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb), '{heldNativeTurnCloseReason}',
+    to_jsonb(case when ${heartbeatRuns.resultJson}->'heldNativeConfigurationEnd' = 'true'::jsonb
+      then 'configuration_changed'::text else 'hold_close'::text end))` })
+    .where(and(eq(heartbeatRuns.id, scope.runId), eq(heartbeatRuns.companyId, scope.companyId),
+      eq(heartbeatRuns.agentId, scope.agentId), eq(heartbeatRuns.nativeIssueId, scope.issueId)));
 }
 
 /** Only committed native-continuous-reply attribution counts as an answer.
