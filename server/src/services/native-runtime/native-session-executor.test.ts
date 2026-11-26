@@ -1,6 +1,8 @@
 import { sandboxRestartMetadata } from "../sandbox-snapshot-restore.js";
 import type { NativeSession } from "../../vendor/paperclip-runner/index.js";
 import * as continuousReply from "./native-continuous-reply.js";
+import { buildNativeExecutionInput } from "./native-execution-input.js";
+import { assertNativeQueuedTurnBound, nativeQueuedTurnCompositionMeasured } from "./native-turn-budget.js";
 import { recoveryPostgresSupport, startRecoveryPostgres } from "../../__tests__/helpers/recovery-postgres.js";
 import { createReleaseIssueExecution } from "../../modules/wake-queue/application/use-cases.js";
 import { createPostgresWakeQueueAdapter } from "../../modules/wake-queue/adapters/postgres.js";
@@ -9313,6 +9315,90 @@ describe("native startup restart detachment", () => {
     state.execute.mockReset();
     await expect(executePaperclipNativeSession({ db: leaseDb(restarting), execution: restarting, runnerInstanceId: "runner" })).rejects.toBeInstanceOf(NativeControllerDetachedForRestartError);
     expect(state.execute).not.toHaveBeenCalled();
+  });
+});
+
+describe("native turn budget executor metadata", () => {
+  it("admits a plugin-task backend first turn with nothing queued through the real Runner", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-plugin-budget-")), previous = process.env.PAPERCLIP_RUNNER_STATE_DIR;
+    process.env.PAPERCLIP_RUNNER_STATE_DIR = directory;
+    const current = buildNativeExecutionInput({ companyId: "company", runId: "plugin-budget-run", agentId: "agent", provider: "codex", normalizedSessionId: "plugin-budget-session",
+      issue: { id: "issue", identifier: "BUDGET-1", title: "Plugin first turn", description: null, workMode: "standard" }, taskPrompt: "Whole plugin request",
+      workspace: { id: "plugin-budget-workspace", cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null }, runtimeContext: nativeRuntimeContextFixture(),
+      completionContract: { id: "contract", sha256: "a".repeat(64), schemaVersion: "paperclip.run-result.v1",
+        contract: { revision: "1", objective: "Continue", criteria: [{ id: "output", requirement: "Continue" }] } } });
+    const launcher = vi.fn(), registration = vi.fn();
+    const owner = vi.spyOn(pluginTaskRuntime, "createPluginRunnerTaskOwner").mockReturnValue({ launcher, registration,
+      driver: { authorityRunId: current.binding.runId, prepareLaunch: vi.fn(), runnerProcessLauncher: launcher, controlPlaneRegistration: registration },
+      readWorkspaceFile: vi.fn(), isRetired: () => false, rebind: vi.fn() } as never);
+    const task = vi.fn(async (operation: unknown) => {
+      environmentTaskOperationSchema.parse(operation);
+      return { kind: "description", launchPreparationVersion: 1, projectAuthCheckVersion: 1, taskId: "budget-task",
+        runner: { version: "fixture", digest: `sha256:${"a".repeat(64)}` } };
+    });
+    let admitted = false;
+    try {
+      const db = leaseDb(current);
+      const backend = await createRunnerdBackend({ db, execution: current, runnerInstanceId: "plugin-budget", runnerIngressAuthorized: true,
+        runnerExecutionTarget: { kind: "remote", transport: "sandbox", providerKey: "plugin", leaseId: "plugin-budget-lease", remoteCwd: "/unused", runnerTask: task } });
+      expect(backend.nativeTurnBudgetAdditions).toBeUndefined();
+      const { executeNativeSession: executeReal } = await import(new URL("../../../../packages/paperclip-runner/src/native-session-runtime.ts", import.meta.url).href) as Pick<typeof import("../../vendor/paperclip-runner/index.js"), "executeNativeSession">;
+      const identity = { ...current.binding, sessionId: "plugin-budget-session" };
+      const session = { identity: () => identity,
+        async capabilities() { return { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true }; },
+        async *events() {}, async result() { return null; }, async close() {},
+        async snapshot() { return { backendKind: "mock" as const, sessionId: "driver", identity, providerSessionId: "provider", cursor: "0", activeTurnId: null, pendingRuntimeRequests: [], lineage: [], workingDirectory: "/workspace" }; },
+        async startTurn() { admitted = true; throw new Error("plugin-first-turn-admitted"); } };
+      // Keep the actual plugin backend's missing metadata contract. Replace
+      // provider I/O only; use the real Runner's first-turn sequencing.
+      await expect(executeReal({ input: current, backend: { ...backend,
+        async descriptor() { return { kind: "mock", name: "plugin-budget", version: "1", capabilities: await session.capabilities(), runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" } }; },
+        async openSession() { return session; } },
+        controlPlane: { async openRun() {}, async checkpointSession() {}, async completeRun() {},
+          async appendEvent(event) { const seq = "sourceSeq" in event ? event.sourceSeq : 0; return { cursor: seq, highestContiguousSourceSeq: seq, disposition: "committed" }; },
+          async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; } },
+        getFirstTurnQueuedInput: async () => {
+          const additions = backend.nativeTurnBudgetAdditions?.();
+          assertNativeQueuedTurnBound(current.binding.runId, { task: current.task }, null,
+            { ...additions, unmeasuredPayload: !nativeQueuedTurnCompositionMeasured(current.provider.kind, current.schema, additions) });
+          return null;
+        }, runnerInstanceId: "runner", controlPlaneInstanceId: "controller",
+      })).rejects.toThrow("plugin-first-turn-admitted");
+      expect(admitted).toBe(true);
+    } finally {
+      owner.mockRestore();
+      if (previous === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR; else process.env.PAPERCLIP_RUNNER_STATE_DIR = previous;
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("reads the executor's own metadata producer before and after its observed session snapshot", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-producer-budget-")), previous = process.env.PAPERCLIP_RUNNER_STATE_DIR;
+    process.env.PAPERCLIP_RUNNER_STATE_DIR = directory;
+    const context = nativeRuntimeContextFixture();
+    context.skills = [{ key: "assigned", runtimeName: "assigned", versionId: null, bundle: { ...context.instructions.bundle, rootPath: "/assigned" } }];
+    context.aggregateDigest = canonicalNativeRuntimeContextDigest(context);
+    const current = { ...execution, schema: "paperclip.native-execution-input.v5", executionMode: "default", planningContext: null, runtimeContext: context,
+      binding: { ...execution.binding, runId: "producer-budget-run", executionWorkspaceId: "producer-budget-workspace" },
+      session: { ...execution.session, normalizedSessionId: "producer-budget-session" } } as NativeExecutionInput;
+    let snapshotCalls = 0;
+    const session = { async snapshot() { snapshotCalls++; return { workingDirectory: '/actual/"日本語"' }; } };
+    try {
+      const backend = await createRunnerdBackend({ db: leaseDb(current), execution: current, runnerInstanceId: "producer-budget" });
+      expect(backend.nativeTurnBudgetAdditions!()).toMatchObject({ unmeasuredPayload: true, workingDirectory: undefined });
+      backend.observeTurnBudgetSession!(session as never);
+      expect(snapshotCalls).toBe(0);
+      await session.snapshot();
+      const additions = backend.nativeTurnBudgetAdditions!();
+      expect(additions).toMatchObject({ unmeasuredPayload: false, workingDirectory: '/actual/"日本語"',
+        skillInputs: [{ type: "skill", name: "assigned", path: expect.stringContaining("/codex-home/skills/assigned/SKILL.md") }] });
+      expect(nativeQueuedTurnCompositionMeasured(current.provider.kind, current.schema, additions)).toBe(true);
+      expect(assertNativeQueuedTurnBound(current.binding.runId, { task: { prompt: "request" }, requestedSkills: ["assigned"] }, "whole queued input", additions)).toBeUndefined();
+      expect(snapshotCalls).toBe(1);
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR; else process.env.PAPERCLIP_RUNNER_STATE_DIR = previous;
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });
 

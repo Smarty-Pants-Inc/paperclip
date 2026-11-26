@@ -39,7 +39,7 @@ export interface HeartbeatTaskContextInput {
       "conversationAgentId" | "description" | "projectId"> | null;
     issueContext: IssueContext | null;
     context: Record<string, unknown>;
-    taskSession: Pick<typeof agentTaskSessions.$inferSelect, "lastRunId"> | null;
+    taskSession: Pick<typeof agentTaskSessions.$inferSelect, "lastRunId"> & Partial<Pick<typeof agentTaskSessions.$inferSelect, "sessionParamsJson" | "sessionDisplayId">> | null;
   };
   policy: {
     recovering?: boolean;
@@ -140,6 +140,7 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
   } else {
     delete context.paperclipSkillTest;
   }
+  delete context.nativeContinuationReadState;
   const executionContinuation =
     issueRef && !isConversation(issueContext) && issueContext?.assigneeAgentId === agent.id
       ? await buildExecutionContinuation({
@@ -150,8 +151,11 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
           runId: run.id,
           context,
           previousContextRunId: taskSession?.lastRunId,
+          nativeSessionId: agent.adapterType === "paperclip_runner" ? readNonEmptyString(parseObject(taskSession?.sessionParamsJson).sessionId) : null,
+          nativeProviderSessionId: agent.adapterType === "paperclip_runner" ? taskSession?.sessionDisplayId : null,
           summary: safeContinuationSummary?.body ?? null,
           exposeLowTrustRaw,
+          ...(agent.adapterType === "paperclip_runner" ? { onNativeReadState: state => { context.nativeContinuationReadState = state; } } : {}),
         })
       : null;
   context.executionContinuation = executionContinuation;
