@@ -51,7 +51,7 @@ export function isContextCompactionRun(context: unknown): boolean {
 /**
  * Harnesses that can compact on request. Compaction needs the Paperclip
  * runner, which resumes the provider session: Codex through its app-server,
- * Claude through ACP.
+ * Claude through ACP, Pi through its own /compact command.
  */
 export function contextCompactionSupport(agent: AgentBinding): { supported: true } | { supported: false; reason: string } {
   const unsupported = { supported: false as const, reason: "This agent's harness can't compact on request." };
@@ -60,6 +60,7 @@ export function contextCompactionSupport(agent: AgentBinding): { supported: true
   const provider = typeof config.provider === "string" ? config.provider : "codex";
   if (provider === "codex") return { supported: true };
   if (provider === "acpx" && config.acpxAgent === "claude") return { supported: true };
+  if (provider === "pi_rpc") return { supported: true };
   return unsupported;
 }
 
