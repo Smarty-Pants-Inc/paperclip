@@ -319,6 +319,18 @@ describe("Retry of a task whose saved work recovery settled", () => {
       expect(wake.payload?.executionWait).toMatchObject({ reason: "previous_execution_unverified" });
     });
 
+  it("discloses that Retry of a recovered chat starts a new session instead of resuming the old one", async () => {
+    const f = await restoredSnapshot();
+    await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: actorId, conversationState: "waiting" })
+      .where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ errorCode: "native_provider_state_incompatible" }).where(eq(heartbeatRuns.id, f.sourceId));
+    const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
+    const message = "Saved work recovered. Retry starts a new session. It gets this conversation's messages and replies (the oldest are left out if the conversation is very long), not the agent's tool steps; the old session is not resumed.";
+    expect(blocker).toMatchObject({ canRetry: true, retryStartsNewSession: true, nextAction: message,
+      workspaceRecovery: { status: "recovered", message } });
+    expect(blocker!.nextAction).not.toContain("continues");
+  });
+
   it("verifies the repair of a restored snapshot that the failed preparation never changed", async () => {
     const f = await restoredSnapshot();
     const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);

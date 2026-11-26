@@ -11,6 +11,8 @@ export interface ExecutionBlocker {
   canContinue?: boolean;
   /** Explicit Retry candidate; the server rechecks stop proof and execution gates. */
   canRetry?: boolean;
+  /** Retry starts a new session because the hold's source session cannot be resumed. */
+  retryStartsNewSession?: boolean;
   /** Required workspace files must be recovered before another provider turn. */
   workspaceRepairRequired?: boolean;
   canRecordWorkspaceRepair?: boolean;

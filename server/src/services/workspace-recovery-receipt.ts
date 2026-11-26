@@ -54,7 +54,10 @@ export function completedWorkspaceRecoveryCondition(runId: string | AnyColumn | 
   );
 }
 
+export const NEW_SESSION_RETRY_NEXT_ACTION = "Retry starts a new session. "
+  + "It gets this conversation's messages and replies (the oldest are left out if the conversation is very long), not the agent's tool steps; the old session is not resumed.";
 export const RECOVERED_WORK_RETRY_MESSAGE = "Saved work recovered. Retry continues from it.";
+export const RECOVERED_WORK_NEW_SESSION_MESSAGE = `Saved work recovered. ${NEW_SESSION_RETRY_NEXT_ACTION}`;
 
 export function recoveredWorkMessage(runStatus: string | null | undefined, retryOffered: boolean) {
   if (retryOffered) return RECOVERED_WORK_RETRY_MESSAGE;

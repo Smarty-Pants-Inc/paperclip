@@ -161,6 +161,20 @@ suite("a person's Retry while a continuation waits for delivery", () => {
     expect(await taskRuns(f)).toHaveLength(1);
   }, 60_000);
 
+  it.each([undefined, "restart_recovery"] as const)("freshens a folded chat Retry only for the person's choice (initiatedBy=%s)", async initiatedBy => {
+    const f = await pendingContinuation("native");
+    await db.update(issues).set({ originKind: "chat_channel" }).where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ errorCode: "native_provider_state_incompatible" }).where(eq(heartbeatRuns.id, f.runId));
+    await occupySlot();
+    const receipt = await requestTaskRetry({ db, companyId, issueId: f.issueId, actorId: userId, observedRunId: f.runId,
+      idempotencyKey: randomUUID(), actorSource: "local_implicit", initiatedBy });
+    expect(receipt).toMatchObject({ accepted: true });
+    await deliver();
+    await heartbeatService(db).resumeTaskRetry(companyId, receipt.requestId!);
+    const run = await expectSingleContinuationRun(f, receipt.requestId!);
+    expect(run.contextSnapshot?.explicitFreshSession).toBe(initiatedBy ? undefined : true);
+  }, 60_000);
+
   it.each(KINDS)("starts exactly one run when a Retry and the delivery pass race (%s)", async kind => {
     const f = await pendingContinuation(kind);
     await occupySlot();

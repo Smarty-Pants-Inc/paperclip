@@ -85,6 +85,22 @@ describe.skipIf(!support.supported)("execution blocker PostgreSQL read projectio
     expect(EXECUTION_BLOCKER_PERSON_RETRY_ACTION).toContain("Agents cannot retry it for them.");
   });
 
+  it.each([
+    { chat: false, errorCode: "adapter_failed", error: "native_controller_recovery_missing_evidence:retained_sandbox_binding", fresh: true },
+    { chat: true, errorCode: "native_provider_state_incompatible", error: "lost resume state", fresh: true },
+    { chat: true, errorCode: "adapter_failed", error: "ordinary provider failure", fresh: false },
+  ])("discloses a fresh-session Retry before the press: chat=$chat, fresh=$fresh", async ({ chat, errorCode, error, fresh }) => {
+    const f = await fixture({ errorCode, error });
+    if (chat) await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: "board", conversationState: "waiting" })
+      .where(eq(issues.id, f.issueId));
+    const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
+    expect(blocker).toMatchObject({ canRetry: true });
+    expect(blocker?.retryStartsNewSession).toBe(fresh ? true : undefined);
+    expect(blocker!.nextAction).toBe(fresh
+      ? "Retry starts a new session. It gets this conversation's messages and replies (the oldest are left out if the conversation is very long), not the agent's tool steps; the old session is not resumed."
+      : `Inspect the source run. ${EXECUTION_BLOCKER_PERSON_RETRY_ACTION}`);
+  });
+
   it("shows plain wording and Retry for a finalization deadline saved by the previous release", async () => {
     const previousReleaseText = "Inspect the failed run and verify its provider has stopped. Reconcile any uncertain external action before explicitly continuing this task.";
     const f = await fixture({ runtimeMode: "native", errorCode: "execution_finalization_deadline_exceeded",

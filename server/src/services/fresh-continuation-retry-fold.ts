@@ -1,5 +1,5 @@
 import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
-import { agentWakeupRequests, chatConversations, heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
+import { agentWakeupRequests, heartbeatRuns, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 import { FRESH_CONTINUATION_SCHEMA, settleCoalescedFreshContinuationHolds } from "./fresh-continuation-fallback.js";
 import { sessionCannotContinue } from "./native-runtime/continued-session.js";
@@ -11,21 +11,11 @@ function retrySourceRunId(payload: unknown): string | null {
   return typeof taskRetry?.sourceRunId === "string" ? taskRetry.sourceRunId : null;
 }
 
-/** A person's chat (Agent Chat or a connected chat); unknown counts as a chat. */
-export async function isChatTask(tx: Pick<Db, "select">, companyId: string, issueId: string) {
-  const [issue] = await tx.select({ conversationAgentId: issues.conversationAgentId, originKind: issues.originKind })
-    .from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
-  if (!issue || issue.conversationAgentId || issue.originKind === "chat_channel") return true;
-  const [chat] = await tx.select({ id: chatConversations.id }).from(chatConversations)
-    .where(and(eq(chatConversations.companyId, companyId), eq(chatConversations.issueId, issueId))).limit(1);
-  return Boolean(chat);
-}
-
-/** A person's Retry of a non-chat task whose session can never be resumed starts a new session. */
+/** A person's Retry starts a new session when the source session cannot resume; the hold discloses this choice, including for chats. */
 export async function retryStartsFresh(tx: Pick<Db, "select">, input: { companyId: string; issueId: string; sourceRunId: string }) {
   const [source] = await tx.select({ error: heartbeatRuns.error, errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns)
     .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.sourceRunId)));
-  return sessionCannotContinue(source) && !(await isChatTask(tx, input.companyId, input.issueId));
+  return sessionCannotContinue(source);
 }
 
 export async function foldWaitingRetriesIntoContinuation(tx: Db, input: {
