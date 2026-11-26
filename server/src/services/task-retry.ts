@@ -312,7 +312,11 @@ function admitTaskRetry(input: TaskRetryRequest) {
       if (!agentRequester) return;
       const refusal = await agentTaskRetryRefusal(db, { ...input, sourceRunId, agentRequester });
       if (refusal) throw conflict(agentTaskRetryMessage(refusal), { code: refusal, retrySourceRunId: sourceRunId });
-      if (!await taskRetryMutationAllowed(db, { ...input, actorSource: input.actorSource ?? "session" }))
+      const actorSource = taskRetryIntentSchema.shape.actorSource.safeParse(input.actorSource ?? "session");
+      if (!actorSource.success)
+        throw conflict("Retry refused: the actor source is not recognized.",
+          { code: "retry_refused_actor_source", retrySourceRunId: sourceRunId });
+      if (!await taskRetryMutationAllowed(db, { ...input, actorSource: actorSource.data }))
         throw forbidden(agentTaskRetryMessage("retry_authority_denied"),
           { code: "retry_authority_denied", retrySourceRunId: sourceRunId });
     };

@@ -1383,6 +1383,15 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       expect(res.body.details.code).toBe("retry_refused_person_stop");
     });
 
+    it("refuses an unknown actor source in locked direct-service admission with a stated reason", async () => {
+      const f = await seedAgentRetry();
+      await expect(requestTaskRetry({ db, ...f, actorId: "board-user", observedRunId: f.retryRunId,
+        idempotencyKey: randomUUID(), actorSource: "unknown_source", agentRequester: requester(f) }))
+        .rejects.toMatchObject({ status: 409, details: { code: "retry_refused_actor_source" } });
+      expect(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
+        eq(agentWakeupRequests.reason, "task_retry")))).toHaveLength(0);
+    });
+
     it("checks the original person's mutation permission in locked direct-service admission", async () => {
       const f = await seedAgentRetry();
       await db.update(companyMemberships).set({ membershipRole: "viewer" }).where(eq(companyMemberships.companyId, f.companyId));
