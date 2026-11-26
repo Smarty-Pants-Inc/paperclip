@@ -505,7 +505,7 @@ describe("agent live run routes", () => {
       expect(mockHeartbeatService.readLog).not.toHaveBeenCalled();
     });
 
-    it("keeps board and instance-admin checks ahead of malformed-ID validation", async () => {
+    it("keeps privileged routes guarded ahead of malformed-ID validation", async () => {
       const app = await createApp({}, { type: "agent", companyId: "company-1", agentId: routeAgentId });
       for (const [method, suffix] of routes.filter(([, suffix]) =>
         suffix === "/cancel" || suffix === "/runtime-requests/approval-1/resolve" || suffix.startsWith("/provider-trace"),
@@ -513,7 +513,7 @@ describe("agent live run routes", () => {
         const response = await requestApp(app, (url) =>
           request(url)[method](`/api/heartbeat-runs/undefined${suffix}`).send({}),
         );
-        expect(response.status, `${method} ${suffix}`).toBe(403);
+        expect(response.status, `${method} ${suffix}`).toBe(method === "get" && suffix === "/provider-trace" ? 400 : 403);
       }
       expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
     });
@@ -1907,6 +1907,117 @@ describe("agent live run routes", () => {
       expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
     },
   );
+
+  describe("agent provider trace reads", () => {
+    const runId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const privateRunId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const actor = { type: "agent", agentId: "example-agent", companyId: "example-org" };
+    const run = { id: runId, companyId: "example-org", scopeKind: "company", issueId: null };
+    const trace = { id: "trace-1", runId, companyId: "example-org" };
+    const inspection = {
+      trace,
+      entries: [{ kind: "frame", frameId: 1, parsed: { token: "[withheld]" }, withheldPaths: ["token"] }],
+    };
+
+    beforeEach(() => {
+      mockHeartbeatService.getRun.mockResolvedValue(run);
+      mockHeartbeatService.getRunReadAccess.mockResolvedValue(run);
+      mockProviderTraceStore.inspect.mockResolvedValue(inspection);
+      mockProviderTraceStore.listMetadataForRuns.mockResolvedValue([trace]);
+    });
+
+    it("lets a same-company agent read the redacted trace and records its identity", async () => {
+      const res = await requestApp(await createApp({}, actor), baseUrl =>
+        request(baseUrl).get(`/api/heartbeat-runs/${runId}/provider-trace`));
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual(inspection);
+      expect(res.body.entries[0]).not.toHaveProperty("rawBase64");
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        actorType: "agent", actorId: "example-agent", agentId: "example-agent",
+        action: "provider_trace.redacted_viewed",
+        details: { traceId: "trace-1", rawPayloadRevealed: false },
+      }));
+    });
+
+    it("lists only metadata for readable same-company runs", async () => {
+      mockHeartbeatService.getRunReadAccess.mockImplementation(async (id: string) => {
+        if (id === runId) return run;
+        if (id === privateRunId) return { ...run, id, scopeKind: "issue", issueId: "private-issue" };
+        if (id === "foreign-run") return { ...run, id, companyId: "second-org" };
+        return null;
+      });
+      const query = { from: vi.fn().mockReturnThis(), where: vi.fn(async () => [{ id: "private-issue" }]) };
+      mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+        allowed: input.action !== "issue:read", action: input.action,
+        reason: "deny_missing_grant", explanation: "Private issue is not readable.",
+      }));
+      const res = await requestApp(await createApp({ select: vi.fn(() => query) }, actor), baseUrl =>
+        request(baseUrl).get(`/api/companies/example-org/provider-traces?runIds=${runId},${privateRunId},foreign-run,missing-run`));
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual([trace]);
+      expect(mockProviderTraceStore.listMetadataForRuns).toHaveBeenCalledWith("example-org", [runId]);
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        actorType: "agent", actorId: "example-agent", action: "provider_trace.metadata_listed",
+      }));
+    });
+
+    it("hides a foreign company's run just like ordinary run reads", async () => {
+      const app = await createApp({}, { ...actor, companyId: "second-org" });
+      for (const suffix of ["", "/provider-trace"]) {
+        const res = await requestApp(app, baseUrl => request(baseUrl).get(`/api/heartbeat-runs/${runId}${suffix}`));
+        expect(res.status).toBe(404);
+        expect(res.body).toEqual({ error: "Heartbeat run not found" });
+      }
+      expect(mockProviderTraceStore.inspect).not.toHaveBeenCalled();
+    });
+
+    it("refuses another company's metadata list", async () => {
+      const res = await requestApp(await createApp({}, { ...actor, companyId: "second-org" }), baseUrl =>
+        request(baseUrl).get(`/api/companies/example-org/provider-traces?runIds=${runId}`));
+      expect(res.status).toBe(403);
+      expect(mockProviderTraceStore.listMetadataForRuns).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      `/api/companies/example-org/provider-traces?runIds=${runId}`,
+      `/api/heartbeat-runs/${runId}/provider-trace`,
+    ])("enforces company telemetry authorization on %s", async path => {
+      mockAccessService.decide.mockResolvedValue({
+        allowed: false, action: "company_scope:read", reason: "deny_missing_grant", explanation: "Denied.",
+      });
+      const res = await requestApp(await createApp({}, actor), baseUrl => request(baseUrl).get(path));
+      expect(res.status).toBe(403);
+      expect(mockProviderTraceStore.inspect).not.toHaveBeenCalled();
+      expect(mockProviderTraceStore.listMetadataForRuns).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalled();
+    });
+
+    it("hides an unreadable private run just like ordinary run reads", async () => {
+      mockHeartbeatService.getRun.mockResolvedValue({ ...run, scopeKind: "issue", issueId: "private-issue" });
+      const query = { from: vi.fn().mockReturnThis(), where: vi.fn(async () => [{ id: "private-issue" }]) };
+      mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+        allowed: input.action !== "issue:read", action: input.action,
+        reason: "deny_missing_grant", explanation: "Private issue is not readable.",
+      }));
+      const app = await createApp({ select: vi.fn(() => query) }, actor);
+      for (const suffix of ["", "/provider-trace"]) {
+        const res = await requestApp(app, baseUrl => request(baseUrl).get(`/api/heartbeat-runs/${runId}${suffix}`));
+        expect(res.status).toBe(404);
+      }
+      expect(mockProviderTraceStore.inspect).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["post", `/api/heartbeat-runs/${runId}/provider-trace/frames/1/reveal`],
+      ["get", `/api/heartbeat-runs/${runId}/provider-trace/download`],
+    ] as const)("keeps raw trace access admin-only: %s %s", async (method, path) => {
+      const res = await requestApp(await createApp({}, actor), baseUrl => request(baseUrl)[method](path));
+      expect(res.status).toBe(403);
+      expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
+      expect(mockProviderTraceStore.revealFrame).not.toHaveBeenCalled();
+      expect(mockProviderTraceStore.download).not.toHaveBeenCalled();
+    });
+  });
 
   it("lists trace status metadata without exposing payload contents", async () => {
     mockProviderTraceStore.listMetadataForRuns.mockResolvedValueOnce([
