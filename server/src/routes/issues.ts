@@ -10098,21 +10098,18 @@ export function issueRoutes(
   });
 
   router.post("/issues/:id/retry", validate(taskRetrySchema), async (req, res) => {
-    // An agent holding a board user's tasks:retry grant presses Retry as that
-    // person, so the person's gates apply, within a per-task daily cap.
+    const presser = req.actor;
+    let refusalReason: string | null = null;
+    try {
+    // The agent's run supplies authority; admission requires the source to carry the same person.
     let agentRetry: { companyId: string; agentId: string; runId: string } | null = null;
     if (req.actor.type === "agent" && req.actor.agentId && req.actor.companyId) {
       const { agentOwnsRun, agentTaskRetryActor } = await import("../services/agent-task-retry.js");
-      const grantor = await agentTaskRetryActor(db, { companyId: req.actor.companyId, agentId: req.actor.agentId,
-        runId: req.actor.runId });
-      if (grantor) {
-        // The agent's own limits apply first: scoped keys never use the grant,
-        // the run must be the agent's, and the agent's own issue:read and
-        // issue:mutate checks (trust boundary, company policy, interaction
-        // rules, and responsible-user ceiling) must pass. The grant lifts only
-        // the board-only gate and task-assignee ownership rule.
+        // Keep the agent's key, run, read and write gates before resolving authority.
         if (req.actor.keyScope && req.actor.keyScope.kind !== "standard")
-          throw forbidden("Scoped credentials cannot use the Retry grant");
+          throw forbidden("Scoped credentials cannot request Retry");
+        if (req.actor.source !== "agent_jwt" || !req.actor.onBehalfOfUserId)
+          throw forbidden("Retry requires an authenticated run-bound agent.", { code: "retry_refused_unsigned_run" });
         const runId = requireAgentRunId(req, res);
         if (!runId) return;
         if (!(await agentOwnsRun(db, { companyId: req.actor.companyId, agentId: req.actor.agentId, runId })))
@@ -10123,8 +10120,11 @@ export function issueRoutes(
         if (!ownWrite.allowed)
           throw forbidden(ownWrite.explanation, authorizationDeniedDetails(ownWrite));
         agentRetry = { companyId: req.actor.companyId, agentId: req.actor.agentId, runId };
-        req.actor = grantor;
-      }
+        const authority = await agentTaskRetryActor(db, agentRetry);
+        if (!authority || authority.userId !== req.actor.onBehalfOfUserId)
+          throw conflict("The authenticated run's person is no longer active.",
+          { code: "retry_authority_unavailable" });
+        req.actor = authority;
     }
     assertBoard(req);
     const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
@@ -10140,7 +10140,7 @@ export function issueRoutes(
         .where(and(eq(chatConversations.companyId, issue.companyId), eq(chatConversations.issueId, issue.id))).limit(1);
       if (chatBinding) throw forbidden("Only a person can retry a chat run");
       const { recordAgentTaskRetry } = await import("../services/agent-task-retry.js");
-      await recordAgentTaskRetry(db, { issueId: issue.id, ...agentRetry, grantedByUserId: req.actor.userId!,
+      await recordAgentTaskRetry(db, { issueId: issue.id, ...agentRetry, authorityUserId: req.actor.userId!,
         idempotencyKey: req.body.idempotencyKey });
     }
     if (issue.conversationAgentId) {
@@ -10150,6 +10150,7 @@ export function issueRoutes(
     const { requestTaskRetry } = await import("../services/task-retry.js");
     const receipt = await requestTaskRetry({ db, companyId: issue.companyId, issueId: issue.id,
       ...req.body, actorId: getActorInfo(req).actorId, actorSource: req.actor.source,
+      ...(agentRetry ? { agentRequester: { agentId: agentRetry.agentId, runId: agentRetry.runId } } : {}),
       prepareChatRetry: opts.chatRunRetries?.prepareFailedChatRunRetry });
     const actor = getActorInfo(req);
     const scheduledRetryRunId = "scheduledRetryRunId" in receipt ? receipt.scheduledRetryRunId : undefined;
@@ -10204,6 +10205,18 @@ export function issueRoutes(
         logger.warn({ err, issueId: issue.id, runId: finalizeRunId }, "Saved result finalization remains queued"));
     } else if (chatActionId) void opts.chatRunRetries?.processFailedChatRunRetry(chatActionId).catch(err =>
       logger.warn({ err, issueId: issue.id }, "Connected task Retry remains queued"));
+    } catch (error) {
+      refusalReason = error instanceof HttpError
+        ? String((error.details as Record<string, unknown> | undefined)?.code ?? `http_${error.status}`) : "internal_error";
+      throw error;
+    } finally {
+      if (presser.type === "agent" && presser.companyId && presser.agentId && (refusalReason || res.statusCode >= 400)) {
+        const { recordAgentTaskRetryRefusal } = await import("../services/agent-task-retry.js");
+        await recordAgentTaskRetryRefusal(db, { companyId: presser.companyId, agentId: presser.agentId,
+          runId: presser.runId, issueId: req.params.id as string, sourceRunId: req.body.observedRunId, authorityUserId: req.actor.type === "board" ? req.actor.userId : null,
+          reason: refusalReason ?? `http_${res.statusCode}` });
+      }
+    }
   });
 
   router.post("/issues/:id/recovery-actions/recover-workspace", validate(recoverWorkspaceSchema), async (req, res) => {

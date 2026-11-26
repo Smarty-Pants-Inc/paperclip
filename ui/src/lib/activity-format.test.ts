@@ -3,6 +3,16 @@ import { describe, expect, it } from "vitest";
 import { formatActivityVerb, formatIssueActivityAction } from "./activity-format";
 
 describe("activity formatting", () => {
+  it.each(["issue.retry_requested", "issue.retry_requested_by_agent", "issue.retry_refused_by_agent"])(
+    "names the carried person, without making them the pressing actor (%s)", action => {
+      const details = { authorityUserId: "original-person", reason: "retry_refused_person_stop" };
+      const options = { currentUserId: "original-person" };
+      const verb = action === "issue.retry_refused_by_agent"
+        ? "was refused Retry (retry_refused_person_stop)" : "requested Retry";
+      expect(formatIssueActivityAction(action, details, options)).toBe(`${verb} on behalf of You`);
+      expect(formatActivityVerb(action, details, options)).toBe(`${verb} on behalf of You for`);
+    },
+  );
   const agentMap = new Map<string, Agent>([
     ["agent-reviewer", { id: "agent-reviewer", name: "Reviewer Bot" } as Agent],
     ["agent-approver", { id: "agent-approver", name: "Approver Bot" } as Agent],

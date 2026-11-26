@@ -34,6 +34,7 @@ import { notifyScheduledRetryCancellation } from "../scheduled-retry-cancellatio
 import { notifyChatResponseAvailability } from "../chat-response-availability.js";
 import { notifyChatInboundWakeNotices } from "../chat-inbound-wake-notice-notifications.js";
 import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js";
+import { agentTaskRetryRefusal, recordAgentTaskRetryRefusal } from "../agent-task-retry.js";
 import { assertTaskRetryConversationAllowed, readTaskRetryIntent, readTaskRetryBoardMessageOrigin, retireSupersededTaskRetry, taskRetryMutationAllowed } from "../task-retry.js";
 import { insertIssueComment } from "../issue-comment-writes.js";
 import { systemNoticePresentation } from "../recovery/notice-format.js";
@@ -3645,11 +3646,17 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               // A declined Retry stays saved, but never silently: name the gate
               // so the task explains it and a new click can replace this intent.
               const declineRetry = async (reason: string, message: string) => {
+                if (retry.agentRequester && parseObject(pending.payload?.executionWait).reason !== reason)
+                  await recordAgentTaskRetryRefusal(tx as unknown as Db, { companyId: agent.companyId, issueId,
+                    ...retry.agentRequester, sourceRunId: retry.sourceRunId, authorityUserId: retry.actorId, reason }, issueActivityPublications);
                 await writeDeferredExecutionWait(tx as unknown as Db, { companyId: agent.companyId,
                   requestId: pending.id }, { reason, message }, { replace: true, publications: issueActivityPublications });
                 logger.warn({ requestId: pending.id, issueId, reason }, "Task Retry could not start");
                 return { kind: "deferred" as const };
               };
+              const refusal = await agentTaskRetryRefusal(tx as unknown as Db, { companyId: agent.companyId, issueId, ...retry });
+              if (refusal) return declineRetry(refusal, "Agent Retry can no longer continue this source.");
+              if (retry.agentRequester) operatorResponsibleUserId = retry.actorId;
               if (!await taskRetryMutationAllowed(tx as unknown as Db, { companyId: agent.companyId, issueId,
                 actorId: retry.actorId, actorSource: retry.actorSource }))
                 return declineRetry("retry_authority_denied", "The user who requested Retry can no longer change this task.");

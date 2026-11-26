@@ -194,6 +194,12 @@ const retryWaitMessages: Record<string, string> = {
   // A new click replaces a Retry declined for its requester's access with a
   // fresh attempt under the clicker's access, so Retry stays available.
   retry_authority_denied: "Retry could not start with the requesting user's access. Press Retry to start it with yours.",
+  retry_authority_unavailable: "Retry refused: the authenticated run's person is no longer active.",
+  retry_refused_different_person: "Retry refused: the pressing agent's run and the source run must carry the same person.",
+  retry_refused_person_stop: "Retry refused: a person deliberately stopped or paused this work.",
+  retry_refused_stop_unverified: "Retry refused: this cancelled run might have been deliberately stopped.",
+  retry_refused_run_not_stopped: "Retry refused: the source run must be stopped or failed.",
+  retry_refused_chat: "Retry refused: only a person can retry a chat or connected-chat run.",
   previous_execution_unverified: "Retry can't continue because Paperclip can't confirm that the previous attempt stopped before it started work. Your message is saved.",
   // An edited saved message can never be replayed; only new input continues.
   retry_source_changed: "Retry cannot continue because its saved message changed. Send a new message to continue from saved work.",

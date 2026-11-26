@@ -31,7 +31,8 @@ export interface RunForIssue {
   scheduledRetryReason?: string | null;
   retryExhaustedReason?: string | null;
   /** Who started a retry run: a named person who pressed Retry, or automatic recovery. */
-  retriedBy?: { kind: "person"; personName: string; summary: string } | { kind: "automatic"; summary: string } | null;
+  retriedBy?: { kind: "person"; personName: string; summary: string }
+    | { kind: "agent"; agentId: string; runId: string; summary: string } | { kind: "automatic"; summary: string } | null;
   livenessState?: RunLivenessState | null;
   livenessReason?: string | null;
   continuationAttempt?: number;

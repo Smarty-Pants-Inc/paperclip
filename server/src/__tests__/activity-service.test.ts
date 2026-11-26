@@ -149,6 +149,10 @@ describeEmbeddedPostgres("activity service", () => {
     };
     const base = { companyId, agentId, issueId, scopeKind: "issue", contextSnapshot: { issueId } } as const;
     const memberTaskRetryId = await wake("task_retry", "user", userId), inheritedRetryId = randomUUID();
+    const agentTaskRetryId = await wake("task_retry", "user", userId), agentRetryId = randomUUID(), presserRunId = randomUUID();
+    await db.update(agentWakeupRequests).set({ payload: { issueId, taskRetry: { schema: "paperclip.task-retry.v1",
+      generationId: agentTaskRetryId, sourceRunId: failedRunId, actorId: userId, actorSource: "session", strategy: "evaluate",
+      agentRequester: { agentId, runId: presserRunId } } } }).where(eq(agentWakeupRequests.id, agentTaskRetryId));
     const at = (seconds: number) => new Date(Date.UTC(2026, 10, 13, 18, 0, seconds));
     await db.insert(heartbeatRuns).values([
       { ...base, id: failedRunId, status: "failed", errorCode: "native_provider_model_rejected", invocationSource: "assignment", createdAt: at(0) },
@@ -167,6 +171,8 @@ describeEmbeddedPostgres("activity service", () => {
         wakeupRequestId: await wake("transient_failure_retry", null, null, "automation"),
         contextSnapshot: { issueId, previousRunId: failedRunId, taskRetryRequestId: memberTaskRetryId }, createdAt: at(5) },
       { ...base, id: unknownRetryId, status: "succeeded", invocationSource: "on_demand", triggerDetail: "manual", retryOfRunId: failedRunId, createdAt: at(4) },
+      { ...base, id: agentRetryId, status: "succeeded", invocationSource: "on_demand", triggerDetail: "manual", responsibleUserId: userId,
+        contextSnapshot: { issueId, previousRunId: failedRunId, taskRetryRequestId: agentTaskRetryId }, createdAt: at(6) },
     ]);
 
     const rows = await activityService(db).runsForIssue(companyId, issueId);
@@ -180,6 +186,8 @@ describeEmbeddedPostgres("activity service", () => {
       summary: "Paperclip retried the failed run automatically; no person pressed Retry." });
     expect(byId.get(inheritedRetryId)).toMatchObject({ kind: "automatic" });
     expect(byId.get(unknownRetryId)).toBeNull();
+    expect(byId.get(agentRetryId)).toEqual({ kind: "agent", agentId, runId: presserRunId,
+      summary: "Morgan requested Retry, continuing as Sam Rivera. No person pressed Retry." });
     expect(JSON.stringify([...byId.values()])).not.toMatch(/local-board|member-/);
     await db.delete(authUsers).where(eq(authUsers.id, userId));
   });

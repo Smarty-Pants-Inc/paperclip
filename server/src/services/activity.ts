@@ -26,6 +26,7 @@ import {
 import { hasWorkspaceRestoreFailure, safeWorkspaceRestorePath, ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, normalizeRunFailureCause, RUN_FAILURE_CAUSE_MAX_LENGTH } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import { readTaskRetryIntent } from "./task-retry.js";
 import { classifyRunLiveness } from "./run-liveness.js";
 import { missingRunLivenessCandidatesQuery } from "./run-liveness-backfill-query.js";
 
@@ -66,7 +67,8 @@ export function activityActorFallbackName(actorType: string, actorId: string) {
 /** Wake reasons recorded when a person presses Retry on a failed run or task. */
 const PERSON_RETRY_WAKE_REASONS = new Set(["retry_failed_run", "task_retry"]);
 
-export type RunRetriedBy = { kind: "person"; personName: string; summary: string } | { kind: "automatic"; summary: string };
+export type RunRetriedBy = { kind: "person"; personName: string; summary: string }
+  | { kind: "agent"; agentId: string; runId: string; summary: string } | { kind: "automatic"; summary: string };
 
 /**
  * Who started a retry run, in plain words. A run's own invocation fields do
@@ -78,8 +80,9 @@ export type RunRetriedBy = { kind: "person"; personName: string; summary: string
  */
 export function describeRunRetry(
   run: { retryOfRunId: string | null; taskRetryRequestId?: string | null; invocationSource: string | null },
-  wake: { reason: string | null; requestedByActorType: string | null } | null,
+  wake: { reason: string | null; requestedByActorType: string | null; payload?: Record<string, unknown> | null } | null,
   personName: string | null,
+  agentName?: string | null,
 ): RunRetriedBy | null {
   if (!run.retryOfRunId && !run.taskRetryRequestId) return null;
   // The run's own start decides first: automatic recovery after a person's
@@ -87,6 +90,9 @@ export function describeRunRetry(
   if (run.invocationSource === "automation") {
     return { kind: "automatic", summary: "Paperclip retried the failed run automatically; no person pressed Retry." };
   }
+  const presser = readTaskRetryIntent(wake?.payload)?.agentRequester;
+  if (presser && wake?.reason === "task_retry") return { kind: "agent", agentId: presser.agentId, runId: presser.runId,
+    summary: `${agentName?.trim() || "An agent"} requested Retry, continuing as ${personName?.trim() || "the original person"}. No person pressed Retry.` };
   if (wake?.requestedByActorType === "user" && wake.reason && PERSON_RETRY_WAKE_REASONS.has(wake.reason)) {
     const name = personName?.trim() || "A board member";
     return { kind: "person", personName: name, summary: `${name} pressed Retry on the failed run. Paperclip did not retry it automatically.` };
@@ -653,6 +659,7 @@ export function activityService(db: Db) {
           reason: agentWakeupRequests.reason,
           requestedByActorType: agentWakeupRequests.requestedByActorType,
           requestedByActorId: agentWakeupRequests.requestedByActorId,
+          payload: agentWakeupRequests.payload,
         }).from(agentWakeupRequests)
           .where(and(eq(agentWakeupRequests.companyId, companyId), inArray(agentWakeupRequests.id, retryWakeIds)))
         : Promise.resolve([]);
@@ -669,13 +676,21 @@ export function activityService(db: Db) {
       const retryPersonNames = new Map((retryPersonIds.length
         ? await db.select({ id: authUsers.id, name: authUsers.name }).from(authUsers).where(inArray(authUsers.id, retryPersonIds))
         : []).filter(row => row.name?.trim()).map(row => [row.id, row.name!.trim()]));
+      const retryAgentIds = [...new Set(retryWakes.flatMap(wake => {
+        const presser = readTaskRetryIntent(wake.payload)?.agentRequester;
+        return presser ? [presser.agentId] : [];
+      }))];
+      const retryAgentNames = new Map((retryAgentIds.length ? await db.select({ id: agents.id, name: agents.name })
+        .from(agents).where(and(eq(agents.companyId, companyId), inArray(agents.id, retryAgentIds))) : [])
+        .map(row => [row.id, row.name]));
       const retriedBy = (run: (typeof runs)[number]) => {
         const wakeId = retryWakeId(run);
         const wake = wakeId ? retryWakeById.get(wakeId) ?? null : null;
         const actorId = wake?.requestedByActorId ?? null;
         const personName = wake?.requestedByActorType === "user" && actorId
           ? retryPersonNames.get(actorId) ?? activityActorFallbackName("user", actorId) : null;
-        return describeRunRetry(run, wake, personName);
+        const presser = readTaskRetryIntent(wake?.payload)?.agentRequester;
+        return describeRunRetry(run, wake, personName, presser ? retryAgentNames.get(presser.agentId) : null);
       };
       const retryExhaustedReasonByRunId = new Map<string, string>();
       for (const row of exhaustionRows) {

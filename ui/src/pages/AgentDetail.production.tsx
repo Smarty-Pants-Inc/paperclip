@@ -2996,6 +2996,9 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                 </div>
               );
             })()}
+            {run.retryRequestedByAgent && <div className="text-xs text-muted-foreground" data-testid="run-retry-presser">
+              Retry pressed by <Link to={`/agents/${run.retryRequestedByAgent.id}`}>{run.retryRequestedByAgent.name}</Link>
+            </div>}
             {run.responsibleUserId && (
               <div
                 data-testid="run-detail-on-behalf-of"

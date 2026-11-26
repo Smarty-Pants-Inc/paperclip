@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { authSessionSchema, currentUserProfileSchema } from "./access.js";
+import { authSessionSchema, currentUserProfileSchema, updateAgentPermissionGrantSchema } from "./access.js";
+
+it("does not offer the retired tasks:retry grant", () => {
+  expect(updateAgentPermissionGrantSchema.safeParse({ permissionKey: "tasks:retry", enabled: true }).success).toBe(false);
+  expect(updateAgentPermissionGrantSchema.safeParse({ permissionKey: "tasks:assign", enabled: true }).success).toBe(true);
+});
 
 describe("currentUserProfileSchema", () => {
   it("coerces empty-string name to null", () => {

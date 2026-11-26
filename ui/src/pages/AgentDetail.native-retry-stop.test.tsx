@@ -16,11 +16,35 @@ vi.mock("../api/heartbeats", async importOriginal => ({ heartbeatsApi: { ...(awa
   get, events: async () => [], workspaceOperations: async () => [] } }));
 vi.mock("../api/grokBot", () => ({ grokBotApi: { stop: grokStop } }));
 vi.mock("../api/client", () => ({ api: { get: async () => [], post: cancel }, detachInflightGet: vi.fn() }));
-vi.mock("../api/access", () => ({ accessApi: { getCurrentBoardAccess: async () => ({ userId: actor.id, source: actor.source, companyIds: ["company-1"], memberships: [] }) } }));
+vi.mock("../api/access", () => ({ accessApi: { listUserDirectory: async () => ({ users: [{ principalId: "original-person", user: { name: "Original Person" } }] }), getCurrentBoardAccess: async () => ({ userId: actor.id, source: actor.source, companyIds: ["company-1"], memberships: [] }) } }));
 vi.mock("../context/SidebarContext", () => ({ useSidebar: () => ({ isMobile: false }) }));
 vi.mock("../context/CompanyContext", () => ({ useCompany: () => ({ selectedCompanyId: "company-1", selectedCompany: { id: "company-1", issuePrefix: "TEST" }, companies: [] }) }));
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 afterEach(() => { get.mockReset(); cancel.mockReset(); grokStop.mockReset(); actor.id = "operator-1"; actor.source = "authenticated"; sessionStorage.clear(); vi.unstubAllGlobals(); });
+
+it.each([RunsTab, ProductionRunsTab])("names the pressing agent and carried person separately on the run page (%#)", async Tab => {
+  const run = { id: "retry-run", companyId: "company-1", agentId: "worker", status: "failed",
+    responsibleUserId: "original-person", retryRequestedByAgent: { id: "pressing-agent", name: "Retry helper" },
+    invocationSource: "on_demand", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z",
+    resultJson: null, contextSnapshot: null, usageJson: null, startedAt: null, finishedAt: null,
+  } as unknown as HeartbeatRun;
+  get.mockResolvedValue(run);
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
+  const element = document.createElement("div"); document.body.append(element);
+  const root = createRoot(element);
+  try {
+    await act(async () => root.render(<QueryClientProvider client={client}><MemoryRouter><PanelProvider><ToastProvider>
+      <Tab runs={[]} companyId="company-1" agentId="worker" agentRouteId="worker" selectedRunId={run.id} adapterType="paperclip_runner" adapterConfig={{}} />
+    </ToastProvider></PanelProvider></MemoryRouter></QueryClientProvider>));
+    await vi.waitFor(async () => {
+      await act(async () => {});
+      expect(element.querySelector('[data-testid="run-retry-presser"]')?.textContent).toBe("Retry pressed by Retry helper");
+      expect(element.querySelector('[data-testid="run-detail-on-behalf-of"]')?.textContent).toBe("On behalf of Original Person");
+    });
+    expect(element.querySelector('[data-testid="run-retry-presser"] a')?.getAttribute("href")).toContain("/agents/pressing-agent");
+    expect(cancel).not.toHaveBeenCalled();
+  } finally { await act(async () => root.unmount()); client.clear(); element.remove(); }
+});
 
 const states = [
   { status: "failed", eligibility: true, label: "Stop" },

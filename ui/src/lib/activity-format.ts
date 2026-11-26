@@ -432,6 +432,13 @@ function formatStructuredIssueChange(input: {
   const details = input.details;
   if (!details) return null;
 
+  if (["issue.retry_requested", "issue.retry_requested_by_agent", "issue.retry_refused_by_agent"].includes(input.action)
+      && typeof details.authorityUserId === "string") {
+    const person = formatUserLabel(details.authorityUserId, input.options);
+    const verb = input.action === "issue.retry_refused_by_agent" ? `was refused Retry (${details.reason})` : "requested Retry";
+    return `${verb} on behalf of ${person}${input.forIssueDetail ? "" : " for"}`;
+  }
+
   if (input.action === "issue.blockers_updated") {
     const added = readIssueReferences(details, "addedBlockedByIssues").map(formatIssueReferenceLabel);
     const removed = readIssueReferences(details, "removedBlockedByIssues").map(formatIssueReferenceLabel);

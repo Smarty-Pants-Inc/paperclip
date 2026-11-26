@@ -154,6 +154,8 @@ export interface GitWorktreeBranchIncoherenceEvidence {
 }
 
 export interface HeartbeatRun {
+  /** The pressing agent, separate from the run's responsible person. */
+  retryRequestedByAgent?: { id: string; name: string } | null;
   /** Persisted native driver identity; older servers may omit this field. */
   driverKind?: string | null;
   execution?: import("./execution-projection.js").ExecutionProjection | null;

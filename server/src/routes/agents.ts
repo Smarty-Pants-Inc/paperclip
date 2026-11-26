@@ -2,6 +2,7 @@ import { resolveLoginEnvironmentTarget } from "../services/login-environment.js"
 import { checkAgentProtectedEnvironmentKeys } from "../services/protected-environment-keys.js";
 import { assertProviderApiPlacementPolicy, managedCursorApiDefaultEnabled, resolveProviderApiPlacement } from "../services/native-runtime/provider-api-placement.js";
 import { isObjectJournalBusyError } from "../services/object-byte-journal.js";
+import { readTaskRetryIntent } from "../services/task-retry.js";
 import { readTaskPanelActivations } from "../services/plugin-task-panels.js";
 import { enqueueNativeRuntimeResponse } from "../services/native-runtime/native-runtime-response-delivery.js";
 import { latestFailedRunsByAgent } from "@paperclipai/shared";
@@ -7485,13 +7486,21 @@ export function agentRoutes(
     if (!run) return;
     if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
     if (!(await assertRunReadAllowed(req, res, run))) return;
+    const retryRequestId = run.contextSnapshot?.taskRetryRequestId;
+    const [retryWake] = typeof retryRequestId === "string" && isUuidLike(retryRequestId) && run.invocationSource !== "automation"
+      ? await db.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.id, retryRequestId))).limit(1) : [];
+    const requester = readTaskRetryIntent(retryWake?.payload)?.agentRequester;
+    const pressingAgent = requester ? await svc.getById(requester.agentId) : null;
+    const retryRequestedByAgent = requester ? { id: requester.agentId,
+      name: pressingAgent?.companyId === run.companyId ? pressingAgent.name : requester.agentId } : null;
     const retryExhaustedReason = await heartbeat.getRetryExhaustedReason(runId);
     const decoratedRun = heartbeat.decorateActiveRunStatus(run);
     res.json(await runRedactions.redactForRun(
       run.companyId,
       run.id,
       redactCurrentUserValue(
-        { ...decoratedRun, execution: await executionProjectionForRun(db, run.companyId, run.id), identityHistory: await listRunIdentityContexts(db, run.companyId, run.id), retryExhaustedReason, outputSilence: await heartbeat.buildRunOutputSilence(run) },
+        { ...decoratedRun, retryRequestedByAgent, execution: await executionProjectionForRun(db, run.companyId, run.id), identityHistory: await listRunIdentityContexts(db, run.companyId, run.id), retryExhaustedReason, outputSilence: await heartbeat.buildRunOutputSilence(run) },
         await getCurrentUserRedactionOptions(),
       ),
       req.actor.type === "board" ? getActorInfo(req).actorId : null,

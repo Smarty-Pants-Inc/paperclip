@@ -187,7 +187,8 @@ function registerRouteMocks() {
   });
   vi.doMock("../services/task-retry.js", () => ({ requestTaskRetry: mockRequestTaskRetry }));
   vi.doMock("../services/agent-task-retry.js", () => ({ agentOwnsRun: async () => true,
-    agentTaskRetryActor: mockAgentTaskRetryActor, recordAgentTaskRetry: async () => undefined }));
+    agentTaskRetryActor: mockAgentTaskRetryActor, recordAgentTaskRetry: async () => undefined,
+    recordAgentTaskRetryRefusal: async () => undefined }));
   vi.doMock("../services/onboarding-first-task-admission.js", async () => ({
     ...await vi.importActual<typeof import("../services/onboarding-first-task-admission.js")>("../services/onboarding-first-task-admission.js"),
     assertOnboardingFirstTaskDependenciesAllowed: mockOnboardingFirstTaskDependenciesAllowed,
@@ -919,7 +920,7 @@ describe("agent issue mutation checkout ownership", () => {
     }));
   });
 
-  it("admits ordinary Retry only for a board actor with task mutation permission", async () => {
+  it("admits board Retry with mutation permission and refuses a plain agent key", async () => {
     const body = { idempotencyKey: recoveryActionId, observedRunId: ownerRunId };
     const deniedAgent = await request(createApp(peerActor())).post(`/api/issues/${issueId}/retry`).send(body);
     expect(deniedAgent.status, JSON.stringify(deniedAgent.body)).toBe(403);
@@ -938,7 +939,7 @@ describe("agent issue mutation checkout ownership", () => {
     }));
   });
 
-  it("keeps a granted agent's own write boundary on Retry", async () => {
+  it("keeps a signed pressing agent's own write boundary on Retry", async () => {
     mockAgentTaskRetryActor.mockResolvedValue({ ...boardActor(), source: "board_key",
       memberships: [{ companyId, membershipRole: "owner", status: "active" }] });
     mockAccessService.decide.mockImplementation(async (input: { action: string; actor: { type: string } }) =>
@@ -947,10 +948,24 @@ describe("agent issue mutation checkout ownership", () => {
         : { allowed: true, action: input.action, reason: "allow_test", explanation: "Allowed." });
     const body = { idempotencyKey: recoveryActionId, observedRunId: ownerRunId };
 
-    const denied = await request(createApp(peerActor())).post(`/api/issues/${issueId}/retry`).send(body);
+    const denied = await request(createApp(peerActor({ source: "agent_jwt", onBehalfOfUserId: "board-user",
+      onBehalfOfMemberships: [{ companyId, membershipRole: "admin", status: "active" }] })))
+      .post(`/api/issues/${issueId}/retry`).send(body);
 
     expect(denied.status, JSON.stringify(denied.body)).toBe(403);
     expect(mockRequestTaskRetry).not.toHaveBeenCalled();
+  });
+
+  it("admits a signed agent without consulting a legacy grant", async () => {
+    mockAgentTaskRetryActor.mockResolvedValue({ ...boardActor(), source: "board_key" });
+    const body = { idempotencyKey: recoveryActionId, observedRunId: ownerRunId };
+    const actor = peerActor({ source: "agent_jwt", onBehalfOfUserId: "board-user",
+      onBehalfOfMemberships: [{ companyId, membershipRole: "admin", status: "active" }] });
+    const res = await request(createApp(actor)).post(`/api/issues/${issueId}/retry`).send(body);
+    expect(res.status, JSON.stringify(res.body)).toBe(202);
+    expect(mockRequestTaskRetry).toHaveBeenCalledWith(expect.objectContaining({
+      actorId: "board-user", agentRequester: { agentId: peerAgentId, runId: actor.runId }, ...body,
+    }));
   });
 
   it("rejects client-selected workspace strategy and certifications on ordinary Retry", async () => {

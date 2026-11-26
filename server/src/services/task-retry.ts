@@ -29,6 +29,7 @@ import { PersistedExecutionWaitRefusal } from "./deferred-execution-wait.js";
 import { rearmExhaustedNativeFinalization } from "./native-runtime/exhausted-finalization-retry.js";
 import { NativeChatReviewPresentationContentionError } from "./native-runtime/native-chat-review-presentation.js";
 import { isExternalChatWaitAuthorizationContention } from "./native-runtime/chat-attachment-reuse.js";
+import { agentTaskRetryRefusal } from "./agent-task-retry.js";
 import { selectTaskRetryInput } from "./chat-channels/task-retry-input.js";
 
 export async function taskRetryMutationAllowed(db: Db, input: {
@@ -56,6 +57,7 @@ const taskRetryIntentSchema = z.object({
   actorId: z.string().min(1), actorSource: z.enum(["local_implicit", "session", "board_key", "cloud_tenant"]).default("session"), strategy: z.enum(["evaluate", "continue", "fresh_isolated_workspace", "finalize_result"]),
   chatActionId: z.string().uuid().optional(), canonicalIntentId: z.string().uuid().optional(),
   queuedChatRequestId: z.string().uuid().optional(),
+  agentRequester: z.object({ agentId: z.string().uuid(), runId: z.string().uuid() }).optional(),
   initiatedBy: z.enum(["restart_recovery", "provider_limit_reset"]).optional(),
   boardMessageOrigin: z.object({ commentId: z.string().uuid(), identityContextId: z.string().uuid() }).optional(),
 });
@@ -65,7 +67,10 @@ export type TaskRetryIntent = z.infer<typeof taskRetryIntentSchema>;
  * not the task's shared state, prevents it from starting; a click by a user
  * with access replaces it. An edited saved board message
  * (`retry_source_changed`) is terminal: only new input continues. */
-export const DECLINED_TASK_RETRY_REASONS = ["retry_authority_denied"] as const;
+export const DECLINED_TASK_RETRY_REASONS = ["retry_authority_denied",
+  "retry_authority_unavailable",
+  "retry_refused_person_stop", "retry_refused_different_person", "retry_refused_run_not_stopped", "retry_refused_chat", "retry_refused_stop_unverified",
+] as const;
 export function isDeclinedTaskRetry(payload: Record<string, unknown> | null | undefined) {
   const wait = payload?.executionWait;
   const reason = wait && typeof wait === "object" && !Array.isArray(wait) ? (wait as Record<string, unknown>).reason : null;
@@ -244,6 +249,7 @@ type TaskRetryRequest = {
   db: Db; companyId: string; issueId: string; actorId: string;
   idempotencyKey: string; observedRunId: string | null; actorSource?: string;
   retryAction?: "move_forward";
+  agentRequester?: TaskRetryIntent["agentRequester"];
   /** Paperclip requests the user's Retry itself: after a restart lost an
    * unstarted turn, or once a provider usage limit it waited on has reset. */
   initiatedBy?: "restart_recovery" | "provider_limit_reset";
@@ -252,7 +258,9 @@ type TaskRetryRequest = {
 };
 
 /** Activity actor for a Retry: the user, or the Paperclip hook acting for them. */
-function automaticRetryActor(input: Pick<TaskRetryRequest, "initiatedBy" | "actorId">) {
+function automaticRetryActor(input: Pick<TaskRetryRequest, "initiatedBy" | "actorId" | "agentRequester">) {
+  if (input.agentRequester) return { actorType: "agent" as const, actorId: input.agentRequester.agentId,
+    agentId: input.agentRequester.agentId };
   if (!input.initiatedBy) return { actorType: "user" as const, actorId: input.actorId };
   return { actorType: "system" as const,
     actorId: input.initiatedBy === "restart_recovery" ? "restart-recovery" : "provider-limit-reset" };
@@ -295,6 +303,10 @@ function admitTaskRetry(input: TaskRetryRequest) {
       eq(issues.id, input.issueId))).for("update");
     if (!issue) throw notFound("Task not found");
     assertTaskRetryConversationAllowed(issue, input.actorId);
+    if (input.agentRequester && input.retryAction === "move_forward")
+      throw conflict("An agent cannot move a task forward through Retry.", { code: "retry_refused_move_forward" });
+    const refusal = await agentTaskRetryRefusal(db, { ...input, sourceRunId: input.observedRunId ?? "" });
+    if (refusal) throw conflict("Agent Retry cannot continue this source.", { code: refusal });
     const key = `task-retry:${input.idempotencyKey}`;
     const [sameRequest] = await tx.select().from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.idempotencyKey, key)));
@@ -330,6 +342,8 @@ function admitTaskRetry(input: TaskRetryRequest) {
       inArray(agentWakeupRequests.status, ["deferred_issue_execution", "queued", "claimed"]),
     )).orderBy(desc(agentWakeupRequests.requestedAt)).limit(1)).at(0);
     const activeIntent = readTaskRetryIntent(active?.payload);
+    if (input.agentRequester && active && activeIntent?.actorId !== input.actorId)
+      throw conflict("An existing Retry belongs to another person.", { code: "retry_refused_different_person" });
     if (active && !active.runId && activeIntent && await retireSupersededTaskRetry(db, {
       companyId: issue.companyId, issueId: issue.id, requestId: active.id, sourceRunId: activeIntent.sourceRunId,
     })) active = undefined;
@@ -420,7 +434,7 @@ function admitTaskRetry(input: TaskRetryRequest) {
     }
     const id = randomUUID();
     const intent: TaskRetryIntent = { schema: "paperclip.task-retry.v1", generationId: active?.id ?? id,
-      sourceRunId: latest.id, actorId: input.actorId,
+      sourceRunId: latest.id, actorId: input.actorId, agentRequester: input.agentRequester,
       actorSource: taskRetryIntentSchema.shape.actorSource.parse(input.actorSource ?? "session"), strategy: "evaluate",
       ...(active && activeIntent?.chatActionId ? { chatActionId: activeIntent.chatActionId } : {}),
       ...(active && activeIntent?.queuedChatRequestId ? { queuedChatRequestId: activeIntent.queuedChatRequestId } : {}),
@@ -516,7 +530,8 @@ function admitTaskRetry(input: TaskRetryRequest) {
     }
     await persistActivity(db, { companyId: issue.companyId, ...automaticRetryActor(input),
       action: "issue.retry_requested", entityType: "issue", entityId: issue.id, runId: latest.id,
-      details: { requestId: active?.id ?? id, sourceRunId: latest.id, attachedToExistingWork: Boolean(active || busy),
+      details: { authorityUserId: input.agentRequester ? input.actorId : undefined,
+        requestId: active?.id ?? id, sourceRunId: latest.id, attachedToExistingWork: Boolean(active || busy),
         ...(replacedRequestId ? { replacedRequestId } : {}),
         ...(input.initiatedBy ? { initiatedBy: input.initiatedBy, onBehalfOfUserId: input.actorId } : {}) } });
     return { requestId: active?.id ?? id, accepted: true, stale: false, observedRunId: latest.id,
