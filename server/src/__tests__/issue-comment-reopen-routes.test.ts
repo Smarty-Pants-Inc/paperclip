@@ -1794,6 +1794,39 @@ describe("issue comment reopen routes", () => {
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
+  it.each((["post", "patch"] as const).flatMap(method => [false, true].flatMap(late =>
+    (late ? ["agent", "board"] : ["agent", "board", "peer", "unassigned"]).map(actor => ({ method, late, actor })),
+  )))("saves a $method comment when open blockers refuse only its resume ($actor, late=$late)", async ({ method, late, actor }) => {
+    const issue = { ...makeIssue("blocked"), ...(actor === "unassigned" ? { assigneeAgentId: null } : {}) };
+    const blockerIds = ["33333333-3333-4333-8333-333333333333"];
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id, patch) => ({ ...issue, ...patch }));
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      unresolvedBlockerCount: 1, unresolvedBlockerIssueIds: blockerIds,
+    });
+    if (late) mockIssueService.getDependencyReadiness.mockResolvedValueOnce({ unresolvedBlockerCount: 0 });
+    const app = await installActor(createApp(), actor === "board" ? undefined
+      : agentActor(actor === "peer" ? "44444444-4444-4444-8444-444444444444" : undefined));
+    const res = method === "post"
+      ? await request(app).post(`/api/issues/${issue.id}/comments`).send({ body: "hello", resume: true })
+      : await request(app).patch(`/api/issues/${issue.id}`).set("Prefer", late ? "return=minimal" : "return=representation")
+        .send({ comment: "hello", resume: true });
+    expect(res.status).toBe(method === "post" ? 201 : 200);
+    expect(method === "post" ? res.body : res.body.comment).toMatchObject({ id: "comment-1", body: "hello" });
+    expect(res.body.resume).toEqual({ applied: false, reason: "open_blockers", blockerIds });
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(issue.id, "hello", expect.anything(), expect.anything(), expect.anything());
+    for (const [, patch] of mockIssueService.update.mock.calls) expect(patch.status).not.toBe("todo");
+    await new Promise(resolve => setImmediate(resolve));
+    if (actor === "agent" || actor === "unassigned") expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    else {
+      await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalled());
+      const wake = mockHeartbeatService.wakeup.mock.calls[0]![1];
+      expect(wake).toMatchObject({ reason: "issue_commented" });
+      expect(wake).not.toMatchObject({ payload: { resumeIntent: true } });
+      expect(wake).not.toMatchObject({ contextSnapshot: { resumeIntent: true } });
+    }
+  });
+
   it("does not move dependency-blocked issues to todo via POST comments", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("blocked"));
     mockIssueService.getDependencyReadiness.mockResolvedValue({

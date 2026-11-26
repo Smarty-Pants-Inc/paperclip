@@ -2316,6 +2316,8 @@ function shouldHumanCommentResumeInProgressScheduledRetry(input: {
   );
 }
 
+type CommentResumeRefusal = { applied: false; reason: "open_blockers"; blockerIds: string[] };
+
 function isExplicitResumeCapableStatus(status: string | null | undefined) {
   return (
     status === "done" ||
@@ -7319,7 +7321,7 @@ export function issueRoutes(
     req: Request,
     res: Response,
     issue: Parameters<typeof decideIssueAccess>[1],
-    options: { resumeIntent?: boolean } = {},
+    options: { resumeIntent?: boolean; onOpenBlockers?: (blockerIds: string[]) => void } = {},
   ) {
     if (
       await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)
@@ -7369,14 +7371,20 @@ export function issueRoutes(
     if (issue.status === "blocked") {
       const readiness = await svc.getDependencyReadiness(issue.id);
       if (readiness.unresolvedBlockerCount > 0) {
-        res.status(409).json({
-          error: "Issue follow-up blocked by unresolved blockers",
-          details: {
-            issueId: issue.id,
-            unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
-          },
-        });
-        return false;
+        if (options.onOpenBlockers) {
+          // This becomes an ordinary comment, not an exercise of resume authority.
+          options.onOpenBlockers(readiness.unresolvedBlockerIssueIds);
+          return true;
+        } else {
+          res.status(409).json({
+            error: "Issue follow-up blocked by unresolved blockers",
+            details: {
+              issueId: issue.id,
+              unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+            },
+          });
+          return false;
+        }
       }
     }
 
@@ -14783,7 +14791,7 @@ export function issueRoutes(
         reviewInteractionId: requestedReviewInteractionId,
         reviewRequest,
         reopen: reopenRequested,
-        resume: resumeRequested,
+        resume: requestedResume,
         interrupt: interruptRequested,
         deferWakeForGoal,
         hiddenAt: hiddenAtRaw,
@@ -14949,6 +14957,12 @@ export function issueRoutes(
           reviewPolicy: existing.reviewPolicy,
         });
       }
+      let resumeRequested = requestedResume;
+      let resume: CommentResumeRefusal | undefined;
+      const refuseResume = (blockerIds: string[]) => {
+        resumeRequested = false;
+        resume = { applied: false, reason: "open_blockers", blockerIds };
+      };
       const shouldCancelActiveRunForCancelledStatus =
         req.actor.source !== "mcp_oauth" && existing.status !== "cancelled" && updateFields.status === "cancelled";
       if (resumeRequested === true && !commentBody) {
@@ -14972,6 +14986,7 @@ export function issueRoutes(
         resumeRequested === true &&
         !(await assertExplicitResumeIntentAllowed(req, res, existing, {
           resumeIntent: true,
+          onOpenBlockers: refuseResume,
         }))
       )
         return;
@@ -15081,20 +15096,15 @@ export function issueRoutes(
       const updateReferenceSummaryBefore = titleOrDescriptionChanged
         ? await issueReferencesSvc.listIssueReferenceSummary(existing.id)
         : null;
-      const hasUnresolvedFirstClassBlockers =
-        isBlocked && effectiveMoveToTodoRequested
-          ? (await svc.getDependencyReadiness(existing.id))
-              .unresolvedBlockerCount > 0
-          : false;
+      const dependencyReadiness = isBlocked && effectiveMoveToTodoRequested
+        ? await svc.getDependencyReadiness(existing.id) : null;
+      const hasUnresolvedFirstClassBlockers = (dependencyReadiness?.unresolvedBlockerCount ?? 0) > 0;
       if (
         resumeRequested === true &&
         isBlocked &&
         hasUnresolvedFirstClassBlockers
       ) {
-        res
-          .status(409)
-          .json({ error: "Issue follow-up blocked by unresolved blockers" });
-        return;
+        refuseResume(dependencyReadiness!.unresolvedBlockerIssueIds);
       }
       let interruptedRunId: string | null = null;
       const closedExecutionWorkspace =
@@ -17122,10 +17132,11 @@ export function issueRoutes(
           changes,
           comment,
           ...(parentAdjusted ? { parentAdjusted } : {}),
+          ...(resume ? { resume } : {}),
         });
         return;
       }
-      res.json({ ...issueResponse, changes, comment, ...(parentAdjusted ? { parentAdjusted } : {}) });
+      res.json({ ...issueResponse, changes, comment, ...(parentAdjusted ? { parentAdjusted } : {}), ...(resume ? { resume } : {}) });
     },
   );
 
@@ -19612,7 +19623,8 @@ export function issueRoutes(
           req.body.body,
         ));
       const reopenRequested = req.body.reopen === true;
-      const resumeRequested = req.body.resume === true;
+      let resumeRequested = req.body.resume === true;
+      let resume: CommentResumeRefusal | undefined;
       const interruptRequested = req.body.interrupt === true;
       const isClosed = isClosedIssueStatus(issue.status);
       const isBlocked = issue.status === "blocked";
@@ -19629,9 +19641,13 @@ export function issueRoutes(
       const effectiveReopenRequested = crossIssueCommentOnlyGrant
         ? false
         : reopenRequested;
-      const effectiveResumeRequested = crossIssueCommentOnlyGrant
+      let effectiveResumeRequested = crossIssueCommentOnlyGrant
         ? false
         : resumeRequested;
+      const refuseResume = (blockerIds: string[]) => {
+        resumeRequested = effectiveResumeRequested = false;
+        resume = { applied: false, reason: "open_blockers", blockerIds };
+      };
       if (
         isClosed &&
         req.actor.type === "agent" &&
@@ -19650,6 +19666,7 @@ export function issueRoutes(
         effectiveResumeRequested === true &&
         !(await assertExplicitResumeIntentAllowed(req, res, issue, {
           resumeIntent: true,
+          onOpenBlockers: refuseResume,
         }))
       )
         return;
@@ -19697,20 +19714,15 @@ export function issueRoutes(
             executionRunId: issue.executionRunId,
           }) ||
           shouldResumeInProgressScheduledRetry);
-      const hasUnresolvedFirstClassBlockers =
-        isBlocked && effectiveMoveToTodoRequested
-          ? (await svc.getDependencyReadiness(issue.id))
-              .unresolvedBlockerCount > 0
-          : false;
+      const dependencyReadiness = isBlocked && effectiveMoveToTodoRequested
+        ? await svc.getDependencyReadiness(issue.id) : null;
+      const hasUnresolvedFirstClassBlockers = (dependencyReadiness?.unresolvedBlockerCount ?? 0) > 0;
       if (
         resumeRequested === true &&
         isBlocked &&
         hasUnresolvedFirstClassBlockers
       ) {
-        res
-          .status(409)
-          .json({ error: "Issue follow-up blocked by unresolved blockers" });
-        return;
+        refuseResume(dependencyReadiness!.unresolvedBlockerIssueIds);
       }
       if (
         effectiveMoveToTodoRequested &&
@@ -20541,7 +20553,7 @@ export function issueRoutes(
 
 
       await queueTaskWatchdogEvaluation(currentIssue, actor.runId);
-      res.status(201).json(comment);
+      res.status(201).json({ ...comment, ...(resume ? { resume } : {}) });
     },
   );
 
