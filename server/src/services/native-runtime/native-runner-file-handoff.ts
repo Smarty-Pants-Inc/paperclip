@@ -35,6 +35,7 @@ import {
 import { getStorageService } from "../../storage/index.js";
 import type { StorageService } from "../../storage/types.js";
 import { readProcessStartedAt } from "../hot-restart.js";
+import { readLimitFromEnv } from "../env-limits.js";
 import { issueService } from "../issues.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
 
@@ -119,7 +120,6 @@ const scrubbedForeignStagingDirectoriesByWorkspace = new Map<
   string,
   Set<string>
 >();
-const MAX_NATIVE_STAGED_ATTACHMENTS = 20;
 const stagingProcessToken = randomUUID();
 let stagingProcessDirectoryNamePromise: Promise<string> | null = null;
 
@@ -888,7 +888,7 @@ export async function resolveNativeRunnerWakeAttachmentSelections(input: {
     throw new Error("paperclip_runner_attachment_staging_not_authorized");
   }
   const selections = wakeAttachmentSelections(run.contextSnapshot);
-  if (selections.length > MAX_NATIVE_STAGED_ATTACHMENTS) {
+  if (selections.length > readLimitFromEnv("PAPERCLIP_MAX_STAGED_ATTACHMENTS", 20)) {
     throw new Error("paperclip_runner_attachment_staging_count_denied");
   }
   return selections;

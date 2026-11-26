@@ -92,7 +92,7 @@ describeEmbeddedPostgres("deleted issue comment redaction", () => {
     const issueId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
-      name: "Comment Redaction Co",
+      name: "example-org",
       issuePrefix: `R${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
     });
@@ -146,6 +146,30 @@ describeEmbeddedPostgres("deleted issue comment redaction", () => {
     app.use(errorHandler);
     return app;
   }
+
+  it("uses the server wake comment limits per call and keeps stock defaults when unset", async () => {
+    const { companyId, issueId } = await seedIssue();
+    const rows = await db.insert(issueComments).values(Array.from({ length: 10 }, () => ({
+      companyId, issueId, authorUserId: "board-user-1", body: "x".repeat(5_000),
+    }))).returning();
+    const input = { db, companyId, contextSnapshot: { issueId, wakeCommentIds: rows.map(row => row.id) } };
+    try {
+      for (const name of ["PAPERCLIP_WAKE_INPUT_MAX_COMMENTS", "PAPERCLIP_WAKE_INPUT_MAX_COMMENT_CHARS", "PAPERCLIP_WAKE_INPUT_MAX_TOTAL_COMMENT_CHARS"]) vi.stubEnv(name, undefined);
+      const stock = await buildPaperclipWakePayload(input);
+      expect(stock?.comments).toHaveLength(3);
+      expect(stock?.comments[0]?.body).toHaveLength(4_000);
+      vi.stubEnv("PAPERCLIP_WAKE_INPUT_MAX_TOTAL_COMMENT_CHARS", "50000");
+      expect((await buildPaperclipWakePayload(input))?.comments).toHaveLength(8);
+      vi.stubEnv("PAPERCLIP_WAKE_INPUT_MAX_COMMENTS", "10");
+      vi.stubEnv("PAPERCLIP_WAKE_INPUT_MAX_COMMENT_CHARS", "5000");
+      const raised = await buildPaperclipWakePayload(input);
+      expect(raised?.comments).toHaveLength(10);
+      expect(raised?.comments.every(comment => (comment.body as string).length === 5_000)).toBe(true);
+      expect(raised?.truncated).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
 
   it("redacts deleted comment bodies from ordinary reads, heartbeat context, and wake payloads", async () => {
     const { companyId, issueId } = await seedIssue();

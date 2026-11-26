@@ -1,3 +1,5 @@
+import { readLimitFromEnv } from "./env-limits.js";
+
 export const COMPANY_SEARCH_RATE_LIMIT_WINDOW_MS = 60_000;
 export const COMPANY_SEARCH_RATE_LIMIT_MAX_REQUESTS = 60;
 
@@ -24,7 +26,6 @@ export function createCompanySearchRateLimiter(options: {
   now?: () => number;
 } = {}): CompanySearchRateLimiter {
   const windowMs = options.windowMs ?? COMPANY_SEARCH_RATE_LIMIT_WINDOW_MS;
-  const maxRequests = options.maxRequests ?? COMPANY_SEARCH_RATE_LIMIT_MAX_REQUESTS;
   const now = options.now ?? Date.now;
   const hitsByKey = new Map<string, number[]>();
 
@@ -34,6 +35,7 @@ export function createCompanySearchRateLimiter(options: {
 
   return {
     consume(actor) {
+      const maxRequests = options.maxRequests ?? readLimitFromEnv("PAPERCLIP_SEARCH_RATE_LIMIT_PER_MINUTE", COMPANY_SEARCH_RATE_LIMIT_MAX_REQUESTS);
       const currentTime = now();
       const cutoff = currentTime - windowMs;
       const actorKey = key(actor);
