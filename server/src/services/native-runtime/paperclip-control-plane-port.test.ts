@@ -1,3 +1,4 @@
+import { issueService } from "../issues.js";
 import { nativeResponsePresentationWork } from "./native-response-presentation-work.js";
 import * as issueCommentWrites from "../issue-comment-writes.js";
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
@@ -460,9 +461,14 @@ describe("PaperclipControlPlanePort conformance", () => {
     } finally { releaseObserver(); await outcome; if (terminalWasRecorded) await observerDone; }
   });
 
-  it("marks a fresh start after a prior session once, but never a resume", async () => {
+  it.each(["no wake", "wake", "clamp"] as const)("marks a fresh start after a prior session once, but never a resume: %s", async mode => {
     const { companyId, agentId } = CONTROL_PLANE_CONFORMANCE_OPEN.identity;
     const issueId = randomUUID(), fixtureContractId = randomUUID();
+    const firstRunAt = new Date("2026-01-01T00:00:00.000Z");
+    const wakeAt = new Date("2026-01-01T00:00:19.000Z");
+    const previousReplyAt = mode === "clamp" ? wakeAt : new Date("2026-01-01T00:00:10.000Z");
+    const markers = () => db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId),
+      sql`${issueComments.presentation}->>'kind' = 'system_notice'`));
     await db.insert(issues).values({ id: issueId, companyId, title: "Fresh-session disclosure",
       assigneeAgentId: agentId, conversationAgentId: agentId, conversationUserId: randomUUID(), conversationState: "active" });
     const [contract] = await db.select().from(completionContracts).where(eq(completionContracts.id, contractId));
@@ -471,39 +477,52 @@ describe("PaperclipControlPlanePort conformance", () => {
     for (const [index, eventType] of (["session.started", "session.started", "session.resumed", "session.started"] as const).entries()) {
       const runId = randomUUID(), sessionId = randomUUID(), runnerId = randomUUID();
       const identity = { companyId, agentId, issueId, runId, sessionId };
-      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native",
+      const runAt = new Date(firstRunAt.getTime() + index * 20_000);
+      let wakeCommentId: string | undefined;
+      if (index === 1 && mode !== "no wake") {
+        const [wake] = await db.insert(issueComments).values({ companyId, issueId, body: "Start the next session",
+          authorType: "user", authorUserId: "board", createdAt: wakeAt }).returning();
+        wakeCommentId = wake!.id;
+      }
+      const [run] = await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native",
         nativeIssueId: issueId, nativeSessionId: sessionId, runnerInstanceId: runnerId,
-        completionContractId: fixtureContractId, completionContractSha256: contractSha,
-        contextSnapshot: { issueId, conversationSessionGeneration: 0 } });
+        completionContractId: fixtureContractId, completionContractSha256: contractSha, createdAt: runAt,
+        contextSnapshot: { issueId, conversationSessionGeneration: 0, ...(wakeCommentId ? { wakeCommentId } : {}) } }).returning();
       const port = new PaperclipControlPlanePort(db, { ...identity, completionContractId: fixtureContractId,
         completionContractSha256: contractSha, sourceInstanceId: runnerId, controlPlaneSourceInstanceId: "marker-control" });
       await port.openRun({ identity, backendKind: "mock", sourceInstanceId: runnerId });
       const event: PrpEvent = { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceEventId: `${runnerId}:1`,
         sourceInstanceId: runnerId, sourceSeq: 1, sourceKind: "runner", runId, normalizedSessionId: sessionId,
-        eventType, priority: 0, emittedAt: new Date().toISOString(), payload: {} };
+        eventType, priority: 0, emittedAt: new Date(runAt.getTime() + 5_000).toISOString(), payload: {} };
       if (index === 3) {
         const markerWrite = vi.spyOn(issueCommentWrites, "insertIssueComment").mockRejectedValueOnce(new Error("marker write failed"));
         try { await expect(port.appendEvent(event)).resolves.toMatchObject({ disposition: "committed" }); }
         finally { markerWrite.mockRestore(); }
         expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId))).toHaveLength(1);
       } else await port.appendEvent(event);
-      if (index === 0) replayFirst = () => port.appendEvent(event);
-      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      if (index === 0) {
+        replayFirst = () => port.appendEvent(event);
+        await db.insert(issueComments).values({ companyId, issueId, body: "Previous session reply", authorType: "agent",
+          authorAgentId: agentId, createdByRunId: runId, createdAt: previousReplyAt });
+      }
+      const comments = await markers();
       expect(comments).toHaveLength(index === 0 ? 0 : 1);
       if (index === 1) {
         expect(comments[0]).toMatchObject({ authorType: "system", authorAgentId: null, authorUserId: null,
           createdByRunId: null, conversationSessionGeneration: 0, metadata: { sourceRunId: runId },
           presentation: { kind: "system_notice", tone: "neutral" } });
-        const [receipt] = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
-        expect(comments[0]!.createdAt).toEqual(receipt!.createdAt);
-        await db.update(issueComments).set({ deletedAt: new Date() }).where(eq(issueComments.id, comments[0]!.id));
+        // Marker time orders the input, not the later session.started receipt.
+        const expectedAt = mode === "no wake" ? run!.createdAt
+          : new Date(Math.max(wakeAt.getTime() - 1, previousReplyAt.getTime() + 1));
+        expect(comments[0]!.createdAt).toEqual(expectedAt);
+        await db.update(issueComments).set({ deletedAt: new Date(runAt.getTime() + 10_000) }).where(eq(issueComments.id, comments[0]!.id));
         await port.appendEvent(event);
         await port.appendEvent({ ...event, sourceEventId: `${runnerId}:2`, sourceSeq: 2 });
-        expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toHaveLength(1);
+        expect(await markers()).toHaveLength(1);
       }
     }
     await replayFirst(); // A later session must not turn the original first start into a marker on replay.
-    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toHaveLength(1);
+    expect(await markers()).toHaveLength(1);
     const activities = await db.select().from(activityLog).where(and(eq(activityLog.entityId, issueId),
       eq(activityLog.action, "issue.conversation_session_started")));
     expect(activities).toHaveLength(1);
@@ -511,6 +530,63 @@ describe("PaperclipControlPlanePort conformance", () => {
     const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(issue).toMatchObject({ conversationSessionGeneration: 0, conversationBoundaryCommentId: null });
     expect(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId), sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`))).toHaveLength(0);
+  });
+
+  it.each(["single", "batch", "clamp", "no wake", "foreign wake"] as const)("orders the fresh-session marker against its first input: %s", async mode => {
+    const { companyId, agentId } = CONTROL_PLANE_CONFORMANCE_OPEN.identity;
+    const issueId = randomUUID(), fixtureContractId = randomUUID();
+    const runAt = new Date("2026-01-01T00:00:10.000Z"), wakeAt = new Date(runAt.getTime() - 1_000);
+    await db.insert(issues).values({ id: issueId, companyId, title: "Marker ordering", assigneeAgentId: agentId,
+      conversationAgentId: agentId, conversationUserId: randomUUID(), conversationState: "active" });
+    const [contract] = await db.select().from(completionContracts).where(eq(completionContracts.id, contractId));
+    await db.insert(completionContracts).values({ ...contract!, id: fixtureContractId, issueId });
+    const priorRunId = randomUUID(), runId = randomUUID(), sharedSessionId = randomUUID();
+    const previousAt = new Date(mode === "clamp" ? wakeAt.getTime() : wakeAt.getTime() - 2_000);
+    let markerRun!: typeof heartbeatRuns.$inferSelect;
+    for (const [index, id] of [priorRunId, runId].entries()) {
+      const sessionId = mode === "clamp" ? sharedSessionId : randomUUID(), runnerId = randomUUID();
+      const identity = { companyId, agentId, issueId, runId: id, sessionId };
+      let context: Record<string, unknown> = { issueId, conversationSessionGeneration: 0 };
+      if (index === 1 && mode !== "no wake") {
+        const [wake] = await db.insert(issueComments).values({ companyId,
+          issueId: mode === "foreign wake" ? CONTROL_PLANE_CONFORMANCE_OPEN.identity.issueId : issueId,
+          body: "First new-session input", authorType: "user", authorUserId: "board", createdAt: wakeAt }).returning();
+        context.wakeCommentId = wake!.id;
+        if (mode === "batch") {
+          const [later] = await db.insert(issueComments).values({ companyId, issueId, body: "Later input",
+            authorType: "user", authorUserId: "board", createdAt: new Date(wakeAt.getTime() + 500) }).returning();
+          context = { ...context, wakeCommentId: later!.id, wakeCommentIds: [later!.id, wake!.id] };
+        }
+      }
+      const [run] = await db.insert(heartbeatRuns).values({ id, companyId, agentId, status: "running", runtimeMode: "native",
+        nativeIssueId: issueId, nativeSessionId: sessionId, runnerInstanceId: runnerId,
+        completionContractId: fixtureContractId, completionContractSha256: contractSha, contextSnapshot: context,
+        createdAt: index === 0 ? new Date(previousAt.getTime() - 1_000) : runAt }).returning();
+      const port = new PaperclipControlPlanePort(db, { ...identity, completionContractId: fixtureContractId,
+        completionContractSha256: contractSha, sourceInstanceId: runnerId, controlPlaneSourceInstanceId: "order-control" });
+      await port.openRun({ identity, backendKind: "mock", sourceInstanceId: runnerId });
+      await port.appendEvent({ schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceEventId: `${runnerId}:1`,
+        sourceInstanceId: runnerId, sourceSeq: 1, sourceKind: "runner", runId: id, normalizedSessionId: sessionId,
+        eventType: "session.started", priority: 0, emittedAt: runAt.toISOString(), payload: {} });
+      if (index === 0) await db.insert(issueComments).values({ companyId, issueId, body: "Previous session answer",
+        authorType: "agent", authorAgentId: agentId, createdByRunId: id, createdAt: previousAt });
+      else markerRun = run!;
+    }
+    const thread = await issueService(db).listComments(issueId, { companyId, order: "asc" });
+    const [storedMarker] = await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId),
+      sql`${issueComments.metadata}->>'sourceRunId' = ${runId}`));
+    const marker = thread.find(comment => comment.id === storedMarker?.id)!;
+    expect(marker).toBeDefined();
+    expect(storedMarker).toMatchObject({ conversationSessionGeneration: 0, presentation: { kind: "system_notice" },
+      metadata: { version: 1, sourceRunId: runId, sections: [] } });
+    const expected = mode === "no wake" || mode === "foreign wake" ? markerRun.createdAt
+      : new Date(Math.max(previousAt.getTime() + 1, wakeAt.getTime() - 1));
+    expect(marker.createdAt).toEqual(expected);
+    expect(thread.findIndex(comment => comment.body === "Previous session answer")).toBeLessThan(thread.indexOf(marker));
+    if (mode === "single" || mode === "batch") {
+      expect(marker.createdAt.getTime()).toBeLessThan(wakeAt.getTime());
+      expect(thread.indexOf(marker)).toBeLessThan(thread.findIndex(comment => comment.body === "First new-session input"));
+    }
   });
 
   async function terminalObserverFixture(options: {
