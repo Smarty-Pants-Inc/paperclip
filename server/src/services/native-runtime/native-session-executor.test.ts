@@ -38,7 +38,7 @@ import { TOOL_CALL_LOOP_REFUSAL_LIMIT, ToolCallLoopError, toolCallLoopContinuati
 import { enableReattachPhase, isReattachPhaseActive, joinReattachPhase, onReattachPhaseEnd, resetReattachPhaseForTests, type ReattachPhaseSummary } from "../heartbeat/run-admission.js";
 import { createSystemRecovery, failSystemRecovery, reserveSystemRecoveryAttempt, SystemRecoveryFailure } from "../system-recovery-state.js";
 import { registerRunStartHandover } from "../run-start-handover.js";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { once } from "node:events";
 import { PgDialect } from "drizzle-orm/pg-core";
 import { eq, type SQL } from "drizzle-orm";
@@ -166,7 +166,7 @@ import * as nativeExecutionDriver from "./native-runner-execution-driver.js";
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
-  return { ...actual, readFileSync: vi.fn(actual.readFileSync) };
+  return { ...actual, closeSync: vi.fn(actual.closeSync), openSync: vi.fn(actual.openSync), readFileSync: vi.fn(actual.readFileSync), renameSync: vi.fn(actual.renameSync), writeFileSync: vi.fn(actual.writeFileSync) };
 });
 
 const usageRecorder = vi.hoisted(() => ({
@@ -541,6 +541,7 @@ import {
   syncRemoteRunnerDirectoryOut,
   isTransientRemoteCheckpointReadFailure,
   remoteProviderStateUnreadable,
+  readRemoteRunnerProviderState,
   retryTransientRemoteCheckpointRead,
   verifyNativeHarnessBackup,
   verifyNativeHarnessBackupStreamed,
@@ -3057,7 +3058,10 @@ describe("remote provider pack manifest", () => {
       providerSessionId: null, activeProviderTurnId: null, config: { provider: "opencode", driver: "opencode_server" } };
     const suspendedState = durableRunnerState({ runId: remoteExecution.binding.runId, runnerInstanceId: "bundled-image-runner",
       environmentLeaseId: "lease", normalizedSessionId: remoteExecution.session.normalizedSessionId }, "suspended");
-    const syncOut = vi.fn(async (operations: Array<{ files: Array<{ kind: string; targetPath: string }> }>) => {
+    const syncOut = vi.fn(async (operations: Array<{ files: Array<{ kind: string; sourcePath: string; targetPath: string }> }>) => {
+      if (inspectionResets > 0 && inspectionReset === "codex-provider-state.json") {
+        inspectionResets--; throw Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" });
+      }
       if (checkpointReadResets > 0 && operations.some(operation => operation.files.some(file => file.targetPath.includes("/.pending-")))) {
         checkpointReadResets--;
         throw Object.assign(new Error("write ECONNRESET"), { code: "ECONNRESET" });
@@ -3067,7 +3071,8 @@ describe("remote provider pack manifest", () => {
           await mkdir(file.targetPath, { recursive: true });
           await writeFile(join(file.targetPath, "runner-state.json"), JSON.stringify(suspendedState));
           await writeFile(join(file.targetPath, "codex-provider-state.json"), JSON.stringify(providerState));
-        } else { await mkdir(dirname(file.targetPath), { recursive: true }); await writeFile(file.targetPath, "qualified launch fixture"); }
+        } else { await mkdir(dirname(file.targetPath), { recursive: true }); await writeFile(file.targetPath,
+          file.sourcePath.endsWith("codex-provider-state.json") ? JSON.stringify(providerState) : "qualified launch fixture"); }
       }
     });
     const preparedDb = leaseDb(remoteExecution), select = preparedDb.select.bind(preparedDb);
@@ -17883,6 +17888,9 @@ describe("native process ownership", () => {
 });
 
 describe("runnerd provider runtime wiring", () => {
+  const copySyncedFiles = async (operations: Array<{ files: Array<{ sourcePath: string; targetPath: string }> }>) => {
+    for (const operation of operations) for (const file of operation.files) await cp(file.sourcePath, file.targetPath);
+  };
   it("keeps remote warm turns open while retaining verified close semantics", async () => {
     const current = scopedNativeExecution("remote-warm-settlement");
     current.session = {
@@ -21077,7 +21085,7 @@ describe("runnerd provider runtime wiring", () => {
         leaseId: priorIdentity.environmentLeaseId, providerKey: "daytona", reusableLeaseConfigured: true,
         effectiveCapabilities: { runnerWebSocketIngress: true },
         sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "retained-sandbox" },
-        runner: { execute: remoteExecute, syncIn },
+        runner: { execute: remoteExecute, syncIn, syncOut: copySyncedFiles },
         getRunnerIngressEndpoint: async () => ({ kind: "authenticated_websocket", websocketUrl: "wss://sandbox.invalid/runner",
           secretHeaders: [{ name: "Authorization", value: "fixture-ingress" }], generation: "1", refresh: vi.fn(), close: vi.fn(async () => undefined) }),
       } as never,
@@ -23723,7 +23731,7 @@ describe("runnerd provider runtime wiring", () => {
         leaseId: "lease-created", providerKey: "daytona", reusableLeaseConfigured: true,
         effectiveCapabilities: { runnerWebSocketIngress: true },
         sandboxLeaseAcquisition: { outcome: "created", providerLeaseId: "sandbox-created" },
-        runner: { execute: remoteExecute, syncIn },
+        runner: { execute: remoteExecute, syncIn, syncOut: copySyncedFiles },
       } as never,
     });
     state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
@@ -23883,7 +23891,7 @@ describe("runnerd provider runtime wiring", () => {
         leaseId: "lease-created", providerKey: "daytona", reusableLeaseConfigured: true,
         effectiveCapabilities: { runnerWebSocketIngress: true },
         sandboxLeaseAcquisition: { outcome: resumed ? "resumed" : "created", providerLeaseId: targetProviderLeaseId },
-        runner: { execute: remoteExecute, syncIn },
+        runner: { execute: remoteExecute, syncIn, syncOut: copySyncedFiles },
       } as never,
     });
     state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
@@ -24054,6 +24062,13 @@ describe("runnerd provider runtime wiring", () => {
       }
     }
     const syncIn = vi.fn(async () => undefined);
+    const syncOut = vi.fn(async (operations: Array<{ files: Array<{ targetPath: string }> }>) => {
+      if (!scenario.startsWith("interrupted_bootstrap_unopened")) throw new Error("fixture_provider_state_missing");
+      for (const operation of operations) for (const file of operation.files) await writeFile(file.targetPath, JSON.stringify({
+        schema: "paperclip.runner.codex-provider-state.v1", lifecycle: "prepared", threadId: null, providerSessionId: null,
+        activeProviderTurnId: scenario.endsWith("_active_turn") ? "turn-in-progress" : null, ambiguousTurnStartPending: false,
+        config: { provider: "codex", driver: "codex_app_server" } }));
+    });
     const remoteExecute = vi.fn(async (command: { command: string; args?: string[] }) => {
       if (command.args?.[2] === "paperclip-runner-claim-unstarted-session") {
         let exitCode = 1;
@@ -24098,13 +24113,6 @@ describe("runnerd provider runtime wiring", () => {
       if (command.args?.[2] === "paperclip-runner-recovery-check" && ["interrupted_bootstrap_unprepared_unrecorded",
         "interrupted_bootstrap_connected_checkpoint_proven"].includes(scenario)) return {
         exitCode: 45, timedOut: false, stdout: "", stderr: "" };
-      if (command.args?.[1]?.includes("base64") && scenario.startsWith("interrupted_bootstrap_unopened")
-        && command.args[1].includes("codex-provider-state.json") && !command.args[1].includes("runner-state.json")) return {
-        exitCode: 0, timedOut: false, stderr: "", stdout: Buffer.from(JSON.stringify({
-          schema: "paperclip.runner.codex-provider-state.v1", lifecycle: "prepared", threadId: null, providerSessionId: null,
-          activeProviderTurnId: scenario.endsWith("_active_turn") ? "turn-in-progress" : null, ambiguousTurnStartPending: false,
-          config: { provider: "codex", driver: "codex_app_server" } })).toString("base64"),
-      };
       if (command.args?.[1]?.includes("base64") && scenario.startsWith("interrupted_bootstrap")) return {
         exitCode: 0, timedOut: false, stderr: "", stdout: Buffer.from(JSON.stringify({
           runnerInstanceId: "runner-new-in-retained-workspace", normalizedSessionId: execution.session.normalizedSessionId,
@@ -24152,7 +24160,7 @@ describe("runnerd provider runtime wiring", () => {
           secretHeaders: [{ name: "Authorization", value: "fixture-ingress-secret" }], generation: "1",
           refresh: vi.fn(), close: vi.fn(async () => undefined) }),
         sandboxLeaseAcquisition: { outcome, providerLeaseId: "sandbox-acquired", reason: outcome === "replacement" ? "not_found" : undefined },
-        runner: { execute: remoteExecute, syncIn },
+        runner: { execute: remoteExecute, syncIn, syncOut },
       } as never,
     });
     expect(backend).toBeDefined();
@@ -25109,6 +25117,171 @@ describe("remoteProviderStateNeverOpened", () => {
     }
     expect(remoteProviderStateNeverOpened({ provider: { kind: "claude_managed" } } as never, { lifecycle: "prepared" })).toBe(false);
   });
+});
+
+it.each(["whole", "absent", "oversize"] as const)("readRemoteRunnerProviderState reads whole or refuses: %s", async scenario => {
+  const payload = { data: "x".repeat((scenario === "oversize" ? 16 : 8) * 1024 * 1024), tail: "complete" };
+  const bytes = JSON.stringify(payload), execute = vi.fn(async () => { throw new Error("stdout fallback forbidden"); }); let target = "";
+  const syncOut = vi.fn(async (operations: Array<{ files: Array<{ sourcePath: string; targetPath: string; kind: string; mode?: number }> }>) => {
+    const file = operations[0]!.files[0]!; expect(operations).toHaveLength(1); expect(operations[0]!.files).toHaveLength(1);
+    expect(file).toMatchObject({ sourcePath: "/state/codex-provider-state.json", kind: "file", mode: 0o600 });
+    target = file.targetPath; expect((await lstat(dirname(target))).mode & 0o777).toBe(0o700);
+    await writeFile(target, bytes, { mode: file.mode });
+    return { operations: [{ operationId: "test", filesTransferred: 1, bytesTransferred: 1 }] };
+  });
+  const result = readRemoteRunnerProviderState({ runner: { execute, ...(scenario === "absent" ? {} : { syncOut }) } as never, stateDirectory: "/state", execution });
+  if (scenario === "whole") {
+    expect(Buffer.byteLength(Buffer.from(bytes).toString("base64"))).toBeGreaterThan(8 * 1024 * 1024); await expect(result).resolves.toEqual(payload);
+  } else await expect(result).rejects.toThrow(`runner_remote_provider_state_unavailable: ${scenario === "absent" ? "native_sync_out_required" : "file_exceeds_16_mib"}`);
+  expect(execute).not.toHaveBeenCalled();
+  if (target) await expect(access(dirname(target))).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+it.each([0, 1, 3])("readRemoteRunnerProviderState fences late publication (mkdir races: %s)", async races => {
+  const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+  const { logger } = await import("../../middleware/logger.js");
+  const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+  vi.useFakeTimers(); let target = "", finish!: () => void, remaining = races;
+  vi.mocked(renameSync).mockImplementation((source, destination) => { actual.renameSync(source, destination);
+    if (source === dirname(target) && remaining > 0) { remaining--; mkdirSync(source, { recursive: true });
+      const staged = `${source}.racing`; writeFileSync(staged, "raced provider state"); actual.renameSync(staged, target); }
+  });
+  const pending = new Promise<void>(resolve => { finish = resolve; });
+  try {
+    const syncOut = vi.fn(async (operations: Array<{ files: Array<{ targetPath: string }> }>) => {
+      target = operations[0]!.files[0]!.targetPath; await pending;
+    });
+    const result = readRemoteRunnerProviderState({ runner: { syncOut } as never, stateDirectory: "/state", execution });
+    const rejected = expect(result).rejects.toThrow("runner_remote_provider_state_unavailable: sync_out_timeout");
+    await vi.advanceTimersByTimeAsync(59_999); expect(vi.getTimerCount()).toBe(1); vi.mocked(openSync).mockClear();
+    await vi.advanceTimersByTimeAsync(1); await rejected;
+    const error = await result.catch(error => error);
+    expect(isTransientRemoteCheckpointReadFailure(error)).toBe(false);
+    expect(vi.mocked(openSync).mock.calls.every(([path, flags, mode]) => path === dirname(target) && flags === "wx" && mode === 0o400)).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    if (races === 3) expect(existsSync(target)).toBe(true);
+    finish(); await syncOut.mock.results[0]!.value; await Promise.resolve();
+    const staged = `${dirname(target)}.staged`; writeFileSync(staged, "late provider state");
+    try {
+      expect((await readdir(dirname(dirname(target)))).filter(name => name.startsWith(`${basename(dirname(target))}.dead-`))).toEqual([]);
+      if (races === 3) {
+        expect(remaining).toBe(0); expect(existsSync(dirname(target))).toBe(false);
+        expect(warn).toHaveBeenCalledExactlyOnceWith({ code: "EEXIST", root: basename(dirname(target)) }, "provider-state timeout fence failed");
+      } else expect(warn).not.toHaveBeenCalled();
+      if (races !== 3) {
+        expect(() => { mkdirSync(dirname(target), { recursive: true }); renameSync(staged, target); }).toThrow();
+        expect(() => renameSync(staged, target)).toThrow(expect.objectContaining({ code: "ENOTDIR" })); expect(existsSync(target)).toBe(false);
+        expect((await lstat(dirname(target))).mode & 0o777).toBe(0o400); expect(readFileSync(dirname(target))).toHaveLength(0);
+      }
+      const syncOutAgain = vi.fn(async (ops: Array<{ files: Array<{ targetPath: string }> }>) => {
+        expect(dirname(ops[0]!.files[0]!.targetPath)).not.toBe(dirname(target)); writeFileSync(ops[0]!.files[0]!.targetPath, "{}");
+      });
+      await expect(readRemoteRunnerProviderState({ runner: { syncOut: syncOutAgain } as never, stateDirectory: "/state", execution })).resolves.toEqual({});
+    } finally { await rm(staged, { force: true }); }
+  } finally {
+    finish(); await pending; vi.mocked(renameSync).mockImplementation(actual.renameSync); warn.mockRestore(); vi.useRealTimers();
+    if (target) {
+      await rm(dirname(target), { recursive: true, force: true });
+      await rm(`${dirname(target)}.staged`, { force: true });
+      for (const name of await readdir(dirname(dirname(target)))) {
+        if (name.startsWith(`${basename(dirname(target))}.dead-`)) await rm(join(dirname(dirname(target)), name), { recursive: true, force: true });
+      }
+    }
+  }
+});
+
+it("readRemoteRunnerProviderState logs EIO and cleans an unfenced root when syncOut settles", async () => {
+  const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+  const { logger } = await import("../../middleware/logger.js");
+  const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+  vi.useFakeTimers(); let target = "", finish!: () => void;
+  const pending = new Promise<void>(resolve => { finish = resolve; });
+  vi.mocked(renameSync).mockImplementationOnce(() => { throw Object.assign(new Error("private path must not be logged"), { code: "EIO" }); });
+  const syncOut = vi.fn(async (operations: Array<{ files: Array<{ targetPath: string }> }>) => {
+    target = operations[0]!.files[0]!.targetPath; await pending; writeFileSync(target, "{}");
+  });
+  try {
+    const result = readRemoteRunnerProviderState({ runner: { syncOut } as never, stateDirectory: "/state", execution });
+    const rejected = expect(result).rejects.toThrow("runner_remote_provider_state_unavailable: sync_out_timeout");
+    await vi.advanceTimersByTimeAsync(60_000); await rejected;
+    expect(warn).toHaveBeenCalledExactlyOnceWith({ code: "EIO", root: basename(dirname(target)) }, "provider-state timeout fence failed");
+    expect((await lstat(dirname(target))).isDirectory()).toBe(true);
+    finish(); await syncOut.mock.results[0]!.value; await Promise.resolve();
+    await expect(access(dirname(target))).rejects.toMatchObject({ code: "ENOENT" });
+  } finally {
+    finish(); await syncOut.mock.results[0]?.value; vi.mocked(renameSync).mockImplementation(actual.renameSync); warn.mockRestore(); vi.useRealTimers();
+    if (target) await rm(dirname(target), { recursive: true, force: true });
+  }
+});
+
+it("readRemoteRunnerProviderState keeps its fence after close EIO and syncOut settlement", async () => {
+  const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+  const { logger } = await import("../../middleware/logger.js");
+  const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+  vi.useFakeTimers(); let target = "", finish!: () => void;
+  const pending = new Promise<void>(resolve => { finish = resolve; });
+  const onSettled = vi.spyOn(pending, "finally");
+  const syncOut = vi.fn((operations: Array<{ files: Array<{ targetPath: string }> }>) => {
+    target = operations[0]!.files[0]!.targetPath; return pending;
+  });
+  vi.mocked(closeSync).mockClear();
+  vi.mocked(closeSync).mockImplementationOnce(fd => {
+    actual.closeSync(fd);
+    throw Object.assign(new Error("private close path must not be logged"), { code: "EIO" });
+  });
+  // Instrument the old writeFileSync path too: exclusive create succeeds, then close throws.
+  vi.mocked(writeFileSync).mockImplementation((path, data, options) => {
+    if (path === dirname(target)) closeSync(actual.openSync(path, "wx", 0o400));
+    else actual.writeFileSync(path, data, options);
+  });
+  try {
+    const result = readRemoteRunnerProviderState({ runner: { syncOut } as never, stateDirectory: "/state", execution });
+    const rejected = expect(result).rejects.toThrow("runner_remote_provider_state_unavailable: sync_out_timeout");
+    await vi.advanceTimersByTimeAsync(60_000); await rejected;
+    expect(closeSync).toHaveBeenCalledTimes(1);
+    expect((await lstat(dirname(target))).isFile()).toBe(true);
+    finish(); await pending; await Promise.resolve();
+    expect(existsSync(dirname(target))).toBe(true);
+    expect(onSettled).toHaveBeenCalledTimes(1); // Dead-root cleanup only; never original-root fallback.
+    expect((await lstat(dirname(target))).mode & 0o777).toBe(0o400);
+    expect(readFileSync(dirname(target))).toHaveLength(0);
+    expect(warn).toHaveBeenCalledExactlyOnceWith({ code: "EIO", root: basename(dirname(target)) }, "provider-state timeout fence close failed");
+    const staged = `${dirname(target)}.staged`; writeFileSync(staged, "late provider state");
+    expect(() => { mkdirSync(dirname(target), { recursive: true }); renameSync(staged, target); }).toThrow();
+    expect(() => renameSync(staged, target)).toThrow(expect.objectContaining({ code: "ENOTDIR" }));
+    expect(existsSync(target)).toBe(false);
+  } finally {
+    finish(); await pending; await Promise.resolve();
+    vi.mocked(closeSync).mockImplementation(actual.closeSync); vi.mocked(writeFileSync).mockImplementation(actual.writeFileSync);
+    onSettled.mockRestore(); warn.mockRestore(); vi.useRealTimers();
+    if (target) {
+      await rm(dirname(target), { recursive: true, force: true });
+      await rm(`${dirname(target)}.staged`, { force: true });
+    }
+  }
+});
+
+it("readRemoteRunnerProviderState removes a recreated dead root again when syncOut settles", async () => {
+  vi.useFakeTimers(); let target = "", deadRoot = "", finish!: () => void;
+  const pending = new Promise<void>(resolve => { finish = resolve; });
+  const syncOut = vi.fn(async (operations: Array<{ files: Array<{ targetPath: string }> }>) => {
+    target = operations[0]!.files[0]!.targetPath; await pending;
+  });
+  try {
+    const result = readRemoteRunnerProviderState({ runner: { syncOut } as never, stateDirectory: "/state", execution });
+    const rejected = expect(result).rejects.toThrow("runner_remote_provider_state_unavailable: sync_out_timeout");
+    await vi.advanceTimersByTimeAsync(60_000); await rejected;
+    deadRoot = String(vi.mocked(renameSync).mock.calls.find(([source]) => source === dirname(target))![1]);
+    expect(existsSync(deadRoot)).toBe(false);
+    mkdirSync(deadRoot); writeFileSync(join(deadRoot, "provider-state.json"), "late publish");
+    finish(); await syncOut.mock.results[0]!.value; await Promise.resolve();
+    expect(existsSync(deadRoot)).toBe(false);
+    expect((await lstat(dirname(target))).isFile()).toBe(true);
+  } finally {
+    finish(); await syncOut.mock.results[0]?.value; vi.useRealTimers();
+    if (target) await rm(dirname(target), { recursive: true, force: true });
+    if (deadRoot) await rm(deadRoot, { recursive: true, force: true });
+  }
 });
 
 describe("isTransientRemoteCheckpointReadFailure", () => {
