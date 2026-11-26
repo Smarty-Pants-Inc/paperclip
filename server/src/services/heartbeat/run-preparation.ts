@@ -128,6 +128,8 @@ import type { TrustPresetResolution } from "../trust-preset-resolver.js";
 
 const EXTERNAL_ATTACHMENT_OMISSIONS_KEY = "externalAttachmentOmissions";
 
+import { readLimitFromEnv } from "../env-limits.js";
+
 export const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 
 const PAPERCLIP_AGENT_MESSAGE_KEY = "paperclipAgentMessage";
@@ -136,18 +138,6 @@ export const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 
 export const PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY =
   "paperclipExternalChatExecutionBound";
-
-const MAX_INLINE_WAKE_COMMENTS = 8;
-
-const MAX_INLINE_WAKE_ATTACHMENTS = 20;
-
-const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
-
-const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
-
-const MAX_INLINE_WAKE_ISSUE_DESCRIPTION_CHARS = 12_000;
-
-const MAX_AGENT_SESSION_MESSAGE_CHARS = 12_000;
 
 export const CONFIGURATION_INCOMPLETE_FAILURE_CODE = "configuration_incomplete";
 
@@ -850,7 +840,7 @@ function sanitizeAgentSessionMessageText(value: unknown): string | null {
   if (!text) return null;
   const redacted = redactSensitiveText(text).slice(
     0,
-    MAX_AGENT_SESSION_MESSAGE_CHARS,
+    readLimitFromEnv("PAPERCLIP_WAKE_INPUT_MAX_SESSION_MESSAGE_CHARS", 12_000),
   );
   return redacted.trim().length > 0 ? redacted : null;
 }
@@ -2310,6 +2300,11 @@ export async function buildPaperclipWakePayload(input: {
   // Simplified Technical English (rendered as a prompt directive downstream).
   simplifiedEnglishInteractions?: boolean;
 }) {
+  const maxComments = readLimitFromEnv("PAPERCLIP_WAKE_INPUT_MAX_COMMENTS", 8);
+  const maxAttachments = readLimitFromEnv("PAPERCLIP_WAKE_INPUT_MAX_ATTACHMENTS", 20);
+  const maxCommentChars = readLimitFromEnv("PAPERCLIP_WAKE_INPUT_MAX_COMMENT_CHARS", 4_000);
+  const maxTotalCommentChars = readLimitFromEnv("PAPERCLIP_WAKE_INPUT_MAX_TOTAL_COMMENT_CHARS", 12_000);
+  const maxDescriptionChars = readLimitFromEnv("PAPERCLIP_WAKE_INPUT_MAX_DESCRIPTION_CHARS", 12_000);
   const executionStage = parseObject(input.contextSnapshot.executionStage);
   const commentIds = extractWakeCommentIds(input.contextSnapshot);
   const annotationCommentId = readNonEmptyString(
@@ -2365,12 +2360,12 @@ export async function buildPaperclipWakePayload(input: {
   const issueDescription = conversationMode ? null : issueSummary?.description ?? null;
   const issueDescriptionTruncated =
     issueDescription !== null &&
-    issueDescription.length > MAX_INLINE_WAKE_ISSUE_DESCRIPTION_CHARS;
+    issueDescription.length > maxDescriptionChars;
   const inlineIssueDescription = issueDescriptionTruncated
-    ? issueDescription.slice(0, MAX_INLINE_WAKE_ISSUE_DESCRIPTION_CHARS)
+    ? issueDescription.slice(0, maxDescriptionChars)
     : issueDescription;
   const comments: Array<Record<string, unknown>> = [];
-  let remainingBodyChars = MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS;
+  let remainingBodyChars = maxTotalCommentChars;
   let truncated = false;
   let missingCommentCount = 0;
   const safeContinuationSummary =
@@ -2385,7 +2380,7 @@ export async function buildPaperclipWakePayload(input: {
       missingCommentCount += 1;
       continue;
     }
-    if (comments.length >= MAX_INLINE_WAKE_COMMENTS && !input.retainFullCommentBodies) {
+    if (comments.length >= maxComments && !input.retainFullCommentBodies) {
       truncated = true;
       break;
     }
@@ -2397,7 +2392,7 @@ export async function buildPaperclipWakePayload(input: {
         : sanitizeQuarantinedCommentForHigherTrust(row);
     const fullBody = deletedAt ? "" : row.origin === "fast_response" ? `[Paperclip acknowledgement; not agent work] ${safeRow.body}` : safeRow.body;
     const allowedBodyChars = Math.max(0, Math.min(
-      MAX_INLINE_WAKE_COMMENT_BODY_CHARS,
+      maxCommentChars,
       remainingBodyChars,
     ));
     if (allowedBodyChars <= 0 && !input.retainFullCommentBodies) {
@@ -2475,8 +2470,8 @@ export async function buildPaperclipWakePayload(input: {
             ),
           )
           .orderBy(asc(issueAttachments.createdAt), asc(issueAttachments.id))
-          .limit(MAX_INLINE_WAKE_ATTACHMENTS + 1);
-  if (attachmentRows.length > MAX_INLINE_WAKE_ATTACHMENTS) truncated = true;
+          .limit(maxAttachments + 1);
+  if (attachmentRows.length > maxAttachments) truncated = true;
   const attachmentsByCommentId = new Map<
     string,
     Array<{
@@ -2489,7 +2484,7 @@ export async function buildPaperclipWakePayload(input: {
   >();
   for (const attachment of attachmentRows.slice(
     0,
-    MAX_INLINE_WAKE_ATTACHMENTS,
+    maxAttachments,
   )) {
     if (!attachment.issueCommentId) continue;
     const descriptors =
@@ -2562,11 +2557,11 @@ export async function buildPaperclipWakePayload(input: {
               anchorState: row.anchorState,
               anchorConfidence: row.anchorConfidence,
               body:
-                row.body.length > MAX_INLINE_WAKE_COMMENT_BODY_CHARS
-                  ? row.body.slice(0, MAX_INLINE_WAKE_COMMENT_BODY_CHARS)
+                row.body.length > maxCommentChars
+                  ? row.body.slice(0, maxCommentChars)
                   : row.body,
               bodyTruncated:
-                row.body.length > MAX_INLINE_WAKE_COMMENT_BODY_CHARS,
+                row.body.length > maxCommentChars,
               createdAt: row.createdAt.toISOString(),
               author: row.authorAgentId
                 ? { type: "agent", id: row.authorAgentId }
