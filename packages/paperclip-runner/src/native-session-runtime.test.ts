@@ -11340,9 +11340,9 @@ it("fails preconfigured recovery without replacing a missing provider session", 
 });
 
 describe("first-turn queued input", () => {
-  async function startFirstTurn(executionInput: NativeExecutionInputV1 | NativeExecutionInputV5, queued: string | null) {
+  async function startFirstTurn(executionInput: NativeExecutionInputV1 | NativeExecutionInputV5, queued: string | null, attachments?: string) {
     const order: string[] = [];
-    const sent: string[] = [];
+    const sent: string[] = [], previews: string[] = [];
     const session: NativeSession = {
       identity: () => identity,
       async capabilities() { return { resume: false, typedEvents: true, steering: false, interruption: true, structuredResult: true }; },
@@ -11359,9 +11359,13 @@ describe("first-turn queued input", () => {
       },
       close: vi.fn(async () => undefined),
     };
-    const getFirstTurnQueuedInput = vi.fn(async () => { order.push("claim"); return queued; });
+    const getFirstTurnQueuedInput = vi.fn(async (renderTurnInput?: (queued: string | null) => string) => {
+      if (renderTurnInput) previews.push(renderTurnInput(queued));
+      order.push("claim"); return queued;
+    });
     await expect(executeNativeSession({
       input: executionInput,
+      prepareWakeAttachmentPrompt: async () => attachments ?? null,
       getFirstTurnQueuedInput,
       backend: { async descriptor() { return { kind: "mock", name: "first-turn", version: "1", capabilities: await session.capabilities(),
         runtimeContextCapabilities: { instructions: "native" as const, skills: "native" as const, mcp: "native" as const } }; }, async openSession() { return session; } },
@@ -11369,7 +11373,7 @@ describe("first-turn queued input", () => {
         async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; }, async completeRun() {} },
       runnerInstanceId: "runner-first-turn", controlPlaneInstanceId: "control-first-turn",
     })).rejects.toThrow("stop after turn.start");
-    return { order, sent, getFirstTurnQueuedInput };
+    return { order, sent, previews, getFirstTurnQueuedInput };
   }
 
   it("adds messages queued during preparation to the first turn, sealed just before turn.start", async () => {
@@ -11381,6 +11385,12 @@ describe("first-turn queued input", () => {
     expect(envelope.task.prompt).toBe(`${preparedInput().task.prompt}\n\n${queued}`);
     // Appending input keeps the prompt-bound completion sources.
     expect(envelope.completionContract.criteria[0]!.source).toMatchObject({ location: "task.prompt" });
+  });
+
+  it("preflights the exact composed turn text before queued input is sealed", async () => {
+    const { previews, sent } = await startFirstTurn(preparedInput(), "whole queued input", "late attachments");
+    expect(previews).toEqual(sent);
+    expect(JSON.parse(previews[0]!).task.prompt).toBe(`${preparedInput().task.prompt}\n\nlate attachments\n\nwhole queued input`);
   });
 
   it("starts the first turn unchanged when nothing is queued", async () => {

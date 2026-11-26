@@ -10,8 +10,30 @@ import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { undeliveredLegacyUserCommentIds } from "../explicit-native-continuation.js";
 import { deliveredQueuedCommentIds } from "../queued-comment-delivery.js";
 import {
-  claimFirstTurnQueuedInput, firstTurnClaimedCommentIds, firstTurnTakesAllQueuedComments, runAcceptsFirstTurnQueuedInput,
+  claimFirstTurnQueuedInput, readFirstTurnQueuedInputReceipt, firstTurnClaimedCommentIds, firstTurnTakesAllQueuedComments, runAcceptsFirstTurnQueuedInput, renderFirstTurnQueuedInput,
 } from "./first-turn-queued-input.js";
+
+import { assertNativeQueuedTurnBound, nativePromptCauseFromError, commandTextBytes, FIRST_TURN_QUEUED_INPUT_MAX_BYTES, NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND } from "./native-turn-budget.js";
+
+describe("first-turn encoded byte budget", () => {
+  const message = (id: string, body: string, kind?: "interaction") => ({ id, body, kind, createdAt: new Date("2026-01-01Z") });
+  it.each([undefined, "interaction"] as const)("carries a long person's input whole or refuses before clipping (%s)", kind => {
+    const body = "🦖".repeat(8000) + " END OF PERSON'S WORDS";
+    const text = renderFirstTurnQueuedInput([message("person", body, kind)])!;
+    expect(text).toContain(body);
+    expect(commandTextBytes(text)).toBeLessThanOrEqual(FIRST_TURN_QUEUED_INPUT_MAX_BYTES);
+    expect(() => renderFirstTurnQueuedInput([message("person", '"'.repeat(40000), kind)]))
+      .toThrow(NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND);
+  });
+  it("refuses a batch that cannot fit whole instead of clipping its later comments", () => {
+    expect(() => renderFirstTurnQueuedInput([0, 1, 2].map(i => message(`comment-${i}`, '"'.repeat(16000)))))
+      .toThrow(NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND);
+  });
+  it("refuses oversized metadata instead of consuming invisible messages; preserves short output", () => {
+    expect(() => renderFirstTurnQueuedInput([message("x".repeat(100000), "hi")])).toThrow(NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND);
+    expect(renderFirstTurnQueuedInput([message("id", "hello")])).toBe("New messages from the user arrived while this run was starting. They were not in the request above. Handle each of them in this turn, oldest first, together with that request:\n\n[Message 1 of 1 · comment id · 2026-01-01T00:00:00.000Z]\nhello");
+  });
+});
 
 const support = await getEmbeddedPostgresTestSupport();
 const USER = "first-turn-user";
@@ -95,6 +117,45 @@ describe.skipIf(!support.supported)("first-turn queued input", () => {
     expect(await claimFirstTurnQueuedInput(db, binding(f, f.runId))).not.toContain("one more thing");
     expect(firstTurnClaimedCommentIds(await readRun(f.runId)).has(later)).toBe(false);
     expect(sealMs).toBeLessThan(1_000);
+  });
+
+  it.each(["comment", "interaction"] as const)("refuses oversized queued person %s before claim and leaves its receipt unclaimed", async kind => {
+    const f = await seed(), body = "whole person's input: " + "🦖".repeat(150000);
+    const answer = kind === "interaction" ? await queueAnswer(f) : null;
+    const id = answer ? answer.card.id : await queueMessage(f, body);
+    if (answer) await db.update(issueThreadInteractions).set({ result: { version: 1,
+      answers: [{ questionId: "color", optionIds: [], otherText: body }] } }).where(eq(issueThreadInteractions.id, id));
+    await expect(claimFirstTurnQueuedInput(db, binding(f, f.runId))).rejects.toMatchObject({
+      code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "queued_input", bytes: expect.any(Number) },
+    });
+    const run = await readRun(f.runId);
+    expect(readFirstTurnQueuedInputReceipt(run)).toBeNull();
+    expect([...firstTurnClaimedCommentIds(run)]).toEqual([]);
+    expect(await runAcceptsFirstTurnQueuedInput(db, run)).toBe(true);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    expect(wake).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    if (answer) {
+      expect((await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, id)))[0])
+        .toMatchObject({ status: "answered", result: { answers: [{ otherText: body }] } });
+    } else {
+      expect([...await deliveredQueuedCommentIds(db, { ...f, commentIds: [id] })]).toEqual([]);
+      expect(await undeliveredLegacyUserCommentIds(db, f.companyId, f.issueId, f.agentId, [id])).toEqual([id]);
+      expect((await db.select().from(issueComments).where(eq(issueComments.id, id)))[0]!.body).toBe(body);
+    }
+  });
+
+  it("refuses the composed turn before claim when whole queued input crosses its remaining room", async () => {
+    const f = await seed(), id = await queueMessage(f, "queued person's words ".repeat(1000));
+    const error = await claimFirstTurnQueuedInput(db, binding(f, f.runId), text => {
+      assertNativeQueuedTurnBound(f.runId, JSON.stringify({ task: { prompt: "late attachments: " + "a".repeat(490000) + text } }), text,
+        JSON.stringify({ task: { prompt: "late attachments: " + "a".repeat(490000) } }));
+    }).catch(error => error);
+    expect(error).toMatchObject({ code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "queued_input" } });
+    expect(nativePromptCauseFromError(new Error(String(error)))).toEqual(error.promptCause);
+    const run = await readRun(f.runId);
+    expect(readFirstTurnQueuedInputReceipt(run)).toBeNull();
+    expect([...firstTurnClaimedCommentIds(run)]).toEqual([]);
+    expect(await undeliveredLegacyUserCommentIds(db, f.companyId, f.issueId, f.agentId, [id])).toEqual([id]);
   });
 
   it("delivers two messages from preparation in their queued order", async () => {

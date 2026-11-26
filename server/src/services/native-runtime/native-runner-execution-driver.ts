@@ -4,6 +4,7 @@ import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/executio
 import { resolvePaperclipRunnerTransport, type PaperclipRunnerTransport } from "@paperclipai/adapter-utils/runner-connectivity";
 import type { RunnerExecutionDriver } from "../../vendor/paperclip-runner/index.js";
 import { registerRunnerPrpAuthority } from "../../realtime/runner-prp-ws.js";
+import { guardNativeTurnCommands } from "./native-turn-budget.js";
 import { connectRunnerPrpIngress } from "../../realtime/runner-prp-outbound.js";
 import type { NativeRunTrace } from "./native-run-trace.js";
 import type { Db } from "@paperclipai/db";
@@ -116,6 +117,7 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
         }
       : undefined,
     controlPlaneRegistration: async (authority, attachmentIdentity) => {
+      guardNativeTurnCommands(authority);
       await measureNativeRunnerSpan(input.trace, "runner.checkpoint.register", async () => {
         await input.beforeConnect?.(attachmentIdentity, authority);
         if (input.controllerPersistence && input.binding.issueId) {

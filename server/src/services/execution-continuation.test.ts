@@ -10,6 +10,7 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  heartbeatRunEvents,
   issueComments,
   issueThreadInteractions,
   issues,
@@ -21,6 +22,11 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "../__tests__/helpers/embedded-postgres.js";
 import { resolveExternalTestDatabaseUrl } from "../__tests__/helpers/external-test-database.js";
+import { commandEnvelopeBytes, NATIVE_TURN_KNOWN_MAX_BYTES, type NativeContinuationReadState } from "./native-runtime/native-turn-budget.js";
+import { buildNativeExecutionInput } from "./native-runtime/native-execution-input.js";
+import { decideNativeContinuation } from "./native-runtime/continued-session.js";
+import { nativeRuntimeContextFixture } from "./native-runtime/runtime-context.test-fixture.js";
+import { buildNativeModelEnvelope } from "../vendor/paperclip-runner/index.js";
 import { StaleExecutionContinuationError, buildExecutionContinuation, currentContinuationOrigins, projectHumanInteractionResponse } from "./execution-continuation.js";
 
 const expectStaleContinuation = async (
@@ -156,6 +162,95 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
         summary: "Notion read completed.",
         exposeLowTrustRaw: false,
       });
+    it("uses only accepted exact snapshot revisions as read, not a refused turn's saved input", async () => {
+      const [prior] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      const delivered = await build();
+      let eventId: number | undefined;
+      // A previously cut snapshot contains only the messages actually prepared.
+      delivered.messages = delivered.messages.slice(0, 2);
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, executionContinuation: delivered } }).where(eq(heartbeatRuns.id, runId));
+      let state: NativeContinuationReadState | undefined;
+      const read = () => buildExecutionContinuation({ db, companyId, issueId, agentId, runId: randomUUID(), previousContextRunId: runId,
+        context: { interactionId }, summary: null, exposeLowTrustRaw: false, onNativeReadState: value => { state = value; } });
+      const [comment] = await db.select().from(issueComments).where(eq(issueComments.id, notionId));
+      try {
+        await read();
+        expect(state?.readCommentIds).toEqual([]);
+        const [event] = await db.insert(heartbeatRunEvents).values({ companyId, runId, agentId, seq: 1, eventType: "turn.accepted", stream: "system", level: "info" }).returning({ id: heartbeatRunEvents.id });
+        eventId = event!.id;
+        await read();
+        expect(state?.readCommentIds).toEqual([notionId, gmailId]);
+        expect(state?.lastRunAt).toBe(prior!.createdAt.toISOString());
+        await db.update(issueComments).set({ updatedAt: new Date(Date.now() + 1000) }).where(eq(issueComments.id, notionId));
+        await read();
+        expect(state?.readCommentIds).toEqual([gmailId]);
+      } finally {
+        if (eventId !== undefined) await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.id, eventId));
+        await db.update(issueComments).set({ updatedAt: comment!.updatedAt }).where(eq(issueComments.id, notionId));
+        await db.update(heartbeatRuns).set({ contextSnapshot: prior!.contextSnapshot }).where(eq(heartbeatRuns.id, runId));
+      }
+    });
+    it.each([false, true])("keeps two ordinary comments delta-only on an oversized retained session (fresh cut: %s)", async freshCut => {
+      const taskId = randomUUID(), sessionId = randomUUID();
+      await db.insert(issues).values({ id: taskId, companyId, title: "Retained conversation", status: "in_progress", assigneeAgentId: agentId });
+      const history = Array.from({ length: 30 }, (_, index) => ({ id: randomUUID(), companyId, issueId: taskId, authorType: "user" as const, authorUserId: "local-board",
+        body: `Earlier request ${index}: ` + "x".repeat(30000), createdAt: new Date(Date.UTC(2026, 0, 1, 0, index)), updatedAt: new Date("2026-01-01T01:00:00Z") }));
+      await db.insert(issueComments).values(history);
+      let previousRunId = randomUUID();
+      const baseline = await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId,
+        context: { wakeReason: "issue_commented", commentId: history.at(-1)!.id }, summary: null, exposeLowTrustRaw: false });
+      let delivered = baseline;
+      if (freshCut) {
+        buildNativeExecutionInput({ companyId, runId: previousRunId, agentId, provider: "pi_rpc", normalizedSessionId: sessionId,
+          issue: { id: taskId, identifier: "BUDGET-1", title: "Retained conversation", description: null, workMode: "standard" }, taskPrompt: "Preserve the objective.",
+          wakePayload: { reason: "issue_commented", executionContinuation: baseline }, boundCommandBytes: true,
+          continuationReadState: { lastRunAt: "2026-01-02T00:00:00Z", readCommentIds: baseline.messages.map(message => message.id) }, onContinuationBudgeted: value => { delivered = value; },
+          workspace: { id: "workspace", cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null }, runtimeContext: nativeRuntimeContextFixture(),
+          completionContract: { id: "contract", sha256: "a".repeat(64), schemaVersion: "paperclip.run-result.v1", contract: { revision: "1", objective: "Continue", criteria: [{ id: "output", requirement: "Continue" }] } } });
+        expect(delivered.messages.length).toBeLessThan(baseline.messages.length);
+        expect(delivered.coverage).toMatchObject({ nativeSessionId: sessionId, omitted: expect.arrayContaining([{ id: history[0]!.id, updatedAt: history[0]!.updatedAt.toISOString() }]) });
+      }
+      Object.assign(delivered.coverage, { providerSessionId: "provider-generation-1" });
+      await db.insert(heartbeatRuns).values({ id: previousRunId, companyId, agentId, nativeSessionId: sessionId, status: "succeeded", contextSnapshot: { issueId: taskId, executionContinuation: delivered } });
+      await db.insert(heartbeatRunEvents).values({ companyId, runId: previousRunId, agentId, seq: 1, eventType: "turn.accepted", stream: "system", level: "info" });
+      for (let turn = 1; turn <= 2; turn++) {
+        const commentId = randomUUID(), nextRunId = randomUUID(), body = `Ordinary follow-up ${turn}`;
+        await db.insert(issueComments).values({ id: commentId, companyId, issueId: taskId, authorType: "user", authorUserId: "local-board", body,
+          createdAt: new Date(Date.UTC(2026, 0, 2, 0, turn)), updatedAt: new Date(Date.UTC(2026, 0, 2, 0, turn)) });
+        let readState: NativeContinuationReadState | undefined;
+        const snapshot = await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId, runId: nextRunId, previousContextRunId: previousRunId, nativeSessionId: sessionId, nativeProviderSessionId: "provider-generation-1",
+          context: { wakeReason: "issue_commented", commentId }, summary: null, exposeLowTrustRaw: false, onNativeReadState: value => { readState = value; } });
+        expect(snapshot.resumeDelta?.messages.map(message => message.id)).toEqual([commentId]);
+        if (freshCut && turn === 1) {
+          expect(readState?.readCommentIds).toContain(history[0]!.id);
+          const otherSession = await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId, previousContextRunId: previousRunId, nativeSessionId: sessionId, nativeProviderSessionId: "provider-generation-2",
+            context: { wakeReason: "issue_commented", commentId }, summary: null, exposeLowTrustRaw: false });
+          expect(otherSession.resumeDelta?.messages.map(message => message.id)).toContain(history[0]!.id);
+          await db.update(issueComments).set({ body: "Edited older requirement", updatedAt: new Date("2026-01-01T02:00:00Z") }).where(eq(issueComments.id, history[0]!.id));
+          const edited = await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId, previousContextRunId: previousRunId, nativeSessionId: sessionId, nativeProviderSessionId: "provider-generation-1",
+            context: { wakeReason: "issue_commented", commentId }, summary: null, exposeLowTrustRaw: false });
+          expect(edited.resumeDelta?.messages.map(message => message.id)).toContain(history[0]!.id);
+          await db.update(issueComments).set({ body: history[0]!.body, updatedAt: history[0]!.updatedAt }).where(eq(issueComments.id, history[0]!.id));
+        }
+        let stored = snapshot;
+        const issue = { id: taskId, identifier: "BUDGET-1", title: "Retained conversation", description: null, workMode: "standard" };
+        const wakePayload = { reason: "issue_commented", commentIds: [commentId], executionContinuation: snapshot };
+        const input = buildNativeExecutionInput({ companyId, runId: nextRunId, agentId, provider: "pi_rpc", normalizedSessionId: sessionId, resumedSession: true,
+          previousTurn: { runId: previousRunId, task: issue }, issue, taskPrompt: "Preserve the objective.", wakePayload, boundCommandBytes: true,
+          continuationReadState: readState, onContinuationBudgeted: value => { stored = value; },
+          workspace: { id: "workspace", cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null }, runtimeContext: nativeRuntimeContextFixture(),
+          completionContract: { id: "contract", sha256: "a".repeat(64), schemaVersion: "paperclip.run-result.v1", contract: { revision: "1", objective: "Continue", criteria: [{ id: "output", requirement: "Continue" }] } } });
+        expect(stored).toBe(snapshot);
+        expect(stored.messages).toHaveLength(30 + turn);
+        expect(stored.coverage).not.toHaveProperty("truncated");
+        expect(commandEnvelopeBytes(buildNativeModelEnvelope(input))).toBeGreaterThan(2 * NATIVE_TURN_KNOWN_MAX_BYTES);
+        expect(buildNativeModelEnvelope(input, { resumedSession: true })).toMatchObject({ events: body });
+        expect(decideNativeContinuation({ provider: "pi_rpc", hasSession: true, previousRunId, agentId, wakePayload })).toEqual({ continue: true, promptOnly: true });
+        await db.insert(heartbeatRuns).values({ id: nextRunId, companyId, agentId, nativeSessionId: sessionId, status: "succeeded", contextSnapshot: { issueId: taskId, executionContinuation: stored } });
+        await db.insert(heartbeatRunEvents).values({ companyId, runId: nextRunId, agentId, seq: 1, eventType: "turn.accepted", stream: "system", level: "info" });
+        previousRunId = nextRunId;
+      }
+    });
     it("attests the exact latest user comment selected as the objective", async () => {
       const envelope = await build();
       const latest = await db.select().from(issueComments).where(eq(issueComments.id, laterId)).then(rows => rows[0]!);

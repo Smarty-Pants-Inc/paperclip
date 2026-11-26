@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
+import { clearNativeFreshFallback, registerNativeFreshFallback, nativeFreshFallbackPayload, commandEnvelopeBytes, NATIVE_TURN_KNOWN_MAX_BYTES, NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND } from "./native-turn-budget.js";
 import type { ExecutionContinuationEnvelope, AskUserQuestionsInteraction } from "@paperclipai/shared";
 
 import { formatDurableQuestionResponseSummary } from "../question-response-delivery.js";
 import { nativeCompletionSource, buildNativeCompletionContract } from "./completion-contracts.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
-import { buildNativeExecutionInput } from "./native-execution-input.js";
+import { buildNativeExecutionInput, budgetNativeFreshFallback } from "./native-execution-input.js";
+import { decideNativeContinuation } from "./continued-session.js";
+import { runnerApiOperation } from "./runner-api-catalog.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
 import { buildNativeModelEnvelope, canonicalNativeRuntimeContextDigest, parseNativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
 
@@ -560,6 +563,191 @@ describe("native execution input external-chat framing", () => {
 
 });
 
+
+describe("native serialized-command budget", () => {
+  const args: Parameters<typeof buildNativeExecutionInput>[0] = {
+    companyId: "company", runId: "run", agentId: "agent", provider: "pi_rpc", normalizedSessionId: "session",
+    issue: { id: "task", identifier: "BUDGET-1", title: "Continue", description: null, workMode: "standard" }, taskPrompt: "Preserve the objective.",
+    workspace: { id: "workspace", cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null }, runtimeContext: nativeRuntimeContextFixture(),
+    completionContract: { id: "contract", sha256: "a".repeat(64), schemaVersion: "paperclip.run-result.v1",
+      contract: { revision: "1", objective: "Continue", criteria: [{ id: "output", requirement: "Continue" }] } },
+  };
+  function shape(count: number, chars: number, actions = 0): ExecutionContinuationEnvelope {
+    const messages = Array.from({ length: count }, (_, i) => ({ id: `message-${i}`, authorType: i === count - 1 ? "user" : "agent", authorId: "author", createdByRunId: null,
+      body: i === count - 1 ? "LATEST HUMAN REQUEST: preserve every write." : `message ${i}: ` + "x".repeat(Math.floor(chars / (count - 1))),
+      createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z", deleted: false, sourceTrust: null }));
+    return { version: 1, companyId: "company", issueId: "task", objective: "Preserve the objective.", objectiveSource: { kind: "comment", id: messages.at(-1)!.id, revision: messages.at(-1)!.updatedAt },
+      trigger: { reason: "issue_reopened_via_comment", interactionId: null, sourceRunId: null }, originCommentIds: [messages[0]!.id], messages,
+      completedActions: Array.from({ length: actions }, (_, i) => ({ runId: "old-run", receiptId: `receipt-${i}`, operationId: "GET /api/issues/{id}/comments", result: { status: "ok", body: "r".repeat(1974) } })),
+      humanResponses: [], interactionOutcomes: [], completedWork: null, unresolvedInteractionIds: [], coverage: { kind: "full_task_history", throughCommentId: messages.at(-1)!.id, summaryThroughCommentId: null } };
+  }
+  function prepare(c: ExecutionContinuationEnvelope, extra: Partial<typeof args> = {}) {
+    let retained = c;
+    const input = buildNativeExecutionInput({ ...args, boundCommandBytes: true, wakePayload: { reason: c.trigger.reason, executionContinuation: c },
+      continuationReadState: { lastRunAt: "2026-01-02T00:00:00Z", readCommentIds: c.messages.map(m => m.id) }, onContinuationBudgeted: value => { retained = value; }, ...extra });
+    return { input, retained };
+  }
+  it.each([["long-receipts 156/87", 156, 235936, 87], ["de496399", 10, 467000, 0], ["fresh 552 KB", 10, 546500, 0], ["resumed reopen", 31, 690000, 0], ["resumed task_retry", 31, 690000, 0]] as const)("bounds %s's full snapshot and preserves every receipt", (name, count, chars, actions) => {
+    const original = shape(count, chars, actions);
+    if (name === "fresh 552 KB") {
+      const stock = buildNativeExecutionInput({ ...args, wakePayload: { reason: original.trigger.reason, executionContinuation: original } });
+      expect(commandEnvelopeBytes(buildNativeModelEnvelope(stock))).toBeGreaterThan(550000);
+      expect(commandEnvelopeBytes(buildNativeModelEnvelope(stock))).toBeLessThan(555000);
+    }
+    if (name === "resumed task_retry") {
+      original.trigger.reason = "task_retry";
+      original.resumeDelta = { baseRunId: "previous", messages: [original.messages.at(-1)!] };
+    }
+    const { input, retained } = prepare(original, name.startsWith("resumed") ? { resumedSession: true, previousTurn: { runId: "previous", task: args.issue } } : {});
+    const envelope = buildNativeModelEnvelope(input, { resumedSession: name.startsWith("resumed") } as { resumedSession: true });
+    expect(commandEnvelopeBytes(envelope)).toBeLessThanOrEqual(NATIVE_TURN_KNOWN_MAX_BYTES);
+    expect(retained.messages.map(m => m.id)).toEqual(expect.arrayContaining([original.messages[0]!.id, original.messages.at(-1)!.id]));
+    expect(retained.completedActions).toHaveLength(actions);
+    expect(input.task.prompt).toContain("History was cut for this turn:");
+    expect(input.task.prompt).toContain("0 receipts omitted");
+    expect(input.task.prompt).toContain('call_api with operationId="GET /api/issues/{id}/comments/{commentId}"');
+    expect(runnerApiOperation("GET /api/issues/{id}/comments/{commentId}")).toMatchObject({ method: "GET", callPolicy: "rest" });
+    expect(input.task.prompt).toContain("LATEST HUMAN REQUEST");
+    if (name.startsWith("resumed")) expect(input.continuationPrompt).toBeNull();
+    expect(original.coverage).not.toHaveProperty("truncated");
+    console.log(JSON.stringify({ shape: name, knownCommandBytes: commandEnvelopeBytes(envelope), retainedMessages: retained.messages.length, coverage: retained.coverage }));
+  });
+  it.each(["continuous", "paperclip"])("budgets only the selected %s delta and retains the full baseline", sessionContinuity => {
+    const c = shape(31, 900000);
+    c.trigger.reason = "issue_commented";
+    c.originCommentIds = [c.messages.at(-1)!.id];
+    c.resumeDelta = { baseRunId: "previous", messages: [c.messages.at(-1)!] };
+    const wakePayload = { reason: c.trigger.reason, commentIds: c.originCommentIds, executionContinuation: c };
+    const extra = { resumedSession: true, sessionContinuity, previousTurn: { runId: "previous", task: args.issue }, wakePayload };
+    const stock = buildNativeExecutionInput({ ...args, ...extra });
+    expect(commandEnvelopeBytes(buildNativeModelEnvelope(stock))).toBeGreaterThan(2 * NATIVE_TURN_KNOWN_MAX_BYTES);
+    const { input, retained } = prepare(c, extra);
+    expect(retained).toBe(c);
+    expect(JSON.stringify(input)).toBe(JSON.stringify(stock));
+    expect(commandEnvelopeBytes(buildNativeModelEnvelope(input, { resumedSession: true }))).toBeLessThan(NATIVE_TURN_KNOWN_MAX_BYTES);
+    expect(input.continuationPrompt).not.toContain("History was cut");
+    expect(decideNativeContinuation({ ...args, ...extra, hasSession: true, previousRunId: "previous" }).promptOnly).toBe(sessionContinuity === "continuous");
+  });
+  it("budgets a failed-resume full bootstrap only when that fallback is selected", () => {
+    const c = shape(31, 900000);
+    c.trigger.reason = "issue_commented";
+    c.originCommentIds = [c.messages.at(-1)!.id];
+    c.resumeDelta = { baseRunId: "previous", messages: [c.messages.at(-1)!] };
+    const wake = { reason: c.trigger.reason, commentIds: c.originCommentIds, executionContinuation: c };
+    const { input } = prepare(c, { wakePayload: wake, resumedSession: true, previousTurn: { runId: "previous", task: args.issue } });
+    expect(input.continuationPrompt).toBe(c.messages.at(-1)!.body);
+    expect(commandEnvelopeBytes(buildNativeModelEnvelope(input))).toBeGreaterThan(2 * NATIVE_TURN_KNOWN_MAX_BYTES);
+    const parsedCopy = parseNativeExecutionInput(input), originalPrompt = input.task.prompt;
+    const bounded = budgetNativeFreshFallback(input, wake, { lastRunAt: "2026-01-02T00:00:00Z", readCommentIds: c.messages.map(message => message.id) });
+    expect(commandEnvelopeBytes(buildNativeModelEnvelope(input))).toBeLessThan(NATIVE_TURN_KNOWN_MAX_BYTES);
+    expect(input.continuationPrompt).toBeNull();
+    expect(bounded!.messages.length).toBeLessThan(c.messages.length);
+    expect(bounded!.coverage).toMatchObject({ nativeSessionId: "session", omitted: expect.any(Array) });
+    expect(input.task.prompt).toContain("History was cut");
+    const copiedEnvelope = buildNativeModelEnvelope(parsedCopy);
+    copiedEnvelope.task.prompt = `late handoff\n\n${copiedEnvelope.task.prompt}\n\nlate attachment`;
+    registerNativeFreshFallback("fallback-copy", originalPrompt, input.task.prompt);
+    try {
+      const payload = nativeFreshFallbackPayload("fallback-copy", { text: JSON.stringify(copiedEnvelope) });
+      expect(JSON.parse(String(payload.text)).task.prompt).toBe(`late handoff\n\n${input.task.prompt}\n\nlate attachment`);
+      expect(commandEnvelopeBytes(JSON.parse(String(payload.text)))).toBeLessThan(NATIVE_TURN_KNOWN_MAX_BYTES);
+    } finally { clearNativeFreshFallback("fallback-copy"); }
+  });
+  it.each(["task_description", "newest_message"] as const)("reports the protected %s cause without suggesting a fresh session", kind => {
+    const c = shape(3, 100);
+    if (kind === "newest_message") c.messages.at(-1)!.body = "x".repeat(600000);
+    try {
+      prepare(c, kind === "task_description" ? { issue: { ...args.issue, description: "x".repeat(600000) }, taskPrompt: "x".repeat(600000) } : {});
+      throw new Error("oversized protected input was accepted");
+    } catch (error) {
+      expect(error).toMatchObject({ code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind, bytes: 600000 } });
+      expect(String(error)).not.toMatch(/new session|compact/);
+    }
+  });
+  it("classifies an unread oversized message when a kept turn falls back to fresh input", () => {
+    const c = shape(3, 100);
+    c.messages[1]!.body = "x".repeat(600000);
+    c.trigger.reason = "issue_commented";
+    c.originCommentIds = [c.messages.at(-1)!.id];
+    c.resumeDelta = { baseRunId: "previous", messages: [c.messages.at(-1)!] };
+    const wakePayload = { reason: c.trigger.reason, executionContinuation: c };
+    const { input } = prepare(c, { wakePayload, resumedSession: true, previousTurn: { runId: "previous", task: args.issue } });
+    try {
+      budgetNativeFreshFallback(input, wakePayload, { lastRunAt: "2026-01-02T00:00:00Z", readCommentIds: [] });
+      throw new Error("oversized unread fallback was accepted");
+    } catch (error) {
+      expect(error).toMatchObject({ promptCause: { kind: "unread_message", bytes: 600000 } });
+      expect(String(error)).toMatch(/unread message.*split/);
+    }
+  });
+  it("carries an unread comment over the queued share whole or refuses with its cause, never shortens it", () => {
+    const c = shape(3, 100), readState = { lastRunAt: "2026-01-02T00:00:00Z", readCommentIds: [] };
+    c.messages[1]!.body = "UNREAD: " + "u".repeat(100000) + " END OF UNREAD WORDS";
+    expect(prepare(c, { continuationReadState: readState }).input.task.prompt).toContain(c.messages[1]!.body);
+    c.messages[1]!.body = "u".repeat(600000);
+    expect(() => prepare(c, { continuationReadState: readState })).toThrow(expect.objectContaining({
+      code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "unread_message", bytes: 600000 },
+    }));
+  });
+  it.each(["humanResponses", "interactionResponses"] as const)("carries long %s answers whole or refuses with the answer cause", channel => {
+    const c = shape(3, 100);
+    const build = (body: string) => {
+      const result = { version: 1, answers: [{ questionId: "scope", optionIds: [], otherText: body }] };
+      c.humanResponses = channel === "humanResponses" ? [{ id: "answer", kind: "ask_user_questions", status: "answered",
+        resolvedByUserId: "board", resolvedAt: "2026-01-01T00:00:00Z", result }] : [];
+      return prepare(c, { interactionResponses: channel === "interactionResponses"
+        ? [{ interactionId: "answer", kind: "ask_user_questions", response: { status: "answered", result } }] : [] }).input;
+    };
+    const body = "PERSON'S ANSWER " + "a".repeat(100000) + " END OF ANSWER";
+    const input = build(body);
+    expect(channel === "humanResponses" ? input.task.prompt : JSON.stringify(buildNativeModelEnvelope(input))).toContain(body);
+    expect(() => build("a".repeat(600000))).toThrow(expect.objectContaining({
+      code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "human_response", bytes: expect.any(Number) },
+    }));
+  });
+  it("does not label an uncut delta with its full snapshot's earlier cut", () => {
+    const c = shape(3, 100);
+    Object.assign(c.coverage, { truncated: true, omittedMessages: 4, omittedCompletedActions: 3 });
+    c.resumeDelta = { baseRunId: "previous", messages: [c.messages.at(-1)!] };
+    const prompt = renderPaperclipWakePrompt({ executionContinuation: c }, { resumedSession: true });
+    expect(prompt).not.toContain("History was cut");
+    expect(prompt).toContain("earlier history remains in this session");
+  });
+  it("keeps short native input byte-identical and leaves unbounded non-native construction unchanged", () => {
+    const c = shape(3, 100);
+    const stock = buildNativeExecutionInput({ ...args, wakePayload: { reason: c.trigger.reason, executionContinuation: c } });
+    expect(JSON.stringify(prepare(c).input)).toBe(JSON.stringify(stock));
+    const large = shape(10, 690000);
+    expect(commandEnvelopeBytes(buildNativeModelEnvelope(prepare(large, { boundCommandBytes: false }).input))).toBeGreaterThan(NATIVE_TURN_KNOWN_MAX_BYTES);
+  });
+  it("preserves stock write and unknown receipts and counts only shortened READ results", () => {
+    const c = shape(30, 400000, 2);
+    Object.assign(c.coverage, { omittedCompletedActions: 3 });
+    c.completedActions!.push({ runId: "r", receiptId: "write", operationId: "POST /api/issues/{id}/comments", result: { id: "saved", contentOmitted: true } },
+      { runId: "r", receiptId: "unknown", operationId: "unknown GET", result: { marker: "do not repeat", text: "u".repeat(10000) } });
+    const { retained } = prepare(c);
+    expect(retained.completedActions!.slice(-2)).toEqual(c.completedActions!.slice(-2));
+    expect(retained.completedActions![0]!.result).toMatchObject({ resultOmittedForSize: true, resultSha256: expect.stringMatching(/^sha256:/) });
+    expect(retained.coverage).toMatchObject({ shortenedCompletedActions: 2, omittedCompletedActions: 3 });
+  });
+  it("never cuts unread, new, or edited-after-last-run messages; refuses an irreducible known prompt", () => {
+    const c = shape(10, 690000);
+    for (const extra of [{ continuationReadState: { lastRunAt: "2026-01-02T00:00:00Z", readCommentIds: [] } },
+      { continuationReadState: { lastRunAt: "2025-01-01T00:00:00Z", readCommentIds: c.messages.map(m => m.id) } },
+      { taskPrompt: "x".repeat(600000) }]) expect(() => prepare(c, extra)).toThrow(NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND);
+    for (const message of c.messages) message.updatedAt = "2026-01-03T00:00:00Z";
+    expect(() => prepare(c)).toThrow(NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND);
+  });
+  it("counts both escaping passes and UTF-8 in multibyte, escape-heavy history", () => {
+    const c = shape(50, 300000);
+    for (const m of c.messages.slice(1, -1)) m.body = '"\\\n日本語🦖'.repeat(2200);
+    const { input } = prepare(c);
+    const envelope = buildNativeModelEnvelope(input);
+    const actual = Buffer.byteLength(JSON.stringify({ payload: { text: JSON.stringify(envelope) } }));
+    expect(actual).toBe(commandEnvelopeBytes(envelope) + Buffer.byteLength('{"payload":{"text":""}}'));
+    expect(commandEnvelopeBytes(envelope)).toBeLessThanOrEqual(NATIVE_TURN_KNOWN_MAX_BYTES);
+  });
+});
 
 describe("follow-up context size", () => {
   it("keeps old messages out of resume deltas while retaining scoped human answers", () => {

@@ -1,6 +1,9 @@
 import type { PaperclipTurnContext } from "@paperclipai/adapter-utils/server-utils";
 import { resolvePaperclipRunnerCursorMode, resolvePaperclipRunnerPiThinkingLevel } from "@paperclipai/adapter-utils";
 import { createHash } from "node:crypto";
+import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
+import { boundNativeExecutionContinuation, commandEnvelopeBytes, NATIVE_HANDOFF_CUT_NOTE_RESERVE_BYTES, NATIVE_TURN_KNOWN_MAX_BYTES, NativeTurnPromptExceedsCommandBoundError, type NativeContinuationReadState, type NativeContinuationCoverage, type NativePromptRefusalCause } from "./native-turn-budget.js";
+import { runnerApiOperation } from "./runner-api-catalog.js";
 import { buildNativeContinuationPrompt } from "./native-continuation.js";
 import { decideNativeContinuation, resolveSessionContinuity } from "./continued-session.js";
 import {
@@ -12,6 +15,7 @@ import {
   type CaseExecutionContext,
 } from "../case-context.js";
 import type {
+  NativeExecutionInput,
   NativeAcpxAgent,
   NativeAcpxPermissionMode,
   NativeCodexApprovalPolicy,
@@ -31,7 +35,7 @@ import type {
   StrictCompletionContractInput,
 } from "../../vendor/paperclip-runner/index.js";
 import {
-  parseNativeExecutionInput,
+  parseNativeExecutionInput, buildNativeModelEnvelope,
   canonicalNativeRuntimeContextDigest, PAPERCLIP_EXECUTION_FINISH_INSTRUCTION, PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION,
   resolveQualifiedAcpxProfile,
 } from "../../vendor/paperclip-runner/index.js";
@@ -70,6 +74,11 @@ export interface BuildNativeExecutionInput {
    * that legacy adapters place in their provider prompt.
    */
   wakePayload?: unknown;
+  /** Only paperclip_runner opts into its journal-byte admission contract. */
+  boundCommandBytes?: boolean;
+  continuationReadState?: NativeContinuationReadState;
+  /** Full-render cuts only: delta turns must retain their unbounded delivery baseline. */
+  onContinuationBudgeted?: (continuation: ExecutionContinuationEnvelope) => void;
   /** Additive source ownership emitted by the server task/wake builders. */
   turnContext?: unknown;
   /** Skill keys selected from the admitted, manager-authored GitHub configuration. */
@@ -216,9 +225,9 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
   const caseMarkdown = caseExecutionMarkdown(input.caseContext ?? null);
   const assignmentPrompt = caseMarkdown && !input.taskPrompt.includes(caseMarkdown)
     ? caseMarkdown + input.taskPrompt : input.taskPrompt;
-  const { taskContextNote, wakePrompt } = selectPaperclipPromptSections({
+  const promptSections = (payload: unknown) => selectPaperclipPromptSections({
     paperclipTaskMarkdownAssignment: assignmentPrompt,
-    paperclipWake: bootstrapWakePayload,
+    paperclipWake: payload,
     conversationMode: input.conversationMode,
   }, {
     resumedSession: false,
@@ -237,7 +246,9 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
   const externalChatSkillDescription = configuredGitHubSkills.length > 0
     ? `Configured GitHub instruction skills:\n${configuredGitHubSkills.map((skill) => `/${skill.runtimeName}`).join("\n")}`
     : null;
-  const taskPrompt = caseProjectionBootstrapPrefix(input.caseContext) + [
+  const composeTaskPrompt = (payload: unknown) => {
+    const { taskContextNote, wakePrompt } = promptSections(payload);
+    return caseProjectionBootstrapPrefix(input.caseContext) + [
     wakePrompt,
     // Durable task questions must survive the current provider turn.
     // Keep routing visible before deferred tool discovery; usage belongs in the tool schema.
@@ -249,6 +260,8 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
   ]
     .filter((section) => section.length > 0)
     .join("\n\n");
+  };
+  const taskPrompt = composeTaskPrompt(bootstrapWakePayload);
   const completionSources = !externalChatTurn && !input.conversationMode && input.taskPrompt.trim()
     ? verifiedCompletionSources(input.turnContext, input.completionContract.sources ?? [])
     : [];
@@ -273,6 +286,11 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
     runtimeContext.prompt.digest = createHash("sha256").update(runtimeContext.prompt.text).digest("hex");
     runtimeContext.aggregateDigest = canonicalNativeRuntimeContextDigest(runtimeContext);
   }
+  const composeContinuationPrompt = (wakePayload: unknown) => continuation.continue && input.previousTurn ? buildNativeContinuationPrompt({
+    wakePayload, promptOnly: continuation.promptOnly, previousRunId: input.previousTurn.runId,
+    previousIssue: input.previousTurn.task, previousGitHubReviewConfigurationKeys: input.previousTurn.githubReviewConfigurationKeys,
+    allowExternalChat: true, issue: input.issue, caseContext: input.caseContext, workflowCase,
+  }) : null;
   const prepared = {
     schema: input.grokEffort !== undefined || input.grokDisableWebSearch !== undefined ? "paperclip.native-execution-input.v10"
       : input.claudeEffort !== undefined ? "paperclip.native-execution-input.v9"
@@ -282,19 +300,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
       initialCommunicationGuidance: [input.initialCommunicationGuidance, input.freshSessionHandoff].filter(Boolean).join("\n\n"),
     } : {}),
     ...(continuation.continue && input.previousTurn ? {
-      continuationPrompt: buildNativeContinuationPrompt({
-        wakePayload: input.wakePayload,
-        promptOnly: continuation.promptOnly,
-        previousRunId: input.previousTurn.runId,
-        previousIssue: input.previousTurn.task,
-        previousGitHubReviewConfigurationKeys: input.previousTurn.githubReviewConfigurationKeys,
-        allowExternalChat: true,
-        issue: input.issue,
-        // A stored paperclipCase alone does not prove that the provider ever
-        // received it. Old/unknown projections take the full bootstrap path.
-        caseContext: input.caseContext,
-        workflowCase,
-      }),
+      continuationPrompt: composeContinuationPrompt(input.wakePayload),
     } : {}),
     executionMode,
     planningContext: input.planningContext ?? null,
@@ -411,7 +417,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
     credentialBindings: [],
     runtimeContext,
   };
-  return parseNativeExecutionInput(input.provider === "muse" ? { ...prepared,
+  const execution = parseNativeExecutionInput(input.provider === "muse" ? { ...prepared,
     schema: "paperclip.native-execution-input.v8", provider: { kind: "muse", model: null, binding: input.museBinding, bridgeRevision: "muse-v1" },
     workspace: { access: "none", cwd: null, repoUrl: null, repoRef: null, branchName: null },
     session: { ...prepared.session, driverKind: "muse_external", lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } }
@@ -420,8 +426,84 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
     workspace: { access: "none", cwd: null, repoUrl: null, repoRef: null, branchName: null },
     session: { ...prepared.session, driverKind: input.provider === "grok_bot" ? "grok_bot_mcp" : "openai_dot_mcp", lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } }
   } : prepared) as NativeExecutionInputV5 | NativeExecutionInputV6 | NativeExecutionInputV7 | NativeExecutionInputV8 | NativeExecutionInputV9 | NativeExecutionInputV10;
+  if (input.boundCommandBytes) {
+    const continuation = wake?.executionContinuation as ExecutionContinuationEnvelope | undefined;
+    const usesDelta = input.resumedSession === true && !!execution.continuationPrompt;
+    const refusalCause = protectedNativePromptCause(input.issue.description ?? "", input.taskPrompt, continuation, input.continuationReadState, input.interactionResponses);
+    const selectedBytes = () => commandEnvelopeBytes(input.resumedSession
+      ? buildNativeModelEnvelope(execution, { resumedSession: true }) : buildNativeModelEnvelope(execution))
+      + (usesDelta ? 0 : NATIVE_HANDOFF_CUT_NOTE_RESERVE_BYTES);
+    const measure = (value: ExecutionContinuationEnvelope) => {
+      // A retained session uses only its verified continuation prompt. Its full
+      // bootstrap is fallback data, not this turn's rendered/delivered history.
+      if (!usesDelta) {
+        if (value !== continuation) (value.coverage as NativeContinuationCoverage).nativeSessionId = input.normalizedSessionId ?? undefined;
+        execution.task.prompt = composeTaskPrompt({ ...(bootstrapWakePayload as Record<string, unknown>), executionContinuation: value });
+        if ("completionSources" in execution && execution.completionSources) execution.completionSources.promptSha256 = createHash("sha256").update(execution.task.prompt).digest("hex");
+      }
+      if ("continuationPrompt" in execution) execution.continuationPrompt = composeContinuationPrompt({ ...(input.wakePayload as Record<string, unknown>), executionContinuation: value });
+      return selectedBytes();
+    };
+    if (continuation?.version === 1) {
+      const bounded = boundNativeExecutionContinuation(continuation, measure, input.continuationReadState, operationId => {
+        try { return ["GET", "HEAD"].includes(runnerApiOperation(operationId).method); } catch { return false; }
+      }, refusalCause);
+      // Never replace the saved baseline with a full-snapshot cut on a delta
+      // turn: the next delta would resurrect history already in this session.
+      if (!usesDelta && bounded !== continuation) input.onContinuationBudgeted?.(bounded);
+    } else if (selectedBytes() > NATIVE_TURN_KNOWN_MAX_BYTES) {
+      throw new NativeTurnPromptExceedsCommandBoundError(refusalCause);
+    }
+  }
+  return execution;
 }
 
+
+function protectedNativePromptCause(description: string, assignment: string, continuation?: ExecutionContinuationEnvelope, readState?: NativeContinuationReadState, interactionResponses?: NativeInteractionResponseEnvelope[]): NativePromptRefusalCause {
+  const newest = continuation?.messages.findLast(message => message.authorType === "user" && !message.createdByRunId && !message.deleted);
+  const read = new Set(readState?.readCommentIds ?? []);
+  const candidates: NativePromptRefusalCause[] = [
+    { kind: "task_description", bytes: Buffer.byteLength(description) },
+    { kind: "protected_input", bytes: Buffer.byteLength(description ? assignment.replace(description, "") : assignment) },
+    ...[...(continuation?.humanResponses ?? []).map(answer => answer.result), ...(interactionResponses ?? []).map(answer => answer.response.result)]
+      .map(result => ({ kind: "human_response" as const, bytes: Buffer.byteLength(JSON.stringify(result) ?? "null") })),
+    ...(continuation?.messages.filter(message => message === newest || !read.has(message.id) || continuation.originCommentIds.includes(message.id)).map(message => ({
+      kind: message === newest ? "newest_message" as const : !read.has(message.id) ? "unread_message" as const : "protected_input" as const,
+      bytes: Buffer.byteLength(message.body),
+    })) ?? []),
+  ];
+  return candidates.sort((a, b) => b.bytes - a.bytes)[0]!;
+}
+
+/** Existing continuity-break hook calls this only after exact resume failed,
+ * before Runner composes the fresh envelope. No unused bootstrap can refuse a delta.
+ */
+export function budgetNativeFreshFallback(execution: NativeExecutionInput, wakePayload: unknown, readState?: NativeContinuationReadState, caseContext?: CaseExecutionContext): ExecutionContinuationEnvelope | null {
+  const wake = wakePayload && typeof wakePayload === "object" ? wakePayload as Record<string, unknown> : {};
+  const continuation = wake.executionContinuation as ExecutionContinuationEnvelope | undefined;
+  if (continuation?.version !== 1) {
+    if (commandEnvelopeBytes(buildNativeModelEnvelope(execution)) > NATIVE_TURN_KNOWN_MAX_BYTES) throw new NativeTurnPromptExceedsCommandBoundError(
+      protectedNativePromptCause(execution.task.description ?? "", execution.task.prompt, undefined, readState, execution.interactionResponses));
+    return null;
+  }
+  const payload = caseWakeWithInstructionReference(wakePayload, caseContext);
+  const render = (value: ExecutionContinuationEnvelope) => selectPaperclipPromptSections({
+    paperclipWake: { ...(payload as Record<string, unknown>), executionContinuation: value },
+    paperclipTaskMarkdownAssignment: "Task assignment is already in the full prompt.",
+    conversationMode: execution.provider.kind === "pi_rpc" && execution.provider.conversationMode === true,
+  }, { resumedSession: false, includeCommunicationGuidance: false, nativeWakeReaderAvailable: true }).wakePrompt;
+  const originalPrompt = execution.task.prompt, originalWake = render(continuation);
+  if (!originalWake || !originalPrompt.includes(originalWake)) throw new NativeTurnPromptExceedsCommandBoundError();
+  const cause = protectedNativePromptCause(execution.task.description ?? "", originalPrompt.replace(originalWake, ""), continuation, readState, execution.interactionResponses);
+  const bounded = boundNativeExecutionContinuation(continuation, value => {
+    if (value !== continuation) (value.coverage as NativeContinuationCoverage).nativeSessionId = execution.session.normalizedSessionId ?? undefined;
+    execution.task.prompt = originalPrompt.replace(originalWake, render(value));
+    return commandEnvelopeBytes(buildNativeModelEnvelope(execution)) + NATIVE_HANDOFF_CUT_NOTE_RESERVE_BYTES;
+  }, readState, operationId => { try { return ["GET", "HEAD"].includes(runnerApiOperation(operationId).method); } catch { return false; } }, cause);
+  if ("completionSources" in execution) delete execution.completionSources;
+  if ("continuationPrompt" in execution) execution.continuationPrompt = null;
+  return bounded;
+}
 
 /** Verify source identities and revisions, never guess provenance from requirement text. */
 function verifiedCompletionSources(

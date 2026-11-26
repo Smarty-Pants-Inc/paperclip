@@ -1,3 +1,4 @@
+import { NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, nativePromptRefusalCause, nativePromptRefusalDetail, type NativePromptRefusalCause } from "../native-runtime/native-turn-budget.js";
 import type { IssueCommentMetadata, IssueCommentPresentation, TaskInterruptionPresentation } from "@paperclipai/shared";
 import { ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE } from "../environment-provider-unavailable-error.js";
 import { PROJECT_STORAGE_ENVIRONMENT_INCOMPATIBLE } from "../project-storage-environment-reason.js";
@@ -68,8 +69,13 @@ export function classifiedRunFailure(run: {
   errorCode?: string | null;
   failedStage?: string | null;
   previousSessionUnconfirmed?: boolean;
-}): NonNullable<TaskInterruptionPresentation["failure"]> {
+  resultJson?: Record<string, unknown> | null;
+}): NonNullable<TaskInterruptionPresentation["failure"]> & { cause?: NativePromptRefusalCause } {
   let code = run.errorCode ?? "run_failed";
+  if (code === NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND) {
+    const cause = nativePromptRefusalCause(run.resultJson?.nativeTurnPromptRefusalCause);
+    return { code, title: "Task history is too large", detail: nativePromptRefusalDetail(cause), ...(cause ? { cause } : {}) };
+  }
   if (code === "native_predecessor_retirement_unproven"
       || code === "native_session_interrupted" && run.previousSessionUnconfirmed)
     code = "previous_session_unconfirmed";

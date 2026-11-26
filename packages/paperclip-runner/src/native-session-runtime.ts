@@ -357,9 +357,10 @@ export interface ExecuteNativeSessionOptions {
   getFreshSessionHandoff?: () => Promise<string | null>;
   /**
    * Seals this run's first-turn input immediately before `turn.start` and
-   * returns user messages that arrived while the run was preparing.
+   * returns user messages that arrived while the run was preparing. The renderer
+   * previews the exact turn text (including attachments) for pre-seal admission.
    */
-  getFirstTurnQueuedInput?: () => Promise<string | null>;
+  getFirstTurnQueuedInput?: (renderTurnInput: (queuedInput: string | null) => string) => Promise<string | null>;
   prepareWakeAttachmentPrompt?: () => Promise<string>;
   /**
    * Steered messages the provider acknowledged but the model never read, read
@@ -3501,13 +3502,18 @@ export async function executeNativeSession(
           }
           if (!dispositionOnlyRecovery || effectFreeInitialAcpxTurn) {
             const attachments = await options.prepareWakeAttachmentPrompt?.();
-            const queuedInput = await options.getFirstTurnQueuedInput?.();
-            const supplemental = [attachments, queuedInput].filter(Boolean).join("\n\n");
-            if (supplemental && "task" in modelEnvelope) {
-              modelEnvelope.task.prompt = `${modelEnvelope.task.prompt}\n\n${supplemental}`;
-            } else if (supplemental && "events" in modelEnvelope) {
-              modelEnvelope.events = `${modelEnvelope.events}\n\n${supplemental}`;
-            }
+            const withSupplementalInput = (queuedInput: string | null): typeof modelEnvelope => {
+              const supplemental = [attachments, queuedInput].filter(Boolean).join("\n\n");
+              if (!supplemental) return modelEnvelope;
+              const envelope = structuredClone(modelEnvelope);
+              if ("task" in envelope) envelope.task.prompt = `${envelope.task.prompt}\n\n${supplemental}`;
+              else if ("events" in envelope) envelope.events = `${envelope.events}\n\n${supplemental}`;
+              return envelope;
+            };
+            // The server can admit these exact composed bytes before it seals
+            // queued input. No provider I/O or durable consumption during preview.
+            const queuedInput = await options.getFirstTurnQueuedInput?.(queued => JSON.stringify(withSupplementalInput(queued)));
+            modelEnvelope = withSupplementalInput(queuedInput ?? null);
           }
           // A recovered session is shared provider state: prove ownership with
           // the fenced checkpoint right before the submit. A new session's

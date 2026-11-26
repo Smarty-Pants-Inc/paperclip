@@ -11,6 +11,7 @@ import { PROVIDER_TURN_ACCEPTED_EVENT_TYPES } from "./provider-attempt-outcome.j
 import { reconcileContinuousSessionInput } from "./continuous-session-input.js";
 import { queuedInteractionId, readQueuedInteractionResponse } from "../queued-interaction-response.js";
 import { resolveSessionContinuity } from "./continued-session.js";
+import { commandTextBytes, FIRST_TURN_QUEUED_INPUT_MAX_BYTES, NativeTurnPromptExceedsCommandBoundError } from "./native-turn-budget.js";
 
 /**
  * Queued input for a run's first provider turn.
@@ -35,8 +36,6 @@ export const FIRST_TURN_QUEUED_INPUT_SCHEMA = "paperclip.first-turn-queued-input
 const DEFERRED_WAKE_STATUS = "deferred_issue_execution";
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const COMMENT_WAKE_REASONS = new Set(["issue_commented", "issue_reopened_via_comment", "issue_comment_mentioned"]);
-const MAX_COMMENT_CHARS = 16_000;
-const MAX_TOTAL_CHARS = 48_000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export type FirstTurnQueuedInputReceipt = {
@@ -187,23 +186,20 @@ function ownsFirstTurnIssue(issue: { executionRunId: string | null; assigneeAgen
 
 export function renderFirstTurnQueuedInput(messages: readonly QueuedMessage[]): string | null {
   if (messages.length === 0) return null;
-  let remaining = MAX_TOTAL_CHARS;
-  const sections = messages.map((message, index) => {
-    const limit = Math.max(0, Math.min(MAX_COMMENT_CHARS, remaining));
-    // A card carries typed JSON, not a comment the model can read for the rest.
-    const truncated = message.kind !== "interaction" && message.body.length > limit;
-    const body = truncated ? message.body.slice(0, limit) : message.body;
-    remaining -= body.length;
-    return [
-      `[Message ${index + 1} of ${messages.length} · ${message.kind ?? "comment"} ${message.id} · ${message.createdAt.toISOString()}]`,
-      body,
-      ...(truncated ? [`(Truncated here. Read comment ${message.id} on the task for the rest.)`] : []),
-    ].join("\n");
-  });
-  return [
+  const text = [
     "New messages from the user arrived while this run was starting. They were not in the request above. Handle each of them in this turn, oldest first, together with that request:",
-    ...sections,
+    ...messages.map((message, index) => [
+      `[Message ${index + 1} of ${messages.length} · ${message.kind ?? "comment"} ${message.id} · ${message.createdAt.toISOString()}]`,
+      message.body,
+    ].join("\n")),
   ].join("\n\n");
+  // A person's words are indivisible, including card answers. Enforce the
+  // queued share BEFORE claimFirstTurnQueuedInput writes its receipt: an
+  // oversized batch remains owed, never a clipped or silently consumed input.
+  const bytes = commandTextBytes(text);
+  if (bytes > FIRST_TURN_QUEUED_INPUT_MAX_BYTES)
+    throw new NativeTurnPromptExceedsCommandBoundError({ kind: "queued_input", bytes });
+  return text;
 }
 
 /**
@@ -252,6 +248,7 @@ async function readQueuedMessages(
 export async function claimFirstTurnQueuedInput(
   db: Db,
   binding: { companyId: string; runId: string; issueId: string; agentId: string },
+  validateTurnInput?: (text: string | null) => void,
 ): Promise<string | null> {
   await reconcileContinuousSessionInput(db, binding);
   return db.transaction(async (tx) => {
@@ -289,7 +286,9 @@ export async function claimFirstTurnQueuedInput(
         const response = await readFirstTurnInteraction(tx as unknown as Db, binding, wake, run.responsibleUserId);
         if (response && receipt.interactionIds?.includes(response.id)) messages.push(response);
       }
-      return render(messages);
+      const text = await render(messages);
+      validateTurnInput?.(text);
+      return text;
     }
     // Conversation input pending at this seal is part of the submitted user
     // message too. Only later arrivals belong to the live-turn steer path.
@@ -319,6 +318,7 @@ export async function claimFirstTurnQueuedInput(
     if (handback) taken.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
     const takenInteractions = interactions.filter(message => !pressedAt || message.createdAt.getTime() <= Date.parse(pressedAt));
     const text = await render([...taken, ...takenInteractions]);
+    validateTurnInput?.(text);
     // Seal even when nothing joined: later messages wait for the turn boundary.
     const sealed: FirstTurnQueuedInputReceipt = {
       schema: FIRST_TURN_QUEUED_INPUT_SCHEMA,
