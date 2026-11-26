@@ -1255,6 +1255,17 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       expect(await retryRunStatus(f)).toBe("scheduled_retry");
     });
 
+    it("refuses a connected-chat task even when the agent holds a tasks:retry grant", async () => {
+      const f = await seedIssueWithRetry();
+      await grant(f, "board-user");
+      await db.update(issues).set({ originKind: "chat_channel" }).where(eq(issues.id, f.issueId));
+
+      const res = await retry(f);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(await retryRunStatus(f)).toBe("scheduled_retry");
+    });
+
     it("caps an agent's Retries on one task per day", async () => {
       const f = await seedIssueWithRetry();
       await grant(f, "board-user");
