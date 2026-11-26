@@ -1,12 +1,13 @@
 import { isNativeSessionId } from "../native-runtime/index.js";
-import { and, desc, eq } from "drizzle-orm";
-import { agentConfigRevisions, type Db, type agents, type agentTaskSessions, type heartbeatRuns, type issues, type projects } from "@paperclipai/db";
+import { and, desc, eq, isNull, lte, ne, or } from "drizzle-orm";
+import { agentConfigRevisions, heartbeatRuns, type Db, type agents, type agentTaskSessions, type issues, type projects } from "@paperclipai/db";
 import type { AiConnectionBinding, AiRuntimeConnectionBinding, ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { getServerAdapter } from "../../adapters/index.js";
 import type { prepareManagedAiRuntime } from "../ai-connection-runtime.js";
 import { aiConnectionSessionCompatibilityInputs, managedAiSessionIdentityCompatible } from "../ai-connection-session.js";
 import { createNativeSessionHandoffLoader } from "../native-runtime/native-session-handoff.js";
-import { decideNativeContinuation, resolveSessionContinuity } from "../native-runtime/continued-session.js";
+import { decideNativeContinuation, isWarmRecoveryRefusal, resolveSessionContinuity } from "../native-runtime/continued-session.js";
+import { isChatTask } from "../fresh-continuation-retry-fold.js";
 import { deriveTaskKey } from "./run-preparation.js";
 import { queuedCommentIdsFromRunContext } from "../../lib/queued-comment-context.js";
 import { agentInstructionsService } from "../agent-instructions.js";
@@ -231,11 +232,27 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
   const continuableConfigChange = continuousPi && sessionConfigFreshness.changedCategories.length > 0 &&
     sessionConfigFreshness.changedCategories.every(category =>
       ["instructions", "environment", "envBindings", "runtimeSkills"].includes(category));
+  let warmRecoveryResetRequired = false;
+  const retainedSessionId = readNonEmptyString(taskSessionDecodedParams?.sessionId) ?? taskSession?.sessionDisplayId;
+  if (continuousPi && taskSession && retainedSessionId && issueRef && context.forceFreshSession === true &&
+      (context.source === "execution.reconciled" || context.wakeReason === "issue_recovery_action_restored") &&
+      !(await isChatTask(db, agent.companyId, issueRef.id))) {
+    // lastRunId can lag a failed pre-claim turn. Inspect the newest run on this
+    // exact session, including progress barriers, not an older failed attempt.
+    const [previous] = await db.select({ status: heartbeatRuns.status, error: heartbeatRuns.error,
+      errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.agentId, agent.id), ne(heartbeatRuns.id, run.id),
+      lte(heartbeatRuns.createdAt, run.createdAt), or(eq(heartbeatRuns.issueId, issueRef.id), eq(heartbeatRuns.nativeIssueId, issueRef.id)),
+      or(isNativeSessionId(retainedSessionId) ? eq(heartbeatRuns.nativeSessionId, retainedSessionId) : undefined,
+        and(isNull(heartbeatRuns.nativeSessionId), or(eq(heartbeatRuns.sessionIdBefore, retainedSessionId), eq(heartbeatRuns.sessionIdAfter, retainedSessionId)))),
+    )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+    warmRecoveryResetRequired = isWarmRecoveryRefusal(previous);
+  }
   let resetTaskSession =
     context.workspaceSelectionChanged === true || shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
   if (decideNativeContinuation({
     provider: runtimeConfig.provider, sessionContinuity: runtimeConfig.sessionContinuity, hasSession: taskSession != null, wakeReset: true,
-    resetRequired: context.explicitFreshSession === true || context.conversationReset === true ||
+    resetRequired: warmRecoveryResetRequired || context.explicitFreshSession === true || context.conversationReset === true ||
       (context.workspaceSelectionChanged === true && (agent.adapterType !== "paperclip_runner" || runtimeConfig.provider !== "pi_rpc")) ||
       sessionConfigFreshness.reasons.some(reason => reason !== wakeSessionResetReason &&
         !(continuableConfigChange && reason.startsWith("effective run configuration changed: "))) ||

@@ -8,6 +8,7 @@ import { caseInstructionAlreadyRepresented } from "../case-context.js";
 export function buildNativeContinuationPrompt(input: {
   wakePayload: unknown;
   promptOnly?: boolean;
+  continuousPi?: boolean;
   previousRunId: string;
   issue: { title: string; description: string | null };
   previousIssue: { title: string; description: string | null };
@@ -19,8 +20,11 @@ export function buildNativeContinuationPrompt(input: {
 }): string | null {
   const wake = normalizePaperclipWakePayload(input.wakePayload);
   if (input.promptOnly && wake) {
-    const messages = [...(wake.executionContinuation?.messages ?? wake.executionContinuation?.resumeDelta?.messages ?? []), ...wake.comments];
-    return wake.commentIds.map(id => wake.comments.find(comment => comment.id === id)?.fullBody ?? messages.find(message => message.id === id)!.body).join("\n\n");
+    const delta = wake.executionContinuation?.resumeDelta;
+    const messages = delta?.messages ?? [...(wake.executionContinuation?.messages ?? []), ...wake.comments];
+    const commentIds = wake.commentIds.filter(id => !delta || messages.some(message => message.id === id));
+    return commentIds.map(id => wake.comments.find(comment => comment.id === id)?.fullBody ?? messages.find(message => message.id === id)!.body).join("\n\n")
+      || "Continue the task; nothing new arrived since your last turn.";
   }
   const continuation = wake?.executionContinuation;
   const delta = continuation?.resumeDelta;
@@ -57,7 +61,7 @@ export function buildNativeContinuationPrompt(input: {
   // Other provider, attachment, question, approval, and recovery paths keep
   // their specialized framing. A matching prior run still gates every delta.
   if (rawWake.chatCompletionUpdates || (wake.externalChatProvider && !externalChat) ||
-    (!['issue_commented', 'issue_children_completed'].includes(wake.reason ?? '') && !caseHandoff &&
+    ((!input.continuousPi || hasAttachmentContext) && !['issue_commented', 'issue_children_completed'].includes(wake.reason ?? '') && !caseHandoff &&
       !(externalChat && wake.reason === "External chat message received")) ||
     wake.fallbackFetchNeeded || wake.truncated || wake.recovery || continuation?.interruptedRunId ||
     (wake.externalChatExecutionBound && !externalChat) || wake.externalChatQuestionResponse ||
@@ -96,6 +100,7 @@ export function buildNativeContinuationPrompt(input: {
   const earlierRead = wake.comments.filter((comment) => comment.readByEarlierTurn && comment.id
     && events.messages.some((message) => message.id === comment.id)).map((comment) => comment.id!);
   if (earlierRead.length > 0) Object.assign(events, { readByEarlierTurn: { messageIds: earlierRead, note: PAPERCLIP_EARLIER_READ_COMMENT_NOTE } });
-  if (!events.messages.length && !humanResponses.length && !wake.childIssueSummaries.length && !Object.keys(taskChanges).length && !input.workflowCase) return null;
+  if (!events.messages.length && !humanResponses.length && !wake.childIssueSummaries.length && !Object.keys(taskChanges).length && !input.workflowCase)
+    return input.continuousPi ? "Continue the task; nothing new arrived since your last turn." : null;
   return JSON.stringify(events);
 }

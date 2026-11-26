@@ -11,6 +11,14 @@ export function sessionCannotContinue(run: { error?: string | null; errorCode?: 
     || currentRunFailureText(run)?.trim() === "native_controller_recovery_missing_evidence:retained_sandbox_binding";
 }
 
+/** Only the current warm-recovery refusal, never an earlier model/tool failure in a chained error. */
+export function isWarmRecoveryRefusal(run: { status: string; error?: string | null; errorCode?: string | null; resultJson?: unknown } | undefined) {
+  if (run?.status !== "failed") return false;
+  const failure = (currentRunFailureText(run) ?? run.errorCode ?? "").trim();
+  return /^(?:runner_state_identity_mismatch:\s*)?(?:remote_warm_session_not_idle|current_run_not_admitted|prior_owner_terminal_state_indeterminate|native_continuation_requires_reconciliation)(?:$|[;:\s])/.test(failure)
+    || failure.startsWith("native_controller_recovery_unsupported:");
+}
+
 export function resolveSessionContinuity(provider: unknown, setting: unknown) {
   return setting === "continuous" || setting === "paperclip" ? setting : provider === "pi_rpc" ? "continuous" : "paperclip";
 }
@@ -36,19 +44,22 @@ export function decideNativeContinuation(input: {
   const hasAttachments = (raw.attachmentOmissions != null && (!Array.isArray(raw.attachmentOmissions) || raw.attachmentOmissions.length > 0)) ||
     (Array.isArray(raw.comments) && raw.comments.some(comment => comment && typeof comment === "object" &&
       comment.attachments != null && (!Array.isArray(comment.attachments) || comment.attachments.length > 0)));
-  const messages = [...(wake?.executionContinuation?.messages ?? wake?.executionContinuation?.resumeDelta?.messages ?? []), ...(wake?.comments ?? [])];
-  const fullBodies = !!wake && wake.commentIds.every(id => wake.comments.some(comment => comment.id === id && typeof comment.fullBody === "string"));
-  return { continue: retained, promptOnly: retained && mode === "continuous" && !hasAttachments && !input.taskChanged && !!wake && ["issue_commented", "issue_reopened_via_comment", "issue_continuation_needed"].includes(wake.reason ?? "") &&
+  const delta = wake?.executionContinuation?.resumeDelta;
+  const messages = delta?.messages ?? [...(wake?.executionContinuation?.messages ?? []), ...(wake?.comments ?? [])];
+  // A matching delta is authoritative: stale wake comment IDs are not new input.
+  const commentIds = wake?.commentIds.filter(id => !delta || messages.some(message => message.id === id)) ?? [];
+  const fullBodies = !!wake && commentIds.every(id => wake.comments.some(comment => comment.id === id && typeof comment.fullBody === "string"));
+  return { continue: retained, promptOnly: retained && input.provider === "pi_rpc" && mode === "continuous" && !hasAttachments && !input.taskChanged && !!wake &&
     (fullBodies || (!raw.truncated && !raw.fallbackFetchNeeded && !wake.comments.some(comment => comment.bodyTruncated))) &&
     (!wake.executionContinuation?.resumeDelta || wake.executionContinuation.resumeDelta.baseRunId === input.previousRunId) &&
     // The agent's own previous replies are already in its session, and the page's fresh-session
     // marker is not input; neither blocks the person's prompt.
-    !wake.executionContinuation?.resumeDelta?.messages.some(message => !wake.commentIds.includes(message.id) && !(message.authorType === "agent" && message.authorId === input.agentId) &&
+    !delta?.messages.some(message => !commentIds.includes(message.id) && !(message.authorType === "agent" && message.authorId === input.agentId) &&
       !(message.authorType === "system" && !message.authorId && message.freshSessionMarker === true && message.body === NATIVE_FRESH_SESSION_MARKER)) &&
     !wake.childIssueSummaries.length && !wake.executionContinuation?.humanResponses?.length && !wake.unresolvedBlockerIssueIds.length &&
     !wake.interactionId && !wake.questionResponse && !wake.externalChatQuestionResponse && !wake.recovery &&
     !wake.executionStage && !wake.taskWatchdog && !wake.livenessContinuation && !wake.dispositionRepair &&
     !wake.documentReviewContext && !wake.planReviewContext && !(wake.annotationDeltas?.length) && !raw.mcpAppContext && !raw.chatCompletionUpdates && !raw.extraContext &&
-    !wake.agentMessage && !wake.skillTest && wake.commentIds.length > 0 &&
-    wake.commentIds.every(id => messages.find(message => message.id === id)?.authorType === "user") };
+    !wake.agentMessage && !wake.skillTest && (commentIds.length > 0 || !!delta) &&
+    commentIds.every(id => messages.find(message => message.id === id)?.authorType === "user") };
 }

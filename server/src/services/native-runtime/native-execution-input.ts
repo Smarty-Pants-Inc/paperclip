@@ -285,6 +285,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
       continuationPrompt: buildNativeContinuationPrompt({
         wakePayload: input.wakePayload,
         promptOnly: continuation.promptOnly,
+        continuousPi: input.provider === "pi_rpc" && continuity === "continuous",
         previousRunId: input.previousTurn.runId,
         previousIssue: input.previousTurn.task,
         previousGitHubReviewConfigurationKeys: input.previousTurn.githubReviewConfigurationKeys,

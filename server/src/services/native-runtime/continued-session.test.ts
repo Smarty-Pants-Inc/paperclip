@@ -2,7 +2,7 @@ import { expect, it } from "vitest";
 import type { Db } from "@paperclipai/db";
 import { buildPaperclipWakePayload } from "../heartbeat/run-preparation.js";
 import { shouldResetTaskSessionForWake } from "../heartbeat/run-state.js";
-import { decideNativeContinuation, NATIVE_FRESH_SESSION_MARKER, sessionCannotContinue, withPiOpenTurnDefault } from "./continued-session.js";
+import { decideNativeContinuation, isWarmRecoveryRefusal, NATIVE_FRESH_SESSION_MARKER, sessionCannotContinue, withPiOpenTurnDefault } from "./continued-session.js";
 import { configuredEnvironmentProjection } from "../../vendor/paperclip-runner/index.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
@@ -32,6 +32,19 @@ it("recognizes only an unrecoverable session's code or retained-binding refusal"
     resultJson: { nativeExactResumeRefusal: { refusal: "native_controller_recovery_missing_evidence:retained_sandbox_binding" } } })).toBe(true);
   expect(sessionCannotContinue({ errorCode: "adapter_failed", error: "ordinary provider failure" })).toBe(false);
   expect(sessionCannotContinue({ errorCode: "adapter_failed", error: "expected native_controller_recovery_missing_evidence:retained_sandbox_binding" })).toBe(false);
+});
+it("classifies only the failed run's current warm-recovery refusal", () => {
+  const run = { status: "failed", errorCode: "native_continuation_requires_reconciliation", error: "ordinary model/tool failure" };
+  expect(isWarmRecoveryRefusal(run)).toBe(false);
+  expect(isWarmRecoveryRefusal({ ...run, error: "expected remote_warm_session_not_idle in tool output" })).toBe(false);
+  expect(isWarmRecoveryRefusal({ ...run, error: "remote_warm_session_not_idle_suffix" })).toBe(false);
+  expect(isWarmRecoveryRefusal({ ...run, status: "succeeded", error: "remote_warm_session_not_idle" })).toBe(false);
+  expect(isWarmRecoveryRefusal({ ...run, error: "remote_warm_session_not_idle", resultJson: {
+    nativeExactResumeRefusal: { refusal: "ordinary current provider failure" },
+  } })).toBe(false);
+  expect(isWarmRecoveryRefusal({ ...run, error: "ordinary earlier provider failure; exact checkpoint resume refused: remote_warm_session_not_idle", resultJson: {
+    nativeExactResumeRefusal: { refusal: "runner_state_identity_mismatch: remote_warm_session_not_idle" },
+  } })).toBe(true);
 });
 it("honors explicit fresh-session resets under continuous", () => {
   const context = { forceFreshSession: true, explicitFreshSession: true };
@@ -74,6 +87,53 @@ it("retains recovery history, sends exact comments, and preserves other unseen e
   const mixed = { ...wakePayload, executionContinuation: { ...wakePayload.executionContinuation, resumeDelta: { baseRunId: "prior", messages: [...messages, { ...messages[0], id: "other", body: "Unseen event" }] } } };
   expect(JSON.parse(buildNativeExecutionInput({ ...args, wakePayload: mixed }).continuationPrompt!).messages).toHaveLength(2);
   expect(buildNativeExecutionInput({ ...args, sessionContinuity: "paperclip" }).continuationPrompt).toBe(JSON.stringify({ messages }));
+});
+it.each(["issue_status_changed", "issue_continuation_needed", "issue_commented"])("sends only the new prompt for a retained Pi session woken by %s", reason => {
+  const task = { id: "issue", identifier: "TASK-1", title: "Original task", description: null, workMode: "standard" };
+  const messages = [{ id: "new", body: "New direction", authorType: "user", authorId: "board" }];
+  const wakePayload = { reason, commentIds: ["new"], comments: [], executionContinuation: {
+    version: 1, messages: [{ id: "old", body: "OLD HISTORY", authorType: "user" }, ...messages], resumeDelta: { baseRunId: "prior", messages },
+  } };
+  const input: Parameters<typeof buildNativeExecutionInput>[0] = {
+    companyId: "company", runId: "next", agentId: "agent", issue: task, taskPrompt: "OLD BRIEF", provider: "pi_rpc",
+    normalizedSessionId: "session", resumedSession: true, previousTurn: { runId: "prior", task }, wakePayload,
+    workspace: { id: "workspace", cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null }, runtimeContext: nativeRuntimeContextFixture(),
+    completionContract: { id: "contract", sha256: "a".repeat(64), schemaVersion: "paperclip.run-result.v1", contract: {
+      revision: "1", objective: "Continue", criteria: [{ id: "reply", requirement: "Reply" }],
+    } },
+  };
+  expect(decideNativeContinuation({ provider: "pi_rpc", hasSession: true, previousRunId: "prior", wakePayload }).promptOnly).toBe(true);
+  expect(buildNativeExecutionInput(input).continuationPrompt).toBe("New direction");
+  const statusMessage = { id: "status", body: "Status changed to in progress", authorType: "system" };
+  const statusWake = { ...wakePayload, commentIds: [], executionContinuation: { ...wakePayload.executionContinuation,
+    resumeDelta: { baseRunId: "prior", messages: [statusMessage] } } };
+  expect(JSON.parse(buildNativeExecutionInput({ ...input, wakePayload: statusWake }).continuationPrompt!)).toEqual({ messages: [statusMessage] });
+  if (reason !== "issue_commented") expect(buildNativeExecutionInput({ ...input, wakePayload: { ...statusWake,
+    attachmentOmissions: [{ commentId: "status", notice: "Unavailable file" }],
+  } }).continuationPrompt).toBeNull();
+  expect(decideNativeContinuation({ provider: "codex", sessionContinuity: "continuous", hasSession: true, previousRunId: "prior", wakePayload }).promptOnly).toBe(false);
+  expect(buildNativeExecutionInput({ ...input, resumedSession: false }).continuationPrompt).toBeUndefined();
+  expect(decideNativeContinuation({ provider: "pi_rpc", hasSession: true, resetRequired: true, previousRunId: "prior", wakePayload }).promptOnly).toBe(false);
+});
+it.each(["issue_continuation_needed", "issue_status_changed"])("does not replay history for an empty retained Pi delta on %s", reason => {
+  const task = { id: "issue", identifier: "TASK-1", title: "Original task", description: null, workMode: "standard" };
+  const wakePayload = { reason, executionContinuation: { version: 1,
+    messages: [{ id: "old", body: "OLD ASK DO NOT REPEAT", authorType: "user" }], resumeDelta: { baseRunId: "prior", messages: [] },
+  } };
+  const input: Parameters<typeof buildNativeExecutionInput>[0] = {
+    companyId: "company", runId: "next", agentId: "agent", issue: task, taskPrompt: "OLD BRIEF", provider: "pi_rpc",
+    normalizedSessionId: "session", resumedSession: true, previousTurn: { runId: "prior", task }, wakePayload,
+    workspace: { id: "workspace", cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null }, runtimeContext: nativeRuntimeContextFixture(),
+    completionContract: { id: "contract", sha256: "a".repeat(64), schemaVersion: "paperclip.run-result.v1", contract: {
+      revision: "1", objective: "Continue", criteria: [{ id: "reply", requirement: "Reply" }],
+    } },
+  };
+  expect(decideNativeContinuation({ provider: "pi_rpc", hasSession: true, previousRunId: "prior", wakePayload }).promptOnly).toBe(true);
+  expect(buildNativeExecutionInput(input).continuationPrompt).toBe("Continue the task; nothing new arrived since your last turn.");
+  const staleCommentWake = { ...wakePayload, commentIds: ["old"], comments: [{ id: "old", body: "OLD ASK DO NOT REPEAT", fullBody: "OLD ASK DO NOT REPEAT", author: { type: "user" } }] };
+  expect(buildNativeExecutionInput({ ...input, wakePayload: staleCommentWake }).continuationPrompt).toBe("Continue the task; nothing new arrived since your last turn.");
+  expect(buildNativeExecutionInput({ ...input, previousTurn: { runId: "unrelated", task } }).continuationPrompt).toBeNull();
+  expect(buildNativeExecutionInput({ ...input, sessionContinuity: "paperclip" }).continuationPrompt).toBeNull();
 });
 it("keeps a reopened task's next prompt bare when only the agent's own reply is new", () => {
   const wake = (authorId: string) => { const messages = [{ id: "r", body: "Reply", authorType: "agent", authorId }, { id: "c", body: "Next", authorType: "user", authorId: "board" }]; return { reason: "issue_reopened_via_comment", commentIds: ["c"], comments: [], executionContinuation: { version: 1, messages, resumeDelta: { baseRunId: "prior", messages } } }; };

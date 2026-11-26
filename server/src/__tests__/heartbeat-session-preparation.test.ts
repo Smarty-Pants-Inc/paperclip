@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, agentTaskSessions, authUsers, companies, companyMemberships, createDb, executionWorkspaces, environments, heartbeatRuns, issueComments, issues, plugins, projects } from "@paperclipai/db";
+import { agents, agentTaskSessions, authUsers, companies, companyMemberships, createDb, executionWorkspaces, environments, heartbeatRuns, issueComments, issueRecoveryActions, issues, plugins, projects } from "@paperclipai/db";
 import { getServerAdapter, registerServerAdapter, unregisterServerAdapter, type AdapterExecutionContext } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
@@ -80,6 +80,12 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     const run = await heartbeat.wakeup(f.agentId, {
       source: "on_demand", triggerDetail: "manual", reason: "manual",
       payload: { issueId: f.issueId }, contextSnapshot: { issueId: f.issueId, ...context },
+      ...(context.source === "execution.reconciled" ? {
+        source: "automation", triggerDetail: "system", reason: "issue_recovery_action_restored",
+        requestedByActorType: "system", requestedByActorId: "execution-recovery",
+        idempotencyKey: `execution-reconciliation:${context.recoveryActionId}`,
+        payload: { issueId: f.issueId, recoveryActionId: context.recoveryActionId },
+      } : {}),
     });
     expect(run).not.toBeNull();
     await heartbeat.drainActiveRunExecutions();
@@ -218,6 +224,52 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       expect(retries.map(input => input.runtime.sessionId)).toEqual([fresh ? null : sessionId]);
     } finally { await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false }); }
   });
+  it.each([
+    { failure: "runner_state_identity_mismatch: remote_warm_session_not_idle", chat: false, fresh: true },
+    { failure: "runner_state_identity_mismatch: remote_warm_session_not_idle", chat: true, fresh: false },
+    { failure: "ordinary model/tool failure", chat: false, fresh: false },
+    { failure: "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; warm_recovery_refused=current_run_not_admitted", chat: false, fresh: true },
+    { failure: "native_controller_recovery_unsupported:metadata_format", chat: false, fresh: true },
+    { failure: "native_continuation_requires_reconciliation", chat: false, fresh: true },
+    { failure: "current_run_not_admitted", chat: false, fresh: true },
+  ].flatMap(row => [true, false].map(reconciled => ({ ...row, reconciled }))))("stock reconciliation of a continuous Pi session: $failure, chat=$chat, fresh=$fresh, reconciled=$reconciled", async ({ failure, chat, fresh, reconciled }) => {
+    const f = await seed(), sessionId = randomUUID();
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", fixtureSessionId: sessionId } })
+      .where(eq(agents.id, f.agentId));
+    if (chat) await db.update(issues).set({ originKind: "chat_channel" }).where(eq(issues.id, f.issueId));
+    await execute(f);
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorUserId: f.userId,
+      body: "SAVED WORK: use the completed analysis", createdAt: new Date(Date.now() - 1_000) });
+    // A refused pre-claim turn does not advance taskSession.lastRunId.
+    const [failed] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      nativeSessionId: sessionId, nativeIssueId: f.issueId, status: "failed", finishedAt: new Date(),
+      error: failure, errorCode: "adapter_failed", contextSnapshot: { issueId: f.issueId } }).returning();
+    // Fail again if session preparation sends this non-chat recovery into the refused session.
+    const adapter = getServerAdapter(adapterType);
+    registerServerAdapter({ ...adapter, execute: async input => {
+      if (fresh && input.runtime.sessionId === sessionId) throw new Error("remote_warm_session_not_idle");
+      return adapter.execute(input);
+    } });
+    try {
+      const recovery = { ...(reconciled ? { source: "execution.reconciled" } : {}), wakeReason: "issue_recovery_action_restored" };
+      const actionId = randomUUID();
+      await db.insert(issueRecoveryActions).values({ id: actionId, companyId: f.companyId, sourceIssueId: f.issueId,
+        kind: "active_run_watchdog", status: "resolved", ownerType: "system", returnOwnerAgentId: f.agentId,
+        cause: "native_continuation_requires_reconciliation", fingerprint: actionId, nextAction: "Continue saved work",
+        evidence: { continuationDelivery: "pending", executionReconciliation: { runId: failed.id,
+          providerStopped: true, actionOutcome: "not_performed", outcomeEvidence: "The failed warm turn did not run." } },
+      });
+      const next = await execute(f, { ...recovery, forceFreshSession: true, recoveryActionId: actionId,
+        previousRunId: failed.id, retryOfRunId: failed.id });
+      expect(next.input.runtime.sessionId).toBe(fresh ? null : sessionId);
+      expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: { reset: fresh, taskSessionReused: !fresh } } });
+      if (fresh) {
+        expect(next.input.context.executionContinuation).toMatchObject({ messages: [expect.objectContaining({ body: "SAVED WORK: use the completed analysis" })] });
+        expect(next.finished.error).toBeNull();
+      }
+    } finally { registerServerAdapter(adapter); }
+  });
+
   it("keeps a workspace source refusal typed before provider startup", async () => {
     const f = await seed(), type = `${adapterType}_source_refusal`;
     registerServerAdapter({ ...getServerAdapter(adapterType), type,
