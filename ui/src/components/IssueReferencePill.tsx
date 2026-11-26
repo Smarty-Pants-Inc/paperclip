@@ -43,7 +43,7 @@ export function IssueReferencePill({
   );
   const content = (
     <>
-      {issue.status ? <StatusIcon {...taskStatusIconProps({ ...issue, status: issue.status })} className="h-3 w-3 shrink-0" /> : null}
+      {issue.status ? <StatusIcon {...taskStatusIconProps({ ...issue, status: issue.status })} className="h-3 w-3 shrink-0" lifecycle={!!onRemove} /> : null}
       {children !== undefined ? children : <span className="min-w-0 truncate">{issue.identifier ?? issue.title}</span>}
     </>
   );

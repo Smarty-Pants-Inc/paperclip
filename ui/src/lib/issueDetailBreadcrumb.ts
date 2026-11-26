@@ -1,4 +1,7 @@
 import type { Issue } from "@paperclipai/shared";
+import { taskStatusIconProps } from "./task-status-presentation";
+
+type TaskStatusEvidence = Pick<Issue, "externalConversationState" | "unblockDescriptor" | "blockedInboxAttention" | "interruption">;
 import { TASK_VIEW_PARAM, normalizeTaskViewKey, taskView } from "./task-views";
 
 type IssueDetailSource = "issues" | "inbox";
@@ -8,7 +11,7 @@ type IssueDetailBreadcrumb = {
   href: string;
 };
 
-export type IssueDetailHeaderSeed = {
+export type IssueDetailHeaderSeed = TaskStatusEvidence & {
   id: string;
   identifier: string | null;
   title: string;
@@ -22,7 +25,7 @@ export type IssueDetailHeaderSeed = {
   originId?: string | null;
 };
 
-type IssueDetailHeaderSeedSource = Pick<Issue, "id" | "title"> & {
+type IssueDetailHeaderSeedSource = Pick<Issue, "id" | "title"> & TaskStatusEvidence & {
   identifier?: string | null;
   status: string;
   displayStatus?: Issue["displayStatus"];
@@ -81,6 +84,7 @@ function isIssueDetailHeaderSeed(value: unknown): value is IssueDetailHeaderSeed
 
 function createIssueDetailHeaderSeed(issue: IssueDetailHeaderSeedSource): IssueDetailHeaderSeed {
   return {
+    ...taskStatusIconProps(issue),
     id: issue.id,
     identifier: issue.identifier ?? null,
     title: issue.title,

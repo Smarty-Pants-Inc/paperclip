@@ -4432,26 +4432,23 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   const breadcrumbTitle = issue?.title ?? issueHeaderSeed?.title ?? "";
   const breadcrumbIdentifier =
     issue?.identifier ?? issueHeaderSeed?.identifier ?? (issueId && /^[a-z0-9]+-\d+$/i.test(issueId) ? issueId : issue?.id.slice(0, 8));
-  const breadcrumbStatus = issue?.status ?? issueHeaderSeed?.status;
-  const breadcrumbBlockerAttention = issue?.blockerAttention;
-  // Stable identity for the breadcrumb status glyph. The glyph's shape/colour
-  // depend on status (+ covered state), and its accessible label is derived
-  // from the blocker counts — so the key signs over the full blockerAttention,
-  // not just `state`, to avoid a stale label when counts change.
-  const breadcrumbStatusKey = breadcrumbStatus
-    ? `${breadcrumbStatus}|${issue?.displayStatus ?? issueHeaderSeed?.displayStatus ?? ""}|${issue?.externalConversationState ?? ""}|${JSON.stringify(breadcrumbBlockerAttention ?? null)}`
-    : "loading-task-status";
+  // A sparse core read must not erase evidence carried by the list we opened.
+  // Only retain it for the same task/state; explicit null from detail still wins.
+  const breadcrumbTask = issue && issueHeaderSeed?.id === issue.id && issueHeaderSeed.status === issue.status
+    ? { ...issueHeaderSeed, ...issue }
+    : issue ?? issueHeaderSeed;
+  const breadcrumbPresentation = breadcrumbTask ? taskStatusIconProps(breadcrumbTask) : null;
+  // Sign all presentation evidence so a newly opened/resolved human question
+  // updates the breadcrumb even when the canonical status remains blocked.
+  const breadcrumbStatusKey = JSON.stringify([
+    breadcrumbPresentation,
+    breadcrumbPresentation && Object.hasOwn(breadcrumbPresentation, "actionRequired"),
+    breadcrumbPresentation && Object.hasOwn(breadcrumbPresentation, "unblockDescriptor"),
+  ]);
   const breadcrumbStatusLeading = useMemo(
-    () =>
-      breadcrumbStatus ? (
-        <StatusIcon
-          status={breadcrumbStatus}
-          displayStatus={issue?.displayStatus ?? issueHeaderSeed?.displayStatus}
-          externalConversationState={issue?.externalConversationState}
-          className="size-3"
-          blockerAttention={breadcrumbBlockerAttention}
-        />
-      ) : <span aria-hidden="true" className="size-3 shrink-0" />,
+    () => breadcrumbPresentation ? (
+      <StatusIcon {...breadcrumbPresentation} className="size-3" />
+    ) : <span aria-hidden="true" className="size-3 shrink-0" />,
     // `breadcrumbStatusKey` is a complete signature of the inputs below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [breadcrumbStatusKey],
@@ -7962,9 +7959,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
 
   const issueStatusControl = (
     <StatusIcon
-      {...taskStatusIconProps(issue)}
+      {...(breadcrumbPresentation ?? taskStatusIconProps(issue))}
       size={proposedTaskHeader ? "md" : "lg"}
-      blockerAttention={issue.blockerAttention}
       onChange={(status) => updateIssue.mutate({ status })}
     />
   );

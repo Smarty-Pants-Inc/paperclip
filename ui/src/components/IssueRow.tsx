@@ -19,14 +19,14 @@ import {
   readRecoveryRetryLineage,
   type RecoveryLivenessContext,
 } from "../lib/recovery-lineage";
-import { StatusIcon, getStatusIconLabel } from "./StatusIcon";
+import { StatusIcon } from "./StatusIcon";
 import { hasAssignedBacklogBlocker } from "../lib/issue-blockers";
 import { ExternalObjectStatusSummary } from "./ExternalObjectStatusSummary";
 import { Badge } from "@/components/ui/badge";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { TaskRowColumnCells, useTaskListColumns, type TaskRowColumnValues } from "./TaskListColumns";
 import { CellMarquee, HoveredCellContext, useCellMarqueeHover } from "./CellMarquee";
-import { taskStatusIconProps } from "@/lib/task-status-presentation";
+import { resolveTaskStatusPresentation, taskStatusIconProps } from "@/lib/task-status-presentation";
 
 export type IssueRowUnreadState = "hidden" | "visible" | "fading";
 export type IssueRowPresentation = "legacy" | "task";
@@ -265,7 +265,7 @@ export function IssueRow({
 
   if (presentation === "task") {
     const refreshed = appearance === "refreshed";
-    const statusLabel = getStatusIconLabel(issue.status, issue.externalConversationState, issue.blockerAttention, issue.displayStatus);
+    const statusLabel = resolveTaskStatusPresentation(taskStatusIconProps(issue)).ariaLabel;
     const statusIcon = <StatusIcon {...taskStatusIconProps(issue)} size="md" className={selectedStatusClass} />;
     const status = statusSlot ?? (refreshed ? (
       <Tooltip>

@@ -89,17 +89,21 @@ function personAction(input: TaskStatusPresentationInput): string | null {
  * ownership read: keep its blocked sign neutral until evidence arrives.
  * An intentional pause takes precedence over a stale blocked descriptor.
  */
-export function resolveTaskStatusPresentation(input: TaskStatusPresentationInput): TaskStatusPresentation {
+export function resolveTaskStatusPresentation(input: TaskStatusPresentationInput, context: "task" | "lifecycle" | "summary" = "task"): TaskStatusPresentation {
   const { status, displayStatus, externalConversationState, blockerAttention, interruption } = input;
   if (status === "paused" || (status === "blocked"
       && interruption?.state === "waiting_for_user" && interruption.userAction === "resume")) {
     return { glyphStatus: "paused", label: "Paused", ariaLabel: "Paused" };
   }
   // Completed/cancelled and optimistic canonical transitions win over stale
-  // projections. Recovery projected as blocked uses the same known/unknown
-  // distinction; a stale legacy descriptor cannot make that recovery red.
+  // projections. Resolve task projections before applying lifecycle colour so
+  // idle, monitoring and paused never revert to their raw stored status.
   const projectedStatus = status === "in_progress" ? (displayStatus ?? status) : status;
   if (projectedStatus === "blocked") {
+    // Static lanes/filter/picker options describe a lifecycle, not an emergency.
+    if (context === "lifecycle") {
+      return { glyphStatus: "blocked_lifecycle", label: "Blocked", ariaLabel: "Blocked" };
+    }
     // actionRequired is the server authority, including explicit null. Without
     // that authority, resolve the legacy rule only after the descriptor read is
     // known (null or a value). Missing/undefined must never imply blue or red.
@@ -107,8 +111,13 @@ export function resolveTaskStatusPresentation(input: TaskStatusPresentationInput
       return { glyphStatus: "blocked_checking", label: "Blocked · checking…", ariaLabel: "Blocked · checking…" };
     }
     const action = personAction(input);
-    const label = action ? `Person: ${action}` : waitingLabel(blockerAttention);
-    return { glyphStatus: action ? "blocked" : "in_queue", label, ariaLabel: label };
+    // Summaries use bounded, stable buckets, not one segment per action/child.
+    const label = context === "summary"
+      ? (action ? "Needs a person" : "Waiting")
+      : (action ? `Person: ${action}` : waitingLabel(blockerAttention));
+    // Aggregated counts are not emergencies; only the individual task is red.
+    const glyphStatus = action ? (context === "summary" ? "blocked_lifecycle" : "blocked") : "in_queue";
+    return { glyphStatus, label, ariaLabel: label };
   }
   const visibleStatus = projectedStatus === "in_review" && externalConversationState === "waiting"
     ? "idle"

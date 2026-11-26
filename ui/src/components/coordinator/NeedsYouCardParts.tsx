@@ -4,6 +4,7 @@ import { AgentAvatar } from "@/components/AgentAvatar";
 import { deriveInitials } from "@/components/Identity";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { StatusIcon } from "@/components/StatusIcon";
+import { taskStatusIconProps } from "@/lib/task-status-presentation";
 import { Button } from "@/components/ui/button";
 import {
   ATTENTION_NO_CLAIM_TEXT,
@@ -114,7 +115,7 @@ export function NeedsYouTaskLink({ task, short = false, onOpen }: {
   const href = task.href;
   return <button type="button" data-attention-task-link title={task.title ?? undefined} onClick={() => onOpen(href)}
     className={cn("flex min-w-0 items-center gap-1.5 text-left text-(length:--text-compact) leading-5 text-muted-foreground hover:text-foreground", short ? "shrink-0" : "max-w-full")}>
-    {task.status ? <StatusIcon status={task.status} size="sm" /> : null}
+    {task.status ? <StatusIcon {...taskStatusIconProps({ ...task, status: task.status })} size="sm" /> : null}
     <span className="min-w-0 truncate">{task.identifier ?? "Open task"}{short || !task.title ? null : ` · ${task.title}`}</span>
     <ArrowUpRight className="size-4 shrink-0" />
   </button>;

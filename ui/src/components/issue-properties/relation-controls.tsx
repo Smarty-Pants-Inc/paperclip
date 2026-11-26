@@ -54,7 +54,7 @@ export function RemovableIssueReferencePill({
     <LockedIssueChip identifier={issue.identifier} />
   ) : (
     <>
-      <StatusIcon {...taskStatusIconProps(issue)} className="h-3 w-3 shrink-0" />
+      <StatusIcon {...taskStatusIconProps(issue)} className="h-3 w-3 shrink-0" lifecycle />
       <span className="truncate">{issueLabel}</span>
     </>
   );
