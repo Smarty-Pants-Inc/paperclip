@@ -431,8 +431,17 @@ import {
   queuedCommentIdsFromWakePayload,
 } from "../services/issue-queued-comment-queue.js";
 
+import { readLimitFromEnv } from "../services/env-limits.js";
+
 const MAX_ISSUE_COMMENT_LIMIT = 500;
+const commentAttachmentIdsSchema = z.lazy(() => z.array(z.string().uuid())
+  .max(readLimitFromEnv("PAPERCLIP_MAX_CHAT_ATTACHMENTS", 20))
+  .refine(ids => new Set(ids).size === ids.length, { message: "Attachment ids must be unique" }));
+const addIssueCommentRouteSchema = addIssueCommentSchema.extend({
+  attachmentIds: commentAttachmentIdsSchema.optional(),
+});
 const updateIssueRouteSchema = updateIssueSchema.extend({
+  attachmentIds: commentAttachmentIdsSchema.optional(),
   interrupt: z.boolean().optional(),
 });
 function queuedCommentDiscardDenial(issue: { identifier?: string | null }, comment: { authorAgentId: string | null }) {
@@ -19437,7 +19446,7 @@ export function issueRoutes(
 
   router.post(
     "/issues/:id/comments",
-    validate(addIssueCommentSchema),
+    validate(addIssueCommentRouteSchema),
     async (req, res) => {
       const id = req.params.id as string;
       const issue = await getAccessibleResource(
