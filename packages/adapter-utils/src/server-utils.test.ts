@@ -23,6 +23,9 @@ import {
   isPaperclipExternalChatTurn,
   materializePaperclipSkillCopy,
   normalizePaperclipRunnerAdapterConfig,
+  normalizePaperclipWakePayload,
+  boundedPaperclipWakeText,
+  projectPaperclipWakeMeaning,
   PAPERCLIP_OPERATIONAL_SKILL_KEY,
   PAPERCLIP_FEEDBACK_SKILL_KEYS,
   refreshPaperclipWorkspaceEnvForExecution,
@@ -47,6 +50,35 @@ import {
 } from "./server-utils.js";
 
 const execFile = promisify(execFileCallback);
+
+it("preserves wake-owned meaning through normalization and the serialized full fallback", () => {
+  const meaning = { reviewDecision: "REVIEW_CANARY", notificationReason: "NOTIFY_CANARY", retryCause: "CAUSE_CANARY",
+    retrySummary: "SUMMARY_CANARY", unblockAction: "UNBLOCK_CANARY", monitor: { future: { notes: ["MONITOR_CANARY", 3] } } };
+  expect(normalizePaperclipWakePayload(meaning)).toMatchObject(meaning);
+  const serialized = stringifyPaperclipWakePayload({ reason: "issue_status_changed", ...meaning, truncated: true });
+  expect(serialized).not.toBeNull();
+  expect(normalizePaperclipWakePayload(JSON.parse(serialized!))).toMatchObject(meaning);
+  const prompt = renderPaperclipWakePrompt(JSON.parse(serialized!));
+  for (const canary of ["REVIEW_CANARY", "NOTIFY_CANARY", "CAUSE_CANARY", "SUMMARY_CANARY", "UNBLOCK_CANARY", "MONITOR_CANARY"])
+    expect(prompt).toContain(canary);
+  const scheduler = { nextCheckAt: "2026-11-26T22:00:00Z", monitorAttemptCount: 2, monitorNotes: "NOTES_CANARY" };
+  const canonical = projectPaperclipWakeMeaning(scheduler);
+  expect(canonical).toEqual({ monitor: scheduler });
+  expect(projectPaperclipWakeMeaning(canonical)).toEqual(canonical);
+  expect(projectPaperclipWakeMeaning({ ...scheduler, ...canonical })).toEqual(canonical);
+  for (const monitor of ["FUTURE_MONITOR_SHAPE", { monitorNotes: "OTHER_NOTES", future: { canary: "NESTED" } }, ["ARRAY_MONITOR"]]) {
+    const projected = projectPaperclipWakeMeaning({ ...scheduler, monitor });
+    expect(projected).toEqual({ monitor: { ...scheduler, wakeMonitor: monitor } });
+    expect(projectPaperclipWakeMeaning(projected)).toEqual(projected);
+    expect(renderPaperclipWakePrompt({ ...projected, truncated: true })).toContain(JSON.stringify(monitor));
+  }
+});
+it("bounds new wake text in bytes including its real task-reader pointer", () => {
+  const result = boundedPaperclipWakeText("🙂".repeat(100_000));
+  expect(Buffer.byteLength(result)).toBeLessThanOrEqual(8192);
+  expect(result).not.toContain("\ufffd");
+  expect(result).toContain("get_task_context({})");
+});
 
 it("keeps Pi draft models empty and preserves saved native Pi settings", () => {
   expect(normalizePaperclipRunnerAdapterConfig("paperclip_runner", { provider: "acpx", acpxAgent: "pi", model: "" })).toMatchObject({ provider: "acpx", acpxAgent: "pi", model: "" });

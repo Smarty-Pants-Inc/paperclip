@@ -19,7 +19,9 @@ import { registerScheduledWork } from "../scheduled-work.js";
 import { notifyNativeFinalizationWork } from "../native-finalization-notifications.js";
 import { idleWorkSnapshot, readTaskDrain, startTaskDrain, stopTaskDrain } from "../task-admission.js";
 import { conflict } from "../../errors.js";
-import { createHeartbeatRunPreparation } from "./run-preparation.js";
+import { buildPaperclipWakePayload, createHeartbeatRunPreparation, enrichWakeContextSnapshot } from "./run-preparation.js";
+import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
+import { buildNativeContinuationPrompt, readNativeTaskSnapshot } from "../native-runtime/native-continuation.js";
 import { createHeartbeatRunState } from "./run-state.js";
 import { createHeartbeatScheduling, type HeartbeatSchedulingDependencies } from "./scheduling.js";
 import { readIdleSleepSafety } from "../idle-sleep-safety.js";
@@ -134,6 +136,36 @@ describe.skipIf(!postgres.supported)("heartbeat scheduling database boundary", (
     deps.parseHeartbeatPolicy.mockReturnValue({ ...timerPolicy, enabled: true });
     deps.parseHeartbeatPolicy.mockClear();
   }
+
+  it("carries the real scheduler's top-level monitor metadata to both prompt renderers", async () => {
+    const f = await fixture();
+    const timeoutAt = new Date(now.getTime() + 600_000).toISOString();
+    await db.update(issues).set({ monitorNotes: "REAL_SCHEDULER_NOTES_CANARY", executionPolicy: {
+      mode: "normal", commentRequired: true, stages: [], monitor: { nextCheckAt: dueAt.toISOString(), serviceName: "REAL_SERVICE_CANARY",
+        timeoutAt, maxAttempts: 5, recoveryPolicy: "wake_owner" },
+    } }).where(eq(issues.id, f.issue.id));
+    expect(await f.scheduler.tickTimers(now)).toMatchObject({ enqueued: 1 });
+    const request = f.deps.enqueueWakeup.mock.calls[0]![1]!;
+    expect(request.contextSnapshot).not.toHaveProperty("monitor");
+    expect(request.contextSnapshot).toMatchObject({ nextCheckAt: dueAt.toISOString(), monitorAttemptCount: 1, monitorNotes: "REAL_SCHEDULER_NOTES_CANARY" });
+    const context: Record<string, unknown> = { ...request.contextSnapshot,
+      executionContinuation: { version: 1, messages: [], resumeDelta: { baseRunId: "prior", messages: [] } } };
+    enrichWakeContextSnapshot({ contextSnapshot: context, reason: request.reason ?? null, source: request.source,
+      triggerDetail: request.triggerDetail ?? null, payload: request.payload ?? null });
+    const issue = await readIssue(f.issue.id);
+    const wake = await buildPaperclipWakePayload({ db, companyId: f.company.id, agentId: f.agent.id, issueSummary: issue, contextSnapshot: context });
+    expect(wake!.monitor).toMatchObject({ nextCheckAt: dueAt.toISOString(), monitorAttemptCount: 1, monitorNotes: "REAL_SCHEDULER_NOTES_CANARY",
+      serviceName: "REAL_SERVICE_CANARY", timeoutAt, maxAttempts: 5, recoveryPolicy: "wake_owner" });
+    const snapshot = readNativeTaskSnapshot(issue)!;
+    const short = buildNativeContinuationPrompt({ wakePayload: wake, previousWakePayload: wake, continuousPi: true,
+      promptOnly: true, previousTurnDelivered: true, previousRunId: "prior", issue, previousIssue: issue,
+      taskSnapshot: snapshot, previousTaskSnapshot: snapshot });
+    expect(short).not.toBeNull();
+    for (const prompt of [short!, renderPaperclipWakePrompt({ ...wake, truncated: true })]) {
+      for (const text of ["REAL_SCHEDULER_NOTES_CANARY", "REAL_SERVICE_CANARY", '"monitorAttemptCount":1', dueAt.toISOString(), timeoutAt, '"maxAttempts":5', "wake_owner"]) expect(prompt).toContain(text);
+      expect(prompt).not.toContain("nothing new arrived");
+    }
+  });
 
   it("shares database monitor claims across scheduler instances", async () => {
     const f = await fixture();

@@ -1,6 +1,9 @@
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
 import { enableRunFailureReporting } from "../../__tests__/helpers/run-failure-reporting.js";
 import { randomUUID } from "node:crypto";
+import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
+import { buildPaperclipWakePayload, enrichWakeContextSnapshot } from "../heartbeat/run-preparation.js";
+import { buildNativeContinuationPrompt, readNativeTaskSnapshot } from "./native-continuation.js";
 import { verifyCommittedReplayPayloadReads } from "./__tests__/helpers/committed-replay.js";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -1083,6 +1086,57 @@ describeEmbeddedPostgres("native run finalizer / status decision committer — a
     const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, fixture.runId));
     expect(events.filter(event => event.eventType === "workspace_export_omitted")).toMatchObject([{ level: "info", payload: { reason: "restore_unsafe_archive", legacy: true } }]);
     expect(events.filter(event => event.eventType === "workspace_export_omitted")).toHaveLength(1);
+  });
+
+  it("routes actual committer wake payloads through enrichment to both prompts and saves the end-of-turn state once", async () => {
+    const f = await seedNativeRun();
+    const resultId = randomUUID(), assessmentId = randomUUID();
+    await db.insert(nativeRunResults).values({ id: resultId, companyId, issueId: f.issueId, runId: f.runId,
+      completionContractId: f.contractId, serverFingerprint: resultId, schemaStatus: "accepted", resultJson: {}, canonicalSha256: resultId });
+    await db.insert(workAssessments).values({ id: assessmentId, companyId, issueId: f.issueId, runId: f.runId,
+      contractId: f.contractId, resultId, triggerKind: "native_result", triggerActorCompanyId: companyId,
+      priorIssueStatus: "in_progress", priorStatusVersion: 0, policyVersion: "fixture", assessmentJson: {}, inputDigest: assessmentId });
+    await db.insert(nativeRunFinalizations).values({ runId: f.runId, companyId, issueId: f.issueId, phase: "arbitrating", attempt: 0, resultId });
+    const input: Parameters<typeof commitNativeStatusDecision>[0] = { db, companyId, issueId: f.issueId, runId: f.runId, assessmentId, priorStatus: "in_progress",
+      priorStatusVersion: 0, priorDecisionId: null, decision: {
+        policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION, statusAction: "in_review" as const, toStatus: "in_review" as const,
+        reasonCode: "continuity_producer_probe", unblockDescriptor: null, effects: [
+          { kind: "notify_owner" as const, agentId, reason: "REAL_NOTIFY_CANARY" },
+          { kind: "bind_blocker" as const, owner: { agentId }, action: "REAL_UNBLOCK_CANARY" },
+          { kind: "schedule_retry" as const, agentId, cause: "REAL_RETRY_CAUSE_CANARY", summary: "REAL_RETRY_SUMMARY_CANARY" },
+        ],
+      } };
+    await commitNativeStatusDecision(input);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const end = run!.contextSnapshot!.paperclipEndTaskSnapshot as { issueId: string; taskSnapshot: unknown };
+    expect(end.issueId).toBe(f.issueId);
+    const snapshot = readNativeTaskSnapshot(end.taskSnapshot)!;
+    expect(snapshot.status).toBe("in_review");
+    const requests = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+    const producerRequests = requests.filter(request => request.payload?.nativeDecisionId && request.payload.issueId === f.issueId);
+    expect(producerRequests).toHaveLength(3);
+    const expected = ["REAL_NOTIFY_CANARY", "REAL_UNBLOCK_CANARY", "REAL_RETRY_CAUSE_CANARY", "REAL_RETRY_SUMMARY_CANARY"];
+    const shortPrompts: string[] = [], fullPrompts: string[] = [];
+    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    for (const request of producerRequests) {
+      const context = { ...(request.payload!._paperclipWakeContext as Record<string, unknown>),
+        executionContinuation: { version: 1, messages: [], resumeDelta: { baseRunId: f.runId, messages: [] } } };
+      expect(request.source).toBe("automation");
+      enrichWakeContextSnapshot({ contextSnapshot: context, reason: request.reason, source: "automation", triggerDetail: null, payload: request.payload });
+      const wake = await buildPaperclipWakePayload({ db, companyId, agentId, contextSnapshot: context, issueSummary: issue });
+      const short = buildNativeContinuationPrompt({ wakePayload: wake, previousWakePayload: wake, previousRunId: f.runId,
+        continuousPi: true, promptOnly: true, previousTurnDelivered: true, taskSnapshot: snapshot, previousTaskSnapshot: snapshot,
+        issue: issue!, previousIssue: issue! });
+      expect(short).not.toBeNull();
+      shortPrompts.push(short!);
+      fullPrompts.push(renderPaperclipWakePrompt({ ...wake, truncated: true }));
+    }
+    for (const canary of expected) for (const prompts of [shortPrompts, fullPrompts]) expect(prompts.join("\n")).toContain(canary);
+    // Later human changes must not rewrite the historical endpoint on replay.
+    await db.update(issues).set({ status: "in_progress", priority: "high" }).where(eq(issues.id, f.issueId));
+    await commitNativeStatusDecision(input);
+    const [replayed] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    expect(replayed!.contextSnapshot!.paperclipEndTaskSnapshot).toEqual(end);
   });
 
   it("emits exactly one event for a cancel_continuations write (trap 2: :685/:518 overlap)", async () => {

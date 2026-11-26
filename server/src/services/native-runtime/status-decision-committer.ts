@@ -31,6 +31,8 @@ import { readNativePlanWait, type NativePlanWaitSource } from "./native-plan-wai
 import { activeIssueInteractionCondition } from "../issue-question-context.js";
 import { questionsAwaitedByAgentBlock } from "../blocked-question-answer.js";
 import { isConversation } from "../agent-conversations.js";
+import { readNativeTaskSnapshot } from "./native-continuation.js";
+import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
 import { hasPendingNativeChildCompletion, type NativeChildCompletionRecipient } from "./native-child-completion-delivery.js";
 import { and, asc, desc, eq, inArray, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -2721,6 +2723,20 @@ export async function commitNativeStatusDecision(input: {
       },
     });
     publications.push(publication);
+    // Capture the state AFTER this turn's own mutations and final disposition,
+    // under the same issue lock/transaction as the decision. The next turn must
+    // not announce our own moves as somebody else's news. Do not refresh this
+    // receipt on replay: a later person's edit is not part of the accepted turn.
+    const [endIssue] = await tx.select().from(issues).where(and(
+      eq(issues.id, input.issueId), eq(issues.companyId, input.companyId),
+    ));
+    const taskSnapshot = readNativeTaskSnapshot({ ...endIssue, description: isConversation(endIssue) ? null : endIssue.description });
+    const endContext = await createRunSecretRedactionRegistry(tx as unknown as Db).redactForIssue(
+      input.companyId, input.issueId, { paperclipEndTaskSnapshot: { issueId: input.issueId, taskSnapshot } },
+    );
+    await tx.update(heartbeatRuns).set({
+      contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify(endContext)}::jsonb`,
+    }).where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId)));
     return {
       decision: { ...decisionRow, applicationState },
       issue: updated,

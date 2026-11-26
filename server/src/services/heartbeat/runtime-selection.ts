@@ -1,4 +1,5 @@
 import { resolveSessionContinuity } from "../native-runtime/continued-session.js";
+import { readNativeTaskSnapshot } from "../native-runtime/native-continuation.js";
 import { assertPaperclipRunnerBinaryConfiguration } from "../native-runtime/native-codex-runner.js";
 import { readNativeWorkspaceMigration, migratedNativeExecutionCwd } from "../native-runtime/native-workspace-migration.js";
 import { resolveProviderApiPlacement } from "../native-runtime/provider-api-placement.js";
@@ -37,6 +38,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   nativeRunFinalizations,
+  nativeRunResults,
 } from "@paperclipai/db";
 import { getStartupTracer } from "../../instrumentation.js";
 import { documentService } from "../documents.js";
@@ -571,6 +573,14 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
             beforeCreatedAt: run.createdAt,
           }))
         : null;
+    // A checkpoint proves resumability, not delivery. Only the exact successful
+    // input's accepted result permits suppressing its bootstrap on the next turn.
+    const previousAcceptedResultId = previousNativeRun?.status === "succeeded"
+      ? (await db.select({ id: nativeRunResults.id }).from(nativeRunResults).where(and(
+          eq(nativeRunResults.companyId, agent.companyId), eq(nativeRunResults.runId, previousNativeRun.id),
+          eq(nativeRunResults.schemaStatus, "accepted"),
+        )).limit(1))[0]?.id ?? null
+      : null;
     nativeRunnerInstanceId =
       previousNativeRun?.runnerInstanceId &&
       previousNativeRun.nativeSessionId ===
@@ -855,6 +865,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
               ].filter(Boolean).join("\n\n"),
               initialCommunicationGuidance: nativeReviewRequest ? null : readNonEmptyString(context.paperclipTaskCommunicationGuidance),
               wakePayload: context.paperclipWake,
+              taskSnapshot: readNativeTaskSnapshot(parseObject(context.paperclipIssue).continuationSnapshot),
               caseContext: nativeReviewRequest ? null : context.paperclipCase as CaseExecutionContext | undefined,
               turnContext: context.paperclipTurnContext,
               githubInstructionSkillKeys: runScopedMentionedSkillKeys,
@@ -866,6 +877,10 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
                   const previousTask = previousInput.task;
                   const previousWake = normalizePaperclipWakePayload(parseObject(previousNativeRun.contextSnapshot).paperclipWake);
                   const githubReviewConfigurationKeys = previousWake?.githubReviewConfigurations.map((config) => config.key);
+                  const endTask = parseObject(parseObject(previousNativeRun.contextSnapshot).paperclipEndTaskSnapshot);
+                  // A start-of-turn snapshot cannot distinguish our own changes
+                  // from later edits. Older sessions conservatively bootstrap once.
+                  const taskSnapshot = endTask.issueId === issueRef.id ? readNativeTaskSnapshot(endTask.taskSnapshot) : null;
                   if (paperclipWakePayload?.externalChatProvider || previousWake?.externalChatProvider) {
                     // External native inputs use a neutral task title. Compare
                     // the saved canonical brief so old provider text is not
@@ -873,11 +888,14 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
                     const savedIssue = parseObject(parseObject(previousNativeRun.contextSnapshot).paperclipIssue);
                     if (savedIssue.id !== issueRef.id || typeof savedIssue.title !== "string" ||
                       (savedIssue.description !== null && typeof savedIssue.description !== "string")) return null;
-                    return { runId: previousNativeRun.id, task: { title: savedIssue.title, description: savedIssue.description },
-                      githubReviewConfigurationKeys, nativeExecutionInput: previousInput,
+                    return { runId: previousNativeRun.id, status: previousNativeRun.status, acceptedResultId: previousAcceptedResultId, task: { title: savedIssue.title, description: savedIssue.description },
+                      wakePayload: parseObject(previousNativeRun.contextSnapshot).paperclipWake,
+                      taskSnapshot, githubReviewConfigurationKeys, nativeExecutionInput: previousInput,
                     };
                   }
-                  return { runId: previousNativeRun.id, task: previousTask, githubReviewConfigurationKeys, nativeExecutionInput: previousInput };
+                  return { runId: previousNativeRun.id, status: previousNativeRun.status, acceptedResultId: previousAcceptedResultId,
+                    wakePayload: parseObject(previousNativeRun.contextSnapshot).paperclipWake,
+                    task: previousTask, taskSnapshot, githubReviewConfigurationKeys, nativeExecutionInput: previousInput };
                 } catch {
                   // An invalid prior snapshot must use the fresh bootstrap.
                   return null;

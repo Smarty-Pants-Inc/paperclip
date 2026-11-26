@@ -11,6 +11,7 @@ import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "../services/issue-conti
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { buildLowTrustSourceTrust, LOW_TRUST_QUARANTINED_BODY } from "../services/source-trust.js";
 import { REDACTED_EVENT_VALUE } from "../redaction.js";
+import { readNativeTaskSnapshot } from "../services/native-runtime/native-continuation.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -92,7 +93,7 @@ describePostgres("heartbeat task context delivered to an adapter", () => {
       id: commentId, companyId: f.companyId, issueId: f.issueId, authorType: "user", authorUserId: "context-user",
       body: `Wake comment canary ${secret}`,
     });
-    const { context } = await execute(f, {
+    const { context, runId } = await execute(f, {
       wakeCommentId: commentId, wakeCommentIds: [commentId],
       paperclipTaskCommunicationGuidance: "FORGED caller guidance", paperclipSkillTest: { directive: "FORGED skill" },
       paperclipContinuationSummary: { body: "FORGED summary" },
@@ -109,6 +110,14 @@ describePostgres("heartbeat task context delivered to an adapter", () => {
     for (const key of ["paperclipIssue", "paperclipWakeComment", "paperclipTaskMarkdown", "paperclipTaskMarkdownAssignment", "paperclipTaskMarkdownCompact", "paperclipTaskMarkdownAssignmentCompact"]) {
       expect(JSON.stringify(context[key])).not.toContain(secret);
     }
+    // The same authorized, redacted row is durably available for the next turn's field comparison.
+    const taskSnapshot = readNativeTaskSnapshot((context.paperclipIssue as Record<string, unknown>).continuationSnapshot);
+    expect(taskSnapshot).toMatchObject({ status: "in_progress", priority: "medium", assigneeAgentId: f.agentId,
+      assigneeUserId: null, parentId: null, projectId: null, goalId: null, billingCode: null,
+      description: `Assignment description canary ${REDACTED_EVENT_VALUE}` });
+    const savedRun = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then(rows => rows[0]);
+    const savedIssue = (savedRun.contextSnapshot as Record<string, unknown>).paperclipIssue as Record<string, unknown>;
+    expect(readNativeTaskSnapshot(savedIssue.continuationSnapshot)).toEqual(taskSnapshot);
     expect(context.paperclipTaskCommunicationGuidance).toBe(FAST_RESPONSE_AGENT_GUIDANCE);
     expect(context.paperclipSkillTest).toBeUndefined();
     expect(context.paperclipAgentJwtScope).toEqual({ kind: "standard" });

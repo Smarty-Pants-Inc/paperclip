@@ -451,6 +451,27 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
       title: issueRef.title,
       description: isConversation(issueContext) ? null : issueRef.description,
       workMode: issueRef.workMode,
+      // Snapshot only agent-visible task context. Conversation framing hides
+      // the brief; the continuation must not expose it through change news.
+      ...(issueContext ? { continuationSnapshot: {
+        identifier: issueRef.identifier,
+        title: issueRef.title,
+        description: isConversation(issueContext) ? null : issueRef.description,
+        workMode: issueRef.workMode,
+        status: issueContext.status,
+        priority: issueContext.priority,
+        assigneeAgentId: issueContext.assigneeAgentId,
+        assigneeUserId: issueContext.assigneeUserId,
+        parentId: issueContext.parentId,
+        projectId: issueContext.projectId,
+        goalId: issueContext.goalId,
+        conversationAgentId: issueContext.conversationAgentId,
+        titleNeedsGeneration: issueContext.titleNeedsGeneration,
+        reviewPolicy: issueContext.reviewPolicy,
+        executionPolicy: issueContext.executionPolicy,
+        responsibleUserId: issueContext.responsibleUserId,
+        billingCode: issueContext.billingCode,
+      } } : {}),
     };
   } else {
     delete context.paperclipIssue;
