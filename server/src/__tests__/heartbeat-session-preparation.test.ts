@@ -14,6 +14,7 @@ import { agents, agentTaskSessions, authUsers, companies, companyMemberships, cr
 import { getServerAdapter, registerServerAdapter, unregisterServerAdapter, type AdapterExecutionContext } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import { companySkillService } from "../services/company-skills.js";
 import * as sessionMetadata from "../services/heartbeat/workspaces.js";
 import { previousSessionMetadata } from "./helpers/previous-session-fingerprint.js";
 import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
@@ -693,7 +694,7 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig }).where(eq(agents.id, f.agentId));
       const currentFilter = sessionFingerprintInputs.paperclipRunnerSessionAdapterConfig;
       const oldFilter = vi.spyOn(sessionFingerprintInputs, "paperclipRunnerSessionAdapterConfig")
-        .mockImplementation(config => currentFilter(config, true));
+        .mockImplementation(config => currentFilter(config, true, true));
       try { await execute(f); } finally { oldFilter.mockRestore(); }
       if (changed) await db.update(agents).set({ adapterConfig: { ...adapterConfig, fixtureOption: "changed" } }).where(eq(agents.id, f.agentId));
       const next = await execute(f);
@@ -705,20 +706,69 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
   });
 
   it.each([
+    { provider: "pi_rpc", sessionContinuity: "continuous", changed: true, oldShape: false, adapterChanged: false, retain: true },
+    { provider: "pi_rpc", sessionContinuity: "continuous", changed: false, oldShape: true, adapterChanged: false, retain: true },
+    { provider: "pi_rpc", sessionContinuity: "paperclip", changed: true, oldShape: false, adapterChanged: false, retain: false },
+    { provider: "codex", sessionContinuity: "continuous", changed: true, oldShape: false, adapterChanged: false, retain: false },
+    { provider: "pi_rpc", sessionContinuity: "continuous", changed: true, oldShape: false, adapterChanged: true, retain: false },
+  ])("skill version continuation: $provider/$sessionContinuity changed=$changed old shape=$oldShape adapter changed=$adapterChanged retains=$retain", async ({ provider, sessionContinuity, changed, oldShape, adapterChanged, retain }) => {
+    const f = await seed(), sessionId = randomUUID(), cwd = await mkdtemp(join(tmpdir(), "pi-skill-continuation-"));
+    const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
+    try {
+      const skills = companySkillService(db);
+      const skill = await skills.createLocalSkill(f.companyId, { name: "Shared company instructions", markdown: "# Shared skill\nOriginal version.\n" });
+      const adapterConfig = { provider, sessionContinuity, model: "fixture/model", fixtureSessionId: sessionId, cwd,
+        paperclipSkillSync: { desiredSkills: [skill.key] } };
+      await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig }).where(eq(agents.id, f.agentId));
+      // Save the exact pre-deploy composition, including skills in adapterConfig.
+      const currentFilter = sessionFingerprintInputs.paperclipRunnerSessionAdapterConfig;
+      const oldFilter = oldShape ? vi.spyOn(sessionFingerprintInputs, "paperclipRunnerSessionAdapterConfig")
+        .mockImplementation(config => ({ ...currentFilter(config), paperclipRuntimeSkills: config.paperclipRuntimeSkills,
+          ...(config.paperclipSkillSync !== undefined ? { paperclipSkillSync: config.paperclipSkillSync } : {}),
+          ...(config.paperclipConnectorSkillDigest !== undefined ? { paperclipConnectorSkillDigest: config.paperclipConnectorSkillDigest } : {}),
+        })) : undefined;
+      let first: Awaited<ReturnType<typeof execute>>;
+      try { first = await execute(f); } finally { oldFilter?.mockRestore(); }
+      const [saved] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId));
+      expect(first.input.config.paperclipRuntimeSkills).toEqual([expect.objectContaining({ key: skill.key, versionId: skill.currentVersionId })]);
+      if (changed) await skills.updateFile(f.companyId, skill.id, "SKILL.md", "# Shared skill\nUpdated version.\n");
+      if (adapterChanged) await db.update(agents).set({ adapterConfig: { ...adapterConfig, provider: "codex" } }).where(eq(agents.id, f.agentId));
+      const next = await execute(f);
+      const delivered = next.input.config.paperclipRuntimeSkills as Array<{ key: string; versionId: string }>;
+      expect(delivered).toEqual([expect.objectContaining({ key: skill.key, versionId: expect.any(String) })]);
+      expect(delivered[0]!.versionId === skill.currentVersionId).toBe(!changed);
+      expect(next.input.runtime.sessionId).toBe(retain ? sessionId : null);
+      expect(next.finished.sessionIdBefore).toBe(retain ? sessionId : null);
+      expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: {
+        reset: !retain, taskSessionAvailable: true, taskSessionReused: retain,
+        changedCategories: changed ? (retain ? ["runtimeSkills"] : expect.arrayContaining(["adapterConfig", "runtimeSkills"])) : [],
+      } } });
+      if (retain) {
+        const [retained] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId));
+        expect(retained.id).toBe(saved.id);
+        expect(next.input.runtime.sessionParams).toMatchObject({ sessionId, adapterState: "preserved" });
+      }
+    } finally { mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true }); }
+  });
+
+  it.each([
     { category: "instructions", retain: true },
     { category: "adapterConfig", retain: false },
     { category: "environment", retain: true },
     { category: "envBindings", retain: true },
-    { category: "runtimeSkills", retain: false },
+    { category: "runtimeSkills", retain: true },
     { category: "agentRuntimeConfig", retain: false },
     { category: "workspaceConfig", retain: false },
     { category: "secrets", retain: false },
     { category: "issueOverrides", retain: false },
     { category: "adapter", retain: false },
-    { category: "instructions,runtimeSkills", retain: false },
+    { category: "instructions,runtimeSkills", retain: true },
+    { category: "adapterConfig,runtimeSkills", retain: false },
     { category: "instructions", retain: true, workspaceChanged: true },
     { category: "environment", retain: true, workspaceChanged: true },
-    { category: "runtimeSkills", retain: false, workspaceChanged: true },
+    { category: "runtimeSkills", retain: true, workspaceChanged: true },
     { category: "missing", retain: false },
     { category: "version", retain: false },
     { category: "fingerprint", retain: false, workspaceChanged: true },

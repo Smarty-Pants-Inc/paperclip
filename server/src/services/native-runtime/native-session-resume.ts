@@ -660,14 +660,17 @@ export function nativeRuntimeContextsMatch(
   toolRefreshOnResume?: boolean,
   instructionRefreshOnResume = false,
   packPromptRefreshOnResume = false,
+  skillRefreshOnResume = false,
 ): boolean {
   return previous.aggregateDigest === current.aggregateDigest ||
-    ((instructionRefreshOnResume || packPromptRefreshOnResume || toolRefreshOnResume === true) && canonicalNativeRuntimeContextDigest({
+    ((instructionRefreshOnResume || packPromptRefreshOnResume || skillRefreshOnResume || toolRefreshOnResume === true) && canonicalNativeRuntimeContextDigest({
       ...previous,
       ...(instructionRefreshOnResume ? { instructions: current.instructions } : {}),
-      // Pack-owned execution framing may advance; skills, account instructions
-      // and tool assignments are still retained-session compatibility inputs.
+      // Pack-owned execution framing may advance; account instructions and
+      // tool assignments are still retained-session compatibility inputs.
       ...(packPromptRefreshOnResume ? { prompt: current.prompt } : {}),
+      // A continuous Pi session takes a new skill list at its next launch.
+      ...(skillRefreshOnResume ? { skills: current.skills } : {}),
       ...(toolRefreshOnResume === true ? { mcp: current.mcp } : {}),
     }) === current.aggregateDigest);
 }
@@ -762,7 +765,7 @@ export function rebindNativeSessionCheckpoint(input: {
     previousExecution.schema !== current.schema ||
     ("homeMode" in previousExecution ? previousExecution.homeMode : "isolated") !== ("homeMode" in current ? current.homeMode : "isolated") ||
     ("runtimeContext" in previousExecution && "runtimeContext" in current &&
-      !nativeRuntimeContextsMatch(previousExecution.runtimeContext, current.runtimeContext, input.toolRefreshOnResume, continuousPi, continuousPi))
+      !nativeRuntimeContextsMatch(previousExecution.runtimeContext, current.runtimeContext, input.toolRefreshOnResume, continuousPi, continuousPi, continuousPi))
   )
     return null;
 
