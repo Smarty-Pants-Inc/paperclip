@@ -72,6 +72,7 @@ import {
   issueService,
 } from "./issues.js";
 import { attentionIssueCondition, executionIssueCondition } from "./issue-visibility.js";
+import { issueStatusProjectionFields } from "./issue-display-status.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isProspectiveBlockedTransition } from "./routable-blocked.js";
 import { authorizationService, canActorReadApproval, issueReadSqlCondition, type AuthorizationActor } from "./authorization.js";
@@ -411,6 +412,30 @@ function issueSubject(prefix: string, issue: IssueSubjectRow): AttentionSubject 
       ...(issue.reviewPolicy !== undefined ? { reviewPolicy: issue.reviewPolicy } : {}),
     },
   };
+}
+
+/** Subjects originate from several intentionally narrow reads. Project only the
+ * returned page in batches, using the detail fields and the feed's read policy,
+ * so none of those source-specific serializers can silently lose the sign. */
+async function attachIssueStatusProjections(
+  db: Db,
+  companyId: string,
+  items: AttentionItem[],
+  readCondition: SQL<boolean>,
+) {
+  const subjects = items.flatMap(item => [item.subject, item.relatedIssue])
+    .filter((subject): subject is AttentionSubject => subject?.kind === "issue");
+  const ids = [...new Set(subjects.map(subject => subject.id))];
+  const byId = new Map<string, Pick<AttentionSubject, "displayStatus" | "unblockDescriptor">>();
+  for (const chunk of chunkValues(ids, ATTENTION_GRAPH_QUERY_CHUNK_SIZE)) {
+    const rows = await db.select({ id: issues.id, ...issueStatusProjectionFields() })
+      .from(issues).where(and(eq(issues.companyId, companyId), inArray(issues.id, chunk), readCondition));
+    for (const { id, ...projection } of rows) byId.set(id, projection);
+  }
+  for (const subject of subjects) {
+    const projection = byId.get(subject.id);
+    if (projection) Object.assign(subject, projection);
+  }
 }
 
 function itemId(sourceKind: AttentionSourceKind, dedupKey: string) {
@@ -2830,6 +2855,8 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         const hasNextPage = pageStart + items.length < rankedItems.length;
         nextCursor = hasNextPage && items.length > 0 ? encodeCursor(sort, items[items.length - 1]!) : null;
       }
+
+      await attachIssueStatusProjections(db, companyId, items, readCondition);
 
       if (options.userId) {
         const trainable: Array<{ sourceKind: "approval" | "interaction"; sourceId: string }> = [];
