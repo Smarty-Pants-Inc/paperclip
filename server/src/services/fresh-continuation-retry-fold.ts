@@ -1,13 +1,31 @@
 import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
-import { agentWakeupRequests, heartbeatRuns, issueRecoveryActions, type Db } from "@paperclipai/db";
+import { agentWakeupRequests, chatConversations, heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 import { FRESH_CONTINUATION_SCHEMA, settleCoalescedFreshContinuationHolds } from "./fresh-continuation-fallback.js";
+import { sessionCannotContinue } from "./native-runtime/continued-session.js";
 
 const LIVE_CONTINUATION_STATUSES = ["queued", "running"];
 
 function retrySourceRunId(payload: unknown): string | null {
   const taskRetry = (payload as { taskRetry?: { sourceRunId?: unknown } } | null)?.taskRetry;
   return typeof taskRetry?.sourceRunId === "string" ? taskRetry.sourceRunId : null;
+}
+
+/** A person's chat (Agent Chat or a connected chat); unknown counts as a chat. */
+export async function isChatTask(tx: Pick<Db, "select">, companyId: string, issueId: string) {
+  const [issue] = await tx.select({ conversationAgentId: issues.conversationAgentId, originKind: issues.originKind })
+    .from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
+  if (!issue || issue.conversationAgentId || issue.originKind === "chat_channel") return true;
+  const [chat] = await tx.select({ id: chatConversations.id }).from(chatConversations)
+    .where(and(eq(chatConversations.companyId, companyId), eq(chatConversations.issueId, issueId))).limit(1);
+  return Boolean(chat);
+}
+
+/** A person's Retry of a non-chat task whose session can never be resumed starts a new session. */
+export async function retryStartsFresh(tx: Pick<Db, "select">, input: { companyId: string; issueId: string; sourceRunId: string }) {
+  const [source] = await tx.select({ error: heartbeatRuns.error, errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.sourceRunId)));
+  return sessionCannotContinue(source) && !(await isChatTask(tx, input.companyId, input.issueId));
 }
 
 export async function foldWaitingRetriesIntoContinuation(tx: Db, input: {
@@ -24,6 +42,12 @@ export async function foldWaitingRetriesIntoContinuation(tx: Db, input: {
   const retries = waiting.filter(wake => queuedCommentIdsFromWakePayload(wake.payload).length === 0
     && retrySourceRunId(wake.payload) === input.sourceRunId).map(wake => wake.id);
   if (!retries.length) return;
+  // A person's folded Retry starts a new session; carry that to the continuation that answers it.
+  const personRetry = waiting.some(wake => retries.includes(wake.id) &&
+    !(wake.payload as { taskRetry?: { initiatedBy?: unknown } } | null)?.taskRetry?.initiatedBy);
+  if (personRetry && await retryStartsFresh(tx, { ...input, sourceRunId: input.sourceRunId })) await tx.update(heartbeatRuns)
+    .set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || '{"explicitFreshSession":true}'::jsonb` })
+    .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.status, "queued")));
   const now = new Date();
   await tx.update(agentWakeupRequests).set({ status: "coalesced", runId: input.runId, finishedAt: now, updatedAt: now,
     payload: sql`coalesce(${agentWakeupRequests.payload}, '{}'::jsonb) || ${JSON.stringify({ coalescedIntoFreshContinuationRun: input.runId })}::jsonb` })

@@ -1,4 +1,15 @@
 import { normalizePaperclipWakePayload } from "@paperclipai/adapter-utils/server-utils";
+import { currentRunFailureText } from "./native-exact-resume-failure.js";
+
+/**
+ * A failed run whose own session can never be resumed: a person's Retry of it starts fresh.
+ * A lost resume state has its own error code; the retained-binding refusal is a plain server
+ * error finalized under a generic code, so the run's current failure text must be exactly it.
+ */
+export function sessionCannotContinue(run: { error?: string | null; errorCode?: string | null; resultJson?: unknown } | undefined) {
+  return run?.errorCode === "native_provider_state_incompatible"
+    || currentRunFailureText(run)?.trim() === "native_controller_recovery_missing_evidence:retained_sandbox_binding";
+}
 
 export function resolveSessionContinuity(provider: unknown, setting: unknown) {
   return setting === "continuous" || setting === "paperclip" ? setting : provider === "pi_rpc" ? "continuous" : "paperclip";
