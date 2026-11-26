@@ -1,5 +1,6 @@
 import { useId, useState, type ReactNode } from "react";
 import { completedActivitySummary } from "./completed-activity-summary";
+import { useTaskChatStatusLine } from "./TaskChatStatusLine";
 import {
   Brain,
   ChevronDown,
@@ -31,6 +32,7 @@ import {
 import { TaskChatUsageReadout } from "./TaskChatUsageReadout";
 import { TaskChatReasoningSummary } from "./TaskChatReasoningSummary";
 import { TaskChatThinking } from "./TaskChatThinking";
+import { TaskChatSystemNotice } from "./TaskChatSystemNotice";
 import { useInlineReasoning } from "./reasoning-display";
 import { latestReasoningHeadline } from "./reasoning-summary";
 import { toolActivityPresentation, type ToolIcon } from "./tool-taxonomy";
@@ -253,6 +255,12 @@ function ActivityRowContent({
   taskLabel?: string;
 }) {
   const row = presentation(item, active, taskLabel);
+  const dockOwnsStatus = useTaskChatStatusLine() !== null;
+  if (row && dockOwnsStatus && item.kind === "tool" && !item.blockedReason &&
+      item.status !== "failed" && item.status !== "interrupted") {
+    row.label = row.target ? "" : toolPresentation(item).displayName;
+    row.target = row.target?.replace(/^\$ /, "");
+  }
   const shimmer = useTaskChatShimmer(item.id);
   if (!row) return null;
   const Icon = row.icon;
@@ -628,6 +636,7 @@ function FoldedActivityGroup({
   item: TaskChatActivityPhaseItem;
   defaultExpanded?: boolean;
 }) {
+  const dockOwnsStatus = useTaskChatStatusLine() !== null;
   const [expanded, setExpanded] = useTaskChatExpansion(
     item.id,
     defaultExpanded,
@@ -660,12 +669,14 @@ function FoldedActivityGroup({
           data-testid="task-chat-phase-interstitial"
           data-conversation-text={item.interstitial.channel === "final" ? "final" : "progress"}
         >
-          <MarkdownBody softBreaks linkIssueReferences>
-            {item.interstitial.text}
-          </MarkdownBody>
+          {item.interstitial.author === "system" && item.interstitial.presentation?.kind === "system_notice"
+            ? <TaskChatSystemNotice item={item.interstitial} />
+            : <MarkdownBody softBreaks linkIssueReferences>{item.interstitial.text}</MarkdownBody>}
         </div>
       ) : null}
-      {latest ? (
+      {dockOwnsStatus ? <ol className="flex min-w-0 flex-col" aria-label="Activity history" data-testid="task-chat-runner-activity-list">
+        {activities.map((activity, index) => <ExpandedActivity key={activity.id} item={activity} active={item.active && index === activities.length - 1} />)}
+      </ol> : latest ? (
         <div className="min-w-0">
           <button
             type="button"

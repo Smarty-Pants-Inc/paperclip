@@ -1,6 +1,7 @@
 import { createContext, useContext, type ReactNode } from "react";
 import type { TaskChatItem } from "./task-chat-model";
 import { protocolActivityIsRunning } from "./task-chat-activity-presentation";
+import { useTaskChatStatusLine } from "./TaskChatStatusLine";
 
 const ShimmerOwner = createContext<string | null | undefined>(undefined);
 
@@ -28,7 +29,8 @@ export function TaskChatShimmerScope({ items, children }: { items: readonly Task
 /** Standalone specimens retain their own state unless a turn elects an owner. */
 export function useTaskChatShimmer(id: string): boolean {
   const owner = useContext(ShimmerOwner);
-  return owner === undefined || owner === id;
+  const dockOwnsStatus = useTaskChatStatusLine() !== null;
+  return !dockOwnsStatus && (owner === undefined || owner === id);
 }
 
 /** Startup plumbing is already represented by Working, rather than appearing

@@ -1,7 +1,7 @@
 import { describeError } from "../api/errors";
 import type { IssueChatComment } from "../lib/issue-chat-messages";
 import type { ExecutionBlocker, IssueRelationIssueSummary, TaskInterruptionPresentation } from "@paperclipai/shared";
-import { AlertCircle, LoaderCircle } from "lucide-react";
+import { AlertCircle } from "lucide-react";
 import { Link } from "@/lib/router";
 import { createIssueDetailPath } from "../lib/issueDetailBreadcrumb";
 import { Button } from "./ui/button";
@@ -26,14 +26,24 @@ export function isPersonStoppedRun(run: { errorCode?: string | null; resultJson?
     (run?.errorCode === "cancelled" && run.resultJson?.executionCancellation));
 }
 
-/** Only the persisted no-result receipt can own this failure's explanation. */
+/** Optional F1 receipt, including the stock no-result receipt on older servers. */
 export function nativeFailureNoticeRunId(comment: IssueChatComment) {
-  const runId = comment.clientRequestId?.match(/^native-output-without-result:(.+)$/)?.[1];
-  return runId && !comment.deletedAt && comment.body.trim() && comment.authorType === "system" &&
+  const receiptRunId = comment.clientRequestId?.match(/^(?:run-failure|native-output-without-result):(.+)$/)?.[1];
+  const runId = receiptRunId ?? comment.metadata?.sourceRunId ?? comment.createdByRunId ?? comment.runId;
+  const failureReceipt = Boolean(receiptRunId || comment.clientRequestId?.startsWith("unanswered-failure:"));
+  // A request receipt may explicitly name its run before that run is loaded.
+  // Tone alone and the set of loaded runs never establish ownership.
+  return failureReceipt && typeof runId === "string" && !comment.deletedAt && comment.body.trim() && comment.authorType === "system" &&
     comment.presentation?.kind === "system_notice" && comment.presentation.tone === "danger" &&
-    comment.metadata?.recoveryResponsibility !== "system" &&
     [comment.metadata?.sourceRunId, comment.createdByRunId, comment.runId, comment.derivedCreatedByRunId].every(id => !id || id === runId)
     ? runId : null;
+}
+
+/** Request-only receipts are optional: older servers may not persist them. */
+export function nativeFailureNoticeRequestId(comment: IssueChatComment) {
+  return !comment.deletedAt && comment.body.trim() && comment.authorType === "system" &&
+    comment.presentation?.kind === "system_notice" && comment.presentation.tone === "danger"
+    ? comment.clientRequestId?.match(/^unanswered-failure:(.+)$/)?.[1] ?? null : null;
 }
 
 /** Ordinary working/resolved projections are not recovery ownership. */
@@ -89,19 +99,9 @@ export function ExecutionBlockerNotice({ presentation, observedStatus, observedR
     intentId: null, nextRetryAt: null, userAction: null, sourceRunIds: [], observedRunId: null };
   const newSession = conversationMode && presentation?.state === "failed" && !(canRetry && presentation.canRetry)
     ? <> Send <code>/new</code> to start a fresh session, then send your message again.</> : null;
-  const recovery = !savedMessageBlocked && isConversationRecovery(presentation,
-    observedStatus ?? (blocker?.workspaceRepairRequired ? "failed" : undefined));
   if (presentation?.projectAccess && !optimistic && !takingLonger) return <TaskProjectAccessNotice
     access={presentation.projectAccess} issueId={issueId} agentName={agentName} projectName={projectName}
     canRetry={canRetry && presentation.canRetry} onRetry={onRetry} error={error} className={className} />;
-  if (recovery && presentation) return <div role="status" aria-label="Task status"
-    className={cn("flex items-center gap-3 text-sm text-muted-foreground", className)}>
-    {(optimistic || presentation.state !== "failed") && <LoaderCircle className="size-4 shrink-0 motion-safe:animate-spin" aria-hidden="true" />}
-    <span className="min-w-0 flex-1">{!optimistic && presentation.state === "failed"
-      ? <>Couldn't resume this conversation. Your message is saved.{newSession}</> : "Preparing your reply…"}</span>
-    {!optimistic && presentation.state === "failed" && canRetry && presentation.canRetry &&
-      <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}
-  </div>;
   if (error && !optimistic && !takingLonger) return <div role="alert" className={cn("flex items-center justify-between gap-2 text-sm text-destructive", className)}><span>{describeError(error).body}</span>{canRetry && <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}</div>;
   if (takingLonger) return <div role="status" className={cn("flex items-center justify-between gap-2 text-sm text-muted-foreground", className)}><span>Taking longer than usual…</span>{canRetry && <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}</div>;
   if (blocker?.workspaceRepairRequired) return (
@@ -207,6 +207,7 @@ export function ExecutionBlockerNotice({ presentation, observedStatus, observedR
             ? <>Couldn’t prepare the task folders. {presentation.workspaceFailure.message}</>
           : presentation.setupFailure
             ? <>Couldn’t set up the task workspace. {presentation.setupFailure.message}. Fix the command in the project’s workspace settings, then retry.</>
+            : presentation.failure ? `${presentation.failure.title}. ${presentation.failure.detail}`
             : "Couldn’t finish this attempt. Your message is saved."}
           {!presentation.retryWait && !presentation.workspaceFailure && !presentation.setupFailure ? newSession : null}
         </span>

@@ -6,6 +6,7 @@ import { isTerminalIssueStatus } from "@/lib/liveIssueIds";
 
 interface Submission {
   attemptId: number;
+  submittedAtMs: number;
   issueId: string | null;
   agentId: string;
   previousAgentId: string | null;
@@ -108,7 +109,7 @@ export function useRunnerSubmission({
       issueId, agentId: targetAgentId, previousAgentId: agentId, interruptionKey, clientRequestId,
       interruptionIntentId: interruption?.intentId ?? null,
       reopeningStatus: reopen && isTerminalIssueStatus(issueStatus) ? issueStatus! : null,
-      attemptId: ++nextAttemptId.current, takingLonger: false,
+      attemptId: ++nextAttemptId.current, submittedAtMs: Date.now(), takingLonger: false,
       runIds: new Set(linkedRuns.map(run => run.runId)),
     } : null;
     setSubmission(next);
@@ -123,5 +124,10 @@ export function useRunnerSubmission({
     });
   }, []);
 
-  return { pending, agentId: pending ? submission.agentId : null, takingLonger, begin, reject, blocked: startupBlocked };
+  const complete = useCallback((clientRequestId: string) => {
+    setSubmission(current => current?.clientRequestId === clientRequestId ? null : current);
+  }, []);
+
+  return { pending, clientRequestId: pending ? submission.clientRequestId : null, complete,
+    submittedAtMs: pending ? submission.submittedAtMs : null, agentId: pending ? submission.agentId : null, takingLonger, begin, reject, blocked: startupBlocked };
 }

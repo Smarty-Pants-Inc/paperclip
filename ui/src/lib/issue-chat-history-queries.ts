@@ -106,9 +106,10 @@ export function buildRecentIssueRunWindow(
   previouslyHadEarlierRuns = false,
   previousEarlierRun?: RecentIssueRunWindow["earlierRun"],
 ): RecentIssueRunWindow {
-  // The second row refreshes a just-finished predecessor. Start with only
-  // the latest run, then keep every run observed while this task is open.
-  const visible = new Set([...previous.map((run) => run.runId), ...recent.slice(0, 1).map((run) => run.runId)]);
+  // Keep failed attempts supplied by the server, including on a cold open.
+  // Otherwise the same no-notice predecessor exists live but vanishes on reload.
+  const visible = new Set([...previous.map((run) => run.runId), ...recent.filter((run, index) =>
+    index === 0 || ["failed", "timed_out", "interrupted"].includes(run.status)).map((run) => run.runId)]);
   const omitted = recent.find((run) => !visible.has(run.runId));
   const retained = recent.length >= 2 && previouslyHadEarlierRuns;
   const window: RecentIssueRunWindow = {

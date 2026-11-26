@@ -1,4 +1,5 @@
 import { groupImageResources } from "./image-resources";
+import { useTaskChatStatusLine } from "./TaskChatStatusLine";
 import { RunnerReasoningDisplay } from "./reasoning-display";
 import { useState, type ReactNode } from "react";
 import { useAgentChatRead } from "@/hooks/useAgentChatRead";
@@ -80,6 +81,9 @@ export function TaskChatTurn({
   leading,
 }: TaskChatTurnProps) {
   const streamlined = useStreamlinedTaskChatPresentation();
+  const dockStatus = useTaskChatStatusLine();
+  const endedLabel = item.id.endsWith(":turn") || item.id.endsWith(":turn:0")
+    ? dockStatus?.get(item.id.split(":turn")[0]!) : undefined;
   const readRef = useAgentChatRead(item.finalResponse?.id ?? "", item.finalResponse?.createdAtIso,
     Boolean(item.standaloneHeader && item.finalResponse?.author === "agent" && !item.finalResponse.optimistic));
   const settledLabel = item.summary.personStopped ? "Stopped" : item.summary.failed ? "Couldn't finish" : "Worked";
@@ -95,7 +99,7 @@ export function TaskChatTurn({
         data-testid="task-chat-turn"
         data-settled={item.settled ? "true" : "false"}
       >
-        {item.agentName || !item.historical ? <div
+        {!item.continuedAfterSteering && (item.agentName || !item.historical) ? <div
           className="flex min-h-8 w-full min-w-0 items-center gap-2 pb-1 pt-1.5 text-sm text-muted-foreground"
           data-testid="task-chat-turn-summary"
           data-turn-position="identity"
@@ -106,10 +110,9 @@ export function TaskChatTurn({
               agentIcon={item.agentIcon} agent={item.agent}
             />
           ) : null}
-          {!item.historical ? <span className="min-w-0 truncate">
-            {item.continuedAfterSteering ? "Continued after steering · " : ""}
+          {dockStatus ? endedLabel ? <span className="min-w-0 truncate" data-testid="task-chat-ended-status">{endedLabel}</span> : null : !item.historical ? <span className="min-w-0 truncate">
             {item.summary.durationLabel
-              ? `${settledLabel} ${item.summary.failed ? "after" : "for"} ${item.summary.durationLabel}`
+              ? `${settledLabel} ${item.summary.failed || item.summary.personStopped ? "after" : "for"} ${item.summary.durationLabel}`
               : settledLabel}
           </span> : null}
         </div> : null}
@@ -185,7 +188,7 @@ export function TaskChatTurn({
   const folded = (item.settled || parentRow) && !open;
   const SummaryIcon = item.summary.failed ? X : Check;
 
-  const showSettledHeader = item.settled && (!item.historical || expandable);
+  const showSettledHeader = item.settled && (dockStatus ? Boolean(endedLabel) || expandable : !item.historical || expandable);
   const header = showSettledHeader ? (
     <button
       type="button"
@@ -208,15 +211,15 @@ export function TaskChatTurn({
           </span>
         </>
       ) : null}
-      {!item.standaloneHeader && !item.historical ? (
+      {!dockStatus && !item.standaloneHeader && !item.historical ? (
         <SummaryIcon className="h-3.5 w-3.5 shrink-0" />
       ) : null}
-      <span>
-        {item.historical ? "Activity" : item.standaloneHeader && item.summary.durationLabel
+      <span data-testid={endedLabel ? "task-chat-ended-status" : undefined}>
+        {dockStatus ? endedLabel ?? "Activity" : item.historical ? "Activity" : item.standaloneHeader && item.summary.durationLabel
           ? `${settledLabel} ${item.summary.failed ? "after" : "for"} ${item.summary.durationLabel}`
           : settledLabel}
       </span>
-      {!item.standaloneHeader && turnSummaryMetrics(item.summary) ? (
+      {!dockStatus && !item.standaloneHeader && turnSummaryMetrics(item.summary) ? (
         // Time/tools/tokens is demoted, not deleted (PAP-502): it stays in the
         // DOM (and the accessible tree) but fades in only on hover/focus so the
         // settled line reads as "2:34 PM · ✓ Worked" at rest. Revealed too when
@@ -239,7 +242,10 @@ export function TaskChatTurn({
         aria-hidden
       />
     </button>
-  ) : parentRow ? (
+  ) : parentRow && dockStatus ? (expandable ? <button type="button" onClick={() => setOpen((value) => !value)} aria-expanded={open}
+    className="flex items-center gap-2 px-1 py-0.5 text-xs text-muted-foreground">
+    Activity <ChevronRight className={cn("size-3", open && "rotate-90")} aria-hidden />
+  </button> : null) : parentRow ? (
     // The pill renders the expand button itself, wrapped around only the
     // gerund status line — the interstitial row above stays outside the
     // hover/click target (PAP-376). Without activity there is no

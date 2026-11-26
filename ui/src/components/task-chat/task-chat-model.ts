@@ -144,6 +144,8 @@ export interface TaskChatMessageItem {
   streaming?: boolean;
   /** Optimistic local echo state (matches IssueChatComment.clientStatus). */
   optimistic?: "pending" | "queued";
+  /** Receipt that this message joined the already-running turn. */
+  addedToRun?: boolean;
   /** Live run this queued message is waiting behind. */
   queueTargetRunId?: string | null;
   /** Run that wrote this agent reply; its MCP Apps views show with the reply. */
@@ -306,6 +308,8 @@ export interface TaskChatMarkerItem {
   variant: "session_start" | "interrupted" | "turn_boundary" | "context_compacted";
   label: string;
   detail?: string;
+  /** A saved F1 comment supplies this same attempt slot, not a second row. */
+  notice?: TaskChatMessageItem;
   /** False when the recorded run cannot be retried, even after the chat continues. */
   retryable?: boolean;
   /** Renders the marker as a quiet disclosure row with detail beneath it. */
@@ -316,6 +320,7 @@ export interface TaskChatMarkerItem {
   createdAtIso?: string;
   runHref?: string;
   planHref?: string;
+  settingsHref?: string;
   /** An actionable credential denial is always expanded in the task conversation. */
   credentialAccess?: {
     agentName: string;
