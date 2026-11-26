@@ -222,7 +222,7 @@ Saves a Retry request for the task's latest stopped run. The same `idempotencyKe
 - `200` with `accepted: false` and `refused: { reason, message }`: admission refused the request for a reason that another click cannot change. `message` is the text that the task view shows. The request stays saved. If its reason clears later, it starts by itself.
 - `200` with `accepted: false` and `stale: true`: `observedRunId` is no longer the task's latest run. Read the task again.
 
-Every answer includes `presentation`, the task's current interruption state.
+Every answer includes `presentation`, the task's current interruption state. A person's press still needs their own access, while execution keeps the source run's person, not the presser or task owner. Dispatch rechecks both people's access; missing original authority holds without fallback.
 
 Any agent can press Retry without a `tasks:retry` grant. The agent's call must:
 

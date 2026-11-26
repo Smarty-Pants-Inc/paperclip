@@ -34,7 +34,7 @@ import { notifyScheduledRetryCancellation } from "../scheduled-retry-cancellatio
 import { notifyChatResponseAvailability } from "../chat-response-availability.js";
 import { notifyChatInboundWakeNotices } from "../chat-inbound-wake-notice-notifications.js";
 import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js";
-import { agentTaskRetryRefusal, recordAgentTaskRetryRefusal } from "../agent-task-retry.js";
+import { readRetrySource, agentTaskRetryRefusal, recordAgentTaskRetryRefusal } from "../agent-task-retry.js";
 import { assertTaskRetryConversationAllowed, readTaskRetryIntent, readTaskRetryBoardMessageOrigin, retireSupersededTaskRetry, taskRetryMutationAllowed } from "../task-retry.js";
 import { insertIssueComment } from "../issue-comment-writes.js";
 import { systemNoticePresentation } from "../recovery/notice-format.js";
@@ -3656,7 +3656,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               };
               const refusal = await agentTaskRetryRefusal(tx as unknown as Db, { companyId: agent.companyId, issueId, ...retry });
               if (refusal) return declineRetry(refusal, "Agent Retry can no longer continue this source.");
-              if (retry.agentRequester) operatorResponsibleUserId = retry.actorId;
+              const original = await readRetrySource(tx as unknown as Db, { companyId: agent.companyId, issueId, sourceRunId: retry.sourceRunId });
+              if (!original?.person) return declineRetry("retry_authority_unavailable", "The original run's person is no longer available.");
+              operatorResponsibleUserId = original.person;
+              if (!await taskRetryMutationAllowed(tx as unknown as Db, { companyId: agent.companyId, issueId,
+                actorId: operatorResponsibleUserId, actorSource: retry.actorSource }))
+                return declineRetry("retry_authority_denied", "The original run's person can no longer change this task.");
               if (!await taskRetryMutationAllowed(tx as unknown as Db, { companyId: agent.companyId, issueId,
                 actorId: retry.actorId, actorSource: retry.actorSource }))
                 return declineRetry("retry_authority_denied", "The user who requested Retry can no longer change this task.");

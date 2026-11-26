@@ -11,6 +11,7 @@ import { LEASE_RELEASE_DEFERRAL_KEY, nativeRunNeverLaunchedRunner, readLeaseRele
   settleUnchangedNativeWorkspace, wakeStoppingAgentLifecycle, nextLeaseReleaseTriggers, nextLeaseReleaseBootIds, nextLeaseReleaseRetryAt,
   type LeaseReleaseDeferral } from "../environment-lease-release-deferral.js";
 import { pendingFailedNativeRetryCancellationCondition } from "../native-runtime/native-cancellation-request.js";
+import { readRetrySource, recordAgentTaskRetryRefusal } from "../agent-task-retry.js";
 import { readTaskRetryIntent, reconcileTaskChatRetryReceipts } from "../task-retry.js";
 import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED, readNativeLocalProcessStop, recordedLocalExecutionStopped } from "../native-local-process-stop.js";
 import { isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
@@ -954,10 +955,19 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         intent.actorId !== wake.requestedByActorId) return;
     const issueId = readNonEmptyString(wake.payload?.issueId);
     if (!issueId) return;
+    const original = await readRetrySource(db, { companyId, issueId, sourceRunId: intent.sourceRunId });
+    if (!original?.person) {
+      if (intent.agentRequester && parseObject(wake.payload?.executionWait).reason !== "retry_authority_unavailable")
+        await recordAgentTaskRetryRefusal(db, { companyId, issueId, ...intent.agentRequester,
+          sourceRunId: intent.sourceRunId, authorityUserId: intent.actorId, reason: "retry_authority_unavailable" });
+      await writeDeferredExecutionWait(db, { companyId, requestId }, { reason: "retry_authority_unavailable",
+        message: "The original run's person is no longer available." }, { replace: true });
+      return;
+    }
     await enqueueWakeup(wake.agentId, { source: "on_demand", triggerDetail: "manual", reason: "task_retry",
       requestedByActorType: "user", requestedByActorId: intent.actorId, taskRetryRequestId: wake.id,
       payload: { issueId }, contextSnapshot: { issueId, triggeredBy: "board", actorId: intent.actorId,
-        responsibleUserId: intent.actorId },
+        responsibleUserId: original.person },
       issueStateGuard: { assigneeAgentId: wake.agentId, statuses: ["todo", "in_progress", "in_review", "blocked"] },
       idempotencyKey: `task-retry-dispatch:${wake.id}` }, wake.id);
     // Admission held this Retry because its source run's files are saved and

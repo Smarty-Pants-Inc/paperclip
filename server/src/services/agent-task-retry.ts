@@ -35,7 +35,7 @@ export async function agentTaskRetryActor(db: Db, agent: { companyId: string; ag
 }
 
 /** One company/task-scoped source lookup for admission, dispatch and refusal audit. */
-async function readRetrySource(db: Db, input: { companyId: string; issueId: string; sourceRunId?: string | null }) {
+export async function readRetrySource(db: Db, input: { companyId: string; issueId: string; sourceRunId?: string | null }) {
   if (!input.sourceRunId || !isUuidLike(input.sourceRunId) || !isUuidLike(input.issueId)) return undefined;
   const [source] = await db.select({ person: heartbeatRuns.responsibleUserId, status: heartbeatRuns.status,
     result: heartbeatRuns.resultJson, finishedAt: heartbeatRuns.finishedAt, errorCode: heartbeatRuns.errorCode }).from(heartbeatRuns).where(and(
