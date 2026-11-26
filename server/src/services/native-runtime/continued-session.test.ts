@@ -2,7 +2,7 @@ import { expect, it } from "vitest";
 import type { Db } from "@paperclipai/db";
 import { buildPaperclipWakePayload } from "../heartbeat/run-preparation.js";
 import { shouldResetTaskSessionForWake } from "../heartbeat/run-state.js";
-import { decideNativeContinuation, sessionCannotContinue, withPiOpenTurnDefault } from "./continued-session.js";
+import { decideNativeContinuation, NATIVE_FRESH_SESSION_MARKER, sessionCannotContinue, withPiOpenTurnDefault } from "./continued-session.js";
 import { configuredEnvironmentProjection } from "../../vendor/paperclip-runner/index.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
@@ -79,4 +79,17 @@ it("keeps a reopened task's next prompt bare when only the agent's own reply is 
   const wake = (authorId: string) => { const messages = [{ id: "r", body: "Reply", authorType: "agent", authorId }, { id: "c", body: "Next", authorType: "user", authorId: "board" }]; return { reason: "issue_reopened_via_comment", commentIds: ["c"], comments: [], executionContinuation: { version: 1, messages, resumeDelta: { baseRunId: "prior", messages } } }; };
   for (const [authorId, expected] of [["agent", true], ["other", false]] as const) expect(decideNativeContinuation({ provider: "pi_rpc", hasSession: true, agentId: "agent", previousRunId: "prior", wakePayload: wake(authorId) }).promptOnly).toBe(expected);
   expect(decideNativeContinuation({ provider: "pi_rpc", hasSession: true, agentId: "agent", previousRunId: "prior", wakePayload: { ...wake("agent"), reason: "issue_continuation_needed" } }).promptOnly).toBe(true);
+  const withNote = (body: string, extra: Record<string, unknown> = { freshSessionMarker: true }) => { const w = wake("agent"); const note = { id: "n", body, authorType: "system", authorId: null, ...extra };
+    return { ...w, executionContinuation: { ...w.executionContinuation, resumeDelta: { baseRunId: "prior", messages: [note, ...w.executionContinuation.resumeDelta.messages] } } }; };
+  for (const [body, expected] of [[NATIVE_FRESH_SESSION_MARKER, true], ["Saved work recovered.", false]] as const)
+    expect(decideNativeContinuation({ provider: "pi_rpc", hasSession: true, agentId: "agent", previousRunId: "prior", wakePayload: withNote(body) }).promptOnly).toBe(expected);
+  // Only a session that is already loaded may skip the marker; a fresh turn always gets the history.
+  expect(decideNativeContinuation({ provider: "pi_rpc", hasSession: false, agentId: "agent", previousRunId: "prior", wakePayload: withNote(NATIVE_FRESH_SESSION_MARKER) }).promptOnly).toBe(false);
+  // A person's comment with the same words is input, not the marker.
+  const personSaid = withNote(NATIVE_FRESH_SESSION_MARKER);
+  personSaid.executionContinuation.resumeDelta.messages[0] = { id: "n", body: NATIVE_FRESH_SESSION_MARKER, authorType: "user", authorId: "board" } as never;
+  expect(decideNativeContinuation({ provider: "pi_rpc", hasSession: true, agentId: "agent", previousRunId: "prior", wakePayload: personSaid }).promptOnly).toBe(false);
+  // Same words without the server's marker provenance (an external or plug-in system comment), or with an author: input.
+  for (const extra of [{}, { freshSessionMarker: true, authorId: "plugin" }])
+    expect(decideNativeContinuation({ provider: "pi_rpc", hasSession: true, agentId: "agent", previousRunId: "prior", wakePayload: withNote(NATIVE_FRESH_SESSION_MARKER, extra) }).promptOnly).toBe(false);
 });
