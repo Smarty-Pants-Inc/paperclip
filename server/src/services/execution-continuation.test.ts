@@ -166,6 +166,49 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
         revision: latest.updatedAt.toISOString(),
       });
     });
+    it("marks only the fresh-session system notice with the writer's stored provenance", async () => {
+      const marker = {
+        companyId,
+        issueId,
+        authorType: "system" as const,
+        authorAgentId: null,
+        authorUserId: null,
+        createdByRunId: null,
+        conversationSessionGeneration: 1,
+        body: "New session · Earlier messages and files are still available.",
+        presentation: { kind: "system_notice" as const, tone: "neutral" as const, detailsDefaultOpen: false },
+        metadata: { version: 1 as const, sourceRunId: runId, sections: [] },
+        createdAt: new Date("2026-09-08T10:03:00Z"),
+      };
+      const markerId = randomUUID();
+      const withoutGenerationId = randomUUID();
+      const withoutSourceRunId = randomUUID();
+      const withoutPresentationId = randomUUID();
+      const boardAuthoredId = randomUUID();
+      const ids = [markerId, withoutGenerationId, withoutSourceRunId, withoutPresentationId, boardAuthoredId];
+      await db.insert(issueComments).values([
+        { ...marker, id: markerId },
+        { ...marker, id: withoutGenerationId, conversationSessionGeneration: null },
+        { ...marker, id: withoutSourceRunId, metadata: { version: 1, sections: [] } },
+        { ...marker, id: withoutPresentationId, presentation: null },
+        { ...marker, id: boardAuthoredId, authorType: "user", authorUserId: "board-user" },
+      ]);
+      try {
+        const envelope = await build();
+        expect(envelope.messages.find(message => message.id === markerId)).toMatchObject({
+          id: markerId, authorType: "system", authorId: null, freshSessionMarker: true,
+        });
+        for (const id of ids.slice(1)) {
+          const message = envelope.messages.find(message => message.id === id);
+          expect(message).toMatchObject(id === boardAuthoredId
+            ? { id, authorType: "user", authorId: "board-user", body: marker.body }
+            : { id, authorType: "system", authorId: null, body: marker.body });
+          expect(message).not.toHaveProperty("freshSessionMarker");
+        }
+      } finally {
+        for (const id of ids) await db.delete(issueComments).where(eq(issueComments.id, id));
+      }
+    });
     it("loads authenticated human answers from stored resolver identity", async () => {
       const answerId = randomUUID();
       await db.insert(issueThreadInteractions).values({ id: answerId, companyId, issueId,
