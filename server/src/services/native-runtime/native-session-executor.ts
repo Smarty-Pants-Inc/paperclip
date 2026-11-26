@@ -1,4 +1,5 @@
 import { sandboxRestartKey } from "../sandbox-snapshot-restore.js";
+import { nativeSessionHandoffMaxBytes } from "./native-session-handoff.js";
 import { resolveSessionContinuity } from "./continued-session.js";
 import { currentControllerProcess } from "../controller-process-identity.js";
 import { settleStartupStop } from "../person-stop-before-turn.js";
@@ -226,6 +227,7 @@ import {
   createNativeSessionBackend,
   createRunnerdCodexTransport,
   executeNativeSession,
+  buildNativeModelEnvelope,
   applyNativeSessionGoalControl,
   inspectStagedRunAttachment,
   inspectDurablePrpCheckpointHeader,
@@ -10847,7 +10849,7 @@ export function resolveNativeCancellationStatus(input: {
 export async function executePaperclipNativeSession(input: {
   casesEnabled?: boolean;
   responsibilitiesEnabled?: boolean;
-  getFreshSessionHandoff?: () => Promise<string | null>;
+  getFreshSessionHandoff?: (maxBytes?: number) => Promise<string | null>;
   /** Retire a retained transport so recovery can replace provider tool declarations. */
   refreshTools?: boolean;
   toolRefreshOnResume?: boolean;
@@ -13116,7 +13118,10 @@ async function executePaperclipNativeSessionAttempt(
             resumeInterruptedTurn: input.restartRecovery?.kind === "resume_dead_runner"
               || input.restartRecovery?.kind === "reattach_remote_runner" || scheduledResumeContinuation,
             providerTurnWait,
-            getFreshSessionHandoff: input.getFreshSessionHandoff,
+            // Runtime requests history before attachments and the queued-input delivery commit.
+            // Count the entire known envelope (including planning context); reserve the later additions.
+            getFreshSessionHandoff: input.getFreshSessionHandoff ? () => input.getFreshSessionHandoff!(
+              nativeSessionHandoffMaxBytes(buildNativeModelEnvelope(runnerExecution))) : undefined,
             // A failed seal commits nothing: the messages stay queued for the
             // turn boundary instead of failing this run before its turn.
             prepareWakeAttachmentPrompt: input.prepareAttachmentPrompt,
