@@ -7173,6 +7173,39 @@ it("rejects Pi thinking settings on a different transport provider", () => {
   expect(() => createCapabilityRunnerdCodexTransport({ provider: "codex", piThinkingLevel: "low" })).toThrow(/only supported/);
 });
 
+it("projects current Pi model and thinking level onto turn.start without changing Codex", async () => {
+  for (const provider of ["pi_rpc", "codex"] as const) {
+    const root = await mkdtemp(join(tmpdir(), "runnerd-turn-selection-"));
+    const proxy = join(root, "provider-proxy");
+    const args = [fakeCodex, ...fakeCodexArgs(root)];
+    await writeFile(proxy, `#!/bin/sh\nexec ${args.map(arg => `'${arg.replaceAll("'", "'\\''")}'`).join(" ")}\n`, { mode: 0o700 });
+    let core!: DurablePrpControlPlane;
+    const bundle = createCapabilityRunnerdCodexTransport({
+      provider, stateDirectory: root, runnerBinary: defaultCapabilityRunnerdBinary(),
+      codexCommand: fakeCodex, codexArgs: fakeCodexArgs(root), piProxyPath: proxy,
+      piRpcModel: "example/model-b", piRpcThinkingLevel: "medium",
+      controlPlaneRegistration: async authority => {
+        core = authority;
+        await authority.start();
+        return { release: () => undefined };
+      },
+    });
+    try {
+      await bundle.transport.request("thread/start", { cwd: root, model: "example/model-a", dynamicTools: [] });
+      await bundle.transport.request("turn/start", { input: [{ type: "text", text: "Continue." }], effort: "low" });
+      const payload = core.store.state.commands.find(command => command.type === "turn.start")!.payload;
+      expect(payload).toEqual({ text: "Continue.", ...(provider === "pi_rpc"
+        ? { model: "example/model-b", effort: "medium" } : { effort: "low" }), turnId: expect.any(String) });
+      if (provider === "codex") {
+        expect(JSON.stringify(payload)).toBe(JSON.stringify({ text: "Continue.", effort: "low", turnId: payload.turnId }));
+      }
+    } finally {
+      await bundle.transport.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+}, 30_000);
+
 describe("runnerd compaction turn payload", () => {
   it("asks Codex for its own compaction and Claude for its /compact command", async () => {
     const { runnerdCompactionTurnPayload } = await import("./runnerd-codex-transport.js");
