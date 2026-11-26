@@ -17323,7 +17323,8 @@ async function createRunnerdBackendWithinSessionClaim(
         bearerToken: assignedMcpToken,
         companyId: input.execution.binding.companyId,
         workMode: input.execution.task.workMode,
-        ...(input.execution.provider.kind === "opencode" ? { delivery: "on_demand" as const } : {}),
+        ...(input.execution.provider.kind === "opencode" || input.execution.provider.kind === "pi_rpc"
+          ? { delivery: "on_demand" as const } : {}),
       }))
       : undefined),
     earlyPluginTaskOwner,
