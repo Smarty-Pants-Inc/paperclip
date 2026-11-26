@@ -158,11 +158,15 @@ const CONTINUOUS_PI_MODEL_KEYS = ["model", "piRpcThinkingLevel", "piThinkingLeve
 // Pack prompt identity lives in the native runtime context, not adapterConfig;
 // its refresh and capability-gated MCP refresh remain owned by that boundary.
 const CONTINUOUS_PI_ADAPTER_CONFIG_KEYS = [...CONTINUOUS_PI_MODEL_KEYS, "env"];
+// The skill list is fingerprinted once, as runtimeSkills; a new skill version
+// continues a continuous Pi session (its next launch loads the new list).
+const CONTINUOUS_PI_SKILL_KEYS = ["paperclipRuntimeSkills", "paperclipConnectorSkillDigest", "paperclipSkillSync"];
 
-export function paperclipRunnerSessionAdapterConfig(config: Record<string, unknown>, retainEnvironment = false): Record<string, unknown> {
+export function paperclipRunnerSessionAdapterConfig(config: Record<string, unknown>, retainEnvironment = false, retainSkills = false): Record<string, unknown> {
   const retained = paperclipRunnerRetainedAdapterConfig(config);
   return config.provider === "pi_rpc" && resolveSessionContinuity(config.provider, config.sessionContinuity) === "continuous"
-    ? omitKeys(retained, retainEnvironment ? CONTINUOUS_PI_MODEL_KEYS : CONTINUOUS_PI_ADAPTER_CONFIG_KEYS) : retained;
+    ? omitKeys(retained, [...(retainEnvironment ? CONTINUOUS_PI_MODEL_KEYS : CONTINUOUS_PI_ADAPTER_CONFIG_KEYS),
+      ...(retainSkills ? [] : CONTINUOUS_PI_SKILL_KEYS)]) : retained;
 }
 
 /** Issue settings reach both the effective config and their own fingerprint category. */
