@@ -65,6 +65,7 @@ export function createDispatchResolvedInteractionIfCurrent(deps: { writer: RunDi
     reservationId: string;
     recoveryLeaseOwner?: string;
     enforceContinuationOwnership?: boolean;
+    configurationFence?: (transaction: unknown, ownershipIssueId?: string | null) => Promise<void | (() => Promise<void>)>;
     dispatch: (markDispatchStarted: () => void) => Promise<T>;
     now?: Date;
   }) => deps.writer.dispatchResolvedInteractionIfCurrent({

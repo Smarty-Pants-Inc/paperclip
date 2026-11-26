@@ -63,6 +63,17 @@ export async function resolveSshAuthenticationBeforeRouting(input: {
   return environment?.driver === "ssh" ? environment.config.useHostAuth === false ? "managed" : "host" : null;
 }
 
+/** Only environment-selection inputs consumed by a fresh admission. Never persisted. */
+export interface HeartbeatEnvironmentSelectionSnapshot {
+  instanceSettingsId: string;
+  executionMode: "any" | "kubernetes";
+  managedSandboxOnly: boolean;
+  /** Omitted when a stronger selector made the instance default irrelevant. */
+  instanceDefaultEnvironmentId?: string | null;
+  /** Omitted outside the low-trust issue-selection branch. */
+  lowTrustIssueEnvironmentId?: string | null;
+}
+
 /** Selects policy and reuse inputs; lease acquisition and cleanup belong to the executor. */
 export interface HeartbeatEnvironmentSelectionInput {
   run: Pick<typeof heartbeatRuns.$inferSelect,
@@ -239,12 +250,23 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
       configurationIncomplete: { reason: "native_recovery_environment_binding_mismatch" },
     });
   }
+  const lowTrustIssueEnvironmentId = trustPreset.kind === "low_trust_review"
+    ? parseIssueExecutionWorkspaceSettings(issueContext?.executionWorkspaceSettings, { includeEnvironmentId: true })?.environmentId ?? null : null;
+  const environmentSelectionSnapshot: HeartbeatEnvironmentSelectionSnapshot | null = providerApiPlacement || persistedNativeExecutionInput ? null : {
+    instanceSettingsId: resolvedInstanceSettings.id,
+    executionMode: resolvedInstanceSettings.general.executionMode ?? "any",
+    managedSandboxOnly,
+    ...(!isExecutionForcedToKubernetes(resolvedInstanceSettings.general) ? {
+      ...(trustPreset.kind === "low_trust_review" ? { lowTrustIssueEnvironmentId } : {}),
+      ...(!lowTrustIssueEnvironmentId && !agent.defaultEnvironmentId
+        ? { instanceDefaultEnvironmentId: resolvedInstanceSettings.defaultEnvironmentId ?? null } : {}),
+    } : {}),
+  };
   const environmentResolution = providerApiPlacement
     ? { environmentId: null, source: "default" as const }
     : admittedLease?.environmentId ? { environmentId: admittedLease.environmentId, source: "run" as const }
     : resolveExecutionWorkspaceEnvironmentId({
-    lowTrustIssueEnvironmentId: trustPreset.kind === "low_trust_review"
-      ? parseIssueExecutionWorkspaceSettings(issueContext?.executionWorkspaceSettings, {includeEnvironmentId: true})?.environmentId : null,
+    lowTrustIssueEnvironmentId,
     agentDefaultEnvironmentId: agent.defaultEnvironmentId,
     instanceDefaultEnvironmentId:
       resolvedInstanceSettings.defaultEnvironmentId ?? null,
@@ -582,6 +604,7 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
     requestedReusableExecutionWorkspaceConfig,
     localEnvironment,
     resolvedInstanceSettings,
+    environmentSelectionSnapshot,
     environmentResolution,
     effectiveExecutionWorkspaceMode,
     executionPolicy,

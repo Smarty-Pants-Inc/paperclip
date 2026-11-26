@@ -46,6 +46,12 @@ export type DispatchResolvedInteractionInput<T> = CancelStaleQueuedRunInput & {
   reservationId: string;
   recoveryLeaseOwner?: string;
   enforceContinuationOwnership?: boolean;
+  /** Acquire configuration fences before authority locks. Defer issue content
+   * checks to the returned callback, which MUST run after the coordinator and
+   * optional ownership issue FOR UPDATE, before the run lock. Ordinary work
+   * acquires its issue SHARE there; ownership needs no second issue lock.
+   * The opaque transaction must not escape or perform provider I/O. */
+  configurationFence?: (transaction: unknown, ownershipIssueId?: string | null) => Promise<void | (() => Promise<void>)>;
   dispatch: (markDispatchStarted: () => void) => Promise<T>;
 };
 

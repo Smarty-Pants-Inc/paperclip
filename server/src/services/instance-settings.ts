@@ -567,6 +567,13 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
   return {
     get: async (): Promise<InstanceSettings> => toInstanceSettings(await getCachedRow()),
 
+    /** Uncached, non-creating read for a caller already holding the settings row lock. */
+    getReadOnly: async (): Promise<InstanceSettings | null> => {
+      const [row] = await db.select().from(instanceSettings)
+        .where(eq(instanceSettings.singletonKey, DEFAULT_SINGLETON_KEY));
+      return row ? toInstanceSettings(row) : null;
+    },
+
     update: async (
       patch: PatchInstanceSettings,
       writeOptions?: { db?: InstanceSettingsWriteDb },

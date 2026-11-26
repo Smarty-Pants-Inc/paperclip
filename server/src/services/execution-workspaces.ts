@@ -1837,7 +1837,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         ? { ...pending, expectedBindingRevision: nextRevision }
         : pending;
       await notifyStatusCardIssueChange(tx, companyId);
-      const [bound] = await tx.update(issues).set({ ...patch, executionWorkspaceId: workspaceId,
+      // Runtime binding changes workspace mode, not the user's environment
+      // selector. Merge under the issue lock so a selector saved during
+      // preparation survives and the final configuration fence can observe it.
+      const [bound] = await tx.update(issues).set({ ...patch,
+        ...(patch.executionWorkspaceSettings ? { executionWorkspaceSettings: {
+          ...parseObject(task.executionWorkspaceSettings), ...patch.executionWorkspaceSettings,
+        } } : {}), executionWorkspaceId: workspaceId,
         workspaceBindingRevision: nextRevision, workspacePendingSelection: pendingAfterFirstBinding, updatedAt: new Date() })
         .where(eq(issues.id, issueId)).returning();
       return bound;

@@ -390,7 +390,7 @@ import {
   carriesSettledPredecessorSession,
 } from "./native-restart-recovery.js";
 
-import { observeHeldNativeConfiguration, readHeldNativeTurnWork } from "./held-native-turn.js";
+import { observeHeldNativeConfiguration, readHeldNativeTurnWork, recordHeldNativeTurnClose } from "./held-native-turn.js";
 
 type ActiveNativeSession = {
   session: NativeSession;
@@ -411,6 +411,8 @@ type ActiveNativeSession = {
   holdCloseIntent?: boolean;
   holdSteeredInputs?: Map<string, { preparing: number; dispatched: boolean }>;
   refreshHeldTurnWork?: () => Promise<boolean>;
+  /** Server-only close classification; never changes the Pi wire reason. */
+  recordHeldTurnClose?: () => Promise<void>;
   /** The release owner offers live completions before it fences new steering. */
   offerHeldCompletion?: () => Promise<boolean>;
   holdCompletionOffering?: boolean;
@@ -10119,7 +10121,9 @@ export async function steerNativeSession(input: {
 }
 
 /** Shared close-at-next-idle door: committed answers, not an ACK or an old final,
- * release the hold. No personStop state or cancel/requeue machinery. */
+ * release the hold. Pi requires the stock person_stop WIRE reason to complete
+ * an idle hold (other reasons cancel the turn). Classify non-Stop closes only
+ * in server metadata, never with personStop state or cancel/requeue machinery. */
 export async function closeHeldNativeTurn(runId: string): Promise<boolean> {
   const active = activeNativeSessions.get(runId);
   if (!active || active.cancelRequested || active.holdCloseRequested || active.holdCompletionOffering) return false;
@@ -10149,6 +10153,8 @@ export async function closeHeldNativeTurn(runId: string): Promise<boolean> {
     const pending = await active.refreshHeldTurnWork?.();
     if (pending || !active.heldIdle) return false;
     const outcome = await interruptNativeTurn({ runId, reason: "person_stop", onlyIfHeldIdle: true });
+    if (outcome && outcome !== "no_turn") await active.recordHeldTurnClose?.().catch(error =>
+      logger.warn({ error, runId }, "could not record server-only held-turn close reason"));
     return Boolean(outcome && outcome !== "no_turn");
   } finally {
     if (!active.holdInterruptSent) active.holdCloseRequested = false;
@@ -13509,6 +13515,7 @@ async function executePaperclipNativeSessionAttempt(
                     else if (active.holdIdlePublicationVersion !== undefined && active.holdIdlePublicationVersion === active.holdActivityVersion && !active.holdPendingItems?.size) active.heldIdle = true;
                     return pending;
                   };
+                  active.recordHeldTurnClose = () => recordHeldNativeTurnClose(input.db, input.execution.binding);
                   const reconcile = () => reconcileHeldTurn(input.execution.binding.runId, active);
                   releaseHeldConfigurationObserver = observeHeldNativeConfiguration(input.db, input.execution.binding, reconcile);
                   reconcile(); // Includes changes committed before attachment or a controller replacement.

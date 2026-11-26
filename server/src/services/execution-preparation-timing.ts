@@ -12,7 +12,7 @@ type PreparationPhase = "environment_selection" | "execution_configuration" | "s
   | "routine_environment" | "responsible_user" | "execution_start"
   | "workspace" | "github_environment" | "github_launchers" | "run_output"
   | "workspace_validation" | "runtime_services" | "instructions" | "runtime_selection"
-  | "configuration_mentions" | "configuration_github_identity" | "configuration_secrets"
+  | "configuration_mentions" | "configuration_github_identity" | "configuration_secrets" | "configuration_dispatch_freshness"
   | "configuration_ai_runtime" | "configuration_skills" | "configuration_skills_adopted" | "configuration_connector_assignments"
   | "configuration_connector_skills" | "configuration_connector_delivery"
   | "configuration_mcp_skills" | "configuration_mcp_skill_bundles" | "configuration_mcp_app_context"
