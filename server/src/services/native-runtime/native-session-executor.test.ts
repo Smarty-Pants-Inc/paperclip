@@ -3528,7 +3528,7 @@ describe("remote provider pack manifest", () => {
     }
   });
 
-  it("accepts a fully digested pack and rejects artifact tampering", async () => {
+  it("keeps a cached warm Pi owner on its admitted pack when the server pack changes", async () => {
     const root = await mkdtemp(join(tmpdir(), "paperclip-provider-pack-"));
     await mkdir(join(root, "dist", "cli"), { recursive: true });
     await mkdir(join(root, "node_modules", "node", "bin"), { recursive: true });
@@ -3667,6 +3667,53 @@ describe("remote provider pack manifest", () => {
         manifest: selectedPack.manifest });
       expect(syncIn).toHaveBeenCalledTimes(mode === "uploaded" || mode === "failed-final" ? 1 : 0);
     }
+    const issueUpdate = vi.spyOn(issueServiceModule, "issueService").mockReturnValue({ update: vi.fn(async () => null) } as never);
+    onTestFinished(() => issueUpdate.mockRestore());
+    const daemonPath = join(root, "paperclip-runnerd"), daemon = Buffer.alloc(64);
+    daemon.set([0x7f, 0x45, 0x4c, 0x46, 2, 1]); daemon.writeUInt16LE(62, 18); await writeFile(daemonPath, daemon);
+    const first = { ...execution, binding: { ...execution.binding, runId: randomUUID(), executionWorkspaceId: randomUUID() }, workspace: { ...execution.workspace, cwd: root },
+      provider: { kind: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous" },
+      session: { ...execution.session, normalizedSessionId: randomUUID(), driverKind: "pi_rpc", lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 } } } as NativeExecutionInputV1;
+    const session = { close: vi.fn(async () => undefined) };
+    state.createBackend.mockReturnValue({ kind: "test", openSession: async () => session } as never);
+    state.execute.mockReset().mockImplementation(async options => {
+      await options.onSession(options.existingSession ?? await options.backend.openSession({ identity: { ...first.binding, sessionId: first.session.normalizedSessionId! } }));
+      return { result: { summary: "done" }, terminal: { runTerminalState: "succeeded" }, turnId: "turn", normalizedSessionId: first.session.normalizedSessionId,
+        providerSessionId: "provider", driverKind: "pi_rpc", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+    });
+    let uploaded = false;
+    const syncIn = vi.fn(async (operations: Array<{ files: Array<{ targetPath: string }> }>) => {
+      if (operations.some(operation => operation.files.some(file => file.targetPath.endsWith("/provider-pack")))) uploaded = true;
+      return { operations: [] };
+    });
+    const execute = vi.fn(async (command: { args?: string[] }) => ({ exitCode: command.args?.[0] === "-e" && !uploaded ? 1 : 0,
+      timedOut: false, stderr: "", stdout: command.args?.[0] === "--build-metadata" ? JSON.stringify({ schema: "paperclip-runner/runnerd-build-metadata/v1",
+        binaryName: "paperclip-runnerd", packageName: "@paperclipai/paperclip-runner", binaryContractVersion: 2,
+        durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"], providerPacks: [] }) : command.args?.[0] === "--version" ? "1.18.34\n" : "" }));
+    const run = (current: NativeExecutionInputV1) => {
+      const db = leaseDb(current), select = db.select.bind(db);
+      db.select = ((fields?: Record<string, unknown>) => fields?.status === heartbeatRuns.status && fields?.runnerProfileJson === heartbeatRuns.runnerProfileJson
+        ? { from: () => ({ where: () => ({ limit: async () => [{ status: "succeeded", runnerProfileJson: { nativeExecutionInput: first } }] }) }) } : select(fields as never)) as Db["select"];
+      return executePaperclipNativeSession({ db, execution: current, useRunnerd: true, runnerInstanceId: "cached-pack-runner",
+        runnerRemoteBinaryPath: daemonPath, runnerRemoteProviderPackPath: root, runnerIngressAuthorized: true,
+        runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace", environmentId: "environment",
+          effectiveCapabilities: { runnerWebSocketIngress: true }, runner: { execute, syncIn } } as never });
+    };
+    onTestFinished(async () => { await closeIdleWarmNativeSessionsForRestart(); });
+    await run(first);
+    state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+    const durableRoot = state.createTransport.mock.calls.at(-1)![0].stateDirectory!;
+    const durableIdentity = { runId: first.binding.runId, normalizedSessionId: first.session.normalizedSessionId, runnerInstanceId: "cached-pack-runner", environmentLeaseId: first.binding.executionWorkspaceId };
+    await mkdir(join(durableRoot, "control-plane"), { recursive: true }); await mkdir(join(durableRoot, "runner"), { recursive: true });
+    await writeFile(join(durableRoot, "control-plane/control-plane-state.json"), JSON.stringify(durableControlPlaneState(durableIdentity)));
+    await writeFile(join(durableRoot, "runner/runner-state.json"), JSON.stringify(durableRunnerState(durableIdentity, "ready")));
+    payload.runnerSourceRevision = "2".repeat(40); await writeManifest(); uploaded = false; syncIn.mockClear(); execute.mockClear();
+    await writeFile(daemonPath, Buffer.concat([daemon, Buffer.from("new controller runner")]));
+    await run({ ...first, binding: { ...first.binding, runId: randomUUID() } });
+    expect(state.execute.mock.calls.at(-1)![0].existingSession).toBe(session);
+    expect(uploaded).toBe(false);
+    expect(syncIn).not.toHaveBeenCalled();
+    expect(execute.mock.calls.some(([command]) => command.args?.some(value => value.includes("rm -rf") && value.includes("provider-pack")))).toBe(false);
     const cursorPath = "provider-assets/cursor/linux-x64";
     await mkdir(join(root, cursorPath), { recursive: true });
     await writeFile(join(root, cursorPath, "runtime"), "pinned Cursor runtime");
