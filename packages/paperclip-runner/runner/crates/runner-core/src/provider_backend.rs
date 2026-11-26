@@ -833,10 +833,26 @@ fn normalize_provider_notification(
         return Ok(events);
     }
     if method != "paperclip/runResult" {
+        // Pi turn totals are not occupancy; only forward its explicit context.
+        let context = (state.config.provider == "pi_rpc" && method == "thread/tokenUsage/updated")
+            .then(|| {
+                let context = params.get("tokenUsage")?.get("context")?;
+                let used_tokens = context.get("usedTokens")?.as_u64()?;
+                let window_tokens = context.get("windowTokens")?.as_u64()?;
+                (window_tokens > 0)
+                    .then(|| json!({"usedTokens": used_tokens, "windowTokens": window_tokens}))
+            })
+            .flatten();
         return Ok(
             normalize_codex_notification_in(method, params, Some(&state.config.cwd))
                 .into_iter()
-                .map(|event| relabel_provider_event(event, &state.config.provider))
+                .map(|mut event| {
+                    if let (Some(context), "usage.reported") = (&context, event.event_type.as_str())
+                    {
+                        event.payload["context"] = context.clone();
+                    }
+                    relabel_provider_event(event, &state.config.provider)
+                })
                 .collect(),
         );
     }
@@ -7333,6 +7349,39 @@ done
         state.config.provider_version = "pi-rpc-v1".to_owned();
         assert!(validate_proxy_run_result(&state, &params).is_ok());
         assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn pi_rpc_context_usage_requires_valid_occupancy() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        state.config.driver = "pi_rpc".to_owned();
+        state.config.provider_version = "pi-rpc-v1".to_owned();
+        let context = json!({"usedTokens": 1200, "windowTokens": 200000});
+        for (reported, expected) in [
+            (Some(context.clone()), Some(context)),
+            (Some(json!({"usedTokens": 1200, "windowTokens": 0})), None),
+            (None, None),
+        ] {
+            // Turn totals and the Codex window must never become Pi occupancy.
+            let mut params = json!({
+                "threadId": "thread-1", "turnId": "turn-1",
+                "tokenUsage": {"last": {"totalTokens": 9000}, "modelContextWindow": 1000000}
+            });
+            if let Some(reported) = reported {
+                params["tokenUsage"]["context"] = reported;
+            }
+            let events =
+                normalize_provider_notification(&mut state, "thread/tokenUsage/updated", &params)
+                    .unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event_type, "usage.reported");
+            assert_eq!(
+                events[0].payload.get("context"),
+                expected.as_ref(),
+                "{params}"
+            );
+        }
     }
 
     fn cursor_cloud_result_state() -> CodexProviderState {
