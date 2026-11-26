@@ -1225,7 +1225,7 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     it.each(["chat", "connected-chat"])("refuses %s tasks", async kind => {
       const f = await seedAgentRetry();
       await db.update(issues).set(kind === "chat"
-        ? { conversationAgentId: f.agentId, conversationUserId: "board-user" }
+        ? { conversationAgentId: f.agentId, conversationUserId: "board-user", conversationState: "active" }
         : { originKind: "chat_channel" }).where(eq(issues.id, f.issueId));
       expect((await press(f)).status).toBe(403);
     });
@@ -1237,8 +1237,10 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       else if (state === "absent") await db.delete(companyMemberships).where(eq(companyMemberships.companyId, f.companyId));
       else await db.update(companyMemberships).set({ status: "suspended" }).where(eq(companyMemberships.companyId, f.companyId));
       const res = await press(f);
-      expect(res.status).toBe(409);
-      expect(res.body.details.code).toBe("retry_authority_unavailable");
+      expect(res.status).toBe(state === "no-person" ? 409 : 404);
+      if (state === "no-person") expect(res.body.details.code).toBe("retry_authority_unavailable");
+      expect(await refusal(f)).toMatchObject({ actorId: f.presserId,
+        details: { reason: state === "no-person" ? "retry_authority_unavailable" : "http_404" } });
     });
 
     it("caps attempts per agent/task and counts a saved replay once", async () => {
@@ -1294,7 +1296,16 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
         const res = await request(app).post(`/api/issues/${f.issueId}/retry`)
           .set("Authorization", `Bearer ${token!}`)
           .send({ observedRunId: f.retryRunId, idempotencyKey: randomUUID(), actorId: "someone-else" });
-        expect(res.status, JSON.stringify(res.body)).toBe(202);
+        expect(res.status, JSON.stringify(res.body)).toBe(400);
+        expect(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
+          eq(agentWakeupRequests.reason, "task_retry")))).toHaveLength(0);
+        const valid = await request(app).post(`/api/issues/${f.issueId}/retry`)
+          .set("Authorization", `Bearer ${token!}`)
+          .send({ observedRunId: f.retryRunId, idempotencyKey: randomUUID() });
+        expect(valid.status, JSON.stringify(valid.body)).toBe(202);
+        const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, valid.body.requestId));
+        expect(wake.payload?.taskRetry).toMatchObject({ actorId: "board-user",
+          agentRequester: { agentId: f.presserId, runId: f.presserRunId } });
       } finally { vi.unstubAllEnvs(); }
     });
 
@@ -1311,7 +1322,8 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       // Model a dispatched durable receipt; the queue's actual dispatch is
       // covered separately. This isolates the read projection and its binding.
       await db.update(agentWakeupRequests).set({ runId: f.retryRunId }).where(eq(agentWakeupRequests.id, res.body.requestId));
-      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, taskRetryRequestId: res.body.requestId } })
+      await db.update(heartbeatRuns).set({ issueId: f.issueId, invocationSource: "on_demand",
+        contextSnapshot: { issueId: f.issueId, wakeReason: "task_retry", taskRetryRequestId: res.body.requestId } })
         .where(eq(heartbeatRuns.id, f.retryRunId));
       const app = express();
       app.use((req, _res, next) => { req.actor = boardActor(f.companyId); next(); });
@@ -1320,6 +1332,8 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       expect(page.status, JSON.stringify(page.body)).toBe(200);
       expect(page.body).toMatchObject({ responsibleUserId: "board-user",
         retryRequestedByAgent: { id: f.presserId, name: "Retry helper" } });
+      await db.update(heartbeatRuns).set({ invocationSource: "automation" }).where(eq(heartbeatRuns.id, f.retryRunId));
+      expect((await request(app).get(`/api/heartbeat-runs/${f.retryRunId}`)).body.retryRequestedByAgent).toBeNull();
     });
   });
 

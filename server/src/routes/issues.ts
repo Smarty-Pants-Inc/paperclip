@@ -302,6 +302,7 @@ import {
   assertCompanyAccess,
   getAccessibleResource,
   getActorInfo,
+  hasCompanyAccess,
   issueNotFoundBody,
 } from "./authz.js";
 import {
@@ -10110,12 +10111,16 @@ export function issueRoutes(
           throw forbidden("Scoped credentials cannot request Retry");
         if (req.actor.source !== "agent_jwt" || !req.actor.onBehalfOfUserId)
           throw forbidden("Retry requires an authenticated run-bound agent.", { code: "retry_refused_unsigned_run" });
-        const runId = requireAgentRunId(req, res);
-        if (!runId) return;
+        const runId = req.actor.runId?.trim();
+        if (!runId) throw unauthorized("Agent run id required");
         if (!(await agentOwnsRun(db, { companyId: req.actor.companyId, agentId: req.actor.agentId, runId })))
           throw forbidden("Run does not belong to this agent");
-        const own = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
-        if (!own || !(await assertIssueReadAllowed(req, res, own))) return;
+        // Throw instead of sending here: the awaited refusal audit must finish
+        // before error middleware answers and callers can tear down this run.
+        const own = await svc.getById(req.params.id as string);
+        if (!own || !hasCompanyAccess(req, own.companyId)) throw notFound("Issue not found");
+        assertCompanyAccess(req, own.companyId);
+        if (!(await decideIssueAccess(req, own, "issue:read")).allowed) throw notFound("Issue not found");
         const ownWrite = await decideIssueAccess(req, own, "issue:mutate");
         if (!ownWrite.allowed)
           throw forbidden(ownWrite.explanation, authorizationDeniedDetails(ownWrite));
