@@ -1858,6 +1858,36 @@ html:has(.paperclip-app-shell[data-keyboard-open="true"] [data-classic-task-shel
   }
 }
 
+/* Approved status line: one 32px row immediately above the composer. */
+.task-chat-status-line {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--spacing) * 2);
+  height: calc(var(--spacing) * 8);
+  min-height: calc(var(--spacing) * 8);
+  min-width: 0;
+  padding-inline: calc(var(--spacing) * 4);
+  font-size: var(--text-sm);
+  line-height: var(--text-sm--line-height);
+  color: var(--foreground);
+}
+.task-chat-status-label { font-weight: 500; white-space: nowrap; }
+.task-chat-status-shimmer {
+  --status-shimmer-highlight: oklch(0.5 0 0);
+  background: linear-gradient(90deg, var(--foreground) 0%, var(--foreground) 38%, var(--status-shimmer-highlight) 50%, var(--foreground) 62%, var(--foreground) 100%);
+  background-size: 200% 100%;
+  background-clip: text;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: shimmer-text-slide var(--motion-conversation-tool-shimmer) linear infinite;
+}
+@media (max-width: 767px) {
+  .task-chat-status-line { padding-inline: calc(var(--spacing) * 3); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .task-chat-status-shimmer { animation: none; background: none; -webkit-text-fill-color: currentColor; }
+}
+
 /* Shimmer text effect for active "Working" state — Cursor-style sweep */
 @keyframes shimmer-text-slide {
   0% { background-position: 100% center; }

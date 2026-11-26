@@ -7,6 +7,7 @@ import {
 import { imagePreparationReceiptIds } from "./task-chat/image-resources";
 import type { ScrollingHistory } from "@/components/task-chat/TaskMessageScroller";
 import { TaskChatShimmerScope } from "@/components/task-chat/TaskChatShimmer";
+import { TaskChatStatusContext, TaskChatStatusLine, taskChatLineState, taskChatRunStartedAt } from "@/components/task-chat/TaskChatStatusLine";
 import { useRunnerSubmission } from "@/hooks/useRunnerSubmission";
 import { useCompanyLiveEvent } from "@/context/LiveUpdatesProvider";
 import { TaskChatLoadingShell } from "@/components/task-chat/TaskChatLoadingShell";
@@ -3082,6 +3083,35 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const tailStatus = tailEndStatus === "succeeded" && isUserStop(tailRunId ?? "") ? "cancelled" : tailEndStatus;
   const tailFinishedAtMs = (tailStatus === "succeeded" && tailHasFinalResponse ? tailFinalRef.current.item?.atMs : undefined)
     ?? tailRunFinishedAtMs ?? (tailTerminal ? toMs(tailTerminal.ts) : tailFinalRef.current.item?.atMs ?? null);
+  // Read the existing Stop button's active-run signal. Its recovery fallback
+  // can also name an ended attempt; that must never light this working line.
+  // This is display-only: the Stop/Send control and all failure rows stay as-is.
+  const statusLineRun = liveRun && !tailEnded && !tailHasFinalResponse && onCancelRun &&
+    !failureNoticeIds.has(liveRun.id) &&
+    ["queued", "running"].includes(terminalStatuses.get(liveRun.id) ?? linkedRunMetaById.get(liveRun.id)?.status ?? liveRun.status)
+    ? liveRun : null;
+  const statusLineStartedAt = useMemo(() => statusLineRun
+    ? taskChatRunStartedAt(statusLineRun, comments, requestCommentByRun.get(statusLineRun.id))
+    : null, [statusLineRun, comments, requestCommentByRun]);
+  // Use the whole run for activity, not a segment's post-Steer clock or slice.
+  const statusLineItems = useMemo(() => statusLineRun
+    ? transcriptToTaskChatItems(transcriptByRun.get(statusLineRun.id) ?? [], {
+        runId: statusLineRun.id, running: true,
+      })
+    : [], [statusLineRun, transcriptByRun]);
+  const statusLine = statusLineRun ? <TaskChatStatusLine
+    clockKey={statusLineRun.id}
+    startedAtMs={statusLineStartedAt}
+    state={taskChatLineState({
+      status: statusLineRun.status,
+      execution: liveExecution,
+      activityLabel: nativeActivityLabelByRun.get(statusLineRun.id) ?? tailPreparationLabel,
+      items: statusLineItems,
+      stopping: stoppingReply,
+      reconnecting: tailActivityUnavailable,
+    })}
+  /> : null;
+
   const tailTurnStatus = useMemo(
     () =>
       isTerminalRunStatus(tailStatus)
@@ -3877,6 +3907,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   };
 
   return (
+    <TaskChatStatusContext.Provider value={statusLineRun?.id ?? null}>
     <TaskChatRequestHistoryContext.Provider value={issueId ?? "unknown"}>
     <McpAppIssueProvider issueId={issueId} sendMessage={composerDisabledReason ? null : sendMcpAppMessage}>
     <ProviderToolIconsProvider companyId={companyId}>
@@ -4014,7 +4045,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                     finishedAtMs={tailFinishedAtMs}
                                     continuedAfterSteering={tailContinued}
                                     statusContent={tailRunSource?.adapterType !== "paperclip_runner" && !optimisticRunnerStartup && !tailProgressLabel && !tailPreparationLabel && !stoppingReply && !isTerminalRunStatus(tailStatus) ? (
-                                      <TaskChatLiveRunPill status={tailStatus} execution={!tailHasFinalResponse && !tailFinalStreaming && !tailTerminal && liveRun?.id === tailRunId ? tailExecution : null}
+                                      <TaskChatLiveRunPill runId={tailRunId} status={tailStatus} execution={!tailHasFinalResponse && !tailFinalStreaming && !tailTerminal && liveRun?.id === tailRunId ? tailExecution : null}
                                         startedAtMs={tailStartedAtMs} finishedAtMs={tailFinishedAtMs} toolSummary={tailToolSummary} />
                                     ) : undefined}
                                   />
@@ -4115,6 +4146,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                 />
               </div>
             ) : null}
+            {!showComposer ? <div className="mx-auto w-full max-w-(--tc-shell-max-w) px-4">{statusLine}</div> : null}
             {showComposer ? (
               <TaskChatComposerDock mobile={isMobile} streamlined={streamlinedUiEnabled} concealed={!historyRevealed}>
                 {prepareInitialContent ? (
@@ -4189,6 +4221,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                         />
                       ) : null}
                       <div className="relative z-10">
+                        {statusLine}
                         <TaskChatComposer
                           composerRef={composerRef}
                           onAdd={handleThreadAdd}
@@ -4256,5 +4289,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     </ProviderToolIconsProvider>
     </McpAppIssueProvider>
     </TaskChatRequestHistoryContext.Provider>
+    </TaskChatStatusContext.Provider>
   );
 }
