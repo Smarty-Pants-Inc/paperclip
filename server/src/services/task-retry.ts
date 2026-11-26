@@ -312,7 +312,8 @@ function admitTaskRetry(input: TaskRetryRequest) {
       if (!agentRequester) return;
       const refusal = await agentTaskRetryRefusal(db, { ...input, sourceRunId, agentRequester });
       if (refusal) throw conflict(agentTaskRetryMessage(refusal), { code: refusal, retrySourceRunId: sourceRunId });
-      if (!await taskRetryMutationAllowed(db, { ...input, actorSource: input.actorSource ?? "session" }))
+      if (!await taskRetryMutationAllowed(db, { ...input,
+        actorSource: taskRetryIntentSchema.shape.actorSource.parse(input.actorSource ?? "session") }))
         throw forbidden(agentTaskRetryMessage("retry_authority_denied"),
           { code: "retry_authority_denied", retrySourceRunId: sourceRunId });
     };
