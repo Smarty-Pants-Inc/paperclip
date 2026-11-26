@@ -186,7 +186,9 @@ function registerRouteMocks() {
     }) };
   });
   vi.doMock("../services/task-retry.js", () => ({ requestTaskRetry: mockRequestTaskRetry }));
-  vi.doMock("../services/agent-task-retry.js", () => ({ agentOwnsRun: async () => true,
+  vi.doMock("../services/agent-task-retry.js", async () => ({
+    ...await vi.importActual<typeof import("../services/agent-task-retry.js")>("../services/agent-task-retry.js"),
+    agentOwnsRun: async () => true, agentTaskRetryPresserRefusal: async () => null,
     agentTaskRetryActor: mockAgentTaskRetryActor, recordAgentTaskRetry: async () => undefined,
     recordAgentTaskRetryRefusal: async () => undefined }));
   vi.doMock("../services/onboarding-first-task-admission.js", async () => ({
@@ -964,7 +966,8 @@ describe("agent issue mutation checkout ownership", () => {
     const res = await request(createApp(actor)).post(`/api/issues/${issueId}/retry`).send(body);
     expect(res.status, JSON.stringify(res.body)).toBe(202);
     expect(mockRequestTaskRetry).toHaveBeenCalledWith(expect.objectContaining({
-      actorId: "board-user", agentRequester: { agentId: peerAgentId, runId: actor.runId }, ...body,
+      actorId: "board-user", agentRequester: { agentId: peerAgentId, runId: actor.runId,
+        credentialSource: "agent_jwt", onBehalfOfUserId: "board-user" }, ...body,
     }));
   });
 
