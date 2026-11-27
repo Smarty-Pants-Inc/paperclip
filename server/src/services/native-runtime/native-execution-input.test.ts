@@ -12,7 +12,7 @@ import { DurablePrpControlPlane } from "../../vendor/paperclip-runner/index.js";
 import { renderFirstTurnQueuedInput } from "./first-turn-queued-input.js";
 import { shouldWakeAssigneeForIssueComment } from "../issue-comment-wakeup.js";
 import { buildQueuedCommentQueueSnapshot } from "../issue-queued-comment-queue.js";
-import { assertNativeTurnCommandBound } from "./native-turn-budget.js";
+import { assertNativeTurnCommandBound, nativeContinuationReadState } from "./native-turn-budget.js";
 import { renderNativeRunnerStagedAttachmentPrompt } from "./native-runner-file-handoff.js";
 import { clearNativeFreshFallback, registerNativeFreshFallback, nativeFreshFallbackPayload, nativeQueuedTurnUpperBound, assertNativeQueuedTurnBound, nativeQueuedTurnCompositionMeasured, observeNativeTurnBudgetSession, guardNativeTurnCommands, commandEnvelopeBytes, NATIVE_TURN_KNOWN_MAX_BYTES, NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND } from "./native-turn-budget.js";
 import type { ExecutionContinuationEnvelope, AskUserQuestionsInteraction } from "@paperclipai/shared";
@@ -598,8 +598,8 @@ describe("native serialized-command budget", () => {
   }
   function prepare(c: ExecutionContinuationEnvelope, extra: Partial<typeof args> = {}) {
     let retained = c;
-    const input = buildNativeExecutionInput({ ...args, boundCommandBytes: true, wakePayload: { reason: c.trigger.reason, executionContinuation: c },
-      continuationReadState: { lastRunAt: "2026-01-02T00:00:00Z", readCommentIds: c.messages.map(m => m.id) }, onContinuationBudgeted: value => { retained = value; }, ...extra });
+    const input = buildNativeExecutionInput({ ...args, resumedSession: true, continuationProviderSessionId: "provider-generation-1", boundCommandBytes: true, wakePayload: { reason: c.trigger.reason, executionContinuation: c },
+      continuationReadState: { nativeSessionId: "session", providerSessionId: "provider-generation-1", lastRunAt: "2026-01-02T00:00:00Z", readCommentIds: c.messages.map(m => m.id) }, onContinuationBudgeted: value => { retained = value; }, ...extra });
     return { input, retained };
   }
   it.each([["long-receipts 156/87", 156, 235936, 87], ["de496399", 10, 467000, 0], ["fresh 552 KB", 10, 546500, 0], ["resumed reopen", 31, 690000, 0], ["resumed task_retry", 31, 690000, 0]] as const)("bounds %s's full snapshot and preserves every receipt", (name, count, chars, actions) => {
@@ -644,7 +644,9 @@ describe("native serialized-command budget", () => {
     expect(decideNativeContinuation({ ...args, ...extra, hasSession: true, previousRunId: "previous" }).promptOnly).toBe(sessionContinuity === "continuous");
   });
   it("budgets a failed-resume full bootstrap only when that fallback is selected", () => {
-    const c = shape(31, 900000);
+    // Read-operation results may still be shortened; old-generation messages may not.
+    const c = shape(31, 100, 1);
+    c.completedActions![0]!.result = { body: "r".repeat(900000) };
     c.trigger.reason = "issue_commented";
     c.originCommentIds = [c.messages.at(-1)!.id];
     c.resumeDelta = { baseRunId: "previous", messages: [c.messages.at(-1)!] };
@@ -656,8 +658,8 @@ describe("native serialized-command budget", () => {
     const bounded = budgetNativeFreshFallback(input, wake, { lastRunAt: "2026-01-02T00:00:00Z", readCommentIds: c.messages.map(message => message.id) });
     expect(commandEnvelopeBytes(buildNativeModelEnvelope(input))).toBeLessThan(NATIVE_TURN_KNOWN_MAX_BYTES);
     expect(input.continuationPrompt).toBeNull();
-    expect(bounded!.messages.length).toBeLessThan(c.messages.length);
-    expect(bounded!.coverage).toMatchObject({ nativeSessionId: "session", omitted: expect.any(Array) });
+    expect(bounded!.messages).toEqual(c.messages);
+    expect(bounded!.coverage).toMatchObject({ nativeSessionId: "session", shortenedCompletedActions: 1, omitted: [] });
     expect(input.task.prompt).toContain("History was cut");
     const copiedEnvelope = buildNativeModelEnvelope(parsedCopy);
     copiedEnvelope.task.prompt = `late handoff\n\n${copiedEnvelope.task.prompt}\n\nlate attachment`;
@@ -669,7 +671,8 @@ describe("native serialized-command budget", () => {
     } finally { clearNativeFreshFallback("fallback-copy"); }
   });
   it.each([100, 900000])("preserves dollar replacement tokens byte-identically through failed-resume fallback (%s)", chars => {
-    const c = shape(31, chars), body = "Person's exact words: $& $' $` $$ END";
+    const c = shape(31, 100, 1), body = "Person's exact words: $& $' $` $$ END";
+    c.completedActions![0]!.result = { body: "r".repeat(chars) };
     c.messages.at(-1)!.body = body;
     c.trigger.reason = "issue_commented";
     c.originCommentIds = [c.messages.at(-1)!.id];
@@ -693,7 +696,8 @@ describe("native serialized-command budget", () => {
   // alternate renderer can stand in for the late joiners this bound protects.
   it.each(["fresh", "retained", "failed-resume", "pair-f1", "escaped", "attachments-128", "dynamic-constraints", "conversation", "near-line"])("server upper bound covers the real Runner's complete command (%s)", async mode => {
     const resumed = mode === "retained" || mode === "failed-resume" || mode === "pair-f1";
-    const c = shape(mode === "failed-resume" ? 31 : 3, mode === "failed-resume" ? 900000 : 100);
+    const c = shape(mode === "failed-resume" ? 31 : 3, 100, mode === "failed-resume" ? 1 : 0);
+    if (mode === "failed-resume") c.completedActions![0]!.result = { body: "r".repeat(900000) };
     c.trigger.reason = "issue_commented"; c.originCommentIds = [c.messages.at(-1)!.id];
     c.resumeDelta = { baseRunId: "previous", messages: [c.messages.at(-1)!] };
     const wake = { reason: c.trigger.reason, commentIds: c.originCommentIds, executionContinuation: c };
@@ -899,7 +903,8 @@ describe("native serialized-command budget", () => {
   it.each(["unrelated", "same-length-unrelated", "bounded-late-joiner", "exact-original", "near-original"] as const)("discriminates real failed-resume bootstrap content (%s)", async mode => {
     // The stale original is BELOW the final command cap: the near-original
     // refusal must come from removed history, not the ordinary byte guard.
-    const c = shape(31, 420000);
+    const c = shape(31, 100, 1);
+    c.completedActions![0]!.result = { body: "r".repeat(420000) };
     c.trigger.reason = "issue_commented";
     c.originCommentIds = [c.messages.at(-1)!.id];
     c.resumeDelta = { baseRunId: "previous", messages: [c.messages.at(-1)!] };
@@ -917,7 +922,7 @@ describe("native serialized-command budget", () => {
     expect(unrelated.slice(0, 128)).toBe(original.slice(0, 128));
     expect(unrelated).not.toContain(original);
     // Change one byte in history actually removed by this cut, not boilerplate.
-    const omittedBody = c.messages[5]!.body;
+    const omittedBody = (c.completedActions![0]!.result as { body: string }).body;
     expect(bounded).not.toContain(omittedBody);
     const changedAt = original.indexOf(omittedBody) + Math.floor(omittedBody.length / 2);
     expect(changedAt).toBeGreaterThan(0);
@@ -1064,6 +1069,56 @@ describe("native serialized-command budget", () => {
     expect(input.task.prompt).toBe(original);
     input.task.prompt = "x".repeat(600000);
     expect(() => budgetNativeFreshFallback(input, wake)).toThrow(expect.objectContaining({ promptCause: { kind: "protected_input", bytes: 600000, remedies: ["new_followup_task"] } }));
+  });
+  it("C31 read-state parsing preserves provenance and fences selected generations", () => {
+    const saved = { nativeSessionId: "session", providerSessionId: "provider", lastRunAt: "2026-01-02T00:00:00Z", readCommentIds: ["read", 3] };
+    const parsed = nativeContinuationReadState(saved);
+    expect(parsed).toEqual({ ...saved, readCommentIds: ["read"] });
+    expect(nativeContinuationReadState(parsed, { nativeSessionId: "session", providerSessionId: "provider" }).readCommentIds).toEqual(["read"]);
+    for (const target of [null, { nativeSessionId: "session", providerSessionId: "other" }, { nativeSessionId: "other", providerSessionId: "provider" }])
+      expect(nativeContinuationReadState(parsed, target).readCommentIds).toEqual([]);
+    expect(nativeContinuationReadState({ lastRunAt: saved.lastRunAt, readCommentIds: ["read"] },
+      { nativeSessionId: "session", providerSessionId: "provider" }).readCommentIds).toEqual([]);
+  });
+  it.each(["old-generation", "legacy", "other-provider", "other-native-session", "fresh"] as const)("C31 fresh fallback never cuts old-only input (%s)", generation => {
+    const c = shape(3, 100);
+    c.messages[1]!.body = "READ_ONLY_IN_OLD_GENERATION " + "x".repeat(400000);
+    c.originCommentIds = [c.messages.at(-1)!.id];
+    const readState = { lastRunAt: "2026-01-02T00:00:00Z", readCommentIds: c.messages.map(m => m.id),
+      ...(generation === "legacy" ? {} : { nativeSessionId: generation === "other-native-session" ? "another-session" : "session",
+        providerSessionId: generation === "other-provider" ? "another-provider" : "provider-generation-1" }) };
+    if (generation === "other-provider" || generation === "other-native-session" || generation === "fresh") {
+      expect(() => prepare(c, { continuationReadState: readState, ...(generation === "fresh" ? { resumedSession: false } : {}) }))
+        .toThrow(expect.objectContaining({ code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: expect.objectContaining({ kind: "unread_message" }) }));
+      return;
+    }
+    c.trigger.reason = "issue_commented";
+    c.resumeDelta = { baseRunId: "previous", messages: [c.messages.at(-1)!] };
+    const wakePayload = { reason: c.trigger.reason, executionContinuation: c };
+    const { input } = prepare(c, { wakePayload, previousTurn: { runId: "previous", task: args.issue }, continuationReadState: readState });
+    expect(() => budgetNativeFreshFallback(input, wakePayload, readState)).toThrow(expect.objectContaining({
+      code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "unread_message", bytes: 400028,
+        remedies: ["edit_message", "delete_own_message", "new_followup_task"] },
+    }));
+    expect(input.task.prompt).toContain(c.messages[1]!.body);
+    expect(c.coverage).not.toHaveProperty("omitted");
+  });
+  it("C31 same-generation full resume still permits exact read-message omission", () => {
+    const c = shape(3, 100);
+    c.messages[1]!.body = "READ_IN_THIS_GENERATION " + "x".repeat(400000);
+    c.originCommentIds = [c.messages.at(-1)!.id];
+    const { input, retained } = prepare(c);
+    expect(retained.messages.map(m => m.id)).not.toContain(c.messages[1]!.id);
+    expect(retained.coverage).toMatchObject({ omitted: expect.arrayContaining([{ id: c.messages[1]!.id, updatedAt: c.messages[1]!.updatedAt }]) });
+    expect(commandEnvelopeBytes(buildNativeModelEnvelope(input))).toBeLessThanOrEqual(NATIVE_TURN_KNOWN_MAX_BYTES);
+  });
+  it("C31 fresh fallback refuses a snapshot already missing old-generation omitted bodies", () => {
+    const c = shape(3, 100);
+    Object.assign(c.coverage, { nativeSessionId: "session", providerSessionId: "provider-generation-1", omitted: [{ id: "missing-old", updatedAt: "2026-01-01T00:00:00Z" }] });
+    const { input } = prepare(c);
+    expect(() => budgetNativeFreshFallback(input, { executionContinuation: c })).toThrow(expect.objectContaining({
+      code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: expect.objectContaining({ kind: "protected_inputs" }),
+    }));
   });
   it("classifies an unread oversized message when a kept turn falls back to fresh input", () => {
     const c = shape(3, 100);

@@ -172,17 +172,48 @@ export function nativeSessionHandoffMaxBytes(promptOrEnvelope: string | object):
   return Math.min(NATIVE_WHOLE_HANDOFF_MAX_BYTES, room);
 }
 
-export type NativeContinuationReadState = { lastRunAt: string | null; readCommentIds: string[] };
+export type NativeContinuationReadState = {
+  lastRunAt: string | null;
+  readCommentIds: string[];
+  nativeSessionId?: string | null;
+  providerSessionId?: string | null;
+};
 export type NativeContinuationCoverage = ExecutionContinuationEnvelope["coverage"] & {
   omitted?: Array<{ id: string; updatedAt: string }>;
   nativeSessionId?: string;
   providerSessionId?: string;
 };
 const record = (v: unknown): Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : {};
-export function nativeContinuationReadState(value: unknown): NativeContinuationReadState {
+export function nativeContinuationReadState(value: unknown, target?: {
+  nativeSessionId: string | null; providerSessionId: string | null;
+} | null): NativeContinuationReadState {
   const state = record(value);
+  const nativeSessionId = typeof state.nativeSessionId === "string" ? state.nativeSessionId : null;
+  const providerSessionId = typeof state.providerSessionId === "string" ? state.providerSessionId : null;
+  // null is an explicitly fresh generation. Missing/legacy provenance never
+  // authorizes cuts in a selected session; parsing alone preserves old state.
+  const sameGeneration = target === undefined || !!(target && nativeSessionId && providerSessionId
+    && nativeSessionId === target.nativeSessionId && providerSessionId === target.providerSessionId);
   return { lastRunAt: typeof state.lastRunAt === "string" ? state.lastRunAt : null,
-    readCommentIds: Array.isArray(state.readCommentIds) ? state.readCommentIds.filter((id): id is string => typeof id === "string") : [] };
+    nativeSessionId, providerSessionId,
+    readCommentIds: sameGeneration && Array.isArray(state.readCommentIds)
+      ? state.readCommentIds.filter((id): id is string => typeof id === "string") : [] };
+}
+
+/** Resolve the previous provider from the saving run's own evidence, never
+ * from a read projection stamped with the currently selected provider. */
+export function nativeContinuationProviderSessionId(
+  savingRun: { nativeSessionId: string | null; runnerProfileJson: unknown; contextSnapshot?: unknown } | null | undefined,
+  normalizedSessionId: string,
+  savingEventProviderId?: string | null,
+): string | null {
+  const checkpoint = record(record(savingRun?.runnerProfileJson).sessionCheckpoint);
+  if ((savingRun?.nativeSessionId ?? checkpoint.sessionId) !== normalizedSessionId) return null;
+  if (typeof checkpoint.providerSessionId === "string" && checkpoint.providerSessionId) return checkpoint.providerSessionId;
+  if (typeof savingEventProviderId === "string" && savingEventProviderId) return savingEventProviderId;
+  const context = record(savingRun?.contextSnapshot);
+  const state = nativeContinuationReadState(context.nativeContinuationReadState);
+  return state.nativeSessionId === normalizedSessionId ? state.providerSessionId ?? null : null;
 }
 
 /** Pure rendering budget: unknown read state protects everything, never guesses. */
