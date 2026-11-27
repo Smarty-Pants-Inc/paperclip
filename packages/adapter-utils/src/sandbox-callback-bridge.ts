@@ -309,6 +309,14 @@ export interface SandboxCallbackBridgeQueueClient {
   remove(remotePath: string): Promise<void>;
 }
 
+export interface SandboxCallbackBridgeLogContext {
+  environmentId?: string | null;
+  leaseId?: string | null;
+  providerLeaseId?: string | null;
+  runId?: string | null;
+  issueId?: string | null;
+}
+
 export interface SandboxCallbackBridgeWorkerHandle {
   stop(options?: { drainTimeoutMs?: number }): Promise<void>;
 }
@@ -819,6 +827,7 @@ async function writeBridgeResponse(
 export async function startSandboxCallbackBridgeWorker(input: {
   client: SandboxCallbackBridgeQueueClient;
   queueDir: string;
+  logContext?: SandboxCallbackBridgeLogContext;
   pollIntervalMs?: number | null;
   // Opt-in idle backoff. Without a queue notification, a long idle sleep
   // cannot retain the base-interval pickup bound, so the default stays off.
@@ -908,6 +917,18 @@ export async function startSandboxCallbackBridgeWorker(input: {
     ((request: SandboxCallbackBridgeRequest) => authorizeSandboxCallbackBridgeRequestWithRoutes(request));
   const buildWorkerFailureMessage = (error: unknown) =>
     `Sandbox callback bridge worker failed: ${error instanceof Error ? error.message : String(error)}`;
+  // Allowlist host identifiers only; never log the queue directory or credentials.
+  const warningContext = (fileName?: string, requestId?: string) => ({
+    environmentId: input.logContext?.environmentId ?? null,
+    leaseId: input.logContext?.leaseId ?? null,
+    providerLeaseId: input.logContext?.providerLeaseId ?? null,
+    runId: input.logContext?.runId ?? null,
+    issueId: input.logContext?.issueId ?? null,
+    ...(fileName === undefined ? {} : {
+      requestId: requestId ?? path.posix.basename(fileName).replace(/\.json$/i, ""),
+      requestFileName: path.posix.basename(fileName),
+    }),
+  });
 
   // Per-attempt finalization guard. Each `processRequestFile` call registers one,
   // keyed by the request file name. The guard is the completion fence between the
@@ -1036,6 +1057,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
           lastWriteError = error instanceof Error ? error.message : String(error);
           console.warn(
             `[paperclip] sandbox callback bridge failed to write response for ${response.id} (attempt ${attempt}/${MAX_BACKSTOP_WRITE_ATTEMPTS}): ${lastWriteError}`,
+            warningContext(fileName, response.id),
           );
           if (attempt < MAX_BACKSTOP_WRITE_ATTEMPTS) {
             await new Promise((resolve) => setTimeout(resolve, BACKSTOP_WRITE_RETRY_MS));
@@ -1167,6 +1189,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
       } catch (error) {
         console.warn(
           `[paperclip] sandbox callback bridge handler failed for ${request.id}: ${error instanceof Error ? error.message : String(error)}`,
+          warningContext(fileName, request.id),
         );
         // Tell a worker abort apart from a normal handler failure. The recovery
         // path aborts `guard.controller` when the per-iteration timeout or the
@@ -1265,6 +1288,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
       } catch (error) {
         console.warn(
           `[paperclip] sandbox callback bridge failed to write 504 backstop for ${requestId} (attempt ${attempt}/${MAX_BACKSTOP_WRITE_ATTEMPTS}): ${error instanceof Error ? error.message : String(error)}`,
+          warningContext(fileName, requestId),
         );
         if (attempt < MAX_BACKSTOP_WRITE_ATTEMPTS) {
           await new Promise((resolve) => setTimeout(resolve, BACKSTOP_WRITE_RETRY_MS));
@@ -1393,6 +1417,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
         // request and strands the caller until its own deadline.
         console.warn(
           `[paperclip] sandbox callback bridge could not read pending request ${requestId}: ${error instanceof Error ? error.message : String(error)}`,
+          warningContext(fileName, requestId),
         );
         continue;
       }
@@ -1427,6 +1452,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
           lastWriteError = error instanceof Error ? error.message : String(error);
           console.warn(
             `[paperclip] sandbox callback bridge failed to write recovery 503 for ${requestId} (attempt ${attempt}/${MAX_BACKSTOP_WRITE_ATTEMPTS}): ${lastWriteError}`,
+            warningContext(fileName, responseId),
           );
           if (attempt < MAX_BACKSTOP_WRITE_ATTEMPTS) {
             await new Promise((resolve) => setTimeout(resolve, BACKSTOP_WRITE_RETRY_MS));
@@ -1441,6 +1467,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
         // Every 503 write failed. Keep the request file for a later recovery pass.
         console.warn(
           `[paperclip] sandbox callback bridge kept queued request ${requestId} after every recovery 503 write failed: ${lastWriteError}`,
+          warningContext(fileName, responseId),
         );
       }
     }
@@ -1451,7 +1478,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
   // span, so the run and the orchestrator see the hang. When no `runtimeSpan`
   // runner is wired (no injected tracer), the helper still writes a warn line,
   // so the failure is never silent.
-  const surfaceRunError = async (error: Error) => {
+  const surfaceRunError = async (error: Error, fileName?: string) => {
     if (input.runtimeSpan) {
       try {
         await input.runtimeSpan(CALLBACK_BRIDGE_WORKER_FAILED_SPAN, async () => {
@@ -1462,7 +1489,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
         // now on the trace; swallow it here so the worker recovery continues.
       }
     }
-    console.warn(`[paperclip] ${error.message}`);
+    console.warn(`[paperclip] ${error.message}`, warningContext(fileName));
   };
 
   // The timestamp of the last successful loop iteration. The watchdog compares
@@ -1483,6 +1510,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
     } catch (error) {
       console.warn(
         `[paperclip] sandbox callback bridge watchdog failed to abort queued requests: ${error instanceof Error ? error.message : String(error)}`,
+        warningContext(),
       );
     }
   };
@@ -1541,6 +1569,14 @@ export async function startSandboxCallbackBridgeWorker(input: {
           if (stopping) {
             break;
           }
+          // A provider's explicit closed-lease refusal cannot recover by polling
+          // the same lease. Use the terminal catch below to drain once and
+          // settle, rather than leaking a retry loop after lease release. A
+          // "not found" stays transient: a lookup can miss briefly on a live lease.
+          const detail = error instanceof Error ? error.message : String(error);
+          if (/\bsandbox lease(?: \S+)? is no longer active\b/i.test(detail)) {
+            throw error;
+          }
           consecutivePollFailures += 1;
           const message = `${buildWorkerFailureMessage(error)} (transient poll failure ${consecutivePollFailures}; retrying)`;
           if (consecutivePollFailures === 1) {
@@ -1548,7 +1584,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
             // only warn, so a flapping channel does not spam failed spans.
             await surfaceRunError(new Error(message));
           } else {
-            console.warn(`[paperclip] ${message}`);
+            console.warn(`[paperclip] ${message}`, warningContext());
           }
           const backoffMs = Math.min(
             pollIntervalMs * 2 ** consecutivePollFailures,
@@ -1610,12 +1646,13 @@ export async function startSandboxCallbackBridgeWorker(input: {
             // loop serves the retry; the old terminal catch left every later
             // request to strand instead.
             const message = buildWorkerFailureMessage(error);
-            await surfaceRunError(new Error(message));
+            await surfaceRunError(new Error(message), fileName);
             try {
               await failPendingRequests(message, { abandonInFlight: true });
             } catch (failPendingError) {
               console.warn(
                 `[paperclip] sandbox callback bridge failed to abort queued requests after a request failure: ${failPendingError instanceof Error ? failPendingError.message : String(failPendingError)}`,
+                warningContext(fileName),
               );
             }
           } finally {
@@ -1635,6 +1672,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
       } catch (failPendingError) {
         console.warn(
           `[paperclip] sandbox callback bridge failed to abort queued requests after worker failure: ${failPendingError instanceof Error ? failPendingError.message : String(failPendingError)}`,
+          warningContext(),
         );
       }
     } finally {
