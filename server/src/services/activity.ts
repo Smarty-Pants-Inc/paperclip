@@ -222,7 +222,16 @@ export function activityService(db: Db) {
         'timeoutConfigured', ${heartbeatRuns.resultJson} -> 'timeoutConfigured',
         'timeoutSource', ${heartbeatRuns.resultJson} -> 'timeoutSource',
         'timeoutFired', ${heartbeatRuns.resultJson} -> 'timeoutFired'
-      ))
+      )) || case when jsonb_typeof(${heartbeatRuns.resultJson} -> 'cancellation') = 'object'
+        -- Keep unknown provenance explicitly null; never copy initiator identity.
+        then jsonb_build_object('cancellation', jsonb_build_object(
+          'source', case when jsonb_typeof(${heartbeatRuns.resultJson} #> '{cancellation,source}') = 'string'
+            then left(${heartbeatRuns.resultJson} #>> '{cancellation,source}', 64) end,
+          'reason', case when jsonb_typeof(${heartbeatRuns.resultJson} #> '{cancellation,reason}') = 'string'
+            then left(${heartbeatRuns.resultJson} #>> '{cancellation,reason}', 120) end,
+          'initiatorType', case when ${heartbeatRuns.resultJson} #>> '{cancellation,initiator,type}' in ('user', 'agent', 'system')
+            then ${heartbeatRuns.resultJson} #>> '{cancellation,initiator,type}' end
+        )) else '{}'::jsonb end
     end
   `.as("resultJson");
 
