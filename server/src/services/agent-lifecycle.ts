@@ -76,7 +76,8 @@ export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): li
     },
     reportFailure(context, error) {
       const code = lifecycle.lifecycleFailureCode(error);
-      logger.warn({ ...context, failureCode: code ?? "unclassified" }, "Agent lifecycle operation failed");
+      const failureReason = lifecycle.lifecycleFailureReason(error);
+      logger.warn({ ...context, failureCode: code ?? "unclassified", ...(failureReason ? { failureReason } : {}) }, "Agent lifecycle operation failed");
     },
     transaction: withAccountingTransaction,
     deleteDependencies: deleteAgentDependencies,
