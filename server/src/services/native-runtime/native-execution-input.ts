@@ -2,7 +2,7 @@ import type { PaperclipTurnContext } from "@paperclipai/adapter-utils/server-uti
 import { resolvePaperclipRunnerCursorMode, resolvePaperclipRunnerPiThinkingLevel } from "@paperclipai/adapter-utils";
 import { createHash } from "node:crypto";
 import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
-import { boundNativeExecutionContinuation, commandEnvelopeBytes, nativeInputRevision, nativePromptRefusalRemedies, NATIVE_HANDOFF_CUT_NOTE_RESERVE_BYTES, NATIVE_TURN_KNOWN_MAX_BYTES, NativeTurnPromptExceedsCommandBoundError, type NativeContinuationReadState, type NativeContinuationCoverage, type NativePromptRefusalCause, type NativeInputRevision } from "./native-turn-budget.js";
+import { boundNativeExecutionContinuation, commandEnvelopeBytes, nativeInputRevision, nativeContinuationReadState, nativePromptRefusalRemedies, NATIVE_HANDOFF_CUT_NOTE_RESERVE_BYTES, NATIVE_TURN_KNOWN_MAX_BYTES, NativeTurnPromptExceedsCommandBoundError, type NativeContinuationReadState, type NativeContinuationCoverage, type NativePromptRefusalCause, type NativeInputRevision } from "./native-turn-budget.js";
 import { runnerApiOperation } from "./runner-api-catalog.js";
 import { buildNativeContinuationPrompt } from "./native-continuation.js";
 import { decideNativeContinuation, resolveSessionContinuity } from "./continued-session.js";
@@ -79,6 +79,8 @@ export interface BuildNativeExecutionInput {
   /** Canonical source identity, before review/other provider prompt projection. */
   inputRevision?: NativeInputRevision;
   continuationReadState?: NativeContinuationReadState;
+  /** Provider generation selected for resume; never part of the model schema. */
+  continuationProviderSessionId?: string | null;
   /** Full-render cuts only: delta turns must retain their unbounded delivery baseline. */
   onContinuationBudgeted?: (continuation: ExecutionContinuationEnvelope) => void;
   /** Additive source ownership emitted by the server task/wake builders. */
@@ -441,6 +443,9 @@ function buildNativeExecutionInputUnchecked(input: BuildNativeExecutionInput): N
     session: { ...prepared.session, driverKind: input.provider === "grok_bot" ? "grok_bot_mcp" : "openai_dot_mcp", lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } }
   } : prepared) as NativeExecutionInputV5 | NativeExecutionInputV6 | NativeExecutionInputV7 | NativeExecutionInputV8 | NativeExecutionInputV9 | NativeExecutionInputV10;
   if (input.boundCommandBytes) {
+    const readState = nativeContinuationReadState(input.continuationReadState, input.resumedSession ? {
+      nativeSessionId: input.normalizedSessionId, providerSessionId: input.continuationProviderSessionId ?? null,
+    } : null);
     const continuation = wake?.executionContinuation as ExecutionContinuationEnvelope | undefined;
     const usesDelta = input.resumedSession === true && !!execution.continuationPrompt;
     const refusalCause = () => {
@@ -465,7 +470,7 @@ function buildNativeExecutionInputUnchecked(input: BuildNativeExecutionInput): N
           if (continuation) selectedContinuation = { ...continuation, messages: events.messages ?? [], humanResponses: events.humanResponses ?? [] };
         }
       }
-      return protectedNativePromptCause(description, assignment, selectedContinuation, input.continuationReadState,
+      return protectedNativePromptCause(description, assignment, selectedContinuation, readState,
         responses, selectedBytes(), JSON.stringify(input.resumedSession ? buildNativeModelEnvelope(execution, { resumedSession: true }) : buildNativeModelEnvelope(execution)));
     };
     const selectedBytes = () => commandEnvelopeBytes(input.resumedSession
@@ -483,7 +488,7 @@ function buildNativeExecutionInputUnchecked(input: BuildNativeExecutionInput): N
       return selectedBytes();
     };
     if (continuation?.version === 1) {
-      const bounded = boundNativeExecutionContinuation(continuation, measure, input.continuationReadState, operationId => {
+      const bounded = boundNativeExecutionContinuation(continuation, measure, readState, operationId => {
         try { return ["GET", "HEAD"].includes(runnerApiOperation(operationId).method); } catch { return false; }
       }, refusalCause);
       // Never replace the saved baseline with a full-snapshot cut on a delta
@@ -560,6 +565,9 @@ function orderIndependentWakeMatch(text: string): string {
  * before Runner composes the fresh envelope. No unused bootstrap can refuse a delta.
  */
 export function budgetNativeFreshFallback(execution: NativeExecutionInput, wakePayload: unknown, readState?: NativeContinuationReadState, caseContext?: CaseExecutionContext): ExecutionContinuationEnvelope | null {
+  // execution.session still names the failed resume here. The replacement has
+  // retained none of its reads, even if the normalized ID will be reused.
+  readState = nativeContinuationReadState(readState, null);
   const wake = wakePayload && typeof wakePayload === "object" ? wakePayload as Record<string, unknown> : {};
   const continuation = wake.executionContinuation as ExecutionContinuationEnvelope | undefined;
   if (continuation?.version !== 1) {
@@ -567,6 +575,14 @@ export function budgetNativeFreshFallback(execution: NativeExecutionInput, wakeP
       protectedNativePromptCause(execution.task.description ?? "", execution.task.prompt, undefined, readState, execution.interactionResponses,
         commandEnvelopeBytes(buildNativeModelEnvelope(execution)), JSON.stringify(buildNativeModelEnvelope(execution))));
     return null;
+  }
+  // A previously budgeted snapshot may already lack old-session-only input.
+  // Without its bodies we cannot restore it; refuse instead of forwarding a
+  // superficially small bootstrap whose omission receipts belong elsewhere.
+  const omitted = (continuation.coverage as NativeContinuationCoverage).omitted ?? [];
+  if (omitted.some(message => !continuation.messages.some(candidate => candidate.id === message.id && candidate.updatedAt === message.updatedAt))) {
+    throw new NativeTurnPromptExceedsCommandBoundError({ kind: "protected_inputs", bytes: commandEnvelopeBytes(buildNativeModelEnvelope(execution)),
+      measure: "envelope_with_reserve", remedies: nativePromptRefusalRemedies("protected_inputs") });
   }
   const payload = caseWakeWithInstructionReference(wakePayload, caseContext);
   const render = (value: ExecutionContinuationEnvelope) => selectPaperclipPromptSections({

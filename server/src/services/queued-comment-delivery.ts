@@ -103,11 +103,11 @@ function historyReadDeliveredSql(companyId: string, issueId: string, agentId: st
     or ${historyReadSql(companyId, agentId, sql`reading_run.context_snapshot->>'issueId' = ${issueId}`, sql`and reading_run.status = 'succeeded' and ${handled}`)})`;
 }
 
-function historyReadSql(companyId: string, agentId: string, binding: SQL, condition: SQL) {
+function historyReadSql(companyId: string, agentId: string, binding: SQL, condition: SQL, generationCondition: SQL = sql``) {
   return sql`exists (select 1 from ${heartbeatRuns} reading_run
       cross join lateral (select 1 from ${heartbeatRunEvents} history_read
         where history_read.company_id = ${companyId} and history_read.run_id = reading_run.id
-          and history_read.event_type = ${TASK_HISTORY_READ_EVENT}
+          and history_read.event_type = ${TASK_HISTORY_READ_EVENT} ${generationCondition}
           and (history_read.payload->'comments'->>${issueComments.id}::text)::timestamptz
             >= date_trunc('milliseconds', ${issueComments.updatedAt})
         limit 1) read_revision
@@ -118,16 +118,28 @@ function historyReadSql(companyId: string, agentId: string, binding: SQL, condit
 
 export async function readByEarlierTurnCommentIds(tx: Pick<Db, "select">, input: {
   companyId: string; issueId: string; agentId: string; commentIds: string[]; currentRunId?: string | null;
+  retainedGeneration?: { nativeSessionId: string | null; providerSessionId: string | null };
 }): Promise<Set<string>> {
   if (input.commentIds.length === 0) return new Set();
+  const generation = input.retainedGeneration;
+  if (generation && (!generation.nativeSessionId || !generation.providerSessionId)) return new Set();
   const { companyId, issueId, agentId } = input;
   const notCurrent = input.currentRunId ? sql`and reading_run.id <> ${input.currentRunId}` : sql``;
+  // A run can replace its provider session after reading. Use the generation
+  // at the read event, not the run's last provider generation.
+  const generationCondition = generation ? sql`and reading_run.native_session_id = ${generation.nativeSessionId}
+      and (select generation_event.payload->'prpEvent'->'payload'->>'providerSessionId'
+        from ${heartbeatRunEvents} generation_event
+        where generation_event.run_id = reading_run.id and generation_event.company_id = ${companyId}
+          and generation_event.event_type in ('session.started', 'session.resumed', 'session.reconciled')
+          and generation_event.seq <= history_read.seq
+        order by generation_event.seq desc limit 1) = ${generation.providerSessionId}` : sql``;
   const rows = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
     inArray(issueComments.id, input.commentIds),
-    sql`(${historyReadSql(companyId, agentId, sql`reading_run.native_issue_id = ${issueId}`, notCurrent)}
-      or ${historyReadSql(companyId, agentId, sql`reading_run.context_snapshot->>'issueId' = ${issueId}`, notCurrent)}
-      or ${firstTurnDeliveredSql(companyId, issueId, agentId, input.currentRunId)})`));
+    sql`(${historyReadSql(companyId, agentId, sql`reading_run.native_issue_id = ${issueId}`, notCurrent, generationCondition)}
+      or ${historyReadSql(companyId, agentId, sql`reading_run.context_snapshot->>'issueId' = ${issueId}`, notCurrent, generationCondition)}
+      or ${firstTurnDeliveredSql(companyId, issueId, agentId, input.currentRunId, generation)})`));
   return new Set(rows.map(row => row.id));
 }
 
@@ -177,7 +189,8 @@ export function taskHistoryHandlingGuidance(commentIds: readonly string[],
  * The comment row was taken into an accepted first provider turn of a run of
  * this agent on this task, and not edited after that run sealed its input.
  */
-function firstTurnDeliveredSql(companyId: string, issueId: string, agentId: string, currentRunId?: string | null) {
+function firstTurnDeliveredSql(companyId: string, issueId: string, agentId: string, currentRunId?: string | null,
+  generation?: { nativeSessionId: string | null; providerSessionId: string | null }) {
   return sql`exists (select 1 from ${heartbeatRuns} first_turn_run
       where first_turn_run.company_id = ${companyId} and first_turn_run.agent_id = ${agentId}
         ${currentRunId ? sql`and first_turn_run.id <> ${currentRunId}` : sql``}
@@ -188,7 +201,14 @@ function firstTurnDeliveredSql(companyId: string, issueId: string, agentId: stri
         and (first_turn_run.context_snapshot->'firstTurnQueuedInput'->>'claimedAt')::timestamptz >= date_trunc('milliseconds', ${issueComments.updatedAt})
         and exists (select 1 from ${heartbeatRunEvents} accepted
           where accepted.company_id = ${companyId} and accepted.run_id = first_turn_run.id
-            and accepted.event_type in ('turn.accepted', 'turn.started')))`;
+            and accepted.event_type in ('turn.accepted', 'turn.started')
+            ${generation ? sql`and first_turn_run.native_session_id = ${generation.nativeSessionId}
+              and (select generation_event.payload->'prpEvent'->'payload'->>'providerSessionId'
+                from ${heartbeatRunEvents} generation_event
+                where generation_event.company_id = ${companyId} and generation_event.run_id = first_turn_run.id
+                  and generation_event.event_type in ('session.started', 'session.resumed', 'session.reconciled')
+                  and generation_event.seq <= accepted.seq
+                order by generation_event.seq desc limit 1) = ${generation.providerSessionId}` : sql``}))`;
 }
 
 /**
