@@ -4,7 +4,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { activityLog, agents, authUsers, companyMemberships, companySkillRepositorySnapshots, principalPermissionGrants, environments, environmentLeases, companies, completionContracts, costEvents, createDb, applyPendingMigrations, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, executionWorkspaces, heartbeatRuns, issues, nativeRunFinalizations, workspaceOperations, type Db } from "@paperclipai/db";
+import { activityLog, agents, agentTaskSessions, authUsers, companyMemberships, companySkillRepositorySnapshots, principalPermissionGrants, environments, environmentLeases, companies, completionContracts, costEvents, createDb, applyPendingMigrations, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, executionWorkspaces, heartbeatRuns, issues, nativeRunFinalizations, workspaceOperations, type Db } from "@paperclipai/db";
 import { accountRunCost } from "../run-cost-accounting.js";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -33,6 +33,9 @@ import { legacyControllerClaim } from "../legacy-controller-lease.js";
 import { agentInstructionWorkingCopyService } from "../agent-instruction-working-copies.js";
 import { createHeartbeatInstructionWorkingCopy } from "./instruction-working-copy.js";
 import { environmentService } from "../environments.js";
+import { prepareHeartbeatSession, type HeartbeatSessionPreparationInput } from "./session-preparation.js";
+import { getAdapterSessionCodec } from "./run-state.js";
+import { attachPaperclipSessionMetadataToSessionParams } from "./workspaces.js";
 
 // Keep the real contract, session, and runtime-selection transactions. Replace only
 // filesystem materialization and sandbox synchronization at their external boundaries.
@@ -149,6 +152,104 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       network.mockRestore();
     }
   });
+
+  it("does not rotate an incident's retained recovery session when its checkpoint is missing", async () => {
+    const { input, run, issue } = await fixture();
+    input.agent.adapterConfig = { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous" };
+    input.nativeRuntimeResolution = resolveHeartbeatNativeRuntimeMode({ persisted: run, enabled: true, runtimeConfig: {},
+      adapterConfig: input.agent.adapterConfig, agent: input.agent, issue, target: null, workspaceId: null });
+    const retained = randomUUID();
+    input.session.taskResumeSessionId = retained;
+    input.session.warmRecoveryRetainSessionId = retained;
+    await expect(selectHeartbeatRuntime(db, input)).rejects.toThrow("warm_recovery_fresh_session_already_attempted");
+    expect((await read(run.id)).nativeSessionId).toBeNull();
+    expect(await coordinators(run.id)).toEqual([]);
+  });
+
+  it("selects a new native session for an open incident when stock reset cleared its pin", async () => {
+    const { input, run, issue } = await fixture();
+    const retained = randomUUID(), incidentId = randomUUID();
+    input.agent.adapterConfig = { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", fixtureOption: "changed" };
+    input.nativeRuntimeResolution = resolveHeartbeatNativeRuntimeMode({ persisted: run, enabled: true, runtimeConfig: {},
+      adapterConfig: input.agent.adapterConfig, agent: input.agent, issue, target: null, workspaceId: null });
+    await db.insert(heartbeatRuns).values({ id: incidentId, companyId: run.companyId, agentId: run.agentId,
+      issueId: issue.id, nativeIssueId: issue.id, nativeSessionId: retained, status: "failed", error: "remote_warm_session_not_idle",
+      contextSnapshot: { issueId: issue.id, warmRecoveryFreshSession: { runId: incidentId, retainedSessionId: retained } } });
+    // The assembled heartbeat test covers the non-continuable-change decision
+    // and clearing this pin. Exercise the real native selector with that reset.
+    input.session.taskResumeSessionId = null;
+    input.session.warmRecoveryRetainSessionId = null;
+    const selected = await selectHeartbeatRuntime(db, input);
+    expect(selected.selected).toBe(true);
+    const saved = await read(run.id);
+    expect(saved.nativeSessionId).toBeTruthy();
+    expect(saved.nativeSessionId).not.toBe(retained);
+    expect(await coordinators(run.id)).toHaveLength(1);
+  });
+
+  it.each(["changed credential", "no task-session row", "no stored identity"] as const)(
+    "preparation and native selection during an open incident: %s", async shape => {
+      const { input, run, issue, agent } = await fixture();
+      const retained = randomUUID(), incidentId = randomUUID();
+      const runtimeConfig = { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous" };
+      input.agent.adapterConfig = runtimeConfig;
+      input.nativeRuntimeResolution = resolveHeartbeatNativeRuntimeMode({ persisted: run, enabled: true, runtimeConfig: {},
+        adapterConfig: runtimeConfig, agent: input.agent, issue, target: null, workspaceId: null });
+      const preparation: HeartbeatSessionPreparationInput = {
+        run, agent: input.agent,
+        task: { context: { forceFreshSession: true, source: "execution.reconciled", wakeReason: "issue_recovery_action_restored" },
+          issueRef: issue, issueContext: null, taskProjectContext: null, workspaceProjectContext: null,
+          wakeCommentId: null, acceptedPlanContinuationWake: false, acceptedPlanWakeRoutingDecision: null },
+        session: { taskSession: null, taskSessionDecodedParams: null, explicitResumeSessionParams: null,
+          explicitResumeSessionDisplayId: null, sessionCodec: getAdapterSessionCodec(agent.adapterType) },
+        config: { runtimeConfig, agentIdentity: undefined, issueAssigneeOverrides: null, originalAiIssueOverrides: null,
+          managedAiRuntime: undefined, aiBinding: undefined, requestedAiBinding: undefined, secretManifest: [],
+          runtimeSkillEntries: [], routineEnvContext: { env: null } },
+        workspace: { requestedExecutionWorkspaceMode: "shared_workspace", effectiveExecutionWorkspaceMode: "shared_workspace",
+          projectExecutionWorkspacePolicy: null, issueExecutionWorkspaceSettings: null, executionPolicy: {} as never,
+          requestedReusableExecutionWorkspaceConfig: null, reusableExistingExecutionWorkspace: null },
+        environment: { environmentResolution: { environmentId: null, source: "default" }, selectedEnvironmentId: null,
+          selectedEnvironmentForConfig: null }, getLatestAgentConfigRevision: async () => ({ id: agent.id, changedKeys: [], createdAt: run.createdAt }),
+      };
+      const baseline = await prepareHeartbeatSession(db, preparation);
+      await db.insert(heartbeatRuns).values({ id: incidentId, companyId: run.companyId, agentId: run.agentId,
+        issueId: issue.id, nativeIssueId: issue.id, nativeSessionId: retained, status: "failed", error: "remote_warm_session_not_idle",
+        createdAt: new Date(run.createdAt.getTime() - 1_000),
+        contextSnapshot: { issueId: issue.id, warmRecoveryFreshSession: { runId: incidentId, retainedSessionId: retained } } });
+      if (shape !== "no task-session row") {
+        const [session] = await db.insert(agentTaskSessions).values({ companyId: run.companyId, agentId: run.agentId,
+          adapterType: agent.adapterType, taskKey: issue.id, sessionDisplayId: retained, lastRunId: incidentId,
+          sessionParamsJson: attachPaperclipSessionMetadataToSessionParams({ sessionId: retained,
+            ...(shape === "changed credential" ? { paperclipAiCredentialIdentity: "fixture-account:0" } : {}),
+          }, runtimeConfig.model, baseline.sessionConfigMetadata),
+        }).returning();
+        preparation.session.taskSession = session!;
+        preparation.session.taskSessionDecodedParams = { sessionId: retained };
+      }
+      // Only credential identity participates here: no credential access or provider transport.
+      preparation.config.managedAiRuntime = { sessionIdentity: "fixture-account:1", identity: "fixture-account" } as never;
+      const prepared = await prepareHeartbeatSession(db, preparation);
+      expect(prepared.resetTaskSession).toBe(false);
+      expect(prepared.taskSessionCredentialCompatible).toBe(false);
+      expect(prepared.taskResumeSessionId).toBeNull();
+      input.session.taskResumeSessionId = prepared.taskResumeSessionId;
+      input.session.warmRecoveryRetainSessionId = prepared.resetTaskSession ? null : prepared.warmRecoveryRetainSessionId;
+      if (shape === "changed credential") {
+        const selected = await selectHeartbeatRuntime(db, input);
+        expect(selected.selected).toBe(true);
+        expect((await read(run.id)).nativeSessionId).not.toBe(retained);
+        expect((await read(run.id)).nativeSessionId).toBeTruthy();
+        expect(await coordinators(run.id)).toHaveLength(1);
+      } else {
+        // Unpublished/legacy identity is not evidence of a changed credential.
+        // The real selector refuses rotation instead of spending a second fresh try.
+        await expect(selectHeartbeatRuntime(db, input)).rejects.toThrow("warm_recovery_fresh_session_already_attempted");
+        expect((await read(run.id)).nativeSessionId).toBeNull();
+        expect(await coordinators(run.id)).toHaveLength(0);
+      }
+      process.stdout.write(`RECOVERY_CREDENTIAL_SELECTION ${JSON.stringify({ shape, runId: run.id,
+        retained, pin: input.session.warmRecoveryRetainSessionId, selectedSession: (await read(run.id)).nativeSessionId })}\n`);
+    });
 
   it("rejects invalid local Runner configuration before native authority and retains the preparation owner", async () => {
     const f = await fixture();

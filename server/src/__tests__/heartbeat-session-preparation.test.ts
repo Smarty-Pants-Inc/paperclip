@@ -3,18 +3,23 @@ import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES, PluginWorkspaceOperationError
 import * as nativeRuntimeMode from "../services/native-runtime/runtime-mode.js";
 import * as sessionFingerprintInputs from "../services/heartbeat/session-fingerprint-inputs.js";
 import * as aiRuntime from "../services/ai-connection-runtime.js";
+import * as runtimeSelection from "../services/heartbeat/runtime-selection.js";
+import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import { aiConnectionService } from "../services/ai-connections.js";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, agentTaskSessions, authUsers, companies, companyMemberships, createDb, executionWorkspaces, environments, heartbeatRuns, issueComments, issues, plugins, projects } from "@paperclipai/db";
+import { activityLog, agents, agentTaskSessions, agentWakeupRequests, authUsers, companies, companyMemberships, createDb, executionWorkspaces, environments, heartbeatRuns, issueComments, issueRecoveryActions, issues, plugins, projects } from "@paperclipai/db";
 import { getServerAdapter, registerServerAdapter, unregisterServerAdapter, type AdapterExecutionContext } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { prepareHeartbeatSession, type HeartbeatSessionPreparationInput } from "../services/heartbeat/session-preparation.js";
+import { getAdapterSessionCodec } from "../services/heartbeat/run-state.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { companySkillService } from "../services/company-skills.js";
+import * as companySkillsModule from "../services/company-skills.js";
 import * as sessionMetadata from "../services/heartbeat/workspaces.js";
 import { previousSessionMetadata } from "./helpers/previous-session-fingerprint.js";
 import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
@@ -36,10 +41,24 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
   let heartbeat: ReturnType<typeof heartbeatService>;
+  let restoreSkillFixture = () => {};
 
   beforeAll(async () => {
     temporary = await startEmbeddedPostgresTestDatabase("heartbeat-session-preparation-");
     db = createDb(temporary.connectionString);
+    // This synthetic adapter does not consume legacy operational/feedback
+    // bundles. Keep the real skill service (including explicit version tests),
+    // but exclude that unrelated implicit bundle on every facade and Retry.
+    // STALL: avoided in tests; cause not found. Excluding implicit bundles
+    // avoids the observed slow copy path, not a production performance fix.
+    const createSkills = companySkillService;
+    const skillFactory = vi.spyOn(companySkillsModule, "companySkillService").mockImplementation((...args) => {
+      const service = createSkills(...args);
+      const withRuntimeSkillEntries: typeof service.withRuntimeSkillEntries = (companyId, options, consume) =>
+        service.withRuntimeSkillEntries(companyId, { ...options, includeLegacy: false }, consume);
+      return { ...service, withRuntimeSkillEntries };
+    });
+    restoreSkillFixture = () => skillFactory.mockRestore();
     heartbeat = heartbeatService(db);
     registerServerAdapter({
       type: adapterType,
@@ -59,32 +78,40 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
   }, 30_000);
 
   afterAll(async () => {
-    await heartbeat?.drainActiveRunExecutions();
-    unregisterServerAdapter(adapterType);
-    await db?.$client.end({ timeout: 0 });
-    await temporary?.cleanup();
+    try {
+      await heartbeat?.drainActiveRunExecutions();
+      unregisterServerAdapter(adapterType);
+      await db?.$client.end({ timeout: 0 });
+      await temporary?.cleanup();
+    } finally { restoreSkillFixture(); }
   });
 
-  async function seed(runtimeConfig: Record<string, unknown> = {}) {
+  async function seed(runtimeConfig: Record<string, unknown> = {}, fixtureAdapterType = adapterType) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), userId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Session fixture", issuePrefix: `S${companyId.slice(0, 6)}` });
     await db.insert(authUsers).values({ id: userId, name: "Session owner", email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
     await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
-    await db.insert(agents).values({ id: agentId, companyId, name: "Session reader", adapterType, status: "idle", adapterConfig: { model: "model-a" }, runtimeConfig });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Session reader", adapterType: fixtureAdapterType, status: "idle", adapterConfig: { model: "model-a" }, runtimeConfig });
     await db.insert(issues).values({ id: issueId, companyId, title: "Session fixture", status: "todo", assigneeAgentId: agentId, responsibleUserId: userId, issueNumber: 1 });
     return { companyId, agentId, issueId, userId };
   }
 
-  async function execute(f: Awaited<ReturnType<typeof seed>>, context: Record<string, unknown> = {}) {
+  async function execute(f: Awaited<ReturnType<typeof seed>>, context: Record<string, unknown> = {}, expectedStatus = "succeeded", service = heartbeat) {
     await db.update(issues).set({ status: "todo" }).where(eq(issues.id, f.issueId));
-    const run = await heartbeat.wakeup(f.agentId, {
+    const run = await service.wakeup(f.agentId, {
       source: "on_demand", triggerDetail: "manual", reason: "manual",
       payload: { issueId: f.issueId }, contextSnapshot: { issueId: f.issueId, ...context },
+      ...(context.source === "execution.reconciled" ? {
+        source: "automation", triggerDetail: "system", reason: "issue_recovery_action_restored",
+        requestedByActorType: "system", requestedByActorId: "execution-recovery",
+        idempotencyKey: `execution-reconciliation:${context.recoveryActionId}`,
+        payload: { issueId: f.issueId, recoveryActionId: context.recoveryActionId },
+      } : {}),
     });
     expect(run).not.toBeNull();
-    await heartbeat.drainActiveRunExecutions();
+    await service.drainActiveRunExecutions();
     const finished = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id)).then(rows => rows[0]);
-    expect(finished?.status, finished?.error ?? undefined).toBe("succeeded");
+    expect(finished?.status, finished?.error ?? undefined).toBe(expectedStatus);
     expect(captured.has(run!.id)).toBe(true);
     return { input: captured.get(run!.id)!, finished };
   }
@@ -218,6 +245,383 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       expect(retries.map(input => input.runtime.sessionId)).toEqual([fresh ? null : sessionId]);
     } finally { await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false }); }
   });
+  it.each([
+    { failure: "runner_state_identity_mismatch: remote_warm_session_not_idle", chat: false, fresh: true },
+    { failure: "runner_state_identity_mismatch: remote_warm_session_not_idle", chat: true, fresh: false },
+    { failure: "ordinary model/tool failure", chat: false, fresh: false },
+    { failure: "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; warm_recovery_refused=current_run_not_admitted", chat: false, fresh: true },
+    { failure: "native_controller_recovery_unsupported:metadata_format", chat: false, fresh: true },
+    { failure: "native_continuation_requires_reconciliation", chat: false, fresh: false },
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", chat: false, fresh: true },
+    { failure: "workspace_continuation_source_missing", errorCode: "native_provider_state_incompatible", chat: false, fresh: true },
+    { failure: "current_run_not_admitted", chat: false, fresh: true },
+  ].flatMap(row => [true, false].map(reconciled => ({ ...row, reconciled }))))("stock reconciliation of a continuous Pi session: $failure, chat=$chat, fresh=$fresh, reconciled=$reconciled", async ({ failure, errorCode, chat, fresh, reconciled }) => {
+    const f = await seed(), sessionId = randomUUID();
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", fixtureSessionId: sessionId } })
+      .where(eq(agents.id, f.agentId));
+    if (chat) await db.update(issues).set({ originKind: "chat_channel" }).where(eq(issues.id, f.issueId));
+    await execute(f);
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorUserId: f.userId,
+      body: "SAVED WORK: use the completed analysis", createdAt: new Date(Date.now() - 1_000) });
+    // A refused pre-claim turn does not advance taskSession.lastRunId.
+    const [failed] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      nativeSessionId: sessionId, nativeIssueId: f.issueId, status: "failed", finishedAt: new Date(),
+      error: failure, errorCode: errorCode ?? "adapter_failed", contextSnapshot: { issueId: f.issueId } }).returning();
+    // Fail again if session preparation sends this non-chat recovery into the refused session.
+    const adapter = getServerAdapter(adapterType);
+    registerServerAdapter({ ...adapter, execute: async input => {
+      if (fresh && input.runtime.sessionId === sessionId) throw new Error("remote_warm_session_not_idle");
+      return adapter.execute(input);
+    } });
+    try {
+      const recovery = { ...(reconciled ? { source: "execution.reconciled" } : {}), wakeReason: "issue_recovery_action_restored" };
+      const actionId = randomUUID();
+      await db.insert(issueRecoveryActions).values({ id: actionId, companyId: f.companyId, sourceIssueId: f.issueId,
+        kind: "active_run_watchdog", status: "resolved", ownerType: "system", returnOwnerAgentId: f.agentId,
+        cause: "native_continuation_requires_reconciliation", fingerprint: actionId, nextAction: "Continue saved work",
+        evidence: { continuationDelivery: "pending", executionReconciliation: { runId: failed.id,
+          providerStopped: true, actionOutcome: "not_performed", outcomeEvidence: "The failed warm turn did not run." } },
+      });
+      const next = await execute(f, { ...recovery, forceFreshSession: true, recoveryActionId: actionId,
+        previousRunId: failed.id, retryOfRunId: failed.id });
+      expect(next.input.runtime.sessionId).toBe(fresh ? null : sessionId);
+      expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: { reset: fresh, taskSessionReused: !fresh } } });
+      if (fresh) {
+        expect(next.input.context.executionContinuation).toMatchObject({ messages: [expect.objectContaining({ body: "SAVED WORK: use the completed analysis" })] });
+        expect(next.finished.error).toBeNull();
+      }
+    } finally { registerServerAdapter(adapter); }
+  });
+
+  it.for([
+    { laggingPointer: false, laterRefusal: false, unpublished: false },
+    { laggingPointer: true, laterRefusal: false, unpublished: false },
+    { laggingPointer: false, laterRefusal: true, unpublished: false },
+    { laggingPointer: false, laterRefusal: false, unpublished: true },
+  ])("allows only one automatic fresh session before success (lagging pointer=$laggingPointer, later refusal=$laterRefusal, unpublished=$unpublished)", { timeout: 30_000 }, async ({ laggingPointer, laterRefusal, unpublished }, { signal, onTestFinished }) => {
+    // Each row owns its adapter and facade. A timed-out row's eventual finally
+    // must never restore another row's adapter or swap the shared heartbeat.
+    const fixtureAdapterType = `${adapterType}_${randomUUID()}`;
+    const adapter = getServerAdapter(adapterType);
+    registerServerAdapter({ ...adapter, type: fixtureAdapterType });
+    let service = heartbeatService(db);
+    onTestFinished(async () => {
+      try { await service.drainActiveRunExecutions(); }
+      finally { unregisterServerAdapter(fixtureAdapterType); }
+    });
+    const f = await seed({}, fixtureAdapterType), oldSession = randomUUID(), freshSession = randomUUID();
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", fixtureSessionId: oldSession } })
+      .where(eq(agents.id, f.agentId));
+    const executeIncident = (context: Record<string, unknown> = {}, status = "succeeded") => {
+      signal.throwIfAborted();
+      return execute(f, context, status, service);
+    };
+    await executeIncident();
+    const [saved] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId));
+    const [refused] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      nativeSessionId: oldSession, nativeIssueId: f.issueId, status: "failed", finishedAt: new Date(),
+      error: "remote_warm_session_not_idle", errorCode: "adapter_failed", contextSnapshot: { issueId: f.issueId } }).returning();
+    const recover = async (sourceRunId: string, expectedStatus = "succeeded") => {
+      signal.throwIfAborted();
+      const actionId = randomUUID();
+      await db.insert(issueRecoveryActions).values({ id: actionId, companyId: f.companyId, sourceIssueId: f.issueId,
+        kind: "active_run_watchdog", status: "resolved", ownerType: "system", returnOwnerAgentId: f.agentId,
+        cause: "native_continuation_requires_reconciliation", fingerprint: actionId, nextAction: "Continue saved work",
+        evidence: { continuationDelivery: "pending", executionReconciliation: { runId: sourceRunId,
+          providerStopped: true, actionOutcome: "not_performed", outcomeEvidence: "The failed warm turn did not run." } },
+      });
+      return executeIncident({ source: "execution.reconciled", wakeReason: "issue_recovery_action_restored", forceFreshSession: true,
+        recoveryActionId: actionId, previousRunId: sourceRunId, retryOfRunId: sourceRunId }, expectedStatus);
+    };
+    let refuseFresh = true;
+    let failureText = laterRefusal ? "ordinary model failure" : "remote_warm_session_not_idle";
+    registerServerAdapter({ ...adapter, type: fixtureAdapterType, execute: async input => {
+      const result = await adapter.execute(input);
+      if (!refuseFresh) return result;
+      if (unpublished) throw new Error("remote_warm_session_not_idle");
+      return { ...result, exitCode: 1, sessionId: freshSession, sessionParams: { sessionId: freshSession },
+        errorMessage: failureText };
+    } });
+    try {
+      const first = await recover(refused.id, "failed");
+      expect(first.input.runtime.sessionId).toBeNull();
+      if (laggingPointer) await db.update(agentTaskSessions).set({ sessionParamsJson: saved.sessionParamsJson,
+        sessionDisplayId: oldSession, lastRunId: saved.lastRunId }).where(eq(agentTaskSessions.id, saved.id));
+      let latest = first.finished.id;
+      failureText = "remote_warm_session_not_idle";
+      if (laterRefusal) {
+        const [later] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+          nativeSessionId: freshSession, nativeIssueId: f.issueId, status: "failed", finishedAt: new Date(),
+          error: "remote_warm_session_not_idle", errorCode: "adapter_failed", contextSnapshot: { issueId: f.issueId } }).returning();
+        latest = later.id;
+      }
+      // A new heartbeat facade emulates restart: no in-memory incident state.
+      service = heartbeatService(db);
+      for (let retry = 0; retry < 2; retry++) {
+        const next = await recover(latest, "failed");
+        expect(next.input.runtime.sessionId).toBe(unpublished ? oldSession : freshSession);
+        if (!unpublished) expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: { reset: false, taskSessionReused: true } } });
+        expect(next.finished.contextSnapshot).toMatchObject({ warmRecoveryNoticeReason: "warm_recovery_fresh_session_already_attempted" });
+        latest = next.finished.id;
+        // A pre-claim failure may leave the same pointer behind on every retry.
+        if (laggingPointer) await db.update(agentTaskSessions).set({ sessionParamsJson: saved.sessionParamsJson,
+          sessionDisplayId: oldSession, lastRunId: saved.lastRunId }).where(eq(agentTaskSessions.id, saved.id));
+      }
+      const notices = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+      expect(notices.filter(comment => comment.presentation?.title === "Fresh-session recovery already attempted"))
+        .toMatchObject([{ authorType: "system", metadata: { sections: [{ rows: [
+          { type: "key_value", label: "Reason", value: "warm_recovery_fresh_session_already_attempted" },
+          { type: "run_link", runId: first.finished.id },
+        ] }] } }]);
+      // Success closes this incident, so a later refusal may get one fresh try.
+      refuseFresh = false;
+      signal.throwIfAborted();
+      const progress = await executeIncident({ forceFreshSession: true, explicitFreshSession: true });
+      expect(progress.input.runtime.sessionId).toBeNull();
+      const [newRefusal] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+        nativeSessionId: progress.finished.sessionIdAfter, nativeIssueId: f.issueId, status: "failed", finishedAt: new Date(),
+        error: "remote_warm_session_not_idle", errorCode: "adapter_failed", contextSnapshot: { issueId: f.issueId } }).returning();
+      const newIncident = await recover(newRefusal.id);
+      expect(newIncident.input.runtime.sessionId).toBeNull();
+    } finally {
+      try { await service.drainActiveRunExecutions(); }
+      finally { unregisterServerAdapter(fixtureAdapterType); }
+    }
+  });
+
+  async function recoveryNoticeFixture() {
+    const f = await seed(), sessionId = randomUUID(), incidentId = randomUUID();
+    const runtimeConfig = { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous" };
+    const [agent] = await db.update(agents).set({ adapterConfig: runtimeConfig }).where(eq(agents.id, f.agentId)).returning();
+    const [incident] = await db.insert(heartbeatRuns).values({ id: incidentId, companyId: f.companyId, agentId: f.agentId,
+      issueId: f.issueId, nativeIssueId: f.issueId, nativeSessionId: sessionId, status: "failed",
+      createdAt: new Date(Date.now() - 1_000), finishedAt: new Date(), error: "remote_warm_session_not_idle",
+      contextSnapshot: { issueId: f.issueId, warmRecoveryFreshSession: { runId: incidentId, retainedSessionId: sessionId } },
+    }).returning();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      issueId: f.issueId, status: "queued", contextSnapshot: { issueId: f.issueId } }).returning();
+    const input: HeartbeatSessionPreparationInput = { run, agent,
+      task: { context: { forceFreshSession: true, source: "execution.reconciled", wakeReason: "issue_recovery_action_restored" },
+        issueRef: { id: f.issueId }, issueContext: null, taskProjectContext: null, workspaceProjectContext: null,
+        wakeCommentId: null, acceptedPlanContinuationWake: false, acceptedPlanWakeRoutingDecision: null },
+      session: { taskSession: null, taskSessionDecodedParams: null, explicitResumeSessionParams: null,
+        explicitResumeSessionDisplayId: null, sessionCodec: getAdapterSessionCodec(agent.adapterType) },
+      config: { runtimeConfig, agentIdentity: undefined, issueAssigneeOverrides: null, originalAiIssueOverrides: null,
+        managedAiRuntime: undefined, aiBinding: undefined, requestedAiBinding: undefined, secretManifest: [],
+        runtimeSkillEntries: [], routineEnvContext: { env: null } },
+      workspace: { requestedExecutionWorkspaceMode: "shared_workspace", effectiveExecutionWorkspaceMode: "shared_workspace",
+        projectExecutionWorkspacePolicy: null, issueExecutionWorkspaceSettings: null, executionPolicy: {} as never,
+        requestedReusableExecutionWorkspaceConfig: null, reusableExistingExecutionWorkspace: null },
+      environment: { environmentResolution: { environmentId: null, source: "default" }, selectedEnvironmentId: null,
+        selectedEnvironmentForConfig: null }, getLatestAgentConfigRevision: async () => ({
+          id: agent.id, changedKeys: [], createdAt: run.createdAt,
+        }) };
+    return { ...f, incident, input };
+  }
+
+  it("publishes the incident notice only after commit, never after rollback", async () => {
+    const f = await recoveryNoticeFixture();
+    const events: unknown[] = [];
+    const unsubscribe = subscribeCompanyLiveEvents(f.companyId, event => {
+      if (event.type === "activity.logged") events.push(event.payload);
+    });
+    const transaction = db.transaction.bind(db);
+    const rollback = vi.spyOn(db, "transaction").mockImplementationOnce((work, config) => transaction(async tx => {
+      await work(tx);
+      // The real comment, activity and receipt have been inserted, but are not committed.
+      expect(await tx.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(1);
+      throw new Error("notice commit failed");
+    }, config));
+    try {
+      await prepareHeartbeatSession(db, f.input).catch(() => null);
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(0);
+      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, f.issueId))).toHaveLength(0);
+      expect(events).toEqual([]);
+      rollback.mockRestore();
+      await prepareHeartbeatSession(db, f.input);
+      await prepareHeartbeatSession(db, f.input);
+      expect(events).toHaveLength(1);
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(1);
+      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, f.issueId))).toHaveLength(1);
+    } finally { rollback.mockRestore(); unsubscribe(); }
+  }, 30_000);
+
+  it("a failed incident notice cannot fail recovery and the next attempt records it", async () => {
+    const f = await recoveryNoticeFixture();
+    const transaction = db.transaction.bind(db);
+    const rollback = vi.spyOn(db, "transaction").mockImplementationOnce((work, config) => transaction(async tx => {
+      await work(tx);
+      throw new Error("notice commit failed");
+    }, config));
+    try {
+      await expect(prepareHeartbeatSession(db, f.input)).resolves.toMatchObject({
+        resetTaskSession: false, taskResumeSessionId: f.incident.nativeSessionId,
+      });
+      const [incident] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.incident.id));
+      expect(incident.contextSnapshot).toMatchObject({ warmRecoveryFreshSession: { runId: incident.id } });
+      expect((incident.contextSnapshot?.warmRecoveryFreshSession as Record<string, unknown>).noticeRecorded).toBeUndefined();
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(0);
+      rollback.mockRestore();
+      await prepareHeartbeatSession(db, f.input);
+      const [recorded] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.incident.id));
+      expect(recorded.contextSnapshot).toMatchObject({ warmRecoveryFreshSession: { noticeRecorded: true } });
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(1);
+    } finally { rollback.mockRestore(); }
+  }, 30_000);
+
+  it("an open incident permits stock reset after a non-continuable configuration change", async () => {
+    const f = await seed(), sessionId = randomUUID(), incidentId = randomUUID();
+    const config = { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", fixtureSessionId: sessionId };
+    await db.update(agents).set({ adapterConfig: config }).where(eq(agents.id, f.agentId));
+    await execute(f);
+    await db.insert(heartbeatRuns).values({ id: incidentId, companyId: f.companyId, agentId: f.agentId,
+      issueId: f.issueId, nativeIssueId: f.issueId, nativeSessionId: sessionId, status: "failed",
+      finishedAt: new Date(), error: "remote_warm_session_not_idle",
+      contextSnapshot: { issueId: f.issueId, warmRecoveryFreshSession: { runId: incidentId, retainedSessionId: sessionId } } });
+    await db.update(agents).set({ adapterConfig: { ...config, fixtureOption: "changed" } }).where(eq(agents.id, f.agentId));
+    const select = runtimeSelection.prepareAndSelectHeartbeatRuntime;
+    let selectionSession: runtimeSelection.HeartbeatRuntimeSelectionInput["session"] | undefined;
+    const capture = vi.spyOn(runtimeSelection, "prepareAndSelectHeartbeatRuntime").mockImplementation(async (...args) => {
+      selectionSession = args[1].session;
+      return select(...args);
+    });
+    try {
+      const next = await execute(f, { forceFreshSession: true, wakeReason: "issue_recovery_action_restored" });
+      expect(next.input.runtime.sessionId).toBeNull();
+      expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: { reset: true, taskSessionReused: false } } });
+      expect(selectionSession).toMatchObject({ taskResumeSessionId: null, warmRecoveryRetainSessionId: null });
+      const notices = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+      expect(notices).toHaveLength(1);
+      expect(notices[0]!.body).not.toContain("keeps the saved session");
+      expect(notices[0]!.body).toContain("Other session-reset rules still apply.");
+      process.stdout.write(`RECOVERY_STOCK_RESET_NOTICE ${JSON.stringify({ runId: next.finished.id,
+        reset: true, selectionSession, body: notices[0]!.body })}\n`);
+    } finally { capture.mockRestore(); }
+  }, 30_000);
+
+  it.each(["person Retry", "stock reset"])("ends an S1 incident when %s starts S2 even if S2 fails", async decision => {
+    const type = `${adapterType}_${randomUUID()}`, adapter = getServerAdapter(adapterType);
+    registerServerAdapter({ ...adapter, type });
+    const service = heartbeatService(db);
+    const f = await seed({}, type), s1 = randomUUID(), s2 = randomUUID(), s3 = randomUUID(), incidentId = randomUUID();
+    const config = { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", fixtureSessionId: s1 };
+    try {
+      await db.update(agents).set({ adapterConfig: config }).where(eq(agents.id, f.agentId));
+      await execute(f, {}, "succeeded", service);
+      await db.insert(heartbeatRuns).values({ id: incidentId, companyId: f.companyId, agentId: f.agentId,
+        issueId: f.issueId, nativeIssueId: f.issueId, nativeSessionId: s1, status: "failed",
+        finishedAt: new Date(), error: "remote_warm_session_not_idle",
+        contextSnapshot: { issueId: f.issueId, warmRecoveryFreshSession: { runId: incidentId, retainedSessionId: s1 } } });
+      let freshSession = s2;
+      registerServerAdapter({ ...adapter, type, execute: async input => {
+        const result = await adapter.execute(input);
+        const sessionId = input.runtime.sessionId ?? freshSession;
+        return { ...result, exitCode: 1, sessionId, sessionParams: { sessionId }, errorMessage: "remote_warm_session_not_idle" };
+      } });
+      if (decision === "stock reset") await db.update(agents).set({ adapterConfig: { ...config, fixtureOption: "changed" } })
+        .where(eq(agents.id, f.agentId));
+      const later = await execute(f, decision === "person Retry" ? { forceFreshSession: true, explicitFreshSession: true } :
+        { forceFreshSession: true, wakeReason: "issue_recovery_action_restored" }, "failed", service);
+      expect(later.input.runtime.sessionId).toBeNull();
+      expect(later.finished.sessionIdAfter).toBe(s2);
+      freshSession = s3;
+      const recovery = { forceFreshSession: true, wakeReason: "issue_recovery_action_restored" };
+      const next = await execute(f, recovery, "failed", service);
+      expect(next.input.runtime.sessionId).not.toBe(s1);
+      expect(next.input.runtime.sessionId).toBeNull();
+      expect(next.finished.contextSnapshot).toMatchObject({ warmRecoveryFreshSession: {
+        runId: next.finished.id, retainedSessionId: s2, refusedRunId: later.finished.id,
+      } });
+      // Restart the facade: the later session boundary and new incident must be durable.
+      const restarted = heartbeatService(db);
+      const subsequent = [];
+      try {
+        for (let retry = 0; retry < 2; retry++) {
+          const kept = await execute(f, recovery, "failed", restarted);
+          expect(kept.input.runtime.sessionId).toBe(s3);
+          expect(kept.finished.resultJson).toMatchObject({ configFreshness: { session: { reset: false } } });
+          subsequent.push({ runId: kept.finished.id, resumes: kept.input.runtime.sessionId });
+        }
+      } finally { await restarted.drainActiveRunExecutions(); }
+      process.stdout.write(`RECOVERY_LATER_SESSION_BOUNDARY ${JSON.stringify({ decision, s1, s2, s3,
+        laterRunId: later.finished.id, nextRunId: next.finished.id, subsequent })}\n`);
+    } finally {
+      try { await service.drainActiveRunExecutions(); }
+      finally { unregisterServerAdapter(type); }
+    }
+  }, 30_000);
+
+  it("writes the incident notice without deadlocking an issue-then-run lock holder", async () => {
+    const f = await recoveryNoticeFixture();
+    let issueHeld!: () => void, continueHolder!: () => void, holderPid = 0;
+    const held = new Promise<void>(resolve => { issueHeld = resolve; });
+    const proceed = new Promise<void>(resolve => { continueHolder = resolve; });
+    const holder = db.transaction(async tx => {
+      await tx.execute(sql`set local statement_timeout = '8s'`);
+      const [connection] = await tx.execute<{ pid: number }>(sql`select pg_backend_pid() as pid`);
+      holderPid = connection!.pid;
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, f.issueId)).for("update");
+      issueHeld();
+      await proceed;
+      // This is the order used by ordinary issue mutation/admission paths.
+      await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.id, f.incident.id)).for("update");
+    });
+    await held;
+    const notice = prepareHeartbeatSession(db, f.input);
+    const settled = Promise.allSettled([holder, notice]);
+    try {
+      // Synchronize on a real PostgreSQL lock wait, not a sleep or mocked SQL.
+      await expect.poll(async () => {
+        const rows = await db.execute<{ pid: number }>(sql`select pid from pg_stat_activity
+          where datname = current_database() and wait_event_type = 'Lock'
+            and ${holderPid} = any(pg_blocking_pids(pid))`);
+        return rows.length;
+      }, { timeout: 5_000, interval: 20 }).toBeGreaterThan(0);
+    } finally { continueHolder(); await settled; }
+    const outcomes = await settled;
+    process.stdout.write(`RECOVERY_NOTICE_LOCK_PG ${JSON.stringify({ issueId: f.issueId, incidentId: f.incident.id,
+      holderPid, outcomes: outcomes.map(result => result.status === "fulfilled" ? { status: result.status } : {
+        status: result.status, code: result.reason?.cause?.code, message: result.reason?.cause?.message ?? String(result.reason),
+      }) })}\n`);
+    expect(outcomes.map(result => result.status)).toEqual(["fulfilled", "fulfilled"]);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(1);
+  });
+
+  it("writes one system incident notice and creates zero task wake requests", async () => {
+    const f = await recoveryNoticeFixture();
+    // Repeated preparation (including another facade/process) shares only the durable receipt.
+    await Promise.all([prepareHeartbeatSession(db, f.input), prepareHeartbeatSession(db, {
+      ...f.input, task: { ...f.input.task, context: { ...f.input.task.context } },
+    })]);
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+    expect(comments).toMatchObject([{ authorType: "system", authorAgentId: null, authorUserId: null,
+      createdByRunId: null, presentation: { kind: "system_notice", title: "Fresh-session recovery already attempted" } }]);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]!.body).toBe("This task's saved session could not be resumed. Paperclip already tried one new session without a successful turn, " +
+      "so automatic recovery will not request another new session for this incident. Other session-reset rules still apply. " +
+      "A person's Retry starts a new session when the failed run reports that the saved session cannot continue; " +
+      "otherwise it tries the saved session again.");
+    // Stronger than task/recipient-only: this notice creates no request for
+    // ANY agent in its company, regardless of reason or payload routing.
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    expect(wakes).toHaveLength(0);
+    process.stdout.write(`RECOVERY_NOTICE_NO_WAKE_PG ${JSON.stringify({ issueId: f.issueId, incidentId: f.incident.id,
+      commentId: comments[0]!.id, authorType: comments[0]!.authorType, presentation: comments[0]!.presentation,
+      wakeRequestScope: "entire_company_all_agents", wakeRequestCount: wakes.length })}\n`);
+  });
+
+  it("a newer successful run on the exact session blocks an old refusal", async () => {
+    const f = await seed(), sessionId = randomUUID();
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", model: "fixture/model", fixtureSessionId: sessionId } })
+      .where(eq(agents.id, f.agentId));
+    await execute(f);
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeSessionId: sessionId,
+      nativeIssueId: f.issueId, status: "failed", error: "remote_warm_session_not_idle" });
+    await execute(f);
+    const next = await execute(f, { wakeReason: "issue_recovery_action_restored", forceFreshSession: true });
+    expect(next.input.runtime.sessionId).toBe(sessionId);
+  });
+
   it("keeps a workspace source refusal typed before provider startup", async () => {
     const f = await seed(), type = `${adapterType}_source_refusal`;
     registerServerAdapter({ ...getServerAdapter(adapterType), type,
