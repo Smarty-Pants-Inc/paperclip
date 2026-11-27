@@ -559,6 +559,30 @@ describe("instance settings routes", () => {
     });
   });
 
+  it("C31 v13 returns the privacy warning when an admin saves a destination", async () => {
+    const destination = { label: "Private instance support", url: "/issues/private-support" };
+    mockInstanceSettingsService.updateGeneral.mockResolvedValue({ id: "instance-settings-1", general: { defectReportDestination: destination } });
+    const res = await request(createApp(localAdminActor())).patch("/api/instance/settings/general")
+      .send({ defectReportDestination: destination }).expect(200);
+    expect(res.headers.warning).toBe('299 Paperclip "Only a private place on this instance: run links and task titles are private content"');
+    expect(res.body.defectReportDestination).toEqual(destination);
+  });
+
+  it.each(["support@example.test", "https://example.test/public", "[support](/public)"])("C31 v13 refuses an unsafe destination label at the admin save boundary: %s", async label => {
+    await request(createApp(localAdminActor())).patch("/api/instance/settings/general")
+      .send({ defectReportDestination: { label, url: "/" } }).expect(400);
+    expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+  });
+
+  it("C31 v13 exposes the destination to a signed-in non-admin org member, not only admins", async () => {
+    const destination = { label: "Private instance support", url: "/issues/private-support" };
+    mockInstanceSettingsService.getGeneral.mockResolvedValue({ defectReportDestination: destination });
+    const app = createApp({ type: "board", userId: "member", source: "session", companyIds: ["company-2"], isInstanceAdmin: false });
+    const res = await request(app).get("/api/instance/settings/general").expect(200);
+    expect(res.body.defectReportDestination).toEqual(destination);
+    await request(app).patch("/api/instance/settings/general").send({ defectReportDestination: destination }).expect(403);
+  });
+
   it("allows local board users to read and update general settings", async () => {
     const app = await createApp(localAdminActor());
 

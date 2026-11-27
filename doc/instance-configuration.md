@@ -57,7 +57,23 @@ The place must be private on this instance: run links and task titles are
 private content. Use the real private task or report place your instance
 maintainers have chosen, not the example path above. URLs must be root-relative;
 absolute URLs, protocol-relative URLs, backslashes and whitespace are rejected.
+Labels are bounded to 200 characters and accept only letters, marks, numbers,
+spaces and simple name punctuation (`' & ( ) , -`), not URLs, email addresses,
+domain-shaped strings or markup. A successful destination save returns the HTTP
+`Warning` header `299 Paperclip "Only a private place on this instance: run links and task titles are private content"`.
+The JSON settings response remains unchanged. Choose an actually private,
+access-controlled place that the intended reporters can use; a same-instance
+path is not proof of its privacy, existence, accessibility or redirect behavior.
 The server does not submit a report or copy diagnostics automatically.
+
+The label and path are not admin-only secrets: any authenticated board member
+of any company on this instance, instance admin, or trusted local board actor
+can read general settings. The full settings GET and company activity logs also
+carry the setting; report-bearing refusal projections use the same instance-wide
+value, not a per-viewer access check. Use a generic label safe to disclose
+instance-wide. Only an instance admin or trusted local board actor may save it.
+An unreadable stored destination becomes `null` without resetting any other
+general setting, including an explicit execution-mode pin.
 
 Absent or `null` means the plain instance-admin handoff sentence, with no public
 tracker default. Set `null` to clear an existing destination. Refusal projection
@@ -65,14 +81,23 @@ reads the current setting, so an old run shows the current destination without
 rewriting its saved evidence. `report_defect` is projected as
 `{kind: "report_defect", destination: {label, url} | null}`; other routes remain
 labels. The shared page contract is `TaskInterruptionPresentation.failure.cause`.
-A missing legacy remedies field projects to `[]` (text only). Unknown kinds or
-measurements with remedies use this reader's kind/measure-specific routes, not
-a newer writer's saved action list.
+A missing legacy remedies field projects to `[]` (text only). An unmarked saved
+`[]` also stays text-only: v11 normalized a missing remedies field to that shape.
+New action-bearing errors carry `remediesVersion: 2` in both structured and
+serialized evidence. A marked empty list can use this reader's kind/measure
+routes on version skew; compatible known rows still do not invent omitted
+routes. Unmarked nonempty v12 lists retain the existing read behavior. Unknown
+provenance versions are text-only. This reader uses its own kind/measure routes,
+not a newer writer's incompatible action list.
 
 Message-specific causes carry `commentIds` for the inputs actually counted.
 These are targets, not permissions. The page must check the current message's
 author, queued/editable and deleted state before offering edit/delete. Legacy
 causes may have no IDs; do not guess the target from the newest visible message.
+Serialized causes require the closing `]`: a cut marker supplies no cause, IDs
+or actions and uses the existing readable fallback. Valid structured evidence
+still takes precedence over the error string. The run page retains the sentence
+saved at failure time; only the task refusal projection resolves today's setting.
 
 ## Company Deletion Toggle
 

@@ -14,9 +14,12 @@ export interface NativePromptRefusalCause {
   bytes: number;
   count?: number;
   measure?: "command" | "command_upper_bound" | "prompt" | "envelope" | "handoff_note" | "protected_parts" | "envelope_with_reserve" | (string & {});
-  /** Missing on legacy saved causes: preserve absence across save/read cycles;
-   * the page receives [] (text only), never newly inferred actions. */
+  /** Missing on legacy saved causes: preserve absence across save/read cycles.
+   * Unmarked [] is also text-only: v11 normalized a missing field to []. */
   remedies?: NativePromptRefusalRemedy[];
+  /** 2 marks modern action provenance. New nonempty writes carry this marker;
+   * readers must not upgrade ambiguous legacy empties to action-bearing rows. */
+  remediesVersion?: number;
   /** Exactly the messages counted by a message-specific measure. Optional for
    * legacy causes. These IDs never grant access or permission: the page must
    * re-read the targets and check author, queued/editable and deleted state.
