@@ -5,8 +5,9 @@ import { legacyShutdownBeforeDispatchCondition } from "./legacy-shutdown-before-
 import { and, desc, eq, gt, inArray, not, or, sql, type SQL } from "drizzle-orm";
 import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
 import { z } from "zod";
-import { agentWakeupRequests, chatConversations, chatEndpoints, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issues, issueRecoveryActions, nativeRunFinalizations, nativeRunResults, toolConnections, workspaceOperations, type Db } from "@paperclipai/db";
-import { canContinueCancelledRun, readRunCancellation } from "./run-cancellation.js";
+import { agents, agentWakeupRequests, chatConversations, chatEndpoints, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issues, issueRecoveryActions, nativeRunFinalizations, nativeRunResults, toolConnections, workspaceOperations, type Db } from "@paperclipai/db";
+import { canContinueCancelledRun, readRunCancellation, recordedUserStop } from "./run-cancellation.js";
+import { canContinueNativeRunWithMessage } from "./explicit-native-continuation-eligibility.js";
 import { canRetryStoppedRun } from "./cancelled-native-startup.js";
 import { heldRetryOffersRetry, heldTaskRetryRefusals } from "./task-retry-eligibility.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
@@ -425,8 +426,16 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
       or consumed.comment_ids @> jsonb_build_array(${issueComments.id}::text))`,
   )) : [];
   const cancellation = run ? readRunCancellation(run.resultJson) : null;
-  const eligibleContinuation = Boolean(!restoreHold && run && conversation?.assigneeAgentId === run.agentId &&
+  const [nativeAgent] = run?.runtimeMode === "native" ? await db.select({ adapterType: agents.adapterType }).from(agents).where(and(
+    eq(agents.companyId, companyId), eq(agents.id, run.agentId),
+  )).limit(1) : [];
+  const nativeContinuation = !reconstructionPending && !withoutWorkspace && !run?.resultJson?.externalWorkspaceInspection
+    && (!restoreHold || !workspaceRepairRequired)
+    && (!workspaceRecoveryState || workspaceRecoveryState.status === "recovered")
+    && canContinueNativeRunWithMessage(conversation, run, nativeAgent?.adapterType);
+  const legacyContinuation = Boolean(!restoreHold && run && conversation?.assigneeAgentId === run.agentId &&
     !["done", "cancelled"].includes(conversation.status) && canContinueCancelledRun(run));
+  const eligibleContinuation = nativeContinuation || legacyContinuation;
   // A failed run whose saved work is verifiably recovered no longer needs the
   // hold to protect its files. Offer the same Retry that admission accepts, so
   // an infrastructure failure (such as a restart) is not left to a new message.
@@ -456,14 +465,18 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
   )).limit(1) : [];
   const heldRefusal = canRetry ? (await heldTaskRetryRefusals(db, companyId, [issueId])).get(issueId) : undefined;
   const retryOffered = canRetry && (!chatBinding || recoveredFailure) && heldRetryOffersRetry(heldRefusal);
+  const nativeMessageAction = nativeContinuation && !chatBinding && run && !recordedUserStop(run)
+    ? retryOffered ? "Send a message or press Retry to continue." : "Send a message to continue."
+    : null;
   const workspaceRecovery = workspaceRecoveryState?.status === "recovered"
-    ? { ...workspaceRecoveryState, message: recoveredWorkMessage(run?.status, retryOffered) }
+    ? { ...workspaceRecoveryState, message: nativeMessageAction
+      ? `Saved work recovered. ${nativeMessageAction}` : recoveredWorkMessage(run?.status, retryOffered) }
     : workspaceRecoveryState && { ...workspaceRecoveryState, canRetry: workspaceRecoveryState.canRetry && retryOffered };
   let nextAction = action.status === "active" && action.cause === EXECUTION_FINALIZATION_DEADLINE_EXCEEDED
     ? EXECUTION_FINALIZATION_DEADLINE_MESSAGE : action.nextAction;
   // Retry is a person's control on this task. Say so, so an agent reading this
   // record points the person to it instead of re-running the work itself.
-  if (canRetry && heldRetryOffersRetry(heldRefusal) && !eligibleContinuation) nextAction += ` ${EXECUTION_BLOCKER_PERSON_RETRY_ACTION}`;
+  if (canRetry && heldRetryOffersRetry(heldRefusal) && !legacyContinuation && !nativeMessageAction) nextAction += ` ${EXECUTION_BLOCKER_PERSON_RETRY_ACTION}`;
   if (chatBinding && !restoreHold) {
     if (chatBinding.state === "endpoint_removed" || !chatBinding.endpointStatus || chatBinding.endpointStatus === "archived") {
       nextAction = "This chat connection was removed. Inspect the stopped run and create a new task to continue the work.";
@@ -473,7 +486,7 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     } else {
       nextAction = "Send a new chat message to continue this conversation.";
     }
-  } else if (!restoreHold && run?.status === "cancelled" && !eligibleContinuation && !canRetry && action.cause === "legacy_execution_requires_reconciliation") {
+  } else if (!restoreHold && run?.status === "cancelled" && !legacyContinuation && !canRetry && action.cause === "legacy_execution_requires_reconciliation") {
     nextAction += " Inspect the run before sending a new message to request continuation.";
   }
 
@@ -486,6 +499,8 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
   if (run?.resultJson?.externalWorkspaceInspection && !restoreHold) {
     nextAction = "Verify the Grok connection, then send a new message to continue. The stopped work will not be replayed.";
   }
+
+  if (nativeMessageAction) nextAction = nativeMessageAction;
 
   return {
     recoveryActionId: action.id,
