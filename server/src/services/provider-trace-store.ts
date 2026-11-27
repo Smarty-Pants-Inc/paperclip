@@ -17,9 +17,9 @@ import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notificatio
 import { logActivity } from "./activity-log.js";
 
 export const PROVIDER_TRACE_MAX_BYTES = 64 * 1024 * 1024;
-// Seam 0271: PAPERCLIP_PROVIDER_TRACE_RETENTION_MS overrides the 24-hour expiry of raw provider traces; 0 keeps them.
+// Seam 0271: raw provider traces are kept (0) unless PAPERCLIP_PROVIDER_TRACE_RETENTION_MS sets an expiry in ms.
 const retentionOverride = process.env.PAPERCLIP_PROVIDER_TRACE_RETENTION_MS?.trim();
-export const PROVIDER_TRACE_RETENTION_MS = retentionOverride ? Number(retentionOverride) : 24 * 60 * 60 * 1_000;
+export const PROVIDER_TRACE_RETENTION_MS = retentionOverride ? Number(retentionOverride) : 0;
 if (!Number.isSafeInteger(PROVIDER_TRACE_RETENTION_MS) || PROVIDER_TRACE_RETENTION_MS < 0)
   throw new Error("PAPERCLIP_PROVIDER_TRACE_RETENTION_MS must be a whole number of milliseconds (0 keeps traces)");
 const EXPIRED_PROVIDER_TRACE_REF = "00000000-0000-0000-0000-000000000000.ndjson";
