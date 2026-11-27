@@ -11,6 +11,8 @@ import type { heartbeatRuns } from "@paperclipai/db";
  * other code, including codes that do not exist yet, gets the fallback.
  */
 export const PERSON_OWNED_FAILURE_CODES = [
+  // A saved continuous session may be replaced only by an informed person's Retry.
+  "saved_session_unavailable", "native_provider_side_effect_pending",
   // A person stopped or paused the work.
   "cancelled", "operator_cancelled", "operator_interrupted", "issue_cancelled", "issue_paused", "agent_paused",
   // A credential, secret or access the person must share.

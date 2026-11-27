@@ -1,3 +1,9 @@
+import express from "express";
+import request from "supertest";
+import { agentRoutes } from "../routes/agents.js";
+import { issueRoutes } from "../routes/issues.js";
+import { getStorageService } from "../storage/index.js";
+import { errorHandler } from "../middleware/index.js";
 import { NativeProviderStateIncompatibleError } from "../vendor/paperclip-runner/index.js";
 import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES, PluginWorkspaceOperationError, workspaceOperationErrorData } from "@paperclipai/plugin-sdk";
 import * as nativeRuntimeMode from "../services/native-runtime/runtime-mode.js";
@@ -13,6 +19,8 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, agentTaskSessions, authUsers, companies, companyMemberships, createDb, executionWorkspaces, environments, heartbeatRuns, issueComments, issues, plugins, projects } from "@paperclipai/db";
 import { getServerAdapter, registerServerAdapter, unregisterServerAdapter, type AdapterExecutionContext } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { agentService } from "../services/agents.js";
+import * as sessionPreparation from "../services/heartbeat/session-preparation.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { companySkillService } from "../services/company-skills.js";
 import * as sessionMetadata from "../services/heartbeat/workspaces.js";
@@ -87,6 +95,22 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     expect(finished?.status, finished?.error ?? undefined).toBe("succeeded");
     expect(captured.has(run!.id)).toBe(true);
     return { input: captured.get(run!.id)!, finished };
+  }
+
+  async function expectConfigurationRefusal(f: Awaited<ReturnType<typeof seed>>, context: Record<string, unknown> = {}) {
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, f.issueId));
+    const run = await heartbeat.wakeup(f.agentId, { source: "on_demand", triggerDetail: "manual", reason: "manual",
+      payload: { issueId: f.issueId }, contextSnapshot: { issueId: f.issueId, ...context } });
+    expect(run).not.toBeNull();
+    await heartbeat.drainActiveRunExecutions();
+    const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id));
+    expect(finished).toMatchObject({ status: "failed", errorCode: "saved_session_unavailable",
+      resultJson: { retryReasonCode: "configuration_reset", retryReason: expect.stringContaining("configuration reset") } });
+    expect(captured.has(run!.id)).toBe(false);
+    const { readRetryConsequence } = await import("../services/run-retry-presentation.js");
+    expect(await readRetryConsequence(db, f.companyId, run!.id)).toMatchObject({ retryStartsNewSession: true,
+      retryReasonCode: "configuration_reset", retryDisclosure: expect.any(String) });
+    return finished;
   }
 
   it.each(["continuous", "paperclip"])("a Pi workspace change preserves resume fields only in %s mode", async sessionContinuity => {
@@ -184,18 +208,18 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
         await db.update(issues).set({ assigneeAdapterOverrides: { adapterConfig: {
           model: "fixture/model-b", piRpcThinkingLevel: "high", fixtureOption: "changed",
         } } }).where(eq(issues.id, f.issueId));
-        const unrelated = await execute(f);
-        expect(unrelated.input.runtime.sessionId).toBeNull();
-        expect(unrelated.finished.resultJson).toMatchObject({ configFreshness: { session: { reset: true, taskSessionReused: false } } });
+        await expectConfigurationRefusal(f);
       }
     } finally { captureMetadata.mockRestore(); mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true }); }
   });
 
   it.each([
-    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", fresh: true, org: "example-org", chat: false },
-    { failure: "ordinary provider failure", fresh: false, org: "second-org", chat: false },
-    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", fresh: false, org: "second-org", chat: true },
-  ])("a person's validated continuous-Pi Retry: $org, chat=$chat, fresh=$fresh", async ({ failure, fresh, org, chat }) => {
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", fresh: true, org: "example-org", chat: false, person: true, initiatedBy: undefined },
+    { failure: "ordinary provider failure", fresh: false, org: "second-org", chat: false, person: true, initiatedBy: undefined },
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", fresh: true, org: "second-org", chat: true, person: true, initiatedBy: undefined },
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", fresh: false, org: "budget_automatic", chat: true, person: false, initiatedBy: undefined },
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", fresh: false, org: "second-org", chat: true, person: false, initiatedBy: "restart_recovery" as const },
+  ])("validated continuous-Pi Retry: $org, chat=$chat, person=$person, initiatedBy=$initiatedBy, fresh=$fresh", async ({ failure, fresh, org, chat, person, initiatedBy }) => {
     const f = await seed(), sessionId = randomUUID();
     await db.update(companies).set({ name: org }).where(eq(companies.id, f.companyId));
     if (chat) await db.update(issues).set({ originKind: "chat_channel" }).where(eq(issues.id, f.issueId));
@@ -210,12 +234,14 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       await db.update(heartbeatRuns).set({ status: "failed", error: failure, errorCode: "native_continuation_requires_reconciliation" }).where(eq(heartbeatRuns.id, first.finished.id));
       await db.update(issues).set({ status: "todo" }).where(eq(issues.id, f.issueId));
       const receipt = await requestTaskRetry({ db, companyId: f.companyId, issueId: f.issueId, actorId: f.userId,
-        actorSource: "local_implicit", observedRunId: first.finished.id, idempotencyKey: randomUUID() });
+        actorSource: "local_implicit", observedRunId: first.finished.id, idempotencyKey: randomUUID(), initiatedBy,
+        personRetry: person ? { userId: f.userId } : undefined });
       expect(receipt).toMatchObject({ accepted: true, stale: false });
       await heartbeat.resumeTaskRetry(f.companyId, receipt.requestId!);
       await heartbeat.drainActiveRunExecutions();
       const retries = [...captured.values()].filter(input => input.context.taskRetryRequestId === receipt.requestId);
       expect(retries.map(input => input.runtime.sessionId)).toEqual([fresh ? null : sessionId]);
+      expect(retries.map(input => input.context.explicitFreshSession)).toEqual([fresh ? true : undefined]);
     } finally { await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false }); }
   });
   it("keeps a workspace source refusal typed before provider startup", async () => {
@@ -451,6 +477,13 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       await agentService(db).update(f.agentId, { adapterConfig: nextConfig,
         ...(key === "adapterType" ? { adapterType } : {}) });
       const [retained] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId));
+      if (continuity === "continuous" && (key === "provider" || key === "adapterType")) {
+        // Stock invalidation now retains refusal authority instead of deleting
+        // the pointer and treating the next unconsented wake as a first turn.
+        expect(retained).toMatchObject({ id: saved.id, sessionParamsJson: { sessionId: "saved-session", paperclipSavedSessionReset: true } });
+        await expectConfigurationRefusal(f);
+        return;
+      }
       if (retain) expect(retained?.id).toBe(saved.id);
       else if (key !== "piRpcThinkingLevel") expect(retained).toBeUndefined();
       const next = await execute(f);
@@ -501,12 +534,15 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       await db.update(issues).set({ assigneeAdapterOverrides: { adapterConfig: {
         model: "fixture/model-b", piRpcThinkingLevel: "high", fixtureOption: "changed",
       } } }).where(eq(issues.id, f.issueId));
-      const unrelated = await execute(f);
-      expect(unrelated.input.runtime.sessionId).toBeNull();
-      expect(unrelated.finished.resultJson).toMatchObject({ configFreshness: { session: {
-        reset: true, taskSessionAvailable: true, taskSessionReused: false,
-        changedCategories: expect.arrayContaining(["issueOverrides"]),
-      } } });
+      if (continuity === "continuous") await expectConfigurationRefusal(f);
+      else {
+        const unrelated = await execute(f);
+        expect(unrelated.input.runtime.sessionId).toBeNull();
+        expect(unrelated.finished.resultJson).toMatchObject({ configFreshness: { session: {
+          reset: true, taskSessionAvailable: true, taskSessionReused: false,
+          changedCategories: expect.arrayContaining(["issueOverrides"]),
+        } } });
+      }
       const [unchanged] = await db.select().from(agents).where(eq(agents.id, f.agentId));
       expect(unchanged.adapterConfig).toEqual(config);
     } finally { mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true }); }
@@ -532,6 +568,7 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       if (changed) await db.update(issues).set({ assigneeAdapterOverrides: {
         adapterConfig: { ...adapterConfig, fixtureOption: "different" },
       } }).where(eq(issues.id, f.issueId));
+      if (changed) { await expectConfigurationRefusal(f); return; }
       const next = await execute(f);
       expect(next.input.config).toMatchObject({ ...adapterConfig, fixtureOption: changed ? "different" : "original" });
       expect(next.input.runtime.sessionId).toBe(changed ? null : "saved-session");
@@ -640,6 +677,7 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
         await db.update(agents).set({ adapterConfig: { ...adapterConfig, [key]: after,
           ...(environmentChanged ? { env: { CONTEXT_NOTE: "new" } } : {}),
         } }).where(eq(agents.id, f.agentId));
+        if (sessionContinuity === "continuous" && !retain) { await expectConfigurationRefusal(f); continue; }
         const next = await execute(f);
         const continued = sessionContinuity === "continuous" && retain;
         if (key === "env") expect((next.input.config.env as Record<string, unknown>).CONTEXT_NOTE).toBe("new");
@@ -696,7 +734,10 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       const oldFilter = vi.spyOn(sessionFingerprintInputs, "paperclipRunnerSessionAdapterConfig")
         .mockImplementation(config => currentFilter(config, true, true));
       try { await execute(f); } finally { oldFilter.mockRestore(); }
-      if (changed) await db.update(agents).set({ adapterConfig: { ...adapterConfig, fixtureOption: "changed" } }).where(eq(agents.id, f.agentId));
+      if (changed) {
+        await db.update(agents).set({ adapterConfig: { ...adapterConfig, fixtureOption: "changed" } }).where(eq(agents.id, f.agentId));
+        await expectConfigurationRefusal(f); return;
+      }
       const next = await execute(f);
       expect(next.input.runtime.sessionId).toBe(changed ? null : "saved-session");
       expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: {
@@ -787,6 +828,7 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       else if (category === "version") params.__paperclipConfigFingerprintVersion = 999;
       else if (category !== "fingerprint") for (const key of category.split(",")) (params.__paperclipConfigCategoryFingerprints as Record<string, string>)[key] = "old-category";
       await db.update(agentTaskSessions).set({ sessionParamsJson: params }).where(eq(agentTaskSessions.id, saved.id));
+      if (!retain) { await expectConfigurationRefusal(f, { workspaceSelectionChanged: workspaceChanged === true }); return; }
       const next = await execute(f, { workspaceSelectionChanged: workspaceChanged === true });
       expect(next.input.runtime.sessionId).toBe(retain ? sessionId : null);
       expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: { reset: !retain, taskSessionReused: retain } } });
@@ -796,6 +838,103 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       if (cwd) await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it.each(["issues", "agents"] as const)("authenticated %s Retry freshens the same cannot-continue Agent Chat advertised by the run", async route => {
+    const f = await seed(), sessionId = randomUUID();
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", model: "fixture/model",
+      sessionContinuity: "continuous", fixtureSessionId: sessionId } }).where(eq(agents.id, f.agentId));
+    await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: f.userId,
+      conversationState: "active" }).where(eq(issues.id, f.issueId));
+    const first = await execute(f);
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "native_provider_state_incompatible",
+      error: "lost resume state" }).where(eq(heartbeatRuns.id, first.finished.id));
+    expect(await heartbeat.getRun(first.finished.id)).toMatchObject({ retryStartsNewSession: true });
+    const app = express(); app.use(express.json());
+    app.use((req, _res, next) => { req.actor = { type: "board", userId: f.userId, source: "local_implicit",
+      companyIds: [f.companyId], isInstanceAdmin: true }; next(); });
+    app.use("/api", route === "issues" ? issueRoutes(db, getStorageService()) : agentRoutes(db, {})); app.use(errorHandler);
+    const response = route === "issues"
+      ? await request(app).post(`/api/issues/${f.issueId}/retry`).send({ observedRunId: first.finished.id,
+        idempotencyKey: randomUUID() })
+      : await request(app).post(`/api/agents/${f.agentId}/wakeup`).send({ reason: "retry_failed_run",
+        failedRunId: first.finished.id, personRetry: { userId: "forged" }, payload: { personRetry: { userId: "forged" } } });
+    expect(response.status, JSON.stringify(response.body)).toBe(202);
+    await heartbeat.drainActiveRunExecutions();
+    const retries = [...captured.values()].filter(input => input.runId !== first.finished.id && input.context.issueId === f.issueId);
+    expect(retries.map(input => input.runtime.sessionId)).toEqual([null]);
+    expect(retries.map(input => input.context.explicitFreshSession)).toEqual([true]);
+    expect(JSON.stringify(retries[0].context)).not.toContain("forged");
+    console.info("authenticated-retry-proof", JSON.stringify({ route, sourceRunId: first.finished.id,
+      successorRunId: retries[0].runId, sessionIdBefore: retries[0].runtime.sessionId, explicitFreshSession: true }));
+  }, 60_000);
+
+  it.each(["provider", "adapter"] as const)("stock %s edit retains saved authority and refuses before dispatch", async change => {
+    const f = await seed(), sessionId = randomUUID();
+    const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
+    try {
+      const config = { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", fixtureSessionId: sessionId };
+      await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: config }).where(eq(agents.id, f.agentId));
+      const first = await execute(f);
+      const [before] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId));
+      await agentService(db).update(f.agentId, change === "adapter" ? { adapterType } : { adapterConfig: { ...config, provider: "codex" } });
+      const [after] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.id, before.id));
+      expect(after).toMatchObject({ lastRunId: first.finished.id, sessionParamsJson: { sessionId, paperclipSavedSessionReset: true } });
+      const refused = await expectConfigurationRefusal(f);
+      const [retained] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.id, before.id));
+      expect(retained.sessionParamsJson?.sessionId).toBe(sessionId);
+      expect([...captured.values()].filter(input => input.context.issueId === f.issueId)).toHaveLength(1);
+      console.info("stock-configuration-refusal-proof", JSON.stringify({ change, sourceRunId: first.finished.id,
+        savedRowId: after.id, savedSessionId: sessionId, refusedRunId: refused.id, dispatched: false }));
+    } finally { mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); }
+  }, 60_000);
+
+  it("HTTP false choice is retained to the actual reset decision, which refuses before adapter dispatch", async () => {
+    const f = await seed(), sessionId = randomUUID();
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous", model: "fixture/model", fixtureSessionId: sessionId } }).where(eq(agents.id, f.agentId));
+    const first = await execute(f);
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "provider_failed", error: "ordinary failure" }).where(eq(heartbeatRuns.id, first.finished.id));
+    const [saved] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId));
+    const params = structuredClone(saved.sessionParamsJson!);
+    params.__paperclipConfigFingerprint = "changed";
+    (params.__paperclipConfigCategoryFingerprints as Record<string, string>).adapterConfig = "changed";
+    await db.update(agentTaskSessions).set({ sessionParamsJson: params }).where(eq(agentTaskSessions.id, saved.id));
+    expect(await heartbeat.getRun(first.finished.id)).toMatchObject({ retryStartsNewSession: false });
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, f.issueId));
+    const app = express(); app.use(express.json());
+    app.use((req, _res, next) => { req.actor = { type: "board", userId: f.userId, source: "local_implicit", companyIds: [f.companyId], isInstanceAdmin: true }; next(); });
+    app.use("/api", agentRoutes(db, {})); app.use(errorHandler);
+    const response = await request(app).post(`/api/agents/${f.agentId}/wakeup`).send({ reason: "retry_failed_run", failedRunId: first.finished.id, expectedStartsNewSession: false });
+    expect(response.status, JSON.stringify(response.body)).toBe(202);
+    await heartbeat.drainActiveRunExecutions();
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
+    const refused = runs.find(run => run.id !== first.finished.id)!;
+    expect(refused).toMatchObject({ status: "failed", errorCode: "saved_session_unavailable", contextSnapshot: { retryExpectedStartsNewSession: false },
+      resultJson: { retryExpectationChanged: true, retryStartsNewSession: true, retryReasonCode: "configuration_reset" } });
+    expect([...captured.values()].filter(input => input.context.issueId === f.issueId)).toHaveLength(1);
+    console.info("actual-reset-choice-proof", JSON.stringify({ sourceRunId: first.finished.id, refusedRunId: refused.id, projected: false, actual: true, dispatched: false }));
+  }, 60_000);
+
+  it("actual managed identity selection refuses a stale false expectation without acquiring another credential", async () => {
+    const f = await seed(), sessionId = randomUUID();
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous", model: "fixture/model", fixtureSessionId: sessionId } }).where(eq(agents.id, f.agentId));
+    const prepare = sessionPreparation.prepareHeartbeatSession;
+    let selected: Parameters<typeof prepare>[1] | undefined;
+    const capture = vi.spyOn(sessionPreparation, "prepareHeartbeatSession").mockImplementation(async (db, input) => { selected = input; return prepare(db, input); });
+    try {
+      await execute(f); await execute(f);
+      expect(selected?.session.taskSession?.lastRunId).toBeTruthy();
+      // Only the already-selected identity is changed. This is the same actual
+      // session-preparation decision used for delegated and router selections.
+      const actual = selected!;
+      const home = "/unused-selected-home";
+      const managed = { identity: "selected-credential", sessionIdentity: "changed-selected-account:1", home } as NonNullable<typeof actual.config.managedAiRuntime>;
+      await expect(prepare(db, { ...actual, task: { ...actual.task, context: { ...actual.task.context, retryExpectedStartsNewSession: false } },
+        config: { ...actual.config, managedAiRuntime: managed } })).rejects.toMatchObject({ status: 409, message: "retry_expectation_changed",
+          details: { retry: { retryStartsNewSession: true, retryReasonCode: "credential_changed" } } });
+    } finally { capture.mockRestore(); }
+  }, 60_000);
 
   it("starts fresh when effective model configuration changes and persists the reason", async () => {
     const f = await seed();

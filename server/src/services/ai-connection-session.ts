@@ -14,6 +14,12 @@ function record(value: unknown): Record<string, unknown> {
     ? value as Record<string, unknown> : {};
 }
 
+/** Account/epoch identity; no credential bytes are needed to describe a Retry. */
+export function managedAiSessionIdentity(grantId: string, responsibleUserId: string | null,
+  credential: { secretId: string; epoch: number } | null) {
+  return `${grantId}:${responsibleUserId ?? "shared"}:${credential ? `${credential.secretId}:${credential.epoch}` : "no-auth"}`;
+}
+
 export function managedAiSessionIdentityCompatible(
   stored: unknown,
   sessionIdentity: string,

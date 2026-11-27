@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { resolveSessionContinuity } from "./continued-session.js";
+import { assertDispatchedRetryConsequence, classifyRetryConsequence, refuseSavedSessionContinuation, resolveSessionContinuity } from "./continued-session.js";
 import { OWN_PROCESS_START_EVENT_TYPES } from "../native-process-start-events.js";
 import { and, desc, eq, exists, inArray, isNotNull, ne, not, notInArray, or, sql } from "drizzle-orm";
 import {
@@ -590,6 +590,12 @@ export function buildNativeExecutionWithCheckpoint(input: {
     Parameters<typeof rebindNativeSessionCheckpoint>[0]["previousRun"] | null;
   normalizedSessionId: string;
   sessionContinuity?: unknown;
+  /** The selector expected a saved session, even if its source row is missing. */
+  savedSessionExpected?: boolean;
+  /** Only the person's disclosed fresh-session choice can authorize this fork. */
+  allowFreshSession?: boolean;
+  expectedStartsNewSession?: unknown;
+  retryIsChat?: boolean;
   executionTargetKind?: NativeToolExecutionTargetKind;
   toolRefreshOnResume?: boolean;
   refreshTools?: boolean;
@@ -622,7 +628,10 @@ export function buildNativeExecutionWithCheckpoint(input: {
         toolRefreshOnResume: input.toolRefreshOnResume,
         refreshTools: input.refreshTools,
       });
-      if (retainedCheckpoint) return { execution: retainedFormat, checkpoint: retainedCheckpoint, normalizedSessionId: input.normalizedSessionId };
+      if (retainedCheckpoint) {
+        assertDispatchedRetryConsequence(input.expectedStartsNewSession, { retryStartsNewSession: false });
+        return { execution: retainedFormat, checkpoint: retainedCheckpoint, normalizedSessionId: input.normalizedSessionId };
+      }
     }
   }
   const checkpoint = input.previousRun
@@ -635,12 +644,22 @@ export function buildNativeExecutionWithCheckpoint(input: {
         refreshTools: input.refreshTools,
       })
     : null;
-  if (checkpoint)
-    return {
-      execution,
-      checkpoint,
-      normalizedSessionId: input.normalizedSessionId,
-    };
+  if (checkpoint) {
+    assertDispatchedRetryConsequence(input.expectedStartsNewSession, { retryStartsNewSession: false });
+    return { execution, checkpoint, normalizedSessionId: input.normalizedSessionId };
+  }
+  const savedSessionExpected = input.savedSessionExpected ?? input.previousRun !== null;
+  const actual = classifyRetryConsequence({ adapterType: "paperclip_runner", config: {
+    provider: execution.provider.kind, sessionContinuity: input.sessionContinuity,
+  }, chat: input.retryIsChat === true, run: input.previousRun ?? {}, savedSessionExpected, checkpointAvailable: false });
+  if (input.allowFreshSession) actual.retryStartsNewSession = true;
+  assertDispatchedRetryConsequence(input.expectedStartsNewSession, actual);
+  if (!input.allowFreshSession && (input.savedSessionExpected ?? input.previousRun !== null) &&
+    execution.provider.kind === "pi_rpc" && resolveSessionContinuity("pi_rpc", input.sessionContinuity ?? execution.provider.sessionContinuity) === "continuous") {
+    if (input.previousRun?.errorCode === NATIVE_PROVIDER_SIDE_EFFECT_PENDING) refuseSavedSessionContinuation({}, "side_effect_pending",
+      "The last action may or may not have run. Check it before you continue.");
+    refuseSavedSessionContinuation({});
+  }
   // Rebuild both task context and wake instructions. Merely rotating the ID
   // leaves a fresh provider with a compact delta and missing task context.
   const normalizedSessionId = randomUUID();

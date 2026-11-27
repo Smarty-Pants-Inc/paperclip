@@ -14,7 +14,7 @@ import { notifyAttentionRetentionWork } from "./retention-work-notifications.js"
 import { notifySkillVersionPinChange } from "./skill-version-retention-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { notifyExternalConversationSettlement } from "./external-conversation-settlement-notifications.js";
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNotNull, sql } from "drizzle-orm";
 import { agents, assets, agentConfigRevisions, agentTaskSessions, agentRuntimeState, issues, type Db } from "@paperclipai/db";
 import { normalizeAgentUrlKey, extractAgentMentionIds } from "@paperclipai/shared";
 import { normalizePaperclipRunnerAdapterConfig } from "@paperclipai/adapter-utils/server-utils";
@@ -177,7 +177,20 @@ export async function completeAgentConfiguration(txDb: Db, existing: AgentConfig
     ));
   if (changedExecution) {
     await notifyExternalConversationSettlement(txDb, { companyId: existing.companyId });
-    await txDb.delete(agentTaskSessions).where(and(eq(agentTaskSessions.companyId, existing.companyId), eq(agentTaskSessions.agentId, id)));
+    // Keep continuous-Pi saved authority across stock pointer invalidation.
+    // Otherwise a provider/adapter edit erases the expectation before selection
+    // can refuse it. The next explicitly authorized session replaces this row;
+    // old-adapter rows remain as scoped refusal evidence, not resume candidates.
+    if (existing.adapterType === "paperclip_runner" && priorAdapterConfig.provider === "pi_rpc" &&
+        resolveSessionContinuity(priorAdapterConfig.provider, priorAdapterConfig.sessionContinuity) === "continuous") {
+      await txDb.update(agentTaskSessions).set({ updatedAt: new Date(),
+        sessionParamsJson: sql`coalesce(${agentTaskSessions.sessionParamsJson}, '{}'::jsonb) || '{"paperclipSavedSessionReset":true}'::jsonb`,
+      }).where(and(eq(agentTaskSessions.companyId, existing.companyId), eq(agentTaskSessions.agentId, id),
+        eq(agentTaskSessions.adapterType, existing.adapterType), isNotNull(agentTaskSessions.lastRunId),
+        sql`nullif(trim(${agentTaskSessions.sessionParamsJson}->>'sessionId'), '') is not null`));
+    }
+    await txDb.delete(agentTaskSessions).where(and(eq(agentTaskSessions.companyId, existing.companyId), eq(agentTaskSessions.agentId, id),
+      sql`coalesce(${agentTaskSessions.sessionParamsJson}->'paperclipSavedSessionReset', 'false'::jsonb) <> 'true'::jsonb`));
     await txDb.update(agentRuntimeState).set({ adapterType: updated.adapterType, sessionId: null, stateJson: {}, updatedAt: new Date() })
       .where(and(eq(agentRuntimeState.companyId, existing.companyId), eq(agentRuntimeState.agentId, id)));
   }

@@ -31,6 +31,7 @@ import { assertOnboardingFirstTaskCreationAllowed, assertOnboardingFirstTaskDepe
 import { readPersistedConfirmationDecision } from "./confirmation-decision.js";
 import { resolveConnectionIntentContinuationSource, resolveItemVerdictContinuationWake } from "./chat-interaction-continuation.js";
 import { insertIssueComment } from "./issue-comment-writes.js";
+import { expediteCommentWorkspaceRecheck } from "./system-recovery.js";
 import { measureRunTransaction } from "./execution-transaction-timing.js";
 import { readNativeMonitorSource } from "./native-runtime/native-monitor-delivery.js";
 import { readNativeContinuationSource } from "./native-runtime/native-continuation-delivery.js";
@@ -14251,6 +14252,9 @@ export function issueService(db: Db) {
 
       if (issue.conversationAgentId && actor.userId) {
         await dbOrTx.update(issues).set({ conversationState: "active" }).where(eq(issues.id, issueId));
+        if (authorType === "user" && !actor.agentId && !actor.runId) {
+          await expediteCommentWorkspaceRecheck(dbOrTx, { companyId: issue.companyId, issueId, userId: actor.userId });
+        }
       }
       if (options?.mirrorToSlack && actor.userId && authorType === "user") {
         await mirrorSlackBoardComment(dbOrTx, comment, { attachmentIds: options.attachmentIds });

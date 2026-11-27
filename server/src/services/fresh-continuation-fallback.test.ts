@@ -1,4 +1,14 @@
 import { randomUUID } from "node:crypto";
+import { mkdtemp, writeFile, readFile, rm, mkdir, cp } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import * as executionTargets from "./environment-execution-target.js";
+import { getStorageService } from "../storage/index.js";
+import { getWorkspaceSnapshot, loadWorkspaceSnapshotArchive } from "./remote-workspace-snapshot-storage.js";
+import { restoreRemoteWorkspaceArchive } from "./remote-workspace-snapshot-archive.js";
+import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
+import path from "node:path";
+import os from "node:os";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -11,11 +21,15 @@ import { PENDING_CONTINUATION_BOUND_MS } from "./recovery-continuation-pacing.js
 import { getExecutionBlocker } from "./execution-blocker.js";
 import {
   FRESH_CONTINUATIONS_PER_HOUR, FRESH_CONTINUATION_SCHEMA, PERSON_OWNED_FAILURE_CODES, continueHeldExecutions, ensureFreshContinuation,
-  resetBacklogContinuationPacingForTests,
+  resetBacklogContinuationPacingForTests, settleHoldIntoAbandonedEpochContinuation,
   continueFreshInTransaction, expediteFreshContinuationChecks, freshContinuationNote, heldExecutionsAwaitingFreshContinuation, runsAwaitingSystemContinuation, nextFreshContinuationCheckAt, recordFreshContinuationCheck, FRESH_CONTINUATION_PENDING_BOUND_MS, FRESH_CONTINUATION_PROGRESS_BOUND_MS, FRESH_CONTINUATION_SAVED_WORK_BOUND_MS,
 } from "./fresh-continuation-fallback.js";
 import { heartbeatService } from "./heartbeat.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
+import { readRetryConsequence, assertRetryExpectation } from "./run-retry-presentation.js";
+import { buildNativeSessionHandoff } from "./native-runtime/native-session-handoff.js";
+import { publishContinuousNativeReply } from "./native-runtime/native-continuous-reply.js";
+import { conversationOwedInputs } from "./conversation-owed-input.js";
 import { currentProcessSpaceHash, observedProcessStartedAt } from "./controller-process-identity.js";
 import { executionControlSchedule } from "./execution-control-work.js";
 import { readFreshWorkspaceReadiness } from "./fresh-workspace-continuation.js";
@@ -30,6 +44,12 @@ import { requestTaskRetry } from "./task-retry.js";
 import { terminalizeLegacyExecution } from "./legacy-execution-recovery.js";
 import { sharedContinuationAttempts } from "./recovery/continuation-ledger.js";
 import { taskAutomaticAttempts } from "./recovery/task-automatic-attempts.js";
+import { issueService } from "./issues.js";
+import { recordReusedRunProcessIdentity } from "./run-process-owner.js";
+import { persistHeartbeatRunProcessMetadata } from "./heartbeat/run-lifecycle.js";
+import { actorMiddleware } from "../middleware/auth.js";
+import * as agentJwt from "../agent-auth-jwt.js";
+import type { Request, Response } from "express";
 
 const support = await getEmbeddedPostgresTestSupport();
 const suite = support.supported ? describe : describe.skip;
@@ -137,7 +157,7 @@ suite("fresh-continuation fallback", () => {
       sql`${issueRecoveryActions.evidence}->'freshContinuation' is not null`));
     expect(record!.evidence).toMatchObject({ continuationDelivery: "delivered", continuationRunId: next[0]!.id,
       freshContinuation: { schema: FRESH_CONTINUATION_SCHEMA, sourceRunId: f.runId },
-      executionReconciliation: { runId: f.runId, providerStopped: true, actionOutcome: "mixed" } });
+      executionReconciliation: { runId: f.runId, providerStopped: false, actionOutcome: "mixed" } });
     expect(record!.nextAction).not.toMatch(adminText);
     expect(record!.ownerType).toBe("system");
     return next[0]!;
@@ -705,6 +725,60 @@ suite("fresh-continuation fallback", () => {
       .resolves.toBeTruthy();
   }, 60_000);
 
+  it.each(["board_chat", "connected_chat"] as const)("does not create an unproven isolated chat continuation either (%s)", async kind => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_continuation_requires_reconciliation",
+      error: "runner_remote_process_identity_unavailable" });
+    const workspaceId = randomUUID(), leaseId = randomUUID();
+    const location = { environmentId: randomUUID(), leaseId, providerLeaseId: "live-chat-source", remoteCwd: "/home/daytona/work" };
+    await db.insert(executionWorkspaces).values({ id: workspaceId, companyId, sourceIssueId: f.issueId, mode: "isolated",
+      strategyType: "remote", name: "Chat files", providerType: "remote", providerRef: location.remoteCwd,
+      metadata: { remoteWorkspace: { schema: "paperclip.remote-workspace.v1", epoch: 3, snapshotId: null,
+        source: { kind: "empty" }, location, writerRunId: f.runId, dirty: true } } });
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { remoteWorkspace: { schema: "paperclip.remote-workspace-run.v1",
+      workspaceId, leaseId, providerLeaseId: location.providerLeaseId, remoteCwd: location.remoteCwd, epoch: 3,
+      state: "prepared", snapshotId: null } } }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(issues).set(kind === "board_chat"
+      ? { conversationAgentId: agentId, conversationUserId: userId, conversationState: "waiting" }
+      : { originKind: "chat_channel" }).where(eq(issues.id, f.issueId));
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused" }))
+      .toMatchObject({ kind: "person_owned", reason: "chat_stop_requires_proof" });
+    expect(await successors(f.runId)).toHaveLength(0);
+    expect((await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, workspaceId)))[0].metadata)
+      .toMatchObject({ remoteWorkspace: { epoch: 3, writerRunId: f.runId, dirty: true } });
+  });
+
+  it.each(["board_chat", "connected_chat", "task"] as const)("never releases an exhausted chat hold on abandoned-epoch evidence alone (%s)", async kind => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_continuation_requires_reconciliation",
+      error: "runner_remote_process_identity_unavailable" });
+    const workspaceId = randomUUID(), leaseId = randomUUID();
+    const location = { environmentId: randomUUID(), leaseId, providerLeaseId: "unproven-live-source", remoteCwd: "/home/daytona/work" };
+    await db.insert(executionWorkspaces).values({ id: workspaceId, companyId, sourceIssueId: f.issueId, mode: "isolated",
+      strategyType: "remote", name: "Old chat files", providerType: "remote", providerRef: location.remoteCwd,
+      metadata: { remoteWorkspace: { schema: "paperclip.remote-workspace.v1", epoch: 3, snapshotId: null,
+        source: { kind: "empty" }, location, writerRunId: f.runId, dirty: true } } });
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { remoteWorkspace: { schema: "paperclip.remote-workspace-run.v1",
+      workspaceId, leaseId, providerLeaseId: location.providerLeaseId, remoteCwd: location.remoteCwd, epoch: 3,
+      state: "prepared", snapshotId: null } } }).where(eq(heartbeatRuns.id, f.runId));
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused" })).toMatchObject({ kind: "continued" });
+    await db.update(issues).set({ status: "blocked", ...(kind === "board_chat"
+      ? { conversationAgentId: agentId, conversationUserId: userId, conversationState: "waiting" }
+      : kind === "connected_chat" ? { originKind: "chat_channel" } : {}) }).where(eq(issues.id, f.issueId));
+    const recovery = { ...createSystemRecovery(f.runId), state: "exhausted" as const, attempts: 6, retriesUsed: 5,
+      failure: { code: "agent_stop_unconfirmed" as const, retryClass: "recheck_evidence" as const, evidenceFingerprint: "no-stop-proof" } };
+    const [late] = await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: f.issueId, kind: "active_run_watchdog",
+      status: "active", ownerType: "board", cause: "native_continuation_requires_reconciliation", fingerprint: `late:${f.runId}`,
+      nextAction: "Previous stop remains unproven.", evidence: { runId: f.runId, systemRecovery: recovery,
+        nativeFailureBlock: { runId: f.runId, statusVersion: 4 } } }).returning();
+    expect(await settleHoldIntoAbandonedEpochContinuation(db, { companyId, issueId: f.issueId, runId: f.runId, actionId: late!.id }))
+      .toBe(kind === "task");
+    if (kind !== "task") {
+      expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
+        .toMatchObject({ kind: "person_owned", reason: "chat_stop_requires_proof" });
+      expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0]?.status).toBe("blocked");
+      expect((await holdRow(late!.id)).status).toBe("active");
+    }
+  });
+
   // The staging shape: the new server cannot re-reach the old Runner, so the old
   // run's sandbox lease is still active (or its cleanup is pending) with no stop
   // receipt. The continuation must still start, not wait behind that cleanup.
@@ -939,8 +1013,429 @@ suite("fresh-continuation fallback", () => {
       .toMatchObject({ kind: "continued", isolation: "fresh_isolated_workspace" });
   }, 60_000);
 
+  it.each(["board", "channel"] as const)("does not certify a %s chat stopped when process and stop evidence are missing", async chat => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_continuation_requires_reconciliation",
+      error: "runner_remote_process_identity_unavailable" });
+    await db.update(issues).set(chat === "board"
+      ? { conversationAgentId: agentId, conversationUserId: userId, conversationState: "waiting" }
+      : { originKind: "chat_channel" }).where(eq(issues.id, f.issueId));
+    const decision = await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused" });
+    expect(decision.kind).not.toBe("continued");
+    expect(await issue(f.issueId)).toMatchObject({ status: "blocked" });
+    const [hold] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId!));
+    expect(hold.status).toBe("active");
+    expect(hold.evidence.executionReconciliation).toBeUndefined();
+    expect(hold.evidence.freshContinuation).toBeUndefined();
+    expect(await successors(f.runId)).toEqual([]);
+    expect(await getExecutionBlocker(db, companyId, f.issueId)).not.toBeNull();
+    console.info("missing-stop-proof", JSON.stringify({ chat, runId: f.runId, issueId: f.issueId, decision,
+      holdStatus: hold.status, providerStopped: false }));
+  }, 60_000);
+
+  it.each([false, true])("a disclosed person Retry fences an unproven chat before its only new answer: provider work %s", async providerWork => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_continuation_requires_reconciliation",
+      error: "runner_remote_process_identity_unavailable" });
+    await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: userId,
+      conversationState: "waiting", conversationSessionGeneration: 0 }).where(eq(issues.id, f.issueId));
+    const [workspace] = await db.insert(executionWorkspaces).values({ companyId, sourceIssueId: f.issueId,
+      name: "Chat files", strategyType: "git_worktree", providerType: "local_fs", mode: "isolated", cwd: "/retained/chat-files" }).returning();
+    await db.update(issues).set({ executionWorkspaceId: workspace.id }).where(eq(issues.id, f.issueId));
+    if (providerWork) await db.insert(heartbeatRunEvents).values({ companyId, runId: f.runId, agentId,
+      seq: 1, eventType: "tool.execution.started", stream: "system", level: "info" });
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId,
+      authorType: "user", authorUserId: userId, body: "Keep my answer pending" }).returning();
+    const [reset] = await db.insert(issueComments).values({ companyId, issueId: f.issueId,
+      authorType: "user", authorUserId: userId, body: "/new" }).returning();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeCommentId: message.id,
+      conversationSessionGeneration: 0 } }).where(eq(heartbeatRuns.id, f.runId));
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused" }))
+      .toMatchObject({ kind: "person_owned" });
+    const offer = await getExecutionBlocker(db, companyId, f.issueId);
+    expect(offer).toMatchObject({ canRetry: true, canContinue: false, retryStartsNewSession: true });
+    expect(offer!.retryReason).toContain("stop could not be confirmed");
+    expect(offer!.retryDisclosure).toContain("copies readable current files at your press");
+    expect(offer!.retryDisclosure).toContain("last saved work");
+    expect(await getExecutionBlocker(db, companyId, f.issueId, { conversationResetCommentId: reset.id })).not.toBeNull();
+    expect((await holdRow(f.actionId!)).status).toBe("active");
+    // The positively authorized press, not the message or /new, settles the
+    // hold and revokes the predecessor under the issue/run transaction fence.
+    await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user",
+      status: "active", membershipRole: "member" });
+    await occupySlot();
+    await heartbeatService(db).wakeup(agentId, { failedRunId: f.runId, personRetry: { userId },
+      source: "on_demand", triggerDetail: "manual", reason: "retry_failed_run",
+      requestedByActorType: "user", requestedByActorId: userId, payload: { issueId: f.issueId },
+      contextSnapshot: { issueId: f.issueId, wakeCommentId: message.id, wakeCommentIds: [message.id], conversationSessionGeneration: 0 } });
+    expect((await holdRow(f.actionId!)).evidence.freshContinuation).toMatchObject({
+      personRetry: { userId }, isolation: "fresh_isolated_workspace" });
+    expect((await issue(f.issueId)).executionWorkspaceId).toBeNull();
+    const comments = issueService(db);
+    await expect(comments.addComment(f.issueId, "OLD ANSWER", { agentId, runId: f.runId }))
+      .rejects.toMatchObject({ status: 409 });
+    await expect(db.transaction(tx => assertAgentRunWriteAllowed(tx as unknown as typeof db, companyId, { agentId, runId: f.runId })))
+      .rejects.toMatchObject({ status: 403, details: { code: "agent_run_superseded" } });
+    // Real API authentication guard, with fixture claims and no signing secret:
+    // an old-run tool POST is refused before its handler can write anything.
+    const verify = vi.spyOn(agentJwt, "verifyLocalAgentJwt").mockReturnValue({ sub: agentId, company_id: companyId,
+      run_id: f.runId, adapter_type: "paperclip_runner", iat: 1, exp: 4_000_000_000 });
+    try {
+      for (const [method, path] of [["POST", `/api/issues/${f.issueId}/comments`],
+        ["PATCH", `/api/issues/${f.issueId}`], ["POST", "/api/tools/execute"]]) {
+        const request = { method, path, originalUrl: path,
+          header: (name: string) => name === "authorization" ? "Bearer fixture-claim" : undefined } as unknown as Request;
+        const response = { status: vi.fn().mockReturnThis(), json: vi.fn() };
+        const writeHandler = vi.fn();
+        await actorMiddleware(db, { deploymentMode: "authenticated" })(request, response as unknown as Response, writeHandler);
+        expect(response.status).toHaveBeenCalledWith(403);
+        expect(response.json).toHaveBeenCalledWith(expect.objectContaining({ code: "agent_run_superseded" }));
+        expect(writeHandler).not.toHaveBeenCalled();
+      }
+    } finally { verify.mockRestore(); }
+    const [next] = await successors(f.runId);
+    expect(next).toBeDefined();
+    expect(next.contextSnapshot).toMatchObject({ explicitFreshSession: true, wakeCommentIds: [message.id] });
+    await db.update(heartbeatRuns).set({ status: "running", contextSnapshot: { ...next.contextSnapshot,
+      conversationSessionGeneration: 0 } }).where(eq(heartbeatRuns.id, next.id));
+    await comments.addComment(f.issueId, "NEW ANSWER", { agentId, runId: next.id }, { completionReply: true });
+    await comments.addComment(f.issueId, "NEW ANSWER", { agentId, runId: next.id }, { completionReply: true });
+    const answers = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "agent")));
+    expect(answers.map(answer => answer.body)).toEqual(["NEW ANSWER"]);
+    process.stdout.write("person-retry-one-answer " + JSON.stringify({ issueId: f.issueId, oldRunId: f.runId, newRunId: next.id,
+      providerWork, answerIds: answers.map(answer => answer.id), oldWritesRevoked: true }) + "\n");
+  }, 60_000);
+
+  it("refuses automatic continuation of an unproven writer with provider work", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_continuation_requires_reconciliation" });
+    await db.insert(heartbeatRunEvents).values({ companyId, runId: f.runId, agentId,
+      seq: 1, eventType: "tool.execution.started", stream: "system", level: "info" });
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused" }))
+      .toMatchObject({ kind: "person_owned", reason: "writer_stop_unproven" });
+    expect((await holdRow(f.actionId!)).status).toBe("active");
+    expect(await successors(f.runId)).toEqual([]);
+  });
+
+  it("copies current local files at the person press into an independent workspace", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "retry-copy-row-"));
+    let copied: string | null = null;
+    try {
+      const f = await unfinishedRun({ runtime: "native", errorCode: "native_continuation_requires_reconciliation" });
+      await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: userId, conversationState: "waiting" })
+        .where(eq(issues.id, f.issueId));
+      const [workspace] = await db.insert(executionWorkspaces).values({ companyId, sourceIssueId: f.issueId,
+        name: "Files", providerType: "local_fs", strategyType: "isolated_workspace", mode: "isolated", cwd: root }).returning();
+      await db.update(issues).set({ executionWorkspaceId: workspace.id }).where(eq(issues.id, f.issueId));
+      await db.insert(heartbeatRunEvents).values({ companyId, runId: f.runId, agentId,
+        seq: 1, eventType: "tool.execution.started", stream: "system", level: "info" });
+      await writeFile(path.join(root, "answer.txt"), "last-moment work");
+      const offered = await getExecutionBlocker(db, companyId, f.issueId);
+      expect(offered?.retryDisclosure).toContain("at your press");
+      const result = await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "continuation_wake", personRetry: { userId } });
+      expect(result).toMatchObject({ kind: "continued", isolation: "fresh_isolated_workspace" });
+      const bound = (await issue(f.issueId)).executionWorkspaceId;
+      expect(bound).toBeTruthy(); expect(bound).not.toBe(workspace.id);
+      const [nextWorkspace] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, bound!));
+      copied = nextWorkspace.cwd;
+      expect(copied).not.toBe(root);
+      expect(await readFile(path.join(copied!, "answer.txt"), "utf8")).toBe("last-moment work");
+      await writeFile(path.join(root, "answer.txt"), "old writer changed it after the choice");
+      expect(await readFile(path.join(copied!, "answer.txt"), "utf8")).toBe("last-moment work");
+      expect(agentRunWritesRevoked((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0])).toBe(true);
+      process.stdout.write("press-copy-proof " + JSON.stringify({ oldRunId: f.runId, oldRoot: root, newRoot: copied, newWorkspaceId: bound,
+        oldWriterStillWrites: true, successorFileUnchanged: true }) + "\n");
+    } finally { await rm(root, { recursive: true, force: true }); if (copied) await rm(copied, { recursive: true, force: true }); }
+  });
+
+  it("copies readable remote current files through sealed custody and still fences the source epoch", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "remote-press-copy-"));
+    const sourceRoot = path.join(root, "old");
+    await mkdir(sourceRoot);
+    await writeFile(path.join(sourceRoot, "answer.txt"), "current remote work");
+    const exec = promisify(execFile);
+    const transfer: NonNullable<CommandManagedRuntimeRunner["syncOut"]> = async operations => {
+      const results = [];
+      for (const operation of operations) {
+        for (const file of operation.files) {
+          await mkdir(path.dirname(file.targetPath), { recursive: true });
+          await cp(file.sourcePath, file.targetPath, { recursive: file.kind === "directory", dereference: false,
+            filter: source => !file.exclude?.some(excluded => path.relative(file.sourcePath, source) === excluded || path.relative(file.sourcePath, source).startsWith(`${excluded}/`)) });
+        }
+        results.push({ operationId: operation.operationId, filesTransferred: operation.files.length, bytesTransferred: 0 });
+      }
+      return { operations: results };
+    };
+    const runner: CommandManagedRuntimeRunner = { syncOut: transfer, syncIn: transfer, execute: async input => {
+      try {
+        const result = await exec(input.command, input.args ?? [], { cwd: input.cwd ?? sourceRoot, timeout: input.timeoutMs,
+          maxBuffer: 4 * 1024 * 1024, env: { PATH: process.env.PATH, ...input.env } });
+        return { ...result, exitCode: 0, timedOut: false, signal: null, pid: process.pid, startedAt: new Date().toISOString() };
+      } catch (error) {
+        const failure = error as { code?: number; stdout?: string; stderr?: string };
+        return { exitCode: typeof failure.code === "number" ? failure.code : 1, stdout: failure.stdout ?? "", stderr: failure.stderr ?? "",
+          timedOut: false, signal: null, pid: process.pid, startedAt: new Date().toISOString() };
+      }
+    } };
+    // Local-backed transfer fixture: executes the real readonly inventory, archive,
+    // seal/upload/readback and restore; it never opens SSH or a provider account.
+    const target = vi.spyOn(executionTargets, "resolveEnvironmentExecutionTarget").mockResolvedValue({
+      kind: "remote", transport: "sandbox", remoteCwd: sourceRoot, runner });
+    try {
+      const f = await unfinishedRun({ runtime: "native", errorCode: "native_continuation_requires_reconciliation" });
+      await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: userId, conversationState: "waiting" }).where(eq(issues.id, f.issueId));
+      const [environment] = await db.insert(environments).values({ name: "Readable fixture", driver: "sandbox" }).returning();
+      const leaseId = randomUUID(), workspaceId = randomUUID();
+      const location = { environmentId: environment.id, leaseId, providerLeaseId: "local-backed-fixture", remoteCwd: sourceRoot };
+      await db.insert(environmentLeases).values({ id: leaseId, companyId, issueId: f.issueId, heartbeatRunId: f.runId,
+        environmentId: environment.id, provider: "daytona", providerLeaseId: location.providerLeaseId, status: "active", leasePolicy: "retain_on_failure" });
+      await db.insert(executionWorkspaces).values({ id: workspaceId, companyId, sourceIssueId: f.issueId, mode: "isolated",
+        strategyType: "remote", name: "Old remote files", providerType: "remote", providerRef: sourceRoot,
+        metadata: { remoteWorkspace: { schema: "paperclip.remote-workspace.v1", epoch: 3, snapshotId: null,
+          source: { kind: "empty" }, location, writerRunId: f.runId, dirty: true } } });
+      await db.update(issues).set({ executionWorkspaceId: workspaceId }).where(eq(issues.id, f.issueId));
+      await db.update(heartbeatRuns).set({ runnerProfileJson: { remoteWorkspace: { schema: "paperclip.remote-workspace-run.v1",
+        workspaceId, leaseId, providerLeaseId: location.providerLeaseId, remoteCwd: sourceRoot, epoch: 3, state: "prepared", snapshotId: null } } }).where(eq(heartbeatRuns.id, f.runId));
+      expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "continuation_wake", personRetry: { userId } }))
+        .toMatchObject({ kind: "continued", isolation: "remote_epoch" });
+      const bound = (await issue(f.issueId)).executionWorkspaceId!;
+      expect(bound).not.toBe(workspaceId);
+      const [copy] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, bound));
+      const remote = copy.metadata!.remoteWorkspace as { snapshotId: string; writerRunId: string | null; location: unknown };
+      expect(remote).toMatchObject({ writerRunId: null, location: null });
+      const snapshot = await getWorkspaceSnapshot(db, { companyId, workspaceId: bound, snapshotId: remote.snapshotId });
+      expect(snapshot).not.toBeNull();
+      const archive = path.join(root, "sealed-copy.pcws");
+      await loadWorkspaceSnapshotArchive({ storage: getStorageService(), reference: snapshot!, targetPath: archive });
+      await writeFile(path.join(sourceRoot, "answer.txt"), "old writer's later edit");
+      const restored = path.join(root, "restored");
+      await restoreRemoteWorkspaceArchive({ archivePath: archive, targetDir: restored, expectedManifestDigest: snapshot!.manifestDigest });
+      expect(await readFile(path.join(restored, "answer.txt"), "utf8")).toBe("current remote work");
+      const [old] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, workspaceId));
+      expect(old.metadata).toMatchObject({ remoteWorkspace: { epoch: 4, writerRunId: null, location: null } });
+      expect((await holdRow(f.actionId!)).evidence).toMatchObject({ executionReconciliation: { providerStopped: false } });
+      process.stdout.write("remote-press-copy-proof " + JSON.stringify({ oldWorkspaceId: workspaceId, copiedWorkspaceId: bound, snapshotId: snapshot!.id,
+        oldEpoch: 3, fencedEpoch: 4, copiedBytesUnaffectedByOldWriter: true }) + "\n");
+    } finally { target.mockRestore(); await rm(root, { recursive: true, force: true }); }
+  }, 60_000);
+
+  it("uses the task's continuity override and refuses a stale press before making a wake", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "adapter_failed", hold: "none" });
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, agentId));
+    try {
+      expect((await heartbeatService(db).getRun(f.runId)).retryStartsNewSession).toBe(false);
+      await db.update(issues).set({ assigneeAdapterOverrides: { adapterConfig: { sessionContinuity: "paperclip" } } }).where(eq(issues.id, f.issueId));
+      // Keep this first assertion on the existing public run surface so the
+      // unchanged implementation fails on the wrong consequence, not a new API.
+      expect((await heartbeatService(db).getRun(f.runId)).retryStartsNewSession).toBe(true);
+      const retry = await readRetryConsequence(db, companyId, f.runId);
+      expect(retry).toMatchObject({ retryStartsNewSession: true, retryDisclosure: expect.stringContaining("this task") });
+      expect(await heartbeatService(db).getRun(f.runId)).toMatchObject(retry);
+      await expect(assertRetryExpectation(db, companyId, f.runId, false)).rejects.toMatchObject({ status: 409, message: "retry_expectation_changed", details: { retry } });
+      await expect(requestTaskRetry({ db, companyId, issueId: f.issueId, actorId: userId, idempotencyKey: randomUUID(), observedRunId: f.runId,
+        expectedStartsNewSession: false, personRetry: { userId, expectedStartsNewSession: false } })).rejects.toMatchObject({ status: 409 });
+      expect(await db.select().from(agentWakeupRequests).where(sql`${agentWakeupRequests.payload}->>'issueId' = ${f.issueId}`)).toEqual([]);
+    } finally { await db.update(agents).set({ adapterConfig: {} }).where(eq(agents.id, agentId)); }
+  });
+
+  it.each(["saved_session_unavailable", "side_effect_pending", "configuration_reset", "credential_changed"] as const)(
+    "does not turn an old client's Retry into consent for %s", async reason => {
+      const f = await unfinishedRun({ runtime: "native", errorCode: reason === "side_effect_pending" ? "native_provider_side_effect_pending" : "saved_session_unavailable", hold: "none" });
+      await db.update(heartbeatRuns).set({ resultJson: { retryReasonCode: reason, retryReason: "An explicit new-session choice is required." } }).where(eq(heartbeatRuns.id, f.runId));
+      const { retryStartsFresh } = await import("./fresh-continuation-retry-fold.js");
+      const input = { companyId, issueId: f.issueId, sourceRunId: f.runId };
+      expect(await retryStartsFresh(db, input)).toBe(false);
+      expect(await retryStartsFresh(db, { ...input, expectedStartsNewSession: false })).toBe(false);
+      expect(await retryStartsFresh(db, { ...input, expectedStartsNewSession: true })).toBe(true);
+    });
+
+  it("gives an uncertain side effect its own disclosed choice and handover", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_provider_side_effect_pending" });
+    const retry = await readRetryConsequence(db, companyId, f.runId);
+    expect(retry).toEqual({ retryStartsNewSession: true, retryReasonCode: "side_effect_pending",
+      retryReason: "The last action may or may not have run. Check it before you continue.",
+      retryDisclosure: "Start a new session anyway: it will be told the last action's outcome is unknown." });
+    expect(await getExecutionBlocker(db, companyId, f.issueId)).toMatchObject(retry);
+    expect(await heartbeatService(db).getRun(f.runId)).toMatchObject(retry);
+    const handover = await buildNativeSessionHandoff({ db, companyId, issueId: f.issueId, agentId, before: new Date(), sourceRunId: f.runId });
+    expect(handover).toContain(retry.retryReason);
+    expect(handover).toContain("last action's outcome is unknown");
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused" })).toMatchObject({ kind: "person_owned" });
+  });
+
+  it.each(["other_host_pid", "remote_reference", "adapter_failed", "saved_session_unavailable", "native_provider_side_effect_pending"] as const)("discloses and executes the same isolated held-chat exit: %s", async variant => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: ["adapter_failed", "saved_session_unavailable", "native_provider_side_effect_pending"].includes(variant) ? variant : "native_continuation_requires_reconciliation" });
+    await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: userId, conversationState: "waiting" })
+      .where(eq(issues.id, f.issueId));
+    if (variant === "other_host_pid") await db.update(heartbeatRuns).set({ processPid: 424242, processHostHash: "another-host",
+      processStartedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+    if (variant === "remote_reference") await db.update(heartbeatRuns).set({ runnerProfileJson: { remoteWorkspace: {
+      schema: "paperclip.remote-workspace-run.v1", workspaceId: randomUUID(), epoch: 1, leaseId: randomUUID(),
+      providerLeaseId: "unreachable", remoteCwd: "/workspace", state: "prepared", snapshotId: null } } }).where(eq(heartbeatRuns.id, f.runId));
+    const blocker = await getExecutionBlocker(db, companyId, f.issueId);
+    expect(blocker).toMatchObject({ canRetry: true, retryStartsNewSession: true });
+    if (variant === "native_provider_side_effect_pending") expect(blocker?.retryDisclosure).toBe("Start a new session anyway: it will be told the last action's outcome is unknown.");
+    else expect(blocker?.retryDisclosure).toContain("earlier run may still be running and could change files");
+    const run = await heartbeatService(db).getRun(f.runId);
+    expect(run.retryStartsNewSession).toBe(blocker?.retryStartsNewSession);
+    expect(run).toMatchObject({ retryDisclosure: blocker?.retryDisclosure });
+    await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
+    await occupySlot();
+    await heartbeatService(db).wakeup(agentId, { failedRunId: f.runId, personRetry: { userId, expectedStartsNewSession: true },
+      source: "on_demand", triggerDetail: "manual", reason: "retry_failed_run", requestedByActorType: "user", requestedByActorId: userId,
+      payload: { issueId: f.issueId }, contextSnapshot: { issueId: f.issueId } });
+    expect(await successors(f.runId)).toHaveLength(1);
+    const hold = await holdRow(f.actionId!);
+    expect(hold).toMatchObject({ status: "resolved", evidence: { executionReconciliation: { providerStopped: false } } });
+    expect(hold.resolutionNote).not.toContain("after the prior execution stopped");
+    expect(agentRunWritesRevoked((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0])).toBe(true);
+    process.stdout.write("sibling-exit-proof " + JSON.stringify({ variant, sourceRunId: f.runId, blocker,
+      successorRunIds: (await successors(f.runId)).map(run => run.id), holdStatus: hold.status, resolutionNote: hold.resolutionNote }) + "\n");
+  }, 60_000);
+
+  it.each(["per_run", "task_retry", "task_retry_lost_context"] as const)("a person's new-session Retry attributes its answer to the source question and clears interruption: %s", async route => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "saved_session_unavailable" });
+    const questionId = randomUUID(), oldSessionId = randomUUID(), newSessionId = randomUUID();
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, agentId));
+    try {
+      await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
+      await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: userId, conversationState: "waiting" }).where(eq(issues.id, f.issueId));
+      await db.insert(issueComments).values({ id: questionId, companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
+        body: "Please answer this saved question.", createdAt: new Date(Date.now() - 120_000) });
+      await db.update(heartbeatRuns).set({ nativeSessionId: oldSessionId, createdAt: new Date(Date.now() - 119_000),
+        startedAt: new Date(Date.now() - 118_000), contextSnapshot: { issueId: f.issueId,
+          ...(route === "task_retry_lost_context" ? {} : { wakeCommentId: questionId }), conversationSessionGeneration: 0 } }).where(eq(heartbeatRuns.id, f.runId));
+      expect((await conversationOwedInputs(db, companyId, [f.issueId])).get(f.issueId)?.commentId).toBe(questionId);
+      const { personRetryOwedQuestionIds } = await import("./fresh-continuation-retry-fold.js");
+      expect(await personRetryOwedQuestionIds(db, { companyId, issueId: f.issueId, agentId, sourceRunId: f.runId, userId: "another-person" })).toEqual([]);
+      await occupySlot();
+      if (route !== "per_run") {
+        const retry = await requestTaskRetry({ db, companyId, issueId: f.issueId, actorId: userId, observedRunId: f.runId,
+          idempotencyKey: randomUUID(), expectedStartsNewSession: true, personRetry: { userId, expectedStartsNewSession: true } });
+        await heartbeatService(db).resumeTaskRetry(companyId, retry.requestId!);
+      } else await heartbeatService(db).wakeup(agentId, { failedRunId: f.runId, personRetry: { userId, expectedStartsNewSession: true },
+        source: "on_demand", triggerDetail: "manual", reason: "retry_failed_run", requestedByActorType: "user", requestedByActorId: userId,
+        payload: { issueId: f.issueId }, contextSnapshot: { issueId: f.issueId } });
+      const [next] = await successors(f.runId);
+      expect(next.contextSnapshot).toMatchObject({ explicitFreshSession: true, wakeCommentIds: [questionId] });
+      const currentIssue = await issue(f.issueId);
+      await db.update(heartbeatRuns).set({ status: "running", runtimeMode: "native", nativeIssueId: f.issueId,
+        nativeSessionId: newSessionId, startedAt: new Date(), contextSnapshot: { ...next.contextSnapshot,
+          conversationSessionGeneration: currentIssue.conversationSessionGeneration } }).where(eq(heartbeatRuns.id, next.id));
+      await db.update(issues).set({ status: "in_progress", executionRunId: next.id, conversationState: "active" }).where(eq(issues.id, f.issueId));
+      await publishContinuousNativeReply({ db, cursor: 10,
+        execution: { binding: { companyId, issueId: f.issueId, runId: next.id, agentId }, provider: { kind: "pi_rpc" } },
+        event: { eventType: "item.completed", runId: next.id, normalizedSessionId: newSessionId,
+          sourceEventId: "person-retry-final", itemId: "person-retry-final", turnId: "replacement-turn",
+          payload: { kind: "agentMessage", channel: "final", text: "Here is the answer to your saved question." } } });
+      const [answered] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next.id));
+      expect(answered.resultJson?.continuousReplies).toMatchObject({ "person-retry-final": { questionCommentIds: [questionId], commentId: expect.any(String) } });
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, next.id));
+      await db.update(issues).set({ executionRunId: null, conversationState: "waiting" }).where(eq(issues.id, f.issueId));
+      expect((await conversationOwedInputs(db, companyId, [f.issueId])).has(f.issueId)).toBe(false);
+      const presentation = await taskInterruptionPresentation(db, await issue(f.issueId));
+      expect(presentation).toBeNull();
+      expect(await getExecutionBlocker(db, companyId, f.issueId)).toBeNull();
+      process.stdout.write("person-retry-answer-proof " + JSON.stringify({ route, sourceRunId: f.runId, successorRunId: next.id,
+        oldSessionId, newSessionId, questionId, replies: answered.resultJson?.continuousReplies, owedAfterAnswer: false, presentation }) + "\n");
+    } finally { await db.update(agents).set({ adapterConfig: {} }).where(eq(agents.id, agentId)); }
+  }, 60_000);
+
+  it("a person Stop is never undone by the unproven-chat fresh Retry", async () => {
+    const f = await unfinishedRun({ runtime: "native", status: "cancelled", errorCode: "cancelled" });
+    await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: userId, conversationState: "waiting" }).where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ resultJson: { operatorInterrupted: true } }).where(eq(heartbeatRuns.id, f.runId));
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "continuation_wake", personRetry: { userId } }))
+      .toMatchObject({ kind: "person_owned" });
+    expect((await getExecutionBlocker(db, companyId, f.issueId))?.retryStartsNewSession).not.toBe(true);
+    expect(await successors(f.runId)).toEqual([]);
+  }, 60_000);
+
+  it.each([false, true])("a reused process records identity before another turn, or refuses unknown identity: %s", async recorded => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
+    if (recorded) await db.update(heartbeatRuns).set({ processPid: 12345, processHostHash: "remote",
+      processStartedAt: new Date("2026-11-20T00:00:00Z") }).where(eq(heartbeatRuns.id, f.runId));
+    const [next] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId: f.issueId,
+      status: "running", contextSnapshot: { issueId: f.issueId } }).returning();
+    const admit = async () => {
+      await recordReusedRunProcessIdentity(db, { companyId, agentId, sourceRunId: f.runId,
+        onSpawn: async meta => { await persistHeartbeatRunProcessMetadata(db, next.id, { ...meta, targetKind: "remote" }); } });
+      await db.insert(heartbeatRunEvents).values({ companyId, runId: next.id, agentId,
+        seq: 2, eventType: "tool.execution.started", stream: "system", level: "info" });
+    };
+    if (recorded) {
+      await admit();
+      const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, next.id)).orderBy(heartbeatRunEvents.seq);
+      expect(events.map(event => [event.seq, event.eventType])).toEqual([[1, "native.process_identity_recorded"], [2, "tool.execution.started"]]);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next.id)))[0]).toMatchObject({ processPid: 12345, processHostHash: "remote" });
+    } else {
+      await expect(admit()).rejects.toThrow("native_warm_process_identity_unavailable");
+      expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, next.id))).toEqual([]);
+    }
+  }, 60_000);
+
+  it.each([false, true])("missing identity refuses automatic continuation when provider work exists: %s", async providerWork => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_continuation_requires_reconciliation" });
+    const [workspace] = await db.insert(executionWorkspaces).values({ companyId, sourceIssueId: f.issueId,
+      name: "Task files", providerType: "local_fs", strategyType: "isolated_workspace", mode: "isolated", status: "active", cwd: "/retained/task-files" }).returning();
+    await db.update(issues).set({ executionWorkspaceId: workspace.id }).where(eq(issues.id, f.issueId));
+    if (providerWork) await db.insert(heartbeatRunEvents).values({ companyId, runId: f.runId, agentId,
+      seq: 1, eventType: "tool.execution.started", stream: "system", level: "info" });
+    const result = await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused" });
+    if (providerWork) {
+      expect(result).toMatchObject({ kind: "person_owned", reason: "writer_stop_unproven" });
+      expect((await issue(f.issueId)).executionWorkspaceId).toBe(workspace.id);
+      expect((await holdRow(f.actionId!)).status).toBe("active");
+      expect(await successors(f.runId)).toEqual([]);
+      return;
+    }
+    expect(result).toMatchObject({ kind: "continued", isolation: "fresh_isolated_workspace" });
+    expect((await issue(f.issueId)).executionWorkspaceId).toBeNull();
+    await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
+    await occupySlot();
+    await deliver();
+    const next = await successors(f.runId);
+    expect(next).toHaveLength(1);
+    expect((await holdRow(f.actionId!)).evidence.continuationDelivery).toBe("delivered");
+    process.stdout.write("missing-identity-workspace " + JSON.stringify({ runId: f.runId, providerWork, result,
+      successorRunId: next[0].id, workspaceId: (await issue(f.issueId)).executionWorkspaceId }) + "\n");
+  });
+
+  it.each(["valid_clean", "valid_work", "historical_kept", "missing_fence", "wrong_schema"] as const)(
+    "delivers only a fenced recorded person choice after an outbox handoff: %s", async mode => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_continuation_requires_reconciliation" });
+    await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: userId, conversationState: "waiting" })
+      .where(eq(issues.id, f.issueId));
+    await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user",
+      authorUserId: userId, body: "Keep this answer pending across the handoff" }).returning();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeCommentId: message.id } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    if (mode !== "valid_clean") await db.insert(heartbeatRunEvents).values({ companyId, runId: f.runId, agentId,
+      seq: 1, eventType: "tool.execution.started", stream: "system", level: "info" });
+    await occupySlot();
+    expect(await db.transaction(tx => continueFreshInTransaction(tx as unknown as typeof db, { companyId,
+      runId: f.runId, trigger: "continuation_wake", delivery: "record", personRetry: { userId } })))
+      .toMatchObject({ kind: "continued" });
+    expect((await holdRow(f.actionId!)).evidence.executionReconciliation).toMatchObject({ providerStopped: false });
+    if (mode === "missing_fence") await db.update(heartbeatRuns).set({ resultJson: {} }).where(eq(heartbeatRuns.id, f.runId));
+    if (mode === "historical_kept") await db.update(issueRecoveryActions).set({
+      evidence: sql`jsonb_set(${issueRecoveryActions.evidence}, '{freshContinuation,isolation}', '"unproven_workspace_kept"'::jsonb)`,
+    }).where(eq(issueRecoveryActions.id, f.actionId!));
+    if (mode === "wrong_schema") await db.update(issueRecoveryActions).set({
+      evidence: sql`jsonb_set(${issueRecoveryActions.evidence}, '{freshContinuation,schema}', '"not-server-authority"'::jsonb)`,
+    }).where(eq(issueRecoveryActions.id, f.actionId!));
+    await deliver();
+    const next = await successors(f.runId), valid = mode.startsWith("valid_");
+    expect(next).toHaveLength(valid ? 1 : 0);
+    if (valid) {
+      expect(next[0].contextSnapshot).toMatchObject({ previousRunId: f.runId, explicitFreshSession: true });
+      expect((await holdRow(f.actionId!)).evidence.continuationDelivery).toBe("delivered");
+    }
+    process.stdout.write("fenced-outbox-proof " + JSON.stringify({ runId: f.runId, mode, successors: next.map(run => run.id) }) + "\n");
+  }, 60_000);
+
   it("keeps the task workspace when the old local writer is proven gone", async () => {
     const f = await unfinishedRun({ runtime: "legacy", errorCode: "process_lost" });
+    // A recorded local PID that is absent is positive proof, unlike no PID.
+    await recordStoppedLocalProcess(f.runId);
     expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused" }))
       .toMatchObject({ kind: "continued", isolation: "writer_ended" });
   }, 60_000);
@@ -1060,10 +1555,17 @@ suite("fresh-continuation fallback", () => {
     expect(note).toContain("FOLLOWUP-NEW");
   }, 60_000);
 
+  async function recordStoppedLocalProcess(runId: string) {
+    // Positive OS proof, not the absence of an execution identity.
+    await db.update(heartbeatRuns).set({ processPid: 2147483647, processHostHash: currentProcessSpaceHash(),
+      processStartedAt: new Date(Date.now() - 60_000) }).where(eq(heartbeatRuns.id, runId));
+  }
+
   it.each([true, false])("relies on saved input only while it still holds an undelivered message (already taken by the cut-off run: %s)", async taken => {
     // R2 cell t003: the cut-off run had taken the follow-up into its turn; the fallback chose saved_input,
     // promotion settled the message as delivered, and no run followed.
     const f = await unfinishedRun({ runtime: "native", errorCode: "native_restart_recovery_blocked" });
+    await recordStoppedLocalProcess(f.runId);
     const [comment] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user",
       authorUserId: userId, body: "Additional requirement: include FOLLOWUP-1" } as typeof issueComments.$inferInsert).returning();
     if (taken) await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeCommentIds: [comment!.id] } })
@@ -1088,6 +1590,8 @@ suite("fresh-continuation fallback", () => {
         source: "issue.comment", wakeReason: "issue_commented" } });
     const wakes = () => db.select().from(agentWakeupRequests).where(sql`${agentWakeupRequests.payload}->>'issueId' = ${f.issueId}`);
     expect((await wakes()).map(w => w.status)).toEqual(["deferred_issue_execution"]);
+    // Stop proof arrives after the input was durably held, not during wake admission.
+    await recordStoppedLocalProcess(f.runId);
     expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused" }))
       .toMatchObject({ kind: "continued", delivery: "saved_input" });
     await occupySlot();

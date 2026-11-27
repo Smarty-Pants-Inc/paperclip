@@ -1,12 +1,12 @@
 import { isNativeSessionId } from "../native-runtime/index.js";
-import { and, desc, eq } from "drizzle-orm";
-import { agentConfigRevisions, type Db, type agents, type agentTaskSessions, type heartbeatRuns, type issues, type projects } from "@paperclipai/db";
+import { and, desc, eq, sql } from "drizzle-orm";
+import { agentConfigRevisions, agentTaskSessions, type Db, type agents, type heartbeatRuns, type issues, type projects } from "@paperclipai/db";
 import type { AiConnectionBinding, AiRuntimeConnectionBinding, ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { getServerAdapter } from "../../adapters/index.js";
 import type { prepareManagedAiRuntime } from "../ai-connection-runtime.js";
 import { aiConnectionSessionCompatibilityInputs, managedAiSessionIdentityCompatible } from "../ai-connection-session.js";
 import { createNativeSessionHandoffLoader } from "../native-runtime/native-session-handoff.js";
-import { decideNativeContinuation, resolveSessionContinuity } from "../native-runtime/continued-session.js";
+import { assertDispatchedRetryConsequence, classifyRetryConsequence, decideNativeContinuation, refuseSavedSessionContinuation, resolveSessionContinuity } from "../native-runtime/continued-session.js";
 import { deriveTaskKey } from "./run-preparation.js";
 import { queuedCommentIdsFromRunContext } from "../../lib/queued-comment-context.js";
 import { agentInstructionsService } from "../agent-instructions.js";
@@ -84,6 +84,17 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
   const { runtimeConfig, agentIdentity, issueAssigneeOverrides, originalAiIssueOverrides, managedAiRuntime, aiBinding, requestedAiBinding, secretManifest, runtimeSkillEntries, routineEnvContext } = input.config;
   const { requestedExecutionWorkspaceMode, effectiveExecutionWorkspaceMode, projectExecutionWorkspacePolicy, issueExecutionWorkspaceSettings, executionPolicy, requestedReusableExecutionWorkspaceConfig, reusableExistingExecutionWorkspace } = input.workspace;
   const { environmentResolution, selectedEnvironmentId, selectedEnvironmentForConfig } = input.environment;
+  // Configuration changes can invalidate an adapter-specific pointer. Retained
+  // saved authority is company/task scoped and survives that adapter change.
+  const taskKey = deriveTaskKey(context, null) ?? issueRef?.id;
+  const [invalidated] = taskKey ? await db.select().from(agentTaskSessions).where(and(
+    eq(agentTaskSessions.companyId, agent.companyId), eq(agentTaskSessions.agentId, agent.id), eq(agentTaskSessions.taskKey, taskKey),
+    sql`${agentTaskSessions.sessionParamsJson}->'paperclipSavedSessionReset' = 'true'::jsonb`,
+  )).orderBy(desc(agentTaskSessions.updatedAt)).limit(1) : [];
+  const savedReset = invalidated && (!taskSession || taskSession.updatedAt <= invalidated.updatedAt);
+  if (savedReset && context.explicitFreshSession !== true && context.conversationReset !== true) {
+    refuseSavedSessionContinuation(context, "configuration_reset", "The saved session requires a configuration reset: agent execution configuration changed.");
+  }
   const latestAgentConfigRevision = await getLatestAgentConfigRevision(
     agent.companyId,
     agent.id,
@@ -249,12 +260,19 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
     managedAiRuntime.sessionIdentity,
     managedAiRuntime.identity,
   );
+  if (continuousPi && taskSession?.lastRunId && readNonEmptyString(taskSessionDecodedParams?.sessionId) &&
+      context.explicitFreshSession !== true && context.conversationReset !== true) {
+    if (!taskSessionCredentialCompatible) refuseSavedSessionContinuation(context, "credential_changed", "The credential for the saved session changed.");
+    if (resetTaskSession) refuseSavedSessionContinuation(context, "configuration_reset",
+      `The saved session requires a configuration reset: ${sessionResetReason || (context.workspaceSelectionChanged ? "workspace selection changed" : "session reset required")}.`);
+  }
   const taskSessionId = readNonEmptyString(taskSessionDecodedParams?.sessionId);
   const taskResumeSessionId = taskSessionCredentialCompatible && taskSessionForRun?.lastRunId &&
     taskSessionForRun.lastRunId !== run.id && isNativeSessionId(taskSessionId) ? taskSessionId : null;
   const getFreshSessionHandoff = issueRef ? createNativeSessionHandoffLoader({
     db, companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id, before: run.createdAt,
     continuation: context.executionContinuation as ExecutionContinuationEnvelope | undefined,
+    sourceRunId: readNonEmptyString(context.previousRunId),
     mode: resolveSessionContinuity(runtimeConfig.provider, runtimeConfig.sessionContinuity) === "continuous" ? "whole" : "bounded",
     throughCommentId: readNonEmptyString(context.conversationReplayThroughCommentId) ?? (context.interactionKind ? null : wakeCommentId),
     excludeCommentIds: [...new Set([...queuedCommentIdsFromRunContext(context),
@@ -283,7 +301,12 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
     const handoff = await getFreshSessionHandoff();
     if (handoff) context.paperclipFreshSessionHandoffMarkdown = handoff;
   }
-  return { sessionConfigMetadata, configuredModel, sessionConfigFreshness, resetTaskSession, sessionResetReason, taskSessionForRun,
+  const savedSessionExpected = Boolean(taskSession?.lastRunId && readNonEmptyString(taskSessionDecodedParams?.sessionId));
+  const actual = classifyRetryConsequence({ adapterType: agent.adapterType, config: runtimeConfig, chat: context.retryIsChat === true, run: {},
+    savedSessionExpected, checkpointAvailable: !(savedSessionExpected && (!taskSessionCredentialCompatible || resetTaskSession)) });
+  if (context.explicitFreshSession === true && !["process", "http", "webhook"].includes(agent.adapterType)) actual.retryStartsNewSession = true;
+  assertDispatchedRetryConsequence(context.retryExpectedStartsNewSession, actual);
+  return { sessionConfigMetadata, configuredModel, sessionConfigFreshness, resetTaskSession, sessionResetReason, taskSessionForRun, savedSessionExpected,
     taskSessionCredentialCompatible, taskResumeSessionId, getFreshSessionHandoff, previousSessionParams };
 }
 
@@ -363,6 +386,10 @@ export async function resolveHeartbeatAdapterSession(input: HeartbeatAdapterSess
     continuationSummaryBody: continuationSummary?.body ?? null,
   });
   if (sessionCompaction.rotate) {
+    assertDispatchedRetryConsequence(context.retryExpectedStartsNewSession, classifyRetryConsequence({
+      adapterType: agent.adapterType, config: agent.adapterConfig ?? {}, chat: context.retryIsChat === true,
+      run: { errorCode: "saved_session_unavailable" },
+    }));
     context.paperclipSessionHandoffMarkdown =
       sessionCompaction.handoffMarkdown;
     context.paperclipSessionRotationReason = sessionCompaction.reason;

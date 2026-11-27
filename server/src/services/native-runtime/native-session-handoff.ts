@@ -92,6 +92,7 @@ export async function buildNativeSessionHandoff(input: {
   db: Db; companyId: string; issueId: string; agentId: string; before: Date;
   throughCommentId?: string | null; excludeCommentIds?: string[]; mode?: HandoffMode;
   continuation?: ExecutionContinuationEnvelope | null;
+  sourceRunId?: string | null;
 }): Promise<string | null> {
   const { db, companyId, issueId, agentId } = input;
   const whole = input.mode === "whole";
@@ -280,6 +281,12 @@ export async function buildNativeSessionHandoff(input: {
     for (const row of retainedReplies) row.body = replyBodies.get(row.id)!;
   }
   const entries: HandoffEntry[] = [];
+  if (input.sourceRunId) {
+    const [source] = await db.select({ code: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.id, input.sourceRunId), runIssueScope)).limit(1);
+    if (source?.code === "native_provider_side_effect_pending" || source?.resultJson?.retryReasonCode === "side_effect_pending") entries.push({ kind: "uncertain_action", id: input.sourceRunId,
+      body: "The last action may or may not have run. Check it before you continue. The last action's outcome is unknown." });
+  }
   const addedCommentIds = new Set<string>();
   // Historical output inherits its dispatch policy. Later agent/project/task
   // edits cannot promote it. Invalid retained policy also stays quarantined.

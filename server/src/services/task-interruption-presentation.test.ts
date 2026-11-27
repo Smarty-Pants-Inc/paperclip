@@ -44,6 +44,26 @@ describe("classified failure of an unanswered message", () => {
   });
 });
 
+describe("Retry session consequence on every offered interruption", () => {
+  const failed = { ...run, errorCode: "adapter_failed", resultJson: null };
+  it.each([
+    { adapterConfig: {}, fresh: true },
+    { adapterConfig: { provider: "pi_rpc" }, fresh: false },
+    { adapterConfig: { provider: "pi_rpc", sessionContinuity: "paperclip" }, fresh: true },
+  ])("emits an explicit boolean including question Retry: $adapterConfig", ({ adapterConfig, fresh }) => {
+    for (const question of [false, true]) {
+      const presentation = projectTaskInterruption(issue, { run: failed, agent: { ...agent, adapterConfig },
+        paused: false, approval: false, question });
+      expect(presentation).toMatchObject({ canRetry: true, retryStartsNewSession: fresh });
+    }
+  });
+  it("discloses cannot-continue even for continuous Pi", () => {
+    expect(projectTaskInterruption(issue, { run: { ...failed, errorCode: "native_provider_state_incompatible" },
+      agent: { ...agent, adapterConfig: { provider: "pi_rpc" } }, paused: false, approval: false }))
+      .toMatchObject({ canRetry: true, retryStartsNewSession: true });
+  });
+});
+
 describe("pending question presentation", () => {
   const failed = { ...run, errorCode: "native_session_interrupted", resultJson: null };
   const input = { run: failed, agent, paused: false, approval: false, question: true };

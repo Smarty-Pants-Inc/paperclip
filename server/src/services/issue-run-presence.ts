@@ -1,3 +1,4 @@
+import { retryStartsNewSessionColumn, readRetryConsequence } from "./run-retry-presentation.js";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { agents as agentsTable, heartbeatRuns, type Db } from "@paperclipai/db";
 import { agentAvatarUrl, resolveAgentAppearance } from "@paperclipai/shared";
@@ -43,6 +44,7 @@ export function issueRunPresenceService(
     const rows = await db
       .select({
         id: heartbeatRuns.id,
+        retryStartsNewSession: retryStartsNewSessionColumn,
         runtimeMode: heartbeatRuns.runtimeMode,
         wakeupRequestId: heartbeatRuns.wakeupRequestId,
         queuedCommentSourceWakeIds: sql<string[] | null>`${heartbeatRuns.contextSnapshot} -> 'queuedCommentSourceWakeIds'`.as("queuedCommentSourceWakeIds"),
@@ -84,6 +86,7 @@ export function issueRunPresenceService(
     const projections = await executionProjectionsForRuns(db, issue.companyId, rows.map(run => run.id));
     return Promise.all(rows.map(async (run) => ({
       ...heartbeat.decorateActiveRunStatus(run, { companyId: issue.companyId, issueId: issue.id }),
+      ...await readRetryConsequence(db, issue.companyId, run.id),
       agentAppearance: resolveAgentAppearance(run.agentAppearance, run.agentId),
       avatarUrl: agentAvatarUrl(resolveAgentAppearance(run.agentAppearance, run.agentId), 512),
       execution: projections.get(run.id) ?? null,
@@ -118,6 +121,7 @@ export function issueRunPresenceService(
     const decoratedRun = heartbeat.decorateActiveRunStatus(run, { companyId: issue.companyId, issueId: issue.id });
     return {
       ...decoratedRun,
+      ...await readRetryConsequence(db, issue.companyId, run.id),
       execution: await executionProjectionForRun(db, issue.companyId, run.id),
       agentId: agent.id,
       agentName: agent.name,

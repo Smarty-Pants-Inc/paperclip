@@ -2405,7 +2405,7 @@ describe("agent issue mutation checkout ownership", () => {
       return { db, order, sourceIssue };
     }
 
-    it("stages immutable recovery evidence before resolution and accepts deferred dispatch", async () => {
+    it("stages recovery evidence without personRetry: resolution is not an authenticated fresh-session Retry", async () => {
       const { db, order } = setupChatRecovery();
       const res = await request(
         await createApp(boardActor(), db, {
@@ -2430,6 +2430,7 @@ describe("agent issue mutation checkout ownership", () => {
         failedRunId: ownerRunId,
         initiatedByUserId: "board-user",
       });
+      expect(mockChatRunRetries.prepareFailedChatRunRetry.mock.calls[0]![1]).not.toHaveProperty("personRetry");
       expect(mockIssueService.update).toHaveBeenCalledExactlyOnceWith(
         issueId,
         expect.objectContaining({ status: "todo" }),

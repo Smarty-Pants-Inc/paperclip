@@ -1675,10 +1675,15 @@ describe("rebindNativeSessionCheckpoint", () => {
       if (key === "skills") current.runtimeContext.skills.push({ key: "fixture-skill", runtimeName: "fixture-skill", versionId: "next", bundle: structuredClone(current.runtimeContext.instructions.bundle) });
       if (key === "connectionInstructions") current.runtimeContext.connectionInstructions = { text: "Changed account policy", digest: "e".repeat(64) };
       current.runtimeContext.aggregateDigest = key === "aggregateDigest" ? "c".repeat(64) : canonicalNativeRuntimeContextDigest(current.runtimeContext);
-      const result = buildNativeExecutionWithCheckpoint({ previousRun: source, normalizedSessionId, buildExecution: () => current });
       const retain = sessionContinuity !== "paperclip" && (key === "instructions" || key === "prompt" || key === "promptDigest" || key === "skills");
-      expect(result.normalizedSessionId === normalizedSessionId).toBe(retain);
-      expect(!!result.checkpoint).toBe(retain);
+      if (!retain && sessionContinuity !== "paperclip") {
+        expect(() => buildNativeExecutionWithCheckpoint({ previousRun: source, normalizedSessionId, buildExecution: () => current }))
+          .toThrow("saved_session_unavailable");
+      } else {
+        const result = buildNativeExecutionWithCheckpoint({ previousRun: source, normalizedSessionId, buildExecution: () => current });
+        expect(result.normalizedSessionId === normalizedSessionId).toBe(retain);
+        expect(!!result.checkpoint).toBe(retain);
+      }
       const wrongOwner = structuredClone(current);
       wrongOwner.binding.agentId = randomUUID();
       expect(rebindNativeSessionCheckpoint({ previousRun: source, currentExecution: wrongOwner })).toBeNull();
@@ -1780,6 +1785,66 @@ describe("rebindNativeSessionCheckpoint", () => {
     const rebound = rebindNativeSessionCheckpoint({ previousRun: source, currentExecution });
     if (retain) expect(rebound).toMatchObject({ sessionId: "provider-thread-123", identity: { sessionId: normalizedSessionId } });
     else expect(rebound).toBeNull();
+  });
+
+  it.each(["External chat message received", "issue_comment_added"])("refuses an undisclosed continuous saved-session fork: %s", () => {
+    const source = previousRun({ sessionCheckpoint: {} });
+    const buildExecution = vi.fn(() => ({ ...execution(currentRunId), provider: { ...execution(currentRunId).provider, kind: "pi_rpc" } } as NativeExecutionInput));
+    expect(() => buildNativeExecutionWithCheckpoint({ previousRun: source, normalizedSessionId, sessionContinuity: "continuous", buildExecution }))
+      .toThrow("saved_session_unavailable");
+    expect(buildExecution).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { savedSessionExpected: false, allowFreshSession: false, blocked: false },
+    { savedSessionExpected: true, allowFreshSession: false, blocked: true },
+    { savedSessionExpected: true, allowFreshSession: true, blocked: false },
+  ])("guards only an undisclosed expected saved-session fork: %j", ({ savedSessionExpected, allowFreshSession, blocked }) => {
+    const buildExecution = vi.fn(({ normalizedSessionId: id }: { normalizedSessionId: string }) => ({ ...execution(currentRunId),
+      provider: { kind: "pi_rpc", model: "fixture/model" }, session: { ...execution(currentRunId).session, normalizedSessionId: id } } as NativeExecutionInput));
+    const dispatch = () => buildNativeExecutionWithCheckpoint({ previousRun: null, normalizedSessionId,
+      savedSessionExpected, allowFreshSession, sessionContinuity: "continuous", buildExecution });
+    if (blocked) { expect(dispatch).toThrow("saved_session_unavailable"); expect(buildExecution).toHaveBeenCalledTimes(1); }
+    else { expect(dispatch().checkpoint).toBeNull(); expect(buildExecution).toHaveBeenCalledTimes(2); }
+  });
+
+  it.each(["checkpoint", "identity", "execution_input", "tool_fingerprint", "tool_refresh", "work_mode", "execution_mode", "provider", "home_mode", "schema", "runtime_context", "workspace", "no_source"])("actual checkpoint decision refuses a stale false Retry before a fork: %s", cause => {
+    const prior = execution(previousRunId), current = execution(currentRunId);
+    for (const value of [prior, current]) { value.provider = { kind: "pi_rpc", model: "fixture/model" }; value.session.driverKind = "pi_rpc"; }
+    const source = previousRun({ nativeExecutionInput: prior });
+    source.runnerProfileJson.sessionCheckpoint.driverKind = "pi_rpc";
+    source.runnerProfileJson.nativeToolContractFingerprint = nativeToolContractFingerprintForTarget("local", "pi_rpc");
+    if (cause === "checkpoint") Object.assign(source.runnerProfileJson, { sessionCheckpoint: {} });
+    if (cause === "identity") source.runnerProfileJson.sessionCheckpoint.identity.issueId = randomUUID();
+    if (cause === "execution_input") Object.assign(source.runnerProfileJson, { nativeExecutionInput: {} });
+    if (cause === "tool_fingerprint") source.runnerProfileJson.nativeToolContractFingerprint = "old-contract";
+    if (cause === "work_mode") current.task.workMode = "planning";
+    if (cause === "execution_mode") Object.assign(current, { executionMode: "plan" });
+    if (cause === "provider") current.provider = { kind: "codex", model: "fixture/model", approvalPolicy: "never" };
+    if (cause === "home_mode") Object.assign(current, { homeMode: "preconfigured" });
+    if (cause === "schema") Object.assign(prior, { schema: "unknown-saved-schema" });
+    if (cause === "runtime_context") current.runtimeContext.aggregateDigest = "unexpected-context";
+    if (cause === "workspace") { current.binding.executionWorkspaceId = randomUUID(); Object.assign(source.runnerProfileJson.sessionCheckpoint, { goal: { status: "in_progress" } }); }
+    try {
+      buildNativeExecutionWithCheckpoint({ previousRun: cause === "no_source" ? null : source, normalizedSessionId,
+        savedSessionExpected: true, expectedStartsNewSession: false, sessionContinuity: "continuous",
+        refreshTools: cause === "tool_refresh", toolRefreshOnResume: false, buildExecution: () => current });
+      expect.fail("the actual rejected checkpoint must not dispatch a replacement");
+    } catch (error) {
+      expect(error).toMatchObject({ status: 409, message: "retry_expectation_changed", details: {
+        retry: { retryStartsNewSession: true, retryReasonCode: "saved_session_unavailable", retryDisclosure: expect.any(String) },
+      } });
+    }
+  });
+
+  it("actual retained checkpoint refuses stale true, and genuine first turn still starts", () => {
+    const prior = execution(previousRunId), current = execution(currentRunId);
+    for (const value of [prior, current]) { value.provider = { kind: "pi_rpc", model: "fixture/model" }; value.session.driverKind = "pi_rpc"; }
+    const source = previousRun({ nativeExecutionInput: prior }); source.runnerProfileJson.sessionCheckpoint.driverKind = "pi_rpc";
+    expect(() => buildNativeExecutionWithCheckpoint({ previousRun: source, normalizedSessionId, expectedStartsNewSession: true,
+      sessionContinuity: "continuous", buildExecution: () => current })).toThrow("retry_expectation_changed");
+    expect(buildNativeExecutionWithCheckpoint({ previousRun: null, normalizedSessionId, expectedStartsNewSession: false,
+      savedSessionExpected: false, sessionContinuity: "continuous", buildExecution: () => current }).checkpoint).toBeNull();
   });
 
   it("rotates a carried session id when no checkpoint source exists", () => {

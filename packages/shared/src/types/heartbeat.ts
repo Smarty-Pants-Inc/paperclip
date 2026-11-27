@@ -154,6 +154,11 @@ export interface GitWorktreeBranchIncoherenceEvidence {
 }
 
 export interface HeartbeatRun {
+  /** Consequence of a person's Retry of this source run, not Retry permission. */
+  retryStartsNewSession?: boolean;
+  retryReasonCode?: import("./execution-projection.js").RetryReasonCode;
+  retryReason?: string;
+  retryDisclosure?: string;
   /** Persisted native driver identity; older servers may omit this field. */
   driverKind?: string | null;
   execution?: import("./execution-projection.js").ExecutionProjection | null;
