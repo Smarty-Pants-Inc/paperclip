@@ -408,6 +408,7 @@ import {
 import {
   dispatchNativeSessionResumptions,
   prepareIdleWarmNativeSessionsForSleep,
+  suspendIdleWarmNativeSessions,
   NativeCancellationPendingRecoveryError,
   NativeControllerDetachedForRestartError,
   prepareNativeWorkspaceSync,
@@ -4819,6 +4820,7 @@ export function heartbeatService(
     stopTaskDrain,
     getTaskDrainStatus,
     prepareIdleWarmNativeSessionsForSleep,
+    suspendIdleWarmNativeSessions,
     readUpgradeReadiness: () => readUpgradeReadiness(db, { activeRunIds: activeRunExecutions,
       counters: () => ({ ...getTaskDrainStatus(), unsavedWakes: unsavedWakeAdmissionCount() }) }),
     computeTaskDrain,

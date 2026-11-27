@@ -484,6 +484,7 @@ import {
   nativeSessionWorkspaceScope,
   reserveWarmNativeInstructionDirectory,
   closeIdleWarmNativeSessionsForRestart,
+  suspendIdleWarmNativeSessions,
   WARM_IDLE_CLOSE_MAX_RETRIES,
   WARM_IDLE_CLOSE_RETRY_MS,
   warmRetainedRunnerStopWait,
@@ -14172,6 +14173,28 @@ describe("native warm session supervision", () => {
     close.mockResolvedValue(undefined);
     expect(await closeIdleWarmNativeSessionsForRestart()).toEqual({ closed: 1, busy: 0, failed: 0, failures: [] });
     expect(collectStopped).toHaveBeenCalledOnce();
+  });
+
+  it("suspends an idle warm session on demand before a restart, with no budget, and leaves the restart sweep nothing", async () => {
+    const name = "warm-operator-suspend";
+    const current = { ...execution,
+      binding: { ...execution.binding, runId: name, executionWorkspaceId: name },
+      session: { ...execution.session, normalizedSessionId: name, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } },
+    } as NativeExecutionInputV1;
+    const close = vi.fn<() => Promise<void>>(async () => undefined);
+    state.execute.mockReset().mockImplementationOnce(async options => {
+      await options.onSession?.({ close });
+      return { result: { summary: "completed" }, terminal: { runTerminalState: "succeeded" },
+        turnId: name, normalizedSessionId: name, providerSessionId: name, driverKind: "test", driverVersion: "1",
+        nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+    });
+    await expect(executePaperclipNativeSession({ db: leaseDb(current), execution: current, runnerInstanceId: name }))
+      .resolves.toMatchObject({ exitCode: 0 });
+    expect(close).not.toHaveBeenCalled();
+    expect(await suspendIdleWarmNativeSessions()).toEqual({ closed: 1, busy: 0, failed: 0, failures: [], released: 0 });
+    expect(close).toHaveBeenCalledOnce();
+    expect(await suspendIdleWarmNativeSessions()).toEqual({ closed: 0, busy: 0, failed: 0, failures: [], released: 0 });
+    expect(await closeIdleWarmNativeSessionsForRestart()).toEqual({ closed: 0, busy: 0, failed: 0, failures: [] });
   });
 
   it("an idle warm session whose close fails with runner_remote_process_identity_unavailable and whose Runner is proven gone is released at controller restart", async () => {
