@@ -21,6 +21,7 @@ import { hasConfirmedSandboxStopAndRetain } from "../sandbox-stop-and-retain.js"
 import { preparedRemoteWorkspaceSource } from "../remote-workspace-lifecycle.js";
 import { releaseUnchangedRemoteWorkspaceWriterById } from "../remote-workspaces.js";
 import { isSupersededWorkspaceExport, markSupersededWorkspaceExportHold } from "./native-superseded-workspace-export.js";
+import { stoppedBeforeFirstInput } from "../person-stop-outcome.js";
 
 const reusableLeasePolicies = ["reuse_by_environment", "reuse_by_execution_workspace"];
 
@@ -117,7 +118,7 @@ export async function preserveNativeFailedWorkspace(db: Db, selected: Pick<typeo
     const [run] = await tx.select().from(heartbeatRuns).where(and(
       eq(heartbeatRuns.id, selected.id), eq(heartbeatRuns.companyId, selected.companyId),
     )).for("update");
-    if (!run || run.runtimeMode !== "native" || (!options.allowPreterminal && run.status !== "failed")) return;
+    if (!run || run.runtimeMode !== "native" || stoppedBeforeFirstInput(run) || (!options.allowPreterminal && run.status !== "failed")) return;
     if (options.requireCancelledStop && (run.status !== "cancelled" || !hasAcknowledgedNativeRunStopRequest(run)
       || run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt.getTime() > Date.now())) return;
     const currentReference = workspaceRecoveryReference(run.runnerProfileJson);
@@ -297,7 +298,7 @@ export function registerCancelledWorkspacePreservationWork(db: Db,
   type Candidate = Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId" | "issueId" | "nativeIssueId"
     | "runtimeMode" | "driverKind" | "status" | "resultJson" | "runnerProfileJson">;
   const eligible = (run: Candidate) => run.nativeIssueId !== null && hasAcknowledgedNativeRunStopRequest(run)
-    && workspaceRecoveryReference(run.runnerProfileJson)?.state === "prepared"
+    && !stoppedBeforeFirstInput(run) && workspaceRecoveryReference(run.runnerProfileJson)?.state === "prepared"
     && !hasRequiredWorkspaceRecovery(run.resultJson) && !nativeRunHasNoWorkspaceAccess(run);
   const scopeCondition = (scope?: CancelledWorkspacePreservationScope) => scope ? and(
     eq(heartbeatRuns.companyId, scope.companyId), scope.runId ? eq(heartbeatRuns.id, scope.runId) : undefined) : undefined;

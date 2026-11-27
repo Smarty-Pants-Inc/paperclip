@@ -174,8 +174,10 @@ export async function unidentifiedLocalLaunchRefusals(db: Db, runs: Unidentified
   const result = new Map<string, LaunchRefusal>();
   const candidates: UnidentifiedLaunchRun[] = [];
   for (const run of runs) {
-    if (run.runtimeMode !== "native" || !run.finishedAt || !FINISHED_RUN_STATUSES.has(run.status))
+    if (!run.finishedAt || !FINISHED_RUN_STATUSES.has(run.status))
       result.set(run.id, { code: "run_not_finished", message: "Only a finished run's stop can be confirmed." });
+    else if (run.runtimeMode !== "native")
+      result.set(run.id, { code: "unsupported_runtime", message: "This run finished before a native runner was selected. Native runner stop confirmation does not apply; its preparation and environment cleanup must settle first." });
     else if (run.processPid || run.processGroupId)
       result.set(run.id, { code: "process_identity_recorded", message: "This run recorded its process. Paperclip verifies that process itself." });
     else candidates.push(run);

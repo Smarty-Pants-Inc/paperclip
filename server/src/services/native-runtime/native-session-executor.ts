@@ -21,6 +21,8 @@ import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_COMPLETED_TURN_CLEANUP_MESSAGE,
   nativeCheckpointRecordsCompletedTurn } from "./completed-turn-cleanup.js";
 import { prepareCursorCloudRuntime } from "./cursor-cloud-runtime.js";
 import { LocalRuntimeApiListenerClosedError, resolveLocalRuntimeApiUrl } from "../../runtime-api.js";
+import { digestBackupDirectoryStreamed } from "./native-harness-backup-digest.js";
+import { PI_HOME_CHECKPOINT_EXCLUDED_ENTRIES, piRunnerCheckpointExclusions } from "./native-pi-checkpoint-policy.js";
 import { providerFailureFromError } from "../../vendor/paperclip-runner/index.js";
 import { readProviderFailure } from "@paperclipai/shared";
 import { nativeCancellationHasUnsettledOwner, notifyNativeCancellation, waitForNativeCancellation } from "./native-cancellation-delivery.js";
@@ -775,6 +777,7 @@ type WarmNativeSession = {
   closeFailureEvidenceLogged?: boolean;
   /** A successor's retirement of this owner failed; it stays registered for its own sandbox. */
   retirementUnproven?: boolean;
+  preservationFailure?: NativeHarnessPreservationRequiredError;
   observabilityCompatibilityKey?: string;
   runId: string;
   issueId: string;

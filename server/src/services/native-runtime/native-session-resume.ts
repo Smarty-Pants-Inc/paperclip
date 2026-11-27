@@ -303,7 +303,7 @@ async function isUnstartedInheritedFollowUp(
  * still prove no handoff or process/controller ownership. Neither may skip a turn. */
 export async function nativeRunHasNoProviderWork(db: Db,
   input: Pick<NativeSessionResumeSelection, "companyId" | "agentId" | "issueId">, runId: string,
-  options: { allowDispatchHandoff?: boolean; allowProcessStartup?: boolean } = {}): Promise<boolean> {
+  options: { allowDispatchHandoff?: boolean; allowProcessStartup?: boolean; beforeFirstInput?: boolean } = {}): Promise<boolean> {
   const [evidence] = await db.select({
     processPid: heartbeatRuns.processPid, processGroupId: heartbeatRuns.processGroupId,
     processStartedAt: heartbeatRuns.processStartedAt, profile: heartbeatRuns.runnerProfileJson,
@@ -318,7 +318,9 @@ export async function nativeRunHasNoProviderWork(db: Db,
         and ${heartbeatRunEvents.eventType} in (${sql.join(OWN_PROCESS_START_EVENT_TYPES.map(type => sql`${type}`), sql`, `)}))`,
     committedTurn: sql<boolean>`exists (select 1 from ${heartbeatRunEvents}
       where ${heartbeatRunEvents.companyId} = ${heartbeatRuns.companyId} and ${heartbeatRunEvents.runId} = ${heartbeatRuns.id}
-        and (${heartbeatRunEvents.eventType} in ('turn.started', 'turn.completed') or ${heartbeatRunEvents.eventType} like 'item.%'))`,
+        and (${heartbeatRunEvents.eventType} in ('turn.started', 'turn.completed') or ${heartbeatRunEvents.eventType} like 'item.%'
+          or (${options.beforeFirstInput === true} and (${heartbeatRunEvents.eventType} like 'turn.%'
+            or ${heartbeatRunEvents.eventType} like 'provider.%'))))`,
     controllerCheckpoint: sql<boolean>`exists (select 1 from ${nativeRunnerCheckpoints}
       where ${nativeRunnerCheckpoints.companyId} = ${heartbeatRuns.companyId} and ${nativeRunnerCheckpoints.runId} = ${heartbeatRuns.id})`,
     result: sql<boolean>`exists (select 1 from ${nativeRunResults}
@@ -342,7 +344,9 @@ export async function nativeRunHasNoProviderWork(db: Db,
     recovery.providerWorkStarted !== true &&
     (evidence.phase === null || ["observed", "terminal_failure"].includes(evidence.phase)) &&
     evidence.resultId === null && !evidence.committedTurn && !evidence.controllerCheckpoint && !evidence.result &&
-    !(await nativeSessionProviderEvidence(db, [runId])).has(runId));
+    // Session/process bootstrap is allowed only at the sealed first-input Stop
+    // boundary. The query above still rejects every turn, item and provider event.
+    (options.beforeFirstInput || !(await nativeSessionProviderEvidence(db, [runId])).has(runId)));
 }
 
 async function selectNativeSessionResumeBarrier(db: Db, input: NativeSessionResumeSelection, skippedRunIds: string[]) {

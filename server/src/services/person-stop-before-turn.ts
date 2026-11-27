@@ -8,10 +8,32 @@ import { queuedCommentIdsFromWakePayload, withQueuedCommentIdsInWakePayload } fr
 import { logger } from "../middleware/logger.js";
 import { notifyDeferredWakesForIssue } from "./deferred-execution-notifications.js";
 import { deliveredQueuedCommentIds } from "./queued-comment-delivery.js";
+import { nativeRunHasNoProviderWork } from "./native-runtime/native-session-resume.js";
 
 const asRecord = (value: unknown): Record<string, unknown> | null => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 type Run = typeof heartbeatRuns.$inferSelect;
 export type PersonStop = { pressedAt: string; userId: string | null };
+
+/** Negative input/work proof only. Callers must separately settle controller
+ * ownership and the exact borrowed allocation before recording an outcome. The
+ * settled transport's checkpoint hook may use this to avoid inventing a backup
+ * for an input it never received; it must not skip stopping the transport. */
+export async function personStopHasNoFirstInput(db: Db, run: Run): Promise<boolean> {
+  const stop = asRecord(run.resultJson?.personStop);
+  const startup = asRecord(run.resultJson?.startupCancellation);
+  const initiator = asRecord(asRecord(run.resultJson?.cancellation)?.initiator);
+  const issueId = run.nativeIssueId ?? run.issueId ?? asRecord(run.contextSnapshot)?.issueId;
+  const earlyNativePreparation = run.runtimeMode === "legacy" && run.runtimeModeResolvedAt === null &&
+    run.executionStage === "preparing" && claimedAdapterType(run) === "paperclip_runner" && startup?.beforeNativeSelection === true;
+  if (!(run.runtimeMode === "native" || earlyNativePreparation) || typeof issueId !== "string" ||
+      !(typeof stop?.requestedAt === "string" || typeof startup?.requestedAt === "string") ||
+      !(run.resultJson?.cancelledByActorType === "user" && typeof run.resultJson.cancelledByUserId === "string" ||
+        initiator?.type === "user" && typeof initiator.id === "string") ||
+      run.resultJson?.firstTurnDispatchCommitted || readFirstTurnQueuedInputReceipt(run) ||
+      Object.keys(asRecord(run.resultJson?.queuedSteeringAcknowledgements) ?? {}).length) return false;
+  return nativeRunHasNoProviderWork(db, { companyId: run.companyId, agentId: run.agentId, issueId }, run.id,
+    { allowDispatchHandoff: !earlyNativePreparation, allowProcessStartup: !earlyNativePreparation, beforeFirstInput: true });
+}
 
 /** Shared with first-turn admission: issue -> run -> wake input, never run -> issue.
  * Issue serialization must permit event persistence's FK KEY SHARE; no issue key changes. */
@@ -19,8 +41,9 @@ export async function settleStartupStop(db: Db, existing: Run, stop: PersonStop)
   const { pressedAt } = stop, runId = existing.id;
   return db.transaction(async tx => {
     const issueId = existing.nativeIssueId ?? existing.issueId ?? asRecord(existing.contextSnapshot)?.issueId;
-    if (typeof issueId === "string") await tx.select({ id: issues.id }).from(issues)
-      .where(and(eq(issues.id, issueId), eq(issues.companyId, existing.companyId))).for("no key update");
+    const [task] = typeof issueId === "string" ? await tx.select({ id: issues.id, status: issues.status,
+      statusVersion: issues.statusVersion, assigneeAgentId: issues.assigneeAgentId,
+    }).from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, existing.companyId))).for("no key update") : [];
     const [current] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).for("update");
     if (!current || current.status === "queued") return null;
     const terminal = ["failed", "cancelled", "timed_out", "interrupted", "succeeded"].includes(current.status);
@@ -47,7 +70,13 @@ export async function settleStartupStop(db: Db, existing: Run, stop: PersonStop)
     const returned = await returnWakeComments(tx as unknown as Db, current, stop, true);
     if (terminal && !returned && !current.resultJson?.personStop) return null;
     await tx.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
-      startupCancellation: { requestedAt: pressedAt, beforeNativeSelection: stillPreparing },
+      startupCancellation: { requestedAt: pressedAt, beforeNativeSelection: stillPreparing,
+        // Compare-and-set custody, not permission to overwrite a later status.
+        ...(asRecord(current.resultJson?.startupCancellation)?.task
+          ? { task: asRecord(current.resultJson?.startupCancellation)!.task }
+          : task ? { task: { issueId: task.id, status: task.status, statusVersion: task.statusVersion,
+            assigneeAgentId: task.assigneeAgentId } } : {}),
+      },
       cancelledByActorType: "user", cancelledByUserId: stop.userId,
     })}::jsonb` }).where(eq(heartbeatRuns.id, runId));
     const [settled] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));

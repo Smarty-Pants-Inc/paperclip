@@ -26,6 +26,7 @@ import {
 import { preserveWorkspaceRestoreRecoveryMetadataSql } from "../legacy-workspace-restore-recovery.js";
 import { nativeRunHasNoWorkspaceAccess } from "../workspace-restore-recovery-state.js";
 import { preserveNativeFailedWorkspace } from "../native-runtime/native-failed-workspace-recovery.js";
+import { recordStoppedBeforeFirstInput, settlePreDispatchStopRecovery, stoppedBeforeFirstInput } from "./pre-dispatch-stop-settlement.js";
 import { NativeWorkspaceFinalizationBusyError } from "../native-runtime/native-workspace-finalization-ownership.js";
 import { readNativeWorkspaceSyncReference } from "../native-runtime/native-workspace-sync.js";
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
@@ -397,7 +398,9 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
   }) {
     let leaseOwnerRun = await getRunCleanupState(input.runId);
     if (leaseOwnerRun && isNativeRunnerOwnershipHeld(leaseOwnerRun)) return;
-    const cancelledRun = leaseOwnerRun?.status === "cancelled" ? await getRun(input.runId) : null;
+    let cancelledRun = leaseOwnerRun?.status === "cancelled" ? await getRun(input.runId) : null;
+    if (cancelledRun && await recordStoppedBeforeFirstInput(db, input.companyId, input.runId))
+      cancelledRun = await getRun(input.runId);
     if (cancelledRun) leaseOwnerRun = cancelledRun;
     if (leaseOwnerRun && isNativeRunnerOwnershipHeld(leaseOwnerRun)) return;
     // Recovery can finish workspace copy-back outside the executor's finally.
@@ -411,11 +414,12 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     // close the prior warm owner: runtime returns only reusable leases untouched.
     if (cancelledRun?.resultJson?.preDispatchCancellationSettledAt &&
         !parseObject(cancelledRun.usageJson?.budgetDispatch).handedOffAt) providerResourceDisposition = undefined;
+    if (cancelledRun && stoppedBeforeFirstInput(cancelledRun)) providerResourceDisposition = "keep_running";
     let neverLaunched: boolean | undefined;
     const runnerNeverLaunched = async () => neverLaunched ??= leaseOwnerRun?.runtimeMode === "native"
       && isHeartbeatRunTerminalStatus(status) && await nativeRunNeverLaunchedRunner(db, input.runId, input.companyId);
     const defer = (reason: string) => deferEnvironmentLeaseRelease(input, reason, providerResourceDisposition);
-    if (cancelledRun?.runtimeMode === "native" && status === "cancelled"
+    if (cancelledRun?.runtimeMode === "native" && status === "cancelled" && !stoppedBeforeFirstInput(cancelledRun)
       && readNativeWorkspaceSyncReference(cancelledRun.runnerProfileJson?.nativeWorkspaceSync)?.state === "prepared"
       && !nativeRunHasNoWorkspaceAccess(cancelledRun) && !await runnerNeverLaunched()) {
       let deferral: string | null = null;
@@ -541,6 +545,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       logger.warn({ runId: input.runId }, "could not wake the agent's stop after its run leases settled");
     });
     await acknowledgeRemoteStop(input.runId, input.companyId);
+    if (cancelledRun && stoppedBeforeFirstInput(cancelledRun))
+      await settlePreDispatchStopRecovery(db, input.companyId, input.runId);
   }
 
   async function wakeAgentAfterRunLeasesSettled(input: { runId: string; companyId: string; agentId: string }) {
