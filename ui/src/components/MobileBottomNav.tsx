@@ -19,7 +19,6 @@ import { useAgentChatEnabled } from "@/hooks/useAgentChatEnabled";
 import { useCombinedInboxTasksEnabled } from "@/hooks/useCombinedInboxTasksEnabled";
 import { useCompanyHomePath } from "@/hooks/useCompanyHomePath";
 import { useResponsibilitiesEnabled } from "@/hooks/useResponsibilitiesEnabled";
-import { Badge } from "@/components/ui/badge";
 
 interface MobileBottomNavProps {
   visible: boolean;
@@ -106,14 +105,15 @@ export function MobileBottomNav({ visible }: MobileBottomNavProps) {
   return (
     <nav
       className={cn(
-        "mobile-bottom-nav fixed bottom-0 left-0 right-0 z-30 bg-muted md:hidden pb-(--sz-safe-bottom)",
+        "mobile-bottom-nav fixed z-30 md:hidden",
       )}
       data-visible={visible}
       inert={!visible}
       aria-label="Mobile navigation"
     >
       <div
-        className="grid h-16 px-1"
+        className="mobile-tab-bar grid"
+        data-testid="mobile-tab-bar"
         style={{ gridTemplateColumns: `repeat(${items.length}, minmax(0, 1fr))` }}
       >
         {items.map((item) => {
@@ -126,13 +126,13 @@ export function MobileBottomNav({ visible }: MobileBottomNavProps) {
                 type="button"
                 onClick={item.onClick}
                 className={cn(
-                  "relative flex min-w-0 flex-col items-center justify-center gap-1 rounded-md text-(length:--text-nano) font-medium transition-colors",
+                  "mobile-tab relative flex flex-col items-center justify-center font-medium transition-colors",
                   active
-                    ? "text-foreground"
+                    ? "mobile-tab-active text-foreground"
                     : "text-muted-foreground hover:text-foreground",
                 )}
               >
-                <Icon className="h-(--sz-18px) w-(--sz-18px)" />
+                <Icon className={cn("h-(--sz-18px) w-(--sz-18px)", active && "stroke-(length:--sw-2_3)")} />
                 <span className="truncate">{item.label}</span>
               </button>
             );
@@ -144,23 +144,24 @@ export function MobileBottomNav({ visible }: MobileBottomNavProps) {
               key={item.label}
               to={item.to}
               state={SIDEBAR_SCROLL_RESET_STATE}
+              aria-label={item.badge != null && item.badge > 0 ? `${item.label}, ${item.badge} items need attention` : item.label}
               className={({ isActive }) =>
                 cn(
-                  "relative flex min-w-0 flex-col items-center justify-center gap-1 rounded-md text-(length:--text-nano) font-medium transition-colors",
+                  "mobile-tab relative flex flex-col items-center justify-center font-medium transition-colors",
                   isActive
-                    ? "text-foreground"
+                    ? "mobile-tab-active text-foreground"
                     : "text-muted-foreground hover:text-foreground",
                 )
               }
             >
               {({ isActive }) => (
                 <>
-                  <span className="relative">
+                  <span className="mobile-tab-icon">
                     <Icon className={cn("h-(--sz-18px) w-(--sz-18px)", isActive && "stroke-(length:--sw-2_3)")} />
                     {item.badge != null && item.badge > 0 && (
-                      <Badge variant="ghost" className="absolute -right-2 -top-2 bg-primary px-1.5 text-(length:--text-nano) leading-none text-primary-foreground">
+                      <span aria-hidden="true" className="mobile-tab-badge absolute">
                         {item.badge > 99 ? "99+" : item.badge}
-                      </Badge>
+                      </span>
                     )}
                   </span>
                   <span className="truncate">{item.label}</span>
