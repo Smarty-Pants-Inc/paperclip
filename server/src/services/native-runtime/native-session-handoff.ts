@@ -6,7 +6,7 @@ import { resolveCoreTrustPreset } from "../trust-preset-resolver.js";
 import { fastResponseHistoryBody, type ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { nativeFinalReplyKey } from "../heartbeat-run-summary.js";
 
-import { commandTextBytes, NATIVE_HANDOFF_MAX_BYTES, NATIVE_WHOLE_HANDOFF_MAX_BYTES, NativeTurnPromptExceedsCommandBoundError } from "./native-turn-budget.js";
+import { commandTextBytes, nativePromptRefusalRemedies, NATIVE_HANDOFF_MAX_BYTES, NATIVE_WHOLE_HANDOFF_MAX_BYTES, NativeTurnPromptExceedsCommandBoundError } from "./native-turn-budget.js";
 export { NATIVE_HANDOFF_MAX_BYTES, NATIVE_WHOLE_HANDOFF_MAX_BYTES, NATIVE_HANDOFF_COMMAND_MAX_BYTES, NATIVE_HANDOFF_COMMAND_RESERVE_BYTES, nativeSessionHandoffMaxBytes } from "./native-turn-budget.js";
 const ENTRY_MAX_CHARS = 4_000;
 const LIMIT = 10;
@@ -33,7 +33,7 @@ export function renderNativeSessionHandoff(input: {
     const messages = (input.omittedMessages ?? 0) + input.entries.filter(isConversationEntry).length;
     const support = input.omittedEntriesAtLeast + input.entries.filter(entry => !isConversationEntry(entry)).length;
     const note = `Fresh session handoff cut for room. At least ${messages} messages and ${support} supporting entries omitted. Retrieve scoped task history as needed.`;
-    if (commandTextBytes(note) > maxBytes) throw new NativeTurnPromptExceedsCommandBoundError({ kind: "command", bytes: commandTextBytes(note), measure: "handoff_note" });
+    if (commandTextBytes(note) > maxBytes) throw new NativeTurnPromptExceedsCommandBoundError({ kind: "command", bytes: commandTextBytes(note), measure: "handoff_note", remedies: nativePromptRefusalRemedies("command") });
     return note;
   };
   if (maxBytes < 2_000) return cutForRoom();
