@@ -20,8 +20,9 @@ export async function requeueContinuousUnanswered(db: Db, scope: { id: string; c
     .where(and(eq(heartbeatRuns.id, scope.id), eq(heartbeatRuns.companyId, scope.companyId)));
   if (!source?.issueId) return;
   await db.transaction(async tx => {
+    // Serialize issue ownership without blocking a run event writer's FK KEY SHARE.
     const [issue] = await tx.select().from(issues).where(and(eq(issues.id, source.issueId!),
-      eq(issues.companyId, scope.companyId))).for("update");
+      eq(issues.companyId, scope.companyId))).for("no key update");
     const [row] = await tx.select({ run: heartbeatRuns, config: agents.adapterConfig }).from(heartbeatRuns)
       .innerJoin(agents, and(eq(agents.id, heartbeatRuns.agentId), eq(agents.companyId, scope.companyId)))
       .where(and(eq(heartbeatRuns.id, scope.id), eq(heartbeatRuns.companyId, scope.companyId)))

@@ -64,7 +64,7 @@ export async function continuousSessionAcknowledgedCommentIds(db: Pick<Db, "sele
  * transaction. Publication can join this transaction using its pre-read proof. */
 export async function settleContinuousSessionInput(tx: Db, scope: Scope, evidence: Evidence | null) {
   if (!evidence?.commentIds.length) return;
-  const [issue] = await tx.select().from(issues).where(and(eq(issues.id, scope.issueId), eq(issues.companyId, scope.companyId))).for("update");
+  const [issue] = await tx.select().from(issues).where(and(eq(issues.id, scope.issueId), eq(issues.companyId, scope.companyId))).for("no key update");
   if (!issue?.assigneeAgentId || issue.executionRunId !== scope.runId ||
       (scope.agentId && issue.assigneeAgentId !== scope.agentId)) return;
   const wakes = await tx.select().from(agentWakeupRequests).where(and(
