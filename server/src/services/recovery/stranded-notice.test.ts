@@ -95,6 +95,19 @@ describe("stranded recovery notice seeds", () => {
     expect(seed.nextAction).toBe("Retry the task.");
   });
 
+  it.each([
+    ["configuration_recovery_stalled", "execution ownership or cleanup"],
+    ["configuration_recovery_unavailable", "a database operation"],
+  ])("v10 %s notice names the final cause without inventing three attempts", (reason, cause) => {
+    // Pure presentation regression: this formatter has no cheaper live boundary.
+    const seed = buildConfigurationIncompleteRecoveryNoticeSeed({ reason });
+    expect(seed.title).toBe("Configuration restart stopped");
+    expect(seed.body).toContain(cause);
+    expect(seed.nextAction).toContain(reason === "configuration_recovery_unavailable" ? "database failure" : "ownership and cleanup");
+    expect(seed.body).toContain("final recovery attempt");
+    expect(seed.body).not.toMatch(/three|secret|restore database access/);
+  });
+
   it("keeps the secret-binding copy for other configuration gaps", () => {
     expect(buildConfigurationIncompleteRecoveryNoticeSeed({ reason: "secret_binding_missing" }).body).toContain(
       "a secret it needs is not set",
