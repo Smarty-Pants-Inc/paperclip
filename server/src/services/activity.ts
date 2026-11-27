@@ -222,7 +222,26 @@ export function activityService(db: Db) {
         'timeoutConfigured', ${heartbeatRuns.resultJson} -> 'timeoutConfigured',
         'timeoutSource', ${heartbeatRuns.resultJson} -> 'timeoutSource',
         'timeoutFired', ${heartbeatRuns.resultJson} -> 'timeoutFired'
-      ))
+      )) || case when jsonb_typeof(${heartbeatRuns.resultJson} -> 'cancellation') = 'object'
+          or jsonb_typeof(${heartbeatRuns.resultJson} -> 'cancelledByActorType') = 'string'
+        -- Keep unknown provenance explicitly null; never copy initiator identity.
+        then jsonb_build_object('cancellation', jsonb_build_object(
+          'source', case when jsonb_typeof(${heartbeatRuns.resultJson} #> '{cancellation,source}') = 'string'
+            then left(${heartbeatRuns.resultJson} #>> '{cancellation,source}', 64) end,
+          'reason', case when jsonb_typeof(${heartbeatRuns.resultJson} #> '{cancellation,reason}') = 'string'
+            then left(${heartbeatRuns.resultJson} #>> '{cancellation,reason}', 120) end,
+          -- The same person-stop shapes the server reads: initiator.type, an older
+          -- string initiator, or the legacy cancelledByActorType (board = a person).
+          'initiatorType', case
+            when ${heartbeatRuns.resultJson} #>> '{cancellation,initiator,type}' in ('user', 'agent', 'system')
+              then ${heartbeatRuns.resultJson} #>> '{cancellation,initiator,type}'
+            when jsonb_typeof(${heartbeatRuns.resultJson} #> '{cancellation,initiator}') = 'string'
+              and ${heartbeatRuns.resultJson} #>> '{cancellation,initiator}' in ('user', 'agent', 'system')
+              then ${heartbeatRuns.resultJson} #>> '{cancellation,initiator}'
+            when ${heartbeatRuns.resultJson} ->> 'cancelledByActorType' in ('user', 'board') then 'user'
+            when ${heartbeatRuns.resultJson} ->> 'cancelledByActorType' in ('agent', 'system')
+              then ${heartbeatRuns.resultJson} ->> 'cancelledByActorType' end
+        )) else '{}'::jsonb end
     end
   `.as("resultJson");
 
