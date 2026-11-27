@@ -809,7 +809,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
 
   async function seedReusablePluginSandboxLease(
     adapterType: string | null = null,
-    options: { timeoutMs?: number | null; defaultAcquireTimeoutMs?: number } = {},
+    options: { timeoutMs?: number | null; bridgeRequestTimeoutMs?: number; defaultAcquireTimeoutMs?: number } = {},
   ) {
     const pluginId = randomUUID();
     const { companyId, agentId, environment: baseEnvironment, runId } = await seedEnvironment();
@@ -817,6 +817,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       provider: "fake-plugin",
       image: "fake:test",
       ...(options.timeoutMs === null ? {} : { timeoutMs: options.timeoutMs ?? 1234 }),
+      ...(options.bridgeRequestTimeoutMs === undefined ? {} : { bridgeRequestTimeoutMs: options.bridgeRequestTimeoutMs }),
       reuseLease: true,
     };
     const environment: Environment = {
@@ -847,6 +848,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
             properties: {
               image: { type: "string" },
               timeoutMs: { type: "number" },
+              bridgeRequestTimeoutMs: { type: "number" },
               reuseLease: { type: "boolean" },
             },
           },
@@ -922,13 +924,45 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     const input = { environment: seeded.environment, lease: seeded.reusableLease, operations: [] };
     await runtime[method]({ ...input, minimumTimeoutMs: 900_000 });
     expect(call.mock.calls[0]?.[1]).toBe(method === "syncIn" ? "environmentSyncIn" : "environmentSyncOut");
-    expect(call.mock.calls[0]?.[2]).toMatchObject({ config: { timeoutMs }, minimumTimeoutMs: 900_000 });
+    expect(call.mock.calls[0]?.[2]).toMatchObject({
+      config: { timeoutMs: method === "syncOut" ? Math.max(timeoutMs, 900_000) : timeoutMs },
+      minimumTimeoutMs: 900_000,
+    });
     expect(call.mock.calls[0]?.[3]).toBeGreaterThan(Math.max(900_000, timeoutMs));
     await runtime[method](input);
-    expect(call.mock.calls[1]?.[2]).toMatchObject({ config: { timeoutMs } });
+    expect(call.mock.calls[1]?.[2]).toMatchObject({
+      config: { timeoutMs: method === "syncOut" ? Math.max(timeoutMs, 300_000) : timeoutMs },
+    });
     expect(call.mock.calls[1]?.[2]).not.toHaveProperty("minimumTimeoutMs");
     expect(seeded.environment.config.timeoutMs).toBe(timeoutMs);
     expect((await environmentService(db).getById(seeded.environment.id))?.config.timeoutMs).toBe(timeoutMs);
+  });
+
+  it.each([
+    { method: "syncOut" as const, label: "no configured timeouts", bridgeRequestTimeoutMs: undefined, minimumTimeoutMs: undefined, configTimeoutMs: 300_000, rpcTimeoutMs: 330_000 },
+    { method: "syncOut" as const, label: "a larger bridge budget", bridgeRequestTimeoutMs: 600_000, minimumTimeoutMs: undefined, configTimeoutMs: 600_000, rpcTimeoutMs: 630_000 },
+    { method: "syncOut" as const, label: "a larger supplied minimum", bridgeRequestTimeoutMs: undefined, minimumTimeoutMs: 1_800_000, configTimeoutMs: 1_800_000, rpcTimeoutMs: 1_830_000 },
+    { method: "syncIn" as const, label: "no configured timeouts", bridgeRequestTimeoutMs: undefined, minimumTimeoutMs: undefined, configTimeoutMs: undefined, rpcTimeoutMs: 30_000 },
+  ])("applies the outbound-only timeout floor to $method with $label", async ({ method, bridgeRequestTimeoutMs, minimumTimeoutMs, configTimeoutMs, rpcTimeoutMs }) => {
+    const seeded = await seedReusablePluginSandboxLease(null, { timeoutMs: null, bridgeRequestTimeoutMs });
+    const call = vi.fn(async (..._args: unknown[]) => ({ operations: [] }));
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: {
+      isRunning: vi.fn(() => true), call,
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentSyncIn", "environmentSyncOut"] })),
+    } as unknown as PluginWorkerManager });
+    await runtime[method]({ environment: seeded.environment, lease: seeded.reusableLease,
+      operations: [], ...(minimumTimeoutMs === undefined ? {} : { minimumTimeoutMs }) });
+    const params = call.mock.calls[0]?.[2] as { config: Record<string, unknown> };
+    expect(call.mock.calls[0]?.[1]).toBe(method === "syncOut" ? "environmentSyncOut" : "environmentSyncIn");
+    expect({
+      configTimeoutMs: params.config.timeoutMs,
+      // An omitted RPC budget uses plugin-worker-manager's existing 30 s default.
+      rpcTimeoutMs: call.mock.calls[0]?.[3] ?? 30_000,
+    }).toEqual({ configTimeoutMs, rpcTimeoutMs });
+    if (method === "syncIn") expect(call.mock.calls[0]?.[3]).toBeUndefined();
+    expect(params.config.bridgeRequestTimeoutMs).toBe(bridgeRequestTimeoutMs);
+    expect(seeded.environment.config).not.toHaveProperty("timeoutMs");
+    expect((await environmentService(db).getById(seeded.environment.id))?.config).toEqual(seeded.environment.config);
   });
 
   it.each(["syncIn", "syncOut"] as const)("rejects invalid %s deadlines before a provider call", async method => {
