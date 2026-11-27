@@ -509,9 +509,7 @@ function protectedNativePromptCause(description: string, assignment: string, con
   const unread = candidates.filter(candidate => candidate.unread);
   if (unread.length > 1 && totalBytes - unread.reduce((sum, candidate) => sum + candidate.saving, 0) <= NATIVE_TURN_KNOWN_MAX_BYTES)
     return { kind: "unread_messages", bytes: unread.reduce((sum, candidate) => sum + candidate.bytes, 0), count: unread.length };
-  const locatedBytes = candidates.reduce((sum, candidate) => sum + candidate.bytes, 0);
-  return { kind: "protected_inputs", bytes: locatedBytes || totalBytes,
-    measure: locatedBytes ? "protected_parts" : "envelope_with_reserve" };
+  return { kind: "protected_inputs", bytes: candidates.reduce((sum, candidate) => sum + candidate.bytes, 0) || totalBytes };
 }
 
 /** Match rendered JSON data without depending on PostgreSQL JSONB key order.
