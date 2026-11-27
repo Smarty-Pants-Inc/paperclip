@@ -297,6 +297,51 @@ describe("the controller consumer with provider-started turn sequences", () => {
     expect(outcome.completeRun).not.toHaveBeenCalled();
   });
 
+  it.each([undefined, "continuous"] as const)("allows stock disposition for a completed Pi task with saved output (continuity=%s)", async sessionContinuity => {
+    const saved = event("old-turn", "item.completed", { kind: "agentMessage", text: "The task is already done." });
+    const terminal = event("old-turn", "turn.completed", { status: "completed", error: null });
+    const checkpoint = { ...restartCheckpoint, driverKind: "pi_rpc" as const, terminalTurns: [completedTerminal("old-turn")] };
+    const outcome = await run({ stream: [event("turn-fresh", "turn.started"),
+      event("turn-fresh", "run.result.proposed", result as unknown as Record<string, unknown>),
+      event("turn-fresh", "turn.completed", { status: "completed", error: null })],
+      executionInput: { ...heldInput, provider: { kind: "pi_rpc", model: "test/pi", ...(sessionContinuity ? { sessionContinuity } : {}) } },
+      restart: { recovery: { checkpoint, snapshot: { ...checkpoint, dispositionOnlyRecoveryConsumed: false }, replay: [saved, terminal] } } });
+    expect(outcome.outcome).toBe("finalized");
+    expect(outcome.startTurn).toHaveBeenCalledOnce();
+    const recovery = JSON.parse(outcome.startTurn.mock.calls[0]![0].message.text);
+    expect(recovery.task.prompt).toBe([
+      "Paperclip semantic-result recovery for a prior completed provider turn.",
+      "The prior turn already performed the work and its user-facing final answer is recorded.",
+      "Do not repeat implementation, tests, research, or the final answer.",
+      "Use the existing session context to invoke exactly one paperclip_finish or paperclip_block with the accurate current disposition, then stop without additional user-facing prose.",
+    ].join("\n"));
+    expect(recovery.task.prompt).not.toContain(input.task.prompt);
+    expect(outcome.completeRun).toHaveBeenCalledOnce();
+  });
+
+  it.each(["task", "conversation"] as const)("still refuses saved Pi output without a completed terminal (%s)", async mode => {
+    const saved = event("old-turn", "item.completed", { kind: "agentMessage", text: "Work was interrupted." });
+    const checkpoint = { ...restartCheckpoint, driverKind: "pi_rpc" as const, terminalTurns: [] };
+    const outcome = await run({ stream: [], executionInput: { ...heldInput,
+      provider: { kind: "pi_rpc", model: "test/pi", ...(mode === "conversation" ? { conversationMode: true as const } : {}) } },
+      restart: { recovery: { checkpoint, snapshot: { ...checkpoint, dispositionOnlyRecoveryConsumed: false }, replay: [saved] } } });
+    expect(outcome.outcome).toContain("native_provider_output_without_result:");
+    expect(outcome.startTurn).not.toHaveBeenCalled();
+    expect(outcome.completeRun).not.toHaveBeenCalled();
+  });
+
+  it("settles a completed Pi conversation without submitting disposition recovery", async () => {
+    const saved = event("old-turn", "item.completed", { kind: "agentMessage", text: "Already answered." });
+    const terminal = event("old-turn", "turn.completed", { status: "completed", error: null });
+    const checkpoint = { ...restartCheckpoint, driverKind: "pi_rpc" as const, terminalTurns: [completedTerminal("old-turn")] };
+    const outcome = await run({ stream: [], executionInput: heldInput,
+      restart: { recovery: { checkpoint, snapshot: { ...checkpoint, dispositionOnlyRecoveryConsumed: false }, replay: [saved, terminal] } },
+      missingResult: () => result });
+    expect(outcome.outcome).toBe("finalized");
+    expect(outcome.startTurn).not.toHaveBeenCalled();
+    expect(outcome.completeRun).toHaveBeenCalledOnce();
+  });
+
   it("allows stock disposition after a tool-only continuation without resending the task", async () => {
     const outcome = await run({ stream: [], restart: {
       output: event("turn-continuation", "tool.execution.completed",

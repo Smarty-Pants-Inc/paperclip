@@ -3408,12 +3408,18 @@ export async function executeNativeSession(
             !conversationTerminal &&
             !dispositionRecoveryStillOwned &&
             !resumedProviderTurnWait));
+        const dispositionOnlyRecovery = Boolean(
+          !isNativePiConversation(input) && recovered &&
+          !recoveredSnapshot.semanticResult &&
+          (persistedSession?.terminalTurns?.length ?? 0) > 0 &&
+          !recoveredActiveTurnId,
+        );
         // Every continuous Pi run can re-submit the original input after a
         // crash without a checkpointed terminal, including task chats. Omitted
         // continuity is continuous; paperclip-policy Pi and non-Pi providers
         // retain stock recovery. Durable same-run finals above still settle.
         if (input.provider.kind === "pi_rpc" && input.provider.sessionContinuity !== "paperclip"
-          && recovered && shouldStartFreshTurn && !options.sessionCompaction
+          && recovered && shouldStartFreshTurn && !options.sessionCompaction && !dispositionOnlyRecovery
           && await replayHasProviderOutput(options.controlPlane, input.binding.runId, options.runnerInstanceId)) {
           throw providerOutputWithoutResult();
         }
@@ -3466,12 +3472,6 @@ export async function executeNativeSession(
             const handoff = await options.getFreshSessionHandoff();
             if (handoff) modelEnvelope.task.prompt = `${handoff}\n\n${modelEnvelope.task.prompt}`;
           }
-          const dispositionOnlyRecovery = Boolean(
-            !isNativePiConversation(input) && recovered &&
-            !recoveredSnapshot.semanticResult &&
-            (persistedSession?.terminalTurns?.length ?? 0) > 0 &&
-            !recoveredActiveTurnId,
-          );
           const effectFreeInitialAcpxTurn =
             dispositionOnlyRecovery && persistedSession
               ? await replayProvesEffectFreeInitialAcpxTurn({
