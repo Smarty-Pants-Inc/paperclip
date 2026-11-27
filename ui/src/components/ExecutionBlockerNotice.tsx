@@ -1,8 +1,8 @@
 import { useRef, useState } from "react";
 import { describeError } from "../api/errors";
 import type { IssueChatComment } from "../lib/issue-chat-messages";
-import type { ExecutionBlocker, IssueRelationIssueSummary, TaskInterruptionPresentation } from "@paperclipai/shared";
-import { AlertCircle, LoaderCircle } from "lucide-react";
+import type { ExecutionBlocker, IssueQueuedCommentQueue, IssueRelationIssueSummary, TaskInterruptionPresentation } from "@paperclipai/shared";
+import { AlertCircle, LoaderCircle, PauseCircle } from "lucide-react";
 import { Link } from "@/lib/router";
 import { createIssueDetailPath } from "../lib/issueDetailBreadcrumb";
 import { Button } from "./ui/button";
@@ -169,9 +169,11 @@ const blockerAction: Record<string, string> = {
 };
 
 /** One ordinary interruption surface. Technical records remain in diagnostics. */
-export function ExecutionBlockerNotice({ presentation, observedStatus, observedResultJson, observedErrorCode, blocker, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, companyId, agentName, projectName, blockers, savedMessageBlocked = false, conversationMode = false, remedyControls }: {
+export function ExecutionBlockerNotice({ presentation, observedStatus, observedResultJson, observedErrorCode, blocker, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, companyId, agentName, projectName, blockers, savedMessageBlocked = false, conversationMode = false, remedyControls, queuedMessageWait }: {
   presentation: TaskInterruptionPresentation | null | undefined;
   observedStatus?: string;
+  /** Admission wait for a message still in the server's queue. */
+  queuedMessageWait?: IssueQueuedCommentQueue["executionWait"];
   /** Saved, unanswered chat with no live work or actionable interruption projection. */
   savedMessageBlocked?: boolean;
   conversationMode?: boolean;
@@ -192,9 +194,21 @@ export function ExecutionBlockerNotice({ presentation, observedStatus, observedR
   agentName?: string;
   projectName?: string;
 }) {
-  if (isPersonStoppedRun({ resultJson: observedResultJson, errorCode: observedErrorCode })) return null;
+  const repairWait = queuedMessageWait?.reason === "workspace_repair_required" ? queuedMessageWait
+    : presentation?.retryWait?.reason === "workspace_repair_required" ? presentation.retryWait : null;
+  const workspaceRepairRequired = blocker?.workspaceRepairRequired || Boolean(repairWait);
+  // Structured recovery ownership, not reassuring hold wording, means wait.
+  const repairRecovering = workspaceRepairRequired && (blocker?.workspaceRecovery?.status === "queued"
+    || blocker?.workspaceRecovery?.status === "recovering"
+    || presentation?.responsibility === "system" && (presentation.state === "working" && Boolean(presentation.recoveryStep)
+      || presentation.state === "retry_scheduled" && Boolean(presentation.nextRetryAt)));
+  const personStopped = isPersonStoppedRun({ resultJson: observedResultJson, errorCode: observedErrorCode });
+  const heldMessageCount = blocker?.savedMessageCount ?? 0;
+  // Stop is not a failure, but it does not resolve any hold on saved messages.
+  if (!workspaceRepairRequired && heldMessageCount <= 0 && personStopped) return null;
   const retryRefused = isExecutionRetryRefused(presentation, observedErrorCode ?? blocker?.cause, observedResultJson);
-  canRetry = canRetry && !retryRefused;
+  canRetry = canRetry && !retryRefused && (!repairRecovering ||
+    (presentation?.canRetry ?? blocker?.workspaceRecovery?.canRetry ?? false) && blocker?.workspaceRecovery?.canRetry !== false);
   if (savedMessageBlocked && (!retryRefused || presentation?.state !== "failed")) presentation = { state: "failed", responsibility: "system", canRetry,
     intentId: null, nextRetryAt: null, userAction: null, sourceRunIds: [], observedRunId: null };
   // Only C31 owns this new explanation/remedy path, including during optimism.
@@ -205,9 +219,29 @@ export function ExecutionBlockerNotice({ presentation, observedStatus, observedR
     {C31_REMEDY_BUTTONS && <RefusalRemedyActions key={`${presentation.observedRunId}:${JSON.stringify(executionFailureCause(presentation.failure, observedResultJson)?.remedies)}`}
       remedies={executionFailureCause(presentation.failure, observedResultJson)?.remedies ?? []} controls={remedyControls} />}
   </div>;
+  if (personStopped && heldMessageCount > 0) {
+    // Do not turn a recovery hold into a promise of automatic progress, or echo
+    // advice to send another message while the person's messages are held.
+    const retryAllowed = canRetry && blocker?.canRetry === true && presentation?.canRetry !== false;
+    return <div className={cn(retryAllowed && "pt-4", className)}>
+      <div role="status" aria-label="Task status" className={retryAllowed
+        ? "flex items-center gap-3 rounded-lg bg-destructive/10 p-4 text-sm text-foreground"
+        : "flex items-center gap-3 text-sm text-muted-foreground"}>
+        {retryAllowed ? <AlertCircle className="size-5 shrink-0 text-destructive" aria-hidden="true" />
+          : <PauseCircle className="size-4 shrink-0" aria-hidden="true" />}
+        <span className="min-w-0 flex-1">Your {heldMessageCount} {heldMessageCount === 1 ? "message is" : "messages are"} saved. {retryAllowed
+          ? "Press Retry to continue from your saved work."
+          : "This task is on hold after the Stop and can't continue from here yet."}
+          {error && !optimistic && !takingLonger && <span role="alert" className="mt-1 block text-destructive">{describeError(error).body}</span>}
+        </span>
+        {retryAllowed && <Button variant="outline" size="sm" className="shrink-0" disabled={optimistic} onClick={onRetry}
+          data-testid="task-execution-retry">{optimistic ? "Retrying…" : "Retry"}</Button>}
+      </div>
+    </div>;
+  }
   const newSession = !retryRefused && conversationMode && presentation?.state === "failed" && !(canRetry && presentation.canRetry)
     ? <> Send <code>/new</code> to start a fresh session, then send your message again.</> : null;
-  const recovery = !savedMessageBlocked && isConversationRecovery(presentation,
+  const recovery = !workspaceRepairRequired && !savedMessageBlocked && isConversationRecovery(presentation,
     observedStatus ?? (blocker?.workspaceRepairRequired ? "failed" : undefined));
   if (presentation?.projectAccess && !optimistic && !takingLonger) return <TaskProjectAccessNotice
     access={presentation.projectAccess} issueId={issueId} agentName={agentName} projectName={projectName}
@@ -222,12 +256,15 @@ export function ExecutionBlockerNotice({ presentation, observedStatus, observedR
   </div>;
   if (error && !optimistic && !takingLonger) return <div role="alert" className={cn("flex items-center justify-between gap-2 text-sm text-destructive", className)}><span>{describeError(error).body}</span>{canRetry && <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}</div>;
   if (takingLonger) return <div role="status" className={cn("flex items-center justify-between gap-2 text-sm text-muted-foreground", className)}><span>Taking longer than usual…</span>{canRetry && <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}</div>;
-  if (blocker?.workspaceRepairRequired) return (
-    <div className={cn("pt-4", className)}>
+  if (workspaceRepairRequired) return (
+    <div className={cn(!repairRecovering && "pt-4", className)}>
       <div role="status" aria-label="Task status"
-        className="flex items-center gap-3 rounded-lg bg-destructive/10 p-4 text-sm text-foreground">
-        <AlertCircle className="size-5 shrink-0 text-destructive" aria-hidden="true" />
-        <span className="min-w-0 flex-1">{blocker.nextAction}</span>
+        className={cn("flex items-center gap-3 text-sm", repairRecovering
+          ? "text-muted-foreground" : "rounded-lg bg-destructive/10 p-4 text-foreground")}>
+        {repairRecovering ? <LoaderCircle className="size-4 shrink-0 motion-safe:animate-spin" aria-hidden="true" />
+          : <AlertCircle className="size-5 shrink-0 text-destructive" aria-hidden="true" />}
+        <span className="min-w-0 flex-1">{blocker?.workspaceRepairRequired ? blocker.nextAction : repairWait?.message}
+          {!repairRecovering && canRetry ? " Press Retry to continue from your saved work." : null}</span>
         {canRetry && <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}
       </div>
     </div>

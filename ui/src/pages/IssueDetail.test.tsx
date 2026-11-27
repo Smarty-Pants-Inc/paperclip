@@ -4136,6 +4136,101 @@ describe("IssueDetail", () => {
     expect(mockIssuesApi.update).not.toHaveBeenCalled();
   });
 
+  it.each(["repair-blocker", "held-queue", "projected-wait", "plain-stop", "empty-queue"] as const)("shows only an actionable recovery hold after a person's Stop: %s", async mode => {
+    coordinatorPreference.enabled = true;
+    queryClient.setQueryData(["issues", "history-expanded", "PAP-1"], false);
+    const message = "Paperclip is recovering saved work before continuing. Your message is saved.";
+    const interruption: NonNullable<Issue["interruption"]> = { intentId: null, responsibility: "system", state: "failed",
+      nextRetryAt: null, canRetry: true, userAction: null, sourceRunIds: ["stopped-run"], observedRunId: "stopped-run",
+      ...(mode === "projected-wait" ? { retryWait: { reason: "workspace_repair_required", message } } : {}) };
+    const issue = createIssue({ status: "blocked", assigneeAgentId: "agent-1", interruption,
+      executionBlocker: mode === "repair-blocker" ? { runId: "stopped-run", cause: "native_continuation_requires_reconciliation",
+        workspaceRepairRequired: true, canRetry: false, nextAction: message } as Issue["executionBlocker"] : null });
+    const held = mode === "repair-blocker" || mode === "held-queue" || mode === "projected-wait";
+    mockIssuesApi.get.mockResolvedValue(issue);
+    mockActivityApi.recentRunsForIssue.mockResolvedValue([{ runId: "stopped-run", runtimeMode: "native", status: "cancelled",
+      agentId: "agent-1", errorCode: "cancelled", resultJson: { personStop: { requestedAt: "2026-11-24T20:00:00Z" } },
+      createdAt: new Date().toISOString() }]);
+    const queue = createQueuedCommentQueue({ targetRunId: null,
+      entries: mode === "held-queue" ? createQueuedCommentQueue().entries : [],
+      executionWait: mode === "held-queue" || mode === "empty-queue" ? { reason: "workspace_repair_required", message } : null });
+    mockIssuesApi.getQueuedComments.mockResolvedValue(queue);
+    queryClient.setQueryData(queryKeys.issues.queuedComments(issue.id), queue);
+    mockAuthApi.getSession.mockResolvedValue({ user: { id: "operator" } });
+    mockAccessApi.getCurrentBoardAccess.mockResolvedValue({ userId: "operator", source: "session",
+      isInstanceAdmin: false, companyIds: [issue.companyId],
+      memberships: [{ companyId: issue.companyId, status: "active", membershipRole: "operator" }] });
+    mockIssuesApi.retryTask.mockResolvedValue({ requestId: "repair-retry", accepted: true, stale: false, presentation: interruption });
+    await act(async () => renderIssueView());
+    await waitForAssertion(() => expect(mockActivityApi.recentRunsForIssue).toHaveBeenCalled());
+    await flushReact();
+    const notice = container.querySelector('[aria-label="Task status"]');
+    if (!held) {
+      expect(notice).toBeNull();
+      expect(mockIssuesApi.retryTask).not.toHaveBeenCalled();
+      return;
+    }
+    expect(notice?.textContent).toBe(`${message} Press Retry to continue from your saved work.Retry`);
+    // A persisted generic failure elsewhere in the thread must not dedupe
+    // away the current hold or its task-level recovery control.
+    await act(async () => mockIssueChatThreadRender.mock.calls.at(-1)![0].onFailureNoticeChange("stopped-run"));
+    expect(container.querySelector('[aria-label="Task status"]')?.textContent).toBe(`${message} Press Retry to continue from your saved work.Retry`);
+    const retry = notice!.querySelector<HTMLButtonElement>('[data-testid="task-execution-retry"]')!;
+    await act(async () => retry.click());
+    await waitForAssertion(() => expect(mockIssuesApi.retryTask).toHaveBeenCalledExactlyOnceWith(issue.id, {
+      idempotencyKey: expect.any(String), observedRunId: "stopped-run",
+    }));
+    expect(mockIssuesApi.resolveRecoveryAction).not.toHaveBeenCalled();
+    expect(mockIssuesApi.update).not.toHaveBeenCalled();
+  });
+
+  it.each(["working", "failed"] as const)("shows the saved-message recovery hold after an early Stop and fresh reload (%s projection)", async state => {
+    coordinatorPreference.enabled = true;
+    const interruption: NonNullable<Issue["interruption"]> = { intentId: null, responsibility: "system", state,
+      nextRetryAt: null, canRetry: false, userAction: null, sourceRunIds: ["stopped-run"], observedRunId: "stopped-run" };
+    const issue = createIssue({ status: "blocked", assigneeAgentId: "agent-1", interruption,
+      executionBlocker: { recoveryActionId: "recovery-hold", runId: "stopped-run", agentId: "agent-1",
+        cause: "legacy_execution_requires_reconciliation", runStatus: "cancelled", runError: "Execution stopped",
+        canContinue: false, canRetry: false, savedMessageCount: 2,
+        nextAction: "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated. Inspect the run before sending a new message to request continuation." } });
+    const comments = [createIssueComment({ id: "saved-1", body: "Please continue with my saved request." }),
+      createIssueComment({ id: "saved-2", body: "Is my message still saved?" })];
+    const noticeComment = createIssueComment({ id: "hold-notice", authorType: "system", authorUserId: null,
+      body: "Couldn't answer your message because execution recovery is still holding this task. Your message is saved; press Retry to continue.",
+      presentation: { kind: "system_notice", tone: "warning", title: "Couldn't answer your message", detailsDefaultOpen: false } });
+    const queue = createQueuedCommentQueue({ targetRunId: null,
+      entries: comments.map((comment, position) => ({ comment, position, canEdit: true, canDiscard: true })) });
+    mockIssuesApi.get.mockResolvedValue(issue);
+    mockIssuesApi.recentComments.mockResolvedValue({ comments: [...comments, noticeComment], latestCommentId: noticeComment.id, hasMore: false });
+    mockIssuesApi.listComments.mockResolvedValue([...comments, noticeComment]);
+    mockActivityApi.recentRunsForIssue.mockResolvedValue([{ runId: "stopped-run", runtimeMode: "legacy", status: "cancelled",
+      agentId: "agent-1", errorCode: "cancelled", resultJson: { personStop: { requestedAt: "2026-11-27T10:00:00Z" } },
+      createdAt: "2026-11-27T09:59:59Z" }]);
+    mockIssuesApi.getQueuedComments.mockResolvedValue(queue);
+    mockAuthApi.getSession.mockResolvedValue({ user: { id: "operator" } });
+    mockAccessApi.getCurrentBoardAccess.mockResolvedValue({ userId: "operator", source: "session", isInstanceAdmin: false,
+      companyIds: [issue.companyId], memberships: [{ companyId: issue.companyId, status: "active", membershipRole: "operator" }] });
+    for (const reload of [false, true]) {
+      if (reload) {
+        await act(async () => root.unmount());
+        queryClient.clear();
+        queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+        root = createTooltipRoot(container);
+      }
+      queryClient.setQueryData(["issues", "history-expanded", "PAP-1"], false);
+      await act(async () => renderIssueView());
+      await waitForAssertion(() => expect(container.querySelector('[aria-label="Task status"]')?.textContent)
+        .toBe("Your 2 messages are saved. This task is on hold after the Stop and can't continue from here yet."));
+      await act(async () => mockIssueChatThreadRender.mock.calls.at(-1)![0].onFailureNoticeChange("stopped-run"));
+      const notice = container.querySelector('[aria-label="Task status"]');
+      expect(notice?.textContent).toBe("Your 2 messages are saved. This task is on hold after the Stop and can't continue from here yet.");
+      expect(notice?.textContent).not.toMatch(/press Retry|send.*new message|Preparing your reply/i);
+      expect(notice?.querySelector("button")).toBeNull();
+      expect(mockIssuesApi.retryTask).not.toHaveBeenCalled();
+      expect(mockHeartbeatsApi.cancel).not.toHaveBeenCalled();
+    }
+  });
+
   it("keeps the existing Retry path for exhausted legacy workspace restoration", async () => {
     const interruption: NonNullable<Issue["interruption"]> = { intentId: "legacy-input", responsibility: "system", state: "failed", nextRetryAt: null,
       canRetry: true, userAction: null, sourceRunIds: ["legacy-run"], observedRunId: "legacy-run" };

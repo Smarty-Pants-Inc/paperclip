@@ -3797,6 +3797,12 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     enabled: false, // Observe the thread's existing run window; do not add another poll.
     select: history => (Array.isArray(history) ? history : history.runs).find(run => run.runId === interruptionRunId),
   });
+  const { data: queuedMessageWait } = useQuery<IssueQueuedCommentQueue, Error, IssueQueuedCommentQueue["executionWait"]>({
+    queryKey: queryKeys.issues.queuedComments(issue?.id ?? issueId ?? ""),
+    queryFn: () => issuesApi.getQueuedComments(issue?.id ?? issueId!),
+    enabled: false, // Observe the composer's queue; do not add another read or poll.
+    select: queue => queue.entries.length ? queue.executionWait : null,
+  });
   // Every live run is still waiting to start: say so instead of "Live".
   const headerWaiting = hasLiveRuns
     && (liveRunCount === 0 || liveRunSummary.waitingOnly)
@@ -8536,8 +8542,12 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
               action={issue.activeRecoveryAction ?? null} />
           )}
           {resolvedDetailTab === "chat" && !(failureNoticeRunId && failureNoticeRunId === interruptionRunId &&
+            !issue.executionBlocker?.workspaceRepairRequired && !issue.executionBlocker?.savedMessageCount &&
+            queuedMessageWait?.reason !== "workspace_repair_required" &&
+            issue.interruption?.retryWait?.reason !== "workspace_repair_required" &&
             issue.interruption?.state === "failed" && isConversationRecovery(issue.interruption, interruptionRun?.status)) && (
             <ExecutionBlockerNotice className={shellSectionClass} presentation={issue.interruption} blockers={issue.blockedBy} conversationMode={!!issue.conversationAgentId}
+              queuedMessageWait={queuedMessageWait}
               observedStatus={interruptionRun?.status} observedResultJson={interruptionRun?.resultJson} observedErrorCode={interruptionRun?.errorCode}
               blocker={retainedRecoveryOwnsRetry ? null : issue.executionBlocker}
               issueId={issue.id} companyId={issue.companyId} agentName={agentMap.get(issue.assigneeAgentId ?? "")?.name} projectName={issue.project?.name}

@@ -244,6 +244,178 @@ describe("ordinary task interruption", () => {
   const render = async (presentation = failed, options: { canRetry?: boolean; optimistic?: boolean; takingLonger?: boolean; error?: Error } = {}) => {
     await act(async () => root.render(<ExecutionBlockerNotice presentation={presentation} canRetry onRetry={retry} {...options} />));
   };
+  const personStops = [
+    { personStop: { requestedAt: "2026-11-24T20:00:00Z" } },
+    { cancellation: { source: "operator", initiator: { type: "user" } } },
+    { executionCancellation: { state: "acknowledged" } },
+  ];
+  const repairMessage = "Paperclip is recovering saved work before continuing. Your message is saved.";
+  const repairRetrySentence = " Press Retry to continue from your saved work.";
+  it.each(personStops)("keeps workspace repair words and the task Retry after a person's Stop (%j)", async observedResultJson => {
+    for (const presentation of [null, failed, { ...failed, state: "resolved" as const }]) {
+      await act(async () => root.render(<ExecutionBlockerNotice presentation={presentation} observedStatus="cancelled"
+        observedErrorCode="cancelled" observedResultJson={observedResultJson} canRetry onRetry={retry}
+        blocker={{ runId: "source", workspaceRepairRequired: true, canRetry: false, nextAction: repairMessage } as never} />));
+      expect(container.querySelector('[role="status"]')?.textContent).toBe(`${repairMessage}${repairRetrySentence}Retry`);
+      expect(container.querySelector('[role="status"]')?.className).toContain("bg-destructive/10");
+      expect(container.textContent).not.toMatch(/failed|Couldn't resume/);
+      await act(async () => container.querySelector<HTMLButtonElement>('[data-testid="task-execution-retry"]')!.click());
+    }
+    expect(retry).toHaveBeenCalledTimes(3);
+  });
+  it.each(personStops)("shows saved messages held by any execution blocker after Stop (%j)", async observedResultJson => {
+    for (const cause of ["legacy_execution_requires_reconciliation", "native_continuation_requires_reconciliation", "future_recovery_hold"]) {
+      for (const allowed of [false, true]) {
+        await act(async () => root.render(<ExecutionBlockerNotice presentation={{ ...failed, state: "working", canRetry: allowed }}
+          observedStatus="cancelled" observedErrorCode="cancelled" observedResultJson={observedResultJson} canRetry onRetry={retry}
+          blocker={{ recoveryActionId: "hold", runId: "source", agentId: "agent", cause,
+            runStatus: "cancelled", runError: "Execution stopped", canContinue: false, canRetry: allowed, savedMessageCount: 2,
+            nextAction: "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated. Inspect the run before sending a new message to request continuation." }} />));
+        const notice = container.querySelector('[aria-label="Task status"]');
+        expect(notice?.textContent).toBe(allowed
+          ? "Your 2 messages are saved. Press Retry to continue from your saved work.Retry"
+          : "Your 2 messages are saved. This task is on hold after the Stop and can't continue from here yet.");
+        expect(notice?.textContent).not.toMatch(/send.*new message|Preparing your reply/);
+        expect(notice?.getAttribute("role")).toBe("status");
+        expect(notice?.className).toBe(allowed
+          ? "flex items-center gap-3 rounded-lg bg-destructive/10 p-4 text-sm text-foreground"
+          : "flex items-center gap-3 text-sm text-muted-foreground");
+        expect(notice?.querySelector("svg")?.classList.contains(allowed ? "lucide-circle-alert" : "lucide-circle-pause")).toBe(true);
+        expect(notice?.querySelector("svg")?.getAttribute("class")).not.toMatch(/animate|spin/);
+        expect(Boolean(notice?.querySelector("button"))).toBe(allowed);
+      }
+    }
+    expect(retry).not.toHaveBeenCalled();
+  });
+  it("does not promise Retry to a read-only viewer or when either server projection refuses it", async () => {
+    for (const [pageCanRetry, presentationCanRetry, blockerCanRetry] of [[false, true, true], [true, false, true], [true, true, false]]) {
+      await act(async () => root.render(<ExecutionBlockerNotice presentation={{ ...failed, canRetry: presentationCanRetry }}
+        observedResultJson={personStops[0]} canRetry={pageCanRetry} onRetry={retry}
+        blocker={{ recoveryActionId: "hold", runId: "source", agentId: "agent", cause: "legacy_execution_requires_reconciliation",
+          nextAction: "Send a new message.", savedMessageCount: 1, canRetry: blockerCanRetry, canContinue: false }} />));
+      expect(container.textContent).toBe("Your 1 message is saved. This task is on hold after the Stop and can't continue from here yet.");
+      expect(container.querySelector('[role="status"]')?.className).toBe("flex items-center gap-3 text-sm text-muted-foreground");
+      expect(container.querySelector('[class*="destructive"], button')).toBeNull();
+    }
+  });
+  it.each(["working", "failed"] as const)("uses the existing neutral waiting style with a still icon for a no-action Stop hold (%s projection)", async state => {
+    // Keep the neutral surface, but only active recovery promises movement.
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={failed} canRetry onRetry={retry}
+      blocker={{ workspaceRepairRequired: true, nextAction: "Recovering saved work…",
+        workspaceRecovery: { status: "recovering", canRetry: false } } as never} />));
+    const waiting = container.querySelector('[role="status"]')!;
+    const waitingClass = waiting.className;
+    expect(waiting.querySelector("svg")?.classList.contains("lucide-loader-circle")).toBe(true);
+    expect(waiting.querySelector("svg")?.classList.contains("motion-safe:animate-spin")).toBe(true);
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={{ ...failed, state, canRetry: false }}
+      observedResultJson={personStops[0]} canRetry onRetry={retry}
+      blocker={{ recoveryActionId: "hold", runId: "source", agentId: "agent", cause: "native_continuation_requires_reconciliation",
+        nextAction: "Continue from saved work.", savedMessageCount: 2, canRetry: false, canContinue: false }} />));
+    const notice = container.querySelector('[role="status"][aria-label="Task status"]')!;
+    expect(notice.className).toBe(waitingClass);
+    expect(notice.querySelector("svg")?.classList.contains("lucide-circle-pause")).toBe(true);
+    expect(notice.querySelector("svg")?.getAttribute("class")).not.toMatch(/animate|spin/);
+    expect(notice.querySelector("svg")?.style.animation).toBe("");
+    expect(notice.querySelector("animate, animateTransform, animateMotion")).toBeNull();
+    expect(notice.querySelector("svg")?.getAttribute("aria-hidden")).toBe("true");
+    expect(container.querySelector('[class*="destructive"], button')).toBeNull();
+    expect(notice.textContent).toBe("Your 2 messages are saved. This task is on hold after the Stop and can't continue from here yet.");
+    expect(retry).not.toHaveBeenCalled();
+  });
+  it("uses the authorized Retry once for saved messages held after Stop", async () => {
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={{ ...failed, state: "working" }}
+      observedResultJson={personStops[0]} canRetry onRetry={retry}
+      blocker={{ recoveryActionId: "hold", runId: "source", agentId: "agent", cause: "native_continuation_requires_reconciliation",
+        nextAction: "Continue from saved work.", savedMessageCount: 2, canRetry: true }} />));
+    await act(async () => container.querySelector<HTMLButtonElement>('[data-testid="task-execution-retry"]')!.click());
+    expect(retry).toHaveBeenCalledOnce();
+  });
+  it("keeps an accepted held-message Retry disabled and reports a rejected Retry inline", async () => {
+    const props = { presentation: { ...failed, state: "working" as const }, observedResultJson: personStops[0], canRetry: true, onRetry: retry,
+      blocker: { recoveryActionId: "hold", runId: "source", agentId: "agent", cause: "legacy_execution_requires_reconciliation",
+        nextAction: "Continue from saved work.", savedMessageCount: 2, canRetry: true } };
+    await act(async () => root.render(<ExecutionBlockerNotice {...props} optimistic />));
+    expect(container.querySelector<HTMLButtonElement>('button')?.disabled).toBe(true);
+    expect(container.querySelector('button')?.textContent).toBe("Retrying…");
+    await act(async () => container.querySelector<HTMLButtonElement>('button')!.click());
+    expect(retry).not.toHaveBeenCalled();
+    await act(async () => root.render(<ExecutionBlockerNotice {...props} error={new Error("Retry was not accepted.")} />));
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe("Retry was not accepted.");
+    expect(container.querySelector<HTMLButtonElement>('button')?.disabled).toBe(false);
+  });
+  it.each(personStops)("keeps a plain person's Stop silent with nothing held (%j)", async observedResultJson => {
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={failed} observedStatus="cancelled"
+      observedErrorCode="cancelled" observedResultJson={observedResultJson} canRetry onRetry={retry} />));
+    expect(container.innerHTML).toBe("");
+    expect(retry).not.toHaveBeenCalled();
+  });
+  it("shows a held queued message's repair wait even without a blocker projection", async () => {
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={null} observedStatus="cancelled"
+      observedResultJson={personStops[0]} queuedMessageWait={{ reason: "workspace_repair_required", message: repairMessage }}
+      canRetry onRetry={retry} />));
+    expect(container.querySelector('[role="status"]')?.textContent).toBe(`${repairMessage}${repairRetrySentence}Retry`);
+    await act(async () => container.querySelector<HTMLButtonElement>('button')!.click());
+    expect(retry).toHaveBeenCalledOnce();
+  });
+  it("keeps the server's projected repair wait above generic conversation recovery after Stop", async () => {
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={{ ...failed,
+      retryWait: { reason: "workspace_repair_required", message: repairMessage } }} observedStatus="cancelled"
+      observedResultJson={personStops[0]} canRetry onRetry={retry} />));
+    expect(container.querySelector('[role="status"]')?.textContent).toBe(`${repairMessage}${repairRetrySentence}Retry`);
+    await act(async () => container.querySelector<HTMLButtonElement>('button')!.click());
+    expect(retry).toHaveBeenCalledOnce();
+  });
+  it.each([false, true])("keeps a scheduled repair check neutral and follows the server's Retry permission (%s)", async serverCanRetry => {
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={{ ...failed, state: "retry_scheduled",
+      nextRetryAt: "2026-11-27T12:00:00Z", canRetry: serverCanRetry, recoveryStep: "saving_previous_files",
+      retryWait: { reason: "workspace_repair_required", message: repairMessage } }} observedStatus="cancelled"
+      observedResultJson={personStops[0]} canRetry onRetry={retry}
+      blocker={{ workspaceRepairRequired: true, nextAction: repairMessage } as never} />));
+    const notice = container.querySelector('[role="status"]')!;
+    expect(notice.textContent).toBe(`${repairMessage}${serverCanRetry ? "Retry" : ""}`);
+    expect(notice.className).toContain("text-muted-foreground");
+    expect(notice.className).not.toContain("destructive");
+    expect(notice.querySelector('svg')?.getAttribute("class")).not.toContain("destructive");
+    expect(Boolean(container.querySelector('button'))).toBe(serverCanRetry);
+    if (serverCanRetry) {
+      await act(async () => container.querySelector<HTMLButtonElement>('button')!.click());
+      expect(retry).toHaveBeenCalledOnce();
+    }
+  });
+  it.each(["queued", "recovering"] as const)("keeps an explicitly %s workspace recovery neutral without inviting interruption", async status => {
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={failed} observedStatus="cancelled"
+      observedResultJson={personStops[0]} canRetry onRetry={retry}
+      blocker={{ workspaceRepairRequired: true, nextAction: "Recovering saved work…",
+        workspaceRecovery: { status, stage: "restoring_files", canRetry: false, message: "Recovering saved work…" } } as never} />));
+    expect(container.querySelector('[role="status"]')?.textContent).toBe("Recovering saved work…");
+    const icon = container.querySelector('[role="status"] svg');
+    expect(icon?.classList.contains("lucide-loader-circle")).toBe(true);
+    expect(icon?.classList.contains("motion-safe:animate-spin")).toBe(true);
+    expect(container.querySelector('[class*="destructive"], button')).toBeNull();
+    expect(retry).not.toHaveBeenCalled();
+  });
+  it("keeps an in-progress repair step neutral and respects read-only task access", async () => {
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={{ ...failed, state: "working", canRetry: true,
+      recoveryStep: "saving_previous_files", retryWait: { reason: "workspace_repair_required", message: repairMessage } }}
+      observedResultJson={personStops[0]} canRetry={false} onRetry={retry} />));
+    expect(container.querySelector('[role="status"]')?.textContent).toBe(repairMessage);
+    expect(container.querySelector('[class*="destructive"], button')).toBeNull();
+  });
+  it("does not turn a failed repair hold into a wait because it has an old check time", async () => {
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={{ ...failed, nextRetryAt: "2026-11-26T12:00:00Z",
+      retryWait: { reason: "workspace_repair_required", message: repairMessage } }} observedResultJson={personStops[0]}
+      canRetry onRetry={retry} />));
+    const notice = container.querySelector('[role="status"]')!;
+    expect(notice.textContent).toBe(`${repairMessage}${repairRetrySentence}Retry`);
+    expect(notice.className).toContain("bg-destructive/10");
+  });
+  it("does not offer a workspace-repair mutation to a read-only viewer after Stop", async () => {
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={failed} observedStatus="cancelled"
+      observedResultJson={personStops[0]} canRetry={false} onRetry={retry}
+      blocker={{ workspaceRepairRequired: true, nextAction: repairMessage } as never} />));
+    expect(container.textContent).toBe(repairMessage);
+    expect(container.querySelector('button')).toBeNull();
+  });
   it.each(["personStop"])("does not call a person's %s a failed conversation resume", async key => {
     await act(async () => root.render(<ExecutionBlockerNotice presentation={failed} observedStatus="failed"
       observedResultJson={{ [key]: { requestedAt: "2026-11-24T20:00:00Z" } }} canRetry onRetry={retry} />));
