@@ -150,6 +150,40 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     }
   });
 
+  it("does not rotate an incident's retained recovery session when its checkpoint is missing", async () => {
+    const { input, run, issue } = await fixture();
+    input.agent.adapterConfig = { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous" };
+    input.nativeRuntimeResolution = resolveHeartbeatNativeRuntimeMode({ persisted: run, enabled: true, runtimeConfig: {},
+      adapterConfig: input.agent.adapterConfig, agent: input.agent, issue, target: null, workspaceId: null });
+    const retained = randomUUID();
+    input.session.taskResumeSessionId = retained;
+    input.session.warmRecoveryRetainSessionId = retained;
+    await expect(selectHeartbeatRuntime(db, input)).rejects.toThrow("warm_recovery_fresh_session_already_attempted");
+    expect((await read(run.id)).nativeSessionId).toBeNull();
+    expect(await coordinators(run.id)).toEqual([]);
+  });
+
+  it("selects a new native session for an open incident when stock reset cleared its pin", async () => {
+    const { input, run, issue } = await fixture();
+    const retained = randomUUID(), incidentId = randomUUID();
+    input.agent.adapterConfig = { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", fixtureOption: "changed" };
+    input.nativeRuntimeResolution = resolveHeartbeatNativeRuntimeMode({ persisted: run, enabled: true, runtimeConfig: {},
+      adapterConfig: input.agent.adapterConfig, agent: input.agent, issue, target: null, workspaceId: null });
+    await db.insert(heartbeatRuns).values({ id: incidentId, companyId: run.companyId, agentId: run.agentId,
+      issueId: issue.id, nativeIssueId: issue.id, nativeSessionId: retained, status: "failed", error: "remote_warm_session_not_idle",
+      contextSnapshot: { issueId: issue.id, warmRecoveryFreshSession: { runId: incidentId, retainedSessionId: retained } } });
+    // The assembled heartbeat test covers the non-continuable-change decision
+    // and clearing this pin. Exercise the real native selector with that reset.
+    input.session.taskResumeSessionId = null;
+    input.session.warmRecoveryRetainSessionId = null;
+    const selected = await selectHeartbeatRuntime(db, input);
+    expect(selected.selected).toBe(true);
+    const saved = await read(run.id);
+    expect(saved.nativeSessionId).toBeTruthy();
+    expect(saved.nativeSessionId).not.toBe(retained);
+    expect(await coordinators(run.id)).toHaveLength(1);
+  });
+
   it("rejects invalid local Runner configuration before native authority and retains the preparation owner", async () => {
     const f = await fixture();
     await claimPreparation(f);

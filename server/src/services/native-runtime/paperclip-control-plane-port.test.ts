@@ -1,4 +1,6 @@
 import { nativeResponsePresentationWork } from "./native-response-presentation-work.js";
+import { prepareHeartbeatSession } from "../heartbeat/session-preparation.js";
+import { getAdapterSessionCodec } from "../heartbeat/run-state.js";
 import * as issueCommentWrites from "../issue-comment-writes.js";
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
 import { plugins } from "@paperclipai/db";
@@ -460,14 +462,17 @@ describe("PaperclipControlPlanePort conformance", () => {
     } finally { releaseObserver(); await outcome; if (terminalWasRecorded) await observerDone; }
   });
 
-  it("marks a fresh start after a prior session once, but never a resume", async () => {
+  it.each([false, true])("marks a fresh start after a prior session once, but never a resume (automatic task recovery=%s)", async taskRecovery => {
     const { companyId, agentId } = CONTROL_PLANE_CONFORMANCE_OPEN.identity;
     const issueId = randomUUID(), fixtureContractId = randomUUID();
     await db.insert(issues).values({ id: issueId, companyId, title: "Fresh-session disclosure",
-      assigneeAgentId: agentId, conversationAgentId: agentId, conversationUserId: randomUUID(), conversationState: "active" });
+      assigneeAgentId: agentId, ...(!taskRecovery ? {
+        conversationAgentId: agentId, conversationUserId: randomUUID(), conversationState: "active",
+      } : {}) });
     const [contract] = await db.select().from(completionContracts).where(eq(completionContracts.id, contractId));
     await db.insert(completionContracts).values({ ...contract!, id: fixtureContractId, issueId });
     let replayFirst: () => Promise<unknown> = async () => {};
+    let previousSessionId: string | null = null;
     for (const [index, eventType] of (["session.started", "session.started", "session.resumed", "session.started"] as const).entries()) {
       const runId = randomUUID(), sessionId = randomUUID(), runnerId = randomUUID();
       const identity = { companyId, agentId, issueId, runId, sessionId };
@@ -475,6 +480,32 @@ describe("PaperclipControlPlanePort conformance", () => {
         nativeIssueId: issueId, nativeSessionId: sessionId, runnerInstanceId: runnerId,
         completionContractId: fixtureContractId, completionContractSha256: contractSha,
         contextSnapshot: { issueId, conversationSessionGeneration: 0 } });
+      if (taskRecovery && index === 1) {
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+        const runtimeConfig = { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous" };
+        const context = { issueId, forceFreshSession: true, source: "execution.reconciled", conversationSessionGeneration: 0 };
+        const prepared = await prepareHeartbeatSession(db, {
+          run, agent: { ...agent, adapterType: "paperclip_runner", adapterConfig: runtimeConfig },
+          task: { context, issueRef: { id: issueId }, issueContext: null, taskProjectContext: null, workspaceProjectContext: null,
+            wakeCommentId: null, acceptedPlanContinuationWake: false, acceptedPlanWakeRoutingDecision: null },
+          session: { taskSession: null, taskSessionDecodedParams: { sessionId: previousSessionId }, explicitResumeSessionParams: null,
+            explicitResumeSessionDisplayId: null, sessionCodec: getAdapterSessionCodec("paperclip_runner") },
+          config: { runtimeConfig, agentIdentity: undefined, issueAssigneeOverrides: null, originalAiIssueOverrides: null,
+            managedAiRuntime: undefined, aiBinding: undefined, requestedAiBinding: undefined, secretManifest: [],
+            runtimeSkillEntries: [], routineEnvContext: { env: null } },
+          workspace: { requestedExecutionWorkspaceMode: "shared_workspace", effectiveExecutionWorkspaceMode: "shared_workspace",
+            projectExecutionWorkspacePolicy: null, issueExecutionWorkspaceSettings: null, executionPolicy: {} as never,
+            requestedReusableExecutionWorkspaceConfig: null, reusableExistingExecutionWorkspace: null },
+          environment: { environmentResolution: { environmentId: null, source: "default" }, selectedEnvironmentId: null,
+            selectedEnvironmentForConfig: null },
+          getLatestAgentConfigRevision: async () => ({ id: agent.id, changedKeys: [], createdAt: run.createdAt }),
+        });
+        expect(prepared.resetTaskSession).toBe(true);
+        expect(prepared.taskResumeSessionId).toBeNull();
+        expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0].contextSnapshot)
+          .toMatchObject({ warmRecoveryFreshSession: { runId } });
+      }
       const port = new PaperclipControlPlanePort(db, { ...identity, completionContractId: fixtureContractId,
         completionContractSha256: contractSha, sourceInstanceId: runnerId, controlPlaneSourceInstanceId: "marker-control" });
       await port.openRun({ identity, backendKind: "mock", sourceInstanceId: runnerId });
@@ -487,15 +518,24 @@ describe("PaperclipControlPlanePort conformance", () => {
         finally { markerWrite.mockRestore(); }
         expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId))).toHaveLength(1);
       } else await port.appendEvent(event);
-      if (index === 0) replayFirst = () => port.appendEvent(event);
+      if (index === 0) {
+        replayFirst = () => port.appendEvent(event);
+        previousSessionId = sessionId;
+        if (taskRecovery) await db.update(heartbeatRuns).set({ status: "failed", error: "remote_warm_session_not_idle" })
+          .where(eq(heartbeatRuns.id, runId));
+      }
       const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
       expect(comments).toHaveLength(index === 0 ? 0 : 1);
       if (index === 1) {
         expect(comments[0]).toMatchObject({ authorType: "system", authorAgentId: null, authorUserId: null,
+          body: "New session · Earlier messages and files are still available.",
           createdByRunId: null, conversationSessionGeneration: 0, metadata: { sourceRunId: runId },
           presentation: { kind: "system_notice", tone: "neutral" } });
         const [receipt] = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
-        expect(comments[0]!.createdAt).toEqual(receipt!.createdAt);
+        const [startedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        // Stock places the marker at run creation, before the provider receipt.
+        expect(comments[0]!.createdAt).toEqual(startedRun.createdAt);
+        expect(comments[0]!.createdAt.getTime()).toBeLessThanOrEqual(receipt!.createdAt.getTime());
         await db.update(issueComments).set({ deletedAt: new Date() }).where(eq(issueComments.id, comments[0]!.id));
         await port.appendEvent(event);
         await port.appendEvent({ ...event, sourceEventId: `${runnerId}:2`, sourceSeq: 2 });
@@ -511,7 +551,7 @@ describe("PaperclipControlPlanePort conformance", () => {
     const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(issue).toMatchObject({ conversationSessionGeneration: 0, conversationBoundaryCommentId: null });
     expect(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId), sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`))).toHaveLength(0);
-  });
+  }, 30_000);
 
   async function terminalObserverFixture(options: {
     secrets?: readonly string[];
