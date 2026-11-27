@@ -381,7 +381,7 @@ describe.skipIf(!support.supported)("task interruption latest run query", () => 
       payload: { issueId: task.id, taskRetry: { sourceRunId: oldRunId } } }).returning();
     for (const presentation of [await taskInterruptionPresentation(db, task),
       (await taskInterruptionPresentations(db, companyId, [task])).get(task.id)]) {
-      expect(presentation).toMatchObject({ state: "resolved", canRetry: false, intentId: null, observedRunId: newRunId });
+      expect(presentation).toBeNull();
     }
     // Reads do not acknowledge input or retire execution authority.
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, retry.id)))[0]?.status)
@@ -819,7 +819,8 @@ describe.skipIf(!support.supported)("task interruption latest run query", () => 
     }
     expect(result.get(input[2]!.id)?.state).toBe("working");
     expect(result.get(input[3]!.id)?.state).toBe("retry_scheduled");
-    for (const n of [4, 5]) expect(result.get(input[n]!.id)?.state).toBe("resolved");
+    expect(result.get(input[4]!.id)).toBeNull(); // successful work is no interruption
+    expect(result.get(input[5]!.id)?.state).toBe("resolved"); // preserve terminal task/Stop semantics
     for (const n of [6, 8]) expect(result.get(input[n]!.id)?.responsibility).toBe("user");
   });
 

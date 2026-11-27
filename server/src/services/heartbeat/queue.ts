@@ -2924,6 +2924,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     if (executionReconciliationWake && !issueId) return null;
     const durableRequest = opts.durableChatRequest;
     let taskRetryActorId: string | null = null;
+    let personRetryQuestionSource: { sourceRunId: string; userId: string } | undefined;
     delete enrichedContextSnapshot.boardMessageRetry;
     if (opts.taskRetryRequestId) {
       const [receipt] = await db.select().from(agentWakeupRequests).where(and(
@@ -2940,6 +2941,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       if (retry.chatActionId ? !chatRetry :
           opts.requestedByActorType !== "user" || retry.actorId !== opts.requestedByActorId) return null;
       taskRetryActorId = retry.actorId;
+      if (!retry.initiatedBy) personRetryQuestionSource = { sourceRunId: retry.sourceRunId, userId: retry.actorId };
       enrichedContextSnapshot.forceFreshSession = true;
       // A continuous session otherwise keeps a binding that can never be resumed.
       if (!retry.initiatedBy && issueId && await retryStartsFresh(db, { companyId: receipt.companyId, issueId, sourceRunId: retry.sourceRunId })) {
@@ -3017,6 +3019,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           (failed.nativeIssueId ?? readNonEmptyString(failed.contextSnapshot?.issueId)) !== issueId) {
         throw conflict("The selected failed run cannot be retried for this task.");
       }
+      personRetryQuestionSource = { sourceRunId: failed.id, userId: opts.requestedByActorId };
       if (!activeRunExecutions.has(failed.id) && !adapterExecutionControls.has(failed.id)) {
         await sweepPendingCleanupLeases({ explicitRetry: {
           companyId: failed.companyId, runId: failed.id, actorId: opts.requestedByActorId,
@@ -5105,6 +5108,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             }, issueActivityPublications);
           }
 
+          const retryQuestionCommentIds = personRetryQuestionSource
+            ? await (await import("../fresh-continuation-retry-fold.js")).personRetryOwedQuestionIds(tx as unknown as Db,
+              { companyId: issue.companyId, issueId: issue.id, agentId, ...personRetryQuestionSource }) : [];
+          if (retryQuestionCommentIds.length) Object.assign(enrichedContextSnapshot, withQueuedCommentIdsInRunContext(enrichedContextSnapshot,
+            [...new Set([...queuedCommentIdsFromRunContext(enrichedContextSnapshot),
+              ...(typeof enrichedContextSnapshot.wakeCommentId === "string" ? [enrichedContextSnapshot.wakeCommentId] : []), ...retryQuestionCommentIds])]));
           const newRun = await freshRecovery.admitFresh({
             receipt: {
               agentId,
@@ -5124,6 +5133,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             queuedCommentInterruptId: opts.queuedCommentInterruptId,
             queuedCommentRequestId: opts.queuedCommentRequestId,
             boardRetryReceiptId: failedChatRetry ? undefined : opts.taskRetryRequestId,
+            retryQuestionCommentIds,
             failedChatRetryReceiptId: failedChatRetry ? opts.taskRetryRequestId : undefined,
             ownsReconstructionContinuation: Boolean(ownsReconstructionContinuation),
             explicitContinuationRunId: explicitContinuation ? explicitContinuationRunId : null,
