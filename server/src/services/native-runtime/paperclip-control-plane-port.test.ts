@@ -647,7 +647,7 @@ describe("PaperclipControlPlanePort conformance", () => {
     expect(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId), sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`))).toHaveLength(0);
   }, 30_000);
 
-  it.each(["single", "batch", "clamp", "no wake", "foreign wake"] as const)("orders the fresh-session marker against its first input: %s", async mode => {
+  it.each(["single", "batch", "batch after start", "clamp", "no wake", "foreign wake"] as const)("orders the fresh-session marker against its first input: %s", async mode => {
     const { companyId, agentId } = CONTROL_PLANE_CONFORMANCE_OPEN.identity;
     const issueId = randomUUID(), fixtureContractId = randomUUID();
     const runAt = new Date("2026-01-01T00:00:10.000Z"), wakeAt = new Date(runAt.getTime() - 1_000);
@@ -667,9 +667,10 @@ describe("PaperclipControlPlanePort conformance", () => {
           issueId: mode === "foreign wake" ? CONTROL_PLANE_CONFORMANCE_OPEN.identity.issueId : issueId,
           body: "First new-session input", authorType: "user", authorUserId: "board", createdAt: wakeAt }).returning();
         context.wakeCommentId = wake!.id;
-        if (mode === "batch") {
+        if (mode === "batch" || mode === "batch after start") {
           const [later] = await db.insert(issueComments).values({ companyId, issueId, body: "Later input",
-            authorType: "user", authorUserId: "board", createdAt: new Date(wakeAt.getTime() + 500) }).returning();
+            authorType: "user", authorUserId: "board",
+            createdAt: new Date((mode === "batch" ? wakeAt : runAt).getTime() + 500) }).returning();
           context = { ...context, wakeCommentId: later!.id, wakeCommentIds: [later!.id, wake!.id] };
         }
       }
@@ -694,14 +695,68 @@ describe("PaperclipControlPlanePort conformance", () => {
     expect(marker).toBeDefined();
     expect(storedMarker).toMatchObject({ conversationSessionGeneration: 0, presentation: { kind: "system_notice" },
       metadata: { version: 1, sourceRunId: runId, sections: [] } });
+    // A run's own wake batch never makes its first wake stale, before or after run start.
     const expected = mode === "no wake" || mode === "foreign wake" ? markerRun.createdAt
       : new Date(Math.max(previousAt.getTime() + 1, wakeAt.getTime() - 1));
     expect(marker.createdAt).toEqual(expected);
     expect(thread.findIndex(comment => comment.body === "Previous session answer")).toBeLessThan(thread.indexOf(marker));
-    if (mode === "single" || mode === "batch") {
+    if (mode === "single" || mode === "batch" || mode === "batch after start") {
       expect(marker.createdAt.getTime()).toBeLessThan(wakeAt.getTime());
       expect(thread.indexOf(marker)).toBeLessThan(thread.findIndex(comment => comment.body === "First new-session input"));
     }
+  });
+
+  it.each(["user", "agent", "system", "late previous reply"] as const)(
+    "dates a recovery marker after newer thread comments with an old wake: %s", async mode => {
+    const { companyId, agentId } = CONTROL_PLANE_CONFORMANCE_OPEN.identity;
+    const issueId = randomUUID(), fixtureContractId = randomUUID(), wakeCommentId = randomUUID();
+    const priorRunId = randomUUID(), runId = randomUUID();
+    const wakeAt = new Date("2026-01-01T00:00:00.000Z");
+    const runAt = new Date(wakeAt.getTime() + 6_000);
+    const previousAt = new Date(wakeAt.getTime() + (mode === "late previous reply" ? 7_000 : -1_000));
+    await db.insert(issues).values({ id: issueId, companyId, title: "Recovery marker ordering", assigneeAgentId: agentId,
+      conversationAgentId: agentId, conversationUserId: randomUUID(), conversationState: "active" });
+    const [contract] = await db.select().from(completionContracts).where(eq(completionContracts.id, contractId));
+    await db.insert(completionContracts).values({ ...contract!, id: fixtureContractId, issueId });
+    await db.insert(issueComments).values({ id: wakeCommentId, companyId, issueId, body: "Original wake C1",
+      authorType: "user", authorUserId: "board", createdAt: wakeAt });
+    // These are not the prior run's replies: the newest pre-run input can be by any author.
+    const authorType = mode === "late previous reply" ? "user" : mode;
+    await db.insert(issueComments).values(Array.from({ length: 5 }, (_, index) => ({ companyId, issueId,
+      body: `Later thread comment ${index + 1}`, authorType,
+      authorAgentId: authorType === "agent" ? agentId : null,
+      authorUserId: authorType === "user" ? "board" : null,
+      createdAt: new Date(wakeAt.getTime() + (index + 1) * 1_000) })));
+    for (const [index, id] of [priorRunId, runId].entries()) {
+      const sessionId = randomUUID(), runnerId = randomUUID();
+      const identity = { companyId, agentId, issueId, runId: id, sessionId };
+      await db.insert(heartbeatRuns).values({ id, companyId, agentId, status: "running", runtimeMode: "native",
+        nativeIssueId: issueId, nativeSessionId: sessionId, runnerInstanceId: runnerId,
+        completionContractId: fixtureContractId, completionContractSha256: contractSha,
+        createdAt: index === 0 ? new Date(wakeAt.getTime() - 2_000) : runAt,
+        contextSnapshot: { issueId, conversationSessionGeneration: 0,
+          ...(index === 1 ? { wakeCommentId, forceFreshSession: true, source: "execution.reconciled" } : {}) } });
+      const port = new PaperclipControlPlanePort(db, { ...identity, completionContractId: fixtureContractId,
+        completionContractSha256: contractSha, sourceInstanceId: runnerId, controlPlaneSourceInstanceId: "recovery-marker-control" });
+      await port.openRun({ identity, backendKind: "mock", sourceInstanceId: runnerId });
+      await port.appendEvent({ schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceEventId: `${runnerId}:1`,
+        sourceInstanceId: runnerId, sourceSeq: 1, sourceKind: "runner", runId: id, normalizedSessionId: sessionId,
+        eventType: "session.started", priority: 0, emittedAt: runAt.toISOString(), payload: {} });
+      if (index === 0) await db.insert(issueComments).values({ companyId, issueId, body: "Previous session reply",
+        authorType: "agent", authorAgentId: agentId, createdByRunId: id, createdAt: previousAt });
+    }
+    const thread = await issueService(db).listComments(issueId, { companyId, order: "asc" });
+    const markers = await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId),
+      sql`${issueComments.metadata}->>'sourceRunId' = ${runId}`));
+    expect(markers).toHaveLength(1);
+    const marker = thread.find(comment => comment.id === markers[0]!.id)!;
+    expect(marker).toBeDefined();
+    const expectedAt = new Date(Math.max(runAt.getTime(), previousAt.getTime() + 1));
+    process.stdout.write(`RECOVERY_MARKER_ORDER ${JSON.stringify({ mode, wakeAt, runAt, previousAt,
+      actualAt: marker.createdAt, expectedAt, thread: thread.map(comment => ({ body: comment.body, createdAt: comment.createdAt })) })}\n`);
+    expect(marker.createdAt).toEqual(expectedAt);
+    expect(thread.indexOf(marker)).toBeGreaterThan(thread.findIndex(comment => comment.body === "Later thread comment 5"));
+    expect(marker.createdAt.getTime()).toBeGreaterThan(previousAt.getTime());
   });
 
   async function terminalObserverFixture(options: {

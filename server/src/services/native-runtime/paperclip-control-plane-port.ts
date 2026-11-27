@@ -2,7 +2,7 @@ import { notifyNativeResultCommit } from "../native-result-commit-notifications.
 import { settleProviderReturnedStopInput } from "../person-stop-before-turn.js";
 import { notifyNativeWorkspaceFinalization } from "../native-workspace-finalization-notifications.js";
 import { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
-import { and, asc, desc, eq, gt, inArray, lt, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, lt, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   heartbeatRunEvents,
@@ -555,6 +555,10 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
               .orderBy(asc(issueComments.createdAt), asc(issueComments.id)).limit(1) : [];
             let markerAt = run.createdAt;
             if (wake) {
+              const [latest] = await tx.select({ createdAt: issueComments.createdAt }).from(issueComments)
+                .where(and(eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+                  lt(issueComments.createdAt, run.createdAt), notInArray(issueComments.id, wakeIds)))
+                .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
               const [previous] = await tx.select({ createdAt: issueComments.createdAt }).from(issueComments)
                 .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, issueComments.createdByRunId))
                 .where(and(eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
@@ -562,8 +566,12 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
                   eq(heartbeatRuns.nativeIssueId, issue.id), eq(heartbeatRuns.runtimeMode, "native"),
                   lt(heartbeatRuns.createdAt, run.createdAt)))
                 .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
+              // A recovery can inherit a wake from before newer thread messages. This run's
+              // own wake batch is what the new session reads, so it never makes the wake stale.
+              const inputAt = latest && wake.createdAt.getTime() < latest.createdAt.getTime()
+                ? run.createdAt.getTime() : wake.createdAt.getTime() - 1;
               // Strict millisecond gaps avoid depending on the thread's UUID tie-breaker.
-              markerAt = new Date(Math.max(wake.createdAt.getTime() - 1,
+              markerAt = new Date(Math.max(inputAt,
                 previous ? previous.createdAt.getTime() + 1 : -Infinity));
             }
             const [comment] = await insertIssueComment(tx, {
