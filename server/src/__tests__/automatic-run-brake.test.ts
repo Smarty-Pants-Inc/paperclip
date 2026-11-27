@@ -135,7 +135,7 @@ suite("automatic-run brake", () => {
     const before = await db.select().from(automaticRunBrakes);
     const report = await assignedWorkSweep(db, reportDeps).report(companyId);
     const after = await db.select().from(automaticRunBrakes);
-    console.info("closed report observation", { cache, beforeRows: before.length, afterRows: after.length, state: report.automaticWork.state });
+    console.info("closed report observation", { cache, beforeRows: before.length, afterRows: after.length, state: report.automaticWork?.state });
     expect(after).toEqual(before);
     expect(report.automaticWork).toMatchObject({ state: "closed", pausedSince: null, nextTryAt: null,
       recentAutomaticRuns: 20, failedBeforeStarting: 20, summary: "Automatic work is running normally." });
@@ -163,7 +163,7 @@ suite("automatic-run brake", () => {
     const report = await assignedWorkSweep(db, reportDeps).report(companyId);
     const after = await db.select().from(automaticRunBrakes);
     console.info("probe report observation", { cache, beforeRows: before.length, afterRows: after.length,
-      beforeUpdatedAt: before[0]!.updatedAt, afterUpdatedAt: after[0]!.updatedAt, state: report.automaticWork.state });
+      beforeUpdatedAt: before[0]!.updatedAt, afterUpdatedAt: after[0]!.updatedAt, state: report.automaticWork?.state });
     expect(after).toEqual(before);
     expect(report.automaticWork).toMatchObject({ state: "open", pausedSince: before[0]!.openedAt,
       nextTryAt: before[0]!.nextProbeAt, recentAutomaticRuns: 1, failedBeforeStarting: 0 });
