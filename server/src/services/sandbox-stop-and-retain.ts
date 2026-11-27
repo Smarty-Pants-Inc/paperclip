@@ -187,11 +187,12 @@ export async function prepareSupersededWarmSandboxStop(db: Db, lease: typeof env
  * the stop and retries it until the provider confirms. A destroyed sandbox, a
  * stop already in progress and a sandbox another lease holds are left alone;
  * the caller verifies that the run has ended. */
-export async function prepareUnconfirmedSourceSandboxStop(db: Db, lease: typeof environmentLeases.$inferSelect) {
+export async function prepareUnconfirmedSourceSandboxStop(db: Db, lease: typeof environmentLeases.$inferSelect, terminal = false) {
   if (!lease.heartbeatRunId || !lease.provider || lease.provider === "local" || !lease.providerLeaseId
     || lease.metadata?.pendingCleanupInFlight === true || hasStopOnlyCleanup(lease)
     || (lease.metadata?.remoteExecutionTermination as { state?: string } | undefined)?.state === "destroyed") return null;
-  return prepareStopAndRetain(db, lease, lease.status);
+  return prepareStopAndRetain(db, lease, lease.status,
+    terminal ? { terminalPiSandbox: { priorStatus: lease.status === "retained" ? "retained" : "released" } } : {});
 }
 
 async function prepareStopAndRetain(db: Db, lease: Lease, fromStatus: string, recovery: Record<string, unknown> = {},
@@ -207,7 +208,7 @@ async function prepareStopAndRetain(db: Db, lease: Lease, fromStatus: string, re
     ...(retention ? { leasePolicy: retention.leasePolicy } : {}),
     metadata: sql`(coalesce(${environmentLeases.metadata}, '{}'::jsonb) - 'remoteExecutionTermination' - 'sandboxStopAndRetainReceipt') || ${JSON.stringify({
       [SANDBOX_STOP_AND_RETAIN_KEY]: intent, pendingCleanupAttemptId: requestId,
-      ...(fromStatus === "active" && Object.keys(recovery).length
+      ...(fromStatus === "active" && !recovery.terminalPiSandbox && Object.keys(recovery).length
         ? { [ORPHANED_SANDBOX_RECOVERY_KEY]: { ...recovery, runId: lease.heartbeatRunId, recoveredAt: now.toISOString() } } : {}),
       pendingCleanupInFlight: false, pendingCleanupLeaseExpiresAtMs: 0,
       pendingCleanupRetryAfterMs: 0, pendingCleanupRetryAttempts: 0, pendingCleanupRetryCapWarned: false,
