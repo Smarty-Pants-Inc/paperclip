@@ -2659,7 +2659,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               id: turnId,
               kind: "turn",
               settled: true,
-              historical: false,
+              historical,
               agentName:
                 meta?.agentName ??
                 (meta?.agentId ? agentMap?.get(meta.agentId)?.name : undefined),
@@ -2988,7 +2988,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             id: turnId,
             kind: "turn",
             settled: true,
-            historical: false,
+            historical,
             agentName:
               meta?.agentName ??
               (meta?.agentId ? agentMap?.get(meta.agentId)?.name : undefined),
