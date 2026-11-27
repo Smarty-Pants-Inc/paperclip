@@ -1,17 +1,48 @@
 import { and, desc, eq, isNotNull, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
-import { environmentLeases, heartbeatRuns, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { environmentLeases, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import type { EnvironmentLease } from "@paperclipai/shared";
 import { reusableSandboxLeaseIsIdle, reusableSandboxReplacementPlan } from "./reusable-sandbox-resume-replacement.js";
-import { readNativeHarnessBackupStamp } from "./native-runtime/native-harness-backup-stamp.js";
+import { nativeHarnessBackupEventCursors, readNativeHarnessBackupStamp } from "./native-runtime/native-harness-backup-stamp.js";
 import { readNativeControllerRecovery } from "./native-runtime/native-controller-recovery.js";
 import { loadNativeRunnerCheckpoint } from "./native-runtime/native-runner-checkpoint.js";
-import { nativeHarnessBackupCoversProviderEvents } from "./native-runtime/native-retired-backup-source.js";
+import { NATIVE_PROVIDER_DURABLE_EVENT_TYPES, nativeHarnessBackupCoversProviderEvents } from "./native-runtime/native-retired-backup-source.js";
 import { retiredReusableLeasePredecessors, reusableLeaseHistoryWithDeletedTaskBindings } from "./environment-lease-handoff.js";
 
 export const REPLACEMENT_DEFERRED_CONVERSATION = "replacement_deferred_unexported_conversation";
 const record = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+
+export type ReusableConversationCoverage = Array<{ sessionId: string; cursors: Array<{ runId: string; seq: number }> }>;
+
+/** Unknown/no-run active rows still block. A terminal run's stale active row
+ * is history, not a live owner; its conversation and finalizer still need proof.
+ * Allocation identity is company + provider lease, never nullable environment. */
+export function reusableAllocationHasActiveSiblingSql(lease: EnvironmentLease) {
+  return sql`exists (select 1 from ${environmentLeases} active_lease
+    where active_lease.company_id = ${lease.companyId}
+      and active_lease.provider_lease_id = ${lease.providerLeaseId}
+      and active_lease.id <> ${lease.id} and active_lease.status = 'active'
+      and not exists (select 1 from ${heartbeatRuns} terminal_owner
+        where terminal_owner.company_id = active_lease.company_id
+          and terminal_owner.id = active_lease.heartbeat_run_id
+          and terminal_owner.status in ('succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted')))`;
+}
+
+/** Recheck the proven, hash-bound causal cursors in the destroying UPDATE's
+ * snapshot. Missing/legacy cursors cover no events. This is not P11 admission
+ * exclusion: a publisher committing after the CAS can still race dispatch. */
+export function reusableConversationCoverageSql(companyId: string, coverage: ReusableConversationCoverage) {
+  return and(...coverage.map(proof => sql`not exists (
+    select 1 from ${heartbeatRunEvents} provider_event
+    inner join ${heartbeatRuns} provider_run on provider_run.id = provider_event.run_id
+      and provider_run.company_id = provider_event.company_id
+    left join jsonb_to_recordset(${JSON.stringify(proof.cursors)}::jsonb)
+      as proven("runId" text, seq bigint) on proven."runId" = provider_event.run_id::text
+    where provider_event.company_id = ${companyId} and provider_run.native_session_id = ${proof.sessionId}
+      and provider_event.event_type in (${sql.join([...NATIVE_PROVIDER_DURABLE_EVENT_TYPES].map(type => sql`${type}`), sql`, `)})
+      and provider_event.seq > coalesce(proven.seq, -1))`));
+}
 
 /** Census still-held continuous Pi conversations. Done/cancelled tasks and
  * older same-task sessions can remain selected by a task pointer or pinned
@@ -20,7 +51,14 @@ const record = (value: unknown): Record<string, unknown> =>
  * newer session never does. */
 export async function preserveReusableSandboxConversation(input: {
   db: Db; lease: EnvironmentLease; heartbeatRunId?: string | null;
-}): Promise<{ kind: "unheld" | "preserved" | "deferred"; lease: EnvironmentLease; detail?: string }> {
+  /** Acquisition-time generic release has no retired-source restore contract.
+   * It may release only an unheld allocation, never substitute a saved backup. */
+  unheldReleaseOnly?: boolean;
+}): Promise<
+  | { kind: "unheld"; lease: EnvironmentLease }
+  | { kind: "preserved"; lease: EnvironmentLease; coverage: ReusableConversationCoverage }
+  | { kind: "deferred"; lease: EnvironmentLease; detail: string }
+> {
   const { db, lease } = input;
   if (!lease.providerLeaseId) return { kind: "unheld", lease };
   const [current] = input.heartbeatRunId ? await db.select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId,
@@ -39,7 +77,6 @@ export async function preserveReusableSandboxConversation(input: {
     backup: sql<unknown>`${environmentLeases.metadata}->'nativeHarnessBackup'`.as("source_backup"),
   }).from(environmentLeases)
     .where(and(eq(environmentLeases.companyId, lease.companyId),
-      eq(environmentLeases.environmentId, lease.environmentId!),
       eq(environmentLeases.providerLeaseId, lease.providerLeaseId), isNotNull(environmentLeases.heartbeatRunId)))
     .orderBy(environmentLeases.heartbeatRunId, desc(environmentLeases.acquiredAt), desc(environmentLeases.id))
     .as("reusable_allocation_runs");
@@ -84,13 +121,10 @@ export async function preserveReusableSandboxConversation(input: {
   // Ownership belongs to every allocation run, not merely its newest turn.
   // The asking run may reacquire its own released lease during same-run resume;
   // its execution status is not a competing owner. Finalizers and every
-  // OTHER active lease row (including its own) still fence the allocation.
+  // OTHER active lease row without a terminal holder (including its own)
+  // still fence the allocation. Terminal rows remain in the held census.
   const census = await db.select({ run: heldSelection.run, backup: heldSelection.backup,
-    busy: sql<boolean>`exists (select 1 from ${environmentLeases} active_lease
-      where active_lease.company_id = ${lease.companyId}
-        and active_lease.environment_id = ${lease.environmentId}
-        and active_lease.provider_lease_id = ${lease.providerLeaseId}
-        and active_lease.id <> ${lease.id} and active_lease.status = 'active')
+    busy: sql<boolean>`${reusableAllocationHasActiveSiblingSql(lease)}
       or exists (select 1 from ${allocationRuns}
       inner join ${heartbeatRuns} on ${heartbeatRuns.id} = ${allocationRuns.runId}
       left join ${nativeRunFinalizations} on ${nativeRunFinalizations.runId} = ${heartbeatRuns.id}
@@ -102,6 +136,9 @@ export async function preserveReusableSandboxConversation(input: {
           (${nativeRunFinalizations.leaseExpiresAt} is null or ${nativeRunFinalizations.leaseExpiresAt} > clock_timestamp()))))`,
   }).from(sql`(select 1) as reusable_census_sentinel`).leftJoin(heldSelection, sql`true`);
   const held = census.filter((source): source is typeof source & { run: NonNullable<typeof source.run> } => source.run !== null);
+  if (input.unheldReleaseOnly) return held.length
+    ? { kind: "deferred", lease, detail: "source_release_requires_retirement" }
+    : { kind: "unheld", lease };
 
   const defer = async (detail: string) => {
     const [fresh] = await db.select().from(environmentLeases).where(and(
@@ -141,6 +178,7 @@ export async function preserveReusableSandboxConversation(input: {
     // its own historical lease; it is usable only through the receipt-linked
     // lineage that the restore consumer also verifies below. Never substitute
     // one task/session's proof for another's.
+    const coverage: ReusableConversationCoverage = [];
     for (const source of held) {
       const tipStamp = readNativeHarnessBackupStamp(fresh.metadata?.nativeHarnessBackup, lease.providerLeaseId);
       const stamp: ReturnType<typeof readNativeHarnessBackupStamp> = tipStamp?.normalizedSessionId === source.run.nativeSessionId
@@ -181,6 +219,9 @@ export async function preserveReusableSandboxConversation(input: {
         // have resumed and advanced this session after its representative's
         // save. Every run's provider work must be covered before destruction.
         stamp })) return defer("source_backup_stale");
+      coverage.push({ sessionId: stamp.normalizedSessionId,
+        cursors: [...(nativeHarnessBackupEventCursors(stamp) ?? new Map<string, number>())]
+          .map(([runId, seq]) => ({ runId, seq })) });
     }
     // Only pay for lease-lineage proof after the held conversations' backups
     // pass. The restore consumer accepts one tip and its verified predecessors;
@@ -189,7 +230,7 @@ export async function preserveReusableSandboxConversation(input: {
     if (!retiredReusableLeasePredecessors(fresh, history.filter(row => row.id !== fresh.id))) {
       return defer("source_history_unproven");
     }
-    return { kind: "preserved", lease: refreshed };
+    return { kind: "preserved", lease: refreshed, coverage };
   } catch (error) {
     return defer(`source_preservation_failed: ${error instanceof Error ? error.message : String(error)}`);
   }

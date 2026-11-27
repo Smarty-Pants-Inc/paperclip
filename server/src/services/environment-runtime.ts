@@ -1,5 +1,6 @@
 import { readPluginLoginCredential } from "./plugin-login-credential.js";
-import { preserveReusableSandboxConversation, REPLACEMENT_DEFERRED_CONVERSATION } from "./reusable-sandbox-conversation.js";
+import { preserveReusableSandboxConversation, reusableAllocationHasActiveSiblingSql,
+  reusableConversationCoverageSql, REPLACEMENT_DEFERRED_CONVERSATION } from "./reusable-sandbox-conversation.js";
 import { sandboxRestartMetadata } from "./sandbox-snapshot-restore.js";
 import { nativeRunHasNoProviderWork } from "./native-runtime/native-session-resume.js";
 import { ENVIRONMENT_LEASE_CONTROLLER_KEY } from "./environment-lease-controller.js";
@@ -3395,18 +3396,14 @@ function createSandboxEnvironmentDriver(
         inArray(environmentLeases.status, ["retained", "released"]),
         sql`${environmentLeases.metadata} = ${JSON.stringify(input.lease.metadata)}::jsonb`,
         sql`${environmentLeases.heartbeatRunId} IS NOT DISTINCT FROM ${input.lease.heartbeatRunId}`,
-        sql`NOT EXISTS (SELECT 1 FROM ${environmentLeases} active_lease
-          WHERE active_lease.company_id = ${input.lease.companyId}
-            AND active_lease.environment_id = ${input.lease.environmentId}
-            AND active_lease.provider_lease_id = ${input.lease.providerLeaseId}
-            AND active_lease.id <> ${input.lease.id} AND active_lease.status = 'active')`,
+        sql`NOT (${reusableAllocationHasActiveSiblingSql(input.lease)})`,
+        reusableConversationCoverageSql(input.lease.companyId, conversation.kind === "preserved" ? conversation.coverage : []),
         sql`NOT EXISTS (SELECT 1 FROM ${heartbeatRuns} owner_run
           INNER JOIN ${environmentLeases} owner_lease ON owner_lease.heartbeat_run_id = owner_run.id
             AND owner_lease.company_id = owner_run.company_id
           LEFT JOIN ${nativeRunFinalizations} owner_finalization ON owner_finalization.run_id = owner_run.id
             AND owner_finalization.company_id = owner_run.company_id
           WHERE owner_lease.company_id = ${input.lease.companyId}
-            AND owner_lease.environment_id = ${input.lease.environmentId}
             AND owner_lease.provider_lease_id = ${input.lease.providerLeaseId}
             AND ((owner_run.id IS DISTINCT FROM ${input.heartbeatRunId ?? null}
                 AND owner_run.status IN ('queued', 'scheduled_retry', 'running'))
@@ -3749,6 +3746,20 @@ function createPluginEnvironmentDriver(
     });
   }
 
+  async function releasePluginTaskForReplacement(input: {
+    environment: Environment; lease: EnvironmentLease; heartbeatRunId?: string | null;
+  }, executionStopObserved = false) {
+    // A release RPC may delete on pause/stop failure. Generic release does
+    // not retire a restore source, so even a saved held conversation must stay.
+    // The stop-observed boolean below is not evidence of preservation.
+    const conversation = await preserveReusableSandboxConversation({ db, lease: input.lease,
+      heartbeatRunId: input.heartbeatRunId, unheldReleaseOnly: true });
+    if (conversation.kind !== "unheld") {
+      throw new Error(`${REPLACEMENT_DEFERRED_CONVERSATION}: source_release_requires_retirement`);
+    }
+    return releasePluginRunLease({ environment: input.environment, lease: input.lease, status: "released" }, executionStopObserved);
+  }
+
   return {
     driver: "plugin",
 
@@ -3809,7 +3820,8 @@ function createPluginEnvironmentDriver(
       if (!handoffPrevious && previous?.providerLeaseId &&
           (freshPortableSession || previous.metadata?.runnerTaskFingerprint !== fingerprint)) {
         // A fresh logical session or changed mount scope must retire the old process before provisioning.
-        await this.releaseRunLease({environment:input.environment,lease:toEnvironmentLeaseSnapshot(previous),status:"released"});
+        await releasePluginTaskForReplacement({ environment: input.environment,
+          lease: toEnvironmentLeaseSnapshot(previous), heartbeatRunId: input.heartbeatRunId });
       } else if (!handoffPrevious && previous?.providerLeaseId) {
         // Resume only inspects the exact computer; an unavailable reply must not create a replacement.
         resumed = await workerManager.call(plugin.id, "environmentResumeLease", {
@@ -3818,7 +3830,8 @@ function createPluginEnvironmentDriver(
           providerLeaseId: previous.providerLeaseId, leaseMetadata: previous.metadata ?? undefined,
         });
         if (!resumed?.providerLeaseId) {
-          await releasePluginRunLease({ environment: input.environment, lease: toEnvironmentLeaseSnapshot(previous), status: "released" }, true);
+          await releasePluginTaskForReplacement({ environment: input.environment,
+            lease: toEnvironmentLeaseSnapshot(previous), heartbeatRunId: input.heartbeatRunId }, true);
           resumed = undefined;
         }
       }

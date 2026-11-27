@@ -379,7 +379,7 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
       JSON.stringify({ phase: "prepared", row: expect.getState().currentTestName, companyId: seeded.companyId,
         sourceRunId: seeded.previousRunId, runId: seeded.runId, sourceLeaseId: seeded.lease.id,
         sourceAllocation: seeded.providerLeaseId, sessionId }) + "\n");
-    return { ...seeded, runtime, call, preserve, answer, change, sessionId, issueId, runnerInstanceId,
+    return { ...seeded, runtime, call, preserve, answer, change, sessionId, issueId, runnerInstanceId, remembered,
       backupRoot: () => backupRoot, stoppedAllocations, registerConversation,
       clearConversations: () => conversations.clear() };
   }
@@ -631,7 +631,7 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
       expect(active).toMatchObject({ status: "active", heartbeatRunId: f.runId, providerLeaseId: f.providerLeaseId });
     });
 
-  it.each([0, -1, "unchanged"] as const)(
+  it.each([0, -1, "unchanged", "claim"] as const)(
     "replacement fence v8 R1 P-by-P9 %s: older asking run's new work always counts toward causal coverage", async delta => {
       const f = await conversationFixture();
       // A real task-bound history, not an unrelated taskless predecessor.
@@ -658,9 +658,10 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
       expect(resumed.lease.providerLeaseId).toBe(f.providerLeaseId);
       const newestAnswer = randomUUID();
       f.registerConversation({ sessionId: f.sessionId, remembered: newestAnswer });
-      await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, runId: older.otherRunId,
+      const advance = async () => { await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, runId: older.otherRunId,
         agentId: f.agentId, seq: 2, eventType: "provider.event",
-        createdAt: new Date(Date.parse(stamp.completedAt) + (typeof delta === "number" ? delta : 0)) });
+        createdAt: new Date(Date.parse(stamp.completedAt) + (typeof delta === "number" ? delta : 0)) }); };
+      if (delta !== "claim") await advance();
       const first = await f.runtime.execute({ environment: f.environment, lease: resumed.lease,
         command: "fixture-pi-rpc", args: ["recall", f.sessionId] });
       expect(JSON.parse(first.stdout!).answer).toBe(newestAnswer);
@@ -673,8 +674,22 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
       const coversAllRuns = await nativeHarnessBackupCoversProviderEvents(db, { companyId: f.companyId,
         sessionId: f.sessionId, stamp });
       expect(coversWhenAskerExcluded).toBe(true);
-      expect(coversAllRuns).toBe(false);
+      expect(coversAllRuns).toBe(delta === "claim");
       if (delta !== "unchanged") await f.change({ image: "fake:changed" });
+      if (delta === "claim") {
+        const identity = controllerIdentity.currentControllerProcess;
+        vi.spyOn(controllerIdentity, "currentControllerProcess").mockImplementationOnce(async () => {
+          await advance(); return identity();
+        });
+        let refusal: unknown;
+        try { await acquireOlder(); } catch (error) { refusal = error; }
+        const destroys = f.call.mock.calls.filter(([, method]) => method === "environmentDestroyLease").length;
+        if (process.env.PAPERCLIP_REPLACEMENT_ROWS) await appendFile(process.env.PAPERCLIP_REPLACEMENT_ROWS,
+          JSON.stringify({ row: expect.getState().currentTestName, boundary: "claim", destroys,
+            refusal: refusal instanceof Error ? refusal.message : null, newestAnswer }) + "\n");
+        expect(destroys).toBe(0);
+        expect(String(refusal)).toContain("source_ownership_changed");
+      }
       const acquired = await acquireOlder();
       let answer: string | null = null, error: unknown;
       try {
@@ -692,6 +707,155 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
       expect(error).toBeUndefined();
       expect(answer).toBe(newestAnswer);
       expect(acquired.lease.providerLeaseId).toBe(f.providerLeaseId);
+    });
+
+  it.each(["fingerprint", "fresh", "resume-empty", "saved", "explicit-reset-control", "unheld-control"] as const)(
+    "replacement fence v9 generic acquisition release %s: no held conversation is released before provisioning", async mode => {
+      const f = await conversationFixture();
+      if (mode === "saved") await f.preserve();
+      if (mode === "explicit-reset-control") await db.update(heartbeatRuns).set({ contextSnapshot: { conversationReset: true } })
+        .where(eq(heartbeatRuns.id, f.runId));
+      const pluginKey = "acme.reusable-sandbox-provider";
+      f.environment.driver = "plugin";
+      f.environment.config = { pluginKey, driverKey: "tasks", driverConfig: {}, runnerLifecycleMode: "warm" };
+      await db.update(environments).set({ driver: "plugin", config: f.environment.config }).where(eq(environments.id, f.environment.id));
+      const [plugin] = await db.select().from(plugins).where(eq(plugins.id, f.pluginId));
+      await db.update(plugins).set({ manifestJson: { ...plugin.manifestJson, environmentDrivers: [{ driverKey: "tasks",
+        kind: "sandbox_provider", supportsTasks: true, warmTaskVersion: 1, sessionHandoffVersion: 1 }] } as never })
+        .where(eq(plugins.id, f.pluginId));
+      const config = parseEnvironmentDriverConfig(f.environment).config;
+      const fingerprint = createHash("sha256").update(JSON.stringify([config, f.agentId, []])).digest("hex");
+      await db.update(environmentLeases).set({ issueId: f.issueId, metadata: { ...f.lease.metadata,
+        pluginId: f.pluginId, pluginKey, driverKey: "tasks", driver: "plugin", agentId: f.agentId,
+        runnerTaskLease: true, runnerTaskFingerprint: ["fingerprint", "saved", "explicit-reset-control", "unheld-control"].includes(mode) ? "old" : fingerprint,
+        runnerTaskIdentity: { sessionId: f.sessionId }, environmentId: f.environment.id } })
+        .where(eq(environmentLeases.id, f.lease.id));
+      if (mode === "unheld-control") await db.update(heartbeatRuns).set({ nativeSessionId: null, runnerProfileJson: {} })
+        .where(eq(heartbeatRuns.id, f.previousRunId));
+      const original = f.call.getMockImplementation()!;
+      f.call.mockImplementation(async (id, method, params) => {
+        if (method === "environmentResumeLease" && mode === "resume-empty") return {};
+        if (method === "environmentReleaseLease") {
+          f.clearConversations(); return { providerLeaseId: f.providerLeaseId, state: "destroyed" };
+        }
+        return original(id, method, params);
+      });
+      let acquired: Awaited<ReturnType<typeof acquire>> | undefined, error: unknown;
+      try { acquired = await f.runtime.acquireRunLease({ companyId: f.companyId, environment: f.environment,
+        issueId: f.issueId, agentId: f.agentId, heartbeatRunId: f.runId, adapterType: "paperclip_runner",
+        ...(mode === "fresh" ? { runnerTaskResumeSessionId: null } : {}),
+        persistedExecutionWorkspace: { id: f.executionWorkspaceId, mode: "isolated_workspace" } }); } catch (caught) { error = caught; }
+      const releases = f.call.mock.calls.filter(([, method]) => method === "environmentReleaseLease").length;
+      const creates = f.call.mock.calls.filter(([, method]) => method === "environmentAcquireLease").length;
+      if (process.env.PAPERCLIP_REPLACEMENT_ROWS) await appendFile(process.env.PAPERCLIP_REPLACEMENT_ROWS,
+        JSON.stringify({ row: expect.getState().currentTestName, mode, releases, creates,
+          allocation: acquired?.lease.providerLeaseId, refusal: error instanceof Error ? error.message : null }) + "\n");
+      if (mode === "unheld-control" || mode === "explicit-reset-control") {
+        expect(error).toBeUndefined(); expect(releases).toBe(1); expect(creates).toBe(1);
+      } else {
+        expect(String(error)).toContain("source_release_requires_retirement");
+        expect(releases).toBe(0); expect(creates).toBe(0);
+        const lease = (await environmentService(db).getLeaseById(f.lease.id))!;
+        const result = await f.runtime.execute({ environment: { ...f.environment, driver: "sandbox" }, lease,
+          command: "fixture-pi-rpc", args: ["recall", f.sessionId] });
+        expect(JSON.parse(result.stdout!)).toEqual({ sessionId: f.sessionId, answer: f.remembered });
+      }
+    });
+
+  it.each(["succeeded", "failed", "cancelled", "timed_out", "interrupted"] as const)(
+    "replacement fence v9 stale active %s: terminal holding run does not refuse every turn", async status => {
+      const f = await conversationFixture();
+      f.clearConversations();
+      await db.update(heartbeatRuns).set({ nativeSessionId: null, runnerProfileJson: {}, status })
+        .where(eq(heartbeatRuns.id, f.previousRunId));
+      await db.update(heartbeatRuns).set({ nativeSessionId: null, runnerProfileJson: {} })
+        .where(eq(heartbeatRuns.id, f.runId));
+      await db.insert(environmentLeases).values({ id: randomUUID(), companyId: f.companyId,
+        environmentId: f.environment.id, heartbeatRunId: f.previousRunId,
+        executionWorkspaceId: f.executionWorkspaceId, provider: f.environment.config.provider as string,
+        providerLeaseId: f.providerLeaseId, status: "active", leasePolicy: "reuse_by_environment", metadata: {} });
+      await f.change({ image: "fake:changed" });
+      for (let turn = 1; turn <= 2; turn++) {
+        let selected: Awaited<ReturnType<typeof acquire>> | undefined, error: unknown;
+        try { selected = await acquire(f, f.runtime); } catch (caught) { error = caught; }
+        const destroys = f.call.mock.calls.filter(([, method]) => method === "environmentDestroyLease").length;
+        if (process.env.PAPERCLIP_REPLACEMENT_ROWS) await appendFile(process.env.PAPERCLIP_REPLACEMENT_ROWS,
+          JSON.stringify({ row: expect.getState().currentTestName, turn, status, destroys,
+            allocation: selected?.lease.providerLeaseId, error: error instanceof Error ? error.message : null }) + "\n");
+        expect(error).toBeUndefined();
+        expect(selected!.lease.providerLeaseId).toBe("replacement-sandbox");
+        expect(destroys).toBe(1);
+        await environmentService(db).releaseLease(selected!.lease.id, "released");
+      }
+    });
+
+  it("replacement fence v9 stale active conversation: terminal row still needs normal preservation proof on both turns", async () => {
+    const f = await conversationFixture();
+    await db.insert(environmentLeases).values({ id: randomUUID(), companyId: f.companyId,
+      environmentId: f.environment.id, heartbeatRunId: f.previousRunId,
+      executionWorkspaceId: f.executionWorkspaceId, provider: f.environment.config.provider as string,
+      providerLeaseId: f.providerLeaseId, status: "active", leasePolicy: "reuse_by_environment", metadata: {} });
+    await f.change({ image: "fake:changed" });
+    for (let turn = 1; turn <= 2; turn++) {
+      const acquired = await acquire(f, f.runtime);
+      expect(acquired.lease.providerLeaseId).toBe(f.providerLeaseId);
+      await f.answer(acquired);
+      expect(f.call.mock.calls.filter(([, method]) => method === "environmentDestroyLease")).toHaveLength(0);
+      await environmentService(db).releaseLease(acquired.lease.id, "released");
+    }
+  });
+
+  it("replacement fence v9 nullable environment history: an unsaved other task on the allocation is still held", async () => {
+    const f = await conversationFixture();
+    await f.preserve();
+    const other = await addOtherConversation(f);
+    await db.update(environmentLeases).set({ environmentId: null }).where(eq(environmentLeases.id, other.otherLeaseId));
+    await f.change({ image: "fake:changed" });
+    const acquired = await acquire(f, f.runtime);
+    const result = await f.runtime.execute({ environment: f.environment, lease: acquired.lease,
+      command: "fixture-pi-rpc", args: ["recall", other.otherSessionId] });
+    expect(JSON.parse(result.stdout!)).toEqual({ sessionId: other.otherSessionId, answer: other.source.remembered });
+    expect(acquired.lease.providerLeaseId).toBe(f.providerLeaseId);
+    expect(f.call.mock.calls.filter(([, method]) => method === "environmentDestroyLease")).toHaveLength(0);
+  });
+
+  it.each(["succeeded", "failed", "cancelled"] as const)(
+    "replacement fence v9 terminal sibling at claim %s: stale active row does not block the CAS", async status => {
+      const f = await conversationFixture();
+      f.clearConversations();
+      await db.update(heartbeatRuns).set({ nativeSessionId: null, runnerProfileJson: {}, status })
+        .where(eq(heartbeatRuns.id, f.previousRunId));
+      await db.update(heartbeatRuns).set({ nativeSessionId: null, runnerProfileJson: {} }).where(eq(heartbeatRuns.id, f.runId));
+      const identity = controllerIdentity.currentControllerProcess;
+      vi.spyOn(controllerIdentity, "currentControllerProcess").mockImplementationOnce(async () => {
+        await db.insert(environmentLeases).values({ id: randomUUID(), companyId: f.companyId,
+          environmentId: null, heartbeatRunId: f.previousRunId, provider: f.environment.config.provider as string,
+          providerLeaseId: f.providerLeaseId, status: "active", leasePolicy: "reuse_by_environment", metadata: {} });
+        return identity();
+      });
+      await f.change({ image: "fake:changed" });
+      const acquired = await acquire(f, f.runtime);
+      expect(acquired.lease.providerLeaseId).toBe("replacement-sandbox");
+      expect(f.call.mock.calls.filter(([, method]) => method === "environmentDestroyLease")).toHaveLength(1);
+    });
+
+  it.each(["census", "claim"] as const)(
+    "replacement fence v9 nullable environment %s: allocation sibling is keyed by company and provider lease", async boundary => {
+      const f = await conversationFixture();
+      f.clearConversations();
+      await db.update(heartbeatRuns).set({ nativeSessionId: null, runnerProfileJson: {} })
+        .where(sql`${heartbeatRuns.id} in (${f.previousRunId}, ${f.runId})`);
+      const insert = async () => { await db.insert(environmentLeases).values({ id: randomUUID(), companyId: f.companyId,
+        environmentId: null, heartbeatRunId: null, provider: f.environment.config.provider as string,
+        providerLeaseId: f.providerLeaseId, status: "active", leasePolicy: "reuse_by_environment", metadata: {} }); };
+      if (boundary === "census") await insert();
+      else {
+        const identity = controllerIdentity.currentControllerProcess;
+        vi.spyOn(controllerIdentity, "currentControllerProcess").mockImplementationOnce(async () => { await insert(); return identity(); });
+      }
+      await f.change({ image: "fake:changed" });
+      await expect(acquire(f, f.runtime)).rejects.toThrow(boundary === "census" ? "source_busy" : "source_ownership_changed");
+      expect(f.call.mock.calls.filter(([, method]) => method === "environmentDestroyLease")).toHaveLength(0);
     });
 
   it.each(["PROBE1", "PROBE-A", "PROBE-B", "PROBE-C", "PROBE-K", "PROBE-L"])(
