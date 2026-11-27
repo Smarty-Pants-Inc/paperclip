@@ -113,7 +113,8 @@ async function renderStrip(streamlined: boolean) {
     );
   });
   await vi.waitFor(() => {
-    expect(container.innerHTML).not.toContain("var(--status-task-icon-blocked)");
+    // The initial sign is also non-red; wait for the summary's specific label.
+    expect(container.innerHTML).toContain('aria-label="Blocked · waiting on dependencies"');
   });
   return container.innerHTML;
 }
@@ -139,7 +140,7 @@ describe("TaskChatLiveWorkLinks status glyphs (BUG-07)", () => {
       const nowRunningRow = (streamlined ? nowRunning : nowRunning?.parentElement)?.outerHTML ?? "";
       expect(glyphToken(nowRunningRow)).toBe(glyphToken(listGlyph(summaries.at(-1)!)));
 
-      // Blocked-but-covered tasks: blue in-queue glyph, never the red blocked one.
+      // Covered blocked tasks are blue queued, never the red blocked palette.
       expect(html).toContain("var(--status-task-icon-in_queue)");
       expect(html).not.toContain("var(--status-task-icon-blocked)");
       // Every request stays within the summaries endpoint limit.

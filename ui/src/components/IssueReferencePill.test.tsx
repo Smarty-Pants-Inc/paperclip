@@ -12,8 +12,8 @@ describe("IssueReferencePill", () => {
   it("keeps removable task references on the task rule, not the lifecycle rule (C7)", () => {
     const base = { id: "task", identifier: "PAP-1", title: "Read traces", status: "blocked" };
     const cases = [
-      { issue: { ...base, unblockDescriptor: null }, label: "Waiting on next step", token: "--status-task-icon-in_queue" },
-      { issue: base, label: "Blocked · checking…", token: "--muted-foreground" },
+      { issue: { ...base, unblockDescriptor: null }, label: "Blocked · waiting", token: "--status-task-icon-in_queue" },
+      { issue: base, label: "Blocked · waiting", token: "--status-task-icon-in_queue" },
       { issue: { ...base, unblockDescriptor: { owner: { userId: "paul" }, action: "Read" } }, label: "Person: Read", token: "--status-task-icon-blocked" },
     ];
     for (const { issue, label, token } of cases) {

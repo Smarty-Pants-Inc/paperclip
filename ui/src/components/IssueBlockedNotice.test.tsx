@@ -513,7 +513,7 @@ describe("IssueBlockedNotice", () => {
 
     const runningStep = node.querySelectorAll('[data-testid="issue-blocked-notice-steps"] a')[2];
     if (!runningStep) throw new Error("Expected a running live-work step.");
-    expect(runningStep.querySelector('svg[aria-label="In Progress status"]')).not.toBeNull();
+    expect(runningStep.querySelector('svg[aria-label="In Progress"]')).not.toBeNull();
     expect(node.querySelector('[data-testid="issue-blocked-notice-now-running"]')).toBeNull();
   });
 

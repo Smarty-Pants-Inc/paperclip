@@ -21,7 +21,7 @@ describe("task created chat card (BUG-07)", () => {
     })], "parent", "company", new Set());
     const html = renderToStaticMarkup(<TaskChatTaskCreatedCard item={item!} />);
     expect(html).toContain("var(--status-task-icon-in_queue)");
-    expect(html).toContain("Waiting on sub-task ONB-3");
+    expect(html).toContain("Blocked · waiting on sub-task ONB-3");
   });
 
   it("shows a waiting review as Idle, like the task pane", () => {

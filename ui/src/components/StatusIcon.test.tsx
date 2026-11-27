@@ -44,7 +44,7 @@ describe("StatusIcon", () => {
     expect(html).not.toContain("bg-cyan");
     expect(html).not.toContain("border-cyan");
     // The known wait still rides on the accessible label.
-    expect(html).toContain("Waiting on sub-task PAP-9");
+    expect(html).toContain("Blocked · waiting on sub-task PAP-9");
   });
 
   it("does not turn known non-person attention into a red task", () => {
@@ -64,7 +64,7 @@ describe("StatusIcon", () => {
         }}
       />,
     );
-    expect(html).toContain("Waiting on next step");
+    expect(html).toContain("Blocked · waiting on PAP-3541");
     // needs_attention alone is not proof of a human action.
     expect(html).not.toContain("var(--status-task-icon-blocked)");
     expect(html).toContain("var(--status-task-icon-in_queue)");
@@ -87,7 +87,7 @@ describe("StatusIcon", () => {
         }}
       />,
     );
-    expect(html).toContain("Waiting on review");
+    expect(html).toContain("Blocked · waiting on review");
   });
 
   it("uses an accessible native button for the icon-only picker trigger", () => {

@@ -10,6 +10,7 @@ import { RunsTab as ProductionRunsTab } from "./AgentDetail.production";
 import { ToastProvider } from "../context/ToastContext";
 import { PanelProvider } from "../context/PanelContext";
 import { pendingSendKeyFor, readPendingSend, writePendingSend } from "../lib/pending-send";
+import { queryKeys } from "../lib/queryKeys";
 
 const { get, cancel, grokStop, actor } = vi.hoisted(() => ({ get: vi.fn(), cancel: vi.fn(), grokStop: vi.fn(), actor: { id: "operator-1", source: "authenticated" } }));
 vi.mock("../api/heartbeats", async importOriginal => ({ heartbeatsApi: { ...(await importOriginal<typeof import("../api/heartbeats")>()).heartbeatsApi,
@@ -21,6 +22,32 @@ vi.mock("../context/SidebarContext", () => ({ useSidebar: () => ({ isMobile: fal
 vi.mock("../context/CompanyContext", () => ({ useCompany: () => ({ selectedCompanyId: "company-1", selectedCompany: { id: "company-1", issuePrefix: "TEST" }, companies: [] }) }));
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 afterEach(() => { get.mockReset(); cancel.mockReset(); grokStop.mockReset(); actor.id = "operator-1"; actor.source = "authenticated"; sessionStorage.clear(); vi.unstubAllGlobals(); });
+
+it("C10: Tasks touched does not invent a person from a sparse blocked response", async () => {
+  const run = { id: "run-1", companyId: "company-1", agentId: "agent-1", status: "succeeded",
+    createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z", invocationSource: "manual",
+    usageJson: null, resultJson: null, contextSnapshot: null, exitCode: 0, error: null,
+    logRef: null, startedAt: null, finishedAt: null,
+  } as unknown as HeartbeatRun;
+  get.mockResolvedValue(run);
+  for (const Tab of [RunsTab, ProductionRunsTab]) {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity, gcTime: 0 } } });
+    // Match activityApi.issuesForRun: issueId, not id; no descriptor or owner.
+    client.setQueryData(queryKeys.runIssues(run.id), [{ issueId: "task-1", identifier: "PAP-1", title: "Read traces", status: "blocked" }]);
+    const element = document.createElement("div"); document.body.append(element);
+    const root = createRoot(element);
+    try {
+      await act(async () => root.render(<QueryClientProvider client={client}><MemoryRouter><PanelProvider><ToastProvider>
+        <Tab runs={[run]} companyId="company-1" agentId="agent-1" agentRouteId="agent-1" selectedRunId={run.id} adapterType="paperclip_runner" adapterConfig={{}} />
+      </ToastProvider></PanelProvider></MemoryRouter></QueryClientProvider>));
+      const link = element.querySelector('a[href$="/issues/PAP-1"]');
+      expect(element.textContent).toContain("Tasks Touched (1)");
+      expect(link?.textContent).toContain("Blocked · waiting");
+      expect(link?.textContent).not.toContain("Person:");
+      expect(link?.querySelector<SVGElement>(".status-chip svg")?.style.color).toBe("var(--status-task-icon-in_queue)");
+    } finally { await act(async () => root.unmount()); client.clear(); element.remove(); }
+  }
+});
 
 const states = [
   { status: "failed", eligibility: true, label: "Stop" },
