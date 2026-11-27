@@ -1662,15 +1662,17 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   }, [comments, commentsById, requestCommentByRun]);
 
   const openingInputsByRun = useMemo(() => {
-    const inputs = new Map<string, { questionIds: Set<string>; atMs: number }>();
+    const inputs = new Map<string, { questionIds: Set<string>; atMs: number; placementMs: number }>();
     for (const run of runs) {
       const meta = linkedRunMetaById.get(run.id);
       const readMs = deliveryPointsByRun.get(run.id)?.opening?.atMs;
       // The first input is the stable opening position. A run can be admitted
       // before a later comment joins its starting input; admission is too early.
       // Older packs retain their original placement, never an ACK boundary.
+      const atMs = readMs && Number.isFinite(readMs) ? readMs : toMs(meta?.createdAt ?? run.createdAt);
       inputs.set(run.id, {
-        atMs: readMs && Number.isFinite(readMs) ? readMs : toMs(meta?.createdAt ?? run.createdAt),
+        atMs,
+        placementMs: atMs,
         questionIds: new Set([requestCommentByRun.get(run.id), ...(meta?.firstTurnCommentIds ?? [])]
           .filter((id): id is string => Boolean(id))),
       });
@@ -1680,8 +1682,15 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     for (const comment of comments) if (comment.consumedByRunId && !comment.steeredIntoRunId) {
       inputs.get(comment.consumedByRunId)?.questionIds.add(comment.id);
     }
+    // A retained session's first read (or admission) can predate this request.
+    // Bound only opening placement by every loaded starting input's send time;
+    // keep the read clock and all later session-read splits unchanged.
+    for (const input of inputs.values()) for (const id of input.questionIds) {
+      const comment = commentsById.get(id);
+      if (comment && !comment.deletedAt) input.placementMs = Math.max(input.placementMs, toMs(comment.createdAt));
+    }
     return inputs;
-  }, [runs, linkedRunMetaById, deliveryPointsByRun, requestCommentByRun, comments]);
+  }, [runs, linkedRunMetaById, deliveryPointsByRun, requestCommentByRun, comments, commentsById]);
 
   const { steeringAnchorsByRun, steeringAnchorByCommentId, steeringSlotsByRun, steeringSlotByQuestionId } = useMemo(() => {
     type Slot = { id: string; atMs: number | undefined; readMs: number; afterEventSeq?: number };
@@ -1804,7 +1813,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       const comment = commentsById.get(commentId);
       if (comment && (comment.deletedAt || comment.authorType !== "agent" || comment.presentation?.kind === "system_notice")) return;
       const run = linkedRunMetaById.get(runId) ?? runsById.get(runId);
-      const openingMs = openingInputsByRun.get(runId)?.atMs || toMs(run?.createdAt) ||
+      const openingMs = openingInputsByRun.get(runId)?.placementMs || toMs(run?.createdAt) ||
         toMs(commentsById.get(requestCommentByRun.get(runId) ?? "")?.createdAt) || 1;
       // A resumed turn replies below ALL its attributed inputs. The server
       // freezes the IDs, not their order (explicit answers can name them in
@@ -1978,8 +1987,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           : !isInput && comment.conversationAnchorAt
             ? toMs(comment.conversationAnchorAt)
             : toMs(comment.createdAt),
+        // A standalone opening reply can share its request's exact send time.
+        // Input wins that tie even when the saved reply has no sequence yet.
         order:
-          1 + Math.min(isInput ? 0 : comment.conversationAnchorSequence ?? 0, 999) / 1000,
+          1 + Math.min(isInput ? 0 : Math.max(comment.conversationAnchorSequence ?? 0,
+            replyPlacementByCommentId.get(comment.id)?.segmentIndex === 0 ? 1 : 0), 999) / 1000,
         id: comment.clientId ?? item.id,
         item,
       });
@@ -2704,7 +2716,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               summary: buildTurnSummary(entries, { durationMs, failed, personStopped: isUserStop(source.id) }),
             },
             anchorCommentId: null,
-            startMs: startedAtMs > 0 ? startedAtMs : Number.POSITIVE_INFINITY,
+            startMs: (sourceIsPaperclipRunner ? openingInputsByRun.get(source.id)?.placementMs : undefined) ||
+              (startedAtMs > 0 ? startedAtMs : Number.POSITIVE_INFINITY),
           });
           settledRunIds.add(source.id);
           if (acceptedSummary && !sourceHasPresentationComment) settledReplyRunIds.add(source.id);
@@ -2935,7 +2948,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         if (completedSegmentFinals[index]) answerStartIndex = index + 1;
         return startMs;
       });
-      const openingMs = openingInputsByRun.get(source.id)?.atMs || toMs(meta?.createdAt ?? source.createdAt) || segments[0]!.startMs;
+      const openingMs = openingInputsByRun.get(source.id)?.placementMs || toMs(meta?.createdAt ?? source.createdAt) || segments[0]!.startMs;
       for (const [segmentIndex, projected] of projectedSegments.entries()) {
         const { segment, parsed } = projected;
         const questionSlot = steeringSlotsByRun.get(source.id)?.[segmentIndex - 1];
@@ -3034,10 +3047,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               personStopped,
             }),
           },
-          // Native turns always use durable chronology, never adjacency to a
-          // request: a continuation can reuse that id while an intervening card
-          // is still in flight. Admission and the card's own time order them
-          // identically live and after reload, without a mount-local anchor.
+          // Keep durable chronology, not adjacency: opening placement is bounded
+          // by its loaded request, while later segments retain their read slots.
+          // A continuation may reuse the request with an intervening card.
           anchorCommentId: segmented ? null : (lastCommentIdByRun.get(source.id) ?? null),
           // Provider startup must not move an admitted slot past newer input.
           // Later slots follow the question's send, independently of late ACKs.

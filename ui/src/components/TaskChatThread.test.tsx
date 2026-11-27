@@ -1878,6 +1878,100 @@ describe("TaskChatThread draft pass-through", () => {
   });
 });
 
+describe("request-comment anchor", () => {
+  const runId = "long-task-opening";
+  const at = (second: number) => `2026-11-27T06:39:${String(second).padStart(2, "0")}.000Z`;
+  const comment = (id: string, body: string, second: number) => ({
+    id, body, companyId: "company", issueId: "issue", authorType: "user" as const,
+    authorUserId: "board", authorAgentId: null, presentation: null, metadata: null,
+    createdAt: new Date(at(second)), updatedAt: new Date(at(second)),
+  });
+  const request = comment("request", "/new", 10);
+  const next = comment("next", "Reply with the single word HERON and nothing else.", 30);
+  const reply = { ...comment("reply", "Ready for your next request.", 20), authorType: "agent" as const,
+    authorUserId: null, authorAgentId: "agent", runId, createdByRunId: runId,
+    clientRequestId: `native-final:${runId}:answer` };
+  const run = { runId, runtimeMode: "native" as const, adapterType: "paperclip_runner", status: "succeeded",
+    agentId: "agent", agentName: "Agent", createdAt: at(0), startedAt: at(0), finishedAt: at(20),
+    resultJson: { continuousReplies: { answer: { commentId: reply.id, questionCommentIds: [request.id] } } } };
+  const requestedRun = { ...run, wakeCommentId: request.id };
+  const entries = (readAt: number, source: string, versionAt = 20) => [
+    { kind: "system", text: "", ts: at(readAt), steeringEvent: { kind: "input", turnId: "turn" } },
+    { kind: "assistant", text: `${source} activity.`, channel: "progress", ts: at(15), itemId: "progress" },
+    { kind: "assistant", text: reply.body, channel: "final", ts: at(20), itemId: "answer",
+      contentVersion: { at: at(versionAt), completed: true } },
+  ];
+  const assertOrder = () => {
+    const text = container.textContent ?? "";
+    expect(text.split(reply.body)).toHaveLength(2);
+    expect(text.indexOf(reply.body)).toBeGreaterThan(text.indexOf(request.body));
+    expect(text.indexOf(reply.body)).toBeLessThan(text.indexOf(next.body));
+  };
+  // Keep reason: a reply is drawn after the request it answered, after a full-history first turn.
+  it.each(["wake", "context", "first-turn", "consumed"] as const)(
+    "keeps opening output after its loaded %s comment across a native-to-log reload", async provenance => {
+      const linked = { ...run, ...(provenance === "wake" ? { wakeCommentId: request.id }
+        : provenance === "context" ? { contextCommentId: request.id }
+        : provenance === "first-turn" ? { firstTurnCommentIds: [request.id] } : {}) };
+      const props = { issueId: "issue", currentUserId: "board", onAdd: async () => {}, linkedRuns: [linked],
+        comments: [{ ...request, ...(provenance === "consumed" ? { consumedByRunId: runId } : {}) }, reply, next] };
+      nativeTranscriptState.hydratedRunIds = new Set([runId]);
+      nativeTranscriptState.transcriptByRun.set(runId, entries(1, "Native"));
+      render(<TaskChatThread {...props} />);
+      await settleThreadLayout();
+      expect(container.textContent).toContain("Native activity.");
+      assertOrder();
+
+      // A fresh mount must use the fresher other durable source, not retained paint.
+      render(<div />);
+      transcriptState.transcriptByRun.set(runId, entries(2, "Log", 21));
+      render(<TaskChatThread {...props} />);
+      await settleThreadLayout();
+      expect(container.textContent).toContain("Log activity.");
+      expect(container.textContent).not.toContain("Native activity.");
+      assertOrder();
+    },
+  );
+  it.each([false, true])("keeps a saved opening reply after its request without authored output (read=%s)", async hasRead => {
+    nativeTranscriptState.hydratedRunIds = new Set([runId]);
+    nativeTranscriptState.transcriptByRun.set(runId, hasRead ? entries(1, "Native").slice(0, 1) : []);
+    render(<TaskChatThread issueId="issue" onAdd={async () => {}} comments={[request, reply, next]}
+      linkedRuns={[requestedRun]} />);
+    await settleThreadLayout();
+    assertOrder();
+  });
+  it.each([undefined, 0])("keeps a standalone saved reply after its request at an equal slot time (sequence=%s)", async sequence => {
+    nativeTranscriptState.hydratedRunIds = new Set([runId]);
+    nativeTranscriptState.terminalHydratedRunIds = new Set();
+    render(<TaskChatThread issueId="issue" onAdd={async () => {}}
+      comments={[request, { ...reply, conversationAnchorSequence: sequence }, next]} linkedRuns={[requestedRun]} />);
+    await settleThreadLayout();
+    expect(container.querySelector('[data-thread-anchor="reply"]')).not.toBeNull();
+    assertOrder();
+  });
+  it("uses the latest loaded starting input, not the order of its first-turn IDs", async () => {
+    nativeTranscriptState.hydratedRunIds = new Set([runId]);
+    nativeTranscriptState.transcriptByRun.set(runId, entries(1, "Native"));
+    const folded = comment("folded", "Include this in the starting request.", 12);
+    render(<TaskChatThread issueId="issue" onAdd={async () => {}} comments={[request, folded, reply, next]}
+      linkedRuns={[{ ...requestedRun, firstTurnCommentIds: [folded.id, request.id] }]} />);
+    await settleThreadLayout();
+    assertOrder();
+    expect(container.textContent!.indexOf(reply.body)).toBeGreaterThan(container.textContent!.indexOf(folded.body));
+  });
+  it.each([false, true])("retains a later real opening-read slot (request loaded=%s)", async loaded => {
+    nativeTranscriptState.hydratedRunIds = new Set([runId]);
+    nativeTranscriptState.transcriptByRun.set(runId, entries(15, "Native"));
+    const intervening = comment("intervening", "An unrelated message before the actual read.", 12);
+    render(<TaskChatThread issueId="issue" onAdd={async () => {}}
+      comments={[...(loaded ? [request] : []), intervening, reply, next]}
+      linkedRuns={[requestedRun]} />);
+    await settleThreadLayout();
+    expect(container.textContent!.indexOf(reply.body)).toBeGreaterThan(container.textContent!.indexOf(intervening.body));
+    expect(container.textContent!.indexOf(reply.body)).toBeLessThan(container.textContent!.indexOf(next.body));
+  });
+});
+
 describe("TaskChatThread runtime transcript selection", () => {
   it.each(["queued", "running"])("retains the live log transport for a %s native run with event history", (status) => {
     nativeTranscriptState.hydratedRunIds = new Set(["native-run"]);
