@@ -57,6 +57,9 @@ import { buildNativeExecutionInput } from "../services/native-runtime/native-exe
 import { buildNativeExecutionWithCheckpoint, nativeToolContractFingerprintForTarget } from "../services/native-runtime/native-session-resume.js";
 import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
 import { requestTaskRetry } from "../services/task-retry.js";
+import { assertNativeRetainedSandboxBinding } from "../services/native-runtime/native-controller-recovery.js";
+import { prepareNativeHeartbeatRun } from "../services/native-runtime/prepare-native-run.js";
+import * as finalizerDb from "@paperclipai/db";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import * as environmentOrchestrator from "../services/environment-run-orchestrator.js";
 import { createPluginWorkspaceFixture } from "./helpers/plugin-workspaces.js";
@@ -262,9 +265,9 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
   });
 
   it.each([
-    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", fresh: true, org: "example-org", chat: false },
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding:binding_lost", fresh: true, org: "example-org", chat: false },
     { failure: "ordinary provider failure", fresh: false, org: "second-org", chat: false },
-    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", fresh: false, org: "second-org", chat: true },
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding:binding_lost", fresh: false, org: "second-org", chat: true },
   ])("a person's validated continuous-Pi Retry: $org, chat=$chat, fresh=$fresh", async ({ failure, fresh, org, chat }) => {
     const f = await seed(), sessionId = randomUUID();
     await db.update(companies).set({ name: org }).where(eq(companies.id, f.companyId));
@@ -295,7 +298,12 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     { failure: "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; warm_recovery_refused=current_run_not_admitted", chat: false, fresh: false },
     { failure: "native_controller_recovery_unsupported:metadata_format", chat: false, fresh: false },
     { failure: "native_continuation_requires_reconciliation", chat: false, fresh: false },
-    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", chat: false, fresh: true },
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding:binding_lost", chat: false, fresh: true },
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", chat: false, fresh: false },
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding:finalizer_unsettled", chat: false, fresh: false },
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding:lease_unsettled", chat: false, fresh: false },
+    { failure: new NativeProviderStateIncompatibleError("workspace_continuation_source_unavailable").message,
+      errorCode: "native_provider_state_incompatible", chat: false, fresh: false },
     { failure: "workspace_continuation_source_missing", errorCode: "native_provider_state_incompatible", chat: false, fresh: true },
     { failure: "current_run_not_admitted", chat: false, fresh: false },
   ].flatMap(row => [true, false].flatMap(reconciled => [true, false].map(enabled => ({
@@ -343,6 +351,43 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     } finally { registerServerAdapter(adapter); }
   });
 
+  it.each([false, true])("AUTO-FRESH-FINALIZER: the same retained binding clears without replacing its session, enabled=%s", async enabled => {
+    const { nativeRunFinalizations, nativeRunResults, environmentLeases } = finalizerDb;
+    await instanceSettingsService(db).updateExperimental({ autoFreshSessionOnRecovery: enabled });
+    const f = await seed(), sessionId = randomUUID(), environmentId = randomUUID();
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", fixtureSessionId: sessionId } })
+      .where(eq(agents.id, f.agentId));
+    await execute(f);
+    const [source] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      nativeIssueId: f.issueId, nativeSessionId: sessionId, status: "running", runtimeMode: "native" }).returning();
+    await prepareNativeHeartbeatRun({ db, run: source, issue: { id: f.issueId, title: "Retained finalizer", description: null }, environmentLeaseId: randomUUID() });
+    const [prepared] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, source.id));
+    const [result] = await db.insert(nativeRunResults).values({ companyId: f.companyId, issueId: f.issueId, runId: source.id,
+      completionContractId: prepared.completionContractId!, serverFingerprint: "finalizer-fixture", schemaStatus: "accepted",
+      resultJson: {}, canonicalSha256: "finalizer-fixture" }).returning();
+    await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: source.id,
+      phase: "workspace_finalizing", resultId: result.id, leaseOwner: "expired-finalizer", leaseExpiresAt: new Date(Date.now() - 1_000) });
+    await db.insert(environments).values({ id: environmentId, name: `Retained finalizer ${environmentId}`, driver: "sandbox" });
+    await db.insert(environmentLeases).values({ companyId: f.companyId, issueId: f.issueId, environmentId,
+      heartbeatRunId: source.id, provider: "daytona", providerLeaseId: "same-retained-box", status: "released", metadata: { remoteCwd: "/workspace" } });
+    const binding = { companyId: f.companyId, issueId: f.issueId, runId: source.id,
+      target: { kind: "remote", transport: "sandbox", environmentId, leaseId: randomUUID(), providerKey: "daytona",
+        remoteCwd: "/workspace", sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "same-retained-box" } } as const };
+    const refusal = await assertNativeRetainedSandboxBinding(db, binding).then(() => null, error => error as Error);
+    expect(refusal?.message).toBe("native_controller_recovery_missing_evidence:retained_sandbox_binding:finalizer_unsettled");
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(), error: refusal!.message, errorCode: "adapter_failed" })
+      .where(eq(heartbeatRuns.id, source.id));
+    const next = await execute(f, { forceFreshSession: true, wakeReason: "issue_recovery_action_restored" });
+    expect(next.input.runtime.sessionId).toBe(sessionId);
+    expect(next.finished.contextSnapshot?.warmRecoveryFreshSession).toBeUndefined();
+    expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: { reset: false } } });
+    await db.update(nativeRunFinalizations).set({ phase: "committed", leaseOwner: null, leaseExpiresAt: null })
+      .where(eq(nativeRunFinalizations.runId, source.id));
+    await expect(assertNativeRetainedSandboxBinding(db, binding)).resolves.toEqual({ remoteCwd: "/workspace" });
+    process.stdout.write(`AUTO-FRESH-FINALIZER ${JSON.stringify({ enabled, sourceRunId: source.id, recoveryRunId: next.finished.id,
+      savedSessionId: sessionId, resumes: next.input.runtime.sessionId, refusal: refusal!.message, sameBindingAfterSettlement: true })}\n`);
+  });
+
   it.each([false, true])("AUTO-FRESH-SWITCH / CHB1: gate-7 recovery with autoFreshSessionOnRecovery=%s", async enabled => {
     await instanceSettingsService(db).updateExperimental({ autoFreshSessionOnRecovery: enabled });
     const type = `${adapterType}_${randomUUID()}`, adapter = getServerAdapter(adapterType);
@@ -357,7 +402,7 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       registerServerAdapter({ ...adapter, type, execute: async input => {
         const result = await adapter.execute(input), sessionId = input.runtime.sessionId ?? s1;
         return { ...result, exitCode: 1, sessionId, sessionParams: { sessionId },
-          errorMessage: "native_controller_recovery_missing_evidence:retained_sandbox_binding" };
+          errorMessage: "native_controller_recovery_missing_evidence:retained_sandbox_binding:binding_lost" };
       } });
       let previous = (await execute(f, {}, "failed", service)).finished.id;
       const resumes: unknown[] = [], runs: string[] = [];
@@ -416,7 +461,7 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     const [saved] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId));
     const [refused] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
       nativeSessionId: oldSession, nativeIssueId: f.issueId, status: "failed", finishedAt: new Date(),
-      error: "native_controller_recovery_missing_evidence:retained_sandbox_binding", errorCode: "adapter_failed", contextSnapshot: { issueId: f.issueId } }).returning();
+      error: "native_controller_recovery_missing_evidence:retained_sandbox_binding:binding_lost", errorCode: "adapter_failed", contextSnapshot: { issueId: f.issueId } }).returning();
     const recover = async (sourceRunId: string, expectedStatus = "succeeded") => {
       signal.throwIfAborted();
       const actionId = randomUUID();
@@ -476,7 +521,7 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       expect(progress.input.runtime.sessionId).toBeNull();
       const [newRefusal] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
         nativeSessionId: progress.finished.sessionIdAfter, nativeIssueId: f.issueId, status: "failed", finishedAt: new Date(),
-        error: "native_controller_recovery_missing_evidence:retained_sandbox_binding", errorCode: "adapter_failed", contextSnapshot: { issueId: f.issueId } }).returning();
+        error: "native_controller_recovery_missing_evidence:retained_sandbox_binding:binding_lost", errorCode: "adapter_failed", contextSnapshot: { issueId: f.issueId } }).returning();
       const newIncident = await recover(newRefusal.id);
       expect(newIncident.input.runtime.sessionId).toBeNull();
     } finally {
@@ -613,7 +658,7 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
         const result = await adapter.execute(input);
         const sessionId = input.runtime.sessionId ?? freshSession;
         return { ...result, exitCode: 1, sessionId, sessionParams: { sessionId },
-          errorMessage: "native_controller_recovery_missing_evidence:retained_sandbox_binding" };
+          errorMessage: "native_controller_recovery_missing_evidence:retained_sandbox_binding:binding_lost" };
       } });
       if (decision === "stock reset") await db.update(agents).set({ adapterConfig: { ...config, fixtureOption: "changed" } })
         .where(eq(agents.id, f.agentId));
@@ -649,7 +694,7 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
   }, 30_000);
 
   it.each([
-    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", fresh: true },
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding:binding_lost", fresh: true },
     { failure: "ordinary provider failure", fresh: false },
     { failure: "remote_warm_session_not_idle", fresh: false },
   ])("task HTTP Retry matches the notice on continuous Pi: $failure, fresh=$fresh", async ({ failure, fresh }) => {
@@ -741,7 +786,7 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     const f = await recoveryNoticeFixture(), sessionId = randomUUID(), laterId = randomUUID();
     const authorizedStart = started && authority !== "wrong credential run" && authority !== "none";
     const [later] = await db.insert(heartbeatRuns).values({ id: laterId, companyId: f.companyId, agentId: f.agentId,
-      issueId: f.issueId, nativeSessionId: sessionId, status: "failed", error: "native_controller_recovery_missing_evidence:retained_sandbox_binding",
+      issueId: f.issueId, nativeSessionId: sessionId, status: "failed", error: "native_controller_recovery_missing_evidence:retained_sandbox_binding:binding_lost",
       contextSnapshot: { issueId: f.issueId, ...(authority === "Retry" ? { explicitFreshSession: true } : {}) },
       resultJson: { configFreshness: { session: { reset: authority === "reset",
         ...(authority.includes("credential") ? { credentialIdentityResetRunId: authority === "credential" ? laterId : randomUUID() } : {}),

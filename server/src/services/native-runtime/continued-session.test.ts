@@ -25,11 +25,22 @@ it("projects the continuous Pi open-turn default while preserving configured ove
   expect(configured).toEqual({ CUSTOM_VALUE: "kept" });
 });
 
-it("recognizes only an unrecoverable session's code or retained-binding refusal", () => {
-  expect(sessionCannotContinue({ errorCode: "native_provider_state_incompatible" })).toBe(true);
-  expect(sessionCannotContinue({ error: "native_controller_recovery_missing_evidence:retained_sandbox_binding" })).toBe(true);
-  expect(sessionCannotContinue({ error: "native_session_interrupted: x; exact checkpoint resume refused: native_controller_recovery_missing_evidence:retained_sandbox_binding",
-    resultJson: { nativeExactResumeRefusal: { refusal: "native_controller_recovery_missing_evidence:retained_sandbox_binding" } } })).toBe(true);
+it("recognizes lost evidence but retains ambiguous, finalizing and temporarily unavailable sessions", () => {
+  const binding = "native_controller_recovery_missing_evidence:retained_sandbox_binding";
+  expect(sessionCannotContinue({ errorCode: "native_provider_state_incompatible" })).toBe(false);
+  expect(sessionCannotContinue({ errorCode: "native_provider_state_incompatible", error: "workspace_continuation_source_missing" })).toBe(true);
+  for (const error of ["workspace_continuation_source_unavailable", "native_session_recovery_failed: workspace_continuation_source_unavailable"]) {
+    expect(sessionCannotContinue({ errorCode: "native_provider_state_incompatible", error })).toBe(false);
+  }
+  for (const error of [binding, `${binding}:finalizer_unsettled`, `${binding}:lease_unsettled`]) {
+    expect(sessionCannotContinue({ error })).toBe(false);
+    expect(isWarmRecoveryRefusal({ status: "failed", error })).toBe(true);
+  }
+  expect(sessionCannotContinue({ error: `${binding}:binding_lost` })).toBe(true);
+  expect(sessionCannotContinue({ error: `native_session_interrupted: x; exact checkpoint resume refused: ${binding}`,
+    resultJson: { nativeExactResumeRefusal: { refusal: `${binding}:binding_lost` } } })).toBe(true);
+  expect(sessionCannotContinue({ errorCode: "native_provider_state_incompatible", error: "workspace_continuation_source_missing",
+    resultJson: { nativeExactResumeRefusal: { refusal: "native_session_recovery_failed: workspace_continuation_source_unavailable" } } })).toBe(false);
   expect(sessionCannotContinue({ errorCode: "adapter_failed", error: "ordinary provider failure" })).toBe(false);
   expect(sessionCannotContinue({ errorCode: "adapter_failed", error: "expected native_controller_recovery_missing_evidence:retained_sandbox_binding" })).toBe(false);
 });

@@ -22559,6 +22559,38 @@ describe("runnerd provider runtime wiring", () => {
     );
   });
 
+  it("AUTO-FRESH-UNAVAILABLE: a transient source read retains the same Pi session and transcript", async () => {
+    const prior = { ...scopedNativeExecution("source-read-unavailable"), provider: { kind: "pi_rpc" as const, model: "provider/model" } };
+    prior.session = { ...prior.session, driverKind: "pi_rpc" };
+    const current: NativeExecutionInput = { ...prior, binding: { ...prior.binding, runId: "run-workspace-next", executionWorkspaceId: "workspace-Y" }, workspace: { ...prior.workspace, cwd: "/workspace-Y" } };
+    const root = await initializeScopedRunnerRoot(prior, "workspace-runner");
+    const identity = { runId: prior.binding.runId, normalizedSessionId: prior.session.normalizedSessionId, runnerInstanceId: "workspace-runner", environmentLeaseId: "workspace-lease" };
+    await mkdir(join(root, "control-plane"), { recursive: true }); await mkdir(join(root, "runner"), { recursive: true });
+    await writeFile(join(root, "control-plane/control-plane-state.json"), JSON.stringify(durableControlPlaneState(identity)));
+    await writeFile(join(root, "runner/runner-state.json"), JSON.stringify(durableRunnerState(identity, "suspended")));
+    await writeFile(join(root, "retained-transcript"), "prior answer\n");
+    const reader = priorNativeRunDb(prior);
+    const input = { db: { select: (fields: Record<string, unknown>) => {
+      if (fields?.status === heartbeatRuns.status && fields?.runnerProfileJson === heartbeatRuns.runnerProfileJson) {
+        throw new Error("controlled transient source read");
+      }
+      return reader.select(fields as never);
+    } } as unknown as Db,
+      execution: current, runnerInstanceId: "next-runner", sessionContinuity: "continuous" as const, workspaceContinuationSource: prior };
+    const failure = await createRunnerdBackend(input).then(() => { throw new Error("expected the source read to fail closed"); },
+      error => error as Error & { code: string });
+    expect(failure).toMatchObject({ code: "native_provider_state_incompatible", message: "native_session_recovery_failed: workspace_continuation_source_unavailable" });
+    const { sessionCannotContinue } = await import("./continued-session.js");
+    expect(sessionCannotContinue({ errorCode: failure.code, error: failure.message })).toBe(false);
+    input.db = priorNativeRunDb(prior);
+    await createRunnerdBackend(input); state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+    const target = state.createTransport.mock.calls.at(-1)![0].stateDirectory!;
+    expect(await readFile(join(target, "retained-transcript"), "utf8")).toBe("prior answer\n");
+    expect(current.session.normalizedSessionId).toBe(prior.session.normalizedSessionId);
+    expect(existsSync(root)).toBe(false);
+    console.log("AUTO-FRESH-UNAVAILABLE", JSON.stringify({ code: failure.code, message: failure.message, sessionId: current.session.normalizedSessionId, transcript: "prior answer\n" }));
+  });
+
   it.each(["continuous", "model-level-change", "paperclip", "unverified", "missing", "unreadable"] as const)("workspace root rename admits only its recorded Pi source: %s", async mode => {
     const prior = { ...scopedNativeExecution(`workspace-${mode}`), provider: { kind: "pi_rpc" as const, model: "provider/model" } };
     prior.session = { ...prior.session, driverKind: "pi_rpc" };
