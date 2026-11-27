@@ -4449,7 +4449,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                           bottomBlockerLinks ? (
                             <>
                               {!tailSegmentSettled && !recoveryOwnsStatus && (tailRunId || (optimisticRunnerStartup && !requestHasTurnSlot)) ? (
-                                <div key={tailRunId ? requestCommentByRun.get(tailRunId) ?? tailRunId : latestUserComment?.id} data-testid="task-chat-live-transcript">
+                                <div data-testid="task-chat-live-transcript">
                                   <TaskChatShimmerScope items={tailItems}>
                                   <TaskChatRunnerHeader
                                     runId={tailRunId}
@@ -4533,7 +4533,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                   </TaskChatShimmerScope>
                                 </div>
                               ) : null}
-                              {requestPending && !optimisticRunnerStartup && !recoveryOwnsStatus && !requestHasTurnSlot ? <div key={latestUserComment?.id} data-testid="task-chat-live-transcript">
+                              {requestPending && !optimisticRunnerStartup && !recoveryOwnsStatus && !requestHasTurnSlot ? <div data-testid="task-chat-live-transcript">
                                 <TaskChatShimmerScope items={[]}><TaskChatRunnerHeader status="queued" startedAtMs={null}
                                   agentName={tailAgent?.name} agent={tailAgent} working={requestWorking} preparationLabel={requestLabel} /></TaskChatShimmerScope>
                               </div> : null}
