@@ -492,6 +492,30 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
     this.#assertActive(options);
     const pendingObservation = this.#deferredEventObservers.get(observerKey);
     const persisted = await appendHeartbeatRunEvent(this.#db, input);
+    if (event.eventType === "usage.reported" && event.sourceKind === "runner"
+      && event.payload.provider === "pi_rpc" && typeof event.payload.model === "string" && event.payload.model.trim()) {
+      // Pi's upgraded proxy puts only message_end.responseModel in params.model.
+      // Other providers can synthesize a usage model from launch config (Codex
+      // reconciliation does); never treat those or a session descriptor as proof.
+      // The receipt is durable first. Repair even a duplicate before acknowledging
+      // it: a crash/failure between these writes must be recoverable on replay.
+      // Source order wins within a source, even if receipt/projection order
+      // differs. Across sources use receipt order. Absence never clears a report.
+      const report = { name: event.payload.model, sourceInstanceId: event.sourceInstanceId,
+        sourceSeq: event.sourceSeq, eventSeq: persisted.row.seq };
+      this.#assertActive(options);
+      await this.#db.update(heartbeatRuns).set({
+        runnerProfileJson: sql`jsonb_set(coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb),
+          '{providerResponseModel}', ${JSON.stringify(report)}::jsonb)`,
+      }).where(and(
+        eq(heartbeatRuns.id, this.#binding.runId),
+        eq(heartbeatRuns.companyId, this.#binding.companyId),
+        eq(heartbeatRuns.agentId, this.#binding.agentId),
+        sql`case when ${heartbeatRuns.runnerProfileJson} #>> '{providerResponseModel,sourceInstanceId}' = ${event.sourceInstanceId}
+          then coalesce((${heartbeatRuns.runnerProfileJson} #>> '{providerResponseModel,sourceSeq}')::bigint, -1) < ${event.sourceSeq}::bigint
+          else coalesce((${heartbeatRuns.runnerProfileJson} #>> '{providerResponseModel,eventSeq}')::bigint, -1) < ${persisted.row.seq}::bigint end`,
+      ));
+    }
     if (event.eventType === "session.started" && persisted.disposition === "committed") {
       try {
         let publication: ActivityPublication | null = null;

@@ -817,6 +817,7 @@ describe("IssueChatThread system notice routing", () => {
         {
           id: "run-live",
           status: "running",
+          runModel: null,
           invocationSource: "wakeup",
           triggerDetail: null,
           startedAt: "2026-05-04T17:05:00.000Z",

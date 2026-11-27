@@ -377,6 +377,7 @@ const liveRuns: LiveRunForIssue[] = [
   {
     id: "run-agent-management-live",
     status: "running",
+    runModel: null,
     invocationSource: "assignment",
     triggerDetail: "issue_assigned",
     startedAt: recent(8).toISOString(),
@@ -395,6 +396,7 @@ const liveRuns: LiveRunForIssue[] = [
   {
     id: "run-agent-management-queued",
     status: "queued",
+    runModel: null,
     invocationSource: "on_demand",
     triggerDetail: "manual",
     startedAt: null,
@@ -413,6 +415,7 @@ const liveRuns: LiveRunForIssue[] = [
   {
     id: "run-agent-management-succeeded",
     status: "succeeded",
+    runModel: null,
     invocationSource: "timer",
     triggerDetail: "scheduler",
     startedAt: recent(48).toISOString(),
@@ -431,6 +434,7 @@ const liveRuns: LiveRunForIssue[] = [
   {
     id: "run-agent-management-failed",
     status: "failed",
+    runModel: null,
     invocationSource: "automation",
     triggerDetail: "routine",
     startedAt: recent(76).toISOString(),

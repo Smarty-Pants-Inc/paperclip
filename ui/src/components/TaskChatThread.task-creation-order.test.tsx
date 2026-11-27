@@ -227,7 +227,7 @@ describe("Coordinator task creation ordering", () => {
   it("omits passive cards from a tray chat's live tail and restores each once after settling", async () => {
     state.handoffs = [handoff(), { ...handoff("suggested-task"), suggestionInteractionId: "suggestion" }];
     const live: LiveRunForIssue = { id: "source-run", agentId: "agent", agentName: "Assistant", adapterType: "paperclip_runner",
-      runtimeMode: "native", status: "running", invocationSource: "on_demand", triggerDetail: null,
+      runModel: null, runtimeMode: "native", status: "running", invocationSource: "on_demand", triggerDetail: null,
       createdAt: at(0), startedAt: at(0), finishedAt: null };
     await paint({ comments: [], interactions: [suggestion("accepted")], linkedRuns: [{ ...sourceRun, status: "running", finishedAt: null }], liveRuns: [live] });
     expect(host.querySelector('[data-thread-anchor="chat_handoff:task"]')).toBeNull();

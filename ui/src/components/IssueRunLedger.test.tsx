@@ -125,6 +125,7 @@ function createActiveRun(overrides: Partial<ActiveRunForIssue> = {}): ActiveRunF
   return {
     id: "run-live-1",
     status: "running",
+    runModel: null,
     invocationSource: "assignment",
     triggerDetail: null,
     startedAt: "2026-04-18T19:58:00.000Z",

@@ -69,6 +69,7 @@ function createRun(index: number) {
   return {
     id: `run-${index}`,
     status: "running",
+    runModel: null,
     invocationSource: "assignment",
     triggerDetail: null,
     startedAt: "2026-04-24T12:00:00.000Z",

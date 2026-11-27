@@ -58,6 +58,7 @@ export function LiveRunWidget({ issueId, companyId }: LiveRunWidgetProps) {
       deduped.set(activeRun.id, {
         id: activeRun.id,
         status: activeRun.status,
+        runModel: activeRun.runModel,
         invocationSource: activeRun.invocationSource,
         triggerDetail: activeRun.triggerDetail,
         startedAt: toIsoString(activeRun.startedAt),

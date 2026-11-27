@@ -1,5 +1,6 @@
 import { notifyExternalConversationSettlement } from "../external-conversation-settlement-notifications.js";
 import { preservedAccountRuntimeState } from "../agent-provider-rate-limits.js";
+import { runModelColumn } from "./run-model.js";
 import { readRuntimeAccountingTotals } from "../runtime-accounting-totals.js";
 import { conversationEventCondition, conversationEventColumns } from "./conversation-events.js";
 import { deriveTaskKey } from "./run-preparation.js";
@@ -386,6 +387,7 @@ const heartbeatRunIssueControlColumns = {
 const heartbeatRunIssueSummaryColumns = {
   id: heartbeatRuns.id,
   runtimeMode: heartbeatRuns.runtimeMode,
+  runModel: runModelColumn,
   wakeupRequestId: heartbeatRuns.wakeupRequestId,
   queuedCommentSourceWakeIds: sql<string[] | null>`${heartbeatRuns.contextSnapshot} -> 'queuedCommentSourceWakeIds'`.as("queuedCommentSourceWakeIds"),
   status: heartbeatRuns.status,
