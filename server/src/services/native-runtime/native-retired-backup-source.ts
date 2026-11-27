@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
 import { and, eq, gt, inArray, ne, notInArray, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
-import { retiredReusableLeasePredecessors } from "../environment-lease-handoff.js";
+import { retiredReusableLeasePredecessors, reusableLeaseHistoryWithDeletedTaskBindings } from "../environment-lease-handoff.js";
 import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js";
 import { hasConfirmedSandboxStopAndRetain } from "../sandbox-stop-and-retain.js";
 import { LEGACY_WORKSPACE_RECOVERY_KEY, LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "../workspace-restore-recovery-state.js";
-import { readNativeHarnessBackupStamp } from "./native-harness-backup-stamp.js";
+import { nativeHarnessBackupEventCursors, readNativeHarnessBackupStamp, type NativeHarnessBackupStamp } from "./native-harness-backup-stamp.js";
 import { nativeWorkspaceExportPendingForLease, nativeWorkspaceExportPendingForResource } from "./native-workspace-finalization-state.js";
 
 /** Durable run events that prove a provider session did work in a run. */
@@ -18,6 +18,35 @@ export const NATIVE_PROVIDER_DURABLE_EVENT_TYPES = new Set([
   "provider.event",
   "provider.rpc_result",
 ]);
+
+/** Per-run event seq is causal; server timestamps can tie or move backwards. */
+export async function readNativeProviderEventCursors(db: Db, companyId: string, sessionId: string,
+  scope: { excludeRunId?: string; runId?: string } = {}): Promise<Array<{ runId: string; seq: number }>> {
+  const events = await db.select({ runId: heartbeatRunEvents.runId, seq: heartbeatRunEvents.seq })
+    .from(heartbeatRunEvents).leftJoin(heartbeatRuns, eq(heartbeatRuns.id, heartbeatRunEvents.runId))
+    .where(and(eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRuns.companyId, companyId),
+      eq(heartbeatRuns.nativeSessionId, sessionId),
+      scope.excludeRunId ? ne(heartbeatRuns.id, scope.excludeRunId) : undefined,
+      scope.runId ? eq(heartbeatRuns.id, scope.runId) : undefined,
+      inArray(heartbeatRunEvents.eventType, [...NATIVE_PROVIDER_DURABLE_EVENT_TYPES])));
+  const cursors = new Map<string, number>();
+  for (const event of events) {
+    if (typeof event.runId !== "string" || !Number.isSafeInteger(event.seq) || event.seq < 0) {
+      throw new Error("native_harness_backup_event_cursor_invalid");
+    }
+    cursors.set(event.runId, Math.max(cursors.get(event.runId) ?? -1, event.seq));
+  }
+  return [...cursors].map(([runId, seq]) => ({ runId, seq }));
+}
+
+export async function nativeHarnessBackupCoversProviderEvents(db: Db, input: {
+  companyId: string; sessionId: string; currentRunId?: string; stamp: NativeHarnessBackupStamp;
+}): Promise<boolean> {
+  const latest = await readNativeProviderEventCursors(db, input.companyId, input.sessionId, { excludeRunId: input.currentRunId });
+  if (!latest.length) return true;
+  const covered = nativeHarnessBackupEventCursors(input.stamp);
+  return covered != null && latest.every(event => event.seq <= (covered.get(event.runId) ?? -1));
+}
 
 export function nativeHarnessBackupManifestSha256(manifestBytes: Buffer | string): string {
   return `sha256:${createHash("sha256").update(manifestBytes).digest("hex")}`;
@@ -58,10 +87,7 @@ export async function retiredSourceAuthorizesNativeBackupRestore(db: Db, input: 
 }): Promise<boolean> {
   if (!input.manifest.sourceProviderLeaseId || input.manifest.normalizedSessionId !== input.normalizedSessionId
     || input.manifest.sourceProviderLeaseId === input.targetProviderLeaseId) return false;
-  const leases = await db.select().from(environmentLeases).where(and(
-    eq(environmentLeases.companyId, input.companyId),
-    eq(environmentLeases.providerLeaseId, input.manifest.sourceProviderLeaseId),
-  ));
+  const leases = await reusableLeaseHistoryWithDeletedTaskBindings(db, input.companyId, input.manifest.sourceProviderLeaseId);
   const source = leases.filter(lease => lease.companyId === input.companyId
     && lease.providerLeaseId === input.manifest.sourceProviderLeaseId);
   const tips = source.filter(lease => !Object.hasOwn(lease.metadata ?? {}, "reusableLeaseSuccessor"));
@@ -77,26 +103,55 @@ export async function retiredSourceAuthorizesNativeBackupRestore(db: Db, input: 
     )).limit(1)).length;
   const destroyed = ["expired", "failed"].includes(lease.status) && hasRemoteTerminationReceipt(lease)
     && termination?.state === "destroyed";
-  const stamp = readNativeHarnessBackupStamp(lease.metadata?.nativeHarnessBackup, lease.providerLeaseId!);
-  if (!stamp || stamp.manifestSha256 !== input.manifestSha256
-    || stamp.normalizedSessionId !== input.normalizedSessionId
-    || stamp.runnerInstanceId !== input.manifest.runnerInstanceId) return false;
+  const matches = (stamp: ReturnType<typeof readNativeHarnessBackupStamp>) => stamp
+    && stamp.manifestSha256 === input.manifestSha256 && stamp.normalizedSessionId === input.normalizedSessionId
+    && stamp.runnerInstanceId === input.manifest.runnerInstanceId;
+  let stamp = readNativeHarnessBackupStamp(lease.metadata?.nativeHarnessBackup, lease.providerLeaseId!);
+  if (!matches(stamp)) {
+    // Several tasks can share one allocation. A verified predecessor's backup
+    // remains that task's restore authority after the tip retires the box; the
+    // tip's last task must not overwrite every other saved session's proof.
+    // The complete single-tip receipt chain above is mandatory, not arbitrary
+    // historical metadata, and a historical stamp must bind its own ended run.
+    const saved = source.find(row => row.id !== lease.id && matches(
+      readNativeHarnessBackupStamp(row.metadata?.nativeHarnessBackup, lease.providerLeaseId!)));
+    if (!saved?.heartbeatRunId) return false;
+    stamp = readNativeHarnessBackupStamp(saved.metadata?.nativeHarnessBackup, lease.providerLeaseId!);
+    const [run] = await db.select({ id: heartbeatRuns.id, finishedAt: heartbeatRuns.finishedAt,
+      createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, saved.heartbeatRunId),
+      eq(heartbeatRuns.nativeSessionId, input.normalizedSessionId),
+      eq(heartbeatRuns.runnerInstanceId, input.manifest.runnerInstanceId),
+      inArray(heartbeatRuns.status, [...TERMINAL_SOURCE_RUN_STATUSES]),
+    ));
+    if (!run || !stamp || Date.parse(stamp.completedAt) <= (run.finishedAt ?? run.createdAt).getTime()) return false;
+  }
+  if (!stamp || !matches(stamp)) return false;
   // A released lease can still be selected for resume; only a retired one is final.
   const idleSource = !destroyed && !obsoleteStopped && !await settledRestoreHoldRetiresSource(db, lease);
   if (idleSource && !await idleWarmSourceRetiresBackup(db, lease, input.currentRunId)) return false;
-  // Provider work recorded after the checkpoint means the destroyed sandbox
-  // held newer state than this backup. Restoring would silently rewind it.
-  const later = await db.select({ runId: heartbeatRunEvents.runId }).from(heartbeatRunEvents)
-    .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, heartbeatRunEvents.runId))
-    .where(and(
-      eq(heartbeatRunEvents.companyId, input.companyId),
-      eq(heartbeatRuns.companyId, input.companyId),
-      eq(heartbeatRuns.nativeSessionId, input.normalizedSessionId),
-      ne(heartbeatRuns.id, input.currentRunId),
-      inArray(heartbeatRunEvents.eventType, [...NATIVE_PROVIDER_DURABLE_EVENT_TYPES]),
-      gt(heartbeatRunEvents.createdAt, new Date(stamp.completedAt)),
-    )).limit(1);
-  if (later.length) return false;
+  const covered = nativeHarnessBackupEventCursors(stamp);
+  if (covered === undefined) {
+    // Upgrade compatibility, RESTORE ONLY: an already-retired box may have
+    // only a pre-cursor save. Preserve the old release's timestamp authority;
+    // unknown causal coverage must still never authorize destroying a box.
+    const later = await db.select({ runId: heartbeatRunEvents.runId }).from(heartbeatRunEvents)
+      .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, heartbeatRunEvents.runId))
+      .where(and(
+        eq(heartbeatRunEvents.companyId, input.companyId),
+        eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.nativeSessionId, input.normalizedSessionId),
+        ne(heartbeatRuns.id, input.currentRunId),
+        inArray(heartbeatRunEvents.eventType, [...NATIVE_PROVIDER_DURABLE_EVENT_TYPES]),
+        gt(heartbeatRunEvents.createdAt, new Date(stamp.completedAt)),
+      )).limit(1);
+    if (later.length) return false;
+  } else {
+    // A cursor-bearing save keeps causal coverage, even for tied/backdated
+    // events. Invalid manifests cannot fall back to the legacy rule.
+    if (covered === null || !await nativeHarnessBackupCoversProviderEvents(db, { companyId: input.companyId,
+      sessionId: input.normalizedSessionId, currentRunId: input.currentRunId, stamp })) return false;
+  }
   return !idleSource || await supersedeIdleWarmSource(db, lease, input);
 }
 

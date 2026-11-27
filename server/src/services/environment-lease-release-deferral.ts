@@ -1,5 +1,6 @@
 import { and, eq, sql } from "drizzle-orm";
-import { environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
+import { environmentLeases, heartbeatRunEvents, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { nativeWorkspaceExportPendingForLease } from "./native-runtime/native-workspace-finalization-state.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { currentControllerBootId } from "./controller-process-identity.js";
 import { wakeStoppingAgentLifecycleInTransaction } from "../modules/agent-lifecycle/index.js";
@@ -60,6 +61,35 @@ export function readLeaseReleaseDeferral(metadata: Record<string, unknown> | nul
   const deferral = value as Record<string, unknown>;
   if (typeof deferral.reason !== "string" || typeof deferral.retryAt !== "string" || typeof deferral.attempts !== "number") return null;
   return deferral as LeaseReleaseDeferral;
+}
+
+/** One readiness decision for orphan release and replacement. Terminal status
+ * alone never proves a holder idle: controller/finalizer ownership, a release
+ * deferral, and pending workspace export all retain the allocation. Callers
+ * supply their local execution census; durable checks also work cross-process. */
+export async function terminalRunLeaseReleaseReadiness(db: Db,
+  lease: Pick<typeof environmentLeases.$inferSelect,
+    "id" | "companyId" | "heartbeatRunId" | "provider" | "providerLeaseId" | "metadata" | "environmentId" | "issueId" | "executionWorkspaceId">,
+  localRuns?: { has(runId: string): boolean }, now = Date.now()) {
+  if (!lease.heartbeatRunId || localRuns?.has(lease.heartbeatRunId)) return { ready: false as const };
+  const deferral = readLeaseReleaseDeferral(lease.metadata);
+  const dueAt = deferral ? leaseReleaseRetryDueAt(deferral, now) : Number.NaN;
+  if (dueAt > now) return { ready: false as const, retryAt: dueAt };
+  const [run] = await db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
+    status: heartbeatRuns.status, error: heartbeatRuns.error, runtimeMode: heartbeatRuns.runtimeMode,
+    controllerLeaseExpiresAt: heartbeatRuns.controllerLeaseExpiresAt })
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, lease.heartbeatRunId), eq(heartbeatRuns.companyId, lease.companyId)));
+  if (!run || !["succeeded", "failed", "cancelled", "timed_out", "interrupted"].includes(run.status)) {
+    return { ready: false as const };
+  }
+  const [owner] = await db.select({ leaseOwner: nativeRunFinalizations.leaseOwner, leaseExpiresAt: nativeRunFinalizations.leaseExpiresAt })
+    .from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.runId, run.id), eq(nativeRunFinalizations.companyId, run.companyId)));
+  if (owner?.leaseOwner && !owner.leaseExpiresAt) return { ready: false as const };
+  const heldUntil = Math.max(run.controllerLeaseExpiresAt?.getTime() ?? 0,
+    owner?.leaseOwner ? owner.leaseExpiresAt?.getTime() ?? 0 : 0);
+  if (heldUntil > now) return { ready: false as const, retryAt: heldUntil };
+  if (await nativeWorkspaceExportPendingForLease(db, lease)) return { ready: false as const };
+  return { ready: true as const, run, deferral };
 }
 
 export function leaseReleaseRetryDelayMs(attempts: number) {

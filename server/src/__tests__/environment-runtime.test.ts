@@ -5104,6 +5104,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       }),
     });
     await runtimeWithPlugin.releaseRunLeases(runId);
+    // A lease release does not terminate its owner. Replacement is a later
+    // wake after that run has ended, never permission to destroy a running box.
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
 
     if (drift === "workspace migration") {
       const operationId = randomUUID();
@@ -5260,6 +5263,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       },
     });
     await runtimeWithPlugin.releaseRunLeases(runId);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
     await secretService(db).rotate(apiSecret.id, { value: "rotated-provider-key" });
 
     const nextRunId = randomUUID();

@@ -1,4 +1,8 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createNativeHarnessBackupStamp } from "./native-harness-backup-stamp.js";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { agents, companies, createDb, environmentLeases, environments, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issues } from "@paperclipai/db";
@@ -12,23 +16,45 @@ const describeDb = recoveryPostgresSupport.supported ? describe : describe.skip;
 describeDb("retired native backup source authority", () => {
   let database: Awaited<ReturnType<typeof startRecoveryPostgres>>;
   let db: ReturnType<typeof createDb>;
+  let fixtureRoot: string;
+  const previousStateDirectory = process.env.PAPERCLIP_RUNNER_STATE_DIR;
   beforeAll(async () => {
+    fixtureRoot = await mkdtemp(join(tmpdir(), "retired-source-cursors-"));
+    process.env.PAPERCLIP_RUNNER_STATE_DIR = fixtureRoot;
     database = await startRecoveryPostgres("retired-backup-source");
     db = createDb(database.connectionString);
   }, 120_000);
-  afterAll(async () => { await database?.cleanup(); });
-
-  const manifestSha256 = `sha256:${"b".repeat(64)}`;
+  afterAll(async () => {
+    await database?.cleanup();
+    await rm(fixtureRoot, { recursive: true, force: true });
+    if (previousStateDirectory === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
+    else process.env.PAPERCLIP_RUNNER_STATE_DIR = previousStateDirectory;
+  });
   let lastSourceLeaseId = "";
   const completedAt = new Date("2026-11-05T05:02:50.000Z");
 
   async function fixture(options: { termination?: "destroyed" | "stopped" | null; status?: string; stampSha?: string;
-    providerEventAt?: Date; secondLease?: boolean; handoffs?: number;
+    providerEventAt?: Date; sourceAdvancedAt?: Date; coversSourceAdvance?: boolean; legacyManifest?: boolean; cursorFault?: "empty" | "null"; secondLease?: boolean; handoffs?: number;
     handoffFault?: "missing_receipt" | "changed_receipt" | "active_predecessor" | "missing_predecessor";
     restoreHold?: "settled" | "no_marker" | "foreign_marker" | "reusable_policy" | "no_stop_receipt" | "dirty_writer";
     idleWarm?: "retained" | "released" | "run_active" | "export_pending" | "same_target" | "cleanup_in_flight" } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), sessionId = randomUUID(), runnerInstanceId = randomUUID();
     const sourceRunId = randomUUID(), currentRunId = randomUUID(), leaseId = randomUUID(), providerLeaseId = randomUUID();
+    const extraRunId = randomUUID();
+    const sessionScopeId = `${companyId}:${sessionId}`;
+    const root = join(fixtureRoot, createHash("sha256").update(sessionScopeId).digest("hex"), "failover-backups", "current");
+    await mkdir(join(root, "runner"), { recursive: true });
+    const manifest = { schema: "paperclip.native-harness-backup.v1", normalizedSessionId: sessionId, runnerInstanceId,
+      sourceProviderLeaseId: providerLeaseId, completedAt: completedAt.toISOString(),
+      directories: [{ name: "runner", sha256: `sha256:${createHash("sha256").update("directory:\0").digest("hex")}`, bytes: 0 }],
+      ...(options.legacyManifest ? {} : { providerEventCursors: [{ runId: sourceRunId, seq: options.coversSourceAdvance ? 2 : 1 },
+        ...(options.providerEventAt && options.providerEventAt < completedAt ? [{ runId: extraRunId, seq: 1 }] : [])] }) };
+    const manifestPath = join(root, "manifest.json");
+    await writeFile(manifestPath, JSON.stringify({ ...manifest,
+      ...(options.cursorFault ? { providerEventCursors: options.cursorFault === "empty" ? [] : null } : {}) }));
+    const stamp = createNativeHarnessBackupStamp({ manifestPath, sessionScopeId, authorizedProviderLeaseId: providerLeaseId,
+      normalizedSessionId: sessionId, runnerInstanceId, completedAt: manifest.completedAt });
+    const manifestSha256 = stamp.manifestSha256;
     await db.insert(companies).values({ id: companyId, name: "Retired source", issuePrefix: `R${companyId.slice(0, 5)}` });
     await db.insert(agents).values({ id: agentId, companyId, name: "Codie", adapterType: "paperclip_runner" });
     for (const id of [sourceRunId, currentRunId]) await db.insert(heartbeatRuns).values({ id, companyId, agentId,
@@ -37,9 +63,7 @@ describeDb("retired native backup source authority", () => {
     const lease = (id: string) => ({ id, companyId, heartbeatRunId: sourceRunId, provider: "daytona", providerLeaseId,
       status: options.status ?? "expired", cleanupStatus: "success", releasedAt: new Date(),
       metadata: {
-        nativeHarnessBackup: { schema: "paperclip.native-harness-backup-stamp.v2", normalizedSessionId: sessionId, runnerInstanceId,
-          sessionScopeSha256: "a".repeat(64), sourceProviderLeaseId: providerLeaseId, authorizedProviderLeaseId: providerLeaseId,
-          manifestSha256: options.stampSha ?? manifestSha256, completedAt: completedAt.toISOString() },
+        nativeHarnessBackup: { ...stamp, manifestSha256: options.stampSha ?? manifestSha256 },
         ...(options.termination === null ? {} : { remoteExecutionTermination: { schema: "paperclip.remote-termination.v1", companyId,
           runId: sourceRunId, leaseId: id, provider: "daytona", providerLeaseId, state: options.termination ?? "destroyed",
           confirmedAt: new Date().toISOString() } }),
@@ -121,8 +145,10 @@ describeDb("retired native backup source authority", () => {
     // The backup turn's own provider events precede the checkpoint.
     await db.insert(heartbeatRunEvents).values({ companyId, runId: sourceRunId, agentId, seq: 1, eventType: "turn.started",
       createdAt: new Date(completedAt.getTime() - 60_000) });
+    if (options.sourceAdvancedAt) await db.insert(heartbeatRunEvents).values({ companyId, runId: sourceRunId,
+      agentId, seq: 2, eventType: "provider.event", createdAt: options.sourceAdvancedAt });
     if (options.providerEventAt) await db.insert(heartbeatRunEvents).values({ companyId, runId: currentRunId === sourceRunId
-      ? sourceRunId : (await db.insert(heartbeatRuns).values({ companyId, agentId, status: "failed", runtimeMode: "native",
+      ? sourceRunId : (await db.insert(heartbeatRuns).values({ id: extraRunId, companyId, agentId, status: "failed", runtimeMode: "native",
         nativeSessionId: sessionId, invocationSource: "automation", triggerDetail: "system" }).returning())[0]!.id,
       agentId, seq: 1, eventType: "session.resumed", createdAt: options.providerEventAt });
     return retiredSourceAuthorizesNativeBackupRestore(db, { companyId, currentRunId, normalizedSessionId: sessionId,
@@ -234,6 +260,23 @@ describeDb("retired native backup source authority", () => {
     await expect(fixture(options)).resolves.toBe(false);
     const [source] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lastSourceLeaseId));
     expect(source!.metadata).toHaveProperty("reusableSandboxLease");
+  });
+
+  it.each([0, -1])("refuses restore after uncovered source seq 2 at save clock delta %i", async delta => {
+    await expect(fixture({ sourceAdvancedAt: new Date(completedAt.getTime() + delta) })).resolves.toBe(false);
+  });
+
+  it("restores when the manifest covers source seq 2 even at a tied timestamp", async () => {
+    await expect(fixture({ sourceAdvancedAt: completedAt, coversSourceAdvance: true })).resolves.toBe(true);
+  });
+
+  it.each(["empty", "null"] as const)("v7 Q: explicit %s cursors do not fall back to legacy timestamp authority", async cursorFault => {
+    await expect(fixture({ cursorFault })).resolves.toBe(false);
+  });
+
+  it.each(["before", "equal", "after"] as const)("v7 Q: legacy manifest uses the old restore timestamp rule (%s)", async when => {
+    const providerEventAt = new Date(completedAt.getTime() + (when === "after" ? 1 : when === "before" ? -1 : 0));
+    await expect(fixture({ legacyManifest: true, providerEventAt })).resolves.toBe(when !== "after");
   });
 
   it("ignores provider work that finished before the checkpoint", async () => {
