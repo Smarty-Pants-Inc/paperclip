@@ -75,7 +75,7 @@ export function buildSearchFilterOptions({
   const status: FilterMenuOption[] = ISSUE_DISPLAY_STATUSES.map((value) => ({
     value,
     label: humanize(value),
-    icon: <StatusIcon status={value} />,
+    icon: <StatusIcon status={value} lifecycle />,
     count: count((counts?.displayStatus ?? counts?.status) as Record<string, number> | undefined, value),
   }));
 

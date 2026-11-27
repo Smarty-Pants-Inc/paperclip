@@ -1,5 +1,6 @@
 import type { Issue, IssueDisplayStatus, IssueStatus } from "@paperclipai/shared";
 import { workflowSort } from "./workflow-sort";
+import { resolveTaskStatusPresentation, taskStatusIconProps } from "./task-status-presentation";
 
 export type SubIssueProgressTargetKind = "next" | "blocked";
 
@@ -14,6 +15,7 @@ export type SubIssueProgressSummary = {
   inProgressCount: number;
   blockedCount: number;
   countsByStatus: Partial<Record<IssueDisplayStatus, number>>;
+  presentationSegments: Array<{ glyphStatus: string; label: string; count: number }>;
   target: SubIssueProgressTarget | null;
 };
 
@@ -36,10 +38,16 @@ export function shouldRenderSubIssueProgressSummary(enabled: boolean | undefined
 
 export function buildSubIssueProgressSummary(issues: Issue[]): SubIssueProgressSummary {
   const countsByStatus: Partial<Record<IssueDisplayStatus, number>> = {};
+  const segments = new Map<string, { glyphStatus: string; label: string; count: number }>();
   const progressIssues = issues.filter((issue) => issue.status !== "cancelled");
   for (const issue of progressIssues) {
     const status = issue.displayStatus ?? issue.status;
     countsByStatus[status] = (countsByStatus[status] ?? 0) + 1;
+    const { glyphStatus, label } = resolveTaskStatusPresentation(taskStatusIconProps(issue), "summary");
+    const key = glyphStatus;
+    const segment = segments.get(key);
+    if (segment) segment.count += 1;
+    else segments.set(key, { glyphStatus, label, count: 1 });
   }
 
   const orderedIssues = workflowSort(progressIssues);
@@ -56,6 +64,8 @@ export function buildSubIssueProgressSummary(issues: Issue[]): SubIssueProgressS
     inProgressCount: countsByStatus.in_progress ?? 0,
     blockedCount: countsByStatus.blocked ?? 0,
     countsByStatus,
+    presentationSegments: ["backlog", "todo", "in_progress", "monitoring", "in_review", "idle", "done", "in_queue", "paused", "blocked_lifecycle"]
+      .flatMap((status) => segments.has(status) ? [segments.get(status)!] : []),
     target: nextIssue
       ? { issue: nextIssue, kind: "next" }
       : blockedIssue

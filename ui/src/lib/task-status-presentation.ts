@@ -96,7 +96,7 @@ function personAction(input: TaskStatusPresentationInput): string | null {
  * names the wait but cannot identify a person. Missing data cannot hide a known action.
  * Current human-action evidence wins over pause evidence; other paused work stays paused.
  */
-export function resolveTaskStatusPresentation(input: TaskStatusPresentationInput): TaskStatusPresentation {
+export function resolveTaskStatusPresentation(input: TaskStatusPresentationInput, context: "task" | "lifecycle" | "summary" = "task"): TaskStatusPresentation {
   const { status, displayStatus, externalConversationState, blockerAttention, interruption } = input;
   const action = personAction(input);
   if (!action && (status === "paused" || (status === "blocked"
@@ -104,14 +104,23 @@ export function resolveTaskStatusPresentation(input: TaskStatusPresentationInput
     return { glyphStatus: "paused", label: "Paused", ariaLabel: "Paused" };
   }
   // Completed/cancelled and optimistic canonical transitions win over stale
-  // projections. Recovery projected as blocked uses the same known/unknown
-  // distinction; a stale legacy descriptor cannot make that recovery red.
+  // projections. Resolve task projections before applying lifecycle colour so
+  // idle, monitoring and paused never revert to their raw stored status.
   const projectedStatus = status === "in_progress" ? (displayStatus ?? status) : status;
   if (projectedStatus === "blocked" || (projectedStatus === "paused" && action)) {
+    // Static lanes/filter/picker options describe a lifecycle, not an emergency.
+    if (context === "lifecycle") {
+      return { glyphStatus: "blocked_lifecycle", label: "Blocked", ariaLabel: "Blocked" };
+    }
     // Known task-owned human action wins even on a sparse read. Only the
     // explicit actionRequired authority (including null/false) can clear it.
-    const label = action ? `Person: ${action}` : waitingLabel(blockerAttention);
-    return { glyphStatus: action ? "blocked" : "in_queue", label, ariaLabel: label };
+    // Summaries use bounded, stable buckets, not one segment per action/child.
+    const label = context === "summary"
+      ? (action ? "Needs a person" : "Waiting")
+      : (action ? `Person: ${action}` : waitingLabel(blockerAttention));
+    // Aggregated counts are not emergencies; only the individual task is red.
+    const glyphStatus = action ? (context === "summary" ? "blocked_lifecycle" : "blocked") : "in_queue";
+    return { glyphStatus, label, ariaLabel: label };
   }
   const visibleStatus = projectedStatus === "in_review" && externalConversationState === "waiting"
     ? "idle"

@@ -33,7 +33,8 @@ import {
   routinePath,
   splitResponsibilityTasks,
 } from "@/lib/responsibilities";
-import { taskStatusIconProps } from "@/lib/task-status-presentation";
+import { resolveTaskStatusPresentation, taskStatusIconProps } from "@/lib/task-status-presentation";
+import { taskStatusIconVar } from "@/lib/status-colors";
 import { cn, issueUrl, projectUrl } from "@/lib/utils";
 import { AddExistingWorkPicker, type ResponsibilityWorkKind } from "./AddExistingWorkPicker";
 import { AgentsAtWorkList } from "./AgentsWorking";
@@ -195,6 +196,7 @@ export function ResponsibilityPageLayout({
   };
 
   const renderTask = (task: ResponsibilityTaskSummary) => {
+    const presentation = resolveTaskStatusPresentation(taskStatusIconProps(task));
     const viaProject = task.membership === "project" && task.projectId ? projectNames.get(task.projectId) : null;
     return (
       <WorkRow
@@ -212,7 +214,7 @@ export function ResponsibilityPageLayout({
           identifier={task.identifier ?? undefined}
           title={task.title}
           to={issueUrl(task)}
-          trailing={task.status === "blocked" ? <span className="text-xs text-(--status-task-icon-blocked)">Blocked</span> : null}
+          trailing={task.status === "blocked" ? <span className="text-xs" style={{ color: `var(${taskStatusIconVar[presentation.glyphStatus]})` }}>{presentation.label}</span> : null}
         />
         {viaProject ? (
           <p className="pb-2 pl-12 text-xs text-muted-foreground">
@@ -432,7 +434,7 @@ export function ResponsibilityPageLayout({
           action={editable ? picker("task") : null}
         />
         {tasks.blocked > 0 ? (
-          <p className="text-sm text-(--status-task-icon-blocked)">
+          <p className="text-sm text-muted-foreground">
             {tasks.blocked === 1 ? "1 task is blocked." : `${tasks.blocked} tasks are blocked.`}
           </p>
         ) : null}

@@ -1,4 +1,6 @@
 import type { DashboardRunActivityDay, HeartbeatRun } from "@paperclipai/shared";
+import { resolveTaskStatusPresentation, taskStatusIconProps, type TaskStatusPresentationInput } from "../lib/task-status-presentation";
+import { taskStatusIconVar, taskStatusIconVarDefault } from "../lib/status-colors";
 
 /* ---- Utilities ---- */
 
@@ -218,35 +220,27 @@ export function PriorityChart({ issues }: { issues: { priority: string; createdA
   );
 }
 
-// DECISION-SHEET.md B5: chart status colors re-pointed at the canonical
-// --status-task-* system (DESIGN.md principle 5 — an operator learns one
-// status vocabulary; badge, row, chart, and log agree). Previously an
-// independent palette (todo blue, in_progress violet, etc.). `backlog`
-// deliberately keeps --project-none (pre-B5, per user ruling); the
-// non-red priority series and warning success-rate tints retain their own hues.
-// Progress, done, and blocked use the icon hues so bars and legends match
-// the task icons in each theme.
-const statusColors: Record<string, string> = {
-  todo: "var(--status-task-todo)",
-  in_progress: "var(--status-task-icon-in_progress)",
-  in_review: "var(--status-task-in_review)",
-  done: "var(--status-task-icon-done)",
-  blocked: "var(--status-task-icon-blocked)",
-  cancelled: "var(--status-task-cancelled)",
-  backlog: "var(--project-none)",
-};
+// Aggregate the same presentation as task rows, never raw blocked counts into
+// a red series. Keep the existing backlog hue; run/priority charts are separate.
+function statusColor(status: string): string {
+  return status === "backlog" ? "var(--project-none)" : `var(${taskStatusIconVar[status] ?? taskStatusIconVarDefault})`;
+}
 
 const statusLabels: Record<string, string> = {
   todo: "To Do",
   in_progress: "In Progress",
   in_review: "In Review",
   done: "Done",
-  blocked: "Blocked",
+  blocked_lifecycle: "Needs a person",
+  in_queue: "Waiting",
+  paused: "Paused",
+  monitoring: "Monitoring",
+  idle: "Idle",
   cancelled: "Cancelled",
   backlog: "Backlog",
 };
 
-export function IssueStatusChart({ issues }: { issues: { status: string; createdAt: Date }[] }) {
+export function IssueStatusChart({ issues }: { issues: (TaskStatusPresentationInput & { createdAt: Date })[] }) {
   const days = getLast14Days();
   const allStatuses = new Set<string>();
   const grouped = new Map<string, Record<string, number>>();
@@ -255,11 +249,12 @@ export function IssueStatusChart({ issues }: { issues: { status: string; created
     const day = new Date(issue.createdAt).toISOString().slice(0, 10);
     const entry = grouped.get(day);
     if (!entry) continue;
-    entry[issue.status] = (entry[issue.status] ?? 0) + 1;
-    allStatuses.add(issue.status);
+    const { glyphStatus } = resolveTaskStatusPresentation(taskStatusIconProps(issue), "summary");
+    entry[glyphStatus] = (entry[glyphStatus] ?? 0) + 1;
+    allStatuses.add(glyphStatus);
   }
 
-  const statusOrder = ["todo", "in_progress", "in_review", "done", "blocked", "cancelled", "backlog"].filter(s => allStatuses.has(s));
+  const statusOrder = ["todo", "in_progress", "monitoring", "in_review", "idle", "done", "in_queue", "paused", "blocked_lifecycle", "cancelled", "backlog"].filter(s => allStatuses.has(s));
   const maxValue = Math.max(...Array.from(grouped.values()).map(v => Object.values(v).reduce((a, b) => a + b, 0)), 1);
   const hasData = allStatuses.size > 0;
 
@@ -277,7 +272,7 @@ export function IssueStatusChart({ issues }: { issues: { status: string; created
               {total > 0 ? (
                 <div className="flex flex-col-reverse gap-px overflow-hidden" style={{ height: `${heightPct}%`, minHeight: 2 }}>
                   {statusOrder.map(s => (entry[s] ?? 0) > 0 ? (
-                    <div key={s} style={{ flex: entry[s], backgroundColor: statusColors[s] ?? "var(--hex-6b7280)" }} />
+                    <div key={s} style={{ flex: entry[s], backgroundColor: statusColor(s) }} />
                   ) : null)}
                 </div>
               ) : (
@@ -288,7 +283,7 @@ export function IssueStatusChart({ issues }: { issues: { status: string; created
         })}
       </div>
       <DateLabels days={days} />
-      <ChartLegend items={statusOrder.map(s => ({ color: statusColors[s] ?? "var(--hex-6b7280)", label: statusLabels[s] ?? s }))} />
+      <ChartLegend items={statusOrder.map(s => ({ color: statusColor(s), label: statusLabels[s] ?? s }))} />
     </div>
   );
 }

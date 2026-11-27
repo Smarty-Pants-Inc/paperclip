@@ -48,6 +48,7 @@ export type StatusGlyphStatus =
   | "in_review"
   | "done"
   | "blocked"
+  | "blocked_lifecycle"
   | "cancelled"
   | "paused"
   | "in_queue";
@@ -68,6 +69,7 @@ const STATUS_ICON: Record<string, LucideIcon> = {
   in_review: CircleDot,
   done: CircleCheck,
   blocked: CircleMinus,
+  blocked_lifecycle: CircleMinus,
   cancelled: Ban,
   paused: CirclePause,
   in_queue: CircleMinus,

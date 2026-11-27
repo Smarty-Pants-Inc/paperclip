@@ -170,12 +170,15 @@ describe("issueDetailBreadcrumb", () => {
   });
 
   it("attaches and reads issue header seed data from route state", () => {
+    const issue = createIssue();
     const seededState = withIssueDetailHeaderSeed(
       createIssueDetailLocationState("Issues", "/issues", "issues"),
-      createIssue(),
+      issue,
     );
 
     expect(readIssueDetailHeaderSeed(seededState)).toEqual({
+      updatedAt: issue.updatedAt,
+      externalConversationState: null, blockedInboxAttention: null, interruption: null,
       id: "11111111-1111-4111-8111-111111111111",
       identifier: "PAP-42",
       title: "Prefilled issue title",
@@ -189,9 +192,10 @@ describe("issueDetailBreadcrumb", () => {
   });
 
   it("persists issue header seed data when breadcrumb state is remembered", () => {
+    const issue = createIssue();
     const seededState = withIssueDetailHeaderSeed(
       createIssueDetailLocationState("Inbox", "/inbox/mine", "inbox"),
-      createIssue(),
+      issue,
     );
 
     sessionStorageMock.clear();
@@ -199,6 +203,8 @@ describe("issueDetailBreadcrumb", () => {
 
     const restoredState = readIssueDetailLocationState("PAP-42", null);
     expect(readIssueDetailHeaderSeed(restoredState)).toEqual({
+      updatedAt: issue.updatedAt.toISOString(),
+      externalConversationState: null, blockedInboxAttention: null, interruption: null,
       id: "11111111-1111-4111-8111-111111111111",
       identifier: "PAP-42",
       title: "Prefilled issue title",

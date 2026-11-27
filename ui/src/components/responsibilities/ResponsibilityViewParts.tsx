@@ -35,7 +35,8 @@ import { skillRoute } from "@/lib/company-skill-routes";
 import { RESPONSIBILITY_HEALTH_LABEL } from "@/lib/responsibilities";
 import { WORK_ITEM_KIND_LABEL, type WorkItem } from "@/lib/responsibility-views";
 import { Link } from "@/lib/router";
-import { taskStatusIconProps } from "@/lib/task-status-presentation";
+import { resolveTaskStatusPresentation, taskStatusIconProps } from "@/lib/task-status-presentation";
+import { taskStatusIconVar } from "@/lib/status-colors";
 import { cn } from "@/lib/utils";
 import { healthStatusStyle } from "./ResponsibilityHealthBadge";
 import type { ResponsibilityPageActions } from "./ResponsibilityPageLayout";
@@ -209,6 +210,7 @@ export function WorkKind({ item, showLabel }: { item: WorkItem; showLabel: boole
  * where a heading already says it.
  */
 export function WorkItemRow({ item, dense = false, showKind = true }: { item: WorkItem; dense?: boolean; showKind?: boolean }) {
+  const taskPresentation = item.kind === "task" ? resolveTaskStatusPresentation(taskStatusIconProps(item.task)) : null;
   return (
     <li data-work-kind={item.kind} data-work-id={item.id} data-attention={item.attention ? "true" : undefined}>
       <Link
@@ -226,7 +228,7 @@ export function WorkItemRow({ item, dense = false, showKind = true }: { item: Wo
           <span className="truncate text-foreground">{item.title}</span>
         </span>
         {item.attention ? (
-          <span className="shrink-0 text-xs text-(--status-task-icon-blocked)">{item.attention}</span>
+          <span className="shrink-0 text-xs text-(--status-task-icon-blocked)" style={taskPresentation ? { color: `var(${taskStatusIconVar[taskPresentation.glyphStatus]})` } : undefined}>{item.attention}</span>
         ) : item.note ? (
           <span className="shrink-0 text-xs text-muted-foreground">{item.note}</span>
         ) : null}

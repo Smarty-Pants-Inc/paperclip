@@ -5,12 +5,12 @@ describe("execution-backed task status", () => {
   it.each([
     ["todo", "Todo"],
     ["in_review", "In Review"],
-    ["blocked", "Blocked"],
+    ["blocked", "Blocked · checking…"],
     ["monitoring", "Monitoring"],
     ["in_progress", "In Progress"],
   ])("uses server presentation %s for a task whose lifecycle is in_progress", (displayStatus, label) => {
     expect(resolveTaskStatusPresentation({ status: "in_progress", displayStatus })).toEqual({
-      glyphStatus: displayStatus, label, ariaLabel: label,
+      glyphStatus: displayStatus === "blocked" ? "blocked_checking" : displayStatus, label, ariaLabel: label,
     });
   });
 
@@ -20,7 +20,7 @@ describe("execution-backed task status", () => {
   });
 
   it.each(["done", "cancelled", "blocked", "in_review", "todo"])("preserves an optimistic %s transition over a stale display status", (status) => {
-    expect(resolveTaskStatusPresentation({ status, displayStatus: "in_progress" }).glyphStatus).toBe(status);
+    expect(resolveTaskStatusPresentation({ status, displayStatus: "in_progress" }).glyphStatus).toBe(status === "blocked" ? "blocked_checking" : status);
   });
 
   it("preserves status when the server did not send a projection", () => {

@@ -32,7 +32,8 @@ import {
   formatRecoveryLineageSummary,
   readRecoveryRetryLineage,
 } from "../lib/recovery-lineage";
-import { StatusGlyph } from "./StatusGlyph";
+import { StatusIcon } from "./StatusIcon";
+import { taskStatusIconProps } from "../lib/task-status-presentation";
 
 function BlockerRecoveryIndicator({
   action,
@@ -140,10 +141,6 @@ function SuccessfulRunRetryNowControl({
 
 const EMPTY_LIVE_IDS: ReadonlySet<string> = new Set<string>();
 
-function waitingTaskStatusLabel(status: string): string {
-  return status.replace(/_/g, " ").replace(/\b\w/g, (character) => character.toUpperCase());
-}
-
 function WaitingChipLink({
   blocker,
   running = false,
@@ -158,11 +155,7 @@ function WaitingChipLink({
       to={createIssueDetailPath(issuePathId)}
       className="inline-flex max-w-full items-center gap-1 rounded-md border border-blue-300/70 bg-background/80 px-2 py-1 font-mono text-xs text-blue-950 transition-colors hover:border-blue-500 hover:bg-blue-100 hover:underline dark:border-blue-500/40 dark:bg-background/40 dark:text-blue-100 dark:hover:bg-blue-500/15"
     >
-      <StatusGlyph
-        status={blocker.status}
-        size="sm"
-        title={`${waitingTaskStatusLabel(blocker.status)} status`}
-      />
+      <StatusIcon {...taskStatusIconProps(blocker)} size="sm" />
       <span>{blocker.identifier ?? blocker.id.slice(0, 8)}</span>
       <span className="max-w-(--sz-18rem) truncate font-sans text-(length:--text-micro) text-blue-800 dark:text-blue-200">
         {blocker.title}

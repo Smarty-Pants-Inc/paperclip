@@ -5,6 +5,7 @@ import {
   CalendarClock,
   ChevronDown,
   ChevronUp,
+  CircleAlert,
   ExternalLink,
   Loader2,
   UserRound,
@@ -41,6 +42,8 @@ import { AttentionAudienceLine } from "./AttentionViews";
 import { attentionAudienceLineNamesResponders } from "../lib/attention-views";
 import { AttentionObligationEvidence } from "./AttentionObligationEvidence";
 import { StatusGlyph } from "./StatusGlyph";
+import { StatusIcon } from "./StatusIcon";
+import { taskStatusIconProps } from "../lib/task-status-presentation";
 import { Button } from "./ui/button";
 import { Collapsible, CollapsibleContent } from "./ui/collapsible";
 import { Textarea } from "./ui/textarea";
@@ -129,11 +132,12 @@ export const AttentionQueueRow = memo(function AttentionQueueRow({
   evidence,
 }: AttentionQueueRowProps) {
   const meta = sourceMeta(item.sourceKind);
-  // Colour + glyph are borrowed wholesale from the task status system, so a
-  // blocking decision reads exactly like a blocked task (DESIGN.md principle 5).
+  // An alert's category is not evidence that its task needs a person.
+  // Linked task signs use current task evidence; unlinked alerts stay neutral.
   const status = attentionStatus(item);
   // The task this row belongs to, whichever field the feed put it in.
   const taskRef = attentionTaskRef(item);
+  const taskStatusSource = item.relatedIssue ?? (item.subject.kind === "issue" ? item.subject : null);
   const inline = isInlineResolvable(item);
   const href = item.subject.href;
   const detailLine = attentionDetailLine(item) ?? item.whyNow;
@@ -256,7 +260,10 @@ export const AttentionQueueRow = memo(function AttentionQueueRow({
       <div className="flex items-start justify-between gap-2">
         <div className="flex min-w-0 flex-wrap items-center gap-1">
           <span className="inline-flex items-center gap-1 text-xs font-medium text-muted-foreground">
-            <StatusGlyph status={status} size="md" />
+            {status === "blocked" ? (
+              taskStatusSource?.status ? <StatusIcon {...taskStatusIconProps({ ...taskStatusSource, status: taskStatusSource.status })} />
+                : <CircleAlert className="size-4 text-muted-foreground" aria-label={meta.label} />
+            ) : <StatusGlyph status={status} size="md" />}
             {meta.label}
           </span>
           {taskRef && (
