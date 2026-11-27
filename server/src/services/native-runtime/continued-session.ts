@@ -25,6 +25,17 @@ export function withPiOpenTurnDefault(provider: unknown, setting: unknown, envir
 /** The page-only marker a fresh native session writes (paperclip-control-plane-port.ts). */
 export const NATIVE_FRESH_SESSION_MARKER = "New session · Earlier messages and files are still available.";
 
+/** Server-authored schedule_retry context, bound to the failed turn already in this conversation. */
+export function nativeStatusRetryPrompt(wakePayload: unknown, previousRunId?: string): string | null {
+  const wake = normalizePaperclipWakePayload(wakePayload);
+  const raw = wakePayload && typeof wakePayload === "object" ? wakePayload as Record<string, unknown> : {};
+  const retry = raw.nativeStatusRetry && typeof raw.nativeStatusRetry === "object"
+    ? raw.nativeStatusRetry as Record<string, unknown> : {};
+  if (wake?.reason !== "issue_status_changed" || retry.cause !== "native_run_failed" || !previousRunId ||
+    retry.sourceRunId !== previousRunId || typeof retry.summary !== "string" || !retry.summary.trim() || !wake.issue?.status) return null;
+  return `The previous native run failed (${retry.cause}). This is the automatic retry.\nStatus: ${wake.issue.status}\n${retry.summary}`;
+}
+
 export function decideNativeContinuation(input: {
   provider?: unknown; sessionContinuity?: unknown; hasSession: boolean;
   resetRequired?: boolean; wakeReset?: boolean; wakePayload?: unknown; taskChanged?: boolean; previousRunId?: string; agentId?: string;
@@ -38,7 +49,10 @@ export function decideNativeContinuation(input: {
       comment.attachments != null && (!Array.isArray(comment.attachments) || comment.attachments.length > 0)));
   const messages = [...(wake?.executionContinuation?.messages ?? wake?.executionContinuation?.resumeDelta?.messages ?? []), ...(wake?.comments ?? [])];
   const fullBodies = !!wake && wake.commentIds.every(id => wake.comments.some(comment => comment.id === id && typeof comment.fullBody === "string"));
-  return { continue: retained, promptOnly: retained && mode === "continuous" && !hasAttachments && !input.taskChanged && !!wake && ["issue_commented", "issue_reopened_via_comment", "issue_continuation_needed"].includes(wake.reason ?? "") &&
+  const retry = input.provider === "pi_rpc" && !!nativeStatusRetryPrompt(input.wakePayload, input.previousRunId) &&
+    !!wake?.executionContinuation?.resumeDelta && !wake.commentIds.length && !wake.comments.length && !raw.truncated && !raw.fallbackFetchNeeded;
+  return { continue: retained, promptOnly: retained && mode === "continuous" && !hasAttachments && !input.taskChanged && !!wake &&
+    (retry || ["issue_commented", "issue_reopened_via_comment", "issue_continuation_needed"].includes(wake.reason ?? "")) &&
     (fullBodies || (!raw.truncated && !raw.fallbackFetchNeeded && !wake.comments.some(comment => comment.bodyTruncated))) &&
     (!wake.executionContinuation?.resumeDelta || wake.executionContinuation.resumeDelta.baseRunId === input.previousRunId) &&
     // The agent's own previous replies are already in its session, and the page's fresh-session
@@ -49,6 +63,6 @@ export function decideNativeContinuation(input: {
     !wake.interactionId && !wake.questionResponse && !wake.externalChatQuestionResponse && !wake.recovery &&
     !wake.executionStage && !wake.taskWatchdog && !wake.livenessContinuation && !wake.dispositionRepair &&
     !wake.documentReviewContext && !wake.planReviewContext && !(wake.annotationDeltas?.length) && !raw.mcpAppContext && !raw.chatCompletionUpdates && !raw.extraContext &&
-    !wake.agentMessage && !wake.skillTest && wake.commentIds.length > 0 &&
-    wake.commentIds.every(id => messages.find(message => message.id === id)?.authorType === "user") };
+    !wake.agentMessage && !wake.skillTest && (retry || (wake.commentIds.length > 0 &&
+    wake.commentIds.every(id => messages.find(message => message.id === id)?.authorType === "user"))) };
 }

@@ -943,6 +943,9 @@ async function materializeDecisionEffect(input: {
         retryCause: effect.cause,
         retrySummary: effect.summary,
       },
+      contextSnapshot: {
+        nativeStatusRetry: { cause: effect.cause, summary: effect.summary, sourceRunId: input.runId },
+      },
     });
     return {
       effectKind: effect.kind,

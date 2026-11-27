@@ -2677,6 +2677,8 @@ export async function buildPaperclipWakePayload(input: {
     : [];
   const payload = {
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
+    ...(input.contextSnapshot.source === "native_status_decision" && input.contextSnapshot.statusDecisionSource === "native_status_decision"
+      && input.contextSnapshot.nativeStatusRetry ? { nativeStatusRetry: input.contextSnapshot.nativeStatusRetry } : {}),
     executionContinuation: input.contextSnapshot.executionContinuation ?? null,
     chatCompletionUpdates: input.contextSnapshot.chatCompletionUpdates ?? null,
     attachmentOmissions,
