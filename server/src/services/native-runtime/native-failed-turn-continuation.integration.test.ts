@@ -6,7 +6,7 @@ import express from "express";
 import request from "supertest";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { eq } from "drizzle-orm";
+import { and, asc, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, agentWakeupRequests, companies, companyMemberships, completionContracts, createDb, heartbeatRuns, issueComments, issueAttachments, assets, issues, nativeRunFinalizations, statusDecisions, heartbeatRunEvents, environmentLeases, authUsers } from "@paperclipai/db";
 import { buildNativeModelEnvelope, executeNativeSession, HarnessDriverBackend, type PersistedNativeSession, type NativeSession, type ControlPlanePort, type NativeExecutionInputV1, type PrpEvent, type PrpTerminalState } from "@paperclipai/paperclip-runner";
@@ -98,7 +98,8 @@ async function prepareRetryState(db: ReturnType<typeof createDb>, execution: Ret
     await mkdir(join(sourceRoot, "runner"), { recursive: true });
     await writeFile(join(sourceRoot, "runner/runner-state.json"), JSON.stringify(runnerState));
     await writeFile(join(sourceRoot, "runner/codex-provider-state.json"), JSON.stringify(providerState));
-    const [receipt] = (await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, sourceRunId)))
+    const [receipt] = (await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, sourceRunId))
+      .orderBy(asc(heartbeatRunEvents.sourceSeq)))
       .filter(event => event.eventType === "turn.started");
     expect(receipt.sourceSeq).toBe(1);
     const [terminal] = (await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, sourceRunId)))
@@ -333,7 +334,7 @@ describe("native failed-turn continuation", () => {
     const [receipt] = dispatchedFrom ? await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation",
       triggerDetail: "system", reason: "issue_status_changed", status: "claimed", requestedByActorType: "system",
       requestedByActorId: `native-status-wake-dispatch:${dispatchedFrom}`, payload: { issueId } }).returning() : [];
-    const [run] = await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native", nativeIssueId: issueId, responsibleUserId: "board-user", invocationSource: "automation", triggerDetail: "system", wakeupRequestId: receipt?.id ?? null, contextSnapshot: { issueId, ...context } }).returning();
+    const [run] = await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native", nativeIssueId: issueId, responsibleUserId: "board-user", invocationSource: "automation", triggerDetail: "system", wakeupRequestId: receipt?.id ?? null, contextSnapshot: { issueId, ...context, skipIssueComment: true } }).returning();
     if (receipt) await db.update(agentWakeupRequests).set({ runId }).where(eq(agentWakeupRequests.id, receipt.id));
     await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
     const native = await prepareNativeHeartbeatRun({ db, run, issue, environmentLeaseId: randomUUID() });
@@ -431,11 +432,26 @@ describe("native failed-turn continuation", () => {
         ...(providerOutput ?? {}), runId, normalizedSessionId: native.normalizedSessionId, sourceInstanceId: native.runnerInstanceId,
         turnId: native.turnId, sourceEventId: "provider-output", sourceSeq: 2,
         eventType: providerOutput?.eventType ?? "item.completed", itemId: "source-answer",
-        // This is task progress, not a published final answer. The final-answer
-        // arbiter correctly suppresses retries for an already answered input.
-        // Error/cancel/history deltas below keep the real driver's exact payload.
-        payload: providerOutput?.eventType === "item.completed" ? { ...providerOutput.payload, channel: "progress" }
-          : providerOutput?.payload ?? { kind: "agentMessage", channel: "progress", text: "I have inspected the assigned task." } });
+        // Preserve the driver's final channel. skipIssueComment on the source
+        // run prevents publication from settling the input before this retry
+        // probe. Error/Stop also complete a display item, not the source turn.
+        // The pinned Runner accepts "progress", not the newer "commentary";
+        // install that persisted native shape below without changing Runner.
+        ...(sourceOutcome === "error" || sourceOutcome === "cancel" ? { eventType: "item.completed" } : {}),
+        payload: sourceOutcome === "error" || sourceOutcome === "cancel"
+          ? { kind: "agentMessage", channel: "progress", text: sourceOutcome === "cancel" ? "Stopped." : "I have inspected the assigned task." }
+          : providerOutput?.payload ?? { kind: "agentMessage", channel: "final", text: "I have inspected the assigned task." } });
+      if (nativeProvider === "pi_rpc" && !beforeSubmit && !hostSubmitFails && ["error", "cancel"].includes(sourceOutcome)) {
+        await db.update(heartbeatRunEvents).set({
+          payload: sql`jsonb_set(${heartbeatRunEvents.payload}, '{prpEvent,payload,channel}', '"commentary"'::jsonb)`,
+        }).where(and(eq(heartbeatRunEvents.runId, runId), eq(heartbeatRunEvents.sourceEventId, "provider-output")));
+        const [stored] = await db.select().from(heartbeatRunEvents).where(and(
+          eq(heartbeatRunEvents.runId, runId), eq(heartbeatRunEvents.sourceEventId, "provider-output")));
+        expect(stored.eventType).toBe("item.completed");
+        expect((stored.payload?.prpEvent as PrpEvent).payload.channel).toBe("commentary");
+        process.stdout.write(JSON.stringify({ proof: "persisted-nonfinal-completed-item", runId, sourceOutcome,
+          event: stored.payload?.prpEvent, nativeDriverGenerated: false }) + "\n");
+      }
       await options.controlPlane.appendEvent({ ...event, sourceSeq: nativeProvider && !beforeSubmit ? hostSubmitFails ? 2 : 3 : 1,
         ...(twoTurns ? { eventType: "turn.interrupted", payload: { status: "interrupted" } } : {}) });
       if (twoTurns) {
@@ -443,7 +459,7 @@ describe("native failed-turn continuation", () => {
           eventType: "turn.started", payload: { status: "inProgress" } });
         await options.controlPlane.appendEvent({ ...event, turnId: `${native.turnId}-B`, sourceEventId: "B-output", sourceSeq: 5,
           eventType: secondMessageCompleted ? "item.completed" : "item.delta", itemId: "B-answer",
-          payload: { kind: "agentMessage", channel: "progress", text: "B partial answer" } });
+          payload: { kind: "agentMessage", channel: secondMessageCompleted ? "final" : "progress", text: "B partial answer" } });
       }
       await options.controlPlane.completeRun({ result, terminal, turnId: native.turnId });
       return { result, terminal, turnId: native.turnId, normalizedSessionId: native.normalizedSessionId, providerSessionId: "fixture-provider-session", driverKind: nativeExecution.session.driverKind, driverVersion: "fixture", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
