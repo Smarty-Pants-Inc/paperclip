@@ -27,48 +27,73 @@ export const NATIVE_HANDOFF_CUT_NOTE_RESERVE_BYTES = 256;
 export const NATIVE_HANDOFF_MAX_BYTES = 24_000;
 export const NATIVE_WHOLE_HANDOFF_MAX_BYTES = 368_000;
 export const NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND = "native_turn_prompt_exceeds_command_bound";
-export const NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND_MESSAGE = "This turn is too large. Reduce the request or task context. Saved task history remains available.";
-export type NativePromptRefusalCause = { kind: "task_description" | "newest_message" | "unread_message" | "unread_messages" | "queued_input" | "human_response" | "protected_input" | "protected_inputs" | "command" | "unmeasured_composition"; bytes: number; count?: number };
+export const NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND_MESSAGE = "This turn is too large. Edit the description on the task page to shorten it, or ask the task's owner in the task's comments to split the work into smaller tasks. Saved task history remains available.";
+const nativePromptMeasures = ["command", "command_upper_bound", "prompt", "envelope", "handoff_note"] as const;
+/** The closed kind list lives here; both title coverage and parsing use it.
+ * For command refusals, bytes names the measured thing through measure:
+ * command = the WHOLE serialized guard command (including its conservative
+ * sequence/identity shell); command_upper_bound = pre-seal command plus reserves;
+ * prompt/envelope/handoff_note = that part's command-encoded bytes, NOT a turn.
+ * Missing measure is supported only for older saved causes; never label those
+ * bytes as a complete command. stale_copy.bytes is raw UTF-8 prompt evidence,
+ * not evidence that the turn exceeds its byte limit. */
+export type NativePromptRefusalCause = {
+  kind: "task_description" | "newest_message" | "unread_message" | "unread_messages" | "queued_input" | "human_response" | "protected_input" | "protected_inputs" | "command" | "unmeasured_composition" | "stale_copy";
+  bytes: number;
+  count?: number;
+  measure?: typeof nativePromptMeasures[number];
+};
+const nativePromptRefusalTitles: Record<NativePromptRefusalCause["kind"], string> = {
+  task_description: "Task description is too large", newest_message: "Newest message is too large",
+  unread_message: "Unread message is too large", unread_messages: "Unread messages are too large",
+  queued_input: "Queued input is too large", human_response: "Answer is too large",
+  protected_input: "Required task input is too large", protected_inputs: "Required task inputs are too large", command: "Turn is too large",
+  unmeasured_composition: "Queued input cannot be measured for this turn",
+  stale_copy: "Session input contains stale history",
+};
 export function nativePromptRefusalTitle(cause?: NativePromptRefusalCause): string {
-  const titles: Record<NativePromptRefusalCause["kind"], string> = {
-    task_description: "Task description is too large", newest_message: "Newest message is too large",
-    unread_message: "Unread message is too large", unread_messages: "Unread messages are too large",
-    queued_input: "Queued input is too large", human_response: "Answer is too large",
-    protected_input: "Required task input is too large", protected_inputs: "Required task inputs are too large", command: "Turn is too large",
-    unmeasured_composition: "Queued input cannot be measured for this turn",
-  };
-  return cause ? titles[cause.kind] : "Turn is too large";
+  return cause ? nativePromptRefusalTitles[cause.kind] : "Turn is too large";
 }
 export function nativePromptRefusalDetail(cause?: NativePromptRefusalCause): string {
   if (!cause) return NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND_MESSAGE;
-  if (cause.kind === "unmeasured_composition") return "This session's command composition cannot be measured before claiming or replaying this queued input. No queued messages or answers were consumed; they remain saved. The session's input delivery needs to be repaired before retrying.";
+  if (cause.kind === "unmeasured_composition") return "This session's command composition cannot be measured before claiming this queued input. No queued messages or answers were consumed; they remain saved. Ask the task's owner in the task's comments to report this run to the Paperclip operator to repair this session's input delivery.";
+  if (cause.kind === "stale_copy") return "This session's input still contains a stale copy of history that was cut for room. Ask the task's owner in the task's comments to report this run to the Paperclip operator to repair fresh-session input delivery. Saved task history remains available to the agent through get_task_history.";
   const size = Math.ceil(cause.bytes / 1024);
-  if (cause.kind === "task_description") return `The task description is ${size} KB. Shorten it before continuing. Saved task history remains available.`;
-  if (cause.kind === "newest_message") return `The newest message is ${size} KB. Split it into smaller messages. Saved task history remains available.`;
-  if (cause.kind === "unread_message") return `An unread message is ${size} KB. Shorten or split it before continuing. Saved task history remains available.`;
-  if (cause.kind === "queued_input") return `The queued input is ${size} KB when encoded for this turn. Split it into smaller messages. This refusal does not claim or consume queued messages or answers; the input remains saved.`;
-  if (cause.kind === "human_response") return `A person's answer is ${size} KB and is too large to send. The whole answer remains saved. The task needs a person's decision about how to continue.`;
-  if (cause.kind === "unread_messages") return `${cause.count ?? "Multiple"} unread messages total ${size} KB. Their combined size is too large for this turn. Split the request before continuing. Saved task history remains available.`;
-  if (cause.kind === "protected_input") return `Required task input is ${size} KB. Reduce the required task context before continuing. Saved task history remains available.`;
-  if (cause.kind === "protected_inputs") return `Required task inputs total ${size} KB. Their combined size is too large for this turn. The task needs a person's decision about how to reduce its context. Saved task history remains available.`;
-  return `The complete encoded turn is ${size} KB and is too large to send. Reduce the request or task context. Saved task history remains available.`;
+  if (cause.kind === "task_description") return `The task description is ${size} KB. Edit the description on the task page to shorten it, or ask the task's owner in the task's comments to split the work into smaller tasks. Saved task history remains available.`;
+  if (cause.kind === "newest_message") return `The newest message is ${size} KB. If it is still queued, edit it in the task's message queue and send the remaining request as smaller messages. Otherwise ask the task's owner in the task's comments to split the request into smaller follow-up tasks. Saved task history remains available.`;
+  if (cause.kind === "unread_message") return `An unread message is ${size} KB. If it is still queued, edit it in the task's message queue and send the remaining request as smaller messages. Otherwise ask the task's owner in the task's comments to split the request into smaller follow-up tasks. Saved task history remains available.`;
+  if (cause.kind === "queued_input") return `The queued input is ${size} KB when encoded for this turn. If you can edit it in the task's message queue, shorten it there and send the rest as smaller messages; otherwise ask the task's owner in the task's comments to split the request into smaller follow-up tasks. This refusal does not claim or consume queued messages or answers; the input remains saved.`;
+  if (cause.kind === "human_response") return `A person's answer is ${size} KB and is too large to send. The whole answer remains saved; a submitted answer cannot be edited here. Ask the task's owner in the task's comments to continue the work in a smaller follow-up task with a short description, linking back to this task for the saved answer.`;
+  if (cause.kind === "unread_messages") return `${cause.count ?? "Multiple"} unread messages total ${size} KB. Their combined size is too large for this turn. Ask the task's owner in the task's comments to split the requests into smaller follow-up tasks, or edit the messages in the task's message queue if they are still editable. Saved task history remains available.`;
+  if (cause.kind === "protected_input") return `Required task input is ${size} KB. Ask the task's owner in the task's comments to shorten the task description on the task page, or split the work into smaller tasks with links to the saved context. Saved task history remains available.`;
+  if (cause.kind === "protected_inputs") return `Required task inputs total ${size} KB. Their combined size is too large for this turn. Ask the task's owner in the task's comments to split the work into smaller tasks with shorter descriptions and links to the saved context. Saved task history remains available.`;
+  const measured: Record<NonNullable<NativePromptRefusalCause["measure"]>, string> = {
+    command: `The serialized command measured by the guard is ${size} KB and exceeds the turn's byte budget.`,
+    command_upper_bound: `The command upper bound, including reserved room, is ${size} KB and exceeds the turn's byte budget.`,
+    prompt: `The encoded prompt is ${size} KB and leaves no room for history within the turn's byte budget.`,
+    envelope: `The encoded envelope is ${size} KB and leaves no room for history within the turn's byte budget.`,
+    handoff_note: `Even the encoded history-omission note (${size} KB) does not fit in the room left for history.`,
+  };
+  return `${cause.measure ? measured[cause.measure] : "The turn exceeds its byte budget; the saved byte count has no measurement label."} Edit the description on the task page to shorten it, or ask the task's owner in the task's comments to split the work into smaller tasks. If those inputs are already small, ask the owner to report this run to the Paperclip operator for input-delivery repair. Saved task history remains available.`;
 }
 export function nativePromptRefusalCause(value: unknown): NativePromptRefusalCause | undefined {
   const v = record(value);
-  return ["task_description", "newest_message", "unread_message", "unread_messages", "queued_input", "human_response", "protected_input", "protected_inputs", "command", "unmeasured_composition"].includes(String(v.kind)) && Number.isSafeInteger(v.bytes) && Number(v.bytes) >= 0
+  return typeof v.kind === "string" && Object.hasOwn(nativePromptRefusalTitles, v.kind) && Number.isSafeInteger(v.bytes) && Number(v.bytes) >= 0
     && (v.count === undefined || Number.isSafeInteger(v.count) && Number(v.count) > 0)
+    && (v.measure === undefined || v.kind === "command" && nativePromptMeasures.some(measure => measure === v.measure))
     ? v as NativePromptRefusalCause : undefined;
 }
 export function nativePromptCauseFromError(error: unknown): NativePromptRefusalCause | undefined {
   const direct = nativePromptRefusalCause(record(error).promptCause);
   if (direct) return direct;
-  const match = (error instanceof Error ? error.message : "").match(/native_prompt_cause=(task_description|newest_message|unread_message|unread_messages|queued_input|human_response|protected_input|protected_inputs|command|unmeasured_composition):(\d+)(?::count=(\d+))?/);
-  return match ? nativePromptRefusalCause({ kind: match[1], bytes: Number(match[2]), ...(match[3] ? { count: Number(match[3]) } : {}) }) : undefined;
+  // Validate against the one closed kind list above, not a second regex enum.
+  const match = (error instanceof Error ? error.message : "").match(/native_prompt_cause=([a-z_]+):(\d+)(?::count=(\d+))?(?::measure=([a-z_]+))?(?=\]|$|\s)/);
+  return match ? nativePromptRefusalCause({ kind: match[1], bytes: Number(match[2]), ...(match[3] ? { count: Number(match[3]) } : {}), ...(match[4] ? { measure: match[4] } : {}) }) : undefined;
 }
 export class NativeTurnPromptExceedsCommandBoundError extends Error {
   readonly code = NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND;
   constructor(readonly promptCause?: NativePromptRefusalCause) {
-    super(`${NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND}: ${nativePromptRefusalDetail(promptCause)}${promptCause ? ` [native_prompt_cause=${promptCause.kind}:${promptCause.bytes}${promptCause.count === undefined ? "" : `:count=${promptCause.count}`}]` : ""}`);
+    super(`${NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND}: ${nativePromptRefusalDetail(promptCause)}${promptCause ? ` [native_prompt_cause=${promptCause.kind}:${promptCause.bytes}${promptCause.count === undefined ? "" : `:count=${promptCause.count}`}${promptCause.measure === undefined ? "" : `:measure=${promptCause.measure}`}]` : ""}`);
   }
 }
 
@@ -78,7 +103,8 @@ export const commandEnvelopeBytes = (envelope: object) => Buffer.byteLength(JSON
 export function nativeSessionHandoffMaxBytes(promptOrEnvelope: string | object): number {
   const room = NATIVE_TURN_KNOWN_MAX_BYTES - (typeof promptOrEnvelope === "string"
     ? commandTextBytes(promptOrEnvelope) : commandEnvelopeBytes(promptOrEnvelope));
-  if (room < 0) throw new NativeTurnPromptExceedsCommandBoundError({ kind: "command", bytes: NATIVE_TURN_KNOWN_MAX_BYTES - room });
+  if (room < 0) throw new NativeTurnPromptExceedsCommandBoundError({ kind: "command", bytes: NATIVE_TURN_KNOWN_MAX_BYTES - room,
+    measure: typeof promptOrEnvelope === "string" ? "prompt" : "envelope" });
   return Math.min(NATIVE_WHOLE_HANDOFF_MAX_BYTES, room);
 }
 
@@ -196,7 +222,7 @@ export function nativeFreshFallbackPayload(runId: string, payload: Record<string
   const prefix = payload.text.match(/^\$[a-zA-Z0-9_-]+(?: \$[a-zA-Z0-9_-]+)*\n\n/)?.[0] ?? "";
   const looksLikeOriginal = (text: string) => fallback.removedMiddle.length > 0
     && !fallback.bounded.includes(fallback.removedMiddle) && containsRemovedMiddle(text, fallback.removedMiddle);
-  const refuseStaleCopy = (text: string): never => { throw new NativeTurnPromptExceedsCommandBoundError({ kind: "protected_input", bytes: Buffer.byteLength(text) }); };
+  const refuseStaleCopy = (text: string): never => { throw new NativeTurnPromptExceedsCommandBoundError({ kind: "stale_copy", bytes: Buffer.byteLength(text) }); };
   let envelope: Record<string, unknown>;
   try { envelope = record(JSON.parse(payload.text.slice(prefix.length))); } catch {
     const text = payload.text.slice(prefix.length);
@@ -212,7 +238,7 @@ export function nativeFreshFallbackPayload(runId: string, payload: Record<string
   // disposition and compaction turns need not contain a bootstrap task.prompt.
   // Unrelated later turns go to the byte guard. Only an exact copy (repaired
   // below) or a ONE-edit copy whose removed-history anchors are unique in the
-  // prompt is caught and refused as protected input. Other stale copies under
+  // prompt is caught and refused as stale_copy (not as an oversized input). Other stale copies under
   // the final byte bound (two or more edits, or a removed region repeated
   // elsewhere) go out with their history uncut; the final guard still bounds
   // their bytes. No current producer of such copies is known.
@@ -229,8 +255,9 @@ export function nativeFreshFallbackPayload(runId: string, payload: Record<string
 export function assertNativeTurnCommandBound(type: string, payload: Record<string, unknown>, commandId?: string, cause?: NativePromptRefusalCause): void {
   const command = { schema: "paperclip.prp.command.v1", commandId: commandId ?? "x".repeat(160),
     controllerSeq: Number.MAX_SAFE_INTEGER, type, issuedAt: new Date().toISOString(), payload, status: "pending", result: null };
-  if (Buffer.byteLength(JSON.stringify(command), "utf8") > NATIVE_TURN_COMMAND_MAX_BYTES)
-    throw new NativeTurnPromptExceedsCommandBoundError(cause ?? { kind: "command", bytes: Buffer.byteLength(JSON.stringify(payload), "utf8") });
+  const bytes = Buffer.byteLength(JSON.stringify(command), "utf8");
+  if (bytes > NATIVE_TURN_COMMAND_MAX_BYTES)
+    throw new NativeTurnPromptExceedsCommandBoundError(cause ?? { kind: "command", bytes, measure: "command" });
 }
 // Stock nativeTaskConstraints: six entries, encoded bytes 55/63/609/405/629/275
 // plus array/property punctuation = 2,084 journal bytes; ceil(2,084 * 1.10).
@@ -341,8 +368,9 @@ export function assertNativeQueuedTurnBound(runId: string, envelope: object, que
   if (!Number.isFinite(bytes)) return false;
   if (bytes > NATIVE_TURN_COMMAND_MAX_BYTES) {
     const queuedAlone = queuedInput && nativeQueuedTurnUpperBound(runId, envelope, null, additions) <= NATIVE_TURN_COMMAND_MAX_BYTES;
-    throw new NativeTurnPromptExceedsCommandBoundError({ kind: queuedAlone ? "queued_input" : "command",
-      bytes: queuedAlone ? commandTextBytes(queuedInput!) : bytes });
+    throw new NativeTurnPromptExceedsCommandBoundError(queuedAlone
+      ? { kind: "queued_input", bytes: commandTextBytes(queuedInput!) }
+      : { kind: "command", bytes, measure: "command_upper_bound" });
   }
 }
 const guarded = new WeakSet<DurablePrpControlPlane>();
