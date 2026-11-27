@@ -1,4 +1,13 @@
 import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
+import { issueRoutes } from "../routes/issues.js";
+import { errorHandler } from "../middleware/index.js";
+import { issueService } from "../services/issues.js";
+import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { taskInterruptionPresentation } from "../services/task-interruption-presentation.js";
+import { admitExplicitNativeContinuation } from "../services/explicit-native-continuation.js";
+import { deliverReconciledExecutions } from "../services/execution-recovery-resolution.js";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
@@ -644,6 +653,191 @@ describeEmbeddedPostgres("environment lease release between sandbox acquire and 
       expect(readFirstTurnQueuedInputReceipt(await run(followupRunId))?.commentIds).toEqual([followupId]);
       console.info("historical-stop-input-custody", JSON.stringify({ action, sourceRunId: f.runId,
         successorRunId: next.id, orderedInputIds: inputIds, modelAnswer: false }));
+    }, 60_000);
+
+  // Investigative integration rows: reuse acquireReusable and the five-held h-wait fixture above.
+  it.each(["restored", "false_positive", "blocked", "cancelled", "retry", "status-back", "restored-evidence"] as const)(
+    "records status-fenced Stop escape (%s)", async exit => {
+      const f = await acquireReusable("replace");
+      const now = new Date(), actionId = randomUUID();
+      await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId));
+      await db.update(heartbeatRuns).set({ runtimeMode: "legacy", runtimeModeResolvedAt: null,
+        nativeIssueId: null, executionStage: "preparing", status: "cancelled", errorCode: null, finishedAt: now,
+        runnerProfileJson: { adapterDispatch: { adapterType: "paperclip_runner" } },
+        resultJson: { startupCancellation: { requestedAt: now.toISOString(), beforeNativeSelection: true },
+          cancelledByActorType: "user", cancelledByUserId: "operator",
+          personStop: { userId: "operator", returned: [], requestedAt: now.toISOString() },
+          startupPreparationSettledAt: new Date(now.getTime() + 1).toISOString(),
+          cancellation: { reason: "Execution stopped", source: "operator", initiator: "user",
+            expected: true, recordedAt: now.toISOString() } },
+      }).where(eq(heartbeatRuns.id, f.runId));
+      await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success", releasedAt: now })
+        .where(eq(environmentLeases.id, f.leaseId));
+      await db.update(issues).set({ status: "blocked", statusVersion: 5, executionRunId: null })
+        .where(eq(issues.id, f.issueId));
+      await db.insert(issueRecoveryActions).values({ id: actionId, companyId: f.companyId, sourceIssueId: f.issueId,
+        kind: "active_run_watchdog", ownerType: "board", cause: "legacy_execution_requires_reconciliation",
+        fingerprint: `legacy-execution:${f.runId}`, status: "resolved", outcome: "blocked",
+        nextAction: "Inspect the run before sending a new message to request continuation.",
+        evidence: { runId: f.runId, legacyCancellationBlock: { runId: f.runId, statusVersion: 5, previousStatus: "in_progress" },
+          attempt: 1, adapterRecovery: {}, originalFailureCode: null,
+          freshContinuationCheck: { kind: "person_owned", reason: "stopped_on_request" },
+          savedPersonWakeNoticeCommentId: randomUUID(),
+          automaticRecovery: { policy: "preserve_without_replay_v1", runId: f.runId, replay: "blocked", actionOutcome: "unknown" } } });
+      const commentIds: string[] = [], wakeIds: string[] = [];
+      for (let index = 0; index < 5; index++) {
+        const id = randomUUID(), wakeId = randomUUID(), at = new Date(now.getTime() + index + 1);
+        commentIds.push(id); wakeIds.push(wakeId);
+        await db.insert(issueComments).values({ id, companyId: f.companyId, issueId: f.issueId,
+          authorType: "user", authorUserId: "operator", body: `held-message-${index}`, createdAt: at, updatedAt: at });
+        await db.insert(agentWakeupRequests).values({ id: wakeId, companyId: f.companyId, agentId: f.agentId,
+          source: "issue", reason: "issue_commented", status: "deferred_issue_execution", requestedAt: at,
+          requestedByActorType: "user", requestedByActorId: "operator", payload: { issueId: f.issueId,
+            executionWait: { reason: "previous_execution_unverified", recoveryActionId: actionId },
+            _paperclipWakeContext: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: id, wakeCommentIds: [id] } } });
+      }
+      await db.update(issues).set({ statusVersion: 6 }).where(eq(issues.id, f.issueId));
+      expect(await reevaluateStoppedBeforeFirstInput(db, { companyId: f.companyId, issueId: f.issueId, agentId: f.agentId })).toBe(0);
+      const action = async () => (await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, actionId)))[0]!;
+      const task = async () => (await db.select().from(issues).where(eq(issues.id, f.issueId)))[0]!;
+      const wakes = async () => await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      const runs = async () => await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
+      expect((await action()).evidence).toHaveProperty("stopSettlementRefusal.code", "person_stop_task_status_changed");
+      const heartbeat = heartbeatService(db, { pluginWorkerManager: f.manager });
+      // Preserve real admission while keeping provider launch below another task's occupied slot.
+      await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, f.agentId));
+      await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+      const send = async (body: string) => {
+        const comment = await issueService(db).addComment(f.issueId, body, { userId: "operator" });
+        commentIds.push(comment.id);
+        let refusal: { reason: string; message: string } | null = null;
+        const admission = await db.transaction(tx => admitExplicitNativeContinuation({ db: tx as unknown as typeof db,
+          companyId: f.companyId, issueId: f.issueId, agentId: f.agentId, actorType: "user", actorId: "operator",
+          reason: "issue_commented", commentId: comment.id, successorRunId: randomUUID(), dryRun: true,
+          onBlocked: (reason, message) => { refusal = { reason, message }; } }));
+        const wakeResult = await heartbeat.wakeup(f.agentId, { source: "on_demand", reason: "issue_commented",
+          requestedByActorType: "user", requestedByActorId: "operator", payload: { issueId: f.issueId, commentId: comment.id },
+          contextSnapshot: { issueId: f.issueId, wakeCommentId: comment.id, wakeReason: "issue_commented" } });
+        return { comment, commentId: comment.id, commentSaved: !!(await db.select().from(issueComments).where(eq(issueComments.id, comment.id)))[0],
+          admission, refusal, wakeResult };
+      };
+      const firstSend = await send("new-send-after-refusal");
+      expect(firstSend.refusal).toMatchObject({ reason: "person_stop_task_status_changed" });
+      expect(firstSend.commentSaved).toBe(true);
+      expect((await runs()).filter(row => row.status === "queued")).toHaveLength(0);
+      const before = { action: await action(), task: await task(), sourceRun: await run(f.runId), wakes: await wakes(), firstSend,
+        blocker: await getExecutionBlocker(db, f.companyId, f.issueId),
+        presentation: await taskInterruptionPresentation(db, await task()) };
+      let result: unknown;
+      if (exit === "retry") {
+        const receipt = await requestTaskRetry({ db, companyId: f.companyId, issueId: f.issueId, actorId: "operator",
+          actorSource: "local_implicit", observedRunId: f.runId, idempotencyKey: randomUUID() });
+        await heartbeat.resumeTaskRetry(f.companyId, receipt.requestId!);
+        result = receipt;
+      } else if (exit === "status-back") {
+        result = await issueService(db).update(f.issueId, { status: "in_progress" });
+      } else {
+        const app = express();
+        app.use(express.json());
+        app.use((req, _res, next) => { (req as unknown as { actor: unknown }).actor = { type: "board", userId: "operator", source: "local_implicit" }; next(); });
+        app.use("/api", issueRoutes(db, {} as Parameters<typeof issueRoutes>[1], { pluginWorkerManager: f.manager }));
+        app.use(errorHandler);
+        const response = await request(app).post(`/api/issues/${f.issueId}/recovery-actions/resolve`).send({ actionId,
+          outcome: exit === "restored-evidence" ? "restored" : exit,
+          sourceIssueStatus: exit === "restored-evidence" || exit === "restored" ? "todo" : exit === "blocked" ? "blocked" : "in_review",
+          resolutionNote: "Reviewed the stopped attempt and the current task.",
+          ...(exit === "restored-evidence" ? { executionReconciliation: { runId: f.runId, providerStopped: true,
+            actionOutcome: "not_performed", outcomeEvidence: "Verified the stopped attempt never received its first input." } } : {}) });
+        result = { status: response.status, body: response.body };
+      }
+      if (exit === "retry") expect(result).toMatchObject({ accepted: true });
+      else if (exit !== "status-back") expect(result).toMatchObject({ status: 200 });
+      const afterAct = { result, action: await action(), task: await task(), wakes: await wakes(), runs: await runs(),
+        blocker: await getExecutionBlocker(db, f.companyId, f.issueId), presentation: await taskInterruptionPresentation(db, await task()) };
+      const nextSend = await send("next-send-after-board-act");
+      await deliverReconciledExecutions(db, heartbeat.wakeup);
+      const after = { nextSend, action: await action(), task: await task(), wakes: await wakes(), runs: await runs(),
+        blocker: await getExecutionBlocker(db, f.companyId, f.issueId), presentation: await taskInterruptionPresentation(db, await task()) };
+      let delivery: Record<string, unknown> | null = null;
+      const successors = after.runs.filter(row => row.status === "queued");
+      if (exit !== "restored-evidence") {
+        expect(afterAct.action.evidence).toHaveProperty("stopSettlementRefusal.code", "person_stop_task_status_changed");
+        if (["restored", "false_positive", "blocked", "cancelled"].includes(exit)) {
+          expect(afterAct.task.status).toBe("blocked");
+          expect(afterAct.task.statusVersion).toBe(6);
+          expect(afterAct.action).toEqual(before.action);
+        }
+        if (exit === "retry") expect(afterAct.wakes.find(wake => wake.reason === "task_retry"))
+          .toMatchObject({ status: "deferred_issue_execution", runId: null,
+            payload: { executionWait: { reason: "person_stop_task_status_changed" } } });
+        if (exit === "status-back") {
+          expect(afterAct.task.status).toBe("in_progress");
+          expect(afterAct.task.statusVersion).toBe(7);
+        }
+        expect(nextSend.refusal).toMatchObject({ reason: "person_stop_task_status_changed" });
+        expect(successors).toHaveLength(0);
+        expect(await deliveredQueuedCommentIds(db, { companyId: f.companyId, issueId: f.issueId,
+          agentId: f.agentId, commentIds })).toEqual(new Set());
+      } else {
+        expect((result as { status: number }).status).toBe(200);
+        expect(nextSend.refusal).toBeNull();
+        expect(afterAct.task.status).toBe("todo");
+        expect(afterAct.blocker).toBeNull();
+        expect(successors).toHaveLength(1);
+        const next = successors[0];
+        const ownIds = next.contextSnapshot?.wakeCommentIds as string[];
+        expect(ownIds).toEqual(commentIds.slice(0, 1));
+        await deliverReconciledExecutions(db, heartbeat.wakeup);
+        await deliverReconciledExecutions(db, heartbeat.wakeup);
+        expect((await runs()).filter(row => row.status === "queued")).toHaveLength(1);
+        await db.update(heartbeatRuns).set({ status: "running", runtimeMode: "native", nativeIssueId: f.issueId,
+          startedAt: new Date(), responsibleUserId: "operator" }).where(eq(heartbeatRuns.id, next.id));
+        await db.update(issues).set({ executionRunId: next.id }).where(eq(issues.id, f.issueId));
+        const binding = { companyId: f.companyId, issueId: f.issueId, agentId: f.agentId, runId: next.id };
+        const text = await claimFirstTurnQueuedInput(db, binding);
+        const receipt = readFirstTurnQueuedInputReceipt(await run(next.id));
+        const orderedInputIds = [...ownIds, ...(receipt?.commentIds ?? [])];
+        expect(orderedInputIds).toEqual(commentIds);
+        expect(new Set(orderedInputIds).size).toBe(7);
+        const bodies = ["held-message-1", "held-message-2", "held-message-3", "held-message-4",
+          "new-send-after-refusal", "next-send-after-board-act"];
+        for (const [index, body] of bodies.entries()) {
+          expect(text).toContain(body);
+          expect(text!.split(body)).toHaveLength(2);
+          if (index) expect(text!.indexOf(body)).toBeGreaterThan(text!.indexOf(bodies[index - 1]));
+        }
+        expect(text).not.toContain("held-message-0"); // Already the run's own input.
+        // Restart-before-acceptance repeats the same seal, not another queue claim.
+        expect(await claimFirstTurnQueuedInput(db, binding)).toBe(text);
+        expect(readFirstTurnQueuedInputReceipt(await run(next.id))).toEqual(receipt);
+        // Same harness acceptance boundary as the five-held fixture; not a model answer.
+        await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, agentId: f.agentId, runId: next.id,
+          seq: 1, eventType: "turn.started", stream: "system" });
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, next.id));
+        const consumed = await deliveredQueuedCommentIds(db, { companyId: f.companyId, issueId: f.issueId,
+          agentId: f.agentId, commentIds });
+        expect([...consumed].sort()).toEqual([...commentIds].sort());
+        const followup = await issueService(db).addComment(f.issueId, "fresh-follow-up", { userId: "operator" });
+        const followupRunId = randomUUID();
+        await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "issue",
+          reason: "issue_commented", status: "deferred_issue_execution", requestedByActorType: "user",
+          requestedByActorId: "operator", payload: { issueId: f.issueId, _paperclipWakeContext: {
+            issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: followup.id, wakeCommentIds: [followup.id] } } });
+        await db.insert(heartbeatRuns).values({ id: followupRunId, companyId: f.companyId, agentId: f.agentId,
+          nativeIssueId: f.issueId, status: "running", runtimeMode: "native", responsibleUserId: "operator" });
+        await db.update(issues).set({ executionRunId: followupRunId }).where(eq(issues.id, f.issueId));
+        const followupText = await claimFirstTurnQueuedInput(db, { ...binding, runId: followupRunId });
+        expect(followupText).toContain("fresh-follow-up");
+        expect(followupText).not.toMatch(/held-message-|new-send-after-refusal|next-send-after-board-act/);
+        expect(readFirstTurnQueuedInputReceipt(await run(followupRunId))?.commentIds).toEqual([followup.id]);
+        delivery = { successorRunId: next.id, ownIds, receipt, orderedInputIds, text, consumedIds: [...consumed],
+          sameSealOnReplay: true, followupRunId, followupText,
+          followupReceipt: readFirstTurnQueuedInputReceipt(await run(followupRunId)), modelAnswer: false };
+      }
+      const evidence = { exit, sourceRunId: f.runId, issueId: f.issueId, commentIds, wakeIds, before, afterAct, after, delivery };
+      if (process.env.STOP_EXIT_EVIDENCE_DIR) writeFileSync(join(process.env.STOP_EXIT_EVIDENCE_DIR, `${exit}.json`), JSON.stringify(evidence, null, 2));
+      console.info("stop-exit-row", JSON.stringify({ exit, firstSend: firstSend.refusal, result,
+        nextSend: nextSend.refusal, queued: after.runs.filter(row => row.status === "queued").map(row => row.id) }));
     }, 60_000);
 
   it.each(ALL_WINDOWS)("terminating the agent releases a sandbox leased during %s", async window => {
