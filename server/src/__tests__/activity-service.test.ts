@@ -451,6 +451,14 @@ describeEmbeddedPostgres("activity service", () => {
       expected: { source: "control_plane", reason: "Execution stopped", initiatorType: "system" } },
     { name: "person Stop", cancellation: requestedRunCancellation({ cancelledByActorType: "user" }, "Stopped by user"),
       expected: { source: "operator", reason: "Stopped by user", initiatorType: "user" } },
+    { name: "legacy string user initiator", cancellation: { source: "operator", reason: "Stopped by user", initiator: "user" },
+      expected: { source: "operator", reason: "Stopped by user", initiatorType: "user" } },
+    { name: "legacy board actor without cancellation", cancellation: undefined, cancelledByActorType: "board",
+      expected: { source: null, reason: null, initiatorType: "user" } },
+    { name: "legacy agent actor without cancellation", cancellation: undefined, cancelledByActorType: "agent",
+      expected: { source: null, reason: null, initiatorType: "agent" } },
+    { name: "unknown legacy actor type", cancellation: {}, cancelledByActorType: "something-else",
+      expected: { source: null, reason: null, initiatorType: null } },
     { name: "operator cancel", cancellation: { source: "operator", reason: "operator_requested" },
       expected: { source: "operator", reason: "operator_requested", initiatorType: null } },
     { name: "agent cancel", cancellation: { source: "api", reason: "agent_requested", initiator: { type: "agent" } },
@@ -466,19 +474,23 @@ describeEmbeddedPostgres("activity service", () => {
     { name: "null cancellation", cancellation: null, expected: undefined },
     { name: "string cancellation", cancellation: "user", expected: undefined },
     { name: "array cancellation", cancellation: [{ source: "operator" }], expected: undefined },
-  ])("preserves bounded cancellation provenance in reloaded task runs: $name", async ({ cancellation, expected }) => {
+  ])("preserves bounded cancellation provenance in reloaded task runs: $name", async (fixture) => {
+    const { cancellation, expected } = fixture;
+    const cancelledByActorType = "cancelledByActorType" in fixture ? fixture.cancelledByActorType : undefined;
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Cancellation history", issuePrefix: `C${companyId.slice(0, 6)}` });
     await db.insert(agents).values({ id: agentId, companyId, name: "Worker", adapterType: "process" });
     await db.insert(issues).values({ id: issueId, companyId, title: "Reload cancelled run", assigneeAgentId: agentId });
     const stored = cancellation && typeof cancellation === "object" && !Array.isArray(cancellation)
       ? { ...cancellation, id: "must-not-leak", userId: "must-not-leak", name: "must-not-leak", email: "must-not-leak",
-        initiator: { ...("initiator" in cancellation ? cancellation.initiator : {}),
-          id: "must-not-leak", userId: "must-not-leak", name: "must-not-leak", email: "must-not-leak" } }
+        initiator: "initiator" in cancellation && typeof cancellation.initiator === "string" ? cancellation.initiator
+          : { ...("initiator" in cancellation ? cancellation.initiator : {}),
+            id: "must-not-leak", userId: "must-not-leak", name: "must-not-leak", email: "must-not-leak" } }
       : cancellation;
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, issueId, scopeKind: "issue",
       status: "cancelled", livenessState: "advanced", finishedAt: new Date(),
-      resultJson: cancellation === undefined ? {} : { cancellation: stored } });
+      resultJson: { ...(cancellation === undefined ? {} : { cancellation: stored }),
+        ...(cancelledByActorType === undefined ? {} : { cancelledByActorType, cancelledByActorId: "must-not-leak" }) } });
 
     // The task chat's recent-run read uses this exact service path after reload.
     const [row] = await activityService(db).runsForIssue(companyId, issueId, null, 2, undefined,
