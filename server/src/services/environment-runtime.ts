@@ -560,6 +560,8 @@ export interface EnvironmentDriverReleaseInput {
   status: Extract<EnvironmentLeaseStatus, "released" | "expired" | "failed">;
 }
 
+const SYNC_OUT_MIN_TIMEOUT_MS = 300_000;
+
 function resolvePluginSandboxRpcTimeoutMs(
   config: Record<string, unknown>,
   defaultTimeoutMs?: number,
@@ -1667,6 +1669,17 @@ function createSandboxEnvironmentDriver(
       provider: providerKey,
     });
     const sanitizedConfig = stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig);
+    if (method === "environmentSyncOut") {
+      sanitizedConfig.timeoutMs = Math.max(
+        SYNC_OUT_MIN_TIMEOUT_MS,
+        typeof sanitizedConfig.timeoutMs === "number" && Number.isFinite(sanitizedConfig.timeoutMs)
+          ? sanitizedConfig.timeoutMs : 0,
+        // Never shorten a larger bridge budget a provider may read instead.
+        typeof sanitizedConfig.bridgeRequestTimeoutMs === "number" && Number.isFinite(sanitizedConfig.bridgeRequestTimeoutMs)
+          ? sanitizedConfig.bridgeRequestTimeoutMs : 0,
+        input.minimumTimeoutMs ?? 0,
+      );
+    }
     const rpcTimeoutMs = input.minimumTimeoutMs === undefined
       ? resolvePluginSandboxRpcTimeoutMs(sanitizedConfig)
       : Math.max(resolvePluginSandboxRpcTimeoutMs(sanitizedConfig) ?? 0,
