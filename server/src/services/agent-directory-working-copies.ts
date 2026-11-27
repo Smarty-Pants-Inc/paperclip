@@ -33,6 +33,13 @@ export class AgentDirectoryOperationBusyError extends HttpError {
   constructor() { super(409, "Agent directory operation is already active"); }
 }
 const completed = new Set(["saved", "unchanged", "resolved", "unavailable"]);
+/** Collection from the sandbox failed: any changes exist only in the sandbox copy. */
+export function isAgentDirectoryCollectionFailure(row: Pick<Copy, "state" | "errorCode">): boolean {
+  return row.state === "unavailable" && (row.errorCode === "AGENT_FILES_FINAL_COLLECTION_UNAVAILABLE" || row.errorCode === "INSTRUCTION_COLLECTION_UNAVAILABLE");
+}
+export function isAgentDirectorySaveFailure(row: Pick<Copy, "state" | "errorCode">): boolean {
+  return row.state === "unavailable" && (row.errorCode === "AGENT_FILES_SAVE_FAILED" || row.errorCode === "AGENT_FILES_LIMIT_EXCEEDED");
+}
 const transports = new Map<string, PreparedAdapterExecutionTargetRuntime>();
 const key = (row: Pick<Copy, "companyId" | "runId">) => `${row.companyId}:${row.runId}`;
 function sandboxTransferRoot(row: Copy, remoteCwd: string): string {
@@ -180,6 +187,27 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       // Interrupted admission may have registered the row before making this root.
       await fs.mkdir(path.resolve(localRoot, "../../.."), { recursive: true, mode: 0o700 });
       return serial(row, () => prepareCopy(input, true), "agent_directory_prepare");
+    }
+    if (row && (isAgentDirectorySaveFailure(row) || isAgentDirectoryCollectionFailure(row))) {
+      // The same run is preparing again (e.g. a warm successor's retirement).
+      // Move the unsaved copies aside, never into the new copy and never
+      // deleted: the host copy (a save failure's collected changes) and the
+      // sandbox copy (a collection failure's only copy), then prepare as usual.
+      const suffix = `.unsaved-${row.updatedAt instanceof Date ? row.updatedAt.getTime() : Date.now()}`;
+      const unsaved = `${path.dirname(row.localRoot)}${suffix}`;
+      await fs.rename(path.dirname(row.localRoot), unsaved).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; });
+      let unsavedRemote: string | null = null;
+      if (row.location !== "local" && input.target?.kind === "remote" && row.executionRoot === executionRoot) {
+        unsavedRemote = `${row.executionRoot}${suffix}`;
+        const [from, to] = [row.executionRoot, unsavedRemote].map(p => `'${p.replaceAll("'", `'"'"'`)}'`);
+        const moved = await runAdapterExecutionTargetShellCommand(row.runId, input.target,
+          `if [ -e ${from} ]; then mv -- ${from} ${to}; fi`, { cwd: input.target.remoteCwd, env: {}, timeoutSec: 15 })
+          .then(result => result.exitCode === 0 && !result.timedOut, () => false);
+        // Never prepare over the only copy: fail this preparation instead.
+        if (!moved) throw conflict("The unsaved agent-file copy in the sandbox could not be moved aside; preparation stopped to keep it");
+      }
+      logger.warn({ companyId: row.companyId, agentId: row.agentId, runId: row.runId, errorCode: row.errorCode, unsaved, unsavedRemote },
+        "unsaved agent-file copy moved aside before same-run preparation");
     }
     if (row && !completed.has(row.state) && row.state !== "preparing") {
       if (input.target?.kind === "remote") {
@@ -463,7 +491,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       errorMessage: rejection ? `Agent-file save rejected: ${rejection} Changes were not saved.` : "Incremental checkpoint could not be validated; collecting after provider stop.", nextAttemptAt: null });
     const storageLimit = failure instanceof AgentFileLimitError || String(failure).includes("LIMIT_EXCEEDED");
     return patch(row, { state: "unavailable", processStoppedAt: new Date(), errorCode: storageLimit ? "AGENT_FILES_LIMIT_EXCEEDED" : "AGENT_FILES_SAVE_FAILED",
-      errorMessage: rejection ? `Agent-file save rejected: ${rejection} Changes were not saved.` : "Agent-file synchronization failed after provider stop. No successful save is claimed.", nextAttemptAt: null,
+      errorMessage: rejection ? `Agent-file save rejected: ${rejection} Changes were not saved; the copy is kept for recovery.` : "Agent-file changes are not saved yet; the copy is kept for recovery.", nextAttemptAt: null,
       receipt: { ...row.receipt, storageWarning: storageLimit ? agentStorageWarning(failure instanceof AgentFileLimitError ? failure.message : "Agent folder exceeds a storage limit") : null } });
   }
   async function collectStopped(row: Copy, target?: AdapterExecutionTarget | null) {
@@ -484,8 +512,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     // Adoption may win between the initial read and the stop CAS. The returned
     // current row is authoritative; a transferred alias cannot inspect or save.
     if (row.receipt?.retainedByRunId || !row.processStoppedAt) return row;
-    // The stopped working copy is the only temporary tree. Retry transient I/O
-    // at this boundary, then clean it up; there are no preserved run snapshots.
+    // Retry transient I/O at this boundary. Successful saves are cleaned up;
+    // failed saves retain the working copy for recovery, not per-run history.
     let inspected: Awaited<ReturnType<typeof retrieve>> | undefined;
     for (;;) {
       row = await patch(row, { attempts: row.attempts + 1 });
@@ -509,8 +537,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
           receipt: { ...row.receipt, storageWarning: error instanceof AgentFileLimitError ? agentStorageWarning(error.message) : row.receipt?.storageWarning ?? null },
           errorCode: error instanceof AgentFileLimitError ? "AGENT_FILES_LIMIT_EXCEEDED" : "AGENT_FILES_SAVE_FAILED",
           errorMessage: error instanceof HttpError && (error.status === 403 || error.status === 422)
-            ? `${error.message}. This run's agent-folder changes were not saved; the temporary copy is discarded.`
-            : "Agent-file synchronization failed. No successful save is claimed; the temporary copy is discarded.",
+            ? `${error.message}. This run's agent-folder changes were not saved; the copy is kept for recovery.`
+            : "Agent-file changes are not saved yet; the copy is kept for recovery.",
         });
         break;
       }
@@ -520,16 +548,26 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
   }
   function releaseIsNoop(row: Copy) {
     return row.state === "superseded" || !row.processStoppedAt ||
-      completed.has(row.state) && row.receipt?.cleanupPending === false;
+      !isAgentDirectorySaveFailure(row) && completed.has(row.state) && row.receipt?.cleanupPending === false;
   }
   async function settleCompletedCleanupRetry(row: Copy) {
-    if (completed.has(row.state) && row.processStoppedAt && !row.receipt?.retainedByRunId && row.receipt?.cleanupPending === false && row.nextAttemptAt) {
+    if (!isAgentDirectorySaveFailure(row) && completed.has(row.state) && row.processStoppedAt && !row.receipt?.retainedByRunId && row.receipt?.cleanupPending === false && row.nextAttemptAt) {
       return patch(row, { nextAttemptAt: null }, sql`${copies.receipt} = ${JSON.stringify(row.receipt)}::jsonb
         AND ${copies.processStoppedAt} IS NOT NULL`);
     }
     return row;
   }
   async function release(row: Copy, target?: AdapterExecutionTarget | null) {
+    // A terminal save failure is not a completed removal obligation. Keep the
+    // baseline, host projection and remote directory; no automatic save retry
+    // exists for this state. Do not even clean the cached transport's scratch.
+    if (isAgentDirectorySaveFailure(row)) {
+      transports.delete(key(row));
+      if (row.receipt?.retainedForRecovery !== true || row.receipt?.cleanupPending !== true || row.nextAttemptAt) {
+        await patch(row, { receipt: { ...row.receipt, cleanupPending: true, retainedForRecovery: true }, nextAttemptAt: null });
+      }
+      return;
+    }
     row = await settleCompletedCleanupRetry(row);
     if (releaseIsNoop(row) || !await owns(row)) return;
     const destroyedOnly = row.receipt?.cleanupDestroyedOnly === true;
@@ -551,8 +589,11 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     const remoteUnavailable = row.location !== "local" && !destroyed && (!lease || terminated
       || Boolean(lease && (lease.releasedAt || lease.status !== "active"))
       || Boolean(cleanupLeaseId && (!lease || cleanupTarget?.kind === "remote" && cleanupTarget.leaseId !== lease.id)));
-    if (remoteUnavailable) cleanupPending = true;
-    else if (!destroyed && row.processStoppedAt && completed.has(row.state) && cleanupTarget?.kind === "remote") {
+    // A failed collection leaves the only copy of any changes in the sandbox:
+    // remove the host projection, never the sandbox copy.
+    const keepRemote = isAgentDirectoryCollectionFailure(row);
+    if (remoteUnavailable) cleanupPending = !keepRemote;
+    else if (!destroyed && !keepRemote && row.processStoppedAt && completed.has(row.state) && cleanupTarget?.kind === "remote") {
       const expected = path.posix.join(cleanupTarget.remoteCwd, ".paperclip-runtime", "agent-files", row.agentId, typeof row.receipt?.materializationRunId === "string" ? row.receipt.materializationRunId : String(row.receipt?.directoryRunId ?? row.runId));
       if (row.executionRoot !== expected) throw new Error("Agent directory cleanup path changed");
       const paths = cleanupTarget.transport === "sandbox" ? [expected, sandboxTransferRoot(row, cleanupTarget.remoteCwd)] : [expected];
@@ -560,7 +601,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       const remoteCleanupFailed = await runAdapterExecutionTargetShellCommand(row.runId, cleanupTarget, `rm -rf -- ${quoted}`,
         { cwd: cleanupTarget.remoteCwd, env: {}, timeoutSec: 15 }).then(result => result.exitCode !== 0 || result.timedOut, () => true);
       cleanupPending ||= remoteCleanupFailed;
-    } else if (!destroyed && row.processStoppedAt && completed.has(row.state) && row.location !== "local") {
+    } else if (!destroyed && !keepRemote && row.processStoppedAt && completed.has(row.state) && row.location !== "local") {
       // Rebind only the current host-owned lease. Never acquire a replacement.
       cleanupPending ||= !await cleanupRemoteAfterRestart(row).catch(() => false);
     }
@@ -574,6 +615,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       await patch(row, { receipt: { schema: AGENT_FILES_CONTRACT, state: row.state, appliedCandidateHash: row.candidateHash, storageWarning: row.receipt?.storageWarning ?? null, cleanupPending,
         materializationRunId: row.receipt?.materializationRunId ?? row.runId,
         ...(row.receipt?.directoryRunId ? { directoryRunId: row.receipt.directoryRunId } : {}),
+        ...(keepRemote && row.location !== "local" && !destroyed ? { sandboxCopyRetained: true, cleanup: row.receipt?.cleanup } : {}),
         ...(cleanupPending ? { cleanup: row.receipt?.cleanup, ...(destroyedOnly ? { cleanupDestroyedOnly: true } : {}) } : {}) },
         nextAttemptAt: cleanupPending ? new Date(Date.now() + 30_000) : null });
     }
