@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { createDb, providerTraceRecords, type Db } from "@paperclipai/db";
 import {
   S3Client,
@@ -16,6 +16,16 @@ import { providerTraceStore } from "./provider-trace-store.js";
 import { idleWorkSnapshot } from "./task-admission.js";
 import { resolveExternalTestDatabaseUrl } from "../__tests__/helpers/external-test-database.js";
 
+// Expiry-policy rows must load the module with an explicit 24-hour policy.
+const originalRetention = vi.hoisted(() => {
+  const original = process.env.PAPERCLIP_PROVIDER_TRACE_RETENTION_MS;
+  process.env.PAPERCLIP_PROVIDER_TRACE_RETENTION_MS = "86400000";
+  return original;
+});
+afterAll(() => {
+  if (originalRetention === undefined) delete process.env.PAPERCLIP_PROVIDER_TRACE_RETENTION_MS;
+  else process.env.PAPERCLIP_PROVIDER_TRACE_RETENTION_MS = originalRetention;
+});
 vi.mock("./activity-log.js", () => ({ logActivity: vi.fn(async () => undefined) }));
 const databaseUrl = resolveExternalTestDatabaseUrl("PAPERCLIP_RUN_EVIDENCE_MIGRATION_DATABASE_URL");
 const endpoint = process.env.PAPERCLIP_LOG_TEST_S3_ENDPOINT;
@@ -86,6 +96,67 @@ describe.skipIf(!databaseUrl)("provider trace retention and capture ownership", 
     vi.stubEnv("PAPERCLIP_STORAGE_S3_FORCE_PATH_STYLE", "true");
     vi.stubEnv("PAPERCLIP_STORAGE_S3_PREFIX", "");
   }
+  async function keepingStore() {
+    vi.stubEnv("PAPERCLIP_PROVIDER_TRACE_RETENTION_MS", "0");
+    vi.resetModules();
+    const module = await import("./provider-trace-store.js");
+    expect(module.PROVIDER_TRACE_RETENTION_MS).toBe(0);
+    return module.providerTraceStore(db);
+  }
+
+  // Keep reason: trace custody; an earlier build's timestamp must not destroy kept bytes.
+  it.for(["local_disk", "s3"] as const)(
+    "keeps a captured %s trace with an earlier build's expired timestamp readable and unscheduled",
+    async (storage, { skip }) => {
+      if (storage === "s3" && !endpoint) skip();
+      if (storage === "s3") external();
+      const store = await keepingStore(), companyId = randomUUID(), runId = randomUUID();
+      owners.push({ store, run: runId, company: companyId });
+      const capture = await store.prepare({ companyId, runId, provider: "codex", requestedBy: "test",
+        assertWriterAuthority: async () => undefined });
+      const entry = { kind: "frame", frameId: 1, rawBase64: Buffer.from("kept exact bytes").toString("base64") };
+      const bytes = Buffer.from(`${JSON.stringify(entry)}\n`);
+      await fs.appendFile(capture.path, bytes);
+      await store.finalize(runId, companyId);
+      const now = new Date();
+      const [before] = await db.update(providerTraceRecords)
+        .set({ expiresAt: new Date(now.getTime() - 3600_000) })
+        .where(eq(providerTraceRecords.runId, runId)).returning();
+
+      expect(await store.cleanupExpired(now)).toEqual([]);
+      expect(await store.getByRun(runId, companyId)).toEqual(before);
+      expect(before!.deletedAt).toBeNull();
+      expect(await store.nextRetentionDeadline()).toBeNull();
+      expect((await store.download(runId, companyId))?.bytes).toEqual(bytes);
+      expect(await store.readExactEntries(runId, companyId)).toEqual([entry]);
+      expect(await store.getByRun(runId, companyId)).toEqual(before);
+    },
+  );
+
+  it.skipIf(!endpoint)("finishes an explicit s3-segments delete through cleanup when retention is zero", async () => {
+    external();
+    const store = await keepingStore(), companyId = randomUUID(), runId = randomUUID();
+    owners.push({ store, run: runId, company: companyId });
+    const capture = await store.prepare({ companyId, runId, provider: "codex", requestedBy: "test",
+      assertWriterAuthority: async () => undefined });
+    await fs.appendFile(capture.path, '{}\n');
+    await store.finalize(runId, companyId);
+    expect((await store.getByRun(runId, companyId))!.traceRef).toMatch(/^s3-segments-v1:/);
+    // A real filesystem failure leaves the person's authoritative deletion pending.
+    await fs.rm(capture.path);
+    await fs.mkdir(capture.path);
+    await expect(store.remove(runId, companyId)).rejects.toThrow();
+    expect(await store.getByRun(runId, companyId)).toMatchObject({ status: "deleted", deletedAt: expect.any(Date) });
+    expect(await store.nextRetentionDeadline()).toBeLessThanOrEqual(Date.now());
+    await fs.rmdir(capture.path);
+    expect(await store.cleanupExpired()).toHaveLength(1);
+    expect(await store.getByRun(runId, companyId)).toMatchObject({ status: "deleted",
+      traceRef: "00000000-0000-0000-0000-000000000000.ndjson", deletedAt: expect.any(Date) });
+    expect(await store.nextRetentionDeadline()).toBeNull();
+    expect(await store.download(runId, companyId)).toBeNull();
+    expect(await fs.readdir(directory)).toEqual([]);
+  });
+
   it("schedules expiry when a new local trace is created after startup becomes quiet", async () => {
     const store = providerTraceStore(db),
       companyId = randomUUID(),
