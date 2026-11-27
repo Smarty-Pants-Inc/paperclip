@@ -4,14 +4,47 @@ import { caseInstructionAlreadyRepresented } from "../case-context.js";
 import { nativeStatusRetryPrompt } from "./continued-session.js";
 
 /** Independent work intent: an empty delta must still produce a model turn.
- * Shared with the next consumer that widens automatic delta routing. */
+ * Shared by automatic delta routing and the empty-system-wake guard. */
 export const NATIVE_AUTOMATIC_CONTINUATION_REASONS: readonly string[] = [
   "issue_continuation_needed", "issue_status_changed", "issue_assigned", "issue_blockers_resolved",
-  "retry_failed_run", "heartbeat_timer", "issue_monitor_due",
+  "retry_failed_run", "heartbeat_timer", "issue_monitor_due", "issue_blocker_stalled",
 ];
+
+export const NATIVE_UNCLAIMED_CONTINUATION_INSTRUCTION = "You are continuing the same conversation. The previous task turn ended without an accepted completion report. Do NOT repeat commands, scripts, or other work already done in this task, or re-answer consumed messages. If the work is complete, file your result against the current contract now. Otherwise finish only what remains, then file your result.";
 
 export function nativeReplyInstruction(receipt: { id: string; receivedAt: string }): string {
   return `Reply to the comment you received at ${receipt.receivedAt} (id ${receipt.id}).`;
+}
+
+/** Read only the structured envelope or our fixed legacy unclaimed framing. */
+export function readNativeContinuationEvents(prompt: unknown): Record<string, unknown> | null {
+  if (typeof prompt !== "string") return null;
+  const text = prompt.startsWith(`${NATIVE_UNCLAIMED_CONTINUATION_INSTRUCTION}\n\n`)
+    ? prompt.slice(NATIVE_UNCLAIMED_CONTINUATION_INSTRUCTION.length + 2) : prompt;
+  try {
+    const value: unknown = JSON.parse(text);
+    return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+  } catch { return null; }
+}
+
+/** Inherited receipt metadata is not proof this turn requested an answer. */
+export function nativeCommentSubmitted(input: {
+  prompt: unknown;
+  message: { id: string; updatedAt: string; body: string };
+  receipt?: { id: string; updatedAt: string; receivedAt: string };
+  bootstrap: boolean;
+}): boolean {
+  const { prompt, message, receipt } = input;
+  const instruction = receipt?.id === message.id && receipt.updatedAt === message.updatedAt ? nativeReplyInstruction(receipt) : null;
+  if (typeof prompt !== "string") return input.bootstrap && !!message.body.trim();
+  const events = readNativeContinuationEvents(prompt);
+  if (events) return (Array.isArray(events.messages) && events.messages.some(value => {
+    const sent = value && typeof value === "object" ? value as Record<string, unknown> : {};
+    return sent.id === message.id && sent.updatedAt === message.updatedAt && sent.body === message.body && !!message.body.trim();
+  })) || !!(instruction && Array.isArray(events.replyInstructions) && events.replyInstructions.includes(instruction));
+  // Plain prompt-only input is a sequence of whole message/instruction blocks.
+  return !!message.body.trim() && (`\n\n${prompt}\n\n`).includes(`\n\n${message.body}\n\n`) ||
+    !!(instruction && prompt.split("\n\n").includes(instruction));
 }
 
 /** Only new, authorized events belong in an already retained provider conversation.
@@ -20,6 +53,8 @@ export function nativeReplyInstruction(receipt: { id: string; receivedAt: string
 export function buildNativeContinuationPrompt(input: {
   wakePayload: unknown;
   promptOnly?: boolean;
+  /** The constructor verified the previous input belongs to this retained session. */
+  retainedSession?: boolean;
   previousRunId: string;
   agentId?: string;
   issue: { title: string; description: string | null };
@@ -36,10 +71,17 @@ export function buildNativeContinuationPrompt(input: {
   // Reopen/resume is independent work even when its named comment already
   // has a reply. Both roads retain the specialized bootstrap framing.
   const unclaimedTask = wake?.reason === "issue_continuation_needed" && rawWake.nativeTaskUnclaimed === true;
-  if ((["issue_reopened_via_comment", "issue_continuation_needed"].includes(wake?.reason ?? "") && !unclaimedTask) ||
+  const automaticWake = input.retainedSession === true &&
+    NATIVE_AUTOMATIC_CONTINUATION_REASONS.includes(wake?.reason ?? "") &&
+    !rawWake.nativeStatusRetry;
+  if ((["issue_reopened_via_comment", "issue_continuation_needed"].includes(wake?.reason ?? "") && !unclaimedTask && !automaticWake) ||
       rawWake.resumeIntent || rawWake.followUpRequested === true || rawWake.reopenedFrom) return null;
   const continuation = wake?.executionContinuation;
-  const delta = continuation?.resumeDelta;
+  const delta = continuation?.resumeDelta ?? (automaticWake ? {
+    baseRunId: input.previousRunId,
+    messages: continuation?.messages.filter(message => wake!.commentIds.includes(message.id)) ?? [],
+    receivedComments: undefined,
+  } : undefined);
   const receipts = new Map((delta?.receivedComments ?? []).filter(receipt => {
     const message = continuation?.messages.find(message => message.id === receipt.id);
     return !message || message.updatedAt === receipt.updatedAt;
@@ -72,7 +114,7 @@ export function buildNativeContinuationPrompt(input: {
       body: comment.fullBody ?? comment.body, createdAt: comment.createdAt ?? "", updatedAt: comment.createdAt ?? "",
       deleted: false, sourceTrust: null });
   }
-  if (input.promptOnly && wake && !unclaimedTask) {
+  if (input.promptOnly && wake && !unclaimedTask && !automaticWake) {
     const retryPrompt = nativeStatusRetryPrompt(input.wakePayload, input.previousRunId);
     if (retryPrompt) {
       // The failed run's own history is already present, but person messages
@@ -89,6 +131,9 @@ export function buildNativeContinuationPrompt(input: {
   }
   if (!wake || !delta || delta.baseRunId !== input.previousRunId) return null;
   if (input.caseContext && !input.workflowCase) return null;
+  // A stalled dependency is a bounded triage wake, never permission to do its work.
+  // Missing current stall context must keep the specialized bootstrap.
+  if (wake.reason === "issue_blocker_stalled" && !wake.blockerStall) return null;
   // Attachment descriptors are intentionally omitted by the generic normalizer.
   // Retain the complete bootstrap framing whenever current input needs them or
   // an omission notice. The compact path never guesses an unavailable file.
@@ -118,13 +163,14 @@ export function buildNativeContinuationPrompt(input: {
   // Other provider, attachment, question, approval, and recovery paths keep
   // their specialized framing. A matching prior run still gates every delta.
   if (rawWake.chatCompletionUpdates || (wake.externalChatProvider && !externalChat) ||
-    (!['issue_commented', 'issue_children_completed'].includes(wake.reason ?? '') && !caseHandoff && !unclaimedTask &&
+    (!['issue_commented', 'issue_children_completed'].includes(wake.reason ?? '') && !caseHandoff && !unclaimedTask && !automaticWake &&
       !(externalChat && wake.reason === "External chat message received")) ||
     wake.fallbackFetchNeeded || wake.truncated || wake.recovery || continuation?.interruptedRunId ||
     (wake.externalChatExecutionBound && !externalChat) || wake.externalChatQuestionResponse ||
     wake.taskWatchdog || wake.livenessContinuation || wake.activeTreeHold ||
     wake.skillTest || wake.executionStage || wake.agentMessage ||
-    wake.documentReviewContext || wake.planReviewContext || wake.annotationDeltas.length > 0
+    wake.documentReviewContext || wake.planReviewContext || wake.annotationDeltas.length > 0 ||
+    (automaticWake && (hasAttachmentContext || wake.interactionId || wake.questionResponse || wake.dispositionRepair))
   ) return null;
   const taskChanges = Object.fromEntries(
     (["title", "description"] as const)
@@ -151,6 +197,10 @@ export function buildNativeContinuationPrompt(input: {
     ...(wake.childIssueSummaries.length ? { childResults: wake.childIssueSummaries } : {}),
     ...(wake.childIssueSummaryTruncated ? { childResultsTruncated: true } : {}),
     ...(wake.unresolvedBlockerIssueIds.length ? { unresolvedBlockerIssueIds: wake.unresolvedBlockerIssueIds } : {}),
+    ...(automaticWake && wake.blockerStall ? {
+      blockerStall: wake.blockerStall,
+      instruction: "Continue by triaging the stalled dependency, then stop: reassign its existing task, escalate to the board with the needed recovery action, or block this task with a reason. Do not redo the dependency's assigned work or treat blocker-dependent deliverables as unblocked; do not wait silently.",
+    } : {}),
     // Server-rendered "App context (untrusted)" from the task's MCP Apps widgets:
     // a resumed turn sees the current selection as well as the new comment.
     ...(typeof rawWake.mcpAppContext === "string" && rawWake.mcpAppContext.trim() ? { appContext: rawWake.mcpAppContext.trim() } : {}),
@@ -158,15 +208,23 @@ export function buildNativeContinuationPrompt(input: {
   const earlierRead = wake.comments.filter((comment) => comment.readByEarlierTurn && comment.id
     && events.messages.some((message) => message.id === comment.id)).map((comment) => comment.id!);
   if (earlierRead.length > 0) Object.assign(events, { readByEarlierTurn: { messageIds: earlierRead, note: PAPERCLIP_EARLIER_READ_COMMENT_NOTE } });
-  if (unclaimedTask) return [
-    "You are continuing the same conversation. The previous task turn ended without an accepted completion report. Do NOT repeat commands, scripts, or other work already done in this task, or re-answer consumed messages. If the work is complete, file your result against the current contract now. Otherwise finish only what remains, then file your result.",
-    ...(events.messages.length || Object.keys(events).length > 1 ? [JSON.stringify(events)] : []),
-  ].join("\n\n");
+  if (unclaimedTask) {
+    // Verified automatic input stays JSON for selected-turn byte attribution.
+    if (automaticWake) return JSON.stringify({ instruction: NATIVE_UNCLAIMED_CONTINUATION_INSTRUCTION, ...events });
+    return [NATIVE_UNCLAIMED_CONTINUATION_INSTRUCTION,
+      ...(events.messages.length || Object.keys(events).length > 1 ? [JSON.stringify(events)] : []),
+    ].join("\n\n");
+  }
   // Child completion is independent work intent. Its producer does not
   // guarantee summaries; keep the pass-1 bootstrap if there is no delta.
   if (wake.reason === "issue_children_completed" && events.messages.length === 0 &&
       Object.keys(events).every(key => key === "messages" || key === "replyInstructions")) return null;
   // Missing named input must never masquerade as an empty system wake.
   if (unseenNamed.some(id => !messages.some(message => message.id === id))) return null;
+  // Keep the event envelope parseable by the selected-turn byte guard.
+  if (automaticWake) return JSON.stringify({
+    resume: `Conversation resumed: ${wake.reason!.replaceAll("_", " ")}. Status: ${wake.issue?.status ?? "unknown"}. Continue the task from the recorded progress; do not repeat completed work.`,
+    ...events,
+  });
   return JSON.stringify(events);
 }

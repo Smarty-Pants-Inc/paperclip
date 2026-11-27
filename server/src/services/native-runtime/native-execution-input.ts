@@ -281,13 +281,13 @@ function buildNativeExecutionInputUnchecked(input: BuildNativeExecutionInput): N
     ? verifiedCompletionSources(input.turnContext, input.completionContract.sources ?? [])
     : [];
   const previousExecution = input.previousTurn?.nativeExecutionInput;
-  const previousCaseProjection = previousExecution && input.previousTurn && input.normalizedSessionId &&
+  const previousSessionMatches = previousExecution && input.previousTurn && input.normalizedSessionId &&
     previousExecution.binding.companyId === input.companyId &&
     previousExecution.binding.agentId === input.agentId &&
     previousExecution.binding.issueId === input.issue.id &&
     previousExecution.binding.runId === input.previousTurn.runId &&
-    previousExecution.session.normalizedSessionId === input.normalizedSessionId
-      ? readCaseProjectionMarker(previousExecution) : null;
+    previousExecution.session.normalizedSessionId === input.normalizedSessionId;
+  const previousCaseProjection = previousSessionMatches ? readCaseProjectionMarker(previousExecution) : null;
   const workflowCase = input.caseContext && previousCaseProjection
     ? projectCaseContinuation(input.caseContext, previousCaseProjection) : null;
   const continuity = resolveSessionContinuity(input.provider, input.sessionContinuity);
@@ -304,6 +304,7 @@ function buildNativeExecutionInputUnchecked(input: BuildNativeExecutionInput): N
   const composeContinuationPrompt = (wakePayload: unknown) => continuationDecision.continue && input.previousTurn ? buildNativeContinuationPrompt({
     wakePayload, promptOnly: continuationDecision.promptOnly, previousRunId: input.previousTurn.runId, agentId: input.agentId,
     previousIssue: input.previousTurn.task, previousGitHubReviewConfigurationKeys: input.previousTurn.githubReviewConfigurationKeys,
+    retainedSession: input.resumedSession === true && !!previousSessionMatches && !input.conversationMode,
     allowExternalChat: true, issue: input.issue, caseContext: input.caseContext, workflowCase,
   }) : null;
   let continuationPrompt = composeContinuationPrompt(input.wakePayload);

@@ -4,7 +4,7 @@ import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { parseObject } from "../../adapters/utils.js";
 import { queuedCommentIdsFromRunContext, queuedCommentIdsFromWakePayload, withQueuedCommentIdsInWakePayload } from "../issue-queued-comment-queue.js";
 import { resolveSessionContinuity } from "./continued-session.js";
-import { nativeReplyInstruction } from "./native-continuation.js";
+import { nativeReplyInstruction, nativeCommentSubmitted, readNativeContinuationEvents } from "./native-continuation.js";
 import { queuedInteractionId, unansweredResolvedInteractionIds } from "../queued-interaction-response.js";
 
 type Scope = { companyId: string; issueId: string; runId: string; agentId?: string };
@@ -171,7 +171,7 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
   companyId: string; issueId: string; agentId: string; runId?: string;
   previousRunId: string; sessionId: string; providerSessionId: string;
   selectedCheckpoint: unknown;
-  messages: ReadonlyArray<{ id: string; updatedAt: string; createdAt: string }>;
+  messages: ReadonlyArray<{ id: string; updatedAt: string; createdAt: string; body: string }>;
 }): Promise<{ received: Set<string>; owed: Set<string>; receipts: RetainedCommentReceipt[] } | null> {
   const runs = await db.select({ id: heartbeatRuns.id,
     checkpoint: sql<Record<string, unknown> | null>`${heartbeatRuns.runnerProfileJson}->'sessionCheckpoint'`,
@@ -251,10 +251,7 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
   const replyOwedRevisions = new Set<string>();
   const submittedByRun = new Map(runs.map(run => {
     const prompt = run.continuationPrompt;
-    let events: Record<string, unknown> | null = null;
-    if (typeof prompt === "string") {
-      try { events = parseObject(JSON.parse(prompt)); } catch { /* Plain prompt-only input. */ }
-    }
+    const events = readNativeContinuationEvents(prompt);
     return [run.id, {
       instructions: new Set(events
         ? Array.isArray(events.replyInstructions) ? events.replyInstructions.filter((value): value is string => typeof value === "string") : []
@@ -324,7 +321,32 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
       const atPublication = inputRevisions(run, typeof attribution.cursor === "number" ? attribution.cursor : 0);
       for (const id of Array.isArray(ids) ? ids : []) {
         const revision = typeof id === "string" ? atPublication.get(id) : undefined;
-        if (revision) answeredRevisions.add(revisionKey(id, revision));
+        if (!revision) continue;
+        const explicit = (attribution.answerAttribution === "provider_explicit" &&
+          Array.isArray(attribution.explicitAnswerCommentIds) && attribution.explicitAnswerCommentIds.includes(id)) ||
+          // Older ledgers did not distinguish provider attribution from inference.
+          (eventsByRun.get(run.id) ?? []).some(event => event.seq === attribution.cursor &&
+            Array.isArray(parseObject(parseObject(event.payload?.prpEvent).payload).answers) &&
+            (parseObject(parseObject(event.payload?.prpEvent).payload).answers as unknown[]).includes(id));
+        const receipt = run.replyReceipts?.find(receipt => receipt.id === id && receipt.updatedAt === revision);
+        const message = scope.messages.find(message => message.id === id && message.updatedAt === revision);
+        // A legacy/server-inferred ledger must be backed by actual submitted
+        // text or its reply instruction, not inherited coverage metadata alone.
+        const submitted = message && nativeCommentSubmitted({ prompt: run.continuationPrompt, message, receipt,
+          bootstrap: run.messages.some(sent => sent.id === id && sent.updatedAt === revision) });
+        const ack = parseObject(parseObject(run.result.queuedSteeringAcknowledgements)[String(id)]);
+        const publishedEvent = (eventsByRun.get(run.id) ?? []).findLast(event => event.eventType === "item.completed" &&
+          typeof attribution.cursor === "number" && event.seq <= attribution.cursor &&
+          ["agentMessage", "assistant_message", "agent_message"].includes(String(parseObject(parseObject(event.payload?.prpEvent).payload).kind)));
+        const answerTurn = attribution.turnId ?? parseObject(publishedEvent?.payload?.prpEvent).turnId;
+        const steered = ack.status === "acknowledged" && typeof answerTurn === "string" && answerTurn === ack.turnId &&
+          (eventsByRun.get(run.id) ?? []).some(event => {
+          const prp = parseObject(event.payload?.prpEvent), payload = parseObject(prp.payload);
+          return typeof attribution.cursor === "number" && event.seq < attribution.cursor && sameGeneration(run, event.seq) &&
+            prp.normalizedSessionId === scope.sessionId && prp.turnId === ack.turnId &&
+            prp.itemId === `${ack.turnId}:steer:${id}` && payload.kind === "steering_acknowledgement" && payload.status === "acknowledged";
+        });
+        if (explicit || submitted || steered) answeredRevisions.add(revisionKey(id, revision));
       }
     }
     const start = eventsByRun.get(run.id)?.find(event => ["turn.accepted", "turn.started"].includes(event.eventType) && sameGeneration(run, event.seq));

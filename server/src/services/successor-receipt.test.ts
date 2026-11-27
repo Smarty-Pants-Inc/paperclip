@@ -13,9 +13,17 @@ import * as continuedSession from "./native-runtime/continued-session.js";
 import * as nativeContinuation from "./native-runtime/native-continuation.js";
 import { nativeRuntimeContextFixture } from "./native-runtime/runtime-context.test-fixture.js";
 import { buildNativeModelEnvelope } from "../vendor/paperclip-runner/index.js";
+import { publishContinuousNativeReply } from "./native-runtime/native-continuous-reply.js";
 import { withQueuedCommentIdsInWakePayload } from "./issue-queued-comment-queue.js";
 import { buildPaperclipWakePayload, enrichWakeContextSnapshot } from "./heartbeat/run-preparation.js";
 
+// Native history is an unloaded provider boundary here, not another server.
+// Retained correlation IDs prove old input retention, not a new submission.
+const retainedHistory = vi.hoisted(() => ({ ids: null as string[] | null }));
+vi.mock("./native-runtime/native-session-executor.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./native-runtime/native-session-executor.js")>();
+  return { ...actual, readNativeSessionUserInputIds: async () => retainedHistory.ids };
+});
 const support = await getEmbeddedPostgresTestSupport();
 describe.skipIf(!support.supported)("retained successor receipt rule", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -200,6 +208,68 @@ describe.skipIf(!support.supported)("retained successor receipt rule", () => {
     if (after === "comment") await db.insert(issueComments).values({ companyId, issueId: s.taskId, authorType: "agent", authorAgentId: agentId, createdByRunId: s.runId, body: "An uncorrelated task comment" });
     return { s, snapshot: await next(s) };
   }
+  it.each(["inherited only", "reply instruction", "revision text", "provider explicit"] as const)("real publisher only answers carried or explicit person input: %s", async mode => {
+    const { s, snapshot } = await acknowledgedSteer("failed", "progress");
+    const child = { ...s, runId: randomUUID() };
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, agentId));
+    const instruction = `Reply to the comment you received at ${t1.toISOString()} (id ${s.commentId}).`;
+    const prompt = JSON.stringify({ childResults: [{ id: "child-build", summary: "Child build passed" }],
+      ...(mode === "reply instruction" ? { replyInstructions: [instruction] } : {}),
+      ...(mode === "revision text" ? { messages: [{ id: s.commentId, updatedAt: t1.toISOString(), body: "PERSON_STEER_OWED" }] } : {}) });
+    await db.insert(heartbeatRuns).values({ id: child.runId, companyId, agentId, runtimeMode: "native", nativeIssueId: s.taskId,
+      nativeSessionId: s.sessionId, status: "running", contextSnapshot: { issueId: s.taskId, executionContinuation: snapshot },
+      runnerProfileJson: { ...checkpoint(child), nativeExecutionInput: { continuationPrompt: prompt } } });
+    await db.update(issues).set({ executionRunId: child.runId }).where(eq(issues.id, s.taskId));
+    const finalEvent = { runId: child.runId, normalizedSessionId: s.sessionId, turnId: "child-turn", sourceEventId: "child-final", itemId: "child-final",
+      eventType: "item.completed" as const, payload: { kind: "agentMessage", channel: "final", text: "Child build passed; unrelated to the person's question",
+        ...(mode === "provider explicit" ? { answers: [s.commentId] } : {}) } };
+    await db.insert(heartbeatRunEvents).values([session(child, 0), event(child, 1, "turn.accepted", {}, "child-turn"),
+      { ...event(child, 2, "item.completed"), payload: { prpEvent: finalEvent } }]);
+    retainedHistory.ids = [s.commentId];
+    try {
+      await publishContinuousNativeReply({ db, cursor: 2, execution: { binding: { companyId, agentId, issueId: s.taskId, runId: child.runId }, provider: { kind: "pi_rpc" } }, event: finalEvent });
+    } finally { retainedHistory.ids = null; }
+    const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, child.runId));
+    const ledger = saved.resultJson?.continuousReplies as Record<string, { questionCommentIds: string[]; answerAttribution?: string }>;
+    const nextSnapshot = await next(child);
+    const receipt = nextSnapshot.resumeDelta?.receivedComments?.find(receipt => receipt.id === s.commentId);
+    const named = turn(child, { reason: "issue_commented", commentIds: [s.commentId], executionContinuation: nextSnapshot }, "JSON");
+    console.log("PUBLISHER_ATTRIBUTION_ROW", JSON.stringify({ mode, runId: child.runId, commentId: s.commentId, prompt, ledger, receipt, named }));
+    expect(ledger["child-final"].questionCommentIds).toEqual(mode === "inherited only" ? [] : [s.commentId]);
+    expect(receipt?.answered).toBe(mode !== "inherited only");
+    if (mode === "inherited only") {
+      expect(named.code).toBeUndefined();
+      expect(named.events?.split(instruction).length).toBe(2);
+      expect(named.events).not.toContain("PERSON_STEER_OWED");
+      // Old deployments saved an undifferentiated server-inferred ledger.
+      // Reconciliation must reject it too, not only prevent new bad writes.
+      for (const answerAttribution of [undefined, "server_inferred"]) {
+        const legacy = { ...ledger["child-final"], questionCommentIds: [s.commentId], answerAttribution };
+        await db.update(heartbeatRuns).set({ resultJson: { ...saved.resultJson, continuousReplies: { "child-final": legacy } } }).where(eq(heartbeatRuns.id, child.runId));
+        const reconciled = await next(child);
+        const reply = turn(child, { reason: "issue_commented", commentIds: [s.commentId], executionContinuation: reconciled }, "JSON");
+        console.log("LEGACY_INFERRED_LEDGER_ROW", JSON.stringify({ runId: child.runId, answerAttribution: answerAttribution ?? "absent", receipt: reconciled.resumeDelta?.receivedComments?.find(r => r.id === s.commentId), reply }));
+        expect(reconciled.resumeDelta?.receivedComments?.find(r => r.id === s.commentId)?.answered).toBe(false);
+        expect(reply.events?.split(instruction).length).toBe(2);
+      }
+    } else expect(named.code).toBe("continuation_nothing_new");
+  });
+  it("rejects a legacy inferred ledger backed only by an ACK in another turn", async () => {
+    const { s } = await acknowledgedSteer("succeeded", "progress");
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, s.runId));
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { ...checkpoint(s), nativeExecutionInput: {
+      continuationPrompt: JSON.stringify({ messages: [], childResults: [{ id: "child", summary: "Unrelated child result" }] }),
+    } }, resultJson: { ...run.resultJson, continuousReplies: { origin: { questionCommentIds: [s.originId] },
+      child: { questionCommentIds: [s.commentId], cursor: 6, turnId: "child-turn" } } } }).where(eq(heartbeatRuns.id, s.runId));
+    await db.insert(heartbeatRunEvents).values([event(s, 5, "turn.accepted", {}, "child-turn"),
+      event(s, 6, "item.completed", { kind: "agentMessage", channel: "final", text: "Unrelated child result" }, "child-turn")]);
+    const snapshot = await next(s);
+    const receipt = snapshot.resumeDelta?.receivedComments?.find(r => r.id === s.commentId);
+    const result = turn(s, { reason: "issue_commented", commentIds: [s.commentId], executionContinuation: snapshot }, "JSON");
+    console.log("OTHER_TURN_INFERRED_ROW", JSON.stringify({ runId: s.runId, commentId: s.commentId, receipt, result }));
+    expect(receipt?.answered).toBe(false);
+    expect(result.events?.split(`Reply to the comment you received at ${t1.toISOString()} (id ${s.commentId}).`).length).toBe(2);
+  });
   it.each([
     ["failed", "progress"], ["timed_out", "progress"], ["succeeded", "progress"], ["failed", "tool"], ["failed", "comment"], ["succeeded", "none"],
   ] as const)("keeps ACK'd input unanswered without attribution: %s / %s", async (status, after) => {
@@ -472,6 +542,27 @@ describe.skipIf(!support.supported)("retained successor receipt rule", () => {
     const result = turn(selected, { reason: "issue_commented", commentIds: [s.commentId], executionContinuation: snapshot }, road);
     expect(result.events?.match(/Reply to the comment you received at/g)).toHaveLength(1);
     console.log("BOOTSTRAP_REPLY_ROW", JSON.stringify({ road, receipt, bootstrap, result }));
+  });
+  it("recognizes a sent reply instruction in the legacy unclaimed preamble plus JSON", async () => {
+    const { s, snapshot: envelope } = await acknowledgedSteer("failed", "progress");
+    const initial = turn(s, { reason: "issue_continuation_needed", nativeTaskUnclaimed: true,
+      commentIds: [s.commentId], executionContinuation: envelope }, "plain");
+    expect(initial.continuationPrompt).toContain("without an accepted completion report");
+    expect(initial.continuationPrompt).toContain(`(id ${s.commentId})`);
+    expect(initial.continuationPrompt).not.toContain("PERSON_STEER_OWED");
+    const selected = { ...s, runId: randomUUID() };
+    await db.insert(heartbeatRuns).values({ id: selected.runId, companyId, agentId, runtimeMode: "native", nativeIssueId: s.taskId, nativeSessionId: s.sessionId, status: "succeeded",
+      contextSnapshot: { issueId: s.taskId, executionContinuation: envelope },
+      runnerProfileJson: { ...checkpoint(selected), nativeExecutionInput: { continuationPrompt: initial.continuationPrompt } }, resultJson: {} });
+    await db.insert(heartbeatRunEvents).values([session(selected, 10), event(selected, 11, "turn.accepted", {}, "turn-2"),
+      event(selected, 12, "item.completed", { kind: "agentMessage", channel: "final", text: "Replied to the unclaimed carried reference" }, "turn-2")]);
+    const snapshot = await next(selected, s.commentId);
+    const receipt = snapshot.resumeDelta?.receivedComments?.find(r => r.id === s.commentId);
+    const repeated = turn(selected, { reason: "issue_commented", commentIds: [s.commentId], executionContinuation: snapshot }, "plain");
+    console.log("UNCLAIMED_REPLY_ONCE_ROW", JSON.stringify({ sourceRun: s.runId, selectedRun: selected.runId, initial, receipt, repeated }));
+    expect(receipt?.answered).toBe(true);
+    expect(repeated.noop?.answeredCommentIds).toEqual([s.commentId]);
+    expect(repeated.events).toBeNull();
   });
   it.each(["reply", "no output", "progress only"])("sends a reply instruction once and clears a carried instruction after %s", async mode => {
     const { s, snapshot: envelope } = await acknowledgedSteer("failed", "progress");

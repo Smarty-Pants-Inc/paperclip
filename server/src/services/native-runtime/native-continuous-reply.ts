@@ -9,6 +9,7 @@ import { logActivity } from "../activity-log.js";
 import { hasChatRunOwnedProviderInteraction } from "../chat-interaction-arbitration.js";
 import { agentRunWritesRevoked } from "../../agent-run-cancellation.js";
 import { resolveSessionContinuity } from "./continued-session.js";
+import { nativeCommentSubmitted } from "./native-continuation.js";
 import { parseObject } from "../../adapters/utils.js";
 import { logger } from "../../middleware/logger.js";
 import { drainContinuousPersonMessages } from "./native-continuous-drain.js";
@@ -126,9 +127,24 @@ export async function publishContinuousNativeReply(input: {
     const firstInputIds = Object.keys(replies).length === 0
       ? [...submittedInputIds, ...sealedIds].filter(id => !answered.has(id)) : [];
     const continued = parseObject(result.continuedSessionInput);
+    const savedExecution = parseObject(parseObject(row.run.runnerProfileJson).nativeExecutionInput);
+    const continuation = parseObject(row.run.contextSnapshot?.executionContinuation);
+    const delta = parseObject(continuation.resumeDelta);
+    const submittedComment = (id: string) => {
+      const message = (Array.isArray(continuation.messages) ? continuation.messages.map(parseObject) : [])
+        .find(message => message.id === id);
+      if (!message || typeof message.updatedAt !== "string" || typeof message.body !== "string") return false;
+      const receipt = (Array.isArray(delta.receivedComments) ? delta.receivedComments.map(parseObject) : [])
+        .find(receipt => receipt.id === id && receipt.updatedAt === message.updatedAt);
+      return nativeCommentSubmitted({ prompt: savedExecution.continuationPrompt,
+        message: { id, updatedAt: message.updatedAt, body: message.body },
+        ...(receipt && typeof receipt.receivedAt === "string" ? { receipt: { id, updatedAt: message.updatedAt, receivedAt: receipt.receivedAt } } : {}),
+        bootstrap: Object.keys(savedExecution).length > 0 && savedExecution.continuationPrompt == null,
+      });
+    };
     const impliedInputIds = Object.keys(replies).length === 0 && continued.runId === runId &&
       continued.sessionId === row.run.nativeSessionId && Array.isArray(continued.commentIds)
-      ? continued.commentIds.filter((id): id is string => typeof id === "string" && !answered.has(id)) : [];
+      ? continued.commentIds.filter((id): id is string => typeof id === "string" && !answered.has(id) && submittedComment(id)) : [];
     const handback = row.run.contextSnapshot?.preDispatchInputHandback === true;
     const nonemptyExplicitAnswers = explicitAnswers && answers.length > 0;
     let questionCommentIds = [...new Set(nonemptyExplicitAnswers
@@ -141,6 +157,11 @@ export async function publishContinuousNativeReply(input: {
         ...(input.event.turnId ? firstInputIds : []),
         ...sameTurnAcknowledgements,
       ])];
+    if (!nonemptyExplicitAnswers && Object.keys(savedExecution).length > 0) {
+      // A sealed first-turn delivery and same-turn steering ACK are direct
+      // submission proof. Other inferred IDs need the selected input itself.
+      questionCommentIds = questionCommentIds.filter(id => sealedIds.includes(id) || sameTurnAcknowledgements.includes(id) || submittedComment(id));
+    }
     if (handback && questionCommentIds.length) {
       const chronological = (await tx.select({ id: issueComments.id }).from(issueComments).where(and(
         eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, questionCommentIds),
@@ -163,7 +184,11 @@ export async function publishContinuousNativeReply(input: {
     });
     if (!resolved.text || resolved.decision.commentAction !== "create") return;
     const normalizedText = resolved.text.trim().replace(/\s+/g, " ");
-    const receipt = { questionCommentIds, sourceEventId: input.event.sourceEventId,
+    const receipt = { questionCommentIds, answerAttribution: nonemptyExplicitAnswers ? "provider_explicit" : "server_inferred",
+      // Sealed aliases can be inferred alongside an explicit provider ID. Do
+      // not upgrade those aliases to provider-authored answer attribution.
+      explicitAnswerCommentIds: nonemptyExplicitAnswers ? answers.filter((id): id is string => typeof id === "string") : [],
+      sourceEventId: input.event.sourceEventId,
       turnId: input.event.turnId ?? null, cursor: input.cursor, normalizedText };
     // Different items can repeat one final. Only a newly answered input earns
     // another identical comment; keep every item in the ledger for replay.

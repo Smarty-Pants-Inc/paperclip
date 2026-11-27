@@ -744,8 +744,21 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
         contextSnapshot: { issueId: f.issueId, conversationSessionGeneration: 0, ...(openingId ? { wakeCommentId: openingId } : {}) } });
       await db.update(issues).set({ executionRunId: retryId }).where(eq(issues.id, f.issueId));
       const scope = { companyId: f.companyId, issueId: f.issueId, agentId: f.agentId, runId: retryId };
-      // R2 has no C in its context or first-turn receipt. Reconcile at the
-      // committed turn-start drain, before its first final or board re-steer.
+      // Retention is not answer attribution. A valid inferred retry must also
+      // carry C's exact revision or its reply instruction in the selected turn.
+      // Keep wake identity absent: reconciliation must not manufacture it.
+      if (mode === "same-legacy" || mode === "same-late-ack") {
+        const [carried] = await db.select().from(issueComments).where(eq(issueComments.id, commentId));
+        const [opening] = openingId ? await db.select().from(issueComments).where(eq(issueComments.id, openingId)) : [];
+        const message = { id: commentId, updatedAt: carried.updatedAt.toISOString(), body: carried.body };
+        const received = { id: commentId, updatedAt: message.updatedAt, receivedAt: message.updatedAt, answered: false };
+        const extra = opening ? [{ id: opening.id, updatedAt: opening.updatedAt.toISOString(), body: opening.body }] : [];
+        await db.update(heartbeatRuns).set({ runnerProfileJson: { nativeExecutionInput: { continuationPrompt: JSON.stringify({
+          messages: extra, replyInstructions: [`Reply to the comment you received at ${received.receivedAt} (id ${commentId}).`],
+        }) } }, contextSnapshot: { issueId: f.issueId, conversationSessionGeneration: 0,
+          ...(openingId ? { wakeCommentId: openingId } : {}), executionContinuation: { messages: [message, ...extra], resumeDelta: { receivedComments: [received] } } },
+        }).where(eq(heartbeatRuns.id, retryId));
+      }
       heldSteering.sent = [];
       heldSteering.userMessages = mode === "unreadable" ? null : mode === "missing-entry" ? [] : ["C: what is 260 plus 5?"];
       heldSteering.userInputIds = mode === "unreadable" ? null : mode === "missing-entry" ? [] : [commentId];
