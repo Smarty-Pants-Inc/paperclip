@@ -1361,8 +1361,6 @@ export interface SuggestTasksResult {
 
 /** Server-recorded task creation in a standing chat's current session. */
 export interface ConversationTaskHandoff {
-  displayStatus?: IssueDisplayStatus;
-  unblockDescriptor?: IssueUnblockDescriptor | null;
   id: string;
   issueId: string;
   identifier: string | null;

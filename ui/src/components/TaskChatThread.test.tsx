@@ -6105,7 +6105,7 @@ describe("TaskChatThread live transcript", () => {
       { kind: "run_terminal", ts: "2026-11-06T15:14:26Z", turnState: "cancelled", runState: "cancelled", disposition: "blocked" },
     ]);
     renderThread({ comments: [], onAdd: async () => {}, issueStatus: "in_progress", conversationMode: true,
-      linkedRuns: [{ id: runId, runId, runtimeMode: "native", status: "succeeded", invocationSource: "issue", triggerDetail: null,
+      linkedRuns: [{ runId, runtimeMode: "native", status: "succeeded", invocationSource: "issue", triggerDetail: null,
         startedAt: "2026-11-06T15:14:05Z", createdAt: "2026-11-06T15:14:05Z", finishedAt: "2026-11-06T15:14:26Z",
         agentId: "agent-1", agentName: "Researcher", adapterType: "paperclip_runner", sessionIdBefore: "retained-session", sessionIdAfter: "retained-session",
         resultJson: { heldNativeConfigurationEnd: true, nativeTerminal: { runTerminalState: "succeeded" } } }],
