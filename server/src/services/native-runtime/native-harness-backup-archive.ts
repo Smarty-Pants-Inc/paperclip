@@ -15,9 +15,18 @@ export const MAX_NATIVE_HARNESS_PATH_BYTES = 4096;
 // two zero blocks terminate the archive. Keep this separate from content size.
 export const MAX_NATIVE_HARNESS_TAR_OVERHEAD_BYTES = MAX_NATIVE_HARNESS_ENTRIES
   * (2 * MAX_NATIVE_HARNESS_PATH_BYTES + 2048) + 1024;
+// Only these two capacity failures can strand otherwise valid history. Keep
+// malformed/changing files on the ordinary retryable archive-error path.
+export class NativeHarnessArchiveCapacityError extends Error {
+  constructor(readonly limit: "entries" | "content_bytes") {
+    super("native_harness_archive_invalid");
+    this.name = "NativeHarnessArchiveCapacityError";
+  }
+}
 const fail = () => new Error("native_harness_archive_invalid");
 export function nativeHarnessArchiveSizeLimit(contentBytes: number) {
-  if (!Number.isSafeInteger(contentBytes) || contentBytes < 0 || contentBytes > MAX_NATIVE_HARNESS_BYTES) throw fail();
+  if (!Number.isSafeInteger(contentBytes) || contentBytes < 0) throw fail();
+  if (contentBytes > MAX_NATIVE_HARNESS_BYTES) throw new NativeHarnessArchiveCapacityError("content_bytes");
   return Math.min(MAX_NATIVE_HARNESS_OBJECT_BYTES, contentBytes + MAX_NATIVE_HARNESS_TAR_OVERHEAD_BYTES);
 }
 const safeName = (name: string) => name.length > 0 && Buffer.byteLength(name) <= MAX_NATIVE_HARNESS_PATH_BYTES && !name.includes("\\")
@@ -60,7 +69,8 @@ export async function captureNativeHarnessArchive(root: string, target: string, 
       if (!relative && excludeRootEntries.includes(name)) continue;
       signal?.throwIfAborted();
       const entry = relative ? `${relative}/${name}` : name;
-      if (!safeName(entry) || ++count > MAX_NATIVE_HARNESS_ENTRIES) throw fail();
+      if (!safeName(entry)) throw fail();
+      if (++count > MAX_NATIVE_HARNESS_ENTRIES) throw new NativeHarnessArchiveCapacityError("entries");
       const file = join(root, entry), stat = await readNativeHarnessBackupSourceInput(() => lstat(file));
       if (stat.isDirectory()) {
         await new Promise<void>((resolve, reject) => archive.entry({ name: entry, type: "directory", mode: stat.mode & 0o777 },
@@ -68,7 +78,7 @@ export async function captureNativeHarnessArchive(root: string, target: string, 
         await visit(entry);
       } else if (stat.isFile()) {
         bytes += stat.size;
-        if (bytes > MAX_NATIVE_HARNESS_BYTES) throw fail();
+        if (bytes > MAX_NATIVE_HARNESS_BYTES) throw new NativeHarnessArchiveCapacityError("content_bytes");
         const handle = await readNativeHarnessBackupSourceInput(() => open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK));
         try {
           const before = await readNativeHarnessBackupSourceInput(() => handle.stat());

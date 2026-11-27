@@ -194,9 +194,9 @@ export function selectNativeSessionResumeRun<
       run.nativeSessionId !== input.normalizedSessionId
     )
       continue;
-    // A sealed undo-send added no progress. Its inherited checkpoint is not a
-    // new source; retain the earlier conversation's actual checkpoint.
-    if (stoppedBeforeFirstInput(run)) continue;
+    // A sealed undo-send adds no input, but its checkpoint may be the only
+    // successful save of earlier history. Skip only when it has no checkpoint.
+    if (stoppedBeforeFirstInput(run) && record(run.runnerProfileJson).sessionCheckpoint == null) continue;
     if (
       run.runtimeMode !== "native" ||
       !LEGACY_RETRY_SOURCE_TERMINAL_STATUSES.has(run.status)
@@ -377,7 +377,8 @@ async function selectNativeSessionResumeBarrier(db: Db, input: NativeSessionResu
         not(sql`coalesce((${heartbeatRuns.status} = 'cancelled'
           and ${heartbeatRuns.resultJson}->'stoppedBeforeFirstInput'->>'schema' = ${STOPPED_BEFORE_FIRST_INPUT}
           and ${heartbeatRuns.resultJson}->'stoppedBeforeFirstInput'->>'runId' = ${heartbeatRuns.id}::text
-          and ${heartbeatRuns.resultJson}->'stoppedBeforeFirstInput'->>'issueId' = ${heartbeatRuns.nativeIssueId}::text), false)`),
+          and ${heartbeatRuns.resultJson}->'stoppedBeforeFirstInput'->>'issueId' = ${heartbeatRuns.nativeIssueId}::text
+          and not coalesce(${heartbeatRuns.runnerProfileJson}->'sessionCheckpoint' <> 'null'::jsonb, false)), false)`),
       ),
     )
     .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))

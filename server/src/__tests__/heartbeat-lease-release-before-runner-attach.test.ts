@@ -479,16 +479,24 @@ describeEmbeddedPostgres("environment lease release between sandbox acquire and 
 
   // Recorded gate-5 shape: Stop before staging, legacy hold already resolved
   // blocked, no captured old task version, and four messages already parked.
-  it.each(["send", "retry", "newer-status", "successor", "live-owner", "provider-work", "changed-allocation", "foreign-hold"] as const)(
-    "re-evaluates an already-stuck early Stop only at a person's request (%s)", async action => {
+  it.each(["send", "retry", "newer-status", "successor", "live-owner", "provider-work", "changed-allocation", "foreign-hold",
+    "h-send", "h-retry", "h-unsettled", "h-system"] as const)(
+    "re-evaluates an already-stuck early Stop only at a person's request (%s)", async scenario => {
+      const liveShape = scenario.startsWith("h-");
+      const action = scenario === "h-send" ? "send" : scenario === "h-retry" ? "retry" : scenario;
       const f = await acquireReusable("replace");
       const now = new Date(), actionId = randomUUID();
       await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId));
       await db.update(heartbeatRuns).set({ runtimeMode: "legacy", runtimeModeResolvedAt: null,
-        nativeIssueId: null, executionStage: "preparing", status: "cancelled", errorCode: "cancelled", finishedAt: now,
+        nativeIssueId: null, executionStage: "preparing", status: "cancelled", errorCode: liveShape ? null : "cancelled", finishedAt: now,
         runnerProfileJson: { adapterDispatch: { adapterType: "paperclip_runner" } },
         resultJson: { startupCancellation: { requestedAt: now.toISOString(), beforeNativeSelection: true },
-          cancelledByActorType: "user", cancelledByUserId: "operator", preDispatchCancellationSettledAt: now.toISOString() },
+          cancelledByActorType: "user", cancelledByUserId: "operator",
+          ...(liveShape ? { personStop: { userId: "operator", returned: [], requestedAt: now.toISOString() },
+            startupPreparationSettledAt: new Date(now.getTime() + (scenario === "h-unsettled" ? -1 : 1)).toISOString(),
+            cancellation: { reason: "Execution stopped", source: scenario === "h-system" ? "system" : "operator",
+              expected: true, initiator: "user", recordedAt: now.toISOString() } }
+            : { preDispatchCancellationSettledAt: now.toISOString() }) },
       }).where(eq(heartbeatRuns.id, f.runId));
       await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success", releasedAt: now })
         .where(eq(environmentLeases.id, f.leaseId));
@@ -499,6 +507,8 @@ describeEmbeddedPostgres("environment lease release between sandbox acquire and 
         kind: "active_run_watchdog", cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${f.runId}`,
         status: "resolved", outcome: "blocked", nextAction: "Inspect the run before sending a new message to request continuation.",
         evidence: { runId: f.runId, legacyCancellationBlock: { runId: f.runId, statusVersion: blockedTask.statusVersion, previousStatus: "in_progress" },
+          ...(liveShape ? { attempt: 1, adapterRecovery: {}, originalFailureCode: null,
+            freshContinuationCheck: { kind: "person_owned", reason: "stopped_on_request" }, savedPersonWakeNoticeCommentId: randomUUID() } : {}),
           automaticRecovery: { policy: "preserve_without_replay_v1", runId: f.runId, replay: "blocked", actionOutcome: "unknown" } } });
       const commentIds: string[] = [], wakeIds: string[] = [];
       for (let index = 0; index < 4; index++) {

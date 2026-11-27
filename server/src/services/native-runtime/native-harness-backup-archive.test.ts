@@ -7,7 +7,7 @@ import tar from "tar-stream";
 import { afterEach, expect, it } from "vitest";
 import { captureNativeHarnessArchive, restoreNativeHarnessArchive, MAX_NATIVE_HARNESS_BYTES,
   MAX_NATIVE_HARNESS_ENTRIES, MAX_NATIVE_HARNESS_OBJECT_BYTES, MAX_NATIVE_HARNESS_PATH_BYTES,
-  nativeHarnessArchiveSizeLimit } from "./native-harness-backup-archive.js";
+  nativeHarnessArchiveSizeLimit, NativeHarnessArchiveCapacityError } from "./native-harness-backup-archive.js";
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
@@ -41,7 +41,9 @@ it("captures at the exact archive byte limit and refuses one byte beyond it", as
   await restoreNativeHarnessArchive(exact, join(root, "restored-exact"));
   expect(await readFile(join(root, "restored-exact", "state"), "utf8")).toBe("retained provider bytes");
   const exceeded = join(root, "exceeded");
-  await expect(captureNativeHarnessArchive(source, exceeded, undefined, bytes - 1)).rejects.toThrow("native_harness_archive_invalid");
+  const refusal = await captureNativeHarnessArchive(source, exceeded, undefined, bytes - 1).catch(error => error);
+  expect(refusal).toMatchObject({ message: "native_harness_archive_invalid" });
+  expect(refusal).not.toBeInstanceOf(NativeHarnessArchiveCapacityError);
   expect((await stat(exceeded)).size).toBeLessThan(bytes);
 });
 it.each([
@@ -103,6 +105,10 @@ it("rejects oversized source files before streaming their payload", async () => 
   const root = await fixture(), source = join(root, "source"); await mkdir(source);
   const handle = await open(join(source, "oversized"), "wx");
   await handle.truncate(MAX_NATIVE_HARNESS_BYTES + 1); await handle.close();
-  await expect(captureNativeHarnessArchive(source, join(root, "archive"))).rejects.toThrow("native_harness_archive_invalid");
+  await expect(captureNativeHarnessArchive(source, join(root, "archive"))).rejects.toMatchObject({
+    name: "NativeHarnessArchiveCapacityError", message: "native_harness_archive_invalid", limit: "content_bytes",
+  });
+  expect(() => nativeHarnessArchiveSizeLimit(MAX_NATIVE_HARNESS_BYTES + 1)).toThrow(NativeHarnessArchiveCapacityError);
+  expect(() => nativeHarnessArchiveSizeLimit(-1)).toThrow("native_harness_archive_invalid");
   expect((await stat(join(root, "archive"))).size).toBeLessThan(1024);
 });

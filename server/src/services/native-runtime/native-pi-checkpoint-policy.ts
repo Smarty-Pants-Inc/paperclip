@@ -7,7 +7,7 @@ import { digestBackupDirectoryStreamed } from "./native-harness-backup-digest.js
 // trailers, extensions or provider configuration. Shared by live snapshots,
 // legacy-backup migration and cold restore staging.
 export const PI_HOME_CHECKPOINT_EXCLUDED_ENTRIES = [
-  "data/pnpm/store", "data/pnpm/.tools", "cache", "node-compile-cache",
+  "data/pnpm/store", "data/pnpm/.tools", "cache", "node-compile-cache", ".npm/_cacache",
 ] as const;
 
 export function piRunnerCheckpointExclusions(sessionId: string): string[] {

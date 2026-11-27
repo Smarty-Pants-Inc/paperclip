@@ -1914,6 +1914,17 @@ describe("rebindNativeSessionCheckpoint", () => {
     expect(source).toEqual(original);
   });
 
+  it.each([true, false])("retains a sealed stopped run's own checkpoint (own=%s)", own => {
+    const source = { ...previousRun(), nativeIssueId: issueId, runtimeMode: "native", status: "failed",
+      createdAt: new Date(0), processPid: null, processGroupId: null, processStartedAt: null };
+    const sealed = { ...source, id: "sealed", status: "cancelled", createdAt: new Date(1),
+      resultJson: { stoppedBeforeFirstInput: { schema: "paperclip.stopped-before-first-input.v1", runId: "sealed", issueId } },
+      runnerProfileJson: own ? source.runnerProfileJson : {} };
+    const runs = own ? [sealed, { ...source, runnerProfileJson: {} }] : [sealed, source];
+    expect(selectNativeSessionResumeRun({ runs, companyId, agentId, issueId, normalizedSessionId,
+      currentRunId, beforeCreatedAt: new Date(100), providerEvidenceRunIds: new Set() })).toBe(own ? sealed : source);
+  });
+
   it("never skips a newer provider authority or incompatible checkpoint", () => {
     const source = {
       ...previousRun(),

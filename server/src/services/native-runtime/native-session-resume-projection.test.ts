@@ -72,6 +72,18 @@ const supported = Boolean(externalUrl) || (await getEmbeddedPostgresTestSupport(
     }
   });
 
+  it("keeps a sealed stopped run when it holds the only checkpoint, and skips it only without one", async () => {
+    const sealedId = randomUUID();
+    const saved = run(0), sealed = run(1, { id: sealedId, status: "cancelled", runnerProfileJson: profile,
+      resultJson: { stoppedBeforeFirstInput: { schema: "paperclip.stopped-before-first-input.v1", runId: sealedId, issueId } } });
+    await db.insert(heartbeatRuns).values([saved, sealed]);
+    expect((await select())?.id).toBe(sealed.id);
+    await writeProfile(saved.id, profile);
+    expect((await select())?.id).toBe(sealed.id);
+    await writeProfile(sealed.id, {});
+    expect((await select())?.id).toBe(saved.id);
+  });
+
   it("treats every non-null checkpoint as a barrier, including invalid false, zero, empty string, array and object values", async () => {
     const saved = source(), newer = run(1);
     await db.insert(heartbeatRuns).values([saved, newer]);

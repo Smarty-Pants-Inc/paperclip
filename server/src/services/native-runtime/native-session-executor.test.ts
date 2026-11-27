@@ -4859,7 +4859,11 @@ describe("remote provider checkpoint snapshots", () => {
         await mkdir(join(source, "runner", sessionPath, "pi-home", cache), { recursive: true });
         await writeFile(join(source, "runner", sessionPath, "pi-home", cache, "regenerable"), "downloaded");
       }
-      const store = join(source, "runner", sessionPath, "pi-home/data/pnpm/store");
+      // Pin the npm cache independently of the policy list, so omission is RED.
+      const store = join(source, "runner", sessionPath, "pi-home/.npm/_cacache");
+      await mkdir(store, { recursive: true });
+      await writeFile(join(source, "runner", sessionPath, "pi-home/.npmrc"), "registry=https://registry.npmjs.org\n");
+      await writeFile(join(source, "runner", sessionPath, "pi-home/.npm/keep"), "non-cache npm state");
       // Real filesystem entries, not a mocked count or an increased safety cap.
       for (let index = 0; index <= MAX_NATIVE_HARNESS_ENTRIES; index += 64)
         await Promise.all(Array.from({ length: Math.min(64, MAX_NATIVE_HARNESS_ENTRIES + 1 - index) }, (_, offset) =>
@@ -4895,8 +4899,11 @@ describe("remote provider checkpoint snapshots", () => {
       const rebuilt = await buildNativeHarnessBackupManifestStreamed({ ...manifestInput, backupRoot: restored });
       expect(restoredManifest.directories).toEqual(rebuilt.directories);
       expect(restoredManifest.normalizedSessionId).toBe(sessionId);
+      await expect(access(join(restored, "runner", sessionPath, "pi-home/.npm/_cacache"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readFile(join(restored, "runner", sessionPath, "pi-home/.npmrc"), "utf8")).toContain("registry=");
+      expect(await readFile(join(restored, "runner", sessionPath, "pi-home/.npm/keep"), "utf8")).toBe("non-cache npm state");
       // The original box remains intact, including every omitted cache entry.
-      expect((await readdir(store)).length).toBe(MAX_NATIVE_HARNESS_ENTRIES + 2);
+      expect((await readdir(store)).length).toBeGreaterThan(MAX_NATIVE_HARNESS_ENTRIES);
       const build = spawnSync(process.execPath, ["-e", 'const fs=require("node:fs");fs.mkdirSync("pi-home/data/pnpm/store",{recursive:true});fs.writeFileSync("pi-home/data/pnpm/store/rebuilt","ok");console.log(JSON.parse(fs.readFileSync("identity.json")).sessionId)'],
         { cwd: join(restored, "runner", sessionPath), encoding: "utf8" });
       expect(build.status).toBe(0);
@@ -14240,13 +14247,40 @@ describe("native warm session supervision", () => {
     expect(collectStopped).toHaveBeenCalledOnce();
   });
 
+  it("retires after a transient archive refusal then a good capture", async () => {
+    const name = "warm-transient-archive";
+    const current = { ...execution, binding: { ...execution.binding, runId: name, executionWorkspaceId: name },
+      session: { ...execution.session, normalizedSessionId: name, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } },
+    } as NativeExecutionInputV1;
+    const close = vi.fn(async () => undefined).mockRejectedValueOnce(new Error("native_harness_archive_invalid", {
+      cause: new Error("file changed while reading"),
+    }));
+    state.execute.mockReset().mockImplementation(async options => {
+      await options.onSession?.({ close });
+      return { result: { summary: "same conversation" }, terminal: { runTerminalState: "succeeded" },
+        turnId: name, normalizedSessionId: name, providerSessionId: name, driverKind: "test", driverVersion: "1",
+        nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+    });
+    try {
+      await executePaperclipNativeSession({ db: leaseDb(current), execution: current, runnerInstanceId: name });
+      const next = { ...current, binding: { ...current.binding, runId: `${name}-next`, executionWorkspaceId: `${name}-next` },
+        provider: { ...current.provider, model: "changed-model" } } as NativeExecutionInputV1;
+      await expect(executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: name }))
+        .rejects.not.toMatchObject({ code: "native_harness_preservation_required" });
+      await expect(executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: name }))
+        .resolves.toMatchObject({ exitCode: 0 });
+      expect(close).toHaveBeenCalledTimes(2);
+    } finally { await closeIdleWarmNativeSessionsForRestart(); }
+  });
+
   it("keeps a conversation after a non-cache archive refusal and never repeats same-owner capture", async () => {
     const name = "warm-archive-preservation";
     const current = { ...execution, binding: { ...execution.binding, runId: name, executionWorkspaceId: name },
       session: { ...execution.session, normalizedSessionId: name, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } },
     } as NativeExecutionInputV1;
     let allowClose = false;
-    const close = vi.fn(async () => { if (!allowClose) throw new Error("native_harness_archive_invalid"); });
+    const { NativeHarnessArchiveCapacityError } = await import("./native-harness-backup-archive.js");
+    const close = vi.fn(async () => { if (!allowClose) throw new NativeHarnessArchiveCapacityError("entries"); });
     state.execute.mockReset().mockImplementationOnce(async options => {
       await options.onSession?.({ close });
       return { result: { summary: "earlier conversation" }, terminal: { runTerminalState: "succeeded" },
@@ -14271,7 +14305,7 @@ describe("native warm session supervision", () => {
         expect(nativeSessionFailureSourceCode(error)).toBe("native_harness_preservation_required");
         expect(nativeSessionFailureDisposition(1, new Date(), nativeSessionFailureSourceCode(error)))
           .toMatchObject({ phase: "terminal_failure", nextAttemptAt: null });
-        expect(String(error)).toContain("conversation is kept");
+        expect(String(error)).toContain("saved history is too large");
       }
       expect(readNativeSessionIdleWork()).toBe("present");
     } finally {
@@ -24812,10 +24846,10 @@ describe("runnerd provider runtime wiring", () => {
     expect(runnerEnvironment).toMatchObject(paths);
   });
 
-  it.each(["cache", "non-cache"] as const)("ordinary stopped-run release checkpoints an over-cap Pi tree with one bounded outcome (%s)", async kind => {
+  it.each(["cache", "non-cache", "transient"] as const)("ordinary stopped-run release checkpoints an over-cap Pi tree with one bounded outcome (%s)", async kind => {
     // The remote filesystem, copy/filter, manifest, archive and restore are real.
     // Runner/DB/object-store boundaries are fixtures: this is NOT a model answer.
-    const { captureNativeHarnessArchive, restoreNativeHarnessArchive, MAX_NATIVE_HARNESS_ENTRIES } = await import("./native-harness-backup-archive.js");
+    const { captureNativeHarnessArchive, restoreNativeHarnessArchive, MAX_NATIVE_HARNESS_ENTRIES, MAX_NATIVE_HARNESS_BYTES } = await import("./native-harness-backup-archive.js");
     const remoteCwd = join(isolatedStateDirectory, `release-${kind}`), sessionId = randomUUID();
     const current = { ...execution, binding: { ...execution.binding, runId: randomUUID(), issueId: randomUUID(), executionWorkspaceId: randomUUID() },
       provider: { kind: "pi_rpc", model: "fixture/model" },
@@ -24846,7 +24880,12 @@ describe("runnerd provider runtime wiring", () => {
     const validateOwner = vi.spyOn(harnessStorage, "assertNativeHarnessBackupOwner").mockResolvedValue(undefined);
     const checkpointRegistration = vi.spyOn(runnerCheckpoint, "nativeRunnerCheckpointRegistration").mockReturnValue(async () => undefined);
     const archive = join(isolatedStateDirectory, `release-${kind}.tar`);
+    let transientCapture = kind === "transient";
     const persist = vi.spyOn(harnessStorage, "persistNativeHarnessBackup").mockImplementation(async input => {
+      if (transientCapture) {
+        transientCapture = false;
+        throw new Error("native_harness_archive_invalid", { cause: new Error("file changed while reading") });
+      }
       await captureNativeHarnessArchive(input.root, archive);
       return {} as never;
     });
@@ -24906,9 +24945,17 @@ describe("runnerd provider runtime wiring", () => {
     await writeFile(join(piSession, "identity.json"), JSON.stringify({ sessionId }));
     const tree = join(piSession, kind === "cache" ? "pi-home/data/pnpm/store" : "required-history");
     await mkdir(tree, { recursive: true });
-    for (let index = 0; index <= MAX_NATIVE_HARNESS_ENTRIES; index += 128)
+    if (kind !== "transient") for (let index = 0; index <= MAX_NATIVE_HARNESS_ENTRIES; index += 128)
       await Promise.all(Array.from({ length: Math.min(128, MAX_NATIVE_HARNESS_ENTRIES + 1 - index) }, (_, offset) => writeFile(join(tree, `entry-${index + offset}`), "")));
-    if (kind === "cache") {
+    if (kind === "transient") {
+      await expect(registration.checkpoint!("settled")).rejects.toMatchObject({ message: "native_harness_archive_invalid" });
+      expect(onLog.mock.calls.filter(call => String(call[1]).includes("saved history is too large"))).toHaveLength(0);
+      await expect(registration.checkpoint!("settled")).resolves.toBeUndefined();
+      expect(persist).toHaveBeenCalledTimes(2);
+      const restored = join(isolatedStateDirectory, "transient-same-session-restored");
+      await restoreNativeHarnessArchive(archive, restored);
+      expect(JSON.parse(await readFile(join(restored, "runner/runner-state.json"), "utf8")).normalizedSessionId).toBe(sessionId);
+    } else if (kind === "cache") {
       // Exactly the callback transport.close invokes after runner process exit.
       await expect(registration.checkpoint!("settled")).resolves.toBeUndefined();
       expect(persist).toHaveBeenCalledTimes(1);
@@ -24921,12 +24968,25 @@ describe("runnerd provider runtime wiring", () => {
       await expect(access(join(restoredSession, "pi-home/data/pnpm/store"))).rejects.toMatchObject({ code: "ENOENT" });
     } else {
       await expect(registration.checkpoint!("settled")).rejects.toMatchObject({ code: "native_harness_preservation_required" });
-      const attempts = remoteExecute.mock.calls.length;
-      for (let attempt = 0; attempt < 4; attempt++)
-        await expect(registration.checkpoint!("settled")).rejects.toMatchObject({ code: "native_harness_preservation_required" });
       expect(persist).toHaveBeenCalledTimes(1);
-      expect(remoteExecute).toHaveBeenCalledTimes(attempts);
-      expect(onLog.mock.calls.filter(call => String(call[1]).includes("The previous conversation is kept"))).toHaveLength(1);
+      await rm(tree, { recursive: true, force: true });
+      // An explicit later capture is allowed to recover; normal retirement
+      // remains latched until that capture succeeds.
+      await rm(archive, { force: true });
+      await expect(registration.checkpoint!("settled")).resolves.toBeUndefined();
+      expect(persist).toHaveBeenCalledTimes(2);
+      await rm(archive, { force: true });
+      await expect(registration.checkpoint!("settled")).resolves.toBeUndefined();
+      expect(persist).toHaveBeenCalledTimes(3);
+      expect(onLog.mock.calls.filter(call => String(call[1]).includes("saved history is too large"))).toHaveLength(1);
+      // A distinct later overflow must report again: success really cleared
+      // the checkpoint's latch, rather than merely bypassing its early throw.
+      await mkdir(tree);
+      const oversized = await open(join(tree, "oversized-history"), "wx");
+      await oversized.truncate(MAX_NATIVE_HARNESS_BYTES + 1); await oversized.close();
+      await rm(archive, { force: true });
+      await expect(registration.checkpoint!("settled")).rejects.toMatchObject({ code: "native_harness_preservation_required" });
+      expect(onLog.mock.calls.filter(call => String(call[1]).includes("saved history is too large"))).toHaveLength(2);
       expect(await readFile(join(piSession, "session.jsonl"), "utf8")).toBe("fixture retained history\n");
     }
   }, 120_000);

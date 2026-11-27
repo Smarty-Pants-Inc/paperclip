@@ -23,6 +23,7 @@ import { prepareCursorCloudRuntime } from "./cursor-cloud-runtime.js";
 import { LocalRuntimeApiListenerClosedError, resolveLocalRuntimeApiUrl } from "../../runtime-api.js";
 import { digestBackupDirectoryStreamed } from "./native-harness-backup-digest.js";
 import { PI_HOME_CHECKPOINT_EXCLUDED_ENTRIES, piRunnerCheckpointExclusions } from "./native-pi-checkpoint-policy.js";
+import { NativeHarnessArchiveCapacityError } from "./native-harness-backup-archive.js";
 import { providerFailureFromError } from "../../vendor/paperclip-runner/index.js";
 import { readProviderFailure } from "@paperclipai/shared";
 import { nativeCancellationHasUnsettledOwner, notifyNativeCancellation, waitForNativeCancellation } from "./native-cancellation-delivery.js";
@@ -805,18 +806,22 @@ type WarmNativeSession = {
   lastActivityAt: string;
 };
 
-function isNativeHarnessArchiveInvalid(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  return error.message === "native_harness_archive_invalid" ||
-    isNativeHarnessArchiveInvalid(error.cause) ||
-    error instanceof AggregateError && error.errors.some(isNativeHarnessArchiveInvalid);
+function isNativeHarnessArchiveOverCapacity(error: unknown): boolean {
+  const pending = [error];
+  for (let seen = 0; pending.length && seen < 16; seen++) {
+    const current = pending.shift();
+    if (current instanceof NativeHarnessArchiveCapacityError) return true;
+    if (current instanceof AggregateError) pending.push(...current.errors);
+    if (current instanceof Error && current.cause !== undefined) pending.push(current.cause);
+  }
+  return false;
 }
 
 const NATIVE_HARNESS_PRESERVATION_REQUIRED = "native_harness_preservation_required";
 export class NativeHarnessPreservationRequiredError extends Error {
   readonly code = NATIVE_HARNESS_PRESERVATION_REQUIRED;
   constructor(cause: unknown) {
-    super("The previous conversation is kept on its sandbox, but its session backup exceeded a safety limit or contains unsupported state. Automatic retries are stopped. Preserve or repair the session backup before continuing; do not reset the conversation.", { cause });
+    super("This conversation's saved history is too large to move to a new sandbox, so its sandbox is kept as it is.", { cause });
     this.name = "NativeHarnessPreservationRequiredError";
   }
 }
@@ -981,7 +986,7 @@ async function retireWarmPredecessor(entry: WarmNativeSession, reason: string,
         });
         throw new NativePredecessorRetirementDirectoryBusyError(entry.runId, error);
       }
-      if (isNativeHarnessArchiveInvalid(error) || findHarnessPreservationFailure(error)) {
+      if (isNativeHarnessArchiveOverCapacity(error) || findHarnessPreservationFailure(error)) {
         entry.preservationFailure = findHarnessPreservationFailure(error) ?? new NativeHarnessPreservationRequiredError(error);
         logger.error({ runId: entry.runId, issueId: entry.issueId, providerLeaseId: entry.providerLeaseId,
           reason: entry.preservationFailure.code }, entry.preservationFailure.message);
@@ -1353,7 +1358,8 @@ async function stopRetainedRunnerOfFinishedOwner(entry: WarmNativeSession, error
 }
 
 function armWarmIdleCloseRetry(sessionId: string, entry: WarmNativeSession): void {
-  if (warmNativeSessions.get(sessionId) !== entry || entry.released || (entry.idleCloseRetries ?? 0) >= WARM_IDLE_CLOSE_MAX_RETRIES) return;
+  if (warmNativeSessions.get(sessionId) !== entry || entry.released || entry.preservationFailure ||
+      (entry.idleCloseRetries ?? 0) >= WARM_IDLE_CLOSE_MAX_RETRIES) return;
   entry.idleCloseRetries = (entry.idleCloseRetries ?? 0) + 1;
   armWarmNativeSessionIdleTimer(sessionId, entry, WARM_IDLE_CLOSE_RETRY_MS);
 }
@@ -19058,19 +19064,24 @@ async function createRunnerdBackendWithinSessionClaim(
   const checkpointRemoteRunner = async (
     settlement: "settled" | "unsettled",
   ) => {
-    if (checkpointPreservationFailure) throw checkpointPreservationFailure;
+    // Normal predecessor retirement is latched on the warm owner. An explicit
+    // later checkpoint must still be allowed to save a now-smaller tree.
+    const warmOwner = warmNativeSessions.get(sessionScopeId);
+    const checkpointOwnerRunId = (sessionToolAuthorityEpochs.get(sessionScopeId) ?? authorityEpoch).runId;
+    const ownsWarmEntry = warmOwner?.runId === checkpointOwnerRunId;
     let saved: boolean;
     checkpointBackupStored = false;
     try {
       saved = await persistRemoteRunnerCheckpoint(settlement);
     } catch (error) {
-      // A warm generation can contain earlier turns even when this run never
-      // received input. Never discard it or silently mark it fresh. Cache
-      // filtering should cure known overflows; other archive refusals require
-      // one visible preservation decision, not another expensive capture.
-      if (isNativeHarnessArchiveInvalid(error)) {
-        checkpointPreservationFailure = new NativeHarnessPreservationRequiredError(error);
-        await Promise.resolve(input.onLog?.("stderr", `[paperclip-runner] ${checkpointPreservationFailure.message}\n`)).catch(() => undefined);
+      // Keep earlier turns on a capacity refusal. Other archive errors, such
+      // as a file changing during capture, remain normal retryable failures.
+      if (isNativeHarnessArchiveOverCapacity(error)) {
+        if (!checkpointPreservationFailure) {
+          checkpointPreservationFailure = new NativeHarnessPreservationRequiredError(error);
+          await Promise.resolve(input.onLog?.("stderr", `[paperclip-runner] ${checkpointPreservationFailure.message}\n`)).catch(() => undefined);
+        }
+        if (ownsWarmEntry) warmOwner.preservationFailure = checkpointPreservationFailure;
         throw checkpointPreservationFailure;
       }
       if (!checkpointBackupStored && remoteTarget?.transport === "sandbox" && remoteTarget.reusableLeaseConfigured !== true) {
@@ -19083,6 +19094,10 @@ async function createRunnerdBackendWithinSessionClaim(
         )).catch(() => undefined);
       }
       throw error;
+    }
+    if (saved) {
+      checkpointPreservationFailure = undefined;
+      if (ownsWarmEntry && warmNativeSessions.get(sessionScopeId) === warmOwner) warmOwner.preservationFailure = undefined;
     }
     // A later save of this run's state restores the resume path. If clearing
     // fails, the next run still starts fresh, which is safe.

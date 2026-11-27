@@ -17,6 +17,25 @@ const record = (value: unknown): Record<string, unknown> => value && typeof valu
 import { STOPPED_BEFORE_FIRST_INPUT, stoppedBeforeFirstInput } from "../person-stop-outcome.js";
 export { stoppedBeforeFirstInput } from "../person-stop-outcome.js";
 
+/** Legacy startup Stop can finish before native selection without setting an
+ * error code. Accept that shape only with the recorded person/operator intent. */
+function personStopErrorCode(run: typeof heartbeatRuns.$inferSelect): boolean {
+  if (run.errorCode === "cancelled") return true;
+  const cancellation = record(run.resultJson?.cancellation);
+  return run.errorCode === null && cancellation.source === "operator" && cancellation.expected === true &&
+    (cancellation.initiator === "user" || record(cancellation.initiator).type === "user") &&
+    Boolean(record(run.resultJson?.personStop).requestedAt);
+}
+
+function preparationStopSettled(run: typeof heartbeatRuns.$inferSelect): boolean {
+  if (run.resultJson?.preDispatchCancellationSettledAt ||
+      hasAcknowledgedNativeRunStopRequest(run) && record(run.resultJson?.nativeCancellation).beforeProviderTurn === true) return true;
+  const startup = record(run.resultJson?.startupCancellation);
+  const requested = typeof startup.requestedAt === "string" ? Date.parse(startup.requestedAt) : NaN;
+  const settled = typeof run.resultJson?.startupPreparationSettledAt === "string" ? Date.parse(run.resultJson.startupPreparationSettledAt) : NaN;
+  return startup.beforeNativeSelection === true && Number.isFinite(requested) && Number.isFinite(settled) && settled >= requested;
+}
+
 /** Negative 'not created by this run' is insufficient for historical repair:
  * bind the borrowed box to its recorded creation and unchanged handoff. */
 async function unchangedBorrowedAllocation(db: Db, lease: typeof environmentLeases.$inferSelect): Promise<boolean> {
@@ -62,7 +81,7 @@ export async function recordStoppedBeforeFirstInput(db: Db, companyId: string, r
       eq(issues.id, selected.issueId))).for("no key update");
     const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
       eq(heartbeatRuns.id, runId))).for("update");
-    if (!run || run.status !== "cancelled" || !run.finishedAt || run.errorCode !== "cancelled") return false;
+    if (!run || run.status !== "cancelled" || !run.finishedAt || !personStopErrorCode(run)) return false;
     if (stoppedBeforeFirstInput(run)) return true;
     const [owner] = await tx.select().from(nativeRunFinalizations).where(and(
       eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.runId, runId),
@@ -70,8 +89,7 @@ export async function recordStoppedBeforeFirstInput(db: Db, companyId: string, r
     // Absence of an owner is not its retirement receipt: generic release can
     // clear that row. Require the preparation owner's fence or the audited
     // startup controller's acknowledgement as well as negative work evidence.
-    if (!(run.resultJson?.preDispatchCancellationSettledAt ||
-        hasAcknowledgedNativeRunStopRequest(run) && record(run.resultJson?.nativeCancellation).beforeProviderTurn === true)) return false;
+    if (!preparationStopSettled(run)) return false;
     if (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date() ||
         owner?.leaseOwner || owner?.controllerPid || owner?.resultId || owner?.failureDetail?.successorRunId ||
         !await personStopHasNoFirstInput(tx, run)) return false;
@@ -112,12 +130,14 @@ export async function settlePreDispatchStopRecovery(db: Db, companyId: string, r
       eq(issues.id, selected.issueId))).for("no key update");
     const [storedRun] = await tx.select().from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId),
-      eq(heartbeatRuns.status, "cancelled"), eq(heartbeatRuns.errorCode, "cancelled"),
+      eq(heartbeatRuns.status, "cancelled"),
       or(eq(heartbeatRuns.runtimeMode, "native"), sql`${heartbeatRuns.resultJson}->'stoppedBeforeFirstInput'->>'schema' = ${STOPPED_BEFORE_FIRST_INPUT}`),
-      or(sql`${heartbeatRuns.resultJson}->>'preDispatchCancellationSettledAt' is not null`,
-        sql`${heartbeatRuns.resultJson}->'stoppedBeforeFirstInput'->>'schema' = ${STOPPED_BEFORE_FIRST_INPUT}`),
     )).for("update");
-    const run = storedRun ? { ...storedRun, nativeIssueId: selected.issueId } : undefined;
+    // Share the exact intent/settlement predicates with the release seal;
+    // this primary-key lookup must not exclude the legacy null-error shape.
+    const run = storedRun?.finishedAt && personStopErrorCode(storedRun) &&
+      (stoppedBeforeFirstInput({ ...storedRun, nativeIssueId: selected.issueId }) || preparationStopSettled(storedRun))
+      ? { ...storedRun, nativeIssueId: selected.issueId } : undefined;
     const cancellation = run?.resultJson?.cancellation as { initiator?: { type?: string } } | undefined;
     if (!run?.nativeIssueId || (run.resultJson?.cancelledByActorType !== "user" && cancellation?.initiator?.type !== "user") ||
       !(stoppedBeforeFirstInput(run) ? await personStopHasNoFirstInput(tx, run)
