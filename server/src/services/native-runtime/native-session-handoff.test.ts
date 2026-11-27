@@ -2,9 +2,8 @@ import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, companies, createDb, documents, heartbeatRunEvents, heartbeatRuns, issueComments, issueDocuments, issues, issueThreadInteractions } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
-import { buildNativeSessionHandoff, createNativeSessionHandoffLoader, NATIVE_HANDOFF_MAX_BYTES, NATIVE_WHOLE_HANDOFF_MAX_BYTES, NATIVE_HANDOFF_COMMAND_MAX_BYTES, NATIVE_HANDOFF_COMMAND_RESERVE_BYTES, nativeSessionHandoffMaxBytes, renderNativeSessionHandoff } from "./native-session-handoff.js";
+import { buildNativeSessionHandoff, createNativeSessionHandoffLoader, NATIVE_HANDOFF_MAX_BYTES, NATIVE_WHOLE_HANDOFF_MAX_BYTES, renderNativeSessionHandoff } from "./native-session-handoff.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
-import { buildPaperclipTaskMarkdown } from "../heartbeat/task-markdown.js";
 import { buildNativeModelEnvelope } from "@paperclipai/paperclip-runner";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
 import { buildExecutionContinuation } from "../execution-continuation.js";
@@ -55,55 +54,6 @@ describe("bounded fresh-session handoff", () => {
     expect(packet.omittedEntriesAtLeast).toBe(packet.omittedMessages + packet.omittedSupportingEntriesAtLeast);
     expect(rendered).toContain(`${packet.omittedMessages} earlier messages were not handed over.`);
     expect(rendered).toContain("At least 3 supporting entries were not handed over.");
-  });
-
-  it("uses only the command room left by a quote-heavy assignment, preserving normal and stock fallback behavior", () => {
-    const args = { issueId: "task", generation: 1, mode: "whole" as const, omittedEntriesAtLeast: 0,
-      entries: [{ kind: "original_request", id: "origin", body: "Keep the original objective" },
-        ...Array.from({ length: 40 }, (_, i) => ({ kind: "message", id: String(i), body: `${i}:` + "history ".repeat(1_000) }))] };
-    const promptFor = (description: string) => buildNativeExecutionInput({
-      companyId: "company", runId: "run", agentId: "agent", normalizedSessionId: "session",
-      issue: { id: "task", identifier: "HAND-2", title: "Continue", description, workMode: "standard" },
-      taskPrompt: buildPaperclipTaskMarkdown({ issue: { id: "task", identifier: "HAND-2", title: "Continue", description }, nativeRunner: true })!,
-      initialCommunicationGuidance: "Preserve completed work.", runtimeContext: nativeRuntimeContextFixture(),
-      workspace: { id: "workspace", cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
-      completionContract: { id: "contract", sha256: "a".repeat(64), schemaVersion: "paperclip.run-result.v1",
-        contract: { revision: "1", objective: "Continue", criteria: [{ id: "objective", requirement: "Continue" }] } },
-    });
-    const normal = buildNativeModelEnvelope(promptFor("Continue the task"));
-    const normalRoom = nativeSessionHandoffMaxBytes(normal);
-    expect(normalRoom).toBe(NATIVE_WHOLE_HANDOFF_MAX_BYTES);
-    expect(renderNativeSessionHandoff({ ...args, maxBytes: normalRoom })).toBe(renderNativeSessionHandoff(args));
-    const large = buildNativeModelEnvelope(promptFor('"'.repeat(100_000)));
-    const room = nativeSessionHandoffMaxBytes(large);
-    expect(room).toBeGreaterThanOrEqual(NATIVE_HANDOFF_MAX_BYTES);
-    expect(room).toBeLessThan(NATIVE_WHOLE_HANDOFF_MAX_BYTES);
-    expect(nativeSessionHandoffMaxBytes({ ...large, planningContext: {
-      documentId: null, baseRevisionId: null, baseRevisionNumber: 0,
-      markdown: '"'.repeat(1_000), sha256: "a".repeat(64), reviewContext: {},
-    } })).toBeLessThan(room - 4_000);
-    const handoff = renderNativeSessionHandoff({ ...args, maxBytes: room });
-    const commandBytes = (history: string) => Buffer.byteLength(JSON.stringify({ type: "turn.start", payload: {
-      text: JSON.stringify({ ...large, task: { ...large.task, prompt: `${history}\n\n${large.task.prompt}` } }),
-    } }));
-    expect(commandBytes(renderNativeSessionHandoff(args))).toBeGreaterThan(NATIVE_HANDOFF_COMMAND_MAX_BYTES);
-    expect(commandBytes(handoff)).toBeLessThanOrEqual(NATIVE_HANDOFF_COMMAND_MAX_BYTES - NATIVE_HANDOFF_COMMAND_RESERVE_BYTES);
-    expect(handoff).toContain("earlier messages were not handed over.");
-    expect(handoff).toContain("Keep the original objective");
-    const encoded = (text: string) => Buffer.byteLength(JSON.stringify(JSON.stringify(text))) - 6;
-    const noRoom = nativeSessionHandoffMaxBytes('"'.repeat(110_000));
-    expect(noRoom).toBeLessThan(NATIVE_HANDOFF_MAX_BYTES);
-    const stock = renderNativeSessionHandoff({ ...args, maxBytes: noRoom });
-    expect(stock).toContain("using this bounded background");
-    expect(stock).toContain("Fresh session handoff");
-    expect(Buffer.byteLength(stock)).toBeLessThanOrEqual(NATIVE_HANDOFF_MAX_BYTES);
-    expect(encoded(stock)).toBeLessThanOrEqual(noRoom);
-    const tiny = renderNativeSessionHandoff({ ...args, maxBytes: 1_500 });
-    expect(tiny).toContain("handoff cut for room");
-    expect(tiny).toContain("41 messages and 0 supporting entries omitted");
-    expect(encoded(tiny)).toBeLessThanOrEqual(1_500);
-    expect(() => renderNativeSessionHandoff({ ...args, maxBytes: 1 })).toThrow("native_turn_prompt_exceeds_command_bound");
-    expect(() => nativeSessionHandoffMaxBytes('"'.repeat(140_000))).toThrow("native_turn_prompt_exceeds_command_bound");
   });
 
   it("reserves the original request while rendering the newest whole messages", () => {

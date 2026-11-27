@@ -7,25 +7,11 @@ import { fastResponseHistoryBody, type ExecutionContinuationEnvelope } from "@pa
 import { nativeFinalReplyKey } from "../heartbeat-run-summary.js";
 
 export const NATIVE_HANDOFF_MAX_BYTES = 24_000;
+// The journal allows 522,240 bytes; reserve 154,240 for the wake/envelope and margin.
 export const NATIVE_WHOLE_HANDOFF_MAX_BYTES = 368_000;
-// durable-prp-control-plane.ts:65-67: floor((1 MiB - 4096) / 2).
-export const NATIVE_HANDOFF_COMMAND_MAX_BYTES = 522_240;
-// A 50-comment/128-attachment fixture measured 45,315 bytes of non-text overhead.
-// Reserve 64 KiB for runtime constraints, attachments, queued input, the command
-// wrapper and separators; this is not a bound on arbitrary supplemental input.
-export const NATIVE_HANDOFF_COMMAND_RESERVE_BYTES = 64 * 1024;
 // Packet text is escaped in the model envelope, then again in command.payload.text.
 // Exclude the six bytes belonging to the two JSON string delimiters.
 const commandTextBytes = (text: string) => Buffer.byteLength(JSON.stringify(JSON.stringify(text)), "utf8") - 6;
-export function nativeSessionHandoffMaxBytes(promptOrEnvelope: string | object): number {
-  // A prepared envelope already contains the prompt's first escaping pass, plus
-  // planning context and every other server-known field; only command escaping remains.
-  const knownBytes = typeof promptOrEnvelope === "string" ? commandTextBytes(promptOrEnvelope)
-    : Buffer.byteLength(JSON.stringify(JSON.stringify(promptOrEnvelope)), "utf8") - 2;
-  const room = NATIVE_HANDOFF_COMMAND_MAX_BYTES - NATIVE_HANDOFF_COMMAND_RESERVE_BYTES - knownBytes;
-  if (room < 0) throw new Error("native_turn_prompt_exceeds_command_bound");
-  return Math.min(NATIVE_WHOLE_HANDOFF_MAX_BYTES, room);
-}
 const ENTRY_MAX_CHARS = 4_000;
 const LIMIT = 10;
 
@@ -33,28 +19,16 @@ export type HandoffEntry = { kind: string; id: string; body: string; truncated?:
 type HandoffMode = "bounded" | "whole";
 const isConversationEntry = (entry: HandoffEntry) => ["original_request", "message", "agent_reply"].includes(entry.kind);
 
-export function createNativeSessionHandoffLoader(input: Parameters<typeof buildNativeSessionHandoff>[0]): (maxBytes?: number) => Promise<string | null> {
-  const packets = new Map<number, Promise<string | null>>();
-  return (maxBytes = input.maxBytes ?? NATIVE_WHOLE_HANDOFF_MAX_BYTES) => {
-    if (!packets.has(maxBytes)) packets.set(maxBytes, buildNativeSessionHandoff({ ...input, maxBytes }));
-    return packets.get(maxBytes)!;
-  };
+export function createNativeSessionHandoffLoader(input: Parameters<typeof buildNativeSessionHandoff>[0]): () => Promise<string | null> {
+  let packet: Promise<string | null> | undefined;
+  return () => packet ??= buildNativeSessionHandoff(input);
 }
 
 /** Deterministic background, never a substitute for the current authorized wake. */
 export function renderNativeSessionHandoff(input: {
-  issueId: string; generation: number | null; entries: HandoffEntry[]; omittedEntriesAtLeast: number; omittedMessages?: number; mode?: HandoffMode; maxBytes?: number;
+  issueId: string; generation: number | null; entries: HandoffEntry[]; omittedEntriesAtLeast: number; omittedMessages?: number; mode?: HandoffMode;
 }): string {
-  const maxBytes = input.maxBytes ?? NATIVE_WHOLE_HANDOFF_MAX_BYTES;
-  const whole = input.mode === "whole" && maxBytes >= NATIVE_HANDOFF_MAX_BYTES;
-  const cutForRoom = () => {
-    const messages = (input.omittedMessages ?? 0) + input.entries.filter(isConversationEntry).length;
-    const support = input.omittedEntriesAtLeast + input.entries.filter(entry => !isConversationEntry(entry)).length;
-    const note = `Fresh session handoff cut for room. At least ${messages} messages and ${support} supporting entries omitted. Retrieve scoped task history as needed.`;
-    if (commandTextBytes(note) > maxBytes) throw new Error("native_turn_prompt_exceeds_command_bound");
-    return note;
-  };
-  if (maxBytes < 2_000) return cutForRoom();
+  const whole = input.mode === "whole";
   const entries: HandoffEntry[] = [];
   let omittedMessages = input.omittedMessages ?? 0;
   let omittedSupport = input.omittedEntriesAtLeast;
@@ -72,7 +46,7 @@ export function renderNativeSessionHandoff(input: {
   for (const entry of input.entries) {
     const complete = whole && isConversationEntry(entry);
     const oversizedOrigin = whole && entry.kind === "original_request" &&
-      commandTextBytes(JSON.stringify(entry)) > maxBytes - 8_000;
+      commandTextBytes(JSON.stringify(entry)) > NATIVE_WHOLE_HANDOFF_MAX_BYTES - 8_000;
     const clipped = oversizedOrigin || (!complete && entry.body.length > ENTRY_MAX_CHARS);
     // Preserve both the start and latest direction in exceptionally long messages.
     const body = clipped ? `${entry.body.slice(0, 2_900)}\n[content omitted]\n${entry.body.slice(-900)}` : entry.body;
@@ -88,18 +62,17 @@ export function renderNativeSessionHandoff(input: {
       truncated = true;
     }
   }
-  if (whole || input.maxBytes !== undefined) {
+  if (whole) {
     // Drop supporting excerpts before conversation, then oldest non-origin messages.
     // Account for the growing visible note without re-serializing the history.
     const entryBytes = new Map(entries.map(entry => [entry, commandTextBytes(JSON.stringify(entry))]));
     let overhead = commandTextBytes(render([]));
     let size = overhead + entries.reduce((sum, entry, i) => sum + entryBytes.get(entry)! + Number(i > 0), 0);
-    const evictionOrder = whole ? [...entries.filter(entry => !isConversationEntry(entry)).reverse(),
-      ...entries.filter(entry => isConversationEntry(entry) && entry.kind !== "original_request"),
-      ...entries.filter(entry => entry.kind === "original_request")] : [...entries].reverse();
+    const evictionOrder = [...entries.filter(entry => !isConversationEntry(entry)).reverse(),
+      ...entries.filter(entry => isConversationEntry(entry) && entry.kind !== "original_request")];
     const evicted = new Set<HandoffEntry>();
     for (const entry of evictionOrder) {
-      if (size <= maxBytes) break;
+      if (size <= NATIVE_WHOLE_HANDOFF_MAX_BYTES) break;
       size -= entryBytes.get(entry)! + Number(entries.length - evicted.size > 1);
       evicted.add(entry);
       if (isConversationEntry(entry)) omittedMessages += 1;
@@ -109,7 +82,7 @@ export function renderNativeSessionHandoff(input: {
       size += nextOverhead - overhead;
       overhead = nextOverhead;
     }
-    return size <= maxBytes ? render(entries.filter(entry => !evicted.has(entry))) : cutForRoom();
+    return render(entries.filter(entry => !evicted.has(entry)));
   }
   return render();
 }
@@ -118,11 +91,10 @@ export function renderNativeSessionHandoff(input: {
 export async function buildNativeSessionHandoff(input: {
   db: Db; companyId: string; issueId: string; agentId: string; before: Date;
   throughCommentId?: string | null; excludeCommentIds?: string[]; mode?: HandoffMode;
-  continuation?: ExecutionContinuationEnvelope | null; maxBytes?: number;
+  continuation?: ExecutionContinuationEnvelope | null;
 }): Promise<string | null> {
   const { db, companyId, issueId, agentId } = input;
-  const maxBytes = input.maxBytes ?? NATIVE_WHOLE_HANDOFF_MAX_BYTES;
-  const whole = input.mode === "whole" && maxBytes >= NATIVE_HANDOFF_MAX_BYTES;
+  const whole = input.mode === "whole";
   const coverage = input.continuation;
   const coveredCommentIds = new Set(whole && coverage?.companyId === companyId && coverage.issueId === issueId &&
     coverage.coverage.kind === "full_task_history" ? coverage.messages.map(message => message.id) : []);
@@ -251,7 +223,7 @@ export async function buildNativeSessionHandoff(input: {
       Number("sequence" in b.row ? b.row.sequence : 0) - Number("sequence" in a.row ? a.row.sequence : 0) || b.row.id.localeCompare(a.row.id));
     const selected = new Set<string>();
     const bodySizes = new Map(candidates.map(({ type, row }) => [`${type}:${row.id}`, Number(row.bodySize)]));
-    let remaining = maxBytes - 8_000;
+    let remaining = NATIVE_WHOLE_HANDOFF_MAX_BYTES - 8_000;
     // An individually oversized original keeps a marked stock excerpt rather
     // than disappearing or allocating an unbounded body during hydration.
     const oversizedOriginId = origin[0] && Number(origin[0].bodySize) + 1_024 > remaining ? origin[0].id : null;
@@ -341,8 +313,7 @@ export async function buildNativeSessionHandoff(input: {
     entries.push({ ...sanitizeQuarantinedCommentForHigherTrust({ ...entry, sourceTrust }), kind: "run_summary" });
   }
   if (!entries.length && !omittedMessages) return null;
-  omittedMessages += Number(!whole && recent.length > LIMIT) + Number(!whole && replies.length > 4);
-  const omittedEntriesAtLeast = Number(decisions.length > 8) + Number(savedDocuments.length > 3) + Number(runSummaries.length > 2);
+  const omittedEntriesAtLeast = Number(!whole && recent.length > LIMIT) + Number(decisions.length > 8) + Number(!whole && replies.length > 4) + Number(savedDocuments.length > 3) + Number(runSummaries.length > 2);
   // Give each indispensable category an early slot before filling the budget
   // with older messages. A long recent exchange cannot crowd out every answer
   // or the current plan.
@@ -355,5 +326,5 @@ export async function buildNativeSessionHandoff(input: {
     ...[...new Set([...priority, ...entries])].filter(entry => !isConversationEntry(entry)),
   ] : [...new Set([...priority, ...entries])];
   const redacted = await createRunSecretRedactionRegistry(db).redactForIssue(companyId, issueId, prioritized);
-  return renderNativeSessionHandoff({ issueId, generation: issue.conversationAgentId ? issue.generation : null, entries: redacted, omittedEntriesAtLeast, omittedMessages, mode: whole ? "whole" : "bounded", maxBytes: input.maxBytes });
+  return renderNativeSessionHandoff({ issueId, generation: issue.conversationAgentId ? issue.generation : null, entries: redacted, omittedEntriesAtLeast, omittedMessages, mode: input.mode });
 }
