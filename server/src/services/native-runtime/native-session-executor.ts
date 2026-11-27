@@ -19677,7 +19677,8 @@ async function createRunnerdBackendWithinSessionClaim(
                   ),
             }
           : {}),
-        ...(input.execution.provider.kind === "pi_rpc" ? { piRpcThinkingLevel: input.execution.provider.piRpcThinkingLevel,
+        ...(input.execution.provider.kind === "pi_rpc" ? { piRpcModel: input.execution.provider.model,
+          piRpcThinkingLevel: input.execution.provider.piRpcThinkingLevel,
           piRuntimeDirectory: remoteStateDirectory ?? root } : {}),
         ...(nativeProviderStartedTurns(input.execution.provider) ? { providerStartedTurns: true } : {}),
         ...(input.execution.provider.kind === "cursor_cloud" ? { cursorCloud: input.execution.provider.cursorCloud } : {}),
