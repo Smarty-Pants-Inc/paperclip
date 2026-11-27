@@ -8330,6 +8330,7 @@ function leaseDb(
   runnerProfileJson: Record<string, unknown> = {},
   runStatus = "running",
   priorAccountingEvents: PrpEvent[] = [],
+  environmentLeaseRows: Array<Record<string, unknown>> = [],
 ): Db {
   const coordinator: LeaseCoordinator = {
     runId: boundExecution.binding.runId,
@@ -8353,7 +8354,9 @@ function leaseDb(
             returning: () => Promise<Array<{ runId: string }>>;
           };
           result.returning = () =>
-            Promise.resolve([{ runId: coordinator.runId, nextEventSeq: 2 }]);
+            Promise.resolve(table === environmentLeases && environmentLeaseRows.length > 0
+              ? environmentLeaseRows.map(row => ({ ...row, runId: coordinator.runId }))
+              : [{ runId: coordinator.runId, nextEventSeq: 2 }]);
           return result;
         },
       };
@@ -8392,6 +8395,8 @@ function leaseDb(
                     checkoutRunId: null,
                   },
                 ]
+              : table === environmentLeases
+                ? environmentLeaseRows
               : table === budgetReservations
                 ? [{ id: "original-held-reservation" }]
               : table === activityLog
@@ -25520,8 +25525,13 @@ describe("runnerd provider runtime wiring", () => {
     const controllerArtifact = join(isolatedStateDirectory, "failover-cursor-controller");
     if (registered) await writeFile(controllerArtifact, "fixture bootstrap artifact");
     const runnerInstanceId = "runner-failover-cursor";
+    const cleanupUpdates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+    const db = leaseDb(execution, {}, {}, cleanupUpdates, {}, "running", [], [{
+      id: "lease-replacement", providerLeaseId: "sandbox-replacement", metadata: {},
+      companyId: execution.binding.companyId, heartbeatRunId: execution.binding.runId,
+    }]);
     await createRunnerdBackend({
-      db: leaseDb(execution), execution, runnerInstanceId,
+      db, execution, runnerInstanceId,
       ...(registered ? { controllerPersistence: { bootId: "failover-cursor-boot" },
         runnerRemoteBinaryPath: controllerArtifact, runnerRemoteCodexPath: controllerArtifact } : {}),
       runnerIngressAuthorized: true,
@@ -25587,6 +25597,10 @@ describe("runnerd provider runtime wiring", () => {
     } else {
       await expect(prepared).rejects.toThrow("runner_harness_state_mismatch: restored_provider_identity_changed");
       expect(syncIn).toHaveBeenCalled();
+      // Failed inspection must not erase the durable provenance of files that
+      // were already copied. The next invocation must still use the END fence.
+      expect(cleanupUpdates.find(update => update.table === environmentLeases)?.values.metadata)
+        .toHaveProperty("nativeHarnessBackup");
     }
   });
 
