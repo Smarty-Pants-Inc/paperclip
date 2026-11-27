@@ -121,6 +121,55 @@ describe("bundleRuntime", () => {
     expect(output.entryDir).toBe(path.join(root, "server", "dist"));
   });
 
+  it("starts snapshot, 1Password and avatar workers from built entries without a TypeScript loader", async () => {
+    const moduleUrl = relative => fileURLToPath(new URL(relative, import.meta.url));
+    write(path.join(root, "server", "dist", "index.js"), [
+      `export { runSnapshotThread } from ${JSON.stringify(moduleUrl("../../packages/adapter-utils/src/workspace-snapshot-thread.ts"))};`,
+      `export { createAgentAvatarPool } from ${JSON.stringify(moduleUrl("../src/services/agent-avatar-pool.ts"))};`,
+      `export { appearanceForPalette } from ${JSON.stringify(moduleUrl("../../packages/shared/src/index.ts"))};`,
+    ].join("\n"));
+    const outdir = path.join(root, "server", "dist-runtime");
+    const summary = await bundleRuntime({ entry: path.join(root, "server", "dist", "index.js"), outdir });
+    const probe = path.join(root, "server", "probe.mjs");
+    write(probe, [
+      'import assert from "node:assert/strict";',
+      'import { readFileSync, readdirSync } from "node:fs";',
+      'import { rm } from "node:fs/promises";',
+      'import { Worker } from "node:worker_threads";',
+      `import { runSnapshotThread, createAgentAvatarPool, appearanceForPalette } from ${JSON.stringify(pathToFileURL(summary.serverModule).href)};`,
+      // Reject an unknown action before authenticating: no token or network.
+      `const worker = new Worker(new URL("./onepassword-worker.js", ${JSON.stringify(pathToFileURL(summary.serverModule).href)}), { workerData: { token: "", tool: "invalid-action", parameters: {} }, env: {}, execArgv: [] });`,
+      'try {',
+      '  const result = await new Promise((resolve, reject) => { worker.once("message", resolve); worker.once("error", reject); });',
+      '  assert.deepEqual(result, { code: "onepassword_request_failed" });',
+      '} finally { await worker.terminate(); }',
+      `const snapshot = await runSnapshotThread({ rootDir: ${JSON.stringify(path.join(root, "packages", "fixture", "src"))} });`,
+      'assert.equal(snapshot.snapshot.version, 2);',
+      'await rm(snapshot.directory, { recursive: true, force: true });',
+      'const pool = createAgentAvatarPool(1);',
+      'try {',
+      '  const png = await pool.render({ appearance: appearanceForPalette("arctic-blue"), size: 24, scale: 2, pose: "rest", muted: false });',
+      '  assert.equal(png.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");',
+      '} finally { await pool.close(); }',
+      'if (process.platform === "linux") {',
+      '  const esbuild = readdirSync("/proc").filter(pid => {',
+      '    if (!/^\\d+$/.test(pid)) return false;',
+      '    try {',
+      '      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");',
+      '      const end = stat.lastIndexOf(")");',
+      '      return stat.slice(0, end).includes("(esbuild") && Number(stat.slice(end + 2).split(" ")[1]) === process.pid;',
+      '    } catch { return false; }',
+      '  });',
+      '  assert.deepEqual(esbuild, []);',
+      '}',
+      'console.log("built workers completed");',
+    ].join("\n"));
+    const env = { ...process.env, TSX_DISABLE_CACHE: "1", ESBUILD_BINARY_PATH: path.join(root, "no-esbuild") };
+    delete env.NODE_OPTIONS;
+    const { stdout } = await execFileAsync(process.execPath, [probe], { env, timeout: 30_000 });
+    expect(stdout.trim()).toBe("built workers completed");
+  }, 30_000);
+
   it("keeps database caller locations public in a source-mapped runtime bundle", async () => {
     const captureModule = fileURLToPath(new URL("../../packages/db/src/response-capture.ts", import.meta.url));
     write(path.join(root, "server", "dist", "services", "response-caller.js"), [
