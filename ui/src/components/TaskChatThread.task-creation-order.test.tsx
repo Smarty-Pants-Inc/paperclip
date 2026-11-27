@@ -36,7 +36,7 @@ vi.mock("@/api/access", async importOriginal => ({
   ...await importOriginal<typeof import("@/api/access")>(), accessApi: { listUserDirectory: vi.fn(async () => ({ users: [] })) },
 }));
 vi.mock("@/components/transcript/useLiveRunTranscripts", () => ({
-  useLiveRunTranscripts: () => ({ transcriptByRun: new Map(), isInitialHydrating: false }),
+  useLiveRunTranscripts: () => ({ transcriptByRun: new Map(), hydratedRunIds: new Set(state.transcripts.keys()), isInitialHydrating: false }),
 }));
 vi.mock("@/components/transcript/useNativeRunTranscripts", () => ({
   useNativeRunTranscripts: () => ({ transcriptByRun: new Map(state.transcripts), errorsByRun: new Map(),
