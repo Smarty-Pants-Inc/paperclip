@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { UNRECOVERED_FILES_NOTICE_PREFIX, matchesUnrecoveredFilesNotice } from "@paperclipai/shared";
+import { unrecoverableSavedFilesNotice } from "./system-recovery-state.js";
 import request from "supertest";
 import { and, eq } from "drizzle-orm";
 import { describe, expect, it, vi } from "vitest";
@@ -88,7 +90,17 @@ describe("Retry of a task whose saved files cannot be recovered", () => {
     const notices = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
       eq(issueComments.authorType, "system")));
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toContain("Paperclip could not recover the unsaved files from the previous run");
+    expect(notices[0]!).toMatchObject({
+      presentation: { kind: "system_notice", tone: "warning", title: "Some files were not recovered", detailsDefaultOpen: true },
+      metadata: { version: 1, kind: "unrecovered_files_notice", sourceRunId: f.runId, successorRunId: successor.id },
+    });
+    expect(notices[0]!.body.startsWith(`${UNRECOVERED_FILES_NOTICE_PREFIX} `)).toBe(true);
+    expect(notices[0]!.body).toBe(unrecoverableSavedFilesNotice(readSystemRecovery(settled.evidence)!.failure!));
+    expect(matchesUnrecoveredFilesNotice("Future wording", notices[0]!.metadata?.kind)).toBe(true);
+    // The page currently supplies the generic presentation kind: its real shared
+    // matcher must still recognize the persisted producer body through that path.
+    expect(matchesUnrecoveredFilesNotice(notices[0]!.body, notices[0]!.presentation?.kind)).toBe(true);
+    expect(notices[0]!.body).not.toMatch(/prove which runs|allocation|snapshot|source_binding|archive/);
     expect(notices[0]!.body).not.toMatch(/[0-9a-f]{8}-[0-9a-f]{4}-/);
 
     const [sourceLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));

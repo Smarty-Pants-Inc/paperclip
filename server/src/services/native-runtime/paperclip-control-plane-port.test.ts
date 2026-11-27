@@ -484,6 +484,11 @@ describe("PaperclipControlPlanePort conformance", () => {
     "marks a fresh start after a prior session once, but never a resume: $mode (automatic task recovery=$taskRecovery)", async ({ mode, taskRecovery }) => {
     const { companyId, agentId } = CONTROL_PLANE_CONFORMANCE_OPEN.identity;
     const issueId = randomUUID(), fixtureContractId = randomUUID();
+    const workspaceContinuity = mode === "clamp"
+      ? { mode: "fresh_isolated_workspace", sourceRunId: randomUUID(), contentOrigin: "configured_source" }
+      : mode === "wake" ? { mode: "reuse_current_workspace", sourceRunId: null, contentOrigin: "existing_workspace" }
+        : { mode: "unknown", sourceRunId: null, contentOrigin: "unknown" };
+    const continuityContext = mode === "no wake" ? {} : { workspaceContinuity };
     const firstRunAt = new Date("2026-01-01T00:00:00.000Z");
     const wakeAt = new Date("2026-01-01T00:00:19.000Z");
     const previousReplyAt = mode === "clamp" ? wakeAt : new Date("2026-01-01T00:00:10.000Z");
@@ -511,13 +516,13 @@ describe("PaperclipControlPlanePort conformance", () => {
       const [run] = await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native",
         nativeIssueId: issueId, nativeSessionId: sessionId, runnerInstanceId: runnerId,
         completionContractId: fixtureContractId, completionContractSha256: contractSha, createdAt: runAt,
-        contextSnapshot: { issueId, conversationSessionGeneration: 0, ...(wakeCommentId ? { wakeCommentId } : {}),
+        contextSnapshot: { issueId, conversationSessionGeneration: 0, ...continuityContext, ...(wakeCommentId ? { wakeCommentId } : {}),
           ...(taskRecovery && index === 3 ? { explicitFreshSession: true } : {}) } }).returning();
       if (taskRecovery && index === 1) {
         const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
         const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
         const runtimeConfig = { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous" };
-        const context = { issueId, forceFreshSession: true, source: "execution.reconciled", conversationSessionGeneration: 0 };
+        const context = { issueId, forceFreshSession: true, source: "execution.reconciled", conversationSessionGeneration: 0, ...continuityContext };
         recoveryInput = {
           run, agent: { ...agent, adapterType: "paperclip_runner", adapterConfig: runtimeConfig },
           task: { context, issueRef: { id: issueId }, issueContext: null, taskProjectContext: null, workspaceProjectContext: null,
@@ -610,7 +615,7 @@ describe("PaperclipControlPlanePort conformance", () => {
       if (index === 1) {
         expect(comments[0]).toMatchObject({ authorType: "system", authorAgentId: null, authorUserId: null,
           body: "New session · Earlier messages and files are still available.",
-          createdByRunId: null, conversationSessionGeneration: 0, metadata: { sourceRunId: runId },
+          createdByRunId: null, conversationSessionGeneration: 0, metadata: { sourceRunId: runId, workspaceContinuity },
           presentation: { kind: "system_notice", tone: "neutral" } });
         // Marker time orders the input, not the later session.started receipt.
         const expectedAt = mode === "no wake" ? run!.createdAt
@@ -641,7 +646,7 @@ describe("PaperclipControlPlanePort conformance", () => {
     const activities = await db.select().from(activityLog).where(and(eq(activityLog.entityId, issueId),
       eq(activityLog.action, "issue.conversation_session_started")));
     expect(activities).toHaveLength(1);
-    expect(activities[0]!.details).toMatchObject({ automatic: true, generation: 0 });
+    expect(activities[0]!.details).toMatchObject({ automatic: true, generation: 0, workspaceContinuity });
     const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(issue).toMatchObject({ conversationSessionGeneration: 0, conversationBoundaryCommentId: null });
     expect(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId), sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`))).toHaveLength(0);

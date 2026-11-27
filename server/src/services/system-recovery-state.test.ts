@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { createSystemRecovery, failSystemRecovery, isDeterministicRecoveryRefusal, readSystemRecovery, reserveSystemRecoveryAttempt, savedFilesUnrecoverable, SystemRecoveryFailure } from "./system-recovery-state.js";
+import { UNRECOVERED_FILES_NOTICE_PREFIX } from "@paperclipai/shared";
+import { unrecoverableSavedFilesNotice, createSystemRecovery, failSystemRecovery, isDeterministicRecoveryRefusal, readSystemRecovery, reserveSystemRecoveryAttempt, savedFilesUnrecoverable, SystemRecoveryFailure } from "./system-recovery-state.js";
 import { exhaustedSystemRecoveryAction } from "./system-recovery.js";
 import { workspaceRecoveryDisplay } from "./workspace-recovery-receipt.js";
 
@@ -70,7 +71,7 @@ describe("durable system recovery budget", () => {
     expect(isDeterministicRecoveryRefusal(refused)).toBe(true);
     expect(savedFilesUnrecoverable(refused)).toBe(true);
     const text = exhaustedSystemRecoveryAction(refused);
-    expect(text).toContain("Paperclip cannot recover the unsaved files from the previous run: Paperclip cannot prove which runs used the sandbox that holds the saved files.");
+    expect(text).toContain("Paperclip cannot recover the unsaved files from the previous run: your earlier work in this task's sandbox could not be recovered.");
     expect(text).not.toContain("allocation_ownership_ambiguous");
     expect(text).toContain("Retry continues the task in a new workspace from its recorded work, without those files");
     expect(text).not.toMatch(/succeeds only after|Paperclip is updated|runs the check again|last saved version/);
@@ -103,6 +104,22 @@ describe("durable system recovery budget", () => {
     expect(savedFilesUnrecoverable({ ...refused, freshAttemptRunId: randomUUID() })).toBe(false);
   });
 
+  it.each([
+    ["allocation_ownership_ambiguous", "your earlier work in this task's sandbox could not be recovered"],
+    ["source_binding_invalid", "the saved files could not be matched safely to your earlier work"],
+    ["snapshot_verification_failed", "the saved copy of your files could not be checked reliably"],
+    ["archive_unsafe", "the saved copy contains files that cannot be opened safely"],
+    ["source_unavailable", "your earlier saved files could not be found in their recorded location"],
+    ["historical_source_missing", "the location of your earlier saved files was not recorded"],
+  ] as const)("keeps the shared leading sentence and a plain reason for %s", (code, reason) => {
+    const state = failSystemRecovery(createSystemRecovery(randomUUID()), new SystemRecoveryFailure(code, "service_required"));
+    const notice = unrecoverableSavedFilesNotice(state.failure!);
+    expect(notice).toBe(`${UNRECOVERED_FILES_NOTICE_PREFIX} ${reason}. `
+      + "Retry continued this task in a new workspace from its recorded work: comments, documents, attachments and pushed commits. "
+      + "Files that run did not save or push are not included. Its completed actions stay recorded and are not repeated.");
+    expect(notice).not.toMatch(/allocation|source_binding|snapshot|archive|prove which runs/);
+  });
+
   it("promises an automatic retry for an unproven stop only while a re-arm remains", () => {
     const stop = { ...failSystemRecovery(reserveSystemRecoveryAttempt(createSystemRecovery(randomUUID()), 0)!,
       new SystemRecoveryFailure("agent_stop_unconfirmed", "recheck_evidence"), { now: 0 }), state: "exhausted" as const };
@@ -122,7 +139,7 @@ describe("durable system recovery budget", () => {
     expect(exhaustedSystemRecoveryAction(withCause)).not.toMatch(/provider_unavailable|sandbox_not_running|last failure/);
     const withoutCause = failSystemRecovery(state, new SystemRecoveryFailure("archive_unsafe", "service_required"), { now: 0 });
     expect(exhaustedSystemRecoveryAction(withoutCause)).not.toContain("archive_unsafe");
-    expect(exhaustedSystemRecoveryAction(withoutCause)).toContain("the saved file archive contains entries that are not safe to apply.");
+    expect(exhaustedSystemRecoveryAction(withoutCause)).toContain("the saved copy contains files that cannot be opened safely.");
   });
   it("reconciles a recorded attempt after restart without spending another retry", () => {
     const running = reserveSystemRecoveryAttempt(createSystemRecovery(randomUUID()), 0)!;
