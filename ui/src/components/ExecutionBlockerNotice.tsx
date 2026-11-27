@@ -12,6 +12,7 @@ import { ProviderFailureNotice } from "./ProviderFailureNotice";
 import { LockedIssueChip, isLockedIssueStub } from "./LockedIssueChip";
 import { PreviousServerStopConfirmation } from "./WorkspaceExportRecovery";
 import { issuesApi } from "../api/issues";
+import { formatTaskChatTimestamp } from "./task-chat/task-chat-adapter";
 
 const recoveryStepText: Record<NonNullable<TaskInterruptionPresentation["recoveryStep"]>, string> = {
   checking_previous_run: "Checking that the previous attempt stopped",
@@ -239,21 +240,50 @@ export function ExecutionBlockerNotice({ presentation, observedStatus, observedR
       </div>
     </div>;
   }
-  const newSession = !retryRefused && conversationMode && presentation?.state === "failed" && !(canRetry && presentation.canRetry)
+  // Capabilities own permission; server prose is displayed, never parsed.
+  const messageContinues = blocker?.canContinue === true;
+  const recoveryRetryAllowed = canRetry && presentation?.canRetry === true && blocker?.canRetry !== false;
+  const cannotContinue = blocker?.canContinue === false && blocker.canRetry === false && !messageContinues;
+  const newSession = !retryRefused && !messageContinues && !cannotContinue && conversationMode && presentation?.state === "failed" && !(canRetry && presentation.canRetry)
     ? <> Send <code>/new</code> to start a fresh session, then send your message again.</> : null;
+  // Recovered files do not prove an unanswered person message is saved.
+  const savedPersonInput = heldMessageCount === 1 ? " Your message is saved."
+    : heldMessageCount > 1 ? ` Your ${heldMessageCount} messages are saved.` : "";
+  const recoveryFailure = blocker?.nextAction?.trim()
+    ? blocker.nextAction
+    : recoveryRetryAllowed
+      ? `This conversation paused after a problem on our side.${savedPersonInput} Press Retry to continue.`
+      : messageContinues
+        ? `This conversation paused after a problem on our side.${savedPersonInput} Send a message to continue.`
+        : cannotContinue
+          ? `Couldn't resume this conversation.${savedPersonInput} This task is on hold and can't continue from here yet.`
+          : <>This conversation paused after a problem on our side.{savedPersonInput}{newSession}</>;
   const recovery = !workspaceRepairRequired && !savedMessageBlocked && isConversationRecovery(presentation,
     observedStatus ?? (blocker?.workspaceRepairRequired ? "failed" : undefined));
   if (presentation?.projectAccess && !optimistic && !takingLonger) return <TaskProjectAccessNotice
     access={presentation.projectAccess} issueId={issueId} agentName={agentName} projectName={projectName}
     canRetry={canRetry && presentation.canRetry} onRetry={onRetry} error={error} className={className} />;
-  if (recovery && presentation) return <div role="status" aria-label="Task status"
-    className={cn("flex items-center gap-3 text-sm text-muted-foreground", className)}>
-    {(optimistic || presentation.state !== "failed") && <LoaderCircle className="size-4 shrink-0 motion-safe:animate-spin" aria-hidden="true" />}
-    <span className="min-w-0 flex-1">{!optimistic && presentation.state === "failed"
-      ? <>Couldn't resume this conversation. Your message is saved.{newSession}</> : "Preparing your reply…"}</span>
-    {!optimistic && presentation.state === "failed" && canRetry && presentation.canRetry &&
-      <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}
-  </div>;
+  if (recovery && presentation) {
+    const recovering = optimistic || presentation.state !== "failed" || Boolean(presentation.nextRetryAt)
+      || blocker?.workspaceRecovery?.status === "queued" || blocker?.workspaceRecovery?.status === "recovering";
+    const retryRequired = recoveryRetryAllowed && !recovering;
+    const personActionRequired = !recovering && (recoveryRetryAllowed || messageContinues);
+    const retryTime = !optimistic ? formatTaskChatTimestamp(presentation.nextRetryAt) : undefined;
+    return <div className={cn(personActionRequired && "pt-4", className)}>
+      <div role="status" aria-label="Task status" className={personActionRequired
+        ? "flex items-center gap-3 rounded-lg bg-destructive/10 p-4 text-sm text-foreground"
+        : "flex items-center gap-3 text-sm text-muted-foreground"}>
+        {personActionRequired ? <AlertCircle className="size-5 shrink-0 text-destructive" aria-hidden="true" />
+          : recovering ? <LoaderCircle className="size-4 shrink-0 motion-safe:animate-spin" aria-hidden="true" />
+          : <PauseCircle className="size-4 shrink-0" aria-hidden="true" />}
+        <span className="min-w-0 flex-1">{recovering
+          ? retryTime ? `Trying again at ${retryTime}` : "Preparing your reply…"
+          : recoveryFailure}</span>
+        {retryRequired &&
+          <Button variant="outline" size="sm" className="shrink-0" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}
+      </div>
+    </div>;
+  }
   if (error && !optimistic && !takingLonger) return <div role="alert" className={cn("flex items-center justify-between gap-2 text-sm text-destructive", className)}><span>{describeError(error).body}</span>{canRetry && <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}</div>;
   if (takingLonger) return <div role="status" className={cn("flex items-center justify-between gap-2 text-sm text-muted-foreground", className)}><span>Taking longer than usual…</span>{canRetry && <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}</div>;
   if (workspaceRepairRequired) return (

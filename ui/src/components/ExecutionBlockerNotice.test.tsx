@@ -251,6 +251,178 @@ describe("ordinary task interruption", () => {
   ];
   const repairMessage = "Paperclip is recovering saved work before continuing. Your message is saved.";
   const repairRetrySentence = " Press Retry to continue from your saved work.";
+  const pausedConversation = "This conversation paused after a problem on our side.";
+  const recoveredBlocker = {
+    recoveryActionId: "hold", runId: "source", agentId: "agent", cause: "native_continuation_requires_reconciliation",
+    runStatus: "failed", runError: "provider-pack.json is unreadable (permission_denied)", canContinue: false, canRetry: false,
+    savedMessageCount: 0, nextAction: "Saved work recovered.",
+  };
+  // A recovered file receipt alone is not permission for a new person turn.
+  it("keeps a failed pack/recovered false-false projection on hold, without guessing from the error", async () => {
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={{ ...failed, canRetry: false }}
+      observedStatus="failed" observedErrorCode="runner_remote_provider_artifact_incompatible"
+      blocker={recoveredBlocker} canRetry onRetry={retry} conversationMode />));
+    expect(container.textContent).toBe(recoveredBlocker.nextAction);
+    expect(container.textContent).not.toMatch(/Send a message|\/new|Press Retry/);
+    expect(container.querySelector("button")).toBeNull();
+  });
+  it.each(["runner_remote_provider_artifact_incompatible", "native_session_interrupted", "future_provider_fault"])(
+    "names the person's next message when the server allows continuation after %s", async observedErrorCode => {
+      await act(async () => root.render(<ExecutionBlockerNotice presentation={{ ...failed, canRetry: false }}
+        observedStatus="failed" observedErrorCode={observedErrorCode}
+        blocker={{ ...recoveredBlocker, canContinue: true, nextAction: "" }} canRetry onRetry={retry} conversationMode />));
+      expect(container.textContent).toBe(`${pausedConversation} Send a message to continue.`);
+      expect(container.textContent).not.toMatch(/Couldn't resume|\/new|agent.*message/i);
+      expect(container.querySelector("button")).toBeNull();
+    });
+  it.each([
+    "Send a message to continue.", "Send a new message to continue.",
+    "Send a new chat message to continue this conversation.", "Saved work recovered. Send a message to continue.",
+  ])("preserves server words without inferring continuation permission: %s", async nextAction => {
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={{ ...failed, canRetry: false }}
+      observedStatus="failed" blocker={{ ...recoveredBlocker, nextAction }} canRetry onRetry={retry} conversationMode />));
+    expect(container.textContent).toBe(nextAction);
+    expect(container.querySelector("button")).toBeNull();
+  });
+  it.each([
+    ["Send a message or press Retry to continue.", true],
+    ["Send a message to continue.", false],
+    ["Saved work recovered. Send a message or press Retry to continue.", true],
+  ] as const)("preserves the server's native person-continuation action: %s", async (nextAction, canRetry) => {
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={{ ...failed, canRetry }} observedStatus="failed"
+      blocker={{ ...recoveredBlocker, canContinue: true, canRetry, nextAction }} canRetry onRetry={retry} conversationMode />));
+    expect(container.querySelector('[role="status"] > span')?.textContent).toBe(nextAction);
+    expect(container.textContent).not.toMatch(/Couldn't resume|Your message is saved|\/new/);
+    expect(container.querySelectorAll("button")).toHaveLength(Number(canRetry));
+    if (canRetry) {
+      await act(async () => container.querySelector<HTMLButtonElement>('button')!.click());
+      expect(retry).toHaveBeenCalledOnce();
+    }
+  });
+  it.each([
+    "Inspect the run before sending a new message to request continuation.",
+    "Verify the connection, then send a new message to continue.",
+    "Do not send a message to continue.", "An agent can send a message to continue.",
+  ])("does not turn conditional or unrelated next-action prose into permission: %s", async nextAction => {
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={{ ...failed, canRetry: false }}
+      observedStatus="failed" blocker={{ ...recoveredBlocker, nextAction }} canRetry onRetry={retry} />));
+    expect(container.textContent).toBe(nextAction);
+    expect(container.querySelector("button")).toBeNull();
+  });
+  // Exact failed/recovered projection: Retry is available, but no unanswered
+  // person messages are held. File custody is not message-delivery custody.
+  it.each([false, true])("shows the recovered-work Retry action, not a failed resume (message continuation=%s)", async canContinue => {
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={{ ...failed, intentId: null }} observedStatus="failed"
+      blocker={{ ...recoveredBlocker, canContinue, canRetry: true, nextAction: "Saved work recovered. Retry continues from it." }}
+      canRetry onRetry={retry} conversationMode />));
+    expect(container.querySelector('[role="status"] > span')?.textContent).toBe("Saved work recovered. Retry continues from it.");
+    expect(container.textContent).not.toMatch(/Couldn't resume|Send a message|\/new|Your message is saved/);
+    expect(container.querySelectorAll("button")).toHaveLength(1);
+    const notice = container.querySelector('[role="status"][aria-label="Task status"]')!;
+    expect(notice.className).toBe("flex items-center gap-3 rounded-lg bg-destructive/10 p-4 text-sm text-foreground");
+    expect(notice.querySelector("svg")?.classList.contains("lucide-circle-alert")).toBe(true);
+    await act(async () => container.querySelector<HTMLButtonElement>('button')!.click());
+    expect(retry).toHaveBeenCalledOnce();
+  });
+  it.each([[false, true, true], [true, false, true], [true, true, false]])(
+    "does not invite an unavailable Retry (page=%s, interruption=%s, blocker=%s)", async (pageRetry, interruptionRetry, blockerRetry) => {
+      await act(async () => root.render(<ExecutionBlockerNotice presentation={{ ...failed, canRetry: interruptionRetry }}
+        observedStatus="failed" blocker={{ ...recoveredBlocker, canContinue: true, canRetry: blockerRetry, nextAction: "" }}
+        canRetry={pageRetry} onRetry={retry} />));
+      expect(container.textContent).toBe(`${pausedConversation} Send a message to continue.`);
+      expect(container.querySelector("button")).toBeNull();
+    });
+  it.each([0, 1, 2])("claims saved person input only when the server reports it (saved count=%s)", async savedMessageCount => {
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={{ ...failed, canRetry: false }}
+      observedStatus="failed" blocker={{ ...recoveredBlocker, canContinue: true, savedMessageCount, nextAction: "" }} canRetry onRetry={retry} />));
+    const saved = savedMessageCount === 1 ? " Your message is saved." : savedMessageCount > 1 ? ` Your ${savedMessageCount} messages are saved.` : "";
+    expect(container.textContent).toBe(`${pausedConversation}${saved} Send a message to continue.`);
+    expect(container.querySelector("button")).toBeNull();
+  });
+  it("does not assert a conversation cannot resume when its continuation capability is unknown", async () => {
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={{ ...failed, canRetry: false }}
+      observedStatus="failed" canRetry onRetry={retry} />));
+    expect(container.textContent).toBe(pausedConversation);
+    expect(container.querySelector("button")).toBeNull();
+  });
+  // Tone follows who owns the next step, independently of the server's words.
+  // Eleven lifecycle/authority states crossed with five server next actions.
+  const toneStates = [
+    { name: "Retry required", red: true, retry: true, moving: false, canContinue: false },
+    { name: "page cannot Retry", red: false, retry: false, moving: false, canContinue: false, pageRetry: false },
+    { name: "presentation cannot Retry", red: false, retry: false, moving: false, canContinue: false, presentation: { canRetry: false } },
+    { name: "blocker cannot Retry", red: false, retry: false, moving: false, canContinue: false, blockerRetry: false },
+    { name: "active recovery", red: false, retry: false, moving: true, canContinue: false, presentation: { state: "working" as const, recoveryStep: "saving_previous_files" as const } },
+    { name: "scheduled recovery", red: false, retry: false, moving: true, canContinue: false, presentation: { state: "retry_scheduled" as const, nextRetryAt: "2026-11-27T14:00:00Z" } },
+    { name: "failed projection with next retry", red: false, retry: false, moving: true, canContinue: false, presentation: { nextRetryAt: "2026-11-27T14:00:00Z" } },
+    { name: "queued workspace recovery", red: false, retry: false, moving: true, canContinue: false, workspaceRecovery: { status: "queued" as const, stage: "restoring_files" as const, canRetry: true, message: "Recovery queued." } },
+    { name: "running workspace recovery", red: false, retry: false, moving: true, canContinue: false, workspaceRecovery: { status: "recovering" as const, stage: "restoring_files" as const, canRetry: true, message: "Recovery running." } },
+    { name: "accepted Retry", red: false, retry: false, moving: true, canContinue: false, optimistic: true },
+    { name: "no-action hold", red: false, retry: false, moving: false, canContinue: false, presentation: { canRetry: false }, blockerRetry: false },
+  ];
+  const toneActions = ["", "Saved work recovered. Retry continues from it.", "Saved work is ready. Choose Retry when you are ready.",
+    "Inspect the run before sending a new message to request continuation.", "Saved <work> stays available."];
+  it.each(toneStates.flatMap(state => toneActions.map(nextAction => ({ ...state, nextAction }))))(
+    "recovery tone: $name / $nextAction", async row => {
+      await act(async () => root.render(<ExecutionBlockerNotice presentation={{ ...failed, ...row.presentation }}
+        observedStatus="failed" blocker={{ ...recoveredBlocker, canContinue: row.canContinue, canRetry: row.blockerRetry ?? true,
+          nextAction: row.nextAction, workspaceRecovery: row.workspaceRecovery }}
+        canRetry={row.pageRetry ?? true} optimistic={row.optimistic} onRetry={retry} conversationMode />));
+      const notice = container.querySelector('[role="status"][aria-label="Task status"]')!;
+      expect(notice.className).toBe(row.red
+        ? "flex items-center gap-3 rounded-lg bg-destructive/10 p-4 text-sm text-foreground"
+        : "flex items-center gap-3 text-sm text-muted-foreground");
+      const icon = notice.querySelector("svg")!;
+      expect(icon.classList.contains(row.red ? "lucide-circle-alert" : row.moving ? "lucide-loader-circle" : "lucide-circle-pause")).toBe(true);
+      expect(icon.getAttribute("aria-hidden")).toBe("true");
+      expect(icon.classList.contains("motion-safe:animate-spin")).toBe(row.moving);
+      expect(Boolean(notice.querySelector("button"))).toBe(row.retry);
+      const expectedCopy = !row.optimistic && row.presentation?.nextRetryAt
+        ? `Trying again at ${new Date(row.presentation.nextRetryAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
+        : row.moving ? "Preparing your reply…"
+        : row.nextAction || (row.retry ? `${pausedConversation} Press Retry to continue.`
+          : row.blockerRetry === false
+            ? "Couldn't resume this conversation. This task is on hold and can't continue from here yet."
+            : `${pausedConversation} Send /new to start a fresh session, then send your message again.`);
+      expect(notice.querySelector(":scope > span")?.textContent).toBe(expectedCopy);
+      if (row.retry) {
+        await act(async () => notice.querySelector<HTMLButtonElement>("button")!.click());
+        expect(retry).toHaveBeenCalledOnce();
+      } else expect(retry).not.toHaveBeenCalled();
+    });
+  it.each([null, "2026-11-27T14:00:00Z"])("names a scheduled recovery's local retry time only when supplied (%s)", async nextRetryAt => {
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={{ ...failed, state: "retry_scheduled", nextRetryAt }}
+      observedStatus="failed" blocker={{ ...recoveredBlocker, canContinue: true, canRetry: true }} canRetry onRetry={retry} />));
+    const notice = container.querySelector('[role="status"][aria-label="Task status"]')!;
+    expect(notice.querySelector(":scope > span")?.textContent).toBe(nextRetryAt
+      ? `Trying again at ${new Date(nextRetryAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
+      : "Preparing your reply…");
+    expect(notice.className).toBe("flex items-center gap-3 text-sm text-muted-foreground");
+    expect(notice.querySelector("svg")?.classList.contains("lucide-loader-circle")).toBe(true);
+    expect(notice.querySelector("button")).toBeNull();
+    expect(notice.textContent).not.toMatch(/Press Retry|Send a message/);
+    expect(retry).not.toHaveBeenCalled();
+  });
+  it.each([[false, true, true], [true, false, true], [true, true, false]])(
+    "marks message-required continuation actionable without Retry (page=%s, presentation=%s, blocker=%s)", async (pageRetry, presentationRetry, blockerRetry) => {
+      await act(async () => root.render(<ExecutionBlockerNotice presentation={{ ...failed, canRetry: presentationRetry }}
+        observedStatus="failed" blocker={{ ...recoveredBlocker, canContinue: true, canRetry: blockerRetry }}
+        canRetry={pageRetry} onRetry={retry} />));
+      const notice = container.querySelector('[role="status"][aria-label="Task status"]')!;
+      expect(notice.className).toBe("flex items-center gap-3 rounded-lg bg-destructive/10 p-4 text-sm text-foreground");
+      expect(notice.querySelector("svg")?.classList.contains("lucide-circle-alert")).toBe(true);
+      expect(notice.querySelector("svg")?.classList.contains("motion-safe:animate-spin")).toBe(false);
+      expect(notice.textContent).toBe(recoveredBlocker.nextAction);
+      expect(notice.querySelector("button")).toBeNull();
+      // The same capability without server copy names the required person action.
+      await act(async () => root.render(<ExecutionBlockerNotice presentation={{ ...failed, canRetry: presentationRetry }}
+        observedStatus="failed" blocker={{ ...recoveredBlocker, canContinue: true, canRetry: blockerRetry, nextAction: "" }}
+        canRetry={pageRetry} onRetry={retry} />));
+      expect(container.querySelector('[role="status"]')?.className).toBe("flex items-center gap-3 rounded-lg bg-destructive/10 p-4 text-sm text-foreground");
+      expect(container.textContent).toBe(`${pausedConversation} Send a message to continue.`);
+      expect(container.querySelector("button")).toBeNull();
+      expect(retry).not.toHaveBeenCalled();
+    });
   it.each(personStops)("keeps workspace repair words and the task Retry after a person's Stop (%j)", async observedResultJson => {
     for (const presentation of [null, failed, { ...failed, state: "resolved" as const }]) {
       await act(async () => root.render(<ExecutionBlockerNotice presentation={presentation} observedStatus="cancelled"
@@ -421,9 +593,10 @@ describe("ordinary task interruption", () => {
       observedResultJson={{ [key]: { requestedAt: "2026-11-24T20:00:00Z" } }} canRetry onRetry={retry} />));
     expect(container.textContent).not.toContain("Couldn't resume this conversation");
   });
-  it("still reports a failed resume when no person stopped the failed run (a budget cancel's startup fence included)", async () => {
+  it("names Retry instead of a failed conversation resume when no person stopped the retryable run (a budget cancel's startup fence included)", async () => {
     await act(async () => root.render(<ExecutionBlockerNotice presentation={failed} observedStatus="failed" observedResultJson={{ startupCancellation: { requestedAt: "2026-11-24T20:00:00Z" } }} canRetry onRetry={retry} />));
-    expect(container.textContent).toContain("Couldn't resume this conversation");
+    expect(container.querySelector('[role="status"] > span')?.textContent).toBe(`${pausedConversation} Press Retry to continue.`);
+    expect(container.textContent).not.toContain("Couldn't resume this conversation");
   });
   it("offers one Retry without delegating infrastructure chores", async () => {
     await render();
