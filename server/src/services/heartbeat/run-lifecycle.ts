@@ -1152,7 +1152,10 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       .then((rows) => rows[0] ?? null);
 
     if (previousStatus && patch?.resultJson !== undefined) patch = { ...patch,
-      resultJson: preserveWorkspaceRestoreRecoveryMetadata(previousStatus.resultJson, patch.resultJson),
+      resultJson: {
+        ...(previousStatus.resultJson?.configurationSupersession ? { configurationSupersession: previousStatus.resultJson.configurationSupersession } : {}),
+        ...preserveWorkspaceRestoreRecoveryMetadata(previousStatus.resultJson, patch.resultJson),
+      },
     };
 
     // Preserve the receipt-source fence when finalization enriches usage. A
@@ -1265,7 +1268,10 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     }
 
     if (previousStatus && patch?.resultJson !== undefined) patch = { ...patch,
-      resultJson: preserveWorkspaceRestoreRecoveryMetadata(previousStatus.resultJson, patch.resultJson),
+      resultJson: {
+        ...(previousStatus.resultJson?.configurationSupersession ? { configurationSupersession: previousStatus.resultJson.configurationSupersession } : {}),
+        ...preserveWorkspaceRestoreRecoveryMetadata(previousStatus.resultJson, patch.resultJson),
+      },
     };
 
     // Preserve the receipt-source fence when finalization enriches usage. A
