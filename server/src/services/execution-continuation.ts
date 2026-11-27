@@ -22,7 +22,7 @@ import { githubRecoveryReceipts } from "./chat-channels/github/recovery-receipts
 import { readTaskRetryIntent } from "./task-retry.js";
 import { readByEarlierTurnCommentIds } from "./queued-comment-delivery.js";
 import type { NativeContinuationReadState } from "./native-runtime/native-turn-budget.js";
-import { continuationResultIdentityKeys } from "./execution-continuation-identity.js";
+import { continuationResultHasError, continuationResultIdentityKeys } from "./execution-continuation-identity.js";
 import { foldRepeatedFailedWrites } from "./execution-continuation-failed-writes.js";
 export { continuationResultIdentityKeys } from "./execution-continuation-identity.js";
 
@@ -41,7 +41,7 @@ function continuationApiResult(operationId: string, result: unknown, companyId: 
   const data = object(response.data);
   if (!savedRecordOperations.has(operationId) || response.operationId !== operationId
     || response.ok !== true || typeof response.status !== "number" || response.status < 200 || response.status >= 300
-    || Object.hasOwn(response, "error") || Object.hasOwn(data, "error")
+    || response.status === 207 || continuationResultHasError(response)
     || data.companyId !== companyId || !z.string().uuid().safeParse(data.id).success) return result;
   const serialized = JSON.stringify(data);
   if (Buffer.byteLength(serialized) <= 4 * 1024) return result;

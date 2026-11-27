@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
-import { continuationResultIdentityKeys } from "../execution-continuation-identity.js";
+import { continuationResultHasError, continuationResultIdentityKeys } from "../execution-continuation-identity.js";
 import type { DurablePrpControlPlane, NativeSession } from "../../vendor/paperclip-runner/index.js";
 
 // One split, in encoded UTF-8 journal-command bytes (not prompt characters).
@@ -262,7 +262,7 @@ export function boundNativeExecutionContinuation(
     // their errors, outcome and retry guidance whole, even under size pressure.
     if (write && (result.ok !== true
       || !(typeof result.status === "number" && result.status >= 200 && result.status < 300)
-      || result.outcome === "unknown" || Object.hasOwn(result, "error") || Object.hasOwn(record(result.data), "error"))) continue;
+      || result.status === 207 || result.outcome === "unknown" || continuationResultHasError(result))) continue;
     if (write && Array.isArray(result.data) && (result.data.length > 20 || result.data.length === 0)) continue;
     const topIdentity = write ? identity(result) : {};
     const dataIdentity = write ? (Array.isArray(result.data) ? result.data.map(resourceIdentity) : resourceIdentity(result.data)) : {};

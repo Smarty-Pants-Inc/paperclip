@@ -98,8 +98,12 @@ export async function foldRepeatedFailedWrites(db: Db, companyId: string, issueI
     const runs = [...new Set(group.map(value => value.action.runId))];
     const boundedRuns = runs.slice(0, 8).join(", ") + (runs.length > 8 ? `, +${runs.length - 8} more` : "");
     const line = `The same request failed ${group.length - 2} more times between ${first.evidence.at} and ${last.evidence.at} (runs: ${boundedRuns}).`;
-    replacements.set(group.reduce((index, value) => Math.min(index, value.index), Infinity), [first.action, { ...group[1]!.action, result: line }, last.action]);
-    for (const value of group) removed.add(value.index);
+    const omitted = group.slice(1, -1);
+    const firstOmitted = omitted.reduce((first, value) => value.index < first.index ? value : first);
+    // Leave both whole endpoints and every other answer at their own positions.
+    // Only omitted occurrences disappear; their first slot holds the summary.
+    replacements.set(firstOmitted.index, [{ ...firstOmitted.action, result: line }]);
+    for (const value of omitted) removed.add(value.index);
   }
   return receipts.flatMap(({ action }, index) => replacements.get(index) ?? (removed.has(index) ? [] : [action]));
 }

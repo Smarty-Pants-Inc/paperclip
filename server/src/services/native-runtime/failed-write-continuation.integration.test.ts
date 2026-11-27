@@ -92,7 +92,14 @@ describe("C73 failed write continuation rows", () => {
     expect(afterBytes).toBeLessThanOrEqual(NATIVE_TURN_KNOWN_MAX_BYTES);
     const failures = retained.completedActions!.filter(row => row.operationId === operationId && typeof row.result !== "string");
     expect(failures).toHaveLength(2);
-    expect(failures.map(row => row.receiptId)).toEqual([receiptId("failed-0"), receiptId("failed-209")]);
+    const endpointIds = new Set([receiptId("failed-0"), receiptId("failed-209")]);
+    expect(failures.map(row => row.receiptId)).toEqual(raw.completedActions.filter(row => endpointIds.has(row.receiptId)).map(row => row.receiptId));
+    // JSONB's within-run key order need not be call-time order. Both whole
+    // call-time endpoints stay at their original slots, just like the saves.
+    expect(retained.completedActions!.filter(row => typeof row.result !== "string"))
+      .toEqual(raw.completedActions.filter(row => row.operationId !== operationId || endpointIds.has(row.receiptId)));
+    const firstOmitted = raw.completedActions.find(row => row.operationId === operationId && !endpointIds.has(row.receiptId))!;
+    expect(retained.completedActions!.find(row => typeof row.result === "string")!.receiptId).toBe(firstOmitted.receiptId);
     const savedReceipts = storedBefore.resultJson!.apiToolReceipts as Record<string, { result: unknown }>;
     for (const row of failures) expect(row.result).toEqual(savedReceipts[row.receiptId]!.result);
     const summary = retained.completedActions!.find(row => typeof row.result === "string")!.result;
@@ -120,9 +127,12 @@ describe("C73 failed write continuation rows", () => {
     const retained = budgetNativeFreshFallback(input, wake, { lastRunAt: null, readCommentIds: [] })!;
     expect(retained.completedActions).toEqual(continuation.completedActions);
     expect(retained.completedActions).toHaveLength(3);
-    expect(retained.completedActions![0]).toMatchObject({ receiptId: receiptId("legacy-0"), result: receipts[receiptId("legacy-0")]!.result });
-    expect(retained.completedActions![2]).toMatchObject({ receiptId: receiptId("legacy-4"), result: receipts[receiptId("legacy-4")]!.result });
-    expect(retained.completedActions![1]!.result).toBe(`The same request failed 3 more times between ${times[0]!.toISOString()} and ${times[4]!.toISOString()} (runs: ${fixture.runId}).`);
+    const endpointIds = new Set([receiptId("legacy-0"), receiptId("legacy-4")]);
+    const firstOmitted = Object.keys(receipts).find(id => !endpointIds.has(id))!;
+    const line = `The same request failed 3 more times between ${times[0]!.toISOString()} and ${times[4]!.toISOString()} (runs: ${fixture.runId}).`;
+    expect(retained.completedActions).toEqual(Object.entries(receipts).flatMap(([id, receipt]) =>
+      endpointIds.has(id) || id === firstOmitted ? [{ runId: fixture.runId, receiptId: id, operationId: args.operationId,
+        result: endpointIds.has(id) ? receipt.result : line }] : []));
     const [after] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
     expect(after.resultJson).toEqual(run.resultJson);
   });
@@ -166,15 +176,62 @@ describe("C73 failed write continuation rows", () => {
     for (const [id, original] of Object.entries(variantReceipts)) expect(continuation.completedActions!.find(row => row.receiptId === id)!.result).toEqual(original.result);
   });
 
-  it("keeps an error-bearing saved-record body whole before budgeting", async () => {
+  it.each([
+    ["challenger", [409, 409, 422, 200, 409, 409]],
+    ["designer", [409, 422, 409, 200, 409, 200]],
+  ] as const)("keeps interleaved %s answers at their original positions", async (name, statuses) => {
     const fixture = await server.fixture({ disableWakeOnDemand: true });
-    const result = { ok: true, status: 200, operationId: "POST /api/issues/{id}/comments",
-      data: { id: randomUUID(), companyId: fixture.companyId, error: "Save refused", body: "whole error details ".repeat(1000) } };
+    const operationId = "PATCH /api/issues/{id}", digest = createHash("sha256").update("same request").digest("hex");
+    const original = [];
+    for (const [i, status] of statuses.entries()) {
+      const receiptId = String(i + 1).padStart(3, "0");
+      const result = status === 200 ? { ok: true, status, data: { id: fixture.blockerId, priority: "high" } }
+        : { ok: false, status, data: { error: status === 409 ? "Full refusal" : "Different failure" }, retryAfter: null };
+      const [run] = await server.db.insert(heartbeatRuns).values({ companyId: fixture.companyId, agentId: fixture.agentId,
+        status: status === 200 ? "succeeded" : "failed", contextSnapshot: { issueId: fixture.issueId },
+        createdAt: new Date(Date.UTC(2026, 0, 1, 10, i)),
+        resultJson: { apiToolReceipts: { [receiptId]: { state: "completed", operationId, digest, result } } } }).returning();
+      original.push({ runId: run.id, receiptId, operationId, result });
+      await server.db.insert(activityLog).values({ companyId: fixture.companyId, agentId: fixture.agentId,
+        runId: run.id, actorType: "agent", actorId: fixture.agentId, action: "runner.api_called",
+        entityType: "issue", entityId: fixture.issueId, createdAt: run.createdAt,
+        details: { receiptId, operationId, requestFingerprint: digest, pathParams: { id: fixture.blockerId }, status } });
+    }
+    const duplicateIndexes = statuses.flatMap((status, i) => status === 409 ? [i] : []);
+    const omitted = duplicateIndexes.slice(1, -1), firstOmitted = omitted[0]!;
+    const expected = original.flatMap((action, i) => !omitted.includes(i) ? [action]
+      : i === firstOmitted ? [{ ...action, result: expect.stringContaining(`The same request failed ${omitted.length} more times between `) }] : []);
+    const { continuation, input, wake } = await prepare(fixture);
+    const retained = budgetNativeFreshFallback(input, wake, { lastRunAt: null, readCommentIds: [] })!;
+    const modelEnvelope = buildNativeModelEnvelope(input);
+    const rendered = [...modelEnvelope.task.prompt.matchAll(/```[^\n]*\n([\s\S]*?)\n```/g)]
+      .map(match => JSON.parse(match[1]!)).find(value => Array.isArray(value.completedActions));
+    await evidence(`order-${name}.json`, { original, continuation, retained, modelEnvelope, rendered });
+    expect(continuation.completedActions).toEqual(expected);
+    expect(retained.completedActions).toEqual(expected);
+    expect(rendered.completedActions).toEqual(retained.completedActions);
+    expect(retained.messages).toEqual(continuation.messages);
+    expect(retained.objective).toBe(continuation.objective);
+    expect(retained.completedActions!.at(-1)).toEqual(original.at(-1));
+  });
+
+  it.each([
+    ["an error-bearing", 200, { error: "Save refused" }],
+    ["a 207", 207, {}],
+    ["a plural errors", 200, { errors: ["Save refused"] }],
+    ["a null plural errors", 200, { errors: null }],
+    ["a nested error", 200, { child: { id: "child", error: "Child save refused" } }],
+    ["a nested bulk error", 200, { results: [{ id: "child", error: "Child save refused" }] }],
+  ] as const)("keeps %s saved-record body whole before budgeting", async (_name, status, data) => {
+    const fixture = await server.fixture({ disableWakeOnDemand: true });
+    const result = { ok: true, status, operationId: "POST /api/issues/{id}/comments",
+      data: { id: randomUUID(), companyId: fixture.companyId, ...data, body: "whole error details ".repeat(1000) } };
     await server.db.update(heartbeatRuns).set({ resultJson: { apiToolReceipts: { candidate: { state: "completed", operationId: result.operationId, result } } } }).where(eq(heartbeatRuns.id, fixture.runId));
     const { continuation, input, wake } = await prepare(fixture);
     expect(continuation.completedActions![0]!.result).toEqual(result);
     const retained = budgetNativeFreshFallback(input, wake, { lastRunAt: null, readCommentIds: [] })!;
     expect(retained.completedActions![0]!.result).toEqual(result);
+    await evidence(`projection-${_name.replaceAll(" ", "-")}.json`, { result, continuation, retained });
   });
 
   it.each([ ["null", null], ["message", "Reported error"] ] as const)("keeps repeated successful 2xx answers with a %s error field whole", async (_name, error) => {
@@ -196,6 +253,12 @@ describe("C73 failed write continuation rows", () => {
   it.each([
     ["2xx body error", { ok: true, status: 200, data: { id: "candidate", error: "Not a successful save" } }],
     ["2xx null body error", { ok: true, status: 200, data: { id: "candidate", error: null } }],
+    ["207 without an error field", { ok: true, status: 207, data: { id: "candidate" } }],
+    ["207 bulk element error", { ok: true, status: 207, data: [{ id: "saved" }, { id: "candidate", error: "Element save refused" }] }],
+    ["top-level plural errors", { ok: true, status: 200, data: { id: "candidate" }, errors: ["Save refused"] }],
+    ["body plural errors", { ok: true, status: 200, data: { id: "candidate", errors: ["Save refused"] } }],
+    ["nested resource error", { ok: true, status: 200, data: { id: "candidate", child: { id: "child", error: "Child save refused" } } }],
+    ["nested bulk error", { ok: true, status: 200, data: { id: "candidate", results: [{ id: "child", error: "Child save refused" }] } }],
     ["absent status", { ok: true, data: { id: "candidate" } }],
     ["nested id only", { ok: true, status: 201, data: { nested: { id: "not-the-resource" } } }],
   ])("keeps a persisted %s answer whole through the real budgeter", async (_name, candidate) => {
@@ -210,6 +273,8 @@ describe("C73 failed write continuation rows", () => {
     const { continuation, input, wake } = await prepare(fixture);
     expect(commandEnvelopeBytes(buildNativeModelEnvelope(input))).toBeGreaterThan(NATIVE_TURN_KNOWN_MAX_BYTES);
     const retained = budgetNativeFreshFallback(input, wake, { lastRunAt: null, readCommentIds: [] })!;
+    await evidence(`budget-${_name.replaceAll(" ", "-")}.json`, { receipts, continuation, retained,
+      afterBytes: commandEnvelopeBytes(buildNativeModelEnvelope(input)), limit: NATIVE_TURN_KNOWN_MAX_BYTES });
     expect(retained.completedActions!.find(row => row.receiptId === "candidate")!.result).toEqual(result);
     expect(retained.completedActions!.find(row => row.receiptId === "saver")!.result).toMatchObject({ resultOmittedForSize: true });
     expect(retained.messages).toEqual(continuation.messages);
