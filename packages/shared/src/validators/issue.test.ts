@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MAX_ISSUE_REQUEST_DEPTH } from "../index.js";
+import { MAX_ISSUE_REQUEST_DEPTH, UNRECOVERED_FILES_NOTICE_KIND, matchesUnrecoveredFilesNotice } from "../index.js";
 import {
   addIssueCommentSchema,
   paperclipQuestionSetPayloadSchema,
@@ -63,6 +63,21 @@ describe("issue validators", () => {
     expect(issueCommentMetadataSchema.parse(metadata)).toEqual(metadata);
     for (const patch of [{ actionId: "bad-id" }, { attemptCount: -1 }, { attemptCount: 0.5 }, { maxAttempts: 0 }, { kind: "prose" }]) {
       expect(issueCommentMetadataSchema.safeParse({ ...metadata, recovery: { ...recovery, ...patch } }).success).toBe(false);
+    }
+  });
+
+  it("retains typed files-loss correlation and workspace continuity without inventing a restore", () => {
+    const sourceRunId = "9af8228f-0be7-45ae-a104-6fbe0af6f1d3";
+    const successorRunId = "b249074c-0cb5-487c-947e-9f45fd29c895";
+    const metadata = { version: 1, kind: UNRECOVERED_FILES_NOTICE_KIND, sourceRunId, successorRunId,
+      workspaceContinuity: { mode: "fresh_isolated_workspace", sourceRunId, contentOrigin: "configured_source" },
+      sections: [{ rows: [{ type: "text", text: "Details" }] }] };
+    expect(issueCommentMetadataSchema.parse(metadata)).toEqual(metadata);
+    expect(matchesUnrecoveredFilesNotice("Wording can change", metadata.kind)).toBe(true);
+    for (const patch of [{ successorRunId: "bad-id" }, { kind: "other_notice" },
+      { workspaceContinuity: { ...metadata.workspaceContinuity, contentOrigin: "last_saved_files" } },
+      { workspaceContinuity: { ...metadata.workspaceContinuity, sourceRunId: "bad-id" } }]) {
+      expect(issueCommentMetadataSchema.safeParse({ ...metadata, ...patch }).success).toBe(false);
     }
   });
 

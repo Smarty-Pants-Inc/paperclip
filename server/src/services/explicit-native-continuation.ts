@@ -6,6 +6,8 @@ import { canSelectFreshWorkspace, freshReadinessSchema, retainedIssueWorkspaceFo
 import { verifiedWorkspaceSnapshotReceipt } from "./workspace-recovery-snapshot.js";
 import { readTaskRetryIntent, retireTaskRetriesContinuedBy } from "./task-retry.js";
 import { isPreDispatchExecutionWaitVerified } from "./pre-dispatch-execution-wait.js";
+import { UNRECOVERED_FILES_NOTICE_KIND } from "@paperclipai/shared";
+import { systemNoticePresentation } from "./recovery/notice-format.js";
 import { readSystemRecovery, savedFilesUnrecoverable, unrecoverableSavedFilesFailure, unrecoverableSavedFilesNotice } from "./system-recovery-state.js";
 import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
 import { hasVerifiedWorkspaceRepair } from "./workspace-recovery-receipt.js";
@@ -731,8 +733,10 @@ export async function admitExplicitNativeContinuation(input: {
     failureDetail: sql`coalesce(${nativeRunFinalizations.failureDetail}, '{}'::jsonb) || ${JSON.stringify({ replacementDenied: "explicit_user_continuation" })}::jsonb`,
     updatedAt: new Date(),
   }).where(and(eq(nativeRunFinalizations.companyId, companyId), inArray(nativeRunFinalizations.runId, nativeSources.map(run => run.id))));
-  const unrecoverable = actions.map(action => freshSources.has(String(action.evidence.runId))
-    ? unrecoverableSavedFilesFailure(readSystemRecovery(action.evidence)) : null).find(failure => failure !== null) ?? null;
+  const unrecoverableSource = actions.find(action => freshSources.has(String(action.evidence.runId))
+    && unrecoverableSavedFilesFailure(readSystemRecovery(action.evidence)) !== null);
+  const unrecoverable = unrecoverableSource
+    ? unrecoverableSavedFilesFailure(readSystemRecovery(unrecoverableSource.evidence)) : null;
   if (actions.length) await db.transaction(async tx => {
     await notifyUnsafeWorkspaceExportRecovery(tx, { companyId, issueId });
   for (const action of actions) {
@@ -755,8 +759,18 @@ export async function admitExplicitNativeContinuation(input: {
   }
   if (unrecoverable) {
     const { issueService } = await import("./issues.js");
-    await issueService(db).addComment(issueId, unrecoverableSavedFilesNotice(unrecoverable), {},
-      { authorType: "system" }, tx);
+    await issueService(db).addComment(issueId, unrecoverableSavedFilesNotice(unrecoverable), {}, {
+      authorType: "system",
+      presentation: { ...systemNoticePresentation({ tone: "warning", title: "Some files were not recovered" }),
+        detailsDefaultOpen: true },
+      metadata: { version: 1, kind: UNRECOVERED_FILES_NOTICE_KIND,
+        sourceRunId: String(unrecoverableSource!.evidence.runId), successorRunId: input.successorRunId,
+        sections: [{ title: "Recovery", rows: [
+          { type: "run_link", label: "Stopped run", runId: String(unrecoverableSource!.evidence.runId), title: "Earlier work" },
+          { type: "run_link", label: "Continuing run", runId: input.successorRunId, title: "New workspace" },
+          { type: "key_value", label: "Recovery reason", value: unrecoverable.code },
+        ] }] },
+    }, tx);
   }
   });
   await persistActivity(db, { companyId, actorType: "user", actorId,
