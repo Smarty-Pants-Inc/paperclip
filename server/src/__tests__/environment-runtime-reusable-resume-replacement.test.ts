@@ -1,5 +1,8 @@
 import { JsonRpcCallError, environmentResumeErrorData } from "@paperclipai/plugin-sdk";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import {
@@ -11,6 +14,9 @@ import {
   executionWorkspaceSnapshots,
   executionWorkspaces,
   heartbeatRuns,
+  heartbeatRunEvents,
+  issues,
+  nativeRunnerCheckpoints,
   plugins,
   projects,
 } from "@paperclipai/db";
@@ -21,12 +27,23 @@ import { environmentRuntimeService } from "../services/environment-runtime.ts";
 import { environmentService } from "../services/environments.ts";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.ts";
 
-// Durable harness-backup verification has its own tests. Here it is a boundary:
-// a lease-bound stamp verifies, a missing stamp (an older release's lease) does not.
-vi.mock("../services/native-runtime/native-harness-backup-storage.js", () => ({
-  verifyRecoverableNativeHarnessBackup: vi.fn(async (input: { stamp: unknown; providerLeaseId: string }) =>
-    Boolean(input.stamp && (input.stamp as { authorizedProviderLeaseId?: unknown }).authorizedProviderLeaseId === input.providerLeaseId)),
-}));
+import * as nativeExecutor from "../services/native-runtime/native-session-executor.js";
+import * as controllerIdentity from "../services/controller-process-identity.js";
+import { createNativeHarnessBackupStamp } from "../services/native-runtime/native-harness-backup-stamp.js";
+import { createNativeControllerRecovery } from "../services/native-runtime/native-controller-recovery.js";
+import { insertMigratedNativeRunnerCheckpoint, loadNativeRunnerCheckpoint } from "../services/native-runtime/native-runner-checkpoint.js";
+import { retiredSourceAuthorizesNativeBackupRestore } from "../services/native-runtime/native-retired-backup-source.js";
+import { captureLegacyDurablePrpCheckpoint, DurablePrpControlPlane } from "../vendor/paperclip-runner/index.js";
+
+// The older resume-refusal rows use a lease-bound stub stamp. Fence rows below
+// have complete manifests and MUST pass the real bytes + source verification.
+vi.mock("../services/native-runtime/native-harness-backup-storage.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../services/native-runtime/native-harness-backup-storage.js")>();
+  return { ...actual, verifyRecoverableNativeHarnessBackup: vi.fn(async (input: Parameters<typeof actual.verifyRecoverableNativeHarnessBackup>[0]) =>
+    (input.stamp as { manifestSha256?: unknown } | undefined)?.manifestSha256
+      ? actual.verifyRecoverableNativeHarnessBackup(input)
+      : Boolean(input.stamp && (input.stamp as { authorizedProviderLeaseId?: unknown }).authorizedProviderLeaseId === input.providerLeaseId)) };
+});
 
 const externalTestDatabaseUrl = resolveExternalTestDatabaseUrl("PAPERCLIP_ENVIRONMENT_RUNTIME_TEST_DATABASE_URL");
 const embeddedPostgresSupport = externalTestDatabaseUrl ? { supported: true } : await getEmbeddedPostgresTestSupport();
@@ -40,8 +57,16 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
   let stopDb: (() => Promise<void>) | null = null;
   let db!: ReturnType<typeof createDb>;
   let connectionString: string;
+  let fixtureRoot: string;
+  const previousStateDirectory = process.env.PAPERCLIP_RUNNER_STATE_DIR;
+  let primingRuntimeService = environmentRuntimeService;
 
   beforeAll(async () => {
+    // Optional two-code deploy exercise: the caller supplies an exact baseline
+    // module beside environment-runtime.ts, so relative imports stay real.
+    if (process.env.PAPERCLIP_REUSABLE_LEASE_BASE_RUNTIME) {
+      primingRuntimeService = (await import(process.env.PAPERCLIP_REUSABLE_LEASE_BASE_RUNTIME)).environmentRuntimeService;
+    }
     if (externalTestDatabaseUrl) connectionString = externalTestDatabaseUrl;
     else {
       const started = await startEmbeddedPostgresTestDatabase("environment-runtime-resume-replacement");
@@ -49,12 +74,19 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
       connectionString = started.connectionString;
     }
   });
-  beforeEach(() => { db = createDb(connectionString); });
+  beforeEach(async () => {
+    db = createDb(connectionString);
+    fixtureRoot = await mkdtemp(join(tmpdir(), "replacement-fence-"));
+    process.env.PAPERCLIP_RUNNER_STATE_DIR = fixtureRoot;
+  });
   afterEach(async () => {
     vi.restoreAllMocks();
     await db.delete(executionWorkspaceSnapshots);
     await db.delete(environmentLeases);
+    await db.delete(nativeRunnerCheckpoints);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
+    await db.delete(issues);
     await db.delete(agents);
     await db.delete(environments);
     await db.delete(executionWorkspaces);
@@ -62,6 +94,9 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
     await db.delete(projects);
     await db.delete(companies);
     await db.$client.end({ timeout: 1 });
+    await rm(fixtureRoot, { recursive: true, force: true });
+    if (previousStateDirectory === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
+    else process.env.PAPERCLIP_RUNNER_STATE_DIR = previousStateDirectory;
   });
   afterAll(async () => { await stopDb?.(); });
 
@@ -71,6 +106,7 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
     dirty?: boolean;
     snapshot?: "committed" | "pending" | null;
     backupStamp?: boolean;
+    providerConfig?: Record<string, unknown>;
   };
 
   async function seed(shape: Shape = {}) {
@@ -84,7 +120,8 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
     const executionWorkspaceId = randomUUID();
     const providerLeaseId = "0f6c1e52-3d1a-4b7e-9c2a-5e8f7a1b2c3d";
     // The staging environment's provider settings, including its 300s start deadline.
-    const providerConfig = { provider: "fake-plugin", image: "fake:test", timeoutMs: 300_000, reuseLease: true };
+    const providerConfig = { provider: "fake-plugin", image: "fake:test", timeoutMs: 300_000, reuseLease: true, ...shape.providerConfig };
+    const provider = String(providerConfig.provider);
     await db.insert(companies).values({ id: companyId, name: "Acme", status: "active" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Coder", role: "engineer", status: "active",
       adapterType: "paperclip_runner", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
@@ -97,7 +134,7 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
         id: "acme.reusable-sandbox-provider", apiVersion: 1, version: "1.0.0", displayName: "Reusable Sandbox Provider",
         description: "Test provider", author: "Paperclip", categories: ["automation"],
         capabilities: ["environment.drivers.register"], entrypoints: { worker: "dist/worker.js" },
-        environmentDrivers: [{ driverKey: "fake-plugin", kind: "sandbox_provider", displayName: "Fake Plugin",
+        environmentDrivers: [{ driverKey: provider, kind: "sandbox_provider", displayName: "Fake Plugin",
           supportsReusableLeases: true,
           configSchema: { type: "object", properties: { image: { type: "string" }, timeoutMs: { type: "number" }, reuseLease: { type: "boolean" } } } }],
       },
@@ -114,7 +151,7 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
       status: "active", config: providerConfig, envVars: {}, metadata: null, createdAt: new Date(), updatedAt: new Date() };
     // The previous run creates the sandbox through the real acquisition path,
     // so the preserved lease carries exactly the identity production records.
-    const priming = environmentRuntimeService(db, { pluginWorkerManager: {
+    const priming = primingRuntimeService(db, { pluginWorkerManager: {
       isRunning: () => true,
       call: async (_pluginId: string, method: string) => {
         if (method !== "environmentAcquireLease") throw new Error(`Unexpected plugin method: ${method}`);
@@ -150,7 +187,7 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
       source: { kind: "empty" }, writerRunId: runId, dirty: shape.dirty ?? false,
       location: { environmentId, leaseId: lease.id, providerLeaseId, remoteCwd: "/home/daytona/paperclip-workspace/.paperclip-workspaces/w" },
     } } }).where(eq(executionWorkspaces.id, executionWorkspaceId));
-    return { companyId, agentId, environment, pluginId, runId, executionWorkspaceId, lease, providerLeaseId };
+    return { companyId, agentId, environment, pluginId, runId, previousRunId, executionWorkspaceId, lease, providerLeaseId };
   }
 
   function worker(seeded: Awaited<ReturnType<typeof seed>>, resume: (attempt: number, timeoutMs: number) => Promise<unknown>,
@@ -185,6 +222,437 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
     vi.spyOn(Date, "now").mockImplementation(() => clock);
     return () => { clock += 40_000; };
   }
+
+  // Real PostgreSQL acquisition/cleanup/execute paths; only provider I/O is a
+  // deterministic conversation store. Destroy erases the source-only answer.
+  async function conversationFixture(config: Record<string, unknown> = {}) {
+    const seeded = await seed({ backupStamp: false, providerConfig: config });
+    const issueId = randomUUID(), sessionId = randomUUID(), runnerInstanceId = randomUUID();
+    const remembered = randomUUID();
+    const identity = { runId: seeded.previousRunId, normalizedSessionId: sessionId, runnerInstanceId,
+      environmentLeaseId: seeded.lease.id, turnId: randomUUID(), itemId: randomUUID() };
+    const execution = { provider: { kind: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous" },
+      binding: { companyId: seeded.companyId, agentId: seeded.agentId, issueId, runId: seeded.previousRunId,
+        executionWorkspaceId: seeded.executionWorkspaceId },
+      workspace: { cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
+      session: { normalizedSessionId: sessionId, driverKind: "pi_rpc", protocolVersion: 1,
+        lifecyclePolicy: { mode: "warm", idleTimeoutMs: 300_000 } } };
+    const snapshot = { backendKind: "runner", driverKind: "pi_rpc", sessionId, providerSessionId: sessionId,
+      identity: { companyId: seeded.companyId, agentId: seeded.agentId, issueId, runId: seeded.previousRunId, sessionId } };
+    await db.insert(issues).values({ id: issueId, companyId: seeded.companyId, title: "Remember the source-only answer", status: "in_progress" });
+    await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: issueId, nativeSessionId: sessionId,
+      runnerInstanceId, runnerProfileJson: { nativeExecutionInput: execution, sessionCheckpoint: snapshot } })
+      .where(eq(heartbeatRuns.id, seeded.previousRunId));
+    await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: issueId, nativeSessionId: sessionId,
+      runnerInstanceId: randomUUID() }).where(eq(heartbeatRuns.id, seeded.runId));
+    const conversations = new Map([[seeded.providerLeaseId, { sessionId, remembered }]]);
+    const stoppedAllocations = new Set<string>();
+    let stamp: ReturnType<typeof createNativeHarnessBackupStamp> | undefined;
+    let backupRoot: string | undefined;
+    async function preserve(options: { controller?: boolean; completedAt?: string } = {}) {
+      const scope = `${seeded.companyId}:${issueId}:${sessionId}`;
+      backupRoot = join(fixtureRoot, createHash("sha256").update(scope).digest("hex"), "failover-backups", "current");
+      await mkdir(join(backupRoot, "runner"), { recursive: true });
+      await writeFile(join(backupRoot, "runner", "conversation.json"), JSON.stringify(conversations.get(seeded.providerLeaseId)));
+      await writeFile(join(backupRoot, "runner", "runner-state.json"), JSON.stringify({ ...identity, lifecycle: "ready", nextSourceSeq: 1 }));
+      const manifest = nativeExecutor.buildNativeHarnessBackupManifest({ backupRoot, execution: execution as never,
+        runnerInstanceId, providerSessionIdentity: { providerSessionId: sessionId, providerBackendSessionId: sessionId },
+        sourceProviderLeaseId: seeded.providerLeaseId, completedAt: options.completedAt });
+      const manifestPath = join(backupRoot, "manifest.json");
+      await writeFile(manifestPath, JSON.stringify(manifest));
+      stamp = createNativeHarnessBackupStamp({ manifestPath, sessionScopeId: scope,
+        authorizedProviderLeaseId: seeded.providerLeaseId, normalizedSessionId: sessionId,
+        runnerInstanceId, completedAt: manifest.completedAt });
+      const source = (await environmentService(db).getLeaseById(seeded.lease.id))!;
+      await environmentService(db).updateLeaseMetadata(source.id, { ...source.metadata, nativeHarnessBackup: stamp });
+      if (options.controller !== false) {
+        const artifact = { version: "fence-fixture", digest: `sha256:${"a".repeat(64)}` };
+        const core = new DurablePrpControlPlane({ stateDirectory: join(fixtureRoot, "controller"), identity,
+          expectedRunnerVersion: artifact.version, expectedRunnerDigest: artifact.digest });
+        try {
+          const checkpoint = captureLegacyDurablePrpCheckpoint(JSON.stringify(core.store.state), identity, artifact);
+          await db.transaction(tx => insertMigratedNativeRunnerCheckpoint(tx, {
+            companyId: seeded.companyId, issueId, runId: seeded.previousRunId }, checkpoint));
+        } finally { await core.stop(); }
+        await db.update(heartbeatRuns).set({ runnerProfileJson: { nativeExecutionInput: execution, sessionCheckpoint: snapshot,
+          nativeControllerRecovery: createNativeControllerRecovery(snapshot as never,
+            { configDigest: `sha256:${"b".repeat(64)}`, processConfigDigest: null }, identity) } })
+          .where(eq(heartbeatRuns.id, seeded.previousRunId));
+      }
+      return stamp;
+    }
+    const call = vi.fn(async (_pluginId: string, method: string, params: any) => {
+      if (method === "environmentResumeLease") {
+        stoppedAllocations.delete(params.providerLeaseId);
+        // Real Boat echoes retained metadata on resume (plugin.ts:141,156-157).
+        return { providerLeaseId: params.providerLeaseId, metadata: {
+          ...(config.provider === "boat" ? params.leaseMetadata : {}), remoteCwd: "/workspace" } };
+      }
+      if (method === "environmentStopLease") {
+        stoppedAllocations.add(params.providerLeaseId);
+        return { providerLeaseId: params.providerLeaseId, state: "stopped" };
+      }
+      if (method === "environmentAcquireLease") return { providerLeaseId: "replacement-sandbox", metadata: { remoteCwd: "/workspace" } };
+      if (method === "environmentDestroyLease") {
+        conversations.delete(params.providerLeaseId);
+        return { providerLeaseId: params.providerLeaseId, state: "destroyed" };
+      }
+      if (method === "environmentExecute") {
+        if (stoppedAllocations.has(params.lease.providerLeaseId)) throw new Error("stopped allocation must resume before execution");
+        let conversation = conversations.get(params.lease.providerLeaseId);
+        // This provider-I/O double uses real retired-source authorization and
+        // encrypted controller recovery; it never opens a fresh conversation.
+        if (!conversation && stamp && backupRoot && await retiredSourceAuthorizesNativeBackupRestore(db, {
+          companyId: seeded.companyId, currentRunId: seeded.runId, normalizedSessionId: sessionId,
+          manifest: stamp, manifestSha256: stamp.manifestSha256, targetProviderLeaseId: params.lease.providerLeaseId,
+        }) && await loadNativeRunnerCheckpoint(db, { companyId: seeded.companyId, issueId, runId: seeded.previousRunId })) {
+          conversation = JSON.parse(await readFile(join(backupRoot, "runner", "conversation.json"), "utf8"));
+          conversations.set(params.lease.providerLeaseId, conversation!);
+        }
+        if (!conversation) throw new Error("PRP provider resume state is unavailable");
+        return { stdout: JSON.stringify({ sessionId: conversation.sessionId, answer: conversation.remembered }), stderr: "", exitCode: 0 };
+      }
+      throw new Error(`Unexpected plugin method: ${method}`);
+    });
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: { isRunning: () => true, call,
+      getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease", "environmentStopLease"] }),
+    } as unknown as PluginWorkerManager });
+    async function answer(acquired: Awaited<ReturnType<typeof acquire>>) {
+      if (process.env.PAPERCLIP_REPLACEMENT_ROWS) await appendFile(process.env.PAPERCLIP_REPLACEMENT_ROWS,
+        JSON.stringify({ phase: "attempt", row: expect.getState().currentTestName, runId: seeded.runId,
+          sourceRunId: seeded.previousRunId, sourceLeaseId: seeded.lease.id, selectedLeaseId: acquired.lease.id,
+          sourceAllocation: seeded.providerLeaseId, selectedAllocation: acquired.lease.providerLeaseId, sessionId,
+          destroys: call.mock.calls.filter(([, method]) => method === "environmentDestroyLease").length }) + "\n");
+      const result = await runtime.execute({ environment: seeded.environment, lease: acquired.lease,
+        command: "fixture-pi-rpc", args: ["recall"] });
+      expect(JSON.parse(result.stdout!)).toEqual({ sessionId, answer: remembered });
+      const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+      expect(current.nativeSessionId).toBe(sessionId);
+      const evidence = { row: expect.getState().currentTestName, companyId: seeded.companyId, sourceRunId: seeded.previousRunId,
+        runId: seeded.runId, sourceLeaseId: seeded.lease.id, selectedLeaseId: acquired.lease.id,
+        sourceAllocation: seeded.providerLeaseId, selectedAllocation: acquired.lease.providerLeaseId,
+        sessionId, replyMatchedSourceOnlyAnswer: true,
+        destroys: call.mock.calls.filter(([, method]) => method === "environmentDestroyLease").length,
+        acquisition: acquired.lease.metadata?.sandboxLeaseAcquisition,
+        baselineModule: process.env.PAPERCLIP_REUSABLE_LEASE_BASE_RUNTIME ?? "current" };
+      if (process.env.PAPERCLIP_REPLACEMENT_ROWS) await appendFile(process.env.PAPERCLIP_REPLACEMENT_ROWS, JSON.stringify(evidence) + "\n");
+    }
+    async function change(config: Record<string, unknown>) {
+      seeded.environment.config = { ...seeded.environment.config, ...config };
+      await db.update(environments).set({ config: seeded.environment.config }).where(eq(environments.id, seeded.environment.id));
+    }
+    if (process.env.PAPERCLIP_REPLACEMENT_ROWS) await appendFile(process.env.PAPERCLIP_REPLACEMENT_ROWS,
+      JSON.stringify({ phase: "prepared", row: expect.getState().currentTestName, companyId: seeded.companyId,
+        sourceRunId: seeded.previousRunId, runId: seeded.runId, sourceLeaseId: seeded.lease.id,
+        sourceAllocation: seeded.providerLeaseId, sessionId }) + "\n");
+    return { ...seeded, runtime, call, preserve, answer, change, sessionId, issueId, runnerInstanceId,
+      backupRoot: () => backupRoot, stoppedAllocations };
+  }
+
+  it.each(["unchanged timeout present", "bridge changed", "timeout changed", "bridge newly present", "bridge removed"])(
+    "replacement fence: deploy old-shape hash, %s resumes the exact allocation and conversation", async mode => {
+      const f = await conversationFixture(mode === "bridge newly present" ? {} : { bridgeRequestTimeoutMs: 30_000 });
+      if (mode.startsWith("bridge")) await f.change({ bridgeRequestTimeoutMs: mode === "bridge removed" ? undefined : 90_000 });
+      if (mode === "timeout changed") await f.change({ timeoutMs: 600_000 });
+      const acquired = await acquire(f, f.runtime);
+      await f.answer(acquired);
+      expect(acquired.lease.providerLeaseId).toBe(f.providerLeaseId);
+      expect(f.call.mock.calls.filter(([, method]) => method === "environmentDestroyLease")).toHaveLength(0);
+      expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "resumed" });
+    });
+
+  it.each(["spares", "spareIdleMinutes", "spareCreateCapPerHour", "hydrationWaitMs"])(
+    "replacement fence: Boat %s policy edit keeps the deployed allocation and session", async key => {
+      const f = await conversationFixture({ provider: "boat", spares: 0, spareIdleMinutes: 0,
+        spareCreateCapPerHour: 6, hydrationWaitMs: 120_000 });
+      await f.change({ [key]: key === "spares" ? 1 : key === "hydrationWaitMs" ? 240_000 : 12 });
+      const acquired = await acquire(f, f.runtime);
+      await f.answer(acquired);
+      expect(acquired.lease.providerLeaseId).toBe(f.providerLeaseId);
+      expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "resumed" });
+      expect(f.call.mock.calls.some(([, method]) => method === "environmentDestroyLease")).toBe(false);
+    });
+
+  it("replacement fence v3: Boat echoed metadata survives two exempt edits and a timeout edit", async () => {
+    const f = await conversationFixture({ provider: "boat", spares: 0, hydrationWaitMs: 120_000 });
+    const saved: Record<string, unknown>[] = [];
+    for (const edit of [{ spares: 1 }, { hydrationWaitMs: 240_000 }, { timeoutMs: 600_000 }]) {
+      await f.change(edit);
+      const acquired = await acquire(f, f.runtime);
+      await f.answer(acquired);
+      expect(acquired.lease.providerLeaseId).toBe(f.providerLeaseId);
+      expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "resumed" });
+      saved.push(acquired.lease.metadata ?? {});
+      await environmentService(db).releaseLease(acquired.lease.id, "released");
+    }
+    expect(saved[0]!.spares).toBe(1);
+    expect(saved[1]!.hydrationWaitMs).toBe(240_000);
+    expect(saved[2]!.timeoutMs).toBe(600_000);
+    expect(f.call.mock.calls.some(([, method]) => method === "environmentDestroyLease")).toBe(false);
+  });
+
+  async function addOtherConversation(f: Awaited<ReturnType<typeof conversationFixture>>) {
+    const otherRunId = randomUUID(), otherIssueId = randomUUID(), otherSessionId = randomUUID();
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.previousRunId));
+    const profile = source.runnerProfileJson as any;
+    await db.insert(issues).values({ id: otherIssueId, companyId: f.companyId, title: "Another task in the shared workspace", status: "in_progress" });
+    await db.insert(heartbeatRuns).values({ id: otherRunId, companyId: f.companyId, agentId: f.agentId,
+      invocationSource: "assignment", status: "succeeded", runtimeMode: "native", nativeIssueId: otherIssueId,
+      nativeSessionId: otherSessionId, runnerInstanceId: randomUUID(), createdAt: new Date(Date.now() - 60_000),
+      runnerProfileJson: { nativeExecutionInput: { ...profile.nativeExecutionInput,
+        binding: { ...profile.nativeExecutionInput.binding, issueId: otherIssueId, runId: otherRunId },
+        session: { ...profile.nativeExecutionInput.session, normalizedSessionId: otherSessionId } } } });
+    await db.insert(environmentLeases).values({ id: randomUUID(), companyId: f.companyId, environmentId: f.environment.id,
+      heartbeatRunId: otherRunId, agentId: f.agentId, executionWorkspaceId: f.executionWorkspaceId,
+      // Historical per-run lease row; the allocation is still held by f.lease.
+      provider: f.environment.config.provider as string, providerLeaseId: f.providerLeaseId, status: "expired",
+      leasePolicy: "reuse_by_environment", metadata: { ...f.lease.metadata, nativeHarnessBackup: undefined } } as never);
+    return { otherRunId, otherIssueId, otherSessionId };
+  }
+
+  it("replacement fence v3: two tasks, same agent and shared workspace, a different session cannot destroy the held source", async () => {
+    const f = await conversationFixture();
+    const other = await addOtherConversation(f);
+    const nextRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: nextRunId, companyId: f.companyId, agentId: f.agentId,
+      invocationSource: "assignment", status: "running", runtimeMode: "native",
+      nativeIssueId: other.otherIssueId, nativeSessionId: other.otherSessionId, runnerInstanceId: randomUUID() });
+    await f.change({ image: "fake:changed" });
+    const acquired = await acquire(f, f.runtime, nextRunId);
+    expect(acquired.lease.providerLeaseId).toBe(f.providerLeaseId);
+    expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toMatchObject({ reason: "replacement_deferred_unexported_conversation" });
+    expect(f.call.mock.calls.some(([, method]) => method === "environmentDestroyLease")).toBe(false);
+    if (process.env.PAPERCLIP_REPLACEMENT_ROWS) await appendFile(process.env.PAPERCLIP_REPLACEMENT_ROWS,
+      JSON.stringify({ row: expect.getState().currentTestName, runId: nextRunId, sourceRunId: f.previousRunId,
+        other, allocation: acquired.lease.providerLeaseId, destroys: 0 }) + "\n");
+  });
+
+  it("replacement fence v3: explicit fresh waives only its own conversation, another held task keeps the box", async () => {
+    const f = await conversationFixture();
+    const other = await addOtherConversation(f);
+    await db.update(heartbeatRuns).set({ contextSnapshot: { explicitFreshSession: true } }).where(eq(heartbeatRuns.id, f.runId));
+    await f.change({ image: "fake:changed" });
+    const acquired = await acquire(f, f.runtime);
+    expect(acquired.lease.providerLeaseId).toBe(f.providerLeaseId);
+    expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toMatchObject({ reason: "replacement_deferred_unexported_conversation" });
+    expect(f.call.mock.calls.some(([, method]) => method === "environmentDestroyLease")).toBe(false);
+    if (process.env.PAPERCLIP_REPLACEMENT_ROWS) await appendFile(process.env.PAPERCLIP_REPLACEMENT_ROWS,
+      JSON.stringify({ row: expect.getState().currentTestName, runId: f.runId, other,
+        allocation: acquired.lease.providerLeaseId, destroys: 0 }) + "\n");
+  });
+
+  it("replacement fence v3: a proved newest conversation cannot waive an older unexported task", async () => {
+    const f = await conversationFixture();
+    await addOtherConversation(f);
+    await f.preserve();
+    await f.change({ image: "fake:changed" });
+    const sweep = vi.spyOn(nativeExecutor, "closeWarmNativeSessionsForEnvironment");
+    const acquired = await acquire(f, f.runtime);
+    expect(sweep).toHaveBeenCalledWith(expect.objectContaining({ conversations: [{ companyId: f.companyId,
+      agentId: f.agentId, issueId: f.issueId, normalizedSessionId: f.sessionId }] }));
+    expect(acquired.lease.providerLeaseId).toBe(f.providerLeaseId);
+    expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toMatchObject({ reason: "replacement_deferred_unexported_conversation" });
+    expect(f.call.mock.calls.some(([, method]) => method === "environmentDestroyLease")).toBe(false);
+  });
+
+  it("replacement fence: no warm owner after restart keeps the old allocation and the same conversation", async () => {
+    const f = await conversationFixture();
+    await f.change({ image: "fake:changed" });
+    const acquired = await acquire(f, f.runtime);
+    await f.answer(acquired);
+    expect(acquired.lease.providerLeaseId).toBe(f.providerLeaseId);
+    expect(acquired.lease.metadata?.image).toBe("fake:test");
+    expect(acquired.lease.metadata?.reusableSandboxLease).toEqual(f.lease.metadata?.reusableSandboxLease);
+    expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toMatchObject({ outcome: "resumed", reason: "replacement_deferred_unexported_conversation" });
+    const resume = f.call.mock.calls.find(([, method]) => method === "environmentResumeLease");
+    expect(resume?.[2].config.image).toBe("fake:test");
+    expect(f.call.mock.calls.some(([, method]) => method === "environmentDestroyLease")).toBe(false);
+  });
+
+  it("replacement fence: resumes the stopped source disk with a cut save, no proof, and a config mismatch", async () => {
+    const f = await conversationFixture();
+    await db.update(environmentLeases).set({ status: "active" }).where(eq(environmentLeases.id, f.lease.id));
+    const stopped = await f.runtime.releaseRunLeases(f.previousRunId, "released", undefined, "stop_and_retain");
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]!.lease).toMatchObject({ status: "released", metadata: { remoteExecutionTermination: { state: "stopped" } } });
+    expect(f.stoppedAllocations.has(f.providerLeaseId)).toBe(true);
+    expect(stopped[0]!.lease.metadata?.nativeHarnessBackup).toBeUndefined();
+    await f.change({ image: "fake:changed" });
+    const acquired = await acquire(f, f.runtime);
+    await f.answer(acquired);
+    expect(acquired.lease.providerLeaseId).toBe(f.providerLeaseId);
+    expect(f.stoppedAllocations.has(f.providerLeaseId)).toBe(false);
+    expect(acquired.lease.metadata?.remoteExecutionTermination).toBeUndefined();
+    expect(acquired.lease.metadata?.sandboxStopAndRetainReceipt).toBeUndefined();
+    expect(acquired.lease.metadata?.pendingCleanupAttemptId).toBeUndefined();
+    expect(f.call.mock.calls.map(([, method]) => method)).toEqual(["environmentStopLease", "environmentResumeLease", "environmentExecute"]);
+    expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toMatchObject({ reason: "replacement_deferred_unexported_conversation" });
+  });
+
+  it("replacement fence: export timeout keeps the source and this run answers on the same session", async () => {
+    const f = await conversationFixture();
+    await f.change({ image: "fake:changed" });
+    vi.spyOn(nativeExecutor, "closeWarmNativeSessionsForEnvironment").mockResolvedValue({ closed: 0, busy: 0, failed: 1,
+      failures: [{ runId: f.previousRunId, normalizedSessionId: f.sessionId, message: "Boat export timed out after 29000ms" }] } as never);
+    const acquired = await acquire(f, f.runtime);
+    await f.answer(acquired);
+    expect(acquired.lease.providerLeaseId).toBe(f.providerLeaseId);
+    expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toMatchObject({ outcome: "resumed", reason: "replacement_deferred_unexported_conversation" });
+    expect(f.call.mock.calls.some(([, method]) => method === "environmentDestroyLease")).toBe(false);
+  });
+
+  it("replacement fence: a failed close that still fences the native owner keeps the source and refuses the run", async () => {
+    const f = await conversationFixture();
+    await f.change({ image: "fake:changed" });
+    vi.spyOn(nativeExecutor, "closeWarmNativeSessionsForEnvironment").mockResolvedValue({ closed: 0, busy: 0, failed: 1,
+      failures: [{ runId: f.previousRunId, normalizedSessionId: f.sessionId, message: "export timed out" }] } as never);
+    vi.spyOn(nativeExecutor, "warmNativeRetirementPending").mockReturnValue(true);
+    await expect(acquire(f, f.runtime)).rejects.toThrow("replacement_deferred_unexported_conversation: source_retirement_unconfirmed");
+    expect(f.call).not.toHaveBeenCalled();
+    expect(await environmentService(db).getLeaseById(f.lease.id)).toMatchObject({ status: "retained" });
+  });
+
+  it("replacement fence: a provider cannot substitute a new allocation for the deferred source", async () => {
+    const f = await conversationFixture();
+    await f.change({ image: "fake:changed" });
+    f.call.mockImplementation(async (_pluginId, method) => {
+      if (method === "environmentResumeLease") return { providerLeaseId: "substituted-box", metadata: { remoteCwd: "/workspace" } };
+      throw new Error(`unexpected ${method}`);
+    });
+    await expect(acquire(f, f.runtime)).rejects.toThrow("replacement_deferred_unexported_conversation: source_resume_failed");
+    expect(f.call.mock.calls.map(([, method]) => method)).toEqual(["environmentResumeLease"]);
+    expect(await environmentService(db).getLeaseById(f.lease.id)).toMatchObject({ status: "retained" });
+  });
+
+  it("replacement fence: a fresh session releases the deferred allocation change", async () => {
+    const f = await conversationFixture();
+    await f.change({ image: "fake:changed" });
+    const kept = await acquire(f, f.runtime);
+    await f.answer(kept);
+    await environmentService(db).releaseLease(kept.lease.id, "released");
+    await db.update(heartbeatRuns).set({ contextSnapshot: { explicitFreshSession: true } }).where(eq(heartbeatRuns.id, f.runId));
+    const next = await acquire(f, f.runtime);
+    expect(next.lease.providerLeaseId).toBe("replacement-sandbox");
+    expect(f.call.mock.calls.filter(([, method]) => method === "environmentDestroyLease")).toHaveLength(1);
+  });
+
+  it("replacement fence: active legacy runtime digests also tolerate only deadline edits", async () => {
+    const f = await conversationFixture({ bridgeRequestTimeoutMs: 30_000 });
+    const { leaseFingerprint: _fingerprint, ...scope } = f.lease.metadata!.reusableSandboxLease as Record<string, unknown>;
+    await db.update(environmentLeases).set({ status: "active", heartbeatRunId: f.runId,
+      metadata: { ...f.lease.metadata, reusableSandboxLease: scope } }).where(eq(environmentLeases.id, f.lease.id));
+    await f.change({ bridgeRequestTimeoutMs: 90_000 });
+    const acquired = await acquire(f, f.runtime);
+    await f.answer(acquired);
+    expect(acquired.lease.providerLeaseId).toBe(f.providerLeaseId);
+    expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "resumed" });
+    expect(f.call.mock.calls.some(([, method]) => method === "environmentDestroyLease")).toBe(false);
+  });
+
+  it("replacement fence: a concurrent owner after proof prevents destructive provider dispatch", async () => {
+    const f = await conversationFixture();
+    await f.change({ image: "fake:changed" });
+    vi.spyOn(nativeExecutor, "closeWarmNativeSessionsForEnvironment").mockImplementation(async () => {
+      await f.preserve(); return { closed: 1, busy: 0, failed: 0, failures: [] };
+    });
+    const identity = controllerIdentity.currentControllerProcess;
+    vi.spyOn(controllerIdentity, "currentControllerProcess").mockImplementationOnce(async () => {
+      await db.update(environmentLeases).set({ status: "active" }).where(eq(environmentLeases.id, f.lease.id));
+      return identity();
+    });
+    await expect(acquire(f, f.runtime)).rejects.toThrow("replacement_deferred_unexported_conversation: source_ownership_changed");
+    expect(f.call).not.toHaveBeenCalled();
+    expect(await environmentService(db).getLeaseById(f.lease.id)).toMatchObject({ status: "active" });
+  });
+
+  it("replacement fence v3: another task acquires a historical row after proof, so provider destroy is refused", async () => {
+    const f = await conversationFixture();
+    const other = await addOtherConversation(f);
+    // This task did not yet have a continuous provider conversation on the box.
+    await db.update(heartbeatRuns).set({ runnerProfileJson: {} }).where(eq(heartbeatRuns.id, other.otherRunId));
+    await f.change({ image: "fake:changed" });
+    vi.spyOn(nativeExecutor, "closeWarmNativeSessionsForEnvironment").mockImplementation(async () => {
+      await f.preserve(); return { closed: 1, busy: 0, failed: 0, failures: [] };
+    });
+    const identity = controllerIdentity.currentControllerProcess;
+    vi.spyOn(controllerIdentity, "currentControllerProcess").mockImplementationOnce(async () => {
+      await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, other.otherRunId));
+      return identity();
+    });
+    await expect(acquire(f, f.runtime)).rejects.toThrow("replacement_deferred_unexported_conversation: source_ownership_changed");
+    expect(f.call).not.toHaveBeenCalled();
+    expect(await environmentService(db).getLeaseById(f.lease.id)).toMatchObject({ status: "retained" });
+  });
+
+  it("replacement fence: awaits preservation publication, then permits a proved replacement and restore", async () => {
+    const f = await conversationFixture();
+    await f.change({ image: "fake:changed" });
+    const providerIo = f.call.getMockImplementation()!;
+    f.call.mockImplementation(async (pluginId, method, params) => {
+      if (method === "environmentDestroyLease") expect(await environmentService(db).getLeaseById(f.lease.id))
+        .toMatchObject({ status: "pending_cleanup", metadata: { pendingCleanupInFlight: true } });
+      return providerIo(pluginId, method, params);
+    });
+    let allow!: () => void, reached!: () => void;
+    const gate = new Promise<void>(resolve => { allow = resolve; });
+    const entered = new Promise<void>(resolve => { reached = resolve; });
+    vi.spyOn(nativeExecutor, "closeWarmNativeSessionsForEnvironment").mockImplementation(async () => {
+      reached(); await gate; await f.preserve(); return { closed: 1, busy: 0, failed: 0, failures: [] };
+    });
+    let settled = false;
+    const acquiring = acquire(f, f.runtime).finally(() => { settled = true; });
+    try {
+      await entered;
+      expect(settled).toBe(false);
+      expect(f.call.mock.calls.some(([, method]) => method === "environmentDestroyLease")).toBe(false);
+    } finally { allow(); }
+    const acquired = await acquiring;
+    await f.answer(acquired);
+    expect(acquired.lease.providerLeaseId).toBe("replacement-sandbox");
+    expect(f.call.mock.calls.filter(([, method]) => method === "environmentDestroyLease")).toHaveLength(1);
+    expect(await environmentService(db).getLeaseById(f.lease.id)).toMatchObject({ status: "expired", failureReason: "lease_fingerprint_mismatch" });
+  });
+
+  it.each(["controller missing", "backup corrupted", "backup stale"])(
+    "replacement fence: %s is not permission to destroy", async mode => {
+      const f = await conversationFixture();
+      await f.preserve({ controller: mode !== "controller missing", completedAt: new Date(Date.now() - 60_000).toISOString() });
+      if (mode === "backup corrupted") await writeFile(join(f.backupRoot()!, "runner", "conversation.json"), "corrupted");
+      if (mode === "backup stale") await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, runId: f.previousRunId,
+        agentId: f.agentId, seq: 1, eventType: "provider.event", payload: {}, createdAt: new Date() });
+      await f.change({ image: "fake:changed" });
+      const acquired = await acquire(f, f.runtime);
+      await f.answer(acquired);
+      expect(acquired.lease.providerLeaseId).toBe(f.providerLeaseId);
+      expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toMatchObject({ reason: "replacement_deferred_unexported_conversation" });
+      expect(f.call.mock.calls.some(([, method]) => method === "environmentDestroyLease")).toBe(false);
+    });
+
+  it("replacement fence: a busy durable source is kept and refused, never shared with this run", async () => {
+    const f = await conversationFixture();
+    await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, f.previousRunId));
+    await f.change({ image: "fake:changed" });
+    await expect(acquire(f, f.runtime)).rejects.toThrow("replacement_deferred_unexported_conversation: source_busy");
+    expect(f.call).not.toHaveBeenCalled();
+    expect(await environmentService(db).getLeaseById(f.lease.id)).toMatchObject({ status: "retained" });
+  });
+
+  it("replacement fence: no held conversation preserves stock mismatch destruction and creation", async () => {
+    const seeded = await seed();
+    seeded.environment.config = { ...seeded.environment.config, image: "fake:changed" };
+    const { call, runtime } = worker(seeded, async () => { throw new Error("must create, not resume"); });
+    call.mockImplementation(async (_id, method, params) => {
+      if (method === "environmentDestroyLease") return { providerLeaseId: seeded.providerLeaseId, state: "destroyed" };
+      if (method === "environmentAcquireLease") return { providerLeaseId: "replacement-sandbox", metadata: { remoteCwd: "/workspace" } };
+      throw new Error(`Unexpected ${method}: ${JSON.stringify(params)}`);
+    });
+    const acquired = await acquire(seeded, runtime);
+    expect(acquired.lease.providerLeaseId).toBe("replacement-sandbox");
+    expect(call.mock.calls.map(([, method]) => method)).toEqual(["environmentDestroyLease", "environmentAcquireLease"]);
+    if (process.env.PAPERCLIP_REPLACEMENT_ROWS) await appendFile(process.env.PAPERCLIP_REPLACEMENT_ROWS,
+      JSON.stringify({ row: expect.getState().currentTestName, runId: seeded.runId, sourceLeaseId: seeded.lease.id,
+        selectedLeaseId: acquired.lease.id, methods: call.mock.calls.map(([, method]) => method) }) + "\n");
+  });
 
   it("replaces a clean, saved sandbox that keeps refusing to resume, within a bounded budget (staging shape)", async () => {
     const seeded = await seed();
