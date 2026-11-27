@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
 import {
   assessProviderTraceEntries,
@@ -7,6 +7,16 @@ import {
   redactProviderTraceFrame,
 } from "../services/provider-trace-store.js";
 
+// Load the expiry-policy rows with an explicit policy, not the default keep policy.
+const originalRetention = vi.hoisted(() => {
+  const original = process.env.PAPERCLIP_PROVIDER_TRACE_RETENTION_MS;
+  process.env.PAPERCLIP_PROVIDER_TRACE_RETENTION_MS = "86400000";
+  return original;
+});
+afterAll(() => {
+  if (originalRetention === undefined) delete process.env.PAPERCLIP_PROVIDER_TRACE_RETENTION_MS;
+  else process.env.PAPERCLIP_PROVIDER_TRACE_RETENTION_MS = originalRetention;
+});
 const mockUnlink = vi.hoisted(() => vi.fn(async () => undefined));
 vi.mock("node:fs/promises", () => ({
   default: { unlink: mockUnlink },
