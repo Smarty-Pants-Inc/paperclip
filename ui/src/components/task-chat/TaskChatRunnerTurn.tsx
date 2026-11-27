@@ -24,6 +24,7 @@ import { TaskChatSubagentTree } from "./TaskChatSubagentCard";
 import { TaskChatRunHealthBanner, partitionRunHealthItems } from "./TaskChatRunHealthBanner";
 import { TaskChatProtocolCard } from "./TaskChatProtocolCard";
 import { TaskChatPlanPreviewCard } from "./TaskChatPlanPreviewCard";
+import { CoordinatorChatTaskHandoff } from "../coordinator/CoordinatorChatTaskHandoffs";
 import { TaskChatMarker } from "./TaskChatMarker";
 import { TaskChatShimmerScope, useTaskChatShimmer } from "./TaskChatShimmer";
 import {
@@ -44,6 +45,7 @@ function currentActivityStatusItems(
     if (
       item.kind === "message" ||
       item.kind === "plan_document" ||
+      item.kind === "task_handoff" ||
       (item.kind === "protocol" &&
         (item.surface === "runtime_request" ||
           item.surface === "run_result" ||
@@ -339,6 +341,8 @@ export function TaskChatRunnerTurn({
                       : "task-chat-plan-preview"
                   }
                 />
+              ) : row.kind === "task_handoff" ? (
+                <CoordinatorChatTaskHandoff handoff={row.handoff} animateEntry={row.animateEntry} />
               ) : row.kind === "marker" ? (
                 <TaskChatMarker item={row} />
               ) : row.kind === "subagent_group" ? (

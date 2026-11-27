@@ -124,7 +124,7 @@ import {
   isOutdatedPlanConfirmation,
   isSuppressedThreadInteraction,
 } from "@/components/task-chat/interaction-thread-order";
-import { orderTaskCreationItems, taskCreationSourceRunId } from "@/components/task-chat/task-creation-order";
+import { embedTaskHandoffsAtCreateBoundaries, orderTaskCreationItems, taskCreationSourceRunId } from "@/components/task-chat/task-creation-order";
 import {
   interactionReplacesComposerSkip,
   shouldHideInteractionCard,
@@ -2317,7 +2317,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // heavy assembly memo doesn't recompute on every parent render.
   const hasBrief = Boolean(issueBrief);
 
+  const taskHandoffItems = useMemo(() =>
+    standaloneChatHandoffs(taskHandoffs.handoffs, interactions ?? [])
+      .filter(handoff => toMs(handoff.createdAt) >= conversationWindowStart)
+      .map(handoff => ({ id: handoff.id, kind: "task_handoff" as const, handoff, animateEntry: liveHandoffIds.has(handoff.id) })),
+  [taskHandoffs.handoffs, interactions, conversationWindowStart, liveHandoffIds]);
   const { items, settledRunIds, settledReplyRunIds, emptyStoppedRunIds, runnerSegmentsById, cutLogNoteRunIds } = useMemo(() => {
+    const embeddedHandoffIds = new Set<string>();
     // A native segment owns the same renderer in the chronological body while
     // streaming, after a steering bubble, and after persistence. No tail handoff.
     const runnerSegmentsById = new Map<string, ComponentProps<typeof TaskChatRunnerTurn>>();
@@ -2346,10 +2352,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       entriesWithFailures.push({ id: `decision-receipt:${receipt.id}`, ms: toMs(receipt.resolvedAt), order: 4,
         item: { id: `decision-receipt:${receipt.id}`, kind: "decision_receipt", receipt } });
     }
-    for (const handoff of standaloneChatHandoffs(taskHandoffs.handoffs, interactions ?? [])) {
-      if (toMs(handoff.createdAt) < conversationWindowStart) continue;
-      entriesWithFailures.push({ id: handoff.id, ms: toMs(handoff.createdAt), order: 4,
-        item: { id: handoff.id, kind: "task_handoff", handoff, animateEntry: liveHandoffIds.has(handoff.id) } });
+    for (const item of taskHandoffItems) {
+      entriesWithFailures.push({ id: item.id, ms: toMs(item.handoff.createdAt), order: 4, item });
     }
     // Settled turns for every terminal run whose transcript we have. Provider
     // commentary, grouped activity (including reasoning summaries), and
@@ -2862,15 +2866,19 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       const runtimeRequests = runtimeRequestSegmentContext(entries, {
         runId: source.id, agentName: meta?.agentName, running: false,
       });
-      const projectedSegments = segments.map((segment, index) => {
-        const parsedTranscript = reconcileSegmentRuntimeRequests(transcriptToTaskChatItems(segment.entries, {
+      const handoffs = taskHandoffItems.filter(item => item.handoff.sourceRunId === source.id);
+      const parsedSegments = embedTaskHandoffsAtCreateBoundaries(segments.map((segment, index) =>
+        reconcileSegmentRuntimeRequests(transcriptToTaskChatItems(segment.entries, {
           runId: source.id,
           agentName: meta?.agentName,
           // A tool belongs to its call's segment, not the latest input. Only
           // its own result (or the run ending) settles that lifecycle.
           running: openSegments,
         }).map(item => index !== activeSegmentIndex && (item.kind === "thinking" || item.kind === "message")
-          ? { ...item, streaming: false } : item), segment.entries, runtimeRequests, openSegments);
+          ? { ...item, streaming: false } : item), segment.entries, runtimeRequests, openSegments)), handoffs);
+      handoffs.forEach(item => embeddedHandoffIds.add(item.id));
+      const projectedSegments = segments.map((segment, index) => {
+        const parsedTranscript = parsedSegments[index]!;
         const parsed =
           source.id === planDocumentSourceRunId && planTurnItem
             ? embedPlanDocumentAtWriteBoundary(parsedTranscript, planTurnItem)
@@ -3220,7 +3228,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       items: prependIssueBrief(
         attachSettledTurns(
           coalesceSettledTurns(
-            coordinatorEnabled ? orderTaskCreationItems(out, sourceRunByItemId) : out,
+            coordinatorEnabled ? orderTaskCreationItems(out.filter(item => !embeddedHandoffIds.has(item.id)), sourceRunByItemId) : out,
             turnMergeMetaById,
           ),
           turnMergeMetaById,
@@ -3235,6 +3243,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     };
   }, [
     orderedEntries,
+    taskHandoffItems,
     coveredAttemptIds,
     failureNoticeIds,
     isUserStop,
@@ -3360,15 +3369,15 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     : showSettlingTail
       ? settlingRun!.id
       : null;
-  // A running (or still settling) turn lives outside the chronological body.
-  // Its task cards follow that same tail until the complete turn takes over.
-  const [threadItems, tailTaskCreationItems] = useMemo<[TaskChatItem[], TaskChatItem[]]>(() => {
+  // Suggestions retain their stock tail; direct creations live inside turns.
+  const [threadItems, tailSuggestionItems] = useMemo<[TaskChatItem[], TaskChatItem[]]>(() => {
     if (!tailRunId) return [items, []];
     const body: TaskChatItem[] = [];
     const tail: TaskChatItem[] = [];
     for (const item of items) {
       if (item.kind === "turn" && !runnerSegmentsById.has(item.id) && (runChainIdsById.get(tailRunId) ?? [tailRunId])
         .some((id) => item.id.startsWith(`${id}:turn`) && !(id === liveRun?.id && isNativePaperclipRunnerRun(liveRun) && item.id.startsWith(`${id}:turn:`)))) continue;
+      if (coordinatorEnabled && item.kind === "task_handoff" && item.handoff.sourceRunId === tailRunId) continue;
       (coordinatorEnabled && taskCreationSourceRunId(item) === tailRunId ? tail : body).push(item);
     }
     return [body, tail];
@@ -3576,9 +3585,15 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         transcriptToTaskChatItems(transcriptByRun.get(id) ?? [], { runId: id, running: false })
           .map((item) => item.kind === "message" ? { ...item, channel: "progress" as const, interstitial: true } : item),
       ));
+      const cardSegments = embedTaskHandoffsAtCreateBoundaries(
+        tailSegments.map((segment, index) => index === tailSegmentIndex || !paperclipRunnerTail
+          ? parsed : transcriptToTaskChatItems(segment.entries, { runId: tailRunId, running: false })),
+        taskHandoffItems.filter(item => item.handoff.sourceRunId === tailRunId),
+      );
+      const withCards = cardSegments[paperclipRunnerTail ? tailSegmentIndex : 0] ?? parsed;
       return [...history, ...(tailPlanItem
-        ? embedPlanDocumentAtWriteBoundary(parsed, tailPlanItem)
-        : parsed)];
+        ? embedPlanDocumentAtWriteBoundary(withCards, tailPlanItem)
+        : withCards)];
     },
     // tailEntries is a fresh array each render; tailContentKey tracks its content.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -3591,6 +3606,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       tailStreaming,
       tailAgentName,
       tailPlanContentKey,
+      taskHandoffItems,
     ],
   );
   // A saved Stop reply can be drawn before the run's terminal receipt.
@@ -4699,11 +4715,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                 <TaskChatShimmerScope items={[]}><TaskChatRunnerHeader status="queued" startedAtMs={null}
                                   agentName={tailAgent?.name} agent={tailAgent} working={requestWorking} preparationLabel={requestLabel} /></TaskChatShimmerScope>
                               </div> : null}
-                              {tailTaskCreationItems.map(item => (
+                              {tailSuggestionItems.map(item => (
                                 <div key={item.id} data-thread-anchor={item.id} data-thread-item-kind={item.kind} className="mt-4">
-                                  {item.kind === "task_handoff"
-                                    ? <CoordinatorChatTaskHandoff handoff={item.handoff} animateEntry={item.animateEntry} />
-                                    : item.kind === "interaction" ? renderInteraction(item) : null}
+                                  {item.kind === "interaction" ? renderInteraction(item) : null}
                                 </div>
                               ))}
                               {bottomBlockerLinks}

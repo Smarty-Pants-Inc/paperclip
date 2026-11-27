@@ -24,7 +24,8 @@ vi.mock("@/components/transcript/useLiveRunTranscripts", () => ({
 }));
 vi.mock("@/components/transcript/useNativeRunTranscripts", () => ({
   useNativeRunTranscripts: () => ({ transcriptByRun: new Map(state.transcripts), errorsByRun: new Map(),
-    terminalHydratedRunIds: new Set(state.transcripts.keys()) }),
+    terminalHydratedRunIds: new Set(state.transcripts.keys()), hydratedRunIds: new Set(state.transcripts.keys()),
+    activityLabelByRun: new Map() }),
 }));
 vi.mock("@/hooks/useIssuePlanDocument", () => ({ useIssuePlanDocument: () => ({ data: state.plan }) }));
 vi.mock("@/context/SidebarContext", () => ({ useSidebar: () => ({ isMobile: false }) }));
@@ -114,10 +115,62 @@ async function paint(overrides: Partial<React.ComponentProps<typeof TaskChatThre
     </CoordinatorPresentation>
   </ThemeProvider></QueryClientProvider>));
 }
-const anchor = (id: string) => host.querySelector(`[data-thread-anchor="${id}"]`)!;
+const anchor = (id: string) => id === "final"
+  ? host.querySelector('[data-testid="task-chat-final-response"]') ?? host.querySelector('[data-thread-anchor="final"]')!
+  : host.querySelector(`[data-thread-anchor="${id}"]`)!;
 const before = (earlier: Element, later: Element) => expect(earlier.compareDocumentPosition(later) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 
 describe("Coordinator task creation ordering", () => {
+  it.each(["running", "succeeded"] as const)("places a task inside a generic script by its creation time while %s", async status => {
+    state.handoffs = [handoff()];
+    state.transcripts.set("source-run", [
+      { kind: "tool_call", ts: at(1), toolUseId: "script", name: "run_script", input: {} },
+      { kind: "tool_result", ts: at(4), toolUseId: "script", content: "Script complete", isError: false },
+      { kind: "tool_call", ts: at(6), toolUseId: "later", name: "read", input: {} },
+      { kind: "tool_result", ts: at(7), toolUseId: "later", content: "Read complete", isError: false },
+      { kind: "assistant", channel: "final", text: "Your task is ready.", ts: at(9) },
+    ]);
+    const live: LiveRunForIssue = { id: "source-run", agentId: "agent", agentName: "Assistant",
+      adapterType: "paperclip_runner", runModel: null, runtimeMode: "native", status: "running",
+      invocationSource: "on_demand", triggerDetail: null, createdAt: at(0), startedAt: at(0), finishedAt: null };
+    await paint({ ...(status === "running" ? { comments: [], liveRuns: [live],
+      linkedRuns: [{ ...sourceRun, status, finishedAt: null }] } : {}) });
+    expect([...host.querySelectorAll('[data-testid="task-chat-turn-timeline-row"]')]
+      .map(row => row.querySelector(".coordinator-created-task") ? "card" : "tool")).toEqual(["tool", "card", "tool"]);
+    expect(host.querySelectorAll('[data-thread-anchor="chat_handoff:task"]')).toHaveLength(1);
+  });
+
+  it("keeps two cards between three tool groups while live, settling, and settled", async () => {
+    state.handoffs = [handoff("first"), handoff("second")];
+    state.transcripts.set("source-run", [
+      { kind: "tool_call", ts: at(1), toolUseId: "create-first", name: "mcp__paperclip__create_task", input: {} },
+      { kind: "tool_result", ts: at(2), toolUseId: "create-first", content: { id: "first" }, isError: false },
+      { kind: "tool_call", ts: at(3), toolUseId: "create-second", name: "create_task", input: {} },
+      { kind: "tool_result", ts: at(4), toolUseId: "create-second", content: { id: "second" }, isError: false },
+      { kind: "tool_call", ts: at(6), toolUseId: "last", name: "read", input: {} },
+      { kind: "tool_result", ts: at(7), toolUseId: "last", content: "Read complete", isError: false },
+      { kind: "assistant", channel: "final", text: "Your task is ready.", ts: at(9) },
+    ]);
+    const check = () => {
+      const rows = [...host.querySelectorAll('[data-testid="task-chat-turn-timeline-row"]')];
+      expect(rows.map(row => row.querySelector(".coordinator-created-task") ? "card" : "tool"))
+        .toEqual(["tool", "card", "tool", "card", "tool"]);
+      for (const id of ["first", "second"]) {
+        expect(host.querySelectorAll(`[data-thread-anchor="chat_handoff:${id}"]`)).toHaveLength(1);
+        expect(anchor(`chat_handoff:${id}`).closest('[data-testid="task-chat-runner-turn"]')).not.toBeNull();
+      }
+    };
+    const live: LiveRunForIssue = { id: "source-run", agentId: "agent", agentName: "Assistant",
+      adapterType: "paperclip_runner", runModel: null, runtimeMode: "native", status: "running",
+      invocationSource: "on_demand", triggerDetail: null, createdAt: at(0), startedAt: at(0), finishedAt: null };
+    await paint({ comments: [], linkedRuns: [{ ...sourceRun, status: "running", finishedAt: null }], liveRuns: [live] });
+    check();
+    await paint({ comments: [], linkedRuns: [{ ...sourceRun, status: "running", finishedAt: null }] });
+    check();
+    await paint();
+    check();
+  });
+
   it("shows agent-created subtasks in ordinary task feeds at creation time and refreshes their status", async () => {
     state.coordinator = false;
     await paint({ conversationMode: false, companyId: "company", createdTasks: [createdTask(), createdTask()] });
@@ -126,8 +179,8 @@ describe("Coordinator task creation ordering", () => {
     expect(card.textContent).toContain("Verify the repair");
     expect(card.textContent).toContain("Todo");
     expect(card.getAttribute("href")).toBe("/issues/PAPER-102");
-    before(card, anchor("final"));
-    before(anchor("final"), anchor("next"));
+    before(anchor("final"), card);
+    before(card, anchor("next"));
     expect(host.querySelectorAll('[data-testid="task-chat-created-task"]')).toHaveLength(1);
     await paint({ conversationMode: false, companyId: "company", createdTasks: [createdTask({ status: "done" })] });
     expect(host.querySelector('[data-testid="task-chat-created-task"]')).toBe(card);
@@ -183,24 +236,35 @@ describe("Coordinator task creation ordering", () => {
     before(plan, output);
     expect(host.querySelectorAll('[data-testid="task-chat-plan-preview"]')).toHaveLength(1);
   });
-  it("puts direct task cards after their complete source reply, before a later conversation", async () => {
+  it("falls back inside the source turn and preserves an older card without provenance", async () => {
     state.handoffs = [handoff(), handoff("unknown", null, 5)];
     await paint();
-    before(anchor("final"), anchor("chat_handoff:task"));
+    expect(anchor("source-run:turn:0").contains(anchor("chat_handoff:task"))).toBe(true);
+    before(anchor("chat_handoff:task"), anchor("final"));
     before(anchor("chat_handoff:task"), anchor("next"));
-    before(anchor("chat_handoff:unknown"), anchor("final"));
+    before(anchor("final"), anchor("chat_handoff:unknown"));
+    before(anchor("chat_handoff:unknown"), anchor("next"));
     expect(host.querySelectorAll('[data-thread-anchor="chat_handoff:task"]')).toHaveLength(1);
   });
 
-  it("puts cards after transcript-only responses and every segment of a steered turn", async () => {
-    state.handoffs = [handoff()];
+  it("keeps a fallback in the last segment of a steered turn", async () => {
+    state.transcripts.set("source-run", [
+      { kind: "system", text: "", ts: at(0), steeringEvent: { kind: "input", turnId: "turn" } },
+      { kind: "assistant", channel: "progress", text: "Earlier work.", ts: at(2) },
+      { kind: "system", text: "", ts: at(5), steeringEvent: { kind: "ack", turnId: "turn", commentId: "steer" } },
+      { kind: "system", text: "", ts: at(5), steeringEvent: { kind: "input", turnId: "turn" } },
+      { kind: "assistant", channel: "progress", text: "Later work.", ts: at(6) },
+      { kind: "assistant", channel: "final", text: "Your task is ready.", ts: at(9) },
+    ]);
+    // No visible tool or earlier timestamp: the final segment owns fallback.
+    state.handoffs = [handoff("task", "source-run", 1)];
     await paint({ comments: [
       { ...comment("steer", "Keep the task small.", 5), steeredIntoRunId: "source-run", conversationAnchorAt: at(5) },
       comment("next", "A later question.", 20),
     ] });
-    before(anchor("source-run:turn:1"), anchor("chat_handoff:task"));
+    expect(anchor("source-run:turn:question:steer").contains(anchor("chat_handoff:task"))).toBe(true);
     before(anchor("chat_handoff:task"), anchor("next"));
-    expect(anchor("source-run:turn:1").textContent).toContain("Your task is ready.");
+    expect(anchor("source-run:turn:question:steer").textContent).toContain("Your task is ready.");
   });
 
   it("keeps a suggestion in the same end-of-turn slot when acceptance creates its task", async () => {
@@ -217,15 +281,18 @@ describe("Coordinator task creation ordering", () => {
     before(card, anchor("next"));
   });
 
-  it("follows the live tail and stays after the final reply when the turn settles", async () => {
+  it("stays inside its turn through live, settling, and settled fallback", async () => {
     state.handoffs = [handoff()];
     const live: LiveRunForIssue = { id: "source-run", agentId: "agent", agentName: "Assistant", adapterType: "paperclip_runner",
       runModel: null, runtimeMode: "native", status: "running", invocationSource: "on_demand", triggerDetail: null,
       createdAt: at(0), startedAt: at(0), finishedAt: null };
     await paint({ comments: [], linkedRuns: [{ ...sourceRun, status: "running", finishedAt: null }], liveRuns: [live] });
-    before(host.querySelector('[data-testid="task-chat-live-transcript"]')!, anchor("chat_handoff:task"));
+    expect(anchor("chat_handoff:task").closest('[data-testid="task-chat-runner-turn"]')).not.toBeNull();
+    await paint({ comments: [], linkedRuns: [{ ...sourceRun, status: "running", finishedAt: null }] });
+    expect(host.querySelectorAll('[data-thread-anchor="chat_handoff:task"]')).toHaveLength(1);
+    expect(anchor("chat_handoff:task").closest('[data-testid="task-chat-runner-turn"]')).not.toBeNull();
     await paint();
-    before(anchor("final"), anchor("chat_handoff:task"));
+    before(anchor("chat_handoff:task"), anchor("final"));
     before(anchor("chat_handoff:task"), anchor("next"));
     expect(host.querySelectorAll('[data-thread-anchor="chat_handoff:task"]')).toHaveLength(1);
   });
@@ -245,7 +312,7 @@ describe("Coordinator task creation ordering", () => {
     expect(host.querySelector('[data-thread-anchor="chat_handoff:suggested-task"]')).toBeNull();
   });
 
-  it("retains an accepted suggestion when its tasks are not known to the tray", async () => {
+  it("retains an accepted suggestion without handoff records", async () => {
     const live: LiveRunForIssue = { id: "source-run", agentId: "agent", agentName: "Assistant", adapterType: "paperclip_runner",
       runtimeMode: "native", status: "running", invocationSource: "on_demand", triggerDetail: null,
       createdAt: at(0), startedAt: at(0), finishedAt: null, runModel: null };
@@ -280,6 +347,6 @@ describe("Coordinator task creation ordering", () => {
   it("keeps classic suggestion chronology when Coordinator is disabled", async () => {
     state.coordinator = false;
     await paint({ interactions: [suggestion("accepted")] });
-    before(anchor("interaction:suggestion"), anchor("final"));
+    before(anchor("final"), anchor("interaction:suggestion"));
   });
 });
