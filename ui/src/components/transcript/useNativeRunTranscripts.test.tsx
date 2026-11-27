@@ -6,6 +6,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useNativeRunTranscripts } from "./useNativeRunTranscripts";
 import { TRANSCRIPT_REQUEST_TIMEOUT_MS } from "./read-transcript-request";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { LiveEvent, HeartbeatRunEvent } from "@paperclipai/shared";
+import { ApiError } from "@/api/client";
+import { __liveUpdatesTestUtils, type CompanyLiveEventHandler } from "@/context/LiveUpdatesProvider";
 
 const eventsMock = vi.hoisted(() => vi.fn());
 const conversationEventsMock = vi.hoisted(() => vi.fn());
@@ -180,6 +183,45 @@ describe("useNativeRunTranscripts", () => {
     vi.restoreAllMocks();
   });
 
+  it("keeps live native catch-up pending until persistence catches up, but exposes a failed read", async () => {
+    let state!: ReturnType<typeof useNativeRunTranscripts>;
+    const listeners = new Set<CompanyLiveEventHandler>();
+    const subscription = { companyId: "company", subscribe: (handler: CompanyLiveEventHandler) => {
+      listeners.add(handler); return () => { listeners.delete(handler); };
+    } };
+    const { LiveEventSubscriptionContext } = __liveUpdatesTestUtils;
+    const row = (seq: number): HeartbeatRunEvent => ({ id: seq, seq, runId: "live", companyId: "company", agentId: "agent",
+      eventType: "item.completed", stream: null, level: null, color: null, message: null, createdAt: new Date(),
+      payload: { prpEvent: { schema: "paperclip.prp.event.v1", schemaVersion: 1, eventType: "item.completed", runId: "live",
+        emittedAt: new Date().toISOString(), itemId: `answer-${seq}`, payload: { kind: "agentMessage", text: `Answer ${seq}` } } },
+    });
+    function Live() {
+      state = useNativeRunTranscripts([{ id: "live", status: "running", runtimeMode: "native" }], { companyId: "company" });
+      return null;
+    }
+    eventsMock.mockResolvedValueOnce([row(1)]);
+    await act(async () => root.render(<LiveEventSubscriptionContext.Provider value={subscription}><Live /></LiveEventSubscriptionContext.Provider>));
+    let finish!: (rows: HeartbeatRunEvent[]) => void;
+    eventsMock.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const event: LiveEvent = { id: 1, companyId: "company", type: "heartbeat.run.event", createdAt: new Date().toISOString(),
+      payload: { runId: "live", agentId: "agent", seq: 3, eventType: "item.completed", payload: row(3).payload } };
+    await act(async () => { for (const listener of listeners) listener(event); });
+    expect(state.errorsByRun.size).toBe(0);
+    expect(state.catchingUpRunIds.has("live")).toBe(true);
+    await act(async () => finish([])); // A successful read can still trail the live watermark.
+    expect(state.errorsByRun.size).toBe(0);
+    expect(state.catchingUpRunIds.has("live")).toBe(true);
+    expect(state.transcriptByRun.get("live")?.map(entry => entry.kind === "assistant" && entry.text)).toEqual(["Answer 1"]);
+    eventsMock.mockRejectedValueOnce(new Error("Storage unavailable"));
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(state.errorsByRun.get("live")?.message).toBe("Storage unavailable");
+    eventsMock.mockResolvedValueOnce([row(2), row(3)]);
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(state.errorsByRun.size).toBe(0);
+    expect(state.catchingUpRunIds.size).toBe(0);
+    expect(state.transcriptByRun.get("live")?.map(entry => entry.kind === "assistant" && entry.text)).toEqual(["Answer 1", "Answer 2", "Answer 3"]);
+  });
+
   it("exposes event transport failures and retries terminal runs until recovery", async () => {
     eventsMock
       .mockRejectedValueOnce(new Error("event endpoint unavailable"))
@@ -196,6 +238,12 @@ describe("useNativeRunTranscripts", () => {
     });
     expect(eventsMock).toHaveBeenCalledTimes(2);
     expect(container.textContent).toBe("");
+  });
+
+  it.each([401, 403])("preserves a real HTTP %s history failure", async status => {
+    eventsMock.mockRejectedValue(new ApiError("History access denied", status, {}));
+    await act(async () => root.render(<Probe />));
+    expect(container.textContent).toBe("native-run");
   });
 
   it("retries only terminal runs whose event request failed", async () => {
