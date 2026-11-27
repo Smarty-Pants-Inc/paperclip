@@ -1,3 +1,4 @@
+import { useRef, useState } from "react";
 import { describeError } from "../api/errors";
 import type { IssueChatComment } from "../lib/issue-chat-messages";
 import type { ExecutionBlocker, IssueRelationIssueSummary, TaskInterruptionPresentation } from "@paperclipai/shared";
@@ -36,6 +37,111 @@ export function nativeFailureNoticeRunId(comment: IssueChatComment) {
     ? runId : null;
 }
 
+/** C31 blocks Retry of the refused run, not every older attempt. At C31 v11
+ * the cause attributes a contributor to the selected composition; it does not
+ * prove that part alone exceeds the bound. Task Retry changes protected source
+ * origins; Agent Chat selects the older request's IDs. Queue/command composition
+ * is checked independently. Every kind is therefore UNKNOWN for an older run
+ * from this receipt alone: keep base behaviour, including ordinary canRetry=false. */
+export function isExecutionRetryRefused(presentation?: TaskInterruptionPresentation | null, errorCode?: string | null, resultJson?: Record<string, unknown> | null) {
+  const permanentRefusal = "native_turn_prompt_exceeds_command_bound";
+  return resultJson?.nativeTurnPromptRefusalCause != null || errorCode === permanentRefusal || presentation?.failure?.code === permanentRefusal;
+}
+
+// Page-side vocabulary at C31 v11 (d21f281a), native-turn-budget.ts:31-57.
+// Keep server implementation out of the UI graph. Titles/details are sent by
+// the server; readable future kind/measure labels survive version skew.
+export type NativePromptRemedy = "edit_task_description" | "edit_message" | "delete_own_message" | "new_followup_task" | "report_defect" | "check_versions";
+export type ExecutionRefusalRemedyControls = Partial<Record<NativePromptRemedy, () => void | Promise<void>>>;
+// Friday gate: keep every remedy button off until the server supplies BOTH
+// helper-derived remedies for unknown kind/measure labels and message id(s) on
+// the cause, so edit/delete can bind to that message and its actual author.
+// A saved list plus the newest visible message is not that authority.
+const C31_REMEDY_BUTTONS = false;
+type NativePromptRefusalKind = "task_description" | "newest_message" | "unread_message" | "unread_messages" | "queued_input" | "human_response" | "protected_input" | "protected_inputs" | "command" | "unmeasured_composition" | "stale_copy";
+type NativePromptMeasure = "command" | "command_upper_bound" | "prompt" | "envelope" | "handoff_note" | "protected_parts" | "envelope_with_reserve";
+type NativePromptRefusalCause = {
+  kind: NativePromptRefusalKind | (string & {});
+  bytes: number;
+  count?: number;
+  measure?: NativePromptMeasure | (string & {});
+  remedies: NativePromptRemedy[];
+};
+// A remedy is a route, not a capability grant. Hosts supply only controls they
+// already expose to this viewer. No per-kind or prose-derived action list.
+const refusalRemedyControls: Record<NativePromptRemedy, string | null> = {
+  edit_task_description: "Go to description", edit_message: "Edit queued message",
+  delete_own_message: "Delete queued message", new_followup_task: "New follow-up task",
+  // This page has no report/version-repair route. The server explains the
+  // handover, including run + task title; do not invent a repair button.
+  report_defect: null, check_versions: null,
+};
+const refusalKindMeasurements: Record<NativePromptRefusalKind, readonly NativePromptMeasure[]> = {
+  task_description: [], newest_message: [], unread_message: [], unread_messages: [],
+  queued_input: [], human_response: [], protected_input: [],
+  protected_inputs: ["protected_parts", "envelope_with_reserve"],
+  command: ["command", "command_upper_bound", "prompt", "envelope", "handoff_note"],
+  unmeasured_composition: [], stale_copy: [],
+};
+const refusalMeasureLabels: Record<NativePromptMeasure, string | null> = {
+  command: "Serialized command", prompt: "Encoded prompt", envelope: "Encoded envelope",
+  handoff_note: "Encoded history-omission note", protected_parts: "Located required inputs before command encoding",
+  // Reserved room is not an observed size. Preserve the qualified server detail
+  // without appending an observed-byte claim for either reserve-bearing measure.
+  command_upper_bound: null, envelope_with_reserve: null,
+};
+
+function executionFailureCause(failure: NonNullable<TaskInterruptionPresentation["failure"]>, resultJson?: Record<string, unknown> | null): NativePromptRefusalCause | null {
+  const value = resultJson?.nativeTurnPromptRefusalCause ?? (failure as typeof failure & { cause?: unknown }).cause;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const { kind, bytes, count, measure, remedies } = value as Record<string, unknown>;
+  if (typeof kind !== "string" || !/^[^\s:\[\]]+$/.test(kind) ||
+    (measure !== undefined && (typeof measure !== "string" || !/^[^\s:\[\]]+$/.test(measure))) ||
+    Object.keys(value).some(key => !["kind", "bytes", "count", "measure", "remedies"].includes(key)) ||
+    (remedies !== undefined && (!Array.isArray(remedies) || !remedies.every(value => typeof value === "string" && /^[a-z_]+$/.test(value)))) ||
+    typeof bytes !== "number" || !Number.isSafeInteger(bytes) || bytes < 0 ||
+    count !== undefined && (typeof count !== "number" || !Number.isSafeInteger(count) || count <= 0)) return null;
+  return { kind, bytes, count, measure,
+    // Unknown future action values are ignored, never guessed. A legacy cause
+    // with no remedies grants no action, even when this host has all controls.
+    remedies: Array.isArray(remedies) ? [...new Set(remedies.filter((value): value is NativePromptRemedy =>
+      typeof value === "string" && Object.hasOwn(refusalRemedyControls, value)))] : [],
+  } as NativePromptRefusalCause;
+}
+
+/** Server copy owns what was refused and the supported way out. Only an explicit
+ * observed measure with a recognized meaning for this kind earns a byte line.
+ * Legacy unlabelled counts and unknown labels add no size claim. Stale-copy
+ * bytes are diagnostic, not evidence of exceeding a limit. */
+export function executionFailureDetail(failure: NonNullable<TaskInterruptionPresentation["failure"]>, resultJson?: Record<string, unknown> | null) {
+  const cause = executionFailureCause(failure, resultJson);
+  const measure = cause?.measure;
+  const label = cause && measure && Object.hasOwn(refusalKindMeasurements, cause.kind) &&
+    refusalKindMeasurements[cause.kind as NativePromptRefusalKind].includes(measure as NativePromptMeasure) &&
+    Object.hasOwn(refusalMeasureLabels, measure) ? refusalMeasureLabels[measure as NativePromptMeasure] : null;
+  return label && cause ? `${failure.detail}\n\n${label}: ${cause.bytes.toLocaleString()} bytes.` : failure.detail;
+}
+
+function RefusalRemedyActions({ remedies, controls }: { remedies: NativePromptRemedy[]; controls?: ExecutionRefusalRemedyControls }) {
+  const [pending, setPending] = useState<NativePromptRemedy | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const pendingRef = useRef(false);
+  const available = remedies.filter(remedy => refusalRemedyControls[remedy] && controls?.[remedy]);
+  if (!available.length) return null;
+  return <div className="flex min-w-0 flex-col gap-2 sm:max-w-sm">
+    <div className="flex flex-wrap gap-2">
+      {available.map(remedy => <Button key={remedy} type="button" variant="outline" size="sm" disabled={pending !== null}
+        aria-busy={pending === remedy} data-testid={`task-refusal-remedy-${remedy}`} onClick={() => {
+          if (pendingRef.current) return;
+          pendingRef.current = true; setPending(remedy); setError(null);
+          void Promise.resolve().then(() => controls![remedy]!()).catch(error => setError(describeError(error).body))
+            .finally(() => { pendingRef.current = false; setPending(null); });
+        }}>{refusalRemedyControls[remedy]}</Button>)}
+    </div>
+    {error && <span role="alert" className="text-destructive">{error}</span>}
+  </div>;
+}
+
 /** Ordinary working/resolved projections are not recovery ownership. */
 export function isConversationRecovery(presentation: TaskInterruptionPresentation | null | undefined, observedStatus?: string) {
   return presentation?.responsibility === "system" && ["working", "retry_scheduled", "failed"].includes(presentation.state)
@@ -63,7 +169,7 @@ const blockerAction: Record<string, string> = {
 };
 
 /** One ordinary interruption surface. Technical records remain in diagnostics. */
-export function ExecutionBlockerNotice({ presentation, observedStatus, observedResultJson, observedErrorCode, blocker, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, companyId, agentName, projectName, blockers, savedMessageBlocked = false, conversationMode = false }: {
+export function ExecutionBlockerNotice({ presentation, observedStatus, observedResultJson, observedErrorCode, blocker, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, companyId, agentName, projectName, blockers, savedMessageBlocked = false, conversationMode = false, remedyControls }: {
   presentation: TaskInterruptionPresentation | null | undefined;
   observedStatus?: string;
   /** Saved, unanswered chat with no live work or actionable interruption projection. */
@@ -76,6 +182,8 @@ export function ExecutionBlockerNotice({ presentation, observedStatus, observedR
   blockers?: IssueRelationIssueSummary[];
   canRetry: boolean;
   onRetry: () => void;
+  onNewSession?: () => Promise<void>;
+  remedyControls?: ExecutionRefusalRemedyControls;
   optimistic?: boolean;
   takingLonger?: boolean;
   error?: Error | null;
@@ -85,9 +193,19 @@ export function ExecutionBlockerNotice({ presentation, observedStatus, observedR
   projectName?: string;
 }) {
   if (isPersonStoppedRun({ resultJson: observedResultJson, errorCode: observedErrorCode })) return null;
-  if (savedMessageBlocked) presentation = { state: "failed", responsibility: "system", canRetry,
+  const retryRefused = isExecutionRetryRefused(presentation, observedErrorCode ?? blocker?.cause, observedResultJson);
+  canRetry = canRetry && !retryRefused;
+  if (savedMessageBlocked && (!retryRefused || presentation?.state !== "failed")) presentation = { state: "failed", responsibility: "system", canRetry,
     intentId: null, nextRetryAt: null, userAction: null, sourceRunIds: [], observedRunId: null };
-  const newSession = conversationMode && presentation?.state === "failed" && !(canRetry && presentation.canRetry)
+  // Only C31 owns this new explanation/remedy path, including during optimism.
+  // Ordinary server failure projections retain base wording, Retry and /new.
+  if (retryRefused && presentation?.state === "failed" && presentation.failure) return <div role="status" aria-label="Task status"
+    className={cn("flex flex-col items-start gap-3 text-sm text-muted-foreground sm:flex-row sm:items-center", className)}>
+    <span className="min-w-0 flex-1 whitespace-pre-line break-words"><span className="block font-medium text-foreground">{presentation.failure.title}</span>{presentation.observedRunId ? executionFailureDetail(presentation.failure, observedResultJson) : presentation.failure.detail}</span>
+    {C31_REMEDY_BUTTONS && <RefusalRemedyActions key={`${presentation.observedRunId}:${JSON.stringify(executionFailureCause(presentation.failure, observedResultJson)?.remedies)}`}
+      remedies={executionFailureCause(presentation.failure, observedResultJson)?.remedies ?? []} controls={remedyControls} />}
+  </div>;
+  const newSession = !retryRefused && conversationMode && presentation?.state === "failed" && !(canRetry && presentation.canRetry)
     ? <> Send <code>/new</code> to start a fresh session, then send your message again.</> : null;
   const recovery = !savedMessageBlocked && isConversationRecovery(presentation,
     observedStatus ?? (blocker?.workspaceRepairRequired ? "failed" : undefined));
