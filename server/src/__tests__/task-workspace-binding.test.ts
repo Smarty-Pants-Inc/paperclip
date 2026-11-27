@@ -15,6 +15,7 @@ import { issueRoutes } from "../routes/issues.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { agents, authUsers, companies, companyMemberships, completionContracts, createDb, environmentLeases, executionWorkspaceRepositories, executionWorkspaceRepositoryAccess, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, nativeRunResults, workspaceOperations, principalPermissionGrants, projectAccessMembers, projects, projectWorkspaces } from "@paperclipai/db";
 import { executionWorkspaceService } from "../services/execution-workspaces.js";
+import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
 import { authorizationService, canActorReadExecutionWorkspace } from "../services/authorization.js";
 import { assertChatExecutionDefaultsAccess } from "../services/chat-execution-defaults.js";
 import { assertExecutionWorkspaceRecordAccess } from "../services/task-workspace-access.js";
@@ -41,6 +42,27 @@ const support = await getEmbeddedPostgresTestSupport();
       mode: "shared_workspace", strategyType: "project_primary", name: "Task files", cwd: `/tmp/task-${issueId}` });
     return { companyId, issueId, workspaceId, actor: { type: "board" as const, source: "local_implicit" as const, isInstanceAdmin: true } };
   }
+
+  it.each([
+    { key: "environmentId", action: "saved" }, { key: "environmentId", action: "cleared" }, { key: "environmentId", action: "removed" },
+    { key: "networkEgress", action: "saved" }, { key: "networkEgress", action: "cleared" }, { key: "networkEgress", action: "removed" },
+  ] as const)("v10 runtime binding preserves a person's $action $key", async ({ key, action }) => {
+    const f = await fixture();
+    const original = { mode: "shared_workspace", environmentId: randomUUID(),
+      networkEgress: { allowFqdns: ["old.invalid"], allowCidrs: [] } };
+    await db.update(issues).set({ executionWorkspaceSettings: original }).where(eq(issues.id, f.issueId));
+    const stale = parseIssueExecutionWorkspaceSettings(original);
+    const saved: Record<string, unknown> = { ...original };
+    if (action === "removed") delete saved[key];
+    else saved[key] = action === "cleared" ? null : key === "environmentId" ? randomUUID() : { allowFqdns: ["new.invalid"], allowCidrs: [] };
+    // A person's committed write lands after parsing but before the real binder.
+    await db.update(issues).set({ executionWorkspaceSettings: saved }).where(eq(issues.id, f.issueId));
+    await executionWorkspaceService(db).bindTaskWorkspace(f.companyId, f.issueId, f.workspaceId, {
+      executionWorkspaceSettings: { ...stale, mode: "isolated_workspace" },
+    });
+    const [row] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    expect(row.executionWorkspaceSettings).toEqual({ ...saved, mode: "isolated_workspace" });
+  });
 
   it("persists a projectless binding, preserves it on project edits, and lists it in overview", async () => {
     const f = await fixture(), svc = executionWorkspaceService(db);

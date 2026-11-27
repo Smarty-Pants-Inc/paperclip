@@ -390,7 +390,7 @@ import {
   carriesSettledPredecessorSession,
 } from "./native-restart-recovery.js";
 
-import { observeHeldNativeConfiguration, readHeldNativeTurnWork } from "./held-native-turn.js";
+import { observeHeldNativeConfiguration, readHeldNativeTurnWork, recordHeldNativeTurnClose } from "./held-native-turn.js";
 
 type ActiveNativeSession = {
   session: NativeSession;
@@ -405,12 +405,17 @@ type ActiveNativeSession = {
   /** Once dispatched, an interrupt's uncertain outcome must never cause a resend. */
   holdInterruptSent?: boolean;
   holdIdlePublicationVersion?: number;
+  /** A replayed/late old final cannot certify a subsequent answer as idle. */
+  holdPublishedAnswerItems?: Set<string>;
+  markHeldConfigurationCheckNeeded?: () => void;
   /** Latched until this exact attachment reaches a genuinely idle publication. */
   holdEndPending?: boolean;
   /** Close at next idle, without fencing the completion offer's steering door. */
   holdCloseIntent?: boolean;
   holdSteeredInputs?: Map<string, { preparing: number; dispatched: boolean }>;
   refreshHeldTurnWork?: () => Promise<boolean>;
+  /** Server-only close classification; never changes the Pi wire reason. */
+  recordHeldTurnClose?: () => Promise<void>;
   /** The release owner offers live completions before it fences new steering. */
   offerHeldCompletion?: () => Promise<boolean>;
   holdCompletionOffering?: boolean;
@@ -10119,7 +10124,9 @@ export async function steerNativeSession(input: {
 }
 
 /** Shared close-at-next-idle door: committed answers, not an ACK or an old final,
- * release the hold. No personStop state or cancel/requeue machinery. */
+ * release the hold. Pi requires the stock person_stop WIRE reason to complete
+ * an idle hold (other reasons cancel the turn). Classify non-Stop closes only
+ * in server metadata, never with personStop state or cancel/requeue machinery. */
 export async function closeHeldNativeTurn(runId: string): Promise<boolean> {
   const active = activeNativeSessions.get(runId);
   if (!active || active.cancelRequested || active.holdCloseRequested || active.holdCompletionOffering) return false;
@@ -10149,6 +10156,8 @@ export async function closeHeldNativeTurn(runId: string): Promise<boolean> {
     const pending = await active.refreshHeldTurnWork?.();
     if (pending || !active.heldIdle) return false;
     const outcome = await interruptNativeTurn({ runId, reason: "person_stop", onlyIfHeldIdle: true });
+    if (outcome && outcome !== "no_turn") await active.recordHeldTurnClose?.().catch(error =>
+      logger.warn({ error, runId }, "could not record server-only held-turn close reason"));
     return Boolean(outcome && outcome !== "no_turn");
   } finally {
     if (!active.holdInterruptSent) active.holdCloseRequested = false;
@@ -10192,6 +10201,11 @@ export async function interruptNativeTurn(input: { runId: string; reason: string
   }
   return { turnId };
 }
+
+// Continuous Pi keeps an outer turn open across answers. Bound that stock
+// turn's lifetime, including a tool that never returns, even for timeoutSec=0.
+// This is an execution timeout, not a configuration-triggered interrupt.
+export const HELD_NATIVE_TURN_TIMEOUT_MS = 15 * 60_000;
 
 const nativeCancellationsInFlight = new Map<string, Promise<unknown>>();
 
@@ -12242,12 +12256,18 @@ async function executePaperclipNativeSessionAttempt(
           if (event.eventType === "item.completed") active.holdPendingItems?.delete(event.itemId);
         }
         const activityVersion = active?.holdActivityVersion;
+        const alreadyPublished = event.itemId && active?.holdPublishedAnswerItems?.has(event.itemId);
         const published = await publishContinuousNativeReply({ db: input.db, execution: input.execution, event, cursor });
-        const pendingSteering = published && active ? await active.refreshHeldTurnWork?.() : false;
-        if (published && active && !active.holdPendingItems?.size && active.holdActivityVersion === activityVersion) {
+        const newAnswer = published && active && event.itemId && !alreadyPublished;
+        if (newAnswer) {
+          (active.holdPublishedAnswerItems ??= new Set()).add(event.itemId!);
+          active.markHeldConfigurationCheckNeeded?.();
+        }
+        const pendingSteering = newAnswer ? await active.refreshHeldTurnWork?.() : false;
+        if (newAnswer && !active.holdPendingItems?.size && active.holdActivityVersion === activityVersion) {
           active.holdIdlePublicationVersion = activityVersion;
         }
-        if (published && active && !pendingSteering && !active.holdPendingItems?.size && activeNativeSessions.get(input.execution.binding.runId) === active &&
+        if (newAnswer && !pendingSteering && !active.holdPendingItems?.size && activeNativeSessions.get(input.execution.binding.runId) === active &&
             active.holdActivityVersion === activityVersion && input.execution.provider.kind === "pi_rpc" &&
             input.execution.provider.conversationMode === true) {
           active.heldIdle = true;
@@ -13191,7 +13211,9 @@ async function executePaperclipNativeSessionAttempt(
             remoteCleanupScope: remoteCleanupLease ? remoteLeaseCleanupScope(remoteCleanupLease) : undefined,
             retainedRunnerReattachment: input.restartRecovery?.kind === "reattach_remote_runner"
               && input.restartRecovery.runId === input.execution.binding.runId,
-            turnTimeoutMs: input.turnTimeoutMs,
+            turnTimeoutMs: input.execution.provider.kind === "pi_rpc" && input.execution.provider.conversationMode === true
+              ? Math.min(input.turnTimeoutMs && input.turnTimeoutMs > 0 ? input.turnTimeoutMs : HELD_NATIVE_TURN_TIMEOUT_MS, HELD_NATIVE_TURN_TIMEOUT_MS)
+              : input.turnTimeoutMs,
             backend:
               input.backend ??
               runnerdBackend ??
@@ -13499,19 +13521,47 @@ async function executePaperclipNativeSessionAttempt(
                     const { offerHeldChatCompletions } = await import("../chat-completion-delivery.js");
                     return offerHeldChatCompletions(input.db, input.execution.binding);
                   };
-                  active.refreshHeldTurnWork = async () => {
-                    const work = await readHeldNativeTurnWork(input.db, input.execution.binding);
-                    if (!work) return true;
-                    if (work.endRequested) active.holdEndPending = true;
-                    for (const id of work.answered) releaseHeldSteeringInput(active, id, "delivery");
-                    const pending = work.unanswered || Boolean(active.holdSteeredInputs?.size);
-                    if (pending) active.heldIdle = false;
-                    else if (active.holdIdlePublicationVersion !== undefined && active.holdIdlePublicationVersion === active.holdActivityVersion && !active.holdPendingItems?.size) active.heldIdle = true;
-                    return pending;
+                  // Resolve configuration once per attachment/answer hold, not
+                  // on every steering authority read. Committed hints invalidate
+                  // this cache, including bounded settings-scan overflow.
+                  let configurationGeneration = 1, checkedConfigurationGeneration = 0;
+                  let reading: Promise<boolean> | undefined;
+                  active.markHeldConfigurationCheckNeeded = () => { configurationGeneration++; };
+                  let restoringPublishedItems = true;
+                  active.refreshHeldTurnWork = () => {
+                    if (reading) return reading;
+                    reading = (async () => {
+                      // A committed hint arriving during a read must not be
+                      // swallowed by coalescing; finish with current authority.
+                      for (;;) {
+                        const generation = configurationGeneration;
+                        const work = await readHeldNativeTurnWork(input.db, input.execution.binding,
+                          { checkConfiguration: generation !== checkedConfigurationGeneration });
+                        if (!work) return true;
+                        checkedConfigurationGeneration = generation;
+                        if (work.endRequested) active.holdEndPending = true;
+                        if (restoringPublishedItems) for (const id of work.publishedItems ?? [])
+                          (active.holdPublishedAnswerItems ??= new Set()).add(id);
+                        for (const id of work.answered) releaseHeldSteeringInput(active, id, "delivery");
+                        const pending = work.unanswered || Boolean(active.holdSteeredInputs?.size);
+                        if (pending) active.heldIdle = false;
+                        else if (active.holdIdlePublicationVersion !== undefined && active.holdIdlePublicationVersion === active.holdActivityVersion && !active.holdPendingItems?.size) active.heldIdle = true;
+                        if (generation === configurationGeneration) return pending;
+                      }
+                    })().finally(() => { reading = undefined; });
+                    return reading;
                   };
-                  const reconcile = () => reconcileHeldTurn(input.execution.binding.runId, active);
+                  active.recordHeldTurnClose = () => recordHeldNativeTurnClose(input.db, input.execution.binding);
+                  const reconcile = () => {
+                    active.markHeldConfigurationCheckNeeded?.();
+                    reconcileHeldTurn(input.execution.binding.runId, active);
+                  };
                   releaseHeldConfigurationObserver = observeHeldNativeConfiguration(input.db, input.execution.binding, reconcile);
-                  reconcile(); // Includes changes committed before attachment or a controller replacement.
+                  // Restore published-item identity before admitting provider
+                  // events, so a reconnect cannot turn an old final into idle.
+                  await active.refreshHeldTurnWork();
+                  restoringPublishedItems = false;
+                  reconcileHeldTurn(input.execution.binding.runId, active);
                 }
                 const startup = nativeSessionStartups.get(input.execution.binding.runId);
                 const stopBeforeProviderTurn = startup?.stopRequested === true && startup.sessionPublished !== true
@@ -13751,7 +13801,23 @@ async function executePaperclipNativeSessionAttempt(
       }
     };
     const stoppedLeaseRenewal = leaseRenewal.stop().catch(() => undefined);
+    let configurationTurnTimedOut = false;
     try {
+      if (input.execution.provider.kind === "pi_rpc" && input.execution.provider.conversationMode === true &&
+          error instanceof Error && /^native session timed out after \d+ms$/.test(error.message)) {
+        configurationTurnTimedOut = (await readHeldNativeTurnWork(input.db, input.execution.binding))?.endRequested === true;
+        if (configurationTurnTimedOut) {
+          // The stock execution timeout already ended provider work. Do not
+          // send a configuration interrupt or retry the obsolete admission.
+          await recordHeldNativeTurnClose(input.db, input.execution.binding);
+          await appendHeartbeatRunEvent(input.db, { companyId: input.execution.binding.companyId,
+            agentId: input.execution.binding.agentId, runId: input.execution.binding.runId,
+            eventType: "lifecycle", stream: "system", level: "warn",
+            message: "This answer reached the native turn time limit. Saved configuration will apply to the next message.",
+            payload: { reason: "configuration_retire_turn_timeout", turnTimeoutMs: Math.min(
+              input.turnTimeoutMs && input.turnTimeoutMs > 0 ? input.turnTimeoutMs : HELD_NATIVE_TURN_TIMEOUT_MS, HELD_NATIVE_TURN_TIMEOUT_MS) } });
+        }
+      }
       await writeExecutionControl(input.db, DELIVERY_QUEUES.executionFinalization, tx => tx
         .update(nativeRunFinalizations)
         .set({
@@ -13910,7 +13976,9 @@ async function executePaperclipNativeSessionAttempt(
       const adoptedRunnerUnanswered = input.runnerExecutionTarget?.kind === "remote"
         && input.restartRecovery?.kind === "reattach_remote_runner"
         && input.restartRecovery.remote.kind !== "plugin_task" && nativeRecoveryCommandUnanswered(error);
-      const disposition = nativeUnansweredRunnerReplacementDisposition(nativeSessionFailureDisposition(
+      const disposition = configurationTurnTimedOut
+        ? { phase: "terminal_failure" as const, failureCode: "native_session_interrupted" as const, nextAttemptAt: null }
+        : nativeUnansweredRunnerReplacementDisposition(nativeSessionFailureDisposition(
         attempt,
         now,
         sourceFailureCode,
