@@ -243,8 +243,32 @@ export async function assertNativeRetainedSandboxBinding(db: Db, input: {
   if (owner.leaseOwner || owner.phase !== "committed") {
     throw new Error("native_controller_recovery_missing_evidence:retained_sandbox_binding:finalizer_unsettled");
   }
-  if (leases.length === 1 && !["active", "released", "expired"].includes(leases[0].status)) {
+  // This attempt can intentionally resume a different sandbox. Zero matches
+  // on that sandbox are not zero recorded allocations for the predecessor.
+  if (leases.length === 0) {
+    const priorLeases = await db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+      eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.issueId, input.issueId),
+      eq(environmentLeases.heartbeatRunId, input.runId))).limit(1);
+    if (priorLeases.length) {
+      throw new Error("native_controller_recovery_missing_evidence:retained_sandbox_binding:binding_elsewhere");
+    }
+    const [prior] = await db.select({ status: heartbeatRuns.status, runnerProfileJson: heartbeatRuns.runnerProfileJson }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.nativeIssueId, input.issueId), eq(heartbeatRuns.id, input.runId))).limit(1);
+    const startupValue = record(prior?.runnerProfileJson).nativeStartupContext;
+    const startup = record(startupValue);
+    if (!prior || !["succeeded", "failed", "cancelled", "interrupted", "timed_out"].includes(prior.status)
+      || (startupValue !== undefined && (!Number.isSafeInteger(startup.deadlineAtMs) || Number(startup.deadlineAtMs) > Date.now()))) {
+      throw new Error("native_controller_recovery_missing_evidence:retained_sandbox_binding:lease_unsettled");
+    }
+    throw new Error("native_controller_recovery_missing_evidence:retained_sandbox_binding:binding_absent");
+  }
+  // Inspect EVERY matching row before cardinality: an unsettled duplicate must
+  // not masquerade as loss. Released duplicates still cannot name one binding.
+  if (leases.some(lease => !["active", "released", "expired"].includes(lease.status))) {
     throw new Error("native_controller_recovery_missing_evidence:retained_sandbox_binding:lease_unsettled");
+  }
+  if (leases.length > 1) {
+    throw new Error("native_controller_recovery_missing_evidence:retained_sandbox_binding:binding_unknown");
   }
   if (typeof recordedCwd !== "string" || !sameSandboxWorkspaceAllocation(recordedCwd, target.remoteCwd)) {
     throw new Error("native_controller_recovery_missing_evidence:retained_sandbox_binding:binding_lost");

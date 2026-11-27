@@ -1,15 +1,24 @@
 import { normalizePaperclipWakePayload } from "@paperclipai/adapter-utils/server-utils";
 import { currentRunFailureText } from "./native-exact-resume-failure.js";
 
-/** Lost provider/binding evidence, not temporarily unavailable reads or finalizers.
+// Positive evidence only. The typed incompatible error also wraps unavailable
+// reads, unknown authority/lifecycle and arbitrary backend diagnostics. New or
+// opaque reasons must retain the saved session until their producer proves loss.
+const LOST_PROVIDER_STATE_REASONS = new Set([
+  "workspace_continuation_source_scope_mismatch",
+]);
+
+/** Positive qualified evidence only, not the incompatible code or free text alone.
  * The historical unsuffixed binding refusal is ambiguous and must retain the session.
  * Always inspect the current refusal, never an earlier error in a chained message. */
 export function sessionCannotContinue(run: { error?: string | null; errorCode?: string | null; resultJson?: unknown } | undefined) {
   const failure = currentRunFailureText(run)?.trim();
   if (run?.errorCode === "native_provider_state_incompatible") {
     const reason = failure?.replace(/^native_session_recovery_failed:\s*/, "");
-    return !!reason && reason !== "workspace_continuation_source_unavailable";
+    return reason !== undefined && LOST_PROVIDER_STATE_REASONS.has(reason);
   }
+  // Even no recorded row is absence of evidence, not proof that the retained
+  // workspace was destroyed: row repair can restore the identical binding.
   return failure === "native_controller_recovery_missing_evidence:retained_sandbox_binding:binding_lost";
 }
 
