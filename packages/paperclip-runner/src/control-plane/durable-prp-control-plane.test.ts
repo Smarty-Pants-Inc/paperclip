@@ -74,6 +74,133 @@ const identity: DurableRecoveryIdentity = {
 const expectedRunnerVersion = "0.3.0";
 const expectedRunnerDigest = `sha256:${"a".repeat(64)}`;
 
+it.each([{ external: false, limit: 500 }, { external: true, limit: 2_000 }])(
+  "bounds the command count at $limit with external persistence=$external", async ({ external, limit }) => {
+    const root = mkdtempSync(resolve(tmpdir(), "runner-command-count-"));
+    const options = { stateDirectory: root, identity, expectedRunnerVersion, expectedRunnerDigest };
+    let core = new DurablePrpControlPlane(options);
+    let checkpoint!: DurablePrpCheckpoint;
+    if (external) core.setCheckpointPersistence(async value => { checkpoint = value; });
+    try {
+      if (!external) {
+        // Seed the valid prefix once; this row tests local admission at #500,
+        // not the filesystem's latency for 499 unrelated full-file fsyncs.
+        const first = core.queueCommand("session.snapshot", {}, "count-1");
+        core.store.state.commands = Array.from({ length: 499 }, (_, index) => ({ ...first,
+          commandId: `count-${index + 1}`, controllerSeq: index + 1 }));
+        (core.store as WritableCoreStore).save();
+        await core.stop();
+        core = new DurablePrpControlPlane(options);
+      }
+      for (let index = external ? 1 : 500; index <= limit; index += 1) {
+        expect(core.queueCommand("session.snapshot", {}, `count-${index}`).controllerSeq).toBe(index);
+      }
+      expect(() => core.queueCommand("session.snapshot", {}, "one-too-many"))
+        .toThrow(expect.objectContaining({ code: "command_journal_full" }));
+      expect(core.queueCommand("session.snapshot", {}, `count-${limit}`).controllerSeq).toBe(limit);
+      await core.flushCheckpoint();
+      expect(core.store.state.commands).toHaveLength(limit);
+      if (!external) {
+        expect(JSON.parse(readFileSync(core.store.path, "utf8")).commands).toHaveLength(500);
+      } else {
+        const projection = resolve(root, "restored");
+        decodeDurablePrpCheckpoint(checkpoint.records).restoreSessionDirectory(projection);
+        await core.stop();
+        core = new DurablePrpControlPlane({ ...options, stateDirectory: resolve(projection, "control-plane") });
+        expect(core.store.state.commands).toHaveLength(2_000);
+        expect(() => core.queueCommand("session.snapshot", {}, "local-after-external-restore"))
+          .toThrow(expect.objectContaining({ code: "command_journal_full" }));
+      }
+    } finally { await core.stop(); rmSync(root, { recursive: true, force: true }); }
+  },
+);
+
+it("bounds external stored command bytes, accounts for results, and reads a near-budget restored local file", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "runner-command-stored-bytes-"));
+  const core = new DurablePrpControlPlane({ stateDirectory: resolve(root, "source"), identity,
+    expectedRunnerVersion, expectedRunnerDigest });
+  let checkpoint!: DurablePrpCheckpoint;
+  core.setCheckpointPersistence(async value => { checkpoint = value; });
+  const budget = (256 - 16) * 1024 * 1024;
+  // Escaping is part of the stored record, not just the unescaped payload.
+  const payload = { text: '"\\\n'.repeat(Math.floor(500 * 1024 / 6)) };
+  let storedBytes = 0;
+  let accepted = 0;
+  let rejected = false;
+  let client: AuthenticatedClient | null = null;
+  let restored: DurablePrpControlPlane | undefined;
+  try {
+    for (let index = 1; index <= 500; index += 1) {
+      let command;
+      try { command = core.queueCommand("semantic_tool.result", payload, `large-${index}`); }
+      catch (error) {
+        expect(error).toMatchObject({ code: "command_journal_full" });
+        rejected = true;
+        break;
+      }
+      storedBytes += Buffer.byteLength(JSON.stringify(command));
+      accepted += 1;
+      expect(storedBytes).toBeLessThanOrEqual(budget);
+    }
+    expect(rejected).toBe(true);
+    expect(accepted).toBeGreaterThan(450);
+    expect(accepted).toBeLessThan(500);
+    await core.flushCheckpoint();
+    expect(storedBytes + Buffer.byteLength(JSON.stringify(core.getCommand("large-1")))).toBeGreaterThan(budget);
+    expect(core.queueCommand("semantic_tool.result", payload, "large-1").controllerSeq).toBe(1);
+    // Leave less than the next result's stored size, without adding a pending-count cap.
+    const padding = core.queueCommand("semantic_tool.result", { text: "x".repeat(budget - storedBytes - 2_048) }, "padding");
+    storedBytes += Buffer.byteLength(JSON.stringify(padding));
+    await core.flushCheckpoint();
+    expect(core.store.state.commands).toHaveLength(accepted + 1);
+    const unchanged = checkpoint;
+    expect(() => core.queueCommand("semantic_tool.result", payload, "still-too-large"))
+      .toThrow(expect.objectContaining({ code: "command_journal_full" }));
+    await core.flushCheckpoint();
+    expect(checkpoint).toBe(unchanged);
+    expect(JSON.parse(readFileSync(core.store.path, "utf8")).schema).toBe("paperclip.runner.external-control-plane-state.v1");
+
+    await core.start();
+    client = (await authenticate(core, core.issueBootstrapTicket()))!;
+    expect(client).not.toBeNull();
+    const head = core.getCommand("large-1")!;
+    const previousBytes = Buffer.byteLength(JSON.stringify(head));
+    const frame = commandResultFrame(client, head, { text: '"\\\n'.repeat(8_000) });
+    sendSecure(client, frame);
+    await vi.waitFor(() => expect(core.commandOutcome("large-1")?.status).toBe("completed"));
+    await core.flushCheckpoint();
+    storedBytes += Buffer.byteLength(JSON.stringify(core.getCommand("large-1"))) - previousBytes;
+    expect(storedBytes).toBeGreaterThan(budget);
+    expect(core.commandOutcome("large-1")?.result).toEqual(frame.payload);
+    expect(() => core.queueCommand("session.snapshot", {}, "result-delta-must-count"))
+      .toThrow(expect.objectContaining({ code: "command_journal_full" }));
+    // Exact result replay changes no stored command bytes and is never refused.
+    sendSecure(client, frame);
+    await vi.waitFor(() => expect(core.store.state.duplicateCommandResults).toBe(1));
+    await core.flushCheckpoint();
+    client.socket.destroy(); client = null;
+
+    // rf-5: use the external checkpoint's actual restoreSessionDirectory path,
+    // then construct a controller, which reads through the 256-MiB private-file reader.
+    const projection = resolve(root, "restored");
+    decodeDurablePrpCheckpoint(checkpoint.records).restoreSessionDirectory(projection);
+    const stateDirectory = resolve(projection, "control-plane");
+    const path = resolve(stateDirectory, "control-plane-state.json");
+    expect(nodeFs.statSync(path).size).toBeGreaterThan(budget);
+    expect(nodeFs.statSync(path).size).toBeLessThan(256 * 1024 * 1024);
+    restored = new DurablePrpControlPlane({ stateDirectory, identity, expectedRunnerVersion, expectedRunnerDigest });
+    expect(restored.store.state.commands).toHaveLength(accepted + 1);
+    expect(restored.commandOutcome("large-1")?.result).toEqual(frame.payload);
+    // The running sum is rebuilt from persisted records, including the result.
+    expect(() => restored!.queueCommand("session.snapshot", {}, "loaded-budget-must-count"))
+      .toThrow(expect.objectContaining({ code: "command_journal_full" }));
+  } finally {
+    client?.socket.destroy();
+    await restored?.stop(); await core.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 60_000);
+
 it("admits only source maintenance while the authenticated owner differs", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "runner-authority-admission-"));
   let owner = identity.runId;

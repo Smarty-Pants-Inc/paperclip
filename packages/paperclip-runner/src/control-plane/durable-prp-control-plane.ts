@@ -65,7 +65,8 @@ const transitionCoreStateSchema =
 const maxFrameBytes = 1024 * 1024;
 // Secure frames hex-encode ciphertext. Reserve envelope/tag space as well.
 const maxCommandBytes = Math.floor((maxFrameBytes - 4 * 1024) / 2);
-const maxCommands = 500;
+const maxLocalCommands = 500;
+const maxExternalCommands = 2_000;
 const maxCommandsAtAttach = 32;
 const maxEventsPerAck = 64;
 class CommandJournalLimitError extends Error {
@@ -79,7 +80,16 @@ class CommandJournalLimitError extends Error {
 const maxCommittedEventWindow = 4_096;
 const EVENT_DELIVERY_STALL_FAILURES = 20;
 const EVENT_DELIVERY_STALL_MS = 45_000;
+// maxStateBytes is a READ bound, not a write guard. The stored-command
+// admission budget keeps new command writes below it, leaving headroom for
+// results already admitted and non-command state. Results are never refused.
 const maxStateBytes = 256 * 1024 * 1024;
+const commandJournalMarginBytes = 16 * 1024 * 1024;
+const maxCommandJournalBytes = maxStateBytes - commandJournalMarginBytes;
+
+function storedCommandBytes(command: DurableRecoveryCoreCommand): number {
+  return Buffer.byteLength(JSON.stringify(command));
+}
 const authChallengeTtlMs = 5_000;
 const stableIdPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,239}$/;
 const runnerDigestPattern = /^sha256:[0-9a-f]{64}$/;
@@ -607,7 +617,7 @@ function checkpointState(records: ReadonlyMap<string, string>) {
     .sort((a, b) => Number(a.slice(prefix.length)) - Number(b.slice(prefix.length)));
   const commandKeys = v2 ? keys("command:") : header.commands;
   const eventKeys = v2 ? keys("event:") : header.events;
-  if (!Array.isArray(commandKeys) || commandKeys.length > maxCommands
+  if (!Array.isArray(commandKeys) || commandKeys.length > maxExternalCommands
     || !Array.isArray(eventKeys) || eventKeys.length > maxCommittedEventWindow
     || commandKeys.some(key => typeof key !== "string" || !/^command:\d+$/.test(key))
     || eventKeys.some(key => typeof key !== "string" || !/^event:\d+$/.test(key))
@@ -1189,7 +1199,8 @@ function isStoredCoreState(
     !isRecord(value.tickets) ||
     !isRecord(value.leases) ||
     !Array.isArray(commands) ||
-    commands.length > maxCommands ||
+    // An externally persisted journal may be restored into a local file.
+    commands.length > maxExternalCommands ||
     !Array.isArray(events) ||
     events.length > maxCommittedEventWindow ||
     !Number.isSafeInteger(value.ackedSourceSeq) ||
@@ -2166,6 +2177,8 @@ export class DurablePrpControlPlane {
   #identity: DurableRecoveryIdentity;
   #stagedTargetCheckpointPublished: string | null = null;
   readonly #store: DurableCoreStore;
+  // Rebuilt once on load/restore, then updated only for changed command records.
+  #commandJournalBytes: number;
   #expectedRunnerVersion: string;
   #expectedRunnerDigest: string;
   #server: Server | null = null;
@@ -2241,6 +2254,7 @@ export class DurablePrpControlPlane {
       options.stateDirectory,
       options.identity,
     );
+    this.#commandJournalBytes = this.#store.state.commands.reduce((sum, command) => sum + storedCommandBytes(command), 0);
     this.#store.onChange = () => this.#readableStateChanged();
     if (this.#store.state.checkpointEventPolicy === "control-v1") {
       this.#recoveredCursor = { runId: options.identity.runId, sourceSeq: this.#store.state.ackedSourceSeq };
@@ -2779,6 +2793,7 @@ export class DurablePrpControlPlane {
           : structuredClone(runAttachTemplate),
     });
     this.#identity = structuredClone(identity);
+    this.#commandJournalBytes = 0;
     this.#store.save();
   }
 
@@ -2807,9 +2822,11 @@ export class DurablePrpControlPlane {
     const kept = suffix.filter((command) => !this.#isTerminalLifecycleCommand(command));
     if (kept.length === suffix.length) return [];
     const withdrawn = suffix.filter((command) => this.#isTerminalLifecycleCommand(command));
+    const previousBytes = suffix.reduce((sum, command) => sum + storedCommandBytes(command), 0);
     for (const command of withdrawn) delete this.#store.state.commandDeliveryCounts[command.commandId];
     kept.forEach((command, index) => { command.controllerSeq = firstPending + index + 1; });
     commands.splice(firstPending, suffix.length, ...kept);
+    this.#commandJournalBytes += kept.reduce((sum, command) => sum + storedCommandBytes(command), 0) - previousBytes;
     this.#store.save();
     return withdrawn.map((command) => command.type);
   }
@@ -3140,11 +3157,18 @@ export class DurablePrpControlPlane {
       status: "pending",
       result: null,
     };
+    // setCheckpointPersistence switches the store through useExternalPersistence:
+    // only that path avoids a full-file rewrite for every command.
+    const maxCommands = this.#persistCheckpoint === null ? maxLocalCommands : maxExternalCommands;
     if (this.#store.state.commands.length >= maxCommands)
       throw new CommandJournalLimitError("command_journal_full");
-    if (Buffer.byteLength(JSON.stringify(command)) > maxCommandBytes)
+    const commandBytes = storedCommandBytes(command);
+    if (commandBytes > maxCommandBytes)
       throw new CommandJournalLimitError("command_payload_too_large");
+    if (this.#commandJournalBytes + commandBytes > maxCommandJournalBytes)
+      throw new CommandJournalLimitError("command_journal_full");
     this.#store.state.commands.push(command);
+    this.#commandJournalBytes += commandBytes;
     if (staged && !retireStaged && type === "run.attach") {
       const { runAttachTemplate: _template, ...descriptor } = staged;
       this.#store.state.stagedRunAttachment = { ...descriptor, commandId: command.commandId };
@@ -4072,6 +4096,7 @@ export class DurablePrpControlPlane {
         candidate.leases = { [lease.credentialId]: structuredClone(lease) };
         const { paperclipNextAuthority: _authority, ...runAttachTemplate } = transition.command.payload;
         candidate.runAttachTemplate = structuredClone(runAttachTemplate);
+        this.#commandJournalBytes = 0;
         this.#store.commit(candidate);
         this.#identity = structuredClone(candidate.identity);
         lease = this.#store.state.leases[lease.credentialId]!;
@@ -4289,6 +4314,19 @@ export class DurablePrpControlPlane {
     );
   }
 
+  #recordCommandResult(
+    command: DurableRecoveryCoreCommand,
+    status: DurableRecoveryCoreCommand["status"],
+    result: Record<string, unknown>,
+  ): void {
+    const previousBytes = storedCommandBytes(command);
+    command.status = status;
+    command.result = structuredClone(result);
+    // Count the record as persisted, including JSON escaping and status changes.
+    // Already-admitted results always land, even when they consume the margin.
+    this.#commandJournalBytes += storedCommandBytes(command) - previousBytes;
+  }
+
   #commandResult(
     connection: AuthorityConnection,
     envelope: Record<string, unknown>,
@@ -4317,8 +4355,7 @@ export class DurablePrpControlPlane {
         const completed = candidate.commands.find(
           (entry) => entry.commandId === commandId,
         )!;
-        completed.status = "completed";
-        completed.result = structuredClone(result);
+        this.#recordCommandResult(completed, "completed", result);
         candidate.warmTransition = {
           receipt: structuredClone(transition.receipt),
           phase: "prepared",
@@ -4391,8 +4428,7 @@ export class DurablePrpControlPlane {
       const completed = candidate.commands.find(
         (entry) => entry.commandId === commandId,
       )!;
-      completed.status = "completed";
-      completed.result = structuredClone(result);
+      this.#recordCommandResult(completed, "completed", result);
       candidate.schema = candidate.stagedRunAttachment ? stagedCoreStateSchema : transitionCoreStateSchema;
       candidate.warmTransition = {
         receipt,
@@ -4407,8 +4443,7 @@ export class DurablePrpControlPlane {
     }
     const turnStart = command.type === "turn.start";
     if (turnStart) crashPoint("runner.turn_start.after_runner_accept_before_controller_checkpoint");
-    command.status = status;
-    command.result = structuredClone(result);
+    this.#recordCommandResult(command, status, result);
     this.#store.save();
     if (turnStart) crashPoint("runner.turn_start.after_controller_journal_before_db_checkpoint");
     if (this.#isTerminalLifecycleCommand(command) && status === "completed") {
