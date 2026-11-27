@@ -62,7 +62,9 @@ it.each([1, 9])("delivers %i whole 5,000-character comments on a continued sessi
 it("retains recovery history, sends exact comments, and preserves other unseen events", () => {
   const task = { id: "issue", identifier: "CHAT-1", title: "Brief", description: null, workMode: "standard", conversationAgentId: "agent" };
   const messages = [{ id: "comment", body: "  Next prompt\n", authorType: "user", authorId: "board" }];
-  const wakePayload = { reason: "issue_commented", commentIds: ["comment"], comments: [], executionContinuation: { version: 1, messages, resumeDelta: { baseRunId: "prior", messages } } };
+  const wakePayload = { reason: "issue_commented", commentIds: ["comment"], comments: [], executionContinuation: { version: 1, messages,
+    coverage: { kind: "full_task_history", throughCommentId: "comment", summaryThroughCommentId: null },
+    resumeDelta: { baseRunId: "prior", messages } } };
   const args: Parameters<typeof buildNativeExecutionInput>[0] = {
     companyId: "company", runId: "next", agentId: "agent", issue: task, taskPrompt: "OLD_BRIEF", provider: "pi_rpc", normalizedSessionId: "session", resumedSession: true, previousTurn: { runId: "prior", task },
     workspace: { id: "workspace", cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null }, runtimeContext: nativeRuntimeContextFixture(), wakePayload,

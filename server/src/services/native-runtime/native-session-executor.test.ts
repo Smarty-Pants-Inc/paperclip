@@ -357,13 +357,37 @@ vi.mock("../../vendor/paperclip-runner/index.js", async (importOriginal) => {
   const original = await importOriginal<
     typeof import("../../vendor/paperclip-runner/index.js")
   >();
+  // Partial session doubles still obey the required snapshot contract. Keep
+  // their identity and explicit snapshot spies; production backends return
+  // HarnessNativeSession for both open and recover.
+  const withSnapshot = <T extends object | null | undefined>(session: T, input: Pick<NativeExecutionInput, "binding" | "session">): T => {
+    if (session && typeof (session as { snapshot?: unknown }).snapshot !== "function") {
+      Object.assign(session, { snapshot: async () => ({ backendKind: "mock" as const,
+        sessionId: input.session.normalizedSessionId!,
+        identity: { ...input.binding, sessionId: input.session.normalizedSessionId! } }) });
+    }
+    return session;
+  };
   return {
     ...original,
     bundledRemoteProviderPackManifestPath: vi.fn((moduleUrl?: string, target?: "linux-x64" | "linux-arm64") => state.bundledPackManifestPath ?? original.bundledRemoteProviderPackManifestPath(moduleUrl, target)),
     bundledRemoteRunnerBinary: () => state.bundledRunnerBinary ?? original.bundledRemoteRunnerBinary(),
-    createNativeSessionBackend: state.createBackend,
+    createNativeSessionBackend: (...args: Parameters<typeof original.createNativeSessionBackend>) => {
+      const backend = state.createBackend(args[0] as NativeExecutionInputV1, args[1] as BackendFactoryOptions) as unknown as ReturnType<typeof original.createNativeSessionBackend>;
+      return { ...backend,
+        ...(backend.openSession ? { openSession: async (...openArgs: Parameters<typeof backend.openSession>) =>
+          withSnapshot(await backend.openSession(...openArgs), args[0]) } : {}),
+        ...(backend.recoverSession ? { recoverSession: async (...recoverArgs: Parameters<NonNullable<typeof backend.recoverSession>>) => {
+          const recovered = await backend.recoverSession!(...recoverArgs);
+          return { ...recovered, session: withSnapshot(recovered.session, args[0]) };
+        } } : {}),
+      };
+    },
     createRunnerdCodexTransport: state.createTransport,
-    executeNativeSession: state.execute,
+    executeNativeSession: (options: Parameters<typeof original.executeNativeSession>[0]) => state.execute({
+      ...options,
+      onSession: (session: Parameters<NonNullable<typeof options.onSession>>[0]) => options.onSession?.(withSnapshot(session, options.input)),
+    }),
     settleRetainedRunnerdSession: state.cleanup,
     retainedRunnerdMaintenanceIsIdle: state.maintenanceIdle,
     drainRetainedRunnerdMaintenanceOperations: state.drainMaintenance,
@@ -21520,7 +21544,8 @@ describe("runnerd provider runtime wiring", () => {
     });
     const append = vi.spyOn(nativeCredentialEvents, "appendNativeCredentialUpdate").mockImplementation(async (_db, input) => { await input.synchronizeCredentials?.(); });
     const binding = { grantId: "10000000-0000-4000-8000-000000000001", secretId: "10000000-0000-4000-8000-000000000002", sessionEpoch: 1, versionSelector: "latest" as const };
-    const session = { close: vi.fn(async () => {}) } as unknown as NativeSession;
+    const session = { close: vi.fn(async () => {}), snapshot: async () => ({ backendKind: "mock" as const,
+      sessionId: current.session.normalizedSessionId!, identity: { ...current.binding, sessionId: current.session.normalizedSessionId! } }) } as unknown as NativeSession;
     try {
       const backend = await createRunnerdBackend({ db: leaseDb(current), execution: current, runnerInstanceId: "managed-runner",
         managedAiCredentialHome: firstHome, managedAiCredentialWriteback: binding });
@@ -21615,8 +21640,13 @@ describe("runnerd provider runtime wiring", () => {
       const notification = { eventType: "auth.credentials.updated" } as never;
       await options.onCredentialsUpdated!(notification);
       expect(owner.mock.results.at(-1)!.value.credentialsUpdated).toHaveBeenCalledWith(notification);
-      expect(options).toMatchObject({ ...driver, runnerArtifact: { version: "fixture" },
+      expect(options).toMatchObject({ ...driver, controlPlaneRegistration: expect.any(Function), runnerArtifact: { version: "fixture" },
         prpIdentity: { environmentLeaseId: "plugin-task-lease" } });
+      // The registration is now a guard-installing wrapper, not the original
+      // function by identity. It still forwards to the plugin's registration.
+      await (options as RunnerTransportOptions & { controlPlaneRegistration: (authority: unknown) => Promise<unknown> })
+        .controlPlaneRegistration({ queueCommand: vi.fn() });
+      expect(registration).toHaveBeenCalledOnce();
       if (kind === "acpx") expect(options).toMatchObject({ acpxAgent: "claude", claudeEffort: "high", providerStartedTurns: true });
       else expect(options).not.toHaveProperty("providerStartedTurns");
       for (const key of ["environment", "codexCommand", "codexArgs", "runnerRuntimePaths", "readRunnerState", "archiveExternalRunnerState"]) {
@@ -25666,7 +25696,7 @@ describe("runnerd provider runtime wiring", () => {
       .calls[0]![0] as RunnerTransportOptions & {
       controlPlaneRegistration: (authority: unknown) => Promise<unknown>;
     };
-    await expect(transport.controlPlaneRegistration({})).rejects.toThrow(
+    await expect(transport.controlPlaneRegistration({ queueCommand: vi.fn() })).rejects.toThrow(
       "reached-preinstalled-codex-verification",
     );
     if (version !== "0.170.0") {
@@ -25785,7 +25815,7 @@ describe("runnerd provider runtime wiring", () => {
         version === "0.158.0" ? "gpt-6-sol" : "gpt-5.6-sol",
       );
     }
-    await expect(transport.controlPlaneRegistration({})).rejects.toThrow(
+    await expect(transport.controlPlaneRegistration({ queueCommand: vi.fn() })).rejects.toThrow(
       "reached-preinstalled-codex-verification",
     );
     expect(remoteExecute.mock.calls.some(([call]) => call.command === "npm")).toBe(false);
