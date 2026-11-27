@@ -12681,19 +12681,26 @@ async function executePaperclipNativeSessionAttempt(
       }
     }
     if (entry) {
-      if (
-        (entry.pluginTaskId !== undefined && (input.runnerExecutionTarget?.kind !== "remote" || input.runnerExecutionTarget.transport !== "sandbox" ||
-          entry.pluginTaskId !== input.runnerExecutionTarget.sandboxLeaseAcquisition?.providerLeaseId)) ||
-        entry.closeOnReleaseReason !== undefined ||
-        entry.configDigest !== warmConfigDigest ||
-        !canReuseNativeProcess(input, entry.processConfigDigest) ||
-        (entry.pluginTaskId !== undefined && pluginTaskDescription?.configuredEnvironmentVersion === 1
+      // Smarty seam (smarty-dev#4605, 11-27): name WHICH reuse input retires a held warm owner (no values), since a
+      // successful retire logs nothing and a warm chat was seen relaunching on every run.
+      const notReused = [
+        entry.pluginTaskId !== undefined && (input.runnerExecutionTarget?.kind !== "remote" || input.runnerExecutionTarget.transport !== "sandbox" ||
+          entry.pluginTaskId !== input.runnerExecutionTarget.sandboxLeaseAcquisition?.providerLeaseId) && "plugin_task",
+        entry.closeOnReleaseReason !== undefined && "close_on_release",
+        entry.configDigest !== warmConfigDigest && "config_digest",
+        input.refreshTools === true && "refresh_tools",
+        nativeProcessReuseKey(input) === undefined && "process_key_unavailable",
+        !canReuseNativeProcess(input, entry.processConfigDigest) && "process_reuse_key",
+        entry.pluginTaskId !== undefined && pluginTaskDescription?.configuredEnvironmentVersion === 1
           && pluginTaskSessionOwners.get(entry.session)?.configuredEnvironmentDelivered() === false
-          && Object.keys(pluginTaskConfiguredEnvironment(input.runnerEnvironment)).length > 0) ||
-        Boolean(entry.githubAccess) !== needsCoreGitHubAccess(input) ||
-        entry.githubAccess?.ready === false ||
-        (entry.githubAccess !== undefined && entry.githubAccess.duplexRequested !== adapterExecutionTargetEnablesSandboxDuplexBridge(input.runnerExecutionTarget))
-      ) {
+          && Object.keys(pluginTaskConfiguredEnvironment(input.runnerEnvironment)).length > 0 && "configured_environment",
+        Boolean(entry.githubAccess) !== needsCoreGitHubAccess(input) && "github_access",
+        entry.githubAccess?.ready === false && "github_access_not_ready",
+        entry.githubAccess !== undefined && entry.githubAccess.duplexRequested !== adapterExecutionTargetEnablesSandboxDuplexBridge(input.runnerExecutionTarget) && "github_duplex",
+      ].filter((reason): reason is string => typeof reason === "string");
+      if (notReused.length > 0) logger.info({ runId: input.execution.binding.runId, priorRunId: entry.runId, issueId: entry.issueId,
+        reasons: notReused, closeOnReleaseReason: entry.closeOnReleaseReason ?? null }, "held warm native session not reused");
+      if (notReused.length > 0) {
         await finishStartupContextForFallback();
         pluginTaskDescription=undefined;
         const preparedCopy = entry.instructionPreparationRunId === input.execution.binding.runId;
