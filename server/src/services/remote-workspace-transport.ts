@@ -12,7 +12,7 @@ import { removeTaskDirectoryTree } from "./isolated-task-directory-snapshot.js";
 import { measureRunPhase } from "./execution-preparation-timing.js";
 import type { GitRemoteAuthProvider } from "./git-credentials.js";
 import { classifyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-merge";
-import { MAX_SANDBOX_SYNC_TIMEOUT_MS, type SandboxSyncOperation } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
+import { sandboxSyncMinimumTimeoutMs, type SandboxSyncOperation } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
 import { REMOTE_WORKSPACE_CAPTURE_TRANSFER_MISMATCH } from "./remote-workspace-archive-io.js";
 
 export type RemoteWorkspaceTarget = Extract<AdapterExecutionTarget, { transport: "sandbox" }>
@@ -21,10 +21,7 @@ export type RemoteWorkspaceTarget = Extract<AdapterExecutionTarget, { transport:
 async function transferArchive(target: RemoteWorkspaceTarget, direction: "syncIn" | "syncOut",
   operations: SandboxSyncOperation[], byteSize: number) {
   if (!Number.isSafeInteger(byteSize) || byteSize <= 0) throw new Error("remote_workspace_archive_size_invalid");
-  const timeoutMs = Math.min(MAX_SANDBOX_SYNC_TIMEOUT_MS, 60_000 + Math.ceil(byteSize / 1024 ** 2) * 1_000);
-  return timeoutMs > 300_000
-    ? target.runner![direction]!(operations, { minimumTimeoutMs: timeoutMs })
-    : target.runner![direction]!(operations);
+  return target.runner![direction]!(operations, { minimumTimeoutMs: sandboxSyncMinimumTimeoutMs(byteSize) });
 }
 
 const checkoutConfiguredRefScript = String.raw`if(input.ref){const remoteRef=input.ref.replace(/^refs\/heads\//,'');

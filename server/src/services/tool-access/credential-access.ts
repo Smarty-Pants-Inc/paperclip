@@ -1,4 +1,5 @@
 import { connectionActorUserId } from "./actor.js";
+import { isGitHubAppConnection, resolveGitHubAppCredential } from "../github-app-credentials.js";
 import { AwsMcpCredentialError, isAwsMcpConnection, resolveAwsMcpAuthorization, sharedAwsMcpCredentialMinter, type AwsMcpClients } from "../connectors/aws/mcp-credentials.js";
 import { workloadIdentityService } from "../workload-identity.js";
 import type { ActorInfo } from "./types.js";
@@ -188,6 +189,11 @@ export function createConnectionCredentialAccess(db: Db, { secrets, audit, verce
       return resolveVercelCredentialHeaders(connection, grant, options);
     }
     if (isAwsMcpConnection(connection)) return resolveAwsMcpHeaders(connection, actor, options);
+    if (isGitHubAppConnection(connection)) {
+      const grant = await vaultGrantForConnection(connection, connection.credentialPolicy === "shared" ? undefined : actor);
+      if (!grant) throw unprocessable("The GitHub App authorization is unavailable");
+      return { Authorization: `Bearer ${(await resolveGitHubAppCredential(db, connection, grant, { ...options, allowDraft: connection.status === "draft" })).token}` };
+    }
     let grant: typeof connectionGrants.$inferSelect | null = null;
     try {
       if (

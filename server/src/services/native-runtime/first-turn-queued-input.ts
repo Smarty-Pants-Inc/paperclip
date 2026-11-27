@@ -1,6 +1,6 @@
 import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agentWakeupRequests, heartbeatRunEvents, heartbeatRuns, issueAttachments, issueComments, issues } from "@paperclipai/db";
+import { agents, agentWakeupRequests, heartbeatRunEvents, heartbeatRuns, issueAttachments, issueComments, issues } from "@paperclipai/db";
 import type { SourceTrustMetadata } from "@paperclipai/shared";
 
 import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
@@ -8,6 +8,9 @@ import { deliveredQueuedCommentIds } from "../queued-comment-delivery.js";
 import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
 import { sanitizeQuarantinedCommentForHigherTrust } from "../source-trust.js";
 import { PROVIDER_TURN_ACCEPTED_EVENT_TYPES } from "./provider-attempt-outcome.js";
+import { reconcileContinuousSessionInput } from "./continuous-session-input.js";
+import { queuedInteractionId, readQueuedInteractionResponse } from "../queued-interaction-response.js";
+import { resolveSessionContinuity } from "./continued-session.js";
 
 /**
  * Queued input for a run's first provider turn.
@@ -41,6 +44,8 @@ export type FirstTurnQueuedInputReceipt = {
   runId: string;
   wakeupRequestIds: string[];
   commentIds: string[];
+  /** Card answers are typed receipts, not editable issue comments. Optional for v1 readers. */
+  interactionIds?: string[];
   claimedAt: string;
 };
 
@@ -70,6 +75,7 @@ export function readFirstTurnQueuedInputReceipt(run: { id: string; contextSnapsh
     runId: run.id,
     wakeupRequestIds: stringIds(receipt.wakeupRequestIds),
     commentIds: stringIds(receipt.commentIds),
+    interactionIds: stringIds(receipt.interactionIds),
     claimedAt,
   };
 }
@@ -77,7 +83,8 @@ export function readFirstTurnQueuedInputReceipt(run: { id: string; contextSnapsh
 /** Message ids a live run already took into its first turn; queue views hide them. */
 export function firstTurnClaimedCommentIds(run: { id: string; status?: string | null; contextSnapshot?: unknown } | null | undefined): Set<string> {
   if (!run || (run.status !== undefined && run.status !== "running")) return new Set();
-  return new Set(readFirstTurnQueuedInputReceipt(run)?.commentIds ?? []);
+  const receipt = readFirstTurnQueuedInputReceipt(run);
+  return new Set([...(receipt?.commentIds ?? []), ...(receipt?.interactionIds ?? [])]);
 }
 
 /**
@@ -150,18 +157,48 @@ export async function hasQueuedChatRequest(
   return Boolean(wake);
 }
 
-type QueuedMessage = { id: string; body: string; createdAt: Date };
+type QueuedMessage = { id: string; body: string; createdAt: Date; kind?: "interaction" };
+
+/** Same authority and fresh-session fences as ordinary queued person input. */
+async function readFirstTurnInteraction(tx: Db, binding: { companyId: string; issueId: string; agentId: string },
+  wake: typeof agentWakeupRequests.$inferSelect, responsibleUserId: string) {
+  const payload = record(wake.payload), context = record(payload[DEFERRED_WAKE_CONTEXT_KEY]);
+  const interactionId = queuedInteractionId(payload);
+  const requester = wake.requestedByActorType === "user" ? wake.requestedByActorId === responsibleUserId
+    : wake.requestedByActorType === "system" || wake.requestedByActorType === null;
+  if (!interactionId || !requester || queuedCommentIdsFromWakePayload(payload).length > 0 ||
+      (Array.isArray(payload.interactionIds) && payload.interactionIds.some(id => id !== interactionId)) ||
+      payload.resumeIntent === true || context.resumeIntent === true || payload.forceFreshSession === true || context.forceFreshSession === true ||
+      payload.queuedCommentInterrupt || deferredWakeIsChatRequest(payload)) return null;
+  // Only the continuous Pi publication path settles sealed interaction input.
+  const [agent] = await tx.select({ config: agents.adapterConfig }).from(agents).where(and(
+    eq(agents.id, binding.agentId), eq(agents.companyId, binding.companyId))).limit(1);
+  if (agent?.config.provider !== "pi_rpc" || resolveSessionContinuity("pi_rpc", agent.config.sessionContinuity) !== "continuous") return null;
+  const response = await readQueuedInteractionResponse(tx, binding.companyId, binding.issueId, payload);
+  if (!response || response.toolActionOutcome || response.source.requiresFreshSession ||
+      response.comment.authorUserId !== responsibleUserId || response.comment.authorAgentId) return null;
+  return { id: response.comment.id, body: response.comment.body, createdAt: new Date(response.comment.createdAt), kind: "interaction" as const };
+}
+
+function ownsFirstTurnIssue(issue: { executionRunId: string | null; assigneeAgentId: string | null;
+  conversationAgentId: string | null; conversationState: string | null; conversationSessionGeneration: number | null } | undefined,
+  run: { id: string; agentId: string; contextSnapshot: unknown }) {
+  return Boolean(issue && issue.executionRunId === run.id && issue.assigneeAgentId === run.agentId &&
+    (!issue.conversationAgentId || (issue.conversationAgentId === run.agentId && issue.conversationState === "active" &&
+      record(run.contextSnapshot).conversationSessionGeneration === issue.conversationSessionGeneration)));
+}
 
 export function renderFirstTurnQueuedInput(messages: readonly QueuedMessage[]): string | null {
   if (messages.length === 0) return null;
   let remaining = MAX_TOTAL_CHARS;
   const sections = messages.map((message, index) => {
     const limit = Math.max(0, Math.min(MAX_COMMENT_CHARS, remaining));
-    const truncated = message.body.length > limit;
+    // A card carries typed JSON, not a comment the model can read for the rest.
+    const truncated = message.kind !== "interaction" && message.body.length > limit;
     const body = truncated ? message.body.slice(0, limit) : message.body;
     remaining -= body.length;
     return [
-      `[Message ${index + 1} of ${messages.length} · comment ${message.id} · ${message.createdAt.toISOString()}]`,
+      `[Message ${index + 1} of ${messages.length} · ${message.kind ?? "comment"} ${message.id} · ${message.createdAt.toISOString()}]`,
       body,
       ...(truncated ? [`(Truncated here. Read comment ${message.id} on the task for the rest.)`] : []),
     ].join("\n");
@@ -183,6 +220,7 @@ function firstTurnEligibleComment(input: { companyId: string; issueId: string; r
     eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
     eq(issueComments.authorUserId, input.responsibleUserId),
     isNull(issueComments.authorAgentId), isNull(issueComments.createdByRunId), isNull(issueComments.deletedAt),
+    sql`btrim(${issueComments.body}) <> '/new'`,
     sql`not exists (select 1 from ${issueAttachments} where ${issueAttachments.companyId} = ${input.companyId}
       and ${issueAttachments.issueCommentId} = ${issueComments.id})`);
 }
@@ -218,14 +256,18 @@ export async function claimFirstTurnQueuedInput(
   db: Db,
   binding: { companyId: string; runId: string; issueId: string; agentId: string },
 ): Promise<string | null> {
+  await reconcileContinuousSessionInput(db, binding);
   return db.transaction(async (tx) => {
     // Redact on this transaction's own connection: a second pool connection
     // while the seal holds its locks can wait forever on a one-connection pool.
     const render = async (messages: QueuedMessage[]) => messages.length === 0 ? null : renderFirstTurnQueuedInput(
-      await createRunSecretRedactionRegistry(tx as unknown as Db).redactForIssue(binding.companyId, binding.issueId, messages));
+      await createRunSecretRedactionRegistry(tx as unknown as Db).redactForIssue(binding.companyId, binding.issueId,
+        [...new Map(messages.map(message => [message.id, message])).values()].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())));
     // Lock in the queue routes' order (task, queue, run) so a concurrent
     // Interrupt and this seal serialize instead of deadlocking.
-    const [issue] = await tx.select({ conversationAgentId: issues.conversationAgentId, executionRunId: issues.executionRunId })
+    const [issue] = await tx.select({ conversationAgentId: issues.conversationAgentId, executionRunId: issues.executionRunId,
+      assigneeAgentId: issues.assigneeAgentId, conversationState: issues.conversationState,
+      conversationSessionGeneration: issues.conversationSessionGeneration })
       .from(issues).where(and(eq(issues.id, binding.issueId), eq(issues.companyId, binding.companyId))).for("update").limit(1);
     const wakes = !issue ? [] : await tx.select().from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, binding.companyId), eq(agentWakeupRequests.agentId, binding.agentId),
@@ -236,6 +278,7 @@ export async function claimFirstTurnQueuedInput(
       id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status,
       runtimeMode: heartbeatRuns.runtimeMode, responsibleUserId: heartbeatRuns.responsibleUserId,
       contextSnapshot: heartbeatRuns.contextSnapshot,
+      resultJson: heartbeatRuns.resultJson,
     }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.id, binding.runId), eq(heartbeatRuns.companyId, binding.companyId),
       eq(heartbeatRuns.agentId, binding.agentId))).for("update").limit(1);
@@ -243,31 +286,56 @@ export async function claimFirstTurnQueuedInput(
     const receipt = readFirstTurnQueuedInputReceipt(run);
     // A restart before the provider accepted the turn repeats the sealed input.
     if (receipt) {
-      return render(await readQueuedMessages(tx as unknown as Db, { ...binding, responsibleUserId: run.responsibleUserId,
-        commentIds: receipt.commentIds, excludeDelivered: false }));
+      const messages = await readQueuedMessages(tx as unknown as Db, { ...binding, responsibleUserId: run.responsibleUserId,
+        commentIds: receipt.commentIds, excludeDelivered: false });
+      for (const wake of wakes.filter(wake => receipt.wakeupRequestIds.includes(wake.id))) {
+        const response = await readFirstTurnInteraction(tx as unknown as Db, binding, wake, run.responsibleUserId);
+        if (response && receipt.interactionIds?.includes(response.id)) messages.push(response);
+      }
+      return render(messages);
     }
-    // Only the run that holds the task takes its queue. Conversations keep
-    // their own turn-boundary contract.
+    // Conversation input pending at this seal is part of the submitted user
+    // message too. Only later arrivals belong to the live-turn steer path.
     // A swarm run's instruction is only its recorded request; nothing joins it.
-    const joining = !issue || issue.conversationAgentId || issue.executionRunId !== run.id || isAntigravitySwarmRun(run)
-      ? [] : wakes.filter(wake => deferredWakeJoinsFirstTurn(wake, run));
-    const commentIds = [...new Set(joining.flatMap(wake => queuedCommentIdsFromWakePayload(wake.payload)))];
-    const taken = await readQueuedMessages(tx as unknown as Db, { ...binding, responsibleUserId: run.responsibleUserId,
-      commentIds, excludeDelivered: true });
+    const ownsIssue = ownsFirstTurnIssue(issue, run) && !isAntigravitySwarmRun(run);
+    const joining = !ownsIssue ? [] : wakes.filter(wake => deferredWakeJoinsFirstTurn(wake, run) &&
+      record(record(wake.payload)[DEFERRED_WAKE_CONTEXT_KEY]).forceFreshSession !== true &&
+      (wake.payload?.preDispatchInputOnly !== true || !issue?.conversationAgentId ||
+        record(wake.payload?._paperclipWakeContext).conversationSessionGeneration === issue.conversationSessionGeneration));
+    // Passive pre-dispatch receipts join the next admitted turn; ordinary
+    // conversation input retains its existing first-turn and interaction rules.
+    const handback = joining.some(wake => wake.payload?.preDispatchInputOnly === true);
+    const ownInput = new Set([
+      ...queuedCommentIdsFromWakePayload({ _paperclipWakeContext: run.contextSnapshot }),
+      record(run.contextSnapshot).wakeCommentId,
+    ]);
+    const interactions: Array<QueuedMessage & { wakeId: string }> = [];
+    if (ownsIssue) for (const wake of wakes) {
+      const response = await readFirstTurnInteraction(tx as unknown as Db, binding, wake, run.responsibleUserId);
+      if (response) interactions.push({ ...response, wakeId: wake.id });
+    }
+    const commentIds = [...new Set(joining.flatMap(wake => queuedCommentIdsFromWakePayload(wake.payload)))].filter(id => !ownInput.has(id));
+    const pressedAt = nonEmptyString(record(record(run.resultJson).personStopHeld).pressedAt);
+    const taken = (await readQueuedMessages(tx as unknown as Db, { ...binding, responsibleUserId: run.responsibleUserId,
+      commentIds, excludeDelivered: true })).filter(message => !pressedAt || message.createdAt.getTime() <= Date.parse(pressedAt));
     // Render before sealing: once the receipt commits, nothing can fail
     // between it and the turn input that the receipt describes.
-    const text = await render(taken);
+    if (handback) taken.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
+    const takenInteractions = interactions.filter(message => !pressedAt || message.createdAt.getTime() <= Date.parse(pressedAt));
+    const text = await render([...taken, ...takenInteractions]);
     // Seal even when nothing joined: later messages wait for the turn boundary.
     const sealed: FirstTurnQueuedInputReceipt = {
       schema: FIRST_TURN_QUEUED_INPUT_SCHEMA,
       runId: run.id,
       wakeupRequestIds: joining.filter(wake => queuedCommentIdsFromWakePayload(wake.payload)
-        .some(id => taken.some(message => message.id === id))).map(wake => wake.id),
+        .some(id => taken.some(message => message.id === id))).map(wake => wake.id).concat(takenInteractions.map(message => message.wakeId)),
       commentIds: taken.map(message => message.id),
+      interactionIds: [...new Set(takenInteractions.map(message => message.id))],
       claimedAt: new Date().toISOString(),
     };
     await tx.update(heartbeatRuns).set({
-      contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ [FIRST_TURN_QUEUED_INPUT_KEY]: sealed })}::jsonb`,
+      contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ [FIRST_TURN_QUEUED_INPUT_KEY]: sealed,
+        ...(handback ? { preDispatchInputHandback: true } : {}) })}::jsonb`,
       updatedAt: new Date(),
     }).where(eq(heartbeatRuns.id, run.id));
     return text;
@@ -358,22 +426,26 @@ export async function firstTurnQueuedCommentIds(
     runtimeModeResolvedAt: heartbeatRuns.runtimeModeResolvedAt, responsibleUserId: heartbeatRuns.responsibleUserId,
     dispatchAdapterType: sql<string | null>`${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType'`,
     receipt: sql<unknown>`${heartbeatRuns.contextSnapshot}->${FIRST_TURN_QUEUED_INPUT_KEY}`,
+    conversationGeneration: sql<number | null>`${heartbeatRuns.contextSnapshot}->'conversationSessionGeneration'`,
     swarmCommentId: sql<unknown>`${heartbeatRuns.contextSnapshot}->'antigravitySwarmCommentId'`,
     executionRunId: issues.executionRunId, conversationAgentId: issues.conversationAgentId,
+    assigneeAgentId: issues.assigneeAgentId, conversationState: issues.conversationState,
+    conversationSessionGeneration: issues.conversationSessionGeneration,
   }).from(heartbeatRuns)
     .leftJoin(issues, and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
     .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId))).limit(1);
   if (!row || row.status !== "running" || row.agentId !== wake.agentId) return [];
   const run = { ...row, runnerProfileJson: { adapterDispatch: { adapterType: row.dispatchAdapterType } },
-    contextSnapshot: { [FIRST_TURN_QUEUED_INPUT_KEY]: row.receipt,
+    contextSnapshot: { [FIRST_TURN_QUEUED_INPUT_KEY]: row.receipt, conversationSessionGeneration: row.conversationGeneration,
       ...(row.swarmCommentId == null ? {} : { antigravitySwarmCommentId: row.swarmCommentId }) } };
   const receipt = readFirstTurnQueuedInputReceipt(run);
   if (receipt) {
     const sealed = new Set(receipt.commentIds);
     return wakeIds.filter(id => sealed.has(id));
   }
-  if (row.conversationAgentId || row.executionRunId !== run.id || !run.responsibleUserId) return [];
-  if (!deferredWakeJoinsFirstTurn(wake, run)) return [];
+  if (!ownsFirstTurnIssue(row, run) || !run.responsibleUserId) return [];
+  if (!deferredWakeJoinsFirstTurn(wake, run) ||
+      record(record(wake.payload)[DEFERRED_WAKE_CONTEXT_KEY]).forceFreshSession === true) return [];
   if (!(await runAcceptsFirstTurnQueuedInput(tx, run))) return [];
   const eligible = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
     inArray(issueComments.id, wakeIds),

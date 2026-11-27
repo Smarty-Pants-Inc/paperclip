@@ -1,6 +1,7 @@
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { notifyNativeStatusReassessment } from "./native-status-reassessment-notifications.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-notifications.js";
+import { notifyDeferredWakesForIssue } from "./deferred-execution-notifications.js";
 import { notifyInstructionCollection } from "./instruction-collection-notifications.js";
 import { notifyExecutionRunWork } from "./execution-control-notifications.js";
 import { hasRequiredWorkspaceRecovery, preserveWorkspaceRestoreRecoveryMetadata, LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "./workspace-restore-recovery-state.js";
@@ -15,6 +16,7 @@ import { REPOSITORY_CATALOG_UNAVAILABLE_CODE } from "./repository-catalog-unavai
 import { RUNNER_REVISION_MISMATCH_CODE } from "./runner-revision-mismatch.js";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { normalizeMaxTurnStopReason } from "./heartbeat-stop-metadata.js";
+import { preservePersonStopResultSql } from "./person-stop-result.js";
 import { claimedAdapterType, hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { canonicalExecutionUuid } from "./execution-identity.js";
 import { randomUUID } from "node:crypto";
@@ -22,6 +24,8 @@ import { and, desc, eq, getTableColumns, inArray, isNull, or, sql, type SQL } fr
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { executionStartedEventPredicate, isPreDispatchResourceWait } from "./pre-dispatch-execution-evidence.js";
 import { readRunCancellation } from "./run-cancellation.js";
+import { readRunFailureStage } from "./run-failure-stage.js";
+import { classifiedRunFailure } from "./recovery/stranded-notice.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
@@ -38,6 +42,14 @@ type Run = typeof heartbeatRuns.$inferSelect;
 export const UNRESTORED_FILES_NEXT_ACTION = "The task's saved files could not be put back after the run stopped. "
   + "They are kept where they were and are not applied. Press Retry to continue from the last saved version in a new workspace.";
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
+
+async function workspaceRecoveryNextAction(db: Pick<Db, "select">, run: Pick<Run, "id" | "companyId" | "errorCode">) {
+  // Containing a prepared workspace does not mean its files caused the failure.
+  const failure = classifiedRunFailure({ errorCode: run.errorCode,
+    ...(run.errorCode === "native_session_interrupted" ? await readRunFailureStage(db, run.companyId, run.id) : undefined) });
+  return ["agent_machine_unreachable", "agent_machine_unavailable", "previous_session_unconfirmed"].includes(failure.code)
+    ? `${failure.title}. ${failure.detail} Press Retry to start it again.` : UNRESTORED_FILES_NEXT_ACTION;
+}
 
 const unusedReconciliationContextKeys = [
   "executionContinuation", "paperclipWake", "paperclipWakeComment",
@@ -194,14 +206,14 @@ export async function terminalizeLegacyExecution(input: {
           .where(
             and(eq(issues.companyId, run.companyId), eq(issues.id, issueId)),
           )
-          .for("update")
+          .for("no key update")
       : [];
     const [current] = await tx.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId,
       runtimeMode: heartbeatRuns.runtimeMode, status: heartbeatRuns.status,
       resultJson: heartbeatRuns.resultJson, executionStatusDeliveryId: heartbeatRuns.executionStatusDeliveryId,
     }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
-    )).for("update");
+    )).for("no key update");
     if (!current || (current.runtimeMode !== "legacy" && !(input.recordRestoreFailureOnly && current.runtimeMode === "native")) ||
         (!input.recordRestoreFailureOnly && !(input.fromStatuses ?? [run.status]).includes(current.status))) return null;
     if (!input.recordRestoreFailureOnly && current.status === status && Object.keys(patch ?? {}).length === 0
@@ -226,6 +238,9 @@ export async function terminalizeLegacyExecution(input: {
       .set({
         status: input.recordRestoreFailureOnly ? current.status : status,
         ...patch,
+        ...(status === "failed" && patch?.resultJson !== undefined ? {
+          resultJson: preservePersonStopResultSql(sql`${JSON.stringify(patch.resultJson)}::jsonb`),
+        } : {}),
         executionStatusDeliveryId: input.recordRestoreFailureOnly || current.status !== status || Object.keys(patch ?? {}).length > 0
           ? randomUUID() : current.executionStatusDeliveryId,
         updatedAt: new Date(),
@@ -319,7 +334,7 @@ export async function terminalizeLegacyExecution(input: {
       const values = { status: "resolved", outcome: "blocked", ownerType: "board", ownerAgentId: null,
         ownerUserId: null, returnOwnerAgentId: null, evidence, resolvedAt: now, updatedAt: now,
         wakePolicy: null, monitorPolicy: null,
-        nextAction: UNRESTORED_FILES_NEXT_ACTION,
+        nextAction: await workspaceRecoveryNextAction(tx, updated),
       };
       if (existing) await tx.update(issueRecoveryActions).set(values).where(eq(issueRecoveryActions.id, existing.id));
       else await tx.insert(issueRecoveryActions).values({ ...values, companyId: run.companyId,
@@ -356,7 +371,7 @@ export async function terminalizeLegacyExecution(input: {
           attempt: executionFailureRetryCount(run) + 1,
         },
         nextAction: hasRequiredWorkspaceRecovery(updated.resultJson)
-          || hasWorkspaceRestoreFailure(updated.resultJson) ? UNRESTORED_FILES_NEXT_ACTION
+          || hasWorkspaceRestoreFailure(updated.resultJson) ? await workspaceRecoveryNextAction(tx, updated)
           : "The run stopped before it finished, and Paperclip cannot tell which of its last actions took effect. "
             + "Press Retry to continue the task in a fresh run; the agent checks those actions before repeating any.",
         maxAttempts: 3,
@@ -379,8 +394,8 @@ export async function settleInterruptedNativeBootstrap(
   const issueId = input.run.contextSnapshot?.issueId;
   if (typeof issueId !== "string") return null;
   return db.transaction(async tx => {
-    const [task] = await tx.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, input.run.companyId))).for("update");
-    const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.run.id), eq(heartbeatRuns.companyId, input.run.companyId))).for("update");
+    const [task] = await tx.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, input.run.companyId))).for("no key update");
+    const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.run.id), eq(heartbeatRuns.companyId, input.run.companyId))).for("no key update");
     if (!task || !run || !isInterruptedNativePreparationCandidate(run) ||
         run.contextSnapshot?.issueId !== task.id ||
         // A spent failure budget keeps the hold, except for a preparation that
@@ -505,7 +520,8 @@ export async function settleCancelledLegacyPreparation(
     )).limit(1);
     if (native || execution || leases.some(lease => lease.provider === "local"
       ? !lease.releasedAt || lease.status === "pending_cleanup" || lease.cleanupStatus === "failed"
-      : !hasRemoteTerminationReceipt(lease))) return null;
+      : !hasRemoteTerminationReceipt(lease) && !(run.resultJson?.preDispatchCancellationSettledAt &&
+          lease.leasePolicy === "reuse_by_environment" && lease.status === "released" && lease.cleanupStatus === "success"))) return null;
     const now = new Date();
     const cancellation = readRunCancellation(run.resultJson);
     const operatorStop = cancellation?.source === "operator" && cancellation.initiator.type === "user";
@@ -550,6 +566,7 @@ export async function settleCancelledLegacyPreparation(
           else ${issueRecoveryActions.evidence} end`,
     }).where(inArray(issueRecoveryActions.id, holds.map(hold => hold.id))).returning({ id: issueRecoveryActions.id }) : [];
     if (resolved.length) {
+      await notifyDeferredWakesForIssue(tx, { companyId: run.companyId, issueId: task.id });
       await notifyUnsafeWorkspaceExportRecovery(tx, { companyId: run.companyId, issueId: task.id });
       await logActivity(tx as unknown as Db, { companyId: run.companyId, actorType: "system", actorId: "system",
         action: "issue.recovery_action_resolved", entityType: "issue", entityId: task.id, agentId: run.agentId, runId: run.id,

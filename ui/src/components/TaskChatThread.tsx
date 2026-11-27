@@ -8,7 +8,9 @@ import { preparationReceiptIds, runFileCardAttachments } from "./task-chat/image
 import { RunFileCardsContext } from "./task-chat/RunFileCardsContext";
 import type { ScrollingHistory } from "@/components/task-chat/TaskMessageScroller";
 import { TaskChatShimmerScope } from "@/components/task-chat/TaskChatShimmer";
+import { TaskChatStatusContext, TaskChatStatusLine, taskChatLineState, taskChatTurnStart } from "@/components/task-chat/TaskChatStatusLine";
 import { useRunnerSubmission } from "@/hooks/useRunnerSubmission";
+import { useCompanyLiveEvent } from "@/context/LiveUpdatesProvider";
 import { TaskChatLoadingShell } from "@/components/task-chat/TaskChatLoadingShell";
 import {
   ISSUE_DETAIL_CONTENT_PAINT_MARK,
@@ -25,6 +27,7 @@ import { skillCreatedItems } from "@/components/task-chat/skill-created-items";
 import { taskCreatedItems } from "@/components/task-chat/task-created-items";
 import { useCoordinatorPresentation } from "@/components/coordinator/CoordinatorPresentation";
 import { useConnectivity } from "@/lib/connectivity";
+import { useSecondTick } from "@/hooks/useSecondTick";
 import { CoordinatorChatHandoffStatus, CoordinatorChatTaskHandoff, standaloneChatHandoffs, useCoordinatorChatTaskHandoffs, useLiveChatHandoffIds } from "@/components/coordinator/CoordinatorChatTaskHandoffs";
 import { CoordinatorChatReceiptStatus, useCoordinatorChatDecisionReceipts } from "@/components/coordinator/CoordinatorChatDecisionReceipts";
 import { CoordinatorChatQuestionStatus, useCoordinatorChatPendingQuestions } from "@/components/coordinator/CoordinatorChatPendingQuestions";
@@ -56,6 +59,9 @@ import { ProviderToolIconsProvider } from "@/components/ProviderToolIcon";
 import { McpAppTurnViews, mcpAppRunRefreshKey } from "@/components/mcp-app/McpAppTurnViews";
 import { ToolCallProgressProvider } from "@/components/task-chat/tool-call-progress";
 import { TaskChatRunnerHeader, TaskChatRunnerTurn } from "@/components/task-chat/TaskChatRunnerTurn";
+import { ExecutionBlockerNotice, nativeFailureNoticeRunId, isConversationRecovery, isPersonStoppedRun } from "./ExecutionBlockerNotice";
+import type { TranscriptEntry } from "@/adapters/types";
+import { isNoLiveExecutionPathNotice } from "./task-chat/adjacent-errors";
 import { partitionRunHealthItems } from "@/components/task-chat/TaskChatRunHealthBanner";
 import {
   TaskChatTurnStatusIsland,
@@ -71,6 +77,7 @@ import {
   assembleThreadItems,
   attachSettledTurns,
   buildTurnSummary,
+  buildTurnTimelineRows,
   coalesceSettledTurns,
   isTerminalRunStatus,
   embedPlanDocumentAtWriteBoundary,
@@ -135,6 +142,7 @@ import {
   useRunnerGoalControl,
 } from "@/components/task-chat/RunnerGoalWidget";
 import { TaskChatQueuedMessages } from "@/components/task-chat/TaskChatQueuedMessages";
+import { useWaitingToStart } from "@/components/task-chat/useWaitingToStart";
 import { QUEUED_MESSAGE_AUTO_STEER_DELAY_MS } from "@/components/task-chat/queued-message-auto-steer";
 import { useSidebar } from "@/context/SidebarContext";
 import { useStreamlinedUiEnabled } from "@/hooks/useStreamlinedUiEnabled";
@@ -415,6 +423,15 @@ function resolvedWithoutUserFacingResponse(value: unknown): boolean {
 }
 
 export type TaskChatThreadProps = ComponentProps<typeof IssueChatThread> & {
+  onFailureNoticeChange?: (runId: string | null) => void;
+  /** A person's Stop hands back the messages the agent hadn't taken (resultJson.personStop.returned). */
+  onRestoreStoppedMessages?: (commentIds: readonly string[]) => Promise<boolean>;
+  /** Placement belongs to the page; hidden queue entries still drive delivery. */
+  sentCommentIds?: ReadonlySet<string>;
+  hiddenThreadCommentIds?: ReadonlySet<string>;
+  hiddenQueuedCommentIds?: ReadonlySet<string>;
+  onRetainedSubmissionChange?: (requestId: string | null) => void;
+  onRestoreReady?: () => void;
   conversationMode?: boolean;
   creationActivity?: ActivityEvent[];
   createdTasks?: Issue[];
@@ -499,9 +516,19 @@ function durableInputLabel(
  * to the tool history. Turns without a reply bubble keep the standalone
  * folded row. flag-OFF remains byte-for-byte IssueChatThread.
  */
+// Server holds that settle by themselves after a Stop: run-control's execution_recovery and
+// explicit-native-continuation's blocked() waits whose words say the message starts automatically
+// or Paperclip is finishing / verifying on its own (not the ones that need the person).
+const HELD_BY_RECOVERY_REASONS = new Set([
+  "execution_recovery", "controller_settling", "execution_settling", "process_running", "process_identity_missing",
+  "cleanup_pending", "local_cleanup", "remote_cleanup", "finalizing_saved_result", "execution_owner_active",
+]);
+
 export function TaskChatThread(props: TaskChatThreadProps) {
   const coordinatorEnabled = useCoordinatorPresentation();
-  const { status: connectionStatus } = useConnectivity();
+  const { status: connectionStatus, recoveredAt } = useConnectivity();
+  const historyRecoveryGrace = recoveredAt !== null && Date.now() - recoveredAt < 10_000;
+  useSecondTick(connectionStatus === "online" && historyRecoveryGrace);
   const { enabled: streamlinedPreference } = useStreamlinedUiEnabled();
   const streamlinedUiEnabled = coordinatorEnabled || streamlinedPreference;
   const {
@@ -525,6 +552,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     stopScope,
     issueWorkMode = "standard",
     onWorkModeChange,
+    composerRef,
     composerAccessory,
     footer,
     showComposer = true,
@@ -571,6 +599,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     onRetryFailedRun,
     retryFailedRunId = null,
     queuedCommentQueue,
+    sentCommentIds,
+    hiddenThreadCommentIds,
+    hiddenQueuedCommentIds,
+    onRetainedSubmissionChange,
+    onRestoreReady,
     onEditQueuedComment,
     onReorderQueuedComments,
     onSteerQueuedComment,
@@ -582,6 +615,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     onResumeAssignee,
     resumeAssigneePending = false,
     onOpenSkill,
+    onRestoreStoppedMessages,
   } = props;
   const {
     data: planDocument,
@@ -603,6 +637,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     requiresExecutionReconciliation(props.recoveryAction?.cause) ||
     props.scheduledRetry ||
     linkedRuns?.some((run) => {
+      // A terminal diagnostic is not a live executor. Honor the current
+      // interruption's explicit Retry permission, never an unresolved hold.
+      if (run.runtimeMode === "native" && ["failed", "timed_out", "interrupted"].includes(run.status) &&
+        run.execution?.phase === "recovery_needed" && !requiresExecutionReconciliation(run.execution.cause) &&
+        !requiresExecutionReconciliation(run.errorCode) && props.interruption?.state === "failed" &&
+        props.interruption.canRetry && props.interruption.observedRunId === run.runId &&
+        isConversationRecovery(props.interruption, run.status)) return false;
       // The server accepts explicit new attempts for these stopped legacy
       // conversations. It still proves process/lease termination and ownership;
       // offering Retry does not certify prior action outcomes or resume them.
@@ -693,10 +734,12 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     [issueId, queryClient],
   );
 
-  const queuedMessageQueue =
-    queuedCommentQueue && queuedCommentQueue.entries.length > 0
-      ? queuedCommentQueue
-      : null;
+  const attemptedAutoSteer = useRef(new Set<string>());
+  const queuedMessageQueue = queuedCommentQueue;
+  const returnedCommentIds = useMemo(() => new Set((linkedRuns ?? []).flatMap(run => {
+    const stop = run.resultJson?.personStop as { returned?: unknown } | undefined;
+    return Array.isArray(stop?.returned) ? stop.returned.filter((id): id is string => typeof id === "string") : [];
+  })), [linkedRuns]);
   const emptyQueuedCommentQueue = useMemo<IssueQueuedCommentQueue>(
     () => ({
       issueId: issueId ?? "",
@@ -713,9 +756,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const queuedCommentIds = useMemo(
     () =>
       new Set(
-        queuedMessageQueue?.entries.map((entry) => entry.comment.id) ?? [],
+        [...(queuedMessageQueue?.entries ?? []), ...(queuedMessageQueue?.pendingQueue?.entries ?? [])]
+          .filter(entry => !sentCommentIds?.has(entry.comment.id))
+          .map((entry) => entry.comment.id),
       ),
-    [queuedMessageQueue],
+    [queuedMessageQueue, sentCommentIds],
   );
   const [queuedEdit, setQueuedEdit] = useState<{
     commentId: string;
@@ -905,11 +950,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   );
   const runFileCards = useMemo(() => runFileCardAttachments(workProducts), [workProducts]);
   const projectedComments = useMemo(
-    () =>
-      comments.flatMap((comment) => {
-        if (imageReceipts.has(comment.id)) return [];
+    () => {
+      return comments.flatMap((comment) => {
+        if (hiddenThreadCommentIds?.has(comment.id) || imageReceipts.has(comment.id)) return [];
         if (comment.authorType === "system" && comment.metadata?.recoveryResponsibility === "system") return [];
-        if (statusRelevance.isHistoricalNotice(comment)) return [];
+        if (statusRelevance.isHistoricalNotice(comment) && !nativeFailureNoticeRunId(comment)) return [];
         if (isRedundantAiRecoveryNotice(comment, interactions)) return [];
         if (comment.body !== LEGACY_WITHHELD_RUN_COMMENT || !comment.runId)
           return [comment];
@@ -922,13 +967,26 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         }
         const summary = acceptedSemanticResultSummary(resultJson);
         return [summary ? { ...comment, body: summary } : comment];
-      }),
-    [comments, interactions, linkedRunMetaById, statusRelevance, imageReceipts],
+      });
+    },
+    [comments, hiddenThreadCommentIds, interactions, linkedRunMetaById, statusRelevance, imageReceipts],
   );
+
+  const failureNoticeIds = useMemo(() => new Map(projectedComments.flatMap(comment => {
+    const runId = nativeFailureNoticeRunId(comment);
+    return runId && linkedRunMetaById.has(runId) ? [[runId, comment.id] as const] : [];
+  })), [projectedComments, linkedRunMetaById]);
+  const noticeOwnedRunId = failureNoticeIds.has(props.interruption?.observedRunId ?? "") ? props.interruption!.observedRunId : null;
+  useLayoutEffect(() => {
+    props.onFailureNoticeChange?.(noticeOwnedRunId);
+    return () => props.onFailureNoticeChange?.(null);
+  }, [props.onFailureNoticeChange, noticeOwnedRunId]);
 
   const commentItems = useMemo(
     () =>
-      commentsToTaskChatItems(projectedComments, {
+      commentsToTaskChatItems(projectedComments.map(comment =>
+        comment.authorType === "user" && comment.conversationSessionGeneration != null
+          ? { ...comment, conversationSessionGeneration: null } : comment), {
         agentMap,
         userLabelMap,
         userProfileMap,
@@ -947,6 +1005,15 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     ],
   );
 
+  const [terminalStatuses, setTerminalStatuses] = useState(new Map<string, string>());
+  const previousLinkedRunMeta = useRef(linkedRunMetaById);
+  useLayoutEffect(() => {
+    // A newer polled recovery supersedes the old turn's terminal receipt.
+    const recoveredIds = new Set([...linkedRunMetaById].filter(([id, run]) =>
+      run.status === "running" && isTerminalRunStatus(previousLinkedRunMeta.current.get(id)?.status ?? "")).map(([id]) => id));
+    previousLinkedRunMeta.current = linkedRunMetaById;
+    if (recoveredIds.size) setTerminalStatuses(current => new Map([...current].filter(([id]) => !recoveredIds.has(id))));
+  }, [linkedRunMetaById]);
   // Every run we might need a transcript for (history + live), deduped by id.
   const runs = useMemo<RunTranscriptSource[]>(() => {
     const map = new Map<string, RunTranscriptSource>();
@@ -984,9 +1051,91 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         lastOutputBytes: activeRun.lastOutputBytes,
       });
     }
-    return [...map.values()];
-  }, [linkedRuns, liveRuns, activeRun]);
+    return [...map.values()].map((run) => {
+      // A stale live snapshot must not restart a settled segment's clock or tail.
+      const status = terminalStatuses.get(run.id) ?? linkedRunMetaById.get(run.id)?.status;
+      return status && isTerminalRunStatus(status) ? { ...run, status } : run;
+    });
+  }, [linkedRuns, liveRuns, activeRun, linkedRunMetaById, terminalStatuses]);
 
+  const requestCommentByRun = useMemo(() => {
+    const byRun = new Map((linkedRuns ?? []).map(run => { const request = run as typeof run & { wakeCommentId?: string; contextCommentId?: string };
+      return [run.runId, request.wakeCommentId ?? request.contextCommentId] as const; }));
+    for (const run of [...(liveRuns ?? []), ...(activeRun ? [activeRun] : [])]) {
+      const commentId = run.contextWakeCommentId ?? run.contextCommentId;
+      if (commentId) byRun.set(run.id, commentId);
+    }
+    return byRun;
+  }, [linkedRuns, liveRuns, activeRun]);
+  const stoppedRunIds = useRef(new Set<string>());
+  const isUserStop = useCallback((id: string) => {
+    return stoppedRunIds.current.has(id) || isPersonStoppedRun(linkedRunMetaById.get(id));
+  }, [linkedRunMetaById]);
+  // Retries of one request join runs; session continuity across new messages does not.
+  const runChainIdsById = useMemo(() => {
+    const predecessors = new Map<string, string | null | undefined>();
+    for (const run of linkedRuns ?? []) predecessors.set(run.runId, run.retryOfRunId ?? run.execution?.predecessorRunId);
+    for (const run of [...(liveRuns ?? []), ...(activeRun ? [activeRun] : [])]) {
+      predecessors.set(run.id, "retryOfRunId" in run && typeof run.retryOfRunId === "string"
+        ? run.retryOfRunId : run.execution?.predecessorRunId ?? predecessors.get(run.id));
+    }
+    for (const [runId, predecessorId] of predecessors) {
+      const request = requestCommentByRun.get(runId);
+      const previousRequest = predecessorId && requestCommentByRun.get(predecessorId);
+      const explicitRetry = linkedRunMetaById.get(runId)?.retryOfRunId === predecessorId ||
+        [...(liveRuns ?? []), ...(activeRun ? [activeRun] : [])].some(run => run.id === runId &&
+          "retryOfRunId" in run && run.retryOfRunId === predecessorId);
+      if (!(request && request === previousRequest) && (!explicitRetry || (request && previousRequest))) {
+        predecessors.delete(runId);
+      }
+    }
+    const previousByComment = new Map<string, string>();
+    for (const run of [...runs].sort((a, b) => toMs(a.createdAt) - toMs(b.createdAt))) {
+      const commentId = requestCommentByRun.get(run.id);
+      if (!commentId || !comments.some(comment => comment.id === commentId && comment.authorUserId && !comment.authorAgentId)) continue;
+      if (previousByComment.has(commentId)) predecessors.set(run.id, previousByComment.get(commentId));
+      previousByComment.set(commentId, run.id);
+    }
+    // A failed continuous run may have taken this request by Steer, not at admission.
+    for (const run of runs) {
+      const request = requestCommentByRun.get(run.id);
+      const previous = request && linkedRuns?.findLast(candidate => candidate.runId !== run.id &&
+        toMs(candidate.createdAt) < toMs(run.createdAt) && ["failed", "timed_out", "interrupted"].includes(candidate.status) &&
+        Object.prototype.hasOwnProperty.call(candidate.resultJson?.queuedSteeringAcknowledgements ?? {}, request));
+      if (previous && !predecessors.get(run.id)) predecessors.set(run.id, previous.runId);
+    }
+    const chains = new Map<string, string[]>();
+    for (const run of runs) {
+      const ids = [run.id];
+      let predecessor = predecessors.get(run.id);
+      while (predecessor && !ids.includes(predecessor) && !isUserStop(predecessor)) {
+        ids.unshift(predecessor);
+        predecessor = predecessors.get(predecessor);
+      }
+      chains.set(run.id, ids);
+    }
+    return chains;
+  }, [runs, linkedRuns, liveRuns, activeRun, requestCommentByRun, linkedRunMetaById, comments, isUserStop]);
+
+  // Pi's Stop (Esc): the messages it hadn't taken go back into the stopping person's input box, once.
+  // Keyed on state (his returned messages still exist), so a reload or another of his devices restores too.
+  const restoredStopCommentIds = useRef(new Set<string>());
+  useLayoutEffect(() => {
+    const availableIds = new Set(comments.filter(comment => !comment.deletedAt && comment.authorUserId === currentUserId).map(comment => comment.id));
+    for (const meta of linkedRunMetaById.values()) {
+      const stop = meta.resultJson?.personStop as { userId?: unknown; returned?: unknown } | undefined;
+      if (!onRestoreStoppedMessages || !currentUserId || stop?.userId !== currentUserId) continue;
+      const returned = Array.isArray(stop?.returned) ? stop.returned.filter((id): id is string =>
+        typeof id === "string" && availableIds.has(id) && !restoredStopCommentIds.current.has(`${issueId}:${id}`)) : [];
+      if (!returned.length) continue;
+      // Track IDs, not runs: [a] arriving first must not complete receipt [a,b].
+      const keys = returned.map(id => `${issueId}:${id}`);
+      keys.forEach(key => restoredStopCommentIds.current.add(key));
+      void onRestoreStoppedMessages(returned).then(done => {
+        if (!done) keys.forEach(key => restoredStopCommentIds.current.delete(key));
+      }, () => { keys.forEach(key => restoredStopCommentIds.current.delete(key)); });
+    }
+  }, [issueId, linkedRunMetaById, comments, currentUserId, onRestoreStoppedMessages]);
   const openedAt = useMemo(() => Date.now(), [issueId]);
   const scrollNavigation = useTaskChatScrollNavigation();
   const requestedTranscripts = useRef({ issueId, ids: new Set<string>() });
@@ -1007,8 +1156,15 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const deferredTranscriptRunIds = useMemo(() => {
     const deferred = new Set<string>();
     if (!compactTranscriptDeferral) return deferred;
-    for (const run of runs) if (slowSettledTranscriptRunIds.has(run.id)) deferred.add(run.id);
+    // The newest finished reply is what the person just saw: a reload keeps its words (moment 10),
+    // even when its transcript misses the reveal budget (it stops holding the reveal and draws when it lands).
+    const newestSucceededRunId = runs.filter(run => run.status === "succeeded" && run.createdAt)
+      .sort((a, b) => toMs(a.createdAt) - toMs(b.createdAt)).at(-1)?.id;
+    for (const run of runs) if (slowSettledTranscriptRunIds.has(run.id) && run.id !== newestSucceededRunId) deferred.add(run.id);
     for (const run of runs) {
+      // Native compact history now retains visible tools; a saved body alone
+      // cannot stand in for the turn's activity after reload.
+      if (run.runtimeMode === "native" || run.id === newestSucceededRunId) continue;
       if (requestedTranscripts.current.ids.has(run.id) || run.status !== "succeeded" ||
         !run.createdAt || toMs(run.createdAt) > openedAt) continue;
       const meta = linkedRunMetaById.get(run.id);
@@ -1035,6 +1191,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   );
   const {
     transcriptByRun: nativeTranscriptByRun,
+    activityLabelByRun: nativeActivityLabelByRun,
     errorsByRun: nativeTranscriptErrorsByRun,
     isInitialHydrating: nativeEventsAreInitiallyHydrating,
     hydratedRunIds: hydratedNativeRunIds,
@@ -1049,6 +1206,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     // Active runs still need the websocket log stream. Only settled native
     // history can skip the legacy transport when event history is available.
     run.status === "running" || run.status === "queued" ||
+    // Retain the old source until native history is ready (no blank at the hand-over).
+    !hydratedNativeRunIds.has(run.id) ||
     nativeTranscriptErrorsByRun.has(run.id) ||
     (hydratedNativeRunIds?.has(run.id) &&
       (nativeTranscriptByRun.get(run.id)?.length ?? 0) === 0)
@@ -1066,46 +1225,90 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   );
   const transcriptByRun = useMemo(() => {
     const next = new Map(logTranscriptByRun);
-    for (const run of nativeRuns) {
+    for (const run of transcriptRuns) {
       const nativeTranscript = nativeTranscriptByRun.get(run.id) ?? [];
       const logTranscript = logTranscriptByRun.get(run.id) ?? [];
-      if (nativeTranscriptErrorsByRun.has(run.id) && logTranscript.length > 0) {
-        fallbackByRunRef.current.set(run.id, logTranscript);
-      }
-      const fallback = fallbackByRunRef.current.get(run.id);
-      const lastTimestamp = (entries: typeof nativeTranscript) =>
-        entries.reduce((latest, entry) => Math.max(latest, toMs(entry.ts)), 0);
-      // Keep a newer fallback visible through native transport recovery. An
-      // empty successful poll must not rewind a response the reader just saw.
-      if (
-        fallback &&
-        (nativeTranscriptErrorsByRun.has(run.id) ||
-          lastTimestamp(nativeTranscript) < lastTimestamp(fallback))
-      ) {
-        next.set(run.id, fallback);
-      } else if (nativeTranscript.length > 0) {
-        fallbackByRunRef.current.delete(run.id);
-        next.set(run.id, nativeTranscript);
-      }
+      // Once native owns the source, later log receipts cannot replace it.
+      // Before that handoff, keep the available log history current.
+      const fallback = nativeTranscript.length === 0 && logTranscript.length > 0
+        ? logTranscript
+        : fallbackByRunRef.current.get(run.id) ?? logTranscript;
+      const reasoningItems = (entries: typeof nativeTranscript) =>
+        paperclipRunnerTimelineItems(transcriptToTaskChatItems(entries, { runId: run.id, running: false }))
+          .filter(item => item.kind === "thinking");
+      const nativeReasoning = new Map(reasoningItems(nativeTranscript).map(item => [item.id, item]));
+      const losesReasoning = reasoningItems(fallback).filter(item => item.lines.some(line => line.trim())).some(item => {
+        const native = nativeReasoning.get(item.id);
+        return !native || native.channel !== item.channel;
+      });
+      // Coverage is rows, identities and channels, never prose or receipt time.
+      const source = nativeTranscript.length > 0 && !losesReasoning
+        ? nativeTranscript
+        : run.runtimeMode === "native" && !hydratedNativeRunIds.has(run.id) && !fallbackByRunRef.current.has(run.id)
+          ? nativeTranscript
+          : fallback;
+      if (source.length > 0) fallbackByRunRef.current.set(run.id, source);
+      next.set(run.id, source);
     }
     for (const id of fallbackByRunRef.current.keys()) {
-      if (!nativeRuns.some((run) => run.id === id))
+      if (!transcriptRuns.some((run) => run.id === id))
         fallbackByRunRef.current.delete(id);
     }
-    return next;
+    // Keep the original attempt in place; omit only identity-and-payload-equal replay groups.
+    // Whole groups prevent a replayed call being removed while its changed result survives alone.
+    const groupKey = (entry: TranscriptEntry) => entry.kind === "assistant" || entry.kind === "thinking"
+      ? entry.itemId && `${entry.kind}:${entry.channel}:${entry.itemId}`
+      : entry.kind === "tool_call" || entry.kind === "tool_result" ? entry.toolUseId && `tool:${entry.toolUseId}` : undefined;
+    const groups = (entries: readonly TranscriptEntry[]) => {
+      const grouped = new Map<string, TranscriptEntry[]>();
+      for (const entry of entries) { const key = groupKey(entry); if (key) grouped.set(key, [...(grouped.get(key) ?? []), entry]); }
+      return grouped;
+    };
+    return new Map([...next].map(([id, entries]) => {
+      const prior = new Set((runChainIdsById.get(id) ?? []).slice(0, -1).flatMap(previous =>
+        [...groups(next.get(previous) ?? []).values()].map(group => JSON.stringify(group))));
+      const replayed = new Set([...groups(entries)].filter(([, group]) => prior.has(JSON.stringify(group))).map(([key]) => key));
+      return [id, entries.filter(entry => !replayed.has(groupKey(entry) ?? ""))];
+    }));
   }, [
+    runChainIdsById,
     logTranscriptByRun,
-    nativeRuns,
+    transcriptRuns,
     nativeTranscriptByRun,
-    nativeTranscriptErrorsByRun,
+    hydratedNativeRunIds,
   ]);
 
+  useCompanyLiveEvent((event) => {
+    const { runId, status } = event.payload;
+    if (event.companyId === companyId && event.type === "heartbeat.run.status" &&
+      typeof runId === "string" && typeof status === "string" && isTerminalRunStatus(status) && runs.some((run) => run.id === runId))
+      setTerminalStatuses((current) => new Map(current).set(runId, status));
+  });
   // The single in-flight run whose turn we stream live (non-terminal).
   const liveRun = useMemo(() => {
     if (isTerminalIssueStatus(issueStatus)) return null;
-    if (activeRun && isLiveIssueRun(activeRun, issueStatus)) return activeRun;
-    return (liveRuns ?? []).find((r) => isLiveIssueRun(r, issueStatus)) ?? null;
-  }, [activeRun, issueStatus, liveRuns]);
+    const isCurrentLive = (r: { id: string; status: string }) => isLiveIssueRun(r, issueStatus) &&
+      !isTerminalRunStatus(terminalStatuses.get(r.id) ?? linkedRunMetaById.get(r.id)?.status ?? "");
+    if (activeRun && isCurrentLive(activeRun)) return activeRun;
+    const live = (liveRuns ?? []).find(isCurrentLive);
+    if (live) return live;
+    const recovering = linkedRuns?.find((r) => !["succeeded", "cancelled"].includes(terminalStatuses.get(r.runId) ?? "") && !statusRelevance.isHistoricalRun(r.runId) && ["reconnecting", "retry_scheduled"].includes(r.execution?.phase ?? "") &&
+      ![...runChainIdsById.values()].some((ids) => ids.at(-1) !== r.runId && ids.includes(r.runId)));
+    return recovering ? { ...recovering, id: recovering.runId, agentName: recovering.agentName ?? "", adapterType: recovering.adapterType ?? "", currentStatusMessage: null } : null;
+  }, [activeRun, issueStatus, liveRuns, linkedRuns, linkedRunMetaById, runChainIdsById, statusRelevance, terminalStatuses]);
+  // Recovery owns status, never a predecessor's saved activity or reply.
+  const coveredAttemptIds = useMemo(() => {
+    const covered = new Set([...runChainIdsById.values()].flatMap(ids => ids.slice(0, -1)));
+    if (props.interruption?.responsibility === "system" &&
+      ["working", "retry_scheduled", "failed"].includes(props.interruption.state)) {
+      for (const id of props.interruption.sourceRunIds) covered.add(id);
+    }
+    return new Set(runs.filter(run => covered.has(run.id) && !isUserStop(run.id) &&
+      !transcriptToTaskChatItems(transcriptByRun.get(run.id) ?? [], { runId: run.id, running: false }).length &&
+      ["failed", "cancelled", "timed_out", "interrupted"].includes(terminalStatuses.get(run.id) ?? run.status)).map(run => run.id));
+  }, [runChainIdsById, props.interruption, runs, isUserStop, terminalStatuses, transcriptByRun]);
+  const stoppingReply = !!liveRun && !isTerminalRunStatus(linkedRunMetaById.get(liveRun.id)?.status ?? liveRun.status) &&
+    ((stopPending && stoppedRunIds.current.has(liveRun.id)) || Boolean(linkedRunMetaById.get(liveRun.id)?.resultJson?.personStop));
 
   // The live runner turn remains the sole owner of its response until the
   // canonical comment and settled activity are both ready. This state is
@@ -1130,7 +1333,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     setSettlingRun({
       id: prev.id,
       startedAtMs:
-        (prev.startedAt ? toMs(prev.startedAt) : null) ?? toMs(prev.createdAt),
+        prev.startedAt ? toMs(prev.startedAt) : null,
     });
   }, [liveRun]);
 
@@ -1143,11 +1346,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           )
         ? settlingRun.id
         : null;
-  const heldPaperclipRunnerStartedAtMs =
-    liveRun && heldPaperclipRunnerRunId === liveRun.id
-      ? ((liveRun.startedAt ? toMs(liveRun.startedAt) : null) ??
-        toMs(liveRun.createdAt))
-      : (settlingRun?.startedAtMs ?? null);
   const heldPaperclipRunnerFinalText = useMemo(() => {
     if (!heldPaperclipRunnerRunId) return null;
     const entries = transcriptByRun.get(heldPaperclipRunnerRunId) ?? [];
@@ -1167,6 +1365,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // Runs observed non-terminal while mounted: their turns ANIMATE the fold when
   // they settle. Runs already terminal at mount collapse instantly.
   const liveSeenRef = useRef<Set<string>>(new Set());
+  const drawnRunnerSegments = useRef(new Set<string>());
   useEffect(() => {
     if (liveRun) liveSeenRef.current.add(liveRun.id);
   }, [liveRun]);
@@ -1195,21 +1394,64 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     return map;
   }, [projectedComments]);
 
-  const steeringAnchorsByRun = useMemo(() => {
-    const map = new Map<string, number[]>();
+  const { steeringAnchorsByRun, steeringAnchorByCommentId } = useMemo(() => {
+    const steeringAnchorsByRun = new Map<string, number[]>();
+    const steeringAnchorByCommentId = new Map<string, number>();
     for (const comment of comments) {
-      const runId = comment.steeredIntoRunId;
-      if (comment.deletedAt || !runId || !comment.conversationAnchorAt)
-        continue;
-      const anchorMs = toMs(comment.conversationAnchorAt);
-      if (!Number.isFinite(anchorMs)) continue;
-      const anchors = map.get(runId) ?? [];
+      if (comment.deletedAt || comment.authorType !== "user") continue;
+      // The receipt splits agent output, not the person's immediate Send echo.
+      // It fixes ONE boundary; later provider consumption never re-splits.
+      const run = runs.find(run => Object.prototype.hasOwnProperty.call(
+        linkedRunMetaById.get(run.id)?.resultJson?.queuedSteeringAcknowledgements ?? {}, comment.id));
+      const receipt = run ? (linkedRunMetaById.get(run.id)?.resultJson?.queuedSteeringAcknowledgements as
+        Record<string, { acknowledgedAt?: string }> | undefined)?.[comment.id] : undefined;
+      const runId = run?.id ?? comment.steeredIntoRunId;
+      const anchorMs = toMs(receipt?.acknowledgedAt ?? (comment.steeredIntoRunId ? comment.conversationAnchorAt : undefined));
+      if (!runId || !Number.isFinite(anchorMs) || anchorMs <= 0) continue;
+      steeringAnchorByCommentId.set(comment.id, anchorMs);
+      const anchors = steeringAnchorsByRun.get(runId) ?? [];
       if (!anchors.includes(anchorMs)) anchors.push(anchorMs);
-      map.set(runId, anchors);
+      steeringAnchorsByRun.set(runId, anchors);
     }
-    for (const anchors of map.values()) anchors.sort((a, b) => a - b);
-    return map;
-  }, [comments]);
+    for (const anchors of steeringAnchorsByRun.values()) anchors.sort((a, b) => a - b);
+    return { steeringAnchorsByRun, steeringAnchorByCommentId };
+  }, [comments, runs, linkedRunMetaById]);
+
+  const visibleQueuedMessageQueue = queuedMessageQueue ?? emptyQueuedCommentQueue;
+
+  const continuousReplyPlacements = useMemo(() => {
+    const placements = new Map<string, { byItem: Map<string, number>; bySegment: Map<number, string>; questionsBySegment: Map<number, string[]> }>();
+    for (const run of linkedRuns ?? []) {
+      const replies = run.resultJson?.continuousReplies;
+      if (!replies || typeof replies !== "object" || Array.isArray(replies)) continue;
+      const anchors = steeringAnchorsByRun.get(run.runId) ?? [];
+      const byItem = new Map<string, number>();
+      const bySegment = new Map<number, string>();
+      const questionsBySegment = new Map<number, string[]>();
+      for (const [itemId, value] of Object.entries(replies)) {
+        if (!value || typeof value !== "object") continue;
+        const reply = value as { questionCommentIds?: unknown; commentId?: unknown };
+        if (!Array.isArray(reply.questionCommentIds) || typeof reply.commentId !== "string") continue;
+        const first = transcriptByRun.get(run.runId)?.find(entry => entry.kind === "assistant" && entry.itemId === itemId);
+        // ACK is queue admission, not consumption: several steers can precede
+        // the first output. Their reply receipts, not that timestamp, own it.
+        const questionSegment = Math.max(0, ...reply.questionCommentIds.map(id =>
+          anchors.indexOf(steeringAnchorByCommentId.get(String(id)) ?? NaN) + 1));
+        // A later steer cannot claim text already streaming before its ACK.
+        // Keep that first slot (also on reload), but not a later timestamp slot
+        // that would put an earlier question's answer below a second question.
+        const segmentIndex = first && toMs(first.ts) < (anchors[questionSegment - 1] ?? -Infinity)
+          ? anchors.filter(anchor => anchor <= toMs(first.ts)).length : questionSegment;
+        byItem.set(itemId, segmentIndex);
+        bySegment.set(segmentIndex, reply.commentId);
+        if (first?.kind === "assistant" && first.channel === "final" && first.text.trim()) {
+          questionsBySegment.set(segmentIndex, reply.questionCommentIds.filter((id): id is string => typeof id === "string"));
+        }
+      }
+      placements.set(run.runId, { byItem, bySegment, questionsBySegment });
+    }
+    return placements;
+  }, [linkedRuns, steeringAnchorsByRun, steeringAnchorByCommentId, transcriptByRun]);
 
   // A native-runner Plan is part of the turn that wrote its current revision.
   // Legacy adapters do not expose the semantic write_document boundary needed
@@ -1311,33 +1553,28 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       (comment) => !comment.deletedAt,
     );
     visibleComments.forEach((comment, index) => {
-      if (queuedCommentIds.has(comment.id)) return;
-      // The live/settling runner lane already renders this run's final answer.
-      // Keep a just-persisted duplicate out of the backbone until the complete
-      // canonical bubble + Worked header can replace that lane atomically.
-      if (
-        heldPaperclipRunnerRunId &&
-        isRunnerResponseComment({
-          comment,
-          runId: heldPaperclipRunnerRunId,
-          runStartedAtMs: heldPaperclipRunnerStartedAtMs,
-          finalText: heldPaperclipRunnerFinalText,
-        })
-      )
-        return;
+      // Run membership does not mean a turn draws this reply: a resumed run's
+      // transcript may contain only its newest turn. Dedupe after assembling
+      // the turns, by the saved replies actually selected as their finals.
       const item = commentItems[index];
-      if (!item) return;
+      if (!item || (queuedCommentIds.has(comment.id) && (returnedCommentIds.has(comment.id) || !steeringAnchorByCommentId.has(comment.id)))) return;
       entries.push({
-        // A held/queued input belongs where the runner actually consumes it,
-        // not where the user first submitted it while another turn was live.
-        ms: comment.conversationAnchorAt
+        // Human messages keep send order. ACK time splits agent output only.
+        ms: comment.authorType !== "user" && comment.conversationAnchorAt
           ? toMs(comment.conversationAnchorAt)
           : toMs(comment.createdAt),
         order:
-          1 + Math.min(comment.conversationAnchorSequence ?? 0, 999) / 1000,
-        id: item.id,
+          1 + Math.min(comment.authorType === "user" ? 0 : comment.conversationAnchorSequence ?? 0, 999) / 1000,
+        id: comment.clientId ?? item.id,
         item,
       });
+      // /new remains the person's message. Its receipt adds a divider below;
+      // it must not replace an already-drawn bubble with a different row kind.
+      if (comment.authorType === "user" && comment.conversationSessionGeneration != null) {
+        const marker = commentsToTaskChatItems([comment])[0];
+        if (marker) entries.push({ ms: toMs(comment.createdAt), order: 1.5,
+          id: `${comment.id}:session-start`, item: { ...marker, id: `${comment.id}:session-start` } });
+      }
     });
     for (const interaction of interactions ?? []) {
       // Withdrawn/superseded confirmations are retracted calls to action — drop
@@ -1533,10 +1770,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     liveRuns,
     planDocument,
     planDocumentSourceRunId,
-    heldPaperclipRunnerRunId,
-    heldPaperclipRunnerStartedAtMs,
-    heldPaperclipRunnerFinalText,
     queuedCommentIds,
+    steeringAnchorByCommentId,
+    returnedCommentIds,
   ]);
 
   const legacyTimelineAnchorsByRun = useMemo(() => {
@@ -1606,17 +1842,17 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // heavy assembly memo doesn't recompute on every parent render.
   const hasBrief = Boolean(issueBrief);
 
-  const { items, settledRunIds, settledReplyRunIds } = useMemo<{
-    items: TaskChatItem[];
-    settledRunIds: Set<string>;
-    settledReplyRunIds: Set<string>;
-  }>(() => {
+  const { items, settledRunIds, settledReplyRunIds, emptyStoppedRunIds, runnerSegmentsById } = useMemo(() => {
+    // A native segment owns the same renderer in the chronological body while
+    // streaming, after a steering bubble, and after persistence. No tail handoff.
+    const runnerSegmentsById = new Map<string, ComponentProps<typeof TaskChatRunnerTurn> & { emptyContinuation: boolean }>();
     // Runs whose settled turn made it into the assembled thread — the live tail
     // hands off to this as its "the settled turn has rendered" signal (PAP-462
     // B4), so the transcript stays mounted through the settle gap without ever
     // double-rendering beside its own settled turn.
     const settledRunIds = new Set<string>();
     const settledReplyRunIds = new Set<string>();
+    const emptyStoppedRunIds = new Set<string>();
     const sourceRunByItemId = new Map<string, string>();
     const commentsById = new Map(projectedComments.map(comment => [comment.id, comment]));
     for (const { item } of orderedEntries) {
@@ -1656,15 +1892,42 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     const turnMergeMetaById = new Map<string, SettledTurnMergeMeta>();
     let previousExecutionWaitKey: string | null = null;
     for (const source of runs) {
-      if (!isTerminalRunStatus(source.status)) continue;
-      if (liveRun && source.id === liveRun.id) continue;
+      if (coveredAttemptIds.has(source.id)) {
+        settledRunIds.add(source.id);
+        continue;
+      }
+      // Keep the same segment owner while activeRun disappears ahead of the
+      // terminal summary; otherwise a second settling tail bypasses dedupe.
+      const openSegments = isNativePaperclipRunnerRun(source) && (source.status === "queued" || source.id === liveRun?.id ||
+        (!liveRun && (source.id === settlingRun?.id || liveSeenRef.current.has(source.id)) && !isTerminalRunStatus(source.status)));
+      if (!isTerminalRunStatus(source.status) && !openSegments) continue;
+      if (liveRun && runChainIdsById.get(liveRun.id)?.includes(source.id) && !openSegments && !isNativePaperclipRunnerRun(source)) continue;
       const entries = transcriptByRun.get(source.id) ?? [];
-      const meta = linkedRunMetaById.get(source.id);
+      const meta: NonNullable<TaskChatThreadProps["linkedRuns"]>[number] | undefined = linkedRunMetaById.get(source.id) ??
+        (openSegments && liveRun ? { ...liveRun, runId: source.id } : undefined);
       const credentialAccess = credentialAccessNotice(meta ? {
         ...meta,
         agentName: meta.agentName || agentMap?.get(meta.agentId)?.name,
       } : undefined, currentUserId, userLabelMap);
       const historical = statusRelevance.isHistoricalRun(source.id);
+      const acceptedSummary = acceptedSemanticResultSummary(meta?.resultJson);
+      const parsedSource = transcriptToTaskChatItems(entries, {
+        runId: source.id,
+        agentName: meta?.agentName,
+        running: false,
+      });
+      // Stop receipts are not output. Decide from display rows at the first
+      // terminal frame, not the later receipt returning the request to the box.
+      if (isUserStop(source.id) &&
+          (isTerminalRunStatus(source.status) || entries.some(entry => entry.kind === "run_terminal")) &&
+          !lastCommentIdByRun.has(source.id) &&
+          !(source.id === planDocumentSourceRunId && planTurnItem) &&
+          buildTurnTimelineRows(paperclipRunnerTimelineItems(parsedSource), false).length === 0 &&
+          !paperclipRunnerFinalResponse(parsedSource, { runId: source.id, fallbackSummary: acceptedSummary })) {
+        settledRunIds.add(source.id);
+        emptyStoppedRunIds.add(source.id);
+        continue;
+      }
       // A workspace admission attempt never started provider work. Its live
       // successor owns the waiting indicator; retain this attempt in the run log.
       if (source.status === "cancelled" && (meta?.errorCode === "workspace_busy" || meta?.errorCode === "agent_directory_busy")) {
@@ -1723,12 +1986,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       for (const marker of compactionMarkers) {
         entriesWithFailures.push({ id: marker.id, ms: toMs(marker.createdAtIso), order: 3, item: marker });
       }
-      const acceptedSummary = acceptedSemanticResultSummary(meta?.resultJson);
-      const parsedSource = transcriptToTaskChatItems(entries, {
-        runId: source.id,
-        agentName: meta?.agentName,
-        running: false,
-      });
       // A run that posted a card yielded to that card. Its wake summary
       // describes the wait, not an answer, so it never becomes the turn's
       // reply, even after the card is answered.
@@ -1750,7 +2007,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         !sourceAcceptedResponseWake;
       const sourceIsPaperclipRunner = isNativePaperclipRunnerRun(source);
       const sourceAllowSummaryFallback = !sourceIsPaperclipRunner ||
-        terminalHydratedRunIds.has(source.id) ||
+        (source.status === "cancelled" && isUserStop(source.id)) || terminalHydratedRunIds.has(source.id) ||
         entries.some((entry) => entry.kind === "run_terminal");
       const decidedCommentId = presentationDecisionCommentId(meta?.resultJson);
       const progressCommentIds = semanticProgressCommentIds(meta?.resultJson);
@@ -1760,20 +2017,23 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               .reverse()
               .find(
                 (comment) =>
-                  !comment.deletedAt &&
+                  !comment.deletedAt && comment.authorType === "agent" &&
+                  comment.presentation?.kind !== "system_notice" &&
                   comment.runId === source.id &&
                   !progressCommentIds.has(comment.id),
               )?.id ?? null)
           : decidedCommentId !== null &&
               projectedComments.some(
                 (comment) =>
-                  !comment.deletedAt &&
+                  !comment.deletedAt && comment.authorType === "agent" &&
+                  comment.presentation?.kind !== "system_notice" &&
                   comment.runId === source.id &&
                   comment.id === decidedCommentId,
               )
             ? decidedCommentId
             : null;
       const sourceHasPresentationComment = sourcePresentationCommentId !== null;
+      const sourcePresentationItem = commentItems.find((item): item is TaskChatMessageItem => item.kind === "message" && item.id === sourcePresentationCommentId);
       const sourcePresentationText = sourcePresentationCommentId
         ? (projectedComments.find(
             (comment) => comment.id === sourcePresentationCommentId,
@@ -1810,7 +2070,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           source.status === "timed_out" ||
           source.status === "cancelled" ||
           source.status === "interrupted");
-      if (sourceHasNativeStop) {
+      if (sourceHasNativeStop && !isUserStop(source.id) && !failureNoticeIds.has(source.id)) {
+        const hasRetrySuccessor = [...runChainIdsById].some(([id, chain]) => id !== source.id && chain.includes(source.id));
+        const keepFailure = parsedSource.length > 0 && (!historical || hasRetrySuccessor);
         settledRunIds.add(source.id);
         const code =
           meta?.errorCode ??
@@ -1873,7 +2135,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         const finishedAt =
           meta?.finishedAt ?? meta?.startedAt ?? meta?.createdAt;
         const diskFullBesideInterruption = Boolean(props.interruption) && code === "sandbox_disk_full" && source.status === "failed";
-        if (!historical && (!props.interruption || credentialAccess || diskFullBesideInterruption ||
+        if (source.status !== "cancelled" && (!historical || keepFailure) && (!props.interruption || credentialAccess || diskFullBesideInterruption ||
+            (keepFailure && !(props.interruption.state === "failed" && props.interruption.observedRunId === source.id)) ||
             (props.interruption.responsibility === "user" &&
               ["native_provider_model_rejected", "native_provider_approval_required"].includes(code)))) entriesWithFailures.push({
           ms: toMs(finishedAt),
@@ -1890,7 +2153,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             // a planning run) has no Retry; one that ran and failed (no result, helpers timed
             // out) keeps it. The same rule as the server's task interruption state.
             retryable: code !== "native_session_cleanup_quarantined" && !diskFullBesideInterruption &&
-              !(code === "antigravity_swarm_unavailable" && swarmFailureNeedsAction(meta?.resultJson)),
+              !(code === "antigravity_swarm_unavailable" && swarmFailureNeedsAction(meta?.resultJson)) &&
+              !hasRetrySuccessor && !isConversationRecovery(props.interruption, source.status),
             ...(credentialAccess ? { credentialAccess, retryable: false } : {}),
             collapsible: true,
             runId: source.id,
@@ -1911,7 +2175,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         source.status === "failed" || source.status === "timed_out" ||
         (source.status === "cancelled" && entries.length === 0)
       );
-      if (sourceHasLegacyStop) {
+      if (sourceHasLegacyStop && !isUserStop(source.id) && !failureNoticeIds.has(source.id)) {
         settledRunIds.add(source.id);
         const code = meta?.errorCode ?? "native_runner_process_exited";
         const retryDetail = meta?.scheduledRetryAt
@@ -1951,7 +2215,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             id,
             kind: "marker",
             variant: "interrupted",
-            label: branchUnavailable ? "Starting branch unavailable" : restoreFailed ? "Workspace restore failed" : aiRequest?.status === "pending" ? "AI connection needed" : source.status === "cancelled" ? (meta?.startedAt ? "Stopped" : "Couldn't start") : "Run failed",
+            label: branchUnavailable ? "Starting branch unavailable" : restoreFailed ? "Workspace restore failed" : aiRequest?.status === "pending" ? "AI connection needed" : isUserStop(source.id) ? "Stopped" : "Couldn't finish",
             runId: source.status === "cancelled" ? undefined : source.id,
             ...(branchUnavailable || aiRequest?.status === "pending" ? { retryable: false } : {}),
             ...(restoreFailed ? {
@@ -1971,30 +2235,32 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           },
         });
       }
-      if (entries.length === 0) {
+      if (entries.length === 0 && !(sourceIsPaperclipRunner && (openSegments || steeringAnchorsByRun.has(source.id)))) {
         if (sourceIsPaperclipRunner && sourceYielded) {
           settledRunIds.add(source.id);
           continue;
         }
         if (sourceIsPaperclipRunner && !sourceAllowSummaryFallback) continue;
+        // A run the person stopped keeps its one 'Stopped' row, native or not (an early Stop is legacy).
         if (
-          isNativePaperclipRunnerRun(source) &&
-          sourceAllowSummaryFallback &&
-          acceptedSummary &&
-          !sourceHasPresentationComment
+          (isNativePaperclipRunnerRun(source) || (source.status === "cancelled" && isUserStop(source.id))) &&
+          sourceAllowSummaryFallback
         ) {
           const startedAtMs = toMs(meta?.startedAt ?? meta?.createdAt);
-          const finishedAtMs = toMs(meta?.finishedAt);
+          const finishedAtMs = toMs(source.status === "succeeded" && sourcePresentationItem?.createdAtIso
+            ? sourcePresentationItem.createdAtIso : meta?.finishedAt);
           const durationMs =
             startedAtMs > 0 && finishedAtMs > 0
               ? Math.max(0, finishedAtMs - startedAtMs)
               : undefined;
-          const failed = source.status !== "succeeded";
-          const turnId = `${source.id}:turn`;
+          const failed = source.status !== "succeeded" || isUserStop(source.id);
+          const turnId = isNativePaperclipRunnerRun(source) ? `${source.id}:turn:0` : `${source.id}:turn`;
           turnMergeMetaById.set(turnId, {
+            chainId: runChainIdsById.get(source.id)?.[0] ?? source.id,
+            chainOrder: runChainIdsById.get(source.id)?.length,
             agentKey: meta?.agentId ?? "",
             agentName: meta?.agentName,
-            parts: [{ entries, durationMs, failed }],
+            parts: [{ entries, durationMs, failed, personStopped: isUserStop(source.id) }],
           });
           settledTurns.push({
             sourceRunId: source.id,
@@ -2002,7 +2268,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               id: turnId,
               kind: "turn",
               settled: true,
-              historical,
+              historical: false,
               agentName:
                 meta?.agentName ??
                 (meta?.agentId ? agentMap?.get(meta.agentId)?.name : undefined),
@@ -2013,18 +2279,18 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               standaloneHeader: true,
               animateFold: liveSeenRef.current.has(source.id),
               items: [],
-              finalResponse: paperclipRunnerFinalResponse([], {
+              finalResponse: sourceHasPresentationComment ? sourcePresentationItem : paperclipRunnerFinalResponse([], {
                 runId: source.id,
                 agentName: meta?.agentName,
                 fallbackSummary: acceptedSummary,
               }),
-              summary: buildTurnSummary(entries, { durationMs, failed }),
+              summary: buildTurnSummary(entries, { durationMs, failed, personStopped: isUserStop(source.id) }),
             },
             anchorCommentId: null,
             startMs: startedAtMs > 0 ? startedAtMs : Number.POSITIVE_INFINITY,
           });
           settledRunIds.add(source.id);
-          settledReplyRunIds.add(source.id);
+          if (acceptedSummary && !sourceHasPresentationComment) settledReplyRunIds.add(source.id);
         } else if (!sourceHasNativeStop && !sourceHasLegacyStop && !lastCommentIdByRun.has(source.id)) {
           settledRunIds.add(source.id);
           const id = `${source.id}:terminal-notice`;
@@ -2036,7 +2302,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               id,
               kind: "marker",
               variant: "turn_boundary",
-              label: source.status === "cancelled" ? "Stopped" : "Run completed",
+              label: source.status === "cancelled" ? (isUserStop(source.id) ? "Stopped" : "Couldn't finish") : "Run completed",
               detail: source.status === "cancelled" ? "This turn was cancelled before it returned a response." : "The runner returned no user-facing response.",
             },
           });
@@ -2074,8 +2340,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           },
         });
       }
-      const failed = source.status !== "succeeded";
-      const startSlotRaw = meta?.startedAt ?? meta?.createdAt;
+      // Live runs are omitted from linkedRuns; their first segment still owns its run-start slot.
+      const startSlotRaw = meta?.startedAt ??
+        (source.id === liveRun?.id ? liveRun.startedAt : undefined) ??
+        meta?.createdAt ?? source.createdAt;
       const startSlotMs = startSlotRaw
         ? toMs(startSlotRaw)
         : Number.POSITIVE_INFINITY;
@@ -2086,6 +2354,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         entries,
         startSlotMs,
         timelineAnchors,
+        continuousReplyPlacements.get(source.id)?.byItem,
       );
       const runtimeRequests = runtimeRequestSegmentContext(entries, {
         runId: source.id, agentName: meta?.agentName, running: false,
@@ -2094,8 +2363,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         const parsedTranscript = reconcileSegmentRuntimeRequests(transcriptToTaskChatItems(segment.entries, {
           runId: source.id,
           agentName: meta?.agentName,
-          running: false,
-        }), segment.entries, runtimeRequests);
+          running: openSegments,
+        }), segment.entries, runtimeRequests, openSegments);
         const parsed =
           source.id === planDocumentSourceRunId && planTurnItem
             ? embedPlanDocumentAtWriteBoundary(parsedTranscript, planTurnItem)
@@ -2108,7 +2377,14 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           // still explains that run's answer, so take it before the filter.
           mcpStartupFailures: partitionRunHealthItems(parsed).failures,
           timelineItems: sourceIsPaperclipRunner
-            ? paperclipRunnerTimelineItems(visibleActivity)
+            // Every authored message was visible live, not just the last final.
+            // Treat it as timeline prose; the run-wide response dedupe below
+            // removes the final copy owned by the completion comment/response.
+            ? paperclipRunnerTimelineItems(visibleActivity.map((item) =>
+                item.kind === "message"
+                  ? { ...item, channel: "progress" as const, interstitial: true }
+                  : item,
+              ))
             : visibleActivity,
         };
       });
@@ -2152,12 +2428,48 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         ? projectedSegments.findLastIndex(({ parsed }) =>
             Boolean(paperclipRunnerFinalResponse(parsed, yieldedOptions)))
         : -1;
+      const authoredFinalTexts = new Set(projectedSegments.map(({ parsed }) =>
+        normalizedMessageText(paperclipRunnerFinalResponse(parsed, yieldedOptions)?.text ?? "")).filter(Boolean));
       const settledSegmentFinalResponse = (
         segmentIndex: number,
         parsed: readonly TaskChatItem[],
       ): TaskChatMessageItem | undefined => {
         if (!sourceIsPaperclipRunner) return undefined;
+        const mappedReplyId = continuousReplyPlacements.get(source.id)?.bySegment.get(segmentIndex);
+        const mappedReply = commentItems.find((item): item is TaskChatMessageItem => item.kind === "message" && item.author === "agent" && item.presentation?.kind !== "system_notice" && item.id === mappedReplyId);
+        const final = paperclipRunnerFinalResponse(parsed, { ...yieldedOptions, yielded: sourceYielded });
+        const finalEntry = final?.transcriptIndex == null ? undefined : segments[segmentIndex]!.entries[final.transcriptIndex];
+        const finalItemId = finalEntry?.kind === "assistant" ? finalEntry.itemId : undefined;
+        const receipt = finalItemId ? (meta?.resultJson?.continuousReplies as Record<string, { commentId?: string }> | undefined)?.[finalItemId] : undefined;
+        const replyKey = finalItemId ? `native-final:${source.id}:${finalItemId}` : null;
+        // Saving can rewrite links or redact text. The native item receipt owns
+        // that saved reply even while the final event or run metadata is lagging.
+        const ownedReply = finalItemId ? projectedComments.find(comment => !comment.deletedAt && comment.authorType === "agent" &&
+          comment.presentation?.kind !== "system_notice" && (comment.createdByRunId ?? comment.runId) === source.id && (comment.id === receipt?.commentId ||
+            (replyKey && (comment.clientRequestId === replyKey || comment.clientRequestId?.startsWith(`${replyKey}:`))))) : undefined;
+        const ownedItem = commentItems.find((item): item is TaskChatMessageItem => item.kind === "message" && item.id === ownedReply?.id);
+        if (ownedItem) return { ...ownedItem, atMs: final?.atMs ?? ownedItem.atMs };
+        // A continuous run can resume with only the new turn's transcript.
+        // Its old placement map is not proof that this segment draws that reply.
+        if (mappedReply && final && normalizedMessageText(mappedReply.text) === normalizedMessageText(final.text)) {
+          return { ...mappedReply, atMs: final.atMs ?? mappedReply.atMs };
+        }
+        if (openSegments && !final) return undefined;
         const lastSegment = segmentIndex === lastPopulatedSegmentIndex;
+        if (final || timelineAnchors.length > 0 || openSegments) {
+          const segment = segments[segmentIndex]!;
+          // Persistence may lag the next question; pair repeated answers in transcript order.
+          const sameText = (text: string) => normalizedMessageText(text) === normalizedMessageText(final?.text ?? "");
+          const occurrence = final ? projectedSegments.slice(0, segmentIndex).filter(({ parsed }) =>
+            sameText(paperclipRunnerFinalResponse(parsed, { ...yieldedOptions, yielded: sourceYielded })?.text ?? "")).length : 0;
+          const reply = projectedComments.filter(comment => !comment.deletedAt && comment.authorType === "agent" &&
+            comment.presentation?.kind !== "system_notice" && (comment.createdByRunId ?? comment.runId) === source.id && !progressCommentIds.has(comment.id) &&
+            (final ? sameText(comment.body) : !authoredFinalTexts.has(normalizedMessageText(comment.body)) &&
+              toMs(comment.createdAt) >= segment.startMs && toMs(comment.createdAt) < segment.endMs))
+            .sort((a, b) => toMs(a.createdAt) - toMs(b.createdAt))[occurrence];
+          const saved = commentItems.find((item): item is TaskChatMessageItem => item.kind === "message" && item.id === reply?.id);
+          return saved ? { ...saved, atMs: final?.atMs ?? toMs(reply?.createdAt) } : final;
+        }
         if (sourceYielded) {
           if (!sourceYieldedResponse) return undefined;
           if (yieldedResponseSegmentIndex === -1) return lastSegment ? sourceYieldedResponse : undefined;
@@ -2165,7 +2477,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             ? paperclipRunnerFinalResponse(parsed, yieldedOptions)
             : undefined;
         }
-        if (sourceHasPresentationComment) return undefined;
+        if (sourceHasPresentationComment) return lastSegment ? sourcePresentationItem : undefined;
         // A steering anchor may split acceptance from its terminal. Keep the
         // whole-run proof and render its answer exactly once.
         if (sourceAcceptedResponseWake) {
@@ -2182,36 +2494,91 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       };
       for (const [segmentIndex, projected] of projectedSegments.entries()) {
         const { segment, parsed } = projected;
-        if (segment.entries.length === 0) continue;
+        const personStopped = isUserStop(source.id) && segmentIndex === segments.length - 1;
+        const failed = segmentIndex === segments.length - 1 && ((!openSegments && source.status !== "succeeded") || personStopped);
+        const stableRunnerSegment = sourceIsPaperclipRunner;
+        if (segment.entries.length === 0 && !stableRunnerSegment) continue;
         const finalResponse = settledSegmentFinalResponse(segmentIndex, parsed);
+        const finalEntry = segment.entries.findLast(entry => entry.kind === "assistant" && entry.channel === "final");
+        // A committed reply is complete even if event history still has its partial stream.
+        const savedFinal = finalResponse && commentItems.some(item => item.kind === "message" && item.id === finalResponse.id);
+        const finalStreaming = finalEntry?.kind === "assistant" && finalEntry.delta === true && !savedFinal;
+        const segmentStreaming = openSegments && segmentIndex === segments.length - 1 &&
+          (!finalResponse || finalStreaming);
         const runHealth = {
           failures: projectedSegments[segmentIndex]?.mcpStartupFailures ?? [],
-          rest: partitionRunHealthItems(timelineItemsBySegment[segmentIndex] ?? []).rest,
+          rest: partitionRunHealthItems(omitProgressRepeatedByResponseAcrossSegments(
+            [timelineItemsBySegment[segmentIndex] ?? []], finalResponse?.text,
+          )[0] ?? []).rest,
         };
         const children = settledRunChildren(runHealth.rest);
-        // A compaction-only run is fully shown by its divider.
-        if (children.length === 0 && !finalResponse && (!sourceIsPaperclipRunner || compactionMarkers.length > 0)) {
-          if (compactionMarkers.length > 0) settledRunIds.add(source.id);
+        // Only an explicit answer receipt can continue a question below. An ACK
+        // alone says nothing about whether the model answered that question.
+        const segmentQuestions = segmentIndex === 0 ? [requestCommentByRun.get(source.id)] : comments
+          .filter(comment => steeringAnchorByCommentId.get(comment.id) === segment.startMs &&
+            (comment.steeredIntoRunId === source.id || Object.prototype.hasOwnProperty.call(
+              meta?.resultJson?.queuedSteeringAcknowledgements ?? {}, comment.id)))
+          .map(comment => comment.id);
+        const coveredByLaterReply = segmentQuestions.length > 0 &&
+          [...(continuousReplyPlacements.get(source.id)?.questionsBySegment ?? [])].some(([index, ids]) =>
+            index > segmentIndex && segmentQuestions.every(id => id !== undefined && ids.includes(id)) &&
+            Boolean(settledSegmentFinalResponse(index, projectedSegments[index]!.parsed)));
+        // Never remove a painted slot or a non-successful run's last work segment.
+        const emptyContinuation = sourceIsPaperclipRunner && !segmentStreaming && !failed && coveredByLaterReply &&
+          (segmentIndex !== lastPopulatedSegmentIndex || source.status === "succeeded") &&
+          children.length === 0 && !finalResponse && runHealth.failures.length === 0;
+        if (
+          (emptyContinuation && !drawnRunnerSegments.current.has(`${source.id}:turn:${segmentIndex}`)) ||
+          (!sourceIsPaperclipRunner && children.length === 0 && !finalResponse)
+        ) {
+          if (sourceIsPaperclipRunner || compactionMarkers.length > 0) settledRunIds.add(source.id);
           continue;
         }
         settledRunIds.add(source.id);
         if (finalResponse) settledReplyRunIds.add(source.id);
-        const segmented = timelineAnchors.length > 0;
+        const segmented = sourceIsPaperclipRunner || timelineAnchors.length > 0;
         const turnId = segmented
           ? `${source.id}:turn:${segmentIndex}`
           : `${source.id}:turn`;
-        const segmentFinishedMs = Number.isFinite(segment.endMs)
+        const answerComplete = finalResponse && !finalStreaming;
+        // The answer owns its end, even while its run remains held or replays.
+        const segmentFinishedMs = (segmented && answerComplete
+          ? finalResponse.atMs ?? (!failed && finalResponse.createdAtIso ? toMs(finalResponse.createdAtIso) : undefined)
+          : undefined) ?? (Number.isFinite(segment.endMs)
           ? segment.endMs
-          : finished;
+          : finished);
+        const answerStartMs = sourceIsPaperclipRunner ? segments[segments.slice(0, segmentIndex).findLastIndex(({ entries }) =>
+          entries.some(entry => entry.kind === "assistant" && entry.channel === "final" && !entry.delta)) + 1]!.startMs : segment.startMs;
         const segmentDurationMs =
-          Number.isFinite(segment.startMs) && Number.isFinite(segmentFinishedMs)
-            ? Math.max(0, segmentFinishedMs - segment.startMs)
+          Number.isFinite(answerStartMs) && Number.isFinite(segmentFinishedMs)
+            ? Math.max(0, segmentFinishedMs - answerStartMs)
             : durationMs;
+        const continuedAfterSteering = sourceIsPaperclipRunner && segmentIndex > 0 &&
+          !segments[segmentIndex - 1]!.entries.some(entry => entry.kind === "assistant" && entry.channel === "final" && !entry.delta) &&
+          [...steeringAnchorByCommentId.values()].includes(segment.startMs);
+        if (stableRunnerSegment) runnerSegmentsById.set(turnId, {
+          emptyContinuation,
+          runId: source.id,
+          finalResponse: finalResponse ?? null,
+          items: finalResponse && !paperclipRunnerFinalResponse(parsed, yieldedOptions)
+            ? [...parsed, { ...finalResponse, channel: "final", interstitial: false }]
+            : parsed,
+          status: segmentStreaming ? source.status : failed ? source.status : "succeeded",
+          ...(source.status === "queued" ? { execution: meta?.execution } : {}),
+          startedAtMs: answerStartMs,
+          finishedAtMs: Number.isFinite(segmentFinishedMs) ? segmentFinishedMs : null,
+          continuedAfterSteering,
+          allowSummaryFallback: sourceAllowSummaryFallback,
+          awaitingContinuation: sourceYielded,
+          waitSummary: acceptedSummary,
+        });
         turnMergeMetaById.set(turnId, {
+          chainId: sourceIsPaperclipRunner && segmented ? turnId : runChainIdsById.get(source.id)?.[0] ?? source.id,
+          chainOrder: runChainIdsById.get(source.id)?.length,
           agentKey: meta?.agentId ?? "",
           agentName: meta?.agentName,
           parts: [
-            { entries: segment.entries, durationMs: segmentDurationMs, failed },
+            { entries: segment.entries, durationMs: segmentDurationMs, failed, personStopped },
           ],
         });
         settledTurns.push({
@@ -2220,7 +2587,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             id: turnId,
             kind: "turn",
             settled: true,
-            historical,
+            historical: false,
             agentName:
               meta?.agentName ??
               (meta?.agentId ? agentMap?.get(meta.agentId)?.name : undefined),
@@ -2229,116 +2596,43 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               ? agentMap?.get(meta.agentId)?.icon
               : undefined,
             standaloneHeader: sourceIsPaperclipRunner,
-            continuedAfterSteering: sourceIsPaperclipRunner && segmentIndex > 0,
+            continuedAfterSteering,
             animateFold: liveSeenRef.current.has(source.id),
             items: children,
             ...(runHealth.failures.length > 0 ? { mcpStartupFailures: runHealth.failures } : {}),
             finalResponse,
             summary: buildTurnSummary(segment.entries, {
-              durationMs: segmentDurationMs,
+              durationMs: sourceIsPaperclipRunner ? segmentDurationMs : durationMs,
               failed,
+              personStopped,
             }),
           },
-          anchorCommentId: segmented
-            ? null
-            : sourceIsPaperclipRunner
-              ? sourceHasPresentationComment
-                ? sourcePresentationCommentId
-                : null
-              : (lastCommentIdByRun.get(source.id) ?? null),
-          // A post-steering segment ties the acknowledgement-backed human
-          // bubble and is therefore inserted immediately after it. The first
-          // segment retains the normal run-start slot.
-          startMs: segment.startMs,
+          // Admission already owns a response slot under this request. Starting
+          // the provider later must not move that slot past a newer question.
+          anchorCommentId: sourceIsPaperclipRunner && segmentIndex === 0 &&
+            orderedEntries.some(entry => entry.id === requestCommentByRun.get(source.id))
+            ? requestCommentByRun.get(source.id)!
+            : segmented ? null : (lastCommentIdByRun.get(source.id) ?? null),
+          // Later segments follow their acknowledged human boundary. Without
+          // request provenance, admission time is stable across queued → running.
+          startMs: sourceIsPaperclipRunner && segmentIndex === 0
+            ? toMs(meta?.createdAt ?? source.createdAt) || segment.startMs
+            : segment.startMs,
         });
       }
     }
 
-    // Same-turn steering is visible before a live run settles. Freeze every
-    // completed pre-steer interval into the main chronology immediately, then
-    // leave only the last interval to the streaming tail below. Reusing the
-    // settled ids and projection makes the terminal handoff structurally
-    // identical instead of moving one unsplit live turn around the steer.
-    if (liveRun) {
-      const timelineAnchors = isNativePaperclipRunnerRun(liveRun)
-        ? (steeringAnchorsByRun.get(liveRun.id) ?? [])
-        : (legacyTimelineAnchorsByRun.get(liveRun.id) ?? []);
-      if (timelineAnchors.length > 0) {
-        const entries = transcriptByRun.get(liveRun.id) ?? [];
-        const startSlotMs =
-          (liveRun.startedAt ? toMs(liveRun.startedAt) : null) ??
-          toMs(liveRun.createdAt);
-        const segments = splitTranscriptAtAnchors(
-          entries,
-          startSlotMs,
-          timelineAnchors,
-        );
-        const runtimeRequests = runtimeRequestSegmentContext(entries, {
-          runId: liveRun.id, agentName: liveRun.agentName, running: true,
-        });
-        for (const [segmentIndex, segment] of segments.slice(0, -1).entries()) {
-          if (segment.entries.length === 0) continue;
-          const parsedTranscript = reconcileSegmentRuntimeRequests(transcriptToTaskChatItems(segment.entries, {
-            runId: liveRun.id,
-            agentName: liveRun.agentName,
-            running: false,
-          }), segment.entries, runtimeRequests);
-          const parsed =
-            liveRun.id === planDocumentSourceRunId && planTurnItem
-              ? embedPlanDocumentAtWriteBoundary(parsedTranscript, planTurnItem)
-              : parsedTranscript;
-          const runHealth = partitionRunHealthItems(
-            isNativePaperclipRunnerRun(liveRun)
-              ? paperclipRunnerTimelineItems(parsed)
-              : parsed,
-          );
-          const children = settledRunChildren(runHealth.rest);
-          if (children.length === 0 && runHealth.failures.length === 0) continue;
-          const turnId = `${liveRun.id}:turn:${segmentIndex}`;
-          const segmentDurationMs =
-            Number.isFinite(segment.startMs) && Number.isFinite(segment.endMs)
-              ? Math.max(0, segment.endMs - segment.startMs)
-              : undefined;
-          turnMergeMetaById.set(turnId, {
-            agentKey: liveRun.agentId ?? "",
-            agentName: liveRun.agentName,
-            parts: [
-              {
-                entries: segment.entries,
-                durationMs: segmentDurationMs,
-                failed: false,
-              },
-            ],
-          });
-          settledTurns.push({
-            sourceRunId: liveRun.id,
-            turn: {
-              id: turnId,
-              kind: "turn",
-              settled: true,
-              agentName:
-                liveRun.agentName ??
-                (liveRun.agentId
-                  ? agentMap?.get(liveRun.agentId)?.name
-                  : undefined),
-              agent: liveRun.agentId ? agentMap?.get(liveRun.agentId) ?? { id: liveRun.agentId } : undefined,
-              agentIcon: liveRun.agentId
-                ? agentMap?.get(liveRun.agentId)?.icon
-                : undefined,
-              standaloneHeader: isNativePaperclipRunnerRun(liveRun),
-              continuedAfterSteering:
-                isNativePaperclipRunnerRun(liveRun) && segmentIndex > 0,
-              items: children,
-              ...(runHealth.failures.length > 0 ? { mcpStartupFailures: runHealth.failures } : {}),
-              summary: buildTurnSummary(segment.entries, {
-                durationMs: segmentDurationMs,
-              }),
-            },
-            anchorCommentId: null,
-            startMs: segment.startMs,
-          });
-        }
-      }
+    // The single reply owner must stay after its human submission anchors,
+    // even when coalescing folds its post-steer answer into the first segment.
+    const chainAnchors = new Map<string, number>();
+    for (const [runId, anchors] of steeringAnchorsByRun) {
+      const chainId = runChainIdsById.get(runId)?.[0] ?? runId;
+      chainAnchors.set(chainId, Math.max(chainAnchors.get(chainId) ?? 0, ...anchors));
+    }
+    for (const settled of settledTurns) {
+      if (!settled.turn.standaloneHeader || (steeringAnchorsByRun.get(settled.sourceRunId)?.length ?? 0) > 0) continue;
+      const chainId = runChainIdsById.get(settled.sourceRunId)?.[0] ?? settled.sourceRunId;
+      settled.startMs = Math.max(settled.startMs, chainAnchors.get(chainId) ?? 0);
     }
     settledTurns.sort((a, b) =>
       a.startMs < b.startMs ? -1 : a.startMs > b.startMs ? 1 : 0,
@@ -2364,11 +2658,27 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     entriesWithFailures.sort(
       (a, b) => a.ms - b.ms || a.order - b.order || a.id.localeCompare(b.id),
     );
+    const responseIds = new Set(settledTurns.flatMap(({ turn }) => turn.finalResponse ? [turn.finalResponse.id] : []));
     const out = assembleThreadItems(
-      entriesWithFailures,
+      entriesWithFailures.filter((entry) => !responseIds.has(entry.id)),
       turnsByAnchor,
       unanchored,
     );
+
+    // Request anchors can put B before unanchored A, or before A's later failure receipt.
+    // Retry lineage, not completion time, orders the whole attempt before its successor.
+    const belongsToRun = (item: TaskChatItem, id: string) => sourceRunByItemId.get(item.id) === id ||
+      item.id === failureNoticeIds.get(id) || item.id === `${id}:failure`;
+    for (const chain of runChainIdsById.values()) for (let index = 1; index < chain.length; index++) {
+      const previous = chain[index - 1]!;
+      const following = out.slice(0, out.findLastIndex(item => belongsToRun(item, previous)) + 1)
+        .filter(item => belongsToRun(item, chain[index]!));
+      if (!following.length) continue;
+      const moved = new Set(following);
+      const retained = out.filter(item => !moved.has(item));
+      const afterPrevious = retained.findLastIndex(item => belongsToRun(item, previous)) + 1;
+      out.splice(0, out.length, ...retained.slice(0, afterPrevious), ...following, ...retained.slice(afterPrevious));
+    }
 
     // PAP-362: two runs replying back-to-back (same agent, nothing but the
     // agent's own bubbles between) fold into ONE "Worked" row below the last
@@ -2391,9 +2701,14 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       ),
       settledRunIds,
       settledReplyRunIds,
+      emptyStoppedRunIds,
+      runnerSegmentsById,
     };
   }, [
     orderedEntries,
+    coveredAttemptIds,
+    failureNoticeIds,
+    isUserStop,
     coordinatorEnabled,
     conversationWindowStart,
     decisionReceipts.receipts,
@@ -2405,14 +2720,21 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     canRetryFailedRun,
     interactions,
     runs,
+    runChainIdsById,
+    requestCommentByRun,
     liveRun,
+    settlingRun,
     transcriptByRun,
     terminalHydratedRunIds,
     linkedRunMetaById,
     lastCommentIdByRun,
     comments,
+    commentItems,
     projectedComments,
+    queuedCommentIds,
     steeringAnchorsByRun,
+    steeringAnchorByCommentId,
+    continuousReplyPlacements,
     legacyTimelineAnchorsByRun,
     hasBrief,
     planDocument,
@@ -2431,7 +2753,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const settlingIsPaperclipRunner =
     settlingRun != null && isNativePaperclipRunnerRun(settlingRunSource);
   // A stopped turn posts no reply, so its settled turn is already complete.
-  const settlingRunStopped = settlingRunSource?.status === "cancelled";
+  const settlingRunStopped = settlingRunSource?.status === "cancelled" || isUserStop(settlingRun?.id ?? "");
   const settlingHasComment =
     settlingRun != null &&
     comments.some((comment) =>
@@ -2456,6 +2778,14 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     settlingRun != null &&
     (settlingIsPaperclipRunner
       ? settledRunIds.has(settlingRun.id) &&
+        // A saved comment is not proof that the yielded turn can draw its reply.
+        // Keep the visible answer and its clock until both are ready to hand over.
+        (!paperclipRunnerFinalResponse(
+          transcriptToTaskChatItems(transcriptByRun.get(settlingRun.id) ?? [], { runId: settlingRun.id, running: false }),
+          { runId: settlingRun.id, allowFallback: false,
+            yielded: acceptedSemanticResultDisposition(linkedRunMetaById.get(settlingRun.id)?.resultJson) === "yielded" },
+        ) || (settledReplyRunIds.has(settlingRun.id) &&
+          linkedRunMetaById.get(settlingRun.id)?.finishedAt != null)) &&
         (settlingHasComment ||
           settlingHasDurableInteraction ||
           settlingRunStopped ||
@@ -2492,15 +2822,17 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // A running (or still settling) turn lives outside the chronological body.
   // Its task cards follow that same tail until the complete turn takes over.
   const [threadItems, tailTaskCreationItems] = useMemo<[TaskChatItem[], TaskChatItem[]]>(() => {
-    if (!coordinatorEnabled || !tailRunId) return [items, []];
+    if (!tailRunId) return [items, []];
     const body: TaskChatItem[] = [];
     const tail: TaskChatItem[] = [];
     for (const item of items) {
-      (taskCreationSourceRunId(item) === tailRunId ? tail : body).push(item);
+      if (item.kind === "turn" && !runnerSegmentsById.has(item.id) && (runChainIdsById.get(tailRunId) ?? [tailRunId])
+        .some((id) => item.id.startsWith(`${id}:turn`) && !(id === liveRun?.id && isNativePaperclipRunnerRun(liveRun) && item.id.startsWith(`${id}:turn:`)))) continue;
+      (coordinatorEnabled && taskCreationSourceRunId(item) === tailRunId ? tail : body).push(item);
     }
     return [body, tail];
-  }, [items, coordinatorEnabled, tailRunId]);
-  const tailStreaming = Boolean(liveRun);
+  }, [items, coordinatorEnabled, tailRunId, runChainIdsById, liveRun, runnerSegmentsById]);
+  const tailStreaming = Boolean(liveRun) && !stoppingReply;
   const tailRunSource = tailRunId
     ? runs.find((run) => run.id === tailRunId)
     : undefined;
@@ -2516,9 +2848,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           interaction.status === "pending",
       )),
   );
-  const tailAllEntries = tailRunId
-    ? (transcriptByRun.get(tailRunId) ?? [])
-    : [];
+  const tailChainIds = tailRunId ? (runChainIdsById.get(tailRunId) ?? [tailRunId]) : [];
+  const tailAllEntries = tailChainIds.filter(id => !coveredAttemptIds.has(id)).flatMap((id) => transcriptByRun.get(id) ?? []);
   const tailActivityUnavailable = Boolean(
     tailRunId &&
     nativeTranscriptErrorsByRun.has(tailRunId) &&
@@ -2530,14 +2861,49 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       ? (steeringAnchorsByRun.get(tailRunId) ?? [])
       : (legacyTimelineAnchorsByRun.get(tailRunId) ?? [])
     : [];
-  const tailSegmentStartMs =
-    tailTimelineAnchors.length > 0
-      ? tailTimelineAnchors[tailTimelineAnchors.length - 1]
-      : null;
-  const tailEntries =
-    tailSegmentStartMs == null
-      ? tailAllEntries
-      : tailAllEntries.filter((entry) => toMs(entry.ts) >= tailSegmentStartMs);
+  const tailSegments = splitTranscriptAtAnchors(tailRunId ? (transcriptByRun.get(tailRunId) ?? []) : [],
+    toMs(linkedRunMetaById.get(tailRunId ?? "")?.startedAt ?? tailRunSource?.createdAt), tailTimelineAnchors,
+    continuousReplyPlacements.get(tailRunId ?? "")?.byItem);
+  const tailSegment = tailSegments[tailSegments.length - 1]!;
+  const tailSegmentSettled = (paperclipRunnerTail && threadItems.some(item =>
+    item.kind === "turn" && item.id === `${tailRunId}:turn:${tailSegments.length - 1}`)) ||
+    emptyStoppedRunIds.has(tailRunId ?? "");
+  const tailEntries = paperclipRunnerTail ? tailSegment.entries : (tailRunId ? (transcriptByRun.get(tailRunId) ?? []) : []);
+  const tailContinued = paperclipRunnerTail && tailTimelineAnchors.length > 0 &&
+    !tailSegments[tailSegments.length - 2]?.entries.some(entry => entry.kind === "assistant" && entry.channel === "final" && !entry.delta);
+  const tailSegmentKey = paperclipRunnerTail ? `${tailRunId}:${tailSegment.startMs}` : tailRunId;
+  const tailAnswerStartMs = tailSegments[tailSegments.slice(0, -1).findLastIndex(({ entries }) =>
+    entries.some(entry => entry.kind === "assistant" && entry.channel === "final" && !entry.delta)) + 1]!.startMs;
+  // A reply that has ended (its terminal event is in) is finishing, not stoppable.
+  // The interruption projection can still say "working" for a run whose end the page
+  // already has (its status event or its terminal entry); that run is not starting again.
+  const observedRunId = props.interruption?.observedRunId ?? "";
+  // After a reload the live status event is gone; the polled run status still says it ended.
+  const observedRunEnded = terminalStatuses.has(observedRunId) ||
+    isTerminalRunStatus(linkedRunMetaById.get(observedRunId)?.status ?? "") ||
+    (transcriptByRun.get(observedRunId) ?? []).some((entry) => entry.kind === "run_terminal");
+  // The run list the page polls carries the freshest execution projection;
+  // the live-run record can hold its first value for the whole run.
+  const liveExecution = (liveRun ? linkedRunMetaById.get(liveRun.id)?.execution : undefined) ?? liveRun?.execution ?? null;
+  const tailEnded = tailEntries.some((entry) => entry.kind === "run_terminal") || liveExecution?.phase === "finishing";
+  const recoveryOwnsStatus = !isUserStop(observedRunId) && isConversationRecovery(props.interruption,
+    terminalStatuses.get(observedRunId) ?? linkedRunMetaById.get(observedRunId)?.status);
+  const tailBeforeTurn = !!liveRun && (!paperclipRunnerTail || tailTimelineAnchors.length === 0) && !tailEnded && !isTerminalRunStatus(liveRun.status) &&
+    (!liveExecution || ["working", "reconnecting"].includes(liveExecution.phase) || (liveExecution.phase === "queued" && !liveExecution.cause)) &&
+    !tailEntries.some(entry => ["assistant", "thinking", "tool_call", "tool_result", "result"].includes(entry.kind) ||
+      (entry.kind === "system" && entry.text === "Turn started"));
+  const tailResuming = Boolean(liveExecution?.predecessorRunId ||
+    tailEntries.some(entry => entry.kind === "system" && entry.text.startsWith("Paperclip session resumed")));
+  const tailResumeWaiting = useWaitingToStart(tailBeforeTurn && tailResuming, liveRun ? ((liveRun.startedAt ? toMs(liveRun.startedAt) : null) ?? toMs(liveRun.createdAt)) : null);
+  const tailPreparationLabel = tailBeforeTurn
+    ? tailResumeWaiting ? tailEntries.some(entry => entry.kind === "system" && entry.text.startsWith("Paperclip session resumed")) ? "Resuming your conversation…" : "Preparing your reply…" : "Starting…" : undefined;
+  // A receipt beats the startup grace, but never a terminal state or a named hold.
+  const tailProgressLabel = liveRun?.id === tailRunId && !tailEnded && !isTerminalRunStatus(liveRun?.status ?? "") &&
+    (!liveExecution || (["working", "reconnecting", "queued"].includes(liveExecution.phase) && !liveExecution.cause))
+    ? nativeActivityLabelByRun.get(tailRunId ?? "") ?? (tailBeforeTurn ? liveRun?.status === "queued" ? "Queued" : "Preparing run…" : undefined)
+    : undefined;
+  const tailExecution = tailResuming && !tailBeforeTurn && liveExecution?.phase === "reconnecting"
+    ? null : liveExecution;
   const tailPlanItem =
     tailRunId === planDocumentSourceRunId ? planTurnItem : null;
   // A fresh array is produced on every render. Track every presentation field
@@ -2558,7 +2924,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     const requestIdentity = entry.kind === "runtime_request" ? JSON.stringify(entry) : "";
     return `${key}|${entry.kind}:${channelIdentity}:${lifecycleIdentity}:${statusIdentity}:${usageIdentity}:${textIdentity}:${contentIdentity}:${requestIdentity}`;
   }, String(tailAllEntries.length));
-  const tailContentKey = `${tailSegmentStartMs ?? "run-start"}:${tailEntryContentKey}`;
+  const tailContentKey = tailEntryContentKey;
   const blockerContentKey = blockerLinks
     ? `${blockerLinks.directBlocker.id}:${blockerLinks.ultimateBlocker?.id ?? ""}`
     : liveWorkLinks
@@ -2591,16 +2957,16 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const settlingFinishedAt = settlingRun
     ? linkedRunMetaById.get(settlingRun.id)?.finishedAt
     : undefined;
-  const tailStatus = liveRun
+  const tailRunStatus = terminalStatuses.get(tailRunId ?? "") ?? (stoppingReply ? "stopping" : liveRun
     ? liveRun.status
-    : (runs.find((run) => run.id === settlingRun?.id)?.status ?? "succeeded");
-  const tailStartedAtMs =
-    tailSegmentStartMs ??
+    : isTerminalIssueStatus(issueStatus) ? (issueStatus === "cancelled" ? "cancelled" : "succeeded")
+    : (runs.find((run) => run.id === settlingRun?.id)?.status ?? "succeeded"));
+  // Admission is not execution, and a pending send must not inherit the last run's clock.
+  const tailStartedAtMs = !tailRunId ? null : paperclipRunnerTail && tailTimelineAnchors.length > 0 ? tailAnswerStartMs :
     (liveRun
-      ? ((liveRun.startedAt ? toMs(liveRun.startedAt) : null) ??
-        toMs(liveRun.createdAt))
+      ? (liveRun.startedAt ? toMs(liveRun.startedAt) : null)
       : (settlingRun?.startedAtMs ?? null));
-  const tailFinishedAtMs = liveRun
+  const tailRunFinishedAtMs = liveRun
     ? liveRun.finishedAt
       ? toMs(liveRun.finishedAt)
       : null
@@ -2625,7 +2991,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const {
     pending: runnerSubmissionPending,
     agentId: submissionAgentId,
-    takingLonger: submissionTakingLonger,
     begin: beginSubmission,
     reject: rejectSubmission,
     blocked: startupBlocked,
@@ -2650,10 +3015,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const tailAgent = tailAgentId ? agentMap?.get(tailAgentId) : undefined;
   const visibleTailAgentName = tailAgentName ?? tailAgent?.name ?? null;
   const visibleTailAgentIcon = tailAgent?.icon ?? null;
-  const tailItems = useMemo(
+  const streamedTailItems = useMemo(
     () => {
       if (!tailRunId) return [];
-      const runtimeRequests = runtimeRequestSegmentContext(tailAllEntries, {
+      const runtimeRequests = runtimeRequestSegmentContext(tailEntries, {
         runId: tailRunId, agentName: tailAgentName, running: tailStreaming,
       });
       const parsed = reconcileSegmentRuntimeRequests(transcriptToTaskChatItems(tailEntries, {
@@ -2661,20 +3026,104 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         agentName: tailAgentName,
         running: tailStreaming,
       }), tailEntries, runtimeRequests, tailStreaming);
-      return tailPlanItem
+      const history = tailChainIds.slice(0, -1).filter(id => !coveredAttemptIds.has(id) && !runnerSegmentsById.has(`${id}:turn:0`)).flatMap((id) => paperclipRunnerTimelineItems(
+        transcriptToTaskChatItems(transcriptByRun.get(id) ?? [], { runId: id, running: false })
+          .map((item) => item.kind === "message" ? { ...item, channel: "progress" as const, interstitial: true } : item),
+      ));
+      return [...history, ...(tailPlanItem
         ? embedPlanDocumentAtWriteBoundary(parsed, tailPlanItem)
-        : parsed;
+        : parsed)];
     },
     // tailEntries is a fresh array each render; tailContentKey tracks its content.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
       tailRunId,
+      tailSegmentKey,
       tailContentKey,
+      coveredAttemptIds,
+      runnerSegmentsById,
       tailStreaming,
       tailAgentName,
       tailPlanContentKey,
     ],
   );
+  // A saved Stop reply can be drawn before the run's terminal receipt.
+  const stoppingResponse = stoppingReply ? threadItems.findLast((item): item is TaskChatMessageItem =>
+    item.kind === "message" && item.author === "agent" && item.sourceRunId === tailRunId &&
+    toMs(item.createdAtIso) >= tailSegment.startMs && toMs(item.createdAtIso) < tailSegment.endMs) : undefined;
+  const tailItems = omitProgressRepeatedByResponseAcrossSegments([streamedTailItems], stoppingResponse?.text)[0] ?? streamedTailItems;
+  // Final-response presentation and its header/tail settle in the same render.
+  const tailFinalResponse = paperclipRunnerTail ? paperclipRunnerFinalResponse(tailItems, {
+    runId: tailRunId ?? undefined,
+    allowFallback: Boolean(paperclipRunnerAcceptedResponseWake(tailItems, tailRunId ?? undefined)) ||
+      (!paperclipRunnerTailAwaitingContinuation && isTerminalRunStatus(tailRunStatus) &&
+        (terminalHydratedRunIds.has(tailRunId ?? "") || tailEntries.some((entry) => entry.kind === "run_terminal"))),
+    yielded: paperclipRunnerTailAwaitingContinuation,
+    waitSummary: acceptedSemanticResultSummary(tailRunId ? linkedRunMetaById.get(tailRunId)?.resultJson : null),
+  }) : undefined;
+  // A final channel names the answer, not its end: a final item still streaming
+  // (Codex labels it final from its first delta) is not a finished reply yet.
+  const tailFinalEntry = tailFinalResponse?.transcriptIndex == null
+    ? undefined : tailEntries[tailFinalResponse.transcriptIndex];
+  const tailFinalStreaming = tailFinalEntry?.kind === "assistant" && tailFinalEntry.delta === true;
+  // The visible transcript answer uses its own saved comment's read cutoff, even while the run stays open.
+  const tailReplyKey = tailFinalEntry?.kind === "assistant" && !tailFinalStreaming && tailFinalEntry.itemId
+    ? `native-final:${tailRunId}:${tailFinalEntry.itemId}` : null;
+  const tailReadReceipt = useMemo(() => {
+    if (!tailReplyKey) return undefined;
+    const reply = projectedComments.find(comment => !comment.deletedAt && comment.authorType === "agent" &&
+      comment.presentation?.kind !== "system_notice" && (comment.createdByRunId ?? comment.runId) === tailRunId &&
+      (comment.clientRequestId === tailReplyKey || comment.clientRequestId?.startsWith(`${tailReplyKey}:`)) &&
+      normalizedMessageText(comment.body) === normalizedMessageText(tailFinalResponse?.text ?? ""));
+    return commentItems.find((item): item is TaskChatMessageItem => item.kind === "message" && item.id === reply?.id);
+  }, [tailReplyKey, tailRunId, tailFinalResponse?.text, projectedComments, commentItems]);
+  // Match the runner turn's replay latch, including its yielded-wait reset.
+  const tailFinalRef = useRef<{ runId: string | null; item?: TaskChatMessageItem }>({ runId: null });
+  if (tailFinalRef.current.runId !== tailSegmentKey || (
+    !paperclipRunnerAcceptedResponseWake(tailItems, tailRunId ?? undefined) &&
+    (paperclipRunnerTailAwaitingContinuation || tailItems.some((item) =>
+      item.kind === "protocol" && item.surface === "run_result" && item.disposition === "yielded"))
+  )) tailFinalRef.current = { runId: tailSegmentKey };
+  if (tailFinalResponse && !tailFinalStreaming) tailFinalRef.current.item = tailFinalResponse;
+  const tailHasFinalResponse = Boolean(tailFinalRef.current.item) && !tailFinalStreaming;
+  const tailTerminal = tailEntries.findLast((entry) => entry.kind === "run_terminal");
+  const tailEndStatus = isTerminalRunStatus(tailRunStatus) ? tailRunStatus :
+    tailTerminal?.runState ?? (tailHasFinalResponse ? "succeeded" : tailRunStatus);
+  const tailStatus = tailEndStatus === "succeeded" && isUserStop(tailRunId ?? "") ? "cancelled" : tailEndStatus;
+  const tailFinishedAtMs = (tailStatus === "succeeded" && tailHasFinalResponse ? tailFinalRef.current.item?.atMs : undefined)
+    ?? tailRunFinishedAtMs ?? (tailTerminal ? toMs(tailTerminal.ts) : tailFinalRef.current.item?.atMs ?? null);
+  // Read the existing Stop button's active-run signal. Its recovery fallback
+  // can also name an ended attempt; that must never light this working line.
+  // This is display-only: the Stop/Send control and all failure rows stay as-is.
+  const statusLineRun = liveRun && !tailEnded && !tailHasFinalResponse && onCancelRun &&
+    !failureNoticeIds.has(liveRun.id) &&
+    ["queued", "running"].includes(terminalStatuses.get(liveRun.id) ?? linkedRunMetaById.get(liveRun.id)?.status ?? liveRun.status)
+    ? liveRun : null;
+  const statusLineTurn = useMemo(() => statusLineRun
+    ? taskChatTurnStart(statusLineRun, comments, requestCommentByRun.get(statusLineRun.id), transcriptByRun.get(statusLineRun.id) ?? [])
+    : { startedAtMs: null, newTurn: false }, [statusLineRun, comments, requestCommentByRun, transcriptByRun]);
+  const statusLineStartedAt = statusLineTurn.startedAtMs;
+  // Activity of the CURRENT turn only: a new send after an answer reads 'Starting'.
+  const statusLineItems = useMemo(() => statusLineRun
+    ? transcriptToTaskChatItems((transcriptByRun.get(statusLineRun.id) ?? []).filter((entry) =>
+        !statusLineTurn.newTurn || statusLineStartedAt == null || new Date(entry.ts).getTime() >= statusLineStartedAt), {
+        runId: statusLineRun.id, running: true,
+      })
+    : [], [statusLineRun, transcriptByRun, statusLineTurn, statusLineStartedAt]);
+  const statusLineFreshTurn = statusLineTurn.newTurn && statusLineItems.length === 0;
+  const statusLine = statusLineRun ? <TaskChatStatusLine
+    clockKey={`${statusLineRun.id}:${statusLineStartedAt ?? ""}`}
+    startedAtMs={statusLineStartedAt}
+    state={taskChatLineState({
+      status: statusLineFreshTurn ? "queued" : statusLineRun.status,
+      execution: liveExecution,
+      activityLabel: statusLineFreshTurn ? undefined : nativeActivityLabelByRun.get(statusLineRun.id) ?? tailPreparationLabel,
+      items: statusLineItems,
+      stopping: stoppingReply,
+      reconnecting: tailActivityUnavailable,
+    })}
+  /> : null;
+
   const tailTurnStatus = useMemo(
     () =>
       isTerminalRunStatus(tailStatus)
@@ -2747,6 +3196,35 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     },
     [interactions, onSubmitInteractionAnswers, onCancelInteraction],
   );
+  const renderRunnerSegment = (item: TaskChatTurnItem) => {
+    const segment = runnerSegmentsById.get(item.id);
+    if (!segment) return undefined;
+    const current = segment.runId === tailRunId && item.id === `${tailRunId}:turn:${tailSegments.length - 1}`;
+    const presentation = current ? {
+      ...segment,
+      items: item.finalResponse && !tailFinalResponse ? segment.items : tailItems,
+      status: isTerminalRunStatus(segment.status) ? segment.status : tailStatus,
+      startedAtMs: tailStartedAtMs,
+      finishedAtMs: isTerminalRunStatus(segment.status) ? segment.finishedAtMs : tailFinishedAtMs,
+      execution: !tailHasFinalResponse && !tailFinalStreaming && !tailTerminal ? tailExecution : null,
+      preparationLabel: tailProgressLabel ?? tailPreparationLabel,
+      activityUnavailable: tailActivityUnavailable,
+      awaitingContinuation: paperclipRunnerTailAwaitingContinuation,
+    } : segment;
+    return <div ref={node => { if (node) drawnRunnerSegments.current.add(item.id); }}
+      data-testid={current ? "task-chat-live-transcript" : undefined}>
+      <TaskChatShimmerScope items={presentation.items}>
+      <TaskChatRunnerHeader {...presentation} agentName={item.agentName} agentIcon={item.agentIcon} agent={item.agent}
+        statusContent={segment.emptyContinuation
+          ? <span className="text-sm font-normal text-muted-foreground" data-conversation-meta="">Continued below</span>
+          : undefined}
+        personStopped={item.summary.personStopped === true} />
+      {presentation.items.length > 0 || !presentation.preparationLabel ?
+        <TaskChatRunnerTurn {...presentation} showHeader={false} agentName={item.agentName} agentIcon={item.agentIcon} agent={item.agent}
+          onRuntimeRequestDecision={handleRuntimeRequestDecision} /> : null}
+      </TaskChatShimmerScope>
+    </div>;
+  };
   const pendingComposerInputs = useMemo<PendingComposerInput[]>(() => {
     const result: PendingComposerInput[] = [];
     const runtimeKey = pendingRuntimeRequest
@@ -2933,17 +3411,80 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     (body: string, clientRequestId: string) => handleThreadAdd(body, undefined, undefined, undefined, clientRequestId),
     [handleThreadAdd],
   );
+  const requestRun = [...runs].filter(run => latestUserComment && requestCommentByRun.get(run.id) === latestUserComment.id)
+    .sort((a, b) => toMs(a.createdAt) - toMs(b.createdAt)).at(-1);
+  const requestChain = requestRun ? runChainIdsById.get(requestRun.id) ?? [requestRun.id] : [];
+  const requestHasTurnSlot = requestChain.some(id => runnerSegmentsById.has(`${id}:turn:0`));
+  const requestAnswered = latestUserComment && (commentItems.some(item => item.kind === "message" && item.author === "agent" && !item.interstitial && item.channel !== "progress" && (item.atMs ?? 0) > toMs(latestUserComment.createdAt)) ||
+    requestChain.some(id => settledReplyRunIds.has(id)) || (tailHasFinalResponse && (tailFinalRef.current.item?.atMs ?? 0) > toMs(latestUserComment.createdAt)));
+  const requestStatus = terminalStatuses.get(requestRun?.id ?? "") ?? requestRun?.status;
+  // A message steered into (or queued behind) another live reply belongs to that reply's block;
+  // a message with no run is pending only while it is being sent or the server says why it holds it.
+  // A blocked task starts nothing by itself: its blocker notice speaks, not a pending
+  // block, and no optimistic start block either (whatever the presentation claims).
+  const requestPending = !!latestUserComment && !requestAnswered && issueStatus !== "blocked" &&
+    !(liveRun && !requestChain.includes(liveRun.id)) &&
+    (requestRun ? !isUserStop(requestRun.id) && (requestStatus === "queued" ||
+      // Only a run the server cancelled to reconcile is followed by another for the same message.
+      (requestStatus === "cancelled" && linkedRunMetaById.get(requestRun.id)?.errorCode === "execution_reconciliation_required"))
+      : runnerSubmissionPending || (queuedCommentIds.has(latestUserComment.id) && !!queuedMessageQueue?.executionWait));
+  const requestExecution = requestRun?.id === liveRun?.id ? liveExecution : linkedRunMetaById.get(requestRun?.id ?? "")?.execution;
+  const requestWait = latestUserComment && queuedCommentIds.has(latestUserComment.id) ? queuedMessageQueue?.executionWait : null;
+  const requestLabel = recoveryOwnsStatus ? "Preparing your reply…"
+    : requestWait?.message ?? (requestStatus === "queued" ? requestExecution?.cause ? requestExecution.label : "Queued" : undefined) ?? "Starting…";
+  // While the task offers Retry nothing is on its way by itself: words, no working sign.
+  const requestWorking = !(props.interruption?.state === "failed" && props.interruption.canRetry) &&
+    (HELD_BY_RECOVERY_REASONS.has(requestWait?.reason ?? requestExecution?.cause ?? "") ||
+    (!requestWait && !requestExecution?.cause && (!requestRun || requestStatus === "queued")));
+  // A person's message the server holds behind a Stop's recovery is still on
+  // its way: draw the working sign with the server's own words, not a blank.
   const optimisticRunnerStartup =
-    hasAgentAssignee &&
-    !startupBlocked &&
-    !tailRunId &&
-    (props.retryPreparing || props.interruption?.state === "working" || runnerSubmissionPending ||
+    hasAgentAssignee && issueStatus !== "blocked" &&
+    (!startupBlocked || requestPending) && !isUserStop(requestRun?.id ?? "") &&
+    (!tailRunId || (requestPending && requestChain.includes(tailRunId))) &&
+    (props.retryPreparing || (!isTerminalIssueStatus(issueStatus) && ((props.interruption?.state === "working" && !observedRunEnded) || props.interruption?.state === "retry_scheduled")) || requestPending || runnerSubmissionPending ||
       commentItems.some(
         (item) =>
           item.kind === "message" &&
           item.author === "human" &&
           item.optimistic === "pending",
       ));
+
+  const latestRun = runs.reduce<(typeof runs)[number] | undefined>((latest, run) =>
+    !latest || toMs(run.createdAt) > toMs(latest.createdAt) ? run : latest, undefined);
+  const latestRunStatus = terminalStatuses.get(latestRun?.id ?? "") ?? latestRun?.status;
+  // Saved replies have createdAt, not the streaming item's atMs. Progress is not an answer.
+  const savedAnswer = latestUserComment && projectedComments.some(comment => {
+    const runId = comment.createdByRunId ?? comment.runId ?? comment.derivedCreatedByRunId;
+    return toMs(comment.createdAt) > toMs(latestUserComment.createdAt) && comment.authorType === "agent" && comment.presentation?.kind !== "system_notice" &&
+      !comment.deletedAt && (runId ? hasVisibleRunAnswer([comment], runId, linkedRunMetaById.get(runId)?.resultJson)
+        : Boolean(comment.body.trim()) && comment.body !== LEGACY_WITHHELD_RUN_COMMENT);
+  });
+  const requestStopped = latestRun && isUserStop(latestRun.id) && latestUserComment &&
+    toMs(latestUserComment.createdAt) <= toMs(linkedRunMetaById.get(latestRun.id)?.finishedAt ?? latestRun.createdAt);
+  // The backend's saved-input receipt beats inferred transcript answers and
+  // resource-only recovery. It names the exact current-session person message.
+  const owedMessage = props.interruption?.state === "failed" && props.interruption.canRetry &&
+    props.interruption.unansweredCommentId === latestUserComment?.id;
+  const blockedChat = conversationMode && (issueStatus === "blocked" || (owedMessage && !isTerminalIssueStatus(issueStatus))) && latestUserComment &&
+    latestUserComment.body.trim() !== "/new" && !requestStopped && (owedMessage || (!requestAnswered && !savedAnswer)) &&
+    (owedMessage || (!failureNoticeIds.has(requestRun?.id ?? "") && !failureNoticeIds.has(latestRun?.id ?? ""))) &&
+    !liveRun && !runs.some(run => ["queued", "running", "scheduled_retry"].includes(terminalStatuses.get(run.id) ?? run.status)) &&
+    !props.retryPreparing && !props.scheduledRetry && !composerPause &&
+    !interactions?.some(interaction => interaction.status === "pending") &&
+    (owedMessage || !props.interruption || props.interruption.state === "resolved");
+  const blockedRetry = blockedChat && owedMessage ? onTryAgainNoLiveExecutionPath
+    : blockedChat && canRetryFailedRun
+      ? onTryAgainNoLiveExecutionPath ?? (latestRun && ["failed", "timed_out"].includes(latestRunStatus ?? "") &&
+        linkedRunMetaById.get(latestRun.id)?.errorCode !== "native_session_cleanup_quarantined"
+        ? () => retryFailedRunHandler!(latestRun.id) : undefined) : undefined;
+  const blockedChatNotice = blockedChat ? <ExecutionBlockerNotice savedMessageBlocked conversationMode presentation={null}
+    canRetry={!!blockedRetry} onRetry={() => { void Promise.resolve().then(blockedRetry).catch(() => undefined); }}
+    optimistic={tryAgainNoLiveExecutionPathPending || retryFailedRunId === latestRun?.id} /> : null;
+  const blockedNoticeItem = blockedChatNotice ? threadItems.slice(
+    threadItems.findIndex(item => item.id === latestUserComment?.id) + 1,
+  ).findLast(item => (item.kind === "marker" && item.variant === "interrupted" && item.tone !== "neutral" && !item.credentialAccess) ||
+    (item.kind === "message" && isNoLiveExecutionPathNotice(item))) : undefined;
 
   // Feedback votes keyed by the comment they target (targetType
   // "issue_comment"), mirroring IssueChatThread — the redesign attaches the
@@ -2962,6 +3503,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // buttons render only when the host wired a vote handler.
   const renderMessageActions = useCallback(
     (item: TaskChatMessageItem) => {
+      const failedRunId = [...failureNoticeIds].find(([, id]) => id === item.id)?.[0];
+      const retryAnswered = failedRunId && [...runChainIdsById].some(([id, chain]) => id !== failedRunId && chain.includes(failedRunId) &&
+        linkedRunMetaById.get(id)?.status === "succeeded" && settledReplyRunIds.has(id));
+      if (failedRunId && onRetryFailedRun && !retryAnswered) return <Button type="button" variant="outline" size="xs"
+        disabled={!canRetryFailedRun || !!liveRun || !!retryFailedRunId || props.retryPreparing}
+        onClick={() => { void Promise.resolve().then(() => retryFailedRunHandler?.(failedRunId)).catch(() => undefined); }}>
+        {retryFailedRunId === failedRunId ? "Retrying…" : "Retry"}</Button>;
       if (item.author !== "agent" || item.optimistic) return null;
       return (
         <TaskChatBubbleActions
@@ -2981,6 +3529,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       );
     },
     [
+      failureNoticeIds, onRetryFailedRun, canRetryFailedRun, liveRun, retryFailedRunId, props.retryPreparing, retryFailedRunHandler,
+      runChainIdsById, linkedRunMetaById, settledReplyRunIds,
       onVote,
       feedbackVoteByTargetId,
       feedbackDataSharingPreference,
@@ -2991,8 +3541,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const renderQueuedAction = useCallback(
     (item: TaskChatMessageItem) => {
       const runId = item.queueTargetRunId;
-      if (composerPause || item.optimistic !== "queued" || !runId || !onInterruptQueued)
+      if (steeringAnchorByCommentId.has(item.id) || stopPending || stoppingReply || composerPause || item.optimistic !== "queued" || !runId || !onInterruptQueued)
         return null;
+      // Agent Chat: Interrupt while the agent starts cancels the start; the tray says it sends when the agent starts.
+      if (conversationMode && queuedMessageQueue?.steeringDisposition === "temporarily_unavailable") return null;
 
       const isInterrupting = interruptingQueuedRunId === runId;
       return (
@@ -3007,7 +3559,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         </Button>
       );
     },
-    [composerPause, interruptingQueuedRunId, onInterruptQueued],
+    [steeringAnchorByCommentId, stopPending, stoppingReply, composerPause, interruptingQueuedRunId, onInterruptQueued, conversationMode, queuedMessageQueue?.steeringDisposition],
   );
 
   const reopenToolReview = useCallback((interactionId: string) => {
@@ -3234,7 +3786,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const transcriptHistoryPending = pendingTranscriptRuns.length > 0;
   // Only these may stop holding the reveal after the budget. See
   // selectBudgetedTranscriptRuns for the live, steered and settled rules.
-  const budgetedTranscriptRuns = selectBudgetedTranscriptRuns(pendingTranscriptRuns, {
+  // Finished native turns are visible history, not deferrable diagnostics.
+  // Wait for their own records; a newer success must never evict their activity.
+  const budgetedTranscriptRuns = selectBudgetedTranscriptRuns(pendingTranscriptRuns.filter(run =>
+    run.runtimeMode !== "native" || !isTerminalRunStatus(run.status)), {
     compactDeferral: compactTranscriptDeferral,
     hasTimelineAnchors: (run) => ((isNativePaperclipRunnerRun(run)
       ? steeringAnchorsByRun.get(run.id)
@@ -3264,8 +3819,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     planError ||
     runs.some((run) =>
       run.runtimeMode === "native"
-        ? nativeTranscriptErrorsByRun.has(run.id) &&
-          (logTranscriptByRun.get(run.id)?.length ?? 0) === 0
+        ? nativeTranscriptErrorsByRun.has(run.id)
         : Boolean(logErrorsByRun?.has(run.id)),
     );
   const historyKey = conversationMode && draftKey ? draftKey : issueId;
@@ -3365,6 +3919,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   };
 
   return (
+    <TaskChatStatusContext.Provider value={statusLineRun?.id ?? null}>
     <TaskChatRequestHistoryContext.Provider value={issueId ?? "unknown"}>
     <McpAppIssueProvider issueId={issueId} sendMessage={composerDisabledReason ? null : sendMcpAppMessage}>
     <ProviderToolIconsProvider companyId={companyId}>
@@ -3395,7 +3950,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               )}
               aria-busy={!historyRevealed}
             >
-              {historyError || (historyPending && historyWaitExpired) ? (
+              {connectionStatus === "online" && !historyRecoveryGrace && (historyError || (historyPending && historyWaitExpired)) ? (
                 <div
                   role="status"
                   className="absolute inset-x-0 top-0 z-20 mx-auto flex w-full max-w-(--tc-shell-max-w) items-center gap-2 border border-border bg-background px-4 py-2 text-sm text-muted-foreground"
@@ -3453,7 +4008,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                     ) : (
                       <RunFileCardsContext.Provider value={runFileCards}>
                       <TaskChatThreadView
-                        items={threadItems}
+                        items={requestPending ? threadItems.filter(item => runnerSegmentsById.has(item.id) || !requestChain.some(id => item.id.startsWith(`${id}:turn`) || item.id === `${id}:execution-wait`)) : threadItems}
                         scrollingHistory={scrollingHistory}
                         attachments={attachments}
                         header={<>{threadHeaderWithBlockers}{!issueBrief ? historyControl : null}<CoordinatorChatQuestionStatus query={pendingQuestions} /><CoordinatorChatReceiptStatus query={decisionReceipts} scroll={!!scrollingHistory} /><CoordinatorChatHandoffStatus query={taskHandoffs} scroll={!!scrollingHistory} /></>}
@@ -3461,6 +4016,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                         renderBrief={renderBrief}
                         renderMessageActions={renderMessageActions}
                         renderQueuedAction={renderQueuedAction}
+                        renderTurn={renderRunnerSegment}
+                        executionNotice={blockedChatNotice ? { itemId: blockedNoticeItem?.id, content: blockedChatNotice } : undefined}
                         onTryAgainNoLiveExecutionPath={
                           issueStatus === "blocked" &&
                           !requiresExecutionReconciliation(
@@ -3481,11 +4038,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                         onOpenBrowser={onOpenBrowser}
                         tail={
                           tailRunId ||
-                          optimisticRunnerStartup ||
+                          optimisticRunnerStartup || requestPending ||
                           bottomBlockerLinks ? (
                             <>
-                              {tailRunId || optimisticRunnerStartup ? (
-                                <div data-testid="task-chat-live-transcript">
+                              {!tailSegmentSettled && !recoveryOwnsStatus && (tailRunId || (optimisticRunnerStartup && !requestHasTurnSlot)) ? (
+                                <div key={tailRunId ? requestCommentByRun.get(tailRunId) ?? tailRunId : latestUserComment?.id} data-testid="task-chat-live-transcript">
                                   <TaskChatShimmerScope items={tailItems}>
                                   <TaskChatRunnerHeader
                                     runId={tailRunId}
@@ -3493,31 +4050,37 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                     agentIcon={visibleTailAgentIcon}
                                     agent={tailAgent ?? (tailAgentId ? { id: tailAgentId } : undefined)}
                                     status={optimisticRunnerStartup ? "queued" : tailStatus}
-                                    execution={liveRun?.id === tailRunId ? liveRun.execution : null}
-                                    preparationLabel={optimisticRunnerStartup && submissionTakingLonger ? "Taking longer than usual…" : undefined}
+                                    personStopped={isUserStop(tailRunId ?? "")}
+                                    working={optimisticRunnerStartup ? requestWorking : undefined}
+                                    execution={!optimisticRunnerStartup && !tailHasFinalResponse && !tailFinalStreaming && !tailTerminal && liveRun?.id === tailRunId ? tailExecution : null}
+                                    preparationLabel={tailProgressLabel ?? tailPreparationLabel ?? (optimisticRunnerStartup ? requestLabel : liveRun && tailHasFinalResponse && (liveExecution?.phase === "finishing" || tailEntries.some((entry) => entry.kind === "run_terminal" && entry.runState === "succeeded")) ? "Answer ready · Saving…" : undefined)}
                                     startedAtMs={tailStartedAtMs}
                                     finishedAtMs={tailFinishedAtMs}
-                                    continuedAfterSteering={paperclipRunnerTail && tailTimelineAnchors.length > 0}
-                                    statusContent={tailRunSource?.adapterType !== "paperclip_runner" && !optimisticRunnerStartup ? (
-                                      <TaskChatLiveRunPill status={tailStatus} execution={liveRun?.id === tailRunId ? liveRun.execution : null}
+                                    continuedAfterSteering={tailContinued}
+                                    statusContent={tailRunSource?.adapterType !== "paperclip_runner" && !optimisticRunnerStartup && !tailProgressLabel && !tailPreparationLabel && !stoppingReply && !isTerminalRunStatus(tailStatus) ? (
+                                      <TaskChatLiveRunPill runId={tailRunId} status={tailStatus} execution={!tailHasFinalResponse && !tailFinalStreaming && !tailTerminal && liveRun?.id === tailRunId ? tailExecution : null}
                                         startedAtMs={tailStartedAtMs} finishedAtMs={tailFinishedAtMs} toolSummary={tailToolSummary} />
                                     ) : undefined}
                                   />
                                   {tailRunSource?.adapterType === "paperclip_runner" ||
-                                  optimisticRunnerStartup ? (
+                                  optimisticRunnerStartup || tailBeforeTurn ? (
                                     <TaskChatRunnerTurn
+                                      key={tailSegmentKey}
                                       showHeader={false}
+                                      preparationLabel={tailProgressLabel ?? tailPreparationLabel ?? (optimisticRunnerStartup ? requestLabel : undefined)}
                                       runId={tailRunId}
                                       execution={
-                                        liveRun?.id === tailRunId
-                                          ? liveRun.execution
+                                        // While the answer itself streams the reply is Working, whatever the label poll says.
+                                        // Once the run's own end is in, the server is saving it: its unleased 'Confirming execution' is not a reconnect.
+                                        !tailHasFinalResponse && !tailFinalStreaming && !tailTerminal && liveRun?.id === tailRunId
+                                          ? tailExecution
                                           : null
                                       }
                                       agentName={visibleTailAgentName}
                                       agentIcon={visibleTailAgentIcon}
                                       agent={tailAgent ?? (tailAgentId ? { id: tailAgentId } : undefined)}
                                       items={tailItems}
-                                      preparationLabel={optimisticRunnerStartup && submissionTakingLonger ? "Taking longer than usual…" : undefined}
+                                      readReceipt={tailReadReceipt}
                                       allowSummaryFallback={!paperclipRunnerTail ||
                                         terminalHydratedRunIds.has(tailRunId ?? "") ||
                                         tailEntries.some((entry) => entry.kind === "run_terminal")}
@@ -3535,10 +4098,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                       waitSummary={acceptedSemanticResultSummary(
                                         tailRunId ? linkedRunMetaById.get(tailRunId)?.resultJson : null,
                                       )}
-                                      continuedAfterSteering={
-                                        paperclipRunnerTail &&
-                                        tailTimelineAnchors.length > 0
-                                      }
+                                      continuedAfterSteering={tailContinued}
                                       onRuntimeRequestDecision={
                                         handleRuntimeRequestDecision
                                       }
@@ -3566,6 +4126,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                   </TaskChatShimmerScope>
                                 </div>
                               ) : null}
+                              {requestPending && !optimisticRunnerStartup && !recoveryOwnsStatus && !requestHasTurnSlot ? <div key={latestUserComment?.id} data-testid="task-chat-live-transcript">
+                                <TaskChatShimmerScope items={[]}><TaskChatRunnerHeader status="queued" startedAtMs={null}
+                                  agentName={tailAgent?.name} agent={tailAgent} working={requestWorking} preparationLabel={requestLabel} /></TaskChatShimmerScope>
+                              </div> : null}
                               {tailTaskCreationItems.map(item => (
                                 <div key={item.id} data-thread-anchor={item.id} data-thread-item-kind={item.kind} className="mt-4">
                                   {item.kind === "task_handoff"
@@ -3577,7 +4141,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                             </>
                           ) : null
                         }
-                        contentKey={`${autoFollowContentKey}:${historyRevealed}`}
+                        contentKey={`${autoFollowContentKey}:${historyRevealed}:${Boolean(blockedChatNotice)}`}
                         className={isMobile ? undefined : "pt-3"}
                       />
                       </RunFileCardsContext.Provider>
@@ -3596,6 +4160,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                 />
               </div>
             ) : null}
+            {!showComposer ? <div className="mx-auto w-full max-w-(--tc-shell-max-w) px-4">{statusLine}</div> : null}
             {showComposer ? (
               <TaskChatComposerDock mobile={isMobile} streamlined={streamlinedUiEnabled} concealed={!historyRevealed}>
                 {prepareInitialContent ? (
@@ -3617,11 +4182,21 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                     >
                       {!composerPause ? (
                         <TaskChatQueuedMessages
+                          agentStarting={tailBeforeTurn && queuedMessageQueue?.targetRunId === tailRunId}
+                          stopPending={stopPending || stoppingReply}
+                          conversationMode={conversationMode}
+                          executionRecoveryPending={Boolean(
+                            (props.recoveryAction && !["resolved", "cancelled"].includes(props.recoveryAction.status)) ||
+                            [...(linkedRuns ?? []).map(run => ({ ...run, id: run.runId })), ...(liveRuns ?? []), ...(activeRun ? [activeRun] : [])]
+                              .some(run => run.execution?.phase === "recovery_needed" && !statusRelevance.isHistoricalRun(run.id))
+                          )}
                           key={issueId}
-                          queue={queuedMessageQueue ?? emptyQueuedCommentQueue}
+                          queue={visibleQueuedMessageQueue}
+                          hiddenCommentIds={hiddenQueuedCommentIds}
                           onEdit={beginQueuedEdit}
                           editingCommentId={queuedEdit?.commentId ?? null}
-                          autoSteerDelayMs={queuedMessageAutoSteerDelayMs}
+                          autoSteerDelayMs={stopPending || stoppingReply ? null : queuedMessageAutoSteerDelayMs}
+                          attemptedAutoSteerKeys={attemptedAutoSteer.current}
                           onReorder={async (orderedCommentIds, revision) => {
                             if (!onReorderQueuedComments)
                               throw new Error("Queue reordering is unavailable.");
@@ -3660,15 +4235,19 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                         />
                       ) : null}
                       <div className="relative z-10">
+                        {statusLine}
                         <TaskChatComposer
+                          composerRef={composerRef}
                           onAdd={handleThreadAdd}
+                          onRetainedSubmissionChange={onRetainedSubmissionChange}
+                          onRestoreReady={onRestoreReady}
                           confirmedSubmissionIds={new Set(comments.filter((comment) =>
                             comment.authorUserId === currentUserId && comment.clientRequestId &&
-                            !("clientStatus" in comment && comment.clientStatus)
+                            !comment.id.startsWith("optimistic-")
                           ).map((comment) => comment.clientRequestId!))}
-                          onStop={liveRun ? onCancelRun : undefined}
+                          onStop={liveRun && !tailEnded && !tailHasFinalResponse && onCancelRun ? () => { stoppedRunIds.current.add(liveRun.id); return onCancelRun(); } : undefined}
                           confirmedStoppedRunIds={confirmedStoppedRunIds}
-                          stopPending={stopPending}
+                          stopPending={stoppingReply}
                           stopScope={stopScope}
                           workMode={issueWorkMode}
                           onWorkModeChange={onWorkModeChange}
@@ -3724,5 +4303,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     </ProviderToolIconsProvider>
     </McpAppIssueProvider>
     </TaskChatRequestHistoryContext.Provider>
+    </TaskChatStatusContext.Provider>
   );
 }

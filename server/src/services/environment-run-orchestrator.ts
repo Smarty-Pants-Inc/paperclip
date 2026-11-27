@@ -22,6 +22,7 @@ import { environmentLeases, type Db } from "@paperclipai/db";
 import { and, eq } from "drizzle-orm";
 import { remoteExecutionHasReleased } from "./remote-execution-termination.js";
 import { remoteRecoveryLeaseMismatch, type RemoteRecoveryLeaseMismatchField } from "./native-runtime/remote-recovery-lease-mismatch.js";
+import { sandboxRestartMetadata } from "./sandbox-snapshot-restore.js";
 import { EnvironmentProviderUnavailableError, readTransientLeaseAcquisitionFailure } from "./environment-provider-unavailable-error.js";
 import { injectLeaseAcquisitionFault } from "./environment-lease-fault-injection.js";
 import { findReusableSandboxResumeError } from "./reusable-sandbox-resume-error.js";
@@ -439,7 +440,9 @@ export function environmentRunOrchestrator(
         if (resumed.metadata?.expired === true) throw remoteRecoveryLeaseMismatch("environment_resume", "lease_expired");
         // Resume confirms allocation readiness. Its optional metadata may
         // describe the allocation root; keep the validated lease's workspace.
-        sandboxLeaseAcquisition = { outcome: "resumed", providerLeaseId: expected.providerLeaseId };
+        const restartMetadata = sandboxRestartMetadata(lease, resumed);
+        sandboxLeaseAcquisition = { outcome: "resumed", providerLeaseId: expected.providerLeaseId, ...restartMetadata };
+        if (Object.keys(restartMetadata).length) lease.metadata = { ...lease.metadata, ...restartMetadata, sandboxLeaseAcquisition };
       }
       leaseRecord = { environment, lease, leaseContext: buildEnvironmentLeaseContext(input) };
     } else {

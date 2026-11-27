@@ -859,6 +859,8 @@ environment, and managed AI connection. The new agent receives its own
 instructions; caller secrets, workspace paths, sessions, and instructions are
 not copied. Existing hiring permissions and company approval policy still apply.
 
+With `hire_agent` the new agent takes your model, and its reasoning level is `medium`; to choose another level, hire through `agent-hires` with an explicit `adapterConfig`. A hire through `agent-hires` that names no level gets `medium`, and one that names no model gets Opus 5.5; name both anyway: a level you leave out is written as `medium`, and an invalid level is refused (422). When you hire through the API with an explicit `adapterConfig`, always name both the model and the reasoning level (for a native Pi agent: `"provider": "pi_rpc"`, `"model": "<provider>/<model>"`, `"piRpcThinkingLevel": "medium"`; off, minimal, low, medium, high, xhigh, max). Leaving either to a default is a failure.
+
 The equivalent native API request is:
 
 ```
@@ -894,6 +896,7 @@ POST /api/companies/{companyId}/agent-hires
   "capabilities": "Market research, competitor analysis",
   "budgetMonthlyCents": 5000,
   "adapterType": "codex_local",
+  "adapterConfig": { "model": "o4-mini", "modelReasoningEffort": "medium" },
   "instructionsBundle": {
     "entryFile": "AGENTS.md",
     "files": {

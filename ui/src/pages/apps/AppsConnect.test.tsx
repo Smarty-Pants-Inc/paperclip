@@ -1,5 +1,10 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act } from "react";
+import { CONNECTABLE_APP_DEFINITIONS } from "@paperclipai/shared";
+import { toolsApi } from "@/api/tools";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { BreadcrumbProvider } from "@/context/BreadcrumbContext";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -74,9 +79,24 @@ vi.mock("@/api/health", () => ({
 vi.mock("@/api/tools", () => ({
   toolsApi: {
     listGallery: vi.fn().mockResolvedValue({ apps: [] }),
+    listApplications: vi.fn().mockResolvedValue({ applications: [] }),
     listConnections: vi.fn().mockResolvedValue({ connections: [] }),
+    getCloudConnectorEnrollment: vi.fn().mockResolvedValue({ configured: false, status: "not_configured" }),
+    connectApp: vi.fn().mockResolvedValue({
+      connectionId: "conn-1",
+      application: { id: "app-1", name: "GitHub" },
+      actions: { readOnly: [], canMakeChanges: [] },
+      catalog: [],
+      suggestedDefaults: {},
+    }),
   },
 }));
+
+vi.mock("@/api/companies-query", () => ({
+  useAccountIdentity: () => ({ userId: "board-user", settled: true, failed: false }),
+  resolveAccountUserId: async () => "board-user",
+}));
+vi.mock("@/context/ToastContext", () => ({ useToast: () => ({ pushToast: vi.fn() }) }));
 
 vi.mock("@/components/new-agent/useSavedProviderKeys", () => ({
   useSavedProviderKeys: () => ({
@@ -109,11 +129,44 @@ function renderAppsConnect() {
   flushSync(() => {
     root.render(
       <QueryClientProvider client={client}>
-        <AppsConnect />
+        <BreadcrumbProvider><TooltipProvider><AppsConnect /></TooltipProvider></BreadcrumbProvider>
       </QueryClientProvider>,
     );
   });
 }
+
+function setFieldValue(field: HTMLInputElement | HTMLTextAreaElement, value: string) {
+  const prototype = field instanceof HTMLTextAreaElement ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+  Object.getOwnPropertyDescriptor(prototype, "value")?.set?.call(field, value);
+  field.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+describe("AppsConnect secret custody", () => {
+  it("keeps a GitHub App private key masked and multiline through submission", async () => {
+    mocks.searchParams = new URLSearchParams({ source: "github", method: "app-installation" });
+    vi.mocked(toolsApi.listGallery).mockResolvedValueOnce({
+      apps: CONNECTABLE_APP_DEFINITIONS.filter(app => app.slug === "github"),
+      capabilities: { canCreateOrganizationGrant: true, organizationGrantReason: null, canSetCompanyInstall: true, companyInstallReason: null },
+      credentialSources: { vercelConnect: { available: false, enabled: false, authentication: null, manageUrl: "", reason: null } },
+    });
+    renderAppsConnect();
+    await vi.waitFor(() => expect(host.querySelector('[aria-label="Your GitHub key"]')).not.toBeNull());
+    const key = host.querySelector<HTMLTextAreaElement>('[aria-label="Your GitHub key"]')!;
+    expect(key.matches("textarea.secret-value-masked.ph-no-capture")).toBe(true);
+    await act(async () => {
+      setFieldValue(host.querySelector<HTMLInputElement>('input[placeholder="123456"]')!, "123456");
+      setFieldValue(host.querySelector<HTMLInputElement>('input[placeholder="12345678"]')!, "12345678");
+      setFieldValue(host.querySelector<HTMLTextAreaElement>('textarea[placeholder="acme/backend, acme/frontend"]')!, "example/repository");
+      setFieldValue(key, "line-1\nline-2\nline-3");
+    });
+    await act(async () => {
+      Array.from(host.querySelectorAll("button")).find(button => button.textContent?.trim() === "Connect")!.click();
+    });
+    expect(toolsApi.connectApp).toHaveBeenCalledWith("company-1", expect.objectContaining({
+      credentialValues: { "credentials.privateKey": "line-1\nline-2\nline-3" },
+    }));
+  });
+});
 
 describe("AppsConnect Antigravity routing and branding", () => {
   it.each(["google", "google-ai"])("redirects legacy source=%s links to source=antigravity while preserving query params", async (legacySource) => {

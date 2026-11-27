@@ -1079,7 +1079,7 @@ describe("inbox helpers", () => {
         workspaces: [],
         liveOnly: false,
         externalObjectStatuses: [],
-        showAgentCreatedTasks: false,
+        showAgentCreatedTasks: true,
         routineTasksOnly: false,
         updatedWithin: null,
         updatedFrom: null,

@@ -32,6 +32,13 @@ const mockIssueService = vi.hoisted(() => ({
   listReviewAttention: vi.fn(),
 }));
 
+const mockHeldEnd = vi.hoisted(() => vi.fn(async () => undefined));
+vi.mock("../services/native-runtime/held-native-turn.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../services/native-runtime/held-native-turn.js")>(),
+  requestHeldNativeConfigurationEnd: mockHeldEnd,
+}));
+
+const mockModelAgent = vi.hoisted(() => vi.fn(async (): Promise<Record<string, unknown> | null> => null));
 const mockPauseGate = vi.hoisted(() => vi.fn(async (): Promise<Record<string, unknown> | null> => null));
 const mockExecutionBlocker = vi.hoisted(() => vi.fn(async (): Promise<Record<string, unknown> | null> => null));
 vi.mock("../services/execution-blocker.js", () => ({ getExecutionBlocker: mockExecutionBlocker }));
@@ -94,7 +101,7 @@ const createServicesMock = vi.hoisted(() => () => ({
     hasPermission: vi.fn(async () => true),
   }),
   agentService: () => ({
-    getById: vi.fn(async () => null),
+    getById: mockModelAgent,
     resolveByReference: vi.fn(async (_companyId: string, raw: string) => ({
       ambiguous: false,
       agent: { id: raw },
@@ -446,6 +453,111 @@ describe("issue update comment wakeups", () => {
         }),
       }),
     );
+  });
+
+  it.each([
+    { saved: "paperclip/gpt-6.1-sol", model: "gpt-6.2-sol", status: 200, normalized: "paperclip/gpt-6.2-sol" },
+    { saved: "gpt-6.1-sol", model: "gpt-6.2-sol", status: 422 },
+    { saved: undefined, model: "gpt-6.2-sol", status: 422 },
+    { saved: "paperclip/gpt-6.1-sol", model: "paperclip/gpt-6.2-sol", status: 200 },
+    { saved: undefined, model: "other/gpt-6.2-sol", status: 200 },
+  ])("validates Pi chat model $model using only the agent's saved prefix (saved: $saved)", async ({ saved, model, status, normalized }) => {
+    const existing = makeIssue({ assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null });
+    mockModelAgent.mockResolvedValue({ id: ASSIGNEE_AGENT_ID, companyId: existing.companyId,
+      adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: saved } });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockImplementation(async (_id, fields) => ({ ...existing, ...fields }));
+    mockIssueService.addComment.mockResolvedValue({ id: "model-comment", issueId: existing.id,
+      companyId: existing.companyId, body: "use this model" });
+    const res = await request(await createApp()).patch(`/api/issues/${existing.id}`).send({
+      comment: "use this model", assigneeAdapterOverrides: { adapterConfig: { model, fastMode: true } },
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(status);
+    if (status === 422) {
+      expect(res.body.error).toContain(model);
+      expect(res.body.error).toContain("pick a provider/model, or clear the chat's model");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    } else {
+      expect(res.body.assigneeAdapterOverrides.adapterConfig).toEqual({ model: normalized ?? model, fastMode: true });
+      await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalled());
+    }
+  });
+
+  it("rejects saved ultra effort with the same bare chat model before any save or wake", async () => {
+    const existing = makeIssue({ assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null });
+    mockModelAgent.mockResolvedValue({ id: ASSIGNEE_AGENT_ID, companyId: existing.companyId,
+      adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: "paperclip/model", effort: "ultra" } });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockImplementation(async (_id, fields) => ({ ...existing, ...fields }));
+    mockIssueService.addComment.mockResolvedValue({ id: "model-comment", issueId: existing.id,
+      companyId: existing.companyId, body: "use this model" });
+    const res = await request(await createApp()).patch(`/api/issues/${existing.id}`).send({
+      comment: "use this model", assigneeAdapterOverrides: { adapterConfig: { model: "model" } },
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain('pi_thinking_level_invalid: "ultra"');
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockHeldEnd).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { provider: "pi_rpc", config: { piRpcThinkingLevel: "ultra" }, status: 422 },
+    { provider: "pi_rpc", config: { modelReasoningEffort: "ultra" }, status: 422 },
+    { provider: "pi_rpc", config: { reasoningEffort: "ultra" }, status: 422 },
+    { provider: "pi_rpc", config: { effort: "ultra" }, status: 422 },
+    { provider: "pi_rpc", config: { piRpcThinkingLevel: "max" }, status: 200 },
+    { provider: "pi_rpc", config: { piRpcThinkingLevel: null }, status: 200 },
+    { provider: "pi_rpc", config: { piRpcThinkingLevel: "" }, status: 200 },
+    { provider: "pi_rpc", config: { piRpcThinkingLevel: " \t " }, status: 200 },
+    { provider: "pi_rpc", config: { effort: "max" }, status: 200 },
+    { provider: "pi_rpc", config: { effort: "none" }, status: 200 },
+    { provider: "codex", config: { modelReasoningEffort: "ultra" }, status: 200 },
+  ])("validates Pi chat reasoning before saving: %j", async ({ provider, config, status }) => {
+    const existing = makeIssue({ assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null });
+    mockModelAgent.mockResolvedValue({ id: ASSIGNEE_AGENT_ID, companyId: existing.companyId,
+      adapterType: "paperclip_runner", adapterConfig: { provider, model: "paperclip/gpt-6.1-sol", piRpcThinkingLevel: "high" } });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockImplementation(async (_id, fields) => ({ ...existing, ...fields }));
+    const res = await request(await createApp()).patch(`/api/issues/${existing.id}`).send({
+      assigneeAdapterOverrides: { adapterConfig: config },
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(status);
+    if (status === 422) {
+      expect(res.body.error).toContain('pi_thinking_level_invalid: "ultra"');
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockHeldEnd).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    } else {
+      expect(res.body.assigneeAdapterOverrides.adapterConfig).toEqual(config);
+    }
+  });
+
+  it.each([
+    { previous: null, next: { model: "gpt-6.2-sol" }, end: true },
+    { previous: { adapterConfig: { model: "gpt-6.2-sol" } }, next: { model: "paperclip/gpt-6.2-sol" }, end: false },
+    { previous: null, next: { modelReasoningEffort: "low" }, end: true },
+    { previous: null, next: { modelReasoningEffort: "xhigh" }, end: false },
+    { previous: null, next: { piRpcThinkingLevel: null }, end: false },
+    { previous: null, next: { piRpcThinkingLevel: " \t " }, end: false },
+    { previous: { adapterConfig: { model: "paperclip/gpt-6.2-sol" } }, next: null, end: true },
+  ])("ends only this chat's held turn on an effective Pi model/level change: %j", async ({ previous, next, end }) => {
+    const existing = makeIssue({ assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null, assigneeAdapterOverrides: previous });
+    mockModelAgent.mockResolvedValue({ id: ASSIGNEE_AGENT_ID, companyId: existing.companyId,
+      adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: "paperclip/gpt-6.1-sol", piRpcThinkingLevel: "xhigh" } });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockImplementation(async (_id, fields) => ({ ...existing, ...fields }));
+    const res = await request(await createApp()).patch(`/api/issues/${existing.id}`).send({
+      assigneeAdapterOverrides: next === null ? null : { adapterConfig: next },
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    if (end) expect(mockHeldEnd).toHaveBeenCalledExactlyOnceWith(expect.anything(), {
+      companyId: existing.companyId, agentId: ASSIGNEE_AGENT_ID, issueId: existing.id,
+    });
+    else expect(mockHeldEnd).not.toHaveBeenCalled();
   });
 
   it("rolls back adapter settings if the accompanying comment fails", async () => {

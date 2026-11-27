@@ -4,6 +4,31 @@ Paperclip work is company-open by default. A task or project can instead be
 marked private when its title, discussion, documents, attachments, work
 products, or agent run traces should be limited to named participants.
 
+## Visibility requests on creation and update
+
+Company task/project creation, child creation, accepted-plan decomposition, and
+task/project PATCH routes require a person to request `visibility: "private"`.
+An agent may make that request through its authenticated current run when the
+active run identity records that person's own action: their instruction, accepted
+steering or queued-interrupt comment, an interaction they resolved, or their manual
+wake. That person must still be an active company member. Inherited responsibility,
+a company default, timer/routine wakes and agent-authored steering do not authorize
+privacy. The server reads the existing active identity and saved message author,
+not a user ID from the request body or the agent's owner. New private tasks belong
+to that responsible user; private projects
+record that person as privacy owner and access member.
+
+An agent run without such a person receives HTTP `403` explaining that "a person
+must ask for it". A decomposition is checked before creating any child or claim.
+Updates also require the same task/project privacy-owner or administrator
+authority that the person would need themselves. This delegation applies only to
+making work private, not publishing it or managing access grants.
+
+Omitting visibility keeps the ordinary open default. A task created under a
+person's private parent or in a private project still inherits that privacy;
+the agent did not request a new restriction. Publishing existing work retains
+its privacy-owner/administrator checks. Board-user permissions are unchanged.
+
 ## Who can read private work
 
 A private task is readable by its responsible user, creating user, current

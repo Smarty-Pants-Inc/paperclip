@@ -5,7 +5,7 @@ import path from "node:path";
 import express from "express";
 import request from "supertest";
 import { and, eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
@@ -26,6 +26,11 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { errorHandler } from "../middleware/index.js";
 import { agentRoutes } from "../routes/agents.js";
 import { secretService } from "../services/secrets.js";
+import { piRpcThinking, resolvePaperclipRunnerNativeProviderInput } from "../services/native-runtime/provider-profile.js";
+import * as providerPack from "../services/native-runtime/remote-provider-pack.js";
+import { fingerprintEnvironmentSandboxProviderConfig, SANDBOX_PLATFORM_PROBE_METADATA_KEY } from "../services/environment-custom-image-runtime.js";
+import { resolveEnvironmentDriverConfigForRuntime } from "../services/environment-config.js";
+import { environmentService } from "../services/environments.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -73,6 +78,8 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
   const secretsTmpDir = path.join(os.tmpdir(), `paperclip-agent-hire-auth-inheritance-${randomUUID()}`);
 
   beforeAll(async () => {
+    // These route rows exercise configuration persistence, not provider-pack installation.
+    vi.spyOn(providerPack, "installedNativePiDriverAvailable").mockResolvedValue(true);
     mkdirSync(secretsTmpDir, { recursive: true });
     process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = path.join(secretsTmpDir, "master.key");
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-agent-hire-auth-inheritance-");
@@ -96,6 +103,7 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
   });
 
   afterAll(async () => {
+    vi.restoreAllMocks();
     await tempDb?.cleanup();
     if (previousKeyFile === undefined) {
       delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
@@ -512,6 +520,290 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     expect(Object.keys(childEnvOf(res))).toHaveLength(0);
   });
 
+  it.each((["agents", "agent-hires"] as const).flatMap(endpoint =>
+    [
+      { provider: "codex", model: undefined, key: "modelReasoningEffort" },
+      { provider: "codex", model: "gpt-6.1-sol", key: "modelReasoningEffort" },
+      { provider: "acpx", acpxAgent: "claude", key: "modelReasoningEffort" },
+      { provider: "acpx", acpxAgent: "grok", key: "reasoningEffort" },
+    ].flatMap(kind => [undefined, null, "", "auto", "high", "unknown", 5].map(level => ({ endpoint, ...kind, level }))),
+  ))("$endpoint $provider/$acpxAgent persists or refuses $key=$level", async ({ endpoint, key, level, ...kind }) => {
+    const companyId = await seedCompany();
+    const res = await request(createApp(db, userActor())).post(`/api/companies/${companyId}/${endpoint}`).send({
+      name: "Reasoning Child", role: "engineer", adapterType: "paperclip_runner",
+      adapterConfig: { ...kind, [key]: level },
+    });
+    if (level === "unknown" || typeof level === "number") {
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(await db.select().from(agents).where(eq(agents.companyId, companyId))).toHaveLength(0);
+      return;
+    }
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const responseAgent = endpoint === "agents" ? res.body : res.body.agent;
+    const [child] = await db.select().from(agents).where(eq(agents.id, responseAgent.id));
+    const expected = level === "high" ? "high" : "medium";
+    expect(child!.adapterConfig[key]).toBe(expected);
+    expect(responseAgent.adapterConfig[key]).toBe(expected);
+    if (kind.provider === "codex") {
+      expect(child!.adapterConfig.model).toBe(kind.model ?? "claude-opus-5-5");
+      expect(responseAgent.adapterConfig.model).toBe(kind.model ?? "claude-opus-5-5");
+    }
+    const native = resolvePaperclipRunnerNativeProviderInput({ backend: kind.provider === "codex" ? "codex_app_server" : "acpx_runtime", adapterConfig: child!.adapterConfig });
+    const nativeKey = kind.acpxAgent === "claude" ? "claudeEffort" : kind.acpxAgent === "grok" ? "grokEffort" : "codexReasoningEffort";
+    expect(native).toMatchObject({ [nativeKey]: expected });
+  });
+
+  it.each((["agents", "agent-hires"] as const).flatMap(endpoint => [
+    { adapterType: "codex_local", key: "modelReasoningEffort" },
+    { adapterType: "claude_local", key: "effort" },
+    { adapterType: "grok_local", key: "reasoningEffort" },
+  ].flatMap(kind => [undefined, "high", "unknown"].map(level => ({ endpoint, ...kind, level })))))
+  ("legacy $endpoint $adapterType persists or refuses $key=$level", async ({ endpoint, adapterType, key, level }) => {
+    const companyId = await seedCompany();
+    const res = await request(createApp(db, userActor())).post(`/api/companies/${companyId}/${endpoint}`).send({
+      name: "Legacy Reasoning Child", role: "engineer", adapterType, runner: "legacy", adapterConfig: { [key]: level },
+    });
+    if (level === "unknown") {
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(await db.select().from(agents).where(eq(agents.companyId, companyId))).toHaveLength(0);
+      return;
+    }
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const responseAgent = endpoint === "agents" ? res.body : res.body.agent;
+    const [child] = await db.select().from(agents).where(eq(agents.id, responseAgent.id));
+    expect(child!.adapterConfig[key]).toBe(level ?? "medium");
+    if (adapterType === "codex_local" || adapterType === "claude_local") {
+      expect(child!.adapterConfig.model).toBe("claude-opus-5-5");
+      expect(responseAgent.adapterConfig.model).toBe("claude-opus-5-5");
+    }
+  });
+
+  it.each(["codex", "pi_rpc"] as const)("%s explicit hires inherit only an omitted environment", async provider => {
+    const companyId = await seedCompany();
+    const parent = await seedParentAgent(companyId, "paperclip_runner", {});
+    const environmentId = randomUUID();
+    await db.insert(environments).values({ id: environmentId, name: "Parent local", driver: "local" });
+    await db.update(agents).set({ defaultEnvironmentId: environmentId }).where(eq(agents.id, parent.id));
+    for (const requestedEnvironment of [undefined, null, environmentId]) {
+      if (requestedEnvironment === environmentId) {
+        await db.update(agents).set({ defaultEnvironmentId: null }).where(eq(agents.id, parent.id));
+      }
+      const res = await hire(agentActor(companyId, parent.id), companyId, {
+        name: "Environment Child", role: "engineer", adapterType: "paperclip_runner",
+        adapterConfig: { provider, ...(provider === "codex" && requestedEnvironment === environmentId ? { model: "gpt-6.1-sol" } : {}), ...(requestedEnvironment === environmentId
+          ? { [provider === "codex" ? "modelReasoningEffort" : "piRpcThinkingLevel"]: "high" } : {}) },
+        defaultEnvironmentId: requestedEnvironment,
+      });
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      const [child] = await db.select().from(agents).where(eq(agents.id, res.body.agent.id));
+      const expectedEnvironment = requestedEnvironment === undefined ? environmentId : requestedEnvironment;
+      expect(child!.defaultEnvironmentId).toBe(expectedEnvironment);
+      expect(res.body.agent.defaultEnvironmentId).toBe(expectedEnvironment);
+      if (provider === "codex") expect(child!.adapterConfig.model)
+        .toBe(requestedEnvironment === environmentId ? "gpt-6.1-sol" : "claude-opus-5-5");
+      expect(child!.adapterConfig[provider === "codex" ? "modelReasoningEffort" : "piRpcThinkingLevel"])
+        .toBe(requestedEnvironment === environmentId ? "high" : "medium");
+    }
+  });
+
+  it.each((["agents", "agent-hires"] as const).flatMap(endpoint =>
+    [undefined, "auto", "legacy"].flatMap(runner => ["sandbox", "local"].map(driver => ({ endpoint, runner, driver }))),
+  ))("Codex card $endpoint on $driver with runner $runner", async ({ endpoint, runner, driver }) => {
+    const companyId = await seedCompany();
+    const parent = await seedParentAgent(companyId, "paperclip_runner", {});
+    const environmentId = randomUUID();
+    await db.insert(environments).values({ id: environmentId, name: "Plugin computer", driver,
+      config: driver === "sandbox" ? { provider: "example-sandbox" } : {} });
+    await db.update(agents).set({ defaultEnvironmentId: environmentId }).where(eq(agents.id, parent.id));
+    const res = await request(createApp(db, endpoint === "agents" ? userActor() : agentActor(companyId, parent.id)))
+      .post(`/api/companies/${companyId}/${endpoint}`).send({
+        name: "Codex card child", role: "engineer", adapterType: "codex_local", runner,
+        adapterConfig: { dangerouslyBypassApprovalsAndSandbox: true },
+        ...(endpoint === "agents" ? { defaultEnvironmentId: environmentId } : {}),
+      });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const responseAgent = endpoint === "agents" ? res.body : res.body.agent;
+    const [child] = await db.select().from(agents).where(eq(agents.id, responseAgent.id));
+    expect(child).toMatchObject({ defaultEnvironmentId: environmentId,
+      adapterType: runner === "legacy" ? "codex_local" : "paperclip_runner", adapterConfig: { modelReasoningEffort: "medium" } });
+    if (runner === "legacy") return expect(child!.adapterConfig.dangerouslyBypassApprovalsAndSandbox).toBe(true);
+    expect(child!.adapterConfig).toMatchObject({ provider: "codex", model: expect.stringMatching(/\S/) });
+    expect(child!.adapterConfig).not.toHaveProperty("dangerouslyBypassApprovalsAndSandbox");
+    expect(responseAgent.adapterConfig).not.toHaveProperty("dangerouslyBypassApprovalsAndSandbox");
+  });
+
+  it.each(["gpt-6.1-sol", undefined])("caller-runtime Codex defaults model and level regardless of caller model %s", async model => {
+    const companyId = await seedCompany();
+    const parent = await seedParentAgent(companyId, "paperclip_runner", {});
+    const environmentId = randomUUID();
+    await db.insert(environments).values({ id: environmentId, name: "Caller local", driver: "local" });
+    await db.update(agents).set({ adapterConfig: {
+      provider: "codex", model, modelReasoningEffort: "high",
+    }, defaultEnvironmentId: environmentId }).where(eq(agents.id, parent.id));
+    const res = await hire(agentActor(companyId, parent.id), companyId, {
+      name: "Inherited Codex Child", role: "engineer", adapterType: "paperclip_runner", inheritRuntimeFrom: "caller",
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const [child] = await db.select().from(agents).where(eq(agents.id, res.body.agent.id));
+    expect(child!.adapterConfig.modelReasoningEffort).toBe("medium");
+    expect(child!.adapterConfig.model).toBe("claude-opus-5-5");
+    expect(child!.defaultEnvironmentId).toBe(environmentId);
+  });
+
+  it.each(["reasoningEffort", "effort"])("Codex uses a named %s alias and refuses a masked invalid alias", async key => {
+    const companyId = await seedCompany();
+    const payload = { name: "Alias Child", role: "engineer", adapterType: "paperclip_runner" };
+    const app = createApp(db, userActor());
+    const res = await request(app).post(`/api/companies/${companyId}/agents`).send({
+      ...payload, adapterConfig: { provider: "codex", [key]: "high" },
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body.adapterConfig.modelReasoningEffort).toBe("high");
+    const invalid = await request(app).post(`/api/companies/${companyId}/agents`).send({
+      ...payload, adapterConfig: { provider: "codex", modelReasoningEffort: "low", [key]: "unknown" },
+    });
+    expect(invalid.status, JSON.stringify(invalid.body)).toBe(422);
+    expect(await db.select().from(agents).where(eq(agents.companyId, companyId))).toHaveLength(1);
+  });
+
+  it.each([
+    { name: "defaults rather than copying the caller level", board: false, callerLevel: "xhigh", requestedLevel: undefined, expectedLevel: "medium" },
+    { name: "keeps an explicitly named level", board: false, callerLevel: "xhigh", requestedLevel: "low", expectedLevel: "low" },
+    { name: "defaults a board hire", board: true, callerLevel: "xhigh", requestedLevel: undefined, expectedLevel: "medium" },
+    { name: "defaults when the caller has no level", board: false, callerLevel: undefined, requestedLevel: undefined, expectedLevel: "medium" },
+  ])("pi_rpc hire thinking level: $name", async ({ board, callerLevel, requestedLevel, expectedLevel }) => {
+    const companyId = await seedCompany();
+    const parent = await seedParentAgent(companyId, "paperclip_runner", {});
+    await db.update(agents).set({ adapterConfig: {
+      provider: "pi_rpc", model: "openai-codex/gpt-5.6", ...(callerLevel ? { piRpcThinkingLevel: callerLevel } : {}),
+    } }).where(eq(agents.id, parent.id));
+    const res = await hire(board ? userActor() : agentActor(companyId, parent.id), companyId, {
+      name: "Pi Child", role: "engineer", adapterType: "paperclip_runner",
+      adapterConfig: { provider: "pi_rpc", model: "openai-codex/gpt-5.6", ...(requestedLevel ? { piRpcThinkingLevel: requestedLevel } : {}) },
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const [child] = await db.select().from(agents).where(eq(agents.id, res.body.agent.id));
+    expect(child!.adapterConfig.piRpcThinkingLevel).toBe(expectedLevel);
+    expect(child!.adapterConfig.model).toBe("openai-codex/gpt-5.6");
+    expect(res.body.agent.adapterConfig.piRpcThinkingLevel).toBe(expectedLevel);
+  });
+
+  it.each((["agents", "agent-hires"] as const).flatMap(endpoint =>
+    ["piRpcThinkingLevel", "modelReasoningEffort", "reasoningEffort", "effort"].flatMap(key =>
+      ["high", "low", "off", 5, "unknown"].map(level => ({ endpoint, key, level })),
+    ),
+  ))("pi_rpc $endpoint honors or refuses $key=$level", async ({ endpoint, key, level }) => {
+    const companyId = await seedCompany();
+    const res = await request(createApp(db, userActor()))
+      .post(`/api/companies/${companyId}/${endpoint}`).send({
+        name: "Pi Child", role: "engineer", adapterType: "paperclip_runner",
+        adapterConfig: { provider: "pi_rpc", [key]: level },
+      });
+    if (typeof level !== "string" || level === "unknown") {
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.error).toContain(key);
+      expect(await db.select().from(agents).where(eq(agents.companyId, companyId))).toHaveLength(0);
+      return;
+    }
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const responseAgent = endpoint === "agents" ? res.body : res.body.agent;
+    const [child] = await db.select().from(agents).where(eq(agents.id, responseAgent.id));
+    expect(child!.adapterConfig.piRpcThinkingLevel).toBe(level);
+    expect(responseAgent.adapterConfig.piRpcThinkingLevel).toBe(level);
+    expect(resolvePaperclipRunnerNativeProviderInput({
+      backend: "pi_rpc", adapterConfig: child!.adapterConfig,
+    })).toMatchObject({ provider: "pi_rpc", piRpcThinkingLevel: level });
+  });
+
+  it.each((["agents", "agent-hires"] as const).flatMap(endpoint => [
+    { config: { piThinkingLevel: "high" }, expected: "high" },
+    { config: { thinking: "low" }, expected: "low" },
+    { config: { piRpcThinkingLevel: "auto", piThinkingLevel: "high" }, expected: "high" },
+    { config: {}, expected: "medium" },
+    { config: { extraArgs: ["--verbose"] }, expected: null },
+    { config: { args: ["--verbose"] }, expected: null },
+    { config: { command: "custom-pi" }, expected: null },
+    { config: { stdoutLogMode: "full" }, expected: null },
+    { config: { model: "unqualified" }, expected: null },
+    { config: { piThinkingLevel: "unknown" }, expected: null },
+    { config: { piRpcThinkingLevel: "low", thinking: "unknown" }, expected: null },
+  ].map(row => ({ endpoint, ...row }))))("direct pi_rpc $endpoint validates and stores $config", async ({ endpoint, config, expected }) => {
+    const companyId = await seedCompany();
+    const res = await request(createApp(db, userActor())).post(`/api/companies/${companyId}/${endpoint}`).send({
+      name: "Native Pi Child", role: "engineer", adapterType: "paperclip_runner",
+      adapterConfig: { provider: "pi_rpc", model: "paperclip/claude-opus-5-5", ...config },
+    });
+    const rows = await db.select().from(agents).where(eq(agents.companyId, companyId));
+    expect(res.status, JSON.stringify(res.body)).toBe(expected === null ? 422 : 201);
+    if (expected === null) {
+      expect(rows).toHaveLength(0);
+      return;
+    }
+    expect(rows).toHaveLength(1);
+    const responseAgent = endpoint === "agents" ? res.body : res.body.agent;
+    expect(rows[0]!.adapterConfig.piRpcThinkingLevel).toBe(expected);
+    expect(responseAgent.adapterConfig.piRpcThinkingLevel).toBe(expected);
+    expect(resolvePaperclipRunnerNativeProviderInput({ backend: "pi_rpc", adapterConfig: rows[0]!.adapterConfig }))
+      .toMatchObject({ piRpcThinkingLevel: expected });
+  });
+
+  it.each(["agents", "agent-hires"])("pi_rpc %s refuses a masked invalid alias before persistence", async endpoint => {
+    const companyId = await seedCompany();
+    const res = await request(createApp(db, userActor())).post(`/api/companies/${companyId}/${endpoint}`).send({
+      name: "Masked Pi Child", role: "engineer", adapterType: "paperclip_runner",
+      adapterConfig: { provider: "pi_rpc", piRpcThinkingLevel: "low", effort: "ultra" },
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("effort");
+    expect(await db.select().from(agents).where(eq(agents.companyId, companyId))).toHaveLength(0);
+  });
+
+  it("pi_rpc defaults absent and auto effort to medium in native projection", () => {
+    expect(piRpcThinking({})).toBe("medium");
+    expect(piRpcThinking({ effort: "auto" })).toBe("medium");
+  });
+
+  it.each((["agents", "agent-hires"] as const).flatMap(endpoint =>
+    [undefined, null, "", " \t\n"].map(unset => ({ endpoint, unset })),
+  ))("pi_rpc $endpoint persists defaults for unset $unset", async ({ endpoint, unset }) => {
+    const companyId = await seedCompany();
+    const parent = await seedParentAgent(companyId, "paperclip_runner", {});
+    await db.update(agents).set({ adapterConfig: {
+      provider: "pi_rpc", model: "openai-codex/gpt-5.6", piRpcThinkingLevel: "xhigh",
+    } }).where(eq(agents.id, parent.id));
+    const actor = endpoint === "agents" ? userActor() : agentActor(companyId, parent.id);
+    const res = await request(createApp(db, actor))
+      .post(`/api/companies/${companyId}/${endpoint}`).send({
+        name: "Pi Child", role: "engineer", adapterType: "paperclip_runner",
+        adapterConfig: { provider: "pi_rpc", model: unset, piRpcThinkingLevel: unset },
+      });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const responseAgent = endpoint === "agents" ? res.body : res.body.agent;
+    const [child] = await db.select().from(agents).where(eq(agents.id, responseAgent.id));
+    const expected = { piRpcThinkingLevel: "medium", model: "paperclip/claude-opus-5-5" };
+    expect(child!.adapterConfig).toMatchObject(expected);
+    expect(responseAgent.adapterConfig).toMatchObject(expected);
+  });
+
+  it.each([undefined, null, "", " \t", "fable/gpt-6.1-sol"])("pi_rpc caller-runtime hire defaults model and level regardless of caller model %j", async callerModel => {
+    const companyId = await seedCompany();
+    await db.update(companies).set({ requireBoardApprovalForNewAgents: true }).where(eq(companies.id, companyId));
+    const parent = await seedParentAgent(companyId, "paperclip_runner", {});
+    await db.update(agents).set({ adapterConfig: {
+      provider: "pi_rpc", model: callerModel, piRpcThinkingLevel: "xhigh",
+    } }).where(eq(agents.id, parent.id));
+    const res = await hire(agentActor(companyId, parent.id), companyId, {
+      name: "Pi Tool Child", role: "engineer", adapterType: "paperclip_runner", inheritRuntimeFrom: "caller",
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const [child] = await db.select().from(agents).where(eq(agents.id, res.body.agent.id));
+    const expected = { piRpcThinkingLevel: "medium", model: "paperclip/claude-opus-5-5" };
+    expect(child!.adapterConfig).toMatchObject(expected);
+    expect(res.body.agent.adapterConfig).toMatchObject(expected);
+    expect(res.body.approval.payload.adapterConfig).toMatchObject(expected);
+    expect(res.body.approval.payload.requestedConfigurationSnapshot.adapterConfig).toMatchObject(expected);
+  });
+
   it("rejects native runtime inheritance for a board actor", async () => {
     const companyId = await seedCompany();
     const parent = await seedParentAgent(companyId, "paperclip_runner", {});
@@ -581,6 +873,38 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     expect(await db.select().from(agents).where(eq(agents.companyId, companyId))).toHaveLength(1);
   });
 
+  it.each([
+    ["agent", "pi_local", undefined], ["agent", "codex_local", undefined],
+    ["board", "codex_local", undefined], ["agent", "codex_local", null], ["agent", "codex_local", "explicit"],
+  ] as const)("plain create environment: %s %s %s", async (actor, adapterType, selection) => {
+    const companyId = await seedCompany();
+    const parent = await seedParentAgent(companyId, "paperclip_runner", {});
+    const environmentId = randomUUID();
+    const config = { provider: "daytona", image: `example/runner@sha256:${"a".repeat(64)}`, reuseLease: false };
+    await db.insert(environments).values({ id: environmentId, name: "Creator sandbox", driver: "sandbox", config });
+    const environment = (await environmentService(db).getById(environmentId))!;
+    const runtime = await resolveEnvironmentDriverConfigForRuntime(db, companyId, environment, { applyCustomImageTemplate: true, readOnlyCustomImageTemplate: true });
+    await db.update(environments).set({ metadata: { [SANDBOX_PLATFORM_PROBE_METADATA_KEY]: { [companyId]: {
+      v: 1, companyId, image: config.image, template: null, baseConfigFingerprint: fingerprintEnvironmentSandboxProviderConfig(config),
+      runtimeConfigFingerprint: fingerprintEnvironmentSandboxProviderConfig(runtime.config as typeof config),
+      facts: { platform: "linux", architecture: "x64", libc: "glibc", glibcVersion: "2.39" },
+    } } } }).where(eq(environments.id, environmentId));
+    await db.update(agents).set({ defaultEnvironmentId: environmentId, adapterConfig: { provider: "pi_rpc" } }).where(eq(agents.id, parent.id));
+    const explicitEnvironmentId = randomUUID();
+    if (selection === "explicit") await db.insert(environments).values({ id: explicitEnvironmentId, name: "Explicit local", driver: "local" });
+    const defaultEnvironmentId = selection === "explicit" ? explicitEnvironmentId : selection;
+    const res = await request(createApp(db, actor === "agent" ? agentActor(companyId, parent.id) : userActor()))
+      .post(`/api/companies/${companyId}/agents`).send({ name: "Plain child", adapterType,
+        ...(adapterType === "pi_local" ? { adapterConfig: { model: "paperclip/claude-opus-5-5" } } : {}),
+        ...(selection === undefined ? {} : { defaultEnvironmentId }) });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const [child] = await db.select().from(agents).where(eq(agents.id, res.body.id));
+    const expectedEnvironmentId = actor === "agent" && selection === undefined ? environmentId : defaultEnvironmentId ?? null;
+    expect(child!.defaultEnvironmentId).toBe(expectedEnvironmentId);
+    expect(res.body.defaultEnvironmentId).toBe(expectedEnvironmentId);
+    expect(child!.adapterType).toBe("paperclip_runner");
+  });
+
   it("validates and preserves an inherited caller default environment", async () => {
     const companyId = await seedCompany();
     const parent = await seedParentAgent(companyId, "paperclip_runner", {});
@@ -614,7 +938,7 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
       version: 3,
     });
     // The response body carries the reference only, never a token value.
-    expect(JSON.stringify(res.body)).not.toContain("sk-");
+    expect(JSON.stringify(res.body).replaceAll(process.env.PAPERCLIP_HOME!, "<home>")).not.toContain("sk-");
 
     const declarations = await db
       .select()

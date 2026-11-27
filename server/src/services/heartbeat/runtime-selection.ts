@@ -1,3 +1,4 @@
+import { resolveSessionContinuity } from "../native-runtime/continued-session.js";
 import { assertPaperclipRunnerBinaryConfiguration } from "../native-runtime/native-codex-runner.js";
 import { resolveAntigravitySwarmRun } from "../antigravity-swarm.js";
 import { antigravityForcesSameSessionRecovery } from "../native-runtime/antigravity-release.js";
@@ -169,6 +170,7 @@ export type HeartbeatRuntimeSelectionResult = { selected: false } | {
   nativeExecution: NativeExecutionInput | null;
   nativeRunnerInstanceId: string | null;
   pluginTaskDescription?: PluginTaskDescription;
+  workspaceContinuationSource?: NativeExecutionInput;
   toolRefreshOnResume?: boolean;
   getNativeFreshSessionHandoff: (() => Promise<string | null>) | undefined;
   nativeWorkspaceSync: Awaited<ReturnType<typeof prepareNativeWorkspaceSync>>;
@@ -340,6 +342,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
     authorityCwd: sshAuthority?.location?.remoteCwd ?? null,
   });
   let nativeExecution: NativeExecutionInput | null = null;
+  let workspaceContinuationSource: NativeExecutionInput | undefined;
   let toolRefreshOnResume: boolean | undefined;
   let getNativeFreshSessionHandoff: (() => Promise<string | null>) | undefined;
   let nativeRunnerInstanceId: string | null = null;
@@ -644,6 +647,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         nativeResumeCheckpoint = rebindNativeSessionCheckpoint({
           previousRun: previousNativeRun,
           currentExecution: nativeExecution,
+          sessionContinuity: parseObject(agent.adapterConfig).sessionContinuity,
           executionTargetKind: executionTarget?.kind ?? "local",
         });
       }
@@ -801,6 +805,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         || nativeRuntimeResolution.profile.backend === "codex_app_server"
         || (nativeRuntimeResolution.profile.backend === "acpx_runtime" && ["claude_local", "grok_local"].includes(agentHarnessType(agent.adapterType, parseObject(agent.adapterConfig))))
         || nativeRuntimeResolution.profile.backend === "opencode_server"
+        || nativeRuntimeResolution.profile.backend === "pi_rpc"
         || (nativeRuntimeResolution.profile.backend === "acpx_runtime"
           && parseObject(agent.adapterConfig).acpxAgent === "copilot")
         ? projectPaperclipRunnerTaskConfig(
@@ -854,7 +859,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
               agentKeyId: agentIdentity?.keyId,
               companyId: agent.companyId,
               runId: run.id,
-              issue: nativeReviewRequest ? { ...issueRef, title: `Review: ${issueRef.title}`, description: nativeReviewRequest } : issueRef,
+              issue: { ...(nativeReviewRequest ? { ...issueRef, title: `Review: ${issueRef.title}`, description: nativeReviewRequest } : issueRef), conversationAgentId: issueContext?.conversationAgentId },
               taskPrompt: [
                 nativeReviewRequest ?? readNonEmptyString(
                   selectPaperclipTaskMarkdown(context, {
@@ -935,6 +940,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
               // The swarm's only instruction: the verified request, in its own field (never task.prompt).
               ...(antigravitySwarm ? { antigravitySwarmRequest: antigravitySwarm.request } : {}),
               lifecyclePolicy: effectiveLifecyclePolicy,
+              sessionContinuity: parseObject(agent.adapterConfig).sessionContinuity,
               interactionResponses,
               completionContract: {
                 id: completionContract.row.id,
@@ -952,6 +958,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
       const nativeExecutionWithCheckpoint = buildNativeExecutionWithCheckpoint({
         previousRun: previousNativeRun,
         normalizedSessionId: nativeSessionId,
+        sessionContinuity: parseObject(agent.adapterConfig).sessionContinuity,
         executionTargetKind: executionTarget?.kind ?? "local",
         toolRefreshOnResume,
         refreshTools: context.refreshTools === true,
@@ -966,6 +973,15 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         nativeRunnerInstanceId = randomUUID();
       }
       nativeSessionId = nativeExecutionWithCheckpoint.normalizedSessionId;
+    }
+    if (nativeResumeCheckpoint && previousNativeRun && nativeExecution.provider.kind === "pi_rpc" &&
+      resolveSessionContinuity("pi_rpc", parseObject(agent.adapterConfig).sessionContinuity) === "continuous" &&
+      (executionTarget?.kind ?? "local") === "local") {
+      const previous = parseNativeExecutionInput(parseObject(previousNativeRun.runnerProfileJson).nativeExecutionInput);
+      if (JSON.stringify(previous.workspace) !== JSON.stringify(nativeExecution.workspace) ||
+        (previous.binding.executionWorkspaceId !== nativeExecution.binding.executionWorkspaceId &&
+          (previous.binding.executionWorkspaceId !== previous.binding.runId || nativeExecution.binding.executionWorkspaceId !== nativeExecution.binding.runId)))
+        workspaceContinuationSource = previous;
     }
     if (nativeResumeCheckpoint && antigravityForcesSameSessionRecovery(nativeExecution.provider)) {
       nativeResumeCheckpoint = { ...nativeResumeCheckpoint, providerRecoveryPolicy: "same_session_only" };
@@ -1224,5 +1240,5 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
       })
       .where(eq(heartbeatRuns.id, run.id)));
   }
-  return { selected: true, nativeExecution, nativeRunnerInstanceId, pluginTaskDescription, toolRefreshOnResume, getNativeFreshSessionHandoff, nativeWorkspaceSync };
+  return { selected: true, nativeExecution, nativeRunnerInstanceId, pluginTaskDescription, workspaceContinuationSource, toolRefreshOnResume, getNativeFreshSessionHandoff, nativeWorkspaceSync };
 }

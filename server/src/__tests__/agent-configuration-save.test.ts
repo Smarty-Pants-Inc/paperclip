@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { createServer } from "node:http";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -6,7 +7,7 @@ import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
-import { agents, agentConfigRevisions, activityLog, builtInManagedResources, companies, companyMemberships, connectionGrants, createDb, environments, issues, toolConnections, toolConnectionInstalls } from "@paperclipai/db";
+import { agents, agentConfigRevisions, activityLog, builtInManagedResources, companies, companyMemberships, connectionGrants, createDb, environments, issues, issueComments, toolConnections, toolConnectionInstalls } from "@paperclipai/db";
 import { agentRoutes } from "../routes/agents.js";
 import { issueRoutes } from "../routes/issues.js";
 import * as issueServices from "../services/issues.js";
@@ -93,6 +94,131 @@ describePostgres("agent configuration save latency", () => {
     expect(response.status, JSON.stringify(response.body)).toBe(200);
     expect((await readAgent()).adapterConfig.model).toBe("gpt-5.6-luna");
     expect(allocate).not.toHaveBeenCalled(); expect(probe).not.toHaveBeenCalled(); expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { provider: "pi_rpc", config: { piRpcThinkingLevel: "ultra" }, status: 422 },
+    { provider: "pi_rpc", config: { effort: "ultra" }, status: 422 },
+    { provider: "pi_rpc", config: { piRpcThinkingLevel: 5 }, status: 422 },
+    { provider: "pi_rpc", config: { piRpcThinkingLevel: "high" }, status: 200 },
+    { provider: "pi_rpc", config: { piRpcThinkingLevel: "max" }, status: 200 },
+    ...["modelReasoningEffort", "reasoningEffort", "effort"].flatMap(key => [
+      { provider: "pi_rpc", config: { piRpcThinkingLevel: "medium", [key]: 5 }, status: 422 },
+      { provider: "pi_rpc", config: { piRpcThinkingLevel: "medium", [key]: "ultra" }, status: 422 },
+    ]),
+    ...[null, "", " \t ", "auto", "none"].map(level => ({ provider: "pi_rpc", config: { piRpcThinkingLevel: level }, status: 200 })),
+
+    { provider: "pi_rpc", config: { effort: "none" }, status: 200 },
+    { provider: "codex", config: { piRpcThinkingLevel: "ultra" }, status: 200 },
+  ])("validates Pi agent reasoning before persisting: %j", async ({ provider, config, status }) => {
+    await db.update(agents).set({ adapterConfig: { provider, model: "paperclip/gpt-6.1-sol" } }).where(eq(agents.id, agent.id));
+    const before = await readAgent();
+    const response = await request(app).patch(`/api/agents/${agent.id}`).send({ adapterConfig: config });
+    expect(response.status, JSON.stringify(response.body)).toBe(status);
+    const saved = await readAgent();
+    if (status === 422) {
+      expect(response.body.error).toContain("pi_thinking_level_invalid:");
+      expect(saved).toEqual(before);
+      expect(await db.select().from(agentConfigRevisions).where(eq(agentConfigRevisions.agentId, agent.id))).toHaveLength(0);
+      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, agent.id))).toHaveLength(0);
+    } else {
+      expect(saved.adapterConfig).toMatchObject(config);
+    }
+  });
+
+  it.each(["agent", "issue"] as const)("validates %s Pi model PATCHes against the gateway catalog before saving", async surface => {
+    vi.mocked(globalThis.fetch).mockRestore();
+    let fetches = 0;
+    let beforeTransaction = () => {};
+    const gateway = createServer((req, res) => {
+      fetches++;
+      beforeTransaction();
+      expect(req.url).toBe("/v1/models");
+      expect(req.headers.authorization).toBe("Bearer fixture-gateway-key");
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ data: [{ id: "gpt-6.1-sol" }, { id: "qwen/qwen3" }] }));
+    });
+    await new Promise<void>(resolve => gateway.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = gateway.address() as { port: number };
+      const connection = await aiConnectionService(db).save(agent.companyId, userId, {
+        provider: "openai", method: "api_key", ownership: "personal", name: "Gateway", agentIds: [agent.id], allAgents: false,
+        routing: { kind: "gateway", protocol: "responses", auth: "bearer", baseUrl: `http://127.0.0.1:${address.port}/v1/`,
+          models: [{ id: "nosuch-model-9" }] }, // Saved picker hints are not the authoritative catalog.
+      }, "fixture-gateway-key");
+      const aiConnection = { provider: "openai", method: "api_key", mode: "delegated", ...connection };
+      await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", model: "paperclip/gpt-6.1-sol" },
+        runtimeConfig: { aiConnection } }).where(eq(agents.id, agent.id));
+      const [issue] = await db.insert(issues).values({ companyId: agent.companyId, title: "Gateway selection",
+        assigneeAgentId: agent.id, responsibleUserId: userId, createdByUserId: userId, status: "in_review" }).returning();
+      const gatewayApp = express(); gatewayApp.use(express.json());
+      gatewayApp.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId, companyIds: [agent.companyId] }; next(); });
+      gatewayApp.use("/api", agentRoutes(db));
+      gatewayApp.use("/api", issueRoutes(db, createStorageService(createLocalDiskStorageProvider(path.join(home, "storage")))));
+      gatewayApp.use((error: { status?: number; message: string }, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+        res.status(error.status ?? 500).json({ error: error.message });
+      });
+      const transaction = vi.spyOn(db, "transaction");
+      beforeTransaction = () => expect(transaction).not.toHaveBeenCalled();
+      const patch = (model: string) => surface === "agent"
+        ? request(gatewayApp).patch(`/api/agents/${agent.id}`).send({ adapterConfig: { model } })
+        : request(gatewayApp).patch(`/api/issues/${issue.id}`).send({ assigneeAdapterOverrides: { adapterConfig: { model } },
+          ...(model.includes("nosuch") ? { comment: "This rejected model must not save a comment or wake the agent" } : {}),
+        });
+      const known = await patch(surface === "agent" ? "paperclip/qwen/qwen3" : "gpt-6.1-sol");
+      expect(known.status, JSON.stringify(known.body)).toBe(200);
+      const beforeAgent = await readAgent();
+      const beforeIssue = (await db.select().from(issues).where(eq(issues.id, issue.id)))[0];
+      const beforeRevisions = await db.select().from(agentConfigRevisions).where(eq(agentConfigRevisions.agentId, agent.id));
+      const beforeActivity = await db.select().from(activityLog).where(eq(activityLog.companyId, agent.companyId));
+      const unknown = await patch(surface === "agent" ? "paperclip/nosuch-model-9" : "nosuch-model-9");
+      expect(unknown.status, JSON.stringify(unknown.body)).toBe(422);
+      expect(unknown.body.error).toBe('Pi cannot use model "paperclip/nosuch-model-9": not offered by the gateway');
+      expect(await readAgent()).toEqual(beforeAgent);
+      expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0]).toEqual(beforeIssue);
+      expect(await db.select().from(agentConfigRevisions).where(eq(agentConfigRevisions.agentId, agent.id))).toEqual(beforeRevisions);
+      expect(await db.select().from(activityLog).where(eq(activityLog.companyId, agent.companyId))).toEqual(beforeActivity);
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issue.id))).toHaveLength(0);
+      expect(fetches).toBe(1);
+      expect(allocate).not.toHaveBeenCalled(); expect(probe).not.toHaveBeenCalled();
+    } finally {
+      gateway.closeAllConnections();
+      await new Promise<void>((resolve, reject) => gateway.close(error => error ? reject(error) : resolve()));
+    }
+  });
+
+  it.each(["agent", "issue"] as const)("fails open for %s Pi model PATCHes when the gateway is down", async surface => {
+    vi.mocked(globalThis.fetch).mockRestore();
+    let fetches = 0;
+    const gateway = createServer((_req, res) => { fetches++; res.writeHead(503); res.end(); });
+    await new Promise<void>(resolve => gateway.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = gateway.address() as { port: number };
+      const connection = await aiConnectionService(db).save(agent.companyId, userId, {
+        provider: "openai", method: "api_key", ownership: "personal", name: "Down gateway", agentIds: [agent.id], allAgents: false,
+        routing: { kind: "gateway", protocol: "responses", auth: "none", baseUrl: `http://127.0.0.1:${address.port}`, models: [] },
+      }, "");
+      const aiConnection = { provider: "openai", method: "api_key", mode: "delegated", ...connection };
+      await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", model: "paperclip/gpt-6.1-sol" },
+        runtimeConfig: { aiConnection } }).where(eq(agents.id, agent.id));
+      const [issue] = await db.insert(issues).values({ companyId: agent.companyId, title: "Down gateway selection",
+        assigneeAgentId: agent.id, responsibleUserId: userId, createdByUserId: userId, status: "in_review" }).returning();
+      const gatewayApp = express(); gatewayApp.use(express.json());
+      gatewayApp.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId, companyIds: [agent.companyId] }; next(); });
+      gatewayApp.use("/api", agentRoutes(db));
+      gatewayApp.use("/api", issueRoutes(db, createStorageService(createLocalDiskStorageProvider(path.join(home, "storage")))));
+      const result = surface === "agent"
+        ? await request(gatewayApp).patch(`/api/agents/${agent.id}`).send({ adapterConfig: { model: "paperclip/nosuch-model-9" } })
+        : await request(gatewayApp).patch(`/api/issues/${issue.id}`).send({ assigneeAdapterOverrides: { adapterConfig: { model: "nosuch-model-9" } } });
+      expect(result.status, JSON.stringify(result.body)).toBe(200);
+      expect(fetches).toBe(1);
+      if (surface === "agent") expect((await readAgent()).adapterConfig.model).toBe("paperclip/nosuch-model-9");
+      else expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0].assigneeAdapterOverrides)
+        .toMatchObject({ adapterConfig: { model: "paperclip/nosuch-model-9" } });
+    } finally {
+      gateway.closeAllConnections();
+      await new Promise<void>((resolve, reject) => gateway.close(error => error ? reject(error) : resolve()));
+    }
   });
 
   it("renames generated chat titles for each user while preserving custom titles and other tasks", async () => {

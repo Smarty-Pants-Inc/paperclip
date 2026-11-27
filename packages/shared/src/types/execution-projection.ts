@@ -141,6 +141,11 @@ export interface ExecutionReconciliation {
 /** A task-level view of one interruption. Diagnostics keep the underlying runs
  * and recovery records; ordinary product surfaces render this projection. */
 export interface TaskInterruptionPresentation {
+  /** Current-session saved person input with no committed delivery owner. */
+  unansweredCommentId?: string;
+  /** Latest failed attempt at the unanswered input. Stable classified copy only;
+   * never raw run/provider text. Present only on a failed, retryable projection. */
+  failure?: { code: string; title: string; detail: string };
   providerFailure?: import("../provider-failure.generated.js").ProviderFailure;
   workspaceFailure?: { message: string };
   /**

@@ -1612,6 +1612,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/issues/{issueId}/file-resources/content",
   "GET /api/issues/{issueId}/file-resources/list",
   "GET /api/issues/{issueId}/file-resources/resolve",
+  "POST /api/issues/{id}/interactions/{interactionId}/resume_review",
   "POST /api/issues/{id}/interactions/{interactionId}/accept",
   "POST /api/issues/{id}/interactions/{interactionId}/reject",
   "POST /api/issues/{id}/interactions/{interactionId}/respond",
@@ -8972,6 +8973,17 @@ registry.registerPath({
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound,
     409: { description: "Stale or conflicting decision" }, 422: { description: "Invalid answer evidence or selection" } },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/interactions/{interactionId}/resume_review",
+  tags: ["issues"],
+  summary: "Resume a pending native completion review after a person's Stop",
+  description: "Board-only action with the card's existing resolver permissions. Requires a pending native completion review whose latest reviewer run succeeded with personStop and no live or queued reviewer attempt. Reuses the same review interaction and decision through the durable native wake/claim path. Concurrent presses create at most one wake/run for that Stop. The interaction projection exposes canResumeReview for eligible people.",
+  request: { params: z.object({ id: z.string(), interactionId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound,
+    409: { description: "Review is not resumable or an attempt is already queued" } },
 });
 
 registry.registerPath({

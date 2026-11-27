@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { Db } from "@paperclipai/db";
-import { activityLog, agentWakeupRequests, agents, companies, createDb, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, agents, chatCompletionDeliveries, chatTaskHandoffs, companies, createDb, heartbeatRunEvents, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -12,6 +12,9 @@ import { createQueuedCommentIssueLockWriter } from "./queued-comment-postgres.js
 import type { QueuedCommentQueuePostgresAdapterDeps } from "./queued-comment-postgres.js";
 import { QueuedCommentMutationError } from "../application/queued-comment-use-cases.js";
 import { buildAgentMentionHref } from "@paperclipai/shared";
+import { createQueuedCommentSteeringAdapter } from "./queued-comment-board-postgres.js";
+import { appendHeartbeatRunEventBatch } from "../../../services/heartbeat-run-events.js";
+import { chatCompletionDeliveryService } from "../../../services/chat-completion-delivery.js";
 
 // Proves the same two properties the release-half adapter test proves for
 // this module's other transaction: the one company the caller names in
@@ -51,6 +54,7 @@ describeEmbeddedPostgres("queued-comment postgres adapter", () => {
     // heartbeat_runs, and none of those foreign keys cascade.
     await db.delete(activityLog);
     await db.delete(issueComments);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(issues);
@@ -138,6 +142,145 @@ describeEmbeddedPostgres("queued-comment postgres adapter", () => {
     });
     return id;
   }
+
+  it("commits native run events while the steering board and agent permission check hold the issue lock", async () => {
+    // Regression: board ISSUE(UPDATE) -> RUN(UPDATE) opposed the event writer's
+    // RUN(NO KEY UPDATE) -> ISSUE(KEY SHARE). Exercise both real lock sites.
+    const companyId = await seedCompany();
+    const agentId = await seedAgent({ companyId });
+    const issueId = await seedIssue({ companyId, assigneeAgentId: agentId });
+    const commentId = await seedComment({ companyId, issueId, authorUserId: "user-1" });
+    await db.update(issueComments).set({ authorUserId: null, authorAgentId: agentId, authorType: "agent" })
+      .where(eq(issueComments.id, commentId));
+    const wakeId = await seedDeferredWake({ companyId, agentId, issueId, commentIds: [commentId] });
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, issueId, nativeIssueId: issueId,
+      status: "running", runtimeMode: "native", contextSnapshot: { issueId } });
+    let markLocked!: () => void, failLocked!: (error: unknown) => void, releaseBoard!: () => void;
+    const locked = new Promise<void>((resolve, reject) => { markLocked = resolve; failLocked = reject; });
+    const release = new Promise<void>(resolve => { releaseBoard = resolve; });
+    let boardReleased = false;
+    const board = createQueuedCommentSteeringAdapter(db).withLockedTarget({
+      issue: { id: issueId, companyId }, queueId: wakeId, commentId, targetRunId: runId, revision: "fixture",
+      actor: { actorType: "user", actorId: "user-1", agentId: null, runId: null, agentApiKeyId: null },
+    }, async tx => {
+      await tx.assertDeliveryAllowed(); // Must not upgrade the board's issue lock.
+      markLocked();
+      await release;
+      boardReleased = true;
+    });
+    // Propagate startup errors rather than leaving the readiness wait hanging.
+    void board.catch(failLocked);
+    try {
+      await locked;
+      const receipts = await db.transaction(async tx => {
+        await tx.execute(sql`set local lock_timeout = '750ms'`);
+        await tx.execute(sql`set local statement_timeout = '3s'`);
+        // Two native appends on an uncursored run take the fallback transaction;
+        // the second run UPDATE rechecks the issue FK, as in the logged cycle.
+        const sourceInstanceId = randomUUID();
+        return appendHeartbeatRunEventBatch(tx as unknown as Db, [1, 2].map(sourceSeq => ({
+          companyId, agentId, runId, eventType: "test.lock_compatibility",
+          nativeSource: { sourceInstanceId, sourceEventId: randomUUID(), sourceSeq,
+            protocolSchemaVersion: 1, canonicalPayload: { sourceSeq } },
+        })));
+      });
+      expect(boardReleased).toBe(false);
+      expect(receipts.map(receipt => receipt.disposition)).toEqual(["committed", "committed"]);
+      expect(receipts.map(receipt => receipt.row.seq)).toEqual([1, 2]);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]?.nextEventSeq).toBe(3);
+    } finally {
+      releaseBoard();
+      await board;
+    }
+  });
+
+  it("commits native event appends while deliverIntoLiveTurn holds both issue locks", async () => {
+    const companyId = await seedCompany(), agentId = await seedAgent({ companyId });
+    const sourceId = await seedIssue({ companyId, assigneeAgentId: agentId });
+    const taskId = await seedIssue({ companyId, assigneeAgentId: agentId });
+    await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: "user-1", conversationState: "waiting" })
+      .where(eq(issues.id, sourceId));
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, taskId));
+    await db.insert(chatTaskHandoffs).values({ companyId, taskId, conversationId: sourceId, agentId, sessionGeneration: 0 });
+    const [delivery] = await db.insert(chatCompletionDeliveries).values({ companyId, taskId, statusVersion: 0 }).returning();
+    await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation",
+      status: "deferred_issue_execution", idempotencyKey: `chat-completion:${delivery!.id}:0` });
+    const runs = [taskId, sourceId].map(issueId => ({ id: randomUUID(), companyId, agentId, issueId, nativeIssueId: issueId,
+      status: "running", runtimeMode: "native", contextSnapshot: { issueId } }));
+    await db.insert(heartbeatRuns).values(runs);
+    let markLocked!: () => void, failLocked!: (error: unknown) => void, releaseDelivery!: () => void;
+    const locked = new Promise<void>((resolve, reject) => { markLocked = resolve; failLocked = reject; });
+    const release = new Promise<void>(resolve => { releaseDelivery = resolve; });
+    const lockedIssueIds: string[] = [];
+    let deliveryReleased = false;
+    // Pause the real service after its second issue lock, preserving both SQL
+    // modes. No provider is needed: lock compatibility is tested before I/O.
+    function observeSelect(builder: object): object {
+      return new Proxy(builder, { get(target, key) {
+        const value = Reflect.get(target, key, target);
+        if (key === "for") return async (...args: unknown[]) => {
+          const rows = await Reflect.apply(value, target, args) as Array<{ id: string }>;
+          lockedIssueIds.push(rows[0]!.id);
+          if (lockedIssueIds.length === 2) {
+            markLocked();
+            await release;
+            deliveryReleased = true;
+          }
+          return rows;
+        };
+        if (key === "from" || key === "where") return (...args: unknown[]) => observeSelect(Reflect.apply(value, target, args));
+        return typeof value === "function" ? value.bind(target) : value;
+      } });
+    }
+    const observingDb = new Proxy(db, { get(target, key) {
+      if (key !== "transaction") return Reflect.get(target, key, target);
+      return (work: (tx: Db) => Promise<unknown>) => target.transaction(async tx => {
+        const observed = new Proxy(tx, { get(inner, property) {
+          if (property !== "select") return Reflect.get(inner, property, inner);
+          return (...args: unknown[]) => observeSelect(Reflect.apply(inner.select, inner, args));
+        } });
+        return work(observed as unknown as Db);
+      });
+    } });
+    const delivering = chatCompletionDeliveryService(observingDb, { wakeup: async () => {
+      throw new Error("Existing deferred wake must be reused");
+    } }).deliver(delivery!.id);
+    void delivering.then(() => failLocked(new Error("Delivery ended before both issue locks")), failLocked);
+    try {
+      await locked;
+      expect(lockedIssueIds).toEqual([taskId, sourceId]);
+      // Both referenced issues must permit FK KEY SHARE, not just the chat.
+      // Two native appends force the same run-update/FK recheck as seam 0324.
+      const appended = await Promise.allSettled(runs.map(run => db.transaction(async tx => {
+        await tx.execute(sql`set local lock_timeout = '750ms'`);
+        await tx.execute(sql`set local statement_timeout = '3s'`);
+        const sourceInstanceId = randomUUID();
+        return appendHeartbeatRunEventBatch(tx as unknown as Db, [1, 2].map(sourceSeq => ({
+          companyId, agentId, runId: run.id, eventType: "test.completion_lock_compatibility",
+          nativeSource: { sourceInstanceId, sourceEventId: randomUUID(), sourceSeq,
+            protocolSchemaVersion: 1, canonicalPayload: { sourceSeq } },
+        })));
+      })));
+      console.info("completion-lock-row", { taskId, sourceId, lockedIssueIds, deliveryReleased,
+        appends: appended.map((result, index) => ({ issueId: runs[index]!.issueId, runId: runs[index]!.id,
+          status: result.status, ...(result.status === "fulfilled"
+            ? { seqs: result.value.map(receipt => receipt.row.seq) }
+            : { error: String(result.reason), cause: String(result.reason?.cause) }) })) });
+      expect(deliveryReleased).toBe(false);
+      for (const result of appended) {
+        expect(result.status).toBe("fulfilled");
+        if (result.status === "fulfilled") {
+          expect(result.value.map(receipt => receipt.disposition)).toEqual(["committed", "committed"]);
+          expect(result.value.map(receipt => receipt.row.seq)).toEqual([1, 2]);
+        }
+      }
+      for (const run of runs) {
+        expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0]?.nextEventSeq).toBe(3);
+        expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, run.id))).toHaveLength(2);
+      }
+    } finally { releaseDelivery(); await delivering; }
+  });
 
   it("checks the authenticated editor and changed mentions atomically before updating a queued comment", async () => {
     const companyId = await seedCompany();

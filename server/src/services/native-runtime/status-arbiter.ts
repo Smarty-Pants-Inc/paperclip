@@ -283,6 +283,8 @@ export function arbitrateNativeStatus(input: {
    */
   executionReviewStageStarts?: boolean;
   /** Re-derived from the committed runner terminal and pinned execution identity. */
+  /** A continuous held run saved replies and has no unanswered person input. */
+  continuousHeldInputAnswered?: boolean;
   providerModelRejected?: boolean;
   providerOverloaded?: boolean;
   providerFailureSuperseded?: boolean;
@@ -352,6 +354,14 @@ export function arbitrateNativeStatus(input: {
     reasonCode: "case_handoff_waiting_for_release", unblockDescriptor: null,
     effects: [{ kind: "release_checkout" }],
   };
+  if (input.continuousHeldInputAnswered && input.terminalState === "failed") {
+    return {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "preserve", toStatus: input.priorIssueStatus,
+      reasonCode: "continuous_held_input_already_answered", unblockDescriptor: null,
+      effects: [{ kind: "release_run_resources" }, { kind: "release_checkout" }],
+    };
+  }
   if (input.providerModelRejected && input.terminalState === "failed" &&
       input.nativeReviewOutcome !== "stale" && input.nativeReviewOutcome !== "resolved") {
     if (input.nativeReviewOutcome === "pending") {

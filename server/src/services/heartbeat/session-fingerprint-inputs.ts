@@ -1,3 +1,5 @@
+import { normalizePaperclipRunnerAdapterConfig } from "@paperclipai/adapter-utils/server-utils";
+import { resolveSessionContinuity } from "../native-runtime/continued-session.js";
 import {
   isPaperclipRunnerProvider,
   PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES,
@@ -63,6 +65,7 @@ export const PAPERCLIP_RUNNER_ADAPTER_CONFIG_SESSION_INPUTS = {
   env: kept("Process environment and secret bindings."),
   workspaceStrategy: kept("Workspace strategy."),
   workspaceRuntime: kept("Workspace runtime services."),
+  sessionContinuity: excluded("Controls session reuse and next-turn framing, not retained session compatibility."),
   timeoutSec: excluded("Whole-turn time limit; the executor receives it apart from the native execution input."),
   graceSec: excluded("Legacy child-process kill grace; the native runner path never reads it."),
 } as const satisfies Record<string, SessionFingerprintClassification>;
@@ -137,7 +140,8 @@ function omitKeys(value: Record<string, unknown>, keys: Iterable<string>): Recor
   return result;
 }
 
-export function paperclipRunnerSessionAdapterConfig(config: Record<string, unknown>): Record<string, unknown> {
+/** Retained thread inputs, before any next-run continuity exemptions. */
+export function paperclipRunnerRetainedAdapterConfig(config: Record<string, unknown>): Record<string, unknown> {
   const result = omitKeys(config, RUNNER_EXCLUDED_KEYS);
   const provider = config.provider ?? "codex";
   if (!isPaperclipRunnerProvider(provider)) return result;
@@ -147,6 +151,44 @@ export function paperclipRunnerSessionAdapterConfig(config: Record<string, unkno
     .flatMap(capability => capability.configurable ? [capability.configKey] : [])
     .filter(key => key !== activeKey);
   return omitKeys(result, [...inactivePermissionKeys, ...(provider === "codex" ? [] : CODEX_ONLY_KEYS)]);
+}
+
+const CONTINUOUS_PI_MODEL_KEYS = ["model", "piRpcThinkingLevel", "piThinkingLevel", "thinkingLevel", "modelReasoningEffort", "reasoningEffort", "effort", "variant"];
+// These are next-turn inputs, not retained-thread compatibility boundaries.
+// Pack prompt identity lives in the native runtime context, not adapterConfig;
+// its refresh and capability-gated MCP refresh remain owned by that boundary.
+const CONTINUOUS_PI_ADAPTER_CONFIG_KEYS = [...CONTINUOUS_PI_MODEL_KEYS, "env"];
+// The skill list is fingerprinted once, as runtimeSkills; a new skill version
+// continues a continuous Pi session (its next launch loads the new list).
+const CONTINUOUS_PI_SKILL_KEYS = ["paperclipRuntimeSkills", "paperclipConnectorSkillDigest", "paperclipSkillSync"];
+
+export function paperclipRunnerSessionAdapterConfig(config: Record<string, unknown>, retainEnvironment = false, retainSkills = false): Record<string, unknown> {
+  const retained = paperclipRunnerRetainedAdapterConfig(config);
+  return config.provider === "pi_rpc" && resolveSessionContinuity(config.provider, config.sessionContinuity) === "continuous"
+    ? omitKeys(retained, [...(retainEnvironment ? CONTINUOUS_PI_MODEL_KEYS : CONTINUOUS_PI_ADAPTER_CONFIG_KEYS),
+      ...(retainSkills ? [] : CONTINUOUS_PI_SKILL_KEYS)]) : retained;
+}
+
+/** Issue settings reach both the effective config and their own fingerprint category. */
+export function paperclipRunnerSessionIssueOverrides(overrides: unknown, config: Record<string, unknown>, retainEnvironment = false): unknown {
+  if (!isRecord(overrides) || config.provider !== "pi_rpc" || resolveSessionContinuity(config.provider, config.sessionContinuity) !== "continuous") return overrides;
+  const result = { ...overrides };
+  if (isRecord(result.adapterConfig)) {
+    const adapterConfig = omitKeys(result.adapterConfig, retainEnvironment ? CONTINUOUS_PI_MODEL_KEYS : CONTINUOUS_PI_ADAPTER_CONFIG_KEYS);
+    result.adapterConfig = Object.keys(adapterConfig).length ? adapterConfig : null;
+  }
+  return Object.values(result).every(value => value == null) ? null : result;
+}
+
+/** Classify saved live inputs without changing next-run session compatibility. */
+export function heldNativeAgentConfigurationInputs(agent: Record<string, unknown>): Record<string, unknown> {
+  const inputs = Object.fromEntries(Object.entries(AGENT_REVISION_FIELD_SESSION_INPUTS)
+    .filter(([, classification]) => classification.kind === "kept").map(([key]) => [key, agent[key]]));
+  if (agent.adapterType === "paperclip_runner" && isRecord(inputs.adapterConfig)) {
+    inputs.adapterConfig = paperclipRunnerRetainedAdapterConfig(normalizePaperclipRunnerAdapterConfig("paperclip_runner", inputs.adapterConfig));
+  }
+  inputs.runtimeConfig = sessionAgentRuntimeConfig(inputs.runtimeConfig);
+  return inputs;
 }
 
 export function sessionAgentRuntimeConfig(runtimeConfig: unknown): unknown {

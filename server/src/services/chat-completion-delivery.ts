@@ -7,6 +7,11 @@ import { agents, agentWakeupRequests, chatCompletionDeliveries as deliveries, ch
 import { extractIssueReferenceMatches } from "@paperclipai/shared";
 import { appendHeartbeatRunEventBatch } from "./heartbeat-run-events.js";
 import { conflict, forbidden, notFound } from "../errors.js";
+import { parseObject } from "../adapters/utils.js";
+import { agentRunWritesRevoked } from "../agent-run-cancellation.js";
+import { resolveSessionContinuity } from "./native-runtime/continued-session.js";
+import { parseNativeExecutionInput } from "../vendor/paperclip-runner/index.js";
+import type { NativeRestartRecoveryClaim } from "./native-runtime/native-restart-recovery.js";
 
 export const CHAT_COMPLETION_WAKE_REASON = "chat_task_completed";
 /** Run event: the conversation agent read its handed-off task after it was done. */
@@ -225,10 +230,29 @@ export async function settleReportedChatCompletions(tx: Connection, input: { com
   return reported > 0 && remaining === 0;
 }
 
-/** Freeze the input at turn start. New completions cannot be consumed by an already-running turn. */
-export async function prepareChatCompletionTurn(db: Db, run: Run): Promise<Run> {
+/** Only server-owned same-run reattachment can reuse a durable admitted input.
+ * Caller wake context and a lease owner alone are not admission evidence. */
+function admittedCompletionReattach(run: Run, claim?: NativeRestartRecoveryClaim): boolean {
+  if (run.runtimeMode !== "native" || run.status !== "running" || claim?.runId !== run.id ||
+      (claim.kind !== "reattach_remote_runner" && claim.kind !== "reattach_existing_runner") ||
+      ids(run).length === 0 || !Array.isArray(run.contextSnapshot?.chatCompletionUpdates) ||
+      run.contextSnapshot.chatCompletionUpdates.length === 0) return false;
+  try {
+    const frozen = parseNativeExecutionInput(run.runnerProfileJson?.nativeExecutionInput);
+    return frozen.binding.runId === run.id && frozen.binding.companyId === run.companyId &&
+      frozen.binding.agentId === run.agentId && frozen.binding.issueId === run.contextSnapshot?.issueId &&
+      frozen.binding.issueId === run.nativeIssueId && frozen.session.normalizedSessionId === run.nativeSessionId;
+  } catch {
+    return false;
+  }
+}
+
+/** Freeze once at turn start. Reattachment reuses the admitted input and reply receipts;
+ * it must neither reselect delivered completions nor absorb later pending completions.
+ * The caller still validates the conversation generation/ownership before dispatch. */
+export async function prepareChatCompletionTurn(db: Db, run: Run, restartRecovery?: NativeRestartRecoveryClaim): Promise<Run> {
   const issueId = run.contextSnapshot?.issueId;
-  if (typeof issueId !== "string") return run;
+  if (typeof issueId !== "string" || admittedCompletionReattach(run, restartRecovery)) return run;
   return db.transaction(async tx => {
     const [source] = await tx.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId))).for("update");
     if (!source) return run;
@@ -308,9 +332,119 @@ export async function existingChatCompletionReply(tx: Connection, runId: string,
   if (rows.length !== ids(run).length) throw new Error("chat_completion_superseded");
   return null;
 }
-export async function acknowledgeChatCompletionReply(tx: Connection, runId: string, commentId: string) {
+/** The opening reply owns only the frozen input; later steering requires explicit attribution. */
+export async function acknowledgeChatCompletionReply(tx: Connection, runId: string, commentId: string, answers?: string[]) {
+  let reported = answers;
+  if (!reported) {
+    const [run] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    reported = run ? ids(run) : [];
+  }
+  if (!reported.length) return;
   await tx.update(deliveries).set({ status: "delivered", responseCommentId: commentId, error: null })
-    .where(and(eq(deliveries.targetRunId, runId), eq(deliveries.status, "queued")));
+    .where(and(eq(deliveries.targetRunId, runId), eq(deliveries.status, "queued"),
+      inArray(sql<string>`${deliveries.id}::text`, reported)));
+}
+
+export async function deliverIntoLiveTurn(db: Db, claimed: typeof deliveries.$inferSelect, key: string, expectedRunId?: string) {
+    return db.transaction(async tx => {
+      // Match status writers' task-first order; promotion and publication own the chat lock.
+      await tx.select({ id: issues.id }).from(issues).where(and(eq(issues.id, claimed.taskId),
+        eq(issues.companyId, claimed.companyId))).for("no key update");
+      const audience = await loadAudience(tx, claimed.id);
+      if (!audience?.source) return false;
+      const [source] = await tx.select().from(issues).where(and(eq(issues.id, audience.source.id),
+        eq(issues.companyId, claimed.companyId))).for("no key update");
+      // Both worker delivery and hold release share this FIFO gate. Never send a
+      // later report around an older person/reset/interaction wake on this issue.
+      const [head] = await tx.select({ idempotencyKey: agentWakeupRequests.idempotencyKey }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, claimed.companyId), eq(agentWakeupRequests.agentId, audience.handoff.agentId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        sql`${agentWakeupRequests.payload}->>'issueId' = ${audience.source.id}`,
+      )).orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id)).limit(1);
+      if (!head || head.idempotencyKey !== key) return false;
+      const [wake] = await tx.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, claimed.companyId), eq(agentWakeupRequests.idempotencyKey, key),
+        eq(agentWakeupRequests.agentId, audience.handoff.agentId), eq(agentWakeupRequests.status, "deferred_issue_execution"))).for("update");
+      const context = parseObject(wake?.payload?._paperclipWakeContext);
+      if (!source?.conversationAgentId || source.conversationAgentId !== audience.handoff.agentId ||
+          source.assigneeAgentId !== source.conversationAgentId || source.conversationState !== "active" || !source.executionRunId ||
+          (expectedRunId !== undefined && source.executionRunId !== expectedRunId) ||
+          !wake || wake.payload?.issueId !== source.id || (context.wakeReason ?? wake.reason) !== CHAT_COMPLETION_WAKE_REASON ||
+          context.conversationSessionGeneration !== source.conversationSessionGeneration || context.forceFreshSession === true ||
+          !Array.isArray(context.chatCompletionDeliveryIds) || context.chatCompletionDeliveryIds.length !== 1 || context.chatCompletionDeliveryIds[0] !== claimed.id) return false;
+      const [row] = await tx.select({ run: heartbeatRuns, config: agents.adapterConfig, agentStatus: agents.status }).from(heartbeatRuns)
+        .innerJoin(agents, and(eq(agents.id, heartbeatRuns.agentId), eq(agents.companyId, claimed.companyId)))
+        .where(and(eq(heartbeatRuns.id, source.executionRunId), eq(heartbeatRuns.companyId, claimed.companyId),
+          eq(heartbeatRuns.agentId, source.conversationAgentId), eq(heartbeatRuns.nativeIssueId, source.id)));
+      if (!row || row.run.status !== "running" || row.run.runtimeMode !== "native" || !row.run.nativeSessionId ||
+          agentRunWritesRevoked(row.run) || row.run.resultJson?.personStop || row.run.contextSnapshot?.skipIssueComment === true ||
+          row.run.contextSnapshot?.conversationSessionGeneration !== source.conversationSessionGeneration ||
+          ["paused", "terminated", "pending_approval", "error"].includes(row.agentStatus) || row.config.provider !== "pi_rpc" ||
+          resolveSessionContinuity("pi_rpc", row.config.sessionContinuity) !== "continuous") return false;
+      const sameClaim = and(eq(deliveries.id, claimed.id), eq(deliveries.companyId, claimed.companyId),
+        inArray(deliveries.status, [...pending]), isNull(deliveries.targetRunId), eq(deliveries.statusVersion, claimed.statusVersion),
+        eq(deliveries.attempts, claimed.attempts), eq(deliveries.nextAttemptAt, claimed.nextAttemptAt));
+      const [owned] = await tx.select({ id: deliveries.id }).from(deliveries).where(sameClaim).for("update");
+      const fresh = await loadAudience(tx, claimed.id);
+      if (!owned || !fresh || !current(fresh) || fresh.source?.id !== source.id ||
+          fresh.handoff.sessionGeneration !== source.conversationSessionGeneration) return false;
+      if (await deliverByEarlierReply(tx, fresh, null)) {
+        await tx.update(agentWakeupRequests).set({ status: "skipped", finishedAt: new Date(), updatedAt: new Date(),
+          error: "Already reported by an earlier reply in this conversation" }).where(eq(agentWakeupRequests.id, wake.id));
+        return true;
+      }
+      // Old packs cannot attribute a report: leave their wake for stock after the hold,
+      // rather than steer a report that an unattributed final would make us repeat.
+      const [final] = await tx.select({ payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents).where(and(
+        eq(heartbeatRunEvents.companyId, claimed.companyId), eq(heartbeatRunEvents.runId, row.run.id),
+        eq(heartbeatRunEvents.eventType, "item.completed"),
+        sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,channel}' = 'final'`)).orderBy(desc(heartbeatRunEvents.seq)).limit(1);
+      if (!Array.isArray(parseObject(parseObject(final?.payload?.prpEvent).payload).answers)) return false;
+      const { getNativeSessionSteeringState } = await import("./native-runtime/native-session-executor.js");
+      const { deliverSteeredMessage } = await import("./queued-comment-steering.js");
+      const steering = await getNativeSessionSteeringState(row.run.id);
+      if (steering.disposition !== "available" || !steering.activeTurnId) return false;
+      await deliverSteeredMessage(db, { executor: tx, companyId: claimed.companyId, runId: row.run.id,
+        messageId: claimed.id, message: chatCompletionInstruction({ chatCompletionUpdates: [await taskResult(tx, fresh.task)] }), identity: null });
+      // ACK ingestion needs the run row. Lock it only AFTER provider I/O, like the board door.
+      const [receiving] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, row.run.id),
+        eq(heartbeatRuns.companyId, claimed.companyId))).for("update");
+      if (!receiving || receiving.status !== "running" || agentRunWritesRevoked(receiving) || receiving.resultJson?.personStop ||
+          receiving.nativeSessionId !== row.run.nativeSessionId) throw new Error("Completion steering target changed after ACK");
+      const moved = await tx.update(agentWakeupRequests).set({ status: "coalesced", runId: receiving.id,
+        finishedAt: new Date(), updatedAt: new Date(), error: null }).where(and(eq(agentWakeupRequests.id, wake.id),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"))).returning({ id: agentWakeupRequests.id });
+      const queued = await tx.update(deliveries).set({ status: "queued", targetRunId: receiving.id, error: null })
+        .where(sameClaim).returning({ id: deliveries.id });
+      if (!moved.length || !queued.length) throw new Error("Completion steering ownership changed after ACK");
+      return true;
+    });
+  }
+
+/** The native hold owner offers completion wakes before fencing steering. A
+ * concurrent delivery can consume a sampled wake; re-read it before closing. */
+export async function offerHeldChatCompletions(db: Db, scope: { companyId: string; issueId: string; agentId: string; runId: string }) {
+  const wakes = await db.select().from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, scope.companyId), eq(agentWakeupRequests.agentId, scope.agentId),
+    eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    sql`${agentWakeupRequests.payload}->>'issueId' = ${scope.issueId}`,
+  )).orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id)).limit(20);
+  let offered = false;
+  for (const wake of wakes) {
+    const context = parseObject(wake.payload?._paperclipWakeContext);
+    if ((context.wakeReason ?? wake.reason) !== CHAT_COMPLETION_WAKE_REASON) break;
+    const ids = context.chatCompletionDeliveryIds;
+    const [delivery] = Array.isArray(ids) && ids.length === 1 && typeof ids[0] === "string"
+      ? await db.select().from(deliveries).where(and(eq(deliveries.companyId, scope.companyId),
+        eq(sql<string>`${deliveries.id}::text`, ids[0]))) : [];
+    if (delivery && wake.idempotencyKey === `chat-completion:${delivery.id}:${delivery.attempts}` &&
+        await deliverIntoLiveTurn(db, delivery, wake.idempotencyKey, scope.runId)) { offered = true; continue; }
+    const [latest] = await db.select({ status: agentWakeupRequests.status }).from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, scope.companyId)));
+    if (latest?.status === "deferred_issue_execution") return false;
+    offered = true;
+  }
+  return offered;
 }
 
 export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentId: string, options: {
@@ -383,6 +517,7 @@ export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentI
         if (advanced && claimed.attempts + 1 < MAX_ATTEMPTS) await deliver(id);
         return;
       }
+      if (wakes.some(w => w.status === "deferred_issue_execution") && await deliverIntoLiveTurn(db, claimed, key)) return;
       if (wakes.some(w => ["queued", "claimed", "deferred_issue_execution", "coalesced"].includes(w.status))) return;
       if (wakes.length) {
         // Terminal receipts must advance the key; reusing them collides forever.
@@ -423,6 +558,7 @@ export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentI
         const receipts = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
           .where(and(eq(agentWakeupRequests.companyId, claimed.companyId), eq(agentWakeupRequests.idempotencyKey, key)));
         if (!receipts.length) throw new Error("Completion wake returned no run or durable receipt");
+        await deliverIntoLiveTurn(db, claimed, key);
       }
       if (run) await db.update(deliveries).set({ targetRunId: run.id, status: "queued" })
         .where(and(eq(deliveries.id, id), inArray(deliveries.status, [...pending]), sql`${deliveries.targetRunId} is null`));

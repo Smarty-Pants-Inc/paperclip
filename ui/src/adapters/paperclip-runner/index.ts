@@ -247,7 +247,7 @@ function parseItemEvent(
   if (type === "agentmessage") {
     const value = itemText(item, payload);
     if (phase === "completed") state.itemChannels.delete(id);
-    if (!value || state.assistantDeltaItemIds.has(id)) return [];
+    if (!value || (phase !== "completed" && state.assistantDeltaItemIds.has(id))) return [];
     if (resolvedChannel === "final") {
       const summary = structuredResultSummary(value);
       if (summary) {
@@ -870,4 +870,5 @@ export const paperclipRunnerUIAdapter: UIAdapterModule = {
   },
   ConfigFields: CodexLocalConfigFields,
   buildAdapterConfig: buildPaperclipRunnerConfig,
+  transcriptPresentation: { liveReasoningView: "inline" },
 };

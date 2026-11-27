@@ -69,6 +69,137 @@ describeDatabase("agent runtime synchronization hooks", () => {
   });
   const events = () => db.select().from(resourceLifecycleEvents).where(and(eq(resourceLifecycleEvents.companyId, companyId), eq(resourceLifecycleEvents.resourceType, "agent_runtime"))).orderBy(resourceLifecycleEvents.id);
 
+  async function heldConfigurationRun() {
+    const { heartbeatRuns, issues } = await import("@paperclipai/db");
+    const root = resolveManagedInstructionsRoot({ id: agentId, companyId, name: "Runtime agent", adapterConfig: {} });
+    const config = { provider: "pi_rpc", model: "openai/gpt-5", sessionContinuity: "continuous",
+      instructionsBundleMode: "managed", instructionsRootPath: root, instructionsEntryFile: "AGENTS.md", instructionsFilePath: `${root}/AGENTS.md` };
+    await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: config }).where(eq(agents.id, agentId));
+    await fs.mkdir(root, { recursive: true });
+    await fs.writeFile(path.join(root, "AGENTS.md"), "Original instructions");
+    const [issue] = await db.insert(issues).values({ companyId, title: "Held configuration", assigneeAgentId: agentId }).returning();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId, invocationSource: "on_demand", status: "running",
+      runtimeMode: "native", nativeIssueId: issue.id, resultJson: { retained: "receipt" } }).returning();
+    const read = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0]!;
+    const clear = () => db.update(heartbeatRuns).set({ resultJson: { retained: "receipt" } }).where(eq(heartbeatRuns.id, run.id));
+    return { config, root, run, read, clear };
+  }
+
+  it.each(["model", "piRpcThinkingLevel", "piThinkingLevel", "thinkingLevel", "modelReasoningEffort", "reasoningEffort", "effort", "variant", "futureRetainedInput"])
+    ("hold seam producers: committed %s changes end only that agent's old native hold; no-op/rollback do not", async key => {
+    const { agentService } = await import("../services/agents.js");
+    const { updateAgentConfigurationInTransaction } = await import("../services/agent-configuration-transaction.js");
+    const { heartbeatRuns } = await import("@paperclipai/db");
+    const f = await heldConfigurationRun();
+    const [otherAgent] = await db.insert(agents).values({ companyId, name: "Unchanged agent" }).returning();
+    const [otherRun] = await db.insert(heartbeatRuns).values({ companyId, agentId: otherAgent.id, invocationSource: "on_demand", status: "running", runtimeMode: "native" }).returning();
+    const service = agentService(db);
+    await service.update(agentId, { name: "Display-only rename" });
+    await service.update(agentId, { adapterConfig: { ...f.config, timeoutSec: 45 } });
+    await service.update(agentId, { adapterConfig: { ...f.config, timeoutSec: 45 } });
+    expect((await f.read()).resultJson?.heldNativeConfigurationEnd).not.toBe(true);
+    await expect(db.transaction(async tx => {
+      await updateAgentConfigurationInTransaction(tx as unknown as Db, agentId, { adapterConfig: { ...f.config, [key]: "rolled-back" } });
+      throw new Error("configuration rollback");
+    })).rejects.toThrow("configuration rollback");
+    expect((await f.read()).resultJson?.heldNativeConfigurationEnd).not.toBe(true);
+    await service.update(agentId, { adapterConfig: { ...f.config, [key]: key === "model" ? "openai/gpt-5-mini" : "high" } });
+    const changed = await f.read();
+    expect(changed.resultJson).toEqual({ retained: "receipt", heldNativeConfigurationEnd: true });
+    expect(changed.status).toBe("running");
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, otherRun.id)))[0]!.resultJson?.heldNativeConfigurationEnd).not.toBe(true);
+    // Intent belongs to the old run; a successor has no stale close/cancel state.
+    const [next] = await db.insert(heartbeatRuns).values({ companyId, agentId, invocationSource: "on_demand", status: "queued", runtimeMode: "native" }).returning();
+    expect(next.resultJson?.heldNativeConfigurationEnd).not.toBe(true);
+  });
+
+  it("hold seam producers: changed instruction entry bytes request an end, identical bytes never do", async () => {
+    const f = await heldConfigurationRun();
+    const actor = { type: "board" as const, userId: "local-board", source: "local_implicit" as const };
+    const instructions = agentInstructionRevisionService(db);
+    const initial = (await instructions.readCurrent({ companyId, agentId }, actor))!;
+    const commit = (content: string, baseRevisionId: string) => instructions.commit({ companyId, agentId,
+      entryFile: "AGENTS.md", content, baseRevisionId, source: "api" }, actor);
+    expect((await commit(initial.content, initial.revision.id)).changed).toBe(false);
+    expect((await f.read()).resultJson?.heldNativeConfigurationEnd).not.toBe(true);
+    const changed = await commit("Changed instructions", initial.revision.id);
+    expect(changed.changed).toBe(true);
+    expect((await f.read()).resultJson).toEqual({ retained: "receipt", heldNativeConfigurationEnd: true });
+    await f.clear();
+    expect((await commit(changed.content, changed.revision.id)).changed).toBe(false);
+    expect((await f.read()).resultJson?.heldNativeConfigurationEnd).not.toBe(true);
+  });
+
+  it("hold seam v3: a chat model change ends only that issue's held run, after commit", async () => {
+    const { heartbeatRuns, issues } = await import("@paperclipai/db");
+    const { requestHeldNativeConfigurationEnd } = await import("../services/native-runtime/held-native-turn.js");
+    const { issueService } = await import("../services/issues.js");
+    const f = await heldConfigurationRun();
+    const [otherIssue] = await db.insert(issues).values({ companyId, title: "Other held chat", assigneeAgentId: agentId }).returning();
+    const [otherRun] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "running", runtimeMode: "native",
+      nativeIssueId: otherIssue.id, resultJson: { retained: "other receipt" } }).returning();
+    const change = async (tx: Db) => {
+      await issueService(db).update(f.run.nativeIssueId!, { assigneeAdapterOverrides: { adapterConfig: { model: "paperclip/gpt-6.2-sol" } } }, tx);
+      await requestHeldNativeConfigurationEnd(tx, { companyId, agentId, issueId: f.run.nativeIssueId! });
+    };
+    await expect(db.transaction(async tx => { await change(tx as unknown as Db); throw new Error("rollback chip change"); }))
+      .rejects.toThrow("rollback chip change");
+    expect((await f.read()).resultJson?.heldNativeConfigurationEnd).not.toBe(true);
+    await db.transaction(tx => change(tx as unknown as Db));
+    expect((await f.read()).resultJson).toEqual({ retained: "receipt", heldNativeConfigurationEnd: true });
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, otherRun.id)))[0]!.resultJson)
+      .toEqual({ retained: "other receipt" });
+  });
+
+  it("hold seam v2: the configuration producer waits on issue before owning run", async () => {
+    const { heartbeatRuns, issues } = await import("@paperclipai/db");
+    const { requestHeldNativeConfigurationEnd } = await import("../services/native-runtime/held-native-turn.js");
+    const f = await heldConfigurationRun();
+    let release!: () => void, locked!: () => void, started!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const ready = new Promise<void>(resolve => { locked = resolve; });
+    const producerReady = new Promise<void>(resolve => { started = resolve; });
+    const checkout = db.transaction(async tx => {
+      await tx.select().from(issues).where(eq(issues.id, f.run.nativeIssueId!)).for("update");
+      locked(); await gate;
+    });
+    await ready;
+    let pid = 0;
+    const producer = db.transaction(async tx => {
+      const [backend] = await tx.execute(sql`select pg_backend_pid() as pid`);
+      pid = Number(backend.pid); started();
+      await requestHeldNativeConfigurationEnd(tx as unknown as Db, { companyId, agentId });
+    });
+    try {
+      await producerReady;
+      await vi.waitFor(async () => {
+        const [waiting] = await db.execute(sql`select wait_event_type, query from pg_stat_activity where pid = ${pid}`);
+        expect(waiting.wait_event_type).toBe("Lock");
+        expect(waiting.query).toContain('from "issues"');
+      });
+      // The issue owner can still take its run lock: no inverse run lock was acquired.
+      await db.transaction(tx => tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.run.id)).for("update", { noWait: true }));
+    } finally { release(); await checkout; await producer; }
+    expect((await f.read()).resultJson?.heldNativeConfigurationEnd).toBe(true);
+  });
+
+  it("hold seam v2: identical entry adoption binds managed paths without ending the hold", async () => {
+    const f = await heldConfigurationRun();
+    const actor = { type: "board" as const, userId: "local-board", source: "local_implicit" as const };
+    const instructions = agentInstructionRevisionService(db);
+    const initial = (await instructions.readCurrent({ companyId, agentId }, actor))!;
+    // Exercise bindEntry on the identical-byte return, not only the already-bound path.
+    const { instructionsBundleMode, instructionsRootPath, ...unbound } = f.config;
+    await db.update(agents).set({ adapterConfig: unbound }).where(eq(agents.id, agentId));
+    const saved = await instructions.commit({ companyId, agentId, entryFile: "AGENTS.md", content: initial.content,
+      baseRevisionId: initial.revision.id, source: "api" }, actor);
+    expect(saved.changed).toBe(false);
+    expect((await f.read()).resultJson?.heldNativeConfigurationEnd).not.toBe(true);
+    const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+    expect(agent!.adapterConfig.instructionsRootPath).toBe(f.root);
+    expect(agent!.adapterConfig.instructionsBundleMode).toBe("managed");
+  });
+
   it("captures all configuration writers while ignoring no-op and heartbeat bookkeeping updates", async () => {
     expect(await events()).toHaveLength(1);
     await db.update(agents).set({ name: "Runtime agent", updatedAt: new Date(), lastHeartbeatAt: new Date(), spendMonthUtc: "2099-01" }).where(eq(agents.id, agentId));

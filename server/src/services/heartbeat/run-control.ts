@@ -1,3 +1,4 @@
+import { requeueContinuousUnanswered } from "../native-runtime/native-continuous-unanswered.js";
 import { writeDeferredExecutionWait } from "../deferred-execution-wait.js";
 import type { DeferredReceiptRecoveryOptions } from "../deferred-execution-notifications.js";
 import { observeStoppedWorkspaceRecovery } from "../workspace-recovery.js";
@@ -396,8 +397,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
   }) {
     let leaseOwnerRun = await getRunCleanupState(input.runId);
     if (leaseOwnerRun && isNativeRunnerOwnershipHeld(leaseOwnerRun)) return;
-    const cancelledRun = leaseOwnerRun?.runtimeMode === "native" && leaseOwnerRun.status === "cancelled"
-      ? await getRun(input.runId) : null;
+    const cancelledRun = leaseOwnerRun?.status === "cancelled" ? await getRun(input.runId) : null;
     if (cancelledRun) leaseOwnerRun = cancelledRun;
     if (leaseOwnerRun && isNativeRunnerOwnershipHeld(leaseOwnerRun)) return;
     // Recovery can finish workspace copy-back outside the executor's finally.
@@ -407,6 +407,10 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       input.providerResourceDisposition,
       status,
     );
+    // The preparation owner proved the dispatch gate never opened. Do not
+    // close the prior warm owner: runtime returns only reusable leases untouched.
+    if (cancelledRun?.resultJson?.preDispatchCancellationSettledAt &&
+        !parseObject(cancelledRun.usageJson?.budgetDispatch).handedOffAt) providerResourceDisposition = undefined;
     let neverLaunched: boolean | undefined;
     const runnerNeverLaunched = async () => neverLaunched ??= leaseOwnerRun?.runtimeMode === "native"
       && isHeartbeatRunTerminalStatus(status) && await nativeRunNeverLaunchedRunner(db, input.runId, input.companyId);
@@ -683,15 +687,30 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     if (!issueId) return;
     const currentRun = run.runtimeMode === "native" ? await readNativeStopExecutionEvidence(db, run.companyId, run.id) : null;
     const [coordinator] = currentRun ? await db.select({ phase: nativeRunFinalizations.phase,
-      leaseOwner: nativeRunFinalizations.leaseOwner }).from(nativeRunFinalizations).where(and(
+      resultId: nativeRunFinalizations.resultId, leaseOwner: nativeRunFinalizations.leaseOwner }).from(nativeRunFinalizations).where(and(
       eq(nativeRunFinalizations.companyId, run.companyId), eq(nativeRunFinalizations.runId, run.id),
     )) : [];
-    // The ordinary path still enforces task holds, ownership, and native session
-    // cleanup before starting a provider.
+    // A Pi startup Stop can retain its idle session without terminating a
+    // process. Once its executor has unwound, the durable admission fence and
+    // absence of turn events prove that no input was dispatched. Re-enter
+    // ordinary admission for post-press input, not execution-recovery admission
+    // (which requires a terminated process and would strand that saved input).
+    const [startup] = currentRun ? await db.select({ beforeFirstTurn: sql<boolean>`
+      ${heartbeatRuns.status} = 'cancelled' and ${heartbeatRuns.finishedAt} is not null
+      and ${heartbeatRuns.resultJson}->'personStop' is not null
+      and ${heartbeatRuns.resultJson}#>>'{startupCancellation,requestedAt}' is not null
+      and ${heartbeatRuns.resultJson}->'firstTurnDispatchCommitted' is null
+      and ${heartbeatRuns.runnerProfileJson}#>>'{nativeExecutionInput,provider,kind}' = 'pi_rpc'
+      and not exists (select 1 from ${heartbeatRunEvents} where ${heartbeatRunEvents.companyId} = ${run.companyId}
+        and ${heartbeatRunEvents.runId} = ${run.id} and ${heartbeatRunEvents.eventType} like 'turn.%')` })
+      .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id))) : [];
+    const stoppedBeforeFirstTurn = startup?.beforeFirstTurn && !coordinator?.resultId;
+    // Ordinary admission still enforces task holds, ownership and session
+    // cleanup. Neither branch may promote while the old executor owns work.
     const stoppedNativeExecution = currentRun && isAcknowledgedNativeStop(currentRun) &&
       !activeRunExecutions.has(run.id) && !coordinator?.leaseOwner &&
       ["terminal_failure", "applied"].includes(coordinator?.phase ?? "") &&
-      await acknowledgedNativeStopExecutionHasStopped(db, currentRun);
+      (stoppedBeforeFirstTurn || await acknowledgedNativeStopExecutionHasStopped(db, currentRun));
     if (stoppedNativeExecution) await observeStoppedWorkspaceRecovery(db, { companyId: run.companyId, issueId, runId: run.id });
     const stoppedNativeContinuation = stoppedNativeExecution && !(await getExecutionBlocker(db, run.companyId, issueId));
     const legacyContinuation = run.runtimeMode === "legacy" &&
@@ -721,6 +740,12 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         } else await recordInterruptedPreparationContinuation(db, run, "deferred");
       }
     }
+    // A later run that owns the issue drains its deferred comments itself when it releases.
+    // Re-enqueueing a plain comment now would add a second copy beside the original.
+    const [owner] = await db.select({ status: heartbeatRuns.status }).from(issues)
+      .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, issues.executionRunId))
+      .where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId)));
+    const ownerLive = Boolean(owner && !isHeartbeatRunTerminalStatus(owner.status));
     for (const wake of pending) {
       if (wake.idempotencyKey?.startsWith("chat-inbound:")) {
         await resumeDeferredChatWake(db, { companyId: run.companyId, agentId: run.agentId,
@@ -762,7 +787,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           sql`${issueComments.id}::text = ${commentId}`, eq(issueComments.authorType, "user"),
           eq(issueComments.authorUserId, requestedByActorId), isNull(issueComments.deletedAt),
           isNull(issueComments.createdByRunId),
-          gt(issueComments.createdAt, userStopBoundaryAt(run)!),
+          sql`${issueComments.createdAt} > coalesce(${typeof parseObject(run.resultJson?.personStop).requestedAt === "string"
+            ? parseObject(run.resultJson?.personStop).requestedAt : null}::timestamptz, ${userStopBoundaryAt(run)?.toISOString() ?? null}::timestamptz)`,
         ));
         if (!comment?.body.trim()) continue;
       } else {
@@ -778,6 +804,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           continue;
         }
       }
+      if (ownerLive) break;
       // Re-enter ordinary admission with the original user's authority. It
       // atomically adopts the deferred comments and still applies every gate.
       await enqueueWakeup(run.agentId, { source: wake.source as WakeupOptions["source"], triggerDetail: (wake.triggerDetail ?? undefined) as WakeupOptions["triggerDetail"],
@@ -1030,6 +1057,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       }).from(heartbeatRuns).where(and(
         eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
       ));
+      await requeueContinuousUnanswered(db, run);
       const sourceHandoff = await pendingCaseHandoffForRun(db, run.id, run.companyId);
       const { postCommitEffects } = await wakeQueue.releaseIssueExecution({
         companyId: run.companyId,
@@ -1322,11 +1350,13 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     const supersedesCaseHandoff = options.resultJson?.cancelledByActorType === "user" || options.errorCode === "issue_reassigned";
     let cancellationClaimed = false;
     let caseHandoffRetryClaimed = false;
+    let completionWon = false;
     if (handoffIssueId && supersedesCaseHandoff && options.resultJson?.caseHandoffYieldStop !== true) {
       const publications: ActivityPublication[] = [];
       let taskRowLocked = false;
       const applySupersession = () => db.transaction(async tx => {
         taskRowLocked = false;
+        completionWon = false;
         // As in legacy terminalization, wait at most 1s for the task row so a
         // board Stop never queues behind a slow task writer. Later locks keep
         // the transaction's previous timeout.
@@ -1341,6 +1371,18 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           eq(heartbeatRuns.companyId, run!.companyId))).for("update");
         if (!current || (options.expectedStatus && current.status !== options.expectedStatus)) return false;
         run = current;
+        // Result publication/event append takes this run lock too. A finished
+        // provider has no Stop to dispatch; leave its existing finalizer alone.
+        if (options.resultJson?.cancelledByActorType === "user" &&
+            current.runtimeMode === "native" && ["running", "succeeded"].includes(current.status)) {
+          const [terminal] = await tx.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+            eq(heartbeatRunEvents.companyId, current.companyId), eq(heartbeatRunEvents.runId, runId),
+            eq(heartbeatRunEvents.eventType, "run.terminal"), isNotNull(heartbeatRunEvents.sourceEventId),
+            sql`${heartbeatRunEvents.payload}#>>'{prpEvent,sourceKind}' = 'control_plane'`,
+            sql`${heartbeatRunEvents.payload}#>>'{prpEvent,payload,runTerminalState}' = 'succeeded'`,
+          )).limit(1);
+          if (current.status === "succeeded" || current.resultJson?.prpRunTerminalState === "succeeded" || terminal) { completionWon = true; return true; }
+        }
         if (options.cancellationRequestId) {
           run = await claimCancellationRequest(tx as unknown as Db, runId, run!.companyId, options.cancellationRequestId,
             options.cancellationRequestedByUserId ?? null);
@@ -1421,6 +1463,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       }
       publications.forEach(publishActivity);
       if (!supersessionApplied) return null;
+      if (completionWon) return run;
     }
     if (options.cancellationRequestId && !cancellationClaimed) {
       run = await claimCancellationRequest(db, runId, run.companyId, options.cancellationRequestId, options.cancellationRequestedByUserId ?? null);

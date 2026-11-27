@@ -2,14 +2,18 @@ import { createUuid } from "@/lib/uuid";
 import { useCurrentAccountGuard } from "@/hooks/useAccountBoundMutation";
 import { ComposerFileDropTarget } from "./ComposerFileDropTarget";
 import { AgentAvatar } from "../AgentAvatar";
+import type { IssueChatComposerHandle } from "@/components/IssueChatThread";
 import {
   useEffect,
+  useLayoutEffect,
   useId,
+  useImperativeHandle,
   useRef,
   useState,
   type ChangeEvent,
   type ClipboardEvent as ReactClipboardEvent,
   type ReactNode,
+  type Ref,
 } from "react";
 import { cn } from "@/lib/utils";
 import { taskChatComposerSurfaceClasses } from "./composer-surface";
@@ -22,6 +26,9 @@ import {
   loadDraft,
   loadDraftAttachments,
   saveDraft,
+  saveRestoredDraft,
+  restoreStoppedCommentDrafts,
+  discardStoppedCommentDrafts,
   saveDraftAttachments,
   loadDraftSubmission,
   replayableRequest,
@@ -110,6 +117,7 @@ export interface TaskChatComposerTakeover {
 }
 
 interface TaskChatComposerProps {
+  composerRef?: Ref<IssueChatComposerHandle>;
   onAdd?: (
     body: string,
     reopen?: boolean,
@@ -141,6 +149,8 @@ interface TaskChatComposerProps {
     onRunSettingsChange: (settings: ComposerRunSettings | null) => void;
   };
   confirmedSubmissionIds?: ReadonlySet<string>;
+  onRetainedSubmissionChange?: (requestId: string | null) => void;
+  onRestoreReady?: () => void;
   onStop?: () => Promise<void>;
   confirmedStoppedRunIds?: ReadonlySet<string>;
   stopPending?: boolean;
@@ -334,9 +344,12 @@ function escapeMarkdownLabel(name: string): string {
 }
 
 export function TaskChatComposer({
+  composerRef,
   onAdd,
   creation,
   confirmedSubmissionIds,
+  onRetainedSubmissionChange,
+  onRestoreReady,
   onStop,
   confirmedStoppedRunIds,
   stopPending = false,
@@ -483,6 +496,32 @@ export function TaskChatComposer({
       requestOwner: pending.requestOwner,
     });
   }
+  useImperativeHandle(composerRef, () => ({
+    focus: () => editorRef.current?.focus(),
+    restoreStoppedMessages: (comments) => {
+      if (!draftKey || creation || queuedEdit || submittingRef.current || uncertainSubmission) return [];
+      const restored = restoreStoppedCommentDrafts(draftKey, bodyRef.current, comments);
+      if (!restored) return [];
+      changeBody(restored.body);
+      requestAnimationFrame(() => editorRef.current?.focus());
+      return restored.commentIds;
+    },
+    restoreDraft: (submittedBody: string) => {
+      if (!submittedBody) return;
+      const next = bodyRef.current.includes(submittedBody) ? bodyRef.current : bodyRef.current ? `${bodyRef.current}\n\n${submittedBody}` : submittedBody;
+      changeBody(next);
+      // Written at once (not after the debounce), and kept past the tab, before the caller deletes the message.
+      if (draftKey) { saveDraft(draftKey, next); saveRestoredDraft(draftKey, next); }
+      requestAnimationFrame(() => editorRef.current?.focus());
+      return !draftKey || loadDraft(draftKey).includes(submittedBody);
+    },
+  }));
+  // A cancellation can return while the original POST is still settling.
+  // Its page owner keeps the text visible and retries custody when this box
+  // becomes available; never acknowledge it while a submission owns the draft.
+  useLayoutEffect(() => {
+    if (draftKey && !creation && !queuedEdit && !submitting && !uncertainSubmission) onRestoreReady?.();
+  }, [draftKey, creation, queuedEdit, submitting, uncertainSubmission, onRestoreReady]);
   const draftTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const queuedEditRef = useRef(queuedEdit);
   queuedEditRef.current = queuedEdit;
@@ -854,10 +893,9 @@ export function TaskChatComposer({
   // clear its error state, so both hold submission until resolved or removed.
   const showStop =
     !queuedEdit &&
-    !submitting &&
     body.trim().length === 0 &&
-    attachments.length === 0 &&
-    Boolean(onStop || stopControl.stopping);
+    draftAttachments.length === 0 &&
+    Boolean(onStop);
   const uploadPending = attachments.some((item) => item.status === "uploading");
   const uploadFailed = attachments.some((item) => item.status === "error");
   const takeoverVisible = Boolean(takeover && !pause);
@@ -1013,7 +1051,7 @@ export function TaskChatComposer({
       (!trimmed && attachedRefs.length === 0) ||
       uploadPending ||
       uploadFailed ||
-      submitting ||
+      submittingRef.current ||
       uncertainSubmission ||
       disabled
     )
@@ -1055,6 +1093,8 @@ export function TaskChatComposer({
     }
     setBody("");
     setSendingAttachmentIds(new Set(submittedAttachments.map(item => item.id)));
+    setActionError(null);
+    submittingRef.current = true;
     setSubmitting(true);
     // A new send replaces the previous refusal.
     setActionError(null);
@@ -1120,12 +1160,20 @@ export function TaskChatComposer({
         changeBody(bodyRef.current);
       }
       sentModeChoice.current = { attemptId, generation: submittedModeGeneration };
-      if (swarmCommand) {
-        await onAdd(fullBody, reopen, reassignment, attachmentIds.length ? attachmentIds : undefined, attemptId, undefined, "swarm");
-      } else if (runSettings) {
-        await onAdd(fullBody, reopen, reassignment, attachmentIds.length ? attachmentIds : undefined, attemptId, runSettings);
-      } else {
-        await onAdd(fullBody, reopen, reassignment, attachmentIds.length ? attachmentIds : undefined, attemptId);
+      try {
+        if (swarmCommand) {
+          await onAdd(fullBody, reopen, reassignment, attachmentIds.length ? attachmentIds : undefined, attemptId, undefined, "swarm");
+        } else if (runSettings) {
+          await onAdd(fullBody, reopen, reassignment, attachmentIds.length ? attachmentIds : undefined, attemptId, runSettings);
+        } else {
+          await onAdd(fullBody, reopen, reassignment, attachmentIds.length ? attachmentIds : undefined, attemptId);
+        }
+      } catch (error) {
+        // The queue/history receipt can beat a lost POST response. Use that
+        // existing receipt, rather than restore then remove the same text.
+        const confirmed = (mountedTaskKey.current === draftKey && confirmedSubmissionIdsRef.current?.has(attemptId)) ||
+          settledSubmissionIds.current.has(JSON.stringify([draftKey, attemptId]));
+        if (!confirmed) throw error;
       }
       // Navigation does not invalidate the server receipt. Settle the captured
       // task before checking whether this composer is still on screen.
@@ -1143,6 +1191,8 @@ export function TaskChatComposer({
       setRunSettings(null);
     } catch (error) {
       if (mountedTaskKey.current !== draftKey) return;
+      if (!queuedEdit && classifySendFailure(error) === "rejected")
+        setActionError(describeError(error, { action: "send this message" }).body);
       const nextDraft = bodyRef.current;
       // Not delivered, or not known to be: keep it and resend with the same
       // ID when the connection allows. The server dedupes by that ID.
@@ -1181,12 +1231,15 @@ export function TaskChatComposer({
     } finally {
       if (pendingDraftRef.current?.attemptId === attemptId) pendingDraftRef.current = null;
       setSendingAttachmentIds(null);
+      submittingRef.current = false;
       setSubmitting(false);
     }
   }
 
   /** A confirmed receipt for the retained send: drop its text, keep any next draft. */
   const settledSubmissionIds = useRef(new Set<string>());
+  const confirmedSubmissionIdsRef = useRef(confirmedSubmissionIds);
+  confirmedSubmissionIdsRef.current = confirmedSubmissionIds;
   function settleUncertainSubmission(submission: ComposerDraftSubmission) {
     const settlementKey = JSON.stringify([draftKey, submission.attemptId]);
     if (settledSubmissionIds.current.has(settlementKey)) return;
@@ -1205,10 +1258,13 @@ export function TaskChatComposer({
       : []);
   }
 
-  useEffect(() => {
-    if (!uncertainSubmission || !confirmedSubmissionIds?.has(uncertainSubmission.attemptId)) return;
-    settleUncertainSubmission(uncertainSubmission);
-  }, [confirmedSubmissionIds, draftKey, uncertainSubmission]);
+  useLayoutEffect(() => {
+    const confirmed = uncertainSubmission && confirmedSubmissionIds?.has(uncertainSubmission.attemptId);
+    onRetainedSubmissionChange?.(confirmed ? null : uncertainSubmission?.attemptId ?? null);
+    // The receipt can arrive via the queue poll before the POST response.
+    // Transfer box -> thread before paint, never through a second tray row.
+    if (confirmed) settleUncertainSubmission(uncertainSubmission);
+  }, [confirmedSubmissionIds, draftKey, uncertainSubmission, onRetainedSubmissionChange]);
 
   async function resendUncertainSubmission(): Promise<SendOutcome> {
     if (!isCurrentAccount()) return "pending";
@@ -1448,7 +1504,11 @@ export function TaskChatComposer({
             <MarkdownEditor
               ref={editorRef}
               value={body}
-              onChange={changeBody}
+              onChange={(value) => {
+                if (!value && bodyRef.current && draftKey && !queuedEdit && !submittingRef.current && !uncertainSubmission)
+                  discardStoppedCommentDrafts(draftKey);
+                changeBody(value);
+              }}
               placeholder={
                 disabled
                   ? (disabledReason ?? "Composer disabled")
@@ -1746,7 +1806,7 @@ export function TaskChatComposer({
               }
               data-slot="icon-button"
             >
-              {submitting || (showStop && stopControl.stopping) ? (
+              {(showStop ? stopControl.stopping : submitting) ? (
                 <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
               ) : showStop ? (
                 <Square className="h-4 w-4 fill-current" aria-hidden />

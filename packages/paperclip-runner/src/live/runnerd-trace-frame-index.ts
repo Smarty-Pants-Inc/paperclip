@@ -16,10 +16,24 @@ export class RunnerdTraceFrameIndex {
   #partialBytes = 0;
   #discardUntilNewline = false;
   #frames = new Map<string, Frame>();
+  #unreadBytes = 0;
+  #nativeChannelCaptured = false;
+
+  get unreadBytes() { return this.#unreadBytes; }
+  get nativeChannelCaptured() { return this.#nativeChannelCaptured; }
 
   locate(tracePath: string, sourceEventId: string) {
+    this.refresh(tracePath);
+    return this.lookup(sourceEventId);
+  }
+
+  /** Refresh once per delivery pass, then use lookup for every correlation. */
+  refresh(tracePath: string): boolean {
     const stat = statSync(tracePath);
     const identity = `${stat.dev}:${stat.ino}`;
+    if (identity === this.#identity && stat.size === this.#offset && stat.mtimeMs === this.#mtimeMs) {
+      return false;
+    }
     if (
       identity !== this.#identity || stat.size < this.#offset ||
       (stat.size === this.#offset && stat.mtimeMs !== this.#mtimeMs)
@@ -34,7 +48,8 @@ export class RunnerdTraceFrameIndex {
         const opened = fstatSync(fd);
         // Do not mix a replacement file with the prefix we already indexed.
         if (`${opened.dev}:${opened.ino}` !== identity) {
-          return { frameId: null, nativeChannelSettled: false };
+          this.#unreadBytes = stat.size - this.#offset;
+          return true;
         }
         const buffer = Buffer.allocUnsafe(Math.min(READ_BUDGET_BYTES, stat.size - this.#offset));
         const bytes = readSync(fd, buffer, 0, buffer.length, this.#offset);
@@ -49,9 +64,14 @@ export class RunnerdTraceFrameIndex {
         closeSync(fd);
       }
     }
+    this.#unreadBytes = stat.size - this.#offset;
+    return true;
+  }
+
+  lookup(sourceEventId: string) {
     // Until the observed suffix is indexed, a later interpretation or terminal
     // status may supersede the prefix. Let the existing pending queue retry.
-    if (this.#offset < stat.size || this.#partialBytes > 0 || this.#discardUntilNewline) {
+    if (this.#unreadBytes || this.#partialBytes > 0 || this.#discardUntilNewline) {
       return { frameId: null, nativeChannelSettled: false };
     }
     const frame = this.#frames.get(sourceEventId);
@@ -71,6 +91,8 @@ export class RunnerdTraceFrameIndex {
     this.#partialBytes = 0;
     this.#discardUntilNewline = false;
     this.#frames.clear();
+    this.#unreadBytes = 0;
+    this.#nativeChannelCaptured = false;
   }
 
   #consume(part: Buffer, terminated: boolean) {
@@ -106,6 +128,7 @@ export class RunnerdTraceFrameIndex {
     }
     if (!entry || typeof entry !== "object") return;
     this.#record += 1;
+    if (entry.debugChannel === "rust_native") this.#nativeChannelCaptured = true;
     if (entry.kind === "trace_status" && entry.debugChannel === "rust_native") {
       this.#settledAt = this.#record;
     }

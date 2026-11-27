@@ -1,4 +1,5 @@
 import { notifyNativeResultCommit } from "../native-result-commit-notifications.js";
+import { settleProviderReturnedStopInput } from "../person-stop-before-turn.js";
 import { checkpointProfileForRun } from "../tool-access/connections/content-cleaning.js";
 import { RUN_CONTENT_DELETED_MARKER } from "../tool-access/connections/run-session-reset.js";
 import { applyNativeAcceptedOutcome, deriveNativeAcceptedOutcome, NATIVE_ACCEPTED_OUTCOME_KEY } from "./native-accepted-outcome.js";
@@ -10,6 +11,7 @@ import type { Db } from "@paperclipai/db";
 import {
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   issues,
   nativeRunFinalizations,
   nativeRunResults,
@@ -35,6 +37,9 @@ import {
 import { appendHeartbeatRunEvent, appendHeartbeatRunEventBatch, type AppendHeartbeatRunEventInput,
   type AppendHeartbeatRunEventResult } from "../heartbeat-run-events.js";
 import { publishLiveEvent } from "../live-events.js";
+import { logger } from "../../middleware/logger.js";
+import { insertIssueComment } from "../issue-comment-writes.js";
+import { persistActivity, publishActivity, type ActivityPublication } from "../activity-log.js";
 import { nativeSha256 } from "./canonical.js";
 import { redactRunnerApiEvent, redactRunnerApiPayloads } from "./runner-api-log-redaction.js";
 import { createNativeControllerRecovery, NATIVE_CONTROLLER_RECOVERY_MAX_BYTES, type NativeControllerCompatibility } from "./native-controller-recovery.js";
@@ -45,6 +50,7 @@ import { lockNativeRunnerCheckpointOwner, nativeRunnerCheckpointOwnerLock, valid
 import { crashPoint } from "@paperclipai/shared/crash-points";
 import { NATIVE_PROVIDER_DURABLE_EVENT_TYPES } from "./native-retired-backup-source.js";
 import { recordRunEventCommitted } from "../server-metrics.js";
+import { NATIVE_FRESH_SESSION_MARKER } from "./continued-session.js";
 
 export interface PaperclipControlPlaneBinding {
   companyId: string;
@@ -416,7 +422,7 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
     this.#assertActive(options);
     if (!isPrpEvent(value)) throw new Error("native_legacy_event_not_supported");
     const validated = validatePrpEvent(value);
-    if (!validated.ok) throw new Error(`native_event_schema_invalid:${validated.issues[0]?.message ?? "unknown"}`);
+    if (!validated.ok) throw new Error(`native_event_schema_invalid:${validated.issues[0]?.path ?? "/"} ${validated.issues[0]?.message ?? "unknown"} (${String((value as { eventType?: unknown }).eventType ?? "unknown")})`);
     let event = this.#identityRedactor.redact(validated.event);
     if (event.runId !== this.#binding.runId || (this.#sessionId && event.normalizedSessionId !== this.#sessionId)) {
       throw new Error("native_event_binding_mismatch");
@@ -491,6 +497,60 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
     this.#assertActive(options);
     const pendingObservation = this.#deferredEventObservers.get(observerKey);
     const persisted = await appendHeartbeatRunEvent(this.#db, input);
+    if (event.eventType === "session.started" && persisted.disposition === "committed") {
+      try {
+        let publication: ActivityPublication | null = null;
+        // The receipt has committed. Marker failure must never roll it back or fail the run.
+        await this.#db.transaction(async (tx) => {
+        const [issue] = await tx.select().from(issues).where(and(eq(issues.id, this.#binding.issueId),
+          eq(issues.companyId, this.#binding.companyId))).for("no key update");
+        const [run] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, this.#binding.runId));
+        if (issue && run && this.#matchesPersistedBinding(run)
+          && issue.assigneeAgentId === this.#binding.agentId
+          && (!issue.conversationAgentId || (issue.conversationAgentId === this.#binding.agentId
+            && record(run.contextSnapshot).conversationSessionGeneration === issue.conversationSessionGeneration))) {
+          // A queued/failed run or a deleted task-session pointer proves nothing.
+          // Only another run's durable provider receipt in this generation counts.
+          const [prior] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+            .innerJoin(heartbeatRunEvents, and(eq(heartbeatRunEvents.runId, heartbeatRuns.id),
+              eq(heartbeatRunEvents.companyId, issue.companyId), eq(heartbeatRunEvents.agentId, run.agentId),
+              sql`${heartbeatRunEvents.eventType} in ('session.started', 'session.resumed')`,
+              sql`${heartbeatRunEvents.sourceEventId} is not null`))
+            .where(and(eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, run.agentId),
+              eq(heartbeatRuns.nativeIssueId, issue.id), eq(heartbeatRuns.runtimeMode, "native"),
+              sql`${heartbeatRuns.id} <> ${run.id}`,
+              issue.conversationAgentId ? sql`${heartbeatRuns.contextSnapshot}->>'conversationSessionGeneration' = ${String(issue.conversationSessionGeneration)}` : undefined)).limit(1);
+          // Keep soft-deleted markers in the dedupe set: deletion is not a retry.
+          const [marker] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+            eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+            sql`${issueComments.conversationSessionGeneration} is not null`,
+            sql`${issueComments.presentation}->>'kind' = 'system_notice'`,
+            sql`${issueComments.metadata}->>'sourceRunId' = ${run.id}`)).limit(1);
+          if (prior && !marker) {
+            const [comment] = await insertIssueComment(tx, {
+              companyId: issue.companyId, issueId: issue.id, authorType: "system",
+              authorAgentId: null, authorUserId: null, createdByRunId: null,
+              conversationSessionGeneration: issue.conversationSessionGeneration,
+              body: NATIVE_FRESH_SESSION_MARKER,
+              presentation: { kind: "system_notice", tone: "neutral", detailsDefaultOpen: false },
+              metadata: { version: 1, sourceRunId: run.id, sections: [] }, createdAt: run.createdAt,
+            });
+            publication = (await persistActivity(tx as unknown as Db, {
+              companyId: issue.companyId, actorType: "system", actorId: "conversation",
+              action: "issue.conversation_session_started", entityType: "issue", entityId: issue.id, runId: run.id,
+              details: { automatic: true, source: "session.started", generation: issue.conversationSessionGeneration,
+                commentId: comment!.id, sourceRunId: run.id },
+            })).publication;
+          }
+        }
+        this.#assertActive(options);
+        });
+        if (publication) publishActivity(publication);
+      } catch (err) {
+        logger.warn({ err, runId: this.#binding.runId, issueId: this.#binding.issueId },
+          "Could not record fresh-session marker; continuing after committed session.started");
+      }
+    }
     const committedAtMs = Date.now();
     this.#assertActive(options);
     const persistenceEndedAt = persistenceStartedAt + performance.now() - persistenceClock;
@@ -548,6 +608,32 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
       // embedding runtime refresh observational state before appendEvent
       // returns to its synchronous governed-wait boundary.
       await this.#onDuplicateEvent?.(event, persisted.row.seq);
+    }
+    // A provider can flush clear_queue after settlement, or replay its notice.
+    // Apply the same click-time filter outside the append's run-row lock; do
+    // not rely solely on the finalizer having seen the notice in time.
+    if (event.eventType === "provider.notice.recorded" && event.payload.category === "pi_stop_returned_input") {
+      const details = Array.isArray(event.payload.details) ? event.payload.details : [];
+      const ids = details.filter(detail => record(detail).name === "returnedCommentIds")
+        .flatMap(detail => String(record(detail).value ?? "").split(",")).map(id => id.trim());
+      const [run] = await this.#db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, this.#binding.companyId), eq(heartbeatRuns.id, this.#binding.runId)));
+      if (run && ids.length) await settleProviderReturnedStopInput(this.#db, run, ids);
+    }
+    if (event.eventType === "turn.started" || event.eventType === "turn.accepted") {
+      // Persistence and its observers have finished: no issue lock is held.
+      // The first steerable turn need not have published a reply yet. Replays
+      // use the same drain and durable queue ACKs as final publication.
+      // Runtime intake awaits appendEvent serially. Never make later events
+      // wait for provider steering round-trips; the drain owns idempotence.
+      void (async () => {
+        try {
+          const { drainContinuousPersonMessages } = await import("./native-continuous-drain.js");
+          await drainContinuousPersonMessages(this.#db, this.#binding, { beforeFirstReply: true });
+        } catch (error) {
+          logger.warn({ error, ...this.#binding }, "turn-start person-message drain deferred");
+        }
+      })();
     }
   }
 

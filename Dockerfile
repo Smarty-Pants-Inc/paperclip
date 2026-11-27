@@ -3,9 +3,13 @@ FROM node:24-trixie-slim AS base
 ARG USER_UID=1000
 ARG USER_GID=1000
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates gosu curl gh git wget ripgrep python3 tini \
+  && apt-get install -y --no-install-recommends ca-certificates gosu curl gh git wget ripgrep python3 tini postgresql-client-17 \
   && rm -rf /var/lib/apt/lists/* \
   && corepack enable
+# The database backup's pg_dump engine (packages/db/src/backup-lib.ts) runs as a
+# child process instead of the in-process JavaScript dump. Pin the binary to the
+# server's major version (PostgreSQL 17) rather than relying on pg_wrapper.
+ENV PAPERCLIP_PG_DUMP_PATH=/usr/lib/postgresql/17/bin/pg_dump
 
 # Modify the existing node user/group to have the specified UID/GID to match host user
 RUN usermod -u $USER_UID --non-unique node \

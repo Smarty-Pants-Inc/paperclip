@@ -190,6 +190,37 @@ describe("session fingerprint keeps sessions across non-thread changes", () => {
   });
 });
 
+describe("continuous Pi per-key session compatibility", () => {
+  it.each(["model", "piRpcThinkingLevel", "piThinkingLevel", "thinkingLevel", "modelReasoningEffort", "reasoningEffort", "effort", "variant", "env"])(
+    "exempts only the next-turn %s key in continuous Pi, including issue overrides", async key => {
+      for (const [provider, sessionContinuity, continues] of [
+        ["pi_rpc", "continuous", true], ["pi_rpc", undefined, true],
+        ["pi_rpc", "paperclip", false], ["codex", "continuous", false],
+      ] as const) {
+        const config = { ...baseInput.effectiveAdapterConfig, provider, sessionContinuity };
+        const oldValue = key === "env" ? { CONTEXT_NOTE: "old" } : "old";
+        const newValue = key === "env" ? { CONTEXT_NOTE: "new" } : "new";
+        const metadata = (value: unknown) => buildEffectiveRunSessionConfigMetadata({ ...baseInput,
+          effectiveAdapterConfig: { ...config, [key]: value }, issueOverrides: { adapterConfig: { [key]: value } },
+        });
+        const saved = await metadata(oldValue), next = await metadata(newValue);
+        expect(next.fingerprint === saved.fingerprint, `${provider}/${sessionContinuity}/${key}`).toBe(continues);
+      }
+    },
+  );
+
+  it.each(["lifecycleMode", "idleTimeoutMs", "instructionsFilePath", "instructionsRootPath", "instructionsEntryFile", "fixtureOption"])(
+    "keeps %s even alongside an allowed environment change", async key => {
+      const config = { ...baseInput.effectiveAdapterConfig, provider: "pi_rpc", sessionContinuity: "continuous" };
+      const saved = await buildEffectiveRunSessionConfigMetadata({ ...baseInput, effectiveAdapterConfig: { ...config, [key]: "old" } });
+      const next = await buildEffectiveRunSessionConfigMetadata({ ...baseInput, effectiveAdapterConfig: {
+        ...config, [key]: "new", env: { CONTEXT_NOTE: "new" },
+      } });
+      expect(next.categoryFingerprints.adapterConfig).not.toBe(saved.categoryFingerprints.adapterConfig);
+    },
+  );
+});
+
 describe("session fingerprint still resets for thread changes", () => {
   it.each<[string, Partial<MetadataInput>]>([
     ["the model", withAdapterConfig({ model: "model-b" })],

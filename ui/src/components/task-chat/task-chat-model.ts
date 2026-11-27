@@ -664,6 +664,7 @@ export interface TaskChatTurnItem {
     tokensLabel?: string;
     /** Failed/interrupted turns get a ✗ affordance instead of ✓. */
     failed?: boolean;
+    personStopped?: boolean;
   };
 }
 

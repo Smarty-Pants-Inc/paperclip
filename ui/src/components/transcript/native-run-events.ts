@@ -816,6 +816,78 @@ function fileChangeDiffEntries(
   return entries;
 }
 
+/** Current receipt-backed activity, not elapsed-time guesses or retrospective span starts. */
+export function nativeRunActivityLabel(events: readonly HeartbeatRunEvent[]): string | undefined {
+  let stage = 0;
+  let label: string | undefined;
+  const advance = (next: number, value: string) => {
+    if (next > stage) { stage = next; label = value; }
+  };
+  const identities = new Map<string, ItemIdentity>();
+  const active = new Map<string, string>();
+  const requests = new Set<string>();
+  const seen = new Set<string>();
+  for (const event of [...events].sort((a, b) => a.seq - b.seq)) {
+    const outer = record(event.payload);
+    if (event.eventType === "lifecycle" && ["snapshot.git", "snapshot.baseline", "pack", "stage.workspace"].includes(String(outer?.phase))) {
+      advance(1, "Preparing run…");
+    }
+    if (event.eventType === "run.startup.reuse" && outer?.schema === "paperclip.startup-reuse.v1"
+      && outer.layer === "workspace" && ["fresh", "reused"].includes(String(outer.state))) {
+      advance(2, "Workspace ready");
+    }
+    const envelope = record(outer?.prpEvent);
+    if (!envelope || envelope.schema !== "paperclip.prp.event.v1" || envelope.schemaVersion !== 1
+      || envelope.runId !== event.runId || envelope.eventType !== event.eventType) continue;
+    const sourceId = text(envelope.sourceEventId);
+    if (sourceId && seen.has(sourceId)) continue;
+    if (sourceId) seen.add(sourceId);
+    const payload = record(envelope.payload);
+    if (!payload) continue;
+    if (["session.started", "session.resumed", "run.attached"].includes(event.eventType)) advance(3, "Conversation ready");
+    // Submitted precedes the provider request; only accepted acknowledges it.
+    if (event.eventType === "turn.submitted") {
+      active.clear();
+      stage = 4;
+      label = "Sending message…";
+    }
+    if (event.eventType === "turn.accepted") advance(5, "Message sent");
+    if (event.eventType === "turn.started") advance(6, "Working");
+    const id = normalizedItemId(envelope, payload);
+    const identity = resolveItemIdentity(payload, id ? identities.get(id) : undefined);
+    if (id && isItemIdentityEvent(event.eventType)) identities.set(id, identity);
+    const tool = isItemIdentityEvent(event.eventType) ? nativeToolItemDetails(payload) : null;
+    const toolId = text(payload.executionId) ?? tool?.id ?? id;
+    if ((event.eventType.startsWith("tool.execution.") && payload.schema === TOOL_EXECUTION_SCHEMA) || tool) {
+      if (!toolId) continue;
+      if (event.eventType === "tool.execution.completed" || tool?.kind === "toolresult"
+        || (event.eventType === "item.completed" && tool?.details.result !== undefined)) active.delete(`tool:${toolId}`);
+      else if (["tool.execution.started", "tool.execution.progressed", "item.started", "item.delta"].includes(event.eventType)) {
+        active.set(`tool:${toolId}`, payload.operation === "edit" ? "Editing files" : "Running a tool");
+      }
+      stage = 6;
+      label = [...active.values()].at(-1) ?? "Working";
+    } else if (id && identity.kind === "reasoning" && isItemIdentityEvent(event.eventType)) {
+      if (event.eventType === "item.completed") active.delete(`thinking:${id}`);
+      else if (event.eventType === "item.started" || normalizedItemText(payload)) active.set(`thinking:${id}`, "Thinking");
+      stage = 6;
+      label = [...active.values()].at(-1) ?? "Working";
+    } else if (isAssistantItemKind(identity.kind) && ["item.delta", "item.completed"].includes(event.eventType) && normalizedItemText(payload)) {
+      stage = 6;
+      label = "Writing an answer";
+    }
+    if (event.eventType.startsWith("runtime_request.")) {
+      const request = runtimeRequestEntry({ eventType: event.eventType, envelope, payload, ts: timestamp(event, envelope) });
+      if (request) {
+        if (request.status === "pending") requests.add(request.requestId);
+        else requests.delete(request.requestId);
+        label = [...active.values()].at(-1) ?? (stage >= 6 ? "Working" : label);
+      }
+    }
+  }
+  return requests.size ? "Waiting for you" : label;
+}
+
 export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]): TranscriptEntry[] {
   const entries: TranscriptEntry[] = [];
   // A subagent's spawning call also arrives as a tool lifecycle on some
@@ -898,8 +970,9 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
       envelope: Record<string, unknown>;
     }
   >();
-  const completedAgentMessageIds = new Set<string>();
-  const completedReasoningIds = new Set<string>();
+  const completedAgentMessages = new Map<string, { payload: Record<string, unknown>; ts: string }>();
+  const completedReasoning = new Map<string, { payload: Record<string, unknown>; ts: string }>();
+  const emittedCompletedItems = new Set<string>();
   const completionItemIdentityById = new Map<string, ItemIdentity>();
   const nativeToolItemsById = new Map<string, NativeToolItemDetails>();
   // An edit call reports an optimistic patch when it starts and the exact one
@@ -974,10 +1047,10 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
     if (event.eventType !== "item.completed") continue;
     const kind = identity.kind;
     if (isAssistantItemKind(kind) && itemId && normalizedItemText(payload)) {
-      completedAgentMessageIds.add(itemId);
+      completedAgentMessages.set(itemId, { payload, ts: timestamp(event, envelope) });
     }
     if (kind === "reasoning" && itemId && normalizedItemText(payload)) {
-      completedReasoningIds.add(itemId);
+      completedReasoning.set(itemId, { payload, ts: timestamp(event, envelope) });
     }
   }
 
@@ -1053,51 +1126,28 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
       continue;
     }
 
-    if (event.eventType === "item.delta" && isAssistantItemKind(itemKind)) {
-      const value = normalizedItemText(payload);
-      if (!value || !itemId) continue;
-      // Once the loss-resistant completion is present, prefer its full text.
-      // Before that point the deltas still provide the live streaming view.
-      if (completedAgentMessageIds.has(itemId)) continue;
-      const channel = itemIdentity.assistantChannel;
-      entries.push({ kind: "assistant", ts, text: value, delta: true, channel, itemId });
-      continue;
-    }
-
-    if (event.eventType === "item.completed" && isAssistantItemKind(itemKind)) {
-      // A `<proposed_plan>` block is shown by its plan proposal card instead.
-      const raw = normalizedItemText(payload) ?? "";
+    // A completion replaces streamed content at its FIRST visible event, not
+    // at its later completion time. Otherwise a final/reasoning item crosses a
+    // steering bubble when its deltas disappear, including on a fresh reload.
+    if ((event.eventType === "item.delta" || event.eventType === "item.completed") &&
+      (isAssistantItemKind(itemKind) || itemKind === "reasoning")) {
+      if (event.eventType === "item.delta" && !itemId) continue;
+      const completion = itemId ? (itemKind === "reasoning" ? completedReasoning : completedAgentMessages).get(itemId) : undefined;
+      if (completion && itemId && emittedCompletedItems.has(itemId)) continue;
+      const raw = normalizedItemText(completion?.payload ?? payload) ?? "";
       const value = itemId && proposedMessageIds.has(itemId) ? withoutProposedPlanBlock(raw) : raw;
       if (!value) continue;
-      const channel = itemIdentity.assistantChannel;
-      entries.push({ kind: "assistant", ts, text: value, channel, ...(itemId ? { itemId } : {}) });
-      continue;
-    }
-
-    if (event.eventType === "item.delta" && itemKind === "reasoning") {
-      const value = normalizedItemText(payload);
-      if (!value || !itemId || completedReasoningIds.has(itemId)) continue;
-      entries.push({
-        kind: "thinking",
-        ts,
-        text: value,
-        delta: true,
-        lifecycle: "started",
-        channel: itemIdentity.reasoningChannel,
-        itemId,
-      });
-      continue;
-    }
-
-    if (event.eventType === "item.completed" && itemKind === "reasoning") {
-      const value = normalizedItemText(payload);
-      if (!value) continue;
-      entries.push({
-        kind: "thinking",
-        ts,
-        text: value,
-        lifecycle: "completed",
-        channel: itemIdentity.reasoningChannel,
+      if (completion && itemId) emittedCompletedItems.add(itemId);
+      const delta = !completion && event.eventType === "item.delta";
+      const contentIdentity = completion ? resolveItemIdentity(completion.payload, itemIdentity) : itemIdentity;
+      entries.push(itemKind === "reasoning" ? {
+        kind: "thinking", ts, text: value, ...(delta ? { delta: true } : {}), completedAt: completion?.ts,
+        lifecycle: delta ? "started" : "completed",
+        channel: contentIdentity.reasoningChannel,
+        ...(itemId ? { itemId } : {}),
+      } : {
+        kind: "assistant", ts, text: value, ...(delta ? { delta: true } : {}), completedAt: completion?.ts,
+        channel: contentIdentity.assistantChannel,
         ...(itemId ? { itemId } : {}),
       });
       continue;

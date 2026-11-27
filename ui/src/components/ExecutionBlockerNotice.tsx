@@ -1,11 +1,11 @@
 import { describeError } from "../api/errors";
-import type { IssueRelationIssueSummary, TaskInterruptionPresentation } from "@paperclipai/shared";
-import { AlertCircle } from "lucide-react";
+import type { IssueChatComment } from "../lib/issue-chat-messages";
+import type { ExecutionBlocker, IssueRelationIssueSummary, TaskInterruptionPresentation } from "@paperclipai/shared";
+import { AlertCircle, LoaderCircle } from "lucide-react";
 import { Link } from "@/lib/router";
 import { createIssueDetailPath } from "../lib/issueDetailBreadcrumb";
 import { Button } from "./ui/button";
 import { cn } from "../lib/utils";
-import { useSecondTick } from "../hooks/useSecondTick";
 import { TaskProjectAccessNotice } from "./TaskProjectAccessNotice";
 import { ProviderFailureNotice } from "./ProviderFailureNotice";
 import { LockedIssueChip, isLockedIssueStub } from "./LockedIssueChip";
@@ -17,6 +17,33 @@ const recoveryStepText: Record<NonNullable<TaskInterruptionPresentation["recover
   saving_previous_files: "Saving files from the previous attempt",
   finishing_recovery: "Finishing recovery of saved work",
 };
+
+/** A startup cancellation fence alone also covers budget stops, not just person Stop. */
+export function isPersonStoppedRun(run: { errorCode?: string | null; resultJson?: Record<string, unknown> | null } | undefined) {
+  const cancellation = run?.resultJson?.cancellation as { source?: string; initiator?: { type?: string } } | undefined;
+  return Boolean(run?.resultJson?.personStop ||
+    (cancellation?.source === "operator" && cancellation.initiator?.type === "user") ||
+    (run?.errorCode === "cancelled" && run.resultJson?.executionCancellation));
+}
+
+/** Only the persisted no-result receipt can own this failure's explanation. */
+export function nativeFailureNoticeRunId(comment: IssueChatComment) {
+  const runId = comment.clientRequestId?.match(/^native-output-without-result:(.+)$/)?.[1];
+  return runId && !comment.deletedAt && comment.body.trim() && comment.authorType === "system" &&
+    comment.presentation?.kind === "system_notice" && comment.presentation.tone === "danger" &&
+    comment.metadata?.recoveryResponsibility !== "system" &&
+    [comment.metadata?.sourceRunId, comment.createdByRunId, comment.runId, comment.derivedCreatedByRunId].every(id => !id || id === runId)
+    ? runId : null;
+}
+
+/** Ordinary working/resolved projections are not recovery ownership. */
+export function isConversationRecovery(presentation: TaskInterruptionPresentation | null | undefined, observedStatus?: string) {
+  return presentation?.responsibility === "system" && ["working", "retry_scheduled", "failed"].includes(presentation.state)
+    && observedStatus !== "person_stopped" && !presentation.projectAccess && !presentation.setupFailure && !presentation.workspaceFailure
+    && presentation.retryWait?.reason !== "dependency_blocked" && presentation.retryAction !== "move_forward"
+    && (presentation.state !== "working" || Boolean(presentation.recoveryStep)
+      || ["failed", "cancelled", "timed_out", "interrupted", "scheduled_retry"].includes(observedStatus ?? ""));
+}
 
 /** A budget hard stop holds saved work. Only a task that already ran has an
  * attempt to report; a task refused before its first run just waits. */
@@ -36,8 +63,15 @@ const blockerAction: Record<string, string> = {
 };
 
 /** One ordinary interruption surface. Technical records remain in diagnostics. */
-export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, companyId, agentName, projectName, blockers }: {
+export function ExecutionBlockerNotice({ presentation, observedStatus, observedResultJson, observedErrorCode, blocker, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, companyId, agentName, projectName, blockers, savedMessageBlocked = false, conversationMode = false }: {
   presentation: TaskInterruptionPresentation | null | undefined;
+  observedStatus?: string;
+  /** Saved, unanswered chat with no live work or actionable interruption projection. */
+  savedMessageBlocked?: boolean;
+  conversationMode?: boolean;
+  observedResultJson?: Record<string, unknown> | null;
+  observedErrorCode?: string | null;
+  blocker?: ExecutionBlocker | null;
   companyId?: string;
   blockers?: IssueRelationIssueSummary[];
   canRetry: boolean;
@@ -50,16 +84,39 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
   agentName?: string;
   projectName?: string;
 }) {
-  useSecondTick(presentation?.state === "retry_scheduled");
+  if (isPersonStoppedRun({ resultJson: observedResultJson, errorCode: observedErrorCode })) return null;
+  if (savedMessageBlocked) presentation = { state: "failed", responsibility: "system", canRetry,
+    intentId: null, nextRetryAt: null, userAction: null, sourceRunIds: [], observedRunId: null };
+  const newSession = conversationMode && presentation?.state === "failed" && !(canRetry && presentation.canRetry)
+    ? <> Send <code>/new</code> to start a fresh session, then send your message again.</> : null;
+  const recovery = !savedMessageBlocked && isConversationRecovery(presentation,
+    observedStatus ?? (blocker?.workspaceRepairRequired ? "failed" : undefined));
   if (presentation?.projectAccess && !optimistic && !takingLonger) return <TaskProjectAccessNotice
     access={presentation.projectAccess} issueId={issueId} agentName={agentName} projectName={projectName}
     canRetry={canRetry && presentation.canRetry} onRetry={onRetry} error={error} className={className} />;
+  if (recovery && presentation) return <div role="status" aria-label="Task status"
+    className={cn("flex items-center gap-3 text-sm text-muted-foreground", className)}>
+    {(optimistic || presentation.state !== "failed") && <LoaderCircle className="size-4 shrink-0 motion-safe:animate-spin" aria-hidden="true" />}
+    <span className="min-w-0 flex-1">{!optimistic && presentation.state === "failed"
+      ? <>Couldn't resume this conversation. Your message is saved.{newSession}</> : "Preparing your reply…"}</span>
+    {!optimistic && presentation.state === "failed" && canRetry && presentation.canRetry &&
+      <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}
+  </div>;
   if (error && !optimistic && !takingLonger) return <div role="alert" className={cn("flex items-center justify-between gap-2 text-sm text-destructive", className)}><span>{describeError(error).body}</span>{canRetry && <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}</div>;
   if (takingLonger) return <div role="status" className={cn("flex items-center justify-between gap-2 text-sm text-muted-foreground", className)}><span>Taking longer than usual…</span>{canRetry && <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}</div>;
+  if (blocker?.workspaceRepairRequired) return (
+    <div className={cn("pt-4", className)}>
+      <div role="status" aria-label="Task status"
+        className="flex items-center gap-3 rounded-lg bg-destructive/10 p-4 text-sm text-foreground">
+        <AlertCircle className="size-5 shrink-0 text-destructive" aria-hidden="true" />
+        <span className="min-w-0 flex-1">{blocker.nextAction}</span>
+        {canRetry && <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}
+      </div>
+    </div>
+  );
   const step = !optimistic && presentation?.responsibility === "system" && presentation.recoveryStep
     && ["working", "retry_scheduled"].includes(presentation.state) ? recoveryStepText[presentation.recoveryStep] : null;
-  const seconds = Math.max(0, Math.ceil((Date.parse(presentation?.nextRetryAt ?? "") - Date.now()) / 1000));
-  const retryIn = `Trying again in ${seconds > 60 ? `${Math.ceil(seconds / 60)}m` : `${seconds}s`}…`;
+  const retryIn = "Trying again…";
   if (!optimistic && presentation?.state === "waiting_for_user" && presentation.userAction === "question")
     return <div role="status" data-testid="task-execution-waiting" className={cn("flex items-center justify-between gap-2 text-sm text-muted-foreground", className)}>
       <span>Respond to the pending question to continue.</span>
@@ -73,7 +130,7 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
         {presentation.userAction === "provider_billing" && <Button variant="outline" size="sm" asChild><Link to="/apps">Review AI account</Link></Button>}
         {canRetry && presentation.canRetry && <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}
       </>}>
-      {presentation.state === "retry_scheduled" && <p>{step ? `${step}. ${retryIn}` : "Paperclip will retry automatically."}</p>}
+      {presentation.state === "retry_scheduled" && <p>{step ? `${step}…` : "Paperclip will retry automatically."}</p>}
       {presentation.userAction === "provider_billing" && <p>Check your provider account’s billing and usage allowance, then retry.</p>}
       {isBudgetWait(presentation) && <p data-testid="task-execution-waiting">It is waiting for the budget to allow new work. Raise the budget in Costs.</p>}
     </ProviderFailureNotice>;
@@ -127,7 +184,7 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
       </div>
     </div>
   );
-  if (optimistic || !presentation || presentation.responsibility !== "system" ||
+  if ((optimistic && !savedMessageBlocked) || !presentation || presentation.responsibility !== "system" ||
       !["failed", "retry_scheduled"].includes(presentation.state)) return null;
   return (
     <div className={cn(presentation.state === "failed" && "pt-4", className)}>
@@ -137,15 +194,17 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
       )}>
         {presentation.state === "failed" && <AlertCircle className="size-5 shrink-0 text-destructive" aria-hidden="true" />}
         <span className="min-w-0 flex-1">{presentation.state === "retry_scheduled"
-          ? step ? `${step}. ${retryIn}`
+          ? step ? `${step}…`
             : presentation.setupFailure ? `${presentation.setupFailure.message}. ${retryIn}` : retryIn
           : presentation.retryWait ? presentation.retryWait.message
           : presentation.workspaceFailure
             ? <>Couldn’t prepare the task folders. {presentation.workspaceFailure.message}</>
           : presentation.setupFailure
             ? <>Couldn’t set up the task workspace. {presentation.setupFailure.message}. Fix the command in the project’s workspace settings, then retry.</>
-            : "Couldn’t finish this attempt. Your message is saved."}</span>
-        {canRetry && presentation.canRetry && <Button variant="outline" size="sm" className="shrink-0" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}
+            : "Couldn’t finish this attempt. Your message is saved."}
+          {!presentation.retryWait && !presentation.workspaceFailure && !presentation.setupFailure ? newSession : null}
+        </span>
+        {canRetry && presentation.canRetry && <Button variant="outline" size="sm" className="shrink-0" disabled={optimistic} onClick={onRetry} data-testid="task-execution-retry">{optimistic ? "Retrying…" : "Retry"}</Button>}
       </div>
     </div>
   );

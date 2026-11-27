@@ -1,10 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, createWriteStream } from "node:fs";
-import { lstat, mkdtemp, open, rm } from "node:fs/promises";
+import { lstat, mkdtemp, open, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import { pipeline } from "node:stream/promises";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
+import { sandboxSyncMinimumTimeoutMs } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
 import type { NativeRunTrace } from "./native-run-trace.js";
 import {
   isProviderAssetPathIncluded,
@@ -276,10 +277,11 @@ export async function stageProviderPackLayers(input: {
       }
     })(), createWriteStream(bundlePath, { flags: "wx", mode: 0o600 })));
     const sha256 = hash.digest("hex");
+    const byteSize = (await stat(bundlePath)).size;
     await measure("provider_pack.archive.transfer", () => runner.syncIn!([{
       operationId: `runner-provider-layers-${randomUUID()}`,
       files: [{ kind: "file", sourcePath: bundlePath, targetPath: remoteArchive, mode: 0o600 }],
-    }]));
+    }], { minimumTimeoutMs: sandboxSyncMinimumTimeoutMs(byteSize) }));
     const installCommands = supplement
       ? [
           `test ! -L ${quote(input.targetPath)}; test -d ${quote(input.targetPath)};`,

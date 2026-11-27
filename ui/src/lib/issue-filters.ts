@@ -59,7 +59,7 @@ export const defaultIssueFilterState: IssueFilterState = {
   workspaces: [],
   liveOnly: false,
   externalObjectStatuses: [],
-  showAgentCreatedTasks: false,
+  showAgentCreatedTasks: true,
   routineTasksOnly: false,
   updatedWithin: null,
   updatedFrom: null,
@@ -265,7 +265,7 @@ export function normalizeIssueFilterState(value: unknown): IssueFilterState {
     workspaces: normalizeIssueFilterValueArray(candidate.workspaces),
     liveOnly: candidate.liveOnly === true,
     externalObjectStatuses: normalizeIssueFilterValueArray(candidate.externalObjectStatuses),
-    showAgentCreatedTasks: candidate.showAgentCreatedTasks === true,
+    showAgentCreatedTasks: candidate.showAgentCreatedTasks !== false,
     routineTasksOnly: candidate.routineTasksOnly === true,
     updatedWithin: typeof candidate.updatedWithin === "string" && ISSUE_UPDATED_WITHIN_VALUES.has(candidate.updatedWithin)
       ? candidate.updatedWithin as IssueUpdatedWithin
@@ -467,6 +467,6 @@ export function countActiveIssueFilters(
   if (state.routineTasksOnly) count += 1;
   if (state.externalObjectStatuses.length > 0) count += 1;
   if (state.updatedWithin) count += 1;
-  if (enableAgentCreatedVisibilityFilter && state.showAgentCreatedTasks) count += 1;
+  if (enableAgentCreatedVisibilityFilter && !state.showAgentCreatedTasks) count += 1;
   return count;
 }

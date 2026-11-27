@@ -3,7 +3,7 @@ import { createCodexTaskEnvelope } from "../contracts/codex.js";
 import { ACPX_CAPABILITY_PROFILES } from "../drivers/acpx/capability-profiles.js";
 import { QUALIFIED_ACPX_VERSION } from "../drivers/acpx/generated-profiles.js";
 import { NATIVE_EXECUTION_INPUT_SCHEMA, NATIVE_EXECUTION_INPUT_SCHEMA_V7, NATIVE_EXECUTION_INPUT_SCHEMA_V9, NATIVE_EXECUTION_INPUT_SCHEMA_V10 } from "../contracts/native-execution.js";
-import type { NativeExecutionInput } from "../contracts/native-execution.js";
+import { isNativePiConversation, type NativeExecutionInput } from "../contracts/native-execution.js";
 import type { PersistedHarnessSession } from "../contracts/harness-driver.js";
 import type {
   NativeSessionBackend,
@@ -65,6 +65,7 @@ function transportDriverIdentity(input: NativeExecutionInput): {
     | "cursor_cloud_api"
     | "codex_app_server"
     | "opencode_server"
+    | "pi_rpc"
     | "claude_managed_agents_api"
     | "aws_agentcore_harness_api"
     | "acpx_runtime";
@@ -85,6 +86,12 @@ function transportDriverIdentity(input: NativeExecutionInput): {
         kind: "opencode_server",
         displayName: "OpenCode server",
         version: "1.18.34",
+      };
+    case "pi_rpc":
+      return {
+        kind: "pi_rpc",
+        displayName: "Pi RPC",
+        version: "pi-rpc-v1",
       };
     case "claude_managed":
       return {
@@ -199,6 +206,7 @@ function createTransportBackedNativeSessionBackend(
         constraints,
       }),
       conversationMode: preparedContext ? "prepared" : "task",
+      ...(isNativePiConversation(input) ? { conversationReply: true } : {}),
       runnerInstanceId:
         options.runnerInstanceId ?? `paperclip-native-${input.binding.runId}`,
       onSpawn: options.onSpawn,
@@ -214,7 +222,7 @@ function createTransportBackedNativeSessionBackend(
       driverIdentity,
       capabilities: isCodex
         ? {}
-        : { steering: false, goals: false, threadLineage: false,
+        : { steering: input.provider.kind === "pi_rpc", goals: false, threadLineage: false,
             ...(input.provider.kind === "cursor_cloud" ? { runtimeRequestResolution: false } : {}),
             toolRefreshOnResume: input.provider.kind !== "acpx"
               || ACPX_CAPABILITY_PROFILES[input.provider.agent].toolRefreshOnResume === true },

@@ -2,6 +2,7 @@ import { and, eq, inArray, sql, type SQL } from "drizzle-orm";
 import { activityLog, heartbeatRunEvents, heartbeatRuns, issueComments, type Db } from "@paperclipai/db";
 import { ANTIGRAVITY_SWARM_REQUESTED_ACTION } from "./antigravity-swarm-refusal.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
+import { parseObject } from "../adapters/utils.js";
 
 /** The wake reason an inbound chat message records (see chat inbound wakeups). */
 export const EXTERNAL_CHAT_MESSAGE_WAKE_REASON = "External chat message received";
@@ -184,10 +185,32 @@ export async function commentsArrivedDuringRun(db: Pick<Db, "select">, input: {
     && Math.max(comment.createdAt.getTime(), comment.updatedAt.getTime()) > startedAt.getTime()).map(comment => comment.id);
 }
 
-export function taskHistoryHandlingGuidance(commentIds: readonly string[]) {
-  return commentIds.length === 0 ? {} : {
-    arrivedDuringThisTurn: commentIds.map(id => `${COMMENT_EVIDENCE_REF_PREFIX}${id}`),
-    handling: "These comments arrived while this turn was running. For each one this turn applies, include its ref in the evidence of paperclip_finish or paperclip_block. Paperclip delivers any comment that is not cited to you again in a new turn after this one.",
+export function taskHistoryHandlingGuidance(commentIds: readonly string[],
+  run?: Pick<typeof heartbeatRuns.$inferSelect, "contextSnapshot" | "resultJson">) {
+  const context = run?.contextSnapshot ?? {};
+  const result = run?.resultJson ?? {};
+  const answered = new Set(Object.values(parseObject(result.continuousReplies)).flatMap(reply => {
+    const ids = parseObject(reply).questionCommentIds;
+    return Array.isArray(ids) ? ids : [];
+  }));
+  // This is an in-progress read projection, not a consumption receipt.
+  // Saved answers and inputs returned by Stop are no longer being answered here.
+  const returned = parseObject(result.personStop).returned;
+  const excluded = new Set([...answered, ...(Array.isArray(returned) ? returned : [])]);
+  const delivered = Object.entries(parseObject(result.queuedSteeringAcknowledgements))
+    .filter(([, receipt]) => parseObject(receipt).status === "acknowledged").map(([id]) => id);
+  const current = [...new Set([
+    ...(Array.isArray(context.wakeCommentIds) ? context.wakeCommentIds : []), context.wakeCommentId, ...delivered,
+  ])].filter((id): id is string => typeof id === "string" && !excluded.has(id));
+  return {
+    ...(current.length ? {
+      beingAnsweredByYouInThisTurn: current.map(id => `${COMMENT_EVIDENCE_REF_PREFIX}${id}`),
+      currentTurnHandling: "These requests opened or were delivered into your current run and are being answered by you in this turn. Saved task history does not include your in-progress reply. Continue from work already performed in this turn; do not repeat it merely because no saved reply appears yet.",
+    } : {}),
+    ...(commentIds.length ? {
+      arrivedDuringThisTurn: commentIds.map(id => `${COMMENT_EVIDENCE_REF_PREFIX}${id}`),
+      handling: "These comments arrived while this turn was running. For each one this turn applies, include its ref in the evidence of paperclip_finish or paperclip_block. Paperclip delivers any comment that is not cited to you again in a new turn after this one.",
+    } : {}),
   };
 }
 

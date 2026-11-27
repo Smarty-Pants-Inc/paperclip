@@ -497,6 +497,7 @@ fn local_process_definitely_gone(_id: u32, _group: bool) -> bool {
 fn facade_provider_name(provider: &str) -> &'static str {
     match provider {
         "opencode" => "OpenCode",
+        "pi_rpc" => "Pi",
         "cursor_cloud" => "Cursor Cloud",
         _ => "Codex",
     }
@@ -506,7 +507,10 @@ fn validate_proxy_run_result(
     state: &CodexProviderState,
     params: &Value,
 ) -> Result<(Value, String, String), DurableRunnerError> {
-    if !matches!(state.config.provider.as_str(), "opencode" | "cursor_cloud") {
+    if !matches!(
+        state.config.provider.as_str(),
+        "opencode" | "pi_rpc" | "cursor_cloud"
+    ) {
         return Err(DurableRunnerError::invalid(
             "paperclip/runResult is reserved for verified provider proxies",
         ));
@@ -947,6 +951,13 @@ fn terminal_events(
                 }),
             },
         ];
+    }
+    if state.config.provider == "pi_rpc"
+        && event_type == "turn.completed"
+        && state.config.conversation_mode.as_deref() == Some("conversation")
+        && state.active_provider_result_fingerprint.is_none()
+    {
+        return Vec::new(); // Core resolves the bound final reply as a conversation yield.
     }
     // Once the correlated semantic-tool result has been accepted, Paperclip's
     // bounded controller finalizer may interrupt the provider after the result
@@ -1722,7 +1733,7 @@ impl CodexProviderState {
                     !matches!(disposition, "done" | "blocked" | "needs_review" | "yielded")
                         || !matches!(
                             self.config.provider.as_str(),
-                            "codex" | "opencode" | "cursor_cloud"
+                            "codex" | "opencode" | "pi_rpc" | "cursor_cloud"
                         )
                 })
             || (matches!(
@@ -3599,10 +3610,18 @@ impl CodexCommandExecutor {
                 next_state.config.include_skill_instructions = config.include_skill_instructions;
                 upgraded_skill_config = true;
             }
-            if next_state.config.provider == "cursor_cloud"
-                && config.provider == "cursor_cloud"
+            if matches!(
+                next_state.config.provider.as_str(),
+                "cursor_cloud" | "pi_rpc"
+            ) && config.provider == next_state.config.provider
                 && self.provider.is_none()
-                && next_state.lifecycle == "prepared"
+                && (next_state.lifecycle == "prepared"
+                    || (config.provider == "pi_rpc"
+                        && self.awaiting_new_run_attach
+                        && matches!(
+                            next_state.lifecycle.as_str(),
+                            "session_open" | "provider_exited"
+                        )))
             {
                 next_state.config.instructions = config.instructions.clone();
             }
@@ -4347,9 +4366,11 @@ impl CodexCommandExecutor {
         // Record cause and pending identities before touching the provider.
         self.persist_state(&next_state)?;
         self.state = Some(next_state);
-        self.ensure_provider()?.interrupt_turn().map_err(|error| {
-            DurableRunnerError::invalid(format!("Codex turn interrupt failed: {error}"))
-        })?;
+        self.ensure_provider()?
+            .interrupt_turn(Some(reason))
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!("Codex turn interrupt failed: {error}"))
+            })?;
         Ok(CommandExecution::result(json!({
             "status": "interrupt_requested",
             "reason": reason,
@@ -4451,9 +4472,12 @@ impl CodexCommandExecutor {
             .get("text")
             .and_then(Value::as_str)
             .ok_or_else(|| DurableRunnerError::invalid("turn.steer payload.text is required"))?;
-        self.ensure_provider()?.steer_turn(text).map_err(|error| {
-            DurableRunnerError::invalid(format!("Codex turn steer failed: {error}"))
-        })?;
+        let correlation_id = payload.get("correlationId").and_then(Value::as_str);
+        self.ensure_provider()?
+            .steer_turn(text, correlation_id)
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!("Codex turn steer failed: {error}"))
+            })?;
         Ok(CommandExecution::result(json!({"status": "steered"})))
     }
 
@@ -5874,7 +5898,7 @@ impl CodexCommandExecutor {
                                 "prompt": prompt,
                                 "input": question_set,
                                 "origin": {
-                                    "adapter": match state.config.provider.as_str() { "opencode" => "opencode-server", "cursor_cloud" => "cursor-cloud-api", _ => "codex-app-server" },
+                                    "adapter": match state.config.provider.as_str() { "opencode" => "opencode-server", "pi_rpc" => "pi-rpc", "cursor_cloud" => "cursor-cloud-api", _ => "codex-app-server" },
                                     "provider": state.config.provider,
                                     "method": "item/tool/requestUserInput",
                                 },
@@ -7307,6 +7331,11 @@ done
         assert_eq!(terminal.len(), 1);
         assert_eq!(terminal[0].event_type, "run.terminal");
         assert_eq!(terminal[0].payload["reportedWorkDisposition"], "done");
+        assert!(state.validate().is_ok());
+        state.config.provider = "pi_rpc".to_owned();
+        state.config.driver = "pi_rpc".to_owned();
+        state.config.provider_version = "pi-rpc-v1".to_owned();
+        assert!(validate_proxy_run_result(&state, &params).is_ok());
         assert!(state.validate().is_ok());
     }
 

@@ -1,9 +1,11 @@
 import { agentWakeupRequests, agents, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import type { IssueQueuedCommentQueue } from "@paperclipai/shared";
+import { isConversationReset } from "../../../services/agent-conversations.js";
+import { agentRunWritesRevoked } from "../../../agent-run-cancellation.js";
 import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { assertQueuedCommentInteractionDelivery, recheckQueuedCommentInteractionDelivery } from "../../../services/agent-interaction-delivery.js";
 import { deliverSteeredMessage, steeringDeliveryIsUncertain } from "../../../services/queued-comment-steering.js";
-import { acceptSteeredIdentity, rejectSteeredIdentity, reserveSteeredIdentity, type RunIdentityContext } from "../../../services/run-identity.js";
+import { acceptSteeredIdentity, rejectSteeredIdentity, reserveSteeredIdentity, storedSteeringAcknowledgement, type RunIdentityContext } from "../../../services/run-identity.js";
 import {
   buildQueuedCommentQueueSnapshot,
   decideQueuedCommentQueueSteering,
@@ -17,11 +19,14 @@ import {
   firstTurnWakeContextFields,
   firstTurnWakePayloadFields,
 } from "../../../services/native-runtime/first-turn-queued-input.js";
-import { getNativeSessionSteeringState } from "../../../services/native-runtime/native-session-executor.js";
+import { closeHeldNativeTurn, getNativeSessionSteeringState } from "../../../services/native-runtime/native-session-executor.js";
 import { queuedInteractionId, readQueuedInteractionResponse, type QueuedInteractionResponse } from "../../../services/queued-interaction-response.js";
 import type { QueuedCommentActor, QueuedCommentSteeringPort, SteerQueuedCommentInput } from "../application/queued-comment-ports.js";
 import { QueuedCommentMutationError } from "../application/queued-comment-use-cases.js";
 import { parseObject } from "../domain/values.js";
+import { continuousSessionAcknowledgedCommentIds, reconcileContinuousSessionInput } from "../../../services/native-runtime/continuous-session-input.js";
+import { isAutomaticSteeringComment, isAutomaticSteeringWake } from "../domain/policy.js";
+import { resolveSessionContinuity } from "../../../services/native-runtime/continued-session.js";
 
 type IssueQueueDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 type IssueQueueTx = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -42,6 +47,7 @@ const QUEUED_INTERRUPT_HANDOFF_WAIT = { reason: "interrupt_handoff", message: "S
 async function findQueuedCommentWake(
   executor: IssueQueueDb,
   issue: { id: string; companyId: string; assigneeAgentId: string | null },
+  claimedIds: Set<string> = new Set(),
 ): Promise<IssueQueueState | null> {
   if (!issue.assigneeAgentId) return null;
   const rows = await executor
@@ -83,18 +89,31 @@ async function findQueuedCommentWake(
   // messages, which are separately queued and remain editable and sendable.
   let receipt: IssueQueueState | null = null;
   let agentOnly: IssueQueueState | null = null;
-  const hasPersonMessage = async (wake: { payload: unknown }) => {
-    const ids = queuedCommentIdsFromWakePayload(wake.payload);
+  let firstTurn: IssueQueueState | null = null;
+  const hasMessage = async (wake: { payload: unknown }) => {
+    const ids = queuedCommentIdsFromWakePayload(wake.payload).filter(id => !claimedIds.has(id));
     if (ids.length === 0) return false;
     const [row] = await executor.select({ id: issueComments.id }).from(issueComments).where(and(
       eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
-      inArray(issueComments.id, ids), eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt),
+      inArray(issueComments.id, ids), isNull(issueComments.deletedAt),
+      sql`${issueComments.authorAgentId} is distinct from ${issue.assigneeAgentId}`,
     )).limit(1);
     return Boolean(row);
   };
   const pendingMessages = async (state: IssueQueueState) => {
-    if (await hasPersonMessage(state.wake)) return state;
-    agentOnly = state;
+    if (await hasMessage(state.wake)) {
+      if (receipt?.response?.source.requiresFreshSession) {
+        const [person] = await executor.select({ id: issueComments.id }).from(issueComments).where(and(
+          eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+          inArray(issueComments.id, queuedCommentIdsFromWakePayload(state.wake.payload)),
+          eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt),
+        )).limit(1);
+        if (!person) return receipt;
+      }
+      return state;
+    }
+    // Preserve the oldest fallback while looking for later eligible input.
+    agentOnly ??= state;
     return null;
   };
   for (const wake of rows) {
@@ -103,9 +122,17 @@ async function findQueuedCommentWake(
       (queuedCommentIdsFromWakePayload(wake.payload).length === 0 && !queuedInteractionId(wake.payload))
     )
       continue;
-    const isReceipt = Boolean(queuedInteractionId(wake.payload));
+    const interactionId = queuedInteractionId(wake.payload);
+    const isReceipt = Boolean(interactionId);
+    if (interactionId && claimedIds.has(interactionId)) continue;
+    const commentIds = queuedCommentIdsFromWakePayload(wake.payload);
+    if (!isReceipt && wake.status === "deferred_issue_execution" && commentIds.length > 0 && commentIds.every(id => claimedIds.has(id))) {
+      // Keep the sent receipt for the board's firstTurnCommentIds display, but
+      // do not let it hide a later message from the live-turn drain.
+      firstTurn ??= { wake, state: "deferred", queueRun: null };
+      continue;
+    }
     if (isReceipt && receipt) continue;
-    if (!isReceipt && agentOnly) continue;
     const readReceipt = () => readQueuedInteractionResponse(executor as Db, wake.companyId, issue.id, wake.payload);
     if (wake.status === "deferred_issue_execution") {
       if (isReceipt) {
@@ -141,7 +168,7 @@ async function findQueuedCommentWake(
       if (messages) return messages;
     }
   }
-  return receipt ?? agentOnly;
+  return receipt ?? agentOnly ?? firstTurn;
 }
 
 async function queueCommentsForWake(
@@ -166,6 +193,55 @@ async function queueCommentsForWake(
   });
 }
 
+/** Release an idle hold for deferred work that cannot be person-message steering.
+ * Keep every wake untouched: ordinary terminal cleanup/admission delivers it. */
+export async function closeConversationResetHold(executor: Db, scope: { companyId: string; issueId: string }): Promise<boolean> {
+  const [current] = await executor.select({ issue: issues, runId: heartbeatRuns.id, run: heartbeatRuns, config: agents.adapterConfig, agentStatus: agents.status }).from(issues)
+    .innerJoin(heartbeatRuns, and(eq(heartbeatRuns.id, issues.executionRunId),
+      eq(heartbeatRuns.companyId, issues.companyId), eq(heartbeatRuns.agentId, issues.conversationAgentId),
+      eq(heartbeatRuns.status, "running"), eq(heartbeatRuns.runtimeMode, "native")))
+    .innerJoin(agents, and(eq(agents.id, heartbeatRuns.agentId), eq(agents.companyId, issues.companyId)))
+    .where(and(eq(issues.id, scope.issueId), eq(issues.companyId, scope.companyId))).limit(1);
+  if (!current?.issue.conversationAgentId || current.issue.conversationState !== "active") return false;
+  // The board snapshot intentionally hides automation wakes and prefers person
+  // messages over receipts. Inspect all deferred wakes so neither can mask work
+  // that needs ordinary admission after this idle turn closes.
+  const wakes = await executor.select().from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, scope.companyId),
+    eq(agentWakeupRequests.agentId, current.issue.conversationAgentId),
+    eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    sql`${agentWakeupRequests.payload}->'issueId' = to_jsonb(${scope.issueId}::text)`,
+  )).orderBy(asc(agentWakeupRequests.requestedAt));
+  for (const wake of wakes) {
+    if (queuedInteractionId(wake.payload)) return closeHeldNativeTurn(current.runId);
+    const comments = await queueCommentsForWake(executor, scope.issueId, wake, null);
+    const head = comments[0];
+    // Transfer agent input only when the continuous drain can actually take it.
+    // Otherwise stock close/release admission owns this unchanged wake.
+    if (head && isAutomaticSteeringComment(head, current.issue.conversationAgentId) &&
+        isAutomaticSteeringWake(wake.reason, parseObject(wake.payload?._paperclipWakeContext))) {
+      if (!head.authorAgentId) continue;
+      if (current.issue.assigneeAgentId === current.issue.conversationAgentId &&
+          current.run.contextSnapshot?.conversationSessionGeneration === current.issue.conversationSessionGeneration &&
+          !agentRunWritesRevoked(current.run) && !current.run.resultJson?.personStop &&
+          Object.keys((current.run.resultJson?.continuousReplies ?? {}) as object).length > 0 &&
+          current.config.provider === "pi_rpc" &&
+          resolveSessionContinuity("pi_rpc", current.config.sessionContinuity) === "continuous" &&
+          !["paused", "terminated", "pending_approval", "error"].includes(current.agentStatus)) {
+        const board = await readBoardQueuedComments({ executor, issue: current.issue, activeRun: current.run,
+          actor: { actorType: "agent", actorId: head.authorAgentId, agentId: head.authorAgentId,
+            runId: head.createdByRunId ?? null, agentApiKeyId: null },
+          queueState: { wake, state: "deferred", queueRun: null } });
+        if (board.steeringDisposition === "available" &&
+            (!board.executionWait || board.executionWait.reason === "execution_recovery") &&
+            !board.entries.some(entry => entry.source?.requiresFreshSession)) continue;
+      }
+    }
+    return closeHeldNativeTurn(current.runId);
+  }
+  return false;
+}
+
 export async function readBoardQueuedComments(input: {
   executor: IssueQueueDb;
   issue: { id: string; companyId: string; assigneeAgentId: string | null; conversationAgentId?: string | null };
@@ -176,7 +252,7 @@ export async function readBoardQueuedComments(input: {
 }): Promise<IssueQueuedCommentQueue> {
   const queueState =
     input.queueState === undefined
-      ? await findQueuedCommentWake(input.executor, input.issue)
+      ? await findQueuedCommentWake(input.executor, input.issue, firstTurnClaimedCommentIds(input.activeRun))
       : input.queueState;
   const wake = queueState?.wake ?? null;
   // Read an interaction receipt once per snapshot.
@@ -187,12 +263,16 @@ export async function readBoardQueuedComments(input: {
     : null;
   // Messages the active run took into its first turn are no longer queued.
   const claimedByFirstTurn = queueState?.state === "deferred" ? firstTurnClaimedCommentIds(input.activeRun) : new Set<string>();
+  const acknowledgedBySession = input.activeRun && wake
+    ? await continuousSessionAcknowledgedCommentIds(input.executor, {
+      companyId: input.issue.companyId, issueId: input.issue.id, runId: input.activeRun.id,
+    }) : new Set<string>();
   const comments = (await queueCommentsForWake(
     input.executor,
     input.issue.id,
     wake,
     response,
-  )).filter((comment) => !claimedByFirstTurn.has(comment.id));
+  )).filter((comment) => !claimedByFirstTurn.has(comment.id) && !acknowledgedBySession.has(comment.id));
   const assignedAgent = input.issue.assigneeAgentId
     ? await input.executor
         .select({ adapterType: agents.adapterType })
@@ -214,7 +294,8 @@ export async function readBoardQueuedComments(input: {
     queuedCommentCount: comments.length,
   });
   const steeringDisposition: IssueQueuedCommentQueue["steeringDisposition"] =
-    input.issue.conversationAgentId ? "unsupported" : steering.kind !== "probe"
+    input.issue.conversationAgentId && (process.env.PAPERCLIP_AGENT_CHAT_STEERING !== "true" || comments.some(({ body }) => isConversationReset(body)))
+      ? "unsupported" : steering.kind !== "probe"
       ? steering.kind
       : input.steeringDisposition
         ?? (await getNativeSessionSteeringState(steering.steeringRunId)
@@ -241,7 +322,8 @@ export async function readBoardQueuedComments(input: {
   });
   if (wake && queuedInteractionId(wake.payload)) {
     if (response?.source.requiresFreshSession) queue.steeringDisposition = "unsupported";
-    queue.entries = response ? [{ comment: response.comment, source: response.source, position: 0, canEdit: false, canDiscard: false }] : [];
+    queue.entries = response && comments.some(comment => comment.id === response.comment.id)
+      ? [{ comment: response.comment, source: response.source, position: 0, canEdit: false, canDiscard: false }] : [];
   } else if (wake && queueState?.state === "deferred" && input.activeRun?.status === "running") {
     // A starting run (a booting sandbox, say) cannot be steered yet, but its
     // first turn takes these messages. The view shows them as sent.
@@ -274,7 +356,7 @@ async function lockBoardQueueRows(input: Pick<BoardQueueTarget, "tx" | "issue" |
         eq(issues.companyId, input.issue.companyId),
       ),
     )
-    .for("update");
+    .for("no key update");
   if (!currentIssue) throw new QueuedCommentMutationError("queued_comment_issue_not_found", "Issue not found");
   const wake = await input.tx
     .select()
@@ -377,7 +459,7 @@ async function readLockedBoardQueue(
   return { activeRun, wake, queueRun, state, queue, queueState };
 }
 
-export function createQueuedCommentSteeringAdapter(db: Db): QueuedCommentSteeringPort<RunIdentityContext> {
+export function createQueuedCommentSteeringAdapter(db: Db, options: { requireQueueHead?: boolean } = {}): QueuedCommentSteeringPort<RunIdentityContext> {
   return {
     async reserveIdentity({ issue, queueId, commentId, targetRunId }) {
       const [wake] = await db.select({ agentId: agentWakeupRequests.agentId, payload: agentWakeupRequests.payload })
@@ -397,7 +479,10 @@ export function createQueuedCommentSteeringAdapter(db: Db): QueuedCommentSteerin
     rejectIdentity: (identity) => rejectSteeredIdentity(db, identity),
     isDeliveryUncertain: steeringDeliveryIsUncertain,
 
-    withLockedTarget(input, apply) {
+    async withLockedTarget(input, apply) {
+      await reconcileContinuousSessionInput(db, {
+        companyId: input.issue.companyId, issueId: input.issue.id, runId: input.targetRunId,
+      });
       return db.transaction(async (tx) => {
         const { issue, wake } = await lockBoardQueueRows({ ...input, tx });
         const { companyId } = issue;
@@ -416,6 +501,22 @@ export function createQueuedCommentSteeringAdapter(db: Db): QueuedCommentSteerin
           }),
           async readPendingQueue() {
             const { queue } = await readLockedBoardQueue({ ...input, tx, issue }, wake, run);
+            // Admission also takes this issue lock. Recheck the global FIFO
+            // after locking, not just the optimistic snapshot: a concurrent
+            // older person wake must not be overtaken by automatic delivery.
+            if (options.requireQueueHead) {
+              const first = await findQueuedCommentWake(tx, issue, firstTurnClaimedCommentIds(run));
+              if (first?.wake.id !== input.queueId || queue.entries[0]?.comment.id !== commentId) {
+                throw new QueuedCommentMutationError("queued_comment_order_mismatch", "Older queued input must be delivered first");
+              }
+              if (!wake || !isAutomaticSteeringWake(wake.reason, parseObject(wake.payload?._paperclipWakeContext))) {
+                throw new QueuedCommentMutationError("steering_unsupported", "This wake needs ordinary admission");
+              }
+            }
+            // Recheck under the queue lock against edits and later-row delivery.
+            if (issue.conversationAgentId && queue.entries.some(({ comment }) => isConversationReset(comment.body))) {
+              throw new QueuedCommentMutationError("queued_response_requires_fresh_session", "/new needs a new session and cannot be steered into this turn");
+            }
             return queue;
           },
           assertDeliveryAllowed: () => assertQueuedCommentInteractionDelivery(tx, {
@@ -433,6 +534,7 @@ export function createQueuedCommentSteeringAdapter(db: Db): QueuedCommentSteerin
             )).for("update");
             if (!acknowledgedRun || !runTargetsIssue(acknowledgedRun, issue.id)) return null;
             const result = parseObject(acknowledgedRun.resultJson);
+            const providerAck = await storedSteeringAcknowledgement(tx, { companyId, runId: targetRunId, messageId: commentId });
             if (identity) await acceptSteeredIdentity(tx, identity);
 
             const now = new Date();
@@ -451,7 +553,7 @@ export function createQueuedCommentSteeringAdapter(db: Db): QueuedCommentSteerin
                 ...result,
                 queuedSteeringAcknowledgements: {
                   ...parseObject(result.queuedSteeringAcknowledgements),
-                  [commentId]: { status: "acknowledged", queueId: wake.id, turnId, acknowledgedAt: now.toISOString() },
+                  [commentId]: { status: "acknowledged", queueId: wake.id, turnId, acknowledgedAt: now.toISOString(), afterEventSeq: providerAck?.afterEventSeq ?? acknowledgedRun.nextEventSeq - 1 },
                 },
               },
               updatedAt: now,

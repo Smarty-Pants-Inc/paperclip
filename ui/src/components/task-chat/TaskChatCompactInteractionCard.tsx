@@ -85,6 +85,7 @@ import {
 import { TaskChatPlanPreviewCard } from "./TaskChatPlanPreviewCard";
 import { TaskChatRichInput } from "./TaskChatRichInput";
 import { ANALYTICS_MASK_CLASS } from "@/lib/analytics/privacy";
+import { ResumeReviewAction } from "@/components/ResumeReviewAction";
 
 const TAKEOVER_TEXTAREA_CLASS =
   "min-h-16 resize-y border-0 bg-muted/35 text-sm shadow-none focus-visible:ring-0 focus-visible:ring-offset-0";
@@ -1149,6 +1150,7 @@ function ConfirmationCard({
           </>
         )}
       </ActionRow>
+      <ResumeReviewAction interaction={interaction} disabled={working !== null} />
     </div>
   );
 }
@@ -2047,7 +2049,10 @@ export function TaskChatCompactInteractionCard({
     && interaction.kind !== "connection_intent"
     && interaction.kind !== "request_item_verdicts"
     && !(interaction.kind === "request_confirmation" && (interaction.payload.toolAction || interaction.payload.secretProposal || interaction.payload.connectionAuthorization))) {
-    return <CoordinatorInteractionReceipt interaction={interaction} />;
+    return <>
+      <CoordinatorInteractionReceipt interaction={interaction} />
+      {interaction.kind === "request_confirmation" ? <ResumeReviewAction interaction={interaction} /> : null}
+    </>;
   }
 
   if (interaction.kind === "suggest_routine") {
@@ -2091,6 +2096,9 @@ export function TaskChatCompactInteractionCard({
           externalReferences={externalReferences}
           compact
         />
+        {/* The pending body is gone, but its native-review band must remain
+            outside the closed receipt so following log content keeps its space. */}
+        {interaction.kind === "request_confirmation" ? <ResumeReviewAction interaction={interaction} /> : null}
       </>
     );
   }
@@ -2157,6 +2165,8 @@ export function TaskChatCompactInteractionCard({
           draftKey={draftKey}
         />
       )}
+      {interaction.status !== "pending" && interaction.kind === "request_confirmation"
+        ? <ResumeReviewAction interaction={interaction} /> : null}
     </InteractionShell>
   );
 }

@@ -249,6 +249,8 @@ export function InstanceExperimentalSettings() {
     experimentalQuery.data?.enableSimplifiedEnglishInteractions === true;
   const enableFirstTaskPlanProposal =
     experimentalQuery.data?.enableFirstTaskPlanProposal === true;
+  const enableQueuedMessageSteerCountdown =
+    experimentalQuery.data?.enableQueuedMessageSteerCountdown === true;
   const enableCloudTrialInference =
     experimentalQuery.data?.enableCloudTrialInference === true;
   const enableSmokeLab = experimentalQuery.data?.enableSmokeLab === true;
@@ -506,6 +508,19 @@ export function InstanceExperimentalSettings() {
           settingKey="enableExperimentalFileViewer"
           managed={managedKeys.enableExperimentalFileViewer}
           ariaLabel="Toggle experimental file viewer setting"
+        />
+
+        <ExperimentalToggleCard
+          title="Steer countdown"
+          description="Wait five seconds, with Edit and Cancel, before a message sent while the agent works is steered into it. Off: it is steered at once."
+          checked={enableQueuedMessageSteerCountdown}
+          onCheckedChange={(checked) =>
+            toggleMutation.mutate({ enableQueuedMessageSteerCountdown: checked })
+          }
+          disabled={toggleMutation.isPending}
+          settingKey="enableQueuedMessageSteerCountdown"
+          managed={managedKeys.enableQueuedMessageSteerCountdown}
+          ariaLabel="Toggle steer countdown experimental setting"
         />
 
         <ExperimentalToggleCard

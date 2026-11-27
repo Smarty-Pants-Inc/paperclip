@@ -64,17 +64,27 @@ function isCurrentEnvelope<TViewState, TColumn extends string>(
     && Array.isArray(candidate.columns);
 }
 
+/** Old saved views included the old default, not necessarily a person's choice. */
+export function restoreTaskCollectionViewState(value: unknown): unknown {
+  if (!value || typeof value !== "object") return value;
+  if (!("showAgentCreatedTasks" in value || "hideAgentCreatedTasks" in value)) return value;
+  return { ...value, showAgentCreatedTasks: !("hideAgentCreatedTasks" in value && value.hideAgentCreatedTasks === true) };
+}
+
 export function saveTaskCollectionPreferences<TViewState, TColumn extends string>(
   location: TaskCollectionPreferenceLocation,
   value: { viewState: TViewState; columns: TColumn[]; viewStateSource?: "stored" | "default" },
   storage: StorageLike | null = browserStorage(),
 ): void {
   if (!storage) return;
+  const viewState = value.viewState && typeof value.viewState === "object" && "showAgentCreatedTasks" in value.viewState
+    ? { ...value.viewState, hideAgentCreatedTasks: value.viewState.showAgentCreatedTasks === false }
+    : value.viewState;
   const envelope: TaskCollectionPreferenceEnvelope<TViewState, TColumn> = {
     version: TASK_COLLECTION_PREFERENCES_VERSION,
     companyId: location.companyId,
     collectionKey: location.collectionKey,
-    viewState: value.viewState,
+    viewState,
     viewStateSource: value.viewStateSource ?? "stored",
     columns: value.columns,
   };
@@ -87,7 +97,7 @@ export function saveTaskCollectionPreferences<TViewState, TColumn extends string
     // Dual-write during migration so older builds using the same worktree keep
     // reading the latest presentation state.
     if (location.legacyViewStorageKey) {
-      storage.setItem(location.legacyViewStorageKey, JSON.stringify(value.viewState));
+      storage.setItem(location.legacyViewStorageKey, JSON.stringify(viewState));
     }
     if (location.legacyColumnsStorageKey) {
       storage.setItem(location.legacyColumnsStorageKey, JSON.stringify(value.columns));
@@ -117,7 +127,7 @@ export function loadTaskCollectionPreferences<TViewState, TColumn extends string
   const current = parseStoredJson(storage, taskCollectionPreferencesStorageKey(location));
   if (isCurrentEnvelope<TViewState, TColumn>(current, location)) {
     return {
-      viewState: normalizeViewState(current.viewState),
+      viewState: normalizeViewState(restoreTaskCollectionViewState(current.viewState)),
       columns: normalizeColumns(current.columns),
       migrated: false,
       source: current.viewStateSource === "default" ? "default" : "current",
@@ -128,7 +138,7 @@ export function loadTaskCollectionPreferences<TViewState, TColumn extends string
   const legacyColumns = parseStoredJson(storage, location.legacyColumnsStorageKey);
   const hasLegacyState = legacyView !== null || legacyColumns !== null;
   const preferences = {
-    viewState: legacyView === null ? defaultViewState : normalizeViewState(legacyView),
+    viewState: legacyView === null ? defaultViewState : normalizeViewState(restoreTaskCollectionViewState(legacyView)),
     columns: legacyColumns === null ? defaultColumns : normalizeColumns(legacyColumns),
   };
 

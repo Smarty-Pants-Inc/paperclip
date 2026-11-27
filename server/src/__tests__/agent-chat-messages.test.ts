@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import { activityLog, agentApiKeys, agents, authUsers, chatCompletionDeliveries, chatTaskHandoffs, companyMemberships, heartbeatRuns, issueComments, issueThreadInteractions, issues, projects } from "@paperclipai/db";
@@ -6,6 +6,8 @@ import type { AgentApiKeyScope } from "@paperclipai/shared";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { sendAgentChatMessage } from "../services/agent-chat-messages.js";
 import { withConversationReadState } from "../services/agent-chat-read-state.js";
+import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
+import { REDACTED_EVENT_VALUE } from "../redaction.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { issueService } from "../services/issues.js";
 import * as issueServices from "../services/issues.js";
@@ -21,8 +23,10 @@ import { recoveryPostgresSupport as support } from "./helpers/recovery-postgres.
 (support.supported ? describe : describe.skip)("proactive agent chat messages", () => {
   let server: Awaited<ReturnType<typeof startRunnerApiTestServer>>;
   const originalSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+  const originalMasterKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY;
   beforeAll(async () => {
     process.env.PAPERCLIP_AGENT_JWT_SECRET = randomUUID();
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY = randomBytes(32).toString("hex");
     server = await startRunnerApiTestServer({ humanSessions: true });
     await instanceSettingsService(server.db).updateExperimental({ enableAgentChat: true });
   }, 60_000);
@@ -30,6 +34,8 @@ import { recoveryPostgresSupport as support } from "./helpers/recovery-postgres.
     await server?.close();
     if (originalSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
     else process.env.PAPERCLIP_AGENT_JWT_SECRET = originalSecret;
+    if (originalMasterKey === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+    else process.env.PAPERCLIP_SECRETS_MASTER_KEY = originalMasterKey;
   });
   const fixture = () => server.fixture({ connectionScenario: "fresh", apiToolsEnabled: false, disableWakeOnDemand: true });
   type Fixture = Awaited<ReturnType<typeof fixture>>;
@@ -446,6 +452,58 @@ import { recoveryPostgresSupport as support } from "./helpers/recovery-postgres.
     const receipt = await send(f);
     const [comment] = await server.db.select().from(issueComments).where(eq(issueComments.id, receipt!.commentId));
     await expect(issueService(server.db).addComment(f.issueId, "Forged source", { agentId: f.agentId, runId: f.runId }, { metadata: comment.metadata! })).rejects.toThrow(/server-owned/);
+  });
+
+  // Keep: secrets must never reach chat previews or the comments route.
+  it("keeps a 300-run chat preview when only three runs registered secrets", async () => {
+    const f = await fixture(), receipt = (await send(f))!;
+    const registry = createRunSecretRedactionRegistry(server.db);
+    const values = ["preview-secret-current", "preview-secret-legacy", "preview-secret-both"];
+    const rows = Array.from({ length: 300 }, (_, index) => ({
+      id: randomUUID(), companyId: f.companyId, agentId: f.agentId, status: "succeeded",
+      contextSnapshot: {
+        ...(index % 3 !== 1 ? { issueId: receipt.conversationId } : {}),
+        ...(index % 3 !== 0 ? { paperclipIssue: { id: receipt.conversationId } } : {}),
+        // Old contexts can omit the registry or carry an empty/non-array value.
+        ...[{}, { paperclipSecretRedactions: [] }, { paperclipSecretRedactions: null },
+          { paperclipSecretRedactions: {} }, { paperclipSecretRedactions: "legacy" }][index % 5],
+      },
+    }));
+    await server.db.insert(heartbeatRuns).values(rows);
+    for (const [index, value] of values.entries()) await registry.register(f.companyId, rows[index].id, value);
+    const body = `Latest reply: ${values.join(" / ")}`;
+    await server.db.update(issueComments).set({ body }).where(eq(issueComments.id, receipt.commentId));
+    const expected = `Latest reply: ${values.map(() => REDACTED_EVENT_VALUE).join(" / ")}`;
+    const preview = "Latest reply: REDACTED / REDACTED / REDACTED";
+    expect(await registry.redactForIssueNotification(f.companyId, receipt.conversationId, body)).toBe(expected);
+    expect(await registry.redactForIssue(f.companyId, receipt.conversationId, body)).toBe(expected);
+    expect(await withConversationReadState(server.db, f.companyId, f.responsibleUserId!, [{ id: receipt.conversationId }]))
+      .toMatchObject([{ latestMessagePreview: preview, unreadMessageCount: 1 }]);
+    const cookie = await server.humanSession(f.responsibleUserId!);
+    const chats = await fetch(`${server.apiUrl}/api/companies/${f.companyId}/chats`, { headers: { Cookie: cookie } });
+    expect(chats.status).toBe(200);
+    expect(await chats.json()).toMatchObject([{ id: receipt.conversationId, latestMessagePreview: preview }]);
+    const comments = await fetch(`${server.apiUrl}/api/issues/${receipt.conversationId}/comments`, { headers: { Cookie: cookie } });
+    expect(comments.status).toBe(200);
+    expect(await comments.json()).toMatchObject([{ body: expected }]);
+  });
+
+  it("still omits the chat preview when more than 64 values are registered", async () => {
+    const f = await fixture(), receipt = (await send(f))!;
+    const registry = createRunSecretRedactionRegistry(server.db);
+    const runId = randomUUID();
+    await server.db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId,
+      status: "succeeded", contextSnapshot: { issueId: receipt.conversationId } });
+    const values = Array.from({ length: 65 }, (_, index) => `budget-secret-${String(index).padStart(3, "0")}`);
+    for (const value of values) await registry.register(f.companyId, runId, value);
+    await server.db.update(issueComments).set({ body: values[0] }).where(eq(issueComments.id, receipt.commentId));
+    await expect(registry.redactForIssueNotification(f.companyId, receipt.conversationId, values[0])).rejects.toThrow("budget exceeded");
+    expect(await withConversationReadState(server.db, f.companyId, f.responsibleUserId!, [{ id: receipt.conversationId }]))
+      .toMatchObject([{ latestMessagePreview: null, unreadMessageCount: 1 }]);
+    const cookie = await server.humanSession(f.responsibleUserId!);
+    const chats = await fetch(`${server.apiUrl}/api/companies/${f.companyId}/chats`, { headers: { Cookie: cookie } });
+    expect(chats.status).toBe(200);
+    expect(await chats.json()).toMatchObject([{ id: receipt.conversationId, latestMessagePreview: null }]);
   });
 
   it("keeps unseen concurrent arrivals unread with exact comment cutoffs and monotonic receipts", async () => {

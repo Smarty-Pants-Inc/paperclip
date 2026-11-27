@@ -1,4 +1,7 @@
+import { normalizePiIssueModelSelection, validatePiRunSelection } from "../adapters/pi-model-selection.js";
+import { resolveSessionContinuity } from "./native-runtime/continued-session.js";
 import { registerHeldPreparationResumer } from "./interrupted-preparation-hold-settlement.js";
+import { settlePreDispatchStopRecovery } from "./heartbeat/pre-dispatch-stop-settlement.js";
 import { antigravitySwarmQuotaScope } from "./antigravity-swarm.js";
 import { registerCompletedTurnCleanupResumer } from "./native-runtime/completed-turn-cleanup-hold-settlement.js";
 import { endStorageOutageWaitOn, reportStorageOutageWaitsTo, runInOwnStorageScope } from "../storage/storage-unavailable.js";
@@ -564,6 +567,7 @@ import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
 
 
 import { environmentService } from "./environments.js";
+import { isBorrowedReusableSandboxLease } from "./sandbox-creation-operations.js";
 
 import {
   environmentRuntimeService,
@@ -1532,12 +1536,19 @@ export function heartbeatService(
   const runControl = createHeartbeatRunControl(db, {
     scheduleBoundedRetry,
     verifyStartupCleanup: async run => {
+      const marker = readNativeStartupCleanup(run);
+      const [lease] = marker ? await db.select().from(environmentLeases).where(and(
+        eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id),
+        eq(environmentLeases.id, marker.leaseId),
+      )) : [];
+      // Startup owns its task, not a borrowed idle conversation's box. Stop
+      // that task with verified receipts; destroy only a newly created box.
+      const borrowed = lease ? await isBorrowedReusableSandboxLease(db, lease) : false;
       await verifyNativeStartupCleanup(db, run, () => envOrchestrator.releaseForRun({
         heartbeatRunId: run.id, companyId: run.companyId, agentId: run.agentId, status: "expired",
-        cancelActiveWork: true, providerResourceDisposition: "destroy",
+        cancelActiveWork: true, providerResourceDisposition: borrowed ? "stop_and_retain" : "destroy",
       }));
-      const marker = readNativeStartupCleanup(run)!;
-      await options.pluginWorkerManager?.retireStartup?.(marker.contextId);
+      await options.pluginWorkerManager?.retireStartup?.(readNativeStartupCleanup(run)!.contextId);
     },
     getRun,
     getRunCleanupState,
@@ -2265,7 +2276,7 @@ export function heartbeatService(
         resumingAdmittedRun: !!runOptions.nativeLeaseOwner,
         conversation: isConversation(conversationIdentity),
       })) return;
-      run = await timePreparation("chat_completion", () => prepareChatCompletionTurn(db, run));
+      run = await timePreparation("chat_completion", () => prepareChatCompletionTurn(db, run, runOptions.nativeRestartRecovery));
       if (chatCompletionAlreadyReported(run)) {
         // An earlier reply in this conversation already reported each completion.
         await setRunStatus(run.id, "succeeded", { finishedAt: new Date(), resultJson: { chatCompletionAlreadyReported: true }, issueCommentStatus: "not_applicable" });
@@ -2380,8 +2391,11 @@ export function heartbeatService(
           const released = run.processLossRetryCount > 0 || (readiness && readiness.mode !== "fresh_isolated_workspace") ? false
             : await executionWorkspacesSvc.releaseAncestorWorkspaceBindingAtAdmission({ companyId: agent.companyId, issueId, runId: run.id });
           if (changed || released) {
-            delete context.resumeSessionParams;
-            delete context.resumeSessionDisplayId;
+            if (!(agent.adapterType === "paperclip_runner" && parseObject(agent.adapterConfig).provider === "pi_rpc" &&
+              resolveSessionContinuity("pi_rpc", parseObject(agent.adapterConfig).sessionContinuity) === "continuous")) {
+              delete context.resumeSessionParams;
+              delete context.resumeSessionDisplayId;
+            }
             context.workspaceSelectionChanged = true;
           }
         }
@@ -2512,9 +2526,10 @@ export function heartbeatService(
       let issueAssigneeOverrides =
         issueContext && issueContext.assigneeAgentId === agent.id
           ? parseIssueAssigneeAdapterOverrides(
-              issueContext.assigneeAdapterOverrides,
+              normalizePiIssueModelSelection(agent, issueContext.assigneeAdapterOverrides),
             )
           : null;
+      validatePiRunSelection(agent, issueAssigneeOverrides);
       const experimentalInstanceSettings =
         await timePreparation("instance_settings", () => instanceSettings.getExperimental());
       const isolatedWorkspacesEnabled =
@@ -2858,7 +2873,8 @@ export function heartbeatService(
         delete context.paperclipContinuationSummary;
       }
       const taskSessionDecodedParams = normalizeSessionParams(
-        sessionCodec.deserialize(context.workspaceSelectionChanged ? null : taskSession?.sessionParamsJson ?? null),
+        sessionCodec.deserialize(context.workspaceSelectionChanged && !(agent.adapterType === "paperclip_runner" &&
+          parseObject(agent.adapterConfig).provider === "pi_rpc" && resolveSessionContinuity("pi_rpc", parseObject(agent.adapterConfig).sessionContinuity) === "continuous") ? null : taskSession?.sessionParamsJson ?? null),
       );
       const explicitResumeSessionParams = normalizeResumeParamsForAdapter(
         agent.adapterType,
@@ -3743,6 +3759,7 @@ export function heartbeatService(
             getNativeFreshSessionHandoff,
             pluginTaskDescription: runtimeSelection.pluginTaskDescription,
             toolRefreshOnResume: runtimeSelection.toolRefreshOnResume,
+            workspaceContinuationSource: runtimeSelection.workspaceContinuationSource,
             getFreshSessionHandoff,
             runOptions,
           },
@@ -4253,6 +4270,19 @@ export function heartbeatService(
               payload: { state: "unavailable", code: uncapturedInstructions.errorCode } });
           }
           await withAdapterExecutionPhase(executionPhaseContext, "instruction_cleanup", releaseInstructionCopy);
+          // Only this preparation owner knows the dispatch gate was never
+          // entered. Persist that proof before releasing a reused allocation;
+          // Stop must return the predecessor's box, not archive its session.
+          if (latestRun?.status === "cancelled" && latestRun.errorCode === "cancelled" &&
+              (latestRun.resultJson?.cancelledByActorType === "user" ||
+                parseObject(parseObject(latestRun.resultJson?.cancellation).initiator).type === "user") &&
+              !legacyAdapterEntered && !nativeDispatchStarted && !nativeOwnershipHeld) {
+            const [settled] = await db.update(heartbeatRuns).set({ resultJson:
+              sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({ preDispatchCancellationSettledAt: new Date().toISOString() })}::jsonb`,
+            }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "cancelled"),
+              sql`${heartbeatRuns.usageJson}#>'{budgetDispatch,handedOffAt}' is null`)).returning();
+            latestRun = settled ?? latestRun;
+          }
           await withAdapterExecutionPhase(executionPhaseContext, "lease_release", () => releaseEnvironmentLeasesForRun({
             runId: run.id,
             companyId: run.companyId,
@@ -4380,6 +4410,9 @@ export function heartbeatService(
           await acknowledgeRemoteStop(run.id, run.companyId).catch(error => {
             logger.warn({ err: error, runId: run.id }, "failed to acknowledge Stop after native process settlement");
           });
+        }
+        if (caseHandoffCleanupSettled && latestRun?.resultJson?.preDispatchCancellationSettledAt) {
+          await settlePreDispatchStopRecovery(db, run.companyId, run.id);
         }
         await db.update(heartbeatRuns).set({
           executionStage: sql`case when ${heartbeatRuns.status} = 'cancelled' then 'settled' else ${heartbeatRuns.executionStage} end`,

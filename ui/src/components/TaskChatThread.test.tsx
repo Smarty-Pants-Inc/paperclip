@@ -72,6 +72,8 @@ vi.mock("@/components/transcript/useLiveRunTranscripts", () => ({
       isInitialHydrating: transcriptState.isInitialHydrating,
       hydratedRunIds: transcriptState.hydratedRunIds,
       truncatedRunIds: transcriptState.truncatedRunIds,
+      errorsByRun: new Map(),
+      retry: () => {},
     };
   },
 }));
@@ -80,8 +82,11 @@ vi.mock("@/components/transcript/useNativeRunTranscripts", () => ({
     transcriptHookRuns.native.push(runs);
     return {
       transcriptByRun: new Map(nativeTranscriptState.transcriptByRun),
+      activityLabelByRun: new Map(),
       errorsByRun: new Map(nativeTranscriptState.errorsByRun),
-      hydratedRunIds: nativeTranscriptState.hydratedRunIds,
+      isInitialHydrating: false,
+      retry: () => {},
+      hydratedRunIds: nativeTranscriptState.hydratedRunIds ?? new Set(),
       terminalHydratedRunIds: nativeTranscriptState.terminalHydratedRunIds ??
         new Set(runs.filter((run) => run.status !== "running" && run.status !== "queued").map((run) => run.id)),
     };
@@ -317,6 +322,32 @@ describe.each(["legacy", "native"] as const)("historical %s system status", (run
       expect(container.querySelector('[data-testid="task-chat-system-notice"]')).toBeNull();
       expect(container.textContent).toContain("Saved the useful response.");
     }
+  });
+
+  it.each(["blocked", "in_progress"])("attaches authoritative owed-input Retry beneath the saved message (%s)", async issueStatus => {
+    const retry = vi.fn();
+    nativeTranscriptState.hydratedRunIds = new Set(["latest"]);
+    transcriptState.hydratedRunIds = new Set(["latest"]);
+    const person = { ...comment("owed-person", "Please continue my saved work"), authorType: "user" as const,
+      authorAgentId: null, authorUserId: "board" };
+    const interruption = { intentId: null, responsibility: "system" as const, state: "failed" as const,
+      canRetry: true, nextRetryAt: null, userAction: null, sourceRunIds: ["latest"], observedRunId: "latest",
+      unansweredCommentId: person.id };
+    const props = { comments: [person], conversationMode: true, issueStatus, onAdd: async () => {},
+      linkedRuns: [{ ...run("latest", "failed", 2), execution: { phase: "recovery_needed" as const,
+        label: "Saved work recovered", cause: "native_predecessor_retirement_unproven", lastConfirmedActivityAt: null,
+        retryAt: null, attempt: 2, maxAttempts: 2, recoveryOwner: null, nextAction: null, permittedActions: [],
+        predecessorRunId: null, successorRunId: null } }],
+      onRetryFailedRun: vi.fn(), onTryAgainNoLiveExecutionPath: retry };
+    render(<TaskChatThread {...props} interruption={interruption} />);
+    const button = container.querySelector<HTMLButtonElement>('[data-testid="task-execution-retry"]');
+    expect(button).not.toBeNull();
+    expect(container.textContent).toContain("Your message is saved.");
+    await act(async () => { button!.click(); });
+    expect(retry).toHaveBeenCalledTimes(1);
+    render(<TaskChatThread {...props} interruption={{ ...interruption, state: "working", canRetry: false,
+      unansweredCommentId: undefined }} />);
+    expect(container.querySelector('[data-testid="task-execution-retry"]')).toBeNull();
   });
 
   it("keeps the latest failure actionable after hiding earlier errors", async () => {

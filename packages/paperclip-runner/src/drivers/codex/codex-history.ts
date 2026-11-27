@@ -4,6 +4,57 @@ import { record, text } from "./codex-driver-values.js";
 
 type Requester = Pick<CodexAppServerTransport, "request">;
 
+/** Pi exposes retained input evidence directly; native Codex uses history. */
+async function readProxyUserInputs(
+  transport: Requester,
+  threadId: string,
+  field: "messages" | "inputIds",
+): Promise<string[] | null | undefined> {
+  let response: Record<string, unknown>;
+  try {
+    response = await transport.request("paperclip/userInputs/read", { threadId });
+  } catch (error) {
+    if (isCodexMethodUnavailable(error)) return undefined;
+    throw new HarnessReconciliationError(
+      `codex_history_read_failed: paperclip/userInputs/read read failed; ${String(error)}`,
+    );
+  }
+  const values = response[field];
+  return Array.isArray(values) && values.every(value => typeof value === "string") ? values : null;
+}
+
+/** Provider-owned entries only: never derive presence from a submitted command. */
+export async function readCodexUserMessages(transport: Requester, threadId: string): Promise<string[] | null> {
+  const proxyMessages = await readProxyUserInputs(transport, threadId, "messages");
+  if (proxyMessages !== undefined) return proxyMessages;
+  const messages: string[] = [];
+  for (const turn of await readCodexTurnMetadata(transport, threadId)) {
+    for (const item of await readCodexTurnItems(transport, threadId, text(turn.id))) {
+      if (item.type !== "userMessage") continue;
+      if (!Array.isArray(item.content)) return null;
+      messages.push(item.content.map(part => text(record(part).text)).join("\n"));
+    }
+  }
+  return messages;
+}
+
+/** Identity must be returned on the provider's retained user item. In
+ * particular a runner's synthetic ACK item id or matching text is not proof.
+ * Old provider packs without correlationId safely return no certified input. */
+export async function readCodexUserInputIds(transport: Requester, threadId: string): Promise<string[] | null> {
+  const proxyIds = await readProxyUserInputs(transport, threadId, "inputIds");
+  if (proxyIds !== undefined) return proxyIds;
+  const ids = new Set<string>();
+  for (const turn of await readCodexTurnMetadata(transport, threadId)) {
+    for (const item of await readCodexTurnItems(transport, threadId, text(turn.id))) {
+      if (item.type !== "userMessage") continue;
+      if (!Array.isArray(item.content)) return null;
+      if (typeof item.correlationId === "string" && item.correlationId) ids.add(item.correlationId);
+    }
+  }
+  return [...ids];
+}
+
 const TURN_STATUSES = ["inProgress", "completed", "failed", "interrupted", "cancelled"];
 
 class CodexPaginatedHistoryUnsupported extends HarnessReconciliationError {}

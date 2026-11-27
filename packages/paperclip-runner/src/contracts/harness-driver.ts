@@ -532,6 +532,16 @@ const RUNNER_RECOVERY_FAILURE_CLASSES: ReadonlySet<string> = new Set([
   PROVIDER_SIDE_EFFECT_PENDING,
 ]);
 
+/** No attachment has started: the cached controller's process is already gone.
+ * The host may evict only this owner and retry once from its saved checkpoint. */
+export class NativeRunnerClosedBeforeAttachmentError extends Error {
+  readonly code = "native_runner_closed_before_attachment";
+  constructor() {
+    super("native_runner_closed_before_attachment");
+    this.name = "NativeRunnerClosedBeforeAttachmentError";
+  }
+}
+
 /** A predecessor's semantic tool call or bridged runtime input has no settled
  * result, so the source runner cannot hand its session to a new run. */
 export class NativeRunnerSourceReconciliationRequiredError extends Error {
@@ -609,7 +619,7 @@ export interface HarnessSession {
   };
   events(): AsyncIterable<PrpEvent>;
   beginRunAttachment?(input: { runId: string }): boolean;
-  attachRun?(input: { runId: string; currentRunGrant?: NativeRunRuntimeGrant; completionContract?: { revision: string; criterionIds: readonly string[] } }): Promise<void> | void;
+  attachRun?(input: { runId: string; dynamicTools?: readonly Readonly<Record<string, unknown>>[]; currentRunGrant?: NativeRunRuntimeGrant; completionContract?: { revision: string; criterionIds: readonly string[] } }): Promise<void> | void;
   startTurn(input: {
     message: NativeUserMessage;
     /** Set by orchestration only after successful provider-session recovery. */
@@ -666,6 +676,10 @@ export interface HarnessSession {
   lineage?(): HarnessThreadLineageEntry[];
   read?(): Promise<Record<string, unknown>>;
   reconcile?(): Promise<Record<string, unknown>>;
+  /** Provider-owned conversation entries, not controller command receipts. */
+  readUserMessages?(): Promise<string[] | null>;
+  /** Correlation IDs on provider-retained user entries; old packs may omit it. */
+  readUserInputIds?(): Promise<string[] | null>;
   usage?(): Promise<Record<string, unknown> | null>;
   transcript?(): Promise<HarnessTranscriptSnapshot>;
   snapshot(): Promise<PersistedHarnessSession>;

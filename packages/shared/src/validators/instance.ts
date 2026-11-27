@@ -93,6 +93,7 @@ export const instanceExperimentalSettingsSchema = z.object({
   enablePaperclipDeveloperMode: z.boolean().default(false),
   enableSimplifiedEnglishInteractions: z.boolean().default(false),
   enableFirstTaskPlanProposal: z.boolean().default(false),
+  enableQueuedMessageSteerCountdown: z.boolean().default(false),
   enableCloudTrialInference: z.boolean().default(false),
   autoRestartDevServerWhenIdle: z.boolean().default(false),
   enableWorkspaceBranchReconcileForward: z.boolean().default(true),

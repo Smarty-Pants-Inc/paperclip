@@ -3,7 +3,7 @@ import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   agents, agentWakeupRequests, assets, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issueAttachments,
-  issueComments, issues,
+  issueComments, issues, issueThreadInteractions,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
@@ -58,6 +58,18 @@ describe.skipIf(!support.supported)("first-turn queued input", () => {
       triggerDetail: "system", reason: "issue_execution_deferred", status: "deferred_issue_execution",
       requestedByActorType: "user", requestedByActorId: USER, payload });
     return comment!.id;
+  }
+
+  async function queueAnswer(f: Awaited<ReturnType<typeof seed>>, provider = "pi_rpc") {
+    await db.update(agents).set({ adapterConfig: { provider, sessionContinuity: "continuous" } }).where(eq(agents.id, f.agentId));
+    const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+      kind: "ask_user_questions", status: "answered", createdByAgentId: f.agentId, resolvedByUserId: USER, resolvedAt: new Date(),
+      payload: { version: 1, questions: [{ id: "color", prompt: "Which color?", selectionMode: "single", required: true,
+        options: [{ id: "green", label: "Green" }] }] }, result: { version: 1, answers: [{ questionId: "color", optionIds: ["green"] }] } }).returning();
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "automation",
+      reason: "issue_commented", status: "deferred_issue_execution", requestedByActorType: "user", requestedByActorId: USER,
+      payload: { issueId: f.issueId, mutation: "interaction", interactionId: card.id, interactionStatus: "answered" } }).returning();
+    return { card, wake };
   }
 
   const binding = (f: { companyId: string; issueId: string; agentId: string }, runId: string) =>
@@ -190,6 +202,46 @@ describe.skipIf(!support.supported)("first-turn queued input", () => {
     } finally {
       await single.$client.end({ timeout: 1 });
     }
+  });
+
+  it("keeps a sealed card answer owed after a failed start and takes it in the next run", async () => {
+    const f = await seed(), { card, wake } = await queueAnswer(f);
+    const input = await claimFirstTurnQueuedInput(db, binding(f, f.runId));
+    expect(input).toContain(card.id);
+    expect(input).toContain('"optionIds": [');
+    expect([...firstTurnClaimedCommentIds(await readRun(f.runId))]).toEqual([card.id]);
+    expect(await claimFirstTurnQueuedInput(db, binding(f, f.runId))).toBe(input);
+    await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, f.runId));
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id)))[0].status).toBe("deferred_issue_execution");
+    const next = await startRun(f.companyId, f.agentId, f.issueId);
+    // A copied predecessor's receipt cannot claim the new run's input.
+    await db.update(heartbeatRuns).set({ contextSnapshot: (await readRun(f.runId)).contextSnapshot }).where(eq(heartbeatRuns.id, next));
+    await db.update(issues).set({ executionRunId: next }).where(eq(issues.id, f.issueId));
+    expect(await claimFirstTurnQueuedInput(db, binding(f, next))).toBe(input);
+    expect([...firstTurnClaimedCommentIds(await readRun(next))]).toEqual([card.id]);
+  });
+
+  it.each(["fresh", "other-user", "resume", "non-pi", "paperclip-continuity"])("leaves a card's independent delivery fences intact (%s)", async mode => {
+    const f = await seed(), { card, wake } = await queueAnswer(f, mode === "non-pi" ? "codex" : "pi_rpc");
+    if (mode === "paperclip-continuity") await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "paperclip" } }).where(eq(agents.id, f.agentId));
+    if (mode === "other-user") await db.update(issueThreadInteractions).set({ resolvedByUserId: "someone-else" }).where(eq(issueThreadInteractions.id, card.id));
+    else if (mode === "fresh" || mode === "resume") await db.update(agentWakeupRequests).set({ payload: { ...wake.payload,
+      _paperclipWakeContext: mode === "fresh" ? { forceFreshSession: true } : { resumeIntent: true } } }).where(eq(agentWakeupRequests.id, wake.id));
+    expect(await claimFirstTurnQueuedInput(db, binding(f, f.runId))).toBeNull();
+    expect([...firstTurnClaimedCommentIds(await readRun(f.runId))]).toEqual([]);
+  });
+
+  it("does not take a reset command or input from a stale conversation generation", async () => {
+    const f = await seed();
+    await queueMessage(f, "/new");
+    expect(await claimFirstTurnQueuedInput(db, binding(f, f.runId))).toBeNull();
+    const next = await startRun(f.companyId, f.agentId, f.issueId);
+    await db.update(issues).set({ executionRunId: next, conversationAgentId: f.agentId, conversationUserId: USER,
+      conversationState: "active", conversationSessionGeneration: 1 }).where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, conversationSessionGeneration: 0 } }).where(eq(heartbeatRuns.id, next));
+    await queueMessage(f, "for the old conversation");
+    await queueAnswer(f);
+    expect(await claimFirstTurnQueuedInput(db, binding(f, next))).toBeNull();
   });
 
   it("leaves a message with files on its own delivery path so the files reach the agent", async () => {

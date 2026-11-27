@@ -63,9 +63,12 @@ resume only when the selected harness explicitly supports refreshing tools.
 Compact continuation messages include the active completion revision and criterion
 IDs plus a reminder to obtain an accepted `paperclip_finish` or `paperclip_block`
 result for this turn. Reports from earlier turns do not finish the new turn.
-Provider final text alone remains insufficient; governed waits and strict native
-completion validation keep their existing behavior. This reminder changes the
-resumed model input, not the tool catalog or automatic retry policy.
+Provider final text alone remains insufficient for tasks. For server-identified,
+same-agent Pi (`pi_rpc`) conversations, a completed final reply instead yields to
+the next message without a finish-first call. Finish/block tools remain available;
+governed waits and strict task completion validation keep their existing behavior.
+This reminder changes the resumed model input, not the tool catalog or automatic
+retry policy.
 
 When recovery needs a fresh conversation, the server supplies a deterministic
 handoff through a lazy history loader at the fresh attempt boundary.

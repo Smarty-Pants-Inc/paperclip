@@ -1038,6 +1038,7 @@ export interface Issue {
   lastActivityAt?: Date | null;
   isUnreadForMe?: boolean;
   unreadMessageCount?: number;
+  latestMessagePreview?: string | null;
   isArchivedForMe?: boolean;
   archivedAt?: Date | null;
   archivedByActorType?: "user" | "agent" | null;
@@ -1822,6 +1823,8 @@ export interface AskUserQuestionsInteraction extends IssueThreadInteractionBase 
 
 export interface RequestConfirmationInteraction extends IssueThreadInteractionBase {
   kind: "request_confirmation";
+  /** Actor-scoped read projection; POST revalidates the same pending review under locks. */
+  canResumeReview?: boolean;
   payload: RequestConfirmationPayload;
   result?: RequestConfirmationResult | null;
 }

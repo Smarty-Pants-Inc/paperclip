@@ -1,7 +1,7 @@
 import type { PluginWorkspaceParams, PluginWorkspacePrepareParams, PluginWorkspacePrepareResult, PluginWorkspaceResult } from "./workspace-provider.js";
 import type { PluginEnvironmentTaskParams, PluginEnvironmentTaskResult } from "./environment-tasks.js";
 import type { PluginAgentRuntimeState, PluginAgentRuntimeIdentity } from "./types.js";
-import type { AgentLifecycleRequest, AgentLifecycleResult } from "@paperclipai/shared";
+import type { AgentLifecycleRequest, AgentLifecycleResult, EnvironmentLeaseStatus } from "@paperclipai/shared";
 import type { AiConnectionRouterRequest, AiConnectionRouterResult } from "@paperclipai/shared";
 /**
  * JSON-RPC 2.0 message types and protocol helpers for the host ↔ worker IPC
@@ -714,11 +714,25 @@ export interface PluginEnvironmentAcquireLeaseParams extends PluginEnvironmentDr
 }
 
 export interface PluginEnvironmentResumeLeaseParams extends PluginEnvironmentDriverBaseParams {
+  /** Lease row status observed by the host before resume (for example active on
+   * restart recovery or retained on acquisition reuse). Informational, not authority. */
+  leaseStatus?: EnvironmentLeaseStatus;
+  /** Most recent heartbeat run bound to this lease, not the incoming acquiring
+   * run. Null when no bound run is available; finishedAt is an ISO 8601 timestamp. */
+  lastRun?: { id: string; status: string; finishedAt: string | null } | null;
   /** New run authority for a retained task; omitted by legacy environment consumers. */
   runId?: string;
   providerLeaseId: string;
   leaseMetadata?: Record<string, unknown>;
   requestedCwd?: string;
+}
+
+/** A resume may rebuild a dead allocation from older filesystem state. */
+export interface PluginEnvironmentResumeLeaseResult extends PluginEnvironmentLease {
+  /** ISO 8601 time of the restore. Set on every snapshot-restoring resume (also
+   * accepted in metadata). The host cold-resumes the existing provider session
+   * with a new Runner instead of adopting the restored Runner's stale journal. */
+  restoredFromSnapshotAt?: string;
 }
 
 export interface PluginEnvironmentReleaseLeaseParams extends PluginEnvironmentDriverBaseParams {
@@ -1494,7 +1508,7 @@ export interface HostToWorkerMethods {
   ];
   environmentResumeLease: [
     params: PluginEnvironmentResumeLeaseParams,
-    result: PluginEnvironmentLease,
+    result: PluginEnvironmentResumeLeaseResult,
   ];
   environmentReleaseLease: [
     params: PluginEnvironmentReleaseLeaseParams,

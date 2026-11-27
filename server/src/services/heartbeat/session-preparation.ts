@@ -1,11 +1,14 @@
 import { isNativeSessionId } from "../native-runtime/index.js";
 import { and, desc, eq } from "drizzle-orm";
 import { agentConfigRevisions, type Db, type agents, type agentTaskSessions, type heartbeatRuns, type issues, type projects } from "@paperclipai/db";
-import type { AiConnectionBinding, AiRuntimeConnectionBinding } from "@paperclipai/shared";
+import type { AiConnectionBinding, AiRuntimeConnectionBinding, ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { getServerAdapter } from "../../adapters/index.js";
 import type { prepareManagedAiRuntime } from "../ai-connection-runtime.js";
 import { aiConnectionSessionCompatibilityInputs, managedAiSessionIdentityCompatible } from "../ai-connection-session.js";
 import { createNativeSessionHandoffLoader } from "../native-runtime/native-session-handoff.js";
+import { decideNativeContinuation, resolveSessionContinuity } from "../native-runtime/continued-session.js";
+import { deriveTaskKey } from "./run-preparation.js";
+import { queuedCommentIdsFromRunContext } from "../../lib/queued-comment-context.js";
 import { agentInstructionsService } from "../agent-instructions.js";
 import {
   describeSessionResetReason, shouldResetTaskSessionForWake, isCanonicalSessionIdForAdapter,
@@ -15,7 +18,7 @@ import {
 import {
   buildEffectiveRunSessionConfigMetadata, readConfigFingerprintFromSessionParams,
   readConfiguredModelFromAdapterConfig, resolveTaskSessionConfigFreshness,
-  stripPaperclipSessionMetadataFromSessionParams, type EffectiveRunSessionConfigMetadata,
+  stripPaperclipSessionMetadataFromSessionParams,
 } from "./workspaces.js";
 import type { HeartbeatWorkspacePreparationInput, prepareHeartbeatWorkspace } from "./workspace-preparation.js";
 import type { prepareHeartbeatTaskContext } from "./task-context.js";
@@ -178,12 +181,30 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
       ...(importedManagedInstructions ? [{ ...sessionConfigMetadataInput, ...candidate, retainManagedInstructionPaths: true }] : []),
     ]));
   }
+  const continuousPi = runtimeConfig.provider === "pi_rpc" &&
+    resolveSessionContinuity(runtimeConfig.provider, runtimeConfig.sessionContinuity) === "continuous";
+  const historicalInputs: SessionMetadataInput[] = [];
+  if (storedFingerprintDiffers && agent.adapterType === "paperclip_runner" && continuousPi) {
+    const previousCompositions = [
+      { retainSkillKeys: true },
+      { retainAdapterConfigEnvironment: true, retainSkillKeys: true },
+      { continuousPiFingerprintComposition: "issue_overrides" as const, retainAdapterConfigEnvironment: true, retainSkillKeys: true },
+      { continuousPiFingerprintComposition: "model_inputs" as const },
+    ];
+    // Category compatibility uses only old shapes of the current inputs, never
+    // alternate account/revision candidates that could mask a real change.
+    historicalInputs.push(...previousCompositions.map(composition => ({ ...sessionConfigMetadataInput, ...composition })));
+    compatibleInputs.push(...compatibleInputs.flatMap(candidate =>
+      previousCompositions.map(composition => ({ ...candidate, ...composition })),
+    ));
+  }
   const legacyInputs = storedFingerprintDiffers
-    ? [sessionConfigMetadataInput, ...compatibleInputs].map(candidate => ({ ...candidate, legacyComposition: true }))
+    ? [sessionConfigMetadataInput, ...compatibleInputs, ...historicalInputs].map(candidate => ({ ...candidate, legacyComposition: true }))
     : [];
-  const compatibleConfigMetadata: EffectiveRunSessionConfigMetadata[] = await Promise.all(
-    [...compatibleInputs, ...legacyInputs].map(candidate => buildEffectiveRunSessionConfigMetadata(candidate)),
-  );
+  const [compatibleConfigMetadata, historicalConfigMetadata] = await Promise.all([
+    Promise.all([...compatibleInputs, ...legacyInputs].map(candidate => buildEffectiveRunSessionConfigMetadata(candidate))),
+    Promise.all(historicalInputs.map(candidate => buildEffectiveRunSessionConfigMetadata(candidate))),
+  ]);
   const configuredModel =
     readConfiguredModelFromAdapterConfig(runtimeConfig);
   if (context.refreshTools === true && agent.adapterType !== "paperclip_runner") {
@@ -195,17 +216,34 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
   const sessionConfigFreshness = resolveTaskSessionConfigFreshness({
     hasTaskSession: taskSession != null,
     configuredModel,
+    preserveSessionOnModelChange: runtimeConfig.provider === "pi_rpc" && resolveSessionContinuity(runtimeConfig.provider, runtimeConfig.sessionContinuity) === "continuous",
     taskSessionParams:
       taskSession?.sessionParamsJson ?? taskSessionDecodedParams,
     configMetadata: sessionConfigMetadata,
-    compatibleConfigMetadata,
+    compatibleConfigMetadata: [...compatibleConfigMetadata, ...historicalConfigMetadata],
+    compatibleCategoryMetadata: historicalConfigMetadata,
     wakeResetReason: wakeSessionResetReason,
     preserveLegacySessionWithoutConfigMetadata:
       acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision && !agentIdentity,
   });
-  const resetTaskSession =
-    context.workspaceSelectionChanged === true || shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset
-    || await runContentDeleted(db, agent.companyId, taskSession?.lastRunId);
+  // Adapter config exemptions are per-key in the fingerprint, never per-category.
+  // Only instruction content, environment and skill-list changes may advance here;
+  // missing/versioned metadata and mixed changes still require stock reset.
+  const continuableConfigChange = continuousPi && sessionConfigFreshness.changedCategories.length > 0 &&
+    sessionConfigFreshness.changedCategories.every(category =>
+      ["instructions", "environment", "envBindings", "runtimeSkills"].includes(category));
+  let resetTaskSession =
+    context.workspaceSelectionChanged === true || shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
+  if (decideNativeContinuation({
+    provider: runtimeConfig.provider, sessionContinuity: runtimeConfig.sessionContinuity, hasSession: taskSession != null, wakeReset: true,
+    resetRequired: context.explicitFreshSession === true || context.conversationReset === true ||
+      (context.workspaceSelectionChanged === true && (agent.adapterType !== "paperclip_runner" || runtimeConfig.provider !== "pi_rpc")) ||
+      sessionConfigFreshness.reasons.some(reason => reason !== wakeSessionResetReason &&
+        !(continuableConfigChange && reason.startsWith("effective run configuration changed: "))) ||
+      (context.wakeReason === "heartbeat_timer" && !deriveTaskKey(context, null)),
+  }).continue) resetTaskSession = false;
+  // Deleted source content is a hard reset, including for continuous sessions.
+  resetTaskSession ||= await runContentDeleted(db, agent.companyId, taskSession?.lastRunId);
   const sessionResetReason =
     sessionConfigFreshness.reasons.join("; ") || null;
   const taskSessionForRun = resetTaskSession ? null : taskSession;
@@ -219,7 +257,12 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
     taskSessionForRun.lastRunId !== run.id && isNativeSessionId(taskSessionId) ? taskSessionId : null;
   const getFreshSessionHandoff = issueRef ? createNativeSessionHandoffLoader({
     db, companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id, before: run.createdAt,
+    continuation: context.executionContinuation as ExecutionContinuationEnvelope | undefined,
+    mode: resolveSessionContinuity(runtimeConfig.provider, runtimeConfig.sessionContinuity) === "continuous" ? "whole" : "bounded",
     throughCommentId: readNonEmptyString(context.conversationReplayThroughCommentId) ?? (context.interactionKind ? null : wakeCommentId),
+    excludeCommentIds: [...new Set([...queuedCommentIdsFromRunContext(context),
+      ...[wakeCommentId, readNonEmptyString(context.wakeCommentId), readNonEmptyString(context.commentId)]
+        .filter((id): id is string => id !== null)])],
   }) : undefined;
   const previousSessionParams =
     explicitResumeSessionParams ??
@@ -364,8 +407,7 @@ export async function resolveHeartbeatAdapterSession(input: HeartbeatAdapterSess
     (!taskSessionForRun ||
       !taskSession?.sessionDisplayId ||
       runtimeForAdapter.sessionDisplayId !== taskSession.sessionDisplayId ||
-      resetTaskSession ||
-      context.forceFreshSession === true)
+      resetTaskSession)
   ) {
     delete executionContinuation.resumeDelta;
   }

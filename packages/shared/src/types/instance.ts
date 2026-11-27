@@ -132,6 +132,7 @@ export interface InstanceExperimentalSettings {
    * flipping it later does not change an existing first task.
    */
   enableFirstTaskPlanProposal: boolean;
+  enableQueuedMessageSteerCountdown: boolean;
   /**
    * Experimental Paperclip Cloud onboarding starter inference: provides a
    * Cloud-funded $1 OpenRouter allowance (defaulting to OpenCode / Luna) via

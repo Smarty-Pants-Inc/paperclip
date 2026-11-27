@@ -18,7 +18,7 @@ export const EFFORT_LABELS: Record<string, string> = {
 };
 
 const MODEL_ADAPTERS = new Set([
-  "claude_local", "codex_local", "opencode_local", "pi_local", "kimi_local",
+  "claude_local", "codex_local", "opencode_local", "pi_local", "pi_rpc", "kimi_local",
   "gemini_local", "cursor", "cursor_cloud", "grok_local", "hermes_local", "paperclip_runner",
 ]);
 
@@ -54,6 +54,7 @@ export function composerDefaultModel(agent: Agent | undefined): string {
 
 export function composerCatalogProvider(agent: Agent | undefined): string | undefined {
   if (!agent) return undefined;
+  if (agent.adapterType === "pi_rpc") return "pi_rpc";
   if (agent.adapterType === "paperclip_runner") return String(agent.adapterConfig.provider ?? "codex");
   if (agent.adapterType !== "opencode_local") return undefined;
   const binding = aiConnectionBindingSchema.safeParse(agent.runtimeConfig?.aiConnection).data;
@@ -67,6 +68,8 @@ export function composerEfforts(agent: Agent | undefined, model: string, catalog
   const effectiveModel = model.trim() || (agent.adapterType === "grok_local" ? DEFAULT_GROK_LOCAL_MODEL
     : agent.adapterType === "kimi_local" ? DEFAULT_KIMI_LOCAL_MODEL : "");
   if (!effectiveModel) return [];
+  // Pi RPC's connection owns its models; startup admits the exact requested level.
+  if (composerCatalogProvider(agent) === "pi_rpc") return ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
   const pool = aiRuntimeConnectionBindingSchema.safeParse(agent.runtimeConfig?.aiConnection).data?.mode === "router";
   if (pool && agent.adapterType === "paperclip_runner") return isCodexLocalKnownModel(effectiveModel) ? codexLocalReasoningEffortsForModel(effectiveModel) : /^claude-/.test(effectiveModel) ? claudeLocalReasoningEffortsForModel(effectiveModel) : [];
   if (agent.adapterType === "codex_local" || (agent.adapterType === "paperclip_runner" && composerCatalogProvider(agent) === "codex")) {
@@ -85,11 +88,13 @@ export function composerFastAvailable(agent: Agent | undefined, model: string): 
   return Boolean(agent && agent.adapterType === "codex_local" && isCodexLocalKnownModel(model) && isCodexLocalFastModeSupported(model));
 }
 
-export function readComposerRunSettings(overrides: IssueAssigneeAdapterOverrides | null | undefined, adapterType: string | undefined): ComposerRunSettings {
+export function readComposerRunSettings(overrides: IssueAssigneeAdapterOverrides | null | undefined, adapterType: string | undefined, adapterConfig?: Agent["adapterConfig"]): ComposerRunSettings {
   const config = overrides?.adapterConfig ?? {};
-  const effortKey = composerEffortKey(adapterType);
-  const effortValue = effortKey && (config[effortKey]
-    ?? (adapterType === "codex_local" || adapterType === "paperclip_runner" ? config.reasoningEffort ?? config.effort : undefined));
+  const effortKey = composerEffortKey(adapterType, adapterConfig);
+  const rawEffort = effortKey && (config[effortKey]
+    ?? (adapterType === "codex_local" || adapterType === "paperclip_runner" ? config.modelReasoningEffort ?? config.reasoningEffort ?? config.effort : undefined));
+  const effortValue = effortKey === "piRpcThinkingLevel" && config.piRpcThinkingLevel === undefined
+    ? rawEffort === "auto" ? "medium" : rawEffort === "none" ? "off" : rawEffort : rawEffort;
   return {
     model: typeof config.model === "string" ? config.model : null,
     effort: typeof effortValue === "string" ? effortValue : null,
@@ -97,7 +102,8 @@ export function readComposerRunSettings(overrides: IssueAssigneeAdapterOverrides
   };
 }
 
-function composerEffortKey(adapterType: string | undefined): string | null {
+function composerEffortKey(adapterType: string | undefined, adapterConfig?: Agent["adapterConfig"]): string | null {
+  if (adapterType === "pi_rpc" || (adapterType === "paperclip_runner" && adapterConfig?.provider === "pi_rpc")) return "piRpcThinkingLevel";
   if (adapterType === "codex_local" || adapterType === "paperclip_runner") return "modelReasoningEffort";
   if (adapterType === "claude_local" || adapterType === "kimi_local") return "effort";
   if (adapterType === "grok_local") return "reasoningEffort";
@@ -111,6 +117,7 @@ export function mergeComposerRunSettings(
   adapterType: string | undefined,
   settings: ComposerRunSettings,
   reassigned = false,
+  adapterConfig?: Agent["adapterConfig"],
 ): IssueAssigneeAdapterOverrides | null {
   const config = { ...(reassigned ? {} : previous?.adapterConfig) };
   delete config.model;
@@ -118,10 +125,11 @@ export function mergeComposerRunSettings(
   delete config.reasoningEffort;
   delete config.effort;
   delete config.thinking;
+  delete config.piRpcThinkingLevel;
   delete config.variant;
   delete config.fastMode;
   if (settings.model) config.model = settings.model;
-  const effortKey = composerEffortKey(adapterType);
+  const effortKey = composerEffortKey(adapterType, adapterConfig);
   if (settings.effort && effortKey) config[effortKey] = settings.effort;
   if (settings.fast && adapterType === "codex_local") config.fastMode = true;
   const useProjectWorkspace = reassigned ? undefined : previous?.useProjectWorkspace;

@@ -8,7 +8,7 @@ import { isNativeRestartInterruption, NativeSessionProtocolIntegrityError } from
 import { isPrpAuthCredentialsUpdated, validatePrpStructuredRunResult } from "../../protocol/replay-contract.js";
 import type { CodexRpcNotification, CodexTraceInterpretation } from "./app-server-transport.js";
 import { redactCodexDiagnostic } from "./app-server-transport.js";
-import { boundedCodexPayload as boundedPayload, boundedCodexValue, isRetainableCodexPayload } from "./codex-boundaries.js";
+import { boundedCodexPayload as boundedPayload, boundedCodexValue, isRetainableCodexPayload, redactCodexValue } from "./codex-boundaries.js";
 import { runtimeRequestProtocolPayload, runtimeRequestResponse } from "./codex-question-adapter.js";
 import {
   isSupportedCodexNotificationMethod,
@@ -39,6 +39,27 @@ import {
   record,
   text,
 } from "./codex-driver-values.js";
+
+// Text items are the durable answer/transcript, not diagnostic previews. Keep
+// their semantic envelope outside the generic cap; retain only bounded metadata
+// beside it, without a second copy of the same provider text.
+function textItemPayload(payload: Record<string, unknown>, diagnosticKey: "item" | "update"): Record<string, unknown> {
+  if (!["agentMessage", "assistant_message", "reasoning"].includes(text(payload.kind))) return boundedPayload(payload);
+  const diagnostic = { ...record(payload[diagnosticKey]) };
+  const answers = payload.answers ?? diagnostic.answers;
+  for (const key of ["text", "delta", "patch", "output", "aggregatedOutput", "summary", "content", "answers"]) delete diagnostic[key];
+  const envelope = { ...payload };
+  delete envelope.text;
+  delete envelope[diagnosticKey];
+  delete envelope.answers;
+  return {
+    ...boundedPayload(record(redactCodexValue(envelope))),
+    ...(Array.isArray(answers) ? { answers: answers.filter((id): id is string => typeof id === "string")
+      .map(id => redactCodexDiagnostic(id)) } : {}),
+    text: redactCodexDiagnostic(text(payload.text)),
+    [diagnosticKey]: boundedPayload(record(redactCodexValue(diagnostic))),
+  };
+}
 
 const DELTA_KINDS: Record<string, string> = {
   "item/agentMessage/delta": "agentMessage",
@@ -635,13 +656,14 @@ async function mapNotificationBody(state: CodexSessionState, notification: Codex
       if (itemId) state.itemChannels.set(itemId, channel);
       state.emit(
         "item.started",
-        boundedPayload({
+        textItemPayload({
           kind: text(item.type, "unknown"),
           channel,
           providerPhase: text(item.phase) || undefined,
           text: itemText(item),
+          ...(Array.isArray(item.answers) ? { answers: item.answers.filter((id): id is string => typeof id === "string") } : {}),
           item,
-        }),
+        }, "item"),
         { turnId, itemId },
       );
       return;
@@ -654,13 +676,17 @@ async function mapNotificationBody(state: CodexSessionState, notification: Codex
         : channelForStartedItem(state, item);
       state.emit(
         "item.completed",
-        boundedPayload({
-          kind: text(item.type, "unknown"),
-          channel,
-          providerPhase: text(item.phase) || undefined,
-          text: itemText(item),
-          item,
-        }),
+        {
+          ...textItemPayload({
+            kind: text(item.type, "unknown"),
+            channel,
+            providerPhase: text(item.phase) || undefined,
+            text: itemText(item),
+            item,
+          }, "item"),
+          // textItemPayload keeps every answer id, sanitized, outside the
+          // diagnostic preview's 128-entry bound.
+        },
         { turnId, itemId },
       );
       if (text(item.type) === "agentMessage") {
@@ -699,7 +725,7 @@ async function mapNotificationBody(state: CodexSessionState, notification: Codex
             : "unknown";
       state.emit(
         "item.delta",
-        boundedPayload({
+        textItemPayload({
           kind: deltaKind,
           channel,
           providerMethod: notification.method,
@@ -707,7 +733,7 @@ async function mapNotificationBody(state: CodexSessionState, notification: Codex
             ? "\n\n"
             : text(params.delta, text(params.patch, text(params.output))),
           update: params,
-        }),
+        }, "update"),
         { turnId, itemId: itemId || `${turnId}:${deltaKind}` },
       );
       if (notification.method === "item/fileChange/patchUpdated") {

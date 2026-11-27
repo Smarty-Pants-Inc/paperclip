@@ -1,4 +1,4 @@
-import { and, eq, isNotNull, isNull, sql } from "drizzle-orm";
+import { and, eq, isNotNull, isNull, notInArray, sql } from "drizzle-orm";
 import {
   heartbeatRuns,
   issueComments,
@@ -23,7 +23,7 @@ export async function hasCommittedNativeResponseWakeWait(
   binding: Binding,
 ): Promise<boolean> {
   const [wait] = await db
-    .select({ runStartedAt: heartbeatRuns.startedAt })
+    .select({ runStartedAt: heartbeatRuns.startedAt, runResult: heartbeatRuns.resultJson })
     .from(nativeRunFinalizations)
     .innerJoin(
       statusDecisions,
@@ -69,6 +69,11 @@ export async function hasCommittedNativeResponseWakeWait(
     )
     .limit(1);
   if (!wait?.runStartedAt) return false;
+  // Seam 0240: a message this run already received (a steer it acknowledged) is not a newer, unanswered one.
+  const received = Object.keys(((wait.runResult as Record<string, unknown> | null)?.queuedSteeringAcknowledgements ?? {}) as object)
+    // Seam 0247: a message a person's Stop returned to his box is not unanswered either, even before a browser restores it.
+    .concat(((wait.runResult as { personStop?: { returned?: unknown } } | null)?.personStop?.returned as string[] | undefined) ?? [])
+    .filter(id => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(id)));
   const [unanswered] = await db
     .select({ id: issueComments.id })
     .from(issueComments)
@@ -80,6 +85,7 @@ export async function hasCommittedNativeResponseWakeWait(
         isNull(issueComments.createdByRunId),
         isNull(issueComments.deletedAt),
         sql`${issueComments.createdAt} > ${wait.runStartedAt.toISOString()}::timestamptz`,
+        received.length ? notInArray(issueComments.id, received) : undefined,
       ),
     )
     .limit(1);

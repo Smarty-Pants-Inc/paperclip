@@ -190,6 +190,62 @@ describe("sandbox callback bridge", () => {
     }
   });
 
+  it.each([undefined, 1000])("backs off only when opted in (%s), resets on a request, and measures idle pickup latency", async idleMaxMs => {
+    vi.useFakeTimers();
+    const scans: number[] = [];
+    const handled: number[] = [];
+    const files = new Map<string, string>();
+    const queueDir = "/virtual-bridge/idle-backoff";
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const client: SandboxCallbackBridgeQueueClient = {
+      makeDir: async () => {}, makeDirs: async () => {},
+      listJsonFiles: async dir => {
+        scans.push(Date.now());
+        return dir === directories.requestsDir
+          ? [...files.keys()].filter(file => file.startsWith(dir + "/")).map(file => path.posix.basename(file)) : [];
+      },
+      readTextFile: async file => { const value = files.get(file); if (value === undefined) throw new Error("missing"); return value; },
+      writeTextFile: async (file, body) => { files.set(file, body); },
+      rename: async (from, to) => { files.set(to, files.get(from)!); files.delete(from); },
+      remove: async file => { files.delete(file); },
+    };
+    const started = Date.now();
+    const worker = await startSandboxCallbackBridgeWorker({ client, queueDir, pollIntervalMs: 100, idleMaxMs,
+      authorizeRequest: async () => null,
+      handleRequest: async () => { handled.push(Date.now()); return { status: 200, body: "OK" }; },
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(2500);
+      const relative = scans.map(time => time - started);
+      if (idleMaxMs) expect(relative).toEqual([0, 100, 300, 700, 1500, 2500]);
+      else expect(relative).toEqual(Array.from({ length: 26 }, (_, index) => index * 100));
+      await vi.advanceTimersByTimeAsync(1);
+      const queuedAt = Date.now();
+      files.set(path.posix.join(directories.requestsDir, "after-idle.json"), bridgeRequestJson("after-idle"));
+      await vi.advanceTimersByTimeAsync(idleMaxMs ? 999 : 99);
+      expect(handled).toHaveLength(1);
+      const latency = handled[0]! - queuedAt;
+      if (idleMaxMs) {
+        // A polling-only worker has no wake signal. This counterexample is why
+        // idle backoff cannot be enabled by default under the base+scan bound.
+        expect(latency).toBe(999);
+        expect(latency).toBeGreaterThan(101);
+      } else expect(latency).toBeLessThanOrEqual(100);
+      const processedAt = handled[0]!;
+      await vi.advanceTimersByTimeAsync(100);
+      expect(scans).toContain(processedAt + 100);
+      if (idleMaxMs) {
+        await vi.advanceTimersByTimeAsync(200);
+        expect(scans).toContain(processedAt + 300);
+      }
+    } finally {
+      const stopping = worker.stop();
+      await vi.advanceTimersByTimeAsync(5000);
+      await stopping;
+      vi.useRealTimers();
+    }
+  });
+
   it("round-trips localhost bridge requests over the sandbox queue without forwarding the bridge token", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-runtime-"));
     cleanupDirs.push(rootDir);
@@ -362,6 +418,7 @@ describe("sandbox callback bridge", () => {
         authorization: `Bearer ${bridgeToken}`,
         "content-type": "application/json",
         "x-paperclip-github-capability": "test-run-scoped-capability",
+        "x-paperclip-github-repository": "second-org/x",
       },
       body: "{}",
     });
@@ -369,7 +426,7 @@ describe("sandbox callback bridge", () => {
     await githubResponse.arrayBuffer();
     expect(seenRequests[2]).toMatchObject({
       method: "POST", path: "/runtime-tools/github/credentials", body: "{}",
-      headers: { "x-paperclip-github-capability": "test-run-scoped-capability" },
+      headers: { "x-paperclip-github-capability": "test-run-scoped-capability", "x-paperclip-github-repository": "second-org/x" },
     });
     expect(seenRequests[2]?.headers.authorization).toBeUndefined();
 

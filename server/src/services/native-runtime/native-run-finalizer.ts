@@ -1,3 +1,5 @@
+import { recoverContinuousNativeReplies } from "./native-continuous-reply.js";
+import { settleProviderReturnedStopInput } from "../person-stop-before-turn.js";
 import { notifyNativeEnvironmentSettlement } from "../native-environment-settlement-notifications.js";
 import { isContextCompactionRun } from "../context-compaction.js";
 import { isWorkspaceGitOperationInProgress, workspaceSaveRestCause } from "./native-workspace-failure.js";
@@ -46,6 +48,7 @@ import { conversationNativeDecision, isConversation, settleConversationTurnForRu
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { COMPLETION_REVIEW_STAGE_REASON, completionReviewStageEntry } from "../issue-execution-policy.js";
 import { randomUUID } from "node:crypto";
+import { answeredContinuousHeldRun } from "./continuous-session-input.js";
 import { preserveNativeWorkspaceExportLease } from "./native-workspace-export-resume.js";
 import { and, desc, eq, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { laterConversationTurn, laterTurns } from "./native-response-presentation-query.js";
@@ -70,6 +73,7 @@ import { classifyNativeEvidence } from "./evidence-classifier.js";
 import type { PrpIgnoredAttentionRequest, PrpTerminalState } from "@paperclipai/paperclip-runner";
 import {
   arbitrateNativeStatus,
+  NATIVE_RESPONSE_WAKE_WAITING_REASON,
   NATIVE_STATUS_ARBITER_POLICY_VERSION,
   supersedeHandedOffDecision,
   supersedeStaleOwnerCompletion,
@@ -1041,6 +1045,7 @@ async function recoverCommittedNativeChatResponseInScope(
   db: Db,
   input: { companyId: string; issueId: string; runId: string; onlyWhenDue?: boolean },
 ): Promise<boolean> {
+  await recoverContinuousNativeReplies(db, { id: input.runId, companyId: input.companyId });
   let agentId: string | null = null;
   let materialized = false;
   let conversationReply = false;
@@ -1276,13 +1281,13 @@ async function recoverCommittedNativeChatResponseInScope(
           }),
         });
         if (!finalAgentMessage && !blockedTaskReply) return false;
-        const comments = await tx.select({ id: issueComments.id, body: issueComments.body, presentation: issueComments.presentation })
+        const comments = await tx.select({ id: issueComments.id, body: issueComments.body, presentation: issueComments.presentation, clientRequestId: issueComments.clientRequestId })
           .from(issueComments).where(and(
             eq(issueComments.companyId, input.companyId),
             eq(issueComments.issueId, input.issueId),
             eq(issueComments.createdByRunId, run.id),
           )).orderBy(desc(issueComments.createdAt), desc(issueComments.id));
-        const existingComment = findHeartbeatRunCompletionComment(comments, run.resultJson);
+        const existingComment = findHeartbeatRunCompletionComment(comments, run.resultJson, finalAgentMessage?.replyKey);
         const responseInput = {
           resultJson: { ...record(run.resultJson), nativeResult: result },
           nativeConversationFinalResponse: conversation,
@@ -1504,6 +1509,7 @@ export async function finalizeNativeRun(input: {
     .then((rows) => rows[0] ?? null);
   if (!admittedRun || admittedRun.runtimeMode !== "native")
     throw new Error("native_finalization_run_missing");
+  await recoverContinuousNativeReplies(input.db, admittedRun);
   const claim = await claimCoordinator({
     db: input.db,
     runId: input.runId,
@@ -1863,6 +1869,8 @@ export async function finalizeNativeRun(input: {
       failureRetryCount: executionFailureRetryCount(run),
       // Only the task's current owner may turn its own failed continuation
       // into a blocker; the committer rechecks that under the issue lock.
+      continuousHeldInputAnswered: terminalState === "failed" && ownsProviderFailureDecision && !reviewContext &&
+        await answeredContinuousHeldRun(input.db, { companyId: run.companyId, issueId: authoritativeIssue.id, runId: run.id }),
       failedTurnContinuationUsed: terminalState === "failed" && ownsProviderFailureDecision && !reviewContext
         && await isFailedTurnContinuationRun(input.db, run, authoritativeIssue.id),
       toolCallLoopContinuation: assessment.reportedDisposition === "yielded"
@@ -1940,6 +1948,23 @@ export async function finalizeNativeRun(input: {
             : effect.kind === "record_finalization_error" ? { ...effect, nextAction: error.message } : effect) };
       }
     }
+    // Seam 0237 (+0269): the comment ids our Pi driver handed back at a person's Stop arrive as the runner's provider notice
+    // (category pi_stop_returned_input, details returnedCommentIds) and ride the run's personStop mark (the page restores them).
+    const returned = record(run.resultJson?.personStop).requestedAt === undefined ? [] : await input.db.select({ payload: heartbeatRunEvents.payload })
+      .from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, run.id), eq(heartbeatRunEvents.eventType, "provider.notice.recorded"),
+        sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,category}' = 'pi_stop_returned_input'`));
+    const returnedDetails = returned.flatMap(event => {
+      const details = record(record(record(event.payload).prpEvent).payload).details;
+      return Array.isArray(details) ? details : [];
+    });
+    const returnedIds = (Array.isArray(returnedDetails) ? returnedDetails : []).filter(detail => record(detail).name === "returnedCommentIds")
+      .flatMap(detail => String(record(detail).value ?? "").split(",")).map(id => id.trim()).filter(id => id.length > 0);
+    if (returnedIds.length) await settleProviderReturnedStopInput(input.db, run, returnedIds);
+    // A person's Stop (seam 0236) never completes or closes the task: the turn ended, the task waits for the person.
+    if (record(run.resultJson?.personStop).requestedAt !== undefined && authoritativeIssue.status === "in_progress"
+      && ["done", "in_review"].includes(proposedDecision.statusAction))
+      proposedDecision = { ...proposedDecision, statusAction: "in_progress", toStatus: "in_progress",
+        reasonCode: NATIVE_RESPONSE_WAKE_WAITING_REASON, unblockDescriptor: null, effects: [{ kind: "release_checkout" }] };
     proposedDecision = gateDoneOnConfiguredReview(proposedDecision, reviewStage, run.agentId);
     const decision = conversationNativeDecision({
       conversation: isConversation(authoritativeIssue), terminalState,

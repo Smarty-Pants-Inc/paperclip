@@ -2,6 +2,7 @@ import type { PaperclipTurnContext } from "@paperclipai/adapter-utils/server-uti
 import { resolvePaperclipRunnerCursorMode, resolvePaperclipRunnerPiThinkingLevel } from "@paperclipai/adapter-utils";
 import { createHash } from "node:crypto";
 import { buildNativeContinuationPrompt } from "./native-continuation.js";
+import { decideNativeContinuation, resolveSessionContinuity } from "./continued-session.js";
 import {
   caseExecutionMarkdown,
   caseProjectionBootstrapPrefix,
@@ -31,6 +32,7 @@ import type {
 } from "../../vendor/paperclip-runner/index.js";
 import {
   parseNativeExecutionInput,
+  canonicalNativeRuntimeContextDigest, PAPERCLIP_EXECUTION_FINISH_INSTRUCTION, PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION,
   resolveQualifiedAcpxProfile,
 } from "../../vendor/paperclip-runner/index.js";
 import {
@@ -55,6 +57,7 @@ export interface BuildNativeExecutionInput {
     title: string;
     description: string | null;
     workMode: string;
+    conversationAgentId?: string | null;
   };
   taskPrompt: string;
   initialCommunicationGuidance?: string | null;
@@ -72,6 +75,7 @@ export interface BuildNativeExecutionInput {
   /** Skill keys selected from the admitted, manager-authored GitHub configuration. */
   githubInstructionSkillKeys?: readonly string[];
   resumedSession?: boolean;
+  sessionContinuity?: unknown;
   previousTurn?: {
     runId: string;
     task: { title: string; description: string | null };
@@ -96,7 +100,7 @@ export interface BuildNativeExecutionInput {
     branchName: string | null;
   };
   normalizedSessionId: string | null;
-  provider?: "cursor_cloud" | "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx" | "openai_dot" | "grok_bot" | "muse";
+  provider?: "cursor_cloud" | "codex" | "opencode" | "pi_rpc" | "claude_managed" | "aws_agentcore" | "acpx" | "openai_dot" | "grok_bot" | "muse";
   museBinding?: MuseBindingSnapshot;
   dotBinding?: DotBindingSnapshot;
   acpxAgent?: NativeAcpxAgent;
@@ -105,6 +109,7 @@ export interface BuildNativeExecutionInput {
   codexReasoningEffort?: string;
   codexWebSearch?: "disabled";
   opencodePermissionMode?: NativeOpenCodePermissionMode;
+  piRpcThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   acpxPermissionMode?: NativeAcpxPermissionMode;
   acpxSessionMode?: "agent" | "plan" | "ask";
   /**
@@ -266,6 +271,17 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
       ? readCaseProjectionMarker(previousExecution) : null;
   const workflowCase = input.caseContext && previousCaseProjection
     ? projectCaseContinuation(input.caseContext, previousCaseProjection) : null;
+  const continuity = resolveSessionContinuity(input.provider, input.sessionContinuity);
+  const piConversation = input.provider === "pi_rpc" && input.conversationMode === true && input.issue.conversationAgentId === input.agentId;
+  const continuation = decideNativeContinuation({ ...input, hasSession: input.resumedSession === true && !!input.previousTurn,
+    taskChanged: !!input.previousTurn && (input.issue.title !== input.previousTurn.task.title || input.issue.description !== input.previousTurn.task.description),
+    wakeReset: input.conversationMode === true, previousRunId: input.previousTurn?.runId });
+  const runtimeContext = piConversation ? structuredClone(input.runtimeContext) : input.runtimeContext;
+  if (piConversation) {
+    runtimeContext.prompt.text = runtimeContext.prompt.text.replace(PAPERCLIP_EXECUTION_FINISH_INSTRUCTION, PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION);
+    runtimeContext.prompt.digest = createHash("sha256").update(runtimeContext.prompt.text).digest("hex");
+    runtimeContext.aggregateDigest = canonicalNativeRuntimeContextDigest(runtimeContext);
+  }
   const prepared = {
     schema: input.grokEffort !== undefined || input.grokDisableWebSearch !== undefined ? "paperclip.native-execution-input.v10"
       : input.claudeEffort !== undefined ? "paperclip.native-execution-input.v9"
@@ -274,9 +290,10 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
     ...((input.initialCommunicationGuidance || input.freshSessionHandoff) ? {
       initialCommunicationGuidance: [input.initialCommunicationGuidance, input.freshSessionHandoff].filter(Boolean).join("\n\n"),
     } : {}),
-    ...(input.resumedSession && input.previousTurn && !input.conversationMode ? {
+    ...(continuation.continue && input.previousTurn ? {
       continuationPrompt: buildNativeContinuationPrompt({
         wakePayload: input.wakePayload,
+        promptOnly: continuation.promptOnly,
         previousRunId: input.previousTurn.runId,
         previousIssue: input.previousTurn.task,
         previousGitHubReviewConfigurationKeys: input.previousTurn.githubReviewConfigurationKeys,
@@ -321,6 +338,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
       normalizedSessionId: input.normalizedSessionId,
       driverKind: input.provider === "cursor_cloud" ? "cursor_cloud_api" : input.provider === "opencode"
         ? "opencode_server"
+        : input.provider === "pi_rpc" ? "pi_rpc"
         : input.provider === "claude_managed"
           ? "claude_managed_agents_api"
           : input.provider === "aws_agentcore"
@@ -371,6 +389,10 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
             commandDigest: acpxProfile!.commandDigest,
           },
         }
+      : input.provider === "pi_rpc"
+        ? { kind: "pi_rpc", model: input.model, ...(piConversation ? { conversationMode: true } : {}),
+            ...(continuity === "paperclip" ? { sessionContinuity: "paperclip" } : {}),
+            ...(input.piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel: input.piRpcThinkingLevel }) }
       : input.provider === "opencode"
         ? {
             kind: "opencode",
@@ -397,7 +419,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
     } } : {}),
     interactionResponses: input.interactionResponses ?? [],
     credentialBindings: [],
-    runtimeContext: input.runtimeContext,
+    runtimeContext,
   };
   return parseNativeExecutionInput(input.provider === "muse" ? { ...prepared,
     schema: "paperclip.native-execution-input.v8", provider: { kind: "muse", model: null, binding: input.museBinding, bridgeRevision: "muse-v1" },

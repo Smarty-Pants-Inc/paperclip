@@ -143,6 +143,10 @@ export function CodexLocalConfigFields({
     isCreate
       ? (values!.adapterSchemaValues?.[key] ?? fallback)
       : eff("adapterConfig", key, config[key] ?? fallback);
+  const piThinkingKey = runnerProvider === "pi_rpc" ? "piRpcThinkingLevel" : "piThinkingLevel";
+  const piEffort = runnerSchemaValue("modelReasoningEffort", runnerSchemaValue("reasoningEffort", runnerSchemaValue("effort", runnerProvider === "pi_rpc" ? "medium" : "low")));
+  const piThinkingLevel = String(runnerSchemaValue(piThinkingKey, runnerProvider === "pi_rpc" ? piEffort === "auto" ? "medium" : piEffort === "none" ? "off" : piEffort : "low"));
+  const piThinkingLevels = runnerProvider === "pi_rpc" ? ["off", "minimal", "low", "medium", "high", "xhigh", "max"] : ["off", "low", "high", "max"];
   const updateRunnerSchemaValue = (key: string, value: unknown): void => {
     if (isCreate) {
       set!({
@@ -390,12 +394,12 @@ export function CodexLocalConfigFields({
           </select>
         </Field>
       )}
-      {runnerManaged && runnerProvider === "acpx" && runnerSchemaValue("acpxAgent", "claude") === "pi" && (
+      {runnerManaged && (runnerProvider === "pi_rpc" || runnerProvider === "acpx" && runnerSchemaValue("acpxAgent", "claude") === "pi") && (
         <Field configSection="adapter" label="Pi thinking level" hint="The runner verifies this exact level before each session can prompt. Changing it starts a new session.">
-          <select className={inputClass} aria-label="Pi thinking level" value={String(runnerSchemaValue("piThinkingLevel", "low"))}
-            onChange={(event) => updateRunnerSchemaValue("piThinkingLevel", event.target.value)}>
-            {!["off", "low", "high", "max"].includes(String(runnerSchemaValue("piThinkingLevel", "low"))) && <option value={String(runnerSchemaValue("piThinkingLevel", "low"))} disabled>Unsupported saved thinking level</option>}
-            <option value="off">Off</option><option value="low">Low</option><option value="high">High</option><option value="max">Max</option>
+          <select className={inputClass} aria-label="Pi thinking level" value={piThinkingLevel}
+            onChange={(event) => updateRunnerSchemaValue(piThinkingKey, event.target.value)}>
+            {!piThinkingLevels.includes(piThinkingLevel) && <option value={piThinkingLevel} disabled>Unsupported saved thinking level: {piThinkingLevel}</option>}
+            {piThinkingLevels.map(level => <option key={level} value={level}>{level === "xhigh" ? "Extra High" : level[0]!.toUpperCase() + level.slice(1)}</option>)}
           </select>
         </Field>
       )}

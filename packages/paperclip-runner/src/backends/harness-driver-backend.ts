@@ -500,6 +500,7 @@ class HarnessNativeSession implements NativeSession {
 
   async attachRun(input: {
     identity: OpenNativeSessionInput["identity"];
+    dynamicTools?: readonly Readonly<Record<string, unknown>>[];
     currentRunGrant?: NativeRunRuntimeGrant;
     completionContract?: { revision: string; criterionIds: readonly string[] };
   }): Promise<void> {
@@ -518,6 +519,7 @@ class HarnessNativeSession implements NativeSession {
     }
     try {
       await this.#session.attachRun({ runId: input.identity.runId,
+        ...(input.dynamicTools !== undefined ? { dynamicTools: structuredClone(input.dynamicTools) } : {}),
         ...(input.currentRunGrant ? { currentRunGrant: structuredClone(input.currentRunGrant) } : {}),
         ...(input.completionContract ? { completionContract: structuredClone(input.completionContract) } : {}),
       });
@@ -928,6 +930,14 @@ class HarnessNativeSession implements NativeSession {
       lineage: snapshot.lineage ?? [],
       ...(snapshot.awaitingProviderTurn === true ? { awaitingProviderTurn: true } : {}),
     };
+  }
+
+  async readUserMessages(): Promise<string[] | null> {
+    return this.#session.readUserMessages?.() ?? null;
+  }
+
+  async readUserInputIds(): Promise<string[] | null> {
+    return this.#session.readUserInputIds?.() ?? null;
   }
 
   async usage(): Promise<Record<string, unknown> | null> {

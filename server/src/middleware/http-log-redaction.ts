@@ -37,5 +37,6 @@ export const HTTP_LOG_REDACT_PATHS = [
   "reqBody.credentialValues",
   "reqBody.browserCode",
   "reqBody.redirectUrl",
+  "errorContext.details.credentialValues",
   "errorContext.details.credentials",
 ] as const;

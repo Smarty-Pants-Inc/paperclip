@@ -1,4 +1,5 @@
 import { groupImageResources } from "./image-resources";
+import { RunnerReasoningDisplay } from "./reasoning-display";
 import { AgentQueueWait } from "@/components/AgentQueueWait";
 import { agentQueueWaitOf } from "@/lib/agent-queue-wait";
 import { WAITING_TO_START_LABEL, useWaitingToStart } from "./useWaitingToStart";
@@ -7,6 +8,7 @@ import { ToolCallProgressRunProvider } from "./tool-call-progress";
 import { useRef, type ReactNode } from "react";
 import type { ExecutionProjection } from "@paperclipai/shared";
 import { useSecondTick } from "@/hooks/useSecondTick";
+import { useTaskChatStatusLine } from "./TaskChatStatusLine";
 import { cn } from "@/lib/utils";
 import type {
   TaskChatItem,
@@ -28,6 +30,7 @@ import {
   buildTurnTimelineRows,
   isTerminalRunStatus,
   omitProgressRepeatedByResponse,
+  paperclipRunnerAcceptedResponseWake,
   paperclipRunnerFinalResponse,
   paperclipRunnerTimelineItems,
 } from "./transcript-adapter";
@@ -72,20 +75,29 @@ function terminalStatusFailed(status: string): boolean {
 }
 
 function RunnerTurnStatus({
+  runId,
   status,
   startedAtMs,
   finishedAtMs,
   continuedAfterSteering = false,
   waitingLabel,
+  working = false,
+  personStopped = false,
 }: {
+  runId?: string | null;
   status: string;
   startedAtMs: number | null;
   finishedAtMs?: number | null;
   continuedAfterSteering?: boolean;
   waitingLabel?: string | null;
+  working?: boolean;
+  personStopped?: boolean;
 }) {
+  const shimmer = useTaskChatShimmer("working");
   const terminal = isTerminalRunStatus(status);
-  useSecondTick(!terminal && startedAtMs != null);
+  const clockRunId = useTaskChatStatusLine();
+  const clockInDock = !terminal && !!runId && clockRunId === runId;
+  useSecondTick(!terminal && !clockInDock && startedAtMs != null);
   const elapsedMs =
     startedAtMs == null
       ? null
@@ -96,14 +108,14 @@ function RunnerTurnStatus({
   const elapsed = formatCompactDuration(elapsedMs);
 
   const failed = terminalStatusFailed(status);
-  const label = terminal ? (failed ? "Stopped" : "Worked") : waitingLabel ?? "Working";
-  const suffix = terminal
+  const label = waitingLabel ?? (terminal ? (personStopped ? "Stopped" : failed ? "Couldn't finish" : "Worked") : "Working");
+  const suffix = waitingLabel || clockInDock ? "" : terminal
     ? elapsed ? ` ${failed ? "after" : "for"} ${elapsed}` : ""
     : elapsed ? `${waitingLabel ? " · " : " for "}${elapsed}` : "";
 
   return (
     <span
-      className="min-w-0 truncate text-sm font-normal text-muted-foreground"
+      className={cn("min-w-0 truncate text-sm font-normal", working && shimmer ? "shimmer-text shimmer-text-muted" : "text-muted-foreground")}
       data-testid="task-chat-turn-status-header"
       data-turn-position="identity"
       aria-live="polite"
@@ -119,11 +131,12 @@ function RunnerCurrentActivityTail({ status, waitingLabel }: { status: string; w
   const shimmer = useTaskChatShimmer("working");
   if (isTerminalRunStatus(status)) return null;
   return <div className="mt-2 flex min-h-8 min-w-0 items-center gap-2 px-1 py-1 text-xs text-muted-foreground" data-testid="task-chat-current-activity" data-turn-position="tail">
-    <span className={cn(!waitingLabel && shimmer && "shimmer-text shimmer-text-muted")} aria-live="polite" data-testid="task-chat-current-activity-label">{waitingLabel ?? "Thinking"}</span>
+    <span className={cn(!waitingLabel && shimmer && "shimmer-text shimmer-text-muted")} aria-live="polite" data-testid="task-chat-current-activity-label">{waitingLabel ?? "Working"}</span>
   </div>;
 }
 
 interface RunnerHeaderProps {
+  personStopped?: boolean;
   runId?: string | null;
   agentName?: string | null;
   agentIcon?: string | null;
@@ -131,22 +144,24 @@ interface RunnerHeaderProps {
   status: string;
   execution?: ExecutionProjection | null;
   preparationLabel?: string;
+  working?: boolean;
   startedAtMs: number | null;
   finishedAtMs?: number | null;
   continuedAfterSteering?: boolean;
 }
 
 function runnerWaitingLabel({ runId, status, execution, preparationLabel }: RunnerHeaderProps, waitingToStart = false) {
+  if (status === "stopping") return "Stopping…";
   if (isTerminalRunStatus(status)) return null;
-  if (execution?.phase === "waiting_for_provider") return execution.label;
-  if (!runId && preparationLabel) return preparationLabel;
-  if (status === "queued" && execution?.cause) return execution.label;
-  return waitingToStart ? WAITING_TO_START_LABEL : null;
+  if (execution && (execution.cause || !["working", "reconnecting", "queued"].includes(execution.phase))) return execution.label;
+  if (preparationLabel) return preparationLabel === "Starting…" && waitingToStart ? WAITING_TO_START_LABEL : preparationLabel;
+  if (execution && execution.phase !== "working") return execution.label;
+  return status === "queued" && runId ? "Queued" : waitingToStart ? WAITING_TO_START_LABEL : status === "queued" ? "Starting…" : null;
 }
 
 /** A run's queued turn with no named hold, past the startup grace period. */
-function useRunnerWaitingToStart({ runId, status, execution, startedAtMs }: Pick<RunnerHeaderProps, "runId" | "status" | "execution" | "startedAtMs">) {
-  return useWaitingToStart(status === "queued" && !!runId && !execution?.cause, startedAtMs);
+function useRunnerWaitingToStart({ runId, status, execution, preparationLabel, startedAtMs }: RunnerHeaderProps) {
+  return useWaitingToStart(preparationLabel === "Starting…" || (!preparationLabel && status === "queued" && !!runId && !execution?.cause), startedAtMs);
 }
 
 function agentQueueWaitFor({ status, execution }: Pick<RunnerHeaderProps, "status" | "execution">) {
@@ -158,8 +173,8 @@ export function TaskChatRunnerHeader({ statusContent, ...props }: RunnerHeaderPr
   const waitingToStart = useRunnerWaitingToStart(props);
   return <div className="flex min-h-8 min-w-0 items-center gap-2 pb-1 pt-2" data-testid="task-chat-runner-identity-row">
     {props.agentName ? <TaskChatAgentIdentity agentName={props.agentName} agentIcon={props.agentIcon} agent={props.agent} /> : null}
-    {statusContent ?? (agentQueueWaitFor(props) ? <AgentQueueWait queue={agentQueueWaitFor(props)!} /> : null) ?? <RunnerTurnStatus status={props.status} startedAtMs={props.startedAtMs} finishedAtMs={props.finishedAtMs}
-      continuedAfterSteering={props.continuedAfterSteering} waitingLabel={runnerWaitingLabel(props, waitingToStart)} />}
+    {statusContent ?? (agentQueueWaitFor(props) ? <AgentQueueWait queue={agentQueueWaitFor(props)!} /> : null) ?? <RunnerTurnStatus runId={props.runId} status={props.status} startedAtMs={props.startedAtMs} finishedAtMs={props.finishedAtMs}
+      continuedAfterSteering={props.continuedAfterSteering} waitingLabel={runnerWaitingLabel(props, waitingToStart)} working={props.working === true} personStopped={props.personStopped} />}
   </div>;
 }
 
@@ -169,6 +184,8 @@ export function TaskChatRunnerTurn({
   agentIcon,
   agent,
   items,
+  finalResponse,
+  readReceipt,
   status,
   execution,
   preparationLabel,
@@ -188,9 +205,12 @@ export function TaskChatRunnerTurn({
   agentIcon?: string | null;
   agent?: import("../AgentAvatar").AvatarAgent;
   items: readonly TaskChatItem[];
+  /** Thread-owned final; null leaves saved replies in their own bubbles. */
+  finalResponse?: TaskChatMessageItem | null;
+  readReceipt?: Pick<TaskChatMessageItem, "id" | "createdAtIso">;
   status: string;
   execution?: ExecutionProjection | null;
-  /** Presentation only while Send/Retry admission has no run yet. */
+  /** Receipt-backed progress, or neutral feedback while Send/Retry has no run yet. */
   preparationLabel?: string;
   startedAtMs: number | null;
   finishedAtMs?: number | null;
@@ -215,7 +235,7 @@ export function TaskChatRunnerTurn({
 }) {
   const { failures: mcpStartupFailures, rest: turnItems } = partitionRunHealthItems(items);
   const terminal = isTerminalRunStatus(status);
-  const waitingToStart = useRunnerWaitingToStart({ runId, status, execution, startedAtMs });
+  const waitingToStart = useRunnerWaitingToStart({ runId, status, execution, preparationLabel, startedAtMs });
   const waitingLabel = runnerWaitingLabel({ runId, status, execution, preparationLabel, startedAtMs }, waitingToStart);
   const yielded = turnItems.some(
     (item) =>
@@ -223,9 +243,12 @@ export function TaskChatRunnerTurn({
       item.surface === "run_result" &&
       item.disposition === "yielded",
   );
-  const observedFinal = paperclipRunnerFinalResponse(turnItems, awaitingContinuation
-    ? { allowFallback: false, yielded: true, waitSummary }
-    : { allowFallback: terminal && allowSummaryFallback });
+  const acceptedWake = paperclipRunnerAcceptedResponseWake(turnItems, runId ?? undefined);
+  const observedFinal = paperclipRunnerFinalResponse(turnItems, {
+    runId: runId ?? undefined,
+    allowFallback: Boolean(acceptedWake) || (!awaitingContinuation && terminal && allowSummaryFallback),
+    yielded: awaitingContinuation, waitSummary: awaitingContinuation ? waitSummary : null,
+  });
   const observedProviderText = Boolean(
     observedFinal &&
     turnItems.some(
@@ -248,10 +271,10 @@ export function TaskChatRunnerTurn({
   // A provider final can arrive before the accepted yielded result. Clear any
   // replay latch once the control plane establishes that this turn is waiting
   // for continuation; only an authored (non-wait) final is re-latched below.
-  if (yielded || awaitingContinuation) finalRef.current = { runId };
+  if (!acceptedWake && (yielded || awaitingContinuation)) finalRef.current = { runId };
   if (
     observedFinal &&
-    (!finalRef.current.item ||
+    (!finalRef.current.item || observedFinal.id !== finalRef.current.item.id ||
       (observedProviderText && !finalRef.current.providerText) ||
       (observedProviderText === Boolean(finalRef.current.providerText) &&
         observedFinal.text.length >= finalRef.current.item.text.length))
@@ -259,16 +282,22 @@ export function TaskChatRunnerTurn({
     finalRef.current.item = observedFinal;
     finalRef.current.providerText = observedProviderText;
   }
-  const final = finalRef.current.item;
-  const timelineItems = paperclipRunnerTimelineItems(turnItems);
+  // The thread's dedupe set and this rendered final must have the same owner.
+  // Standalone turns retain their replay latch; controlled segments must not
+  // replay an older final beside the saved bubble the thread kept visible.
+  const final = finalResponse === undefined ? finalRef.current.item : finalResponse ?? undefined;
+  const timelineItems = paperclipRunnerTimelineItems(turnItems.map((item) =>
+    item.kind === "message" && item.id !== final?.id ? { ...item, interstitial: true } : item,
+  ));
   const currentActivityItems = currentActivityStatusItems(timelineItems);
   const timelineRows = groupImageResources(buildTurnTimelineRows(
     omitProgressRepeatedByResponse(timelineItems, final?.text),
-    !terminal,
+    !terminal && status !== "stopping",
+    Boolean(final),
   ));
 
   return (
-    <TaskChatShimmerScope items={items}><ToolCallProgressRunProvider runId={runId}><div
+    <RunnerReasoningDisplay><TaskChatShimmerScope items={items}><ToolCallProgressRunProvider runId={runId}><div
       className="flex min-w-0 flex-col"
       data-testid="task-chat-runner-turn"
       data-phase={status === "queued" ? "startup" : undefined}
@@ -331,15 +360,15 @@ export function TaskChatRunnerTurn({
           data-testid="task-chat-final-response"
         >
           <TaskChatBubble
-            item={{ ...final, authorName: agentName ?? undefined, agentIcon, agent, timestamp: final.timestamp ?? formatTaskChatTimestamp(final.atMs) }}
+            item={{ ...final, id: readReceipt?.id ?? final.id, createdAtIso: readReceipt?.createdAtIso ?? final.createdAtIso, authorName: agentName ?? undefined, agentIcon, agent, timestamp: final.timestamp ?? formatTaskChatTimestamp(final.atMs) }}
             animateEntry={false}
-            hideAgentIdentity={!continuedAfterSteering}
+            hideAgentIdentity
             actions={<TaskChatBubbleActions copyText={final.text} />}
           />
         </div>
       ) : null}
-      {!final && currentActivityItems.length === 0 && !(status === "queued" && runId && (waitingLabel || agentQueueWaitFor({ status, execution })))
+      {(!final || final.streaming) && currentActivityItems.length === 0 && !waitingLabel && !agentQueueWaitFor({ status, execution })
         ? <RunnerCurrentActivityTail status={status} waitingLabel={waitingLabel} /> : null}
-    </div></ToolCallProgressRunProvider></TaskChatShimmerScope>
+    </div></ToolCallProgressRunProvider></TaskChatShimmerScope></RunnerReasoningDisplay>
   );
 }

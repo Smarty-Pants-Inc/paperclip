@@ -199,6 +199,7 @@ function TaskChatBubbleContent({
     return (
       <TaskChatSystemNotice
         item={item}
+        actions={actions}
         onTryAgainNoLiveExecutionPath={onTryAgainNoLiveExecutionPath}
         tryAgainNoLiveExecutionPathPending={tryAgainNoLiveExecutionPathPending}
       />

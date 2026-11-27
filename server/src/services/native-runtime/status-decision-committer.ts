@@ -36,6 +36,7 @@ import { isConversation } from "../agent-conversations.js";
 import { hasPendingNativeChildCompletion, type NativeChildCompletionRecipient } from "./native-child-completion-delivery.js";
 import { and, asc, desc, eq, inArray, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { answeredContinuousHeldRun } from "./continuous-session-input.js";
 import type { CreateIssueThreadInteraction } from "@paperclipai/shared";
 import {
   agentWakeupRequests,
@@ -2051,6 +2052,9 @@ export async function commitNativeStatusDecision(input: {
           })) throw new NativeStatusRaceError();
       await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueMonitors);
     }
+    if (reasonCode === "continuous_held_input_already_answered" && !await answeredContinuousHeldRun(tx as unknown as Db, {
+      companyId: input.companyId, issueId: input.issueId, runId: input.runId,
+    })) throw new NativeStatusRaceError();
     // Recheck under the parent status lock: a child can finish between the
     // finalizer's read and this commit. Re-arbitrate instead of discarding its wake.
     if (input.requireNoPendingChildCompletion && await hasPendingNativeChildCompletion(
@@ -2381,7 +2385,7 @@ export async function commitNativeStatusDecision(input: {
       // no chat presentation authorization is supplied: this is Board-only.
       await issueService(tx as unknown as Db).addComment(
         input.issueId,
-        boardResponseWait.summary,
+        boardResponseWait.replyText,
         { agentId: boardResponseWait.source.agentId, runId: input.runId },
         undefined,
         tx,

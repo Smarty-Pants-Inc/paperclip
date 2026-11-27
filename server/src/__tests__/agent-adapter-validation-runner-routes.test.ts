@@ -230,7 +230,7 @@ describe("agent routes adapter validation: runner rollout and upgrades", () => {
       expect.objectContaining({
         adapterConfig: expect.objectContaining({
           provider: "codex",
-          model: "gpt-6.1-sol",
+          model: "claude-opus-5-5",
           codexPermissionMode: "never",
           // No stored lifecycle: the product default applies.
           paperclipSkillSync: { desiredSkills: ["company-1/reviewer"] },

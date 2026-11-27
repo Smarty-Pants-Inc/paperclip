@@ -11,7 +11,8 @@ export type ProviderPackIdentity = {
   schema: string;
   digest: string;
   payload: {
-    compatibility?: { opencode: number; acpx: number };
+    compatibility?: { opencode: number; acpx: number; pi_rpc?: number };
+    pi_rpc?: { version: string; runtime: { path: string; sha256: string }; resources: { path: string; sha256: string } };
     contractDigest?: string;
     acpxProfileDigests?: Record<string, string>;
     providers?: Record<string, unknown>;
@@ -29,7 +30,7 @@ export function providerPackIncompatible(check: string, detail: string): Error &
 }
 
 export type ProviderPackInstallation = { root: string; manifest: unknown; immutable: boolean };
-export type PackProvider = { kind: "opencode" } | { kind: "acpx"; agent: string };
+export type PackProvider = { kind: "opencode" } | { kind: "pi_rpc" } | { kind: "acpx"; agent: string };
 export type AdmittedProviderPackReceipt = {
   providerPackDigest: string;
   opencodeProxySha256: string;
@@ -46,6 +47,7 @@ export function toPackProvider(
 ): PackProvider | undefined {
   if (!provider) return undefined;
   if (provider.kind === "opencode") return { kind: "opencode" };
+  if (provider.kind === "pi_rpc") return { kind: "pi_rpc" };
   if (provider.kind === "acpx" && typeof provider.agent === "string" && provider.agent.length > 0) {
     return { kind: "acpx", agent: provider.agent };
   }
@@ -62,6 +64,9 @@ export function requiredProviderAssetNames(
 ): string[] | null {
   if (!provider) return null;
   if (provider.kind === "opencode") return [];
+  // Native Pi declares runtime/resources paths, not an ACPX asset selection.
+  // Keep its existing full-pack staging until a safe subset is declared.
+  if (provider.kind === "pi_rpc") return null;
   const agent = provider.agent;
   if (!SAFE_PROVIDER_ASSET_NAME.test(agent)) return null;
   if (manifest) {

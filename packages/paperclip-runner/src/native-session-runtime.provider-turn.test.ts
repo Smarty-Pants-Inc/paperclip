@@ -30,6 +30,12 @@ const input: NativeExecutionInputV1 = {
   credentialBindings: [],
 };
 
+const heldInput: NativeExecutionInputV1 = {
+  ...input,
+  session: { ...input.session, driverKind: "pi_rpc" },
+  provider: { kind: "pi_rpc", model: "test/pi", conversationMode: true },
+};
+
 const result: PrpStructuredRunResult = {
   schema: "paperclip.run_result.v1",
   reportedWorkDisposition: "done",
@@ -99,6 +105,7 @@ const restartCheckpoint: PersistedNativeSession = {
 };
 
 interface RestartContinuation {
+  output?: PrpEvent;
   onDisposition?: (push: (...values: Array<PrpEvent | "end">) => void) => void;
   recovery?: { checkpoint: PersistedNativeSession; snapshot: Partial<PersistedNativeSession>; replay?: PrpEvent[] };
 }
@@ -126,7 +133,8 @@ function harness(options: { withoutInterrupt?: boolean; restart?: RestartContinu
     if (!options.restart) return { turnId: "turn-1" };
     if (options.restart.recovery) return { turnId: "turn-fresh" };
     if (startTurn.mock.calls.length === 1) {
-      push(event("turn-continuation", "turn.started", { status: "inProgress" }), event("turn-continuation", "item.completed", usage),
+      push(event("turn-continuation", "turn.started", { status: "inProgress" }),
+        ...(options.restart.output ? [options.restart.output] : []), event("turn-continuation", "item.completed", usage),
         event("turn-continuation", "turn.completed", { status: "completed", error: null, awaitingProviderTurn: true }));
       return { turnId: "turn-continuation", borrowedDispositionMarker: true as const };
     }
@@ -172,6 +180,7 @@ function harness(options: { withoutInterrupt?: boolean; restart?: RestartContinu
 
 async function run(options: {
   stream: PrpEvent[];
+  executionInput?: NativeExecutionInputV1;
   after?: (control: ReturnType<typeof harness>, appended: PrpEvent[]) => Promise<void> | void;
   providerTurnWait?: ProviderTurnWaitOptions;
   turnTimeoutMs?: number;
@@ -197,7 +206,7 @@ async function run(options: {
   const capabilities = { resume: options.restart !== undefined, typedEvents: true, steering: false, interruption: true, structuredResult: true };
   const started = Date.now();
   const execution = executeNativeSession({
-    input,
+    input: options.executionInput ?? input,
     backend: { async descriptor() { return { kind: "mock", name: "provider-turn", version: "1", capabilities }; },
       async openSession() { return control.session; },
       ...(options.restart ? { async recoverSession() { return { recovered: true, session: control.session }; } } : {}) },
@@ -232,6 +241,89 @@ const types = (events: PrpEvent[]) => events.map(value => value.eventType);
 const waitFor = async (condition: () => boolean) => vi.waitFor(() => expect(condition()).toBe(true), { timeout: 5_000, interval: 5 });
 
 describe("the controller consumer with provider-started turn sequences", () => {
+  it.each([
+    ["delta", "item.delta", { kind: "agentMessage", text: "Provider output was shown." }],
+    ["old-stub", "item.completed", { answers: [], byteSize: 66888, truncated: true }],
+    ["tool-only", "tool.execution.completed", { output: "file written", operation: "execute" }],
+    ["file-edit-only", "tool.execution.completed", { output: "", operation: "edit", fileChanges: [{ path: "answer.txt" }] }],
+    ["native-file-edit", "item.completed", { kind: "fileChange", changes: [{ path: "answer.txt" }] }],
+    ["over-frame-final", "item.completed", { kind: "agentMessage", channel: "detail", transcriptOverflow: true, truncated: true }],
+  ] as const)("does not resubmit resultless output; only transcript overflow is a permanent failure (%s)", async (_name, eventType, payload) => {
+    const outcome = await run({ stream: [
+      event("turn-1", "turn.started", { status: "inProgress" }),
+      event("turn-1", eventType, payload),
+      event("turn-1", "turn.completed", { status: "completed", error: null }),
+    ] });
+    expect(outcome.outcome).toContain(_name === "over-frame-final"
+      ? "native_provider_output_without_result:" : "native_finalization_missing:");
+    expect(outcome.startTurn).toHaveBeenCalledTimes(1);
+    expect(outcome.completeRun).not.toHaveBeenCalled();
+  });
+
+  it("refuses old saved stub output before held Pi original-input resubmission", async () => {
+    const stub = event("old-turn", "item.completed", { answers: [], byteSize: 66888, truncated: true });
+    const checkpoint = { ...restartCheckpoint, driverKind: "pi_rpc" as const, terminalTurns: [] };
+    const outcome = await run({ stream: [], executionInput: heldInput, restart: { recovery: {
+      checkpoint, snapshot: { ...checkpoint, dispositionOnlyRecoveryConsumed: false }, replay: [stub],
+    } } });
+    expect(outcome.outcome).toContain("native_provider_output_without_result:");
+    expect(outcome.startTurn).not.toHaveBeenCalled();
+  });
+
+  it.each(["codex", "pi_rpc"] as const)("restores a saved final before the output fence (%s), never submitting again", async kind => {
+    const final = event("old-turn", "item.completed", { kind: "agentMessage", channel: "final", text: "Already published.", answers: [] });
+    const terminal = event("old-turn", "turn.completed", { status: "completed", error: null });
+    const checkpoint = { ...restartCheckpoint, terminalTurns: [completedTerminal("old-turn")] };
+    const outcome = await run({ stream: [], executionInput: { ...input,
+      session: { ...input.session, driverKind: kind === "pi_rpc" ? "pi_rpc" : "codex_app_server" },
+      provider: kind === "pi_rpc" ? { kind, model: "test/pi", conversationMode: true } : { kind, model: null } },
+      restart: { recovery: { checkpoint, snapshot: checkpoint, replay: [final, terminal] } },
+      missingResult: ({ terminalEvent }) => terminalEvent.sourceEventId === terminal.sourceEventId ? result : null });
+    expect(outcome.outcome).toBe("finalized");
+    expect(outcome.startTurn).not.toHaveBeenCalled();
+    expect(outcome.completeRun).toHaveBeenCalledOnce();
+    expect(outcome.resolveMissingResult).toHaveBeenCalledOnce();
+  });
+
+  it.each(["tool.execution.completed", "item.completed"] as const)("refuses saved tool/file-only output before held Pi original-input resubmission (%s)", async eventType => {
+    const saved = event("old-turn", eventType, eventType === "item.completed"
+      ? { kind: "fileChange", changes: [{ path: "answer.txt" }] } : { output: "", operation: "edit" });
+    const checkpoint = { ...restartCheckpoint, driverKind: "pi_rpc" as const, terminalTurns: [] };
+    const outcome = await run({ stream: [], executionInput: heldInput, restart: { recovery: {
+      checkpoint, snapshot: { ...checkpoint, dispositionOnlyRecoveryConsumed: false }, replay: [saved],
+    } } });
+    expect(outcome.outcome).toContain("native_provider_output_without_result:");
+    expect(outcome.startTurn).not.toHaveBeenCalled();
+    expect(outcome.completeRun).not.toHaveBeenCalled();
+  });
+
+  it("allows stock disposition after a tool-only continuation without resending the task", async () => {
+    const outcome = await run({ stream: [], restart: {
+      output: event("turn-continuation", "tool.execution.completed",
+        { output: "", operation: "edit", fileChanges: [{ path: "once.txt" }] }),
+      onDisposition: push => push(event("turn-disposition", "turn.started"),
+        event("turn-disposition", "run.result.proposed", result as unknown as Record<string, unknown>),
+        event("turn-disposition", "turn.completed", { status: "completed", error: null })),
+    }, providerTurnWait: { capMs: 20 } });
+    expect(outcome.outcome).toBe("finalized");
+    expect(outcome.startTurn).toHaveBeenCalledTimes(2);
+    const disposition = JSON.parse(outcome.startTurn.mock.calls[1]![0].message.text);
+    expect(disposition.task.prompt).toContain("Do not repeat completed work");
+    expect(disposition.task.prompt).not.toContain(input.task.prompt);
+    expect(outcome.completeRun).toHaveBeenCalledOnce();
+  });
+
+  it.each([70_000, 300_000])("settles a complete large answer without a recovery submission (%i)", async size => {
+    const answer = "word ".repeat(size / 5);
+    const final = event("turn-1", "item.completed", { kind: "agentMessage", channel: "final", text: answer, answers: [] });
+    const outcome = await run({ stream: [event("turn-1", "turn.started"), final,
+      event("turn-1", "turn.completed", { status: "completed", error: null })], missingResult: () => result });
+    expect(outcome.outcome).toBe("finalized");
+    expect(outcome.appended.find(value => value === final || value.sourceEventId === final.sourceEventId)?.payload.text).toBe(answer);
+    expect(outcome.startTurn).toHaveBeenCalledTimes(1);
+    expect(outcome.completeRun).toHaveBeenCalledTimes(1);
+  });
+
   it("finalizes a no-result turn exactly as before when the Runner did not await", async () => {
     const outcome = await run({ stream: [...turnOne(false), ...providerTurn("provider-1", { result: true })] });
     expect(outcome.outcome).toContain("native_finalization_missing");

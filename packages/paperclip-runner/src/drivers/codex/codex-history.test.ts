@@ -4,11 +4,65 @@ import {
   readCodexThreadState,
   readCodexTurnMetadata,
   readCodexTurnItems,
+  readCodexUserMessages,
+  readCodexUserInputIds,
 } from "./codex-history.js";
 
 const unsupported = (method: string) => new CodexRpcError(`${method} is not supported`, CODEX_METHOD_NOT_FOUND);
 
 describe("Codex paginated history", () => {
+  it.each([
+    ["messages", readCodexUserMessages, ["retained Pi input"]],
+    ["inputIds", readCodexUserInputIds, ["pi-input-id"]],
+  ] as const)("uses proxy %s without requesting Codex history", async (_field, read, expected) => {
+    const request = vi.fn().mockResolvedValue({ messages: ["retained Pi input"], inputIds: ["pi-input-id"] });
+    expect(await read({ request }, "thread")).toEqual(expected);
+    expect(request).toHaveBeenCalledExactlyOnceWith("paperclip/userInputs/read", { threadId: "thread" });
+  });
+  it.each([readCodexUserMessages, readCodexUserInputIds])("preserves unknown proxy input evidence as null", async read => {
+    const request = vi.fn().mockResolvedValue({ messages: null, inputIds: null });
+    expect(await read({ request }, "thread")).toBeNull();
+    expect(request).toHaveBeenCalledExactlyOnceWith("paperclip/userInputs/read", { threadId: "thread" });
+  });
+  it.each([readCodexUserMessages, readCodexUserInputIds])("does not fall back when the proxy read fails for an open-thread error", async read => {
+    const request = vi.fn().mockRejectedValue(new CodexRpcError("Pi thread is not open", -32000));
+    await expect(read({ request }, "thread")).rejects.toThrow("Pi thread is not open");
+    expect(request).toHaveBeenCalledExactlyOnceWith("paperclip/userInputs/read", { threadId: "thread" });
+  });
+  it("falls back on method-not-found to retained user history, including failed-turn steering, not assistant echoes", async () => {
+    const request = vi.fn().mockRejectedValueOnce(unsupported("paperclip/userInputs/read")).mockResolvedValueOnce({ data: [{ id: "one", status: "failed" }] })
+      .mockResolvedValueOnce({ data: [
+        { turnId: "one", item: { id: "c", type: "userMessage", content: [{ type: "text", text: "C" }] } },
+        { turnId: "one", item: { id: "a", type: "agentMessage", text: "D" } },
+      ] });
+    expect(await readCodexUserMessages({ request }, "thread")).toEqual(["C"]);
+    expect(request.mock.calls.map(call => call[0])).toEqual([
+      "paperclip/userInputs/read", "thread/turns/list", "thread/items/list",
+    ]);
+  });
+  it("does not infer a user entry from incomplete provider history", async () => {
+    const request = vi.fn().mockRejectedValueOnce(unsupported("paperclip/userInputs/read")).mockResolvedValueOnce({ data: [{ id: "one", status: "failed" }] })
+      .mockResolvedValueOnce({ data: [{ turnId: "one", item: { id: "c", type: "userMessage" } }] });
+    expect(await readCodexUserMessages({ request }, "thread")).toBeNull();
+  });
+  it("certifies only provider-retained user correlation IDs, not matching text, item ids or assistant echoes", async () => {
+    const request = vi.fn().mockRejectedValueOnce(unsupported("paperclip/userInputs/read")).mockResolvedValueOnce({ data: [{ id: "one", status: "failed" }] })
+      .mockResolvedValueOnce({ data: [
+        { turnId: "one", item: { id: "entry-1", type: "userMessage", correlationId: "card-id", content: [{ type: "text", text: "K" }] } },
+        { turnId: "one", item: { id: "copy-id", type: "userMessage", content: [{ type: "text", text: "K" }] } },
+        { turnId: "one", item: { id: "one:steer:ack-only-id", type: "userMessage", content: [{ type: "text", text: "K" }] } },
+        { turnId: "one", item: { id: "assistant", type: "agentMessage", correlationId: "echo-id", text: "K" } },
+      ] });
+    expect(await readCodexUserInputIds({ request }, "thread")).toEqual(["card-id"]);
+    expect(request.mock.calls.map(call => call[0])).toEqual([
+      "paperclip/userInputs/read", "thread/turns/list", "thread/items/list",
+    ]);
+  });
+  it("does not certify identity from legacy retained text alone", async () => {
+    const request = vi.fn().mockRejectedValueOnce(unsupported("paperclip/userInputs/read")).mockResolvedValueOnce({ data: [{ id: "one", status: "failed" }] })
+      .mockResolvedValueOnce({ data: [{ turnId: "one", item: { id: "c", type: "userMessage", content: [{ type: "text", text: "C" }] } }] });
+    expect(await readCodexUserInputIds({ request }, "thread")).toEqual([]);
+  });
   it("reads state without hydrating history", async () => {
     const request = vi.fn().mockResolvedValue({ thread: { id: "thread" } });
     await readCodexThreadState({ request }, "thread");

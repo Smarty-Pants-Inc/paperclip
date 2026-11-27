@@ -33,7 +33,8 @@ import { clearLegacyChatMessageRequests } from "@/lib/chat-message-request";
 import { agentChatDraft } from "@/lib/agent-chat-draft";
 import { captureAgentChatMessageSent } from "@/lib/analytics/onboarding-analytics";
 import { trackRecentProject } from "@/lib/recent-projects";
-import { ExecutionBlockerNotice } from "../components/ExecutionBlockerNotice";
+import { ExecutionBlockerNotice, isConversationRecovery } from "../components/ExecutionBlockerNotice";
+import { WorkspaceReconstructionRecovery } from "../components/WorkspaceReconstructionRecovery";
 import type { TaskComposerPause } from "../components/task-chat/TaskChatPausedTakeover";
 import { TaskDetailTasksPanel } from "@/components/task-detail/TaskDetailTasksPanel";
 import { IssueCreatedFromNote } from "@/components/task-detail/IssueCreatedFromNote";
@@ -235,6 +236,7 @@ import {
   type IssueChatRunFinalizationAction,
 } from "../components/IssueChatThread";
 import { TaskChatThread } from "../components/TaskChatThread";
+import { QUEUED_MESSAGE_AUTO_STEER_DELAY_MS } from "../components/task-chat/queued-message-auto-steer";
 import { hasVisibleRunAnswer } from "@/lib/run-answer-visibility";
 import type { TaskChatIssueBrief } from "../components/task-chat/TaskChatDescriptionBubble";
 import { useClassicTaskInterfaceEnabled } from "../hooks/useClassicTaskInterfaceEnabled";
@@ -483,6 +485,24 @@ type IssueDetailComment = (IssueComment | OptimisticIssueComment) & {
   conversationAnchorAt?: Date | string | null;
   conversationAnchorSequence?: number;
 };
+
+// First snapshot wins; authoritative rows replace echoes, never their render keys.
+function reconcileThreadComments(comments: readonly IssueDetailComment[]): IssueDetailComment[] {
+  const byId = new Map<string, IssueDetailComment>();
+  const byRequest = new Map<string, IssueDetailComment>();
+  for (const comment of comments) {
+    const key = comment.clientRequestId ? JSON.stringify([comment.authorUserId, comment.clientRequestId]) : null;
+    const previous = byId.get(comment.id) ?? (key ? byRequest.get(key) : undefined);
+    const saved = previous && !previous.id.startsWith("optimistic-") ? previous : comment;
+    const echo = "clientId" in comment && comment.clientId ? comment : previous;
+    const clientId = echo && "clientId" in echo ? echo.clientId : undefined;
+    const canonical = { ...saved, ...(clientId ? { clientId, createdAt: echo!.createdAt } : {}) };
+    if (previous) byId.delete(previous.id);
+    byId.set(canonical.id, canonical);
+    if (key) byRequest.set(key, canonical);
+  }
+  return [...byId.values()];
+}
 
 function isPlanConfirmationInteraction(
   interaction: IssueThreadInteraction,
@@ -1225,6 +1245,8 @@ function InboxMobileToolbar({
 }
 
 type IssueDetailChatTabProps = {
+  onFailureNoticeChange?: (runId: string | null) => void;
+  queuedMessageAutoSteerDelayMs?: number | null;
   executionBlocked?: boolean;
   interruption?: Issue["interruption"];
   retryPreparing?: boolean;
@@ -1344,6 +1366,9 @@ type IssueDetailChatTabProps = {
   onDeleteComment?: (commentId: string) => Promise<void> | void;
   onPauseWorkRun?: (runId: string, feedback?: "composer") => Promise<void>;
   onStopResponse?: (runId: string) => Promise<void>;
+  onRestoreStoppedMessages?: (commentIds: readonly string[], availableComments?: readonly IssueDetailComment[]) => Promise<boolean>;
+  restoredStoppedCommentIds: ReadonlySet<string>;
+  onRestoreReady?: () => void;
   stopResponsePending?: boolean;
   pauseWorkPending?: boolean;
   pauseWorkScope?: "leaf" | "subtree";
@@ -1393,6 +1418,7 @@ type IssueDetailChatTabProps = {
 const DesignSandboxTaskThread = lazy(() => import("../components/design-sandbox/DesignSandboxTaskThread"));
 
 const IssueDetailChatTab = memo(function IssueDetailChatTab({
+  queuedMessageAutoSteerDelayMs,
   executionBlocked,
   interruption,
   retryPreparing,
@@ -1479,6 +1505,9 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   onDeleteComment,
   onPauseWorkRun,
   onStopResponse,
+  onRestoreStoppedMessages,
+  restoredStoppedCommentIds,
+  onRestoreReady,
   stopResponsePending,
   pauseWorkPending,
   pauseWorkScope,
@@ -1501,6 +1530,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   resumeAssigneePending,
   onTryAgainNoLiveExecutionPath,
   tryAgainNoLiveExecutionPathPending,
+  onFailureNoticeChange,
   externalReferences,
   linkCaseReferences,
 }: IssueDetailChatTabProps) {
@@ -1622,8 +1652,6 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       string,
       {
         targetRunId: string;
-        anchorAt: string;
-        sequence: number;
         comment?: IssueDetailComment;
       }
     >
@@ -1672,10 +1700,15 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     [...queryKeys.issues.runs(issueQueryRef), "comment-window"], observedRunIds,
     ids => activityApi.runsByIdsForIssue(issueQueryRef, ids), !!issueId && !!conversationMode && !historyExpanded,
   );
-  const linkedRuns = useMemo(() => [...new Map([
-    ...(Array.isArray(linkedRunHistory) ? linkedRunHistory : linkedRunHistory?.runs ?? []),
-    ...(conversationMode && !historyExpanded ? commentRuns.data ?? [] : []),
-  ].map(run => [run.runId, run])).values()], [linkedRunHistory, conversationMode, historyExpanded, commentRuns.data]);
+  const linkedRuns = useMemo(() => {
+    const history = Array.isArray(linkedRunHistory) ? linkedRunHistory : linkedRunHistory?.runs ?? [];
+    const byId = new Map(history.map(run => [run.runId, run]));
+    // Batches fill older runs, but must not overwrite the every-second poll's receipts.
+    for (const run of conversationMode && !historyExpanded ? commentRuns.data ?? [] : []) {
+      if (!byId.has(run.runId)) byId.set(run.runId, run);
+    }
+    return [...byId.values()];
+  }, [linkedRunHistory, conversationMode, historyExpanded, commentRuns.data]);
   const earlierRun = Array.isArray(linkedRunHistory) ? undefined : linkedRunHistory?.earlierRun;
   const hasEarlierRuns = !Array.isArray(linkedRunHistory) && linkedRunHistory?.hasEarlierRuns === true && !(
     earlierRun?.status === "succeeded" && hasVisibleRunAnswer(comments, earlierRun.runId, earlierRun.resultJson)
@@ -1748,17 +1781,26 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     if (resolvedActiveRun) ids.add(resolvedActiveRun.id);
     return ids;
   }, [resolvedActiveRun, resolvedLiveRuns]);
-  const timelineRuns = useMemo(() => {
-    const historicalRuns =
-      liveRunIds.size === 0
-        ? resolvedLinkedRuns
-        : resolvedLinkedRuns.filter((run) => !liveRunIds.has(run.runId));
-    return historicalRuns.map((run) => ({
-      ...run,
-      adapterType: run.adapterType,
-      hasStoredOutput: (run.logBytes ?? 0) > 0,
-    }));
-  }, [liveRunIds, resolvedLinkedRuns]);
+  // The live-run records keep their first execution projection between status
+  // events; the run history the page polls every second while live has the
+  // current execution and runtime mode. Both status and transcript selection need them.
+  const polledRunMetaById = useMemo(() => new Map((Array.isArray(linkedRunHistory) ? linkedRunHistory : linkedRunHistory?.runs ?? []).map((run) => [run.runId, {
+    ...(run.execution ? { execution: run.execution } : {}),
+    ...(run.runtimeMode ? { runtimeMode: run.runtimeMode } : {}),
+  }])), [linkedRunHistory]);
+  const freshLiveRuns = useMemo(() => resolvedLiveRuns.map((run) =>
+    polledRunMetaById.has(run.id) ? { ...run, ...polledRunMetaById.get(run.id) } : run),
+  [resolvedLiveRuns, polledRunMetaById]);
+  const freshActiveRun = resolvedActiveRun && polledRunMetaById.has(resolvedActiveRun.id)
+    ? { ...resolvedActiveRun, ...polledRunMetaById.get(resolvedActiveRun.id) } : resolvedActiveRun;
+  // The thread also needs the polled reply/input receipts while a run is live.
+  // It merges these records with liveRuns by ID; dropping them until settlement
+  // withholds answer ownership and changes the conversation when the hold ends.
+  const timelineRuns = useMemo(() => resolvedLinkedRuns.map((run) => ({
+    ...run,
+    adapterType: run.adapterType,
+    hasStoredOutput: (run.logBytes ?? 0) > 0,
+  })), [resolvedLinkedRuns]);
   const commentsWithRunMeta = useMemo<IssueDetailComment[]>(() => {
     const activeRunStartedAt =
       interruptibleIssueRun?.startedAt ??
@@ -1854,11 +1896,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         });
       }
     }
-    // Same-turn steering has a durable PRP acknowledgement and a matching
-    // activity fact keyed by commentId/targetRunId. Its acknowledgement time,
-    // not the comment submission time, is the causal conversation slot. Use
-    // only the first acknowledgement; an idempotent replay emits a diagnostic
-    // activity row with duplicate=true but must not move the message later.
+    // A steering bubble enters the conversation at its delivery receipt, not
+    // while it is queued. Duplicate receipts must not move that boundary.
     const steeringEvents = resolvedActivity
       .filter((evt) => evt.action === "issue.queued_comment_steered")
       .sort(
@@ -1876,10 +1915,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
           ? details["targetRunId"]
           : null;
       if (!commentId || !targetRunId) continue;
-      const anchorAt =
-        evt.createdAt instanceof Date
-          ? evt.createdAt.toISOString()
-          : evt.createdAt;
+      const anchorAt = new Date(evt.createdAt).toISOString();
       const anchorMs = new Date(anchorAt).getTime();
       if (!Number.isFinite(anchorMs)) continue;
       const sequence = steeringSequenceByRunId.get(targetRunId) ?? 0;
@@ -1911,17 +1947,6 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
           kind: "run_start",
           queueIds: new Set(authoritativeQueuedCommentQueue.queueId ? [authoritativeQueuedCommentQueue.queueId] : []),
         });
-      });
-    }
-    for (const [commentId, placement] of localSteeringPlacements) {
-      if (inputPlacementByCommentId.has(commentId)) continue;
-      inputPlacementByCommentId.set(commentId, {
-        runId: placement.targetRunId,
-        anchorAt: placement.anchorAt,
-        sequence: placement.sequence,
-        anchorMs: new Date(placement.anchorAt).getTime(),
-        kind: "steer",
-        queueIds: new Set(),
       });
     }
     for (const evt of resolvedActivity) {
@@ -2079,7 +2104,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         return nextComment;
       }
       if (
-        isQueuedIssueComment({
+        nextComment.authorType !== "system" && isQueuedIssueComment({
           comment: nextComment,
           activeRunStartedAt,
           activeRunAgentId: interruptibleIssueRun?.agentId ?? null,
@@ -2238,7 +2263,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
               ) &&
               deliveredCommentRunIds.get(entry.comment.id) !==
                 authoritativeQueuedCommentQueue.targetRunId,
-          ),
+          ).sort((a, b) => a.position - b.position ||
+            new Date(a.comment.createdAt).getTime() - new Date(b.comment.createdAt).getTime()),
         }
       : null;
     const pendingComments = commentsWithRunMeta.flatMap((comment) => {
@@ -2263,7 +2289,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       // later message. A request still in flight keeps its original target.
       if (targetRunId && !liveRunIds.has(targetRunId) && !comment.id.startsWith("optimistic-")) return [];
       return targetRunId ? [{ comment, targetRunId }] : [];
-    });
+    }).sort((a, b) => new Date(a.comment.createdAt).getTime() - new Date(b.comment.createdAt).getTime());
     const fallbackProtocol =
       liveRuntimeRun?.adapterType === "paperclip_runner" ||
       (!liveRuntimeRun && assigneeUsesPaperclipRunner)
@@ -2287,46 +2313,76 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     locallyQueuedCommentRunIds,
     queuedCommentQueueEnabled,
   ]);
-  const visibleQueuedCommentQueue = useMemo(() => {
-    if (!effectiveQueuedCommentQueue) return null;
-    const entries = effectiveQueuedCommentQueue.entries
-      .filter(entry => !startingCommentIds.has(entry.comment.id))
-      .map((entry, position) => ({ ...entry, position }));
-    return entries.length ? { ...effectiveQueuedCommentQueue, entries } : null;
-  }, [effectiveQueuedCommentQueue, startingCommentIds]);
-  const commentsForThread = useMemo(
-    () =>
-      [...commentsWithRunMeta, ...(authoritativeQueuedCommentQueue?.entries ?? [])
-        .filter(entry => startingCommentIds.has(entry.comment.id) &&
-          !commentsWithRunMeta.some(comment => comment.id === entry.comment.id))
-        .map((entry): IssueDetailComment => entry.comment)].flatMap((comment) => {
-        if (discardedQueuedCommentIds.has(comment.id)) return [];
-        if (!consumedQueuedCommentIds.has(comment.id) && !startingCommentIds.has(comment.id)) return [comment];
-        return [
-          {
-            ...comment,
-            ...(!comment.consumedByRunId && localInterruptPlacements.has(comment.id)
-              ? {
-                  conversationAnchorAt: localInterruptPlacements.get(comment.id)!.anchorAt,
-                  conversationAnchorSequence: localInterruptPlacements.get(comment.id)!.sequence,
-                }
-              : {}),
-            clientStatus: undefined,
-            queueState: undefined,
-            queueTargetRunId: null,
-            queueReason: undefined,
-          },
-        ];
-      }),
-    [
-      commentsWithRunMeta,
-      consumedQueuedCommentIds,
-      discardedQueuedCommentIds,
-      localInterruptPlacements,
-      authoritativeQueuedCommentQueue,
-      startingCommentIds,
-    ],
-  );
+  const [retainedSubmissionId, setRetainedSubmissionId] = useState<string | null>(null);
+  // Retain committed rows independently of queue/history refresh order.
+  const paintedComments = useRef({ issueId, rows: [] as IssueDetailComment[] });
+  if (paintedComments.current.issueId !== issueId) paintedComments.current = { issueId, rows: [] };
+  // One placement projection. A queue record is transport state, not a request
+  // to wait: this composer offers Send, not Wait. Ordinary human sends belong
+  // in the thread; interaction queues retain their existing tray controls.
+  // Keep transport entries for auto-steer, without letting either child infer
+  // placement from clientStatus. Only this owner retains committed thread rows.
+  const { visibleQueuedCommentQueue, commentsForThread, sentCommentIds, hiddenThreadCommentIds, hiddenQueuedCommentIds } = useMemo(() => {
+    // Stop asks for restoration; only the box's durable receipt hides a row.
+    const returnedIds = new Set<string>();
+    const deliveredIds = new Set(resolvedLinkedRuns.flatMap(run => Object.keys(run.resultJson?.queuedSteeringAcknowledgements ?? {})));
+    const queueEntries = [...(effectiveQueuedCommentQueue?.entries ?? []), ...(effectiveQueuedCommentQueue?.pendingQueue?.entries ?? [])];
+    const retained = paintedComments.current.rows;
+    const canonicalComments = reconcileThreadComments([
+      ...commentsWithRunMeta, ...queueEntries.map(entry => entry.comment), ...retained,
+    ]);
+    for (const comment of canonicalComments) {
+      if (restoredStoppedCommentIds.has(`${issueId}:${comment.id}`)) returnedIds.add(comment.id);
+    }
+    const queuedIds = new Set(queueEntries.map(entry => entry.comment.id));
+    // The tray is part of THIS person's composer, never an agent/bridge inbox.
+    const hiddenQueuedCommentIds = new Set(queueEntries.filter(entry =>
+      entry.comment.authorType !== "user" || !currentUserId || entry.comment.authorUserId !== currentUserId).map(entry => entry.comment.id));
+    const byId = new Map(canonicalComments.map(comment => [comment.id, comment]));
+    const interactionIds = new Set(queueEntries.filter(entry => entry.source).map(entry => entry.comment.id));
+    const sentCommentIds = new Set<string>();
+    const hiddenThreadCommentIds = new Set<string>();
+    const commentsForThread = [...byId.values()].flatMap((comment): IssueDetailComment[] => {
+      // Send ownership is a property of the message, not its viewer or whether
+      // this mount has painted it. Identical queue/history snapshots must give
+      // the same thread after reload and in another person's tab.
+      const sent = (comment.authorType === "user" &&
+        !interactionIds.has(comment.id) && !comment.id.startsWith("interaction-response:")) ||
+        deliveredIds.has(comment.id) || consumedQueuedCommentIds.has(comment.id) || startingCommentIds.has(comment.id) || Boolean(comment.steeredIntoRunId);
+      if (sent) { sentCommentIds.add(comment.id); hiddenQueuedCommentIds.add(comment.id); }
+      if (discardedQueuedCommentIds.has(comment.id)) return [];
+      if (returnedIds.has(comment.id) || (!sent && queuedIds.has(comment.id)) ||
+        (comment.id.startsWith("optimistic-") && comment.clientRequestId === retainedSubmissionId)) hiddenThreadCommentIds.add(comment.id);
+      if (!sent) return [comment];
+      const placement = localInterruptPlacements.get(comment.id);
+      return [{ ...comment,
+        ...(!comment.consumedByRunId && placement ? {
+          conversationAnchorAt: placement.anchorAt, conversationAnchorSequence: placement.sequence,
+        } : {}),
+        clientStatus: undefined, queueState: undefined, queueTargetRunId: null, queueReason: undefined,
+      }];
+    });
+    const keepEntry = (entry: (typeof queueEntries)[number]) => byId.has(entry.comment.id) && !returnedIds.has(entry.comment.id) && !deliveredIds.has(entry.comment.id) &&
+      !discardedQueuedCommentIds.has(entry.comment.id) && !startingCommentIds.has(entry.comment.id) &&
+      (!classicTaskInterfaceEnabled || !hiddenQueuedCommentIds.has(entry.comment.id));
+    const visibleQueuedCommentQueue = effectiveQueuedCommentQueue ? {
+      ...effectiveQueuedCommentQueue,
+      entries: effectiveQueuedCommentQueue.entries.filter(keepEntry),
+      pendingQueue: effectiveQueuedCommentQueue.pendingQueue ? {
+        ...effectiveQueuedCommentQueue.pendingQueue,
+        entries: effectiveQueuedCommentQueue.pendingQueue.entries.filter(keepEntry),
+      } : null,
+    } : null;
+    return { visibleQueuedCommentQueue, commentsForThread, sentCommentIds, hiddenThreadCommentIds, hiddenQueuedCommentIds };
+  }, [effectiveQueuedCommentQueue, commentsWithRunMeta, resolvedLinkedRuns, discardedQueuedCommentIds,
+    consumedQueuedCommentIds, startingCommentIds, localInterruptPlacements, retainedSubmissionId, currentUserId, classicTaskInterfaceEnabled, issueId, restoredStoppedCommentIds]);
+  useLayoutEffect(() => {
+    paintedComments.current.rows = commentsForThread.filter(comment =>
+      !comment.id.startsWith("optimistic-") && !comment.deletedAt && !hiddenThreadCommentIds.has(comment.id));
+  }, [commentsForThread, hiddenThreadCommentIds]);
+  const restoreVisibleStoppedMessages = useCallback((ids: readonly string[]) =>
+    onRestoreStoppedMessages?.(ids, commentsForThread) ?? Promise.resolve(false),
+  [onRestoreStoppedMessages, commentsForThread]);
 
   const storeQueuedCommentQueue = useCallback(
     (value: unknown) => {
@@ -2428,23 +2484,13 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         throw new Error(
           "The queued message no longer has an active run target.",
         );
-      const anchorAt = new Date().toISOString();
-      setLocalSteeringPlacements((current) => {
+      const queuedComment = effectiveQueuedCommentQueue.entries.find(entry => entry.comment.id === commentId)?.comment;
+      if (!queuedComment) throw new Error("The queued message is no longer available.");
+      const acknowledgeSteeringPlacement = () => setLocalSteeringPlacements((current) => {
         const next = new Map(current);
-        const sequence = [...current.values()].filter(
-          (placement) => placement.targetRunId === targetRunId,
-        ).length;
-        next.set(commentId, {
-          targetRunId,
-          anchorAt,
-          sequence,
-          comment: effectiveQueuedCommentQueue?.entries.find(
-            (entry) => entry.comment.id === commentId,
-          )?.comment,
-        });
+        next.set(commentId, { targetRunId, comment: queuedComment });
         return next;
       });
-      setConsumedQueuedCommentIds((current) => new Set(current).add(commentId));
       try {
         const nextQueue = await issuesApi.steerQueuedComment(
           issueId,
@@ -2455,8 +2501,10 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             revision,
           },
         );
-        // The local placement bridges the durable receipt refresh. Release the
-        // control as soon as delivery is acknowledged, even on a slow refetch.
+        // Retain the submitted input while the durable receipt refreshes. Only
+        // that receipt, never the POST callback's clock, places it in the thread.
+        acknowledgeSteeringPlacement();
+        setConsumedQueuedCommentIds((current) => new Set(current).add(commentId));
         storeQueuedCommentQueue(nextQueue);
         void Promise.all([
           queryClient.invalidateQueries({
@@ -2477,6 +2525,14 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
           next.delete(commentId);
           return next;
         });
+        // A definitive refusal returns the person's send through the existing
+        // cancel/restore door. Conflicts may mean delivery won the race.
+        const refusal = error instanceof ApiError ? error.body as { code?: string; details?: { code?: string } } | null : null;
+        const refusedSteering = (refusal?.code ?? refusal?.details?.code) === "steering_unsupported";
+        if (queuedComment.authorUserId === currentUserId && sentCommentIds.has(commentId) && error instanceof ApiError &&
+          error.status >= 400 && error.status < 500 && (error.status !== 409 || refusedSteering)) {
+          onCancelQueued(commentId);
+        }
         await refreshQueueAfterConflict(error);
       }
     },
@@ -2487,6 +2543,9 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       queryClient,
       refreshQueueAfterConflict,
       storeQueuedCommentQueue,
+      sentCommentIds,
+      currentUserId,
+      onCancelQueued,
     ],
   );
 
@@ -2500,17 +2559,17 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       const ids = queuedComments.map((comment) => comment.id);
       const anchorAt = new Date().toISOString();
       setClassicQueuedDeliveryError(null);
-      setConsumedQueuedCommentIds((current) => new Set([...current, ...ids]));
-      setLocalInterruptPlacements((current) => {
-        const next = new Map(current);
-        queuedComments.forEach((comment, sequence) => {
-          next.set(comment.id, { anchorAt, sequence, comment });
-        });
-        return next;
-      });
       try {
         const updatedQueue = await onInterruptQueued(runId);
-        if (updatedQueue?.state === "deferred" && !isQueuedInterruptHandoff(updatedQueue)) {
+        setConsumedQueuedCommentIds((current) => new Set([...current, ...ids]));
+        setLocalInterruptPlacements((current) => {
+          const next = new Map(current);
+          queuedComments.forEach((comment, sequence) => {
+            next.set(comment.id, { anchorAt, sequence, comment });
+          });
+          return next;
+        });
+        if ((updatedQueue?.state === "queued" || updatedQueue?.state === "deferred") && !isQueuedInterruptHandoff(updatedQueue)) {
           const remaining = new Set(updatedQueue.entries.map(entry => entry.comment.id));
           setConsumedQueuedCommentIds(current => new Set([...current].filter(id => !remaining.has(id))));
           setLocalInterruptPlacements(current => new Map([...current].filter(([id]) => !remaining.has(id))));
@@ -2549,7 +2608,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
 
   const discardQueuedComment = useCallback(
     async (commentId: string, revision: string) => {
-      const queueId = effectiveQueuedCommentQueue?.queueId;
+      const queueId = effectiveQueuedCommentQueue?.entries.some(entry => entry.comment.id === commentId)
+        ? effectiveQueuedCommentQueue.queueId : null;
       try {
         if (queueId) {
           storeQueuedCommentQueue(
@@ -2607,7 +2667,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       }
     },
     [
-      effectiveQueuedCommentQueue?.queueId,
+      effectiveQueuedCommentQueue,
       issueId,
       onRemoveCommentFromCache,
       pushToast,
@@ -2674,8 +2734,10 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
           <EmailThreadProvider companyId={companyId} issueId={issueId}>
           <TaskTranscriptAgents.Provider value={conversationMode ? null : agentMap}>
           <ThreadComponent
+            queuedMessageAutoSteerDelayMs={queuedMessageAutoSteerDelayMs}
             {...(!classicTaskInterfaceEnabled ? {
               compactHistory: !historyExpanded,
+              onFailureNoticeChange,
               onExpandHistory: conversationMode ? undefined : onExpandHistory,
               scrollingHistory,
               historyControl: conversationMode ? null : !historyExpanded && (hasEarlierMessages || hasEarlierRuns) ? (
@@ -2725,6 +2787,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
               if (activeRunQueryEnabled) void refetchActiveRun();
             }}
             composerRef={composerRef}
+            onRestoreStoppedMessages={restoreVisibleStoppedMessages}
             composerAccessory={<><WorkspaceRetryControl />{composerAccessory}</>}
             threadHeader={
               !classicTaskInterfaceEnabled &&
@@ -2736,7 +2799,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
               ) : null
             }
             issueBrief={issueBrief}
-            comments={commentsForThread}
+            comments={classicTaskInterfaceEnabled ? commentsForThread.filter(comment => !hiddenThreadCommentIds.has(comment.id)) : commentsForThread}
             interactions={interactions}
             documents={documents}
             workProducts={workProducts}
@@ -2753,8 +2816,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             }
             timelineEvents={timelineEvents}
             workModeChanges={workModeChanges}
-            liveRuns={resolvedLiveRuns}
-            activeRun={resolvedActiveRun}
+            liveRuns={freshLiveRuns}
+            activeRun={freshActiveRun}
             issueId={issueId}
             blockedBy={blockedBy ?? []}
             liveIssueIds={liveIssueIds}
@@ -2807,6 +2870,11 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             onAttachImage={onAttachImage}
             onInterruptQueued={interruptQueuedComments}
             queuedCommentQueue={visibleQueuedCommentQueue}
+            sentCommentIds={sentCommentIds}
+            hiddenThreadCommentIds={hiddenThreadCommentIds}
+            hiddenQueuedCommentIds={hiddenQueuedCommentIds}
+            onRetainedSubmissionChange={setRetainedSubmissionId}
+            onRestoreReady={onRestoreReady}
             onEditQueuedComment={editQueuedComment}
             onReorderQueuedComments={reorderQueuedComments}
             onSteerQueuedComment={steerQueuedComment}
@@ -3380,6 +3448,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   const commentComposerRef = useRef<IssueChatComposerHandle | null>(null);
   const cancelledQueuedOptimisticCommentIdsRef = useRef(new Set<string>());
   const commentRenderKeys = useRef(new Map<string, string>());
+  const commentSubmissionTimes = useRef(new Map<string, Date>());
   const resolvedIssueDetailState = useMemo(
     () =>
       readIssueDetailLocationState(issueId, location.state, location.search),
@@ -3717,6 +3786,15 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     ? shouldTrackIssueActiveRun(issue) && hasActiveRun
     : hasActiveRun;
   const hasLiveRuns = liveRunCount > 0 || resolvedHasActiveRun;
+  const [failureNoticeRunId, setFailureNoticeRunId] = useState<string | null>(null);
+  const interruptionRunId = issue?.executionBlocker?.workspaceRepairRequired
+    ? issue.executionBlocker.runId ?? issue.interruption?.observedRunId
+    : issue?.interruption?.observedRunId;
+  const { data: interruptionRun } = useQuery<RunForIssue[] | RecentIssueRunWindow, Error, RunForIssue | undefined>({
+    queryKey: historyExpanded ? queryKeys.issues.runs(issueId ?? "") : recentIssueRunWindowQueryKey(issueId ?? ""),
+    enabled: false, // Observe the thread's existing run window; do not add another poll.
+    select: history => (Array.isArray(history) ? history : history.runs).find(run => run.runId === interruptionRunId),
+  });
   // Every live run is still waiting to start: say so instead of "Live".
   const headerWaiting = hasLiveRuns
     && (liveRunCount === 0 || liveRunSummary.waitingOnly)
@@ -4338,15 +4416,20 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   );
 
   const threadComments = useMemo(
-    () =>
-      mergeIssueComments(comments ?? [], optimisticComments)
+    () => {
+      const merged = reconcileThreadComments([
+        ...mergeIssueComments(comments ?? [], optimisticComments.filter(comment => !comment.clientRequestId)),
+        ...optimisticComments.filter(comment => comment.clientRequestId),
+      ]);
+      return merged.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
       .filter(comment => !(comment.authorType === "system" && comment.metadata?.recoveryResponsibility === "system"))
       .map((comment) => {
         if ("clientId" in comment && comment.clientId)
           commentRenderKeys.current.set(comment.id, comment.clientId);
         const clientId = commentRenderKeys.current.get(comment.id);
-        return clientId ? { ...comment, clientId } : comment;
-      }),
+        return clientId ? { ...comment, clientId, createdAt: commentSubmissionTimes.current.get(clientId) ?? comment.createdAt } : comment;
+      });
+    },
     [comments, optimisticComments],
   );
   const breadcrumbTitle = issue?.title ?? issueHeaderSeed?.title ?? "";
@@ -4528,8 +4611,48 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     [issueCacheRefs, queryClient],
   );
 
+  const [restoredStoppedCommentIds, setRestoredStoppedCommentIds] = useState<ReadonlySet<string>>(new Set());
+  const restoredStoppedCommentIdsRef = useRef(restoredStoppedCommentIds);
+  const acknowledgeRestoredComments = useCallback((comments: readonly IssueDetailComment[]) => {
+    if (!comments.length) return;
+    const next = new Set(restoredStoppedCommentIdsRef.current);
+    for (const comment of comments) next.add(`${comment.issueId}:${comment.id}`);
+    if (next.size === restoredStoppedCommentIdsRef.current.size) return;
+    restoredStoppedCommentIdsRef.current = next;
+    setRestoredStoppedCommentIds(next);
+  }, []);
+
+  const forgetRestoredComments = useCallback((comments: readonly IssueDetailComment[]) => {
+    const next = new Set(restoredStoppedCommentIdsRef.current);
+    for (const comment of comments) next.delete(`${comment.issueId}:${comment.id}`);
+    if (next.size === restoredStoppedCommentIdsRef.current.size) return;
+    restoredStoppedCommentIdsRef.current = next;
+    setRestoredStoppedCommentIds(next);
+  }, []);
+
+  // A cancel receipt requests a return; it is not a composer receipt. Keep
+  // failed transfers here until the existing composer can accept them.
+  const pendingCancelledReturns = useRef(new Map<string, IssueDetailComment>());
+  const restoreCancelledComment = useCallback((comment: IssueDetailComment) => {
+    const restored = commentComposerRef.current?.restoreStoppedMessages?.([comment]).includes(comment.id) === true;
+    if (restored) {
+      pendingCancelledReturns.current.delete(comment.id);
+      acknowledgeRestoredComments([comment]);
+    } else {
+      pendingCancelledReturns.current.set(comment.id, comment);
+      forgetRestoredComments([comment]);
+    }
+    return restored;
+  }, [acknowledgeRestoredComments, forgetRestoredComments]);
+  const retryCancelledReturns = useCallback(() => {
+    for (const comment of pendingCancelledReturns.current.values()) {
+      if (comment.issueId !== (issue?.id ?? issueId) || comment.authorUserId !== currentUserId) continue;
+      if (restoreCancelledComment(comment)) void removeCommentFromCache(comment.id);
+    }
+  }, [issue?.id, issueId, currentUserId, restoreCancelledComment, removeCommentFromCache]);
+
   const restoreQueuedCommentDraft = useCallback((body: string) => {
-    commentComposerRef.current?.restoreDraft(body);
+    return Boolean(commentComposerRef.current) && commentComposerRef.current!.restoreDraft(body) !== false;
   }, []);
 
   const invalidateIssueCollections = useCallback(() => {
@@ -4895,7 +5018,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   const stopResponse = useMutation({
     mutationFn: async (runId: string) => {
       const stoppedRun = await heartbeatsApi.cancel(runId);
-      await waitForStoppedRuns([runId], { initialRuns: [stoppedRun] });
+      // A cold Pi start can take 330 s (0234): keep Stop pending through the server hold and settlement.
+      await waitForStoppedRuns([runId], { initialRuns: [stoppedRun], timeoutMs: 400_000 });
     },
     onSettled: () => Promise.all([
       queryClient.invalidateQueries({ queryKey: queryKeys.issues.detail(issueId!) }),
@@ -5170,6 +5294,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
             freshIssue.assigneeAdapterOverrides,
             (conversation?.agent ?? agentMap.get(issue.conversationAgentId))?.adapterType,
             runSettings,
+            false,
+            (conversation?.agent ?? agentMap.get(issue.conversationAgentId))?.adapterConfig,
           ),
         });
         assertCurrentAccount();
@@ -5177,7 +5303,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       }
       return issuesApi.addComment(writableIssueId, body, reopen, interrupt, attachmentIds, clientRequestId ?? createUuid(), nativeCommand);
     },
-    onMutate: async ({ body, reopen, interrupt }) => {
+    onMutate: async ({ body, reopen, interrupt, clientRequestId }) => {
       // Start cache cancellation immediately but do not put it in front of the
       // optimistic echo. The new-runner startup placeholder must paint in the
       // same frame as send, even when an in-flight comments query is slow to
@@ -5208,7 +5334,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         : null;
 
       if (optimisticComment) {
-        setOptimisticComments((current) => [...current, optimisticComment]);
+        commentSubmissionTimes.current.set(optimisticComment.clientId, optimisticComment.createdAt);
+        setOptimisticComments((current) => [...current, { ...optimisticComment, clientRequestId }]);
       }
       if (previousIssue) {
         queryClient.setQueryData(
@@ -5226,6 +5353,11 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       };
     },
     onSuccess: async (comment, _variables, context) => {
+      // A return can beat the POST response. It must not resurrect the bubble.
+      if (restoredStoppedCommentIdsRef.current.has(`${comment.issueId}:${comment.id}`)) {
+        setOptimisticComments(current => current.filter(entry => entry.clientId !== context?.optimisticCommentId));
+        return;
+      }
       if (
         context?.optimisticCommentId &&
         cancelledQueuedOptimisticCommentIdsRef.current.has(
@@ -5276,7 +5408,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       if (context?.optimisticCommentId) {
         commentRenderKeys.current.set(comment.id, context.optimisticCommentId);
       }
-      if (paginatedConversation) retainComment(comment);
+      retainComment(comment);
       queryClient.setQueryData<InfiniteData<IssueComment[], string | null>>(
         queryKeys.issues.comments(issueId ?? comment.issueId),
         (current) =>
@@ -5603,6 +5735,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                 agentMap.get(reassignment?.assigneeAgentId ?? freshIssue?.assigneeAgentId ?? "")?.adapterType,
                 runSettings,
                 Boolean(reassignment),
+                agentMap.get(reassignment?.assigneeAgentId ?? freshIssue?.assigneeAgentId ?? "")?.adapterConfig,
               )
             : null,
         } : {}),
@@ -5610,7 +5743,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         ...(interrupt ? { interrupt } : {}),
       });
     },
-    onMutate: async ({ body, reopen, reassignment, interrupt }) => {
+    onMutate: async ({ body, reopen, reassignment, interrupt, clientRequestId }) => {
       // Cache cancellation can wait on an active request for several seconds.
       // Start it now, but paint the optimistic echo before awaiting it so a
       // reassignment never clears the composer into an empty thread.
@@ -5640,7 +5773,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         : null;
 
       if (optimisticComment) {
-        setOptimisticComments((current) => [...current, optimisticComment]);
+        commentSubmissionTimes.current.set(optimisticComment.clientId, optimisticComment.createdAt);
+        setOptimisticComments((current) => [...current, { ...optimisticComment, clientRequestId }]);
       }
       if (previousIssue) {
         queryClient.setQueryData(
@@ -5663,6 +5797,10 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     onSuccess: async (result, _variables, context) => {
       const { comment, ...nextIssue } = result;
       queryClient.setQueryData(queryKeys.issues.detail(issueId!), nextIssue);
+      if (comment && restoredStoppedCommentIdsRef.current.has(`${comment.issueId}:${comment.id}`)) {
+        setOptimisticComments(current => current.filter(entry => entry.clientId !== context?.optimisticCommentId));
+        return;
+      }
       if (
         comment &&
         context?.optimisticCommentId &&
@@ -5707,7 +5845,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         });
       }
       if (comment) {
-        if (paginatedConversation) retainComment(comment);
+        retainComment(comment);
         if (context?.optimisticCommentId)
           commentRenderKeys.current.set(
             comment.id,
@@ -5800,15 +5938,21 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         next.delete(comment.id);
         return next;
       });
-      await removeCommentFromCache(comment.id);
-      restoreQueuedCommentDraft(comment.body);
+      // A refused hidden steer may return before its original save responds.
+      // Retire that echo and fence the late response using the same return door.
+      setOptimisticComments(current => current.filter(entry => !comment.clientRequestId || entry.clientRequestId !== comment.clientRequestId));
+      // The paint fence is not custody: an explicit discard may have released
+      // the durable copy while cancel was in flight. Ask the box afresh.
+      const restored = restoreCancelledComment(comment);
+      if (restored) await removeCommentFromCache(comment.id);
+      else await upsertCommentInCache(comment); // No fresh receipt: keep the returned text visible.
       invalidateIssueDetail();
       invalidateIssueThreadLazily();
       invalidateIssueCollections();
       pushToast({
         title: "Queued comment canceled",
-        body: "The queued message was restored to the composer.",
-        tone: "success",
+        body: restored ? "The queued message was restored to the composer." : `Your message (copy it): ${comment.body}`,
+        tone: restored ? "success" : "error",
       });
     },
     onError: (err) => {
@@ -5823,6 +5967,27 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     },
   });
 
+  // Transfer the whole batch before deleting anything. Only the composer's
+  // durable per-comment receipts authorize deletion; text equality and an old
+  // in-memory acknowledgment are not custody of this message.
+  const restoreStoppedMessages = useCallback(async (commentIds: readonly string[], availableComments: readonly IssueDetailComment[] = []) => {
+    const byId = new Map([...availableComments, ...threadComments].map(comment => [comment.id, comment]));
+    const ids = [...new Set(commentIds)];
+    const comments = ids.flatMap(id => {
+      const comment = byId.get(id);
+      return comment && comment.issueId === (issue?.id ?? issueId) && !comment.deletedAt && comment.authorUserId === currentUserId ? [comment] : [];
+    });
+    // Missing text cannot complete a return. The caller retries individual IDs.
+    if (comments.length !== ids.length || !comments.length) return false;
+    const restoredIds = new Set(commentComposerRef.current?.restoreStoppedMessages?.(comments) ?? []);
+    acknowledgeRestoredComments(comments.filter(comment => restoredIds.has(comment.id)));
+    // Hide accepted IDs in the same paint as the box. Re-read custody on each
+    // deletion attempt: the UI fence alone is never a durable receipt.
+    const deleted = await Promise.all(comments.map(comment => restoredIds.has(comment.id)
+      ? issuesApi.deleteComment(issueId!, comment.id).then(upsertCommentInCache).then(() => true).catch(() => false)
+      : false));
+    return deleted.every(Boolean);
+  }, [threadComments, issueId, issue?.id, currentUserId, upsertCommentInCache, acknowledgeRestoredComments]);
   const deleteComment = useMutation({
     mutationFn: async ({ commentId }: { commentId: string }) =>
       issuesApi.deleteComment(issueId!, commentId),
@@ -5851,6 +6016,11 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
 
   const handleCancelQueuedComment = useCallback(
     (commentId: string) => {
+      // The text goes back into the input box; with no box to take it, keep it queued.
+      if (!commentComposerRef.current) {
+        pushToast({ title: "Message kept", body: "Open the message box to take it back; it is still queued.", tone: "error" });
+        return;
+      }
       if (commentId.startsWith("optimistic-")) {
         cancelledQueuedOptimisticCommentIdsRef.current.add(commentId);
         let cancelledCommentBody: string | null = null;
@@ -6123,7 +6293,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   }, [breadcrumbParentRef, resolvedIssueDetailState, location.state, location.search]);
   useEffect(() => {
     if (isAgentChatRoute) {
-      setBreadcrumbs([{ label: "Chat" }]);
+      setBreadcrumbs([{ label: "All chats", href: "/chats" }, { label: conversationAgent?.name ?? "Chat" }]);
       return;
     }
     setBreadcrumbs([
@@ -6150,6 +6320,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     ]);
   }, [
     isAgentChatRoute,
+    conversationAgent?.name,
     coordinatorWorkspaceEnabled,
     breadcrumbTitle,
     breadcrumbIdentifier,
@@ -7063,6 +7234,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       runSettings?: ComposerRunSettings,
       nativeCommand?: "swarm",
     ) => {
+      if (!body.trim() && !attachmentIds?.length)
+        throw new Error("Write a message or attach a file before sending.");
       // A swarm request always uses the comments endpoint, which checks it.
       if (nativeCommand) {
         await addComment.mutateAsync({ body, reopen, attachmentIds, clientRequestId, nativeCommand });
@@ -8379,12 +8552,22 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
               onRecoveryControlChange={setRetainedRecoveryOwnsRetry}
               action={issue.activeRecoveryAction ?? null} />
           )}
-          {resolvedDetailTab === "chat" && (
-            <ExecutionBlockerNotice className={shellSectionClass} presentation={issue.interruption} blockers={issue.blockedBy}
+          {resolvedDetailTab === "chat" && !(failureNoticeRunId && failureNoticeRunId === interruptionRunId &&
+            issue.interruption?.state === "failed" && isConversationRecovery(issue.interruption, interruptionRun?.status)) && (
+            <ExecutionBlockerNotice className={shellSectionClass} presentation={issue.interruption} blockers={issue.blockedBy} conversationMode={!!issue.conversationAgentId}
+              observedStatus={interruptionRun?.status} observedResultJson={interruptionRun?.resultJson} observedErrorCode={interruptionRun?.errorCode}
+              blocker={retainedRecoveryOwnsRetry ? null : issue.executionBlocker}
               issueId={issue.id} companyId={issue.companyId} agentName={agentMap.get(issue.assigneeAgentId ?? "")?.name} projectName={issue.project?.name}
               canRetry={canResolveBoardRecoveryAction && !(issue.executionBlocker?.workspaceRepairRequired
                 && isRetainedWorkspaceExportCause(issue.executionBlocker.cause) && retainedRecoveryOwnsRetry)} onRetry={taskRetry.retry}
               optimistic={taskRetry.optimistic} takingLonger={taskRetry.takingLonger} error={taskRetry.error} />
+          )}
+          {resolvedDetailTab === "chat" && issue.executionBlocker?.canReconstructWorkspace && (
+            <div className={shellSectionClass}>
+              <WorkspaceReconstructionRecovery key={`${issue.id}:${issue.executionBlocker.recoveryActionId}`}
+                issueId={issue.id} blocker={issue.executionBlocker} canManage={canManageBoardRuntime}
+                onRecorded={() => { invalidateIssueDetail(); invalidateIssueCollections(); }} />
+            </div>
           )}
 
           {issue.status === "in_review" && issue.externalConversationState === "waiting" && (
@@ -8695,6 +8878,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                     void queryClient.invalidateQueries({ queryKey: queryKeys.issues.runs(issueId!) });
                   }} />
                 <IssueDetailChatTab
+                  onFailureNoticeChange={setFailureNoticeRunId}
+                  queuedMessageAutoSteerDelayMs={instanceExperimentalSettings?.enableQueuedMessageSteerCountdown === true ? QUEUED_MESSAGE_AUTO_STEER_DELAY_MS : 0}
                   executionBlocked={Boolean(issue.executionBlocker)}
                   interruption={issue.interruption}
                   retryPreparing={taskRetry.optimistic}
@@ -8885,6 +9070,9 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                       .mutateAsync({ commentId })
                       .then(() => undefined)
                   }
+                  onRestoreStoppedMessages={restoreStoppedMessages}
+                  restoredStoppedCommentIds={restoredStoppedCommentIds}
+                  onRestoreReady={retryCancelledReturns}
                   onStopResponse={canManageTreeControl
                     ? (runId) => stopResponse.mutateAsync(runId)
                     : undefined}
@@ -8950,9 +9138,11 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                   }
                   resumeAssigneePending={resumeAssigneeAgent.isPending}
                   onTryAgainNoLiveExecutionPath={
-                    issue.status === "blocked" && !issue.interruption && issue.activeRecoveryAction
-                      ? handleTryAgainNoLiveExecutionPath
-                      : undefined
+                    canResolveBoardRecoveryAction && issue.interruption?.unansweredCommentId && issue.interruption.canRetry
+                      ? taskRetry.retry
+                      : issue.status === "blocked" && !issue.interruption && issue.activeRecoveryAction
+                        ? handleTryAgainNoLiveExecutionPath
+                        : undefined
                   }
                   tryAgainNoLiveExecutionPathPending={
                     resolveRecoveryAction.isPending &&

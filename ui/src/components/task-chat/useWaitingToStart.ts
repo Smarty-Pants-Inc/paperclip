@@ -8,7 +8,7 @@ import { useEffect, useReducer } from "react";
  * with no named hold is not starting, and saying "Working" would be untrue.
  */
 export const QUEUED_START_GRACE_MS = 30_000;
-export const WAITING_TO_START_LABEL = "Waiting to start";
+export const WAITING_TO_START_LABEL = "Waiting to start…";
 
 /**
  * True once an eligible queued turn has waited past the grace period since

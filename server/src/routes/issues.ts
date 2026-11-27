@@ -15,6 +15,9 @@ import { INBOX_MINE_ISSUE_STATUS_FILTER, latestFailedRunsByAgent } from "@paperc
 import { getHeartbeatRunReadDecisions, redactHeartbeatRunListRow } from "../services/heartbeat-run-privacy.js";
 import { taskInterruptionPresentation, taskInterruptionPresentations, taskRetryRefusal } from "../services/task-interruption-presentation.js";
 import { parseObject } from "../adapters/utils.js";
+import { normalizePiIssueModelSelection, validatePiGatewayModelSelection } from "../adapters/pi-model-selection.js";
+import { requestHeldNativeConfigurationEnd } from "../services/native-runtime/held-native-turn.js";
+import { piRpcThinking, projectPaperclipRunnerTaskConfig } from "../services/native-runtime/provider-profile.js";
 import { prepareRestrictedWorkspaceRetry } from "../services/restricted-workspace-retry.js";
 import { ISSUE_SUMMARIES_MAX_IDS, issueChatBootstrapQuerySchema, issueSummariesQuerySchema, type IssueSummary } from "@paperclipai/shared";
 import { readIssueChatBootstrapItems } from "../services/issue-chat-bootstrap.js";
@@ -29,6 +32,7 @@ import { recordNativeHumanSelfHandoff } from "../services/native-runtime/native-
 import { recordChildTaskRead, recordChildTaskReads } from "../services/native-runtime/native-child-completion-delivery.js";
 import { recordCompletedHandoffRead, recordCompletedHandoffReads } from "../services/chat-completion-delivery.js";
 import { recordDeclinedInteractionRead } from "../services/chat-interaction-outcome-report.js";
+import { recordInteractionResponseRead } from "../services/queued-interaction-response.js";
 import { runRetainsIssueIdentity } from "../services/task-repository-acquisition.js";
 import { withConversationReadState } from "../services/agent-chat-read-state.js";
 import { markIssueReadSchema } from "@paperclipai/shared";
@@ -37,6 +41,7 @@ import { hasRequiredWorkspaceRecovery, LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "
 import { hasUnverifiedNativeWorkspaceFinalizationOwner } from "../services/native-runtime/native-workspace-finalization-recovery-state.js";
 import { monitorPoliciesEqual, applyActorMonitorScheduledBy, assertCanManageIssueMonitor, summarizeIssueMonitor } from "../services/issue-monitors.js";
 import type { IssuePrivacyConstraints, WithdrawIssueThreadInteraction } from "@paperclipai/shared";
+import { canResumeNativeReview, resumeNativeReview } from "../services/native-runtime/resume-native-review.js";
 import { canActorReadHeartbeatRun } from "../services/heartbeat-run-privacy.js";
 import {
   childCreatedByRequest,
@@ -61,7 +66,7 @@ import { deferredWakeJoinsFirstTurn, firstTurnTakesAllQueuedComments, runAccepts
 import { reconstructNativeWorkspace, unreconciledNativeExportPredicate } from "../services/native-runtime/native-workspace-reconstruction.js";
 import { reconstructWorkspaceSchema } from "@paperclipai/shared";
 import { hasQueuedInteractionResponse } from "../services/queued-interaction-response.js";
-import { deliverConversationComments, heldConversationComments, isConversation } from "../services/agent-conversations.js";
+import { deliverConversationComments, heldConversationComments, isConversation, isConversationReset } from "../services/agent-conversations.js";
 import { assertOnboardingFirstTaskDependenciesAllowed } from "../services/onboarding-first-task-admission.js";
 import { resolveChatTaskAssignment } from "../services/chat-task-assignment.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
@@ -367,6 +372,7 @@ import { stalledReviewDecisionService } from "../services/stalled-review-decisio
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { ensurePersonalPrivateProject } from "../services/projects.js";
+import { privateRequestActor } from "./private-request-actor.js";
 import { redactSensitiveText } from "../redaction.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import {
@@ -430,8 +436,20 @@ import {
   queuedCommentIdsFromWakePayload,
 } from "../services/issue-queued-comment-queue.js";
 
+import { readLimitFromEnv } from "../services/env-limits.js";
+
 const MAX_ISSUE_COMMENT_LIMIT = 500;
+const commentAttachmentIdsSchema = z.lazy(() => z.array(z.string().uuid())
+  .max(readLimitFromEnv("PAPERCLIP_MAX_CHAT_ATTACHMENTS", 20))
+  .refine(ids => new Set(ids).size === ids.length, { message: "Attachment ids must be unique" }));
+const addIssueCommentRouteSchema = addIssueCommentSchema.extend({
+  attachmentIds: commentAttachmentIdsSchema.optional(),
+});
+const addIssueSwarmCommentRouteSchema = addIssueSwarmCommentSchema.extend({
+  attachmentIds: commentAttachmentIdsSchema.optional(),
+});
 const updateIssueRouteSchema = updateIssueSchema.extend({
+  attachmentIds: commentAttachmentIdsSchema.optional(),
   interrupt: z.boolean().optional(),
 });
 function queuedCommentDiscardDenial(issue: { identifier?: string | null }, comment: { authorAgentId: string | null }) {
@@ -5509,7 +5527,7 @@ export function issueRoutes(
   }
 
   async function assertCanManageIssuePrivacy(
-    req: Request,
+    req: Pick<Request, "actor">,
     res: Response,
     issue: { companyId: string; responsibleUserId: string | null; createdByUserId: string | null; assigneeUserId: string | null },
   ) {
@@ -5558,9 +5576,10 @@ export function issueRoutes(
       responsibleUserId: string | null;
       createdByUserId: string | null;
     },
+    privacyActor = req.actor,
   ) {
     if (!(await assertIssueReadAllowed(req, res, issue))) return null;
-    if (!(await assertCanManageIssuePrivacy(req, res, issue))) return null;
+    if (!(await assertCanManageIssuePrivacy({ actor: privacyActor }, res, issue))) return null;
     // Management is scoped to this exact task; an ancestor privacy root is
     // inheritance provenance, never authority to mutate its grants.
     return issue;
@@ -8560,7 +8579,7 @@ export function issueRoutes(
       ...recentCommentsAndFacts,
       recentActivity,
       recentRuns,
-      interactions,
+      interactions: await projectResumeReviewActions(req, issue, interactions),
       attachments,
       liveRuns,
       activeRun,
@@ -10139,6 +10158,11 @@ export function issueRoutes(
     if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
     if (agentRetry) {
       if (issue.conversationAgentId) throw forbidden("Only the conversation owner can retry a chat run");
+      // A connected chat (Slack, GitHub, other channels) is a person's conversation too.
+      const [chatBinding] = issue.originKind === "chat_channel" ? [{ id: issue.id }] : await db
+        .select({ id: chatConversations.id }).from(chatConversations)
+        .where(and(eq(chatConversations.companyId, issue.companyId), eq(chatConversations.issueId, issue.id))).limit(1);
+      if (chatBinding) throw forbidden("Only a person can retry a chat run");
       const { recordAgentTaskRetry } = await import("../services/agent-task-retry.js");
       await recordAgentTaskRetry(db, { issueId: issue.id, ...agentRetry, grantedByUserId: req.actor.userId!,
         idempotencyKey: req.body.idempotencyKey });
@@ -13148,6 +13172,10 @@ export function issueRoutes(
     async (req, res) => {
       const companyId = req.params.companyId as string;
       assertCompanyAccess(req, companyId);
+      // Inherited privacy remains the issue service's responsibility.
+      if (req.body.visibility === "private") {
+        await privateRequestActor(db, req.actor, companyId, "task");
+      }
       if (isSkillTestScopedActor(req)) {
         res.status(403).json({
           error: "Skill-test run tokens cannot create issues.",
@@ -13732,6 +13760,9 @@ export function issueRoutes(
         "Parent issue not found",
       );
       if (!parent) return;
+      if (req.body.visibility === "private") {
+        await privateRequestActor(db, req.actor, parent.companyId, "task");
+      }
       if (
         !isTaskBridgeKeyActor(req) &&
         !(await assertIssueWriteInfluenceAllowed(req, res, parent))
@@ -14023,6 +14054,10 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!sourceIssue) return;
+      // Preflight the whole set before creating any child or decomposition claim.
+      if (req.body.children.some((child: { visibility?: string }) => child.visibility === "private")) {
+        await privateRequestActor(db, req.actor, sourceIssue.companyId, "task");
+      }
       if (!(await assertAgentIssueMutationAllowed(req, res, sourceIssue)))
         return;
 
@@ -14872,9 +14907,10 @@ export function issueRoutes(
           return;
         }
       }
-      // An authorized agent may restrict a task; widening access remains an owner/admin action.
-      if (req.body.visibility !== undefined && !(req.actor.type === "agent" && req.body.visibility === "private")
-        && !(await resolveManagedIssueForPrivacy(req, res, existing))) return;
+      const privacyActor = req.body.visibility === "private"
+        ? await privateRequestActor(db, req.actor, existing.companyId, "task") : req.actor;
+      if (req.body.visibility !== undefined
+        && !(await resolveManagedIssueForPrivacy(req, res, existing, privacyActor))) return;
       // MCP task changes cannot stop a run or implicitly decide a pending review.
       const mcpParticipationChange = req.actor.source === "mcp_oauth" &&
         ["status", "assigneeAgentId", "assigneeUserId", "blockedByIssueIds", "parentId", "projectId"].some(key => req.body[key] !== undefined);
@@ -14949,6 +14985,27 @@ export function issueRoutes(
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
         ...updateFields
       } = req.body;
+      const modelAssigneeId = normalizedAssigneeAgentId === undefined
+        ? existing.assigneeAgentId : normalizedAssigneeAgentId;
+      let endPiHeldTurn = false;
+      if (updateFields.assigneeAdapterOverrides !== undefined && modelAssigneeId) {
+        const modelAgent = await agentsSvc.getById(modelAssigneeId);
+        if (modelAgent?.companyId === existing.companyId) {
+          updateFields.assigneeAdapterOverrides = normalizePiIssueModelSelection(modelAgent, updateFields.assigneeAdapterOverrides);
+          await validatePiGatewayModelSelection(db, modelAgent,
+            existing.responsibleUserId ?? authenticatedActorResponsibleUserId(req) ?? null, updateFields.assigneeAdapterOverrides);
+          if (modelAgent.adapterType === "paperclip_runner" && parseObject(modelAgent.adapterConfig).provider === "pi_rpc") {
+            let previous = existing.assigneeAdapterOverrides;
+            // Invalid old rows must remain repairable with a qualified pick.
+            try { previous = normalizePiIssueModelSelection(modelAgent, previous); } catch { /* compare the invalid old value */ }
+            const selection = (overrides: unknown) => {
+              const config = projectPaperclipRunnerTaskConfig("pi_rpc", modelAgent.adapterConfig, parseObject(parseObject(overrides).adapterConfig));
+              return JSON.stringify([config.model ?? null, piRpcThinking(config)]);
+            };
+            endPiHeldTurn = selection(previous) !== selection(updateFields.assigneeAdapterOverrides);
+          }
+        }
+      }
       if (commentBody && req.actor.type === "agent") {
         await assertAgentInteraction(db, { companyId: existing.companyId, actorAgentId: req.actor.agentId,
           operation: "comment", issueId: existing.id, texts: [commentBody] });
@@ -15994,6 +16051,7 @@ export function issueRoutes(
         Boolean(commentAttachmentIds?.length) ||
         agentCommentUpdate ||
         commentWithAdapterOverrides ||
+        endPiHeldTurn ||
         Boolean(decision) ||
         shouldRelayStop ||
         persistReviewActivityTransactionally ||
@@ -16018,6 +16076,9 @@ export function issueRoutes(
               return null;
             const updated = await updateIssue(tx);
             if (!updated) return null;
+            if (endPiHeldTurn) await requestHeldNativeConfigurationEnd(tx as unknown as Db, {
+              companyId: updated.companyId, agentId: modelAssigneeId!, issueId: id,
+            });
             if (commentAttachmentIds?.length || commentWithAdapterOverrides || agentCommentUpdate) {
               // Adapter settings, reassignment, comment and upload binding commit together.
               // A failed comment or invalid receipt rolls back the issue update.
@@ -17902,9 +17963,19 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!issue) return;
-      if (issue.conversationAgentId) throw conflict("Conversation messages are processed in order at turn boundaries");
+      if (issue.conversationAgentId && process.env.PAPERCLIP_AGENT_CHAT_STEERING !== "true") throw conflict("Conversation messages are processed in order at turn boundaries");
       const decision = await decideIssueAccess(req, issue, "issue:comment");
       if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+      // Seam 0251: a run a person is stopping takes no new steer (the 0233 mark is set before its interrupt).
+      // The message stays queued and its own wake answers it after the Stop.
+      const [stopping] = await db.select({ result: heartbeatRuns.resultJson }).from(heartbeatRuns).where(eq(heartbeatRuns.id, req.body.targetRunId)).limit(1);
+      if ((stopping?.result as { personStop?: unknown } | null)?.personStop) throw conflict("This run is being stopped; the message is answered after it stops");
+      if (issue.conversationAgentId) {
+        const [comment] = await db.select({ body: issueComments.body }).from(issueComments).where(and(
+          eq(issueComments.id, commentId), eq(issueComments.issueId, issue.id), eq(issueComments.companyId, issue.companyId),
+          isNull(issueComments.deletedAt))).limit(1);
+        if (comment && isConversationReset(comment.body)) throw conflict("/new needs a new session and cannot be steered into this turn");
+      }
       const actor = getActorInfo(req);
       const { queue, turnId, duplicate } = await runQueuedCommentMutation(() =>
         queuedCommentQueue.steerQueuedComment({
@@ -18042,6 +18113,59 @@ export function issueRoutes(
     }));
   });
 
+  async function personCanActOnResumeReview(
+    req: Request,
+    issue: Parameters<typeof resolvePendingReviewInteractionRestriction>[0] & {
+      conversationAgentId?: string | null; conversationUserId?: string | null;
+    },
+    interaction: Parameters<typeof evaluateIssueThreadInteractionResolverAudience>[0]["interaction"] & {
+      id: string; kind: string; status: string;
+    },
+  ) {
+    if (req.actor.type !== "board" || (issue.conversationAgentId && req.actor.userId !== issue.conversationUserId)) return false;
+    const restriction = await resolvePendingReviewInteractionRestriction(issue, interaction);
+    return evaluateIssueThreadInteractionResolverAudience({
+      actor: { type: "user", userId: getActorInfo(req).actorId }, interaction,
+      additionalRestriction: restriction?.restriction,
+    }).allowed;
+  }
+
+  async function projectResumeReviewActions(
+    req: Request,
+    issue: NonNullable<Awaited<ReturnType<typeof svc.getById>>>,
+    interactions: Awaited<ReturnType<ReturnType<typeof issueThreadInteractionService>["listForIssue"]>>,
+  ) {
+    return Promise.all(interactions.map(async interaction => {
+      if (interaction.kind !== "request_confirmation") return interaction;
+      const target = interaction.payload.target;
+      if (target?.type !== "custom" || target.key !== "native_completion_review") return interaction;
+      const allowed = await personCanActOnResumeReview(req, issue, interaction);
+      return { ...interaction, canResumeReview: allowed && await canResumeNativeReview(db, {
+        companyId: issue.companyId, issueId: issue.id, interactionId: interaction.id,
+      }) };
+    }));
+  }
+
+  router.post("/issues/:id/interactions/:interactionId/resume_review", async (req, res) => {
+    assertBoard(req);
+    const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+    if (!issue) return;
+    const authorization = await getIssueThreadInteractionResolutionAuthorization(req, res, issue, req.params.interactionId as string);
+    if (!authorization) return;
+    const result = await resumeNativeReview(db, {
+      companyId: issue.companyId, issueId: issue.id, interactionId: authorization.current.id,
+      // Re-read audience/conversation authority while the issue and card are locked.
+      authorize: current => personCanActOnResumeReview(req, current.issue, current.interaction),
+    });
+    const actor = getActorInfo(req);
+    await logActivity(db, { companyId: issue.companyId, actorType: actor.actorType, actorId: actor.actorId,
+      action: "issue.review_resumed", entityType: "issue", entityId: issue.id,
+      details: { interactionId: authorization.current.id, wakeId: result.wakeId } });
+    // The durable intent is already committed; ordinary dispatch/claim revalidates its authority.
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: issue.companyId, requestId: result.wakeId });
+    res.json(result);
+  });
+
   router.get("/issues/:id/interactions", async (req, res) => {
     const id = req.params.id as string;
     const issue = await getAccessibleResource(
@@ -18055,11 +18179,26 @@ export function issueRoutes(
     const interactions =
       await issueThreadInteractionService(db).listForIssue(issue.id, issue);
     if (req.actor.type === "agent" && req.actor.agentId && req.actor.runId) {
+      const { agentId, runId } = req.actor;
+      // A close without finish must not retire an answer the response never delivered.
+      // Receipt failures leave the answer owed, never fail an already-sent response.
+      res.once("finish", () => {
+        void recordInteractionResponseRead(db, {
+          companyId: issue.companyId,
+          agentId,
+          runId,
+          issue,
+          interactions,
+        }).catch(error => logger.warn(
+          { err: error, runId },
+          "could not record the interaction responses a run read",
+        ));
+      });
       await recordDeclinedInteractionRead(db, { companyId: issue.companyId, agentId: req.actor.agentId, runId: req.actor.runId,
         issue, interactions: interactions as Parameters<typeof recordDeclinedInteractionRead>[1]["interactions"] })
         .catch(error => logger.warn({ err: error, runId: req.actor.runId }, "could not record the declined actions a run read"));
     }
-    res.json(interactions);
+    res.json(await projectResumeReviewActions(req, issue, interactions));
   });
 
   router.post(
@@ -19550,7 +19689,7 @@ export function issueRoutes(
   router.post(
     "/issues/:id/comments",
     // A /swarm request without a request text gets the route's documented refusal, not a validation error.
-    (req, res, next) => validate(req.body?.nativeCommand === ANTIGRAVITY_SWARM_COMMAND ? addIssueSwarmCommentSchema : addIssueCommentSchema)(req, res, next),
+    (req, res, next) => validate(req.body?.nativeCommand === ANTIGRAVITY_SWARM_COMMAND ? addIssueSwarmCommentRouteSchema : addIssueCommentRouteSchema)(req, res, next),
     async (req, res) => {
       const id = req.params.id as string;
       const issue = await getAccessibleResource(

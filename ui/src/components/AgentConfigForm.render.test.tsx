@@ -10,6 +10,7 @@ import { ToastProvider } from "../context/ToastContext";
 import { AdapterTypeDropdown, AgentConfigForm } from "./AgentConfigForm";
 import { isBlockedFromReplay } from "@/lib/analytics/replay-recording.test-utils";
 import { ApiError } from "../api/client";
+import { aiConnectionsApi } from "../api/ai-connections";
 import { CodexLocalConfigFields } from "../adapters/codex-local/config-fields";
 import type { AdapterConfigFieldsProps } from "../adapters/types";
 
@@ -234,6 +235,74 @@ describe("AgentConfigForm session replay masking", () => {
     roots = [];
     document.body.innerHTML = "";
     vi.clearAllMocks();
+  });
+
+  async function renderModelForm(provider: string, withConnection = true) {
+    mockEnvironmentsApi.list.mockResolvedValue([]);
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    roots.push(root);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <ToastProvider>
+            <TooltipProvider>
+              <AgentConfigForm mode="edit" agent={makeAgent({
+                adapterType: "paperclip_runner",
+                adapterConfig: { provider, model: "paperclip/gpt-6.1-sol" },
+                runtimeConfig: withConnection ? { aiConnection: { provider: "openai", method: "api_key", mode: "responsible_user" } } : {},
+              })} onSave={vi.fn()} hidePromptTemplate />
+            </TooltipProvider>
+          </ToastProvider>
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="Model"]')?.click();
+    });
+    await flushReact();
+    return container;
+  }
+
+  it.each(["opencode", "pi_rpc"])("loads %s models from the routed gateway connection without an unknown adapter request", async provider => {
+    let resolveAccounts!: (value: Awaited<ReturnType<typeof aiConnectionsApi.list>>) => void;
+    const accounts = vi.spyOn(aiConnectionsApi, "list").mockReturnValue(new Promise(resolve => { resolveAccounts = resolve; }));
+    try {
+      await renderModelForm(provider);
+      const pendingRequests = [...mockAgentsApi.adapterModels.mock.calls];
+      const pendingRefresh = [...document.querySelectorAll("button")].some(button => button.textContent === "Refresh models");
+      await act(async () => resolveAccounts({ currentUserId: "you", canManageConnections: true, connections: [{
+        id: "gateway-account", grantId: "gateway-grant", companyId: "company-1", provider: "openai", method: "api_key", name: "Routed gateway",
+        ownership: "personal", ownerUserId: "you", isDefault: true, status: "connected",
+        routing: { kind: "gateway", protocol: provider === "opencode" ? "chat" : "responses", auth: "bearer", baseUrl: "https://gateway.example.com/v1", models: [{ id: "gpt-6.1-sol", label: "Gateway Sol" }] },
+      }] }));
+      await flushReact();
+      expect([...document.querySelectorAll('[role="option"]')].some(option => option.textContent?.includes("Gateway Sol"))).toBe(true);
+      expect(pendingRefresh).toBe(provider === "opencode");
+      if (provider === "pi_rpc") {
+        expect(pendingRequests).toEqual([]);
+        expect(mockAgentsApi.adapterModels).not.toHaveBeenCalled();
+      } else {
+        expect(pendingRequests.length).toBeGreaterThan(0);
+        expect(pendingRequests.every(call => call[1] === "opencode_local")).toBe(true);
+      }
+      expect([...document.querySelectorAll("button")].some(button => button.textContent === "Refresh models")).toBe(false);
+    } finally { accounts.mockRestore(); }
+  });
+
+  it("does not offer an adapter catalog or refresh for Pi RPC without a connection", async () => {
+    const accounts = vi.spyOn(aiConnectionsApi, "list").mockResolvedValue({ currentUserId: "you", canManageConnections: true, connections: [] });
+    try {
+      const container = await renderModelForm("pi_rpc", false);
+      expect(mockAgentsApi.adapterModels).not.toHaveBeenCalled();
+      expect([...document.querySelectorAll("button")].some(button => button.textContent === "Refresh models")).toBe(false);
+      expect(container.querySelector('[aria-label="Model"]')?.textContent).toContain("paperclip/gpt-6.1-sol");
+    } finally { accounts.mockRestore(); }
   });
 
   it("blocks the displayed login code from session replay", async () => {

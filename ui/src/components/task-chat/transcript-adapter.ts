@@ -59,14 +59,15 @@ export interface TranscriptTimeSegment {
 
 /**
  * Split one provider run at durable in-turn input timestamps. Each boundary
- * belongs to the segment after it, so a steering acknowledgement can stay in
- * the thread between the work produced before and after the steer. Live and
- * settled renderers share this projector to avoid re-sorting at handoff.
+ * belongs to the segment after it. Boundaries are acknowledged input slots;
+ * reply ownership can name a question's segment. Tool updates keep their call even when
+ * the result arrives after a boundary. Live and settled use the same projector.
  */
 export function splitTranscriptAtAnchors(
   entries: readonly TranscriptEntry[],
   startMs: number,
   rawAnchors: readonly number[],
+  replySegments?: ReadonlyMap<string, number>,
 ): TranscriptTimeSegment[] {
   const anchors = [...new Set(rawAnchors.filter(Number.isFinite))].sort(
     (a, b) => a - b,
@@ -80,19 +81,42 @@ export function splitTranscriptAtAnchors(
       },
     ];
   }
-  return [startMs, ...anchors].map((segmentStartMs, index) => {
-    const segmentEndMs = anchors[index] ?? Number.POSITIVE_INFINITY;
-    return {
-      startMs: segmentStartMs,
-      endMs: segmentEndMs,
-      entries: entries.filter((entry) => {
-        const parsed = Date.parse(entry.ts);
-        const entryMs = Number.isFinite(parsed) ? parsed : 0;
-        const afterStart = index === 0 || entryMs >= segmentStartMs;
-        return afterStart && entryMs < segmentEndMs;
-      }),
-    };
-  });
+  const segments: TranscriptTimeSegment[] = [startMs, ...anchors].map((segmentStartMs, index) => ({
+    startMs: segmentStartMs,
+    endMs: anchors[index] ?? Number.POSITIVE_INFINITY,
+    entries: [],
+  }));
+  const toolSegments = new Map<string, number>();
+  const authoredSegments = new Map<string, number>();
+  // Multi-block messages use :bN item suffixes. A mapped final also owns the
+  // preceding blocks of that message (not unrelated work at the same time).
+  const messageReplies = new Map<string, { block: number; segment: number }[]>();
+  for (const [itemId, segment] of replySegments ?? []) {
+    const match = /^(.*):b(\d+)$/.exec(itemId);
+    if (!match) continue;
+    const replies = messageReplies.get(match[1]!) ?? [];
+    replies.push({ block: Number(match[2]), segment });
+    messageReplies.set(match[1]!, replies);
+  }
+  for (const replies of messageReplies.values()) replies.sort((a, b) => a.block - b.block);
+  for (const entry of entries) {
+    const parsed = Date.parse(entry.ts);
+    const entryMs = Number.isFinite(parsed) ? parsed : 0;
+    let index = anchors.findIndex(anchor => entryMs < anchor);
+    if (index < 0) index = anchors.length;
+    if ((entry.kind === "assistant" || entry.kind === "thinking") && entry.itemId) {
+      const block = /^(.*):b(\d+)$/.exec(entry.itemId);
+      const messageSegment = block && messageReplies.get(block[1]!)?.find(reply => reply.block >= Number(block[2]))?.segment;
+      index = Math.min(anchors.length, replySegments?.get(entry.itemId) ?? messageSegment ?? authoredSegments.get(entry.itemId) ?? index);
+      authoredSegments.set(entry.itemId, index);
+    }
+    if ((entry.kind === "tool_call" || entry.kind === "tool_result" || entry.kind === "diff") && entry.toolUseId) {
+      index = toolSegments.get(entry.toolUseId) ?? index;
+      toolSegments.set(entry.toolUseId, index);
+    }
+    segments[index]!.entries.push(entry);
+  }
+  return segments;
 }
 
 /**
@@ -829,7 +853,7 @@ export function transcriptToTaskChatItems(
           // waiting for one leaves every earlier brain blue and shimmering.
           finishThinking();
           items.push({
-            id: `${runId}:think:${i}`,
+            id: `${runId}:think:${entry.itemId ?? i}`,
             kind: "thinking",
             lines: entry.text ? entry.text.split("\n") : [],
             streaming: running && entry.lifecycle !== "completed",
@@ -872,9 +896,9 @@ export function transcriptToTaskChatItems(
           }
         } else {
           finishThinking();
-          const atMs = Date.parse(entry.ts);
+          const atMs = Date.parse(entry.completedAt ?? entry.ts);
           items.push({
-            id: `${runId}:msg:${i}`,
+            id: `${runId}:msg:${entry.itemId ?? i}`,
             kind: "message",
             author: "agent",
             authorName: agentName,
@@ -1368,6 +1392,17 @@ export function omitProgressRepeatedByResponse(
  * one removal per segment. Preserve all intentional earlier repetitions and
  * remove only the final progress item matching the durable response.
  */
+// The server stores long item text cut at a bound, ending in this marker
+// (heartbeat-run-summary.ts RUN_EVENT_TEXT_BOUND_MARKER). A cut copy whose kept
+// text the response already carries is that response's earlier copy.
+const RUN_EVENT_TEXT_BOUND_MARKER = "…[truncated]";
+function truncatedCopyOf(text: string, normalizedResponse: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed.endsWith(RUN_EVENT_TEXT_BOUND_MARKER)) return false;
+  const kept = trimmed.slice(0, -RUN_EVENT_TEXT_BOUND_MARKER.length).trim();
+  return kept.length > 0 && normalizedResponse.includes(kept);
+}
+
 export function omitProgressRepeatedByResponseAcrossSegments(
   segments: readonly (readonly TaskChatItem[])[],
   responseText: string | null | undefined,
@@ -1387,8 +1422,10 @@ export function omitProgressRepeatedByResponseAcrossSegments(
       if (
         item.kind === "message" &&
         item.interstitial &&
-        item.channel === "progress" &&
-        item.text.trim() === normalizedResponse
+        // Unclassified streamed prose (a delta with no start, Pi) is the
+        // response's own stream when its text equals the response.
+        item.channel !== "final" &&
+        (item.text.trim() === normalizedResponse || truncatedCopyOf(item.text, normalizedResponse))
       ) {
         redundantSegmentIndex = segmentIndex;
         redundantIndex = index;
@@ -1425,7 +1462,7 @@ function omitProgressComposingResponse(
     const items = segments[segmentIndex]!;
     for (let index = items.length - 1; index >= 0; index -= 1) {
       const item = items[index]!;
-      const text = item.kind === "message" && item.interstitial && item.channel === "progress" ? item.text.trim() : "";
+      const text = item.kind === "message" && item.interstitial && item.channel !== "final" ? item.text.trim() : "";
       if (!text) continue;
       composed = composed ? `${text}\n\n${composed}` : text;
       if (composed.length > normalizedResponse.length) break walk;
@@ -1560,10 +1597,12 @@ export function paperclipRunnerTimelineItems(
   const activityIds = new Set(
     paperclipRunnerActivityItems(parsed).map((item) => item.id),
   );
+  // Keep textless reasoning at settle, but not empty receipts for prose already present.
   return markRetriedTools(parsed.filter(
     (item) =>
-      activityIds.has(item.id) ||
-      (item.kind === "thinking" && Boolean(item.streaming)) ||
+      (item.kind === "thinking"
+        ? item.lines.some(line => line.trim()) || !activityIds.has(item.id)
+        : activityIds.has(item.id)) ||
       item.kind === "plan_document" ||
       (item.kind === "protocol" && item.surface === "runtime_request"),
   ));
@@ -1667,7 +1706,7 @@ export function paperclipRunnerFinalResponse(
     allowFallback?: boolean;
     /** Run metadata established a yielded wait even if the transcript lacks its result. */
     yielded?: boolean;
-    /** The yielded result's wait summary, when known outside the transcript. */
+    /** Legacy run summary; equality alone does not establish a wait stub. */
     waitSummary?: string | null;
   },
 ): TaskChatMessageItem | undefined {
@@ -1701,10 +1740,10 @@ export function paperclipRunnerFinalResponse(
     // It streamed into view while the turn was live; dropping it on settle
     // makes the conversation flash and lose that reply. Wait stubs are
     // skipped, not terminal: a provider may echo one after its reply.
-    const waitSummaries = [
-      options?.waitSummary,
-      ...yieldedResults.map((result) => result.summary),
-    ];
+    // A yielded summary may copy the reply; only actual request prompts identify card echoes.
+    const waitSummaries = parsed.flatMap((item) =>
+      item.kind === "protocol" && item.surface === "runtime_request" ? [item.prompt] : [],
+    );
     for (let index = parsed.length - 1; index >= 0; index -= 1) {
       const item = parsed[index];
       if (item.kind !== "message" || item.channel !== "final") continue;
@@ -2099,6 +2138,7 @@ function subagentsFromDelegation(
 export function buildTurnTimelineRows(
   parsed: readonly TaskChatItem[],
   running: boolean,
+  hasFinalResponse = true,
 ): TaskChatTurnChildItem[] {
   const rows: TaskChatTurnChildItem[] = [];
   let current: TaskChatActivityPhaseItem | null = null;
@@ -2197,7 +2237,7 @@ export function buildTurnTimelineRows(
       const legacyTrailingReply =
         (item.channel == null || item.channel === "unknown") &&
         item === legacyReplyBoundary;
-      if (!running && (explicitFinal || legacyTrailingReply)) continue;
+      if (!running && (explicitFinal || (legacyTrailingReply && hasFinalResponse))) continue;
       current = {
         id: `${item.id}:phase`,
         kind: "activity_phase",
@@ -2364,7 +2404,7 @@ function transcriptSpanMs(
  */
 export function buildTurnSummary(
   entries: readonly TranscriptEntry[],
-  opts: { durationMs?: number; failed?: boolean } = {},
+  opts: { durationMs?: number; failed?: boolean; personStopped?: boolean } = {},
 ): TaskChatTurnItem["summary"] {
   const toolIds = new Set<string>();
   let added = 0;
@@ -2397,6 +2437,7 @@ export function buildTurnSummary(
     removed,
     tokensLabel: formatTokensLabel(tokens),
     failed: opts.failed || undefined,
+    personStopped: opts.personStopped || undefined,
   };
 }
 
@@ -2405,6 +2446,7 @@ export interface TurnSummaryPart {
   entries: readonly TranscriptEntry[];
   durationMs?: number;
   failed?: boolean;
+  personStopped?: boolean;
 }
 
 /**
@@ -2428,7 +2470,7 @@ export function buildMergedTurnSummary(
   }
   // durationMs: 0 suppresses the concatenated-span fallback (which would count
   // the gap between runs); the summed label is applied over it below.
-  const counts = buildTurnSummary(all, { durationMs: 0, failed });
+  const counts = buildTurnSummary(all, { durationMs: 0, failed, personStopped: parts.some(part => part.personStopped) });
   return {
     ...counts,
     durationLabel:
@@ -2493,6 +2535,9 @@ export function prependIssueBrief(
 
 /** Per-turn identity + raw summary inputs for coalescing (keyed by turn item id). */
 export interface SettledTurnMergeMeta {
+  /** Explicit request lineage; independent of agent identity and adjacency. */
+  chainId?: string;
+  chainOrder?: number;
   /** Stable agent identity (agentId); empty/unknown turns never merge. */
   agentKey: string;
   /** Display name, used to keep another agent's bubble from bridging a merge. */
@@ -2539,34 +2584,47 @@ export function coalesceSettledTurns(
   const mergedMeta = new Map<string, SettledTurnMergeMeta>();
   const metaFor = (id: string) => mergedMeta.get(id) ?? metaById.get(id);
   let heldIdx = -1; // index in `out` of the last mergeable settled turn
+  const chainSlots = new Map<string, number>();
   for (const item of items) {
     if (item.kind === "turn" && item.settled) {
       const meta = metaFor(item.id);
+      if (meta?.chainId) heldIdx = chainSlots.get(meta.chainId) ?? -1;
       const held = heldIdx >= 0 ? (out[heldIdx] as TaskChatTurnItem) : null;
       const heldMeta = held ? metaFor(held.id) : undefined;
       if (
         held &&
         meta &&
         heldMeta &&
-        Boolean(item.historical) === Boolean(held.historical) &&
-        meta.agentKey &&
-        meta.agentKey === heldMeta.agentKey
+        (meta.chainId ? meta.chainId === heldMeta.chainId :
+          !heldMeta.chainId && Boolean(item.historical) === Boolean(held.historical) &&
+          meta.agentKey && meta.agentKey === heldMeta.agentKey)
       ) {
-        out.splice(heldIdx, 1);
+        if (!meta.chainId) out.splice(heldIdx, 1);
         const parts = [...heldMeta.parts, ...meta.parts];
+        const latest = (meta.chainOrder ?? 0) >= (heldMeta.chainOrder ?? 0) ? item : held;
         const mcpStartupFailures = mergeMcpStartupFailures(held.mcpStartupFailures, item.mcpStartupFailures);
-        out.push({
+        const merged: TaskChatTurnItem = {
           ...held,
-          items: [...held.items, ...item.items],
+          historical: latest.historical,
+          continuedAfterSteering: held.continuedAfterSteering || item.continuedAfterSteering,
+          items: [...held.items, ...(meta.chainId && held.finalResponse ? [held.finalResponse] : []), ...item.items],
           ...(mcpStartupFailures ? { mcpStartupFailures } : {}),
-          finalResponse: item.finalResponse ?? held.finalResponse,
+          finalResponse: meta.chainId ? item.finalResponse : item.finalResponse ?? held.finalResponse,
           animateFold: held.animateFold || item.animateFold || undefined,
-          summary: buildMergedTurnSummary(parts),
-        });
-        mergedMeta.set(held.id, { ...heldMeta, parts });
+          summary: meta.chainId ? {
+            ...buildMergedTurnSummary(parts),
+            failed: latest.summary.failed,
+            personStopped: latest.summary.personStopped,
+            durationLabel: latest.summary.durationLabel,
+          } : buildMergedTurnSummary(parts),
+        };
+        if (meta.chainId) out[heldIdx] = merged;
+        else out.push(merged);
+        mergedMeta.set(held.id, { ...(latest === item ? meta : heldMeta), parts });
       } else {
         out.push(item);
       }
+      if (meta?.chainId && !chainSlots.has(meta.chainId)) chainSlots.set(meta.chainId, out.length - 1);
       heldIdx = meta?.agentKey ? out.length - 1 : -1;
       continue;
     }
@@ -2607,6 +2665,7 @@ export function attachSettledTurns(
     if (
       item.kind === "turn" &&
       item.settled &&
+      !metaById.get(item.id)?.chainId &&
       prev?.kind === "message" &&
       prev.author === "agent" &&
       prev.origin !== "fast_response" &&

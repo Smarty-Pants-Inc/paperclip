@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   DndContext,
   KeyboardSensor,
@@ -29,6 +29,7 @@ import type {
   IssueQueuedCommentQueue,
 } from "@paperclipai/shared";
 import { cn } from "@/lib/utils";
+import { ApiError } from "@/api/client";
 import { MarkdownBody } from "@/components/MarkdownBody";
 import { extractImageRefs, stripStandaloneImageEmbeds } from "./task-chat-attachments";
 import { TaskChatComposerBar } from "./TaskChatComposerBar";
@@ -37,7 +38,7 @@ import {
   queuedMessageAutoSteerEligible,
   queuedMessageAutoSteerKey,
 } from "./queued-message-auto-steer";
-import { isQueuedInterruptHandoff } from "@/lib/issue-queued-comment-queue";
+import { isQueuedInterruptHandoff, type DisplayIssueQueuedCommentQueue } from "@/lib/issue-queued-comment-queue";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -85,7 +86,13 @@ function queueActionErrorCode(error: unknown): string | null {
 }
 
 export interface TaskChatQueuedMessagesProps {
-  queue: IssueQueuedCommentQueue;
+  agentStarting?: boolean; stopPending?: boolean;
+  conversationMode?: boolean;
+  /** A generic deferred-wake reason alone does not establish recovery. */
+  executionRecoveryPending?: boolean;
+  queue: DisplayIssueQueuedCommentQueue;
+  /** Page-projected thread messages; transport stays eligible for auto-steer. */
+  hiddenCommentIds?: ReadonlySet<string>;
   onEdit: (commentId: string) => void;
   onReorder: (orderedCommentIds: string[], revision: string) => Promise<void>;
   onSteer: (commentId: string, revision: string) => Promise<void>;
@@ -95,9 +102,12 @@ export interface TaskChatQueuedMessagesProps {
   editingCommentId?: string | null;
   /** Steer eligible queued messages automatically after this delay; null keeps every message queued. */
   autoSteerDelayMs?: number | null;
+  attemptedAutoSteerKeys?: Set<string>;
 }
 
 function SortableQueuedMessage({
+  agentStarting, stopPending, waitingForRun,
+  conversationMode,
   entry,
   queue,
   busy,
@@ -110,6 +120,8 @@ function SortableQueuedMessage({
   onDiscard,
   onCancelAutoSteer,
 }: {
+  agentStarting?: boolean; stopPending?: boolean; waitingForRun: boolean;
+  conversationMode?: boolean;
   entry: IssueQueuedCommentEntry;
   queue: IssueQueuedCommentQueue;
   busy: boolean;
@@ -127,7 +139,8 @@ function SortableQueuedMessage({
   const body = queuedMessageLabel(entry);
   const images = extractImageRefs(body).filter(image =>
     /^\/api\/(?:attachments|assets)\/[^/?#\\]+\/content(?:\?[^#\\]*)?$/.test(image.url));
-  const label = stripStandaloneImageEmbeds(body);
+  const preview = stripStandaloneImageEmbeds(body).replace(/\s+/g, " ").trim();
+  const label = preview.length > 100 ? `${preview.slice(0, 100)}…` : preview;
   const sortable = useSortable({
     id: entry.comment.id,
     disabled: queueMutationDisabled || immutableResponse,
@@ -187,7 +200,9 @@ function SortableQueuedMessage({
         </div> : null}
       </div>
 
-      {autoSteerSecondsLeft !== null ? (
+      {stopPending || waitingForRun ? <span className="px-1 text-xs text-muted-foreground">Queued</span> : queue.executionWait ? <span className="px-1 text-xs text-muted-foreground">Held</span> : conversationMode && queue.steeringDisposition === "temporarily_unavailable" ? (
+        <span className="px-1 text-xs text-muted-foreground">{agentStarting ? "Sends when the agent starts" : "Queued"}</span>
+      ) : autoSteerSecondsLeft !== null ? (
         <span className="flex shrink-0 items-center gap-1" data-testid={`task-chat-queued-auto-steer-${entry.comment.id}`}>
           <span className="px-1 text-xs text-muted-foreground tabular-nums">
             Sending in {autoSteerSecondsLeft}s
@@ -288,8 +303,25 @@ function SortableQueuedMessage({
 }
 
 /** Compact production queue shown immediately above the default task composer. */
-export function TaskChatQueuedMessages({
+export function TaskChatQueuedMessages(props: TaskChatQueuedMessagesProps) {
+  return <>
+    <TaskChatQueuedMessageQueue {...props} />
+    {props.queue.pendingQueue?.entries.length ? <TaskChatQueuedMessageQueue
+      {...props}
+      key="pending"
+      queue={props.queue.pendingQueue}
+      onInterrupt={undefined}
+      autoSteerDelayMs={null}
+    /> : null}
+  </>;
+}
+
+function TaskChatQueuedMessageQueue({
+  agentStarting, stopPending,
+  conversationMode,
+  executionRecoveryPending = true,
   queue,
+  hiddenCommentIds,
   onEdit,
   onReorder,
   onSteer,
@@ -297,13 +329,17 @@ export function TaskChatQueuedMessages({
   onDiscard,
   editingCommentId = null,
   autoSteerDelayMs = null,
+  attemptedAutoSteerKeys,
 }: TaskChatQueuedMessagesProps) {
-  const [entries, setEntries] = useState(queue.entries);
+  const [entries, setEntries] = useState(() => queue.entries.filter(entry => !hiddenCommentIds?.has(entry.comment.id)));
+  // Keep the server wait for admission/actions; only its presentation changes.
+  const waitingForRun = queue.executionWait?.reason === "first_turn_pending" ||
+    (queue.state === "deferred" && queue.executionWait?.reason === "execution_recovery" && !executionRecoveryPending);
   // Automatic steering: Cancel keeps a message queued for this view; each
   // message revision gets at most one automatic attempt, so a failure falls
   // back to the ordinary queue instead of retrying in a loop.
   const [cancelledAutoSteer, setCancelledAutoSteer] = useState<ReadonlySet<string>>(() => new Set());
-  const attemptedAutoSteer = useRef(new Set<string>());
+  const attemptedAutoSteer = useRef(attemptedAutoSteerKeys ?? new Set<string>());
   // Recomputes the deadlines after an attempt; the set itself is a ref.
   const [autoSteerAttempts, setAutoSteerAttempts] = useState(0);
   // First time this view offered each message revision for automatic steering.
@@ -319,6 +355,18 @@ export function TaskChatQueuedMessages({
   const [reordering, setReordering] = useState(false);
   const [announcement, setAnnouncement] = useState("");
   const [visibleError, setVisibleError] = useState<string | null>(null);
+  // One failed attempt per message revision, never a single last-error slot.
+  // Succeeding B cannot clear A; editing A cannot retry its superseded body.
+  const [deliveryFailures, setDeliveryFailures] = useState<ReadonlyMap<string, string>>(() => new Map());
+  const failedEntries = queue.entries.filter(entry => deliveryFailures.has(queuedMessageAutoSteerKey(entry)));
+  useEffect(() => {
+    const currentKeys = new Set(queue.entries.map(queuedMessageAutoSteerKey));
+    setDeliveryFailures(current => {
+      const next = new Map([...current].filter(([key]) => currentKeys.has(key)));
+      return next.size === current.size ? current : next;
+    });
+    if (entries.length === 0) setVisibleError(null);
+  }, [queue.entries, entries.length]);
   const [deferredStatus, setDeferredStatus] = useState<{ queueId: string | null; message: string } | null>(null);
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
@@ -327,12 +375,13 @@ export function TaskChatQueuedMessages({
     }),
   );
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    // Remove delivered rows before paint, when the thread draws their bubbles.
     // Polling can return the old queue while delivery is still in flight.
     setEntries(queue.entries.filter(
-      (entry) => !optimisticDeliveryIds.current.has(entry.comment.id),
+      (entry) => !optimisticDeliveryIds.current.has(entry.comment.id) && !hiddenCommentIds?.has(entry.comment.id),
     ));
-  }, [queue.entries, queue.revision]);
+  }, [queue.entries, queue.revision, hiddenCommentIds]);
 
   useEffect(() => {
     setDeferredStatus(current => {
@@ -357,7 +406,7 @@ export function TaskChatQueuedMessages({
   );
   const autoSteerDeadlines = useMemo(() => {
     const deadlines = new Map<string, number>();
-    if (autoSteerDelayMs === null) return deadlines;
+    if (autoSteerDelayMs === null || queue.executionWait) return deadlines;
     for (const entry of autoSteerEntries) {
       if (queuedMessageAutoSteerEligible({ queue, entry, cancelledIds: cancelledAutoSteer,
         attemptedKeys: attemptedAutoSteer.current, editingCommentId })) {
@@ -391,14 +440,14 @@ export function TaskChatQueuedMessages({
     const due = autoSteerEntries.find(entry => {
       const deadline = autoSteerDeadlines.get(entry.comment.id);
       // The deadlines memo does not see these refs change; check them here.
-      return deadline !== undefined && deadline <= now
+      return deadline !== undefined && (autoSteerDelayMs === 0 || deadline <= now)
         && !attemptedAutoSteer.current.has(queuedMessageAutoSteerKey(entry))
         && !optimisticDeliveryIds.current.has(entry.comment.id);
     });
     if (!due) return;
     attemptedAutoSteer.current.add(queuedMessageAutoSteerKey(due));
     setAutoSteerAttempts((count) => count + 1);
-    void runRowAction(due.comment.id, "steer");
+    void runRowAction(due.comment.id, "steer", true);
   });
 
   async function handleDragEnd(event: DragEndEvent) {
@@ -428,7 +477,10 @@ export function TaskChatQueuedMessages({
       `Moved queued message to position ${to + 1} of ${next.length}.`,
     );
     try {
-      await onReorder(orderedIds, queue.revision);
+      const visibleIds = new Set(orderedIds);
+      let position = 0;
+      await onReorder(queue.entries.map(entry => visibleIds.has(entry.comment.id)
+        ? orderedIds[position++]! : entry.comment.id), queue.revision);
     } catch (error) {
       setEntries(previous);
       setAnnouncement("");
@@ -445,23 +497,26 @@ export function TaskChatQueuedMessages({
   async function runRowAction(
     commentId: string,
     action: Exclude<QueueAction, null>,
+    automatic = false,
+    expectedKey?: string,
   ) {
+    const actionQueue = latestQueue.current;
+    const actionEntry = actionQueue.entries.find(entry => entry.comment.id === commentId);
+    const attemptKey = actionEntry ? queuedMessageAutoSteerKey(actionEntry) : null;
     if (
       pending ||
       reordering ||
-      (!queue.queueId && action !== "interrupt" && action !== "discard")
+      stopPending ||
+      (expectedKey !== undefined && expectedKey !== attemptKey) ||
+      (actionQueue.executionWait && action !== "discard") ||
+      (!actionQueue.queueId && action !== "interrupt" && action !== "discard")
     ) {
       return;
     }
     const deliveredIds = action === "interrupt"
       ? entries.map((entry) => entry.comment.id)
-      : action === "steer" ? [commentId] : [];
-    for (const id of deliveredIds) optimisticDeliveryIds.current.add(id);
-    if (deliveredIds.length) {
-      setEntries((current) => current.filter(
-        (entry) => !optimisticDeliveryIds.current.has(entry.comment.id),
-      ));
-    }
+      : [];
+    // Pending is not delivered. Keep deliberate waits until the response.
     setPending({ commentId, action });
     setVisibleError(null); setDeferredStatus(null);
     setAnnouncement(
@@ -472,19 +527,26 @@ export function TaskChatQueuedMessages({
           : "Discarding queued message.",
     );
     try {
-      if (action === "steer") await onSteer(commentId, queue.revision);
+      if (action === "steer") await onSteer(commentId, actionQueue.revision);
       else if (action === "interrupt") {
         const updatedQueue = await onInterrupt?.();
-        // The stopped turn is handing off to these messages: they are sent.
-        if (updatedQueue?.state === "deferred" && !isQueuedInterruptHandoff(updatedQueue)) {
+        if ((updatedQueue?.state === "queued" || updatedQueue?.state === "deferred") && !isQueuedInterruptHandoff(updatedQueue)) {
           for (const entry of updatedQueue.entries) optimisticDeliveryIds.current.delete(entry.comment.id);
-          setEntries(updatedQueue.entries.filter(entry => !optimisticDeliveryIds.current.has(entry.comment.id)));
+          setEntries(updatedQueue.entries.filter(entry => !optimisticDeliveryIds.current.has(entry.comment.id) && !hiddenCommentIds?.has(entry.comment.id)));
           setDeferredStatus({ queueId: updatedQueue.queueId, message: updatedQueue.executionWait?.message ?? "Messages are still queued. They will send when the task is ready." });
           setAnnouncement("Messages are still queued.");
           return;
         }
+        for (const id of deliveredIds) optimisticDeliveryIds.current.add(id);
+        setEntries(current => current.filter(entry => !optimisticDeliveryIds.current.has(entry.comment.id)));
       }
-      else await onDiscard(commentId, queue.revision);
+      else await onDiscard(commentId, actionQueue.revision);
+      if (attemptKey) setDeliveryFailures(current => {
+        if (!current.has(attemptKey)) return current;
+        const next = new Map(current);
+        next.delete(attemptKey);
+        return next;
+      });
       if (action === "discard") {
         setEntries((current) =>
           current.filter((entry) => entry.comment.id !== commentId),
@@ -503,10 +565,19 @@ export function TaskChatQueuedMessages({
       for (const id of deliveredIds) optimisticDeliveryIds.current.delete(id);
       if (deliveredIds.length) {
         setEntries(latestQueue.current.entries.filter(
-          (entry) => !optimisticDeliveryIds.current.has(entry.comment.id),
+          (entry) => !optimisticDeliveryIds.current.has(entry.comment.id) && !hiddenCommentIds?.has(entry.comment.id),
         ));
       }
       setAnnouncement("");
+      if (hiddenCommentIds?.has(commentId) && attemptKey) {
+        // Keep the bubble and this revision's explicit retry. A late rejection
+        // must not attach itself to a newer revision or resurrect a delivered row.
+        if (latestQueue.current.entries.some(entry => queuedMessageAutoSteerKey(entry) === attemptKey)) {
+          setDeliveryFailures(current => new Map(current).set(attemptKey, commentId));
+        }
+        return;
+      }
+      if (automatic && error instanceof ApiError && error.status === 409) return;
       const code = queueActionErrorCode(error);
       setVisibleError(
         code === "queued_comment_already_dispatching"
@@ -524,19 +595,16 @@ export function TaskChatQueuedMessages({
     }
   }
 
-  // A chat message held in the outbox (for example by the agent's daily
-  // limit) has no receipt or run whose task status could explain the wait,
-  // so the queue says why it waits. Receipt-backed waits keep the task status.
-  const statusMessage = deferredStatus?.message
-    ?? (queue.state === "deferred" && !queue.queueId && !queue.targetRunId && entries.length > 0
-      ? queue.executionWait?.message ?? null : null);
+  // Explain a server hold once for the whole strip, including receipt-backed waits.
+  const statusMessage = entries.length && !waitingForRun
+    ? queue.executionWait?.message ?? deferredStatus?.message ?? null : null;
 
-  if (entries.length === 0 && !visibleError && !statusMessage) return null;
+  if (entries.length === 0 && failedEntries.length === 0 && !visibleError && !statusMessage) return null;
 
   return (
     <TaskChatComposerBar
       data-testid="task-chat-queued-messages"
-      aria-label="Queued messages"
+      aria-label={entries.length ? "Queued messages" : "Delivery problems"}
     >
       <DndContext
         sensors={sensors}
@@ -558,6 +626,8 @@ export function TaskChatQueuedMessages({
             );
             return (
               <SortableQueuedMessage
+                agentStarting={agentStarting} stopPending={stopPending} waitingForRun={waitingForRun}
+                conversationMode={conversationMode}
                 key={entry.comment.id}
                 entry={entry}
                 queue={queue}
@@ -593,6 +663,27 @@ export function TaskChatQueuedMessages({
           {visibleError}
         </div>
       ) : null}
+      {failedEntries.length ? <div className="max-h-(--tc-queued-list-max-h) overflow-y-auto" aria-label="Unconfirmed deliveries">
+        {failedEntries.map(entry => {
+          const key = queuedMessageAutoSteerKey(entry);
+          const label = queuedMessageLabel(entry).replace(/\s+/g, " ").trim();
+          const retrying = pending?.commentId === entry.comment.id;
+          return <div key={key} role="status" data-testid={`task-chat-delivery-failure-${entry.comment.id}`}
+            className="flex min-w-0 flex-wrap items-center gap-2 bg-destructive/5 px-3 py-2 text-xs">
+            <span className="min-w-0 flex-1">
+              <span className="block text-muted-foreground">Delivery not confirmed</span>
+              <span className="block truncate" title={label}>{label || "Message"}</span>
+            </span>
+            <button type="button" className="min-h-11 shrink-0 rounded-md px-2 underline hover:bg-accent focus-visible:outline focus-visible:outline-ring disabled:opacity-50"
+              aria-label={`Retry delivery: ${label || "Message"}`}
+              disabled={Boolean(pending || reordering || stopPending || queue.executionWait || !queue.queueId)}
+              onClick={() => void runRowAction(entry.comment.id, "steer", false, key)}>
+              {retrying ? "Retrying…" : "Retry delivery"}
+            </button>
+            {queue.executionWait ? <span className="w-full text-muted-foreground">{queue.executionWait.message}</span> : null}
+          </div>;
+        })}
+      </div> : null}
       <div className="sr-only" aria-live="polite" aria-atomic="true">
         {announcement}
       </div>
