@@ -13248,9 +13248,15 @@ describe("native warm session supervision", () => {
             expect(retiredReceipt).toMatchObject({ materializationRunId, cleanup: { leaseId: currentLease, remoteCwd } });
             expect((await copies.get(companyId, runId))?.processStoppedAt).toBeInstanceOf(Date);
             const compact = (await copies.get(companyId, runId))!.receipt;
-            expect(compact).toMatchObject({ materializationRunId, cleanupPending: false });
-            expect(compact?.baseline).toBeUndefined();
-            await expect(access(originalRoot)).rejects.toMatchObject({ code: "ENOENT" });
+            if (ending === "claim-remove-entry") {
+              expect(compact).toMatchObject({ materializationRunId, cleanupPending: true, retainedForRecovery: true });
+              expect(compact?.baseline).toBeDefined();
+              expect((await lstat(originalRoot)).isDirectory()).toBe(true);
+            } else {
+              expect(compact).toMatchObject({ materializationRunId, cleanupPending: false });
+              expect(compact?.baseline).toBeUndefined();
+              await expect(access(originalRoot)).rejects.toMatchObject({ code: "ENOENT" });
+            }
             if (ending === "claim-edit") expect(await readFile(join(canonical, "AGENTS.md"), "utf8")).toBe("Remote edit before next claim\n");
             if (ending === "claim-add") expect(await readFile(join(canonical, "memory.txt"), "utf8")).toBe("Remote addition before next claim\n");
             if (ending === "claim-remove") await expect(access(join(canonical, "optional-memory.txt"))).rejects.toMatchObject({ code: "ENOENT" });
@@ -13260,7 +13266,20 @@ describe("native warm session supervision", () => {
             }
             if (ending === "claim-canonical") expect(await readFile(join(canonical, "AGENTS.md"), "utf8")).toBe("Canonical edit before next claim\n");
             // Heartbeat rematerializes only after the successor proved retirement.
+            const retainedHostRoot = ending === "claim-remove-entry" ? (await copies.get(companyId, runId))!.localRoot : null;
             active = await copies.prepare({ companyId, agentId, runId, target, cwd: remoteCwd });
+            if (retainedHostRoot) {
+              const { dirname, basename } = await import("node:path");
+              const runRoot = dirname(retainedHostRoot), runsRoot = dirname(runRoot);
+              const siblings = (await readdir(runsRoot)).filter(name => name.startsWith(`${basename(runRoot)}.unsaved-`));
+              expect(siblings).toHaveLength(1);
+              expect(siblings[0]).toMatch(/\.unsaved-\d+$/);
+              const retainedLive = join(runsRoot, siblings[0]!, "live");
+              expect((await lstat(retainedLive)).isDirectory()).toBe(true);
+              await expect(access(join(retainedLive, "AGENTS.md"))).rejects.toMatchObject({ code: "ENOENT" });
+              expect(await readFile(join(retainedLive, "optional-memory.txt"), "utf8")).toBe("Optional memory\n");
+              expect(await readFile(join(active!.localRoot, "AGENTS.md"), "utf8")).toBe("Retain this exact directory.\n");
+            }
             expect(active).toMatchObject({ state: "prepared", executionRoot: originalRoot, processStoppedAt: null });
             expect(active!.receipt?.retirementRequired).toBeUndefined();
             expect(await copies.hasChanges({ companyId, runId, target })).toBe(false);
