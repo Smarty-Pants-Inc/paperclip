@@ -5485,6 +5485,7 @@ html:not(.dark) .coordinator-sidebar {
 .coordinator-task-commitment[data-motion="gather"] > .coordinator-task-light { display: block; background: radial-gradient(ellipse at 25% 20%, color-mix(in oklab, var(--foreground) 8%, transparent), transparent 75%); animation: coordinator-task-gather var(--coordinator-task-light-duration) var(--coordinator-task-ease) both; }
 .coordinator-task-light::before { content: ""; position: absolute; inset: 0; background: linear-gradient(110deg, transparent 15%, color-mix(in oklab, var(--coordinator-task-light-cool) 18%, transparent) 37%, color-mix(in oklab, var(--foreground) 20%, transparent) 50%, color-mix(in oklab, var(--coordinator-task-light-warm) 18%, transparent) 63%, transparent 85%); animation: coordinator-task-light-pass var(--coordinator-task-light-duration) var(--coordinator-task-ease) both; }
 .coordinator-created-task, .coordinator-decision-receipt { display: flex; align-items: center; gap: calc(var(--spacing) * 3); padding: calc(var(--spacing) * 4); color: var(--foreground); transition: background-color var(--motion-fast, 120ms); }
+.coordinator-created-task-compact { padding-block: calc(var(--spacing) * 2); }
 .coordinator-created-task:hover, .coordinator-decision-receipt:hover { background: var(--accent); }
 .coordinator-created-task:focus-visible, .coordinator-decision-receipt:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
 .coordinator-decision-receipt { border: 1px solid var(--border); border-radius: 14px; background: var(--card); padding-block: calc(var(--spacing) * 3); }
