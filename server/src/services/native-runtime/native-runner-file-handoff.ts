@@ -48,6 +48,8 @@ export interface NativeRunnerFileHandoffBinding {
   readonly agentId: string;
   readonly workspaceRoot: string;
   readonly executionTargetKind: "local" | "remote";
+  /** Server-bound transport admission cap, never larger than the attachment limit. */
+  readonly maxDeliverableBytes?: number;
   /** Server-bound reader. Never supplied by the model or a request body. */
   readonly readRemoteWorkspaceFile?: RemoteWorkspaceFileReader;
   /** Provider-bound reader which authorizes absolute paths within task-granted locations. */
@@ -326,12 +328,14 @@ export async function readVerifiedWorkspaceFile(
     throw new Error("paperclip_runner_file_handoff_invalid_filename");
   }
   const title = requiredText(input.title, "title", 500);
+  const maxBytes = Math.min(MAX_ATTACHMENT_BYTES, binding.maxDeliverableBytes ?? MAX_ATTACHMENT_BYTES);
   if (
+    !Number.isSafeInteger(maxBytes) ||
     !Number.isSafeInteger(input.byteSize) ||
     input.byteSize <= 0 ||
-    input.byteSize > MAX_ATTACHMENT_BYTES
+    input.byteSize > maxBytes
   ) {
-    throw new Error("paperclip_runner_file_handoff_size_denied");
+    throw new Error(`paperclip_runner_file_handoff_size_denied: maximum=${maxBytes} bytes`);
   }
   const expectedSha256 = input.sha256.trim().toLowerCase();
   if (!/^[a-f0-9]{64}$/u.test(expectedSha256)) {

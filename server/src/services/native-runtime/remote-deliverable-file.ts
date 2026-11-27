@@ -8,6 +8,50 @@ export const MAX_REMOTE_DELIVERABLE_BYTES = MAX_ATTACHMENT_BYTES;
 const PREFIX = "paperclip_runner_file_handoff_";
 const READ_TIMEOUT_MS = 10_000;
 
+/** Boat's waiting command output is at most 8 MiB per stream, including base64 overhead. */
+export function remoteDeliverableByteLimit(target: {
+  kind: "local" | "remote";
+  transport?: string;
+  providerKey?: string | null;
+}): number {
+  return target.kind === "remote" && target.transport === "sandbox" && target.providerKey === "boat"
+    ? Math.min(MAX_REMOTE_DELIVERABLE_BYTES, 6_291_456)
+    : MAX_REMOTE_DELIVERABLE_BYTES;
+}
+
+const SAFE_REMOTE_ERROR_CODES = new Set([
+  "ENOENT", "EACCES", "EPERM", "ENOSPC", "EIO", "ENOTDIR", "EISDIR",
+  "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "ENOTFOUND", "EAI_AGAIN",
+  "ABORT_ERR", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_SOCKET", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+  "output_truncated", "result_unconfirmed", "rpc_timeout",
+]);
+const SAFE_REMOTE_REASONS = new Set(["output_truncated", "result_unconfirmed", "rpc_timeout"]);
+
+function ownField(value: unknown, key: string): unknown {
+  try {
+    return value && typeof value === "object" ? Object.getOwnPropertyDescriptor(value, key)?.value : undefined;
+  } catch { return undefined; }
+}
+
+/** Closed diagnostics only: never error text, nested data, command output, or a raw cause. */
+function remoteReadFailure(error: unknown): Error {
+  const details: string[] = [];
+  const code = [ownField(error, "code"), ownField(error, "errorCode")].find(value =>
+    (typeof value === "string" && SAFE_REMOTE_ERROR_CODES.has(value)) ||
+    (typeof value === "number" && Number.isInteger(value) && value >= -2_147_483_648 && value <= 2_147_483_647));
+  if (typeof code === "string") details.push(`code=${code}`);
+  else if (typeof code === "number") details.push(`rpc_code=${code}`);
+  const status = ["httpStatus", "status", "statusCode"].map(key => ownField(error, key)).find(value =>
+    typeof value === "number" && Number.isInteger(value) && value >= 100 && value <= 599);
+  if (typeof status === "number") details.push(`http_status=${status}`);
+  const reason = ownField(error, "reason");
+  if (typeof reason === "string" && SAFE_REMOTE_REASONS.has(reason)) details.push(`reason=${reason}`);
+  else if (ownField(error, "exitCode") === null) details.push("reason=result_unconfirmed");
+  const failure = code === "output_truncated" || code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" || reason === "output_truncated"
+    ? "output_limit" : "remote_read_failed";
+  return new Error(`${PREFIX}${failure}${details.length ? `: ${details.join(", ")}` : ""}`.slice(0, 300));
+}
+
 // Runs only in the server-bound remote workspace. No file is opened on the
 // controller and no bytes are emitted until confinement and identity pass.
 const READ_REMOTE_FILE = String.raw`
@@ -82,6 +126,8 @@ export async function readVerifiedRemoteWorkspaceFile(input: {
   contentRef: string;
   byteSize: number;
   sha256: string;
+  /** Server-bound effective hand-off cap; cannot raise the attachment limit. */
+  maxBytes?: number;
 }): Promise<Buffer> {
   const { workspaceRoot, contentRef, byteSize } = input;
   if (typeof workspaceRoot !== "string" || !posix.isAbsolute(workspaceRoot) || workspaceRoot.length > 4096 ||
@@ -92,8 +138,9 @@ export async function readVerifiedRemoteWorkspaceFile(input: {
   }
   const relative = posix.normalize(contentRef);
   if (relative === "." || relative === ".." || relative.startsWith("../")) throw new Error(`${PREFIX}path_denied`);
-  if (!Number.isSafeInteger(byteSize) || byteSize <= 0 || byteSize > MAX_REMOTE_DELIVERABLE_BYTES) {
-    throw new Error(`${PREFIX}size_denied`);
+  const maxBytes = Math.min(MAX_REMOTE_DELIVERABLE_BYTES, input.maxBytes ?? MAX_REMOTE_DELIVERABLE_BYTES);
+  if (!Number.isSafeInteger(maxBytes) || !Number.isSafeInteger(byteSize) || byteSize <= 0 || byteSize > maxBytes) {
+    throw new Error(`${PREFIX}size_denied: maximum=${maxBytes} bytes`);
   }
   const sha256 = typeof input.sha256 === "string" ? input.sha256.trim().toLowerCase() : "";
   if (!/^[a-f0-9]{64}$/u.test(sha256)) throw new Error(`${PREFIX}invalid_sha256`);
@@ -104,7 +151,8 @@ export async function readVerifiedRemoteWorkspaceFile(input: {
     env: { NODE_OPTIONS: "", NODE_PATH: "" },
     timeoutMs: READ_TIMEOUT_MS,
     bypassSession: true,
-  }).catch(() => { throw new Error(`${PREFIX}remote_read_failed`); });
+  }).catch((error: unknown) => { throw remoteReadFailure(error); });
+  if (result.outputTruncated) throw new Error(`${PREFIX}output_limit`);
   if (result.timedOut) throw new Error(`${PREFIX}remote_read_timeout`);
   if (result.exitCode !== 0) {
     const code = [result.stderr.trim(), result.stdout.trim()].find((output) =>
@@ -112,11 +160,14 @@ export async function readVerifiedRemoteWorkspaceFile(input: {
     if (code === `${PREFIX}workspace_file_missing`) {
       throw new Error(`${code}: Create or copy the file into get_workspace.cwd, then retry with a workspace-relative contentRef. AGENT_HOME is for personal instructions and memory.`);
     }
-    throw new Error(code ?? `${PREFIX}remote_read_failed`);
+    throw code ? new Error(code) : remoteReadFailure(result);
   }
   const encoded = result.stdout;
-  if (encoded.length !== 4 * Math.ceil(byteSize / 3)) throw new Error(`${PREFIX}size_denied`);
+  const encodedLength = 4 * Math.ceil(byteSize / 3);
+  if (encoded.length < encodedLength) throw new Error(`${PREFIX}output_limit`);
+  if (encoded.length !== encodedLength) throw new Error(`${PREFIX}size_denied`);
   const body = Buffer.from(encoded, "base64");
+  if (body.length < byteSize) throw new Error(`${PREFIX}output_limit`);
   if (body.length !== byteSize || body.toString("base64") !== encoded) throw new Error(`${PREFIX}size_denied`);
   if (createHash("sha256").update(body).digest("hex") !== sha256) throw new Error(`${PREFIX}hash_mismatch`);
   return body;

@@ -65,6 +65,8 @@ export interface RunProcessResult {
   // run-disposition seam sets it to `duplex_channel_lost` when the sandbox
   // duplex control channel died before a clean completion.
   errorCode?: string | null;
+  /** Provider reports that command output was cut short; never treat it as complete file content. */
+  outputTruncated?: boolean;
   terminalResultCleanup?: TerminalResultCleanupEvidence | null;
 }
 

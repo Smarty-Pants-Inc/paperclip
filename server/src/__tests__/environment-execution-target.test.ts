@@ -696,6 +696,16 @@ describe("resolveEnvironmentExecutionTarget", () => {
     return delivered;
   }
 
+  it.each(["outputTruncated", "output_truncated"])("carries the provider's %s flag without forwarding metadata", async key => {
+    const { tracer } = createRecordingExecTracer();
+    const runner = await runnerFor({ provider: "boat", tracer, execResult: {
+      exitCode: 0, timedOut: false, stdout: "", stderr: "", metadata: { [key]: true, command: "secret", path: "/private/path" },
+    } });
+    const result = await runner.execute({ command: "node" });
+    expect(result).toMatchObject({ outputTruncated: true });
+    expect(JSON.stringify(result)).not.toMatch(/secret|private|metadata/);
+  });
+
   it("delivers only the un-streamed suffix after a provider streams a prefix then polls the complete result", async () => {
     // The provider streams a prefix through the incremental sink, then its
     // stream fails and it polls the complete output as the final result. The
