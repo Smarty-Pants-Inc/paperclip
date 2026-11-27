@@ -240,6 +240,46 @@ describe("useNativeRunTranscripts", () => {
     expect(container.textContent).toBe("");
   });
 
+  it.each(["network", "aborted transport", "HTTP 503"])("history retry feedback keeps %s native reads quiet until the bounded retry finishes", async kind => {
+    let state!: ReturnType<typeof useNativeRunTranscripts>;
+    const failure = kind === "network" ? new TypeError("Failed to fetch") : kind === "aborted transport"
+      ? new DOMException("Aborted", "AbortError") : new ApiError("Storage unavailable", 503, {});
+    let finish!: (rows: HeartbeatRunEvent[]) => void;
+    eventsMock.mockRejectedValueOnce(failure).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    function History() {
+      state = useNativeRunTranscripts([{ id: "native-run", status: "succeeded", runtimeMode: "native" }]);
+      return null;
+    }
+    await act(async () => root.render(<History />));
+    expect(state.errorsByRun.size).toBe(0);
+    expect(state.isInitialHydrating).toBe(true);
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(state.errorsByRun.size).toBe(0);
+    expect(state.isInitialHydrating).toBe(true);
+    await act(async () => finish([]));
+    expect(state.isInitialHydrating).toBe(false);
+    expect(state.errorsByRun.size).toBe(0);
+  });
+
+  it("history retry feedback keeps an exhausted native failure visible during the next retry", async () => {
+    let state!: ReturnType<typeof useNativeRunTranscripts>;
+    let finish!: (rows: HeartbeatRunEvent[]) => void;
+    eventsMock.mockRejectedValue(new ApiError("Storage unavailable", 503, {}));
+    function History() {
+      state = useNativeRunTranscripts([{ id: "native-run", status: "succeeded", runtimeMode: "native" }]);
+      return null;
+    }
+    await act(async () => root.render(<History />));
+    expect(state.errorsByRun.size).toBe(0);
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(state.errorsByRun.get("native-run")?.message).toBe("Storage unavailable");
+    eventsMock.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(state.errorsByRun.get("native-run")?.message).toBe("Storage unavailable");
+    await act(async () => finish([]));
+    expect(state.errorsByRun.size).toBe(0);
+  });
+
   it.each([401, 403])("preserves a real HTTP %s history failure", async status => {
     eventsMock.mockRejectedValue(new ApiError("History access denied", status, {}));
     await act(async () => root.render(<Probe />));

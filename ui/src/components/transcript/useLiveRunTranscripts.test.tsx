@@ -17,7 +17,8 @@ const { useQueryMock, logMock, buildTranscriptMock } = vi.hoisted(() => ({
   buildTranscriptMock: vi.fn((chunks: unknown[]) => chunks),
 }));
 
-vi.mock("@tanstack/react-query", () => ({
+vi.mock("@tanstack/react-query", async importOriginal => ({
+  ...await importOriginal<typeof import("@tanstack/react-query")>(),
   useQuery: useQueryMock,
 }));
 
@@ -129,6 +130,58 @@ describe("useLiveRunTranscripts", () => {
       expect(logMock).toHaveBeenCalledTimes(3);
       expect(latest.hydratedRunIds.has("run-1")).toBe(true);
       expect(latest.isInitialHydrating).toBe(false);
+      expect(latest.errorsByRun.size).toBe(0);
+    } finally { await act(async () => root.unmount()); }
+  });
+
+  it.each(["network", "aborted transport", "HTTP 503"])("history retry feedback keeps %s log reads quiet until the bounded retry finishes", async kind => {
+    vi.useFakeTimers();
+    let latest!: ReturnType<typeof useLiveRunTranscripts>;
+    const failure = kind === "network" ? new TypeError("Failed to fetch") : kind === "aborted transport"
+      ? new DOMException("Aborted", "AbortError") : new ApiError("Storage unavailable", 503, {});
+    let finish!: (value: Awaited<ReturnType<typeof logMock>>) => void;
+    logMock.mockRejectedValueOnce(failure).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    function Harness() {
+      latest = useLiveRunTranscripts({ companyId: "company-1", runs: [
+        { id: "run-1", status: "succeeded", adapterType: "paperclip_runner", logBytes: 100 },
+      ] });
+      return null;
+    }
+    const root = createRoot(document.createElement("div"));
+    try {
+      await act(async () => root.render(<Harness />));
+      expect(latest.errorsByRun.size).toBe(0);
+      expect(latest.isInitialHydrating).toBe(true);
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      expect(latest.errorsByRun.size).toBe(0);
+      expect(latest.isInitialHydrating).toBe(true);
+      await act(async () => finish({ runId: "run-1", store: "memory", logRef: "log-1", content: "", nextOffset: 0 }));
+      expect(latest.isInitialHydrating).toBe(false);
+      expect(latest.errorsByRun.size).toBe(0);
+    } finally { await act(async () => root.unmount()); }
+  });
+
+  it("history retry feedback keeps an exhausted log failure visible during the next retry", async () => {
+    vi.useFakeTimers();
+    let latest!: ReturnType<typeof useLiveRunTranscripts>;
+    let finish!: (value: Awaited<ReturnType<typeof logMock>>) => void;
+    logMock.mockRejectedValue(new ApiError("Storage unavailable", 503, {}));
+    function Harness() {
+      latest = useLiveRunTranscripts({ companyId: "company-1", runs: [
+        { id: "run-1", status: "succeeded", adapterType: "paperclip_runner", logBytes: 100 },
+      ] });
+      return null;
+    }
+    const root = createRoot(document.createElement("div"));
+    try {
+      await act(async () => root.render(<Harness />));
+      expect(latest.errorsByRun.size).toBe(0);
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      expect(latest.errorsByRun.get("run-1")?.message).toBe("Storage unavailable");
+      logMock.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      expect(latest.errorsByRun.get("run-1")?.message).toBe("Storage unavailable");
+      await act(async () => finish({ runId: "run-1", store: "memory", logRef: "log-1", content: "", nextOffset: 0 }));
       expect(latest.errorsByRun.size).toBe(0);
     } finally { await act(async () => root.unmount()); }
   });

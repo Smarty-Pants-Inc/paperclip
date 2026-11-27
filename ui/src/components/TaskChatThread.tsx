@@ -4384,10 +4384,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   useEffect(() => {
     recordIssueDetailReadiness({ plan: !planLoading, transcripts: !transcriptHistoryPending, history: !historyPending });
   }, [issueId, planLoading, transcriptHistoryPending, historyPending]);
-  const historyError =
-    initialHistoryError ||
-    planError ||
-    transcriptHistoryErrors.size > 0 || questionReads.some(read => read.isError);
+  const failedHistorySources = [
+    initialHistoryError && "saved conversation",
+    planError && "plan",
+    transcriptHistoryErrors.size > 0 && `run activity for ${transcriptHistoryErrors.size} ${transcriptHistoryErrors.size === 1 ? "turn" : "turns"}`,
+    questionReads.some(read => read.isError) && "referenced questions",
+  ].filter(Boolean);
+  const historyError = failedHistorySources.length > 0;
   const [revealedHistoryKey, setRevealedHistoryKey] = useState<string | null | undefined>(undefined);
   const revealCachedHeader = connectionStatus !== "online" && Boolean(threadHeader);
   const historyRevealed = revealedHistoryKey === historyKey || revealCachedHeader;
@@ -4526,7 +4529,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                   role="status"
                   className="absolute inset-x-0 top-0 z-20 mx-auto flex w-full max-w-(--tc-shell-max-w) items-center gap-2 border border-border bg-background px-4 py-2 text-sm text-muted-foreground"
                 >
-                  {historyError ? "Some task history could not be loaded." : "Some task history is still loading."}
+                  {historyError ? `Some task history could not be loaded. Missing: ${failedHistorySources.join(", ")}.` : "Some task history is still loading."}
                   {historyError ? (
                     <Button variant="ghost" size="sm" onClick={retryHistory}>
                       Retry

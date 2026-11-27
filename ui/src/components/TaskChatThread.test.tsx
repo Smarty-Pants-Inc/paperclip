@@ -24,6 +24,8 @@ import type {
   TaskBrowser,
 } from "@paperclipai/shared";
 import { heartbeatsApi } from "@/api/heartbeats";
+import { issuesApi } from "@/api/issues";
+import { ApiError } from "@/api/client";
 import { nativeRunEventsToTranscript } from "./transcript/native-run-events";
 import { genericPendingRequestConfirmationInteraction, pendingConnectionIntentInteraction } from "@/fixtures/issueThreadInteractionFixtures";
 import { TaskChatScrollNavigation, useTaskChatScrollNavigation } from "./task-chat/scroll-navigation";
@@ -2309,6 +2311,42 @@ describe("HISTFAIL durable-source failures", () => {
     expect(container.textContent).toContain("Saved response history-11.");
     expect(container.textContent).toContain("Some task history could not be loaded.");
     expect([...container.querySelectorAll("button")].some(button => button.textContent === "Retry")).toBe(true);
+  });
+
+  it("history retry feedback names missing referenced questions", async () => {
+    const props = historyFixture();
+    const questionId = "00000000-0000-4000-8000-000000000001";
+    vi.spyOn(issuesApi, "getComment").mockRejectedValue(new ApiError("Not allowed", 403, {}));
+    render(<TaskChatThread {...props} linkedRuns={props.linkedRuns.map(run => ({ ...run, firstTurnCommentIds: [questionId] }))} />);
+    await vi.waitFor(() => expect(container.textContent).toContain("Some task history could not be loaded."));
+    expect(container.textContent).toContain("Missing: referenced questions.");
+    expect(container.textContent).toContain("Saved response history-11.");
+  });
+
+  it.each(["plan", "saved conversation", "run activity", "multiple sources"])("history retry feedback names the missing %s without hiding other turns", async source => {
+    const props = historyFixture();
+    planState.isError = source === "plan" || source === "multiple sources";
+    if (source === "run activity" || source === "multiple sources") {
+      nativeTranscriptState.transcriptByRun.delete("history-5");
+      nativeTranscriptState.errorsByRun.set("history-5", { message: "Unavailable" });
+      transcriptState.errorsByRun.set("history-5", new Error("Unavailable"));
+    }
+    const show = (failed: boolean) => render(<TaskChatThread {...props}
+      initialHistoryError={failed && (source === "saved conversation" || source === "multiple sources")} />);
+    show(true);
+    await settleThreadLayout();
+    const notice = [...container.querySelectorAll('[role="status"]')].find(node => node.textContent?.includes("Some task history could not be loaded."));
+    expect(notice?.textContent).toContain("Missing:");
+    if (source === "plan" || source === "multiple sources") expect(notice?.textContent).toContain("plan");
+    if (source === "saved conversation" || source === "multiple sources") expect(notice?.textContent).toContain("saved conversation");
+    if (source === "run activity" || source === "multiple sources") expect(notice?.textContent).toContain("run activity for 1 turn");
+    expect(container.textContent).toContain("Saved response history-11.");
+    expect(notice?.querySelector("button")?.textContent).toBe("Retry");
+    planState.isError = false;
+    nativeTranscriptState.errorsByRun.clear();
+    transcriptState.errorsByRun.clear();
+    show(false);
+    expect(container.textContent).not.toContain("Missing:");
   });
 });
 
