@@ -1141,11 +1141,6 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       && !(nativeExecution && "access" in nativeExecution.workspace && nativeExecution.workspace.access === "none")) {
       input.effects.onProviderResourceDisposition("stop_and_retain");
     }
-    // An unattached warm reservation retires its predecessor, which can save
-    // its checkpoint. Do that before the 60-s deadline below, which does not
-    // count the save as live work. The release in finally is then a no-op.
-    await nativeInstructionReservation?.release().catch((releaseErr: unknown) => logger.warn(
-      { err: releaseErr, runId: run.id }, "warm instruction reservation release failed before execution deadline"));
     try {
       await writeExecutionControl(db, DELIVERY_QUEUES.executionFinalization, tx => tx
         .update(heartbeatRuns)
