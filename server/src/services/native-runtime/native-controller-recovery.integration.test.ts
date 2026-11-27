@@ -518,6 +518,67 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
     expect(await claimNativeSessionResumptions({ db, runnerInstanceId: "successor", runIds: [runId], now: deadline })).toHaveLength(1);
   });
 
+  it.each([
+    { mode: "zero-running", count: 0, status: "running", leaseStatus: "released", matches: true },
+    { mode: "zero-terminal-start-window", count: 0, status: "succeeded", leaseStatus: "released", matches: true },
+    { mode: "zero-terminal-old", count: 0, status: "succeeded", leaseStatus: "released", matches: true },
+    { mode: "zero-on-this-sandbox-row-elsewhere", count: 1, status: "succeeded", leaseStatus: "released", matches: true },
+    { mode: "two-one-unsettled", count: 2, status: "succeeded", leaseStatus: "pending_cleanup", matches: true },
+    ...["failed", "retained", "pending_cleanup"].map(leaseStatus => ({ mode: `one-${leaseStatus}`, count: 1, status: "succeeded", leaseStatus, matches: true })),
+    { mode: "two-active", count: 2, status: "succeeded", leaseStatus: "active", matches: false },
+    { mode: "two-released-with-session", count: 2, status: "succeeded", leaseStatus: "released", matches: true },
+    { mode: "two-released-without-session", count: 2, status: "succeeded", leaseStatus: "released", matches: false },
+    { mode: "three-released-with-session", count: 3, status: "succeeded", leaseStatus: "released", matches: true },
+  ])("AUTO-FRESH-LEASE-CARDINALITY qualifies retained binding evidence: $mode", async ({ mode, count, status, leaseStatus, matches }) => {
+    const fixture = await seed(), environmentId = randomUUID();
+    await db.update(heartbeatRuns).set({ status, createdAt: new Date(Date.now() - (mode === "zero-terminal-old" ? 86_400_000 : 1_000)),
+      runnerProfileJson: { ...fixture.profile, nativeStartupContext: { schema: "paperclip.native-startup-context.v1",
+        contextId: randomUUID(), leaseId: randomUUID(), deadlineAtMs: Date.now() + (mode === "zero-terminal-old" ? -60_000 : 60_000) } },
+    }).where(eq(heartbeatRuns.id, fixture.scope.runId));
+    await db.insert(environments).values({ id: environmentId, name: `Cardinality ${environmentId}`, driver: "sandbox" });
+    for (let i = 0; i < count; i++) await db.insert(environmentLeases).values({ companyId, environmentId, issueId: fixture.scope.issueId,
+      heartbeatRunId: fixture.scope.runId, provider: "daytona", providerLeaseId: mode.includes("elsewhere") ? "other-sandbox" : "retained-box",
+      status: mode === "two-one-unsettled" && i === 1 ? "released" : leaseStatus,
+      metadata: { remoteCwd: matches && i === 0 ? "/workspace" : `/other-${i}` } });
+    const binding = { ...fixture.scope, target: { kind: "remote", transport: "sandbox", environmentId, leaseId: randomUUID(),
+      providerKey: "daytona", remoteCwd: "/workspace", sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "retained-box" } } as const };
+    const refusal = await assertNativeRetainedSandboxBinding(db, binding).then(() => null, error => error as Error);
+    const suffix = mode === "zero-terminal-old" ? "binding_absent" : mode.includes("elsewhere") ? "binding_elsewhere"
+      : count === 0 || ["failed", "retained", "pending_cleanup"].includes(leaseStatus) ? "lease_unsettled" : "binding_unknown";
+    expect(refusal?.message).toBe(`native_controller_recovery_missing_evidence:retained_sandbox_binding:${suffix}`);
+    const { sessionCannotContinue } = await import("./continued-session.js");
+    expect(sessionCannotContinue({ error: refusal!.message })).toBe(false);
+    // Publishing the missing row or resolving ambiguity admits the SAME allocation/session.
+    await db.delete(environmentLeases).where(eq(environmentLeases.heartbeatRunId, fixture.scope.runId));
+    await db.insert(environmentLeases).values({ companyId, environmentId, issueId: fixture.scope.issueId,
+      heartbeatRunId: fixture.scope.runId, provider: "daytona", providerLeaseId: "retained-box", status: "released", metadata: { remoteCwd: "/workspace" } });
+    await expect(assertNativeRetainedSandboxBinding(db, binding)).resolves.toEqual({ remoteCwd: "/workspace" });
+    console.log("AUTO-FRESH-LEASE-CARDINALITY", JSON.stringify({ mode, count, sourceRunId: fixture.scope.runId,
+      sessionId: fixture.scope.normalizedSessionId, refusal: refusal!.message, sameBindingAfterSettlement: true }));
+  });
+
+  it.each([0, 2])("DESIGNER-J: %s matching lease rows are unknown, not proven lost", async count => {
+    const fixture = await seed(), environmentId = randomUUID();
+    await db.insert(environments).values({ id: environmentId, name: `Designer J ${environmentId}`, driver: "sandbox" });
+    await db.update(nativeRunFinalizations).set({ phase: "committed", leaseOwner: null, leaseExpiresAt: null, recoveryState: null })
+      .where(eq(nativeRunFinalizations.runId, fixture.scope.runId));
+    const lease = { companyId, environmentId, issueId: fixture.scope.issueId, heartbeatRunId: fixture.scope.runId,
+      provider: "daytona", providerLeaseId: "designer-same-sandbox", status: "released", metadata: { remoteCwd: "/workspace" } };
+    const target = { kind: "remote", transport: "sandbox", environmentId, leaseId: randomUUID(), providerKey: "daytona",
+      remoteCwd: "/workspace", sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "designer-same-sandbox" } } as const;
+    const rows = count ? await db.insert(environmentLeases).values(Array.from({ length: count }, () => lease)).returning() : [];
+    const inspect = () => assertNativeRetainedSandboxBinding(db, { ...fixture.scope, target });
+    const failure = await inspect().then(() => { throw new Error("expected fail-closed binding refusal"); }, error => error as Error);
+    expect(failure.message).toMatch(/^native_controller_recovery_missing_evidence:retained_sandbox_binding:/);
+    const { sessionCannotContinue } = await import("./continued-session.js");
+    const freshAuthorized = sessionCannotContinue({ error: failure.message });
+    if (count === 0) await db.insert(environmentLeases).values(lease);
+    else await db.delete(environmentLeases).where(eq(environmentLeases.id, rows[1]!.id));
+    await expect(inspect()).resolves.toEqual({ remoteCwd: "/workspace" });
+    console.log("DESIGNER-J", JSON.stringify({ count, refusal: failure.message, freshAuthorized, sameBindingAfterRowSettlement: true, sourceRun: fixture.scope.runId, session: fixture.scope.normalizedSessionId }));
+    expect(freshAuthorized).toBe(false);
+  });
+
   it.each(["committed", "workspace_finalizing"])("defers a remote warm continuation while its %s predecessor has a finalization lease", async phase => {
     const fixture = await seed(), runId = randomUUID(), environmentId = randomUUID();
     const previous = parseNativeExecutionInput({
@@ -599,7 +660,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
       .where(eq(nativeRunFinalizations.runId, fixture.scope.runId));
     await expect(readSandbox()).resolves.toEqual({ remoteCwd: "/workspace" });
     await expect(readSandbox({ remoteCwd: "/unrelated" })).rejects.toThrow("retained_sandbox_binding:binding_lost");
-    await db.update(environmentLeases).set({ status: "provisioning", metadata: {} })
+    await db.update(environmentLeases).set({ status: "pending_cleanup", metadata: {} })
       .where(eq(environmentLeases.heartbeatRunId, fixture.scope.runId));
     await expect(readSandbox()).rejects.toThrow("retained_sandbox_binding:lease_unsettled");
     await db.update(environmentLeases).set({ status: "released", metadata: { remoteCwd: "/workspace" } })

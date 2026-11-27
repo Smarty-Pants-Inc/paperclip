@@ -272,11 +272,19 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding:lease_unsettled", chat: false, fresh: false },
     { failure: new NativeProviderStateIncompatibleError("workspace_continuation_source_unavailable").message,
       errorCode: "native_provider_state_incompatible", chat: false, fresh: false },
-    { failure: "workspace_continuation_source_missing", errorCode: "native_provider_state_incompatible", chat: false, fresh: true },
+    ...["workspace_continuation_source_missing", "workspace_continuation_target_conflict", "workspace_continuation_source_authority_indeterminate", "workspace_continuation_source_terminal_state_indeterminate",
+      "workspace_continuation_source_unverifiable", "unknown", "warm_recovery_fresh_session_already_attempted"].map(reason => ({
+      failure: new NativeProviderStateIncompatibleError(reason).message, errorCode: "native_provider_state_incompatible", chat: false, fresh: false,
+      auditLabel: reason.replace("workspace_continuation_", ""),
+    })),
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding:binding_unknown", chat: false, fresh: false },
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding:binding_elsewhere", chat: false, fresh: false },
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding:binding_absent", chat: false, fresh: false, auditLabel: "binding_absent" },
+    { failure: "workspace_continuation_source_scope_mismatch", errorCode: "native_provider_state_incompatible", chat: false, fresh: true },
     { failure: "current_run_not_admitted", chat: false, fresh: false },
   ].flatMap(row => [true, false].flatMap(reconciled => [true, false].map(enabled => ({
     ...row, fresh: row.fresh && enabled, reconciled, enabled,
-  })))))("stock reconciliation of a continuous Pi session: $failure, chat=$chat, fresh=$fresh, reconciled=$reconciled, enabled=$enabled", async ({ failure, errorCode, chat, fresh, reconciled, enabled }) => {
+  })))))("stock reconciliation of a continuous Pi session: $auditLabel $failure, chat=$chat, fresh=$fresh, reconciled=$reconciled, enabled=$enabled", async ({ failure, errorCode, chat, fresh, reconciled, enabled }) => {
     await instanceSettingsService(db).updateExperimental({ autoFreshSessionOnRecovery: enabled });
     const f = await seed(), sessionId = randomUUID();
     await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", fixtureSessionId: sessionId } })
@@ -306,6 +314,7 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       });
       const next = await execute(f, { ...recovery, forceFreshSession: true, recoveryActionId: actionId,
         previousRunId: failed.id, retryOfRunId: failed.id });
+      process.stdout.write(`DESIGNER-PREP ${JSON.stringify({ failure, errorCode, reconciled, enabled, sourceRunId: failed.id, recoveryRunId: next.finished.id, savedSessionId: sessionId, resumes: next.input.runtime.sessionId, actualReset: next.finished.resultJson?.configFreshness, marker: next.finished.contextSnapshot?.warmRecoveryFreshSession })}\n`);
       expect(next.input.runtime.sessionId).toBe(fresh ? null : sessionId);
       expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: { reset: fresh, taskSessionReused: !fresh } } });
       expect(Boolean(next.finished.contextSnapshot?.warmRecoveryFreshSession)).toBe(fresh);
@@ -1008,7 +1017,7 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
   it("keeps a workspace source refusal typed before provider startup", async () => {
     const f = await seed(), type = `${adapterType}_source_refusal`;
     registerServerAdapter({ ...getServerAdapter(adapterType), type,
-      execute: async () => { throw new NativeProviderStateIncompatibleError("workspace_continuation_source_missing"); } });
+      execute: async () => { throw new NativeProviderStateIncompatibleError("workspace_continuation_source_scope_mismatch"); } });
     try {
       await db.update(agents).set({ adapterType: type }).where(eq(agents.id, f.agentId));
       const run = await heartbeat.wakeup(f.agentId, { source: "on_demand", triggerDetail: "manual", reason: "manual",
@@ -1016,7 +1025,7 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       await heartbeat.drainActiveRunExecutions();
       const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id));
       expect(finished).toMatchObject({ status: "failed", errorCode: "native_provider_state_incompatible",
-        error: expect.stringContaining("workspace_continuation_source_missing") });
+        error: expect.stringContaining("workspace_continuation_source_scope_mismatch") });
     } finally { unregisterServerAdapter(type); }
   });
 

@@ -41,7 +41,7 @@ import { registerRunStartHandover } from "../run-start-handover.js";
 import { closeSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { once } from "node:events";
 import { PgDialect } from "drizzle-orm/pg-core";
-import { eq, type SQL } from "drizzle-orm";
+import { eq, sql, type SQL } from "drizzle-orm";
 import {
   access,
   chmod,
@@ -21414,6 +21414,49 @@ describe("runnerd provider runtime wiring", () => {
     );
   });
 
+  it.each(["authority_indeterminate", "terminal_state_indeterminate", "unverifiable", "target_conflict"] as const)("DESIGNER-I: recoverable %s must not authorize fresh", async mode => {
+    const prior = { ...scopedNativeExecution(`designer-${mode}`), provider: { kind: "pi_rpc" as const, model: "provider/model" } };
+    prior.session = { ...prior.session, driverKind: "pi_rpc" };
+    const current: NativeExecutionInput = { ...prior, binding: { ...prior.binding, runId: "run-workspace-next", executionWorkspaceId: "workspace-Y" }, workspace: { ...prior.workspace, cwd: "/workspace-Y" } };
+    const root = await initializeScopedRunnerRoot(prior, "workspace-runner");
+    const identity = { runId: prior.binding.runId, normalizedSessionId: prior.session.normalizedSessionId, runnerInstanceId: "workspace-runner", environmentLeaseId: "workspace-lease" };
+    await mkdir(join(root, "control-plane"), { recursive: true }); await mkdir(join(root, "runner"), { recursive: true });
+    await writeFile(join(root, "control-plane/control-plane-state.json"), JSON.stringify(durableControlPlaneState(identity)));
+    await writeFile(join(root, "runner/runner-state.json"), JSON.stringify(durableRunnerState(identity, "suspended")));
+    await writeFile(join(root, "retained-transcript"), "prior answer\n");
+    const input = { db: priorNativeRunDb(prior), execution: current, runnerInstanceId: "next-runner", sessionContinuity: "continuous" as const, workspaceContinuationSource: prior };
+    if (mode === "authority_indeterminate") input.db = priorNativeRunDb({ ...prior, schema: "temporarily-invalid" } as never);
+    let affectedFile = mode === "terminal_state_indeterminate" ? join(root, "runner/runner-state.json") : join(root, "control-plane/control-plane-state.json");
+    if (mode === "target_conflict") {
+      await createRunnerdBackend(input); state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+      const reader = priorNativeRunDb(prior);
+      input.db = { select: (fields: Record<string, unknown>) => {
+        if (fields?.status === heartbeatRuns.status && fields?.runnerProfileJson === heartbeatRuns.runnerProfileJson) throw new Error("controlled DB read after completed rename");
+        return reader.select(fields as never);
+      } } as unknown as Db;
+    }
+    const { chmod } = await import("node:fs/promises");
+    if (mode === "terminal_state_indeterminate" || mode === "unverifiable") await chmod(affectedFile, 0);
+    let failure: Error & { code: string };
+    try {
+      failure = await createRunnerdBackend(input).then(() => { throw new Error("expected fail-closed source refusal"); }, error => error as Error & { code: string });
+    } finally {
+      if (mode === "terminal_state_indeterminate" || mode === "unverifiable") await chmod(affectedFile, 0o600);
+    }
+    const reason = mode === "target_conflict" ? "workspace_continuation_target_conflict" : `workspace_continuation_source_${mode}`;
+    expect(failure!).toMatchObject({ code: "native_provider_state_incompatible", message: `native_session_recovery_failed: ${reason}` });
+    const { sessionCannotContinue } = await import("./continued-session.js");
+    const freshAuthorized = sessionCannotContinue({ errorCode: failure!.code, error: failure!.message });
+    input.db = priorNativeRunDb(prior);
+    await createRunnerdBackend(input); state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+    const target = state.createTransport.mock.calls.at(-1)![0].stateDirectory!;
+    const transcript = await readFile(join(target, "retained-transcript"), "utf8");
+    expect(transcript).toBe("prior answer\n");
+    expect(current.session.normalizedSessionId).toBe(prior.session.normalizedSessionId);
+    console.log("DESIGNER-I", JSON.stringify({ reason, code: failure!.code, freshAuthorized, sameSessionReadmitted: true, transcript, session: current.session.normalizedSessionId }));
+    expect(freshAuthorized).toBe(false);
+  });
+
   it("AUTO-FRESH-UNAVAILABLE: a transient source read retains the same Pi session and transcript", async () => {
     const prior = { ...scopedNativeExecution("source-read-unavailable"), provider: { kind: "pi_rpc" as const, model: "provider/model" } };
     prior.session = { ...prior.session, driverKind: "pi_rpc" };
@@ -21444,6 +21487,97 @@ describe("runnerd provider runtime wiring", () => {
     expect(current.session.normalizedSessionId).toBe(prior.session.normalizedSessionId);
     expect(existsSync(root)).toBe(false);
     console.log("AUTO-FRESH-UNAVAILABLE", JSON.stringify({ code: failure.code, message: failure.message, sessionId: current.session.normalizedSessionId, transcript: "prior answer\n" }));
+  });
+
+  it.skipIf(!recoveryPostgresSupport.supported).each(["terminal-state", "target-read-unavailable"] as const)("AUTO-FRESH-REAL-PG: retains Pi context after %s", async mode => {
+    const database = await startRecoveryPostgres("auto-fresh-real-pg-");
+    const pg = createDb(database.connectionString);
+    try {
+      const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+      await pg.insert(companies).values({ id: companyId, name: "Qualified continuity", issuePrefix: "QCT" });
+      await pg.insert(agents).values({ id: agentId, companyId, name: "Pi", adapterType: "paperclip_runner" });
+      await pg.insert(issues).values({ id: issueId, companyId, title: "Retain saved context", status: "todo" });
+      const prior: NativeExecutionInput = { ...scopedNativeExecution(`real-pg-${mode}`), provider: { kind: "pi_rpc", model: "provider/model" } };
+      prior.binding = { ...prior.binding, companyId, agentId, issueId, runId: randomUUID() };
+      prior.session = { ...prior.session, normalizedSessionId: randomUUID(), driverKind: "pi_rpc" };
+      const current: NativeExecutionInput = { ...prior, binding: { ...prior.binding, runId: randomUUID(), executionWorkspaceId: "workspace-Y" }, workspace: { ...prior.workspace, cwd: "/workspace-Y" } };
+      for (const saved of [prior, current]) await pg.insert(heartbeatRuns).values({ id: saved.binding.runId, companyId, agentId,
+        nativeIssueId: issueId, nativeSessionId: saved.session.normalizedSessionId, status: "succeeded", runtimeMode: "native",
+        runnerProfileJson: { nativeExecutionInput: saved } });
+      const saved = mode === "terminal-state" ? prior : current;
+      const root = await initializeScopedRunnerRoot(saved, "workspace-runner");
+      const identity = { runId: saved.binding.runId, normalizedSessionId: saved.session.normalizedSessionId, runnerInstanceId: "workspace-runner", environmentLeaseId: "workspace-lease" };
+      await mkdir(join(root, "control-plane"), { recursive: true }); await mkdir(join(root, "runner"), { recursive: true });
+      await writeFile(join(root, "control-plane/control-plane-state.json"), JSON.stringify(durableControlPlaneState(identity)));
+      const lifecycleFile = join(root, "runner/runner-state.json");
+      await writeFile(lifecycleFile, JSON.stringify(durableRunnerState(identity, mode === "terminal-state" ? "ready" : "suspended")));
+      await writeFile(join(root, "retained-transcript"), "prior answer\n");
+      // All saved rows are real PG. Fault exactly the wrapped second target read
+      // with a real PostgreSQL division-by-zero error, not a stubbed row/result.
+      const faultDb = new Proxy(pg, { get(target, key) {
+        if (key !== "select") return Reflect.get(target, key);
+        return (fields: Record<string, unknown>) => {
+          if (fields?.runnerProfileJson === heartbeatRuns.runnerProfileJson && !fields.status) {
+            const query = { from: () => query, where: () => query, limit: () => query,
+              then: (yes: (value: unknown) => unknown, no: (error: unknown) => unknown) => pg.execute(sql`select 1 / 0`).then(yes, no) };
+            return query;
+          }
+          return pg.select(fields as never);
+        };
+      } }) as Db;
+      const input = { db: mode === "terminal-state" ? pg : faultDb, execution: current, runnerInstanceId: "next-runner",
+        sessionContinuity: "continuous" as const, workspaceContinuationSource: prior };
+      const failure = await createRunnerdBackend(input).then(() => { throw new Error("expected closed admission"); }, error => error as Error & { code: string });
+      const reason = mode === "terminal-state" ? "workspace_continuation_source_terminal_state_indeterminate" : "workspace_continuation_target_conflict";
+      expect(failure).toMatchObject({ code: "native_provider_state_incompatible", message: `native_session_recovery_failed: ${reason}` });
+      const { sessionCannotContinue } = await import("./continued-session.js");
+      expect(sessionCannotContinue({ errorCode: failure.code, error: failure.message })).toBe(false);
+      expect(await readFile(join(root, "retained-transcript"), "utf8")).toBe("prior answer\n");
+      input.db = pg;
+      await writeFile(lifecycleFile, JSON.stringify(durableRunnerState(identity, "suspended")));
+      await createRunnerdBackend(input); state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+      const target = state.createTransport.mock.calls.at(-1)![0].stateDirectory!;
+      expect(await readFile(join(target, "retained-transcript"), "utf8")).toBe("prior answer\n");
+      console.log("AUTO-FRESH-REAL-PG", JSON.stringify({ mode, code: failure.code, message: failure.message,
+        sourceRunId: prior.binding.runId, targetRunId: current.binding.runId, sessionId: current.session.normalizedSessionId, transcriptPreserved: true }));
+    } finally { await database.cleanup(); }
+  });
+
+  it.each(["missing-run", "missing-input", "malformed-input", "not-suspended", "unreadable-lifecycle"] as const)("AUTO-FRESH-INDETERMINATE: retains the same Pi source through %s", async mode => {
+    const prior = { ...scopedNativeExecution(`source-${mode}`), provider: { kind: "pi_rpc" as const, model: "provider/model" } };
+    prior.session = { ...prior.session, driverKind: "pi_rpc" };
+    const current: NativeExecutionInput = { ...prior, binding: { ...prior.binding, runId: "run-workspace-next", executionWorkspaceId: "workspace-Y" }, workspace: { ...prior.workspace, cwd: "/workspace-Y" } };
+    const root = await initializeScopedRunnerRoot(prior, "workspace-runner");
+    const identity = { runId: prior.binding.runId, normalizedSessionId: prior.session.normalizedSessionId, runnerInstanceId: "workspace-runner", environmentLeaseId: "workspace-lease" };
+    await mkdir(join(root, "control-plane"), { recursive: true }); await mkdir(join(root, "runner"), { recursive: true });
+    await writeFile(join(root, "control-plane/control-plane-state.json"), JSON.stringify(durableControlPlaneState(identity)));
+    const lifecycleFile = join(root, "runner/runner-state.json");
+    await writeFile(lifecycleFile, mode === "unreadable-lifecycle" ? "{" : JSON.stringify(durableRunnerState(identity, mode === "not-suspended" ? "ready" : "suspended")));
+    await writeFile(join(root, "retained-transcript"), "prior answer\n");
+    const reader = priorNativeRunDb(prior);
+    const input = { db: { select: (fields: Record<string, unknown>) => {
+      if (fields?.status === heartbeatRuns.status && fields?.runnerProfileJson === heartbeatRuns.runnerProfileJson && !["not-suspended", "unreadable-lifecycle"].includes(mode)) {
+        const rows = mode === "missing-run" ? [] : [{ status: "succeeded", runnerProfileJson: mode === "missing-input" ? {} : { nativeExecutionInput: { invalid: true } } }];
+        const result = Promise.resolve(rows);
+        const query = { from: () => query, where: () => query, limit: () => query, then: result.then.bind(result) };
+        return query;
+      }
+      return reader.select(fields as never);
+    } } as unknown as Db, execution: current, runnerInstanceId: "next-runner", sessionContinuity: "continuous" as const, workspaceContinuationSource: prior };
+    const failure = await createRunnerdBackend(input).then(() => { throw new Error("expected source admission to fail closed"); }, error => error as Error & { code: string });
+    const reason = ["not-suspended", "unreadable-lifecycle"].includes(mode) ? "terminal_state_indeterminate" : "authority_indeterminate";
+    expect(failure).toMatchObject({ code: "native_provider_state_incompatible", message: `native_session_recovery_failed: workspace_continuation_source_${reason}` });
+    const { sessionCannotContinue } = await import("./continued-session.js");
+    expect(sessionCannotContinue({ errorCode: failure.code, error: failure.message })).toBe(false);
+    expect(await readFile(join(root, "retained-transcript"), "utf8")).toBe("prior answer\n");
+    input.db = priorNativeRunDb(prior);
+    await writeFile(lifecycleFile, JSON.stringify(durableRunnerState(identity, "suspended")));
+    await createRunnerdBackend(input); state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+    const target = state.createTransport.mock.calls.at(-1)![0].stateDirectory!;
+    expect(await readFile(join(target, "retained-transcript"), "utf8")).toBe("prior answer\n");
+    expect(current.session.normalizedSessionId).toBe(prior.session.normalizedSessionId);
+    console.log("AUTO-FRESH-INDETERMINATE", JSON.stringify({ mode, code: failure.code, message: failure.message,
+      sessionId: current.session.normalizedSessionId, transcript: "prior answer\n" }));
   });
 
   it.each(["continuous", "model-level-change", "paperclip", "unverified", "missing", "unreadable"] as const)("workspace root rename admits only its recorded Pi source: %s", async mode => {

@@ -350,8 +350,8 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
         }
       } else if (sessionCannotContinue(previous) &&
           (await instanceSettingsService(db).getExperimentalReadOnly()).autoFreshSessionOnRecovery === true) {
-        // Spend only on qualified lost provider/binding evidence, not transient
-        // reads, unsettled finalizers or ambiguous historical binding refusals.
+        // Spend only on the classifier's positive evidence allow-list. A typed
+        // incompatible error, free text or ambiguous allocation is not enough.
         // The four other refusal families may clear; ON retries their saved session.
         // An incident opens only when this fresh try is spent: without its marker,
         // authorized-newer selection does not override a lagging pointer for them.
