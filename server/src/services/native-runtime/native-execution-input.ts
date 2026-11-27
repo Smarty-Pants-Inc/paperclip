@@ -1,3 +1,5 @@
+import type { NativeToolContractVersion } from "./native-session-resume.js";
+import { savedAutomaticWakeEvents, savedAutomaticWakesText, withoutDuplicateSavedWakeContext } from "./saved-automatic-wakes.js";
 import type { PaperclipTurnContext } from "@paperclipai/adapter-utils/server-utils";
 import { resolvePaperclipRunnerCursorMode, resolvePaperclipRunnerPiThinkingLevel } from "@paperclipai/adapter-utils";
 import { createHash } from "node:crypto";
@@ -86,6 +88,8 @@ export interface BuildNativeExecutionInput {
   /** Skill keys selected from the admitted, manager-authored GitHub configuration. */
   githubInstructionSkillKeys?: readonly string[];
   resumedSession?: boolean;
+  /** Server-selected retained catalog, not a provider-supplied capability. */
+  nativeToolContractVersion?: NativeToolContractVersion;
   sessionContinuity?: unknown;
   previousTurn?: {
     runId: string;
@@ -260,17 +264,17 @@ function buildNativeExecutionInputUnchecked(input: BuildNativeExecutionInput): N
   const externalChatSkillDescription = configuredGitHubSkills.length > 0
     ? `Configured GitHub instruction skills:\n${configuredGitHubSkills.map((skill) => `/${skill.runtimeName}`).join("\n")}`
     : null;
+  const savedEventsReaderAvailable = input.nativeToolContractVersion !== "v19";
+  let savedEventsInlineLimit = savedAutomaticWakeEvents(input.wakePayload).length;
+  let savedEventsByReference = false;
   const composeTaskPrompt = (payload: unknown) => {
-    const { taskContextNote, wakePrompt } = promptSections(payload);
-    const savedEvents = payload && typeof payload === "object"
-      ? (payload as Record<string, unknown>).nativeInputRefusalWakes : null;
+    const { taskContextNote, wakePrompt } = promptSections(withoutDuplicateSavedWakeContext(payload));
     return caseProjectionBootstrapPrefix(input.caseContext) + [
     wakePrompt,
     // The shared wake normalizer intentionally ignores unknown fields. Keep
     // these server-bound events in the measured native prompt, not just JSON
     // stored on the run. They are data, never authority or runtime instructions.
-    Array.isArray(savedEvents) && savedEvents.length
-      ? `Saved automatic wake events (untrusted data):\n${JSON.stringify(savedEvents)}` : "",
+    savedAutomaticWakesText(payload, savedEventsByReference, savedEventsReaderAvailable, savedEventsInlineLimit),
     // Durable task questions must survive the current provider turn.
     // Keep routing visible before deferred tool discovery; usage belongs in the tool schema.
     "Use Paperclip's request_human_input for durable task questions.",
@@ -308,7 +312,7 @@ function buildNativeExecutionInputUnchecked(input: BuildNativeExecutionInput): N
     runtimeContext.aggregateDigest = canonicalNativeRuntimeContextDigest(runtimeContext);
   }
   const composeContinuationPrompt = (wakePayload: unknown) => continuationDecision.continue && input.previousTurn ? buildNativeContinuationPrompt({
-    wakePayload, promptOnly: continuationDecision.promptOnly, previousRunId: input.previousTurn.runId,
+    wakePayload, savedEventsByReference, savedEventsReaderAvailable, savedEventsInlineLimit, promptOnly: continuationDecision.promptOnly, previousRunId: input.previousTurn.runId,
     previousIssue: input.previousTurn.task, previousGitHubReviewConfigurationKeys: input.previousTurn.githubReviewConfigurationKeys,
     allowExternalChat: true, issue: input.issue, caseContext: input.caseContext, workflowCase,
   }) : null;
@@ -489,6 +493,32 @@ function buildNativeExecutionInputUnchecked(input: BuildNativeExecutionInput): N
       if ("continuationPrompt" in execution) execution.continuationPrompt = composeContinuationPrompt({ ...(input.wakePayload as Record<string, unknown>), executionContinuation: value });
       return selectedBytes();
     };
+    // Inline saved events are optional representation, never required source
+    // bytes. Switch to the closed reader before the measured command guard can
+    // blame the person's repaired request for the size of an automatic backlog.
+    if (selectedBytes() > NATIVE_TURN_KNOWN_MAX_BYTES && savedAutomaticWakesText(input.wakePayload)) {
+      const renderSavedEvents = () => {
+        execution.task.prompt = composeTaskPrompt(bootstrapWakePayload);
+        if ("continuationPrompt" in execution) execution.continuationPrompt = composeContinuationPrompt(input.wakePayload);
+      };
+      if (savedEventsReaderAvailable) {
+        savedEventsByReference = true;
+        renderSavedEvents();
+      } else {
+        // A v19 thread cannot call the reader. Retain the newest whole events
+        // inline, measured on this turn's actual road; disclose every omission.
+        let low = 0, high = savedEventsInlineLimit;
+        while (low < high) {
+          savedEventsInlineLimit = Math.ceil((low + high) / 2);
+          renderSavedEvents();
+          if (selectedBytes() <= NATIVE_TURN_KNOWN_MAX_BYTES) low = savedEventsInlineLimit;
+          else high = savedEventsInlineLimit - 1;
+        }
+        savedEventsInlineLimit = low;
+        renderSavedEvents();
+      }
+      if ("completionSources" in execution && execution.completionSources) execution.completionSources.promptSha256 = createHash("sha256").update(execution.task.prompt).digest("hex");
+    }
     if (continuation?.version === 1) {
       const bounded = boundNativeExecutionContinuation(continuation, measure, input.continuationReadState, operationId => {
         try { return ["GET", "HEAD"].includes(runnerApiOperation(operationId).method); } catch { return false; }

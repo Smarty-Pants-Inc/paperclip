@@ -57,6 +57,7 @@ import {
   nativeCompletionSource,
   nativeImmediateObjectiveSource,
   nativeToolContractFingerprintForTarget,
+  type NativeToolContractVersion,
   prepareNativeSessionBootstrapPersistence,
   prepareNativeWorkspaceSync,
   type NativeRestartRecoveryClaim,
@@ -346,6 +347,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
   let nativeExecution: NativeExecutionInput | null = null;
   let workspaceContinuationSource: NativeExecutionInput | undefined;
   let toolRefreshOnResume: boolean | undefined;
+  let nativeToolContractVersion: NativeToolContractVersion = "v20";
   let getNativeFreshSessionHandoff: (() => Promise<string | null>) | undefined;
   let nativeRunnerInstanceId: string | null = null;
   let pluginTaskDescription = activeEnvironmentLease?.pluginTaskDescription;
@@ -838,7 +840,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
       }
       const workspaceMigration = persistedExecutionWorkspace?.metadata?.nativeWorkspaceMigration
         ? await readNativeWorkspaceMigration(db, { companyId: agent.companyId, id: nativeExecutionWorkspaceId }) : null;
-      const buildExecution = ({ normalizedSessionId, resumedSession }: { normalizedSessionId: string; resumedSession: boolean }) =>
+      const buildExecution = ({ normalizedSessionId, resumedSession, nativeToolContractVersion }: { normalizedSessionId: string; resumedSession: boolean; nativeToolContractVersion?: NativeToolContractVersion }) =>
             buildNativeExecutionInput({
               agentKeyId: agentIdentity?.keyId,
               companyId: agent.companyId,
@@ -873,6 +875,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
               turnContext: context.paperclipTurnContext,
               githubInstructionSkillKeys: runScopedMentionedSkillKeys,
               resumedSession,
+              nativeToolContractVersion,
               previousTurn: (() => {
                 if (!previousNativeRun || nativeReviewRequest) return null;
                 try {
@@ -957,6 +960,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         buildExecution,
       });
       nativeExecution = nativeExecutionWithCheckpoint.execution;
+      nativeToolContractVersion = nativeExecutionWithCheckpoint.nativeToolContractVersion;
       nativeResumeCheckpoint = nativeExecutionWithCheckpoint.checkpoint;
       if (
         nativeSessionId !==
@@ -1118,10 +1122,13 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
                 ? { inheritedProcessIdentityRunId: previousNativeRun.id }
                 : {}),
             nativeResourceDisposition: providerResourceDispositionForRun,
-            nativeToolContractFingerprint:
-              nativeToolContractFingerprintForTarget(
+            nativeToolContractFingerprint: lockedProfile.nativeExecutionInput &&
+              typeof lockedProfile.nativeToolContractFingerprint === "string"
+              ? lockedProfile.nativeToolContractFingerprint
+              : nativeToolContractFingerprintForTarget(
                 executionTarget?.kind ?? "local",
                 nativeExecution!.provider.kind,
+                nativeToolContractVersion,
               ),
             ...(lockedProfile.sessionCheckpoint != null
               ? { sessionCheckpoint: lockedProfile.sessionCheckpoint }

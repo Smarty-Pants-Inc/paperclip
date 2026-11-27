@@ -21,6 +21,8 @@ import { hasLocalRuntimeSkillObligations } from "../native-runtime/runtime-skill
 import * as runtimeSkillPreservation from "../native-runtime/runtime-skill-preservation.js";
 import { removeRuntimeAssetTree } from "../native-runtime/runtime-asset-retention.js";
 import { nativeRuntimeContextFixture } from "../native-runtime/runtime-context.test-fixture.js";
+import { nativeToolContractFingerprintForTarget, nativeToolContractVersionForProfile } from "../native-runtime/native-session-resume.js";
+import { PaperclipRunnerToolAuthority } from "../native-runtime/paperclip-runner-tool-authority.js";
 import { prepareNativeWorkspaceSync } from "../native-runtime/native-workspace-sync.js";
 import { resolveHeartbeatNativeRuntimeMode } from "../native-runtime/runtime-mode.js";
 import { claimNativeRestartRecoveries } from "../native-runtime/native-restart-recovery.js";
@@ -592,6 +594,51 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       payload: expect.objectContaining({ state: changed ? "saved" : "unchanged", contract: "agent_files", errorCode: null }) }));
     if (changed) expect(await readFile(join(canonical, "memory.txt"), "utf8")).toBe("Synthetic changed memory.\n");
   }, 45_000);
+
+  it.each([
+    ["pi_rpc", "local", "v19"], ["codex", "remote", "v19"], ["opencode", "remote", "v19"],
+    ["pi_rpc", "local", "v20"], ["codex", "remote", "v20"], ["opencode", "remote", "v20"],
+  ] as const)("V17 runtime selection persists the %s %s %s catalog across two follow-ups", async (provider, target, version) => {
+    const { input, run, issue, agent } = await fixture();
+    input.agent.adapterConfig = { provider, model: provider === "codex" ? "gpt-5.6-luna" : "provider/model", sessionContinuity: "continuous" };
+    input.workspace.executionTarget = target === "remote" ? sandbox : null;
+    input.nativeRuntimeResolution = resolveHeartbeatNativeRuntimeMode({ persisted: run, enabled: true, runtimeConfig: {},
+      adapterConfig: input.agent.adapterConfig, agent: input.agent, issue, target: input.workspace.executionTarget, workspaceId: null });
+    const first = await selectHeartbeatRuntime(db, input);
+    if (!first.selected || !first.nativeExecution) throw new Error("Expected fresh native selection");
+    let saved = await read(run.id);
+    const sessionId = saved.nativeSessionId!;
+    expect(saved.runnerProfileJson?.nativeToolContractFingerprint).toBe(nativeToolContractFingerprintForTarget(target, provider));
+    const fingerprint = nativeToolContractFingerprintForTarget(target, provider, version);
+    for (let turn = 1; turn <= 2; turn++) {
+      const priorInput = saved.runnerProfileJson!.nativeExecutionInput as typeof first.nativeExecution;
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(), runnerProfileJson: {
+        ...saved.runnerProfileJson, nativeToolContractFingerprint: fingerprint,
+        sessionCheckpoint: { backendKind: "runner", driverKind: priorInput.session.driverKind,
+          sessionId: "held-provider-thread", providerSessionId: "held-provider-thread", identity: { ...priorInput.binding, sessionId } },
+      } }).where(eq(heartbeatRuns.id, saved.id));
+      const [next] = await db.insert(heartbeatRuns).values({ companyId: agent.companyId, agentId: agent.id, issueId: issue.id,
+        scopeKind: "issue", status: "running", nativeSessionId: sessionId, createdAt: new Date(saved.createdAt.getTime() + 1000) }).returning();
+      input.run = next!;
+      input.task.context.paperclipWake = { reason: "issue_children_completed", nativeInputRefusalWakes: [{ childSummary: "OWED-A-" + "a".repeat(20_000) }, { childSummary: "OWED-B-" + "b".repeat(20_000) }] };
+      const selected = await selectHeartbeatRuntime(db, input);
+      if (!selected.selected || !selected.nativeExecution) throw new Error("Expected retained native selection");
+      saved = await read(next!.id);
+      expect(saved.nativeSessionId).toBe(sessionId);
+      expect(saved.runnerProfileJson?.nativeToolContractFingerprint).toBe(fingerprint);
+      expect(saved.runnerProfileJson?.sessionCheckpoint).toMatchObject({ sessionId: "held-provider-thread", identity: { runId: next!.id } });
+      const readerAvailable = nativeToolContractVersionForProfile(saved.runnerProfileJson, target, provider) !== "v19";
+      const authority = new PaperclipRunnerToolAuthority(db, { companyId: agent.companyId, agentId: agent.id, issueId: issue.id, runId: saved.id,
+        savedAutomaticWakeReaderAvailable: readerAvailable });
+      expect(authority.definitions().some(tool => tool.name === "read_saved_automatic_wakes")).toBe(version === "v20");
+      if (version === "v19") {
+        expect(selected.nativeExecution.task.prompt).toContain("OWED-A-"); expect(selected.nativeExecution.task.prompt).toContain("OWED-B-");
+        expect(selected.nativeExecution.task.prompt).not.toContain("read_saved_automatic_wakes");
+      } else expect(selected.nativeExecution.task.prompt).toContain("read_saved_automatic_wakes");
+      authority.close();
+      console.info(JSON.stringify({ row: "V17-persisted-catalog", provider, target, version, turn, sessionId, runId: saved.id, fingerprint, readerAvailable }));
+    }
+  });
 
   it.each([true, false])("records which earlier run a follow-up's process identity came from (prior identity: %s)", async priorIdentity => {
     const { input, run, agent, issue } = await fixture();

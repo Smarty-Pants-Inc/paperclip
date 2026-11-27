@@ -1,4 +1,5 @@
-import { deferNativeInputRefusalWake, hasUnchangedNativeInputRefusal, isNativeInputSizeRefusal, latestTaskRunIsNativeInputSizeRefusal } from "../../../services/native-input-refusal.js";
+import { deferNativeInputRefusalWake, isNativeInputSizeRefusal, restoreRefusedNativeInputWakes, heldNativeInputWakeIsUnchanged, handOverNativeInputWakes } from "../../../services/native-input-refusal.js";
+import { resumeRepairedNativeInputRefusal } from "../../../services/recovery/native-input-refusal-repair.js";
 import { notifyStrandedAgentStatus } from "../../../services/live-run-recovery-notifications.js";
 import { notifyDeferredExecutionWork } from "../../../services/deferred-execution-notifications.js";
 import { writeDeferredExecutionWait } from "../../../services/deferred-execution-wait.js";
@@ -294,6 +295,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
     },
 
     async findNextDeferredWake({ companyId, issueId, excludedWakeIds }) {
+      await handOverNativeInputWakes(tx, { companyId, issueId });
       const excluded = [...(excludedWakeIds ?? [])];
       while (true) {
         const row = await tx
@@ -320,9 +322,12 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         // revisions gate every deferred promotion, not just enqueue; skip
         // before comment cleanup so a held receipt stays in durable custody.
         const scope = { companyId, issueId, agentId: row.agentId };
+        if (parseObject(row.payload).nativeInputRefusalHold === true) {
+          const [owner] = await tx.select({ agentId: issues.assigneeAgentId, status: issues.status }).from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
+          if (!owner?.agentId || owner.status === "blocked") { excluded.push(row.id); continue; }
+        }
         if ((parseObject(row.payload).nativeInputRefusalHold === true || row.source === "automation" || row.requestedByActorType !== "user")
-          && await latestTaskRunIsNativeInputSizeRefusal(tx, scope)
-          && await hasUnchangedNativeInputRefusal(tx, scope)) {
+          && await heldNativeInputWakeIsUnchanged(tx, scope, row.payload)) {
           // Fold pre-v15 saved receipts into the same aggregate on first
           // inspection. No new wake is needed to repair the old row pile.
           if (!Array.isArray(parseObject(row.payload).nativeInputRefusalWakes)) {
@@ -645,6 +650,12 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
     },
 
     async claimDeferredWakeForPromotion({ companyId, wakeId, now }) {
+      const [wake] = await tx.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, wakeId),
+      )).for("update");
+      const issueId = wake?.payload?.issueId;
+      if (wake && typeof issueId === "string" && (wake.payload?.nativeInputRefusalHold === true || wake.source === "automation" || wake.requestedByActorType !== "user")
+        && await heldNativeInputWakeIsUnchanged(tx, { companyId, issueId, agentId: wake.agentId }, wake.payload)) return false;
       const claimed = await tx
         .update(agentWakeupRequests)
         .set({
@@ -674,8 +685,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.id, input.wakeId)));
       const scope = { companyId: input.companyId, issueId: input.issue.id, agentId: input.deferredAgent.id };
       if (receipt && (receipt.payload?.nativeInputRefusalHold === true || receipt.source === "automation" || receipt.actorType !== "user")
-        && await latestTaskRunIsNativeInputSizeRefusal(tx, scope)
-        && await hasUnchangedNativeInputRefusal(tx, scope)) {
+        && await heldNativeInputWakeIsUnchanged(tx, scope, receipt.payload)) {
         throw new Error("native_input_refusal_held: deferred input must change before promotion");
       }
       await notifyChatRunMilestones(tx, { companyId: input.companyId, issueId: input.issue.id });
@@ -811,6 +821,14 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
     },
 
     async queueReviewParticipantRecoveryRun({ companyId, issue, finishingRun, recoveryAgent, sessionBefore, now }) {
+      // This separate run-creation door is still automatic admission. Save its
+      // owed recovery event instead of replaying the refused review input.
+      if (await deferNativeInputRefusalWake(tx, { companyId, issueId: issue.id, agentId: recoveryAgent.id,
+        source: "automation", triggerDetail: "system", reason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
+        payload: { issueId: issue.id, retryOfRunId: finishingRun.id },
+        contextSnapshot: { issueId: issue.id, wakeReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON },
+        requestedByActorType: "system", requestedByActorId: null, idempotencyKey: null,
+      })) return null;
       await notifyStatusCardIssueChange(tx, companyId);
       const executionState = parseIssueExecutionState(issue.executionState);
       const wakeupRequest = await tx
@@ -1430,7 +1448,11 @@ export function createPostgresIssueWakeAdmission(db: Db) {
           lockedIssue = issue ?? null;
           return lockedIssue;
         };
-        await lockIssue();
+        const admissionIssue = await lockIssue();
+        if (admissionIssue?.status === "blocked") {
+          await resumeRepairedNativeInputRefusal(tx as unknown as Db, { companyId, issueId });
+          await lockIssue();
+        }
         const deferBlockedWake = createWakeRecoveryDeferral<ActivityPublication>(issueId, Boolean(durableChatRequest), {
           updateWait({ requestId, agentId, condition, publications }) {
             return writeDeferredExecutionWait(tx as unknown as Db, {
@@ -1540,10 +1562,17 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
               `,
         );
 
+        await restoreRefusedNativeInputWakes(tx, run);
+        if (contextIssueId) {
+          await handOverNativeInputWakes(tx, { companyId: input.companyId, issueId: contextIssueId });
+          await resumeRepairedNativeInputRefusal(tx, { companyId: input.companyId, issueId: contextIssueId });
+        }
+
         // A run the fresh-continuation fallback replaced is settled for good: its
         // finalization may stay terminal_failure (restart recovery ended it), and
         // the saved input queued behind it is now the task's next turn.
-        if (input.resumeStrandedQueue && run.runtimeMode === "native" && !agentRunSupersededByFreshContinuation(run)) {
+        if (input.resumeStrandedQueue && run.runtimeMode === "native" && !agentRunSupersededByFreshContinuation(run)
+          && !(run.errorCode === "native_input_refusal_claim_held" && !run.startedAt)) {
           const [finalized] = contextIssueId && run.nativeIssueId === contextIssueId
             ? await tx.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(
                 eq(nativeRunFinalizations.companyId, input.companyId), eq(nativeRunFinalizations.runId, run.id),
@@ -1786,6 +1815,8 @@ export function createFreshIssueRunStore(
       return receipt;
     },
     async readCommentCandidates({ issueId, agentId, handoffRunId, receiptScope, checkExecutionBlocker }) {
+      await handOverNativeInputWakes(tx, { companyId, issueId });
+      await resumeRepairedNativeInputRefusal(tx, { companyId, issueId });
       const [handoff] = handoffRunId ? await tx.select({ agentId: heartbeatRuns.agentId }).from(heartbeatRuns).where(and(
         eq(heartbeatRuns.id, handoffRunId), eq(heartbeatRuns.companyId, companyId),
         eq(heartbeatRuns.status, "cancelled"), eq(heartbeatRuns.errorCode, "issue_reassigned"),
@@ -1810,11 +1841,11 @@ export function createFreshIssueRunStore(
       const blocked = candidates.length > 0 && checkExecutionBlocker && await getExecutionBlocker(tx, companyId, issueId);
       // A person's unchanged Retry is explicit permission for its own attempt,
       // not permission to consume automatic wakes held on the refused input.
-      const hold = candidates.some(wake => parseObject(wake.payload).nativeInputRefusalHold === true)
-        && await latestTaskRunIsNativeInputSizeRefusal(tx, { companyId, issueId, agentId })
-        && await hasUnchangedNativeInputRefusal(tx, { companyId, issueId, agentId });
+      const heldIds = new Set<string>();
+      for (const wake of candidates) if (parseObject(wake.payload).nativeInputRefusalHold === true &&
+        await heldNativeInputWakeIsUnchanged(tx, { companyId, issueId, agentId }, wake.payload)) heldIds.add(wake.id);
       return { handoffAgentId: handoff?.agentId ?? null, candidates: blocked ? [] : candidates.filter(wake =>
-        !hold || parseObject(wake.payload).nativeInputRefusalHold !== true).map(wake => {
+        !heldIds.has(wake.id)).map(wake => {
           const payload = parseObject(wake.payload);
           return payload.nativeInputRefusalHold === true && !Array.isArray(payload.nativeInputRefusalWakes)
             ? { ...wake, payload: { ...payload, nativeInputRefusalWakes: [{ reason: wake.reason, payload }] } } : wake;
@@ -1833,8 +1864,7 @@ export function createFreshIssueRunStore(
         actorType: agentWakeupRequests.requestedByActorType }).from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, seed.wakeupRequestId)));
       if (seed.issueId && receipt && (receipt.payload?.nativeInputRefusalHold === true || receipt.source === "automation" || receipt.actorType !== "user")
-        && await latestTaskRunIsNativeInputSizeRefusal(tx, { companyId, issueId: seed.issueId, agentId: seed.agentId })
-        && await hasUnchangedNativeInputRefusal(tx, { companyId, issueId: seed.issueId, agentId: seed.agentId })) {
+        && await heldNativeInputWakeIsUnchanged(tx, { companyId, issueId: seed.issueId, agentId: seed.agentId }, receipt.payload)) {
         throw new Error("native_input_refusal_held: deferred input must change before admission");
       }
       const [run] = await tx.insert(heartbeatRuns).values({

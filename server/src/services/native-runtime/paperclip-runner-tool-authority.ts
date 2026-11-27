@@ -42,6 +42,7 @@ import { agentCommentaryToolInputSchema } from "@paperclipai/shared";
 import { submitAgentCommentary } from "../agent-commentary.js";
 import { sendAgentChatMessage } from "../agent-chat-messages.js";
 import type { createAssignedMcpTools } from "./assigned-mcp-tools.js";
+import { READ_SAVED_AUTOMATIC_WAKES, READ_SAVED_AUTOMATIC_WAKES_DEFINITION, readSavedAutomaticWakes } from "./saved-automatic-wakes.js";
 import { captureRunnerToolResult, fitRunnerToolResultPage, READ_TOOL_RESULT, READ_TOOL_RESULT_DEFINITION, readToolResultSchema, RUNNER_TOOL_RESULT_MAX_BYTES } from "./runner-tool-results.js";
 import { assertAssignableAgent } from "../agent-assignability.js";
 import { approvalReadSqlCondition, canActorReadApproval, authorizationService, issueReadSqlCondition, type AuthorizationActor } from "../authorization.js";
@@ -153,6 +154,7 @@ import { logger } from "../../middleware/logger.js";
 const ARTIFACT_STORAGE_READ_TIMEOUT_MS = 60_000;
 const EXTERNAL_WORKSPACE_OPERATIONS = new Set(["get_workspace", "list_workspaces", "select_workspace", "prepare_repository", "register_deliverable"]);
 const IMPLEMENTED_OPERATIONS = new Set([
+  READ_SAVED_AUTOMATIC_WAKES,
   "send_chat_message",
   "submit_complaint", "submit_suggestion",
   "read_agent_instructions", "update_agent_instructions", "get_agent_instruction_history", "restore_agent_instructions",
@@ -167,6 +169,7 @@ const IMPLEMENTED_OPERATIONS = new Set([
 
 /** Closed first-party native Muse profile. No connector, generic API, credential or workspace grants. */
 export const MUSE_NATIVE_OPERATIONS = new Set([
+  READ_SAVED_AUTOMATIC_WAKES,
   "get_identity", "list_people",
   "submit_complaint", "submit_suggestion", "get_task_context", "get_task_history", "search_tasks", "report_progress", "set_task_title", "set_task_monitor",
   "create_task", "handoff_case", ...NATIVE_CASE_OPERATIONS, "reassign_task", "set_dependencies", "create_project", "list_projects", "list_documents", "read_document", "list_document_revisions", "write_document",
@@ -174,6 +177,7 @@ export const MUSE_NATIVE_OPERATIONS = new Set([
 ]);
 
 const NATIVE_REVIEW_READ_TOOLS = new Set([
+  READ_SAVED_AUTOMATIC_WAKES,
   "get_task_context", "get_task_history", "list_documents", "read_document", "list_document_revisions",
 ]);
 
@@ -181,6 +185,7 @@ const NATIVE_REVIEW_READ_TOOLS = new Set([
 // which rechecks the current tool advertisement, run, permissions and file scope.
 // External connector annotations never authorize replay of an uncertain effect.
 const RECOVERABLE_READ_OPERATIONS = new Set([
+  READ_SAVED_AUTOMATIC_WAKES,
   ...CAPABILITY_CANONICAL_OPERATIONS.filter(tool => IMPLEMENTED_OPERATIONS.has(tool.operationId) && tool.sideEffectClass === "read")
     .map(tool => tool.operationId),
   ...RUNNER_BRIDGE_READ_OPERATIONS,
@@ -230,6 +235,8 @@ type Binding = {
   runId: string;
   agentId: string;
   normalizedSessionId?: string;
+  /** False for a retained pre-reader provider thread, regardless of current server catalog. */
+  savedAutomaticWakeReaderAvailable?: boolean;
   pinnedMcpDigest?: string;
   /** Server-owned API origin and storage; never obtained from tool input. */
   apiUrl?: string;
@@ -397,6 +404,7 @@ export class PaperclipRunnerToolAuthority {
       // Scope Paperclip control-plane actions. Provider file and shell access
       // still follow the configured agent/environment policy, including tests.
       return [
+        ...(this.binding.savedAutomaticWakeReaderAvailable === false ? [] : [READ_SAVED_AUTOMATIC_WAKES_DEFINITION]),
         ...CAPABILITY_SEMANTIC_TOOL_CATALOG
           .filter((tool) => NATIVE_REVIEW_READ_TOOLS.has(tool.operationId))
           .map((tool) => ({ name: tool.operationId, description: tool.description, inputSchema: tool.inputSchema })),
@@ -471,6 +479,7 @@ export class PaperclipRunnerToolAuthority {
       && this.binding.workspaceRoot && runnerApiToolsEnabled(this.binding.companyId, this.binding.apiToolsEnabled)
       && (this.binding.executionTargetKind === "remote" ? this.binding.installRemoteArtifact : process.platform === "linux")) definitions.push(DOWNLOAD_ARTIFACT_DEFINITION);
     if (this.#imageGenerationAdvertised(workMode)) definitions.push(GENERATE_IMAGE_DEFINITION);
+    if (this.binding.savedAutomaticWakeReaderAvailable !== false) definitions.push(READ_SAVED_AUTOMATIC_WAKES_DEFINITION);
     definitions.push(READ_CURRENT_WAKE_COMMENTS_TOOL_DEFINITION);
     definitions.push(LIST_CHAT_ATTACHMENTS_TOOL_DEFINITION);
     definitions.push(REUSE_CHAT_ATTACHMENT_TOOL_DEFINITION);
@@ -852,6 +861,10 @@ export class PaperclipRunnerToolAuthority {
     }
     const context = await this.#boundContext({ tool: call.tool });
     const input = record(call.arguments);
+    if (call.tool === READ_SAVED_AUTOMATIC_WAKES) {
+      if (this.binding.savedAutomaticWakeReaderAvailable === false) throw new Error("saved_automatic_wakes_reader_not_declared");
+      return readSavedAutomaticWakes(context.run.contextSnapshot, input);
+    }
     if (call.tool === READ_CHAT_ATTACHMENT_TOOL_NAME) {
       const scope = this.binding.chatAttachmentReadScope;
       const identityKeys = ["companyId", "issueId", "runId", "agentId"] as const;

@@ -1,3 +1,4 @@
+import { retainRefusedPersonMessagesOnAssignment } from "./native-input-refusal.js";
 import { recordMcpAttachmentCleanup, type McpAttachmentCleanup } from "./public-mcp/upload-cleanup.js";
 import { assertAgentInteraction } from "./agent-interaction-policy.js";
 import { instancePublicOrigin, mayContainInventedHostLink, relativizeInventedHostLinks } from "./agent-invented-host-links.js";
@@ -12232,6 +12233,9 @@ export function issueService(db: Db) {
           await cancelCaseHandoffsForIssue(tx, { companyId: receiptExisting.companyId, issueId: id,
             reason: "Task assignment changed", exceptId: caseHandoffId, publications: activityPublications });
           patch.statusVersion = sql`${issues.statusVersion} + 1` as unknown as number;
+          if (receiptExisting.assigneeAgentId) await retainRefusedPersonMessagesOnAssignment(tx as Db, {
+            companyId: receiptExisting.companyId, issueId: id, agentId: receiptExisting.assigneeAgentId,
+          });
           // Invalidate human direction at the common assignment boundary, including
           // plugin/service writes that do not go through HTTP run cancellation.
           // Keep the requester attribution for audit; cancellation revokes its use.
@@ -12346,6 +12350,25 @@ export function issueService(db: Db) {
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;
+        // Assignment advances statusVersion to revoke the old human grant, but
+        // is not itself a new blocking decision. Carry only our exact automatic
+        // refusal block across that version; explicit Blocked/blocker edits do
+        // not inherit it and can never be undone by a later source repair.
+        if (receiptExisting.status === "blocked" && updated.status === "blocked" && issueData.status === undefined
+          && blockedByIssueIds === undefined && issueData.unblockDescriptor === undefined
+          && (updated.assigneeAgentId !== receiptExisting.assigneeAgentId || updated.assigneeUserId !== receiptExisting.assigneeUserId)) {
+          const actions = await tx.select().from(issueRecoveryActions).where(and(
+            eq(issueRecoveryActions.companyId, updated.companyId), eq(issueRecoveryActions.sourceIssueId, updated.id),
+            inArray(issueRecoveryActions.status, ["active", "escalated"]),
+          ));
+          for (const action of actions) {
+            const marker = parseObject(action.evidence.nativeInputRefusalBlock);
+            if (marker.statusVersion !== receiptExisting.statusVersion || typeof marker.runId !== "string") continue;
+            await tx.update(issueRecoveryActions).set({ evidence: { ...action.evidence,
+              nativeInputRefusalBlock: { ...marker, statusVersion: updated.statusVersion } }, updatedAt: new Date(),
+            }).where(and(eq(issueRecoveryActions.companyId, updated.companyId), eq(issueRecoveryActions.id, action.id)));
+          }
+        }
         if (updated.status === "done") {
           await completeTerminalCaseHandoffsForIssue(tx, { companyId: updated.companyId, issueId: updated.id,
             publications: activityPublications });

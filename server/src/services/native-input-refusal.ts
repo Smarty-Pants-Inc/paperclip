@@ -94,6 +94,12 @@ export async function deferNativeInputRefusalWake(db: Db, input: {
   return db.transaction(async rawTx => {
     const tx = rawTx as unknown as Db;
     await tx.execute(sql`select id from issues where company_id = ${input.companyId} and id = ${input.issueId} for update`);
+    const [refused] = await tx.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId),
+      sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.issueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${input.issueId}`,
+      inArray(heartbeatRuns.status, ["succeeded", "failed", "timed_out", "interrupted"]),
+    )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+    if (refused) await restoreRefusedNativeInputWakes(tx, refused);
     if (!await latestTaskRunIsNativeInputSizeRefusal(tx, input) || !await hasUnchangedNativeInputRefusal(tx, input)) return false;
     const rows = await tx.select().from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.agentId, input.agentId),
@@ -108,6 +114,7 @@ export async function deferNativeInputRefusalWake(db: Db, input: {
       const payload = { ...object(row.payload) };
       delete payload.nativeInputRefusalHold;
       delete payload.nativeInputRefusalWakes;
+      delete payload.nativeInputRefusalAgentIds;
       const contextSnapshot = { ...object(payload._paperclipWakeContext) };
       delete contextSnapshot.nativeInputRefusalWakes;
       delete payload._paperclipWakeContext;
@@ -123,8 +130,12 @@ export async function deferNativeInputRefusalWake(db: Db, input: {
     events.set(contentKey(event), event);
     const first = rows[0];
     const seed = first ? object(first.payload) : input.payload;
+    const owners = new Set([input.agentId, ...rows.flatMap(row => {
+      const prior = object(row.payload).nativeInputRefusalAgentIds;
+      return Array.isArray(prior) ? prior.filter((id): id is string => typeof id === "string") : [row.agentId];
+    })]);
     const payload = { ...seed, issueId: input.issueId, nativeInputRefusalHold: true,
-      nativeInputRefusalWakes: [...events.values()],
+      nativeInputRefusalAgentIds: [...owners], nativeInputRefusalWakes: [...events.values()],
       _paperclipWakeContext: { ...object(seed._paperclipWakeContext ?? input.contextSnapshot) } };
     if (first) {
       await tx.update(agentWakeupRequests).set({ payload, updatedAt: new Date(), coalescedCount: first.coalescedCount + 1 })
@@ -140,4 +151,138 @@ export async function deferNativeInputRefusalWake(db: Db, input: {
     }
     return true;
   });
+}
+
+/** Called under the issue lock after the terminal refusal is durable. Binding
+ * an owed receipt to an attempt is not delivery if that attempt never fit. */
+export async function restoreRefusedNativeInputWakes(db: Db, run: {
+  id: string; companyId: string; agentId: string; status: string; errorCode: string | null;
+}) {
+  if (run.status !== "failed" || !isNativeInputSizeRefusal(run.errorCode)) return;
+  const restored = await db.select().from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.runId, run.id),
+    sql`${agentWakeupRequests.payload}->>'nativeInputRefusalHold' = 'true'`,
+  ));
+  for (const row of restored) {
+    const payload = object(row.payload), prior = payload.nativeInputRefusalAgentIds;
+    const owners = new Set([run.agentId, ...(Array.isArray(prior) ? prior.filter((id): id is string => typeof id === "string") : [row.agentId])]);
+    await db.update(agentWakeupRequests).set({ runId: null, status: "deferred_issue_execution", finishedAt: null,
+      payload: { ...payload, nativeInputRefusalAgentIds: [...owners] }, updatedAt: new Date(),
+    }).where(and(eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.id, row.id), eq(agentWakeupRequests.runId, run.id)));
+  }
+  if (restored.length) await notifyDeferredExecutionWork(db, { companyId: run.companyId });
+}
+
+/** A reassigned held receipt retains the original refusal's revision gate.
+ * All source holds must be repaired before a merged aggregate is delivered. */
+export async function heldNativeInputWakeIsUnchanged(db: Db, scope: Required<Scope>, payload: unknown): Promise<boolean> {
+  const owners = object(payload).nativeInputRefusalAgentIds;
+  const ids = [scope.agentId, ...(Array.isArray(owners) ? owners.filter((id): id is string => typeof id === "string") : [])];
+  for (const agentId of new Set(ids)) {
+    const ownerScope = { ...scope, agentId };
+    if (await latestTaskRunIsNativeInputSizeRefusal(db, ownerScope) && await hasUnchangedNativeInputRefusal(db, ownerScope)) return true;
+  }
+  return false;
+}
+
+/** Reassignment changes custody, not the input revision or its owed content.
+ * The caller holds the same issue lock used for admission and release. */
+export async function handOverNativeInputWakes(db: Db, scope: { companyId: string; issueId: string }) {
+  const [issue] = await db.select({ agentId: issues.assigneeAgentId }).from(issues).where(and(
+    eq(issues.companyId, scope.companyId), eq(issues.id, scope.issueId)));
+  if (!issue?.agentId) return;
+  const rows = await db.select().from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, scope.companyId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    isNull(agentWakeupRequests.runId), sql`${agentWakeupRequests.payload}->>'issueId' = ${scope.issueId}`,
+    sql`${agentWakeupRequests.payload}->>'nativeInputRefusalHold' = 'true'`,
+  )).orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id));
+  if (rows.length < 2 && !rows.some(row => row.agentId !== issue.agentId)) return;
+  const events = new Map<string, unknown>(), owners = new Set<string>();
+  for (const row of rows) {
+    const payload = object(row.payload), prior = payload.nativeInputRefusalAgentIds;
+    for (const id of Array.isArray(prior) ? prior : [row.agentId]) if (typeof id === "string") owners.add(id);
+    const saved = payload.nativeInputRefusalWakes;
+    for (const event of Array.isArray(saved) ? saved : [{ source: row.source, triggerDetail: row.triggerDetail, reason: row.reason,
+      requestedByActorType: row.requestedByActorType, requestedByActorId: row.requestedByActorId,
+      payload: Object.fromEntries(Object.entries(payload).filter(([key]) => !["nativeInputRefusalHold", "_paperclipWakeContext"].includes(key))),
+      contextSnapshot: object(payload._paperclipWakeContext) }]) events.set(contentKey(event), event);
+  }
+  const first = rows[0]!;
+  await db.update(agentWakeupRequests).set({ agentId: issue.agentId, payload: { ...object(first.payload),
+    nativeInputRefusalWakes: [...events.values()], nativeInputRefusalAgentIds: [...owners] }, updatedAt: new Date(),
+  }).where(and(eq(agentWakeupRequests.companyId, scope.companyId), eq(agentWakeupRequests.id, first.id)));
+  for (const row of rows.slice(1)) await db.update(agentWakeupRequests).set({ status: "coalesced", finishedAt: new Date(), updatedAt: new Date() })
+    .where(and(eq(agentWakeupRequests.companyId, scope.companyId), eq(agentWakeupRequests.id, row.id)));
+}
+
+/** Final execution boundary for old queued receipts as well as new admissions.
+ * Caller holds the issue lock; use issue -> wake -> run order throughout. A
+ * declined queued attempt never consumed its receipt, so return it to pending. */
+export async function deferUnchangedNativeInputRunClaim(db: Db, run: typeof heartbeatRuns.$inferSelect, issueId: string): Promise<boolean> {
+  const [wake] = run.wakeupRequestId ? await db.select().from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.id, run.wakeupRequestId),
+    eq(agentWakeupRequests.agentId, run.agentId),
+  )).for("update") : [];
+  const payload = object(wake?.payload), context = object(run.contextSnapshot);
+  const automatic = wake ? wake.source === "automation" || wake.requestedByActorType !== "user" : run.invocationSource !== "on_demand" || Boolean(run.scheduledRetryReason);
+  if (payload.nativeInputRefusalHold !== true && context.nativeInputRefusalHold !== true && !automatic) return false;
+  const scope = { companyId: run.companyId, agentId: run.agentId, issueId };
+  if (!await heldNativeInputWakeIsUnchanged(db, scope, payload)) return false;
+  const [lockedRun] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id))).for("update");
+  if (!lockedRun || lockedRun.status !== "queued") return true;
+  if (wake && wake.runId === run.id) {
+    await db.update(agentWakeupRequests).set({ status: "deferred_issue_execution", runId: null, claimedAt: null, finishedAt: null,
+      payload: { ...payload, issueId, nativeInputRefusalHold: true,
+        nativeInputRefusalWakes: Array.isArray(payload.nativeInputRefusalWakes) ? payload.nativeInputRefusalWakes : [{
+          source: wake.source, triggerDetail: wake.triggerDetail, reason: wake.reason, requestedByActorType: wake.requestedByActorType,
+          requestedByActorId: wake.requestedByActorId, payload: Object.fromEntries(Object.entries(payload).filter(([key]) => !["nativeInputRefusalHold", "_paperclipWakeContext"].includes(key))),
+          contextSnapshot: object(payload._paperclipWakeContext ?? run.contextSnapshot),
+        }],
+        nativeInputRefusalAgentIds: [...new Set([run.agentId, ...(Array.isArray(payload.nativeInputRefusalAgentIds) ? payload.nativeInputRefusalAgentIds.filter((id): id is string => typeof id === "string") : [])])],
+        _paperclipWakeContext: object(payload._paperclipWakeContext ?? run.contextSnapshot) }, updatedAt: new Date(),
+    }).where(and(eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.runId, run.id)));
+    await notifyDeferredExecutionWork(db, { companyId: run.companyId });
+  } else if (!wake) {
+    await deferNativeInputRefusalWake(db, { ...scope, source: "automation", triggerDetail: run.triggerDetail,
+      reason: typeof context.wakeReason === "string" ? context.wakeReason : "native_input_refusal_claim_held",
+      payload: { issueId }, contextSnapshot: context, requestedByActorType: "system", requestedByActorId: null, idempotencyKey: null });
+  }
+  await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date(), updatedAt: new Date(),
+    errorCode: "native_input_refusal_claim_held", error: "Required input is unchanged since the size refusal; its wake remains pending.",
+    resultJson: { ...object(lockedRun.resultJson), ...(!lockedRun.startedAt ? { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } : {}) },
+  }).where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")));
+  await db.update(issues).set({ executionRunId: null, executionAgentNameKey: null, executionLockedAt: null, updatedAt: new Date() })
+    .where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId), eq(issues.executionRunId, run.id)));
+  return true;
+}
+
+/** Assignment revokes the old person's execution grant, not their undelivered
+ * message. Copy owed data into a system-owned receipt before revoking the old
+ * request. This does not transfer a person's authority to another agent. */
+export async function retainRefusedPersonMessagesOnAssignment(db: Db, scope: Required<Scope>) {
+  if (!await latestTaskRunIsNativeInputSizeRefusal(db, scope)) return;
+  const pending = await db.select().from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, scope.companyId), eq(agentWakeupRequests.agentId, scope.agentId),
+    eq(agentWakeupRequests.requestedByActorType, "user"), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    isNull(agentWakeupRequests.runId),
+    sql`coalesce(${agentWakeupRequests.payload}->>'issueId', ${agentWakeupRequests.payload}->>'taskId',
+      ${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'issueId', ${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'taskId') = ${scope.issueId}`,
+  )).for("update");
+  for (const row of pending) {
+    const payload = object(row.payload), contextSnapshot = object(payload._paperclipWakeContext);
+    const ids = [payload.commentId, contextSnapshot.wakeCommentId, contextSnapshot.commentId,
+      ...(Array.isArray(contextSnapshot.wakeCommentIds) ? contextSnapshot.wakeCommentIds : [])];
+    // Assignment-only human grants are deliberately not replayable content.
+    if (!ids.some(id => typeof id === "string") && !Array.isArray(payload.nativeInputRefusalWakes)) continue;
+    await db.insert(agentWakeupRequests).values({ companyId: scope.companyId, agentId: scope.agentId,
+      source: "automation", reason: row.reason, triggerDetail: row.triggerDetail, requestedByActorType: "system",
+      status: "deferred_issue_execution", payload: { ...payload, issueId: scope.issueId, nativeInputRefusalHold: true,
+        nativeInputRefusalAgentIds: [...new Set([scope.agentId, ...(Array.isArray(payload.nativeInputRefusalAgentIds) ? payload.nativeInputRefusalAgentIds.filter((id): id is string => typeof id === "string") : [])])],
+        nativeInputRefusalWakes: Array.isArray(payload.nativeInputRefusalWakes) ? payload.nativeInputRefusalWakes : [{
+          source: row.source, reason: row.reason, triggerDetail: row.triggerDetail, requestedByActorType: row.requestedByActorType,
+          requestedByActorId: row.requestedByActorId, payload: Object.fromEntries(Object.entries(payload).filter(([key]) => key !== "_paperclipWakeContext")), contextSnapshot,
+        }],
+      } });
+  }
+  if (pending.length) await notifyDeferredExecutionWork(db, { companyId: scope.companyId });
 }
