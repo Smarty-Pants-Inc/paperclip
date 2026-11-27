@@ -3048,14 +3048,14 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             }),
           },
           // Keep durable chronology, not adjacency: opening placement is bounded
-          // by its loaded request, while later segments retain their read slots.
-          // A continuation may reuse the request with an intervening card.
+          // by its loaded request. Later slots cannot sort above that opening,
+          // even when saved send clocks are ahead of retained session reads.
           anchorCommentId: segmented ? null : (lastCommentIdByRun.get(source.id) ?? null),
           // Provider startup must not move an admitted slot past newer input.
           // Later slots follow the question's send, independently of late ACKs.
           startMs: sourceIsPaperclipRunner
-            ? segmentIndex === 0 ? openingMs : questionSlot?.atMs ??
-              (finalResponse ? replyPlacementByCommentId.get(finalResponse.id)?.atMs : undefined) ?? openingMs
+            ? Math.max(openingMs, segmentIndex === 0 ? openingMs : questionSlot?.atMs ??
+              (finalResponse ? replyPlacementByCommentId.get(finalResponse.id)?.atMs : undefined) ?? openingMs)
             : segment.startMs,
         });
       }

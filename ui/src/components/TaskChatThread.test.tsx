@@ -6642,3 +6642,100 @@ it("explains a missing provider runtime with an installation repair", () => {
   expect(container.textContent).toContain("Reinstall or rebuild Paperclip");
   expect(container.textContent).toContain("test the agent's runtime");
 });
+
+describe("native opening placement and segment order", () => {
+  const runId = "native-turn";
+  const at = (second: number) => new Date(Date.UTC(2026, 0, 1, 12, 0, second)).toISOString();
+  const comment = (id: string, body: string, second: number) => ({
+    id, body, companyId: "company", issueId: "issue", authorType: "user" as const,
+    authorUserId: "viewer", authorAgentId: null, presentation: null, metadata: null,
+    createdAt: new Date(at(second)), updatedAt: new Date(at(second)),
+  });
+  const reply = (id: string, body: string, second: number) => ({
+    ...comment(id, body, second), authorType: "agent" as const, authorUserId: null,
+    authorAgentId: "assistant", runId, createdByRunId: runId,
+    clientRequestId: `native-final:${runId}:${id}`,
+  });
+  const run = { runId, runtimeMode: "native" as const, adapterType: "paperclip_runner", status: "succeeded",
+    agentId: "assistant", agentName: "Assistant", createdAt: at(0), startedAt: at(0), finishedAt: at(50) };
+  const assertBefore = (first: string, second: string) => {
+    const text = container.textContent ?? "";
+    expect(text).toContain(first);
+    expect(text).toContain(second);
+    expect(text.indexOf(first)).toBeLessThan(text.indexOf(second));
+  };
+
+  // Saved send clocks may be ahead of retained session reads. Splitting still
+  // follows reads; moving the opening must not invert its authored segments.
+  it.each([
+    { shape: "retained read with later sent steer", requestAt: 10, readAt: 8, foldedAt: undefined },
+    { shape: "consumed starting input ahead of later read", requestAt: 10, readAt: 15, foldedAt: 20 },
+    { shape: "saved send clock ahead of later read", requestAt: 20, readAt: 15, foldedAt: undefined },
+  ])("preserves opening then later answer after reload: $shape", async ({ requestAt, readAt, foldedAt }) => {
+    const request = comment("request", "Start the review.", requestAt);
+    const steer = { ...comment("steer", "Also check the conclusion.", 12),
+      consumedByRunId: runId, steeredIntoRunId: runId, conversationAnchorAt: new Date(at(readAt)) };
+    const folded = foldedAt === undefined ? [] : [{ ...comment("folded", "Include the appendix in the starting request.", foldedAt), consumedByRunId: runId }];
+    const opening = reply("opening", "Opening answer.", 5);
+    const later = reply("later", "Later answer.", readAt + 1);
+    const entries = [
+      { kind: "system", text: "", ts: at(1), eventSeq: 1, steeringEvent: { kind: "input", turnId: "turn" } },
+      { kind: "assistant", text: opening.body, channel: "final", ts: at(5), eventSeq: 2, itemId: opening.id },
+      { kind: "system", text: "", ts: at(readAt - 1), eventSeq: 3,
+        steeringEvent: { kind: "ack", turnId: "turn", commentId: steer.id } },
+      { kind: "system", text: "", ts: at(readAt), eventSeq: 4, steeringEvent: { kind: "input", turnId: "turn" } },
+      { kind: "assistant", text: later.body, channel: "final", ts: at(readAt + 1), eventSeq: 5, itemId: later.id },
+    ];
+    const props = { issueId: "issue", currentUserId: "viewer", onAdd: async () => {},
+      comments: [request, steer, ...folded, opening, later],
+      linkedRuns: [{ ...run, wakeCommentId: request.id, resultJson: { continuousReplies: {
+        opening: { commentId: opening.id, questionCommentIds: [request.id] },
+        later: { commentId: later.id, questionCommentIds: [steer.id] },
+      } } }] };
+    nativeTranscriptState.hydratedRunIds = new Set([runId]);
+    nativeTranscriptState.transcriptByRun.set(runId, entries);
+    for (const transport of ["native", "log"]) {
+      if (transport === "log") {
+        render(<div />);
+        nativeTranscriptState.transcriptByRun.clear();
+        transcriptState.transcriptByRun.set(runId, entries);
+      }
+      render(<TaskChatThread {...props} />);
+      await settleThreadLayout();
+      assertBefore(request.body, opening.body);
+      assertBefore(steer.body, later.body);
+      if (folded[0]) assertBefore(folded[0].body, opening.body);
+      assertBefore(opening.body, later.body);
+      expect(container.textContent!.split(opening.body)).toHaveLength(2);
+      expect(container.textContent!.split(later.body)).toHaveLength(2);
+    }
+  });
+
+  it("keeps a folded non-steered starting input before the opening reply", async () => {
+    const request = comment("request", "Start the review.", 10);
+    const folded = { ...comment("folded", "Include the appendix in the starting request.", 20), consumedByRunId: runId };
+    const answer = reply("opening", "The appendix is included.", 25);
+    nativeTranscriptState.hydratedRunIds = new Set([runId]);
+    nativeTranscriptState.transcriptByRun.set(runId, [
+      { kind: "system", text: "", ts: at(1), steeringEvent: { kind: "input", turnId: "turn" } },
+      { kind: "assistant", text: answer.body, channel: "final", ts: at(25), itemId: answer.id },
+    ]);
+    render(<TaskChatThread issueId="issue" currentUserId="viewer" onAdd={async () => {}}
+      comments={[request, folded, answer]} linkedRuns={[{ ...run, wakeCommentId: request.id,
+        resultJson: { continuousReplies: { opening: { commentId: answer.id, questionCommentIds: [request.id, folded.id] } } } }]} />);
+    await settleThreadLayout();
+    assertBefore(folded.body, answer.body);
+    expect(container.textContent!.split(answer.body)).toHaveLength(2);
+  });
+
+  it("keeps the empty-transcript summary duration independent of opening placement", async () => {
+    const request = comment("request", "Start the review.", 10);
+    const answer = reply("opening", "The review is complete.", 40);
+    nativeTranscriptState.hydratedRunIds = new Set([runId]);
+    render(<TaskChatThread issueId="issue" currentUserId="viewer" onAdd={async () => {}}
+      comments={[request, answer]} linkedRuns={[{ ...run, wakeCommentId: request.id }]} />);
+    await settleThreadLayout();
+    assertBefore(request.body, answer.body);
+    expect(container.querySelector('[data-testid="task-chat-turn-summary"]')?.textContent).toContain("Worked for 40s");
+  });
+});
