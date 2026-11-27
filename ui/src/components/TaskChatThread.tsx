@@ -1475,11 +1475,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     const selected = selectedTranscriptByRun.get(run.id);
     return selected && selected === nativeTranscriptByRun.get(run.id);
   }).map(run => run.id));
+  // A bounded tail or a not-yet-hydrated source is not a failed read.
   const transcriptHistoryErrors = new Set(transcriptRuns.filter(run => selectedNativeRunIds.has(run.id)
-    ? nativeTranscriptErrorsByRun.has(run.id) || !hydratedNativeRunIds.has(run.id)
-    : logErrorsByRun.has(run.id) || truncatedRunIds.has(run.id) ||
-      (nativeTranscriptErrorsByRun.has(run.id) && !(selectedTranscriptByRun.get(run.id)?.length)) ||
-      (!["queued", "scheduled_retry"].includes(run.status) && !hydratedLogRunIds.has(run.id))
+    ? nativeTranscriptErrorsByRun.has(run.id)
+    : logErrorsByRun.has(run.id) ||
+      (nativeTranscriptErrorsByRun.has(run.id) && !(selectedTranscriptByRun.get(run.id)?.length))
   ).map(run => run.id));
   const drawnByRunRef = useRef(new Map<string, TranscriptEntry[]>());
   const rawTranscriptByRun = useMemo(() => {

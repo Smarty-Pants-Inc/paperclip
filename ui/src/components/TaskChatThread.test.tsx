@@ -36,6 +36,7 @@ const transcriptState = vi.hoisted(() => ({
   isInitialHydrating: false,
   hydratedRunIds: undefined as Set<string> | undefined,
   truncatedRunIds: new Set<string>(),
+  errorsByRun: new Map<string, Error>(),
 }));
 const nativeTranscriptState = vi.hoisted(() => ({
   transcriptByRun: new Map(),
@@ -49,7 +50,7 @@ const transcriptHookRuns = vi.hoisted(() => ({
   native: [] as unknown[][],
 }));
 const sidebarState = vi.hoisted(() => ({ isMobile: false }));
-const planState = vi.hoisted(() => ({ data: null as IssueDocument | null }));
+const planState = vi.hoisted(() => ({ data: null as IssueDocument | null, isError: false }));
 const DIRECT_ADAPTER_TYPES = [
   "codex_local",
   "claude_local",
@@ -71,7 +72,7 @@ vi.mock("@/components/transcript/useLiveRunTranscripts", () => ({
       // HIST10 reads both durable sources before selection; a completed mock read must report hydration, even for an empty log.
       hydratedRunIds: transcriptState.hydratedRunIds ?? new Set(transcriptState.isInitialHydrating ? [] : runs.map(run => run.id)),
       truncatedRunIds: transcriptState.truncatedRunIds,
-      errorsByRun: new Map(),
+      errorsByRun: new Map(transcriptState.errorsByRun),
       retry: () => {},
     };
   },
@@ -142,6 +143,7 @@ beforeEach(() => {
   transcriptState.isInitialHydrating = false;
   transcriptState.hydratedRunIds = undefined;
   transcriptState.truncatedRunIds.clear();
+  transcriptState.errorsByRun.clear();
   nativeTranscriptState.transcriptByRun.clear();
   nativeTranscriptState.errorsByRun.clear();
   nativeTranscriptState.hydratedRunIds = undefined;
@@ -151,6 +153,7 @@ beforeEach(() => {
   transcriptHookRuns.native.length = 0;
   sidebarState.isMobile = false;
   planState.data = null;
+  planState.isError = false;
   streamlinedState.enabled = true;
   container = document.createElement("div");
   document.body.appendChild(container);
@@ -1969,6 +1972,170 @@ describe("request-comment anchor", () => {
     await settleThreadLayout();
     expect(container.textContent!.indexOf(reply.body)).toBeGreaterThan(container.textContent!.indexOf(intervening.body));
     expect(container.textContent!.indexOf(reply.body)).toBeLessThan(container.textContent!.indexOf(next.body));
+  });
+});
+
+describe("HISTFAIL durable-source failures", () => {
+  function historyFixture() {
+    const linkedRuns = Array.from({ length: 12 }, (_, index) => ({
+      runId: `history-${index}`, runtimeMode: "native" as const, status: "succeeded",
+      agentId: "agent-1", agentName: "Runner", adapterType: "paperclip_runner",
+      createdAt: new Date(Date.UTC(2026, 7, 25, 18, index)).toISOString(),
+      startedAt: new Date(Date.UTC(2026, 7, 25, 18, index)).toISOString(),
+      finishedAt: new Date(Date.UTC(2026, 7, 25, 18, index, 10)).toISOString(),
+    }));
+    const ids = linkedRuns.map(run => run.runId);
+    nativeTranscriptState.hydratedRunIds = new Set(ids);
+    transcriptState.hydratedRunIds = new Set(ids);
+    for (const run of linkedRuns) nativeTranscriptState.transcriptByRun.set(run.runId, [
+      assistantEntry(run.createdAt, `Saved activity ${run.runId}.`, "progress"),
+      assistantEntry(run.finishedAt, `Saved response ${run.runId}.`, "final"),
+    ]);
+    return { issueId: "long-history", comments: [], onAdd: async () => {}, linkedRuns };
+  }
+
+  it.each([false, true])("reveals the native thread when one settled log read fails (compact=%s)", async compactHistory => {
+    const props = historyFixture();
+    const failed = "history-5";
+    // A failed read settles hydration too (the real hook's finally path).
+    transcriptState.errorsByRun.set(failed, new Error("Run history took too long to load. Retry to load it."));
+    render(<TaskChatThread {...props} compactHistory={compactHistory} />);
+    await settleThreadLayout();
+    expect(container.textContent).toContain(`Saved response ${failed}.`);
+    expect(container.textContent).toContain("Saved response history-11.");
+    expect(container.textContent).not.toContain("Some task history could not be loaded.");
+  });
+
+  it.each(["failed", "bounded"])("keeps newest words and distinguishes a %s settled log from a failed history read", async state => {
+    const props = historyFixture();
+    const failed = "history-5";
+    transcriptState.transcriptByRun.set(failed, [
+      assistantEntry("2026-08-25T18:05:11.000Z", "Newest words from the saved log.", "final"),
+    ]);
+    if (state === "failed") transcriptState.errorsByRun.set(failed, new Error("HTTP 500"));
+    else transcriptState.truncatedRunIds.add(failed); // A successful bounded 200, not an HTTP error.
+    render(<TaskChatThread {...props} compactHistory />);
+    await settleThreadLayout();
+    expect(container.textContent).toContain("Newest words from the saved log.");
+    expect(container.textContent).toContain("Saved response history-11.");
+    expect(container.textContent?.includes("Some task history could not be loaded.")).toBe(state === "failed");
+  });
+
+  it.each([false, true])("keeps the 417337-byte settled run's readable tail on cold open and reload (compact=%s)", async compactHistory => {
+    const props = historyFixture();
+    const runId = "history-5";
+    nativeTranscriptState.transcriptByRun.delete(runId);
+    transcriptState.transcriptByRun.set(runId, [
+      assistantEntry("2026-08-25T18:05:10.000Z", "Latest part of the long saved log.", "final"),
+    ]);
+    transcriptState.truncatedRunIds.add(runId);
+    const linkedRuns = props.linkedRuns.map(run => run.runId === runId ? { ...run, logBytes: 417_337 } : run);
+    const expand = vi.fn();
+    for (const key of ["open", "reload"]) {
+      render(<TaskChatThread key={key} {...props} linkedRuns={linkedRuns} compactHistory={compactHistory} onExpandHistory={expand} />);
+      await settleThreadLayout();
+      expect(container.textContent).toContain("Latest part of the long saved log.");
+      expect(container.textContent).not.toContain("Some task history could not be loaded.");
+      if (compactHistory) {
+        const earlier = [...container.querySelectorAll("button")].find(button => button.textContent === "More run output");
+        expect(earlier).toBeDefined();
+        flushSync(() => earlier!.click());
+      }
+    }
+    expect(expand).toHaveBeenCalledTimes(compactHistory ? 2 : 0);
+  });
+
+  it.each(["native", "log", "both"])("keeps a long task pending, not failed, 2.5 seconds after open (%s)", async source => {
+    vi.useFakeTimers();
+    try {
+      const props = historyFixture();
+      if (source !== "log") nativeTranscriptState.hydratedRunIds!.delete("history-5");
+      if (source !== "native") transcriptState.hydratedRunIds!.delete("history-5");
+      render(<TaskChatThread {...props} />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_500); });
+      expect(container.querySelector('[data-testid="task-chat-history-loading"]')).not.toBeNull();
+      expect(container.textContent).not.toContain("Some task history could not be loaded.");
+      expect(container.textContent).not.toContain("Some task history is still loading.");
+      await act(async () => { await vi.advanceTimersByTimeAsync(12_500); });
+      expect(container.textContent).toContain("Some task history is still loading.");
+      expect(container.textContent).not.toContain("Some task history could not be loaded.");
+      expect([...container.querySelectorAll("button")].some(button => button.textContent === "Retry")).toBe(false);
+      nativeTranscriptState.hydratedRunIds!.add("history-5");
+      transcriptState.hydratedRunIds!.add("history-5");
+      render(<TaskChatThread {...props} />);
+      expect(container.textContent).toContain("Saved response history-5.");
+      expect(container.textContent).not.toContain("Some task history is still loading.");
+      expect(container.textContent).not.toContain("Some task history could not be loaded.");
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("shows a real HTTP 500 after a pending read and clears it on a successful re-read", async () => {
+    const props = historyFixture();
+    nativeTranscriptState.transcriptByRun.delete("history-5");
+    nativeTranscriptState.hydratedRunIds!.delete("history-5");
+    transcriptState.hydratedRunIds!.delete("history-5");
+    render(<TaskChatThread {...props} />);
+    expect(container.textContent).not.toContain("Some task history could not be loaded.");
+    nativeTranscriptState.errorsByRun.set("history-5", { message: "HTTP 500" });
+    transcriptState.errorsByRun.set("history-5", new Error("HTTP 500"));
+    nativeTranscriptState.hydratedRunIds!.add("history-5");
+    transcriptState.hydratedRunIds!.add("history-5");
+    render(<TaskChatThread {...props} />);
+    await settleThreadLayout();
+    expect(container.textContent).toContain("Some task history could not be loaded.");
+    expect([...container.querySelectorAll("button")].some(button => button.textContent === "Retry")).toBe(true);
+    nativeTranscriptState.errorsByRun.clear();
+    transcriptState.errorsByRun.clear();
+    nativeTranscriptState.transcriptByRun.set("history-5", [
+      assistantEntry("2026-08-25T18:05:10.000Z", "Recovered response after Retry.", "final"),
+    ]);
+    render(<TaskChatThread {...props} />);
+    expect(container.textContent).toContain("Recovered response after Retry.");
+    expect(container.textContent).not.toContain("Some task history could not be loaded.");
+  });
+
+  it("does not call an unhydrated replacement read a failure after a cancelled open", async () => {
+    const props = historyFixture();
+    nativeTranscriptState.hydratedRunIds!.delete("history-5");
+    transcriptState.hydratedRunIds!.delete("history-5");
+    render(<TaskChatThread {...props} />);
+    expect(container.textContent).not.toContain("Some task history could not be loaded.");
+    nativeTranscriptState.hydratedRunIds!.add("history-5");
+    transcriptState.hydratedRunIds!.add("history-5");
+    render(<TaskChatThread {...props} />);
+    await settleThreadLayout();
+    expect(container.textContent).toContain("Saved response history-5.");
+    expect(container.textContent).not.toContain("Some task history could not be loaded.");
+  });
+
+  it("reveals saved logs when one settled native-event read fails", async () => {
+    const props = historyFixture();
+    const failed = "history-5";
+    nativeTranscriptState.transcriptByRun.delete(failed);
+    nativeTranscriptState.errorsByRun.set(failed, { message: "HTTP 503", failedAt: "2026-08-25T18:05:12.000Z" });
+    transcriptState.transcriptByRun.set(failed, [
+      assistantEntry("2026-08-25T18:05:10.000Z", "Recovered from the saved log.", "final"),
+    ]);
+    render(<TaskChatThread {...props} />);
+    await settleThreadLayout();
+    expect(container.textContent).toContain("Recovered from the saved log.");
+    expect(container.textContent).toContain("Saved response history-11.");
+    expect(container.textContent).not.toContain("Some task history could not be loaded.");
+  });
+
+  it.each(["plan", "initial history", "both transcripts", "empty alternate"])("keeps other turns readable and a real %s failure actionable", async source => {
+    const props = historyFixture();
+    if (source === "plan") planState.isError = true;
+    if (source === "both transcripts" || source === "empty alternate") {
+      nativeTranscriptState.transcriptByRun.delete("history-5");
+      transcriptState.errorsByRun.set("history-5", new Error("HTTP 500"));
+      if (source === "both transcripts") nativeTranscriptState.errorsByRun.set("history-5", { message: "HTTP 500" });
+    }
+    render(<TaskChatThread {...props} initialHistoryError={source === "initial history"} />);
+    await settleThreadLayout();
+    expect(container.textContent).toContain("Saved response history-11.");
+    expect(container.textContent).toContain("Some task history could not be loaded.");
+    expect([...container.querySelectorAll("button")].some(button => button.textContent === "Retry")).toBe(true);
   });
 });
 
