@@ -31,6 +31,8 @@ import { CoordinatorPresentation } from "./coordinator/CoordinatorPresentation";
 import type { HeartbeatRunEvent } from "@paperclipai/shared";
 import type { HeartbeatRun } from "@paperclipai/shared";
 import { waitForStoppedRuns } from "@/lib/wait-for-stopped-runs";
+import { chatHistoryReadEvents, compactChatHistoryReadEvents, continuousChatHistoryReadEvents, historyReadAt, historyReadRunA,
+  historyReadRunB, omitHistoryReads } from "../../../server/src/__tests__/fixtures/chat-history-reads";
 
 const transcriptState = vi.hoisted(() => ({
   transcriptByRun: new Map(),
@@ -44,6 +46,7 @@ const transcriptState = vi.hoisted(() => ({
 const nativeTranscriptState = vi.hoisted(() => ({
   transcriptByRun: new Map(),
   isInitialHydrating: false,
+  catchingUpRunIds: new Set<string>(),
   errorsByRun: new Map(),
   hydratedRunIds: undefined as Set<string> | undefined,
   terminalHydratedRunIds: undefined as Set<string> | undefined,
@@ -90,6 +93,7 @@ vi.mock("@/components/transcript/useNativeRunTranscripts", () => ({
       transcriptByRun: new Map(nativeTranscriptState.transcriptByRun),
       activityLabelByRun: new Map(),
       errorsByRun: new Map(nativeTranscriptState.errorsByRun),
+      catchingUpRunIds: nativeTranscriptState.catchingUpRunIds,
       isInitialHydrating: nativeTranscriptState.isInitialHydrating,
       retry: () => {},
       hydratedRunIds: nativeTranscriptState.hydratedRunIds ?? new Set(),
@@ -154,6 +158,7 @@ beforeEach(() => {
   transcriptState.errorsByRun.clear();
   nativeTranscriptState.transcriptByRun.clear();
   nativeTranscriptState.isInitialHydrating = false;
+  nativeTranscriptState.catchingUpRunIds.clear();
   nativeTranscriptState.errorsByRun.clear();
   nativeTranscriptState.hydratedRunIds = undefined;
   nativeTranscriptState.terminalHydratedRunIds = undefined;
@@ -2363,16 +2368,18 @@ describe("bounded run output notes", () => {
     },
   );
 
-  it("keeps compact cut history and a live follow-up readable while its sequence gap is loading", async () => {
+  it.each(["log", "native"] as const)("keeps compact cut history and a live follow-up readable while its %s sequence gap is loading", async source => {
     vi.useFakeTimers();
     try {
       const props = fixture();
       props.linkedRuns = props.linkedRuns.filter(run => run.runId === "long");
       transcriptState.truncatedRunIds.add("long");
-      transcriptState.catchingUpRunIds.add("follow-up");
+      const catchingUp = source === "native" ? nativeTranscriptState.catchingUpRunIds : transcriptState.catchingUpRunIds;
+      const errors = source === "native" ? nativeTranscriptState.errorsByRun : transcriptState.errorsByRun;
+      catchingUp.add("follow-up");
       transcriptState.hydratedRunIds!.add("follow-up");
       nativeTranscriptState.hydratedRunIds!.add("follow-up");
-      transcriptState.transcriptByRun.set("follow-up", [assistantEntry("2026-08-25T18:03:01Z", "Working on the follow-up.", "progress")]);
+      (source === "native" ? nativeTranscriptState : transcriptState).transcriptByRun.set("follow-up", [assistantEntry("2026-08-25T18:03:01Z", "Working on the follow-up.", "progress")]);
       const followUp = { ...nativeRunningRun(), id: "follow-up", createdAt: "2026-08-25T18:03:00Z", startedAt: "2026-08-25T18:03:00Z" };
       const page = () => <TaskChatThread {...props} companyId="company" compactHistory onExpandHistory={() => {}}
         activeRun={followUp} issueStatus="in_progress" />;
@@ -2383,12 +2390,12 @@ describe("bounded run output notes", () => {
       expect(container.textContent).toContain("More run output");
       expect(container.textContent).toContain("Some task history is still loading.");
       expect(container.textContent).not.toContain("Some task history could not be loaded.");
-      transcriptState.errorsByRun.set("follow-up", new Error("HTTP 503"));
+      errors.set("follow-up", new Error("HTTP 503"));
       render(page());
       expect(container.textContent).toContain("Some task history could not be loaded.");
       expect([...container.querySelectorAll("button")].some(button => button.textContent === "Retry")).toBe(true);
-      transcriptState.errorsByRun.clear();
-      transcriptState.catchingUpRunIds.clear();
+      errors.clear();
+      catchingUp.clear();
       render(page());
       expect(container.textContent).not.toContain("Some task history is still loading.");
       expect(container.textContent).not.toContain("Some task history could not be loaded.");
@@ -7435,4 +7442,155 @@ describe("native opening placement and segment order", () => {
     assertBefore(request.body, answer.body);
     expect(container.querySelector('[data-testid="task-chat-turn-summary"]')?.textContent).toContain("Worked for 40s");
   });
+});
+
+describe("continuous heartbeat two-answer chronology", () => {
+  for (const compact of [false, true]) for (const opening of [false, true]) for (const steer of [false, true]) {
+    it(`diagnoses and replays compact=${compact}, opening=${opening}, steer=${steer}`, async () => {
+      const comment = (id: string, body: string, second: number) => ({
+        id, body, companyId: "company", issueId: "issue", authorType: "user" as const,
+        authorUserId: "viewer", authorAgentId: null, presentation: null, metadata: null,
+        createdAt: new Date(historyReadAt(second)), updatedAt: new Date(historyReadAt(second)),
+        consumedByRunId: historyReadRunA,
+      });
+      const requestA = comment("request-a", "Start turn A.", 0);
+      const requestB = { ...comment("request-b", "Start turn B.", 30), steeredIntoRunId: historyReadRunA,
+        conversationAnchorAt: new Date(historyReadAt(31)) };
+      const steerB = { ...comment("steer-b", "Mid-turn B input.", 36), steeredIntoRunId: historyReadRunA,
+        conversationAnchorAt: new Date(historyReadAt(37)) };
+      const finalA = { ...comment("answer-a", "A final answer.", 20), authorType: "agent" as const,
+        authorUserId: null, authorAgentId: "assistant", runId: historyReadRunA, createdByRunId: historyReadRunA,
+        clientRequestId: `native-final:${historyReadRunA}:a-final` };
+      nativeTranscriptState.hydratedRunIds = new Set([historyReadRunA]);
+      nativeTranscriptState.transcriptByRun.set(historyReadRunA,
+        nativeRunEventsToTranscript(continuousChatHistoryReadEvents(compact, opening, steer)
+          .filter(event => (event.payload!.prpEvent as Record<string, unknown>).itemId !== "b-final")));
+      const run = { ...nativePlanRun(historyReadRunA), agentId: "assistant", agentName: "Assistant",
+        createdAt: historyReadAt(0), startedAt: historyReadAt(0) };
+      const props = { issueId: "issue", currentUserId: "viewer", onAdd: async () => {}, compactHistory: compact,
+        conversationMode: true, comments: [requestA, finalA, requestB, steerB], activeRun: run,
+        linkedRuns: [{ ...run, runId: run.id, wakeCommentId: requestA.id,
+          resultJson: { continuousReplies: { "a-final": { commentId: finalA.id, questionCommentIds: [requestA.id] } },
+            queuedSteeringAcknowledgements: { "request-b": { acknowledgedAt: historyReadAt(31) },
+              "steer-b": { acknowledgedAt: historyReadAt(37) } } } }],
+      };
+      for (let reload = 0; reload < 2; reload++) {
+        if (reload) render(<div />);
+        render(<TaskChatThread {...props} />);
+        await settleThreadLayout();
+        for (let pass = 0; pass < 3; pass++) flushSync(() => {
+          for (const button of container.querySelectorAll<HTMLButtonElement>(
+            '[data-testid="task-chat-turn-summary"][aria-expanded="false"], [data-testid="task-chat-activity-phase-toggle"][aria-expanded="false"]')) button.click();
+        });
+        const text = container.textContent ?? "";
+        const position = (value: string) => { expect(text).toContain(value); return text.indexOf(value); };
+        expect(position("A reasoning.")).toBeLessThan(position(finalA.body));
+        if (!opening && steer) {
+          // Without the initial input, B's read is mistaken for the run's
+          // opening. A's already-authored final moves below B's submission.
+          expect(position(requestB.body)).toBeLessThan(position(finalA.body));
+        } else expect(position(finalA.body)).toBeLessThan(position(requestB.body));
+        if (opening && steer) {
+          expect(position("a-fixture.ts")).toBeLessThan(position(finalA.body));
+          expect(position(requestB.body)).toBeLessThan(position("B reasoning before read."));
+          expect(position("B reasoning before read.")).toBeLessThan(position("B opening line."));
+          expect(position("B opening line.")).toBeLessThan(position("b-fixture.ts"));
+          expect(position("b-fixture.ts")).toBeLessThan(position(steerB.body));
+          expect(position("B reasoning before read.")).toBeLessThan(position(steerB.body));
+          expect(position(steerB.body)).toBeLessThan(position("B reasoning after read."));
+        } else if (!steer) {
+          // Diagnosis, not desired behavior: the unseparated B prefix is drawn
+          // in A's activity, ABOVE A's already-authored final and B's input.
+          expect(position("B reasoning before read.")).toBeLessThan(position(finalA.body));
+        }
+        // The same incomplete opening evidence also duplicates A's final;
+        // the complete driver event contract must not do so.
+        expect(text.split(finalA.body)).toHaveLength(!opening && steer ? 3 : 2);
+      }
+      if (opening && steer) {
+        // B finishing must not move A's already-drawn answer. Repeat the same
+        // check cold after the live-to-settled transition.
+        nativeTranscriptState.transcriptByRun.set(historyReadRunA,
+          nativeRunEventsToTranscript(continuousChatHistoryReadEvents(compact, true, true)));
+        for (let reload = 0; reload < 2; reload++) {
+          if (reload) render(<div />);
+          render(<TaskChatThread {...props} activeRun={undefined} linkedRuns={[
+            { ...props.linkedRuns[0]!, status: "succeeded", finishedAt: historyReadAt(41) },
+          ]} />);
+          await settleThreadLayout();
+          const text = container.textContent ?? "";
+          expect(text).toContain(finalA.body);
+          expect(text).toContain(requestB.body);
+          expect(text).toContain("B final answer.");
+          expect(text.indexOf(finalA.body)).toBeLessThan(text.indexOf(requestB.body));
+          expect(text.indexOf(requestB.body)).toBeLessThan(text.indexOf("B final answer."));
+        }
+      }
+    });
+  }
+});
+
+describe("compact history reads across consecutive turns", () => {
+  for (const compact of [false, true]) for (const opening of [false, true]) for (const steer of [false, true]) {
+    for (const running of [false, true]) {
+      it(`preserves chronology on reload: compact=${compact}, opening=${opening}, steer=${steer}, running=${running}`, async () => {
+        const comment = (id: string, body: string, second: number) => ({
+          id, body, companyId: "company", issueId: "issue", authorType: "user" as const,
+          authorUserId: "viewer", authorAgentId: null, presentation: null, metadata: null,
+          createdAt: new Date(historyReadAt(second)), updatedAt: new Date(historyReadAt(second)),
+        });
+        const requestA = { ...comment("request-a", "Start turn A.", 0), consumedByRunId: historyReadRunA };
+        const requestB = { ...comment("request-b", "Start turn B.", 30), consumedByRunId: historyReadRunB };
+        const steerB = { ...comment("steer-b", "Mid-turn B input.", 36), consumedByRunId: historyReadRunB,
+          steeredIntoRunId: historyReadRunB, conversationAnchorAt: new Date(historyReadAt(37)) };
+        const finalA = { ...comment("answer-a", "A final answer.", 20), authorType: "agent" as const,
+          authorUserId: null, authorAgentId: "assistant", runId: historyReadRunA, createdByRunId: historyReadRunA,
+          clientRequestId: `native-final:${historyReadRunA}:a-final` };
+        const meta = (runId: string, second: number) => ({ runId, runtimeMode: "native" as const,
+          adapterType: "paperclip_runner", status: "succeeded", agentId: "assistant", agentName: "Assistant",
+          createdAt: historyReadAt(second), startedAt: historyReadAt(second) });
+        const source = compact ? compactChatHistoryReadEvents : chatHistoryReadEvents;
+        nativeTranscriptState.hydratedRunIds = new Set([historyReadRunA, historyReadRunB]);
+        nativeTranscriptState.transcriptByRun.set(historyReadRunA,
+          nativeRunEventsToTranscript(omitHistoryReads(source(historyReadRunA), opening, steer)));
+        nativeTranscriptState.transcriptByRun.set(historyReadRunB,
+          nativeRunEventsToTranscript(omitHistoryReads(source(historyReadRunB), opening, steer)
+            .filter(event => !running || event.seq !== 11)));
+        const props = { issueId: "issue", currentUserId: "viewer", onAdd: async () => {}, compactHistory: compact,
+          conversationMode: true, comments: [requestA, finalA, requestB, steerB],
+          activeRun: running ? { ...nativePlanRun(historyReadRunB), agentId: "assistant", agentName: "Assistant",
+            createdAt: historyReadAt(31), startedAt: historyReadAt(31) } : undefined,
+          linkedRuns: [
+            { ...meta(historyReadRunA, 0), finishedAt: historyReadAt(21), wakeCommentId: requestA.id,
+              resultJson: { continuousReplies: { "a-final": { commentId: finalA.id, questionCommentIds: [requestA.id] } } } },
+            { ...meta(historyReadRunB, 31), status: running ? "running" : "succeeded", wakeCommentId: requestB.id,
+              finishedAt: running ? null : historyReadAt(41) },
+          ],
+        };
+        for (let reload = 0; reload < 2; reload++) {
+          if (reload) render(<div />);
+          render(<TaskChatThread {...props} />);
+          await settleThreadLayout();
+          // Inspect expanded activity, not just the final bubbles. Open the
+          // outer summaries first, then the activity phases mounted inside.
+          for (let pass = 0; pass < 3; pass++) flushSync(() => {
+            for (const button of container.querySelectorAll<HTMLButtonElement>(
+              '[data-testid="task-chat-turn-summary"][aria-expanded="false"], [data-testid="task-chat-activity-phase-toggle"][aria-expanded="false"]')) button.click();
+          });
+          const text = container.textContent ?? "";
+          const position = (value: string) => { expect(text).toContain(value); return text.indexOf(value); };
+          expect(position("A reasoning.")).toBeLessThan(position(finalA.body));
+          expect(position(finalA.body)).toBeLessThan(position(requestB.body));
+          expect(position(requestB.body)).toBeLessThan(position("B reasoning before read."));
+          expect(position("B reasoning before read.")).toBeLessThan(position("B opening line."));
+          expect(position("B reasoning before read.")).toBeLessThan(position("B reasoning after read."));
+          if (opening && steer) {
+            expect(position("B reasoning before read.")).toBeLessThan(position(steerB.body));
+            expect(position(steerB.body)).toBeLessThan(position("B reasoning after read."));
+          }
+          expect(text.split(finalA.body)).toHaveLength(2);
+        }
+      });
+    }
+  }
 });

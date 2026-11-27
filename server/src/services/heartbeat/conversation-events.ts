@@ -72,7 +72,7 @@ export function conversationEventCondition(runId: string) {
     )
     or (
       ${heartbeatRunEvents.eventType} in ('item.started', 'item.delta', 'item.completed')
-      and (lower(replace(coalesce(${heartbeatRunEvents.payload} #>> '{prpEvent,payload,kind}', ${heartbeatRunEvents.payload} #>> '{prpEvent,payload,item,kind}', ${heartbeatRunEvents.payload} #>> '{prpEvent,payload,item,type}', ''), '_', '')) in ('agentmessage', 'assistantmessage', 'tooluse', 'toolresult', 'toolcall', 'dynamictoolcall', 'reasoning')
+      and (lower(replace(coalesce(${heartbeatRunEvents.payload} #>> '{prpEvent,payload,kind}', ${heartbeatRunEvents.payload} #>> '{prpEvent,payload,item,kind}', ${heartbeatRunEvents.payload} #>> '{prpEvent,payload,item,type}', ''), '_', '')) in ('agentmessage', 'assistantmessage', 'tooluse', 'toolresult', 'toolcall', 'dynamictoolcall', 'reasoning', 'usermessage', 'steeringacknowledgement')
       or coalesce(
         ${heartbeatRunEvents.payload} #>> '{prpEvent,itemId}',
         ${heartbeatRunEvents.payload} #>> '{prpEvent,payload,itemId}',
@@ -83,7 +83,7 @@ export function conversationEventCondition(runId: string) {
         from heartbeat_run_events e
         where e.run_id = ${runId}
           and e.event_type in ('item.started', 'item.delta', 'item.completed')
-          and lower(replace(coalesce(e.payload #>> '{prpEvent,payload,kind}', e.payload #>> '{prpEvent,payload,item,kind}', e.payload #>> '{prpEvent,payload,item,type}', ''), '_', '')) in ('agentmessage', 'assistantmessage', 'tooluse', 'toolresult', 'toolcall', 'dynamictoolcall', 'reasoning')
+          and lower(replace(coalesce(e.payload #>> '{prpEvent,payload,kind}', e.payload #>> '{prpEvent,payload,item,kind}', e.payload #>> '{prpEvent,payload,item,type}', ''), '_', '')) in ('agentmessage', 'assistantmessage', 'tooluse', 'toolresult', 'toolcall', 'dynamictoolcall', 'reasoning', 'usermessage', 'steeringacknowledgement')
       ))
     )
   )`;
