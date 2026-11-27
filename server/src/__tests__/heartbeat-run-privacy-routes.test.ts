@@ -270,8 +270,8 @@ describeEmbeddedPostgres("heartbeat run privacy routes", { concurrent: false }, 
     const f = await seedFixture();
     const automaticWork = { state: "closed", pausedSince: null, nextTryAt: null,
       recentAutomaticRuns: 0, failedBeforeStarting: 0, summary: "Automatic work is running normally." };
-    const brakeRead = vi.spyOn(automaticRunBrake, "read").mockResolvedValue({ state: "closed", pausedSince: null,
-      evidence: { counted: 0, failedBeforeStarting: 0 } } as Awaited<ReturnType<typeof automaticRunBrake.read>>);
+    const brakeRead = vi.spyOn(automaticRunBrake, "peek").mockResolvedValue({ state: "closed", pausedSince: null,
+      evidence: { counted: 0, failedBeforeStarting: 0 } } as Awaited<ReturnType<typeof automaticRunBrake.peek>>);
     const earlier = new Date(Date.now() - 3_600_000);
     await db.update(heartbeatRuns).set({ status: "failed", finishedAt: earlier })
       .where(eq(heartbeatRuns.id, f.privateRunId));
