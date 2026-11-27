@@ -31,6 +31,14 @@ export function withPiOpenTurnDefault(provider: unknown, setting: unknown, envir
   return { ...environment, PAPERCLIP_PI_OPEN_TURN_MS: "600000" };
 }
 
+/** Tell the Pi driver this server settles pi_claim_returned_input notices, so it may hand
+ * queued steers back at a claim. Without it the driver keeps them in Pi (a server that
+ * ignores the notice would otherwise lose them). A task configuration may still set it. */
+export function withPiClaimReturnCapability(provider: unknown, environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  if (provider !== "pi_rpc" || environment.PAPERCLIP_PI_CLAIM_RETURN !== undefined) return environment;
+  return { ...environment, PAPERCLIP_PI_CLAIM_RETURN: "1" };
+}
+
 /** The page-only marker a fresh native session writes (paperclip-control-plane-port.ts). */
 export const NATIVE_FRESH_SESSION_MARKER = "New session · Earlier messages and files are still available.";
 

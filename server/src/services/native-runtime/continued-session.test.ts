@@ -2,7 +2,7 @@ import { expect, it } from "vitest";
 import type { Db } from "@paperclipai/db";
 import { buildPaperclipWakePayload } from "../heartbeat/run-preparation.js";
 import { shouldResetTaskSessionForWake } from "../heartbeat/run-state.js";
-import { decideNativeContinuation, isWarmRecoveryRefusal, NATIVE_FRESH_SESSION_MARKER, sessionCannotContinue, withPiOpenTurnDefault } from "./continued-session.js";
+import { decideNativeContinuation, isWarmRecoveryRefusal, NATIVE_FRESH_SESSION_MARKER, sessionCannotContinue, withPiClaimReturnCapability, withPiOpenTurnDefault } from "./continued-session.js";
 import { configuredEnvironmentProjection } from "../../vendor/paperclip-runner/index.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
@@ -23,6 +23,14 @@ it("projects the continuous Pi open-turn default while preserving configured ove
     expect(project(provider, "continuous", configured)).toEqual(configuredEnvironmentProjection(configured));
   }
   expect(configured).toEqual({ CUSTOM_VALUE: "kept" });
+});
+
+it("tells only the Pi driver that this server settles claim-returned input", () => {
+  const projected = configuredEnvironmentProjection(withPiClaimReturnCapability("pi_rpc", { CUSTOM_VALUE: "kept" }));
+  expect(projected.PAPERCLIP_PI_CLAIM_RETURN).toBe("1");
+  expect(JSON.parse(projected.PAPERCLIP_CONFIGURED_ENV_KEYS!)).toContain("PAPERCLIP_PI_CLAIM_RETURN");
+  expect(withPiClaimReturnCapability("pi_rpc", { PAPERCLIP_PI_CLAIM_RETURN: "0" }).PAPERCLIP_PI_CLAIM_RETURN).toBe("0");
+  for (const provider of ["codex", "acpx", "openai_dot"]) expect(withPiClaimReturnCapability(provider, {})).toEqual({});
 });
 
 it("recognizes only an unrecoverable session's code or retained-binding refusal", () => {

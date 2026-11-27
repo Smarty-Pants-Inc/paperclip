@@ -1,5 +1,6 @@
 import { notifyNativeResultCommit } from "../native-result-commit-notifications.js";
 import { reconcileSteeredIdentitiesAfterTurn } from "../run-identity.js";
+import { settleClaimReturnedInput } from "./native-continuous-unanswered.js";
 import { settleProviderReturnedStopInput } from "../person-stop-before-turn.js";
 import { notifyNativeWorkspaceFinalization } from "../native-workspace-finalization-notifications.js";
 import { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
@@ -423,6 +424,8 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
     if (event.runId !== this.#binding.runId || (this.#sessionId && event.normalizedSessionId !== this.#sessionId)) {
       throw new Error("native_event_binding_mismatch");
     }
+    if (event.eventType === "provider.notice.recorded" && event.payload.category === "pi_claim_returned_input" && event.sourceKind !== "runner")
+      throw new Error("native_claim_return_source_invalid");
     const expectedSourceInstanceId = event.sourceKind === "control_plane"
       ? this.#binding.controlPlaneSourceInstanceId
       : this.#binding.sourceInstanceId;
@@ -621,6 +624,10 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
     persistenceEndedAt: number,
     committedAtMs: number,
   ): Promise<void> {
+    if (event.eventType === "provider.notice.recorded" && event.payload.category === "pi_claim_returned_input") {
+      if (event.sourceKind !== "runner") throw new Error("native_claim_return_source_invalid");
+      await settleClaimReturnedInput(this.#db, { id: this.#binding.runId, companyId: this.#binding.companyId });
+    }
     try { await this.#onEventPersistence?.(event, persistenceStartedAt, persistenceEndedAt); } catch {}
     if (persisted.disposition === "committed") {
       recordRunEventCommitted(event.emittedAt, committedAtMs);

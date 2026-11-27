@@ -543,18 +543,41 @@ export async function recordSteeredIdentityTarget(db: Db, context: RunIdentityCo
 }
 
 export async function rejectSteeredIdentity(
-  db: Pick<Db, "update">,
+  db: Pick<Db, "update" | "select">,
   context: RunIdentityContext,
+  options?: { returnedInput: true },
 ) {
   await db
     .update(runIdentityContexts)
-    .set({ status: "rejected" })
+    .set({ status: "rejected", ...(options?.returnedInput ? { acceptedAt: null } : {}) })
     .where(
       and(
         eq(runIdentityContexts.id, context.id),
-        eq(runIdentityContexts.status, "pending"),
+        eq(runIdentityContexts.companyId, context.companyId),
+        eq(runIdentityContexts.runId, context.runId),
+        options?.returnedInput ? inArray(runIdentityContexts.status, ["pending", "accepted"]) : eq(runIdentityContexts.status, "pending"),
       ),
     );
+  if (options?.returnedInput) {
+    // A queue ACK may already have activated the steer. Restore its parent
+    // only if it is still active; never replace a later instruction's identity.
+    let parentId = context.parentContextId, parent: RunIdentityContext | undefined;
+    const visited = new Set<string>();
+    while (parentId && !visited.has(parentId)) {
+      visited.add(parentId);
+      const [candidate] = await db.select().from(runIdentityContexts).where(and(
+        eq(runIdentityContexts.id, parentId), eq(runIdentityContexts.companyId, context.companyId), eq(runIdentityContexts.runId, context.runId)));
+      if (candidate?.status === "accepted") { parent = candidate; break; }
+      parentId = candidate?.parentContextId ?? null;
+    }
+    await db.update(heartbeatRuns).set({ activeIdentityContextId: parent?.id ?? null,
+      ...(parent ? { responsibleUserId: parent.responsibleUserId } : {}) }).where(and(
+      eq(heartbeatRuns.id, context.runId), eq(heartbeatRuns.companyId, context.companyId), eq(heartbeatRuns.activeIdentityContextId, context.id)));
+    const [binding] = await db.select({ issueId: boundRunIssueIdSql() }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.id, context.runId), eq(heartbeatRuns.companyId, context.companyId)));
+    if (binding?.issueId) await db.update(issues).set({ continuationIdentityContextId: parent?.id ?? null }).where(and(
+      eq(issues.id, binding.issueId), eq(issues.companyId, context.companyId), eq(issues.continuationIdentityContextId, context.id)));
+  }
 }
 
 /** Accept within the caller's task/run transaction; standalone recovery uses reconcileSteeredIdentity. */
@@ -570,6 +593,9 @@ export async function acceptSteeredIdentity(
       and(
         eq(runIdentityContexts.id, context.id),
         eq(runIdentityContexts.status, "pending"),
+        sql`not exists (select 1 from ${heartbeatRuns} returned_run where returned_run.id = ${context.runId}
+          and returned_run.company_id = ${context.companyId}
+          and coalesce(returned_run.result_json->'claimReturnedInput', '{}'::jsonb) ? ${context.messageId ?? ""})`,
       ),
     )
     .returning();

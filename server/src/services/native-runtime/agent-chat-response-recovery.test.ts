@@ -1,7 +1,11 @@
 import { randomUUID } from "node:crypto";
+import { settleClaimReturnedInput } from "./native-continuous-unanswered.js";
+import { deliveredQueuedCommentIds } from "../queued-comment-delivery.js";
+import { returnWakeComments } from "../person-stop-before-turn.js";
+import { acceptSteeredIdentity } from "../run-identity.js";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, authUsers, companies, companyMemberships, completionContracts, createDb, heartbeatRunEvents, heartbeatRuns, issueComments, issues, nativeRunFinalizations, nativeRunResults, issueThreadInteractions, chatTaskHandoffs, chatCompletionDeliveries, agentWakeupRequests, statusDecisions, type Db, approvals, issueApprovals, issueQuestionResponseDeliveries } from "@paperclipai/db";
+import { agents, authUsers, companies, companyMemberships, completionContracts, createDb, heartbeatRunEvents, heartbeatRuns, issueComments, issues, nativeRunFinalizations, nativeRunResults, issueThreadInteractions, chatTaskHandoffs, chatCompletionDeliveries, agentWakeupRequests, statusDecisions, type Db, approvals, issueApprovals, issueQuestionResponseDeliveries, runIdentityContexts } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
 import { NativeRunCoordinatorStore } from "./native-run-coordinator-store.js";
@@ -110,6 +114,228 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     const input = { companyId, issueId, runId };
     return { ...input, input, agentId, userId, wakeId, prpEvent, reply };
   }
+  async function claimReturnFixture(identityStatus: "pending" | "accepted" = "accepted") {
+    const f = await fixture(true);
+    heldSteering.available = false;
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, f.agentId));
+    await db.update(heartbeatRuns).set({ status: "running", finishedAt: null }).where(eq(heartbeatRuns.id, f.runId));
+    const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorType: "user", authorUserId: f.userId, body: "After this claim, what is 260 plus 5?" }).returning();
+    const [parent] = await db.insert(runIdentityContexts).values({ companyId: f.companyId, runId: f.runId,
+      revision: 1, responsibleUserId: f.userId, cause: "initial", correlationId: "initial", status: "accepted", acceptedAt: new Date() }).returning();
+    await db.update(heartbeatRuns).set({ activeIdentityContextId: parent.id, nextEventSeq: 171 }).where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "issue", reason: "issue_commented",
+      status: "deferred_issue_execution", requestedByActorType: "user", requestedByActorId: f.userId,
+      payload: { issueId: f.issueId, _paperclipWakeContext: { wakeCommentIds: [comment.id] } } });
+    const previousFlag = process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+    process.env.PAPERCLIP_AGENT_CHAT_STEERING = "true";
+    heldSteering.available = true; heldSteering.sent = [];
+    try {
+      await drainContinuousPersonMessages(db, { ...f.input, agentId: f.agentId }, { beforeFirstReply: true });
+      expect(heldSteering.sent).toEqual([comment.id]);
+    } finally {
+      heldSteering.available = false;
+      if (previousFlag === undefined) delete process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+      else process.env.PAPERCLIP_AGENT_CHAT_STEERING = previousFlag;
+    }
+    const [identity] = await db.select().from(runIdentityContexts).where(and(eq(runIdentityContexts.runId, f.runId), eq(runIdentityContexts.messageId, comment.id)));
+    expect(identity.status).toBe("accepted");
+    if (identityStatus === "pending") {
+      await db.update(runIdentityContexts).set({ status: "pending", acceptedAt: null }).where(eq(runIdentityContexts.id, identity.id));
+      await db.update(heartbeatRuns).set({ activeIdentityContextId: parent.id }).where(eq(heartbeatRuns.id, f.runId));
+    }
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    expect(run.resultJson?.queuedSteeringAcknowledgements).toMatchObject({ [comment.id]: { status: "acknowledged" } });
+    const port = new PaperclipControlPlanePort(db, { ...f, sessionId: run.nativeSessionId!, sourceInstanceId: run.runnerInstanceId!,
+      controlPlaneSourceInstanceId: "claim-return-control", completionContractId: run.completionContractId!, completionContractSha256: run.completionContractSha256! });
+    const event: PrpEvent = { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceInstanceId: run.runnerInstanceId!,
+      sourceEventId: "claim-return:1", sourceSeq: 1, sourceKind: "runner", runId: f.runId, normalizedSessionId: run.nativeSessionId!,
+      turnId: "held-turn", eventType: "provider.notice.recorded", priority: 0, emittedAt: new Date().toISOString(),
+      payload: { schema: "paperclip.provider.notice.v1", noticeId: "claim-return", severity: "info", category: "pi_claim_returned_input",
+        scope: "turn", recoverable: true, userActionable: false, summary: "Returned unread claim input",
+        details: [{ name: "returnedCommentIds", value: comment.id }] } };
+    const read = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0];
+    const pending = () => db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution")));
+    return { ...f, comment, identity, parent, run, port, event, read, pending };
+  }
+
+  it.each(["pending", "accepted"] as const)("claim-return: NEXT run receives and answers exactly once, rejecting %s identity", async identityStatus => {
+    const f = await claimReturnFixture(identityStatus);
+    await f.port.appendEvent(f.event);
+    await f.port.appendEvent(f.event);
+    expect((await f.read()).resultJson?.queuedSteeringAcknowledgements).toEqual({});
+    const [rejected] = await db.select().from(runIdentityContexts).where(eq(runIdentityContexts.id, f.identity.id));
+    expect(rejected).toMatchObject({ status: "rejected", acceptedAt: null });
+    await acceptSteeredIdentity(db, f.identity); // Late ACK cannot reactivate returned authority.
+    expect((await db.select().from(runIdentityContexts).where(eq(runIdentityContexts.id, f.identity.id)))[0].status).toBe("rejected");
+    expect((await f.read()).activeIdentityContextId).toBe(f.parent.id);
+    expect(await f.pending()).toHaveLength(1);
+    const scope = { companyId: f.companyId, issueId: f.issueId, agentId: f.agentId };
+    expect([...await deliveredQueuedCommentIds(db, { ...scope, commentIds: [f.comment.id] })]).toEqual([]);
+    // A lingering provider-history ID is NOT proof that Pi consumed a returned queue entry.
+    heldSteering.userInputIds = [f.comment.id];
+    await drainContinuousPersonMessages(db, { ...scope, runId: f.runId }, { beforeFirstReply: true });
+    expect(await f.pending()).toHaveLength(1);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+    const [next] = await db.insert(heartbeatRuns).values({ ...scope, nativeIssueId: f.issueId, nativeSessionId: f.run.nativeSessionId,
+      runtimeMode: "native", status: "running", responsibleUserId: f.userId,
+      contextSnapshot: { issueId: f.issueId, conversationSessionGeneration: 0 } }).returning();
+    await db.update(issues).set({ executionRunId: next.id }).where(eq(issues.id, f.issueId));
+    expect(await readContinuousSessionInput(db, { ...scope, runId: next.id })).toBeNull();
+    const input = await claimFirstTurnQueuedInput(db, { ...scope, runId: next.id });
+    expect(input).toContain(f.comment.body);
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next.id)))[0].contextSnapshot?.firstTurnQueuedInput)
+      .toMatchObject({ commentIds: [f.comment.id] });
+    const nextIdentity = await db.insert(runIdentityContexts).values({ companyId: f.companyId, runId: next.id, revision: 1,
+      responsibleUserId: f.userId, messageId: f.comment.id, cause: "initial", correlationId: `message:${f.comment.id}`, status: "pending" }).returning();
+    await db.transaction(tx => acceptSteeredIdentity(tx as unknown as Db, nextIdentity[0]));
+    expect((await db.select().from(runIdentityContexts).where(eq(runIdentityContexts.id, nextIdentity[0].id)))[0].status).toBe("accepted");
+    await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, agentId: f.agentId, runId: next.id, seq: 1,
+      eventType: "turn.accepted", payload: {} });
+    await publishContinuousNativeReply({ db, cursor: 2, execution: { binding: { ...scope, runId: next.id }, provider: { kind: "pi_rpc" } },
+      event: { eventType: "item.completed", runId: next.id, normalizedSessionId: next.nativeSessionId!, turnId: "next-turn",
+        sourceEventId: "claim-return-answer", itemId: "claim-return-answer", payload: { kind: "agentMessage", channel: "final", text: "265.", answers: [f.comment.id] } } });
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, next.id));
+    await requeueContinuousUnanswered(db, { id: f.runId, companyId: f.companyId });
+    expect(await f.pending()).toHaveLength(0);
+    expect([...await deliveredQueuedCommentIds(db, { ...scope, commentIds: [f.comment.id] })]).toEqual([f.comment.id]);
+    const [third] = await db.insert(heartbeatRuns).values({ ...scope, nativeIssueId: f.issueId, runtimeMode: "native", status: "running",
+      responsibleUserId: f.userId, contextSnapshot: { issueId: f.issueId, conversationSessionGeneration: 0 } }).returning();
+    await db.update(issues).set({ executionRunId: third.id }).where(eq(issues.id, f.issueId));
+    expect(await claimFirstTurnQueuedInput(db, { ...scope, runId: third.id })).toBeNull();
+    const replies = await comments(next.id);
+    expect(replies.map(reply => reply.body)).toEqual(["265."]);
+    expect((await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).some(comment => comment.body.includes("remains unanswered"))).toBe(false);
+    process.stdout.write(`CLAIM_RETURN_ROW ${JSON.stringify({ row: 1, sourceRun: f.runId, nextRun: next.id, thirdRun: third.id,
+      commentId: f.comment.id, identityStatus, rejectedIdentityId: rejected.id, reply: replies[0].body, pending: 0 })}\n`);
+    heldSteering.userInputIds = null;
+  });
+
+  it.each([false, true])("claim-return: provider ACK without queue commit keeps the existing wake (Stop=%s)", async stopFirst => {
+    const f = await claimReturnFixture();
+    const receipt = (f.run.resultJson!.queuedSteeringAcknowledgements as Record<string, { queueId: string }>)[f.comment.id];
+    await f.port.appendEvent({ ...f.event, sourceEventId: "provider-ack:1", eventType: "item.completed",
+      itemId: `held-turn:steer:${f.comment.id}`, payload: { kind: "steering_acknowledgement" } });
+    await db.update(heartbeatRuns).set({ resultJson: { ...f.run.resultJson, queuedSteeringAcknowledgements: {} } }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(agentWakeupRequests).set({ status: "deferred_issue_execution", finishedAt: null }).where(eq(agentWakeupRequests.id, receipt.queueId));
+    if (stopFirst) await db.transaction(async tx => {
+      await tx.select().from(issues).where(eq(issues.id, f.issueId)).for("no key update");
+      await returnWakeComments(tx as unknown as Db, await f.read(), { pressedAt: new Date(Date.now() + 1000).toISOString(), userId: f.userId }, true);
+    });
+    await f.port.appendEvent({ ...f.event, sourceSeq: 2 });
+    const saved = await f.read();
+    expect(saved.resultJson?.claimReturnedInput).toHaveProperty(f.comment.id);
+    expect(await f.pending()).toHaveLength(stopFirst ? 0 : 1);
+    if (stopFirst) expect(saved.resultJson?.personStop).toMatchObject({ returned: expect.arrayContaining([f.comment.id]) });
+    else {
+      expect((await f.pending())[0].id).toBe(receipt.queueId);
+      expect((await f.pending())[0].payload?.claimReturnedSourceRunId).toBe(f.runId);
+      const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+      expect((await readBoardQueuedComments({ executor: db, issue, activeRun: saved,
+        actor: { actorType: "user", actorId: f.userId, agentId: null, runId: null, agentApiKeyId: null } })).entries).toEqual([]);
+    }
+    process.stdout.write(`CLAIM_RETURN_ROW ${JSON.stringify({ row: "ack-commit-gap", sourceRun: f.runId,
+      commentId: f.comment.id, stopFirst, pending: (await f.pending()).length })}\n`);
+  });
+
+  it("claim-return: hand-back defeats source history consumption and provisional reply attribution only", async () => {
+    const f = await claimReturnFixture();
+    await publishContinuousNativeReply({ db, cursor: 180, execution: { binding: { ...f.input, agentId: f.agentId }, provider: { kind: "pi_rpc" } },
+      event: { eventType: "item.completed", runId: f.runId, normalizedSessionId: f.run.nativeSessionId!, turnId: "held-turn",
+        sourceEventId: "source-before-claim", itemId: "source-before-claim", payload: { kind: "agentMessage", channel: "final", text: "Opening work is done.", answers: [] } } });
+    const before = await f.read();
+    expect(before.resultJson?.continuousReplies).toMatchObject({ "source-before-claim": { questionCommentIds: [f.wakeId, f.comment.id] } });
+    await db.insert(heartbeatRunEvents).values([{ companyId: f.companyId, agentId: f.agentId, runId: f.runId, seq: 180,
+      eventType: "task_history.read", payload: { comments: { [f.comment.id]: f.comment.updatedAt.toISOString() } } },
+    { companyId: f.companyId, agentId: f.agentId, runId: f.runId, seq: 181, eventType: "run.result.accepted",
+      payload: { prpEvent: { payload: { result: { evidence: [{ ref: `comment:${f.comment.id}` }] } } } } }]);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(), nextEventSeq: 182 }).where(eq(heartbeatRuns.id, f.runId));
+    const scope = { companyId: f.companyId, issueId: f.issueId, agentId: f.agentId, commentIds: [f.comment.id] };
+    expect([...await deliveredQueuedCommentIds(db, scope)]).toEqual([f.comment.id]);
+    await f.port.appendEvent(f.event);
+    expect([...await deliveredQueuedCommentIds(db, scope)]).toEqual([]);
+    expect((await f.read()).resultJson?.continuousReplies).toMatchObject({ "source-before-claim": { questionCommentIds: [f.wakeId] } });
+    expect(await f.pending()).toHaveLength(1);
+    process.stdout.write(`CLAIM_RETURN_ROW ${JSON.stringify({ row: "history-and-attribution", sourceRun: f.runId,
+      commentId: f.comment.id, pending: 1 })}\n`);
+  });
+
+  it.each(["failed", "cancelled", "interrupted"] as const)("claim-return: persisted hand-back survives a %s source and observer loss", async status => {
+    const f = await claimReturnFixture();
+    // Real append committed, but the process died before its observer ran.
+    const { appendHeartbeatRunEvent } = await import("../heartbeat-run-events.js");
+    await appendHeartbeatRunEvent(db, { companyId: f.companyId, runId: f.runId, agentId: f.agentId,
+      eventType: f.event.eventType, stream: "system", level: "info", payload: { prpEvent: f.event as unknown as Record<string, unknown> },
+      nativeSource: { sourceInstanceId: f.event.sourceInstanceId, sourceEventId: f.event.sourceEventId, sourceSeq: f.event.sourceSeq,
+        protocolSchemaVersion: 1, canonicalPayload: f.event as unknown as Record<string, unknown> } });
+    await db.update(heartbeatRuns).set({ status, errorCode: "adapter_failed", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+    await requeueContinuousUnanswered(db, { id: f.runId, companyId: f.companyId });
+    await settleClaimReturnedInput(db, { id: f.runId, companyId: f.companyId });
+    expect(await f.pending()).toHaveLength(1);
+    expect((await f.read()).resultJson?.queuedSteeringAcknowledgements).toEqual({});
+    process.stdout.write(`CLAIM_RETURN_ROW ${JSON.stringify({ row: 2, sourceRun: f.runId, commentId: f.comment.id, status,
+      wake: (await f.pending())[0].id, pending: 1 })}\n`);
+  });
+
+  it.each(["before-notice", "after-notice"] as const)("claim-return: person's Stop wins %s with input box and no self-start", async order => {
+    const f = await claimReturnFixture();
+    const stop = { pressedAt: new Date(Date.now() + 1000).toISOString(), userId: f.userId };
+    if (order === "after-notice") await f.port.appendEvent(f.event);
+    await db.transaction(async tx => {
+      await tx.select().from(issues).where(eq(issues.id, f.issueId)).for("no key update");
+      const [run] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)).for("update");
+      await returnWakeComments(tx as unknown as Db, run, stop, true);
+    });
+    if (order === "before-notice") await f.port.appendEvent(f.event);
+    await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, f.runId));
+    await requeueContinuousUnanswered(db, { id: f.runId, companyId: f.companyId });
+    expect((await f.read()).resultJson?.personStop).toMatchObject({ returned: expect.arrayContaining([f.comment.id]) });
+    expect(await f.pending()).toEqual([]);
+    process.stdout.write(`CLAIM_RETURN_ROW ${JSON.stringify({ row: 3, sourceRun: f.runId, commentId: f.comment.id, order,
+      personStop: (await f.read()).resultJson?.personStop, pending: 0 })}\n`);
+  });
+
+  it("claim-return: removes only named ACKs and identities in this run", async () => {
+    const f = await claimReturnFixture();
+    const [other] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorType: "user", authorUserId: f.userId, body: "A different delivered steer" }).returning();
+    const [otherIdentity] = await db.insert(runIdentityContexts).values({ companyId: f.companyId, runId: f.runId, revision: 3,
+      responsibleUserId: f.userId, messageId: other.id, parentContextId: f.identity.id, cause: "steering",
+      correlationId: `message:${other.id}`, status: "accepted", acceptedAt: new Date() }).returning();
+    await db.update(heartbeatRuns).set({ activeIdentityContextId: otherIdentity.id, resultJson: { ...f.run.resultJson,
+      queuedSteeringAcknowledgements: { ...f.run.resultJson?.queuedSteeringAcknowledgements as object,
+        [other.id]: { status: "acknowledged", turnId: "held-turn" } } } }).where(eq(heartbeatRuns.id, f.runId));
+    await f.port.appendEvent(f.event);
+    const saved = await f.read();
+    expect(saved.resultJson?.queuedSteeringAcknowledgements).toEqual({ [other.id]: { status: "acknowledged", turnId: "held-turn" } });
+    expect(saved.activeIdentityContextId).toBe(otherIdentity.id);
+    expect((await db.select().from(runIdentityContexts).where(eq(runIdentityContexts.id, otherIdentity.id)))[0].status).toBe("accepted");
+    expect(await f.pending()).toHaveLength(1);
+    process.stdout.write(`CLAIM_RETURN_ROW ${JSON.stringify({ row: "exact-scope", sourceRun: f.runId,
+      returnedId: f.comment.id, unchangedId: other.id, unchangedIdentityId: otherIdentity.id })}\n`);
+  });
+
+  it("claim-return: refuses unsteered and other-task ids and unbound runner/control-plane notices", async () => {
+    const f = await claimReturnFixture();
+    const [otherIssue] = await db.insert(issues).values({ companyId: f.companyId, title: "Other task", assigneeAgentId: f.agentId }).returning();
+    const badIds: string[] = [];
+    for (const issueId of [f.issueId, otherIssue.id]) {
+      const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId,
+        authorType: "user", authorUserId: f.userId, body: "Not steered in this run" }).returning();
+      badIds.push(comment.id);
+    }
+    const run = await f.read();
+    await db.update(heartbeatRuns).set({ resultJson: { ...run.resultJson, queuedSteeringAcknowledgements: {
+      ...run.resultJson?.queuedSteeringAcknowledgements as object, [badIds[1]]: { status: "acknowledged" } } } }).where(eq(heartbeatRuns.id, f.runId));
+    await expect(f.port.appendEvent({ ...f.event, sourceInstanceId: randomUUID() })).rejects.toThrow("native_event_source_binding_mismatch");
+    await expect(f.port.appendEvent({ ...f.event, sourceKind: "control_plane", sourceInstanceId: "claim-return-control" })).rejects.toThrow("native_claim_return_source_invalid");
+    await f.port.appendEvent({ ...f.event, payload: { ...f.event.payload, details: [{ name: "returnedCommentIds", value: badIds.join(",") }] } });
+    expect((await f.read()).resultJson?.claimReturnedInput).toBeUndefined();
+    expect(await f.pending()).toEqual([]);
+    process.stdout.write(`CLAIM_RETURN_ROW ${JSON.stringify({ row: 4, sourceRun: f.runId, refusedIds: badIds, pending: 0 })}\n`);
+  });
+
   it("settles the exact claimed wake when recovery projects a committed native run", async () => {
     // The provider and result are already committed. Recovery owns terminal
     // projection because the live executor will not return to completeRun.
