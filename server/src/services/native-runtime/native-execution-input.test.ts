@@ -843,7 +843,7 @@ describe("native serialized-command budget", () => {
       prepare(c, kind === "task_description" ? { issue: { ...args.issue, description: "x".repeat(600000) }, taskPrompt: "x".repeat(600000) } : {});
       throw new Error("oversized protected input was accepted");
     } catch (error) {
-      expect(error).toMatchObject({ code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind, bytes: 600000, remedies: kind === "task_description" ? ["edit_task_description", "new_followup_task"] : ["edit_message", "delete_own_message", "new_followup_task"] } });
+      expect(error).toMatchObject({ code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind, bytes: 600000 } });
       expect(String(error)).not.toMatch(/new session|compact/);
     }
   });
@@ -892,7 +892,7 @@ describe("native serialized-command budget", () => {
       const changed = variant === "prefix" ? original.slice(0, -1) : original.slice(0, -1) + "!";
       const text = variant === "non-json" ? changed : "$first $second\n\n" + JSON.stringify({ task: { prompt: changed } });
       expect(() => nativeFreshFallbackPayload(runId, { text })).toThrow(expect.objectContaining({
-        code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "stale_copy", bytes: Buffer.byteLength(changed), remedies: ["report_defect"] },
+        code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "stale_copy", bytes: Buffer.byteLength(changed) },
       }));
     } finally { clearNativeFreshFallback(runId); }
   });
@@ -944,7 +944,7 @@ describe("native serialized-command budget", () => {
         try { expect(plainRun.queueCommand("turn.start", { text }, "fits-byte-guard").payload.text).toBe(text); }
         finally { await plainRun.stop(); }
         expect(() => core.queueCommand("turn.start", { text }, "near-original")).toThrow(expect.objectContaining({
-          promptCause: { kind: "stale_copy", bytes: Buffer.byteLength(nearOriginal), remedies: ["report_defect"] },
+          promptCause: { kind: "stale_copy", bytes: Buffer.byteLength(nearOriginal) },
         }));
         expect(core.store.state.commands).toHaveLength(0);
       } else {
@@ -985,8 +985,8 @@ describe("native serialized-command budget", () => {
     c.originCommentIds = [];
     for (const message of c.messages) { message.authorType = "user"; message.body = "x".repeat(600_000 / count); }
     expect(() => prepare(c, { continuationReadState: { lastRunAt: null, readCommentIds: [] } })).toThrow(expect.objectContaining({
-      promptCause: count === 10 ? { kind: "unread_messages", bytes: 600_000, count, remedies: ["edit_message", "delete_own_message", "new_followup_task"] }
-        : { kind: "unread_message", bytes: 300_000, remedies: ["edit_message", "delete_own_message", "new_followup_task"] },
+      promptCause: count === 10 ? { kind: "unread_messages", bytes: 600_000, count }
+        : { kind: "unread_message", bytes: 300_000 },
     }));
     const short = buildNativeExecutionInput({ ...args, boundCommandBytes: true,
       issue: { ...args.issue, id: "follow-up", title: "Read linked request", description: "Read the long request at https://example.test/saved-text" },
@@ -996,7 +996,7 @@ describe("native serialized-command budget", () => {
       const ownerAsk = "@owner please split this request";
       c.messages.push({ ...c.messages[0]!, id: "owner-ask", body: ownerAsk });
       expect(() => prepare(c, { continuationReadState: { lastRunAt: null, readCommentIds: [] } })).toThrow(expect.objectContaining({
-        promptCause: { kind: "unread_messages", bytes: 600_000 + Buffer.byteLength(ownerAsk), count: 11, remedies: ["edit_message", "delete_own_message", "new_followup_task"] },
+        promptCause: { kind: "unread_messages", bytes: 600_000 + Buffer.byteLength(ownerAsk), count: 11 },
       }));
       console.info(JSON.stringify({ recoveryRow: "owner-ask-adds-to-combined-refusal", count: 11, bytes: 600_000 + Buffer.byteLength(ownerAsk) }));
     }
@@ -1013,7 +1013,7 @@ describe("native serialized-command budget", () => {
     expect(wakes).toBe(true);
     const readState = { lastRunAt: null, readCommentIds: [] };
     expect(() => prepare(c, { continuationReadState: readState })).toThrow(expect.objectContaining({
-      promptCause: { kind: "unread_message", bytes: 600_000, remedies: ["edit_message", "delete_own_message", "new_followup_task"] },
+      promptCause: { kind: "unread_message", bytes: 600_000 },
     }));
     // execution-continuation projects a tombstoned comment as deleted + empty body.
     c.messages[0]!.body = "";
@@ -1037,13 +1037,13 @@ describe("native serialized-command budget", () => {
     for (const message of c.messages) message.body = "u".repeat(250000);
     c.originCommentIds = [];
     expect(() => prepare(c, { continuationReadState: { lastRunAt: "2026-01-02T00:00:00Z", readCommentIds: [] } })).toThrow(expect.objectContaining({
-      promptCause: { kind: "unread_messages", bytes: 750000, count: 3, remedies: ["edit_message", "delete_own_message", "new_followup_task"] },
+      promptCause: { kind: "unread_messages", bytes: 750000, count: 3 },
     }));
   });
   it("names combined required inputs rather than blaming the largest insufficient part", () => {
     const c = shape(3, 100); c.messages.at(-1)!.body = "n".repeat(450000);
     expect(() => prepare(c, { issue: { ...args.issue, description: "d".repeat(450000) }, taskPrompt: "a".repeat(450000) })).toThrow(expect.objectContaining({
-      promptCause: { kind: "protected_inputs", bytes: expect.any(Number), measure: "protected_parts", remedies: ["new_followup_task"] },
+      promptCause: { kind: "protected_inputs", bytes: expect.any(Number), measure: "protected_parts" },
     }));
   });
   it("C31 v11: labels an envelope-only refusal instead of calling its bytes a raw-part sum", () => {
@@ -1063,7 +1063,7 @@ describe("native serialized-command budget", () => {
     expect(budgetNativeFreshFallback(input, wake)).toBe(c);
     expect(input.task.prompt).toBe(original);
     input.task.prompt = "x".repeat(600000);
-    expect(() => budgetNativeFreshFallback(input, wake)).toThrow(expect.objectContaining({ promptCause: { kind: "protected_input", bytes: 600000, remedies: ["new_followup_task"] } }));
+    expect(() => budgetNativeFreshFallback(input, wake)).toThrow(expect.objectContaining({ promptCause: { kind: "protected_input", bytes: 600000 } }));
   });
   it("classifies an unread oversized message when a kept turn falls back to fresh input", () => {
     const c = shape(3, 100);
@@ -1087,7 +1087,7 @@ describe("native serialized-command budget", () => {
     expect(prepare(c, { continuationReadState: readState }).input.task.prompt).toContain(c.messages[1]!.body);
     c.messages[1]!.body = "u".repeat(600000);
     expect(() => prepare(c, { continuationReadState: readState })).toThrow(expect.objectContaining({
-      code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "unread_message", bytes: 600000, remedies: ["edit_message", "delete_own_message", "new_followup_task"] },
+      code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "unread_message", bytes: 600000 },
     }));
   });
   it.each(["humanResponses", "interactionResponses"] as const)("carries long %s answers whole or refuses with the answer cause", channel => {
@@ -1103,7 +1103,7 @@ describe("native serialized-command budget", () => {
     const input = build(body);
     expect(channel === "humanResponses" ? input.task.prompt : JSON.stringify(buildNativeModelEnvelope(input))).toContain(body);
     expect(() => build("a".repeat(600000))).toThrow(expect.objectContaining({
-      code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "human_response", bytes: expect.any(Number), remedies: ["new_followup_task"] },
+      code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "human_response", bytes: expect.any(Number) },
     }));
   });
   it("does not label an uncut delta with its full snapshot's earlier cut", () => {

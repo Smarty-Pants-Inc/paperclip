@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { projectTaskInterruption } from "./task-interruption-presentation.js";
-import { NativeTurnPromptExceedsCommandBoundError, nativePromptCauseFromError, nativePromptRefusalCause, nativePromptRefusalRemedies, assertNativeTurnCommandBound, assertNativeQueuedTurnBound, nativeQueuedTurnUpperBound, nativeSessionHandoffMaxBytes, NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, type NativePromptRefusalCause } from "./native-runtime/native-turn-budget.js";
+import { NativeTurnPromptExceedsCommandBoundError, nativePromptCauseFromError, nativePromptRefusalCause, assertNativeTurnCommandBound, assertNativeQueuedTurnBound, nativeQueuedTurnUpperBound, nativeSessionHandoffMaxBytes, NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, type NativePromptRefusalCause } from "./native-runtime/native-turn-budget.js";
 import { renderNativeSessionHandoff } from "./native-runtime/native-session-handoff.js";
 
 const issue = { id: "task", companyId: "11111111-1111-4111-8111-111111111111", status: "blocked", assigneeAgentId: "agent", projectId: "22222222-2222-4222-8222-222222222222" };
@@ -12,7 +12,7 @@ const agent = { status: "idle", pauseReason: null };
 // Unit test agreed in task: pure refusal projection and measurement must truthfully
 // name the compared data and an existing edit/escalation path; no provider needed.
 describe("C31 v10 refusal measures and supported exits", () => {
-  const projectCause = (cause: Omit<NativePromptRefusalCause, "remedies"> & { remedies?: NativePromptRefusalCause["remedies"] }) => projectTaskInterruption(issue, {
+  const projectCause = (cause: NativePromptRefusalCause) => projectTaskInterruption(issue, {
     run: { ...run, errorCode: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, resultJson: { nativeTurnPromptRefusalCause: cause } },
     agent, paused: false, approval: false,
   });
@@ -25,9 +25,9 @@ describe("C31 v10 refusal measures and supported exits", () => {
   };
 
   it.each([
-    { kind: "future-input_v12", bytes: 25, remedies: [] },
-    { kind: "command", bytes: 123, measure: "future-measure_v12", remedies: [] },
-    { kind: "stale_copy", bytes: 25, measure: "future_measure", remedies: [] },
+    { kind: "future-input_v12", bytes: 25 },
+    { kind: "command", bytes: 123, measure: "future-measure_v12" },
+    { kind: "stale_copy", bytes: 25, measure: "future_measure" },
   ])("C31 v11 preserves readable fields through version skew: %j", cause => {
     expect(nativePromptRefusalCause(cause)).toEqual(cause);
     const parsed = nativePromptCauseFromError(new Error(`native_prompt_cause=${cause.kind}:${cause.bytes}${"measure" in cause ? `:measure=${cause.measure}` : ""}`));
@@ -47,7 +47,7 @@ describe("C31 v10 refusal measures and supported exits", () => {
   });
 
   it.each(["protected_parts", "envelope_with_reserve"] as const)("C31 v11 labels protected-input bytes: %s", measure => {
-    const cause = { kind: "protected_inputs" as const, bytes: 750_000, measure, remedies: nativePromptRefusalRemedies("protected_inputs") };
+    const cause = { kind: "protected_inputs" as const, bytes: 750_000, measure };
     expect(nativePromptRefusalCause(cause)).toEqual(cause);
     const presentation = projectCause(cause);
     expect(presentation?.failure?.detail).toContain(measure === "protected_parts" ? "located required inputs total 733 KB before command encoding" : "encoded task envelope, including reserved room, is 733 KB");
@@ -59,7 +59,7 @@ describe("C31 v10 refusal measures and supported exits", () => {
     const cause = refusal(() => assertNativeTurnCommandBound("turn.start", payload, "measured-command"));
     const compared = { schema: "paperclip.prp.command.v1", commandId: "measured-command", controllerSeq: Number.MAX_SAFE_INTEGER,
       type: "turn.start", issuedAt: new Date().toISOString(), payload, status: "pending", result: null };
-    expect(cause).toEqual({ kind: "command", bytes: Buffer.byteLength(JSON.stringify(compared)), measure: "command", remedies: ["edit_task_description", "new_followup_task", "report_defect"] });
+    expect(cause).toEqual({ kind: "command", bytes: Buffer.byteLength(JSON.stringify(compared)), measure: "command" });
     expect(cause.bytes).toBeGreaterThan(Buffer.byteLength(JSON.stringify(payload)));
     expect(nativePromptCauseFromError(new Error(String(new NativeTurnPromptExceedsCommandBoundError(cause))))).toEqual(cause);
     expect(projectCause(cause)?.failure?.detail).toContain("serialized command measured by the guard");
@@ -69,7 +69,7 @@ describe("C31 v10 refusal measures and supported exits", () => {
     const text = '"'.repeat(140_000);
     const cause = refusal(() => nativeSessionHandoffMaxBytes(measure === "prompt" ? text : { task: { prompt: text } }));
     const bytes = Buffer.byteLength(JSON.stringify(JSON.stringify(measure === "prompt" ? text : { task: { prompt: text } }))) - (measure === "prompt" ? 6 : 2);
-    expect(cause).toEqual({ kind: "command", bytes, measure, remedies: ["edit_task_description", "new_followup_task", "report_defect"] });
+    expect(cause).toEqual({ kind: "command", bytes, measure });
     expect(projectCause(cause)?.failure?.detail).toContain(measure === "prompt" ? "encoded prompt" : "encoded envelope");
     expect(projectCause(cause)?.failure?.detail).not.toContain("complete encoded turn");
     expect(nativePromptCauseFromError(new Error(String(new NativeTurnPromptExceedsCommandBoundError(cause))))).toEqual(cause);
@@ -86,13 +86,13 @@ describe("C31 v10 refusal measures and supported exits", () => {
   it("names the pre-seal whole-command upper bound, including its reserves", () => {
     const envelope = { task: { prompt: "x".repeat(510_000) } };
     const cause = refusal(() => assertNativeQueuedTurnBound("run", envelope, "short queued message"));
-    expect(cause).toEqual({ kind: "command", bytes: nativeQueuedTurnUpperBound("run", envelope, "short queued message"), measure: "command_upper_bound", remedies: ["edit_task_description", "new_followup_task", "report_defect"] });
+    expect(cause).toEqual({ kind: "command", bytes: nativeQueuedTurnUpperBound("run", envelope, "short queued message"), measure: "command_upper_bound" });
     expect(projectCause(cause)?.failure?.detail).toContain("command upper bound, including reserved room");
     expect(nativePromptCauseFromError(new Error(String(new NativeTurnPromptExceedsCommandBoundError(cause))))).toEqual(cause);
   });
 
   it("keeps an under-cap stale copy distinct from every size refusal", () => {
-    const cause: NativePromptRefusalCause = { kind: "stale_copy", bytes: 25, remedies: ["report_defect"] };
+    const cause: NativePromptRefusalCause = { kind: "stale_copy", bytes: 25 };
     expect(nativePromptRefusalCause(cause)).toEqual(cause);
     expect(nativePromptCauseFromError(new Error(String(new NativeTurnPromptExceedsCommandBoundError(cause))))).toEqual(cause);
     const presentation = projectCause(cause);
@@ -102,12 +102,12 @@ describe("C31 v10 refusal measures and supported exits", () => {
   });
 
   it("reads old causes without inventing a measurement and retains future labels", () => {
-    const legacy = { kind: "command" as const, bytes: 123, remedies: [] };
+    const legacy = { kind: "command" as const, bytes: 123 };
     expect(nativePromptRefusalCause(legacy)).toEqual(legacy);
     expect(nativePromptCauseFromError(new Error("native_prompt_cause=command:123"))).toEqual(legacy);
     expect(projectCause(legacy)?.failure?.detail).not.toMatch(/123|1 KB|complete encoded turn/);
     expect(nativePromptRefusalCause({ ...legacy, measure: "payload_masquerading_as_command" })).toEqual({ ...legacy, measure: "payload_masquerading_as_command" });
-    expect(nativePromptCauseFromError(new Error("native_prompt_cause=unknown:123"))).toEqual({ kind: "unknown", bytes: 123, remedies: [] });
+    expect(nativePromptCauseFromError(new Error("native_prompt_cause=unknown:123"))).toEqual({ kind: "unknown", bytes: 123 });
     expect(nativePromptCauseFromError(new Error("native_prompt_cause=command:123:measure=unknown"))).toEqual({ ...legacy, measure: "unknown" });
   });
 
@@ -124,7 +124,7 @@ describe("C31 v10 refusal measures and supported exits", () => {
     ["unmeasured_composition", "defect in the agent's runtime or Paperclip"],
     ["stale_copy", "defect in the agent's runtime or Paperclip"],
   ] as const)("gives %s a supported edit or named escalation path", (kind, wayOut) => {
-    const cause: NativePromptRefusalCause = { kind, remedies: nativePromptRefusalRemedies(kind), bytes: kind === "unmeasured_composition" ? 0 : kind === "stale_copy" ? 25 : 750_000,
+    const cause: NativePromptRefusalCause = { kind, bytes: kind === "unmeasured_composition" ? 0 : kind === "stale_copy" ? 25 : 750_000,
       ...(kind === "unread_messages" ? { count: 3 } : {}), ...(kind === "command" ? { measure: "command" as const } : {}) };
     const presentation = projectCause(cause);
     expect(presentation).toMatchObject({ canRetry: false, failure: { cause } });
@@ -136,73 +136,6 @@ describe("C31 v10 refusal measures and supported exits", () => {
       expect(presentation?.failure?.detail).toContain("After the fix is installed, send a message to continue");
     }
     expect(nativePromptCauseFromError(new Error(String(new NativeTurnPromptExceedsCommandBoundError(cause))))).toEqual(cause);
-  });
-});
-
-// Unit test agreed in task: closed pure-data repair routes and legacy validation
-// cannot be proven more cheaply through a provider or UI flow.
-describe("C31 server-owned remedies", () => {
-  it.each([
-    ["task_description", ["edit_task_description", "new_followup_task"]],
-    ["newest_message", ["edit_message", "delete_own_message", "new_followup_task"]],
-    ["unread_message", ["edit_message", "delete_own_message", "new_followup_task"]],
-    ["unread_messages", ["edit_message", "delete_own_message", "new_followup_task"]],
-    ["queued_input", ["edit_message", "new_followup_task"]],
-    ["human_response", ["new_followup_task"]],
-    ["protected_input", ["new_followup_task"]],
-    ["protected_inputs", ["new_followup_task"]],
-    ["command", ["edit_task_description", "new_followup_task", "report_defect"]],
-    ["unmeasured_composition", ["report_defect"]],
-    ["stale_copy", ["report_defect"]],
-  ] as const)("persists and serializes %s supported routes without reading prose", (kind, expected) => {
-    const cause: NativePromptRefusalCause = { kind, bytes: 123, remedies: nativePromptRefusalRemedies(kind),
-      ...(kind === "unread_messages" ? { count: 3 } : {}), ...(kind === "command" ? { measure: "command" as const } : {}) };
-    expect(cause.remedies).toEqual(expected);
-    const error = new NativeTurnPromptExceedsCommandBoundError(cause);
-    expect(nativePromptCauseFromError(error)).toEqual(cause);
-    expect(error.message).toContain(`:remedies=${expected.join(",")}]`);
-    expect(nativePromptCauseFromError(new Error(String(error)))).toEqual(cause);
-    const resultJson = JSON.parse(JSON.stringify({ nativeTurnPromptRefusalCause: nativePromptCauseFromError(error) }));
-    const presentation = projectTaskInterruption(issue, {
-      run: { ...run, errorCode: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, resultJson }, agent, paused: false, approval: false,
-    });
-    expect(presentation?.failure).toMatchObject({ cause });
-  });
-
-  it("keeps legacy structured and serialized causes empty, without inferring actions", () => {
-    const legacy = { kind: "newest_message", bytes: 123, count: 2 };
-    expect(nativePromptRefusalCause(legacy)).toEqual({ ...legacy, remedies: [] });
-    expect(nativePromptCauseFromError({ promptCause: legacy })).toEqual({ ...legacy, remedies: [] });
-    expect(nativePromptCauseFromError(new Error("native_prompt_cause=newest_message:123:count=2")))
-      .toEqual({ ...legacy, remedies: [] });
-    const empty: NativePromptRefusalCause = { kind: "command", bytes: 123, measure: "prompt", remedies: [] };
-    expect(nativePromptCauseFromError(new Error(String(new NativeTurnPromptExceedsCommandBoundError(empty))))).toEqual(empty);
-  });
-
-  it.each(["compact", "new_session", "unknown", "edit_task_description,unknown", null, "ask_task_owner", [42], ["bad:route"], [""]].map(remedies => ({ remedies })))(
-    "rejects malformed remedies: $remedies", ({ remedies }) => {
-      expect(nativePromptRefusalCause({ kind: "command", bytes: 123, remedies })).toBeUndefined();
-    },
-  );
-  it.each([",", "edit_message,", ",edit_message", "edit_message,,report_defect", "bad:route", "edit_message:extra"])(
-    "rejects malformed serialized remedies instead of parsing a legacy prefix: %s", remedies => {
-      expect(nativePromptCauseFromError(new Error(`native_prompt_cause=command:123:remedies=${remedies}`))).toBeUndefined();
-    },
-  );
-  it("keeps readable evidence when a future writer names an unsupported route", () => {
-    const expected = { kind: "command", bytes: 123, remedies: ["new_followup_task"] };
-    expect(nativePromptRefusalCause({ ...expected, remedies: ["future_route", "new_followup_task"] })).toEqual(expected);
-    expect(nativePromptCauseFromError(new Error("native_prompt_cause=command:123:remedies=future_route,new_followup_task"))).toEqual(expected);
-  });
-  it("does not guess a version-skewed input's edit route", () => {
-    expect(nativePromptRefusalRemedies("future-input_v12")).toEqual(["check_versions"]);
-    expect(nativePromptRefusalRemedies("task_description", "future-measure_v12")).toEqual(["new_followup_task"]);
-    expect(nativePromptRefusalRemedies("stale_copy", "future-measure_v12")).toEqual(["report_defect"]);
-  });
-  it("does not share remedy arrays between causes", () => {
-    const first = nativePromptRefusalRemedies("command");
-    first.length = 0;
-    expect(nativePromptRefusalRemedies("command")).toEqual(["edit_task_description", "new_followup_task", "report_defect"]);
   });
 });
 
@@ -255,7 +188,7 @@ describe("classified failure of an unanswered message", () => {
     expect(presentation?.failure?.detail).not.toMatch(/new session|compact/i);
   });
   it.each(["unread_messages", "protected_input", "protected_inputs", "command"] as const)("supplies specific safe copy and serialized cause for %s", kind => {
-    const cause = { kind, remedies: nativePromptRefusalRemedies(kind), bytes: 750000, ...(kind === "unread_messages" ? { count: 3 } : {}), ...(kind === "command" ? { measure: "command" as const } : {}) };
+    const cause = { kind, bytes: 750000, ...(kind === "unread_messages" ? { count: 3 } : {}), ...(kind === "command" ? { measure: "command" as const } : {}) };
     const error = new NativeTurnPromptExceedsCommandBoundError(cause);
     expect(nativePromptCauseFromError(new Error(String(error)))).toEqual(cause);
     const presentation = project({ errorCode: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, resultJson: { nativeTurnPromptRefusalCause: cause } });
@@ -266,7 +199,7 @@ describe("classified failure of an unanswered message", () => {
     if (kind === "protected_input") expect(presentation?.failure?.title).toBe("Required task input is too large");
   });
   it("presents an unmeasured handback refusal truthfully, not as an oversized request", () => {
-    const cause = { kind: "unmeasured_composition" as const, bytes: 0, remedies: nativePromptRefusalRemedies("unmeasured_composition") };
+    const cause = { kind: "unmeasured_composition" as const, bytes: 0 };
     const error = new NativeTurnPromptExceedsCommandBoundError(cause);
     expect(nativePromptCauseFromError(new Error(String(error)))).toEqual(cause);
     const presentation = project({ errorCode: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND,
