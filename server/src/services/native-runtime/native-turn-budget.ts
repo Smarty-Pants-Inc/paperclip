@@ -27,67 +27,82 @@ export const NATIVE_HANDOFF_CUT_NOTE_RESERVE_BYTES = 256;
 export const NATIVE_HANDOFF_MAX_BYTES = 24_000;
 export const NATIVE_WHOLE_HANDOFF_MAX_BYTES = 368_000;
 export const NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND = "native_turn_prompt_exceeds_command_bound";
-export const NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND_MESSAGE = "This turn is too large. Edit the description on the task page to shorten it, or ask the task's owner in the task's comments to split the work into smaller tasks. Saved task history remains available.";
+export const NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND_MESSAGE = "The task input could not be sent, but this run has no readable explanation. Give your instance admin this run and the task title to check the agent's runtime and Paperclip versions; if you are the instance admin, check those versions directly. After the cause is fixed, send a message to continue. Saved messages and answers are kept.";
 const nativePromptMeasures = ["command", "command_upper_bound", "prompt", "envelope", "handoff_note"] as const;
-/** The closed kind list lives here; both title coverage and parsing use it.
+/** The known kind list lives here; title coverage is checked against it.
  * For command refusals, bytes names the measured thing through measure:
  * command = the WHOLE serialized guard command (including its conservative
  * sequence/identity shell); command_upper_bound = pre-seal command plus reserves;
  * prompt/envelope/handoff_note = that part's command-encoded bytes, NOT a turn.
  * Missing measure is supported only for older saved causes; never label those
  * bytes as a complete command. stale_copy.bytes is raw UTF-8 prompt evidence,
- * not evidence that the turn exceeds its byte limit. */
+ * not evidence that the turn exceeds its byte limit. protected_inputs uses
+ * protected_parts for the raw sum of located parts, or envelope_with_reserve
+ * for the encoded envelope plus its reserved room. Readers retain unknown
+ * kind/measure labels across version skew without guessing their meaning. */
+type NativePromptRefusalKind = "task_description" | "newest_message" | "unread_message" | "unread_messages" | "queued_input" | "human_response" | "protected_input" | "protected_inputs" | "command" | "unmeasured_composition" | "stale_copy";
 export type NativePromptRefusalCause = {
-  kind: "task_description" | "newest_message" | "unread_message" | "unread_messages" | "queued_input" | "human_response" | "protected_input" | "protected_inputs" | "command" | "unmeasured_composition" | "stale_copy";
+  kind: NativePromptRefusalKind | (string & {});
   bytes: number;
   count?: number;
-  measure?: typeof nativePromptMeasures[number];
+  measure?: typeof nativePromptMeasures[number] | "protected_parts" | "envelope_with_reserve" | (string & {});
 };
-const nativePromptRefusalTitles: Record<NativePromptRefusalCause["kind"], string> = {
+const nativePromptRefusalTitles: Record<string, string> = {
   task_description: "Task description is too large", newest_message: "Newest message is too large",
   unread_message: "Unread message is too large", unread_messages: "Unread messages are too large",
   queued_input: "Queued input is too large", human_response: "Answer is too large",
   protected_input: "Required task input is too large", protected_inputs: "Required task inputs are too large", command: "Turn is too large",
   unmeasured_composition: "Queued input cannot be measured for this turn",
   stale_copy: "Session input contains stale history",
-};
+} satisfies Record<NativePromptRefusalKind, string>;
 export function nativePromptRefusalTitle(cause?: NativePromptRefusalCause): string {
-  return cause ? nativePromptRefusalTitles[cause.kind] : "Turn is too large";
+  return cause && Object.hasOwn(nativePromptRefusalTitles, cause.kind) ? nativePromptRefusalTitles[cause.kind]! : "Task input could not be sent";
 }
 export function nativePromptRefusalDetail(cause?: NativePromptRefusalCause): string {
   if (!cause) return NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND_MESSAGE;
-  if (cause.kind === "unmeasured_composition") return "This session's command composition cannot be measured before claiming this queued input. No queued messages or answers were consumed; they remain saved. Ask the task's owner in the task's comments to report this run to the Paperclip operator to repair this session's input delivery.";
-  if (cause.kind === "stale_copy") return "This session's input still contains a stale copy of history that was cut for room. Ask the task's owner in the task's comments to report this run to the Paperclip operator to repair fresh-session input delivery. Saved task history remains available to the agent through get_task_history.";
+  const followUp = "Create and assign a new short follow-up task linking to the long text or this task's saved context, rather than copying the long text into its description or messages. Send a short message there to start the work; this task stays stopped. Saved messages and answers are kept.";
+  const defectReport = "This is a defect in the agent's runtime or Paperclip, not an admin setting you can repair. Report this run and the task title to the developers maintaining the agent's runtime or Paperclip. Your instance admin can pass on the report; if that is you, report it directly. After the fix is installed, send a message to continue. Saved messages and answers are kept.";
+  if (!Object.hasOwn(nativePromptRefusalTitles, cause.kind)) return `This Paperclip version does not recognize the saved input-refusal reason. The saved diagnostic byte count is ${cause.bytes} bytes; its meaning is not known here. Give your instance admin this run and the task title to check the agent's runtime and Paperclip versions; if you are the instance admin, check those versions directly. After the cause is fixed, send a message to continue. Saved messages and answers are kept.`;
+  if (cause.kind === "unmeasured_composition") return `Paperclip could not check the complete turn's size before taking the queued input. No queued messages or answers were consumed; they remain saved. ${defectReport}`;
+  if (cause.kind === "stale_copy") return `The agent's input still includes an old copy of task history that Paperclip left out to make room. ${defectReport}`;
   const size = Math.ceil(cause.bytes / 1024);
-  if (cause.kind === "task_description") return `The task description is ${size} KB. Edit the description on the task page to shorten it, or ask the task's owner in the task's comments to split the work into smaller tasks. Saved task history remains available.`;
-  if (cause.kind === "newest_message") return `The newest message is ${size} KB. If it is still queued, edit it in the task's message queue and send the remaining request as smaller messages. Otherwise ask the task's owner in the task's comments to split the request into smaller follow-up tasks. Saved task history remains available.`;
-  if (cause.kind === "unread_message") return `An unread message is ${size} KB. If it is still queued, edit it in the task's message queue and send the remaining request as smaller messages. Otherwise ask the task's owner in the task's comments to split the request into smaller follow-up tasks. Saved task history remains available.`;
-  if (cause.kind === "queued_input") return `The queued input is ${size} KB when encoded for this turn. If you can edit it in the task's message queue, shorten it there and send the rest as smaller messages; otherwise ask the task's owner in the task's comments to split the request into smaller follow-up tasks. This refusal does not claim or consume queued messages or answers; the input remains saved.`;
-  if (cause.kind === "human_response") return `A person's answer is ${size} KB and is too large to send. The whole answer remains saved; a submitted answer cannot be edited here. Ask the task's owner in the task's comments to continue the work in a smaller follow-up task with a short description, linking back to this task for the saved answer.`;
-  if (cause.kind === "unread_messages") return `${cause.count ?? "Multiple"} unread messages total ${size} KB. Their combined size is too large for this turn. Ask the task's owner in the task's comments to split the requests into smaller follow-up tasks, or edit the messages in the task's message queue if they are still editable. Saved task history remains available.`;
-  if (cause.kind === "protected_input") return `Required task input is ${size} KB. Ask the task's owner in the task's comments to shorten the task description on the task page, or split the work into smaller tasks with links to the saved context. Saved task history remains available.`;
-  if (cause.kind === "protected_inputs") return `Required task inputs total ${size} KB. Their combined size is too large for this turn. Ask the task's owner in the task's comments to split the work into smaller tasks with shorter descriptions and links to the saved context. Saved task history remains available.`;
-  const measured: Record<NonNullable<NativePromptRefusalCause["measure"]>, string> = {
+  // Do not reinterpret a future measurement label as today's raw input bytes.
+  if (cause.measure && cause.kind !== "command" && cause.kind !== "protected_inputs") return `The saved byte count (${cause.bytes} bytes) has no recognized measurement label for this input. ${followUp}`;
+  if (cause.kind === "task_description") return `The task description is ${size} KB. Edit the description on the task page to shorten it to a brief request with links to the long text. Then send a message to continue. Or ${followUp.charAt(0).toLowerCase() + followUp.slice(1)}`;
+  if (cause.kind === "newest_message" || cause.kind === "unread_message") return `${cause.kind === "newest_message" ? "The newest message" : "An unread message"} is ${size} KB. If you wrote it and it is still editable, edit it in the task's message queue to a short request with a link to the long text. If it is no longer editable, you can save its text elsewhere and delete your own oversized message. After either change, send a short message to continue. Otherwise, ${followUp.charAt(0).toLowerCase() + followUp.slice(1)}`;
+  if (cause.kind === "queued_input") return `The queued input is ${size} KB when encoded for this turn. If it is a message you wrote and it is still editable, edit it in the task's message queue to a short request with a link to the long text, then send a short message to continue. Sending the same text as several messages can exceed the same combined limit. Otherwise, ${followUp.charAt(0).toLowerCase() + followUp.slice(1)} This refusal does not claim or consume queued messages or answers.`;
+  if (cause.kind === "human_response") return `A person's answer is ${size} KB and is too large to send. The whole answer remains saved; a submitted answer cannot be edited here. ${followUp}`;
+  if (cause.kind === "unread_messages") return `${cause.count ?? "Multiple"} unread messages total ${size} KB. Their combined size is too large for this turn; sending the same text as several smaller messages does not reduce it. If you wrote the messages and they are still editable, shorten them in the task's message queue to brief requests with links to the long text, then send a short message to continue. You can instead save your own oversized messages elsewhere and delete them, then send a short message to continue. Otherwise, ${followUp.charAt(0).toLowerCase() + followUp.slice(1)}`;
+  if (cause.kind === "protected_input") return `Required task input is ${size} KB: task instructions other than the description, or a saved message that this turn must keep. ${followUp}`;
+  if (cause.kind === "protected_inputs") {
+    const measurement = cause.measure === "protected_parts" ? `The located required inputs total ${size} KB before command encoding.`
+      : cause.measure === "envelope_with_reserve" ? `The encoded task envelope, including reserved room, is ${size} KB.`
+      : "The required inputs exceed this turn's budget; the saved byte count has no recognized measurement label.";
+    return `${measurement} ${followUp}`;
+  }
+  const measured: Record<string, string> = {
     command: `The serialized command measured by the guard is ${size} KB and exceeds the turn's byte budget.`,
     command_upper_bound: `The command upper bound, including reserved room, is ${size} KB and exceeds the turn's byte budget.`,
     prompt: `The encoded prompt is ${size} KB and leaves no room for history within the turn's byte budget.`,
     envelope: `The encoded envelope is ${size} KB and leaves no room for history within the turn's byte budget.`,
     handoff_note: `Even the encoded history-omission note (${size} KB) does not fit in the room left for history.`,
   };
-  return `${cause.measure ? measured[cause.measure] : "The turn exceeds its byte budget; the saved byte count has no measurement label."} Edit the description on the task page to shorten it, or ask the task's owner in the task's comments to split the work into smaller tasks. If those inputs are already small, ask the owner to report this run to the Paperclip operator for input-delivery repair. Saved task history remains available.`;
+  return `${cause.measure && Object.hasOwn(measured, cause.measure) ? measured[cause.measure] : "The turn exceeds its byte budget; the saved byte count has no recognized measurement label."} If the description contains the long text, edit the description on the task page to shorten it, then send a message to continue. Otherwise, ${followUp.charAt(0).toLowerCase() + followUp.slice(1)} If the task inputs are already small, ${defectReport.charAt(0).toLowerCase() + defectReport.slice(1)}`;
 }
 export function nativePromptRefusalCause(value: unknown): NativePromptRefusalCause | undefined {
   const v = record(value);
-  return typeof v.kind === "string" && Object.hasOwn(nativePromptRefusalTitles, v.kind) && Number.isSafeInteger(v.bytes) && Number(v.bytes) >= 0
+  // A newer writer may know a kind or measure this reader does not. Preserve
+  // the readable evidence; only the unknown label's presentation falls back.
+  return typeof v.kind === "string" && /^[^\s:\[\]]+$/.test(v.kind) && Number.isSafeInteger(v.bytes) && Number(v.bytes) >= 0
     && (v.count === undefined || Number.isSafeInteger(v.count) && Number(v.count) > 0)
-    && (v.measure === undefined || v.kind === "command" && nativePromptMeasures.some(measure => measure === v.measure))
+    && (v.measure === undefined || typeof v.measure === "string" && /^[^\s:\[\]]+$/.test(v.measure))
     ? v as NativePromptRefusalCause : undefined;
 }
 export function nativePromptCauseFromError(error: unknown): NativePromptRefusalCause | undefined {
   const direct = nativePromptRefusalCause(record(error).promptCause);
   if (direct) return direct;
-  // Validate against the one closed kind list above, not a second regex enum.
-  const match = (error instanceof Error ? error.message : "").match(/native_prompt_cause=([a-z_]+):(\d+)(?::count=(\d+))?(?::measure=([a-z_]+))?(?=\]|$|\s)/);
+  // Read unfamiliar labels too; presentation, not parsing, owns known labels.
+  const match = (error instanceof Error ? error.message : "").match(/native_prompt_cause=([^\s:\[\]]+):(\d+)(?::count=(\d+))?(?::measure=([^\s:\[\]]+))?(?=\]|$|\s)/);
   return match ? nativePromptRefusalCause({ kind: match[1], bytes: Number(match[2]), ...(match[3] ? { count: Number(match[3]) } : {}), ...(match[4] ? { measure: match[4] } : {}) }) : undefined;
 }
 export class NativeTurnPromptExceedsCommandBoundError extends Error {
