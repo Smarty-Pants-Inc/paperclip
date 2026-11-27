@@ -1,7 +1,6 @@
 import { and, eq, sql } from "drizzle-orm";
 import { agents, budgetReservations, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { centsToUnits, unitsToCents } from "@paperclipai/shared";
-import { parseObject } from "../adapters/utils.js";
 import { conflict, notFound } from "../errors.js";
 import { withOperationAccountingTransaction } from "./accounting-transaction.js";
 import { queueBudgetEvaluation } from "./budget-evaluation-work.js";
@@ -117,12 +116,7 @@ export async function reserveRunBudget(db: Db, companyId: string, runId: string,
         if (!await extendOwnNativeRecoveryClaimInTransaction(tx, { companyId, runId, leaseOwner: recoveryLeaseOwner! }))
           throw conflict("Native recovery no longer owns provider dispatch");
       };
-      const supersession = parseObject(run.resultJson?.configurationSupersession);
-      const sameWakePreparation = supersession.state === "ready" && supersession.reservationId === existing.id &&
-        Number(supersession.attempt) >= 1 && Number(supersession.attempt) <= 3 && existing.state === "held" &&
-        existing.projectId === projectId && !parseObject(run.usageJson?.budgetDispatch).handedOffAt &&
-        !run.resultJson?.firstTurnDispatchCommitted;
-      if (owner || sameWakePreparation) {
+      if (owner) {
         if (stopRecovery) {
           await keepRecoveryClaim();
           return { ...existing, reused: true };
@@ -130,15 +124,13 @@ export async function reserveRunBudget(db: Db, companyId: string, runId: string,
         // Recovery has already made this run queued/running, so its own pending
         // accounting is excluded. Current overruns, other unfinished runs and
         // scope pauses still apply before any more paid work starts.
-        const block = await budgetServiceInTransaction(tx, publications).getInvocationBlock(companyId, run.agentId, { projectId, runId, admittedRecovery: Boolean(owner) });
+        const block = await budgetServiceInTransaction(tx, publications).getInvocationBlock(companyId, run.agentId, { projectId, runId, admittedRecovery: true });
         if (block) return { admissionBlockReason: block.reason };
         const [agent] = await tx.select({ status: agents.status, lifecycleState: agents.lifecycleState }).from(agents)
           .where(and(eq(agents.companyId, companyId), eq(agents.id, run.agentId)));
         if (!agent || agent.lifecycleState !== "ready" || ["paused", "terminated", "pending_approval"].includes(agent.status))
           return { admissionBlockReason: "Agent is paused and cannot start new work" };
-        if (owner) await keepRecoveryClaim();
-        else await tx.update(heartbeatRuns).set({ resultJson: sql`jsonb_set(${heartbeatRuns.resultJson},
-          '{configurationSupersession,state}', '"preparing"'::jsonb)` }).where(eq(heartbeatRuns.id, runId));
+        await keepRecoveryClaim();
         return { ...existing, reused: true };
       }
       throw conflict("Provider dispatch has already reserved this run");

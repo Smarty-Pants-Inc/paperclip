@@ -275,36 +275,6 @@ export function buildConfigurationIncompleteRecoveryNoticeSeed(
       tone: "danger",
     };
   }
-  if (["configuration_supersession_refused", "configuration_recovery_stalled", "configuration_recovery_unavailable"].includes(readNonEmptyStringField(configurationIncomplete, "reason") ?? "")) {
-    return {
-      title: "Configuration restart stopped",
-      body: readNonEmptyStringField(configurationIncomplete, "reason") === "configuration_recovery_unavailable"
-        ? "Automatic configuration restart stopped because a database operation still failed on the final recovery attempt."
-        : readNonEmptyStringField(configurationIncomplete, "reason") === "configuration_recovery_stalled"
-          ? "Automatic configuration restart stopped because execution ownership or cleanup still failed on the final recovery attempt."
-          : "Configuration changed before launch, but execution ownership no longer permits an automatic restart. This attempt stopped.",
-      nextAction: readNonEmptyStringField(configurationIncomplete, "reason") === "configuration_recovery_unavailable"
-        ? "Review the database failure, then retry the task when it is safe."
-        : "Review execution ownership and cleanup, then retry the task when it is safe.",
-      tone: "danger",
-    };
-  }
-  if (readNonEmptyStringField(configurationIncomplete, "reason") === "configuration_churn") {
-    return {
-      title: "Configuration kept changing",
-      body: "The agent did not start because its configuration changed during three automatic retries. No provider work was started.",
-      nextAction: "Wait for configuration changes to finish, then retry the task.",
-      tone: "danger",
-    };
-  }
-  if (["secret_deleted", "secret_inactive", "version_inactive"].includes(readNonEmptyStringField(configurationIncomplete, "reason") ?? "")) {
-    return {
-      title: "Required secret unavailable",
-      body: "The agent did not start because a required secret or its selected version was removed or revoked before launch.",
-      nextAction: "Restore an active secret binding in the agent's settings, then retry the task.",
-      tone: "danger",
-    };
-  }
   return {
     body:
       "The agent did not start because a secret it needs is not set. " +

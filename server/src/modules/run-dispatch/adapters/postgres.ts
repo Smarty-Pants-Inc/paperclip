@@ -247,7 +247,6 @@ export function createPostgresRunDispatchAdapter(
     operation: (tx: Db, run: HeartbeatRun, publications: ActivityPublication[]) => Promise<T>,
     mode: "accounting" | "ownership",
     isolation: "snapshot" | "read committed" = "snapshot",
-    configurationFence?: DispatchResolvedInteractionInput<unknown>["configurationFence"],
   ): Promise<T> {
     // Queue editing and claiming already use issue -> wake -> run. Read the
     // immutable issue reference without a lock first, then acquire issue ->
@@ -268,27 +267,21 @@ export function createPostgresRunDispatchAdapter(
         : readNonEmptyString(parseObject(hint.contextSnapshot).issueId);
 
       const locked = async (typedTx: Db, publications: ActivityPublication[]) => {
-        // Configuration writers own config -> issue -> run. Never wait for a
-        // save/rotation while holding its consumer issue or run lock.
         if (mode === "accounting") {
           await lockBudgetAdmissionControls(typedTx, input.companyId, hint.projectId);
           await typedTx.select({ id: agents.id }).from(agents)
             .where(and(eq(agents.id, hint.agentId), eq(agents.companyId, input.companyId))).for("share");
         }
-        let issueLocked = false;
-        const lockIssue = async () => {
-          if (issueLocked) throw new Error("run-dispatch: configuration fence acquired issue locks twice");
-          // Recovery keeps coordinator -> issue -> run order after config locks.
-          await lockRunBudgetRecoveryOwnerInTransaction(typedTx, input.companyId, input.runId, input.recoveryLeaseOwner);
-          if (hintedIssueId) {
-            await typedTx.select({ id: issues.id }).from(issues)
-              .where(and(eq(issues.id, hintedIssueId), eq(issues.companyId, input.companyId))).for("update");
-          }
-          issueLocked = true;
-        };
-        if (configurationFence) await configurationFence(typedTx, hintedIssueId, lockIssue);
-        else await lockIssue();
-        if (!issueLocked) throw new Error("run-dispatch: configuration fence skipped issue validation/locks");
+        // Recovery keeps coordinator -> issue -> run order after the shared
+        // dispatch-control fences. Settlement never uses these authority locks.
+        await lockRunBudgetRecoveryOwnerInTransaction(typedTx, input.companyId, input.runId, input.recoveryLeaseOwner);
+        if (hintedIssueId) {
+          await typedTx
+            .select({ id: issues.id })
+            .from(issues)
+            .where(and(eq(issues.id, hintedIssueId), eq(issues.companyId, input.companyId)))
+            .for("update");
+        }
 
         const run = await typedTx
           .select()
@@ -311,8 +304,7 @@ export function createPostgresRunDispatchAdapter(
       const result: { kind: "missing" | "retry" } | { kind: "value"; value: T } = mode === "accounting"
         ? await withOperationAccountingTransaction(db, input.companyId, locked,
           isolation === "read committed" ? { isolationLevel: "read committed" } : {})
-        : await db.transaction(tx => locked(tx as unknown as Db, []),
-          isolation === "read committed" ? { isolationLevel: "read committed" } : undefined);
+        : await db.transaction(tx => locked(tx as unknown as Db, []));
 
       if (result.kind === "missing") return onMissing();
       if (result.kind === "value") return result.value;
@@ -797,8 +789,6 @@ export function createPostgresRunDispatchAdapter(
           eq(heartbeatRuns.id, input.runId),
           eq(heartbeatRuns.companyId, input.companyId),
           eq(heartbeatRuns.status, "scheduled_retry"),
-          // General/manual retry cannot bypass supersession-owned teardown.
-          sql`coalesce(${heartbeatRuns.resultJson}#>>'{configurationSupersession,state}', '') <> 'cleanup_pending'`,
           lte(heartbeatRuns.scheduledRetryAt, input.now),
         ),
       )
@@ -1625,7 +1615,7 @@ export function createPostgresRunDispatchAdapter(
       catch (error) { resultPromise = Promise.reject(error); }
       void resultPromise.catch(() => {});
       return { dispatched: true as const, resultPromise };
-    }, "ownership", "read committed", input.configurationFence);
+    }, "ownership");
   }
 
   return {

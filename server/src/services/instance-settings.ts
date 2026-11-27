@@ -1,5 +1,3 @@
-import { lockHeldNativeSettingsConsumers, requestHeldNativeConfigurationEndForSettings } from "./native-runtime/held-native-turn.js";
-import { retryDeadlockedTransactionOnce } from "./transient-lock-contention.js";
 import { notifyLiveRunRecovery, notifyLiveResourceRecovery } from "./live-run-recovery-notifications.js";
 import { notifyDeferredExecutionEligibility } from "./deferred-execution-notifications.js";
 import { notifyRunDispatch } from "./run-dispatch-notifications.js";
@@ -569,13 +567,6 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
   return {
     get: async (): Promise<InstanceSettings> => toInstanceSettings(await getCachedRow()),
 
-    /** Uncached, non-creating read for fresh selection and its content fence. */
-    getReadOnly: async (): Promise<InstanceSettings | null> => {
-      const [row] = await db.select().from(instanceSettings)
-        .where(eq(instanceSettings.singletonKey, DEFAULT_SINGLETON_KEY));
-      return row ? toInstanceSettings(row) : null;
-    },
-
     update: async (
       patch: PatchInstanceSettings,
       writeOptions?: { db?: InstanceSettingsWriteDb },
@@ -584,9 +575,7 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
       // atomically with a sibling write (e.g. clearing the managed-default
       // stamp on the environment row alongside a defaultEnvironmentId
       // change). Reads use the same runner so the row is visible to the tx.
-      const save = async (runner: InstanceSettingsWriteDb) => {
-      const consumers = Object.hasOwn(patch, "defaultEnvironmentId")
-        ? await lockHeldNativeSettingsConsumers(runner as Db) : undefined;
+      const runner = writeOptions?.db ?? db;
       const current = await getOrCreateRow(runner);
       const now = new Date();
       const [updated] = await runner
@@ -600,15 +589,7 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
         .where(eq(instanceSettings.id, current.id))
         .returning();
       await announceInstanceSettingsChange(runner);
-      const settings = toInstanceSettings(updated ?? current);
-      if (Object.hasOwn(patch, "defaultEnvironmentId")) {
-        await requestHeldNativeConfigurationEndForSettings(runner as Db, settings, consumers);
-      }
-      return settings;
-      };
-      // A caller-owned transaction must retry its whole operation, not this
-      // nested save. The managed-default writer does so at its outer boundary.
-      return writeOptions?.db ? save(writeOptions.db) : retryDeadlockedTransactionOnce(() => db.transaction(save));
+      return toInstanceSettings(updated ?? current);
     },
 
     getGeneral: async (
@@ -630,10 +611,7 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
     },
 
     updateGeneral: async (patch: PatchInstanceGeneralSettings): Promise<InstanceSettings> => {
-      const save = async (runner: InstanceSettingsWriteDb) => {
-      const current = await getOrCreateRow(runner);
-      const consumers = Object.hasOwn(patch, "executionMode")
-        ? await lockHeldNativeSettingsConsumers(runner as Db) : undefined;
+      const current = await getOrCreateRow();
       const storedGeneral = normalizeGeneralSettings(current.general);
       // A full-GET echo carries the overlaid operator value for a field the
       // user never chose; stripping it keeps the overlay strictly read-time,
@@ -644,7 +622,7 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
         operatorDefaults,
       );
       const now = new Date();
-      const [updated] = await runner
+      const [updated] = await db
         .update(instanceSettings)
         .set({
           general: { ...nextGeneral },
@@ -652,18 +630,11 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
         })
         .where(eq(instanceSettings.id, current.id))
         .returning();
-      await announceInstanceSettingsChange(runner);
-      const settings = toInstanceSettings(updated ?? current);
-      if (Object.hasOwn(patch, "executionMode")) {
-        await requestHeldNativeConfigurationEndForSettings(runner as Db, settings, consumers);
-      }
-      return settings;
-      };
-      // Only execution-policy writes need to commit with held-turn retirement.
-      return Object.hasOwn(patch, "executionMode") ? retryDeadlockedTransactionOnce(() => db.transaction(save)) : save(db);
+      await announceInstanceSettingsChange(db);
+      return toInstanceSettings(updated ?? current);
     },
 
-    updateExperimental: async (patch: PatchInstanceExperimentalSettings): Promise<InstanceSettings> => retryDeadlockedTransactionOnce(async () => {
+    updateExperimental: async (patch: PatchInstanceExperimentalSettings): Promise<InstanceSettings> => {
       for (const [key, enabled] of Object.entries(managedConfig?.features ?? {})) {
         // Retired always-on keys are ignored on read, so an old client's write must not be rejected.
         if (key === "enablePublicMcp") continue;
@@ -694,9 +665,6 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
       }
       const now = new Date();
       const [updated] = await db.transaction(async tx => {
-        const consumers = Object.hasOwn(patch, "enableManagedSandboxOnly") ||
-          toExperimentalView(current.experimental).enableManagedSandboxOnly !== nextExperimental.enableManagedSandboxOnly
-          ? await lockHeldNativeSettingsConsumers(tx as unknown as Db) : undefined;
         await announceInstanceSettingsChange(tx);
         if (patch.enableStatusCards !== undefined) await notifyStatusCardEvaluation(tx);
         if (patch.enableMcpTasks !== undefined) await notifyDeliveryWork(tx, DELIVERY_QUEUES.mcpTasks);
@@ -730,7 +698,7 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
         }
         if (patch.enableChatConnectors !== undefined) await notifyVoiceChange(tx);
         await notifyToolConnectionHealth(tx, "*");
-        const rows = await tx
+        return tx
           .update(instanceSettings)
           .set({
             experimental: { ...nextExperimental },
@@ -738,15 +706,9 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
           })
           .where(eq(instanceSettings.id, current.id))
           .returning();
-        const settings = toInstanceSettings(rows[0] ?? current);
-        if (Object.hasOwn(patch, "enableManagedSandboxOnly") ||
-          toExperimentalView(current.experimental).enableManagedSandboxOnly !== settings.experimental.enableManagedSandboxOnly) {
-          await requestHeldNativeConfigurationEndForSettings(tx as unknown as Db, settings, consumers);
-        }
-        return rows;
       });
       return toInstanceSettings(updated ?? current);
-    }),
+    },
 
     listCompanyIds: async (): Promise<string[]> =>
       db

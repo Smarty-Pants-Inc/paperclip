@@ -1,5 +1,4 @@
 import { privateRequestActor } from "./private-request-actor.js";
-import { requestHeldNativeConfigurationEndForTargets } from "../services/native-runtime/held-native-turn.js";
 import { projectEnvironmentOptions } from "../services/project-environments.js";
 import { listProtectedEnvironmentKeyHolders, protectedEnvironmentKeyWarnings } from "../services/protected-environment-keys.js";
 import { projectGitAuthorizationService } from "../services/project-git-authorization.js";
@@ -552,21 +551,17 @@ export function projectRoutes(db: Db) {
     }
     const configurationWarnings = body.env !== undefined
       ? protectedEnvironmentKeyWarnings(await listProtectedEnvironmentKeyHolders(db), body.env, "env") : [];
-    const project = body.env === undefined ? await svc.update(id, body) : await db.transaction(async tx => {
-      const targetDb = tx as unknown as Db;
-      const updated = await projectService(targetDb).update(id, body);
-      if (!updated) return null;
-      await secretService(targetDb).syncEnvBindingsForTarget(
-        updated.companyId, { targetType: "project", targetId: updated.id }, updated.env,
-      );
-      await requestHeldNativeConfigurationEndForTargets(targetDb, [
-        { companyId: updated.companyId, targetType: "project", targetId: updated.id },
-      ]);
-      return updated;
-    });
+    const project = await svc.update(id, body);
     if (!project) {
       res.status(404).json({ error: "Project not found" });
       return;
+    }
+    if (body.env !== undefined) {
+      await secretsSvc.syncEnvBindingsForTarget?.(
+        project.companyId,
+        { targetType: "project", targetId: project.id },
+        project.env,
+      );
     }
 
     const actor = getActorInfo(req);

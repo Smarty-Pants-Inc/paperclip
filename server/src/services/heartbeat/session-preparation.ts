@@ -226,11 +226,11 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
       acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision && !agentIdentity,
   });
   // Adapter config exemptions are per-key in the fingerprint, never per-category.
-  // Instruction content, environment/binding/secret revisions and skill lists may advance here;
-  // each run resolves current values; missing/versioned metadata and mixed changes still reset.
+  // Only instruction content, environment and skill-list changes may advance here;
+  // missing/versioned metadata and mixed changes still require stock reset.
   const continuableConfigChange = continuousPi && sessionConfigFreshness.changedCategories.length > 0 &&
     sessionConfigFreshness.changedCategories.every(category =>
-      ["instructions", "environment", "envBindings", "secrets", "runtimeSkills"].includes(category));
+      ["instructions", "environment", "envBindings", "runtimeSkills"].includes(category));
   let resetTaskSession =
     context.workspaceSelectionChanged === true || shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
   if (decideNativeContinuation({

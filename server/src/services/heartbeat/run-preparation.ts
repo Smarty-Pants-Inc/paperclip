@@ -3034,14 +3034,13 @@ export function createHeartbeatRunPreparation(db: Db) {
   async function getRoutineEnvForExecutionIssue(
     companyId: string,
     issueContext: { originKind: string | null; originId: string | null; originRunId: string | null } | null,
-  ): Promise<{ routineId: string | null; liveRoutineId?: string | null;
-    env: NonNullable<RoutineRevisionSnapshotV1["routine"]["env"]> | null; responsibleUserId: string | null }> {
+  ) {
     if (
       !issueContext ||
       issueContext.originKind !== "routine_execution" ||
       !issueContext.originId
     ) {
-      return { routineId: null, liveRoutineId: null, env: null, responsibleUserId: null };
+      return { routineId: null, env: null, responsibleUserId: null };
     }
 
     const routineRun = issueContext.originRunId
@@ -3081,8 +3080,6 @@ export function createHeartbeatRunPreparation(db: Db) {
       if (snapshot?.version === 1) {
         return {
           routineId: issueContext.originId,
-          // Immutable revision: later routine saves must not retire this launch.
-          liveRoutineId: null,
           env: snapshot.routine.env ?? null,
           responsibleUserId:
             routineRun?.responsibleUserId ??
@@ -3108,7 +3105,6 @@ export function createHeartbeatRunPreparation(db: Db) {
       .then((rows) => rows[0] ?? null);
     return {
       routineId: issueContext.originId,
-      liveRoutineId: issueContext.originId,
       env: routine?.env ?? null,
       responsibleUserId:
         routineRun?.responsibleUserId ?? routine?.responsibleUserId ?? null,

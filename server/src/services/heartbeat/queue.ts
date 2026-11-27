@@ -227,7 +227,7 @@ import { emitSystemTaskBlockedAfterCommit } from "../product-telemetry.js";
 type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
 type QueuedRunCandidate = Pick<HeartbeatRun, "id" | "companyId" | "agentId" | "status" | "invocationSource" | "createdAt"
   | "startedAt" | "wakeupRequestId" | "retryOfRunId" | "scheduledRetryAt" | "scheduledRetryAttempt" | "scheduledRetryReason"
-  | "contextSnapshot"> & { configurationSupersessionReady?: boolean };
+  | "contextSnapshot">;
 type QueuedDispatchRequest = { attachSetupRequest: boolean; retryRefused: boolean; continuesChain: boolean; triedRunIds: ReadonlySet<string> };
 type HeartbeatRunState = ReturnType<typeof createHeartbeatRunState>;
 type RunPreparation = ReturnType<typeof createHeartbeatRunPreparation>;
@@ -1188,7 +1188,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       {
         issueId: readNonEmptyString(context.issueId),
         projectId: readNonEmptyString(context.projectId),
-        ...(parseObject(run.resultJson?.configurationSupersession).state === "ready" ? { runId: run.id } : {}),
       },
     );
     if (budgetBlock) {
@@ -1558,8 +1557,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 .then((rows) => rows[0] ?? null);
               if (
                 !wake ||
-                (wake.status !== "queued" && !(wake.status === "claimed" &&
-                  parseObject(lockedRun?.resultJson?.configurationSupersession).state === "ready")) ||
+                wake.status !== "queued" ||
                 wake.runId !== run.id ||
                 !lockedRun ||
                 lockedRun.status !== "queued" ||
@@ -1774,13 +1772,18 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 await assertAgentRunSlotFree(tx, run);
               });
               await notifyChatRunMilestones(tx, { companyId: run.companyId, issueId });
-              if (parseObject(lockedRun.resultJson?.configurationSupersession).state !== "ready") {
-                await tx.update(agentWakeupRequests).set({
-                  status: "claimed", claimedAt,
-                  payload: withQueuedCommentIdsInWakePayload(wake.payload, liveIds),
+              await tx
+                .update(agentWakeupRequests)
+                .set({
+                  status: "claimed",
+                  claimedAt,
+                  payload: withQueuedCommentIdsInWakePayload(
+                    wake.payload,
+                    liveIds,
+                  ),
                   updatedAt: claimedAt,
-                }).where(eq(agentWakeupRequests.id, wake.id));
-              }
+                })
+                .where(eq(agentWakeupRequests.id, wake.id));
               const [claimedRun] = await tx
                 .update(heartbeatRuns)
                 .set({
@@ -1930,7 +1933,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     });
     publishRunLifecyclePluginEvent(claimed);
 
-    if (!nativeReviewContext && parseObject(claimed.resultJson?.configurationSupersession).state !== "ready") {
+    if (!nativeReviewContext) {
       crashPoint("wake.claim.after_run_running_before_wakeup_claimed");
       await setWakeupStatus(claimed.wakeupRequestId, "claimed", { claimedAt });
     }
@@ -2737,11 +2740,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             continuesChain: true, triedRunIds: new Set([...triedRunIds, ...triedThisPass]) });
           break;
         }
-        // This is the already-admitted SAME wake, not another automatic run
-        // start to debit from a brake probe/release slot.
-        const start = candidate.configurationSupersessionReady
-          ? { held: false as const, release: async () => {} }
-          : await reserveAutomaticRunStart(db, candidate, { personOrigin: dispatcher.personOrigin(candidate) });
+        const start = await reserveAutomaticRunStart(db, candidate, { personOrigin: dispatcher.personOrigin(candidate) });
         if (start.held) continue;
         claimAttempts += 1;
         triedThisPass.push(candidate.id);
@@ -2824,7 +2823,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
       scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
       scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
-      configurationSupersessionReady: sql<boolean>`coalesce(${heartbeatRuns.resultJson}#>>'{configurationSupersession,state}' = 'ready', false)`,
       orderContext: sql<Record<string, string | null>>`jsonb_build_object(${sql.join(QUEUED_RUN_ORDER_CONTEXT_KEYS.map(key =>
         sql`${key}::text, ${contextText(key)}`), sql`, `)})`,
     }).from(heartbeatRuns).where(and(

@@ -63,31 +63,6 @@ export async function resolveSshAuthenticationBeforeRouting(input: {
   return environment?.driver === "ssh" ? environment.config.useHostAuth === false ? "managed" : "host" : null;
 }
 
-/** Only environment-selection inputs consumed by a fresh admission. The held
- * configuration snapshot retains these selectors (never resolved secret values). */
-export interface HeartbeatEnvironmentSelectionSnapshot {
-  localEnvironmentId: string;
-  executionMode: "any" | "kubernetes";
-  managedSandboxOnly: boolean;
-  /** Omitted when a stronger selector made the instance default irrelevant. */
-  instanceDefaultEnvironmentId?: string | null;
-  /** Omitted outside the low-trust issue-selection branch. */
-  lowTrustIssueEnvironmentId?: string | null;
-}
-
-/** The fresh selector is shared by preparation and the final dispatch fence.
- * Lookups stay with environmentService; never re-run workspace/provider effects. */
-export function resolveFreshHeartbeatEnvironmentId(input: Parameters<typeof resolveExecutionWorkspaceEnvironmentId>[0] & {
-  executionMode: "any" | "kubernetes";
-  kubernetesEnvironmentId: string | null;
-}) {
-  if (isExecutionForcedToKubernetes(input)) {
-    if (!input.kubernetesEnvironmentId) throw new Error("No managed Kubernetes environment is available");
-    return input.kubernetesEnvironmentId;
-  }
-  return resolveExecutionWorkspaceEnvironmentId(input).environmentId;
-}
-
 /** Selects policy and reuse inputs; lease acquisition and cleanup belong to the executor. */
 export interface HeartbeatEnvironmentSelectionInput {
   run: Pick<typeof heartbeatRuns.$inferSelect,
@@ -124,7 +99,7 @@ export interface HeartbeatEnvironmentSelectionInput {
       | "reopenClosedIsolatedExecutionWorkspaceForIssue" | "clearReopenPendingConsumptionForUnconsumedReopen">;
     environmentsSvc: Pick<ReturnType<typeof environmentService>,
       "ensureLocalEnvironment" | "findManagedSandboxEnvironment" | "findKubernetesEnvironment" | "ensureKubernetesEnvironment" | "getById" | "getLeaseById">;
-    instanceSettings: Pick<ReturnType<typeof instanceSettingsService>, "get" | "getExperimental" | "getReadOnly">;
+    instanceSettings: Pick<ReturnType<typeof instanceSettingsService>, "get" | "getExperimental">;
     findSharedWorkspaceHolder: ReturnType<typeof createHeartbeatRetries>["findSharedWorkspaceHolder"];
     findExecutionWorkspaceHolder: ReturnType<typeof createHeartbeatRetries>["findExecutionWorkspaceHolder"];
   };
@@ -239,15 +214,16 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
   const localEnvironment = await environmentsSvc.ensureLocalEnvironment(
     agent.companyId,
   );
-  // Fresh admissions must see even a save committed just after the prior fence.
-  const resolvedInstanceSettings = await instanceSettings.getReadOnly() ?? await instanceSettings.get();
+  const resolvedInstanceSettings = await instanceSettings.get();
   // Managed-sandbox-only policy: a run that would land on the local
   // environment is redirected onto the platform-managed sandbox row, and
   // with no active managed row the resolution fails closed
   // (ManagedSandboxUnavailableError) — never local. Mirrors the forced
   // kubernetes execution mode below, which takes precedence when both
   // regimes are active.
-  const managedSandboxOnly = resolvedInstanceSettings.experimental.enableManagedSandboxOnly === true;
+  const managedSandboxOnly =
+    (await instanceSettings.getExperimental()).enableManagedSandboxOnly ===
+    true;
   const managedSandboxEnvironment = managedSandboxOnly && !providerApiPlacement
     ? await environmentsSvc.findManagedSandboxEnvironment(agent.companyId)
     : null;
@@ -263,23 +239,12 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
       configurationIncomplete: { reason: "native_recovery_environment_binding_mismatch" },
     });
   }
-  const lowTrustIssueEnvironmentId = trustPreset.kind === "low_trust_review"
-    ? parseIssueExecutionWorkspaceSettings(issueContext?.executionWorkspaceSettings, { includeEnvironmentId: true })?.environmentId ?? null : null;
-  const environmentSelectionSnapshot: HeartbeatEnvironmentSelectionSnapshot | null = providerApiPlacement || persistedNativeExecutionInput ? null : {
-    localEnvironmentId: localEnvironment.id,
-    executionMode: resolvedInstanceSettings.general.executionMode ?? "any",
-    managedSandboxOnly,
-    ...(!isExecutionForcedToKubernetes(resolvedInstanceSettings.general) ? {
-      ...(trustPreset.kind === "low_trust_review" ? { lowTrustIssueEnvironmentId } : {}),
-      ...(!lowTrustIssueEnvironmentId && !agent.defaultEnvironmentId
-        ? { instanceDefaultEnvironmentId: resolvedInstanceSettings.defaultEnvironmentId ?? null } : {}),
-    } : {}),
-  };
   const environmentResolution = providerApiPlacement
     ? { environmentId: null, source: "default" as const }
     : admittedLease?.environmentId ? { environmentId: admittedLease.environmentId, source: "run" as const }
     : resolveExecutionWorkspaceEnvironmentId({
-    lowTrustIssueEnvironmentId,
+    lowTrustIssueEnvironmentId: trustPreset.kind === "low_trust_review"
+      ? parseIssueExecutionWorkspaceSettings(issueContext?.executionWorkspaceSettings, {includeEnvironmentId: true})?.environmentId : null,
     agentDefaultEnvironmentId: agent.defaultEnvironmentId,
     instanceDefaultEnvironmentId:
       resolvedInstanceSettings.defaultEnvironmentId ?? null,
@@ -369,16 +334,6 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
       );
     }
     selectedEnvironmentId = kubernetesEnvironment.id;
-  }
-  if (!providerApiPlacement && !persistedNativeExecutionInput) {
-    selectedEnvironmentId = resolveFreshHeartbeatEnvironmentId({
-      lowTrustIssueEnvironmentId, agentDefaultEnvironmentId: agent.defaultEnvironmentId,
-      instanceDefaultEnvironmentId: resolvedInstanceSettings.defaultEnvironmentId ?? null,
-      localDefaultEnvironmentId: localEnvironment.id, managedSandboxOnly,
-      managedSandboxEnvironmentId: managedSandboxEnvironment?.id ?? null,
-      executionMode: resolvedInstanceSettings.general.executionMode ?? "any",
-      kubernetesEnvironmentId: executionForcedToKubernetes ? selectedEnvironmentId : null,
-    });
   }
   const selectedEnvironmentForConfig =
     selectedEnvironmentId === localEnvironment.id
@@ -627,7 +582,6 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
     requestedReusableExecutionWorkspaceConfig,
     localEnvironment,
     resolvedInstanceSettings,
-    environmentSelectionSnapshot,
     environmentResolution,
     effectiveExecutionWorkspaceMode,
     executionPolicy,
