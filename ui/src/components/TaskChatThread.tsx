@@ -2607,6 +2607,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             variant: "interrupted",
             label: branchUnavailable ? "Starting branch unavailable" : restoreFailed ? "Workspace restore failed" : aiRequest?.status === "pending" ? "AI connection needed" : isUserStop(source.id) ? "Stopped" : "Couldn't finish",
             runId: source.status === "cancelled" ? undefined : source.id,
+            retryable: source.status === "failed" || source.status === "timed_out",
             ...(branchUnavailable || aiRequest?.status === "pending" ? { retryable: false } : {}),
             ...(restoreFailed ? {
               retryable: meta?.resultJson?.workspaceRestoreFailure !== "restore_unsafe_archive"

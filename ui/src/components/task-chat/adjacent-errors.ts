@@ -59,7 +59,9 @@ export function compactAdjacentErrors(items: readonly TaskChatItem[]): {
     const latest = items[end - 1];
     if (mixed && errorKind(latest) === "recovery") {
       const marker = items.slice(start, end).reverse().find(
-        (item): item is TaskChatMarkerItem => item.kind === "marker" && isRetryableFailureMarker(item),
+        // Keep the latest target even when it cannot be retried; falling
+        // back to an older attempt would retry the wrong message.
+        (item): item is TaskChatMarkerItem => item.kind === "marker" && errorKind(item) === "run",
       );
       // Preserve the retry target separately from the surviving error's text.
       // The renderer still applies the parent's permission and pending state.
@@ -71,8 +73,12 @@ export function compactAdjacentErrors(items: readonly TaskChatItem[]): {
   return { items: result, retryMarkers };
 }
 
-const RETRYABLE_FAILURE_LABELS = new Set(["Run failed", "Usage limit reached", "Model unavailable"]);
+const LEGACY_RETRYABLE_FAILURE_LABELS = new Set(["Run failed", "Usage limit reached", "Model unavailable"]);
 
-export function isRetryableFailureMarker(marker: Pick<TaskChatMarkerItem, "variant" | "label">) {
-  return marker.variant === "interrupted" && RETRYABLE_FAILURE_LABELS.has(marker.label);
+export function isRetryableFailureMarker(marker: Pick<TaskChatMarkerItem, "variant" | "label" | "retryable">) {
+  // Production run markers carry the code/status-derived decision. Display copy
+  // cannot override it. Old standalone markers lack that contract; preserve their
+  // existing policy until their producer supplies retryable, rather than guess.
+  return marker.variant === "interrupted" &&
+    (marker.retryable ?? LEGACY_RETRYABLE_FAILURE_LABELS.has(marker.label));
 }
