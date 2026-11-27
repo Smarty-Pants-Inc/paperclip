@@ -6034,6 +6034,25 @@ describe("TaskChatThread live transcript", () => {
     },
   );
 
+  it("keeps a configuration-ended native hold in the same conversation without Stop or New session rows", () => {
+    const runId = "native-configuration-ended";
+    nativeTranscriptState.hydratedRunIds = new Set([runId]);
+    nativeTranscriptState.transcriptByRun.set(runId, [
+      assistantEntry("2026-11-06T15:14:05Z", "Retained progress.", "progress"),
+      assistantEntry("2026-11-06T15:14:20Z", "Retained answer before the configuration save.", "final"),
+      { kind: "run_terminal", ts: "2026-11-06T15:14:26Z", turnState: "cancelled", runState: "cancelled", disposition: "blocked" },
+    ]);
+    renderThread({ comments: [], onAdd: async () => {}, issueStatus: "in_progress", conversationMode: true,
+      linkedRuns: [{ id: runId, runId, runtimeMode: "native", status: "succeeded", invocationSource: "issue", triggerDetail: null,
+        startedAt: "2026-11-06T15:14:05Z", createdAt: "2026-11-06T15:14:05Z", finishedAt: "2026-11-06T15:14:26Z",
+        agentId: "agent-1", agentName: "Researcher", adapterType: "paperclip_runner", sessionIdBefore: "retained-session", sessionIdAfter: "retained-session",
+        resultJson: { heldNativeConfigurationEnd: true, nativeTerminal: { runTerminalState: "succeeded" } } }],
+    });
+    expect(container.textContent).toContain("Retained answer before the configuration save.");
+    expect(container.textContent).not.toContain("Stopped");
+    expect(container.textContent).not.toContain("New session");
+  });
+
   it("renders one Stopped row when an interrupted native turn settles without a reply", () => {
     const runId = "native-interrupted";
     nativeTranscriptState.transcriptByRun.set(runId, [

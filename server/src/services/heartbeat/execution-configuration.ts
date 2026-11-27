@@ -5,8 +5,10 @@ import { agentObservabilityService, unavailableAgentObservability, type Resolved
 import { agentObservabilityLaunch } from "../agent-observability-launch.js";
 import { withSkillActor } from "../skill-access.js";
 import type { AuthorizationActor } from "../authorization.js";
+import { readExecutionConfigurationRows, assertExecutionConfigurationCurrent, configurationChangedBeforeLaunch,
+  executionEnvironmentConfigurationFingerprint, type PlainLaunchSources } from "./execution-configuration-fence.js";
 import { eq, sql } from "drizzle-orm";
-import { heartbeatRuns, type Db, type agents, type projects } from "@paperclipai/db";
+import { heartbeatRuns, projects, type Db, type agents } from "@paperclipai/db";
 import type { AiConnectionBinding } from "@paperclipai/shared";
 import { readPaperclipSkillSyncPreference, resolvePaperclipDesiredSkillNames, resolveLegacyPaperclipDesiredSkillNames,
   writePaperclipSkillSyncPreference } from "@paperclipai/adapter-utils/server-utils";
@@ -65,6 +67,7 @@ export interface HeartbeatExecutionConfigurationInput {
   agent: typeof agents.$inferSelect;
   task: {
     issueId: string | null;
+    issueLaunchConfiguration?: PlainLaunchSources["issue"];
     context: Record<string, unknown>;
     responsibleUserId: string | null;
     acceptedPlanContinuationWake: boolean;
@@ -83,7 +86,7 @@ export interface HeartbeatExecutionConfigurationInput {
   policy: Pick<HeartbeatWorkspacePreparationInput["policy"],
     "trustPreset" | "useIsolatedTaskDirectory" | "requestedExecutionWorkspaceMode"> & { explicitTaskDirectory: boolean };
   environment: Pick<EnvironmentSelection,
-    "selectedEnvironmentId" | "selectedEnvironmentForConfig" | "resolvedInstanceSettings" | "persistedNativeExecutionInput">;
+    "selectedEnvironmentId" | "selectedEnvironmentForConfig" | "resolvedInstanceSettings" | "persistedNativeExecutionInput" | "environmentSelectionSnapshot">;
   services: {
     secretsSvc: Parameters<typeof resolveExecutionRunAdapterConfig>[0]["secretsSvc"];
     companySkills: Pick<ReturnType<typeof companySkillService>, "withRuntimeSkillEntries">;
@@ -119,6 +122,23 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
   const time = createHeartbeatPreparationTiming(run.id);
   const { issueId, context, responsibleUserId, acceptedPlanContinuationWake, acceptedPlanWakeRoutingDecision, taskProjectContext, routineEnvContext, pinnedSkillTest } = input.task;
   const { selectedEnvironmentId, selectedEnvironmentForConfig, resolvedInstanceSettings, persistedNativeExecutionInput } = input.environment;
+  const supersessions = Number(parseObject(run.resultJson?.configurationSupersession).attempt ?? 0);
+  const configurationRows = !persistedNativeExecutionInput ? await readExecutionConfigurationRows(db, {
+    companyId: agent.companyId, environmentId: selectedEnvironmentForConfig?.id ?? null, projectId: taskProjectContext?.id ?? null,
+    environmentSelection: input.environment.environmentSelectionSnapshot,
+    plainSources: { agentId: agent.id, agentEnv: parseObject(agent.adapterConfig).env, agentDefaultEnvironmentId: agent.defaultEnvironmentId,
+      issue: input.task.issueLaunchConfiguration ?? null,
+      liveRoutine: routineEnvContext.liveRoutineId ? { id: routineEnvContext.liveRoutineId, env: routineEnvContext.env } : null },
+  }) : null;
+  if (configurationRows?.environment && selectedEnvironmentForConfig) {
+    // Selection already used driver/config to choose transport and workspace.
+    // Do not silently substitute a newer transport into that preparation.
+    if (executionEnvironmentConfigurationFingerprint({ ...selectedEnvironmentForConfig, env: configurationRows.environment.env }) !== configurationRows.environmentFingerprint) {
+      throw configurationChangedBeforeLaunch(supersessions);
+    }
+    selectedEnvironmentForConfig.envVars = configurationRows.environment.env as typeof selectedEnvironmentForConfig.envVars;
+  }
+  if (configurationRows?.project && taskProjectContext) taskProjectContext.env = configurationRows.project.env;
   const useSshHostAuth = selectedEnvironmentForConfig?.driver === "ssh" && selectedEnvironmentForConfig.config.useHostAuth !== false && !persistedNativeExecutionInput;
   let sshRunnerHomeMode: "isolated" | "preconfigured" | undefined;
   if (agent.adapterType === "paperclip_runner" && selectedEnvironmentForConfig?.driver === "ssh" && !persistedNativeExecutionInput) {
@@ -202,8 +222,21 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
       selectedEnvironmentForConfig?.driver ?? "local",
     );
 
-  const { resolvedConfig, configuredTaskEnvironment, secretKeys, secretManifest } =
-    await time("configuration_secrets", () => resolveExecutionRunAdapterConfig({
+  // Launch-time identity is immutable even when accepted steering later changes
+  // the run's responsibleUserId. Publish it before resolving user-secret values.
+  if (!persistedNativeExecutionInput) {
+    context.paperclipSecretIdentity = { responsibleUserId };
+    // Safe content fingerprints and consumed selection, not resolved values.
+    // Recovery retains these alongside its immutable admitted execution input.
+    context.paperclipHeldConfiguration = {
+      agentEnvFingerprint: configurationRows?.agentEnvFingerprint,
+      agentDefaultEnvironmentId: agent.defaultEnvironmentId,
+      selection: configurationRows?.environmentSelection ?? null,
+    };
+    await db.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ paperclipSecretIdentity: context.paperclipSecretIdentity, paperclipHeldConfiguration: context.paperclipHeldConfiguration })}::jsonb` })
+      .where(eq(heartbeatRuns.id, run.id));
+  }
+  const resolveConfiguration = (environmentEnv: unknown, projectEnv: unknown) => resolveExecutionRunAdapterConfig({
       managedAiCredentials: Boolean(aiBinding),
       managedGitHubCredentials: !useHostGitHub,
       companyId: agent.companyId,
@@ -212,17 +245,24 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
       issueId,
       heartbeatRunId: run.id,
       environmentId: selectedEnvironmentForConfig?.id ?? null,
-      environmentEnv: aiBinding ? stripAiAuthBindings(selectedEnvironmentForConfig?.envVars) : selectedEnvironmentForConfig?.envVars ?? null,
+      environmentEnv: aiBinding ? stripAiAuthBindings(environmentEnv) : environmentEnv,
       environmentDriver: selectedEnvironmentForConfig?.driver ?? null,
       projectId: taskProjectContext?.id ?? null,
       routineId: routineEnvContext.routineId,
       responsibleUserId,
       executionRunConfig: aiBinding ? { ...executionRunConfig, env: stripAiAuthBindings(executionRunConfig.env) } : executionRunConfig,
-      projectEnv: aiBinding ? stripAiAuthBindings(taskProjectContext?.env) : taskProjectContext?.env ?? null,
+      projectEnv: aiBinding ? stripAiAuthBindings(projectEnv) : projectEnv,
       routineEnv: aiBinding ? stripAiAuthBindings(routineEnvContext.env) : routineEnvContext.env,
       secretsSvc,
       trustPreset,
-    }));
+    });
+  // Fingerprinting, resolution and the dispatch fence share the same content snapshot.
+  const { resolvedConfig, configuredTaskEnvironment, secretKeys, secretManifest } =
+    await time("configuration_secrets", () => resolveConfiguration(selectedEnvironmentForConfig?.envVars ?? null, taskProjectContext?.env ?? null));
+  const assertConfigurationCurrent = async (transaction: unknown, ownershipIssueId: string | null, lockIssue: () => Promise<void>) => {
+    if (!configurationRows) return lockIssue(); // Recovery owns its saved execution contract.
+    return assertExecutionConfigurationCurrent(transaction as Db, configurationRows, secretManifest, supersessions, ownershipIssueId, lockIssue);
+  };
   onFailureSecretsResolved(() => collectRunFailureSecretValues(resolvedConfig.env, secretKeys));
   identityRedactor.addSecretValues(secretEnvironmentValues(resolvedConfig.env, secretKeys));
   if (aiBinding) {
@@ -479,7 +519,7 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
   return {
     prepared: true as const,
     mergedConfig, configSnapshot, runScopedMentionedSkillKeys, githubSelection, useHostGitHub,
-    resolvedConfig, configuredTaskEnvironment, secretKeys, secretManifest,
+    resolvedConfig, configuredTaskEnvironment, secretKeys, secretManifest, assertConfigurationCurrent,
     runtimeSkillEntries, nativeRunnerPreparationSpans, runtimeConfig, agentIdentity, observability,
   };
 }

@@ -1,4 +1,4 @@
-import type { RunDispatchWriter, ScheduledRetryReader } from "./ports.js";
+import type { DispatchResolvedInteractionInput, RunDispatchWriter, ScheduledRetryReader } from "./ports.js";
 import type { PostCommitEffect, PromoteScheduledRetryOutcome } from "./types.js";
 
 export function createEvaluateScheduledRetryGate(deps: { reader: ScheduledRetryReader }) {
@@ -65,6 +65,7 @@ export function createDispatchResolvedInteractionIfCurrent(deps: { writer: RunDi
     reservationId: string;
     recoveryLeaseOwner?: string;
     enforceContinuationOwnership?: boolean;
+    configurationFence?: DispatchResolvedInteractionInput<T>["configurationFence"];
     dispatch: (markDispatchStarted: () => void) => Promise<T>;
     now?: Date;
   }) => deps.writer.dispatchResolvedInteractionIfCurrent({
