@@ -3,7 +3,7 @@ import { connectionIntentService } from "../connection-intents.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
 import { CONTEXT_COMPACTION_WAKE_REASON, ContextCompactionError, isContextCompactionRun, readContextCompactionRequest } from "../context-compaction.js";
 import { isProcessRunAdmissionClosed, isReattachPhaseActive as isProcessReattachPhaseActive } from "./run-admission.js";
-import { continueFreshInTransaction, hasPendingFreshContinuation, isFreshIsolatedContinuationWake, settleCoalescedFreshContinuationHolds } from "../fresh-continuation-fallback.js";
+import { FRESH_CONTINUATION_SCHEMA, continueFreshInTransaction, hasPendingFreshContinuation, isFreshIsolatedContinuationWake, settleCoalescedFreshContinuationHolds } from "../fresh-continuation-fallback.js";
 import { answeredContinuousHeldRun } from "../native-runtime/continuous-session-input.js";
 import { deliverContinuationAsRun, foldWaitingRetriesIntoContinuation, foldWaitingRetriesIntoRecordedContinuation, undeliveredContinuation,
   undeliveredContinuationContext, retryStartsFresh } from "../fresh-continuation-retry-fold.js";
@@ -2924,6 +2924,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     if (executionReconciliationWake && !issueId) return null;
     const durableRequest = opts.durableChatRequest;
     let taskRetryActorId: string | null = null;
+    let personRetry = opts.personRetry?.userId ? opts.personRetry : undefined;
+    let personRetrySourceRunId = opts.failedRunId ?? durableRequest?.failedRunRetry?.failedRunId;
     delete enrichedContextSnapshot.boardMessageRetry;
     if (opts.taskRetryRequestId) {
       const [receipt] = await db.select().from(agentWakeupRequests).where(and(
@@ -2940,9 +2942,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       if (retry.chatActionId ? !chatRetry :
           opts.requestedByActorType !== "user" || retry.actorId !== opts.requestedByActorId) return null;
       taskRetryActorId = retry.actorId;
+      personRetry = !retry.initiatedBy && retry.personRetry?.userId === retry.actorId ? retry.personRetry : undefined;
+      personRetrySourceRunId = retry.sourceRunId;
       enrichedContextSnapshot.forceFreshSession = true;
       // A continuous session otherwise keeps a binding that can never be resumed.
-      if (!retry.initiatedBy && issueId && await retryStartsFresh(db, { companyId: receipt.companyId, issueId, sourceRunId: retry.sourceRunId })) {
+      if (!retry.initiatedBy && retry.personRetry?.userId === retry.actorId && issueId && await retryStartsFresh(db, { companyId: receipt.companyId, issueId, sourceRunId: retry.sourceRunId })) {
         enrichedContextSnapshot.explicitFreshSession = true;
       }
       enrichedContextSnapshot.previousRunId = retry.sourceRunId;
@@ -3010,17 +3014,22 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
     if (opts.failedRunId) {
       const failed = await getRun(opts.failedRunId, { includeExecutionEvidence: true });
-      if (opts.requestedByActorType !== "user" || !opts.requestedByActorId ||
+      if (opts.requestedByActorType !== "user" ||
           reason !== "retry_failed_run" || source !== "on_demand" || triggerDetail !== "manual" ||
           !failed || failed.companyId !== agent.companyId || failed.agentId !== agentId ||
           !(await canRetryStoppedRun(db, failed)) ||
           (failed.nativeIssueId ?? readNonEmptyString(failed.contextSnapshot?.issueId)) !== issueId) {
         throw conflict("The selected failed run cannot be retried for this task.");
       }
-      if (!activeRunExecutions.has(failed.id) && !adapterExecutionControls.has(failed.id)) {
+      if (opts.requestedByActorId && !activeRunExecutions.has(failed.id) && !adapterExecutionControls.has(failed.id)) {
         await sweepPendingCleanupLeases({ explicitRetry: {
           companyId: failed.companyId, runId: failed.id, actorId: opts.requestedByActorId,
         } });
+      }
+      if (opts.personRetry?.userId && opts.personRetry.userId === opts.requestedByActorId && issueId &&
+          await retryStartsFresh(db, { companyId: agent.companyId, issueId, sourceRunId: failed.id })) {
+        enrichedContextSnapshot.explicitFreshSession = true;
+        enrichedContextSnapshot.forceFreshSession = true;
       }
       if (isConversationAdapter(agent.adapterType) || agent.adapterType === "paperclip_runner") {
         enrichedContextSnapshot.previousRunId = failed.id;
@@ -3067,6 +3076,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     }
     if (durableRequest?.failedRunRetry) {
       opts = { ...opts, allowRunCoalescing: false };
+      // This marker is supplied by the authorized durable board Retry worker,
+      // not by a chat message or the HTTP wake payload.
+      if (opts.personRetry?.userId && issueId &&
+          await retryStartsFresh(db, { companyId: agent.companyId, issueId,
+            sourceRunId: durableRequest.failedRunRetry.failedRunId })) {
+        enrichedContextSnapshot.explicitFreshSession = true;
+        enrichedContextSnapshot.forceFreshSession = true;
+      }
     }
     const dotRequest = opts.durableDotRequest;
     const museRequest = opts.durableMuseRequest;
@@ -4005,6 +4022,20 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               action?.evidence.executionReconciliation,
             );
             const sourceRunId = readNonEmptyString(decision.runId);
+            const freshDecision = parseObject(action?.evidence.freshContinuation);
+            // A server-recorded fresh continuation revokes API writes without
+            // claiming that the old process stopped. Revalidate that fence
+            // here too, so a crash between choice and outbox delivery is safe.
+            const fencedFreshContinuation = decision.providerStopped === false
+              && freshDecision.schema === FRESH_CONTINUATION_SCHEMA && freshDecision.sourceRunId === sourceRunId
+              && ["fresh_isolated_workspace", "unproven_workspace_kept"].includes(String(freshDecision.isolation))
+              && sourceRunId && isUuidLike(sourceRunId)
+              && (await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+                eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.id, sourceRunId),
+                or(eq(heartbeatRuns.nativeIssueId, issue.id), eq(heartbeatRuns.issueId, issue.id),
+                  sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}::text`),
+                sql`jsonb_typeof(${heartbeatRuns.resultJson}->'freshContinuationSupersededAt') = 'string'`,
+              )).limit(1)).length > 0;
             if (
               !action ||
               action.status !== "resolved" ||
@@ -4012,7 +4043,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               action.returnOwnerAgentId !== agentId ||
               !sourceRunId ||
               !isUuidLike(sourceRunId) ||
-              decision.providerStopped !== true ||
+              (decision.providerStopped !== true && !fencedFreshContinuation) ||
               !["completed", "not_performed", "mixed"].includes(
                 String(decision.actionOutcome),
               ) ||
@@ -4146,6 +4177,23 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               },
             });
           };
+          // A disclosed Retry is distinct from /new or a saved message. Fence
+          // the old API token and record the workspace decision under this same
+          // task transaction, before prepareRecovery can admit a successor.
+          if (personRetry && personRetrySourceRunId) {
+            const offered = await getExecutionBlocker(tx as unknown as Db, issue.companyId, issue.id);
+            if (offered?.runId === personRetrySourceRunId && offered.retryStartsNewSession &&
+                await (await import("../run-process-owner.js")).runHasNoProcessIdentity(tx as unknown as Db, issue.companyId, personRetrySourceRunId)) {
+              const fresh = await continueFreshInTransaction(tx as unknown as Db, { companyId: issue.companyId,
+                runId: personRetrySourceRunId, trigger: "continuation_wake", delivery: "record", personRetry });
+              if (fresh.kind === "continued" || fresh.kind === "already_continued") {
+                enrichedContextSnapshot.explicitFreshSession = true;
+                enrichedContextSnapshot.forceFreshSession = true;
+                const [updated] = await tx.select().from(issues).where(eq(issues.id, issue.id));
+                if (updated) Object.assign(issue, updated);
+              }
+            }
+          }
           const explicitContinuationRunId = randomUUID();
           const recovery = await prepareRecovery({
             agentId, actorType: taskRetryActorId ? "user" : opts.requestedByActorType, actorId: taskRetryActorId ?? opts.requestedByActorId,

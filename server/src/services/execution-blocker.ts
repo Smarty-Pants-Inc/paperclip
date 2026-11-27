@@ -5,7 +5,7 @@ import { legacyShutdownBeforeDispatchCondition } from "./legacy-shutdown-before-
 import { and, desc, eq, gt, inArray, not, or, sql, type SQL } from "drizzle-orm";
 import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
 import { z } from "zod";
-import { agentWakeupRequests, chatConversations, chatEndpoints, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issues, issueRecoveryActions, nativeRunFinalizations, nativeRunResults, toolConnections, workspaceOperations, type Db } from "@paperclipai/db";
+import { agents, agentWakeupRequests, chatConversations, chatEndpoints, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issues, issueRecoveryActions, nativeRunFinalizations, nativeRunResults, toolConnections, workspaceOperations, type Db } from "@paperclipai/db";
 import { canContinueCancelledRun, readRunCancellation } from "./run-cancellation.js";
 import { canRetryStoppedRun } from "./cancelled-native-startup.js";
 import { heldRetryOffersRetry, heldTaskRetryRefusals } from "./task-retry-eligibility.js";
@@ -15,12 +15,17 @@ import { hasRequiredWorkspaceRecovery, LEGACY_WORKSPACE_RECOVERY_SCHEMA, nativeR
 import { unreconciledNativeExportPredicate } from "./native-runtime/native-workspace-reconstruction.js";
 import { hasRecoveredCleanupStopReceipt, hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
-import { completedWorkspaceRecoveryCondition, hasVerifiedWorkspaceRepair, recoveredWorkMessage, savedWorkOffersRetry, workspaceRecoveryDisplay } from "./workspace-recovery-receipt.js";
+import { CHAT_STOP_PROOF_WAIT_ACTION } from "./system-recovery-state.js";
+import { completedWorkspaceRecoveryCondition, hasVerifiedWorkspaceRepair, NEW_SESSION_RETRY_NEXT_ACTION, newSessionRetryNextAction, recoveredWorkMessage, savedWorkOffersRetry, workspaceRecoveryDisplay } from "./workspace-recovery-receipt.js";
 import { nativeManualAdmissionHoldsExecution } from "./native-runtime/native-runner-ownership.js";
 import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED } from "./native-local-process-stop.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED } from "./native-runtime/completed-turn-cleanup.js";
 import { EXECUTION_FINALIZATION_DEADLINE_EXCEEDED, EXECUTION_FINALIZATION_DEADLINE_MESSAGE } from "./execution-control-deadline.js";
 import { NATIVE_HUMAN_SELF_HANDOFF_KEY } from "./native-runtime/native-human-self-handoff.js";
+import { sessionCannotContinue } from "./native-runtime/continued-session.js";
+import { isChatTask } from "./fresh-continuation-retry-fold.js";
+import { runHasNoProcessIdentity, runHasProviderWork } from "./run-process-owner.js";
+import { agentRetryStartsNewSession } from "./run-retry-presentation.js";
 
 const blockerContextKeys = ["issueId", "taskId", "source", "connectionIntentResolution",
   "interactionKind", "interactionStatus", "mutation", "interactionId"] as const;
@@ -363,7 +368,14 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
       eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
       eq(issueComments.id, options.conversationResetCommentId),
     )).limit(1);
-    if (command?.authorUserId && !command.deletedAt && command.body.trim() === "/new") return null;
+    if (command?.authorUserId && !command.deletedAt && command.body.trim() === "/new") {
+      const [held] = await db.select({ runId: sql<string>`${issueRecoveryActions.evidence}->>'runId'` })
+        .from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId), executionBlockerPredicate())).limit(1);
+      const [source] = held?.runId ? await db.select({ resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, companyId), sql`${heartbeatRuns.id}::text = ${held.runId}`)) : [];
+      if (!held?.runId || readRunCancellation(source?.resultJson) || !await runHasNoProcessIdentity(db, companyId, held.runId)) return null;
+    }
   }
   const [boundary] = conversation?.conversationAgentId && conversation.conversationBoundaryCommentId
     ? await db.select({ createdAt: issueComments.createdAt }).from(issueComments).where(and(
@@ -444,7 +456,16 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
       ? "Execution was cancelled; its source was not recorded."
       // Rows written before SQL text was kept out of run errors still carry it.
       : run?.error ? withoutSqlStatementText(run.error, readRunFailureCause(run.resultJson)) : run?.error);
-  const [chatBinding] = eligibleContinuation || canRetry ? await db.select({
+  const chat = await isChatTask(db, companyId, issueId);
+  const stopCannotBeProven = run?.errorCode === "native_continuation_requires_reconciliation"
+    || action.evidence.chatStopRequiresProof === true
+    || (action.evidence.systemRecovery as { failure?: { code?: unknown } } | undefined)?.failure?.code === "agent_stop_unconfirmed";
+  const unprovenChatCandidate = Boolean(stopCannotBeProven && chat && !restoreHold && run && ["failed", "interrupted", "timed_out"].includes(run.status)
+    && conversation?.assigneeAgentId === run.agentId && !["done", "cancelled"].includes(conversation.status)
+    && !cancellation && !run.runnerProfileJson?.remoteWorkspace && !action.evidence.executionReconciliation
+    && ["native_continuation_requires_reconciliation", "legacy_execution_requires_reconciliation"].includes(action.cause)
+    && await runHasNoProcessIdentity(db, companyId, run.id));
+  const [chatBinding] = eligibleContinuation || canRetry || unprovenChatCandidate ? await db.select({
     state: chatConversations.state, endpointStatus: chatEndpoints.status,
     connectionStatus: toolConnections.status, connectionEnabled: toolConnections.enabled,
   }).from(chatConversations).leftJoin(chatEndpoints, and(
@@ -455,16 +476,40 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     eq(chatConversations.companyId, companyId), eq(chatConversations.issueId, issueId),
   )).limit(1) : [];
   const heldRefusal = canRetry ? (await heldTaskRetryRefusals(db, companyId, [issueId])).get(issueId) : undefined;
-  const retryOffered = canRetry && (!chatBinding || recoveredFailure) && heldRetryOffersRetry(heldRefusal);
+  // Keep ordinary offers unchanged. The new unproven-stop exit must also be
+  // executable: a removed/unavailable connected chat cannot admit its Retry.
+  const unprovenChatRetry = unprovenChatCandidate && (!chatBinding || (chatBinding.state === "active"
+    && ["active", "verifying"].includes(chatBinding.endpointStatus ?? "")
+    && chatBinding.connectionStatus === "active" && chatBinding.connectionEnabled === true));
+  const retryOffered = unprovenChatRetry || canRetry && (!chatBinding || recoveredFailure || sessionCannotContinue(run)) && heldRetryOffersRetry(heldRefusal);
+  const [retryAgent] = retryOffered && run ? await db.select({ config: agents.adapterConfig }).from(agents)
+    .where(and(eq(agents.companyId, companyId), eq(agents.id, run.agentId))).limit(1) : [];
+  const retryStartsNewSession = retryOffered && (unprovenChatRetry || sessionCannotContinue(run)
+    || agentRetryStartsNewSession(retryAgent?.config));
+  const retryDisclosure = unprovenChatRetry
+    ? "Paperclip could not confirm the earlier run stopped. Retry starts a new session; the earlier run loses permission to write to this chat. "
+      + (await runHasProviderWork(db, companyId, run!.id)
+        ? "Provider work was recorded, so the task keeps its workspace and later files; the earlier process may still be running."
+        : "It starts in a separate workspace from the last saved work; any later unsaved files stay in the earlier workspace.")
+    : newSessionRetryNextAction(chat);
+  const cleanReason = (message: string) => message.replaceAll(NEW_SESSION_RETRY_NEXT_ACTION, "")
+    .replaceAll(newSessionRetryNextAction(true), "").trim()
+    || "The previous session cannot be resumed.";
+  const exhaustedStopWait = (action.evidence.systemRecovery as { state?: unknown } | undefined)?.state === "exhausted"
+    && (action.evidence.systemRecovery as { failure?: { retryClass?: unknown } } | undefined)?.failure?.retryClass === "recheck_evidence";
+  const exhaustedChat = exhaustedStopWait && chat;
   const workspaceRecovery = workspaceRecoveryState?.status === "recovered"
     ? { ...workspaceRecoveryState, message: recoveredWorkMessage(run?.status, retryOffered) }
-    : workspaceRecoveryState && { ...workspaceRecoveryState, canRetry: workspaceRecoveryState.canRetry && retryOffered };
-  let nextAction = action.status === "active" && action.cause === EXECUTION_FINALIZATION_DEADLINE_EXCEEDED
-    ? EXECUTION_FINALIZATION_DEADLINE_MESSAGE : action.nextAction;
+    : workspaceRecoveryState && { ...workspaceRecoveryState, canRetry: workspaceRecoveryState.canRetry && retryOffered,
+      message: exhaustedChat ? CHAT_STOP_PROOF_WAIT_ACTION : cleanReason(workspaceRecoveryState.message) };
+  let nextAction = exhaustedChat ? CHAT_STOP_PROOF_WAIT_ACTION
+    : action.status === "active" && action.cause === EXECUTION_FINALIZATION_DEADLINE_EXCEEDED
+      ? EXECUTION_FINALIZATION_DEADLINE_MESSAGE : cleanReason(action.nextAction);
   // Retry is a person's control on this task. Say so, so an agent reading this
   // record points the person to it instead of re-running the work itself.
-  if (canRetry && heldRetryOffersRetry(heldRefusal) && !eligibleContinuation) nextAction += ` ${EXECUTION_BLOCKER_PERSON_RETRY_ACTION}`;
-  if (chatBinding && !restoreHold) {
+  if (unprovenChatRetry) nextAction = "The earlier run's stop could not be confirmed. Your messages are saved. You can choose Retry after reading its new-session disclosure.";
+  else if (retryOffered && !eligibleContinuation) nextAction += ` ${EXECUTION_BLOCKER_PERSON_RETRY_ACTION}`;
+  if (chatBinding && !restoreHold && !unprovenChatRetry) {
     if (chatBinding.state === "endpoint_removed" || !chatBinding.endpointStatus || chatBinding.endpointStatus === "archived") {
       nextAction = "This chat connection was removed. Inspect the stopped run and create a new task to continue the work.";
     } else if (chatBinding.state === "unavailable" || !["active", "verifying"].includes(chatBinding.endpointStatus) ||
@@ -493,12 +538,15 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     // A stopped reviewer can differ from the task owner who receives the work back.
     agentId: run?.agentId ?? null,
     cause: action.cause,
-    nextAction: workspaceRecovery?.message ?? (reconstructionPending ? "Continuation from saved sources is queued and waiting for execution checks." : nextAction),
+    nextAction: unprovenChatRetry ? nextAction : workspaceRecovery?.message ?? (reconstructionPending
+      ? "Continuation from saved sources is queued and waiting for execution checks." : nextAction),
     ...(workspaceRecovery ? { workspaceRecovery } : {}),
     runStatus: run?.status ?? null,
-    runError: runError?.slice(0, 1024) ?? null,
+    runError: runError ? cleanReason(runError).slice(0, 1024) : runError ?? null,
     canContinue: eligibleContinuation && !chatBinding,
     canRetry: retryOffered,
+    ...(retryOffered ? { retryStartsNewSession } : {}),
+    ...(retryStartsNewSession ? { retryDisclosure } : {}),
     ...(restoreHold ? { workspaceRepairRequired, canRecordWorkspaceRepair: workspaceRepairRequired && hasRequiredWorkspaceRecovery(action.evidence) } : {}),
     savedMessageCount: saved.length,
     ...(canReconstructWorkspace ? { canReconstructWorkspace, workspaceRecoveryStatusVersion: conversation!.statusVersion } : {}),

@@ -26,6 +26,8 @@ import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { logger } from "../middleware/logger.js";
 import { canonicalExecutionUuid } from "./execution-identity.js";
+import { sessionCannotContinue } from "./native-runtime/continued-session.js";
+import { agentRetryStartsNewSession, retryStartsNewSessionColumn } from "./run-retry-presentation.js";
 import { chatActionDeadline } from "./chat-action-work.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED } from "./native-runtime/completed-turn-cleanup.js";
 import { isAcknowledgedLegacyUserStop, isQueuedDependencyWait, runStopPresentationJson } from "./run-cancellation.js";
@@ -65,6 +67,7 @@ type ProjectionRun = Pick<typeof heartbeatRuns.$inferSelect,
   "id" | "status" | "scheduledRetryAt" | "errorCode" | "livenessState" | "resultJson"> &
   Partial<Pick<typeof heartbeatRuns.$inferSelect, "agentId" | "error" | "companyId" | "nativeIssueId" | "runtimeMode" | "startedAt"
     | "scheduledRetryReason" | "createdAt" | "finishedAt" | "processPid" | "processGroupId">> & {
+  retryStartsNewSession?: boolean;
   failedStage?: string | null;
   previousSessionUnconfirmed?: boolean;
   environmentProviderWaitName?: string | null;
@@ -95,7 +98,7 @@ type ProjectionState = {
   retryWait?: ProjectionWait;
   /** The pending queued message this run was interrupted for, if any. */
   interruptWait?: ProjectionWait;
-  agent?: Pick<typeof agents.$inferSelect, "status" | "pauseReason">;
+  agent?: Pick<typeof agents.$inferSelect, "status" | "pauseReason"> & Partial<Pick<typeof agents.$inferSelect, "adapterConfig">>;
   projectAccessAllowed?: boolean;
   projectAccessProjectId?: string | null;
   workspaceSelectionAvailable?: boolean;
@@ -239,6 +242,9 @@ function deniedProjectId(issue: ProjectionIssue, run?: ProjectionRun): string | 
  * owner settles that gate. Without one, the task Retry (explicit continuation)
  * proves the old session stopped and continues in a fresh session. */
 export function projectTaskInterruption(issue: ProjectionIssue, input: ProjectionState, now = Date.now()): TaskInterruptionPresentation | null {
+  const withRetryConsequence = (value: TaskInterruptionPresentation | null) => value?.canRetry ? { ...value,
+    retryStartsNewSession: input.run?.retryStartsNewSession
+      ?? (sessionCannotContinue(input.run) || agentRetryStartsNewSession(input.agent?.adapterConfig)) } : value;
   let presentation = projectTaskInterruptionState(issue, input, now);
   const owed = input.owedInput;
   const stopped = input.run && input.run.finishedAt && input.run.finishedAt >= (owed?.createdAt ?? new Date(0))
@@ -265,9 +271,9 @@ export function projectTaskInterruption(issue: ProjectionIssue, input: Projectio
   }
   if (input.question && !["done", "cancelled"].includes(issue.status) && !["running", "queued"].includes(input.run?.status ?? "")
       && presentation?.responsibility !== "user")
-    return { intentId: input.wait?.id ?? null, responsibility: "user", state: "waiting_for_user", userAction: "question",
+    return withRetryConsequence({ intentId: input.wait?.id ?? null, responsibility: "user", state: "waiting_for_user", userAction: "question",
       canRetry: presentation?.canRetry === true && presentation.retryAction !== "move_forward" && !input.wait && !input.retryWait,
-      nextRetryAt: null, sourceRunIds: input.run ? [input.run.id] : [], observedRunId: input.run?.id ?? null };
+      nextRetryAt: null, sourceRunIds: input.run ? [input.run.id] : [], observedRunId: input.run?.id ?? null });
   if (presentation?.canRetry && input.run?.errorCode === NATIVE_SESSION_CLEANUP_QUARANTINED && input.cleanupSettling)
     presentation = { ...presentation, canRetry: false };
   if (presentation?.state === "failed" && presentation.canRetry) {
@@ -276,7 +282,7 @@ export function projectTaskInterruption(issue: ProjectionIssue, input: Projectio
       : input.failureRun;
     if (failed) presentation = { ...presentation, failure: classifiedRunFailure(failed) };
   }
-  return presentation;
+  return withRetryConsequence(presentation);
 }
 
 function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionState, now: number): TaskInterruptionPresentation | null {
@@ -522,6 +528,7 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       nativeIssueId: heartbeatRuns.nativeIssueId, runtimeMode: heartbeatRuns.runtimeMode, startedAt: heartbeatRuns.startedAt,
       processPid: heartbeatRuns.processPid, processGroupId: heartbeatRuns.processGroupId,
       agentAdapter: agents.adapterType,
+      retryStartsNewSession: retryStartsNewSessionColumn,
       error: sql<string | null>`case when ${heartbeatRuns.errorCode} = 'setup_failed'
         and ${heartbeatRuns.error} = 'Project is outside this low-trust boundary.'
         or ${heartbeatRuns.errorCode} = 'workspace_validation_failed'

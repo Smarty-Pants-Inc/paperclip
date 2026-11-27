@@ -19695,8 +19695,10 @@ describe("runnerd provider runtime wiring", () => {
         : request.args[1]?.includes("cat --") ? `nonce\n123\n2026-09-19T10:00:00.000Z\n${identity.runnerInstanceId}\nlinux:abcd-1234:100\n` : "" }));
     state.createBackend.mockClear(); state.createTransport.mockClear(); state.resolveRemoteRunnerBinary.mockClear();
     const artifact = { version: "admitted-version", digest: `sha256:${"a".repeat(64)}` };
+    const onSpawn = vi.fn(async () => {});
     await createRunnerdBackend({ db: leaseDb(current), execution: current, runnerInstanceId: identity.runnerInstanceId,
       runnerRemoteBinaryPath: missingBinary, runnerRemoteProviderPackPath: missingPack,
+      onSpawn,
       runnerIngressAuthorized: true,
       controllerPersistence: { bootId: "successor", runnerArtifact: artifact },
       runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace",
@@ -19711,6 +19713,9 @@ describe("runnerd provider runtime wiring", () => {
     expect(state.createTransport.mock.calls.at(-1)![0]).toMatchObject({ prpIdentity: identity,
       runnerArtifact: artifact, adoptExistingRunner: { pid: 123, startedAt: "2026-09-19T10:00:00.000Z" } });
     expect(state.resolveRemoteRunnerBinary).not.toHaveBeenCalled();
+    // Reattachment must record the exact validated owner for the current run,
+    // not merely reuse a transport with no durable heartbeat identity.
+    expect(onSpawn).toHaveBeenCalledExactlyOnceWith({ pid: 123, processGroupId: null, startedAt: "2026-09-19T10:00:00.000Z" });
     expect(execute.mock.calls.some(([request]) => request.args.includes("paperclip-runner-launch") || request.args.includes("--build-metadata"))).toBe(false);
     const options = state.createTransport.mock.calls.at(-1)![0] as RunnerTransportOptions & { prepareExternalRunnerState: () => Promise<void> };
     await expect(options.prepareExternalRunnerState()).resolves.toBeUndefined();

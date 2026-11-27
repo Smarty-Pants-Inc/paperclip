@@ -1,10 +1,11 @@
 import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
+import { isChatTask } from "./fresh-continuation-retry-fold.js";
 import {
   agentWakeupRequests, agents, approvals, companies, documentRevisions, documents, executionWorkspaces, heartbeatRuns, issueApprovals,
   issueComments, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, toolInvocations, type Db,
 } from "@paperclipai/db";
 import {
-  EXECUTION_RECONCILIATION_CAUSES, readRemoteWorkspaceAuthority, remoteWorkspaceRunReferenceSchema, type ExecutionReconciliation,
+  EXECUTION_RECONCILIATION_CAUSES, readRemoteWorkspaceAuthority, remoteWorkspaceRunReferenceSchema,
 } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
 import { answeredContinuousHeldRun } from "./native-runtime/continuous-session-input.js";
@@ -20,7 +21,7 @@ import { notifyDeferredWakesForIssue } from "./deferred-execution-notifications.
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { issueService } from "./issues.js";
 import { holdOwnsBlockedStatus } from "./recovery-hold-blocked-status.js";
-import { proveRunProcessGone } from "./run-process-owner.js";
+import { proveRunProcessGone, runHasNoProcessIdentity, runHasProviderWork } from "./run-process-owner.js";
 import { hasPendingRunCleanup } from "./execution-blocker.js";
 import { hasHumanGateEvidence } from "./recovery/human-gate-evidence.js";
 import { abandonUnverifiedRemoteWorkspaceEpoch } from "./remote-workspace-epoch-abandonment.js";
@@ -108,7 +109,7 @@ const EXACT_RECOVERY_STATES = ["scheduled", "running", "awaiting_evidence"];
  *   continuation gets a new isolated workspace and never writes the old
  *   directory. Nothing waits for that proof.
  */
-export type FreshContinuationIsolation = "remote_epoch" | "writer_ended" | "fresh_isolated_workspace";
+export type FreshContinuationIsolation = "remote_epoch" | "writer_ended" | "fresh_isolated_workspace" | "unproven_workspace_kept";
 
 export type FreshContinuationTrigger = "recovery_refused" | "held_recovery" | "continuation_wake" | "assigned_work";
 
@@ -133,6 +134,8 @@ type Input = {
    * task in the same transaction, and that wake is the continuation.
    */
   delivery?: "record" | "caller_owns";
+  /** Internal authority, written only after an authenticated person's Retry checks. */
+  personRetry?: { userId: string };
 };
 
 const object = (value: unknown): Record<string, unknown> =>
@@ -318,16 +321,17 @@ function isOwnedReconciliationHold(hold: typeof issueRecoveryActions.$inferSelec
 /**
  * The old local writer's state. `alive`: its process is running on this host,
  * so it is still executing and is settled by its own owner (stop, reaper)
- * first. `ended`: no process this host can see and no allocation or workspace
- * finalization left unsettled. `unproven`: anything else (another host, an
- * unsettled allocation); the continuation is isolated from it, never waits.
+ * first. `ended`: positive proof that the recorded process is gone, with no
+ * allocation or workspace finalization left unsettled. `unproven`: anything
+ * else (no identity, another host, an unsettled allocation). Ordinary tasks
+ * may continue in isolation; chats keep their stop-proof hold.
  */
 async function localWriterState(tx: Db, run: typeof heartbeatRuns.$inferSelect): Promise<"alive" | "ended" | "unproven"> {
   // The shared owner proof compares the recorded process identity (host, PID
   // space, start time), so a recycled PID is never mistaken for the old writer.
   const proof = await proveRunProcessGone(run, "fresh_continuation");
   if (proof?.verdict === "alive") return "alive";
-  if (proof?.verdict === "unprovable" || await hasPendingRunCleanup(tx, run.companyId, run.id)) return "unproven";
+  if (proof?.verdict !== "gone" || await hasPendingRunCleanup(tx, run.companyId, run.id)) return "unproven";
   return "ended";
 }
 
@@ -419,6 +423,8 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     .orderBy(asc(issueRecoveryActions.createdAt), asc(issueRecoveryActions.id)).for("update");
   const prior = holds.find(hold => object(hold.evidence.freshContinuation).sourceRunId === run.id);
   if (prior) {
+    if (holds.some(isOwnedReconciliationHold) && await isChatContinuation(tx, issue))
+      return { kind: "person_owned", reason: "chat_stop_requires_proof" };
     await settleLateHolds(tx, { companyId, issue, run, prior, holds: holds.filter(isOwnedReconciliationHold), now });
     return { kind: "already_continued", recoveryActionId: prior.id };
   }
@@ -592,9 +598,20 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
   // (the reaper or a Stop) settles it first, then the fallback continues.
   const aliveWait = writer === "alive" ? pending("previous_process_running", new Date(now.getTime() + step)) : null;
   if (aliveWait) return aliveWait;
-  const fenced = await fenceSourceWorkspace(tx, run);
+  // Isolation protects files, not a chat's live provider session. Never let
+  // this automatic fallback turn an unproven chat stop into continuation.
+  const noIdentity = await runHasNoProcessIdentity(tx, companyId, run.id);
+  const personRetry = Boolean(input.personRetry?.userId && noIdentity && !remoteSource
+    && (!issue.conversationAgentId || issue.conversationUserId === input.personRetry.userId));
+  if ((remoteSource || writer !== "ended" || pastBound() || refused) && await isChatContinuation(tx, issue) && !personRetry)
+    return { kind: "person_owned", reason: "chat_stop_requires_proof" };
+  // Pre-identity-gate releases could execute tools without recording a PID.
+  // Never throw away their later files merely because the identity is missing.
+  const keepUnprovenWorkspace = noIdentity && await runHasProviderWork(tx, companyId, run.id);
+  const fenced = keepUnprovenWorkspace ? null : await fenceSourceWorkspace(tx, run);
   // Never claim a stop that was not proven: record what isolates the successor.
-  const isolation: FreshContinuationIsolation = fenced || remoteSource ? "remote_epoch"
+  const isolation: FreshContinuationIsolation = keepUnprovenWorkspace ? "unproven_workspace_kept"
+    : fenced || remoteSource ? "remote_epoch"
     : writer === "ended" && !pastBound() && !refused ? "writer_ended" : "fresh_isolated_workspace";
   if (isolation === "fresh_isolated_workspace" && delivery === "saved_input") delivery = "recorded";
   const unconfirmed = object(coordinator?.failureDetail).unconfirmedActions;
@@ -602,14 +619,16 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     ...(Array.isArray(unconfirmed) ? unconfirmed.filter((name): name is string => typeof name === "string") : [])])].slice(0, 20);
   const created = await createdObjects(tx, run);
   const note = freshContinuationNote({ runId: run.id, unverified, created,
-    workspace: isolation === "writer_ended" ? "kept" : "restored_last_save" });
-  const decision: ExecutionReconciliation & { providerStopProof: "writer_ended" | "isolated" } = { runId: run.id, providerStopped: true,
+    workspace: isolation === "writer_ended" || keepUnprovenWorkspace ? "kept" : "restored_last_save" });
+  const decision = { runId: run.id, providerStopped: !keepUnprovenWorkspace && !personRetry,
     // Only a proven end is a stop. `isolated` means exactly: the old run's agent
     // token is refused for writes, and the continuation runs in a new workspace
     // root (a fenced remote epoch or a new local workspace). Nothing more.
-    providerStopProof: isolation === "writer_ended" ? "writer_ended" : "isolated",
+    providerStopProof: keepUnprovenWorkspace ? "unproven_workspace_kept" : isolation === "writer_ended" ? "writer_ended" : "isolated",
     actionOutcome: "mixed", outcomeEvidence: note,
-    workspaceRepairEvidence: fenced
+    workspaceRepairEvidence: keepUnprovenWorkspace
+      ? "The previous writer is not proven stopped. Provider work was recorded, so its workspace and later files are kept; its Paperclip writes are revoked."
+      : fenced
       ? `Paperclip abandoned unverified workspace epoch ${fenced.abandonedEpoch} of run ${run.id}; the continuation restores `
         + `${fenced.snapshotId ? `committed snapshot ${fenced.snapshotId}` : "the workspace source"} into a new root.`
       : isolation === "fresh_isolated_workspace"
@@ -617,13 +636,15 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
         : `The continuation of run ${run.id} starts from the task's last saved workspace; no unverified files are applied.` };
   const freshContinuation = { schema: FRESH_CONTINUATION_SCHEMA, sourceRunId: run.id, trigger: input.trigger,
     failureCode: run.errorCode ?? null, delivery, recordedAt: now.toISOString(), isolation,
-    stopProof: isolation === "writer_ended" ? "writer_ended" : fenced ? "unproven_epoch_abandoned" : "unproven_isolated",
+    ...(personRetry ? { personRetry: input.personRetry } : {}),
+    stopProof: keepUnprovenWorkspace ? "unproven_workspace_kept" : isolation === "writer_ended" ? "writer_ended" : fenced ? "unproven_epoch_abandoned" : "unproven_isolated",
     unverifiedActions: unverified, createdObjects: created, ...(fenced ? { workspace: fenced } : {}) };
   const reconciliation = { ...decision, actorId: FRESH_CONTINUATION_ACTOR, recordedAt: now.toISOString() };
   // Who, what, why and when. A fresh run is not a replay: the interrupted turn
   // is not re-sent, no tool call or write is re-executed, and any governed
   // action the new run wants goes through its approval gate again.
-  const settlement = { schema: FRESH_CONTINUATION_SCHEMA, actorType: "system", actorId: FRESH_CONTINUATION_ACTOR,
+  const settlement = { schema: FRESH_CONTINUATION_SCHEMA, actorType: personRetry ? "user" : "system",
+    actorId: personRetry ? input.personRetry!.userId : FRESH_CONTINUATION_ACTOR,
     decision: "continue_in_fresh_run", replay: "none", sourceRunId: run.id, failureCode: run.errorCode ?? null,
     reason: "exact_resumption_unavailable", isolation, unverifiedActions: unverified, recordedAt: now.toISOString(),
     ...(owned.some(isRestoreHold) ? { heldFiles: "kept_not_applied" } : {}),
@@ -718,7 +739,7 @@ export async function settleHoldIntoAbandonedEpochContinuation(db: Db, input: {
     const [issue] = await tx.select().from(issues).where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId))).for("update");
     const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId),
       eq(heartbeatRuns.id, input.runId)));
-    if (!issue || !run) return false;
+    if (!issue || !run || await isChatContinuation(tx, issue)) return false;
     const [hold] = await tx.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, input.companyId),
       eq(issueRecoveryActions.sourceIssueId, issue.id), eq(issueRecoveryActions.id, input.actionId))).for("update");
     if (!hold || !["active", "escalated"].includes(hold.status) || isHumanGate(hold) || hold.evidence.runId !== run.id
@@ -739,10 +760,15 @@ export async function settleHoldIntoAbandonedEpochContinuation(db: Db, input: {
   });
 }
 
+// One chat predicate for every continuation path (fresh-continuation-retry-fold.ts).
+function isChatContinuation(tx: Pick<Db, "select">, issue: typeof issues.$inferSelect) {
+  return isChatTask(tx, issue.companyId, issue.id);
+}
+
 async function settleLateHolds(tx: Db, input: { companyId: string; issue: typeof issues.$inferSelect; run: typeof heartbeatRuns.$inferSelect;
   prior: typeof issueRecoveryActions.$inferSelect; holds: Array<typeof issueRecoveryActions.$inferSelect>; now: Date }) {
   const { companyId, issue, run, prior, holds, now } = input;
-  if (!holds.length) return;
+  if (!holds.length || await isChatContinuation(tx, issue)) return;
   await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionContinuation);
   await notifyStatusCardIssueChange(tx, companyId);
   await notifyRoutineExecutionStatus(tx, issue.id, companyId);

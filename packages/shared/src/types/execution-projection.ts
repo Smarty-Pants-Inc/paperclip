@@ -11,6 +11,10 @@ export interface ExecutionBlocker {
   canContinue?: boolean;
   /** Explicit Retry candidate; the server rechecks stop proof and execution gates. */
   canRetry?: boolean;
+  /** Retry starts a new session because the hold's source session cannot be resumed. */
+  retryStartsNewSession?: boolean;
+  /** Action disclosure, separate from the reason; present only with offered Retry. */
+  retryDisclosure?: string;
   /** Required workspace files must be recovered before another provider turn. */
   workspaceRepairRequired?: boolean;
   canRecordWorkspaceRepair?: boolean;
@@ -23,6 +27,8 @@ export interface ExecutionBlocker {
     stage: "verifying_stop" | "restoring_files" | "saving_receipts";
     canRetry: boolean;
     message: string;
+    /** ISO timestamp for the next saved-work evidence re-check, not a new run. */
+    nextCheckAt?: string;
   };
 }
 
@@ -169,6 +175,8 @@ export interface TaskInterruptionPresentation {
   state: "working" | "retry_scheduled" | "failed" | "waiting_for_user" | "resolved";
   nextRetryAt: string | null;
   canRetry: boolean;
+  /** Always explicit when Retry is offered; computed before the person presses it. */
+  retryStartsNewSession?: boolean;
   retryAction?: "move_forward";
   userAction: "approval" | "question" | "reconnect" | "assign_agent" | "choose_model" | "resume" | "budget" | "project_access"
     /** Board confirms that a previous server, which can no longer report, stopped its workspace copyback. */
