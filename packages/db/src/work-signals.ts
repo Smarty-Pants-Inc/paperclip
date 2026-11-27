@@ -6,7 +6,7 @@ import { workSignalDebug } from "./work-signal-debug.js";
 // commit-bound PostgreSQL notifications during controller replacement. No SQL
 // triggers, tables, timers, or query replay. Only registered work fetches an XID.
 type Listener = (event: "intent" | "settled", hints?: ReadonlySet<string>) => void;
-type Transaction = { topics: Set<string>; hints: Map<string, Set<string>>; xid?: Promise<string>; uncertain: boolean };
+type Transaction = { topics: Set<string>; hints: Map<string, Set<string>>; unscoped: Set<string>; xid?: Promise<string>; uncertain: boolean };
 type Scope = { key: object; listeners: Map<string, Set<Listener>>; transactions: Set<Transaction>; root: Connection; notificationOrigin: string; notify: boolean;
   reconnectHints?: Map<string, string> };
 type PendingNotification = { hints: Set<string>; unscoped: boolean };
@@ -34,7 +34,7 @@ function install(connection: Connection, context: Context) {
   connection.transaction = async function (callback, ...options) {
     // Nested savepoints belong to the outermost transaction. Even a released
     // savepoint must not wake a consumer before its parent commits.
-    const state = context.transaction ?? { topics: new Set<string>(), hints: new Map<string, Set<string>>(), uncertain: false };
+    const state = context.transaction ?? { topics: new Set<string>(), hints: new Map<string, Set<string>>(), unscoped: new Set<string>(), uncertain: false };
     try {
       let level: Context | undefined;
       const result = await transaction.call(this, async (tx: Connection) => {
@@ -77,7 +77,13 @@ export async function signalDatabaseWork(connection: object, topic: string, hint
   if (!state) throw new Error("Database work must be registered inside a transaction");
   if (workSignalDebug.enabled) workSignalDebug.signal(topic, hint, signalDatabaseWork);
   state.topics.add(topic);
-  if (hint !== undefined) {
+  // Broad invalidation dominates scoped hints, regardless of their order or
+  // nested savepoint. Settlement and uncertain-outcome reconciliation use the
+  // same aggregate; a sampled consumer must not hide overflow consumers.
+  if (hint === undefined) {
+    state.unscoped.add(topic);
+    state.hints.delete(topic);
+  } else if (!state.unscoped.has(topic)) {
     let hints = state.hints.get(topic);
     if (!hints) state.hints.set(topic, hints = new Set());
     hints.add(hint);
@@ -91,7 +97,7 @@ export async function signalDatabaseWork(connection: object, topic: string, hint
   // Keep a failed acquisition distinguishable from an uncertain queue write.
   try { await state.xid; }
   catch (error) { state.xid = undefined; throw error; }
-  if (context.scope.notify) notifyAtCommit(context, topic, hint ?? null);
+  if (context.scope.notify) notifyAtCommit(context, topic, hint);
 }
 
 export function primeDatabaseWorkTransactionId(connection: object, xid: string): void {
