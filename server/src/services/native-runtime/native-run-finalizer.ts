@@ -17,8 +17,11 @@ import { notifyUnsafeWorkspaceExportRecovery } from "../unsafe-workspace-export-
 import { notifyCancelledWorkspacePreservation } from "../cancelled-workspace-preservation-notifications.js";
 import { notifyInstructionCollection } from "../instruction-collection-notifications.js";
 import { readRequiredQualityReview } from "../required-quality-review.js";
+import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
+import { primaryAgentService } from "../primary-agent.js";
 import { NativeDeliverableEvidenceError, validateNativeDeliverableEvidence } from "./native-deliverable-feedback.js";
 import { OWN_QUESTION_UNANSWERED_REASON, pendingOwnQuestionId, reportsOnlyProviderMessage } from "./own-question-wait.js";
+import { hasUnclaimedTaskPersonInput, PI_UNCLAIMED_CONTINUATION_KEY, UNCLAIMED_TASK_OWNER_REASON, UNCLAIMED_TASK_OWNER_MISSING_REASON, UNCLAIMED_TASK_OWNER_MISSING_NOTICE } from "./unclaimed-task.js";
 import { conversationTurnPresentsAnswer, pendingNativeGovernance } from "./native-governance.js";
 import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js";
 import { onboardingFirstTaskCompletionAllowed } from "../onboarding-first-task-admission.js";
@@ -53,6 +56,7 @@ import { and, desc, eq, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-
 import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
+  agents,
   completionContracts,
   heartbeatRuns,
   heartbeatRunEvents,
@@ -1859,6 +1863,62 @@ export async function finalizeNativeRun(input: {
       proposedDecision = { ...proposedDecision, statusAction: "in_review", toStatus: "in_review",
         reasonCode: OWN_QUESTION_UNANSWERED_REASON, unblockDescriptor: null, effects: [{ kind: "release_checkout" }] };
     }
+    // A Pi task's provider-message fallback is not a completion claim. Unlike
+    // ordinary attention, the second consecutive unclaimed stop is server-owned review.
+    if ((proposedDecision.statusAction === "done" || proposedDecision.reasonCode === COMPLETION_REVIEW_STAGE_REASON) &&
+        !isConversation(authoritativeIssue) && !stopRequested && record(savedStop?.personStop).requestedAt === undefined &&
+        reportsOnlyProviderMessage(result) &&
+        Array.isArray(result.evidence) && result.evidence.some(ref => record(ref).ref === "provider:pi_rpc:agent-message")) {
+      if (await hasUnclaimedTaskPersonInput(input.db, run, authoritativeIssue.id)) {
+        proposedDecision = { ...proposedDecision, statusAction: "in_progress", toStatus: "in_progress",
+          reasonCode: "explicit_user_message", unblockDescriptor: null, effects: [{ kind: "release_checkout" }] };
+      } else {
+        const repeated = record(sourceWake?.payload).continuationIdempotencyKey === PI_UNCLAIMED_CONTINUATION_KEY;
+        // Escalate to an agent who can move the task before asking a person:
+        // executor's lead, creating agent, then the person's primary. Every
+        // candidate must pass the same company, executor and invokability fences.
+        let ownerAgentId: string | null = null;
+        if (repeated) {
+          const invokableOwner = async (agentId: string | null | undefined): Promise<string | null> => {
+            if (!agentId || agentId === run.agentId) return null;
+            const [candidate] = await input.db.select().from(agents).where(and(
+              eq(agents.companyId, run.companyId), eq(agents.id, agentId),
+            ));
+            return candidate && (await evaluateAgentInvokabilityFromDb(input.db, candidate)).invokable ? candidate.id : null;
+          };
+          const [executor] = await input.db.select({ reportsTo: agents.reportsTo }).from(agents).where(and(
+            eq(agents.companyId, run.companyId), eq(agents.id, run.agentId),
+          ));
+          ownerAgentId = await invokableOwner(executor?.reportsTo);
+          ownerAgentId ??= await invokableOwner(authoritativeIssue.createdByAgentId);
+          if (!ownerAgentId && statusInput.reviewOwnerUserId) {
+            const { primaryAgentId } = await primaryAgentService(input.db).get(authoritativeIssue.companyId, statusInput.reviewOwnerUserId);
+            ownerAgentId = await invokableOwner(primaryAgentId);
+          }
+        }
+        assessment.hasBlockingRemainingWork = true;
+        assessment.continuation = null;
+        if (repeated && !ownerAgentId && !statusInput.reviewOwnerUserId) {
+          // Deliberate board recovery, not an anonymous reviewer or retryable
+          // finalization error. The status transaction also saves the notice.
+          proposedDecision = { ...proposedDecision, statusAction: "blocked", toStatus: "blocked",
+            reasonCode: UNCLAIMED_TASK_OWNER_MISSING_REASON,
+            unblockDescriptor: { owner: "board", action: UNCLAIMED_TASK_OWNER_MISSING_NOTICE }, effects: [
+              { kind: "release_checkout" }, { kind: "record_recovery", cause: UNCLAIMED_TASK_OWNER_MISSING_REASON,
+                nextAction: UNCLAIMED_TASK_OWNER_MISSING_NOTICE, agentId: run.agentId },
+            ] };
+        } else {
+          if (repeated) assessment.attentionRequests = [{ kind: "review", ownerClass: ownerAgentId ? "agent" : "human",
+            targetAgentId: ownerAgentId, sourceIndex: 0, sourceKind: UNCLAIMED_TASK_OWNER_REASON, legacy: false,
+            summary: "This task stopped twice without an accepted completion report. Decide how to continue the unfinished work." }];
+          proposedDecision = resolveNativeFinalizerStatus({ ...statusInput, allowIncompleteContinuation: !repeated });
+          proposedDecision = { ...proposedDecision, effects: proposedDecision.effects.map(effect => effect.kind === "enqueue_continuation"
+            ? { ...effect, idempotencyKey: PI_UNCLAIMED_CONTINUATION_KEY }
+            : effect.kind === "bind_reviewer" ? { ...effect, requestKey: UNCLAIMED_TASK_OWNER_REASON } : effect) };
+          if (repeated && ownerAgentId) proposedDecision.effects.push({ kind: "notify_owner", agentId: ownerAgentId, reason: UNCLAIMED_TASK_OWNER_REASON });
+        }
+      }
+    }
     if (proposedDecision.statusAction === "done" || proposedDecision.reasonCode === COMPLETION_REVIEW_STAGE_REASON) {
       const continuation = record(run.contextSnapshot?.executionContinuation);
       const objective = typeof continuation.objective === "string" ? continuation.objective
@@ -1878,7 +1938,7 @@ export async function finalizeNativeRun(input: {
     }
     // Seam 0237 (+0269): the comment ids our Pi driver handed back at a person's Stop arrive as the runner's provider notice
     // (category pi_stop_returned_input, details returnedCommentIds) and ride the run's personStop mark (the page restores them).
-    const returned = record(run.resultJson?.personStop).requestedAt === undefined ? [] : await input.db.select({ payload: heartbeatRunEvents.payload })
+    const returned = record(savedStop?.personStop).requestedAt === undefined ? [] : await input.db.select({ payload: heartbeatRunEvents.payload })
       .from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, run.id), eq(heartbeatRunEvents.eventType, "provider.notice.recorded"),
         sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,category}' = 'pi_stop_returned_input'`));
     const returnedDetails = returned.flatMap(event => {
@@ -1889,7 +1949,7 @@ export async function finalizeNativeRun(input: {
       .flatMap(detail => String(record(detail).value ?? "").split(",")).map(id => id.trim()).filter(id => id.length > 0);
     if (returnedIds.length) await settleProviderReturnedStopInput(input.db, run, returnedIds);
     // A person's Stop (seam 0236) never completes or closes the task: the turn ended, the task waits for the person.
-    if (record(run.resultJson?.personStop).requestedAt !== undefined && authoritativeIssue.status === "in_progress"
+    if (record(savedStop?.personStop).requestedAt !== undefined && authoritativeIssue.status === "in_progress"
       && ["done", "in_review"].includes(proposedDecision.statusAction))
       proposedDecision = { ...proposedDecision, statusAction: "in_progress", toStatus: "in_progress",
         reasonCode: NATIVE_RESPONSE_WAKE_WAITING_REASON, unblockDescriptor: null, effects: [{ kind: "release_checkout" }] };
