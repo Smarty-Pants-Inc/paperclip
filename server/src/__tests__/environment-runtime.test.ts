@@ -20,6 +20,9 @@ import {
 } from "@paperclipai/adapter-utils/ssh";
 import {
   activityLog,
+  agentTaskSessions,
+  heartbeatRunEvents,
+  issueComments,
   workspaceOperations,
   costEvents,
   agents,
@@ -73,6 +76,8 @@ import { createNativeHarnessBackupStamp } from "../services/native-runtime/nativ
 import { environmentRunOrchestrator } from "../services/environment-run-orchestrator.js";
 import { claimNativeRestartRecoveries } from "../services/native-runtime/native-restart-recovery.js";
 import { NATIVE_PREPARATION_FENCING_VERSION } from "../services/native-runtime/native-active-runs.js";
+import { createHeartbeatRunState } from "../services/heartbeat/run-state.js";
+import { verifyRecoverableNativeHarnessBackup } from "../services/native-runtime/native-harness-backup-storage.js";
 
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 
@@ -249,6 +254,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     await db.delete(workspaceOperations);
     await db.delete(activityLog);
     await db.delete(environmentLeases);
+    await db.delete(agentTaskSessions);
+    await db.delete(heartbeatRunEvents);
+    await db.delete(issueComments);
     await db.delete(issues);
     await db.delete(costEvents);
     await db.delete(heartbeatRuns);
@@ -5642,6 +5650,274 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       status: "active",
       leasePolicy: "reuse_by_environment",
     });
+  });
+
+  // Real PostgreSQL, runtime acquire/release/destroy and authenticated backup
+  // bytes. Only the provider's remote process and model I/O are deterministic.
+  async function terminalConversationFixture(options: { backup?: boolean; session?: boolean; live?: boolean } = {}) {
+    const f = await seedReusablePluginSandboxLease("paperclip_runner");
+    const issueId = randomUUID(), sessionId = randomUUID(), runnerInstanceId = randomUUID();
+    const answer = `remember-${randomUUID()}`;
+    const boxes = new Map<string, string>();
+    const originalBox = f.reusableLease.providerLeaseId!;
+    const call = vi.fn(async (_pluginId: string, method: string, params: any) => {
+      if (method === "environmentResumeLease") return { providerLeaseId: params.providerLeaseId, metadata: { remoteCwd: "/workspace" } };
+      if (method === "environmentAcquireLease") return { providerLeaseId: "terminal-replacement", metadata: {
+        provider: "fake-plugin", image: "fake:test", reuseLease: true, timeoutMs: 1234, remoteCwd: "/workspace" } };
+      if (method === "environmentReleaseLease") return undefined;
+      if (method === "environmentStopLease") return { providerLeaseId: params.providerLeaseId, state: "stopped" };
+      if (method === "environmentDestroyLease") { boxes.delete(params.providerLeaseId); return { providerLeaseId: params.providerLeaseId, state: "destroyed" }; }
+      if (method === "environmentExecute") {
+        const box = params.lease.providerLeaseId;
+        if (params.command === "remember") boxes.set(box, params.args[0]);
+        if (!boxes.has(box)) throw new Error("PRP provider resume state is unavailable");
+        return { exitCode: 0, stdout: boxes.get(box), stderr: "" };
+      }
+      throw new Error(`Unexpected plugin method: ${method}`);
+    });
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: {
+      isRunning: () => true, call, getWorker: () => ({ supportedMethods: [
+        "environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease", "environmentStopLease", "environmentExecute" ] }),
+    } as unknown as PluginWorkerManager });
+    await db.insert(issues).values({ id: issueId, companyId: f.companyId, title: "Reopen this conversation", status: "in_progress" });
+    await db.update(environmentLeases).set({ issueId }).where(eq(environmentLeases.id, f.reusableLease.id));
+    await db.update(heartbeatRuns).set({ nativeIssueId: issueId, issueId, runtimeMode: "native",
+      nativeSessionId: options.session === false ? null : sessionId, runnerInstanceId,
+      runnerProfileJson: { nativeExecutionInput: { provider: { kind: "pi_rpc" } }, sessionCheckpoint: { sessionId } },
+    }).where(eq(heartbeatRuns.id, f.runId));
+    const input = { companyId: f.companyId, environment: f.environment, issueId, agentId: f.agentId,
+      adapterType: "paperclip_runner", heartbeatRunId: f.runId,
+      persistedExecutionWorkspace: { id: f.executionWorkspaceId, mode: "shared_workspace" as const } };
+    const acquired = await runtime.acquireRunLease(input);
+    await runtime.execute({ environment: f.environment, lease: acquired.lease, command: "remember", args: [answer] });
+    const finishedAt = new Date(Date.now() - 1_000);
+    if (options.session !== false) await db.insert(heartbeatRunEvents).values({ companyId: f.companyId,
+      runId: f.runId, agentId: f.agentId, seq: 1, eventType: "provider.event", createdAt: new Date(finishedAt.getTime() - 1),
+      payload: { answer } });
+    await runtime.releaseRunLeases(f.runId, "released", undefined, "keep_running");
+    await db.update(heartbeatRuns).set({ status: options.live ? "running" : "succeeded",
+      finishedAt: options.live ? null : finishedAt }).where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(agentTaskSessions).values({ companyId: f.companyId, agentId: f.agentId, adapterType: "paperclip_runner",
+      taskKey: issueId, lastRunId: f.runId, sessionDisplayId: sessionId, sessionParamsJson: { sessionId } });
+    const root = await mkdtemp(path.join(os.tmpdir(), "terminal-conversation-")); fixtureRoots.push(root);
+    vi.stubEnv("PAPERCLIP_RUNNER_STATE_DIR", root);
+    const scopeId = randomUUID(), backupRoot = path.join(root, createHash("sha256").update(scopeId).digest("hex"), "failover-backups", "current");
+    async function saveBackup(completedAt = new Date().toISOString(), normalizedSessionId = sessionId) {
+      await mkdir(path.join(backupRoot, "runner"), { recursive: true });
+      await writeFile(path.join(backupRoot, "runner", "conversation.json"), JSON.stringify({ sessionId: normalizedSessionId, answer }), { mode: 0o600 });
+      const manifest = buildNativeHarnessBackupManifest({ backupRoot, execution: { provider: { kind: "pi_rpc" },
+        binding: { companyId: f.companyId, issueId, runId: f.runId, agentId: f.agentId, executionWorkspaceId: f.executionWorkspaceId },
+        workspace: { cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
+        session: { normalizedSessionId, driverKind: "pi_rpc", protocolVersion: 1, lifecyclePolicy: { mode: "warm", idleTimeoutMs: null } },
+      } as never, runnerInstanceId, providerSessionIdentity: { providerSessionId: sessionId }, sourceProviderLeaseId: originalBox, completedAt });
+      const manifestPath = path.join(backupRoot, "manifest.json");
+      await writeFile(manifestPath, JSON.stringify(manifest), { mode: 0o600 });
+      const stamp = createNativeHarnessBackupStamp({ manifestPath, sessionScopeId: scopeId, authorizedProviderLeaseId: originalBox,
+        normalizedSessionId, runnerInstanceId, completedAt });
+      const current = (await environmentService(db).getLeaseById(acquired.lease.id))!;
+      await environmentService(db).updateLeaseMetadata(current.id, { ...current.metadata, nativeHarnessBackup: stamp });
+      return stamp;
+    }
+    if (options.backup) expect(await verifyRecoverableNativeHarnessBackup({ db, companyId: f.companyId,
+      stamp: await saveBackup(), providerLeaseId: originalBox })).toBe(true);
+    async function reopen() {
+      await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
+      const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId, body: "What did I ask you to remember?", authorUserId: "local-board" }).returning();
+      const selected = await createHeartbeatRunState(db).getTaskSession(f.companyId, f.agentId, "paperclip_runner", issueId);
+      expect(selected?.sessionDisplayId).toBe(sessionId);
+      const nextRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: nextRunId, companyId: f.companyId, agentId: f.agentId, issueId,
+        nativeIssueId: issueId, nativeSessionId: sessionId, runtimeMode: "native", status: "running", invocationSource: "on_demand" });
+      const next = await runtime.acquireRunLease({ ...input, heartbeatRunId: nextRunId });
+      const reply = await runtime.execute({ environment: f.environment, lease: next.lease, command: "recall" })
+        .then(result => result.stdout, error => (error as Error).message);
+      return { next, reply, commentId: comment!.id, nextRunId };
+    }
+    async function drainStop(ownerRunId = f.runId, stopSupported = true) {
+      // The terminal branch has made even an idle released lease pending. Use
+      // the existing claimed retry/stop/settlement dispatcher, not provider mocks
+      // for the host policy. A fresh service proves no in-process warm census.
+      const restarted = environmentRuntimeService(db, { pluginWorkerManager: {
+        isRunning: () => true, call, getWorker: () => ({ supportedMethods: stopSupported ? ["environmentStopLease"] : [] }),
+      } as unknown as PluginWorkerManager });
+      await restarted.releaseRunLeases(ownerRunId, "released", undefined, "stop_and_retain", true);
+      return (await environmentService(db).getLeaseById(acquired.lease.id))!;
+    }
+    const lease = (await environmentService(db).getLeaseById(acquired.lease.id))!;
+    return { ...f, runtime, call, input, issueId, sessionId, runnerInstanceId, answer, originalBox, lease, finishedAt, backupRoot, saveBackup, reopen, drainStop };
+  }
+
+  it.each(["done", "cancelled"] as const)("terminal hold keeps an unsaved Pi conversation on %s and resumes the same session and box after a comment", async status => {
+    const f = await terminalConversationFixture();
+    await db.update(issues).set({ status }).where(eq(issues.id, f.issueId));
+    const destroyed = await f.runtime.destroyReusableSandboxLeases({ companyId: f.companyId, issueId: f.issueId,
+      executionWorkspaceId: f.executionWorkspaceId, failureReason: `issue_terminal_${status}` });
+    const pending = (await environmentService(db).getLeaseById(f.lease.id))!;
+    const held = await f.drainStop();
+    const { next, reply, commentId, nextRunId } = await f.reopen();
+    const destroys = f.call.mock.calls.filter(([, method]) => method === "environmentDestroyLease").length;
+    console.log("TERMINAL_HOLD_ROW", JSON.stringify({ status, runId: f.runId, issueId: f.issueId, sessionId: f.sessionId,
+      backupPresent: false, destroys, stops: f.call.mock.calls.filter(([, method]) => method === "environmentStopLease").length,
+      heldStatus: held.status, originalBox: f.originalBox, reopenedBox: next.lease.providerLeaseId, reply, answer: f.answer, commentId, nextRunId }));
+    expect(destroyed).toEqual([]); expect(destroys).toBe(0);
+    expect(pending.status).toBe("pending_cleanup"); expect(pending.failureReason).toBe("sandbox_stop_pending");
+    expect(held.status).toBe("released"); expect(held.expiresAt).toEqual(f.lease.expiresAt);
+    expect(f.call.mock.calls.filter(([, method]) => method === "environmentStopLease")).toHaveLength(1);
+    expect(next.lease.providerLeaseId).toBe(f.originalBox); expect(reply).toBe(f.answer);
+  });
+
+  it.each(["done", "cancelled"] as const)("terminal hold stops a %s task's box even with a proven backup and reuses its same conversation after a comment", async status => {
+    const f = await terminalConversationFixture({ backup: true });
+    await db.update(issues).set({ status }).where(eq(issues.id, f.issueId));
+    const destroyed = await f.runtime.destroyReusableSandboxLeases({ companyId: f.companyId, issueId: f.issueId, failureReason: `issue_terminal_${status}` });
+    expect(destroyed).toHaveLength(0);
+    expect((await f.drainStop()).status).toBe("released");
+    const { next, reply, commentId } = await f.reopen();
+    console.log("TERMINAL_HOLD_ROW", JSON.stringify({ status, issueId: f.issueId, sessionId: f.sessionId, backupPresent: true,
+      destroys: f.call.mock.calls.filter(([, method]) => method === "environmentDestroyLease").length,
+      stops: f.call.mock.calls.filter(([, method]) => method === "environmentStopLease").length,
+      originalBox: f.originalBox, reopenedBox: next.lease.providerLeaseId, reply, answer: f.answer, commentId }));
+    expect(next.lease.providerLeaseId).toBe(f.originalBox); expect(reply).toBe(f.answer);
+  });
+
+  it.each(["no_session", "live_run"] as const)("terminal hold preserves the existing %s behavior", async control => {
+    const f = await terminalConversationFixture({ session: control !== "no_session", live: control === "live_run" });
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+    const destroyed = await f.runtime.destroyReusableSandboxLeases({ companyId: f.companyId, issueId: f.issueId, failureReason: "issue_terminal_done" });
+    expect(destroyed).toHaveLength(control === "no_session" ? 1 : 0);
+    expect(f.call.mock.calls.filter(([, method]) => method === "environmentDestroyLease")).toHaveLength(control === "no_session" ? 1 : 0);
+  });
+
+  it("terminal hold also queues stop-only cleanup from the terminal task finalizer", async () => {
+    const f = await terminalConversationFixture();
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+    await db.update(environmentLeases).set({ status: "active" }).where(eq(environmentLeases.id, f.lease.id));
+    await f.runtime.releaseRunLeases(f.runId, "released", undefined, "destroy");
+    expect((await f.drainStop()).status).toBe("released");
+    expect(f.call.mock.calls.some(([, method]) => ["environmentDestroyLease", "environmentReleaseLease"].includes(method))).toBe(false);
+    expect((await f.reopen()).reply).toBe(f.answer);
+  });
+
+  it.each(["released", "retained"] as const)("terminal hold stops an idle %s box once across repeated cleanup", async status => {
+    const f = await terminalConversationFixture();
+    await db.update(environmentLeases).set({ status }).where(eq(environmentLeases.id, f.lease.id));
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+    const cleanup = () => f.runtime.destroyReusableSandboxLeases({ companyId: f.companyId, issueId: f.issueId, failureReason: "issue_terminal_done" });
+    expect(await cleanup()).toEqual([]); expect(await cleanup()).toEqual([]);
+    const held = await f.drainStop(); expect(held.status).toBe("released");
+    expect(held.expiresAt).toEqual(f.lease.expiresAt);
+    expect(await cleanup()).toEqual([]); expect(await cleanup()).toEqual([]);
+    expect(f.call.mock.calls.filter(([, method]) => method === "environmentStopLease")).toHaveLength(1);
+    expect(f.call.mock.calls.some(([, method]) => ["environmentDestroyLease", "environmentReleaseLease"].includes(method))).toBe(false);
+    const reopened = await f.reopen(); expect(reopened.next.lease.providerLeaseId).toBe(f.originalBox); expect(reopened.reply).toBe(f.answer);
+  });
+
+  it.each(["continuous", "paperclip"] as const)("terminal hold includes Pi %s continuity", async sessionContinuity => {
+    const f = await terminalConversationFixture();
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { nativeExecutionInput: { provider: { kind: "pi_rpc", sessionContinuity } } } }).where(eq(heartbeatRuns.id, f.runId));
+    await f.runtime.destroyReusableSandboxLeases({ companyId: f.companyId, issueId: f.issueId, failureReason: "issue_terminal_done" });
+    expect((await f.drainStop()).status).toBe("released");
+    const reopened = await f.reopen(); expect(reopened.next.lease.providerLeaseId).toBe(f.originalBox); expect(reopened.reply).toBe(f.answer);
+  });
+
+  it.each(["failure", "unsupported"] as const)("terminal hold retries %s stop without falling back to delete or release", async fault => {
+    const f = await terminalConversationFixture();
+    await f.runtime.destroyReusableSandboxLeases({ companyId: f.companyId, issueId: f.issueId, failureReason: "issue_terminal_done" });
+    if (fault === "failure") f.call.mockRejectedValueOnce(new Error("provider stop unavailable"));
+    expect((await f.drainStop(f.runId, fault !== "unsupported")).status).toBe("pending_cleanup");
+    expect(f.call.mock.calls.some(([, method]) => ["environmentDestroyLease", "environmentReleaseLease"].includes(method))).toBe(false);
+    expect((await f.drainStop()).status).toBe("released");
+    expect((await f.reopen()).reply).toBe(f.answer);
+  });
+
+  it("terminal hold leaves non-Pi sessions on today's destroy path", async () => {
+    const f = await terminalConversationFixture();
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { nativeExecutionInput: { provider: { kind: "codex" } } } }).where(eq(heartbeatRuns.id, f.runId));
+    expect(await f.runtime.destroyReusableSandboxLeases({ companyId: f.companyId, issueId: f.issueId, failureReason: "issue_terminal_done" })).toHaveLength(1);
+    expect(f.call.mock.calls.filter(([, method]) => method === "environmentDestroyLease")).toHaveLength(1);
+  });
+
+  it("terminal hold converts an unclaimed terminal-origin retry into stop-only work", async () => {
+    const f = await terminalConversationFixture();
+    await db.update(environmentLeases).set({ status: "pending_cleanup", failureReason: "issue_terminal_done" }).where(eq(environmentLeases.id, f.lease.id));
+    const lease = (await environmentService(db).getLeaseById(f.lease.id))!;
+    expect(await f.runtime.isPendingCleanupWorkerReady({ environment: f.environment, lease })).toBe(false);
+    const stoppedIntent = (await environmentService(db).getLeaseById(f.lease.id))!;
+    expect(await f.runtime.isPendingCleanupWorkerReady({ environment: f.environment, lease: stoppedIntent })).toBe(true);
+    expect((await f.drainStop()).status).toBe("released");
+    expect(f.call.mock.calls.some(([, method]) => ["environmentDestroyLease", "environmentReleaseLease"].includes(method))).toBe(false);
+    expect((await f.reopen()).reply).toBe(f.answer);
+  });
+
+  it.each(["stale", "equal_finish", "changed_bytes", "wrong_session", "unfinished"] as const)("terminal hold queues stop without relying on %s backup proof", async fault => {
+    const f = await terminalConversationFixture();
+    await f.saveBackup(fault === "stale" ? new Date(f.finishedAt.getTime() - 1).toISOString()
+      : fault === "equal_finish" ? f.finishedAt.toISOString() : undefined, fault === "wrong_session" ? randomUUID() : undefined);
+    if (fault === "changed_bytes") await writeFile(path.join(f.backupRoot, "runner", "conversation.json"), "not the saved conversation");
+    if (fault === "unfinished") await db.update(heartbeatRuns).set({ finishedAt: null }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, f.issueId));
+    expect(await f.runtime.destroyReusableSandboxLeases({ companyId: f.companyId, issueId: f.issueId, failureReason: "issue_terminal_cancelled" })).toEqual([]);
+    expect(f.call.mock.calls.some(([, method]) => method === "environmentDestroyLease")).toBe(false);
+  });
+
+  it.each([false, true])("terminal hold does not steal an in-flight terminal cleanup claim (retry=%s)", async retryOwner => {
+    const f = await terminalConversationFixture();
+    const attemptId = randomUUID();
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+    await db.update(environmentLeases).set({ status: "pending_cleanup", failureReason: "issue_terminal_done", metadata: { ...f.lease.metadata,
+      pendingCleanupAttemptId: attemptId, pendingCleanupInFlight: true, pendingCleanupLeaseExpiresAtMs: Date.now() + 60_000,
+    } }).where(eq(environmentLeases.id, f.lease.id));
+    const claimed = (await environmentService(db).getLeaseById(f.lease.id))!;
+    if (retryOwner) {
+      await expect(f.runtime.retryPendingSandboxTeardown({ environment: f.environment, lease: claimed })).rejects.toThrow(/stop-only/);
+      const fenced = (await environmentService(db).getLeaseById(f.lease.id))!;
+      expect(fenced).toEqual({ ...claimed, metadata: { ...claimed.metadata, terminalPiSandboxOrigin: true } });
+      // The old sweep overwrites the reason after a failed attempt; durable
+      // provenance must survive that, and must not become ordinary destruction.
+      await db.update(environmentLeases).set({ failureReason: "pending_cleanup_retry",
+        metadata: { ...fenced.metadata, pendingCleanupInFlight: false } }).where(eq(environmentLeases.id, f.lease.id));
+      const retry = (await environmentService(db).getLeaseById(f.lease.id))!;
+      expect(await f.runtime.isPendingCleanupWorkerReady({ environment: f.environment, lease: retry })).toBe(false);
+      expect((await f.drainStop()).status).toBe("released");
+      expect((await f.reopen()).reply).toBe(f.answer);
+    } else {
+      expect(await f.runtime.destroyReusableSandboxLeases({ companyId: f.companyId, issueId: f.issueId,
+        failureReason: "issue_terminal_done" })).toEqual([]);
+      expect(await environmentService(db).getLeaseById(f.lease.id)).toEqual(claimed);
+    }
+    expect(f.call.mock.calls.some(([, method]) => method === "environmentDestroyLease")).toBe(false);
+  });
+
+  it.each([false, true])("terminal hold rejects an earlier owner's backup after a real lease handoff (same session=%s)", async sameSession => {
+    const f = await terminalConversationFixture({ backup: true });
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId, runtimeMode: "native", status: "running",
+      nativeIssueId: f.issueId, nativeSessionId: sameSession ? f.sessionId : randomUUID(), invocationSource: "on_demand" });
+    const next = await f.runtime.acquireRunLease({ ...f.input, heartbeatRunId: runId });
+    expect(next.lease.providerLeaseId).toBe(f.originalBox);
+    await f.runtime.releaseRunLeases(runId, "released", undefined, "keep_running");
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+    expect(await f.runtime.destroyReusableSandboxLeases({ companyId: f.companyId, issueId: f.issueId, failureReason: "issue_terminal_done" })).toEqual([]);
+    expect(f.call.mock.calls.some(([, method]) => method === "environmentDestroyLease")).toBe(false);
+    await f.drainStop(runId);
+    const reopened = await f.reopen(); expect(reopened.next.lease.providerLeaseId).toBe(f.originalBox); expect(reopened.reply).toBe(f.answer);
+  });
+
+  it.each([false, true])("terminal hold includes earlier allocation sessions after a real lease handoff (new session=%s)", async newSession => {
+    const f = await terminalConversationFixture();
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId, runtimeMode: "native", status: "running",
+      nativeIssueId: f.issueId, nativeSessionId: newSession ? randomUUID() : null, invocationSource: "on_demand" });
+    const next = await f.runtime.acquireRunLease({ ...f.input, heartbeatRunId: runId });
+    expect(next.lease.providerLeaseId).toBe(f.originalBox);
+    await f.runtime.releaseRunLeases(runId, "released", undefined, "keep_running");
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+    await f.runtime.destroyReusableSandboxLeases({ companyId: f.companyId, issueId: f.issueId, failureReason: "issue_terminal_done" });
+    expect(f.call.mock.calls.some(([, method]) => method === "environmentDestroyLease")).toBe(false);
+    await f.drainStop(runId);
+    expect((await environmentService(db).getLeaseById(next.lease.id))?.status).toBe("released");
   });
 
   it.each([
