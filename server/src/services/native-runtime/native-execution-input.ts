@@ -589,7 +589,7 @@ export function budgetNativeFreshFallback(execution: NativeExecutionInput, wakeP
     if (value !== continuation) (value.coverage as NativeContinuationCoverage).nativeSessionId = execution.session.normalizedSessionId ?? undefined;
     execution.task.prompt = originalWake && value !== continuation ? originalPrompt.replace(originalWake, () => render(value)) : originalPrompt;
     return commandEnvelopeBytes(buildNativeModelEnvelope(execution)) + NATIVE_HANDOFF_CUT_NOTE_RESERVE_BYTES;
-  }, readState, operationId => { try { return ["GET", "HEAD"].includes(runnerApiOperation(operationId).method); } catch { return false; } }, cause);
+  }, undefined, operationId => { try { return ["GET", "HEAD"].includes(runnerApiOperation(operationId).method); } catch { return false; } }, cause);
   if ("completionSources" in execution) delete execution.completionSources;
   if ("continuationPrompt" in execution) execution.continuationPrompt = null;
   return bounded;
