@@ -29,6 +29,8 @@ export const NATIVE_WHOLE_HANDOFF_MAX_BYTES = 368_000;
 export const NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND = "native_turn_prompt_exceeds_command_bound";
 export const NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND_MESSAGE = "The task input could not be sent, but this run has no readable explanation. Give your instance admin this run and the task title to check the agent's runtime and Paperclip versions; if you are the instance admin, check those versions directly. After the cause is fixed, send a message to continue. Saved messages and answers are kept.";
 const nativePromptMeasures = ["command", "command_upper_bound", "prompt", "envelope", "handoff_note"] as const;
+const nativePromptRemedies = ["edit_task_description", "edit_message", "delete_own_message", "new_followup_task", "report_defect", "check_versions"] as const;
+export type Remedy = typeof nativePromptRemedies[number];
 /** The known kind list lives here; title coverage is checked against it.
  * For command refusals, bytes names the measured thing through measure:
  * command = the WHOLE serialized guard command (including its conservative
@@ -44,6 +46,13 @@ type NativePromptRefusalKind = "task_description" | "newest_message" | "unread_m
 export type NativePromptRefusalCause = {
   kind: NativePromptRefusalKind | (string & {});
   bytes: number;
+  /** Supported routes, not permission grants. edit_message requires an editable
+   * queued message written by the reader; delete_own_message is author-only.
+   * For command, edit_task_description applies only if it contains the long text;
+   * report_defect applies when the task inputs are already small. A defect report
+   * includes this run and the task title. new_followup_task stays short and links
+   * to the saved context; it does not split the same text into more messages. */
+  remedies: Array<Remedy>;
   count?: number;
   measure?: typeof nativePromptMeasures[number] | "protected_parts" | "envelope_with_reserve" | (string & {});
 };
@@ -55,6 +64,26 @@ const nativePromptRefusalTitles: Record<string, string> = {
   unmeasured_composition: "Queued input cannot be measured for this turn",
   stale_copy: "Session input contains stale history",
 } satisfies Record<NativePromptRefusalKind, string>;
+/** Server-owned routes mirror the detail text; callers still check permissions.
+ * Return fresh arrays so one cause cannot mutate another cause's routes. */
+export function nativePromptRefusalRemedies(kind: NativePromptRefusalCause["kind"], measure?: NativePromptRefusalCause["measure"]): Array<Remedy> {
+  const remedies = {
+    task_description: ["edit_task_description", "new_followup_task"],
+    newest_message: ["edit_message", "delete_own_message", "new_followup_task"],
+    unread_message: ["edit_message", "delete_own_message", "new_followup_task"],
+    unread_messages: ["edit_message", "delete_own_message", "new_followup_task"],
+    queued_input: ["edit_message", "new_followup_task"],
+    human_response: ["new_followup_task"],
+    protected_input: ["new_followup_task"],
+    protected_inputs: ["new_followup_task"],
+    command: ["edit_task_description", "new_followup_task", "report_defect"],
+    unmeasured_composition: ["report_defect"],
+    stale_copy: ["report_defect"],
+  } satisfies Record<NativePromptRefusalKind, readonly Remedy[]>;
+  if (!Object.hasOwn(remedies, kind)) return ["check_versions"];
+  if (measure && !["command", "protected_inputs", "unmeasured_composition", "stale_copy"].includes(kind)) return ["new_followup_task"];
+  return [...remedies[kind as NativePromptRefusalKind]];
+}
 export function nativePromptRefusalTitle(cause?: NativePromptRefusalCause): string {
   return cause && Object.hasOwn(nativePromptRefusalTitles, cause.kind) ? nativePromptRefusalTitles[cause.kind]! : "Task input could not be sent";
 }
@@ -96,19 +125,23 @@ export function nativePromptRefusalCause(value: unknown): NativePromptRefusalCau
   return typeof v.kind === "string" && /^[^\s:\[\]]+$/.test(v.kind) && Number.isSafeInteger(v.bytes) && Number(v.bytes) >= 0
     && (v.count === undefined || Number.isSafeInteger(v.count) && Number(v.count) > 0)
     && (v.measure === undefined || typeof v.measure === "string" && /^[^\s:\[\]]+$/.test(v.measure))
-    ? v as NativePromptRefusalCause : undefined;
+    && (v.remedies === undefined || Array.isArray(v.remedies)
+      && v.remedies.every(remedy => typeof remedy === "string" && /^[a-z_]+$/.test(remedy)))
+    // A future route must not erase the readable kind/bytes. Do not advertise
+    // an unsupported action; legacy causes keep an empty, non-inferred list.
+    ? { ...v, remedies: (v.remedies as string[] | undefined ?? []).filter(remedy => nativePromptRemedies.some(known => known === remedy)) } as NativePromptRefusalCause : undefined;
 }
 export function nativePromptCauseFromError(error: unknown): NativePromptRefusalCause | undefined {
   const direct = nativePromptRefusalCause(record(error).promptCause);
   if (direct) return direct;
   // Read unfamiliar labels too; presentation, not parsing, owns known labels.
-  const match = (error instanceof Error ? error.message : "").match(/native_prompt_cause=([^\s:\[\]]+):(\d+)(?::count=(\d+))?(?::measure=([^\s:\[\]]+))?(?=\]|$|\s)/);
-  return match ? nativePromptRefusalCause({ kind: match[1], bytes: Number(match[2]), ...(match[3] ? { count: Number(match[3]) } : {}), ...(match[4] ? { measure: match[4] } : {}) }) : undefined;
+  const match = (error instanceof Error ? error.message : "").match(/native_prompt_cause=([^\s:\[\]]+):(\d+)(?::count=(\d+))?(?::measure=([^\s:\[\]]+))?(?::remedies=([a-z_,]*))?(?=\]|$|\s)/);
+  return match ? nativePromptRefusalCause({ kind: match[1], bytes: Number(match[2]), ...(match[3] ? { count: Number(match[3]) } : {}), ...(match[4] ? { measure: match[4] } : {}), ...(match[5] === undefined ? {} : { remedies: match[5] ? match[5].split(",") : [] }) }) : undefined;
 }
 export class NativeTurnPromptExceedsCommandBoundError extends Error {
   readonly code = NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND;
   constructor(readonly promptCause?: NativePromptRefusalCause) {
-    super(`${NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND}: ${nativePromptRefusalDetail(promptCause)}${promptCause ? ` [native_prompt_cause=${promptCause.kind}:${promptCause.bytes}${promptCause.count === undefined ? "" : `:count=${promptCause.count}`}${promptCause.measure === undefined ? "" : `:measure=${promptCause.measure}`}]` : ""}`);
+    super(`${NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND}: ${nativePromptRefusalDetail(promptCause)}${promptCause ? ` [native_prompt_cause=${promptCause.kind}:${promptCause.bytes}${promptCause.count === undefined ? "" : `:count=${promptCause.count}`}${promptCause.measure === undefined ? "" : `:measure=${promptCause.measure}`}:remedies=${promptCause.remedies.join(",")}]` : ""}`);
   }
 }
 
@@ -118,7 +151,7 @@ export const commandEnvelopeBytes = (envelope: object) => Buffer.byteLength(JSON
 export function nativeSessionHandoffMaxBytes(promptOrEnvelope: string | object): number {
   const room = NATIVE_TURN_KNOWN_MAX_BYTES - (typeof promptOrEnvelope === "string"
     ? commandTextBytes(promptOrEnvelope) : commandEnvelopeBytes(promptOrEnvelope));
-  if (room < 0) throw new NativeTurnPromptExceedsCommandBoundError({ kind: "command", bytes: NATIVE_TURN_KNOWN_MAX_BYTES - room,
+  if (room < 0) throw new NativeTurnPromptExceedsCommandBoundError({ kind: "command", remedies: nativePromptRefusalRemedies("command"), bytes: NATIVE_TURN_KNOWN_MAX_BYTES - room,
     measure: typeof promptOrEnvelope === "string" ? "prompt" : "envelope" });
   return Math.min(NATIVE_WHOLE_HANDOFF_MAX_BYTES, room);
 }
@@ -237,7 +270,7 @@ export function nativeFreshFallbackPayload(runId: string, payload: Record<string
   const prefix = payload.text.match(/^\$[a-zA-Z0-9_-]+(?: \$[a-zA-Z0-9_-]+)*\n\n/)?.[0] ?? "";
   const looksLikeOriginal = (text: string) => fallback.removedMiddle.length > 0
     && !fallback.bounded.includes(fallback.removedMiddle) && containsRemovedMiddle(text, fallback.removedMiddle);
-  const refuseStaleCopy = (text: string): never => { throw new NativeTurnPromptExceedsCommandBoundError({ kind: "stale_copy", bytes: Buffer.byteLength(text) }); };
+  const refuseStaleCopy = (text: string): never => { throw new NativeTurnPromptExceedsCommandBoundError({ kind: "stale_copy", bytes: Buffer.byteLength(text), remedies: nativePromptRefusalRemedies("stale_copy") }); };
   let envelope: Record<string, unknown>;
   try { envelope = record(JSON.parse(payload.text.slice(prefix.length))); } catch {
     const text = payload.text.slice(prefix.length);
@@ -272,7 +305,7 @@ export function assertNativeTurnCommandBound(type: string, payload: Record<strin
     controllerSeq: Number.MAX_SAFE_INTEGER, type, issuedAt: new Date().toISOString(), payload, status: "pending", result: null };
   const bytes = Buffer.byteLength(JSON.stringify(command), "utf8");
   if (bytes > NATIVE_TURN_COMMAND_MAX_BYTES)
-    throw new NativeTurnPromptExceedsCommandBoundError(cause ?? { kind: "command", bytes, measure: "command" });
+    throw new NativeTurnPromptExceedsCommandBoundError(cause ?? { kind: "command", bytes, measure: "command", remedies: nativePromptRefusalRemedies("command") });
 }
 // Stock nativeTaskConstraints: six entries, encoded bytes 55/63/609/405/629/275
 // plus array/property punctuation = 2,084 journal bytes; ceil(2,084 * 1.10).
@@ -384,8 +417,8 @@ export function assertNativeQueuedTurnBound(runId: string, envelope: object, que
   if (bytes > NATIVE_TURN_COMMAND_MAX_BYTES) {
     const queuedAlone = queuedInput && nativeQueuedTurnUpperBound(runId, envelope, null, additions) <= NATIVE_TURN_COMMAND_MAX_BYTES;
     throw new NativeTurnPromptExceedsCommandBoundError(queuedAlone
-      ? { kind: "queued_input", bytes: commandTextBytes(queuedInput!) }
-      : { kind: "command", bytes, measure: "command_upper_bound" });
+      ? { kind: "queued_input", bytes: commandTextBytes(queuedInput!), remedies: nativePromptRefusalRemedies("queued_input") }
+      : { kind: "command", bytes, measure: "command_upper_bound", remedies: nativePromptRefusalRemedies("command") });
   }
 }
 const guarded = new WeakSet<DurablePrpControlPlane>();

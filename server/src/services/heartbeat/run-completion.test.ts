@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import { runFailureMessage } from "@paperclipai/shared";
-import { NativeTurnPromptExceedsCommandBoundError } from "../native-runtime/native-turn-budget.js";
+import { NativeTurnPromptExceedsCommandBoundError, type NativePromptRefusalCause } from "../native-runtime/native-turn-budget.js";
 import { createDurableRunLogStore } from "../run-log-store.js";
 import { createServer } from "node:http";
 import { registerLocalRuntimeApiServer } from "../../runtime-api.js";
@@ -857,7 +857,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
   });
 
   it.each(["execution", "setup"] as const)("keeps the named prompt refusal and way out on the %s failed-run page", async phase => {
-    const cause = { kind: "newest_message" as const, bytes: 600000 };
+    const cause: NativePromptRefusalCause = { kind: "newest_message", bytes: 600000, remedies: ["edit_message", "delete_own_message", "new_followup_task"] };
     const f = await fixture(), error = new NativeTurnPromptExceedsCommandBoundError(cause);
     expect(nativeSessionFailureSourceCode(error)).toBe(error.code);
     expect(nativeSessionFailureDisposition(1, new Date(), error.code)).toMatchObject({ phase: "terminal_failure", failureCode: error.code, nextAttemptAt: null });
@@ -866,7 +866,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     const failed = await read(f.run.id);
     expect(failed).toMatchObject({ status: "failed", errorCode: error.code, error: error.message,
       resultJson: { nativeTurnPromptRefusalCause: cause } });
-    expect(runFailureMessage(failed)).toMatch(/newest message.*split/i);
+    expect(runFailureMessage(failed)).toMatch(/newest message.*if you wrote it.*new short follow-up task/i);
   });
 
   it.each(["execution", "setup"] as const)("retains a provider startup cause at the outer %s settlement boundary", async phase => {
