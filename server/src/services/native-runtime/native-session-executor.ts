@@ -1173,6 +1173,11 @@ export async function reserveWarmNativeInstructionDirectory(input: {
 export async function closeWarmNativeSessionsForEnvironment(input: {
   environmentId: string;
   providerLeaseId?: string;
+  companyId?: string;
+  runId?: string;
+  /** Terminal-task retirement requires a real suspend/checkpoint, never the
+   * destructive/operator fallback that merely proves an owner gone. */
+  requireCheckpoint?: boolean;
   reason: string;
   forceStopUnsettled?: boolean;
   db?: Db;
@@ -1333,6 +1338,9 @@ export async function prepareIdleWarmNativeSessionsForSleep(input: {
 async function closeIdleWarmNativeSessions(input: {
   environmentId?: string;
   providerLeaseId?: string;
+  companyId?: string;
+  runId?: string;
+  requireCheckpoint?: boolean;
   reason: string;
   closeBusyOnRelease?: boolean;
   detachReleased?: boolean;
@@ -1349,7 +1357,8 @@ async function closeIdleWarmNativeSessions(input: {
   let stopped = false;
   const closeEntry = async (sessionId: string, entry: WarmNativeSession) => {
     if (entry.busy || entry.preparingRunId || executingRunnerdSessionScopes.has(sessionId)
-      || (input.canRetire && (entry.instructionPreparationRunId || closingWarmNativeSessions.has(sessionId)))) {
+      || (input.requireCheckpoint && entry.controllerDetachedForRestart)
+      || ((input.canRetire || input.requireCheckpoint) && (entry.instructionPreparationRunId || closingWarmNativeSessions.has(sessionId)))) {
       // A busy turn can complete while another idle session is checkpointing.
       // Fence that entry now so its eventual release cannot leave a new idle
       // owner behind after the shutdown sweep has already passed it.
@@ -1360,7 +1369,9 @@ async function closeIdleWarmNativeSessions(input: {
     // The host owns retention after release; a quiet local handle needs no retirement for sleep.
     if (input.canRetire && entry.released && !entry.closeOnReleaseReason) return;
     const detach = input.detachReleased === true && entry.released === true && !entry.closeOnReleaseReason;
-    if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
+    // Strict done-stop is opportunistic: a failed save must leave the
+    // existing idle deadline in charge, not replace it with a non-strict retry.
+    if (!input.requireCheckpoint && entry.idleTimer !== null) clearTimeout(entry.idleTimer);
     // Keep a fenced owner until both retirement and stopped collection succeed.
     // Failure must not make a live directory eligible for a replacement owner.
     entry.busy = true;
@@ -1375,15 +1386,18 @@ async function closeIdleWarmNativeSessions(input: {
     closingWarmNativeSessions.set(sessionId, closing);
     try {
       await closing;
+      if (input.requireCheckpoint && entry.idleTimer !== null) clearTimeout(entry.idleTimer);
       forgetWarmNativeSession(sessionId, entry);
       closed += 1;
     } catch (error) {
+      // As with stock close failures, retain the close-on-release fence. A
+      // half-closed owner must not become eligible for warm reuse again.
       if (detach) entry.closeOnReleaseReason = "released Runner local detach is unconfirmed";
       if (!detach && error instanceof AgentDirectoryOperationBusyError) {
         busy += 1;
         return;
       }
-      if (!detach && await warmCloseFailureProvesOwnerGone(entry, error, input.db ?? entry.sandboxLeaseDb)) {
+      if (!detach && !input.requireCheckpoint && await warmCloseFailureProvesOwnerGone(entry, error, input.db ?? entry.sandboxLeaseDb)) {
         logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
           providerLeaseId: entry.providerLeaseId ?? null, reason: input.reason, closeFailure: describeWarmCloseFailure(error) },
         "warm native session's Runner or sandbox is gone; released its owner");
@@ -1392,7 +1406,7 @@ async function closeIdleWarmNativeSessions(input: {
         return;
       }
       failed += 1;
-      if (!detach && entry.idleCloseRetries !== undefined) retryIdleCloseAfterSweep.push([sessionId, entry]);
+      if (!detach && !input.requireCheckpoint && entry.idleCloseRetries !== undefined) retryIdleCloseAfterSweep.push([sessionId, entry]);
       const forced = forcedStopFailure === undefined ? "" : `; forced Runner stop failed: ${describeWarmCloseFailure(forcedStopFailure)}`;
       failures.push({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
         providerLeaseId: entry.providerLeaseId ?? null,
@@ -1411,6 +1425,8 @@ async function closeIdleWarmNativeSessions(input: {
   const owners = [...warmNativeSessions];
   if (input.abort) owners.sort((a, b) => b[1].lastActivityAt.localeCompare(a[1].lastActivityAt));
   for (const [sessionId, entry] of owners) {
+    if (input.companyId !== undefined && entry.companyId !== input.companyId) continue;
+    if (input.runId !== undefined && entry.runId !== input.runId) continue;
     if (input.environmentId !== undefined && entry.environmentId !== input.environmentId) continue;
     if (input.providerLeaseId !== undefined && entry.providerLeaseId !== input.providerLeaseId) continue;
     const agentKey = `${entry.companyId}:${entry.agentId}`;
