@@ -1020,7 +1020,8 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       if (environment.driver === "local") return false;
       if (environment.driver !== "sandbox") return true;
       const provider = typeof environment.config?.provider === "string" ? environment.config.provider : null;
-      return provider !== null && provider !== "fake";
+      // Restricted list responses redact config; an unknown provider is not a fake provider.
+      return provider !== "fake";
     }),
     [environments, supportedEnvironmentDrivers],
   );

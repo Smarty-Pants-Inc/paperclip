@@ -1768,6 +1768,38 @@ describe("AgentConfigForm environment selector", () => {
     expect(selector?.textContent).toContain("E2B · sandbox");
   });
 
+  it.each(["workers", "boat-default"].flatMap(current => [false, true].map(omitConfig => ({ current, omitConfig }))))(
+    "keeps every captured sandbox choice when its provider is unknown (current: $current, omit config: $omitConfig)",
+    async ({ current, omitConfig }) => {
+      // Gate-7's 200 list: 17 sandbox rows (one archived) + Local; no config keys.
+      // Restricted readers intentionally receive config: {}, not provider credentials.
+      const names = ["workers", "boat-plain", "boat-edge-cold", "boat-edge-cold2", "boat-edge-cold3", "boat-edge",
+        "boat-paul-try", "boat-paul-smarty", "boat-default", "boat-small", "boat-snap", "boat-snap-short-idle (test, 5 min)",
+        "boat-clean", "boat-sync", "boat-spare", "boat-plain-pt", "boat-standin"];
+      const environments = names.map(name => {
+        const environment = makeEnvironment({ id: name, name, driver: "sandbox", status: name === "boat-spare" ? "archived" : "active" });
+        if (omitConfig) delete (environment as Partial<Environment>).config;
+        return environment;
+      });
+      const fake = makeEnvironment({ id: "fake", name: "Internal probe", driver: "sandbox", config: { provider: "fake" } });
+      const result = await renderForm([...environments, makeEnvironment({ id: "local", name: "Local" }), fake], {
+        adapterType: "paperclip_runner", defaultEnvironmentId: current,
+        adapterConfig: { provider: "pi_rpc", model: "saved-model", piRpcThinkingLevel: "medium" },
+      });
+      roots.push(result.root);
+      const options = await environmentOptions(result.container);
+      expect([...options.querySelectorAll('[role="option"]')].map(option => option.textContent)).toEqual([
+        "Default: Local", ...names.map(name => `${name} · sandbox`),
+      ]);
+      expect(options.textContent).not.toContain("Internal probe");
+      expect(options.querySelectorAll(`[data-value="${current}"]`)).toHaveLength(1);
+      const next = current === "workers" ? "boat-small" : "workers";
+      await clickElement(options.querySelector(`[data-value="${next}"]`));
+      await clickByText(result.container, "Save");
+      expect(result.onSave).toHaveBeenCalledWith({ defaultEnvironmentId: next });
+    },
+  );
+
   it("keeps an existing non-runnable override visible so it can be cleared", async () => {
     const result = await renderForm(
       [
