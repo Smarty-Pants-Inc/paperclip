@@ -262,12 +262,15 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
           authorAgentId: sender.id, body: "Bridge agent asks for a held reply" });
         // Separate root-DB reads prove both authored comment and admission are
         // committed, not visible only inside a comment/admission transaction.
-        expect((await db.select().from(issueComments).where(eq(issueComments.id, comment.id)))[0].authorAgentId).toBe(sender.id);
+        const [savedComment] = await db.select().from(issueComments).where(eq(issueComments.id, comment.id));
+        expect(savedComment.authorAgentId).toBe(sender.id);
         expect(heldSteering.sent).toEqual([comment.id]);
         const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, scope.agentId));
         expect(wake).toMatchObject({ status: "cancelled", requestedByActorType: "agent", requestedByActorId: sender.id });
         const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
-        expect(run.resultJson?.queuedSteeringAcknowledgements).toMatchObject({ [comment.id]: { status: "acknowledged" } });
+        expect(run.resultJson?.queuedSteeringAcknowledgements).toMatchObject({ [comment.id]: {
+          status: "acknowledged", commentUpdatedAt: savedComment.updatedAt.toISOString(),
+        } });
         const event = { eventType: "item.completed" as const, runId: scope.runId, normalizedSessionId: run.nativeSessionId!,
           sourceEventId: "plugin-held-answer", itemId: "plugin-held-answer", payload: { kind: "agentMessage", channel: "final",
             text: "Bridge held reply answered once.", answers: [comment.id] } };

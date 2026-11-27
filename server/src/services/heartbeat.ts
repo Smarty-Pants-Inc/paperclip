@@ -4124,11 +4124,17 @@ export function heartbeatService(
         // release reopens the finished task for it (work-intent outbox). If
         // this fast path fails or the closing run has not settled yet, the
         // ownership reconciler saves it once that run settles.
-        await deferUndeliveredCommentsOfStaleRun(db, run).catch(err =>
-          logger.warn({ err, runId: run.id }, "could not save the messages of a stale continuation"));
+        // A verified empty successor owes nothing. Do not requeue its saved
+        // wake IDs through the ownership-change undelivered-message repair.
+        if (outerErr.code === "continuation_task_ownership_changed") {
+          await deferUndeliveredCommentsOfStaleRun(db, run).catch(err =>
+            logger.warn({ err, runId: run.id }, "could not save the messages of a stale continuation"));
+        }
         await cancelRunInternal(run.id, outerErr.code, {
           errorCode: outerErr.code,
-          eventMessage: "stale execution continuation cancelled before dispatch",
+          eventMessage: outerErr.code === "continuation_nothing_new"
+            ? "continuation settled before dispatch: nothing new"
+            : "stale execution continuation cancelled before dispatch",
           suppressImmediateRecovery: true,
         });
       } else if (outerErr instanceof AgentDirectoryPreparationDeferral && await finalizeAgentDirectoryBusyDeferral(run, outerErr)

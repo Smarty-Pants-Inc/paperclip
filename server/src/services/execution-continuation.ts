@@ -22,6 +22,7 @@ import { githubRecoveryReceipts } from "./chat-channels/github/recovery-receipts
 import { readTaskRetryIntent } from "./task-retry.js";
 import { readByEarlierTurnCommentIds } from "./queued-comment-delivery.js";
 import type { NativeContinuationReadState } from "./native-runtime/native-turn-budget.js";
+import { retainedSessionCommentCoverage } from "./native-runtime/continuous-session-input.js";
 
 const retryWakeReasons = new Set(["task_retry", "retry_failed_run"]);
 const maxRequeueChain = 32;
@@ -53,7 +54,7 @@ function continuationApiResult(operationId: string, result: unknown, companyId: 
 }
 
 export class StaleExecutionContinuationError extends Error {
-  constructor(readonly code: "continuation_task_ownership_changed") {
+  constructor(readonly code: "continuation_task_ownership_changed" | "continuation_nothing_new") {
     super(code);
     this.name = "StaleExecutionContinuationError";
   }
@@ -408,12 +409,19 @@ export async function buildExecutionContinuation(input: {
     && Array.isArray(priorCoverage.omitted)
     ? priorCoverage.omitted.map(object) : [];
   const omittedRevision = (message: ExecutionContinuationEnvelope["messages"][number]) => omitted.some(prior => prior.id === message.id && prior.updatedAt === message.updatedAt);
+  const retainedCoverage = input.previousContextRunId && input.nativeSessionId && input.nativeProviderSessionId
+    && previousRun?.nativeSessionId === input.nativeSessionId
+    ? await retainedSessionCommentCoverage(db, { companyId, issueId, agentId: input.agentId, runId: input.runId,
+        previousRunId: input.previousContextRunId, sessionId: input.nativeSessionId,
+        providerSessionId: input.nativeProviderSessionId, messages }) : null;
   const resumeDelta =
     deliveredMessages && input.previousContextRunId
       ? {
           baseRunId: input.previousContextRunId,
           messages: messages.filter(
             (message) =>
+              retainedCoverage?.owed.has(message.id) ||
+              (retainedCoverage ? !retainedCoverage.received.has(message.id) :
               originCommentIds.includes(message.id) ||
               !(omittedRevision(message) || deliveredMessages.some(
                 (prior) =>
@@ -425,7 +433,7 @@ export async function buildExecutionContinuation(input: {
                   (prior.createdByRunId ?? null) === message.createdByRunId &&
                   JSON.stringify(prior.sourceTrust) ===
                     JSON.stringify(message.sourceTrust),
-              )),
+              ))),
           ),
         }
       : undefined;
@@ -454,14 +462,11 @@ export async function buildExecutionContinuation(input: {
     .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
   if (input.onNativeReadState) {
     const read = await readByEarlierTurnCommentIds(db, { companyId, issueId, agentId: input.agentId,
-      commentIds: messages.map(message => message.id), currentRunId: input.runId });
-    // A stored snapshot alone is not delivery proof: size refusal can precede
-    // acceptance. Only a prior accepted turn can make its exact revisions read.
-    if (accepted && deliveredMessages) for (const message of messages) {
-      if (omittedRevision(message) || deliveredMessages.some(prior => prior.id === message.id && prior.updatedAt === message.updatedAt && prior.body === message.body
-        && prior.deleted === message.deleted && prior.authorId === message.authorId
-        && (prior.createdByRunId ?? null) === message.createdByRunId && JSON.stringify(prior.sourceTrust) === JSON.stringify(message.sourceTrust))) read.add(message.id);
-    }
+      commentIds: messages.map(message => message.id), currentRunId: input.runId,
+      retainedGeneration: { nativeSessionId: input.nativeSessionId ?? null, providerSessionId: input.nativeProviderSessionId ?? null } });
+    if (retainedCoverage) for (const id of retainedCoverage.received) read.add(id);
+    // Fresh/unknown sessions cannot inherit a previous generation's budget
+    // cuts. Only the generation-scoped read/retention evidence above counts.
     const lastRun = priorRuns.findLast(run => run.id !== input.runId);
     input.onNativeReadState({ lastRunAt: (lastRun?.startedAt ?? lastRun?.createdAt)?.toISOString() ?? null, readCommentIds: [...read] });
   }
