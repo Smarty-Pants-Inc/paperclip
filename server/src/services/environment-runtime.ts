@@ -1131,19 +1131,21 @@ async function latestDurableTerminalPiSource(db: Db, sources: Awaited<ReturnType
 
 async function terminalPiTaskResetBoundary(db: Db, input: { companyId: string; issueId: string | null; agentId: string | null }) {
   if (!input.issueId || !input.agentId) return null;
-  // A real task-session reset is an authority boundary even before the new
-  // conversation has recorded provider work. Historical held boxes stay held.
+  // A person can reset immediately; an automatic fresh retry is a boundary
+  // only after it has bound a native session. Scheduling or a pre-start failure
+  // must not make the saved conversation historical.
   const [reset] = await db.select({ createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId),
     eq(boundRunIssueIdSql(), input.issueId),
-    sql`(${heartbeatRuns.contextSnapshot}->>'explicitFreshSession' = 'true'
+    sql`((${heartbeatRuns.contextSnapshot}->>'explicitFreshSession' = 'true'
+        and ${heartbeatRuns.nativeSessionId} is not null)
       or ${heartbeatRuns.contextSnapshot}->>'conversationReset' = 'true')`,
   )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
   return reset?.createdAt ?? null;
 }
 
-/** Reopen authority is the task's latest durable Pi session, not lease order. */
-async function latestDurableTerminalPiTaskSource(db: Db, input: { companyId: string; issueId: string | null; agentId: string | null }) {
+/** Reopen authority is the task's latest Pi session, even before provider work. */
+async function latestTerminalPiTaskSource(db: Db, input: { companyId: string; issueId: string | null; agentId: string | null }) {
   if (!input.issueId || !input.agentId) return null;
   const reset = await terminalPiTaskResetBoundary(db, input);
   const sources = await db.select({ id: heartbeatRuns.id, createdAt: heartbeatRuns.createdAt, companyId: heartbeatRuns.companyId,
@@ -1151,9 +1153,11 @@ async function latestDurableTerminalPiTaskSource(db: Db, input: { companyId: str
     .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId),
       eq(boundRunIssueIdSql(), input.issueId), eq(heartbeatRuns.runtimeMode, "native"), isNotNull(heartbeatRuns.nativeSessionId),
       reset ? sql`${heartbeatRuns.createdAt} >= ${reset.toISOString()}::timestamptz` : undefined,
-      sql`${heartbeatRuns.runnerProfileJson}#>>'{nativeExecutionInput,provider,kind}' = 'pi_rpc'`,
-    )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id));
-  return latestDurableTerminalPiSource(db, sources);
+      // Acquisition can precede the provider profile being saved. Its native
+      // session is still the task's requested session, not the other box's.
+      sql`coalesce(${heartbeatRuns.runnerProfileJson}#>>'{nativeExecutionInput,provider,kind}', 'pi_rpc') = 'pi_rpc'`,
+    )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+  return sources[0] ?? null;
 }
 
 /** A null lease task uses exactly the run binding used by terminal finalization.
@@ -1171,14 +1175,11 @@ async function reusableTerminalLeaseMatchesTask(db: Db, lease: EnvironmentLease,
 }) {
   if (!lease.metadata?.sandboxStopAndRetainReceipt && !lease.metadata?.terminalPiSandboxPreviousRunId
     && !lease.metadata?.terminalPiSandboxOrigin) return true;
-  const sources = await terminalPiSandboxSources(db, lease);
-  const source = await latestDurableTerminalPiSource(db, sources);
-  // Without durable provider work, retain the ordinary pre-fence reuse path.
-  if (!source) {
-    const reset = await terminalPiTaskResetBoundary(db, input);
-    return !reset || !sources[0] || sources[0].createdAt >= reset;
-  }
-  const taskSource = await latestDurableTerminalPiTaskSource(db, input);
+  const reset = await terminalPiTaskResetBoundary(db, input);
+  const sources = (await terminalPiSandboxSources(db, lease)).filter(source => !reset || source.createdAt >= reset);
+  const source = await latestDurableTerminalPiSource(db, sources) ?? sources[0];
+  if (!source) return !reset;
+  const taskSource = await latestTerminalPiTaskSource(db, input);
   return source.issueId === input.issueId && source.agentId === input.agentId && source.sessionId === taskSource?.sessionId;
 }
 
@@ -1204,8 +1205,10 @@ async function waitForSettlingReusableLease(db: Db, input: {
         && (current.metadata?.sandboxStopAndRetainReceipt as Record<string, unknown>)?.requestId === requestId) return toEnvironmentLeaseSnapshot(current);
       const currentIntent = current.metadata?.[SANDBOX_STOP_AND_RETAIN_KEY];
       if (current.status !== "pending_cleanup" || !isRecord(currentIntent) || !isRecord(currentIntent.terminalPiSandbox)) return null;
-      const taskSource = await latestDurableTerminalPiTaskSource(db, input);
-      const source = await latestDurableTerminalPiSource(db, await terminalPiSandboxSources(db, current));
+      const taskSource = await latestTerminalPiTaskSource(db, input);
+      const reset = await terminalPiTaskResetBoundary(db, input);
+      const sources = (await terminalPiSandboxSources(db, current)).filter(source => !reset || source.createdAt >= reset);
+      const source = await latestDurableTerminalPiSource(db, sources) ?? sources[0];
       if (!source || source.issueId !== input.issueId || source.agentId !== input.agentId
         || source.sessionId !== taskSource?.sessionId) return null;
       if (current.metadata?.pendingCleanupInFlight !== true
@@ -1220,8 +1223,7 @@ async function waitForSettlingReusableLease(db: Db, input: {
         eq(environmentLeases.companyId, input.companyId),
         eq(environmentLeases.environmentId, input.environmentId),
         eq(environmentLeases.leasePolicy, "reuse_by_environment"),
-        or(and(inArray(environmentLeases.status, ["released", "retained"]),
-          sql`${environmentLeases.metadata} ?| array['sandboxStopAndRetainReceipt', 'terminalPiSandboxPreviousRunId', 'terminalPiSandboxOrigin']`),
+        or(inArray(environmentLeases.status, ["released", "retained"]),
           and(eq(environmentLeases.status, "pending_cleanup"),
           sql`${environmentLeases.metadata}->'sandboxStopAndRetain' ? 'terminalPiSandbox'`,
           or(eq(environmentLeases.heartbeatRunId, input.heartbeatRunId),
@@ -1238,34 +1240,36 @@ async function waitForSettlingReusableLease(db: Db, input: {
         sql`${environmentLeases.metadata}->>'agentId' = ${input.agentId}`,
       )).orderBy(environmentLeases.id);
     const ordinary: typeof environmentLeases.$inferSelect[] = [];
-    const terminalCandidates: Array<{ lease: typeof environmentLeases.$inferSelect;
+    const terminalCandidates: Array<{ lease: typeof environmentLeases.$inferSelect; durable: boolean;
       source: NonNullable<Awaited<ReturnType<typeof latestDurableTerminalPiSource>>> }> = [];
-    const taskSource = await latestDurableTerminalPiTaskSource(db, input);
+    const taskSource = await latestTerminalPiTaskSource(db, input);
     const reset = await terminalPiTaskResetBoundary(db, input);
     for (const { lease } of selected) {
       const raw = lease.metadata?.[SANDBOX_STOP_AND_RETAIN_KEY];
       const terminal = isRecord(raw) && isRecord(raw.terminalPiSandbox);
       const held = lease.metadata?.sandboxStopAndRetainReceipt || lease.metadata?.terminalPiSandboxPreviousRunId
         || lease.metadata?.terminalPiSandboxOrigin;
-      if (!terminal && !held) { ordinary.push(lease); continue; }
+      if (!terminal && !held && !["released", "retained"].includes(lease.status)) { ordinary.push(lease); continue; }
       if (!input.issueId) continue;
-      const sources = await terminalPiSandboxSources(db, lease);
-      // A saved session id alone may be an unused/inherited bootstrap. Find
-      // the latest source with provider progress on this exact allocation;
-      // never hand off another task's conversation or an empty second box.
+      const sources = (await terminalPiSandboxSources(db, lease)).filter(source => !reset || source.createdAt >= reset);
+      // Provider progress identifies a durable conversation on this allocation.
+      // Without it, the latest source still owns a real pending stop: never
+      // substitute an empty box while that task's chosen stop is unfinished.
       const durableSource = await latestDurableTerminalPiSource(db, sources);
-      if (durableSource?.issueId === input.issueId && durableSource.agentId === input.agentId) {
-        if (durableSource.sessionId === taskSource?.sessionId) terminalCandidates.push({ lease, source: durableSource });
-      } else if (!durableSource && !taskSource && sources[0]?.issueId === input.issueId
-        && sources[0]?.agentId === input.agentId && (!reset || sources[0].createdAt >= reset)) {
-        // No provider work is not a terminal-stop fence. It may still use the
-        // existing unattempted-stop handoff and ordinary reusable-box path.
-        ordinary.push(lease);
+      // A completed handoff drops terminal metadata. Keep its Pi allocation
+      // in the census so a leftover second stop cannot steal the next message.
+      if (!terminal && !held && sources.length === 0) continue;
+      const source = durableSource ?? sources[0];
+      if (source?.issueId === input.issueId && source.agentId === input.agentId
+        && source.sessionId === taskSource?.sessionId && (!reset || source.createdAt >= reset)) {
+        terminalCandidates.push({ lease, source, durable: !!durableSource });
       }
     }
-    // A census ambiguity is not an unfinished stop. Prefer the newest durable
-    // source deterministically; only its actual pending terminal stop fences.
-    terminalCandidates.sort((a, b) => b.source.createdAt.getTime() - a.source.createdAt.getTime()
+    // Keep a proven conversation ahead of an unused bootstrap of the same
+    // session. Otherwise prefer the newest source, then stable ids. Only the
+    // chosen box's actual pending terminal stop can fence an acquisition.
+    terminalCandidates.sort((a, b) => Number(b.durable) - Number(a.durable)
+      || b.source.createdAt.getTime() - a.source.createdAt.getTime()
       || b.source.id.localeCompare(a.source.id) || a.lease.id.localeCompare(b.lease.id));
     const settling = terminalCandidates[0]?.lease ?? ordinary[0];
     if (!settling) return null;

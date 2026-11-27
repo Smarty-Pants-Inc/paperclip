@@ -6041,6 +6041,123 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(result.error).not.toBe("reusable_sandbox_terminal_stop_unsettled");
   });
 
+  it("terminal stop without provider work refuses through backoff and task-session reset, then reuses the same box", async () => {
+    const f = await terminalConversationFixture();
+    await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.runId));
+    await chTerminal(f, "done", 360_000);
+    const dispatch = f.call.getMockImplementation()!;
+    let broken = true;
+    f.call.mockImplementation(async (id, method, params) => {
+      if (broken && method === "environmentStopLease") throw new Error("provider stop unavailable");
+      return dispatch(id, method, params);
+    });
+    await chSweep(f);
+    for (let i = 0; i < 2; i++) {
+      expect((await chReopen(f)).error).toBe("reusable_sandbox_terminal_stop_unsettled");
+    }
+    await createHeartbeatRunState(db).resetRuntimeSession(f.agentId, { taskKey: f.issueId });
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId,
+      issueId: f.issueId, nativeIssueId: f.issueId, nativeSessionId: f.sessionId, runtimeMode: "native",
+      status: "running", invocationSource: "on_demand" });
+    const input = { ...f.input, heartbeatRunId: runId };
+    await expect(f.runtime.acquireRunLease(input)).rejects.toMatchObject({ reason: "reusable_sandbox_terminal_stop_unsettled" });
+    expect(chCount(f, "environmentAcquireLease")).toBe(0);
+    broken = false;
+    await chDue(f); await chSweep(f);
+    const next = await f.runtime.acquireRunLease(input);
+    const reply = await f.runtime.execute({ environment: f.environment, lease: next.lease, command: "recall" });
+    chRow("NO_WORK_STOP_REPAIRED", { originalBox: f.originalBox, selectedBox: next.lease.providerLeaseId,
+      answer: f.answer, reply: reply.stdout, creates: chCount(f, "environmentAcquireLease") });
+    expect(next.lease.providerLeaseId).toBe(f.originalBox); expect(reply.stdout).toBe(f.answer);
+    expect(chCount(f, "environmentAcquireLease")).toBe(0);
+  });
+
+  it.each([false, true].flatMap(otherFirst => [false, true].map(sameSession => ({ otherFirst, sameSession }))))(
+    "terminal boxes without provider work follow the requested native session (other first=$otherFirst, same session=$sameSession)", async ({ otherFirst, sameSession }) => {
+    const f = await terminalConversationFixture();
+    await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.runId));
+    const otherRun = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: otherRun, companyId: f.companyId, agentId: f.agentId,
+      issueId: f.issueId, nativeIssueId: f.issueId, nativeSessionId: sameSession ? f.sessionId : randomUUID(), runtimeMode: "native",
+      status: "failed", invocationSource: "on_demand", finishedAt: new Date(),
+      createdAt: sameSession ? new Date(f.lease.createdAt.getTime() - 60_000) : new Date(),
+      runnerProfileJson: { nativeExecutionInput: { provider: { kind: "pi_rpc" } } } });
+    const [source] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+    await db.insert(environmentLeases).values({ ...source!, id: otherFirst
+      ? "00000000-0000-4000-8000-000000000001" : "ffffffff-ffff-4fff-bfff-ffffffffffff",
+      heartbeatRunId: otherRun, providerLeaseId: "other-terminal-box" });
+    await chTerminal(f, "done", 360_000);
+    const result = await chReopen(f);
+    expect(result.error).toBeNull(); expect(result.box).toBe(f.originalBox); expect(result.reply).toBe(f.answer);
+    await f.runtime.releaseRunLeases(result.runId!, "released", undefined, "keep_running");
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, result.runId!));
+    const again = await chReopen(f);
+    chRow("NO_WORK_TWO_BOXES", { otherFirst, sameSession, originalBox: f.originalBox, answer: f.answer, result, again });
+    expect(again.error).toBeNull(); expect(again.box).toBe(f.originalBox); expect(again.reply).toBe(f.answer);
+    expect(chCount(f, "environmentAcquireLease")).toBe(0);
+  });
+
+  it.each(["scheduled_retry", "cancelled", "failed"] as const)(
+    "a real fresh blocker retry that never bound a session preserves the saved box (%s)", async status => {
+    const f = await terminalConversationFixture();
+    await chTerminal(f, "done", 360_000); await chSweep(f);
+    const { materializeNativeEnvironmentBlockerRetry } = await import("../services/native-runtime/native-provider-capacity-retry.js");
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "native_environment_blocker", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, f.runId));
+    const retryId = await db.transaction(tx => materializeNativeEnvironmentBlockerRetry({ tx: tx as never,
+      companyId: f.companyId, issueId: f.issueId, runId: f.runId, agentId: f.agentId }));
+    if (status !== "scheduled_retry") await db.update(heartbeatRuns).set({ status, finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, retryId));
+    const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retryId));
+    expect(retry!.contextSnapshot?.explicitFreshSession).toBe(true); expect(retry!.nativeSessionId).toBeNull();
+    const result = await chReopen(f);
+    chRow("FRESH_RETRY_NO_SESSION", { status, retryId, originalBox: f.originalBox, answer: f.answer, result });
+    expect(result.error).toBeNull(); expect(result.box).toBe(f.originalBox); expect(result.reply).toBe(f.answer);
+    expect(chCount(f, "environmentAcquireLease")).toBe(0);
+  });
+
+  it("a fresh reset that bound a session but failed before provider work fences only its own pending box", async () => {
+    const f = await terminalConversationFixture();
+    await chTerminal(f, "done", 360_000);
+    const dispatch = f.call.getMockImplementation()!;
+    let broken = true;
+    f.call.mockImplementation(async (id, method, params) => {
+      if (broken && method === "environmentStopLease") throw new Error("provider stop unavailable");
+      return dispatch(id, method, params);
+    });
+    await chSweep(f);
+    const older = (await environmentService(db).getLeaseById(f.lease.id))!;
+    const runId = randomUUID(), sessionId = randomUUID(), answer = `fresh-${randomUUID()}`;
+    await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId,
+      issueId: f.issueId, nativeIssueId: f.issueId, nativeSessionId: sessionId, runtimeMode: "native",
+      status: "running", invocationSource: "on_demand", contextSnapshot: { explicitFreshSession: true },
+      runnerProfileJson: { nativeExecutionInput: { provider: { kind: "pi_rpc" } } } });
+    const fresh = await f.runtime.acquireRunLease({ ...f.input, heartbeatRunId: runId });
+    expect(fresh.lease.providerLeaseId).not.toBe(f.originalBox);
+    expect(await environmentService(db).getLeaseById(f.lease.id)).toEqual(older);
+    await f.runtime.execute({ environment: f.environment, lease: fresh.lease, command: "remember", args: [answer] });
+    await f.runtime.releaseRunLeases(runId, "released", undefined, "keep_running");
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+    expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId))).toHaveLength(0);
+    await f.runtime.destroyReusableSandboxLeases({ companyId: f.companyId, issueId: f.issueId, failureReason: "issue_terminal_done" });
+    await chSweep(f);
+    const nextId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: nextId, companyId: f.companyId, agentId: f.agentId,
+      issueId: f.issueId, nativeIssueId: f.issueId, nativeSessionId: sessionId, runtimeMode: "native",
+      status: "running", invocationSource: "on_demand" });
+    const input = { ...f.input, heartbeatRunId: nextId };
+    await expect(f.runtime.acquireRunLease(input)).rejects.toMatchObject({ reason: "reusable_sandbox_terminal_stop_unsettled",
+      providerLeaseId: fresh.lease.providerLeaseId });
+    broken = false; await chDue(f); await chSweep(f);
+    const next = await f.runtime.acquireRunLease(input);
+    const reply = await f.runtime.execute({ environment: f.environment, lease: next.lease, command: "recall" });
+    chRow("BOUND_RESET_NO_WORK", { oldBox: f.originalBox, freshBox: fresh.lease.providerLeaseId,
+      selectedBox: next.lease.providerLeaseId, answer, reply: reply.stdout, creates: chCount(f, "environmentAcquireLease") });
+    expect(next.lease.providerLeaseId).toBe(fresh.lease.providerLeaseId); expect(reply.stdout).toBe(answer);
+    expect(chCount(f, "environmentAcquireLease")).toBe(1); expect(chCount(f, "environmentDestroyLease")).toBe(0);
+  });
+
   async function terminalConversationFixture(options: { backup?: boolean; session?: boolean; live?: boolean; projectless?: boolean } = {}) {
     const f = await seedReusablePluginSandboxLease("paperclip_runner");
     const issueId = randomUUID(), sessionId = randomUUID(), runnerInstanceId = randomUUID();
