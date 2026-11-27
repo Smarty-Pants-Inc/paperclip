@@ -580,7 +580,9 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
     const [previousNativeGeneration] = previousNativeRun ? await db.select({ providerSessionId: sql<string | null>`coalesce(
       (select generation_event.payload->'prpEvent'->'payload'->>'providerSessionId'
         from ${heartbeatRunEvents} generation_event
-        where generation_event.company_id = ${heartbeatRuns.companyId} and generation_event.run_id = ${heartbeatRuns.id}
+        -- Drizzle renders single-table columns unqualified; inside this subquery an
+        -- unqualified id / company_id would bind to heartbeat_run_events' own columns.
+        where generation_event.company_id = "heartbeat_runs"."company_id" and generation_event.run_id = "heartbeat_runs"."id"
           and generation_event.event_type in ('session.started', 'session.resumed', 'session.reconciled')
         order by generation_event.seq desc limit 1),
       ${heartbeatRuns.contextSnapshot}->'nativeContinuationReadState'->>'providerSessionId',
