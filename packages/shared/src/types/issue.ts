@@ -1368,6 +1368,17 @@ export interface ConversationTaskHandoff {
   identifier: string | null;
   title: string;
   status: IssueStatus;
+  /** Status evidence is optional for compatibility with older servers. */
+  displayStatus?: Issue["displayStatus"];
+  externalConversationState?: "active" | "waiting" | null;
+  blockerAttention?: IssueBlockerAttention;
+  /** Current servers always send this key, null when no descriptor is saved. */
+  unblockDescriptor?: Issue["unblockDescriptor"] | null;
+  interruption?: Issue["interruption"] | null;
+  blockedInboxAttention?: Issue["blockedInboxAttention"] | null;
+  assigneeAgentId?: string | null;
+  assigneeUserId?: string | null;
+  updatedAt?: string;
   createdAt: string;
   /** Durable creation provenance; null for older or human-created handoffs. */
   sourceRunId: string | null;
