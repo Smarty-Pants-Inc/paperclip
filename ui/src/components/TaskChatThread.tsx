@@ -2451,18 +2451,23 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               waitSummary: acceptedSummary,
             })
           : undefined;
-      const sourceHasNativeResponse =
+      // Historical response fallback accepts unclassified authored text. That
+      // preserves words; it cannot prove a failed run completed a final response.
+      const sourceHasNativeOutput =
         sourceIsPaperclipRunner &&
         (Boolean(sourceYieldedResponse) || !sourceYielded) &&
         (sourceHasPresentationComment || Boolean(sourceYieldedResponse) ||
           Boolean(acceptedSummary) ||
           entries.some(
             (entry) =>
-              (entry.kind === "assistant" &&
-                entry.channel !== "progress" &&
-                Boolean(entry.text.trim())) ||
+              (entry.kind === "assistant" && entry.channel !== "progress" && Boolean(entry.text.trim())) ||
               (entry.kind === "run_result" && Boolean(entry.summary.trim())),
           ));
+      const sourceHasNativeResponse = sourceHasNativeOutput &&
+        (sourceHasPresentationComment || Boolean(acceptedSummary) || entries.some((entry) =>
+          (entry.kind === "assistant" && entry.channel === "final" && !entry.delta && Boolean(entry.text.trim())) ||
+          (entry.kind === "run_result" && Boolean(entry.summary.trim())),
+        ));
       const sourceHasNativeStop =
         sourceIsPaperclipRunner &&
         (source.status === "failed" ||
@@ -2715,7 +2720,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         sourceAllowSummaryFallback &&
         !sourceHasPresentationComment &&
         resolvedWithoutUserFacingResponse(meta?.resultJson) &&
-        !sourceHasNativeResponse
+        !sourceHasNativeOutput
       ) {
         const id = `${source.id}:terminal-notice`;
         if (!historical && (!props.interruption || credentialAccess)) entriesWithFailures.push({

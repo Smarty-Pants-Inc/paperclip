@@ -2701,6 +2701,56 @@ describe("TaskChatThread runtime transcript selection", () => {
     },
   );
 
+  it.each(["interim", "progress", "partial-final", "complete-final", "partial-yielded", "complete-yielded", "accepted-summary", "run-result"] as const)(
+    "describes the native failure response boundary truthfully for %s output", (evidence) => {
+      const runId = "native-response-boundary";
+      const complete = ["complete-final", "complete-yielded", "accepted-summary", "run-result"].includes(evidence);
+      nativeTranscriptState.hydratedRunIds = new Set([runId]);
+      nativeTranscriptState.transcriptByRun.set(runId, evidence === "run-result" ? [{
+        kind: "run_result", ts: "2026-08-25T18:00:01.000Z", summary: "Saved the useful response.",
+        disposition: "needs_review", objectiveSatisfied: false, verification: [], remainingWork: [], blocker: null, artifacts: [],
+      }] : evidence === "accepted-summary" ? [] : [
+        { kind: "assistant", ts: "2026-08-25T18:00:01.000Z", text: "I am checking the result.",
+          ...(evidence === "progress" ? { channel: "progress" } : evidence.includes("final") || evidence.includes("yielded") ? { channel: "final" } : {}),
+          ...(evidence.startsWith("partial-") ? { delta: true } : {}) },
+        ...(evidence.includes("yielded") ? [{ kind: "run_result", ts: "2026-08-25T18:00:01.500Z", summary: "",
+          disposition: "yielded", objectiveSatisfied: false, verification: [], remainingWork: [], blocker: null, artifacts: [] }] : []),
+        ...(evidence === "interim" ? [{ kind: "tool_call", ts: "2026-08-25T18:00:01.500Z",
+          name: "Bash", input: { command: "check-result" }, toolUseId: "check" }] : []),
+      ]);
+      renderThread({ comments: [], onAdd: async () => {}, linkedRuns: [{
+        runId, runtimeMode: "native", status: "failed", errorCode: "adapter_failed", agentId: "agent-1", agentName: "Runner",
+        adapterType: "paperclip_runner", createdAt: "2026-08-25T18:00:00.000Z", startedAt: "2026-08-25T18:00:00.000Z",
+        finishedAt: "2026-08-25T18:00:02.000Z", ...(evidence === "accepted-summary" ? {
+          resultJson: { acceptedResult: { schema: "paperclip.run_result.v1", summary: "Saved the useful response." } },
+        } : {}),
+      }] });
+      const marker = container.querySelector('[data-testid="task-chat-collapsible-marker"]');
+      expect(marker).not.toBeNull();
+      flushSync(() => marker!.querySelector<HTMLButtonElement>('button[aria-expanded="false"]')!.click());
+      const detail = container.querySelector('[data-testid="task-chat-collapsible-marker-details"]')?.textContent;
+      expect(detail).toContain(complete ? "The runner stopped after returning a final response (adapter_failed)." : "The runner stopped (adapter_failed).");
+      if (!complete) expect(detail).not.toContain("after returning a final response");
+    },
+  );
+
+  it("keeps the historical unclassified response fallback separate from a failed run's completed-response claim", () => {
+    const runId = "historical-unclassified-response";
+    nativeTranscriptState.hydratedRunIds = new Set([runId]);
+    nativeTranscriptState.transcriptByRun.set(runId, [
+      { kind: "assistant", ts: "2026-08-25T18:00:01.000Z", text: "Saved historical response." },
+    ]);
+    renderThread({ comments: [], onAdd: async () => {}, linkedRuns: [{
+      runId, runtimeMode: "native", status: "succeeded", agentId: "agent-1", agentName: "Runner",
+      adapterType: "paperclip_runner", createdAt: "2026-08-25T18:00:00.000Z", startedAt: "2026-08-25T18:00:00.000Z",
+      finishedAt: "2026-08-25T18:00:02.000Z", resultJson: {
+        presentationDecision: { schema: "paperclip.run_presentation_decision.v1", chosenSource: "none", commentId: null },
+      },
+    }] });
+    expect(container.textContent).toContain("Saved historical response.");
+    expect(container.textContent).not.toContain("The runner returned no user-facing response.");
+  });
+
   it("shows an actionable approval-required reason for a stopped native run", () => {
     renderThread({
       comments: [],
