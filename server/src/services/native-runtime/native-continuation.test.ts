@@ -25,6 +25,24 @@ describe("native continuation event projection", () => {
     expect(JSON.parse(text).messages[0]).toMatchObject({ authorType: "user", body: message.body });
     expect(text.length).toBeLessThan(600);
   });
+  it("uses the retained delta even when an already received steer remains in prompt-only wake IDs", () => {
+    const text = buildNativeContinuationPrompt({ wakePayload: { ...wake, commentIds: ["old", "new"] },
+      promptOnly: true, previousRunId: "prior", issue, previousIssue: issue });
+    expect(text).toBe(message.body);
+    expect(text).not.toContain("OLD_HISTORY");
+  });
+  it("preserves the empty prompt-only fallback without a verified delta", () => {
+    expect(buildNativeContinuationPrompt({ wakePayload: { ...wake, commentIds: [],
+      executionContinuation: { ...wake.executionContinuation, resumeDelta: undefined } },
+      promptOnly: true, previousRunId: "prior", issue, previousIssue: issue })).toBe("");
+  });
+  it.each([false, true])("keeps an empty retained delta off the full-bootstrap path (promptOnly=%s)", promptOnly => {
+    const text = buildNativeContinuationPrompt({ wakePayload: { ...wake, commentIds: ["old"], comments: [],
+      executionContinuation: { ...wake.executionContinuation, resumeDelta: { baseRunId: "prior", messages: [] } } },
+      promptOnly, previousRunId: "prior", issue, previousIssue: issue });
+    expect(JSON.parse(text!)).toEqual({ messages: [] });
+    expect(text).not.toContain("OLD_HISTORY");
+  });
   it("tells a resumed turn which delivered comments an earlier turn already read", () => {
     const comment = { id: "new", body: message.body, author: { type: "user", id: "board" } };
     const marked = JSON.parse(build({ ...wake, comments: [{ ...comment, readByEarlierTurn: true }] })!);

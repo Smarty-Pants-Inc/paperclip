@@ -6,6 +6,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
+  agentWakeupRequests,
   applyPendingMigrations,
   companies,
   createDb,
@@ -25,6 +26,7 @@ import { resolveExternalTestDatabaseUrl } from "../__tests__/helpers/external-te
 import { commandEnvelopeBytes, NATIVE_TURN_KNOWN_MAX_BYTES, type NativeContinuationReadState } from "./native-runtime/native-turn-budget.js";
 import { buildNativeExecutionInput } from "./native-runtime/native-execution-input.js";
 import { decideNativeContinuation } from "./native-runtime/continued-session.js";
+import { withQueuedCommentIdsInWakePayload } from "./issue-queued-comment-queue.js";
 import { nativeRuntimeContextFixture } from "./native-runtime/runtime-context.test-fixture.js";
 import { buildNativeModelEnvelope } from "../vendor/paperclip-runner/index.js";
 import { StaleExecutionContinuationError, buildExecutionContinuation, currentContinuationOrigins, projectHumanInteractionResponse } from "./execution-continuation.js";
@@ -251,6 +253,127 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
         previousRunId = nextRunId;
       }
     });
+    // PostgreSQL integration: retained-session input identity/revision is the
+    // boundary, not mocked DB/runner call counts.
+    it.each(["exact revision", "legacy pre-queue revision", "edited exact revision", "C31 origin cut"])("advances three retained native runs beyond the origin with a live steer (%s)", async receiptKind => {
+      const taskId = randomUUID(), sessionId = randomUUID(), firstRunId = randomUUID(), queueId = randomUUID();
+      const originId = randomUUID(), steeredId = randomUUID(), providerSessionId = `pi-${randomUUID()}`;
+      const revision = new Date("2026-01-01T00:00:00Z"), queuedAt = new Date("2026-01-01T00:01:00Z");
+      const steeredRevision = receiptKind === "edited exact revision" ? new Date("2026-01-01T00:01:30Z") : revision;
+      await db.insert(issues).values({ id: taskId, companyId, title: "Retained delta", status: "in_progress", assigneeAgentId: agentId });
+      await db.insert(issueComments).values({ id: originId, companyId, issueId: taskId, authorType: "user", authorUserId: "local-board",
+        body: "Original request", createdAt: revision, updatedAt: revision });
+      const baseline = await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId,
+        context: { commentId: originId }, summary: null, exposeLowTrustRaw: false });
+      if (receiptKind === "C31 origin cut") {
+        Object.assign(baseline.coverage, { nativeSessionId: sessionId, providerSessionId, omitted: [{ id: originId, updatedAt: revision.toISOString() }] });
+        baseline.messages = []; // Already-read origin cut out of the accepted command, not lost from task history.
+      }
+      await db.insert(heartbeatRuns).values({ id: firstRunId, companyId, agentId, runtimeMode: "native", nativeIssueId: taskId,
+        nativeSessionId: sessionId, status: "succeeded", createdAt: revision, contextSnapshot: { issueId: taskId, commentId: originId, executionContinuation: baseline },
+        resultJson: { queuedSteeringAcknowledgements: { [steeredId]: { status: "acknowledged", queueId, turnId: "first-turn",
+          ...(receiptKind !== "legacy pre-queue revision" ? { commentUpdatedAt: steeredRevision.toISOString() } : {}), acknowledgedAt: "2026-01-01T00:01:45.000Z" } } } });
+      await db.insert(heartbeatRunEvents).values([
+        { companyId, runId: firstRunId, agentId, seq: 0, eventType: "session.started", sourceEventId: "session",
+          payload: { prpEvent: { normalizedSessionId: sessionId, payload: { providerSessionId } } } },
+        { companyId, runId: firstRunId, agentId, seq: 1, eventType: "turn.accepted" },
+        { companyId, runId: firstRunId, agentId, seq: 2, eventType: "item.completed", sourceEventId: "steer-accepted",
+          payload: { prpEvent: { normalizedSessionId: sessionId, turnId: "first-turn", itemId: `first-turn:steer:${steeredId}`,
+            payload: { kind: "steering_acknowledgement", status: "acknowledged" } } } },
+      ]);
+      await db.insert(issueComments).values({ id: steeredId, companyId, issueId: taskId, authorType: "user", authorUserId: "local-board",
+        body: "Steered and answered during run one", createdAt: revision, updatedAt: steeredRevision });
+      await db.insert(agentWakeupRequests).values({ id: queueId, companyId, agentId, source: "issue", reason: "issue_commented", status: "cancelled",
+        createdAt: queuedAt, payload: withQueuedCommentIdsInWakePayload({ issueId: taskId }, [steeredId]) });
+      for (let turn = 2; turn <= 3; turn++) {
+        const wakeId = randomUUID(), nextRunId = randomUUID();
+        const at = new Date(Date.UTC(2026, 0, 1, 0, turn));
+        await db.insert(issueComments).values({ id: wakeId, companyId, issueId: taskId, authorType: "user", authorUserId: "local-board",
+          body: `New wake ${turn}`, createdAt: at, updatedAt: at });
+        // Keep the baseline pinned to the origin as on the reported row.
+        const snapshot = await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId, runId: nextRunId,
+          previousContextRunId: firstRunId, nativeSessionId: sessionId, nativeProviderSessionId: providerSessionId,
+          context: { previousRunId: firstRunId, commentId: wakeId, commentIds: [steeredId, wakeId], wakeReason: "issue_children_completed" }, summary: null, exposeLowTrustRaw: false });
+        expect(snapshot.originCommentIds).toContain(originId);
+        expect(snapshot.messages.map(message => message.id)).toContain(steeredId);
+        expect(snapshot.resumeDelta?.messages.map(message => message.id)).toEqual([wakeId]);
+        const issue = { id: taskId, identifier: null, title: "Retained delta", description: null, workMode: "standard" };
+        const options = { companyId, runId: nextRunId, agentId, provider: "pi_rpc" as const, normalizedSessionId: sessionId,
+          resumedSession: true, previousTurn: { runId: firstRunId, task: issue }, issue, taskPrompt: "Keep working.",
+          wakePayload: { reason: "issue_children_completed", commentIds: [steeredId, wakeId], executionContinuation: snapshot },
+          workspace: { id: "workspace", cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null }, runtimeContext: nativeRuntimeContextFixture(),
+          completionContract: { id: "contract", sha256: "a".repeat(64), schemaVersion: "paperclip.run-result.v1", contract: {
+            revision: "1", objective: "Continue", criteria: [{ id: "output", requirement: "Continue" }] } } };
+        const execution = buildNativeExecutionInput(options);
+        expect(JSON.stringify(buildNativeModelEnvelope(execution))).toContain("Steered and answered during run one");
+        const resumed = buildNativeModelEnvelope(execution, { resumedSession: true });
+        if (!("events" in resumed) || typeof resumed.events !== "string") throw new Error("expected retained continuation events");
+        expect(JSON.parse(resumed.events).messages.map((message: { id: string }) => message.id)).toEqual([wakeId]);
+        const plain = buildNativeExecutionInput({ ...options, wakePayload: { ...options.wakePayload, reason: "issue_commented" } });
+        const plainEnvelope = buildNativeModelEnvelope(plain, { resumedSession: true });
+        if (!("events" in plainEnvelope)) throw new Error("expected plain retained continuation events");
+        expect(plainEnvelope.events).toBe(`New wake ${turn}`);
+        console.log("retained successor PG evidence", JSON.stringify({ receiptKind, turn, taskId, sessionId, providerSessionId, previousContextRunId: firstRunId,
+          originId, steeredId, steeredRevision, wakeId, fullHistoryIds: snapshot.messages.map(message => message.id), delta: snapshot.resumeDelta?.messages.map(({ id, updatedAt }) => ({ id, updatedAt })),
+          plainEvents: plainEnvelope.events }));
+        await db.insert(heartbeatRuns).values({ id: nextRunId, companyId, agentId, runtimeMode: "native", nativeIssueId: taskId,
+          nativeSessionId: sessionId, status: "succeeded", createdAt: at, contextSnapshot: { issueId: taskId, executionContinuation: snapshot } });
+        await db.insert(heartbeatRunEvents).values([
+          { companyId, runId: nextRunId, agentId, seq: 0, eventType: "session.resumed", sourceEventId: "resumed",
+            payload: { prpEvent: { normalizedSessionId: sessionId, payload: { providerSessionId } } } },
+          { companyId, runId: nextRunId, agentId, seq: 1, eventType: "turn.accepted" },
+        ]);
+      }
+    });
+    it.each(["edited", "edited before late legacy ACK", "refused", "uncertain", "wrong session", "wrong turn", "fresh session", "fresh provider", "Stop hand-back", "pending queue"])(
+      "retains owed successor input after %s", async mode => {
+        const taskId = randomUUID(), sessionId = randomUUID(), firstRunId = randomUUID(), queueId = randomUUID();
+        const originId = randomUUID(), steeredId = randomUUID(), wakeId = randomUUID(), providerSessionId = `pi-${randomUUID()}`;
+        const revision = new Date("2026-01-01T00:00:00Z"), queuedAt = new Date("2026-01-01T00:01:00Z"), editedAt = new Date("2026-01-01T00:02:00Z");
+        await db.insert(issues).values({ id: taskId, companyId, title: "Owed input", status: "in_progress", assigneeAgentId: agentId });
+        await db.insert(issueComments).values({ id: originId, companyId, issueId: taskId, authorType: "user", authorUserId: "local-board",
+          body: "Original request", createdAt: revision, updatedAt: revision });
+        const baseline = await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId,
+          context: { commentId: originId }, summary: null, exposeLowTrustRaw: false });
+        await db.insert(heartbeatRuns).values({ id: firstRunId, companyId, agentId, runtimeMode: "native", nativeIssueId: taskId,
+          nativeSessionId: sessionId, status: "succeeded", contextSnapshot: { issueId: taskId, executionContinuation: baseline },
+          resultJson: { queuedSteeringAcknowledgements: { [steeredId]: { status: "acknowledged", queueId, turnId: "first-turn",
+            ...(mode === "edited before late legacy ACK" ? {} : { commentUpdatedAt: revision.toISOString() }),
+            acknowledgedAt: new Date("2026-01-01T00:03:00Z").toISOString() } },
+            ...(mode === "Stop hand-back" ? { personStop: { returned: [steeredId, originId] } } : {}) } });
+        await db.insert(heartbeatRunEvents).values([
+          { companyId, runId: firstRunId, agentId, seq: 0, eventType: "session.started", sourceEventId: "session",
+            payload: { prpEvent: { normalizedSessionId: sessionId, payload: { providerSessionId } } } },
+          { companyId, runId: firstRunId, agentId, seq: 1, eventType: "turn.accepted" },
+          ...(mode === "uncertain" ? [] : [{ companyId, runId: firstRunId, agentId, seq: 2, eventType: "item.completed", sourceEventId: "steer",
+            payload: { prpEvent: { normalizedSessionId: mode === "wrong session" ? randomUUID() : sessionId,
+              turnId: mode === "wrong turn" ? "other-turn" : "first-turn", itemId: `first-turn:steer:${steeredId}`,
+              payload: { kind: "steering_acknowledgement", status: mode === "refused" ? "rejected" : "acknowledged" } } } }]),
+        ]);
+        await db.insert(issueComments).values([
+          { id: steeredId, companyId, issueId: taskId, authorType: "user", authorUserId: "local-board", body: mode.startsWith("edited") ? "Edited instruction" : "Steered instruction",
+            createdAt: revision, updatedAt: mode.startsWith("edited") ? editedAt : revision },
+          { id: wakeId, companyId, issueId: taskId, authorType: "user", authorUserId: "local-board", body: "Unread current wake",
+            createdAt: editedAt, updatedAt: editedAt },
+        ]);
+        await db.insert(agentWakeupRequests).values({ id: queueId, companyId, agentId, source: "issue", reason: "issue_commented",
+          status: mode === "pending queue" ? "deferred_issue_execution" : "cancelled", createdAt: queuedAt,
+          payload: withQueuedCommentIdsInWakePayload({ issueId: taskId }, [steeredId]) });
+        const snapshot = await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId, runId: randomUUID(),
+          previousContextRunId: firstRunId, nativeSessionId: mode === "fresh session" ? randomUUID() : sessionId,
+          nativeProviderSessionId: mode === "fresh provider" ? "new-provider" : providerSessionId,
+          context: { commentId: wakeId, wakeReason: "issue_children_completed" }, summary: null, exposeLowTrustRaw: false });
+        expect(snapshot.resumeDelta?.messages.map(message => message.id)).toEqual(expect.arrayContaining([steeredId, wakeId]));
+        if (mode === "Stop hand-back") expect(snapshot.resumeDelta?.messages.map(message => message.id)).toContain(originId);
+        if (mode.startsWith("fresh")) {
+          const prompt = renderPaperclipWakePrompt({ executionContinuation: snapshot }, { resumedSession: false });
+          expect(prompt).toContain("Original request"); expect(prompt).toContain("Steered instruction"); expect(prompt).toContain("Unread current wake");
+        }
+        expect(snapshot.messages).toHaveLength(3);
+        console.log("owed successor PG evidence", JSON.stringify({ mode, taskId, sessionId, providerSessionId, originId, steeredId, wakeId,
+          fullHistoryIds: snapshot.messages.map(message => message.id), delta: snapshot.resumeDelta?.messages.map(({ id, updatedAt }) => ({ id, updatedAt })) }));
+      },
+    );
     it("attests the exact latest user comment selected as the objective", async () => {
       const envelope = await build();
       const latest = await db.select().from(issueComments).where(eq(issueComments.id, laterId)).then(rows => rows[0]!);

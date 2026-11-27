@@ -22,6 +22,7 @@ import { githubRecoveryReceipts } from "./chat-channels/github/recovery-receipts
 import { readTaskRetryIntent } from "./task-retry.js";
 import { readByEarlierTurnCommentIds } from "./queued-comment-delivery.js";
 import type { NativeContinuationReadState } from "./native-runtime/native-turn-budget.js";
+import { retainedSessionCommentCoverage } from "./native-runtime/continuous-session-input.js";
 
 const retryWakeReasons = new Set(["task_retry", "retry_failed_run"]);
 const maxRequeueChain = 32;
@@ -408,12 +409,19 @@ export async function buildExecutionContinuation(input: {
     && Array.isArray(priorCoverage.omitted)
     ? priorCoverage.omitted.map(object) : [];
   const omittedRevision = (message: ExecutionContinuationEnvelope["messages"][number]) => omitted.some(prior => prior.id === message.id && prior.updatedAt === message.updatedAt);
+  const retainedCoverage = input.previousContextRunId && input.nativeSessionId && input.nativeProviderSessionId
+    && previousRun?.nativeSessionId === input.nativeSessionId
+    ? await retainedSessionCommentCoverage(db, { companyId, issueId, agentId: input.agentId, runId: input.runId,
+        previousRunId: input.previousContextRunId, sessionId: input.nativeSessionId,
+        providerSessionId: input.nativeProviderSessionId, messages }) : null;
   const resumeDelta =
     deliveredMessages && input.previousContextRunId
       ? {
           baseRunId: input.previousContextRunId,
           messages: messages.filter(
             (message) =>
+              retainedCoverage?.owed.has(message.id) ||
+              (retainedCoverage ? !retainedCoverage.received.has(message.id) :
               originCommentIds.includes(message.id) ||
               !(omittedRevision(message) || deliveredMessages.some(
                 (prior) =>
@@ -425,7 +433,7 @@ export async function buildExecutionContinuation(input: {
                   (prior.createdByRunId ?? null) === message.createdByRunId &&
                   JSON.stringify(prior.sourceTrust) ===
                     JSON.stringify(message.sourceTrust),
-              )),
+              ))),
           ),
         }
       : undefined;
