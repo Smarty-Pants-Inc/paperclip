@@ -3,6 +3,7 @@ import { buildNativeContinuationPrompt } from "./native-continuation.js";
 
 const issue = { title: "Original task", description: "Retain my long task brief." };
 const message = { id: "new", body: "Yes, please proceed.", authorType: "user", authorId: "board", sourceTrust: "user", createdByRunId: null };
+const answeredOld = { id: "old", updatedAt: "2026-01-01T00:00:00Z", receivedAt: "2026-01-01T00:00:00Z", answered: true };
 const wake = {
   reason: "issue_commented",
   executionContinuation: {
@@ -15,7 +16,13 @@ const wake = {
   },
   comments: [message], continuationSummary: { markdown: "OLD_SUMMARY" },
 };
-const build = (value: unknown = wake, previousIssue = issue) => buildNativeContinuationPrompt({ wakePayload: value, previousRunId: "prior", issue, previousIssue });
+// Keep the original external-chat parameter fixtures byte-for-byte stable:
+// their serialized values are part of the existing exact test names.
+const receivedWake = { ...wake, executionContinuation: { ...wake.executionContinuation,
+  messages: [{ ...wake.executionContinuation.messages[0]!, createdAt: answeredOld.receivedAt, updatedAt: answeredOld.updatedAt }, message],
+  resumeDelta: { ...wake.executionContinuation.resumeDelta, receivedComments: [answeredOld] },
+} };
+const build = (value: unknown = receivedWake, previousIssue = issue) => buildNativeContinuationPrompt({ wakePayload: value, previousRunId: "prior", issue, previousIssue });
 
 describe("native continuation event projection", () => {
   it("sends a new comment once without the unchanged brief, objective, history or summary", () => {
@@ -26,7 +33,7 @@ describe("native continuation event projection", () => {
     expect(text.length).toBeLessThan(600);
   });
   it("uses the retained delta even when an already received steer remains in prompt-only wake IDs", () => {
-    const text = buildNativeContinuationPrompt({ wakePayload: { ...wake, commentIds: ["old", "new"] },
+    const text = buildNativeContinuationPrompt({ wakePayload: { ...receivedWake, commentIds: ["old", "new"] },
       promptOnly: true, previousRunId: "prior", issue, previousIssue: issue });
     expect(text).toBe(message.body);
     expect(text).not.toContain("OLD_HISTORY");
@@ -37,8 +44,8 @@ describe("native continuation event projection", () => {
       promptOnly: true, previousRunId: "prior", issue, previousIssue: issue })).toBe("");
   });
   it.each([false, true])("keeps an empty retained delta off the full-bootstrap path (promptOnly=%s)", promptOnly => {
-    const text = buildNativeContinuationPrompt({ wakePayload: { ...wake, commentIds: ["old"], comments: [],
-      executionContinuation: { ...wake.executionContinuation, resumeDelta: { baseRunId: "prior", messages: [] } } },
+    const text = buildNativeContinuationPrompt({ wakePayload: { ...receivedWake, commentIds: ["old"], comments: [],
+      executionContinuation: { ...receivedWake.executionContinuation, resumeDelta: { baseRunId: "prior", messages: [], receivedComments: [answeredOld] } } },
       promptOnly, previousRunId: "prior", issue, previousIssue: issue });
     if (promptOnly) expect(text).toBe("");
     else expect(JSON.parse(text!)).toEqual({ messages: [] });
@@ -54,7 +61,7 @@ describe("native continuation event projection", () => {
   });
   it("tells a resumed turn which delivered comments an earlier turn already read", () => {
     const comment = { id: "new", body: message.body, author: { type: "user", id: "board" } };
-    const marked = JSON.parse(build({ ...wake, comments: [{ ...comment, readByEarlierTurn: true }] })!);
+    const marked = JSON.parse(build({ ...receivedWake, comments: [{ ...comment, readByEarlierTurn: true }] })!);
     expect(marked.readByEarlierTurn).toEqual({ messageIds: ["new"], note: expect.stringContaining("may have applied it") });
     expect(JSON.parse(build({ ...wake, comments: [comment] })!).readByEarlierTurn).toBeUndefined();
   });

@@ -647,24 +647,20 @@ describe("native serialized-command budget", () => {
   it.each([false, true])("settles an empty plain-text successor without starting a model turn (own wake: %s)", ownWake => {
     const c = shape(2, 100);
     c.trigger.reason = "issue_commented";
-    c.resumeDelta = { baseRunId: "previous", messages: [] };
-    const body = "My new wake, not the saved task brief.";
+    c.resumeDelta = { baseRunId: "previous", messages: [], receivedComments: [{ id: c.messages.at(-1)!.id,
+      updatedAt: c.messages.at(-1)!.updatedAt, receivedAt: c.messages.at(-1)!.createdAt, answered: true }] };
+    const body = "Already received wake text, not new input.";
     const wakePayload = { reason: c.trigger.reason, commentIds: [c.messages.at(-1)!.id], executionContinuation: c,
       comments: ownWake ? [{ ...c.messages.at(-1)!, body, fullBody: body }] : [] };
     const construct = () => buildNativeExecutionInput({ ...args, boundCommandBytes: true, resumedSession: true,
       previousTurn: { runId: "previous", task: args.issue }, wakePayload });
-    if (ownWake) {
-      const envelope = buildNativeModelEnvelope(construct(), { resumedSession: true });
-      expect(envelope).toMatchObject({ events: body });
-      expect(JSON.stringify(envelope)).not.toContain('{\\"messages\\":[]}');
-      console.log("empty delta successor evidence", JSON.stringify({ ownWake, events: "events" in envelope ? envelope.events : null }));
-    } else {
-      let observed: unknown;
-      try { construct(); } catch (error) { observed = error; }
-      expect(observed).toBeInstanceOf(StaleExecutionContinuationError);
-      expect(observed).toMatchObject({ code: "continuation_nothing_new" });
-      console.log("empty delta successor evidence", JSON.stringify({ ownWake, code: (observed as StaleExecutionContinuationError)?.code, modelTurnStarted: false }));
-    }
+    let observed: unknown;
+    try { construct(); } catch (error) { observed = error; }
+    expect(observed).toBeInstanceOf(StaleExecutionContinuationError);
+    expect(observed).toMatchObject({ code: "continuation_nothing_new", continuationNothingNew: {
+      namedCommentIds: [c.messages.at(-1)!.id], answeredCommentIds: [c.messages.at(-1)!.id], cause: "all_named_answered",
+    } });
+    console.log("empty delta successor evidence", JSON.stringify({ ownWake, code: (observed as StaleExecutionContinuationError)?.code, modelTurnStarted: false }));
   });
   it("settles a genuinely empty successor even when no wake comment IDs select the plain-text road", () => {
     const c = shape(2, 100);

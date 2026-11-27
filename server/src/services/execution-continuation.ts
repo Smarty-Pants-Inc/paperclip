@@ -11,7 +11,7 @@ import {
   issues,
   type Db,
 } from "@paperclipai/db";
-import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
+import type { ContinuationNothingNew, ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { sanitizeQuarantinedCommentForHigherTrust } from "./source-trust.js";
 import { hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
@@ -54,7 +54,8 @@ function continuationApiResult(operationId: string, result: unknown, companyId: 
 }
 
 export class StaleExecutionContinuationError extends Error {
-  constructor(readonly code: "continuation_task_ownership_changed" | "continuation_nothing_new") {
+  constructor(readonly code: "continuation_task_ownership_changed" | "continuation_nothing_new",
+    readonly continuationNothingNew?: ContinuationNothingNew) {
     super(code);
     this.name = "StaleExecutionContinuationError";
   }
@@ -418,6 +419,7 @@ export async function buildExecutionContinuation(input: {
     deliveredMessages && input.previousContextRunId
       ? {
           baseRunId: input.previousContextRunId,
+          ...(retainedCoverage ? { receivedComments: retainedCoverage.receipts } : {}),
           messages: messages.filter(
             (message) =>
               retainedCoverage?.owed.has(message.id) ||

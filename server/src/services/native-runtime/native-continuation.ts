@@ -10,6 +10,7 @@ export function buildNativeContinuationPrompt(input: {
   wakePayload: unknown;
   promptOnly?: boolean;
   previousRunId: string;
+  agentId?: string;
   issue: { title: string; description: string | null };
   previousIssue: { title: string; description: string | null };
   /** The constructor opts complete plain-text chat batches into the resume protocol. */
@@ -19,6 +20,29 @@ export function buildNativeContinuationPrompt(input: {
   previousGitHubReviewConfigurationKeys?: readonly string[];
 }): string | null {
   const wake = normalizePaperclipWakePayload(input.wakePayload);
+  const continuation = wake?.executionContinuation;
+  const delta = continuation?.resumeDelta;
+  const receipts = new Map((delta?.receivedComments ?? []).filter(receipt => {
+    const message = continuation?.messages.find(message => message.id === receipt.id);
+    return !message || message.updatedAt === receipt.updatedAt;
+  }).map(receipt => [receipt.id, receipt]));
+  const replyInstructions = [...receipts.values()].filter(receipt => !receipt.answered)
+    .map(receipt => `Reply to the comment you received at ${receipt.receivedAt} (id ${receipt.id}).`);
+  // An empty delta alone does not prove that a named person's input was seen.
+  // Restore only unseen named input, never bodies backed by provider receipts.
+  if (wake?.comments.some(comment => comment.authorType === "user" && !comment.id)) return null;
+  const unseenNamed = (wake?.commentIds ?? []).filter(id => !receipts.has(id));
+  const messages = (delta?.messages ?? []).filter(message => !receipts.has(message.id) &&
+    !(message.authorType === "agent" && message.authorId === input.agentId) && !message.freshSessionMarker);
+  for (const id of unseenNamed) {
+    if (messages.some(message => message.id === id)) continue;
+    const message = continuation?.messages.find(message => message.id === id);
+    if (message) { messages.push(message); continue; }
+    const comment = wake?.comments.find(comment => comment.id === id);
+    if (comment) messages.push({ id, authorType: comment.authorType ?? "unknown", authorId: comment.authorId,
+      body: comment.fullBody ?? comment.body, createdAt: comment.createdAt ?? "", updatedAt: comment.createdAt ?? "",
+      deleted: false, sourceTrust: null });
+  }
   if (input.promptOnly && wake) {
     const retryPrompt = nativeStatusRetryPrompt(input.wakePayload, input.previousRunId);
     if (retryPrompt) {
@@ -27,24 +51,13 @@ export function buildNativeContinuationPrompt(input: {
       const unseen = wake.executionContinuation?.resumeDelta?.messages.filter(message => message.authorType === "user") ?? [];
       return [retryPrompt, ...unseen.map(message => message.body)].join("\n\n");
     }
-    const delta = wake.executionContinuation?.resumeDelta;
     if (delta && delta.baseRunId !== input.previousRunId) return null;
-    const messages = [...(wake.executionContinuation?.messages ?? delta?.messages ?? []), ...wake.comments];
-    // A wake can still name a comment already steered into this session.
-    // The revision-aware delta is authoritative, even on the plain-text road.
-    const ids = wake.commentIds.filter(id => !delta || delta.messages.some(message => message.id === id));
-    if (ids.length) return ids.map(id => wake.comments.find(comment => comment.id === id)?.fullBody ?? messages.find(message => message.id === id)!.body).join("\n\n");
-    // An empty delta is not a JSON user instruction. Only this wake's own
-    // comment text may supply a turn; never resurrect its full-history backup.
-    // The constructor settles a verified empty result before model dispatch.
-    return delta && delta.messages.length === 0 ? wake.commentIds.flatMap(id => {
-      const comment = wake.comments.find(comment => comment.id === id);
-      const text = comment?.fullBody ?? comment?.body;
-      return text?.trim() ? [text] : [];
-    }).join("\n\n") : "";
+    const bodies = unseenNamed.map(id => wake.comments.find(comment => comment.id === id)?.fullBody ??
+      messages.find(message => message.id === id)?.body);
+    // Missing input is not nothing-new; keep the specialized bootstrap framing.
+    if (bodies.some(body => typeof body !== "string" || !body.trim())) return null;
+    return [...bodies, ...replyInstructions].join("\n\n");
   }
-  const continuation = wake?.executionContinuation;
-  const delta = continuation?.resumeDelta;
   if (!wake || !delta || delta.baseRunId !== input.previousRunId) return null;
   if (input.caseContext && !input.workflowCase) return null;
   const rawWake = input.wakePayload && typeof input.wakePayload === "object"
@@ -104,7 +117,8 @@ export function buildNativeContinuationPrompt(input: {
     // agent response; neither becomes a new provider instruction.
     messages: externalChat
       ? wake.commentIds.map((id) => delta.messages.find((message) => message.id === id)!)
-      : delta.messages.filter(message => !input.workflowCase || !caseInstructionAlreadyRepresented(input.caseContext, message)),
+      : messages.filter(message => !input.workflowCase || !caseInstructionAlreadyRepresented(input.caseContext, message)),
+    ...(replyInstructions.length ? { replyInstructions } : {}),
     ...(input.workflowCase ? { workflowCase: input.workflowCase } : {}),
     ...(humanResponses.length ? { humanResponses } : {}),
     ...(Object.keys(taskChanges).length ? { taskChanges } : {}),
@@ -122,6 +136,10 @@ export function buildNativeContinuationPrompt(input: {
     "You are continuing the same conversation. The previous task turn ended without an accepted completion report. Do NOT repeat commands, scripts, or other work already done in this task, or re-answer consumed messages. If the work is complete, file your result against the current contract now. Otherwise finish only what remains, then file your result.",
     ...(events.messages.length || Object.keys(events).length > 1 ? [JSON.stringify(events)] : []),
   ].join("\n\n");
-  // An empty verified delta must not select the full-history fallback.
+  // Child completion is independent work intent. Its producer does not
+  // guarantee summaries; keep the pass-1 bootstrap if there is no delta.
+  if (wake.reason === "issue_children_completed" && events.messages.length === 0 && Object.keys(events).length === 1) return null;
+  // Missing named input must never masquerade as an empty system wake.
+  if (unseenNamed.some(id => !messages.some(message => message.id === id))) return null;
   return JSON.stringify(events);
 }

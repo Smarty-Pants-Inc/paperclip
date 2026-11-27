@@ -1,7 +1,7 @@
 import type { PaperclipTurnContext } from "@paperclipai/adapter-utils/server-utils";
 import { resolvePaperclipRunnerCursorMode, resolvePaperclipRunnerPiThinkingLevel } from "@paperclipai/adapter-utils";
 import { createHash } from "node:crypto";
-import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
+import { CONTINUATION_NOTHING_NEW_SCHEMA, type ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { boundNativeExecutionContinuation, commandEnvelopeBytes, nativeInputRevision, nativePromptRefusalRemedies, NATIVE_HANDOFF_CUT_NOTE_RESERVE_BYTES, NATIVE_TURN_KNOWN_MAX_BYTES, NativeTurnPromptExceedsCommandBoundError, type NativeContinuationReadState, type NativeContinuationCoverage, type NativePromptRefusalCause, type NativeInputRevision } from "./native-turn-budget.js";
 import { runnerApiOperation } from "./runner-api-catalog.js";
 import { buildNativeContinuationPrompt } from "./native-continuation.js";
@@ -302,17 +302,32 @@ function buildNativeExecutionInputUnchecked(input: BuildNativeExecutionInput): N
     runtimeContext.aggregateDigest = canonicalNativeRuntimeContextDigest(runtimeContext);
   }
   const composeContinuationPrompt = (wakePayload: unknown) => continuationDecision.continue && input.previousTurn ? buildNativeContinuationPrompt({
-    wakePayload, promptOnly: continuationDecision.promptOnly, previousRunId: input.previousTurn.runId,
+    wakePayload, promptOnly: continuationDecision.promptOnly, previousRunId: input.previousTurn.runId, agentId: input.agentId,
     previousIssue: input.previousTurn.task, previousGitHubReviewConfigurationKeys: input.previousTurn.githubReviewConfigurationKeys,
     allowExternalChat: true, issue: input.issue, caseContext: input.caseContext, workflowCase,
   }) : null;
-  const continuationPrompt = composeContinuationPrompt(input.wakePayload);
+  let continuationPrompt = composeContinuationPrompt(input.wakePayload);
   if (continuationPrompt === JSON.stringify({ messages: [] }) ||
-      (continuationDecision.promptOnly && continuationPrompt === "" &&
-        (wake?.executionContinuation as ExecutionContinuationEnvelope | undefined)?.resumeDelta?.messages.length === 0)) {
-    // Reuse heartbeat's obsolete-continuation cancellation, not setup failure
-    // or a falsy continuationPrompt that would select the full bootstrap.
-    throw new StaleExecutionContinuationError("continuation_nothing_new");
+      (continuationDecision.promptOnly && continuationPrompt === "")) {
+    const continuation = wake?.executionContinuation as ExecutionContinuationEnvelope | undefined;
+    const delta = continuation?.resumeDelta;
+    const namedCommentIds = Array.isArray(wake?.commentIds) ? wake.commentIds.filter((id): id is string => typeof id === "string") : [];
+    const answeredCommentIds = namedCommentIds.filter(id => delta?.receivedComments?.some(receipt =>
+      receipt.id === id && receipt.answered && (!continuation?.messages.some(message =>
+        message.id === id && message.updatedAt !== receipt.updatedAt))));
+    // The constructor and heartbeat share the same proof; a page must never
+    // infer a benign cancellation from the absence of text or a status badge.
+    if (answeredCommentIds.length === namedCommentIds.length) {
+      throw new StaleExecutionContinuationError("continuation_nothing_new", {
+        schema: CONTINUATION_NOTHING_NEW_SCHEMA, namedCommentIds, answeredCommentIds,
+        cause: namedCommentIds.length > 0 ? "all_named_answered" :
+          delta?.messages.some(message => message.authorType === "agent" && message.authorId === input.agentId)
+            ? "own_reply_only" : "empty_system_wake",
+      });
+    }
+    // Projection may suppress a message already represented by a case. That
+    // is not provider receipt proof: retain the bootstrap instead of settling.
+    continuationPrompt = null;
   }
   const prepared = {
     schema: input.grokEffort !== undefined || input.grokDisableWebSearch !== undefined ? "paperclip.native-execution-input.v10"

@@ -125,7 +125,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { scopedTelemetryCompanyId, scopedTelemetryPerson } from "../telemetry-company-scope.js";
-import type { EnvironmentLease } from "@paperclipai/shared";
+import { CONTINUATION_NOTHING_NEW_SCHEMA, type ContinuationNothingNew, type EnvironmentLease } from "@paperclipai/shared";
 import type { NativeExecutionInput } from "../vendor/paperclip-runner/index.js";
 import { runningProcesses, type AdapterExecutionContext, type AdapterExecutionResult } from "../adapters/index.ts";
 import {
@@ -2087,9 +2087,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     "continuation_nothing_new",
   ] as const)("cancels obsolete continuation setup: %s", async (code) => {
     const { companyId, issueId, agentId, runId, wakeupRequestId } = await seedQueuedIssueRunFixture();
+    const commentId = randomUUID();
+    const receipt: ContinuationNothingNew | undefined = code === "continuation_nothing_new" ? {
+      schema: CONTINUATION_NOTHING_NEW_SCHEMA, namedCommentIds: [commentId], answeredCommentIds: [commentId], cause: "all_named_answered",
+    } : undefined;
+    if (receipt) {
+      await db.insert(issueComments).values({ id: commentId, companyId, issueId, authorType: "user", authorUserId: "responsible-user", body: "Already answered" });
+      const [queued] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      await db.update(heartbeatRuns).set({ resultJson: { existingEvidence: "preserved" }, contextSnapshot: {
+        ...queued.contextSnapshot, wakeReason: "issue_commented", wakeCommentId: commentId, wakeCommentIds: [commentId],
+      } }).where(eq(heartbeatRuns.id, runId));
+    }
     const commentsBefore = await db.select({ id: issueComments.id }).from(issueComments).where(eq(issueComments.issueId, issueId));
     const build = vi.spyOn(executionContinuation, "buildExecutionContinuation")
-      .mockRejectedValueOnce(new executionContinuation.StaleExecutionContinuationError(code));
+      .mockRejectedValueOnce(new executionContinuation.StaleExecutionContinuationError(code, receipt));
     try {
       const heartbeat = heartbeatService(db);
       await heartbeat.resumeQueuedRuns();
@@ -2108,6 +2119,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       const runs = await selectRecoveryRunsByAgent(agentId);
       expect(runs).toHaveLength(1);
       if (code === "continuation_nothing_new") {
+        expect((await heartbeat.getRun(runId))?.resultJson).toMatchObject({ existingEvidence: "preserved", continuationNothingNew: receipt });
         expect(mockCaptureRunFailure.mock.calls.some(([event]) => event.runId === runId)).toBe(false);
         const commentsAfter = await db.select({ id: issueComments.id }).from(issueComments).where(eq(issueComments.issueId, issueId));
         expect(commentsAfter).toEqual(commentsBefore);
@@ -2115,10 +2127,38 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         expect(issue.executionRunId).toBeNull();
         console.log("nothing-new settlement PG evidence", JSON.stringify({ companyId, issueId, runId,
           status: (await heartbeat.getRun(runId))?.status, wakeStatus: wakeup.status, agentStatus: agent.status,
-          issueExecutionRunId: issue.executionRunId, recoveryRunCount: runs.length, failureNoticeCount: commentsAfter.length - commentsBefore.length }));
+          issueExecutionRunId: issue.executionRunId, recoveryRunCount: runs.length, failureNoticeCount: commentsAfter.length - commentsBefore.length,
+          resultJson: (await heartbeat.getRun(runId))?.resultJson }));
       }
     } finally {
       build.mockRestore();
+    }
+  });
+
+  it("cancels obsolete continuation setup: person wake admission persists named IDs", async () => {
+    const { companyId, issueId, agentId, runId, wakeupRequestId } = await seedQueuedIssueRunFixture();
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+    await db.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: new Date() }).where(eq(agentWakeupRequests.id, wakeupRequestId));
+    await db.update(issues).set({ executionRunId: null, checkoutRunId: null }).where(eq(issues.id, issueId));
+    // Occupy dispatch only, not this issue: exercise actual wake admission and
+    // persistence without starting a provider or fabricating an agent answer.
+    await db.insert(heartbeatRuns).values({ companyId, agentId, status: "running", startedAt: new Date(), contextSnapshot: {} });
+    const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "responsible-user", body: "Person comment wake" }).returning();
+    try {
+      const heartbeat = heartbeatService(db);
+      const admitted = await heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system", reason: "issue_commented",
+        requestedByActorType: "user", requestedByActorId: "responsible-user",
+        payload: { issueId, commentId: comment!.id, mutation: "comment" } });
+      expect(admitted).not.toBeNull();
+      const [stored] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, admitted!.id));
+      expect(stored.contextSnapshot).toMatchObject({ wakeReason: "issue_commented", wakeCommentId: comment!.id, wakeCommentIds: [comment!.id] });
+      expect(stored.status).toBe("queued");
+      expect(mockAdapterExecute.mock.calls.some(([input]) => (input as { runId?: string })?.runId === stored.id)).toBe(false);
+      console.log("person wake admission PG evidence", JSON.stringify({ runId: stored.id, commentId: comment!.id,
+        status: stored.status, contextSnapshot: stored.contextSnapshot }));
+    } finally {
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(and(eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.status, ["running", "queued"])));
+      await db.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: new Date() }).where(and(eq(agentWakeupRequests.companyId, companyId), inArray(agentWakeupRequests.status, ["queued", "claimed"])));
     }
   });
 

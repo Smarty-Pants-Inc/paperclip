@@ -1703,7 +1703,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           }
 
           const finishedAt = new Date();
-          let persistedCancellationRun = run.runtimeMode === "native" ? await getRun(run.id) : null;
+          let persistedCancellationRun = run.runtimeMode === "native" || resultJson ? await getRun(run.id) : null;
           if (persistedCancellationRun && readNativeStartupCleanup(persistedCancellationRun)) {
             if (!dependencies.verifyStartupCleanup) throw conflict("Native startup cleanup worker unavailable");
             await dependencies.verifyStartupCleanup(persistedCancellationRun);

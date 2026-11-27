@@ -167,8 +167,12 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
   companyId: string; issueId: string; agentId: string; runId?: string;
   previousRunId: string; sessionId: string; providerSessionId: string;
   messages: ReadonlyArray<{ id: string; updatedAt: string }>;
-}): Promise<{ received: Set<string>; owed: Set<string> } | null> {
-  const runs = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status,
+}): Promise<{ received: Set<string>; owed: Set<string>; receipts: Array<{
+  id: string; updatedAt: string; receivedAt: string; answered: boolean;
+}> } | null> {
+  const runs = await db.select({ id: heartbeatRuns.id,
+    checkpoint: sql<Record<string, unknown> | null>`${heartbeatRuns.runnerProfileJson}->'sessionCheckpoint'`,
+    replyReceipts: sql<Array<{ id: string; updatedAt: string; receivedAt: string; answered: boolean }> | null>`${heartbeatRuns.contextSnapshot} #> '{executionContinuation,resumeDelta,receivedComments}'`,
     coverage: sql<Record<string, unknown> | null>`${heartbeatRuns.contextSnapshot} #> '{executionContinuation,coverage}'`,
     // Transfer revision identities, not N copies of the task's message bodies.
     messages: sql<Array<{ id: string; updatedAt: string }>>`(select coalesce(jsonb_agg(jsonb_build_object(
@@ -191,12 +195,13 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
   if (!runs.some(run => run.id === scope.previousRunId)) return null;
   const events = await db.select({ runId: heartbeatRunEvents.runId, seq: heartbeatRunEvents.seq,
     eventType: heartbeatRunEvents.eventType, sourceEventId: heartbeatRunEvents.sourceEventId,
+    sourceSeq: heartbeatRunEvents.sourceSeq, timestamp: heartbeatRunEvents.createdAt,
     payload: heartbeatRunEvents.payload,
   }).from(heartbeatRunEvents).where(and(
     eq(heartbeatRunEvents.companyId, scope.companyId), inArray(heartbeatRunEvents.runId, runs.map(run => run.id)),
     or(inArray(heartbeatRunEvents.eventType, ["turn.accepted", "turn.started", "session.started", "session.resumed", "session.reconciled", "task_history.read"]),
       and(eq(heartbeatRunEvents.eventType, "item.completed"),
-        sql`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'kind' = 'steering_acknowledgement'`)),
+        sql`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'kind' in ('steering_acknowledgement', 'agentMessage', 'assistant_message', 'agent_message')`)),
   )).orderBy(asc(heartbeatRunEvents.seq));
   const eventsByRun = new Map<string, typeof events>();
   for (const event of events) {
@@ -225,66 +230,99 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
   // A budget cut says the board had read this revision, not which provider
   // generation read it. Require the read's own retained-generation evidence.
   const readRevisions = new Set<string>();
+  const received = new Set<string>(), owed = new Set<string>();
+  const receipts = new Map<string, { id: string; updatedAt: string; receivedAt: string; answered: boolean }>();
+  // A logged output is not proof that the next resume can load it. The saved
+  // checkpoint must bind this run and generation and cover the source event.
+  // Missing/legacy checkpoints fail open to delivery, never to silent omission.
+  const checkpointCovers = (run: typeof runs[number], event: typeof events[number]) => {
+    const saved = parseObject(run.checkpoint), identity = parseObject(saved.identity);
+    const cursor = typeof saved.cursor === "string" && saved.cursor.trim() ? Number(saved.cursor) : NaN;
+    return typeof saved.sessionId === "string" && saved.sessionId.trim().length > 0
+      && identity.runId === run.id && identity.companyId === scope.companyId && identity.issueId === scope.issueId
+      && identity.agentId === scope.agentId && identity.sessionId === scope.sessionId
+      && saved.providerSessionId === scope.providerSessionId && Number.isSafeInteger(cursor)
+      && typeof event.sourceSeq === "number" && event.sourceSeq > 0 && cursor >= event.sourceSeq;
+  };
+  const outputAfter = (run: typeof runs[number], after: typeof events[number]) =>
+    (eventsByRun.get(run.id) ?? []).some(event => {
+      const prp = parseObject(event.payload?.prpEvent), payload = parseObject(prp.payload);
+      const afterTurn = parseObject(after.payload?.prpEvent).turnId;
+      return event.seq > after.seq && event.eventType === "item.completed" && sameGeneration(run, event.seq)
+        && ["agentMessage", "assistant_message", "agent_message"].includes(String(payload.kind))
+        && typeof payload.text === "string" && payload.text.trim().length > 0
+        && prp.normalizedSessionId === scope.sessionId
+        && (typeof afterTurn === "string" ? prp.turnId === afterTurn : after.eventType === "task_history.read")
+        && checkpointCovers(run, event);
+    });
   for (const run of runs) {
     const runEvents = eventsByRun.get(run.id) ?? [];
     if (!sameGeneration(run) || !runEvents.some(event =>
       ["turn.accepted", "turn.started"].includes(event.eventType) && sameGeneration(run, event.seq))) continue;
-    for (const event of runEvents) if (event.eventType === "task_history.read" && sameGeneration(run, event.seq)) {
+    for (const event of runEvents) if (event.eventType === "task_history.read" && sameGeneration(run, event.seq) && outputAfter(run, event)) {
       for (const [id, revision] of Object.entries(parseObject(event.payload?.comments))) {
         if (typeof revision === "string") readRevisions.add(JSON.stringify([id, revision]));
       }
     }
   }
-  const received = new Set<string>(), owed = new Set<string>();
-  const accept = (id: unknown, revision: unknown) => {
+  const accept = (id: unknown, revision: unknown, event: typeof events[number], answered: boolean) => {
     if (typeof id === "string" && typeof revision === "string" && revisions.get(id) === revision) {
       received.add(id); owed.delete(id);
+      const prior = receipts.get(id);
+      receipts.set(id, { id, updatedAt: revision, receivedAt: prior?.receivedAt ?? event.timestamp.toISOString(),
+        answered: answered || prior?.answered === true });
     }
   };
   for (const run of runs) {
     const runEvents = eventsByRun.get(run.id) ?? [];
     if (sameGeneration(run)) {
-      // Admission is not retention: a failed/unfinished carrier must be replayed.
-      if (run.status === "succeeded" && runEvents.some(event => ["turn.accepted", "turn.started"].includes(event.eventType) && sameGeneration(run, event.seq))) {
+      // Work status is irrelevant. Only output after the carrying turn began,
+      // in saved state of the selected generation, proves this input retained.
+      const start = runEvents.find(event => ["turn.accepted", "turn.started"].includes(event.eventType) && sameGeneration(run, event.seq));
+      if (start && outputAfter(run, start)) {
         // A successor's full history is fallback data, not its delivered delta.
-        for (const message of run.messages) accept(message.id, message.updatedAt);
+        for (const message of run.messages) accept(message.id, message.updatedAt, start, true);
+        // A reply-only successor carries receipt references, not the old text.
+        for (const receipt of run.replyReceipts ?? []) accept(receipt.id, receipt.updatedAt, start, true);
         const coverage = run.coverage;
         if (coverage?.nativeSessionId === scope.sessionId && coverage.providerSessionId === scope.providerSessionId && Array.isArray(coverage.omitted)) {
           for (const value of coverage.omitted) {
             const message = parseObject(value);
-            if (readRevisions.has(JSON.stringify([message.id, message.updatedAt]))) accept(message.id, message.updatedAt);
+            if (readRevisions.has(JSON.stringify([message.id, message.updatedAt]))) accept(message.id, message.updatedAt, start, true);
           }
         }
       }
       for (const [id, value] of Object.entries(parseObject(run.result.queuedSteeringAcknowledgements))) {
         const receipt = parseObject(value);
         if (receipt.status !== "acknowledged" || typeof receipt.turnId !== "string") continue;
-        const acknowledged = runEvents.some(event => {
+        const acknowledged = runEvents.find(event => {
           const prp = parseObject(event.payload?.prpEvent), payload = parseObject(prp.payload);
           return event.eventType === "item.completed" && event.sourceEventId !== null && sameGeneration(run, event.seq)
             && prp.normalizedSessionId === scope.sessionId && prp.turnId === receipt.turnId
             && prp.itemId === `${receipt.turnId}:steer:${id}`
-            && payload.kind === "steering_acknowledgement" && payload.status === "acknowledged";
+            && payload.kind === "steering_acknowledgement" && payload.status === "acknowledged"
+            && checkpointCovers(run, event);
         });
         if (!acknowledged) continue;
-        if (typeof receipt.commentUpdatedAt === "string") accept(id, receipt.commentUpdatedAt);
+        if (typeof receipt.commentUpdatedAt === "string") accept(id, receipt.commentUpdatedAt, acknowledged, outputAfter(run, acknowledged));
         else {
           // Older ACKs stored no revision. Only the unchanged pre-queue
           // revision is provable; a later edit can never be hidden by its ACK.
           const wake = typeof receipt.queueId === "string" ? wakesById.get(receipt.queueId) : undefined;
           const revision = revisions.get(id);
-          if (wake && revision && Date.parse(revision) <= wake.createdAt.getTime()) accept(id, revision);
+          if (wake && revision && Date.parse(revision) <= wake.createdAt.getTime()) accept(id, revision, acknowledged, outputAfter(run, acknowledged));
         }
       }
     }
     const returned = parseObject(run.result.personStop).returned;
-    if (Array.isArray(returned)) for (const id of returned) if (typeof id === "string") { received.delete(id); owed.add(id); }
+    if (Array.isArray(returned)) for (const id of returned) if (typeof id === "string" && !received.has(id)) owed.add(id);
   }
-  // Pending/returned input is debt, even when an older revision was received.
+  // Queue state cannot undo exact-revision provider proof. A queued ACK without
+  // output still owes a reply, not a duplicate copy of the comment's text.
   for (const wake of wakes) if (["queued", "deferred_issue_execution"].includes(wake.status)) {
-    for (const id of queuedCommentIdsFromWakePayload(wake.payload)) { received.delete(id); owed.add(id); }
+    for (const id of queuedCommentIdsFromWakePayload(wake.payload)) if (!received.has(id)) owed.add(id);
   }
-  return { received, owed };
+  return { received, owed, receipts: [...receipts.values()] };
 }
 
 export async function reconcileContinuousSessionInput(db: Db, scope: Scope) {
