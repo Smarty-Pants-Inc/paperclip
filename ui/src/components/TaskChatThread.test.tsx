@@ -605,6 +605,16 @@ it.each([true, false])("keeps an upload attached when a conversation draft becom
   expect(onAdd.mock.calls[0]?.[3]).toEqual([id]);
 });
 
+it("does not let an older interruption hide a different live run's responder", () => {
+  render(<TaskChatThread issueId="issue" issueStatus="in_progress" comments={[]} onAdd={async () => {}}
+    issueAssigneeAgentId="agent" agentMap={new Map([["agent", { id: "agent", name: "Current worker" } as Agent]])}
+    activeRun={{ ...nativeRunningRun(), id: "current-run", runtimeMode: "legacy", adapterType: "codex_local",
+      agentId: "agent", agentName: "Current worker" }}
+    interruption={{ intentId: "old-intent", responsibility: "system", state: "failed", nextRetryAt: null,
+      canRetry: true, userAction: null, sourceRunIds: ["previous-run"], observedRunId: "previous-run" }} />);
+  expect(container.querySelector('[data-testid="task-chat-agent-identity"]')?.textContent).toBe("Current worker");
+});
+
 it("shows activity during admission and clears it when the saved follow-up enters backoff", async () => {
   const pending = { id: "optimistic-recovery", companyId: "company", issueId: "issue", authorType: "user" as const,
     authorAgentId: null, authorUserId: "board", body: "Confirm the existing result.", presentation: null, metadata: null,

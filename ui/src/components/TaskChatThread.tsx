@@ -3301,8 +3301,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // the live-run record can hold its first value for the whole run.
   const liveExecution = (liveRun ? linkedRunMetaById.get(liveRun.id)?.execution : undefined) ?? liveRun?.execution ?? null;
   const tailEnded = tailEntries.some((entry) => entry.kind === "run_terminal") || liveExecution?.phase === "finishing";
-  const recoveryOwnsStatus = !isUserStop(observedRunId) && isConversationRecovery(props.interruption,
-    terminalStatuses.get(observedRunId) ?? linkedRunMetaById.get(observedRunId)?.status);
   const tailBeforeTurn = !!liveRun && (!paperclipRunnerTail || tailTimelineAnchors.length === 0) && !tailEnded && !isTerminalRunStatus(liveRun.status) &&
     (!liveExecution || ["working", "reconnecting"].includes(liveExecution.phase) || (liveExecution.phase === "queued" && !liveExecution.cause)) &&
     !tailEntries.some(entry => ["assistant", "thinking", "tool_call", "tool_result", "result"].includes(entry.kind) ||
@@ -3843,16 +3841,21 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       : runnerSubmissionPending || (queuedCommentIds.has(latestUserComment.id) && !!queuedMessageQueue?.executionWait));
   const requestExecution = requestRun?.id === liveRun?.id ? liveExecution : linkedRunMetaById.get(requestRun?.id ?? "")?.execution;
   const requestWait = latestUserComment && queuedCommentIds.has(latestUserComment.id) ? queuedMessageQueue?.executionWait : null;
+  // Submission tracks the interruption identity present at Send. An older
+  // recovery cannot own the new reply; a matching new outcome ends submission.
+  const recoveryOwnsStatus = !runnerSubmissionPending && (!tailRunId || tailChainIds.includes(observedRunId)) &&
+    !isUserStop(observedRunId) && isConversationRecovery(props.interruption,
+    terminalStatuses.get(observedRunId) ?? linkedRunMetaById.get(observedRunId)?.status);
   const requestLabel = recoveryOwnsStatus ? "Preparing your reply…"
     : requestWait?.message ?? (requestStatus === "queued" ? requestExecution?.cause ? requestExecution.label : "Queued" : undefined) ?? "Starting…";
   // While the task offers Retry nothing is on its way by itself: words, no working sign.
-  const requestWorking = !(props.interruption?.state === "failed" && props.interruption.canRetry) &&
+  const requestWorking = !(recoveryOwnsStatus && props.interruption?.state === "failed" && props.interruption.canRetry) &&
     (HELD_BY_RECOVERY_REASONS.has(requestWait?.reason ?? requestExecution?.cause ?? "") ||
     (!requestWait && !requestExecution?.cause && (!requestRun || requestStatus === "queued")));
   // A person's message the server holds behind a Stop's recovery is still on
   // its way: draw the working sign with the server's own words, not a blank.
   const optimisticRunnerStartup =
-    hasAgentAssignee && issueStatus !== "blocked" &&
+    hasAgentAssignee && (issueStatus !== "blocked" || runnerSubmissionPending) &&
     (!startupBlocked || requestPending) && !isUserStop(requestRun?.id ?? "") &&
     (!tailRunId || (requestPending && requestChain.includes(tailRunId))) &&
     (props.retryPreparing || (!isTerminalIssueStatus(issueStatus) && ((props.interruption?.state === "working" && !observedRunEnded) || props.interruption?.state === "retry_scheduled")) || requestPending || runnerSubmissionPending ||
