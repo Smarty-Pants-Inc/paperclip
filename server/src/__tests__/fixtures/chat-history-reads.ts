@@ -67,7 +67,8 @@ export function continuousChatHistoryReadEvents(compact: boolean, opening: boole
   return combined.filter(event => {
     const id = (event.payload.prpEvent as Record<string, unknown>).itemId;
     return (opening || id !== "a-input") &&
-      (steer || !["b-input", "b-steer-input", "turn-b:steer:steer-b", "turn-a:steer:request-b"].includes(String(id))) &&
+      // Keep ACKs in every read-omission case: acknowledgement is not a read.
+      (steer || !["b-input", "b-steer-input"].includes(String(id))) &&
       (!compact || event.eventType !== "lifecycle");
   });
 }
@@ -77,6 +78,6 @@ export function omitHistoryReads(events: HeartbeatRunEvent[], opening: boolean, 
     const envelope = event.payload!.prpEvent as Record<string, unknown>;
     const id = envelope.itemId;
     return (opening || (id !== "a-input" && id !== "b-input")) &&
-      (steer || (id !== "b-steer-input" && id !== "turn-b:steer:steer-b"));
+      (steer || id !== "b-steer-input");
   });
 }
