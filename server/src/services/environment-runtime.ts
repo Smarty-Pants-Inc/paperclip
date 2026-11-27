@@ -28,6 +28,7 @@ import { PluginWorkerUnavailableError } from "./plugin-worker-unavailable-error.
 import { HttpError } from "../errors.js";
 import { captureEnvironmentAcquisitionDiagnostic } from "./environment-acquisition-diagnostics.js";
 import { createOwnedSandbox, isBorrowedReusableSandboxLease, queueCancelledSandboxCreationStops, recoverSandboxCreations, recoverablePluginCreation } from "./sandbox-creation-operations.js";
+import { stoppedBeforeFirstInput } from "./person-stop-outcome.js";
 import { dueRunLeaseReleaseCondition, pendingRunLeaseReleaseCondition } from "./environment-lease-release-state.js";
 import { flushDeferredEnvironmentCleanup, registerDeferredEnvironmentCleanup, writeEnvironmentCleanup } from "./environment-cleanup-notifications.js";
 import { executeEnvironmentTask, pluginEnvironmentSupportsTasks, settleDispatchedEnvironmentTask } from "./environment-task-runtime.js";
@@ -3941,8 +3942,8 @@ async function isUnstartedCancelledRun(db: Db, runId: string): Promise<boolean> 
     eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "cancelled"),
   )).limit(1);
   const issueId = run?.nativeIssueId ?? run?.issueId ?? run?.contextSnapshot?.issueId;
-  return Boolean(run && typeof issueId === "string" && await nativeRunHasNoProviderWork(db,
-    { companyId: run.companyId, agentId: run.agentId, issueId }, runId));
+  return Boolean(run && typeof issueId === "string" && (stoppedBeforeFirstInput(run) || await nativeRunHasNoProviderWork(db,
+    { companyId: run.companyId, agentId: run.agentId, issueId }, runId)));
 }
 
 export function environmentRuntimeService(

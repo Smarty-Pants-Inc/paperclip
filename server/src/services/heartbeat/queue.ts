@@ -2276,14 +2276,15 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           const [current] = await tx.select().from(issueRecoveryActions).where(and(
             eq(issueRecoveryActions.companyId, hinted.companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
             eq(issueRecoveryActions.id, action.id), eq(issueRecoveryActions.status, "resolved"))).for("update");
-          if (!current || current.evidence.savedPersonWakeNoticeCommentId ||
-              !await getExecutionBlocker(tx as unknown as Db, hinted.companyId, issueId)) return;
+          if (!current || current.evidence.savedPersonWakeNoticeCommentId) return;
+          const blocker = await getExecutionBlocker(tx as unknown as Db, hinted.companyId, issueId);
+          if (!blocker) return;
           const [pending] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
             eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, hinted.companyId),
             eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId)));
           if (!pending) return;
           const [notice] = await insertIssueComment(tx, { companyId: hinted.companyId, issueId,
-            body: "Couldn't answer your message because execution recovery is still holding this task. Your message is saved; press Retry to continue.",
+            body: `Couldn't answer your message because execution recovery is still holding this task. Your message is saved. ${blocker.nextAction}`,
             presentation: systemNoticePresentation({ tone: "warning", title: "Couldn't answer your message" }) });
           await tx.update(issueRecoveryActions).set({ evidence: {
             ...current.evidence, savedPersonWakeNoticeCommentId: notice!.id,
@@ -4170,6 +4171,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           };
           const explicitContinuationRunId = randomUUID();
           const recovery = await prepareRecovery({
+            reevaluatePersonStop: !executionWaitRequestId && !durableRequest?.resumeDeferred,
             agentId, actorType: taskRetryActorId ? "user" : opts.requestedByActorType, actorId: taskRetryActorId ?? opts.requestedByActorId,
             requestedByActorType: opts.requestedByActorType, requestedByActorId: opts.requestedByActorId,
             reason: taskRetryActorId ? "task_retry" : durableRequest && !failedChatRetry ? "issue_commented" : reason,

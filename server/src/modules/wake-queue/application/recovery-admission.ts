@@ -8,6 +8,8 @@ type WakeRecoveryReadInput = {
   commentId: string | null;
   requestedByActorType?: string | null;
   requestedByActorId?: string | null;
+  /** Only a new request, never the deferred receipt's background replay. */
+  reevaluatePersonStop?: boolean;
 };
 type ExplicitContinuationIntent = { commentId: string | null; queuedCommentInterruptId?: string };
 

@@ -1,9 +1,103 @@
-import { and, eq, inArray, sql } from "drizzle-orm";
-import { environmentLeases, heartbeatRuns, issueRecoveryActions, type Db } from "@paperclipai/db";
+import { and, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { environmentLeases, heartbeatRuns, issues, issueRecoveryActions, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { notifyDeferredWakesForIssue } from "../deferred-execution-notifications.js";
 import { nativeRunHasNoProviderWork } from "../native-runtime/native-session-resume.js";
 import { isBorrowedReusableSandboxLease } from "../sandbox-creation-operations.js";
+import { personStopHasNoFirstInput } from "../person-stop-before-turn.js";
+import { readNativeWorkspaceSyncReference } from "../native-runtime/native-workspace-sync.js";
+import { remoteWorkspaceRunReferenceSchema } from "@paperclipai/shared";
+import { releaseUnchangedRemoteWorkspaceWriterById } from "../remote-workspaces.js";
+import { issueService } from "../issues.js";
+import { logActivity } from "../activity-log.js";
+import { hasAcknowledgedNativeRunStopRequest } from "../acknowledged-native-stop.js";
+
+const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value)
+  ? value as Record<string, unknown> : {};
+import { STOPPED_BEFORE_FIRST_INPUT, stoppedBeforeFirstInput } from "../person-stop-outcome.js";
+export { stoppedBeforeFirstInput } from "../person-stop-outcome.js";
+
+/** Negative 'not created by this run' is insufficient for historical repair:
+ * bind the borrowed box to its recorded creation and unchanged handoff. */
+async function unchangedBorrowedAllocation(db: Db, lease: typeof environmentLeases.$inferSelect): Promise<boolean> {
+  if (!await isBorrowedReusableSandboxLease(db, lease) || lease.metadata?.reusableLeaseSuccessor ||
+      lease.metadata?.reusableSandboxLeaseSuperseded || lease.metadata?.portableTaskSuccessor) return false;
+  const handoff = record(lease.metadata?.reusableLeasePredecessor);
+  if (typeof handoff.previousLeaseId !== "string") return false;
+  const [previous] = await db.select().from(environmentLeases).where(and(
+    eq(environmentLeases.id, handoff.previousLeaseId), eq(environmentLeases.companyId, lease.companyId),
+  )).for("update");
+  if (!previous || previous.status !== "expired" || previous.cleanupStatus !== "success" ||
+      previous.releasedAt?.getTime() !== lease.acquiredAt.getTime() ||
+      previous.heartbeatRunId === lease.heartbeatRunId || previous.provider !== lease.provider ||
+      previous.providerLeaseId !== lease.providerLeaseId || previous.environmentId !== lease.environmentId ||
+      previous.issueId !== lease.issueId ||
+      previous.metadata?.agentId !== lease.metadata?.agentId || !previous.heartbeatRunId ||
+      typeof handoff.handoffId !== "string" || previous.acquiredAt > lease.acquiredAt) return false;
+  const expected = { schema: "paperclip.reusable-lease-handoff.v1", previousLeaseId: previous.id,
+    successorLeaseId: lease.id, previousRunId: previous.heartbeatRunId, successorRunId: lease.heartbeatRunId,
+    companyId: lease.companyId, environmentId: lease.environmentId, workspaceId: previous.executionWorkspaceId,
+    issueId: lease.issueId, agentId: lease.metadata?.agentId ?? null, provider: lease.provider,
+    providerLeaseId: lease.providerLeaseId, recordedAt: lease.acquiredAt.toISOString(), handoffId: handoff.handoffId };
+  const outgoing = record(previous.metadata?.reusableLeaseSuccessor);
+  return Object.keys(handoff).length === Object.keys(expected).length && Object.keys(outgoing).length === Object.keys(expected).length &&
+    Object.entries(expected).every(([key, value]) => handoff[key] === value && outgoing[key] === value);
+}
+
+/** The existing Stop/dispatch fence supplies input proof; this transaction adds
+ * settled ownership and exact allocation custody. It never resumes any input.
+ * Called at release boundaries, not by a new recovery poller. */
+export async function recordStoppedBeforeFirstInput(db: Db, companyId: string, runId: string): Promise<boolean> {
+  // Ordinary/system release must retain its existing bounded lock-conflict
+  // handling. Only a person-Stop candidate enters the issue-serialized proof.
+  const [candidate] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
+  if (!candidate || candidate.status !== "cancelled" || !["native", "legacy"].includes(candidate.runtimeMode ?? "") ||
+      !(record(candidate.resultJson?.personStop).requestedAt || record(candidate.resultJson?.startupCancellation).requestedAt)) return false;
+  return db.transaction(async transaction => {
+    const tx = transaction as unknown as Db;
+    const [selected] = await tx.select({ issueId: sql<string>`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.issueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId')` }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
+    if (!selected?.issueId) return false;
+    await tx.select({ id: issues.id }).from(issues).where(and(eq(issues.companyId, companyId),
+      eq(issues.id, selected.issueId))).for("no key update");
+    const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+      eq(heartbeatRuns.id, runId))).for("update");
+    if (!run || run.status !== "cancelled" || !run.finishedAt || run.errorCode !== "cancelled") return false;
+    if (stoppedBeforeFirstInput(run)) return true;
+    const [owner] = await tx.select().from(nativeRunFinalizations).where(and(
+      eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.runId, runId),
+      eq(nativeRunFinalizations.issueId, selected.issueId))).for("update");
+    // Absence of an owner is not its retirement receipt: generic release can
+    // clear that row. Require the preparation owner's fence or the audited
+    // startup controller's acknowledgement as well as negative work evidence.
+    if (!(run.resultJson?.preDispatchCancellationSettledAt ||
+        hasAcknowledgedNativeRunStopRequest(run) && record(run.resultJson?.nativeCancellation).beforeProviderTurn === true)) return false;
+    if (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date() ||
+        owner?.leaseOwner || owner?.controllerPid || owner?.resultId || owner?.failureDetail?.successorRunId ||
+        !await personStopHasNoFirstInput(tx, run)) return false;
+    const leases = await tx.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, companyId),
+      eq(environmentLeases.heartbeatRunId, runId))).for("update");
+    const remote = leases.filter(lease => lease.provider !== "local");
+    if ((!remote.length && run.runtimeMode !== "legacy") || leases.some(lease => !["active", "released"].includes(lease.status) ||
+        lease.status === "released" && (lease.cleanupStatus !== "success" || !lease.releasedAt) ||
+        lease.metadata?.pendingCleanupInFlight === true || lease.metadata?.workspaceRestoreRecovery)) return false;
+    for (const lease of remote) if (!await unchangedBorrowedAllocation(tx, lease)) return false;
+    const sync = readNativeWorkspaceSyncReference(run.runnerProfileJson?.nativeWorkspaceSync);
+    if (run.runnerProfileJson?.nativeWorkspaceSync != null && !sync) return false;
+    if (sync && (sync.state !== "prepared" || !remote.some(lease => lease.id === sync.leaseId &&
+        lease.providerLeaseId === sync.providerLeaseId && lease.issueId === selected.issueId &&
+        lease.executionWorkspaceId === sync.workspaceId && lease.metadata?.remoteCwd === sync.remoteCwd))) return false;
+    const workspace = remoteWorkspaceRunReferenceSchema.safeParse(run.runnerProfileJson?.remoteWorkspace);
+    if (run.runnerProfileJson?.remoteWorkspace != null && (!workspace.success || workspace.data.state !== "prepared")) return false;
+    if (workspace.success && workspace.data.state === "prepared" &&
+        !await releaseUnchangedRemoteWorkspaceWriterById(transaction, { companyId, workspaceId: workspace.data.workspaceId, runId })) return false;
+    await tx.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ||
+      ${JSON.stringify({ stoppedBeforeFirstInput: { schema: STOPPED_BEFORE_FIRST_INPUT, runId, issueId: selected.issueId,
+        settledAt: new Date().toISOString(), leases: remote.map(lease => ({ id: lease.id, providerLeaseId: lease.providerLeaseId })) } })}::jsonb`,
+    }).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
+    return true;
+  });
+}
 
 /** The preparation owner calls this only after its dispatch gate unwound and
  * lease cleanup finished. Close only this run's conservative unwind hold, not
@@ -11,42 +105,160 @@ import { isBorrowedReusableSandboxLease } from "../sandbox-creation-operations.j
 export async function settlePreDispatchStopRecovery(db: Db, companyId: string, runId: string): Promise<number> {
   return db.transaction(async transaction => {
     const tx = transaction as unknown as Db;
-    const [run] = await tx.select().from(heartbeatRuns).where(and(
+    const [selected] = await tx.select({ issueId: sql<string>`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.issueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId')` }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
+    if (!selected?.issueId) return 0;
+    const [task] = await tx.select().from(issues).where(and(eq(issues.companyId, companyId),
+      eq(issues.id, selected.issueId))).for("no key update");
+    const [storedRun] = await tx.select().from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId),
       eq(heartbeatRuns.status, "cancelled"), eq(heartbeatRuns.errorCode, "cancelled"),
-      eq(heartbeatRuns.runtimeMode, "native"),
-      sql`${heartbeatRuns.resultJson}->>'preDispatchCancellationSettledAt' is not null`,
+      or(eq(heartbeatRuns.runtimeMode, "native"), sql`${heartbeatRuns.resultJson}->'stoppedBeforeFirstInput'->>'schema' = ${STOPPED_BEFORE_FIRST_INPUT}`),
+      or(sql`${heartbeatRuns.resultJson}->>'preDispatchCancellationSettledAt' is not null`,
+        sql`${heartbeatRuns.resultJson}->'stoppedBeforeFirstInput'->>'schema' = ${STOPPED_BEFORE_FIRST_INPUT}`),
     )).for("update");
+    const run = storedRun ? { ...storedRun, nativeIssueId: selected.issueId } : undefined;
     const cancellation = run?.resultJson?.cancellation as { initiator?: { type?: string } } | undefined;
     if (!run?.nativeIssueId || (run.resultJson?.cancelledByActorType !== "user" && cancellation?.initiator?.type !== "user") ||
-      !await nativeRunHasNoProviderWork(tx, { companyId, agentId: run.agentId, issueId: run.nativeIssueId }, runId)) return 0;
+      !(stoppedBeforeFirstInput(run) ? await personStopHasNoFirstInput(tx, run)
+        : await nativeRunHasNoProviderWork(tx, { companyId, agentId: run.agentId, issueId: run.nativeIssueId }, runId))) return 0;
+    if (stoppedBeforeFirstInput(run)) {
+      const [owner] = await tx.select().from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId, companyId),
+        eq(nativeRunFinalizations.runId, runId), eq(nativeRunFinalizations.issueId, run.nativeIssueId))).for("update");
+      if (owner?.leaseOwner || owner?.controllerPid || owner?.resultId || owner?.failureDetail?.successorRunId ||
+          run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date()) return 0;
+    }
     const leases = await tx.select().from(environmentLeases).where(and(
       eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, runId),
     )).for("update");
     if (leases.some(lease => !lease.releasedAt || !["released", "expired"].includes(lease.status) ||
       lease.cleanupStatus === "failed" || lease.metadata?.pendingCleanupInFlight === true)) return 0;
     const remote = leases.filter(lease => lease.provider !== "local");
-    if (!remote.length) return 0;
+    if (!remote.length && !stoppedBeforeFirstInput(run)) return 0;
     for (const lease of remote) {
       if (lease.status !== "released" || lease.cleanupStatus !== "success" ||
-        !await isBorrowedReusableSandboxLease(tx, lease)) return 0;
+        !await unchangedBorrowedAllocation(tx, lease)) return 0;
     }
-    const actions = await tx.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+    const firstInputStop = stoppedBeforeFirstInput(run);
+    const receipt = record(run.resultJson?.stoppedBeforeFirstInput);
+    if (firstInputStop && (remote.length !== (receipt.leases as unknown[])?.length || remote.some(lease =>
+      !(receipt.leases as Array<{ id: string; providerLeaseId: string }>).some(saved => saved.id === lease.id && saved.providerLeaseId === lease.providerLeaseId)))) return 0;
+    const actions = await tx.select().from(issueRecoveryActions).where(and(
       eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, run.nativeIssueId),
-      eq(issueRecoveryActions.cause, "native_continuation_requires_reconciliation"),
-      inArray(issueRecoveryActions.status, ["active", "escalated"]),
+      firstInputStop ? inArray(issueRecoveryActions.cause, ["native_continuation_requires_reconciliation", "legacy_execution_requires_reconciliation"])
+        : eq(issueRecoveryActions.cause, "native_continuation_requires_reconciliation"),
+      firstInputStop ? or(inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        and(eq(issueRecoveryActions.status, "resolved"), eq(issueRecoveryActions.outcome, "blocked")))
+        : inArray(issueRecoveryActions.status, ["active", "escalated"]),
       sql`${issueRecoveryActions.evidence}->>'runId' = ${runId}`,
     )).for("update");
     let settled = 0;
+    const settledActionIds = new Set<string>();
     for (const action of actions) {
+      if (firstInputStop && action.status === "resolved") {
+        const recovery = record(action.evidence.workspaceRestoreRecovery);
+        const automatic = record(action.evidence.automaticRecovery);
+        if (automatic.runId !== runId || automatic.replay !== "blocked" ||
+            action.evidence.executionReconciliation || action.evidence.freshContinuation ||
+            (action.evidence.workspaceRestoreRecovery != null && (!Array.isArray(recovery.leaseIds) ||
+              !recovery.leaseIds.every(id => remote.some(lease => lease.id === id))))) continue;
+        await tx.update(issueRecoveryActions).set({ outcome: "cancelled", resolutionNote: "stopped before first input",
+          evidence: { ...action.evidence, workspaceRestoreFailure: null, workspaceRestoreRecovery: null,
+            automaticRecovery: { ...record(action.evidence.automaticRecovery), replay: "cancelled" } }, updatedAt: new Date(),
+        }).where(eq(issueRecoveryActions.id, action.id));
+        settled++;
+        settledActionIds.add(action.id);
+        continue;
+      }
       const resolved = await issueRecoveryActionService(tx).resolveActiveForIssue({ companyId,
-        sourceIssueId: run.nativeIssueId, actionId: action.id, cause: "native_continuation_requires_reconciliation",
+        sourceIssueId: run.nativeIssueId, actionId: action.id, cause: action.cause,
         status: "resolved", outcome: "cancelled", resolutionNote: "stopped before dispatch" }, tx);
-      if (resolved) settled++;
+      if (resolved) { settled++; settledActionIds.add(action.id); }
+    }
+    if (firstInputStop) {
+      // Repair only this run's no-result finalizer and this run's false file flag.
+      // Accepted results, successor decisions and other sources are untouched.
+      await tx.update(nativeRunFinalizations).set({ phase: "terminal_failure", recoveryState: null,
+        failureCode: null, nextAttemptAt: null, controlDeadlineAt: null, updatedAt: new Date(),
+      }).where(and(eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.runId, runId),
+        isNull(nativeRunFinalizations.resultId), isNull(nativeRunFinalizations.leaseOwner),
+        sql`${nativeRunFinalizations.failureDetail}->>'successorRunId' is null`));
+      const recovery = record(run.resultJson?.workspaceRestoreRecovery);
+      const clearFiles = Array.isArray(recovery.leaseIds) && recovery.leaseIds.every(id => remote.some(lease => lease.id === id));
+      await tx.update(heartbeatRuns).set({
+        resultJson: clearFiles ? sql`${heartbeatRuns.resultJson} - 'workspaceRestoreFailure' - 'workspaceRestoreRecovery'` : run.resultJson,
+        runnerProfileJson: sql`(case when ${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceSync'->>'state' = 'prepared'
+          then (${heartbeatRuns.runnerProfileJson} - 'nativeWorkspaceSync') || jsonb_build_object(
+            'nativeWorkspaceSyncReleasedUnchanged', ${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceSync')
+          else ${heartbeatRuns.runnerProfileJson} end) -
+          case when ${heartbeatRuns.runnerProfileJson}->'remoteWorkspace'->>'state' = 'prepared' then array['remoteWorkspace'] else array[]::text[] end ||
+          case when ${heartbeatRuns.runnerProfileJson}->'remoteWorkspace'->>'state' = 'prepared' then jsonb_build_object(
+            'remoteWorkspaceReleasedUnchanged', ${heartbeatRuns.runnerProfileJson}->'remoteWorkspace') else '{}'::jsonb end`,
+      }).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
+      const captured = record(record(run.resultJson?.startupCancellation).task);
+      const ownBlock = actions.some(action => {
+        return settledActionIds.has(action.id) && [action.evidence.nativeFailureBlock, action.evidence.nativeBootstrapFailureBlock, action.evidence.legacyCancellationBlock].some(value => {
+          const block = record(value);
+          return block.runId === runId && block.statusVersion === task?.statusVersion;
+        });
+      });
+      const [successor] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.issueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${run.nativeIssueId}`,
+        ne(heartbeatRuns.id, runId),
+        or(inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+          sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${run.createdAt.toISOString()}::timestamptz, ${run.id}::uuid)`),
+      )).limit(1);
+      const [otherHold] = await tx.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, run.nativeIssueId),
+        or(inArray(issueRecoveryActions.status, ["active", "escalated"]),
+          and(eq(issueRecoveryActions.status, "resolved"), eq(issueRecoveryActions.outcome, "blocked"))),
+      )).limit(1);
+      if (task && !successor && !otherHold && task.assigneeAgentId === run.agentId && !task.assigneeUserId &&
+          (!task.executionRunId || task.executionRunId === runId) && (!task.checkoutRunId || task.checkoutRunId === runId) &&
+          (((task.status === "in_progress" || task.status === "todo") && captured.issueId === task.id &&
+              captured.assigneeAgentId === task.assigneeAgentId && captured.statusVersion === task.statusVersion) ||
+            task.status === "blocked" && ownBlock)) {
+        if (task.status !== "todo") {
+          await issueService(tx).update(task.id, { status: "todo" }, tx);
+          await logActivity(tx, { companyId, actorType: "system", actorId: "person-stop-settlement",
+            action: "issue.updated", entityType: "issue", entityId: task.id, runId,
+            details: { status: "todo", previousStatus: task.status, reason: "stopped_before_first_input" } });
+        }
+      }
     }
     // EVENT: the last reconciliation gate cleared; wake each parked message in
     // this same transaction, through the existing deferred-receipt event door.
     if (settled) await notifyDeferredWakesForIssue(tx, { companyId, issueId: run.nativeIssueId });
     return settled;
+  });
+}
+
+/** Request-time repair, not a historical sweep or replay authority. The caller
+ * has verified a new person Send/Retry. Only the latest exact task attempt and
+ * its existing hold are eligible; normal admission still owns every message. */
+export async function reevaluateStoppedBeforeFirstInput(db: Db, input: {
+  companyId: string; issueId: string; agentId: string;
+}): Promise<number> {
+  return db.transaction(async transaction => {
+    const tx = transaction as unknown as Db;
+    const [task] = await tx.select().from(issues).where(and(eq(issues.companyId, input.companyId),
+      eq(issues.id, input.issueId))).for("no key update");
+    if (!task || ["done", "cancelled"].includes(task.status) || task.assigneeAgentId !== input.agentId || task.assigneeUserId) return 0;
+    const [latest] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId),
+      sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.issueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${input.issueId}`,
+    )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1).for("update");
+    if (!latest || latest.agentId !== input.agentId || latest.status !== "cancelled" || !latest.finishedAt ||
+        task.executionRunId && task.executionRunId !== latest.id || task.checkoutRunId && task.checkoutRunId !== latest.id) return 0;
+    const holds = await tx.select().from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.companyId, input.companyId), eq(issueRecoveryActions.sourceIssueId, input.issueId),
+      or(inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        and(eq(issueRecoveryActions.status, "resolved"), eq(issueRecoveryActions.outcome, "blocked"))),
+    )).limit(26).for("update");
+    if (!holds.length || holds.length > 25 || holds.some(hold => hold.evidence.runId !== latest.id ||
+        !["legacy_execution_requires_reconciliation", "native_continuation_requires_reconciliation"].includes(hold.cause) ||
+        hold.evidence.executionReconciliation || hold.evidence.freshContinuation)) return 0;
+    if (!await recordStoppedBeforeFirstInput(tx, input.companyId, latest.id)) return 0;
+    return settlePreDispatchStopRecovery(tx, input.companyId, latest.id);
   });
 }

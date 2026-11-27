@@ -1,4 +1,5 @@
 import { isRetainedWorkspaceWorkerStopProof } from "./native-runtime/native-workspace-platform-proof.js";
+import { stoppedBeforeFirstInput } from "./person-stop-outcome.js";
 import { isPreDispatchReviewWait } from "./pre-dispatch-review-wait.js";
 import { createHash } from "node:crypto";
 import { and, eq, gt, inArray, isNotNull, isNull, lte, sql } from "drizzle-orm";
@@ -181,6 +182,11 @@ export async function isInterruptedNativePreparation(db: Db, run: Run): Promise<
 export async function canRetryStoppedRun(db: Db, run: Run): Promise<boolean> {
   if (run.errorCode === "native_session_cleanup_quarantined") return false;
   if (["failed", "timed_out"].includes(run.status) || canContinueCancelledRun(run)) return true;
+  if (stoppedBeforeFirstInput(run)) {
+    const [owner] = await db.select().from(nativeRunFinalizations).where(and(
+      eq(nativeRunFinalizations.companyId, run.companyId), eq(nativeRunFinalizations.runId, run.id)));
+    return isCancelledNativeStartup(db, run, owner);
+  }
   if (run.status !== "cancelled" || !run.finishedAt || run.processPid || run.processGroupId ||
       run.processStartedAt || run.sessionIdAfter) return false;
   const [coordinator] = await db.select().from(nativeRunFinalizations).where(and(
@@ -270,6 +276,18 @@ async function isCancelledUnclaimedWorkspaceWaitRetry(db: Db, run: Run): Promise
  * work. Attempt zero is a durable never-claimed receipt: every native executor
  * commits its first claim before it can start or attach a provider. */
 export async function isCancelledNativeStartup(db: Db, run: Run, coordinator: Coordinator | undefined) {
+  if (stoppedBeforeFirstInput(run)) {
+    if (!run.finishedAt || await preparerMayStillUnwind(run) || coordinator?.leaseOwner || coordinator?.controllerPid ||
+        coordinator?.resultId || coordinator?.failureDetail?.successorRunId || holdsPreparedFiles(run)) return false;
+    const leases = await db.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, run.companyId),
+      eq(environmentLeases.heartbeatRunId, run.id)));
+    const saved = (run.resultJson!.stoppedBeforeFirstInput as { leases?: Array<{ id: string; providerLeaseId: string }> }).leases;
+    const remote = leases.filter(lease => lease.provider !== "local");
+    return Array.isArray(saved) && saved.length === remote.length && leases.every(lease =>
+      lease.status === "released" && lease.releasedAt && lease.cleanupStatus === "success" &&
+      lease.metadata?.pendingCleanupInFlight !== true && !lease.metadata?.workspaceRestoreRecovery) &&
+      remote.every(lease => saved.some(receipt => receipt.id === lease.id && receipt.providerLeaseId === lease.providerLeaseId));
+  }
   if (run.status !== "cancelled" || !run.finishedAt || run.processPid || run.processGroupId ||
       run.processStartedAt || run.sessionIdAfter) return false;
   const cancellation = run.resultJson?.startupCancellation as Record<string, unknown> | undefined;
