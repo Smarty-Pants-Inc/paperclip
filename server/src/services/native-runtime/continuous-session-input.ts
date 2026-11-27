@@ -51,8 +51,11 @@ export async function readContinuousSessionInput(db: Pick<Db, "select">, scope: 
 
 /** Board reads use only the receipt written atomically with queue settlement. */
 export async function continuousSessionAcknowledgedCommentIds(db: Pick<Db, "select">, scope: Scope): Promise<Set<string>> {
-  const [run] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, scope.runId), eq(heartbeatRuns.companyId, scope.companyId)));
-  const saved = parseObject(parseObject(run?.resultJson).continuedSessionInput);
+  const [run] = await db.select({
+    continuedSessionInput: sql<Record<string, unknown> | null>`${heartbeatRuns.resultJson}->'continuedSessionInput'`,
+    nativeSessionId: heartbeatRuns.nativeSessionId,
+  }).from(heartbeatRuns).where(and(eq(heartbeatRuns.id, scope.runId), eq(heartbeatRuns.companyId, scope.companyId)));
+  const saved = parseObject(run?.continuedSessionInput);
   return new Set(saved.runId === scope.runId && saved.sessionId === run?.nativeSessionId && Array.isArray(saved.commentIds)
     ? saved.commentIds.filter((id): id is string => typeof id === "string") : []);
 }

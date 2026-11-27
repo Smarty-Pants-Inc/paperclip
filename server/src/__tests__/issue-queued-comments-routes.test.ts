@@ -226,11 +226,17 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
   }
 
   it.each([false, true])("polls queued comments without transferring run snapshots (agent fallback: %s)", async fallback => {
-    const f = await seedQueue(), payload = "saved-execution-input🙂".repeat(25_000);
+    const f = await seedQueue(), payload = "saved-execution-input🙂".repeat(25_000), sessionId = randomUUID();
     await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, prompt: payload },
       runnerProfileJson: { adapterDispatch: { adapterType: "paperclip_runner", adapterConfig: { instructions: payload } } },
       stdoutExcerpt: payload, stderrExcerpt: payload,
+      nativeSessionId: sessionId,
+      resultJson: { bulk: "x".repeat(1_048_576), continuedSessionInput: {
+        runId: f.runId, sessionId, commentIds: [f.commentIds[0]],
+      } },
     }).where(eq(heartbeatRuns.id, f.runId));
+    const { continuousSessionAcknowledgedCommentIds } = await import("../services/native-runtime/continuous-session-input.js");
+    expect(await continuousSessionAcknowledgedCommentIds(db, f)).toEqual(new Set([f.commentIds[0]]));
     if (fallback) await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, f.issueId));
     const [before] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
     const observed = createDb(tempDb!.connectionString), events: Array<Record<string, unknown>> = [], now = Date.now();
@@ -241,7 +247,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
         .get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
       expect(response.body.queueId).toBe(f.wakeId);
       expect(response.body.targetRunId).toBe(f.runId);
-      expect(response.body.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(f.commentIds);
+      expect(response.body.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(f.commentIds.slice(1));
       capture.flush();
       const reads = events.filter(event => event.table === "heartbeat_runs" && event.operation === "select");
       expect(reads.length).toBeGreaterThan(0);

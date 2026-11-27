@@ -19,18 +19,33 @@ import { queuedInteractionId } from "../queued-interaction-response.js";
 
 /** Replay the ingestion/publication crash gap before terminal presentation or queue release. */
 export async function recoverContinuousNativeReplies(db: Db, scope: { id: string; companyId: string }) {
-  const [row] = await db.select({ run: heartbeatRuns, config: agents.adapterConfig }).from(heartbeatRuns)
+  const [row] = await db.select({ issueId: heartbeatRuns.nativeIssueId, agentId: heartbeatRuns.agentId }).from(heartbeatRuns)
     .innerJoin(agents, and(eq(agents.id, heartbeatRuns.agentId), eq(agents.companyId, scope.companyId)))
-    .where(and(eq(heartbeatRuns.id, scope.id), eq(heartbeatRuns.companyId, scope.companyId)));
-  if (!row?.run.nativeIssueId || row.run.runtimeMode !== "native" || row.config.provider !== "pi_rpc" ||
-      resolveSessionContinuity("pi_rpc", row.config.sessionContinuity) !== "continuous") return;
-  const events = await db.select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents)
+    .where(and(eq(heartbeatRuns.id, scope.id), eq(heartbeatRuns.companyId, scope.companyId),
+      eq(heartbeatRuns.runtimeMode, "native"), sql`${heartbeatRuns.nativeIssueId} is not null`,
+      sql`${agents.adapterConfig}->'provider' = '"pi_rpc"'::jsonb`,
+      // Pi defaults to continuous for every value except the explicit paperclip setting.
+      sql`${agents.adapterConfig}->'sessionContinuity' is distinct from '"paperclip"'::jsonb`));
+  if (!row?.issueId) return;
+  const prpEvent = sql`${heartbeatRunEvents.payload}->'prpEvent'`;
+  const payload = sql`${prpEvent}->'payload'`;
+  const events = await db.select({ seq: heartbeatRunEvents.seq,
+    // Preserve absent keys as absent (not JSON null): the publisher compares
+    // session identity and persists optional receipt fields verbatim.
+    event: sql<Parameters<typeof publishContinuousNativeReply>[0]["event"]>`
+      coalesce((select jsonb_object_agg(key, value) from jsonb_each(${prpEvent})
+        where key in ('runId', 'normalizedSessionId', 'itemId', 'sourceEventId', 'turnId')), '{}'::jsonb)
+      || jsonb_build_object('payload', (select jsonb_object_agg(key, value) from jsonb_each(${payload})
+        where key in ('kind', 'channel', 'text', 'answers', 'itemId')))`,
+  }).from(heartbeatRunEvents)
     .where(and(eq(heartbeatRunEvents.companyId, scope.companyId), eq(heartbeatRunEvents.runId, scope.id),
-      eq(heartbeatRunEvents.eventType, "item.completed"))).orderBy(asc(heartbeatRunEvents.seq));
+      eq(heartbeatRunEvents.eventType, "item.completed"),
+      sql`${payload}->'kind' in ('"agentMessage"'::jsonb, '"assistant_message"'::jsonb)`,
+      sql`${payload}->'channel' = '"final"'::jsonb`)).orderBy(asc(heartbeatRunEvents.seq));
   for (const event of events) await publishContinuousNativeReply({ db, cursor: event.seq, recoverTerminal: true,
-    execution: { binding: { companyId: scope.companyId, issueId: row.run.nativeIssueId, runId: scope.id, agentId: row.run.agentId },
+    execution: { binding: { companyId: scope.companyId, issueId: row.issueId, runId: scope.id, agentId: row.agentId },
       provider: { kind: "pi_rpc" } },
-    event: { ...parseObject(parseObject(event.payload).prpEvent), eventType: "item.completed" } as Parameters<typeof publishContinuousNativeReply>[0]["event"],
+    event: { ...event.event, eventType: "item.completed" },
   });
 }
 
