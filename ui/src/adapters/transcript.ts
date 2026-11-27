@@ -40,6 +40,7 @@ export function appendTranscriptEntry(entries: TranscriptEntry[], entry: Transcr
     ) {
       last.text += entry.text;
       last.ts = entry.ts;
+      last.contentVersion = entry.contentVersion;
       return;
     }
   }

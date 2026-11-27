@@ -110,6 +110,9 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
     if (!hasTranscriptBody) cursor.requireHistory(row.seq);
     if (cursor.observe(row.seq) && !gapPendingRef.current.has(runId)) {
       gapPendingRef.current.add(runId);
+      setErrorsByRun(previous => previous.has(runId) ? previous : new Map(previous).set(runId, {
+        message: "Native run history is incomplete", failedAt: new Date().toISOString(),
+      }));
       refreshByRunRef.current.get(runId)?.();
     }
     if (!hasTranscriptBody) return;
@@ -226,6 +229,9 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
           });
         }
         setErrorsByRun((previous) => {
+          if (failed) return previous.has(run.id) ? previous : new Map(previous).set(run.id, {
+            message: "Native run history is incomplete", failedAt: new Date().toISOString(),
+          });
           if (!previous.has(run.id)) return previous;
           const next = new Map(previous);
           next.delete(run.id);

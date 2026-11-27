@@ -482,9 +482,12 @@ const PROVIDER_DETAIL_KEYS: Record<
   ],
 };
 
-function providerActivityKey(
+export function providerActivityKey(
   entry: Extract<TranscriptEntry, { kind: "provider_activity" }>,
+  occurrence = entry.family === "hook" || entry.eventType === "context.compacted" ||
+    (entry.family === "provider_notice" && entry.payload.category === "provider_retry"),
 ): string {
+  const occurrenceId = occurrence ? `:${entry.providerEventId ?? entry.firstSeenAt ?? entry.ts}` : "";
   const idKeys = [
     "planId",
     "proposalId",
@@ -503,9 +506,9 @@ function providerActivityKey(
   ];
   for (const key of idKeys) {
     const value = stringValue(entry.payload[key]);
-    if (value) return `${entry.family}:${value}`;
+    if (value) return `${entry.family}:${value}${occurrenceId}`;
   }
-  return `${entry.family}:${entry.eventType}:${entry.ts}`;
+  return `${entry.family}:${entry.eventType}:${occurrenceId || entry.ts}`;
 }
 
 function providerActivityItem(
@@ -634,7 +637,7 @@ function providerActivityItem(
         stringValue(entry.payload.summary));
 
   return {
-    id: `${runId}:provider:${providerActivityKey(entry)}:${index}`,
+    id: `${runId}:provider:${providerActivityKey(entry)}${!entry.providerEventId && entry.family === "provider_notice" && entry.payload.category === "provider_retry" ? `:${index}` : ""}`,
     kind: "protocol",
     surface: "provider_activity",
     family: entry.family,
@@ -1125,7 +1128,7 @@ export function transcriptToTaskChatItems(
       case "provider_activity": {
         if (entry.eventType === "context.compacted") {
           // One entry per compaction; producers may reuse a thread-scoped id.
-          items.push(contextCompactedMarker(entry, `${runId}:compaction:${String(entry.payload.compactionId ?? "")}:${i}`));
+          items.push(contextCompactedMarker(entry, `${runId}:compaction:${providerActivityKey(entry)}`));
           resetInline();
           break;
         }
@@ -1138,10 +1141,8 @@ export function transcriptToTaskChatItems(
             .includes(String(entry.payload.category)))) break;
         // Each retry keeps its own position, so work between two retries in
         // one turn cannot make the later retry look recovered.
-        const key = entry.family === "provider_notice" && entry.payload.category === "provider_retry"
-          ? `provider:${providerActivityKey(entry)}:${i}`
-          : `provider:${providerActivityKey(entry)}`;
         const item = providerActivityItem(entry, runId, i);
+        const key = entry.family === "hook" ? `provider:${providerActivityKey(entry, false)}` : item.id;
         const existingIndex = protocolIndexByKey.get(key);
         const previous = existingIndex == null ? undefined : items[existingIndex];
         // A harness can reuse one hook id for two calls (for example two
@@ -1151,7 +1152,8 @@ export function transcriptToTaskChatItems(
         const newHookCall = entry.family === "hook"
           && previous?.kind === "protocol"
           && previous.surface === "provider_activity"
-          && previous.status !== "running";
+          && (previous.status !== "running" || entry.eventType === "hook.started")
+          && previous.id !== item.id;
         if (existingIndex == null || newHookCall) {
           items.push(item);
           protocolIndexByKey.set(key, items.length - 1);
@@ -1419,7 +1421,7 @@ export function settledCompactionMarkers(
   const markers: TaskChatMarkerItem[] = [];
   entries.forEach((entry, index) => {
     if (entry.kind !== "provider_activity" || entry.eventType !== "context.compacted") return;
-    markers.push(contextCompactedMarker(entry, `${runId}:compaction:${String(entry.payload.compactionId ?? "")}:${index}`));
+    markers.push(contextCompactedMarker(entry, `${runId}:compaction:${providerActivityKey(entry)}`));
   });
   return markers;
 }

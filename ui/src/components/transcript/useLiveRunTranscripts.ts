@@ -151,6 +151,8 @@ export function useLiveRunTranscripts({
   const requestCatchUp = (runId: string) => {
     if (gapPendingRef.current.has(runId)) return;
     gapPendingRef.current.add(runId);
+    missingTerminalLogRunIdsRef.current.delete(runId);
+    setErrorsByRun(previous => previous.has(runId) ? previous : new Map(previous).set(runId, new Error("Run history is incomplete")));
     refreshByRunRef.current.get(runId)?.();
   };
   const bindLog = (runId: string, store: unknown, ref: unknown): "same" | "changed" | "stale" => {
@@ -473,10 +475,6 @@ export function useLiveRunTranscripts({
             rewinding = false;
           }
           alignStartToRecord = false;
-          setErrorsByRun(previous => {
-            if (!previous.has(run.id)) return previous;
-            const next = new Map(previous); next.delete(run.id); return next;
-          });
           const rows = parsePersistedLogContent(run.id, result.content, pendingLogRowsByRunRef.current);
           appendChunks(run.id, rows);
           for (const row of rows) sequence(run.id).confirm(row.seq);
@@ -487,10 +485,17 @@ export function useLiveRunTranscripts({
         }
         failed = sequence(run.id).needsCatchup;
         if (!failed) gapPendingRef.current.delete(run.id);
+        // One successful page cannot clear an incomplete-history warning.
+        setErrorsByRun(previous => {
+          if (failed) return previous.has(run.id) ? previous : new Map(previous).set(run.id, new Error("Run history is incomplete"));
+          if (!previous.has(run.id)) return previous;
+          const next = new Map(previous); next.delete(run.id); return next;
+        });
       } catch (error) {
         if (cancelled) return;
         failed = true;
-        if (error instanceof ApiError && error.status === 404) {
+        if (error instanceof ApiError && error.status === 404 && offset === 0 &&
+          !sequence(run.id).needsCatchup && !run.hasStoredOutput && runKnownLogBytes(run) === null) {
           setErrorsByRun((previous) => {
             if (!previous.has(run.id)) return previous;
             const next = new Map(previous);
@@ -513,7 +518,7 @@ export function useLiveRunTranscripts({
           if (pendingRefresh.has(run.id)) {
             missingTerminalLogRunIdsRef.current.delete(run.id);
             void readRunLog(run);
-          } else if (failed && stream.healthy) {
+          } else if (failed && (stream.healthy || isTerminalStatus(run.status))) {
             const timer = window.setTimeout(() => { retryTimers.delete(run.id); void readRunLog(run); }, LOG_POLL_INTERVAL_MS);
             retryTimers.set(run.id, timer);
           }

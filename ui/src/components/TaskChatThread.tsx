@@ -7,7 +7,7 @@ import {
 import { imagePreparationReceiptIds } from "./task-chat/image-resources";
 import type { ScrollingHistory } from "@/components/task-chat/TaskMessageScroller";
 import { TaskChatShimmerScope } from "@/components/task-chat/TaskChatShimmer";
-import { TaskChatStatusContext, TaskChatStatusLine, taskChatLineState, taskChatTurnStart } from "@/components/task-chat/TaskChatStatusLine";
+import { TaskChatStatusContext, TaskChatStatusLine, taskChatActivityLabel, taskChatLineState, taskChatTurnStart } from "@/components/task-chat/TaskChatStatusLine";
 import { useRunnerSubmission } from "@/hooks/useRunnerSubmission";
 import { useCompanyLiveEvent } from "@/context/LiveUpdatesProvider";
 import { TaskChatLoadingShell } from "@/components/task-chat/TaskChatLoadingShell";
@@ -60,7 +60,7 @@ import { McpAppTurnViews, mcpAppRunRefreshKey } from "@/components/mcp-app/McpAp
 import { ToolCallProgressProvider } from "@/components/task-chat/tool-call-progress";
 import { TaskChatRunnerHeader, TaskChatRunnerTurn } from "@/components/task-chat/TaskChatRunnerTurn";
 import { ExecutionBlockerNotice, nativeFailureNoticeRunId, isConversationRecovery, isPersonStoppedRun } from "./ExecutionBlockerNotice";
-import type { TranscriptEntry } from "@/adapters/types";
+import type { TranscriptContentVersion, TranscriptEntry } from "@/adapters/types";
 import { isNoLiveExecutionPathNotice } from "./task-chat/adjacent-errors";
 import { partitionRunHealthItems } from "@/components/task-chat/TaskChatRunHealthBanner";
 import {
@@ -86,6 +86,7 @@ import {
   paperclipRunnerAcceptedResponseWake,
   paperclipRunnerTimelineItems,
   prependIssueBrief,
+  providerActivityKey,
   settledCompactionMarkers,
   settledRunChildren,
   splitTranscriptAtAnchors,
@@ -180,6 +181,117 @@ function toMs(value: Date | string | null | undefined): number {
   if (!value) return 0;
   const ms = new Date(value).getTime();
   return Number.isNaN(ms) ? 0 : ms;
+}
+
+// Normalize a source before its first paint, including a reload. Once loaded,
+// the selected source owns text and authored placement, not the previous paint.
+function canonicalTranscript(entries: TranscriptEntry[], preserveReadPositions = true): TranscriptEntry[] {
+  const key = (entry: TranscriptEntry): string | undefined => {
+    if ((entry.kind === "assistant" || entry.kind === "thinking") && entry.itemId) {
+      // Native inline bursts can straddle a read or tool. Folding them by item
+      // alone would erase those boundaries. Word coverage ignores that layout.
+      const cursor = preserveReadPositions && entry.eventSeq !== undefined &&
+        (entry.kind === "thinking" || entry.channel !== "final") ? `:${entry.eventSeq}` : "";
+      return `${entry.kind}:${entry.itemId}${cursor}`;
+    }
+    if ((entry.kind === "tool_call" || entry.kind === "tool_result") && entry.toolUseId) return `${entry.kind}:${entry.toolUseId}`;
+    if (entry.kind === "runtime_request") return `${entry.kind}:${entry.requestId}`;
+    if (entry.kind === "provider_activity") return `${entry.kind}:${providerActivityKey(entry)}`;
+    if (entry.kind === "workspace_change") return `${entry.kind}:${entry.changeSetId}`;
+    if (entry.kind === "workspace_file_reference") return `${entry.kind}:${entry.referenceId}`;
+  };
+  const result = new Map<string, TranscriptEntry>();
+  const hooks = new Map<string, string>();
+  for (const raw of entries) {
+    let entry = raw.firstSeenAt ? { ...raw, ts: raw.firstSeenAt } : raw;
+    // Unidentified records stay distinct, even when their prose is identical.
+    let id = key(entry) ?? `unkeyed:${result.size}`;
+    if (entry.kind === "provider_activity" && entry.family === "hook") {
+      const lifecycle = providerActivityKey(entry, false);
+      const activeId = hooks.get(lifecycle);
+      const active = activeId ? result.get(activeId) : undefined;
+      if (active?.kind === "provider_activity" && active.status === "running" &&
+        (entry.eventType !== "hook.started" || entry.providerEventId === active.providerEventId)) {
+        id = activeId!;
+        entry = { ...entry, providerEventId: active.providerEventId, payload: { ...active.payload, ...entry.payload } };
+      }
+      hooks.set(lifecycle, id);
+    }
+    const first = result.get(id);
+    // These are partial updates, not snapshots. Keep them at their first
+    // authored position and let transcriptToTaskChatItems merge their facts;
+    // last-record-only folding drops omitted ownership, input and detail.
+    if (first && (entry.kind === "tool_call" || (entry.kind === "provider_activity" && entry.family !== "hook" &&
+      entry.eventType !== "context.compacted" && entry.payload.category !== "provider_retry"))) {
+      result.set(`update:${result.size}`, { ...entry, ts: first.ts });
+      continue;
+    }
+    let next = first ? { ...entry, ts: first.ts } : entry;
+    if ((entry.kind === "assistant" || entry.kind === "thinking") && first?.kind === entry.kind) {
+      next = { ...next, text: entry.delta ? first.text + entry.text : entry.text || first.text,
+        channel: entry.channel === "unknown" ? first.channel : entry.channel,
+        ...(entry.kind === "thinking" && first.kind === "thinking" && first.lifecycle === "completed" ? { lifecycle: "completed" as const } : {}),
+      } as TranscriptEntry;
+    } else if (entry.kind === "tool_result" && first?.kind === "tool_result") {
+      next = { ...entry, ts: first.ts, content: entry.delta ? first.content + entry.content : entry.content || first.content };
+    }
+    result.set(id, next);
+  }
+  return [...result.values()].sort((a, b) =>
+    preserveReadPositions && a.eventSeq !== undefined && b.eventSeq !== undefined
+      ? a.eventSeq - b.eventSeq : toMs(a.ts) - toMs(b.ts));
+}
+
+function compareContentVersion(a: TranscriptContentVersion, b: TranscriptContentVersion): number {
+  if (a.scope === b.scope && a.sequence !== undefined && b.sequence !== undefined && a.sequence !== b.sequence) {
+    return a.sequence - b.sequence;
+  }
+  return toMs(a.at) - toMs(b.at) || Number(a.completed) - Number(b.completed);
+}
+
+function latestTranscriptContent(entries: TranscriptEntry[]): TranscriptContentVersion {
+  let latest: TranscriptContentVersion | undefined;
+  for (const entry of entries) {
+    // A later usage/transport/governance receipt cannot make older words newer.
+    if (["init", "system", "stderr", "user", "result", "run_result", "run_terminal"].includes(entry.kind)) continue;
+    const version = entry.contentVersion ?? {
+      at: entry.completedAt ?? entry.firstSeenAt ?? entry.ts,
+      completed: Boolean(entry.completedAt) || (entry.kind === "thinking" && entry.lifecycle === "completed") || entry.kind === "tool_result",
+    };
+    if (!latest || compareContentVersion(version, latest) > 0) latest = version;
+  }
+  return latest ?? { at: "", completed: false };
+}
+
+function transcriptWords(entries: TranscriptEntry[]): string[] {
+  const words: string[] = [];
+  const toolOutputs = new Map<string, string>();
+  for (const entry of canonicalTranscript(entries, false)) {
+    if (entry.kind === "assistant" || entry.kind === "thinking") {
+      words.push(JSON.stringify([entry.kind, entry.itemId, entry.channel, entry.text,
+        entry.kind === "thinking" ? entry.lifecycle === "completed" : undefined]));
+    }
+    if (entry.kind === "tool_result" && entry.toolUseId) toolOutputs.set(entry.toolUseId, entry.content);
+    // The log's provider card and native tool result carry the same output,
+    // despite their intentionally different tool labels/presentation.
+    if (entry.kind === "provider_activity" && entry.family === "tool_execution" &&
+      typeof entry.payload.executionId === "string" && typeof entry.payload.output === "string") {
+      toolOutputs.set(entry.payload.executionId, entry.payload.output);
+    }
+  }
+  return [...words, ...[...toolOutputs].map(([id, output]) => JSON.stringify(["tool_result", id, output]))];
+}
+
+function containsTranscriptWords(candidate: TranscriptEntry[], current: TranscriptEntry[]): boolean {
+  const words = new Map<string, number>();
+  for (const word of transcriptWords(candidate)) words.set(word, (words.get(word) ?? 0) + 1);
+  // A complete source may restore older rows missing from a bounded log read,
+  // but may not replace or lose its words (including identical distinct rows).
+  return transcriptWords(current).every(word => {
+    const count = words.get(word) ?? 0;
+    words.set(word, count - 1);
+    return count > 0;
+  });
 }
 
 function normalizedMessageText(value: string | null | undefined): string {
@@ -1298,20 +1410,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     terminalHydratedRunIds,
     retry: retryNativeEvents,
   } = useNativeRunTranscripts(nativeRuns, { companyId });
-  const logRuns = useMemo(() => transcriptRuns.filter((run) =>
-    (!nativeRuns.some((nativeRun) => nativeRun.id === run.id && nativeRun.conversationOnly) ||
-      nativeTranscriptErrorsByRun.has(run.id) ||
-      (hydratedNativeRunIds.has(run.id) && (nativeTranscriptByRun.get(run.id)?.length ?? 0) === 0)) && (
-    run.runtimeMode !== "native" ||
-    // Active runs still need the websocket log stream. Only settled native
-    // history can skip the legacy transport when event history is available.
-    run.status === "running" || run.status === "queued" ||
-    // Retain the old source until native history is ready (no blank at the hand-over).
-    !hydratedNativeRunIds.has(run.id) ||
-    nativeTranscriptErrorsByRun.has(run.id) ||
-    (hydratedNativeRunIds?.has(run.id) &&
-      (nativeTranscriptByRun.get(run.id)?.length ?? 0) === 0)
-  )), [transcriptRuns, nativeRuns, nativeTranscriptErrorsByRun, hydratedNativeRunIds, nativeTranscriptByRun]);
+  // Read both durable sources, including settled/compact reloads. Native history
+  // existing is not evidence that its content is as recent as the saved log.
+  const logRuns = transcriptRuns;
   const {
     transcriptByRun: logTranscriptByRun,
     isInitialHydrating: logsAreInitiallyHydrating,
@@ -1320,39 +1421,62 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     errorsByRun: logErrorsByRun,
     retry: retryLogs,
   } = useLiveRunTranscripts({ runs: logRuns, companyId, ...(props.compactHistory ? { logReadLimitBytes: COMPACT_RUN_LOG_READ_LIMIT_BYTES } : {}) });
-  const fallbackByRunRef = useRef(
-    new Map<string, NonNullable<ReturnType<typeof logTranscriptByRun.get>>>(),
-  );
-  const rawTranscriptByRun = useMemo(() => {
+  const selectedTranscriptByRun = useMemo(() => {
     const next = new Map(logTranscriptByRun);
-    for (const run of transcriptRuns) {
+    for (const run of nativeRuns) {
+      // A reload must not briefly draw the older source just because its HTTP
+      // read won the race. Existing paint still bridges later refresh gaps.
+      if (!hydratedNativeRunIds.has(run.id) ||
+        (!["queued", "scheduled_retry"].includes(run.status) && !hydratedLogRunIds.has(run.id))) {
+        next.delete(run.id);
+        continue;
+      }
       const nativeTranscript = nativeTranscriptByRun.get(run.id) ?? [];
       const logTranscript = logTranscriptByRun.get(run.id) ?? [];
-      // Once native owns the source, later log receipts cannot replace it.
-      // Before that handoff, keep the available log history current.
-      const fallback = nativeTranscript.length === 0 && logTranscript.length > 0
-        ? logTranscript
-        : fallbackByRunRef.current.get(run.id) ?? logTranscript;
-      const reasoningItems = (entries: typeof nativeTranscript) =>
-        paperclipRunnerTimelineItems(transcriptToTaskChatItems(entries, { runId: run.id, running: false }))
-          .filter(item => item.kind === "thinking");
-      const nativeReasoning = new Map(reasoningItems(nativeTranscript).map(item => [item.id, item]));
-      const losesReasoning = reasoningItems(fallback).filter(item => item.lines.some(line => line.trim())).some(item => {
-        const native = nativeReasoning.get(item.id);
-        return !native || native.channel !== item.channel;
-      });
-      // Coverage is rows, identities and channels, never prose or receipt time.
-      const source = nativeTranscript.length > 0 && !losesReasoning
-        ? nativeTranscript
-        : run.runtimeMode === "native" && !hydratedNativeRunIds.has(run.id) && !fallbackByRunRef.current.has(run.id)
-          ? nativeTranscript
-          : fallback;
-      if (source.length > 0) fallbackByRunRef.current.set(run.id, source);
-      next.set(run.id, source);
+      const freshness = compareContentVersion(latestTranscriptContent(nativeTranscript), latestTranscriptContent(logTranscript));
+      // The same rule on first load, recovery and reload: newest durable content
+      // wins. Equal versions may hand over only without changing the words.
+      // Transport failure is a tie-breaker, never a reason to rewind content.
+      if (nativeTranscript.length > 0 && (!logTranscript.length || freshness > 0 ||
+        (freshness === 0 && containsTranscriptWords(nativeTranscript, logTranscript) &&
+          (!nativeTranscriptErrorsByRun.has(run.id) || !containsTranscriptWords(logTranscript, nativeTranscript))))) {
+        next.set(run.id, nativeTranscript);
+      }
     }
-    for (const id of fallbackByRunRef.current.keys()) {
-      if (!transcriptRuns.some((run) => run.id === id))
-        fallbackByRunRef.current.delete(id);
+    return next;
+  }, [
+    logTranscriptByRun,
+    nativeRuns,
+    nativeTranscriptByRun,
+    nativeTranscriptErrorsByRun,
+    hydratedNativeRunIds,
+    hydratedLogRunIds,
+  ]);
+  // Read provenance from the selector's exact array, not from retained paint.
+  const selectedNativeRunIds = new Set(nativeRuns.filter(run => {
+    const selected = selectedTranscriptByRun.get(run.id);
+    return selected && selected === nativeTranscriptByRun.get(run.id);
+  }).map(run => run.id));
+  const transcriptHistoryErrors = new Set(transcriptRuns.filter(run => selectedNativeRunIds.has(run.id)
+    ? nativeTranscriptErrorsByRun.has(run.id) || !hydratedNativeRunIds.has(run.id)
+    : logErrorsByRun.has(run.id) || truncatedRunIds.has(run.id) ||
+      (nativeTranscriptErrorsByRun.has(run.id) && !(selectedTranscriptByRun.get(run.id)?.length)) ||
+      (!["queued", "scheduled_retry"].includes(run.status) && !hydratedLogRunIds.has(run.id))
+  ).map(run => run.id));
+  const drawnByRunRef = useRef(new Map<string, TranscriptEntry[]>());
+  const rawTranscriptByRun = useMemo(() => {
+    const next = new Map(selectedTranscriptByRun);
+    for (const run of transcriptRuns) {
+      const selected = next.get(run.id) ?? [];
+      const nativeSelected = selected === nativeTranscriptByRun.get(run.id);
+      const loaded = nativeSelected
+        ? hydratedNativeRunIds.has(run.id) && !nativeTranscriptErrorsByRun.has(run.id)
+        : hydratedLogRunIds.has(run.id) && !logErrorsByRun.has(run.id);
+      // Only bridge a loading/failed-read gap. The freshness-selected source
+      // owns content and placement; never union it with old paint.
+      next.set(run.id, !loaded && drawnByRunRef.current.has(run.id)
+        ? drawnByRunRef.current.get(run.id)!
+        : run.runtimeMode === "native" ? canonicalTranscript(selected) : selected);
     }
     // Keep the original attempt in place; omit only identity-and-payload-equal replay groups.
     // Whole groups prevent a replayed call being removed while its changed result survives alone.
@@ -1361,7 +1485,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       : entry.kind === "tool_call" || entry.kind === "tool_result" ? entry.toolUseId && `tool:${entry.toolUseId}` : undefined;
     const groups = (entries: readonly TranscriptEntry[]) => {
       const grouped = new Map<string, TranscriptEntry[]>();
-      for (const entry of entries) { const key = groupKey(entry); if (key) grouped.set(key, [...(grouped.get(key) ?? []), entry]); }
+      for (const entry of entries) {
+        const key = groupKey(entry);
+        if (!key) continue;
+        const group = grouped.get(key) ?? [];
+        group.push(entry);
+        grouped.set(key, group);
+      }
       return grouped;
     };
     return new Map([...next].map(([id, entries]) => {
@@ -1372,10 +1502,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     }));
   }, [
     runChainIdsById,
-    logTranscriptByRun,
+    selectedTranscriptByRun,
     transcriptRuns,
     nativeTranscriptByRun,
     hydratedNativeRunIds,
+    nativeTranscriptErrorsByRun,
+    hydratedLogRunIds,
+    logErrorsByRun,
   ]);
   const deliveryPointsByRun = useMemo(() => new Map([...rawTranscriptByRun]
     .map(([runId, entries]) => [runId, steeringDeliveryPoints(entries)])), [rawTranscriptByRun]);
@@ -3126,7 +3259,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const tailChainIds = tailRunId ? (runChainIdsById.get(tailRunId) ?? [tailRunId]) : [];
   const tailAllEntries = tailChainIds.filter(id => !coveredAttemptIds.has(id)).flatMap((id) => transcriptByRun.get(id) ?? []);
   const tailActivityUnavailable = Boolean(
-    tailRunId &&
+    tailRunId && tailAllEntries.length === 0 &&
     nativeTranscriptErrorsByRun.has(tailRunId) &&
     (logTranscriptByRun.get(tailRunId)?.length ?? 0) === 0 &&
     !logsAreInitiallyHydrating,
@@ -3181,7 +3314,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // A receipt beats the startup grace, but never a terminal state or a named hold.
   const tailProgressLabel = liveRun?.id === tailRunId && !tailEnded && !isTerminalRunStatus(liveRun?.status ?? "") &&
     (!liveExecution || (["working", "reconnecting", "queued"].includes(liveExecution.phase) && !liveExecution.cause))
-    ? nativeActivityLabelByRun.get(tailRunId ?? "") ?? (tailBeforeTurn ? liveRun?.status === "queued" ? "Queued" : "Preparing run…" : undefined)
+    ? (selectedNativeRunIds.has(tailRunId ?? "") && !nativeTranscriptErrorsByRun.has(tailRunId ?? "") ? nativeActivityLabelByRun.get(tailRunId ?? "") : undefined) ?? (tailBeforeTurn ? liveRun?.status === "queued" ? "Queued" : "Preparing run…" : undefined)
     : undefined;
   const tailExecution = tailResuming && !tailBeforeTurn && liveExecution?.phase === "reconnecting"
     ? null : liveExecution;
@@ -3399,7 +3532,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     state={taskChatLineState({
       status: statusLineFreshTurn ? "queued" : statusLineRun.status,
       execution: liveExecution,
-      activityLabel: statusLineFreshTurn ? undefined : nativeActivityLabelByRun.get(statusLineRun.id) ?? tailPreparationLabel,
+      activityLabel: statusLineFreshTurn ? undefined : (selectedNativeRunIds.has(statusLineRun.id) && !nativeTranscriptErrorsByRun.has(statusLineRun.id)
+        ? nativeActivityLabelByRun.get(statusLineRun.id) : undefined) ?? taskChatActivityLabel(statusLineItems) ?? tailPreparationLabel,
       items: statusLineItems,
       stopping: stoppingReply,
       reconnecting: tailActivityUnavailable,
@@ -4052,11 +4186,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         : nativeEventsAreInitiallyHydrating)
     )
       return true;
-    if (
-      run.runtimeMode === "native" &&
-      (nativeTranscriptByRun.get(run.id)?.length ?? 0) > 0
-    )
-      return false;
     return run.status !== "queued" && hydratedLogRunIds
       ? !hydratedLogRunIds.has(run.id)
       : logsAreInitiallyHydrating;
@@ -4095,15 +4224,14 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const historyError =
     initialHistoryError ||
     planError ||
-    runs.some((run) =>
-      run.runtimeMode === "native"
-        ? nativeTranscriptErrorsByRun.has(run.id)
-        : Boolean(logErrorsByRun?.has(run.id)),
-    ) || questionReads.some(read => read.isError);
+    transcriptHistoryErrors.size > 0 || questionReads.some(read => read.isError);
   const historyKey = conversationMode && draftKey ? draftKey : issueId;
   const [revealedHistoryKey, setRevealedHistoryKey] = useState<string | null | undefined>(undefined);
   const revealCachedHeader = connectionStatus !== "online" && Boolean(threadHeader);
   const historyRevealed = revealedHistoryKey === historyKey || revealCachedHeader;
+  useLayoutEffect(() => {
+    if (historyRevealed) drawnByRunRef.current = transcriptByRun;
+  }, [historyRevealed, transcriptByRun]);
   useEffect(() => {
     if (revealCachedHeader) setRevealedHistoryKey(historyKey);
   }, [revealCachedHeader, historyKey]);

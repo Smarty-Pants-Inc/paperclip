@@ -62,13 +62,14 @@ const editorCallbacks = vi.hoisted(() => ({ change: (_value: string) => {} }));
 const streamlinedState = vi.hoisted(() => ({ enabled: true }));
 
 vi.mock("@/components/transcript/useLiveRunTranscripts", () => ({
-  useLiveRunTranscripts: ({ runs, logReadLimitBytes }: { runs: unknown[]; logReadLimitBytes?: number }) => {
+  useLiveRunTranscripts: ({ runs, logReadLimitBytes }: { runs: { id: string }[]; logReadLimitBytes?: number }) => {
     transcriptHookRuns.legacy.push(runs);
     transcriptHookRuns.legacyReadLimits.push(logReadLimitBytes);
     return {
       transcriptByRun: new Map(transcriptState.transcriptByRun),
       isInitialHydrating: transcriptState.isInitialHydrating,
-      hydratedRunIds: transcriptState.hydratedRunIds,
+      // HIST10 reads both durable sources before selection; a completed mock read must report hydration, even for an empty log.
+      hydratedRunIds: transcriptState.hydratedRunIds ?? new Set(transcriptState.isInitialHydrating ? [] : runs.map(run => run.id)),
       truncatedRunIds: transcriptState.truncatedRunIds,
       errorsByRun: new Map(),
       retry: () => {},
@@ -1622,7 +1623,8 @@ describe("TaskChatThread runtime transcript selection", () => {
     expect(transcriptHookRuns.legacy.at(-1)).toMatchObject([{ id: "native-run", status }]);
 
     render(<TaskChatThread {...props} linkedRuns={[{ ...props.linkedRuns[0], status: "succeeded" }]} />);
-    expect(transcriptHookRuns.legacy.at(-1)).toEqual([]);
+    // HIST10: read both durable sources on settled runs too; native history can be older than the saved log.
+    expect(transcriptHookRuns.legacy.at(-1)).toMatchObject([{ id: "native-run", status: "succeeded" }]);
   });
 
   it("does not download fallback logs until native events are empty or fail", () => {

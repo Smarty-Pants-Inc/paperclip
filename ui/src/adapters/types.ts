@@ -1,9 +1,19 @@
 import type { ComponentType } from "react";
 import type { CreateConfigValues, TranscriptEntry as SharedTranscriptEntry } from "@paperclipai/adapter-utils";
 
+// Content freshness is separate from placement and completion's clock.
+export interface TranscriptContentVersion {
+  at: string;
+  sequence?: number;
+  scope?: string;
+  completed: boolean;
+}
 // Placement keeps event order across session reads; completion owns the clock.
 export type TranscriptEntry = SharedTranscriptEntry & {
   completedAt?: string;
+  firstSeenAt?: string;
+  providerEventId?: string;
+  contentVersion?: TranscriptContentVersion;
   eventSeq?: number;
   steeringEvent?: { kind: "ack" | "input" | "end"; turnId: string | null; commentId?: string };
 };

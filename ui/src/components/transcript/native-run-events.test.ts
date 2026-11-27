@@ -1358,6 +1358,7 @@ describe("context compaction", () => {
     const items = transcriptToTaskChatItems(transcript, { runId: RUN_ID, agentName: "Codex", running: false });
     const markers = items.filter((item) => item.kind === "marker" && item.variant === "context_compacted");
     expect(markers.map((item) => item.kind === "marker" ? item.detail : null)).toEqual([
+      "from 230k tokens",
       "230k → 40k tokens",
       "235k → 36k tokens",
     ]);
