@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { AdapterEnvironmentTestResult } from "@paperclipai/adapter-utils";
 import { ADAPTER_AUTH_MISSING_CHECK_CODE } from "@paperclipai/shared";
 import { assertHarnessTestPassed } from "../services/agent-harness-verification.js";
+import { lifecycleFailureReason } from "../modules/agent-lifecycle/application/failure.js";
 
 describe("saved harness verification", () => {
   const result = (status: AdapterEnvironmentTestResult["status"], codes: string[]): AdapterEnvironmentTestResult => ({
@@ -23,6 +24,32 @@ describe("saved harness verification", () => {
     } catch (error) {
       expect(error).toMatchObject({ code, message: "The harness test failed" });
     }
+  });
+  it("retains only a bounded, re-redacted native diagnostic, never arbitrary adapter prose", () => {
+    const failed = result("fail", []);
+    failed.adapterType = "paperclip_runner";
+    failed.checks = [{ code: "codex_hello_probe_auth_required", level: "error",
+      message: "401 Unauthorized: sk-proj-FakeToken1234567890 https://alice:private-password@gateway.invalid/responses\nprivate second line" }];
+    let error: unknown;
+    try { assertHarnessTestPassed(failed); } catch (caught) { error = caught; }
+    expect(error).toMatchObject({ code: "harness_auth_failed", message: "The harness test failed" });
+    const reason = lifecycleFailureReason(error);
+    expect(reason).toContain("401 Unauthorized");
+    expect(reason).toContain("gateway.invalid/responses");
+    expect(reason).not.toMatch(/FakeToken|alice|private-password|second line/);
+    failed.checks[0].message = "😀".repeat(301) + "\rmore";
+    try { assertHarnessTestPassed(failed); } catch (caught) { error = caught; }
+    expect(Array.from(lifecycleFailureReason(error)!)).toHaveLength(300);
+    for (const adapterType of ["test", "codex_local"]) {
+      try { assertHarnessTestPassed({ ...failed, adapterType }); } catch (caught) { error = caught; }
+      expect(lifecycleFailureReason(error)).toBeUndefined();
+    }
+    failed.checks[0].message = "\nno first line";
+    try { assertHarnessTestPassed(failed); } catch (caught) { error = caught; }
+    expect(lifecycleFailureReason(error)).toBeUndefined();
+    expect(() => assertHarnessTestPassed({ ...failed, status: "pass", checks: [
+      { code: "codex_hello_probe_passed", level: "info", message: "verified" },
+    ] })).not.toThrow();
   });
   it("classifies a plugin Runner-task target without a managed AI connection before retryable checks", () => {
     const refused = result("fail", ["ai_connection_required", "opencode_cwd_invalid"]);
