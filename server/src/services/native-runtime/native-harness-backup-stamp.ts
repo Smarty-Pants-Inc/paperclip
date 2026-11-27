@@ -196,6 +196,28 @@ function backupCandidates(stamp: NativeHarnessBackupStamp) {
   return !root || !isRealDirectory(root) ? [] : ["current", "previous"].map(name => resolve(root, "failover-backups", name));
 }
 
+/** Read causal coverage only from the hash-bound manifest, never lease metadata.
+ * Undefined means a verified pre-cursor manifest; null means invalid/unavailable.
+ * Destruction requires causal proof; restore may apply the legacy timestamp rule. */
+export function nativeHarnessBackupEventCursors(stamp: NativeHarnessBackupStamp): Map<string, number> | null | undefined {
+  for (const candidate of backupCandidates(stamp)) {
+    try {
+      if (!matchingBackupDirectories(candidate, stamp)) continue;
+      const manifest = JSON.parse(readFileSync(resolve(candidate, "manifest.json"), "utf8"));
+      if (!Object.hasOwn(manifest, "providerEventCursors")) return undefined;
+      if (!Array.isArray(manifest.providerEventCursors)) return null;
+      const cursors = new Map<string, number>();
+      for (const cursor of manifest.providerEventCursors) {
+        if (!cursor || typeof cursor.runId !== "string" || !cursor.runId || cursors.has(cursor.runId)
+          || !Number.isSafeInteger(cursor.seq) || cursor.seq < 0) return null;
+        cursors.set(cursor.runId, cursor.seq);
+      }
+      return cursors;
+    } catch {}
+  }
+  return null;
+}
+
 export function verifyNativeHarnessBackupStamp(value: unknown, expectedProviderLeaseId: string): boolean {
   const stamp = readNativeHarnessBackupStamp(value, expectedProviderLeaseId);
   if (!stamp) return false;
