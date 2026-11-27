@@ -2,6 +2,7 @@ import { tailscaleNetworks } from "./services/connectors/tailscale/network.js";
 import type { IdleDeadlineOwners } from "./services/idle-deadline-types.js";
 import { closeProcessRunAdmission, isProcessRunAdmissionClosed } from "./services/heartbeat/run-admission.js";
 import { registerReattachPhaseWork } from "./services/heartbeat/reattach-phase.js";
+import { startBootTaskDrain } from "./services/boot-task-drain.js";
 import { createRunStartHandover, registerRunStartHandover } from "./services/run-start-handover.js";
 import { registerOwnershipReconciliationWork } from "./services/native-runtime/native-finalization-reconciler.js";
 import { registerPersonCommentWaitWork } from "./services/native-runtime/native-provider-turn-wait.js";
@@ -801,6 +802,10 @@ async function startServerWithDatabaseTeardown(
   // were never awaited before it.
   if (deploymentListenUrl !== null) await assertEphemeralServerData(db as any);
   startupTimeline.mark("volume_free_data_gate");
+
+  // Before createApp, scheduler registration, startup dispatch and run-start
+  // handover: use the ordinary drain, not restore suppression (which skips wakes).
+  if (config.startTaskDrained) await startBootTaskDrain(db as any);
 
   const isWarmStandby = await createCloudWarmStandby(db as any);
 

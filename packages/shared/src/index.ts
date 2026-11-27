@@ -1971,6 +1971,8 @@ export {
 export {
   MAX_TASK_DRAIN_TTL_MS,
   startTaskDrainRequestSchema,
+  allowTaskDrainRunRequestSchema,
+  type AllowTaskDrainRunRequest,
   type StartTaskDrainRequest,
 } from "./validators/instance.js";
 

@@ -4,6 +4,9 @@ import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 
 export type TaskDrainState = { startedAt: Date; expiresAt: Date | null; ownerId?: string };
 let taskDrainState: TaskDrainState | null = null;
+// One explicit run start, scoped to this drain generation. Never an agent-wide
+// exemption, and never authority to bypass the controller lease or idle sleep.
+let taskDrainAllowedRunId: string | null = null;
 const expiryListeners = new Set<() => void>();
 const changeListeners = new Set<() => void>();
 
@@ -58,6 +61,7 @@ export function setControllerLeaseQuiesce(quiesced: boolean): void {
 export function readTaskDrain(now: Date): TaskDrainState | null {
   if (taskDrainState?.expiresAt && taskDrainState.expiresAt.getTime() <= now.getTime()) {
     taskDrainState = null;
+    taskDrainAllowedRunId = null;
     for (const listener of expiryListeners) {
       try { listener(); } catch (error) { process.emitWarning(`Task drain expiry notification failed: ${String(error)}`); }
     }
@@ -72,6 +76,7 @@ export function computeTaskDrain(opts: { ttlMs?: number | null; purpose?: "idle"
 }
 
 export function applyTaskDrain(drain: TaskDrainState): void {
+  taskDrainAllowedRunId = null;
   taskDrainState = drain;
   notifyDrainChanged();
 }
@@ -83,10 +88,33 @@ export function startTaskDrain(opts: { ttlMs?: number | null; purpose?: "idle" }
 export function stopTaskDrain(): { wasActive: boolean } {
   const wasActive = readTaskDrain(new Date()) !== null && taskDrainState !== null;
   taskDrainState = null;
+  taskDrainAllowedRunId = null;
   notifyDrainChanged();
   return { wasActive };
 }
 export function isIdleTaskDrainActive(): boolean { return Boolean(readTaskDrain(new Date())?.ownerId); }
+
+export function readTaskDrainAllowedRunId(): string | null {
+  readTaskDrain(new Date());
+  return taskDrainState && !taskDrainState.ownerId && !controllerLeaseQuiesce ? taskDrainAllowedRunId : null;
+}
+export function isTaskDrainRunAllowed(runId: string): boolean {
+  return readTaskDrainAllowedRunId() === runId;
+}
+export function canAllowTaskDrainRun(runId: string, drain: TaskDrainState): boolean {
+  return readTaskDrain(new Date()) === drain && taskDrainState === drain && !drain.ownerId &&
+    (taskDrainAllowedRunId === null || taskDrainAllowedRunId === runId);
+}
+export function allowTaskDrainRun(runId: string, drain: TaskDrainState): boolean {
+  if (!canAllowTaskDrainRun(runId, drain)) return false;
+  taskDrainAllowedRunId = runId;
+  return true;
+}
+// Claim and execution both check the same capability. Consume only at entry to
+// execution, so its second suppression check can admit the claimed run once.
+export function consumeTaskDrainRun(runId: string): void {
+  if (taskDrainAllowedRunId === runId) taskDrainAllowedRunId = null;
+}
 
 // Tokens count work until its actual promise settles, including after HTTP
 // disconnects and after a cleanup batch has been removed from its input queue.

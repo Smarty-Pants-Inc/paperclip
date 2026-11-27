@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { allowTaskDrainRun, consumeTaskDrainRun, setControllerLeaseQuiesce } from "../services/task-admission.js";
 import {
   getTaskDrainStatus,
   resolveHeartbeatSchedulingSuppression,
@@ -9,6 +10,7 @@ import {
 describe("heartbeat task drain", () => {
   afterEach(() => {
     stopTaskDrain();
+    setControllerLeaseQuiesce(false);
     vi.useRealTimers();
   });
 
@@ -18,6 +20,28 @@ describe("heartbeat task drain", () => {
       suppressed: true,
       reason: "task_drain",
     });
+  });
+
+  // Pure admission-state guard: an exact-run capability must never turn into
+  // authority for another run, another drain, or another suppression class.
+  it("allows only the selected run once, without bypassing other suppression", () => {
+    const drain = startTaskDrain();
+    expect(allowTaskDrainRun("selected", drain)).toBe(true);
+    expect(allowTaskDrainRun("other", drain)).toBe(false);
+    expect(resolveHeartbeatSchedulingSuppression({}, { runId: "selected" }).suppressed).toBe(false);
+    expect(resolveHeartbeatSchedulingSuppression({}, { runId: "other" }).suppressed).toBe(true);
+    expect(resolveHeartbeatSchedulingSuppression({}).suppressed).toBe(true);
+    expect(resolveHeartbeatSchedulingSuppression({ PAPERCLIP_IN_WORKTREE: "1" }, { runId: "selected" }).reason).toBe("worktree_instance");
+    expect(resolveHeartbeatSchedulingSuppression({ PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS: "1" }, { runId: "selected" }).reason).toBe("database_restore_in_progress");
+    setControllerLeaseQuiesce(true);
+    expect(resolveHeartbeatSchedulingSuppression({}, { runId: "selected" }).suppressed).toBe(true);
+    setControllerLeaseQuiesce(false);
+    consumeTaskDrainRun("selected");
+    expect(resolveHeartbeatSchedulingSuppression({}, { runId: "selected" }).suppressed).toBe(true);
+    expect(allowTaskDrainRun("selected", drain)).toBe(true);
+    startTaskDrain();
+    expect(resolveHeartbeatSchedulingSuppression({}, { runId: "selected" }).suppressed).toBe(true);
+    expect(allowTaskDrainRun("selected", drain)).toBe(false);
   });
 
   it("stop_task_drain_restores_admission", () => {

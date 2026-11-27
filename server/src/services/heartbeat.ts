@@ -585,7 +585,7 @@ import { effectiveProjectWorkspacePolicy, sourcelessProjectWorkspacePolicy } fro
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 
 import { computeTaskDrain, applyTaskDrain, startTaskDrain, stopTaskDrain, readTaskDrain, subscribeTaskDrainChanges,
-  subscribeTaskDrainExpiry } from "./task-admission.js";
+  subscribeTaskDrainExpiry, isTaskDrainRunAllowed, consumeTaskDrainRun } from "./task-admission.js";
 
 const execFile = promisify(execFileCallback);
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = [
@@ -869,7 +869,7 @@ function isTruthyRuntimeEnvValue(value: string | undefined) {
 
 export function resolveHeartbeatSchedulingSuppression(
   env: Record<string, string | undefined> = process.env,
-  overrides: { allowWorktreeRunExecution?: boolean } = {},
+  overrides: { allowWorktreeRunExecution?: boolean; runId?: string } = {},
 ): {
   suppressed: boolean;
   reason:
@@ -887,7 +887,8 @@ export function resolveHeartbeatSchedulingSuppression(
   ) {
     return { suppressed: true, reason: "database_restore_in_progress" };
   }
-  if (readTaskDrain(new Date()) !== null) {
+  if (readTaskDrain(new Date()) !== null &&
+      !(overrides.runId && isTaskDrainRunAllowed(overrides.runId))) {
     return { suppressed: true, reason: "task_drain" };
   }
   return { suppressed: false, reason: null };
@@ -996,10 +997,11 @@ export function heartbeatService(
     }
     return cachedWorktreeRunExecutionOverride;
   };
-  const getSchedulingSuppression = async (fresh = false) => {
+  const getSchedulingSuppression = async (fresh = false, runId?: string) => {
     const override = await resolveWorktreeRunExecutionOverride(fresh);
     return resolveHeartbeatSchedulingSuppression(runtimeEnv, {
       allowWorktreeRunExecution: override.allowed,
+      runId,
     });
   };
   const getWorktreeExecutionCutoff = async () => {
@@ -2006,7 +2008,7 @@ export function heartbeatService(
   ) {
     const attemptStartedAtMs = Date.now();
     let attestedQuestionResponseAtMs: number | null = null;
-    if ((await getSchedulingSuppression()).suppressed) {
+    if ((await getSchedulingSuppression(false, runId)).suppressed) {
       try {
         await releaseRunClaimedJustBeforeSuppression(runId);
       } catch (err) {
@@ -2036,6 +2038,7 @@ export function heartbeatService(
       run = claimed;
     }
 
+    consumeTaskDrainRun(runId);
     const releaseInstructionCopy = createHeartbeatInstructionCopyRelease(run, instructionCopies, appendRunEvent);
 
     if (

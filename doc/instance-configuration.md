@@ -57,6 +57,43 @@ Default behavior:
 - `local_trusted`: enabled
 - `authenticated`: disabled
 
+## Start with task execution held
+
+Set `PAPERCLIP_START_TASK_DRAINED=1` to enter the ordinary task drain at boot,
+with no expiry, before the app registers dispatchers or accepts requests.
+`true`, `yes` and `on` are also accepted. Unset or other values preserve normal
+startup. A system `instance.task_drain.started` activity is recorded for each
+existing company, and the task-drain status endpoint reports the hold.
+
+Wakes arriving during this hold remain queued. Do not use database-restore
+suppression for this workflow: restore suppression writes skipped wakes.
+The environment switch reapplies the hold on every server restart; stopping
+the drain releases only the current process, not the next boot.
+
+An instance administrator can allow one existing queued run:
+
+```http
+POST /api/instance/task-drain/allow-run
+Content-Type: application/json
+
+{"runId":"00000000-0000-4000-8000-000000000001"}
+```
+
+This records `instance.task_drain.run_allowed` and asks the normal dispatcher
+to start that exact run. The response acknowledges permission, not successful
+execution. Pause, authority, budgets, concurrency, dependencies, worktree/restore
+suppression, controller ownership and handover still apply. Other queued runs,
+including the selected agent's next run and any new retry, remain held.
+Only one unconsumed permission can be outstanding. Retrying the same selection
+is allowed while it remains queued. The permission is consumed at execution
+entry; replacing, stopping or expiring the drain also clears it. Idle-sleep
+holds cannot allow individual runs. Controller lease quiescence is never bypassed.
+
+After inspecting the selected run, use the existing
+`DELETE /api/instance/task-drain` endpoint to release the rest. Leaving the
+environment switch set means another restart holds starts again. This switch
+does not change restart recovery or its existing scheduling suppression checks.
+
 ## Cloud startup configuration
 
 Cloud stores nonsecret startup choices in a private PostgreSQL singleton.

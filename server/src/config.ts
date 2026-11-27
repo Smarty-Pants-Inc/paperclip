@@ -117,6 +117,7 @@ export interface Config extends StorageConfig {
   secretsMasterKeyFilePath: string;
   feedbackExportBackendUrl: string | undefined;
   feedbackExportBackendToken: string | undefined;
+  startTaskDrained: boolean;
   heartbeatSchedulerEnabled: boolean;
   heartbeatSchedulerIntervalMs: number;
   companyDeletionEnabled: boolean;
@@ -439,6 +440,7 @@ export function loadConfig(override?: PaperclipConfig | null): Config {
     ...storage,
     feedbackExportBackendUrl,
     feedbackExportBackendToken,
+    startTaskDrained: ["1", "true", "yes", "on"].includes(process.env.PAPERCLIP_START_TASK_DRAINED ?? ""),
     heartbeatSchedulerEnabled: process.env.HEARTBEAT_SCHEDULER_ENABLED !== "false",
     heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),
     companyDeletionEnabled,

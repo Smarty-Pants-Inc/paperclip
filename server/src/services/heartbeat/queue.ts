@@ -99,6 +99,7 @@ import {
 import { agentService } from "../agents.js";
 import { normalizeLegacyRunnerProvider } from "@paperclipai/adapter-utils";
 import { randomUUID } from "node:crypto";
+import { readTaskDrain, readTaskDrainAllowedRunId, isTaskDrainRunAllowed } from "../task-admission.js";
 import {
   and,
   asc,
@@ -259,7 +260,7 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
   isSameTaskScope: (left: string | null, right: string | null) => boolean;
   runTaskKey: (run: HeartbeatRun) => string | null;
   filterZombieCoalesceTarget: <T extends { id: string; status: string }>(run: T | null, live: { has(id: string): boolean }) => T | null;
-  getSchedulingSuppression: () => Promise<{ suppressed: boolean; reason: "worktree_instance" | "database_restore_in_progress" | "task_drain" | null }>;
+  getSchedulingSuppression: (fresh?: boolean, runId?: string) => Promise<{ suppressed: boolean; reason: "worktree_instance" | "database_restore_in_progress" | "task_drain" | null }>;
   isRunAdmissionClosed?: () => boolean;
   isReattachPhaseActive?: () => boolean;
   /** Before a dispatch pass, refresh admission inputs that have gone stale; null when current. */
@@ -915,8 +916,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
   // moves the run to running: throwing rolls the whole claim back, so the run,
   // its wake and the task's execution lock stay exactly as they were, queued
   // for the serving server.
-  function confirmRunAdmissionStillOpen(claimedRun: unknown) {
-    if (claimedRun && isRunAdmissionClosed()) throw new RunAdmissionClosedDuringClaim();
+  function confirmRunAdmissionStillOpen(claimedRun: { id: string } | null | undefined) {
+    if (claimedRun && (isRunAdmissionClosed() ||
+        (readTaskDrain(new Date()) !== null && !isTaskDrainRunAllowed(claimedRun.id)))) {
+      throw new RunAdmissionClosedDuringClaim();
+    }
   }
 
   const CLOSED_TASK_CONTINUATION = { error: "The task was closed before this continuation started.",
@@ -1035,7 +1039,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     // anything it started now would be cut off by its own exit.
     const refreshing = refreshRunAdmission();
     if (refreshing) await refreshing;
-    if (isRunAdmissionClosed()) return null;
+    if (isRunAdmissionClosed() || (await getSchedulingSuppression(false, run.id)).suppressed) return null;
     // A system continuation queued while its task was open has nothing left to
     // do once another run finished or cancelled the task before this one
     // started. A person's message on a done task is not one of these reasons.
@@ -2689,14 +2693,24 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       // Null unless this server has not read the run-start hand-over recently.
       const refreshing = refreshRunAdmission();
       if (refreshing) await refreshing;
-      if (isRunAdmissionClosed() || (await getSchedulingSuppression()).suppressed) return [];
+      if (isRunAdmissionClosed()) return [];
+      const suppression = await getSchedulingSuppression();
+      if (suppression.suppressed) {
+        const allowedRunId = readTaskDrainAllowedRunId();
+        if (suppression.reason !== "task_drain" || !allowedRunId) return [];
+        // Do not even reconsider another agent's held work (including pause
+        // cancellations) while this one-run capability is outstanding.
+        const [allowed] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.id, allowedRunId), eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "queued")));
+        if (!allowed) return [];
+      }
       const cutoff = await getWorktreeExecutionCutoff();
       const agent = await getAgent(agentId);
       if (!agent) return [];
       const invokability = await getAgentInvokability(agent);
       if (!invokability.invokable) {
         if (attachSetupRequest) await attachQueuedSetupRequest(agent);
-        if (shouldCancelRunsForNonInvokableAgent(invokability)) {
+        if (!suppression.suppressed && shouldCancelRunsForNonInvokableAgent(invokability)) {
           cancellationReason = `Cancelled because the agent is not invokable: ${invokability.reason}`;
         }
         return [];
@@ -2706,7 +2720,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const availableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
       if (availableSlots <= 0) return [];
 
-      const queuedRuns = await listQueuedRunCandidates(agentId, cutoff);
+      const queuedRuns = (await listQueuedRunCandidates(agentId, cutoff)).filter(run =>
+        readTaskDrain(new Date()) === null || isTaskDrainRunAllowed(run.id));
       forgetSettledClaimBackoffs(agentId, queuedRuns);
       if (queuedRuns.length === 0) return [];
       if (queuedRuns.every(run => !run.startedAt) && !await canStartNewExternalBotWork(agent)) return [];

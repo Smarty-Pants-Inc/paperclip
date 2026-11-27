@@ -167,6 +167,9 @@ export type PatchInstanceExperimentalSettings = Partial<
 export type PatchInstanceSettings = z.infer<typeof patchInstanceSettingsSchema>;
 export type StartTaskDrainRequest = z.infer<typeof startTaskDrainRequestSchema>;
 
+export const allowTaskDrainRunRequestSchema = z.object({ runId: z.string().uuid() }).strict();
+export type AllowTaskDrainRunRequest = z.infer<typeof allowTaskDrainRunRequestSchema>;
+
 export const instanceSettingsSchema = z.object({
   id: z.string().guid(),
   defaultEnvironmentId: z.string().guid().nullable(),

@@ -1,15 +1,17 @@
 import type { IdleDeadlineOwners } from "../services/idle-deadline-types.js";
 import { verifiedCloudControlClaims, verifiedIdleCapabilities } from "../middleware/cloud-control.js";
-import { trackIdleWork } from "../services/task-admission.js";
+import { trackIdleWork, readTaskDrain, canAllowTaskDrainRun, allowTaskDrainRun } from "../services/task-admission.js";
+import { eq } from "drizzle-orm";
 import { Router, type Request, type RequestHandler } from "express";
-import { companies, type Db } from "@paperclipai/db";
+import { companies, heartbeatRuns, type Db } from "@paperclipai/db";
 import {
   patchInstanceSettingsSchema,
   patchInstanceExperimentalSettingsSchema,
   patchInstanceGeneralSettingsSchema,
   startTaskDrainRequestSchema,
+  allowTaskDrainRunRequestSchema,
 } from "@paperclipai/shared";
-import { conflict, forbidden } from "../errors.js";
+import { conflict, forbidden, notFound } from "../errors.js";
 import { assertAgentsReadyForEnvironmentChange } from "../services/plugin-environment-driver.js";
 import {
   cloudTenantPrimaryCompanyId,
@@ -419,6 +421,42 @@ export function instanceSettingsRoutes(
       res.json(drain);
     },
   );
+
+  router.post("/instance/task-drain/allow-run", validate(allowTaskDrainRunRequestSchema), async (req, res) => {
+    assertCanManageInstanceSettings(req);
+    const actor = getActorInfo(req);
+    const runId = req.body.runId.toLowerCase();
+    const run = await withTaskDrainTransition(async () => {
+      const drain = readTaskDrain(new Date());
+      if (!drain || !canAllowTaskDrainRun(runId, drain)) {
+        throw conflict("An operator task drain with no other allowed run is required");
+      }
+      const publications: ActivityPublication[] = [];
+      const run = await db.transaction(async tx => {
+        const [queued] = await tx.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId,
+          agentId: heartbeatRuns.agentId, status: heartbeatRuns.status }).from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId)).for("update");
+        if (!queued) throw notFound("Run not found");
+        if (queued.status !== "queued") throw conflict("Only a queued run can be allowed through a task drain");
+        await logActivity(tx as unknown as Db, {
+          companyId: queued.companyId, actorType: actor.actorType, actorId: actor.actorId,
+          agentId: actor.agentId, runId: actor.runId, agentApiKeyId: actor.agentApiKeyId,
+          action: "instance.task_drain.run_allowed", entityType: "instance_settings", entityId: "default",
+          details: { runId, startedAt: drain.startedAt },
+        }, publications);
+        return queued;
+      });
+      if (!allowTaskDrainRun(runId, drain)) throw conflict("Task drain changed before the run could be allowed");
+      publishActivitiesBestEffort(publications, "instance.task_drain.run_allowed");
+      return run;
+    });
+    // This is the normal dispatcher: every eligibility, identity, budget,
+    // concurrency, dependency and handover gate still applies. Only the exact
+    // selected run may pass the drain, not the agent's next run or a retry.
+    try { await heartbeat.resumeQueuedRunsForAgent(run.companyId, run.agentId); }
+    catch (err) { logger.error({ err, runId }, "failed to dispatch allowed run; it remains subject to normal claim gates"); }
+    res.json({ runId });
+  });
 
   router.delete("/instance/task-drain", async (req, res) => {
     assertCanManageInstanceSettings(req);
