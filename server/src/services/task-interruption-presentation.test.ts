@@ -24,6 +24,36 @@ describe("C31 v10 refusal measures and supported exits", () => {
     throw new Error("expected a measured refusal");
   };
 
+  it.each([
+    { kind: "future-input_v12", bytes: 25 },
+    { kind: "command", bytes: 123, measure: "future-measure_v12" },
+    { kind: "stale_copy", bytes: 25, measure: "future_measure" },
+  ])("C31 v11 preserves readable fields through version skew: %j", cause => {
+    expect(nativePromptRefusalCause(cause)).toEqual(cause);
+    const parsed = nativePromptCauseFromError(new Error(`native_prompt_cause=${cause.kind}:${cause.bytes}${"measure" in cause ? `:measure=${cause.measure}` : ""}`));
+    expect(parsed).toEqual(cause);
+    const presentation = projectCause(parsed!);
+    expect(presentation).toMatchObject({ canRetry: false, failure: { cause } });
+    if (cause.kind === "future-input_v12") {
+      expect(presentation?.failure?.title).toBe("Task input could not be sent");
+      expect(presentation?.failure?.detail).not.toMatch(/too large|Edit the description/);
+    } else if (cause.kind === "stale_copy") {
+      expect(presentation?.failure?.title).toBe("Session input contains stale history");
+      expect(presentation?.failure?.detail).not.toMatch(/too large|Edit the description/);
+    } else {
+      expect(presentation?.failure?.detail).toContain("no recognized measurement label");
+      expect(presentation?.failure?.detail).not.toContain("1 KB");
+    }
+  });
+
+  it.each(["protected_parts", "envelope_with_reserve"] as const)("C31 v11 labels protected-input bytes: %s", measure => {
+    const cause = { kind: "protected_inputs" as const, bytes: 750_000, measure };
+    expect(nativePromptRefusalCause(cause)).toEqual(cause);
+    const presentation = projectCause(cause);
+    expect(presentation?.failure?.detail).toContain(measure === "protected_parts" ? "located required inputs total 733 KB before command encoding" : "encoded task envelope, including reserved room, is 733 KB");
+    expect(presentation?.failure).toMatchObject({ cause });
+  });
+
   it("reports the whole serialized guard command, not only its payload", () => {
     const payload = { text: "x".repeat(500_000), lateMetadata: "whole field" };
     const cause = refusal(() => assertNativeTurnCommandBound("turn.start", payload, "measured-command"));
@@ -67,39 +97,44 @@ describe("C31 v10 refusal measures and supported exits", () => {
     expect(nativePromptCauseFromError(new Error(String(new NativeTurnPromptExceedsCommandBoundError(cause))))).toEqual(cause);
     const presentation = projectCause(cause);
     expect(presentation).toMatchObject({ canRetry: false, failure: { cause, title: "Session input contains stale history" } });
-    expect(presentation?.failure?.detail).toContain("repair fresh-session input delivery");
+    expect(presentation?.failure?.detail).toContain("defect in the agent's runtime or Paperclip");
     expect(presentation?.failure?.detail).not.toMatch(/too large|\bKB\b|shorten|split/);
   });
 
-  it("reads old causes without inventing a measurement and rejects unknown kinds/measures", () => {
+  it("reads old causes without inventing a measurement and retains future labels", () => {
     const legacy = { kind: "command" as const, bytes: 123 };
     expect(nativePromptRefusalCause(legacy)).toEqual(legacy);
     expect(nativePromptCauseFromError(new Error("native_prompt_cause=command:123"))).toEqual(legacy);
     expect(projectCause(legacy)?.failure?.detail).not.toMatch(/123|1 KB|complete encoded turn/);
-    expect(nativePromptRefusalCause({ ...legacy, measure: "payload_masquerading_as_command" })).toBeUndefined();
-    expect(nativePromptCauseFromError(new Error("native_prompt_cause=unknown:123"))).toBeUndefined();
-    expect(nativePromptCauseFromError(new Error("native_prompt_cause=command:123:measure=unknown"))).toBeUndefined();
+    expect(nativePromptRefusalCause({ ...legacy, measure: "payload_masquerading_as_command" })).toEqual({ ...legacy, measure: "payload_masquerading_as_command" });
+    expect(nativePromptCauseFromError(new Error("native_prompt_cause=unknown:123"))).toEqual({ kind: "unknown", bytes: 123 });
+    expect(nativePromptCauseFromError(new Error("native_prompt_cause=command:123:measure=unknown"))).toEqual({ ...legacy, measure: "unknown" });
   });
 
   it.each([
     ["task_description", "Edit the description on the task page"],
     ["newest_message", "edit it in the task's message queue"],
     ["unread_message", "edit it in the task's message queue"],
-    ["unread_messages", "task's owner in the task's comments"],
+    ["unread_messages", "new short follow-up task"],
     ["queued_input", "edit it in the task's message queue"],
-    ["human_response", "smaller follow-up task"],
-    ["protected_input", "task's owner in the task's comments"],
-    ["protected_inputs", "task's owner in the task's comments"],
-    ["command", "Edit the description on the task page"],
-    ["unmeasured_composition", "Paperclip operator to repair this session's input delivery"],
-    ["stale_copy", "Paperclip operator to repair fresh-session input delivery"],
+    ["human_response", "new short follow-up task"],
+    ["protected_input", "task instructions other than the description"],
+    ["protected_inputs", "new short follow-up task"],
+    ["command", "edit the description on the task page"],
+    ["unmeasured_composition", "defect in the agent's runtime or Paperclip"],
+    ["stale_copy", "defect in the agent's runtime or Paperclip"],
   ] as const)("gives %s a supported edit or named escalation path", (kind, wayOut) => {
     const cause: NativePromptRefusalCause = { kind, bytes: kind === "unmeasured_composition" ? 0 : kind === "stale_copy" ? 25 : 750_000,
       ...(kind === "unread_messages" ? { count: 3 } : {}), ...(kind === "command" ? { measure: "command" as const } : {}) };
     const presentation = projectCause(cause);
     expect(presentation).toMatchObject({ canRetry: false, failure: { cause } });
     expect(presentation?.failure?.detail).toContain(wayOut);
-    expect(presentation?.failure?.detail).not.toMatch(/\bcompact\b|\/new|new session/i);
+    expect(presentation?.failure?.detail).not.toMatch(/\bcompact\b|\/new|new session|Paperclip operator|owner in the task's comments/i);
+    if (["newest_message", "unread_message"].includes(kind)) expect(presentation?.failure?.detail).toContain("If you wrote it");
+    if (["unmeasured_composition", "stale_copy"].includes(kind)) {
+      expect(presentation?.failure?.detail).toContain("this run and the task title");
+      expect(presentation?.failure?.detail).toContain("After the fix is installed, send a message to continue");
+    }
     expect(nativePromptCauseFromError(new Error(String(new NativeTurnPromptExceedsCommandBoundError(cause))))).toEqual(cause);
   });
 });
@@ -134,7 +169,7 @@ describe("classified failure of an unanswered message", () => {
     for (const owed of [undefined, owedInput]) {
       const presentation = projectTaskInterruption(issue, { run: refused, agent, paused: false, approval: false, owedInput: owed });
       expect(presentation).toMatchObject({ state: "failed", canRetry: false,
-        failure: { code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, title: "Turn is too large", detail: expect.stringContaining("Edit the description on the task page") } });
+        failure: { code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, title: "Task input could not be sent", detail: expect.stringContaining("no readable explanation") } });
       expect(JSON.stringify(presentation)).not.toContain("private.example");
     }
   });
@@ -147,9 +182,9 @@ describe("classified failure of an unanswered message", () => {
     if (kind === "human_response") {
       expect(presentation?.failure?.detail).not.toMatch(/shorten|split/i);
       expect(presentation?.failure?.detail).toContain("a submitted answer cannot be edited here");
-      expect(presentation?.failure?.detail).toContain("task's owner in the task's comments");
-      expect(presentation?.failure?.detail).toContain("smaller follow-up task");
-    } else expect(presentation?.failure?.detail).toMatch(/shorten|split/i);
+      expect(presentation?.failure?.detail).not.toContain("task's owner in the task's comments");
+      expect(presentation?.failure?.detail).toContain("new short follow-up task");
+    } else expect(presentation?.failure?.detail).toMatch(/shorten|short request/i);
     expect(presentation?.failure?.detail).not.toMatch(/new session|compact/i);
   });
   it.each(["unread_messages", "protected_input", "protected_inputs", "command"] as const)("supplies specific safe copy and serialized cause for %s", kind => {
@@ -158,7 +193,8 @@ describe("classified failure of an unanswered message", () => {
     expect(nativePromptCauseFromError(new Error(String(error)))).toEqual(cause);
     const presentation = project({ errorCode: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, resultJson: { nativeTurnPromptRefusalCause: cause } });
     expect(presentation?.failure?.title).not.toBe("Task history is too large");
-    expect(presentation?.failure?.detail).toContain("733 KB");
+    if (kind !== "protected_inputs") expect(presentation?.failure?.detail).toContain("733 KB");
+    else expect(presentation?.failure?.detail).toContain("no recognized measurement label");
     if (kind === "unread_messages") expect(presentation?.failure?.detail).toContain("3 unread messages total");
     if (kind === "protected_input") expect(presentation?.failure?.title).toBe("Required task input is too large");
   });
@@ -170,8 +206,8 @@ describe("classified failure of an unanswered message", () => {
       resultJson: { nativeTurnPromptRefusalCause: cause } });
     expect(presentation).toMatchObject({ state: "failed", canRetry: false, failure: { cause,
       title: "Queued input cannot be measured for this turn", detail: expect.stringContaining("No queued messages or answers were consumed; they remain saved.") } });
-    expect(presentation?.failure?.detail).toContain("task's owner in the task's comments");
-    expect(presentation?.failure?.detail).toContain("Paperclip operator to repair this session's input delivery");
+    expect(presentation?.failure?.detail).toContain("this run and the task title");
+    expect(presentation?.failure?.detail).toContain("defect in the agent's runtime or Paperclip");
     expect(JSON.stringify(presentation)).not.toMatch(/too large|shorten|split|Reduce the request/);
   });
   it("uses existing stock titles, and a safe fallback for an unmapped classified code", () => {

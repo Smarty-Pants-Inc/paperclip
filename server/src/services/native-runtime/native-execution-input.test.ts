@@ -10,6 +10,9 @@ const { executeNativeSession } = await import(new URL("../../../../packages/pape
 const { nativeTaskConstraints } = await import(new URL("../../../../packages/paperclip-runner/src/backends/runtime-context.ts", import.meta.url).href) as { nativeTaskConstraints: (input: ReturnType<typeof parseNativeExecutionInput>) => string[] };
 import { DurablePrpControlPlane } from "../../vendor/paperclip-runner/index.js";
 import { renderFirstTurnQueuedInput } from "./first-turn-queued-input.js";
+import { shouldWakeAssigneeForIssueComment } from "../issue-comment-wakeup.js";
+import { buildQueuedCommentQueueSnapshot } from "../issue-queued-comment-queue.js";
+import { assertNativeTurnCommandBound } from "./native-turn-budget.js";
 import { renderNativeRunnerStagedAttachmentPrompt } from "./native-runner-file-handoff.js";
 import { clearNativeFreshFallback, registerNativeFreshFallback, nativeFreshFallbackPayload, nativeQueuedTurnUpperBound, assertNativeQueuedTurnBound, nativeQueuedTurnCompositionMeasured, observeNativeTurnBudgetSession, guardNativeTurnCommands, commandEnvelopeBytes, NATIVE_TURN_KNOWN_MAX_BYTES, NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND } from "./native-turn-budget.js";
 import type { ExecutionContinuationEnvelope, AskUserQuestionsInteraction } from "@paperclipai/shared";
@@ -977,6 +980,58 @@ describe("native serialized-command budget", () => {
         .toThrow(NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND);
     } finally { clearNativeFreshFallback(runId); await core.stop(); rmSync(directory, { recursive: true, force: true }); }
   });
+  it.each([2, 10])("C31 v11: splitting 600000 bytes into %i unread messages still refuses; a short link-only follow-up passes", count => {
+    const c = shape(count, 0);
+    c.originCommentIds = [];
+    for (const message of c.messages) { message.authorType = "user"; message.body = "x".repeat(600_000 / count); }
+    expect(() => prepare(c, { continuationReadState: { lastRunAt: null, readCommentIds: [] } })).toThrow(expect.objectContaining({
+      promptCause: count === 10 ? { kind: "unread_messages", bytes: 600_000, count }
+        : { kind: "unread_message", bytes: 300_000 },
+    }));
+    const short = buildNativeExecutionInput({ ...args, boundCommandBytes: true,
+      issue: { ...args.issue, id: "follow-up", title: "Read linked request", description: "Read the long request at https://example.test/saved-text" },
+      taskPrompt: "Read the long request at https://example.test/saved-text" });
+    expect(() => assertNativeTurnCommandBound("turn.start", { text: JSON.stringify(buildNativeModelEnvelope(short)) })).not.toThrow();
+    if (count === 10) {
+      const ownerAsk = "@owner please split this request";
+      c.messages.push({ ...c.messages[0]!, id: "owner-ask", body: ownerAsk });
+      expect(() => prepare(c, { continuationReadState: { lastRunAt: null, readCommentIds: [] } })).toThrow(expect.objectContaining({
+        promptCause: { kind: "unread_messages", bytes: 600_000 + Buffer.byteLength(ownerAsk), count: 11 },
+      }));
+      console.info(JSON.stringify({ recoveryRow: "owner-ask-adds-to-combined-refusal", count: 11, bytes: 600_000 + Buffer.byteLength(ownerAsk) }));
+    }
+    console.info(JSON.stringify({ recoveryRow: "split-versus-new-task", count, combinedBytes: 600_000, splitRefused: true, linkOnlyFollowUpAdmitted: true }));
+  });
+  it("C31 v11: asking the owner here wakes another refused turn and adds unread input; deleting your oversized message removes that size cause", () => {
+    const c = shape(2, 0);
+    c.originCommentIds = [];
+    c.messages[0]!.authorType = "user";
+    c.messages[0]!.body = "x".repeat(600_000);
+    c.messages[1]!.body = "@owner please split this request";
+    const wakes = shouldWakeAssigneeForIssueComment({ selfComment: false, resumeRequested: false,
+      issueAtCommentStart: {}, reopened: false, currentStatus: "blocked" });
+    expect(wakes).toBe(true);
+    const readState = { lastRunAt: null, readCommentIds: [] };
+    expect(() => prepare(c, { continuationReadState: readState })).toThrow(expect.objectContaining({
+      promptCause: { kind: "unread_message", bytes: 600_000 },
+    }));
+    // execution-continuation projects a tombstoned comment as deleted + empty body.
+    c.messages[0]!.body = "";
+    c.messages[0]!.deleted = true;
+    const { input } = prepare(c, { continuationReadState: readState });
+    expect(() => assertNativeTurnCommandBound("turn.start", { text: JSON.stringify(buildNativeModelEnvelope(input)) })).not.toThrow();
+    console.info(JSON.stringify({ recoveryRow: "owner-comment-and-author-delete", wakes, unreadMessagesBeforeDelete: 2,
+      beforeDeleteRefused: true, afterDeleteAdmitted: true, sendsContinuationMessage: true }));
+  });
+  it("C31 v11: queued does not let another person edit a message", () => {
+    const snapshot = (actorId: string) => buildQueuedCommentQueueSnapshot({ issueId: "task", queueId: "queue", state: "queued",
+      activeRunId: null, protocol: "legacy", steeringDisposition: "unsupported", actorType: "user", actorId,
+      comments: [{ id: "message", authorUserId: "author", authorAgentId: null, body: "long request",
+        createdAt: new Date(0), updatedAt: new Date(0) }] });
+    expect(snapshot("author").entries[0]!.canEdit).toBe(true);
+    expect(snapshot("another-user").entries[0]!.canEdit).toBe(false);
+    console.info(JSON.stringify({ recoveryRow: "author-only-queued-edit", authorCanEdit: true, otherCanEdit: false }));
+  });
   it("names the unread SUM when no one message alone would make the turn fit", () => {
     const c = shape(3, 100);
     for (const message of c.messages) message.body = "u".repeat(250000);
@@ -988,8 +1043,17 @@ describe("native serialized-command budget", () => {
   it("names combined required inputs rather than blaming the largest insufficient part", () => {
     const c = shape(3, 100); c.messages.at(-1)!.body = "n".repeat(450000);
     expect(() => prepare(c, { issue: { ...args.issue, description: "d".repeat(450000) }, taskPrompt: "a".repeat(450000) })).toThrow(expect.objectContaining({
-      promptCause: { kind: "protected_inputs", bytes: expect.any(Number) },
+      promptCause: { kind: "protected_inputs", bytes: expect.any(Number), measure: "protected_parts" },
     }));
+  });
+  it("C31 v11: labels an envelope-only refusal instead of calling its bytes a raw-part sum", () => {
+    try {
+      buildNativeExecutionInput({ ...args, taskPrompt: "", boundCommandBytes: true,
+        issue: { ...args.issue, title: "x".repeat(600_000) } });
+      throw new Error("expected envelope-only refusal");
+    } catch (error) {
+      expect(error).toMatchObject({ promptCause: { kind: "protected_inputs", bytes: expect.any(Number), measure: "envelope_with_reserve" } });
+    }
   });
   it("names required task input specifically and budgets an unlocatable bootstrap whole", () => {
     const c = shape(3, 100), wake = { executionContinuation: c };
@@ -1014,7 +1078,7 @@ describe("native serialized-command budget", () => {
       throw new Error("oversized unread fallback was accepted");
     } catch (error) {
       expect(error).toMatchObject({ promptCause: { kind: "unread_message", bytes: 600000 } });
-      expect(String(error)).toMatch(/unread message.*split/);
+      expect(String(error)).toMatch(/unread message.*new short follow-up task/);
     }
   });
   it("carries an unread comment over the queued share whole or refuses with its cause, never shortens it", () => {
