@@ -889,7 +889,7 @@ describe("native serialized-command budget", () => {
       const changed = variant === "prefix" ? original.slice(0, -1) : original.slice(0, -1) + "!";
       const text = variant === "non-json" ? changed : "$first $second\n\n" + JSON.stringify({ task: { prompt: changed } });
       expect(() => nativeFreshFallbackPayload(runId, { text })).toThrow(expect.objectContaining({
-        code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "stale_copy", bytes: Buffer.byteLength(changed) },
+        code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "protected_input", bytes: Buffer.byteLength(changed) },
       }));
     } finally { clearNativeFreshFallback(runId); }
   });
@@ -941,7 +941,7 @@ describe("native serialized-command budget", () => {
         try { expect(plainRun.queueCommand("turn.start", { text }, "fits-byte-guard").payload.text).toBe(text); }
         finally { await plainRun.stop(); }
         expect(() => core.queueCommand("turn.start", { text }, "near-original")).toThrow(expect.objectContaining({
-          promptCause: { kind: "stale_copy", bytes: Buffer.byteLength(nearOriginal) },
+          promptCause: { kind: "protected_input", bytes: Buffer.byteLength(nearOriginal) },
         }));
         expect(core.store.state.commands).toHaveLength(0);
       } else {

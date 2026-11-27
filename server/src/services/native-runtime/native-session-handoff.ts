@@ -33,7 +33,7 @@ export function renderNativeSessionHandoff(input: {
     const messages = (input.omittedMessages ?? 0) + input.entries.filter(isConversationEntry).length;
     const support = input.omittedEntriesAtLeast + input.entries.filter(entry => !isConversationEntry(entry)).length;
     const note = `Fresh session handoff cut for room. At least ${messages} messages and ${support} supporting entries omitted. Retrieve scoped task history as needed.`;
-    if (commandTextBytes(note) > maxBytes) throw new NativeTurnPromptExceedsCommandBoundError({ kind: "command", bytes: commandTextBytes(note), measure: "handoff_note" });
+    if (commandTextBytes(note) > maxBytes) throw new NativeTurnPromptExceedsCommandBoundError({ kind: "command", bytes: commandTextBytes(note) });
     return note;
   };
   if (maxBytes < 2_000) return cutForRoom();

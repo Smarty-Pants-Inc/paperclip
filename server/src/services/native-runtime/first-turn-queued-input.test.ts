@@ -212,7 +212,7 @@ describe.skipIf(!support.supported)("first-turn queued input", () => {
       assertNativeQueuedTurnBound(f.runId, { task: { prompt: "request" } }, text, { attachmentPrompt }))).resolves.toBeNull();
     expect(readFirstTurnQueuedInputReceipt(await readRun(f.runId))).toMatchObject({ commentIds: [], interactionIds: [] });
     expect(() => assertNativeTurnCommandBound("turn.start", { text: attachmentPrompt })).toThrow(expect.objectContaining({
-      code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "command", bytes: expect.any(Number), measure: "command" },
+      code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "command", bytes: expect.any(Number) },
     }));
   });
 
