@@ -17,6 +17,7 @@ import { INITIAL_TRANSCRIPT_REVEAL_BUDGET_MS, TaskChatThread } from "./TaskChatT
 import { IssueChatThread } from "./IssueChatThread";
 import type {
   Agent,
+  Issue,
   IssueDocument,
   IssueQueuedCommentQueue,
   IssueThreadInteraction,
@@ -1886,6 +1887,161 @@ describe("TaskChatThread draft pass-through", () => {
     expect(
       container.querySelector('[data-assignee-trigger-avatar="user-1"]'),
     ).not.toBeNull();
+  });
+});
+
+// Keep reason: ordinary saved replies must not jump to their native run's opening slot.
+describe("saved task chronology", () => {
+  const at = (time: string) => `2026-11-27T${time}Z`;
+  const comment = (id: string, body: string, time: string, runId?: string) => ({
+    id, body, companyId: "company", issueId: "issue", authorType: runId ? "agent" as const : "user" as const,
+    authorUserId: runId ? null : "board", authorAgentId: runId ? "lead" : null,
+    runId: runId ?? null, createdByRunId: runId ?? null, presentation: null, metadata: null,
+    createdAt: new Date(at(time)), updatedAt: new Date(at(time)),
+  });
+  const update = { ...comment("update", "Update from the assistant: keep each commit separate.", "10:32:56.622", "updater"),
+    consumedByRunId: "step1", steeredIntoRunId: "step1", conversationAnchorAt: new Date(at("10:33:26.550")) };
+  const note = { ...comment("note", "Note from the person: no change to the work. Reply ACK-NOTE.", "10:33:34.036"), consumedByRunId: "ack" };
+  const part1 = comment("part1", "PART1 PAPER-102", "10:36:52.787", "step1");
+  const finished1 = comment("finished1", "I've finished step 1. Waiting for the first subtask.", "10:37:10.222", "step1");
+  const ackUpdate = comment("ack-update", "ACK-UPDATE Both commit messages already follow the request.", "10:37:16.838", "step1");
+  const ack = comment("ack-note", "ACK-NOTE Your note doesn't change the work.", "10:37:55.121", "ack");
+  const part2 = comment("part2", "PART2 PAPER-103", "10:41:12.882", "step2");
+  const finished2 = comment("finished2", "I've finished step 2. Waiting for the second subtask.", "10:41:24.607", "step2");
+  const landed = comment("landed", "LANDED The two commits are ready.", "10:51:20.063", "landed-run");
+  const comments = [update, note, part1, finished1, ackUpdate, ack, part2, finished2, landed];
+  const createdTasks = [
+    { id: "child1", identifier: "PAPER-102", title: "First subtask", createdAt: new Date(at("10:36:40.000")) },
+    { id: "child2", identifier: "PAPER-103", title: "Second subtask", createdAt: new Date(at("10:41:00.000")) },
+  ].map(task => ({ ...task, companyId: "company", parentId: "issue", status: "done", createdByAgentId: "lead" } as Issue));
+  const linkedRuns = [
+    { runId: "step1", createdAt: at("10:32:29.386"), startedAt: at("10:32:29.616"), finishedAt: at("10:37:21.261") },
+    { runId: "ack", createdAt: at("10:37:24.210"), startedAt: at("10:37:25.676"), finishedAt: at("10:38:01.645"), wakeCommentId: note.id },
+    { runId: "step2", createdAt: at("10:40:35.615"), startedAt: at("10:40:36.346"), finishedAt: at("10:41:28.612") },
+    { runId: "landed-run", createdAt: at("10:50:40.509"), startedAt: at("10:50:40.700"), finishedAt: at("10:52:42.711") },
+  ].map(run => ({ ...run, status: "succeeded", runtimeMode: "native" as const, adapterType: "paperclip_runner", agentId: "lead", agentName: "Lead" }));
+  it.each(["empty", "per-run", "retained-read"])("keeps the person's note before ACK and later saved replies in send order (%s)", async history => {
+    nativeTranscriptState.hydratedRunIds = new Set(linkedRuns.map(run => run.runId));
+    for (const run of linkedRuns) {
+      const replies = comments.filter(row => row.runId === run.runId);
+      nativeTranscriptState.transcriptByRun.set(run.runId, [
+        ...(history === "retained-read" ? [{ kind: "system", text: "", ts: at("10:32:30.000"), steeringEvent: { kind: "input", turnId: "session-turn" } }] : []),
+        ...(history === "empty" ? [] : replies.map((row, index) => row.id === replies.at(-1)?.id
+          ? { kind: "assistant", channel: "final", text: row.body, ts: row.createdAt.toISOString(), itemId: row.id }
+          : { kind: "tool_call", name: "add_comment", toolUseId: `${run.runId}-${index}`, input: {}, ts: row.createdAt.toISOString() })),
+
+      ]);
+    }
+    const props = { issueId: "issue", companyId: "company", comments, linkedRuns, createdTasks, onAdd: async () => {} };
+    render(<TaskChatThread {...props} />);
+    await settleThreadLayout();
+    const text = container.textContent ?? "";
+    for (const row of comments) expect(text.split(row.body)).toHaveLength(2);
+    const assertOrder = () => {
+      const text = container.textContent ?? "";
+      for (let index = 1; index < comments.length; index++) {
+        expect(text.indexOf(comments[index - 1]!.body), `${comments[index - 1]!.id} before ${comments[index]!.id}`)
+          .toBeLessThan(text.indexOf(comments[index]!.body));
+      }
+      expect(text.indexOf("First subtask")).toBeLessThan(text.indexOf(part1.body));
+      expect(text.indexOf("Second subtask")).toBeLessThan(text.indexOf(part2.body));
+      expect(text.indexOf("Second subtask")).toBeGreaterThan(text.indexOf(ack.body));
+    };
+    assertOrder();
+    // Loading older messages must not select a different run-opening request.
+    render(<div />);
+    render(<TaskChatThread {...props} comments={comments.slice(5)} hasOlderComments
+      historyControl={<button>More messages</button>} />);
+    await settleThreadLayout();
+    render(<TaskChatThread {...props} />);
+    await settleThreadLayout();
+    assertOrder();
+    // A fresh mount through the other durable transport keeps the same order.
+    render(<div />);
+    for (const [id, entries] of nativeTranscriptState.transcriptByRun) transcriptState.transcriptByRun.set(id, entries);
+    nativeTranscriptState.transcriptByRun.clear();
+    render(<TaskChatThread {...props} />);
+    await settleThreadLayout();
+    assertOrder();
+  });
+});
+
+// Keep reason: saved task updates and retained-session work must follow the input they answer.
+describe("saved task update shapes", () => {
+  const at = (time: string) => `2026-11-27T${time}Z`;
+  const comment = (id: string, body: string, time: string, runId: string, agentId: string) => ({
+    id, body, companyId: "company", issueId: "issue", authorType: "agent" as const,
+    authorUserId: null, authorAgentId: agentId, runId, createdByRunId: runId,
+    clientRequestId: null, presentation: null, metadata: null,
+    createdAt: new Date(at(time)), updatedAt: new Date(at(time)),
+  });
+  const run = (runId: string, agentId: string, created: string, started: string, finished: string) => ({
+    runId, agentId, agentName: agentId, status: "succeeded", runtimeMode: "native" as const,
+    adapterType: "paperclip_runner", createdAt: at(created), startedAt: at(started), finishedAt: at(finished),
+  });
+  const check = (rows: { id: string; body: string }[]) => {
+    const text = container.textContent ?? "";
+    for (const row of rows) expect(text.split(row.body), `${row.id} appears once`).toHaveLength(2);
+    for (let index = 1; index < rows.length; index++) {
+      expect(text.indexOf(rows[index - 1]!.body), `${rows[index - 1]!.id} before ${rows[index]!.id}`)
+        .toBeLessThan(text.indexOf(rows[index]!.body));
+    }
+  };
+  const paint = async (props: ComponentProps<typeof TaskChatThread>, entries: Map<string, unknown[]>) => {
+    // Reload through both durable readers; neither has a reply-placement receipt.
+    for (const transport of ["native", "log"]) {
+      render(<div />);
+      nativeTranscriptState.transcriptByRun.clear();
+      transcriptState.transcriptByRun.clear();
+      nativeTranscriptState.hydratedRunIds = new Set(entries.keys());
+      const target = transport === "native" ? nativeTranscriptState : transcriptState;
+      for (const [id, transcript] of entries) target.transcriptByRun.set(id, transcript);
+      render(<TaskChatThread {...props} />);
+      await settleThreadLayout();
+      check(props.comments);
+      const update = container.querySelector('[data-thread-anchor="update"]')!;
+      const work = container.querySelector('[data-testid="task-chat-runner-turn"]')!;
+      expect(update).not.toBeNull();
+      expect(work).not.toBeNull();
+      expect(update.compareDocumentPosition(work) & Node.DOCUMENT_POSITION_FOLLOWING,
+        "the writer's work group follows the update").not.toBe(0);
+    }
+  };
+
+  it("keeps the lead's completion and acknowledgement below the update and subtask announcement", async () => {
+    const update = { ...comment("update", "Update from the assistant: keep commit messages short.", "11:08:25.367", "updater", "Assistant"),
+      consumedByRunId: "lead-run", steeredIntoRunId: "lead-run", conversationAnchorAt: new Date(at("11:08:49.212")) };
+    const part = comment("part", "PART1 PAPER-202", "11:12:21.583", "lead-run", "Lead");
+    const finished = comment("finished", "Step 1 is finished. Waiting for the first worker.", "11:12:34.574", "lead-run", "Lead");
+    const ack = comment("ack", "ACK-UPDATE Both planned messages fit the limit.", "11:12:46.066", "lead-run", "Lead");
+    const rows = [update, part, finished, ack];
+    const linkedRuns = [run("lead-run", "Lead", "11:07:51.191", "11:07:51.317", "11:12:49.866")];
+    const entries = new Map([["lead-run", [
+      // Older packs have no session-input receipt for the queued update.
+      { kind: "tool_call", name: "add_comment", toolUseId: "part", input: {}, ts: at("11:12:21.583") },
+      { kind: "assistant", channel: "final", itemId: finished.id, text: finished.body, ts: at("11:12:34.574") },
+      { kind: "assistant", channel: "final", itemId: ack.id, text: ack.body, ts: at("11:12:46.066") },
+    ]]]);
+    await paint({ issueId: "issue", companyId: "company", comments: rows, linkedRuns, onAdd: async () => {} }, entries);
+  });
+
+  it("keeps retained writer work and its saved replies below the lead's later-sent update", async () => {
+    const update = { ...comment("update", "Update from the lead: keep the required message below the limit.", "11:12:42.793", "lead-run", "Lead"),
+      consumedByRunId: "writer-run" };
+    const detailed = comment("detailed", "Part 1 is ready. The message meets the limit the lead set.", "11:15:18.212", "writer-run", "Writer");
+    const final = comment("final", "PART 1 ready at the saved revision.", "11:15:28.778", "writer-run", "Writer");
+    const rows = [update, detailed, final];
+    const linkedRuns = [
+      { ...run("cancelled", "Writer", "11:12:12.429", "11:12:12.666", "11:12:13.621"), status: "cancelled" },
+      { ...run("writer-run", "Writer", "11:12:13.853", "11:13:29.734", "11:15:34.488"), wakeCommentId: update.id },
+    ];
+    const entries = new Map<string, unknown[]>([["cancelled", []], ["writer-run", [
+      // The resumed session can retain an input clock from before this send.
+      { kind: "system", text: "", ts: at("11:12:12.666"), steeringEvent: { kind: "input", turnId: "retained-turn" } },
+      { kind: "tool_call", name: "add_comment", toolUseId: "detailed", input: {}, ts: at("11:15:18.212") },
+      { kind: "assistant", channel: "final", itemId: final.id, text: final.body, ts: at("11:15:28.778") },
+    ]]]);
+    await paint({ issueId: "issue", companyId: "company", comments: rows, linkedRuns, onAdd: async () => {} }, entries);
   });
 });
 
