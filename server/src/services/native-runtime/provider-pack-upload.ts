@@ -1,4 +1,7 @@
+import { randomUUID } from "node:crypto";
+import { posix } from "node:path";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
+import { logger } from "../../middleware/logger.js";
 import type { NativeRunTrace } from "./native-run-trace.js";
 import { readProviderPackArchive, stageProviderPackArchive } from "./provider-pack-archive.js";
 import type { ProviderPackIdentity } from "./remote-provider-pack-verification.js";
@@ -55,8 +58,15 @@ export async function uploadVerifiedProviderPack(input: {
   }
   if (!archive) await verifyDirectory();
   input.signal?.throwIfAborted();
+  if (!input.targetPath || input.targetPath === "." || input.targetPath === "/" || input.targetPath === ".."
+    || input.targetPath.startsWith("../") || input.targetPath.includes("/../")
+    || input.targetPath.endsWith("/") || posix.normalize(input.targetPath) !== input.targetPath) {
+    logger.warn({ pack: posix.basename(input.targetPath) }, "Skipping unsafe provider pack target");
+    throw new Error("runner_remote_provider_artifact_incompatible: stale provider pack could not be replaced");
+  }
+  const stalePath = `${input.targetPath}.stale-${randomUUID()}`;
   const cleared = await measure("provider_pack.clear_stale", () => input.runner.execute({
-    command: "sh", args: ["-c", `rm -rf ${quote(input.targetPath)}`],
+    command: "sh", args: ["-c", `[ ! -e ${quote(input.targetPath)} ] || { touch -h -- ${quote(input.targetPath)} && mv -- ${quote(input.targetPath)} ${quote(stalePath)}; }`],
     cwd: input.cwd, bypassSession: true, timeoutMs: 10_000,
   }));
   if (cleared.exitCode !== 0 || cleared.timedOut) {
@@ -72,4 +82,13 @@ export async function uploadVerifiedProviderPack(input: {
     await input.stageDirectory(source.root);
   });
   await measure("provider_pack.verify_uploaded", input.verifyUploaded);
+  // No per-target lock: preserve other uploads' fresh stale trees, including old trees just renamed.
+  const stalePattern = `${posix.basename(input.targetPath).replace(/[\\*?[\]]/g, "\\$&")}.stale-*`;
+  await measure("provider_pack.clear_stale_late", async () => {
+    const cleaned = await input.runner.execute({
+      command: "sh", args: ["-c", `rm -rf -- ${quote(stalePath)} && find ${quote(posix.dirname(input.targetPath))} -mindepth 1 -maxdepth 1 -name ${quote(stalePattern)} -mmin +10 -exec rm -rf -- {} +`],
+      cwd: input.cwd, bypassSession: true, timeoutMs: 300_000,
+    });
+    if (cleaned.exitCode !== 0 || cleaned.timedOut) throw Error("provider_pack_cleanup_failed");
+  }).catch(() => { logger.warn({ pack: posix.basename(input.targetPath) }, "Late provider pack cleanup failed; continuing"); });
 }
