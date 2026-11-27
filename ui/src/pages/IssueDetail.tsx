@@ -1636,8 +1636,11 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         issueId,
       ),
     enabled: queuedCommentQueueEnabled,
-    refetchInterval: (query) => queuedCommentQueueEnabled &&
-      (liveRuntimeRun || query.state.data?.entries.length) ? 1000 : false,
+    refetchInterval: (query) => queuedCommentQueueEnabled && query.state.data?.entries.length
+      ? 1000
+      : queuedCommentQueueEnabled && liveRuntimeRun
+        ? (hasLiveConnection ? 30000 : 1000)
+        : false,
   });
   const [consumedQueuedCommentIds, setConsumedQueuedCommentIds] = useState<
     ReadonlySet<string>

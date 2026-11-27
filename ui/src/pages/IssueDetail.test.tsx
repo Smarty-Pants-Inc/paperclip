@@ -62,6 +62,11 @@ import type { issuesApi } from "../api/issues";
 // persistence have their own hook tests; keep their readiness explicit here.
 const coordinatorPreference = vi.hoisted(() => ({ enabled: false, loaded: true }));
 const inlineEditorFixture = vi.hoisted(() => ({ real: false }));
+const taskLiveConnection = vi.hoisted(() => ({ connected: false }));
+vi.mock("../context/LiveUpdatesProvider", async importOriginal => ({
+  ...await importOriginal<typeof import("../context/LiveUpdatesProvider")>(),
+  useTaskRunLiveUpdates: () => taskLiveConnection.connected,
+}));
 // Reads deferred until the page settles start at once in these tests.
 vi.mock("@/hooks/usePageSettled", () => ({ usePageSettled: () => true, PAGE_SETTLED_MAX_WAIT_MS: 0 }));
 vi.mock("../hooks/useCoordinatorWorkspaceEnabled", () => ({
@@ -1357,6 +1362,7 @@ describe("IssueDetail", () => {
   beforeEach(() => {
     Object.assign(coordinatorPreference, { enabled: false, loaded: true });
     inlineEditorFixture.real = false;
+    taskLiveConnection.connected = false;
     mockTaskPluginPanels.panels = []; mockTaskPluginPanels.isLoading = false;
     localStorage.clear();
     sessionStorage.clear();
@@ -5445,6 +5451,55 @@ describe("IssueDetail", () => {
       });
     },
   );
+
+  it.each([
+    { liveRun: false, connected: true, hasEntries: false, interval: false as const },
+    { liveRun: false, connected: false, hasEntries: false, interval: false as const },
+    { liveRun: false, connected: true, hasEntries: true, interval: 1000 },
+    { liveRun: false, connected: false, hasEntries: true, interval: 1000 },
+    { liveRun: true, connected: true, hasEntries: false, interval: 30000 },
+    { liveRun: true, connected: false, hasEntries: false, interval: 1000 },
+    { liveRun: true, connected: true, hasEntries: true, interval: 1000 },
+    { liveRun: true, connected: false, hasEntries: true, interval: 1000 },
+  ])("refreshes the queue at $interval ms (liveRun=$liveRun, connection=$connected, entries=$hasEntries)", async ({ liveRun, connected, hasEntries, interval }) => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      taskLiveConnection.connected = connected;
+      mockIssuesApi.get.mockResolvedValue(createIssue({
+        status: liveRun ? "in_progress" : "todo", assigneeAgentId: "agent-1",
+        executionRunId: liveRun ? "run-active-1" : null,
+      }));
+      mockHeartbeatsApi.liveRunsForIssue.mockResolvedValue(liveRun ? [{
+        id: "run-active-1", status: "running", agentId: "agent-1",
+        adapterType: "paperclip_runner", issueId: "issue-1",
+      }] : []);
+      const initialQueue = createQueuedCommentQueue({
+        entries: hasEntries ? createQueuedCommentQueue().entries : [],
+      });
+      const nextQueue = createQueuedCommentQueue({ revision: "next-queue-revision" });
+      mockIssuesApi.getQueuedComments.mockResolvedValueOnce(initialQueue).mockResolvedValue(nextQueue);
+      const queueKey = queryKeys.issues.queuedComments("issue-1");
+      await act(async () => renderIssueView());
+      await waitForAssertion(() => {
+        expect(queryClient.getQueryData<IssueQueuedCommentQueue>(queueKey)?.revision).toBe(initialQueue.revision);
+        expect(mockIssueChatThreadRender).toHaveBeenCalled();
+      });
+
+      // A connected live run still discovers a queue entry when no event arrives,
+      // but neither it nor an idle empty task should make one-second requests.
+      await act(async () => { await vi.advanceTimersByTimeAsync(interval === false ? 30000 : interval - 1); });
+      expect(queryClient.getQueryData<IssueQueuedCommentQueue>(queueKey)?.revision).toBe(initialQueue.revision);
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      await waitForAssertion(() => {
+        const expected = interval === false ? initialQueue : nextQueue;
+        expect(queryClient.getQueryData<IssueQueuedCommentQueue>(queueKey)?.revision).toBe(expected.revision);
+        expect(mockIssueChatThreadRender.mock.calls.at(-1)?.[0].queuedCommentQueue?.entries ?? [])
+          .toEqual(expected.entries);
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   it("queues messages against a queued live run and interrupts that exact run", async () => {
     const postedComment = createDeferred<IssueComment>();
