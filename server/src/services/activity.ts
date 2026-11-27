@@ -161,6 +161,11 @@ export function activityService(db: Db) {
     case
       when ${heartbeatRuns.resultJson} is null then null
       else jsonb_strip_nulls(jsonb_build_object(
+        'continuationNothingNew', case
+          when ${heartbeatRuns.resultJson} #>> '{continuationNothingNew,schema}' = 'paperclip.continuation-nothing-new.v1'
+            and pg_column_size(${heartbeatRuns.resultJson}->'continuationNothingNew') <= 16384
+            and (${heartbeatRuns.resultJson}->'continuationNothingNew')::text ~ '^[ -~]*$'
+          then ${heartbeatRuns.resultJson}->'continuationNothingNew' end,
         'conversationReset', ${heartbeatRuns.resultJson} -> 'conversationReset',
         'executionCancellation', case when ${heartbeatRuns.resultJson} ? 'executionCancellation'
           then jsonb_build_object('state', case
