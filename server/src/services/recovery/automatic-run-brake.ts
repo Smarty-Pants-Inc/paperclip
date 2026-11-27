@@ -385,6 +385,23 @@ export function createAutomaticRunBrake(options: { loadRules?: () => Promise<Aut
     return (await current(db, companyId)).snapshot;
   }
 
+  /** Observe persisted state and fresh evidence without settling it or caching
+   * an unsettled snapshot that could delay the next enforcement decision. */
+  async function peek(db: Db, companyId: string): Promise<AutomaticRunBrakeSnapshot> {
+    const row = await readRow(db, companyId);
+    const signal = await readSignal(db, companyId, row);
+    const rules = await rulesOrNull();
+    const state: AutomaticRunBrakeState = row?.state ?? "closed";
+    const evidence: Evidence = rules ? evaluate(signal.rows, state, signal.lower, signal.now, rules)
+      : { counted: 0, failedBeforeStarting: 0, healthy: 0, providerRefusalStreak: false, recoveredSince: false,
+        lastStartAt: null, lastActivityAt: null };
+    return {
+      companyId, state, pausedSince: row?.openedAt ?? null, stateChangedAt: row?.stateChangedAt ?? null,
+      reason: row?.reason ?? {}, nextProbeAt: row?.nextProbeAt ?? null, nextCreationAt: row?.nextCreationAt ?? null,
+      probeRunId: row?.probeRunId ?? null, probeSuccesses: row?.probeSuccesses ?? 0, dbNow: signal.now, evidence,
+    };
+  }
+
   async function isPersonWork(db: Db, companyId: string, work: AutomaticWork) {
     if (!work.sourceRunId) return true;
     const personReasons = sql.join([...PERSON_WAKE_REASONS].map(reason => sql`${reason}`), sql`, `);
@@ -575,6 +592,7 @@ export function createAutomaticRunBrake(options: { loadRules?: () => Promise<Aut
 
   return {
     read,
+    peek,
     refresh: async (db: Db, companyId: string) => (await refresh(db, companyId)).snapshot,
     creationHeldUntil,
     reserveCreation,
@@ -621,7 +639,7 @@ export function automaticWorkStatusText(snapshot: AutomaticRunBrakeSnapshot) {
 }
 
 export async function readAutomaticWorkStatus(db: Db, companyId: string) {
-  const snapshot = await automaticRunBrake.read(db, companyId);
+  const snapshot = await automaticRunBrake.peek(db, companyId);
   return {
     state: snapshot.state,
     pausedSince: snapshot.pausedSince,
