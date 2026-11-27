@@ -1270,6 +1270,137 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
     expect(await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system")))).toHaveLength(1);
   });
 
+  it.each(["same-first", "same-explicit", "different", "earlier-turn", "deleted"])("publishes report_progress then final once only when their bodies match (%s)", async scenario => {
+    const reuse = scenario.startsWith("same-");
+    await fixture(true, { beforeFinalize: async scope => {
+      await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, scope.agentId));
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      const outbox = await completion(scope);
+      await db.insert(companyMemberships).values({ companyId: scope.companyId, principalId: run.responsibleUserId!,
+        principalType: "user", status: "active", membershipRole: "owner" });
+      await db.update(heartbeatRuns).set({ contextSnapshot: { ...run.contextSnapshot,
+        ...(scenario === "same-explicit" ? {} : { chatCompletionDeliveryIds: [outbox.deliveryId] }),
+      } }).where(eq(heartbeatRuns.id, scope.runId));
+      const startTurn = () => db.insert(heartbeatRunEvents).values({ companyId: scope.companyId, runId: scope.runId, agentId: scope.agentId,
+        seq: 171, eventType: "turn.started", payload: { prpEvent: { turnId } } });
+      // earlier-turn: the progress belongs to the run's earlier turn; the final is a new turn's.
+      const turnId = scenario === "earlier-turn" ? "next-turn" : "hire-turn";
+      if (scenario !== "earlier-turn") await startTurn();
+      await db.update(heartbeatRuns).set({ nextEventSeq: 172 }).where(eq(heartbeatRuns.id, scope.runId));
+      const authority = new PaperclipRunnerToolAuthority(db, scope);
+      let progress!: { commentId: string };
+      try {
+        progress = await authority.execute({ tool: "report_progress", callId: randomUUID(), arguments: {
+          body: scenario === "different" ? "Still working." : "Same  \tanswer.", idempotencyKey: "progress-answer",
+        } }) as typeof progress;
+      } finally { authority.close(); }
+      if (scenario === "earlier-turn") await startTurn();
+      if (scenario === "deleted") await db.update(issueComments).set({ deletedAt: new Date() }).where(eq(issueComments.id, progress.commentId));
+      const event = { eventType: "item.completed" as const, runId: scope.runId, normalizedSessionId: run.nativeSessionId!,
+        turnId, sourceEventId: "progress-final", itemId: "progress-final",
+        payload: { kind: "agentMessage", channel: "final", text: "Same answer.",
+          ...(scenario === "same-explicit" ? { answers: [run.contextSnapshot!.wakeCommentId as string, outbox.deliveryId] } : {}) } };
+      const execution = { binding: scope, provider: { kind: "pi_rpc" as const } };
+      await db.insert(heartbeatRunEvents).values({ companyId: scope.companyId, runId: scope.runId, agentId: scope.agentId,
+        seq: 180, eventType: event.eventType, payload: { prpEvent: event } });
+      for (let replay = 0; replay < 2; replay++) await publishContinuousNativeReply({ db, execution, event, cursor: 180 });
+      // A second item repeating the final must also reuse the published answer,
+      // including when the first item's canonical comment came from a tool.
+      await publishContinuousNativeReply({ db, execution, cursor: 181, event: { ...event, itemId: "progress-repeat",
+        sourceEventId: "progress-repeat", payload: { ...event.payload, answers: [] } } });
+      const published = await comments(scope.runId);
+      expect(published).toHaveLength(reuse ? 1 : 2);
+      const reply = reuse ? published[0] : published.find(comment => comment.body === "Same answer.")!;
+      expect(reply.id === progress.commentId).toBe(reuse);
+      const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      expect(saved.resultJson?.continuousReplies).toMatchObject({ "progress-final": {
+        commentId: reply.id, questionCommentIds: expect.arrayContaining([run.contextSnapshot!.wakeCommentId]),
+        ...(reuse ? { publishedByReference: true } : {}),
+      }, "progress-repeat": { commentId: reply.id, questionCommentIds: [], publishedByReference: true } });
+      expect(await answeredContinuousHeldRun(db, scope)).toBe(true);
+      expect(await outbox.delivery()).toMatchObject({ status: "delivered", responseCommentId: reply.id, targetRunId: scope.runId });
+      process.stdout.write(`PROGRESS_FINAL_PROOF ${JSON.stringify({ scenario, progressCommentId: progress.commentId,
+        comments: published.map(({ id, body }) => ({ id, body })), replies: saved.resultJson?.continuousReplies,
+        delivery: await outbox.delivery() })}\n`);
+      if (scenario === "same-first") {
+        const [followup] = await db.insert(issueComments).values({ companyId: scope.companyId, issueId: scope.issueId,
+          authorUserId: run.responsibleUserId, body: "Give me the same answer again." }).returning();
+        await db.insert(heartbeatRunEvents).values({ companyId: scope.companyId, runId: scope.runId, agentId: scope.agentId,
+          seq: 182, eventType: "turn.started", payload: { prpEvent: { turnId: "next-turn" } } });
+        await publishContinuousNativeReply({ db, execution, cursor: 183, event: { ...event, turnId: "next-turn",
+          itemId: "next-final", sourceEventId: "next-final", payload: { ...event.payload, answers: [followup.id] } } });
+        const [nextRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+        expect(await comments(scope.runId)).toHaveLength(2);
+        const next = (nextRun.resultJson!.continuousReplies as Record<string, { commentId: string }>)["next-final"];
+        expect(next).toMatchObject({ questionCommentIds: [followup.id], normalizedText: "Same answer." });
+        expect(next.commentId).not.toBe(progress.commentId);
+        expect(next).not.toHaveProperty("publishedByReference");
+        process.stdout.write(`DISTINCT_TURN_PROOF ${JSON.stringify({ previousCommentId: reply.id, next })}\n`);
+      }
+    }, reply: "Same answer." });
+  });
+
+  it.each(["turn-started", "items-only"])("gives two inputs in one held turn separate identical replies after reusing only the first progress comment (%s)", async scenario => {
+    const f = await fixture(true, { beforeFinalize: async scope => {
+      await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, scope.agentId));
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      await db.insert(companyMemberships).values({ companyId: scope.companyId, principalId: run.responsibleUserId!,
+        principalType: "user", status: "active", membershipRole: "owner" });
+      const turnId = "held-progress-turn";
+      await db.insert(heartbeatRunEvents).values({ companyId: scope.companyId, runId: scope.runId, agentId: scope.agentId,
+        seq: 171, eventType: scenario === "items-only" ? "item.started" : "turn.started", payload: { prpEvent: { turnId } } });
+      await db.update(heartbeatRuns).set({ nextEventSeq: 172 }).where(eq(heartbeatRuns.id, scope.runId));
+      const authority = new PaperclipRunnerToolAuthority(db, scope);
+      let progress!: { commentId: string };
+      try {
+        progress = await authority.execute({ tool: "report_progress", callId: randomUUID(), arguments: {
+          body: "Same  \tanswer.", idempotencyKey: "held-first-progress",
+        } }) as typeof progress;
+      } finally { authority.close(); }
+      const execution = { binding: scope, provider: { kind: "pi_rpc" as const } };
+      const event = { eventType: "item.completed" as const, runId: scope.runId, normalizedSessionId: run.nativeSessionId!,
+        turnId, sourceEventId: "held-progress-first", itemId: "held-progress-first",
+        payload: { kind: "agentMessage", channel: "final", text: "Same answer.", answers: [run.contextSnapshot!.wakeCommentId as string] } };
+      await db.insert(heartbeatRunEvents).values({ companyId: scope.companyId, runId: scope.runId, agentId: scope.agentId,
+        seq: 180, eventType: event.eventType, payload: { prpEvent: event } });
+      await publishContinuousNativeReply({ db, execution, event, cursor: 180 });
+      expect(await comments(scope.runId)).toEqual([expect.objectContaining({ id: progress.commentId, body: "Same  \tanswer." })]);
+      const [firstRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      expect(firstRun.resultJson?.continuousReplies).toMatchObject({ "held-progress-first": {
+        turnId, cursor: 180, questionCommentIds: [run.contextSnapshot!.wakeCommentId], commentId: progress.commentId, publishedByReference: true,
+      } });
+
+      // The held turn receives another input, but publishes no new progress.
+      const [followup] = await db.insert(issueComments).values({ companyId: scope.companyId, issueId: scope.issueId,
+        authorUserId: run.responsibleUserId, body: "Give the same answer to this second input." }).returning();
+      const second = { ...event, sourceEventId: "held-progress-second", itemId: "held-progress-second",
+        payload: { ...event.payload, answers: [followup.id] } };
+      await db.insert(heartbeatRunEvents).values({ companyId: scope.companyId, runId: scope.runId, agentId: scope.agentId,
+        seq: 190, eventType: second.eventType, payload: { prpEvent: second } });
+      await publishContinuousNativeReply({ db, execution, event: second, cursor: 190 });
+      const published = await comments(scope.runId);
+      expect(published).toHaveLength(2);
+      const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
+      const replies = saved.resultJson!.continuousReplies as Record<string, { commentId: string; publishedByReference?: boolean }>;
+      expect(replies["held-progress-first"]).toMatchObject({ commentId: progress.commentId, publishedByReference: true });
+      expect(replies["held-progress-second"]).toMatchObject({ turnId, cursor: 190, questionCommentIds: [followup.id], normalizedText: "Same answer." });
+      expect(replies["held-progress-second"].commentId).not.toBe(progress.commentId);
+      expect(replies["held-progress-second"]).not.toHaveProperty("publishedByReference");
+      expect(published.find(comment => comment.id === replies["held-progress-second"].commentId)?.body).toBe("Same answer.");
+      if (scenario === "items-only") {
+        const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, scope.runId));
+        expect(events.some(event => event.eventType.startsWith("turn."))).toBe(false);
+        const turnEvents = events.filter(event => (event.payload?.prpEvent as { turnId?: string } | undefined)?.turnId === turnId);
+        expect(turnEvents).toHaveLength(3);
+        expect(turnEvents.every(event => event.eventType.startsWith("item."))).toBe(true);
+      }
+      process.stdout.write(`SAME_HELD_TURN_PROGRESS_PROOF ${JSON.stringify({ scenario, runId: scope.runId,
+        progressCommentId: progress.commentId, secondInputId: followup.id, replies,
+        comments: published.map(({ id, body }) => ({ id, body })) })}\n`);
+    }, reply: "Same answer." });
+    expect(await comments(f.runId)).toHaveLength(2);
+  });
+
   it("coalesces identical held-turn finals only without new attribution, replays idempotently, and reuses the last at finalization", async () => {
     const f = await fixture(true, { beforeFinalize: async scope => {
       const [personRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, scope.runId));
