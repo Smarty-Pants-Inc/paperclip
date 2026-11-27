@@ -1,5 +1,6 @@
 import { normalizePaperclipWakePayload } from "@paperclipai/adapter-utils/server-utils";
 import { currentRunFailureText } from "./native-exact-resume-failure.js";
+import { hasCompactWakeShape } from "./compact-wake-shape.js";
 
 /**
  * A failed run whose own session can never be resumed: a person's Retry of it starts fresh.
@@ -24,6 +25,16 @@ export function withPiOpenTurnDefault(provider: unknown, setting: unknown, envir
 
 /** The page-only marker a fresh native session writes (paperclip-control-plane-port.ts). */
 export const NATIVE_FRESH_SESSION_MARKER = "New session · Earlier messages and files are still available.";
+export function isNativeFreshSessionMarker(message: { authorType?: string | null; authorId?: string | null; freshSessionMarker?: boolean; body?: string }) {
+  return message.authorType === "system" && !message.authorId && message.freshSessionMarker === true && message.body === NATIVE_FRESH_SESSION_MARKER;
+}
+
+/** Only the exact resumed turn's output is known to be in this session.
+ * Agent identity alone says nothing about another run/runtime or a reset.
+ */
+export function isNativePreviousTurnReply(message: { authorType?: string | null; authorId?: string | null; createdByRunId?: string | null }, agentId?: string, previousRunId?: string) {
+  return !!agentId && !!previousRunId && message.authorType === "agent" && message.authorId === agentId && message.createdByRunId === previousRunId;
+}
 
 export function decideNativeContinuation(input: {
   provider?: unknown; sessionContinuity?: unknown; hasSession: boolean;
@@ -31,24 +42,29 @@ export function decideNativeContinuation(input: {
 }): { continue: boolean; promptOnly: boolean } {
   const mode = resolveSessionContinuity(input.provider, input.sessionContinuity);
   const retained = input.hasSession && !input.resetRequired && (mode === "continuous" || !input.wakeReset);
+  if (input.provider === "pi_rpc" && mode === "continuous" && !hasCompactWakeShape(input.wakePayload))
+    return { continue: retained, promptOnly: false };
   const wake = normalizePaperclipWakePayload(input.wakePayload);
   const raw = input.wakePayload && typeof input.wakePayload === "object" ? input.wakePayload as Record<string, unknown> : {};
   const hasAttachments = (raw.attachmentOmissions != null && (!Array.isArray(raw.attachmentOmissions) || raw.attachmentOmissions.length > 0)) ||
     (Array.isArray(raw.comments) && raw.comments.some(comment => comment && typeof comment === "object" &&
       comment.attachments != null && (!Array.isArray(comment.attachments) || comment.attachments.length > 0)));
-  const messages = [...(wake?.executionContinuation?.messages ?? wake?.executionContinuation?.resumeDelta?.messages ?? []), ...(wake?.comments ?? [])];
-  const fullBodies = !!wake && wake.commentIds.every(id => wake.comments.some(comment => comment.id === id && typeof comment.fullBody === "string"));
-  return { continue: retained, promptOnly: retained && mode === "continuous" && !hasAttachments && !input.taskChanged && !!wake && ["issue_commented", "issue_reopened_via_comment", "issue_continuation_needed"].includes(wake.reason ?? "") &&
+  const delta = wake?.executionContinuation?.resumeDelta;
+  const messages = delta?.messages ?? [...(wake?.executionContinuation?.messages ?? []), ...(wake?.comments ?? [])];
+  // A matching delta is authoritative: stale wake comment IDs are not new input.
+  const commentIds = wake?.commentIds.filter(id => !delta || messages.some(message => message.id === id)) ?? [];
+  const fullBodies = !!wake && commentIds.every(id => wake.comments.some(comment => comment.id === id && typeof comment.fullBody === "string"));
+  return { continue: retained, promptOnly: retained && input.provider === "pi_rpc" && mode === "continuous" && !hasAttachments && !input.taskChanged && !!wake &&
     (fullBodies || (!raw.truncated && !raw.fallbackFetchNeeded && !wake.comments.some(comment => comment.bodyTruncated))) &&
     (!wake.executionContinuation?.resumeDelta || wake.executionContinuation.resumeDelta.baseRunId === input.previousRunId) &&
     // The agent's own previous replies are already in its session, and the page's fresh-session
     // marker is not input; neither blocks the person's prompt.
-    !wake.executionContinuation?.resumeDelta?.messages.some(message => !wake.commentIds.includes(message.id) && !(message.authorType === "agent" && message.authorId === input.agentId) &&
-      !(message.authorType === "system" && !message.authorId && message.freshSessionMarker === true && message.body === NATIVE_FRESH_SESSION_MARKER)) &&
-    !wake.childIssueSummaries.length && !wake.executionContinuation?.humanResponses?.length && !wake.unresolvedBlockerIssueIds.length &&
+    !delta?.messages.some(message => !commentIds.includes(message.id) && !isNativePreviousTurnReply(message, input.agentId, input.previousRunId) &&
+      !isNativeFreshSessionMarker(message)) &&
+    !wake.childIssueSummaries.length && !wake.executionContinuation?.humanResponses?.some(answer => answer.id === wake.interactionId) && !wake.unresolvedBlockerIssueIds.length &&
     !wake.interactionId && !wake.questionResponse && !wake.externalChatQuestionResponse && !wake.recovery &&
     !wake.executionStage && !wake.taskWatchdog && !wake.livenessContinuation && !wake.dispositionRepair &&
     !wake.documentReviewContext && !wake.planReviewContext && !(wake.annotationDeltas?.length) && !raw.mcpAppContext && !raw.chatCompletionUpdates && !raw.extraContext &&
-    !wake.agentMessage && !wake.skillTest && wake.commentIds.length > 0 &&
-    wake.commentIds.every(id => messages.find(message => message.id === id)?.authorType === "user") };
+    !wake.agentMessage && !wake.skillTest && (commentIds.length > 0 || !!delta) &&
+    commentIds.every(id => messages.find(message => message.id === id)?.authorType === "user") };
 }

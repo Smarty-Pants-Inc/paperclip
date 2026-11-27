@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { writeFile } from "node:fs/promises";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issueComments, issues, responsibilities, responsibilityLinks, routineTriggers, routines, userWorkspacePreferences } from "@paperclipai/db";
+import { agents, authUsers, companies, companyMemberships, completionContracts, createDb, heartbeatRuns, issueComments, issueThreadInteractions, issues, nativeRunFinalizations, nativeRunResults, responsibilities, responsibilityLinks, routineTriggers, routines, userWorkspacePreferences, workAssessments } from "@paperclipai/db";
 import { FAST_RESPONSE_AGENT_GUIDANCE } from "@paperclipai/shared";
 import { registerServerAdapter, unregisterServerAdapter, type AdapterExecutionContext } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
@@ -11,6 +12,19 @@ import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "../services/issue-conti
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { buildLowTrustSourceTrust, LOW_TRUST_QUARANTINED_BODY } from "../services/source-trust.js";
 import { REDACTED_EVENT_VALUE } from "../redaction.js";
+import { buildNativeContinuationPrompt, readNativeTaskSnapshot } from "../services/native-runtime/native-continuation.js";
+import * as nativeContinuation from "../services/native-runtime/native-continuation.js";
+import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
+import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
+import { commitNativeStatusDecision } from "../services/native-runtime/status-decision-committer.js";
+import { NATIVE_STATUS_ARBITER_POLICY_VERSION } from "../services/native-runtime/status-arbiter.js";
+import { issueService } from "../services/issues.js";
+import { logActivity } from "../services/activity-log.js";
+import { buildExecutionContinuation } from "../services/execution-continuation.js";
+import { PaperclipRunnerToolAuthority } from "../services/native-runtime/paperclip-runner-tool-authority.js";
+import { hasCompactWakeShape } from "../services/native-runtime/compact-wake-shape.js";
+// Keep the behavioral revert control runnable on v3, which has no raw revisions.
+const withNativeTaskRevisions = (value: unknown) => nativeContinuation.withNativeTaskRevisions?.(value) ?? readNativeTaskSnapshot(value);
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -24,6 +38,7 @@ describePostgres("heartbeat task context delivered to an adapter", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
   let heartbeat: ReturnType<typeof heartbeatService>;
+  const visiblePrompts: Record<string, unknown> = {};
 
   beforeAll(async () => {
     temporary = await startEmbeddedPostgresTestDatabase("heartbeat-task-context-");
@@ -48,6 +63,7 @@ describePostgres("heartbeat task context delivered to an adapter", () => {
     unregisterServerAdapter(adapterType);
     await db?.$client.end({ timeout: 0 });
     await temporary?.cleanup();
+    if (process.env.CONTINUITY_PROMPT_OUTPUT) await writeFile(process.env.CONTINUITY_PROMPT_OUTPUT, JSON.stringify(visiblePrompts, null, 2) + "\n");
   });
 
   async function seed() {
@@ -76,6 +92,240 @@ describePostgres("heartbeat task context delivered to an adapter", () => {
     return captured.get(run!.id)!;
   }
 
+  // Real PostgreSQL regressions for the two continuity findings: use the stock
+  // task-start context, issue mutation receipts, comment provenance and committer.
+  async function continuityTurn(description = "Assignment description canary", secrets: string[] = []) {
+    const f = await seed(), runId = randomUUID(), sessionId = randomUUID(), contractId = randomUUID();
+    await db.update(issues).set({ status: "in_progress", description }).where(eq(issues.id, f.issueId));
+    await db.insert(completionContracts).values({ id: contractId, companyId: f.companyId, issueId: f.issueId,
+      revision: 1, schemaVersion: "paperclip.completion-contract.v1", policyVersion: "continuity",
+      risk: "standard", completionAuthority: "server_arbiter", incompleteCriteriaPolicy: "preserve_non_terminal",
+      contractJson: {}, canonicalSha256: contractId, createdByActorType: "system", createdByActorId: "test" });
+    const [run] = await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId,
+      status: "running", runtimeMode: "native", nativeIssueId: f.issueId, nativeSessionId: sessionId,
+      completionContractId: contractId, completionContractSha256: contractId, contextSnapshot: { issueId: f.issueId } }).returning();
+    await db.update(issues).set({ executionRunId: runId, checkoutRunId: runId }).where(eq(issues.id, f.issueId));
+    for (const secret of secrets) await createRunSecretRedactionRegistry(db).register(f.companyId, runId, secret);
+    const [agent] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+    const [issueRef] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    const context: Record<string, unknown> = { issueId: f.issueId, executionContinuation: { version: 1, messages: [] } };
+    await prepareHeartbeatTaskContext(db, { run, agent, task: { issueRef, issueContext: issueRef as never, context, taskSession: null },
+      policy: { trustPreset: { kind: "standard" }, experimentalInstanceSettings: {} },
+      services: { issuesSvc: { getAncestors: async () => [] }, getPinnedSkillTestContext: async () => null } });
+    await db.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify(context)}::jsonb` }).where(eq(heartbeatRuns.id, runId));
+    const start = readNativeTaskSnapshot((context.paperclipIssue as Record<string, unknown>).continuationSnapshot)!;
+    expect(start).not.toBeNull();
+    return { ...f, runId, sessionId, contractId, start };
+  }
+  async function editDuringTurn(f: Awaited<ReturnType<typeof continuityTurn>>, patch: { description?: string; priority?: string }, actor: "person" | "own" | "unknown" | "other-run") {
+    const updated = await issueService(db).update(f.issueId, { ...patch, actorUserId: actor === "person" ? "context-user" : null,
+      actorAgentId: actor === "own" || actor === "other-run" ? f.agentId : null });
+    if (actor === "unknown") return;
+    const otherRunId = actor === "other-run" ? randomUUID() : null;
+    if (otherRunId) await db.insert(heartbeatRuns).values({ id: otherRunId, companyId: f.companyId, agentId: f.agentId, status: "succeeded" });
+    await logActivity(db, { companyId: f.companyId, actorType: actor === "person" ? "user" : "agent",
+      actorId: actor === "person" ? "context-user" : f.agentId, agentId: actor === "person" ? null : f.agentId,
+      runId: actor === "own" ? f.runId : otherRunId, action: "issue.updated", entityType: "issue", entityId: f.issueId,
+      details: { ...patch, changes: updated!.changes } });
+  }
+  async function finishContinuityTurn(f: Awaited<ReturnType<typeof continuityTurn>>) {
+    const [beforeCommit] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    expect(beforeCommit.status).toBe("in_progress");
+    const resultId = randomUUID(), assessmentId = randomUUID();
+    await db.insert(nativeRunResults).values({ id: resultId, companyId: f.companyId, issueId: f.issueId, runId: f.runId,
+      completionContractId: f.contractId, serverFingerprint: resultId, schemaStatus: "accepted", resultJson: {}, canonicalSha256: resultId });
+    await db.insert(workAssessments).values({ id: assessmentId, companyId: f.companyId, issueId: f.issueId, runId: f.runId,
+      contractId: f.contractId, resultId, triggerKind: "native_result", triggerActorCompanyId: f.companyId,
+      priorIssueStatus: beforeCommit.status, priorStatusVersion: beforeCommit.statusVersion, policyVersion: "continuity", assessmentJson: {}, inputDigest: assessmentId });
+    await db.insert(nativeRunFinalizations).values({ runId: f.runId, companyId: f.companyId, issueId: f.issueId, phase: "arbitrating", attempt: 0, resultId });
+    await commitNativeStatusDecision({ db, companyId: f.companyId, issueId: f.issueId, runId: f.runId, assessmentId,
+      priorStatus: beforeCommit.status, priorStatusVersion: beforeCommit.statusVersion, priorDecisionId: beforeCommit.lastStatusDecisionId,
+      decision: { policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION, statusAction: "in_review", toStatus: "in_review",
+        reasonCode: "continuity_attribution", unblockDescriptor: null, effects: [] } });
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    const end = run.contextSnapshot!.paperclipEndTaskSnapshot as { taskSnapshot: unknown };
+    const baseline = readNativeTaskSnapshot(end.taskSnapshot)!;
+    const current = (await createRunSecretRedactionRegistry(db).redactForIssue(f.companyId, f.issueId, withNativeTaskRevisions(issue)))!;
+    const wake = { reason: "issue_continuation_needed", executionContinuation: { version: 1, messages: [], resumeDelta: { baseRunId: f.runId, messages: [] } } };
+    const prompt = buildNativeContinuationPrompt({ wakePayload: wake, previousWakePayload: wake, continuousPi: true, promptOnly: true,
+      previousTurnDelivered: true, previousRunId: f.runId, issue, previousIssue: issue, taskSnapshot: current, previousTaskSnapshot: baseline });
+    expect(prompt).not.toBeNull();
+    expect(prompt).not.toContain("status: in_progress -> in_review");
+    return { prompt: prompt!, baseline, current, wake, issue, receipt: end, runId: f.runId, resultId, companyId: f.companyId, issueId: f.issueId };
+  }
+  it("bootstraps rather than trusting legacy, foreign or missing-start baseline receipts", async () => {
+    const f = await continuityTurn(), result = await finishContinuityTurn(f);
+    const read = nativeContinuation.readNativeEndTaskSnapshot;
+    expect(read(result.receipt, f.issueId)).toEqual(result.baseline);
+    const missingStart = await continuityTurn();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: missingStart.issueId } }).where(eq(heartbeatRuns.id, missingStart.runId));
+    const untrusted = await finishContinuityTurn(missingStart);
+    for (const receipt of [{ issueId: f.issueId, taskSnapshot: result.current },
+      { ...result.receipt, issueId: randomUUID() }, untrusted.receipt]) {
+      const previousTaskSnapshot = read(receipt, f.issueId);
+      expect(previousTaskSnapshot).toBeNull();
+      expect(buildNativeContinuationPrompt({ wakePayload: result.wake, continuousPi: true, promptOnly: true, previousTurnDelivered: true,
+        previousRunId: f.runId, issue: result.issue, previousIssue: result.issue, taskSnapshot: result.current, previousTaskSnapshot })).toBeNull();
+    }
+    expect(read(untrusted.receipt, missingStart.issueId)).toBeNull();
+  });
+  it.each(["person", "unknown", "other-run"] as const)("announces a mid-turn %s description edit, not this turn's own status move", async actor => {
+    const f = await continuityTurn();
+    await editDuringTurn(f, { description: "MID_TURN_PERSON_DESCRIPTION" }, actor);
+    const result = await finishContinuityTurn(f);
+    expect(result.prompt).toContain("description: changed\nMID_TURN_PERSON_DESCRIPTION");
+    expect(result.baseline.description).toBe(f.start.description);
+    if (actor === "person") visiblePrompts.midTurnPersonDescription = result;
+  });
+  it("announces a concurrent person priority change while suppressing attributable agent-only changes", async () => {
+    const f = await continuityTurn();
+    await editDuringTurn(f, { description: "OWN_DESCRIPTION" }, "own");
+    await editDuringTurn(f, { priority: "urgent" }, "person");
+    const result = await finishContinuityTurn(f);
+    expect(result.prompt).toContain("priority: medium -> urgent");
+    expect(result.prompt).not.toContain("description: changed");
+    expect(result.baseline.description).toBe("OWN_DESCRIPTION");
+  });
+  it("does not announce agent-only field changes or replay the original brief", async () => {
+    const f = await continuityTurn();
+    await editDuringTurn(f, { description: "OWN_DESCRIPTION", priority: "high" }, "own");
+    const result = await finishContinuityTurn(f);
+    expect(result.prompt).toContain("no new messages");
+    expect(result.prompt).not.toContain("no task field differs");
+    expect(result.prompt).not.toContain("description: changed");
+    expect(result.prompt).not.toContain("priority: medium -> high");
+    visiblePrompts.repeatedWake = result;
+    const [person] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorType: "user", authorUserId: "context-user", body: "PERSON_COMMENT_AFTER_OWN_STATUS" }).returning();
+    const executionContinuation = await buildExecutionContinuation({ db, companyId: f.companyId, issueId: f.issueId,
+      agentId: f.agentId, context: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentIds: [person.id] },
+      previousContextRunId: f.runId, summary: null, exposeLowTrustRaw: true });
+    const commentedWake = { ...result.wake, reason: "issue_commented", commentIds: [person.id], comments: [], executionContinuation };
+    const prompt = buildNativeContinuationPrompt({ wakePayload: commentedWake, continuousPi: true, promptOnly: true,
+      previousTurnDelivered: true, previousRunId: f.runId, issue: result.issue, previousIssue: result.issue,
+      taskSnapshot: result.current, previousTaskSnapshot: result.baseline });
+    expect(prompt).toContain("\n\nPERSON_COMMENT_AFTER_OWN_STATUS");
+    expect(prompt).not.toContain('"messages"');
+    expect(prompt).not.toContain("status: in_progress -> in_review");
+    visiblePrompts.ownStatusThenPersonComment = { ...result, wake: commentedWake, prompt };
+  });
+  it("keeps real cumulative receipts and answered-question history on the constructor's short path", async () => {
+    const f = await continuityTurn();
+    await db.update(heartbeatRuns).set({ resultJson: { apiToolReceipts: { review: {
+      state: "completed", operationId: "request_review", result: { status: "in_review" },
+    } } } }).where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, sourceRunId: f.runId,
+      kind: "ask_user_questions", status: "answered", resolvedByUserId: "context-user", resolvedAt: new Date(),
+      payload: { version: 1, questions: [{ id: "scope", prompt: "Which scope?", selectionMode: "single", options: [{ id: "yes", label: "Yes" }] }] },
+      result: { version: 1, answers: [{ questionId: "scope", optionIds: ["yes"] }] } });
+    const settled = await finishContinuityTurn(f);
+    const [person] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorType: "user", authorUserId: "context-user", body: "PLAIN_AFTER_REAL_HISTORY" }).returning();
+    for (const reviewerReturn of [false, true]) {
+      if (reviewerReturn) await issueService(db).update(f.issueId, { status: "in_progress", actorUserId: "context-user" });
+      const executionContinuation = await buildExecutionContinuation({ db, companyId: f.companyId, issueId: f.issueId,
+        agentId: f.agentId, context: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentIds: [person.id] },
+        previousContextRunId: f.runId, summary: null, exposeLowTrustRaw: true });
+      expect(executionContinuation.completedActions).toEqual([expect.objectContaining({ operationId: "request_review" })]);
+      expect(executionContinuation.interactionOutcomes).toHaveLength(1);
+      expect(executionContinuation.humanResponses).toHaveLength(1);
+      const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+      const wake = { reason: "issue_commented", commentIds: [person.id], comments: [], executionContinuation };
+      expect(hasCompactWakeShape(wake), JSON.stringify(wake, null, 2)).toBe(true);
+      const result = buildNativeExecutionInput({ companyId: f.companyId, runId: randomUUID(), agentId: f.agentId, issue,
+        taskSnapshot: withNativeTaskRevisions(issue), taskPrompt: "ORIGINAL_BRIEF", provider: "pi_rpc", normalizedSessionId: f.sessionId, resumedSession: true,
+        previousTurn: { runId: f.runId, status: "succeeded", acceptedResultId: settled.resultId, task: settled.issue, taskSnapshot: settled.baseline }, wakePayload: wake,
+        workspace: { id: randomUUID(), cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null }, runtimeContext: nativeRuntimeContextFixture(),
+        completionContract: { id: f.contractId, sha256: "a".repeat(64), schemaVersion: "paperclip.run-result.v1", contract: {
+          revision: "1", objective: "Continue", criteria: [{ id: "reply", requirement: "Reply" }] } } });
+      expect(result.continuationPrompt).not.toBeNull();
+      expect(result.continuationPrompt).toContain("\n\nPLAIN_AFTER_REAL_HISTORY");
+      expect(result.continuationPrompt).not.toContain('"messages"');
+      expect(result.continuationPrompt).not.toContain("request_review");
+      expect(result.continuationPrompt).not.toContain("Which scope?");
+      if (reviewerReturn) expect(result.continuationPrompt).toContain("status: in_review -> in_progress");
+    }
+  });
+  it("makes a truncated executionPolicy readable through the named authorized task tool", async () => {
+    const f = await continuityTurn(), executionPolicy = { note: "POLICY_READER_CANARY_".repeat(1000) };
+    await db.update(issues).set({ executionPolicy, billingCode: "reader-billing", reviewPolicy: "human_only" }).where(eq(issues.id, f.issueId));
+    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    const prompt = buildNativeContinuationPrompt({ wakePayload: { reason: "issue_updated_by_user", executionContinuation: { version: 1, messages: [], resumeDelta: { baseRunId: f.runId, messages: [] } } }, continuousPi: true,
+      promptOnly: true, previousTurnDelivered: true, previousRunId: f.runId, issue, previousIssue: issue,
+      taskSnapshot: withNativeTaskRevisions(issue), previousTaskSnapshot: f.start });
+    expect(prompt).toContain("executionPolicy: changed");
+    expect(prompt).toContain("get_task_context({})");
+    expect(prompt).not.toContain(JSON.stringify(executionPolicy));
+    const authority = new PaperclipRunnerToolAuthority(db, { companyId: f.companyId, agentId: f.agentId, issueId: f.issueId, runId: f.runId });
+    const result = await authority.execute({ tool: "get_task_context", callId: "truncated-policy-reader", arguments: {} });
+    expect(result).toMatchObject({ activeTask: { executionPolicy, billingCode: "reader-billing", reviewPolicy: "human_only",
+      responsibleUserId: "context-user", conversationAgentId: null } });
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.runId));
+  });
+  it.each(["person", "own"] as const)("compares raw revisions across redaction collisions (%s edit)", async actor => {
+    const secretA = "registered-continuity-canary-A", secretB = "registered-continuity-canary-B";
+    const f = await continuityTurn("Use " + secretA, [secretA, secretB]);
+    await editDuringTurn(f, { description: "Use " + secretB }, actor);
+    const result = await finishContinuityTurn(f);
+    expect(result.current.description).toBe(result.baseline.description);
+    if (actor === "person") expect(result.prompt).toContain("description: changed\nUse " + REDACTED_EVENT_VALUE);
+    else expect(result.prompt).not.toContain("description: changed");
+    expect(result.prompt).not.toContain(secretA);
+    expect(result.prompt).not.toContain(secretB);
+    expect(result.prompt).not.toContain("fieldRevisions");
+  });
+  it.each(["person-first", "own-first"] as const)("never absorbs another actor's same-field edit (%s)", async order => {
+    const f = await continuityTurn();
+    if (order === "person-first") await editDuringTurn(f, { description: "PERSON_FIRST" }, "person");
+    await editDuringTurn(f, { description: "OWN_DESCRIPTION" }, "own");
+    if (order === "own-first") await editDuringTurn(f, { description: "PERSON_LAST" }, "person");
+    const result = await finishContinuityTurn(f);
+    expect(result.prompt).toContain("description: changed\n" + (order === "person-first" ? "OWN_DESCRIPTION" : "PERSON_LAST"));
+  });
+  it.each(["own-turn", "other-session", "unattributable"] as const)("uses stock comment run provenance for a same-agent %s reply", async source => {
+    const f = await continuityTurn(), otherRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: otherRunId, companyId: f.companyId, agentId: f.agentId, status: "succeeded",
+      runtimeMode: "native", nativeIssueId: f.issueId, nativeSessionId: randomUUID() });
+    const commentRunId = source === "own-turn" ? f.runId : source === "other-session" ? otherRunId : null;
+    const [reply] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorAgentId: f.agentId,
+      authorType: "agent", createdByRunId: commentRunId, body: "SAME_AGENT_REPLY_" + source }).returning();
+    const settled = await finishContinuityTurn(f);
+    const [person] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorType: "user", authorUserId: "context-user", body: "NEXT_PERSON_MESSAGE" }).returning();
+    const context = { issueId: f.issueId, wakeReason: "issue_reopened_via_comment", wakeCommentIds: [person.id] };
+    const executionContinuation = await buildExecutionContinuation({ db, companyId: f.companyId, issueId: f.issueId,
+      agentId: f.agentId, context, previousContextRunId: f.runId, summary: null, exposeLowTrustRaw: true });
+    expect(executionContinuation.resumeDelta!.messages.find(message => message.id === reply.id)?.createdByRunId).toBe(commentRunId);
+    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    // Exercise the retained-input projection with the real stock DB delta.
+    // Full comment presentation metadata has its separate full-framing guard.
+    const wake = { reason: context.wakeReason, executionContinuation, commentIds: [person.id], comments: [] };
+    const execution = buildNativeExecutionInput({ companyId: f.companyId, runId: randomUUID(), agentId: f.agentId, issue,
+      taskSnapshot: settled.current, taskPrompt: "ORIGINAL_BRIEF", provider: "pi_rpc", normalizedSessionId: f.sessionId, resumedSession: true,
+      previousTurn: { runId: f.runId, status: "succeeded", acceptedResultId: settled.resultId, task: issue, taskSnapshot: settled.baseline }, wakePayload: wake,
+      workspace: { id: randomUUID(), cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null }, runtimeContext: nativeRuntimeContextFixture(),
+      completionContract: { id: f.contractId, sha256: "a".repeat(64), schemaVersion: "paperclip.run-result.v1", contract: {
+        revision: "1", objective: "Continue", criteria: [{ id: "reply", requirement: "Reply" }] } } });
+    const prompt = execution.continuationPrompt!;
+    expect(prompt, JSON.stringify(wake, null, 2)).not.toBeNull();
+    expect(prompt).toContain(person.body);
+    const generic = buildNativeContinuationPrompt({ wakePayload: wake, continuousPi: true, promptOnly: false,
+      previousTurnDelivered: true, previousRunId: f.runId, agentId: f.agentId, issue, previousIssue: issue,
+      taskSnapshot: settled.current, previousTaskSnapshot: settled.baseline })!;
+    if (source === "own-turn") {
+      expect(prompt).not.toContain(reply.body);
+      expect(generic).not.toContain(reply.body);
+      expect(prompt).not.toContain('"messages"');
+    } else {
+      expect(prompt).toContain(reply.body);
+      expect(generic).toContain(reply.body);
+    }
+    if (source === "other-session") visiblePrompts.otherSessionSameAgentComment = { prompt, generic, runId: f.runId, commentRunId,
+      nativeSessionId: f.sessionId, companyId: f.companyId, issueId: f.issueId, commentId: reply.id };
+  });
+
   it("keeps assignment, wake, compact, and revision context aligned after secret redaction", async () => {
     const f = await seed();
     const secret = "task-context-secret-canary";
@@ -92,7 +342,7 @@ describePostgres("heartbeat task context delivered to an adapter", () => {
       id: commentId, companyId: f.companyId, issueId: f.issueId, authorType: "user", authorUserId: "context-user",
       body: `Wake comment canary ${secret}`,
     });
-    const { context } = await execute(f, {
+    const { context, runId } = await execute(f, {
       wakeCommentId: commentId, wakeCommentIds: [commentId],
       paperclipTaskCommunicationGuidance: "FORGED caller guidance", paperclipSkillTest: { directive: "FORGED skill" },
       paperclipContinuationSummary: { body: "FORGED summary" },
@@ -109,6 +359,14 @@ describePostgres("heartbeat task context delivered to an adapter", () => {
     for (const key of ["paperclipIssue", "paperclipWakeComment", "paperclipTaskMarkdown", "paperclipTaskMarkdownAssignment", "paperclipTaskMarkdownCompact", "paperclipTaskMarkdownAssignmentCompact"]) {
       expect(JSON.stringify(context[key])).not.toContain(secret);
     }
+    // The same authorized, redacted row is durably available for the next turn's field comparison.
+    const taskSnapshot = readNativeTaskSnapshot((context.paperclipIssue as Record<string, unknown>).continuationSnapshot);
+    expect(taskSnapshot).toMatchObject({ status: "in_progress", priority: "medium", assigneeAgentId: f.agentId,
+      assigneeUserId: null, parentId: null, projectId: null, goalId: null, billingCode: null,
+      description: `Assignment description canary ${REDACTED_EVENT_VALUE}` });
+    const savedRun = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then(rows => rows[0]);
+    const savedIssue = (savedRun.contextSnapshot as Record<string, unknown>).paperclipIssue as Record<string, unknown>;
+    expect(readNativeTaskSnapshot(savedIssue.continuationSnapshot)).toEqual(taskSnapshot);
     expect(context.paperclipTaskCommunicationGuidance).toBe(FAST_RESPONSE_AGENT_GUIDANCE);
     expect(context.paperclipSkillTest).toBeUndefined();
     expect(context.paperclipAgentJwtScope).toEqual({ kind: "standard" });

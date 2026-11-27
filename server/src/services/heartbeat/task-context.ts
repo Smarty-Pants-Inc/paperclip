@@ -12,6 +12,7 @@ import { buildExecutionContinuation } from "../execution-continuation.js";
 import { getIssueContinuationSummaryDocument } from "../issue-continuation-summary.js";
 import type { issueService } from "../issues.js";
 import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
+import { withNativeTaskRevisions } from "../native-runtime/native-continuation.js";
 import { redactQuarantinedBodyForHigherTrust, sanitizeQuarantinedCommentForHigherTrust } from "../source-trust.js";
 import { getTaskPlanContext } from "../task-plan-context.js";
 import { loadResponsibilityBarGuidance } from "../responsibility-bar-guidance.js";
@@ -451,6 +452,27 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
       title: issueRef.title,
       description: isConversation(issueContext) ? null : issueRef.description,
       workMode: issueRef.workMode,
+      // Snapshot only agent-visible task context. Conversation framing hides
+      // the brief; the continuation must not expose it through change news.
+      ...(issueContext ? { continuationSnapshot: withNativeTaskRevisions({
+        identifier: issueRef.identifier,
+        title: issueRef.title,
+        description: isConversation(issueContext) ? null : issueRef.description,
+        workMode: issueRef.workMode,
+        status: issueContext.status,
+        priority: issueContext.priority,
+        assigneeAgentId: issueContext.assigneeAgentId,
+        assigneeUserId: issueContext.assigneeUserId,
+        parentId: issueContext.parentId,
+        projectId: issueContext.projectId,
+        goalId: issueContext.goalId,
+        conversationAgentId: issueContext.conversationAgentId,
+        titleNeedsGeneration: issueContext.titleNeedsGeneration,
+        reviewPolicy: issueContext.reviewPolicy,
+        executionPolicy: issueContext.executionPolicy,
+        responsibleUserId: issueContext.responsibleUserId,
+        billingCode: issueContext.billingCode,
+      }) } : {}),
     };
   } else {
     delete context.paperclipIssue;
