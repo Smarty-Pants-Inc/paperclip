@@ -180,7 +180,8 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
     await db.insert(authUsers).values({ id: userId, name: "Task owner", email: `${userId}@example.invalid`,
       createdAt: new Date(), updatedAt: new Date() });
     await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId, membershipRole: "owner" });
-    await db.update(agents).set({ status: "idle", adapterConfig: { provider } }).where(eq(agents.id, agentId));
+    await db.update(agents).set({ status: "idle", adapterConfig: { provider,
+      ...(provider === "pi_rpc" ? { model: "openai/fixture-model" } : {}) } }).where(eq(agents.id, agentId));
     await instanceSettingsService(db).updateExperimental({ enableAgentChat: true, enableNativeRunner: true });
     const [issue] = await db.insert(issues).values({ companyId, title: "Survive a database fault", status,
       assigneeAgentId: agentId, responsibleUserId: userId, conversationAgentId: agentId, conversationUserId: userId,

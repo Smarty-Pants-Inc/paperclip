@@ -3014,6 +3014,14 @@ describe("remote provider pack manifest", () => {
     return JSON.stringify(value);
   };
 
+  async function restoreArtifactFixture(input: Parameters<typeof providerArtifactStorage.restoreNativeProviderArtifacts>[0]) {
+    // The real restore materializes these files before size-budgeted sync-in.
+    await mkdir(input.targetRoot, { recursive: true, mode: 0o700 });
+    for (const name of ["nodeCommand", "opencodeProxy", "opencodeExecutable"]) {
+      await writeFile(join(input.targetRoot, name), "restored fixture artifact", { mode: 0o700 });
+    }
+  }
+
   it.each(["opencode", "opencode-new-durable", "opencode-new-durable-reset", "opencode-new-durable-inspect-reset", "opencode-new-durable-provider-reset", "opencode-new-durable-store-failed", "opencode-new-durable-publish-failed", "opencode-new-durable-slow-capture", "opencode-new-durable-ready", "opencode-continuation", "opencode-continuation-missing", "opencode-continuation-no-receipt", "opencode-continuation-replacement", "opencode-continuation-cold", "opencode-continuation-legacy-durable", "opencode-continuation-prior-receipt", "opencode-continuation-prior-receipt-replacement", "opencode-dirty", "opencode-diagnostics", "opencode-diagnostics-stale", "cursor", "claude-x64", "claude-arm64"] as const)("uses the bundled Linux image authority for remote %s without controller overrides", async provider => {
     const firstDurable = provider.startsWith("opencode-new-durable");
     // A sandbox connection drops once while the settled state is read out.
@@ -3035,7 +3043,7 @@ describe("remote provider pack manifest", () => {
       opencodeProxy: "dist/cli/opencode-app-server-proxy.cjs", acpxSidecar: "dist/cli/acpx-runtime-sidecar.cjs",
     }).map(([key, path]) => [key, { path, sha256: digest }])) as Record<"nodeCommand" | "opencodeCommand" | "opencodeExecutable" | "opencodeProxy", { path: string; sha256: string }>;
     const payload = {
-      compatibility: { opencode: 1, acpx: 1 }, contractDigest: digest,
+      compatibility: { opencode: 1, pi_rpc: 1, acpx: 1 }, contractDigest: digest,
       target: { platform: "linux", architecture }, runnerSourceRevision: "a".repeat(40),
       pins: { nodeMinimum: "24.11.0", codex: QUALIFIED_ACPX_PROFILES.codex.agentRuntimeVersion,
         opencode: "1.18.34", acpx: "0.22.0", grok: QUALIFIED_ACPX_PROFILES.grok.agentRuntimeVersion,
@@ -3179,7 +3187,7 @@ describe("remote provider pack manifest", () => {
       }
       expect(syncIn).toHaveBeenCalledWith([expect.objectContaining({ files: [expect.objectContaining({
         sourcePath: state.bundledRunnerBinary, targetPath: "/workspace/.paperclip-runtime/paperclip-runner/bin/paperclip-runnerd",
-      })] })]);
+      })] })], { minimumTimeoutMs: 61_000 });
       expect(execute.mock.calls.some(([call]) => call.args?.[1] === "uname -s; uname -m")).toBe(false);
       expect(existsSync(join(transport.stateDirectory!, "provider-pack-authority.json"))).toBe(false);
       expect(transport).toMatchObject({ providerPackAuthorityDigest: installed.digest,
@@ -3303,7 +3311,7 @@ describe("remote provider pack manifest", () => {
           if (cold) await rm(receiptPath);
           const storageMode = vi.spyOn(harnessStorage, "durableNativeHarnessStorage").mockReturnValue({} as never);
           const backupOwner = vi.spyOn(harnessStorage, "nativeHarnessBackupOwner").mockResolvedValue({} as never);
-          const restore = vi.spyOn(providerArtifactStorage, "restoreNativeProviderArtifacts").mockResolvedValue(undefined);
+          const restore = vi.spyOn(providerArtifactStorage, "restoreNativeProviderArtifacts").mockImplementation(restoreArtifactFixture);
           const capture = legacyDurable ? vi.spyOn(providerArtifactStorage, "retainNativeProviderArtifacts").mockResolvedValue(artifactReceipt) : null;
           onTestFinished(() => { storageMode.mockRestore(); backupOwner.mockRestore(); restore.mockRestore(); capture?.mockRestore(); });
         }
@@ -3492,7 +3500,7 @@ describe("remote provider pack manifest", () => {
             closureDigest: "sha256:" + "9".repeat(64), providerPackDigest: admitted.digest, manifest: admitted, launchRoot, accountUid: 1000 };
           const storageMode = vi.spyOn(harnessStorage, "durableNativeHarnessStorage").mockReturnValue({} as never);
           const backupOwner = vi.spyOn(harnessStorage, "nativeHarnessBackupOwner").mockResolvedValue({} as never);
-          const restore = vi.spyOn(providerArtifactStorage, "restoreNativeProviderArtifacts").mockResolvedValue(undefined);
+          const restore = vi.spyOn(providerArtifactStorage, "restoreNativeProviderArtifacts").mockImplementation(restoreArtifactFixture);
           onTestFinished(() => { storageMode.mockRestore(); backupOwner.mockRestore(); restore.mockRestore(); });
           const artifactExecute = vi.fn(async (request: { args: string[] }) => request.args?.[1]?.startsWith("const os=require")
             ? { exitCode: 0, timedOut: false, stderr: "", stdout: JSON.stringify({ home: "/home/runtime-account", uid: 1000 }) }
@@ -3585,14 +3593,6 @@ describe("remote provider pack manifest", () => {
   });
 
   describe("remote provider pack reattach and relaunch after deploy or restart", () => {
-    async function restoreArtifactFixture(input: Parameters<typeof providerArtifactStorage.restoreNativeProviderArtifacts>[0]) {
-      // The real restore materializes these files before size-budgeted sync-in.
-      await mkdir(input.targetRoot, { recursive: true, mode: 0o700 });
-      for (const name of ["nodeCommand", "opencodeProxy", "opencodeExecutable"]) {
-        await writeFile(join(input.targetRoot, name), "restored fixture artifact", { mode: 0o700 });
-      }
-    }
-
     function buildPackManifest(revision: string, overrides?: { proxyChar?: string; contractChar?: string; nodeChar?: string }) {
       const digest = "sha256:" + (overrides?.contractChar ?? "a").repeat(64);
       const artifacts = Object.fromEntries(Object.entries({
@@ -9175,7 +9175,7 @@ describe("native startup cancellation fence", () => {
     const artifacts = Object.fromEntries(Object.entries({ grokLauncher: "dist/providers/grok/launcher.cjs", nodeCommand: "node_modules/node/bin/node",
       productionLock: "pnpm-lock.yaml", opencodeCommand: "node_modules/.bin/opencode", opencodeExecutable: "node_modules/opencode-ai/bin/opencode.exe",
       opencodeProxy: "dist/cli/opencode-app-server-proxy.cjs", acpxSidecar: "dist/cli/acpx-runtime-sidecar.cjs" }).map(([name, path]) => [name, { path, sha256: sha }]));
-    const payload = { compatibility: { opencode: 1, acpx: 1 }, contractDigest: sha, target: { platform: "linux", architecture: "x64" }, runnerSourceRevision: "a".repeat(40),
+    const payload = { compatibility: { opencode: 1, pi_rpc: 1, acpx: 1 }, contractDigest: sha, target: { platform: "linux", architecture: "x64" }, runnerSourceRevision: "a".repeat(40),
       pins: { nodeMinimum: "24.11.0", codex: QUALIFIED_ACPX_PROFILES.codex.agentRuntimeVersion, opencode: "1.18.34", acpx: "0.22.0",
         grok: QUALIFIED_ACPX_PROFILES.grok.agentRuntimeVersion, claudeAcp: QUALIFIED_ACPX_PROFILES.claude.agentServerVersion, codexAcp: QUALIFIED_ACPX_PROFILES.codex.agentServerVersion },
       acpxProfileDigests: Object.fromEntries(["grok", "claude", "codex"].map(agent => [agent, QUALIFIED_ACPX_PROFILES[agent as "grok" | "claude" | "codex"].commandDigest])),
@@ -20682,7 +20682,7 @@ describe("runnerd provider runtime wiring", () => {
         opencodeExecutable: "node_modules/opencode-ai/bin/opencode.exe",
         opencodeProxy: "dist/cli/opencode-app-server-proxy.cjs", acpxSidecar: "dist/cli/acpx-runtime-sidecar.cjs",
       }).map(([key, path]) => [key, { path, sha256: digest }]));
-      const payload = { compatibility: { opencode: 1, acpx: 1 }, contractDigest: digest,
+      const payload = { compatibility: { opencode: 1, pi_rpc: 1, acpx: 1 }, contractDigest: digest,
         target: { platform: "linux", architecture: "x64" }, runnerSourceRevision: "a".repeat(40),
         pins: { nodeMinimum: "24.11.0", codex: QUALIFIED_ACPX_PROFILES.codex.agentRuntimeVersion,
           opencode: "1.18.34", acpx: "0.22.0", grok: QUALIFIED_ACPX_PROFILES.grok.agentRuntimeVersion,
@@ -25015,7 +25015,7 @@ describe("runnerd provider runtime wiring", () => {
         await writeFile(join(sessionRoot, "filesystem", "elsewhere", "runner-state.json"), "{}");
       }
     }
-    const syncIn = vi.fn(async () => undefined);
+    const syncIn = vi.fn(async (_operations: Array<{ files: Array<{ sourcePath: string }> }>, _options?: { minimumTimeoutMs: number }) => undefined);
     const syncOut = vi.fn(async (operations: Array<{ files: Array<{ targetPath: string }> }>) => {
       if (!scenario.startsWith("interrupted_bootstrap_unopened")) throw new Error("fixture_provider_state_missing");
       for (const operation of operations) for (const file of operation.files) await writeFile(file.targetPath, JSON.stringify({
@@ -25252,23 +25252,23 @@ describe("runnerd provider runtime wiring", () => {
       if (homeMode === "isolated") {
         expect(syncIn).toHaveBeenCalledWith([expect.objectContaining({
           files: [expect.objectContaining({ sourcePath: join(home, "skills"), kind: "directory", mode: 0o700 })],
-        })]);
+        })], { minimumTimeoutMs: 60_000 });
         for (const name of ["auth.json", "config.toml"]) {
           expect(syncIn).toHaveBeenCalledWith([expect.objectContaining({
             files: [expect.objectContaining({ sourcePath: join(home, name), kind: "file", mode: 0o600 })],
-          })]);
+          })], { minimumTimeoutMs: 61_000 });
         }
       } else {
-        const files = syncIn.mock.calls.flat(2).flatMap((entry: { files: Array<{ sourcePath: string }> }) => entry.files);
+        const files = syncIn.mock.calls.flatMap(([operations]) => operations.flatMap(operation => operation.files));
         for (const name of ["skills", "auth.json", "config.toml"]) {
           expect(files.some(file => file.sourcePath === join(home, name))).toBe(false);
         }
       }
-      expect(syncIn.mock.calls.flat(2).flatMap((entry: { files: Array<{ sourcePath: string }> }) => entry.files)
-        .filter((file: { sourcePath: string }) => file.sourcePath === runtimeContext.instructions.bundle.rootPath)).toHaveLength(1);
+      expect(syncIn.mock.calls.flatMap(([operations]) => operations.flatMap(operation => operation.files))
+        .filter(file => file.sourcePath === runtimeContext.instructions.bundle.rootPath)).toHaveLength(1);
       expect(syncIn).toHaveBeenCalledWith([expect.objectContaining({
         files: [expect.objectContaining({ sourcePath: join(options.stateDirectory!, "runtime-context.json"), kind: "file" })],
-      })]);
+      })], { minimumTimeoutMs: 61_000 });
       expect(remoteExecute.mock.calls.filter(([command]) => command.args?.[2] === "paperclip-runner-claim-unstarted-session")).toHaveLength(1);
     } else {
       await expect(options.prepareExternalRunnerState()).rejects.toThrow(
@@ -25519,7 +25519,7 @@ describe("runnerd provider runtime wiring", () => {
           sourcePath: controllerArtifact,
           targetPath: "/workspace/.paperclip-runtime/paperclip-runner/bin/paperclip-runnerd",
         })],
-      })]);
+      })], { minimumTimeoutMs: 61_000 });
     } else {
       expect(syncIn).not.toHaveBeenCalled();
     }

@@ -1282,13 +1282,27 @@ pub fn normalize_codex_notification_in(
             // Seam 0269: the Pi driver's Stop names the person's queued comments it handed back; their ids ride the
             // notice's own fields (category + details) so Core can return them. Every other notice is unchanged.
             if method == "warning" && string(params.get("code")) == "pi_stop_returned_input" {
-                let ids: Vec<&str> = params.get("returned").and_then(Value::as_array).into_iter().flatten()
-                    .filter_map(|entry| entry.get("commentId").and_then(Value::as_str)).take(64).collect();
-                notice["noticeId"] = json!(stable_id(&format!("pi_stop_returned_input-{}", ids.join("-")), "pi-notice"));
+                let ids: Vec<&str> = params
+                    .get("returned")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| entry.get("commentId").and_then(Value::as_str))
+                    .take(64)
+                    .collect();
+                notice["noticeId"] = json!(stable_id(
+                    &format!("pi_stop_returned_input-{}", ids.join("-")),
+                    "pi-notice"
+                ));
                 notice["category"] = json!("pi_stop_returned_input");
                 notice["details"] = json!([{ "name": "returnedCommentIds", "value": bounded_text(&ids.join(","), 4000) }]);
             }
-            push(&mut events, "provider.notice.recorded", EventPriority::P0, notice);
+            push(
+                &mut events,
+                "provider.notice.recorded",
+                EventPriority::P0,
+                notice,
+            );
         }
         "hook/started" | "hook/completed" => push(
             &mut events,

@@ -625,10 +625,7 @@ impl CodexProviderConfig {
                 "OpenCode providerVersion must equal the qualified {QUALIFIED_OPENCODE_VERSION} release",
             )));
         }
-        if self.provider == "pi_rpc"
-            && (self.provider_version != "pi-rpc-v1"
-                || self.read_only)
-        {
+        if self.provider == "pi_rpc" && (self.provider_version != "pi-rpc-v1" || self.read_only) {
             return Err(LocalRunnerError::invalid(
                 "Pi RPC requires pi-rpc-v1, an explicit provider/model and sandbox-owned permissions",
             ));
@@ -2499,7 +2496,11 @@ impl CodexProvider {
         }
     }
 
-    pub fn steer_turn(&mut self, message: &str, correlation_id: Option<&str>) -> Result<Value, LocalRunnerError> {
+    pub fn steer_turn(
+        &mut self,
+        message: &str,
+        correlation_id: Option<&str>,
+    ) -> Result<Value, LocalRunnerError> {
         let turn_id = self
             .active_provider_turn_id
             .clone()
@@ -2515,7 +2516,9 @@ impl CodexProvider {
             "input": [{"type": "text", "text": message, "text_elements": []}],
         });
         // Seam 0265: our Pi proxy maps a steer back to its comment by this id; Codex's app-server never sees it.
-        if let (Some(id), "pi_rpc") = (correlation_id, self.config.provider.as_str()) { params["correlationId"] = json!(id); }
+        if let (Some(id), "pi_rpc") = (correlation_id, self.config.provider.as_str()) {
+            params["correlationId"] = json!(id);
+        }
         self.request("turn/steer", params)
     }
 
@@ -2527,7 +2530,9 @@ impl CodexProvider {
         self.cancel_pending_requests()?;
         let mut params = json!({"threadId": self.thread_id, "turnId": turn_id});
         // Seam 0241: our Pi proxy needs the reason to tell a person's Stop from a cancel; Codex's app-server never sees it.
-        if let (Some(reason), "pi_rpc") = (reason, self.config.provider.as_str()) { params["reason"] = json!(reason); }
+        if let (Some(reason), "pi_rpc") = (reason, self.config.provider.as_str()) {
+            params["reason"] = json!(reason);
+        }
         self.request("turn/interrupt", params)
     }
 

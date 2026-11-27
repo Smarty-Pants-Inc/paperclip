@@ -165,7 +165,7 @@ suite("recovery wake herd", () => {
       await db.update(heartbeatRuns).set({ status: "running", runtimeMode: "native", nativeIssueId: issue.id,
         nativeSessionId: sessionId }).where(eq(heartbeatRuns.id, retry.id));
       await db.update(issues).set({ executionRunId: retry.id }).where(eq(issues.id, issue.id));
-      const event = { runId: retry.id, normalizedSessionId: sessionId, itemId: "retry-final", sourceEventId: "retry-final",
+      const event = { runId: retry.id, normalizedSessionId: sessionId, turnId: "retry-turn", itemId: "retry-final", sourceEventId: "retry-final",
         eventType: "item.completed" as const, payload: { kind: "agentMessage", channel: "final", text: "The recovered answer.", answers: [] } };
       await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: retry.id, seq: 1,
         eventType: event.eventType, payload: { prpEvent: event } });

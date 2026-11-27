@@ -4366,9 +4366,11 @@ impl CodexCommandExecutor {
         // Record cause and pending identities before touching the provider.
         self.persist_state(&next_state)?;
         self.state = Some(next_state);
-        self.ensure_provider()?.interrupt_turn(Some(reason)).map_err(|error| {
-            DurableRunnerError::invalid(format!("Codex turn interrupt failed: {error}"))
-        })?;
+        self.ensure_provider()?
+            .interrupt_turn(Some(reason))
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!("Codex turn interrupt failed: {error}"))
+            })?;
         Ok(CommandExecution::result(json!({
             "status": "interrupt_requested",
             "reason": reason,
@@ -4471,9 +4473,11 @@ impl CodexCommandExecutor {
             .and_then(Value::as_str)
             .ok_or_else(|| DurableRunnerError::invalid("turn.steer payload.text is required"))?;
         let correlation_id = payload.get("correlationId").and_then(Value::as_str);
-        self.ensure_provider()?.steer_turn(text, correlation_id).map_err(|error| {
-            DurableRunnerError::invalid(format!("Codex turn steer failed: {error}"))
-        })?;
+        self.ensure_provider()?
+            .steer_turn(text, correlation_id)
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!("Codex turn steer failed: {error}"))
+            })?;
         Ok(CommandExecution::result(json!({"status": "steered"})))
     }
 

@@ -4646,8 +4646,19 @@ mod tests {
                 json!({"kind": "agentMessage", "channel": "final", "text": answer}),
             )
             .unwrap();
-        assert_eq!(small.outbox[0].envelope.pointer("/payload/payload/transcriptOverflow"), Some(&Value::Bool(true)));
-        assert_eq!(small.outbox[0].envelope.pointer("/payload/payload/channel").and_then(Value::as_str), Some("detail"));
+        assert_eq!(
+            small.outbox[0]
+                .envelope
+                .pointer("/payload/payload/transcriptOverflow"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            small.outbox[0]
+                .envelope
+                .pointer("/payload/payload/channel")
+                .and_then(Value::as_str),
+            Some("detail")
+        );
     }
 
     #[test]
@@ -4681,7 +4692,10 @@ mod tests {
 
         // 20,000 raw bytes, but about 40,000 once JSON-escaped: fail visibly.
         let quotes = "\"".repeat(20_000);
-        assert_eq!(final_text(&quotes), "Provider output exceeded the durable frame budget; no complete answer was saved.");
+        assert_eq!(
+            final_text(&quotes),
+            "Provider output exceeded the durable frame budget; no complete answer was saved."
+        );
 
         // The same length of plain prose fits and is kept complete.
         let prose = "a".repeat(20_000);
