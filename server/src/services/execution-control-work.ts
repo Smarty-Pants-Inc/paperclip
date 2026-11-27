@@ -20,6 +20,8 @@ export function registerExecutionControlWork(
     run: () => Promise<unknown>;
     next: () => Promise<number | null>;
     onSettled?: () => void;
+    /** Only an explicit producer hint may preempt the maintenance sweep floor. */
+    immediateHint?: string;
     settleEmptyWhilePaused?: boolean;
   }>,
   canRun: () => boolean = () => true,
@@ -33,7 +35,10 @@ export function registerExecutionControlWork(
     const worker = coordinator.register(duty.queue, {
       retryMs: EXECUTION_RECONCILIATION_INTERVAL_MS,
       pausePassiveMaintenance: true,
-      onSettled: () => { requested += 1; duty.onSettled?.(); },
+      onSettled: hints => {
+        if (duty.immediateHint && hints?.has(duty.immediateHint)) earliestRunAt = 0;
+        requested += 1; duty.onSettled?.();
+      },
       run: async () => {
         if (!canRun()) { requested += 1; next = null; return; }
         const now = Date.now();

@@ -1,4 +1,5 @@
 import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
+import { isChatTask } from "./fresh-continuation-retry-fold.js";
 import {
   agentWakeupRequests, agents, approvals, companies, documentRevisions, documents, executionWorkspaces, heartbeatRuns, issueApprovals,
   issueComments, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, toolInvocations, type Db,
@@ -318,16 +319,17 @@ function isOwnedReconciliationHold(hold: typeof issueRecoveryActions.$inferSelec
 /**
  * The old local writer's state. `alive`: its process is running on this host,
  * so it is still executing and is settled by its own owner (stop, reaper)
- * first. `ended`: no process this host can see and no allocation or workspace
- * finalization left unsettled. `unproven`: anything else (another host, an
- * unsettled allocation); the continuation is isolated from it, never waits.
+ * first. `ended`: positive proof that the recorded process is gone, with no
+ * allocation or workspace finalization left unsettled. `unproven`: anything
+ * else (no identity, another host, an unsettled allocation). Ordinary tasks
+ * may continue in isolation; chats keep their stop-proof hold.
  */
 async function localWriterState(tx: Db, run: typeof heartbeatRuns.$inferSelect): Promise<"alive" | "ended" | "unproven"> {
   // The shared owner proof compares the recorded process identity (host, PID
   // space, start time), so a recycled PID is never mistaken for the old writer.
   const proof = await proveRunProcessGone(run, "fresh_continuation");
   if (proof?.verdict === "alive") return "alive";
-  if (proof?.verdict === "unprovable" || await hasPendingRunCleanup(tx, run.companyId, run.id)) return "unproven";
+  if (proof?.verdict !== "gone" || await hasPendingRunCleanup(tx, run.companyId, run.id)) return "unproven";
   return "ended";
 }
 
@@ -419,6 +421,8 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     .orderBy(asc(issueRecoveryActions.createdAt), asc(issueRecoveryActions.id)).for("update");
   const prior = holds.find(hold => object(hold.evidence.freshContinuation).sourceRunId === run.id);
   if (prior) {
+    if (holds.some(isOwnedReconciliationHold) && await isChatContinuation(tx, issue))
+      return { kind: "person_owned", reason: "chat_stop_requires_proof" };
     await settleLateHolds(tx, { companyId, issue, run, prior, holds: holds.filter(isOwnedReconciliationHold), now });
     return { kind: "already_continued", recoveryActionId: prior.id };
   }
@@ -592,6 +596,10 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
   // (the reaper or a Stop) settles it first, then the fallback continues.
   const aliveWait = writer === "alive" ? pending("previous_process_running", new Date(now.getTime() + step)) : null;
   if (aliveWait) return aliveWait;
+  // Isolation protects files, not a chat's live provider session. Never let
+  // this automatic fallback turn an unproven chat stop into continuation.
+  if ((remoteSource || writer !== "ended" || pastBound() || refused) && await isChatContinuation(tx, issue))
+    return { kind: "person_owned", reason: "chat_stop_requires_proof" };
   const fenced = await fenceSourceWorkspace(tx, run);
   // Never claim a stop that was not proven: record what isolates the successor.
   const isolation: FreshContinuationIsolation = fenced || remoteSource ? "remote_epoch"
@@ -718,7 +726,7 @@ export async function settleHoldIntoAbandonedEpochContinuation(db: Db, input: {
     const [issue] = await tx.select().from(issues).where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId))).for("update");
     const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId),
       eq(heartbeatRuns.id, input.runId)));
-    if (!issue || !run) return false;
+    if (!issue || !run || await isChatContinuation(tx, issue)) return false;
     const [hold] = await tx.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, input.companyId),
       eq(issueRecoveryActions.sourceIssueId, issue.id), eq(issueRecoveryActions.id, input.actionId))).for("update");
     if (!hold || !["active", "escalated"].includes(hold.status) || isHumanGate(hold) || hold.evidence.runId !== run.id
@@ -739,10 +747,15 @@ export async function settleHoldIntoAbandonedEpochContinuation(db: Db, input: {
   });
 }
 
+// One chat predicate for every continuation path (fresh-continuation-retry-fold.ts).
+function isChatContinuation(tx: Pick<Db, "select">, issue: typeof issues.$inferSelect) {
+  return isChatTask(tx, issue.companyId, issue.id);
+}
+
 async function settleLateHolds(tx: Db, input: { companyId: string; issue: typeof issues.$inferSelect; run: typeof heartbeatRuns.$inferSelect;
   prior: typeof issueRecoveryActions.$inferSelect; holds: Array<typeof issueRecoveryActions.$inferSelect>; now: Date }) {
   const { companyId, issue, run, prior, holds, now } = input;
-  if (!holds.length) return;
+  if (!holds.length || await isChatContinuation(tx, issue)) return;
   await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionContinuation);
   await notifyStatusCardIssueChange(tx, companyId);
   await notifyRoutineExecutionStatus(tx, issue.id, companyId);

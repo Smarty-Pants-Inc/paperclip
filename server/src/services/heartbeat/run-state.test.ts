@@ -19,6 +19,8 @@ import {
 } from "../../__tests__/helpers/embedded-postgres.js";
 import * as legacy from "../heartbeat.js";
 import * as extracted from "./run-state.js";
+import { activityService } from "../activity.js";
+import { sessionCannotContinue } from "../native-runtime/continued-session.js";
 import { readRunCancellation } from "../run-cancellation.js";
 import { decideQueuedCommentQueueSteering } from "../issue-queued-comment-queue.js";
 import { STORAGE_UNAVAILABLE_CODE, STORAGE_UNAVAILABLE_HELD_MESSAGE, STORAGE_UNAVAILABLE_MESSAGE } from "../../storage/storage-unavailable.js";
@@ -172,6 +174,28 @@ describePostgres("heartbeat run state database wiring", () => {
     const [issue] = await db.insert(issues).values({ companyId, title: "Session task", assigneeAgentId: agent.id }).returning();
     return { companyId, agent, issue, state: extracted.createHeartbeatRunState(db) };
   }
+
+  it.each([
+    { errorCode: "native_provider_state_incompatible", error: "bad state", resultJson: null },
+    { errorCode: "adapter_failed", error: " native_controller_recovery_missing_evidence:retained_sandbox_binding ", resultJson: null },
+    { errorCode: "adapter_failed", error: "\t\n\v\f\rnative_controller_recovery_missing_evidence:retained_sandbox_binding\r\n", resultJson: null },
+    { errorCode: "adapter_failed", error: "earlier failure", resultJson: { nativeExactResumeRefusal: { refusal: "\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeffnative_controller_recovery_missing_evidence:retained_sandbox_binding\ufeff" } } },
+    { errorCode: "adapter_failed", error: "\u2060native_controller_recovery_missing_evidence:retained_sandbox_binding\u2060", resultJson: null },
+    { errorCode: "adapter_failed", error: "chained earlier failure", resultJson: { nativeExactResumeRefusal: { refusal: "native_controller_recovery_missing_evidence:retained_sandbox_binding" } } },
+    { errorCode: "adapter_failed", error: "native_controller_recovery_missing_evidence:retained_sandbox_binding", resultJson: { nativeExactResumeRefusal: { refusal: "another_refusal" } } },
+    { errorCode: "adapter_failed", error: "ordinary failure", resultJson: null },
+  ])("exposes the same source-run fresh-session decision on detail, summaries and failed-run Retry markers ($errorCode / $error)", async failure => {
+    const { companyId, agent, issue, state } = await fixture();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, issueId: issue.id,
+      status: "failed", finishedAt: new Date(), ...failure }).returning();
+    const expected = sessionCannotContinue(run);
+    for (const projection of [await state.getRun(run.id), await state.getRun(run.id, { unsafeFullResultJson: true }),
+      await state.getRunIssueSummary(run.id), ...(await state.listRuns(companyId, agent.id, 1)),
+      ...(await state.listRuns(companyId, agent.id, 1, { summary: true })),
+      ...(await activityService(db).runsForIssue(companyId, issue.id, null, undefined, undefined, { skipLivenessBackfill: true }))]) {
+      expect(projection, JSON.stringify(projection)).toHaveProperty("retryStartsNewSession", expected);
+    }
+  });
 
   it("reads current execution-wait evidence without transferring saved input or output", async () => {
     const { companyId, agent, issue } = await fixture();

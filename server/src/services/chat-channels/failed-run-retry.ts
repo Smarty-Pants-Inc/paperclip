@@ -1996,6 +1996,11 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
           source: "on_demand",
           triggerDetail: "manual",
           reason: "retry_failed_run",
+          // Per-run actions are admitted by a board person. Task-retry actions
+          // carry their own positively checked personRetry in the retry intent.
+          ...(typeof claimed.payload.taskRetryIntentId !== "string" &&
+              typeof claimed.payload.initiatedByUserId === "string"
+            ? { personRetry: { userId: claimed.payload.initiatedByUserId } } : {}),
           payload: context,
           contextSnapshot: context,
           allowRunCoalescing: false,

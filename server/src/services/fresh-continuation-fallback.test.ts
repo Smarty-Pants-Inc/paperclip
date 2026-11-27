@@ -11,7 +11,7 @@ import { PENDING_CONTINUATION_BOUND_MS } from "./recovery-continuation-pacing.js
 import { getExecutionBlocker } from "./execution-blocker.js";
 import {
   FRESH_CONTINUATIONS_PER_HOUR, FRESH_CONTINUATION_SCHEMA, PERSON_OWNED_FAILURE_CODES, continueHeldExecutions, ensureFreshContinuation,
-  resetBacklogContinuationPacingForTests,
+  resetBacklogContinuationPacingForTests, settleHoldIntoAbandonedEpochContinuation,
   continueFreshInTransaction, expediteFreshContinuationChecks, freshContinuationNote, heldExecutionsAwaitingFreshContinuation, runsAwaitingSystemContinuation, nextFreshContinuationCheckAt, recordFreshContinuationCheck, FRESH_CONTINUATION_PENDING_BOUND_MS, FRESH_CONTINUATION_PROGRESS_BOUND_MS, FRESH_CONTINUATION_SAVED_WORK_BOUND_MS,
 } from "./fresh-continuation-fallback.js";
 import { heartbeatService } from "./heartbeat.js";
@@ -705,6 +705,60 @@ suite("fresh-continuation fallback", () => {
       .resolves.toBeTruthy();
   }, 60_000);
 
+  it.each(["board_chat", "connected_chat"] as const)("does not create an unproven isolated chat continuation either (%s)", async kind => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_continuation_requires_reconciliation",
+      error: "runner_remote_process_identity_unavailable" });
+    const workspaceId = randomUUID(), leaseId = randomUUID();
+    const location = { environmentId: randomUUID(), leaseId, providerLeaseId: "live-chat-source", remoteCwd: "/home/daytona/work" };
+    await db.insert(executionWorkspaces).values({ id: workspaceId, companyId, sourceIssueId: f.issueId, mode: "isolated",
+      strategyType: "remote", name: "Chat files", providerType: "remote", providerRef: location.remoteCwd,
+      metadata: { remoteWorkspace: { schema: "paperclip.remote-workspace.v1", epoch: 3, snapshotId: null,
+        source: { kind: "empty" }, location, writerRunId: f.runId, dirty: true } } });
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { remoteWorkspace: { schema: "paperclip.remote-workspace-run.v1",
+      workspaceId, leaseId, providerLeaseId: location.providerLeaseId, remoteCwd: location.remoteCwd, epoch: 3,
+      state: "prepared", snapshotId: null } } }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(issues).set(kind === "board_chat"
+      ? { conversationAgentId: agentId, conversationUserId: userId, conversationState: "waiting" }
+      : { originKind: "chat_channel" }).where(eq(issues.id, f.issueId));
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused" }))
+      .toMatchObject({ kind: "person_owned", reason: "chat_stop_requires_proof" });
+    expect(await successors(f.runId)).toHaveLength(0);
+    expect((await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, workspaceId)))[0].metadata)
+      .toMatchObject({ remoteWorkspace: { epoch: 3, writerRunId: f.runId, dirty: true } });
+  });
+
+  it.each(["board_chat", "connected_chat", "task"] as const)("never releases an exhausted chat hold on abandoned-epoch evidence alone (%s)", async kind => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_continuation_requires_reconciliation",
+      error: "runner_remote_process_identity_unavailable" });
+    const workspaceId = randomUUID(), leaseId = randomUUID();
+    const location = { environmentId: randomUUID(), leaseId, providerLeaseId: "unproven-live-source", remoteCwd: "/home/daytona/work" };
+    await db.insert(executionWorkspaces).values({ id: workspaceId, companyId, sourceIssueId: f.issueId, mode: "isolated",
+      strategyType: "remote", name: "Old chat files", providerType: "remote", providerRef: location.remoteCwd,
+      metadata: { remoteWorkspace: { schema: "paperclip.remote-workspace.v1", epoch: 3, snapshotId: null,
+        source: { kind: "empty" }, location, writerRunId: f.runId, dirty: true } } });
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { remoteWorkspace: { schema: "paperclip.remote-workspace-run.v1",
+      workspaceId, leaseId, providerLeaseId: location.providerLeaseId, remoteCwd: location.remoteCwd, epoch: 3,
+      state: "prepared", snapshotId: null } } }).where(eq(heartbeatRuns.id, f.runId));
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused" })).toMatchObject({ kind: "continued" });
+    await db.update(issues).set({ status: "blocked", ...(kind === "board_chat"
+      ? { conversationAgentId: agentId, conversationUserId: userId, conversationState: "waiting" }
+      : kind === "connected_chat" ? { originKind: "chat_channel" } : {}) }).where(eq(issues.id, f.issueId));
+    const recovery = { ...createSystemRecovery(f.runId), state: "exhausted" as const, attempts: 6, retriesUsed: 5,
+      failure: { code: "agent_stop_unconfirmed" as const, retryClass: "recheck_evidence" as const, evidenceFingerprint: "no-stop-proof" } };
+    const [late] = await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: f.issueId, kind: "active_run_watchdog",
+      status: "active", ownerType: "board", cause: "native_continuation_requires_reconciliation", fingerprint: `late:${f.runId}`,
+      nextAction: "Previous stop remains unproven.", evidence: { runId: f.runId, systemRecovery: recovery,
+        nativeFailureBlock: { runId: f.runId, statusVersion: 4 } } }).returning();
+    expect(await settleHoldIntoAbandonedEpochContinuation(db, { companyId, issueId: f.issueId, runId: f.runId, actionId: late!.id }))
+      .toBe(kind === "task");
+    if (kind !== "task") {
+      expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
+        .toMatchObject({ kind: "person_owned", reason: "chat_stop_requires_proof" });
+      expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0]?.status).toBe("blocked");
+      expect((await holdRow(late!.id)).status).toBe("active");
+    }
+  });
+
   // The staging shape: the new server cannot re-reach the old Runner, so the old
   // run's sandbox lease is still active (or its cleanup is pending) with no stop
   // receipt. The continuation must still start, not wait behind that cleanup.
@@ -939,8 +993,29 @@ suite("fresh-continuation fallback", () => {
       .toMatchObject({ kind: "continued", isolation: "fresh_isolated_workspace" });
   }, 60_000);
 
+  it.each(["board", "channel"] as const)("does not certify a %s chat stopped when process and stop evidence are missing", async chat => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_continuation_requires_reconciliation",
+      error: "runner_remote_process_identity_unavailable" });
+    await db.update(issues).set(chat === "board"
+      ? { conversationAgentId: agentId, conversationUserId: userId, conversationState: "waiting" }
+      : { originKind: "chat_channel" }).where(eq(issues.id, f.issueId));
+    const decision = await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused" });
+    expect(decision.kind).not.toBe("continued");
+    expect(await issue(f.issueId)).toMatchObject({ status: "blocked" });
+    const [hold] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId!));
+    expect(hold.status).toBe("active");
+    expect(hold.evidence.executionReconciliation).toBeUndefined();
+    expect(hold.evidence.freshContinuation).toBeUndefined();
+    expect(await successors(f.runId)).toEqual([]);
+    expect(await getExecutionBlocker(db, companyId, f.issueId)).not.toBeNull();
+    console.info("missing-stop-proof", JSON.stringify({ chat, runId: f.runId, issueId: f.issueId, decision,
+      holdStatus: hold.status, providerStopped: false }));
+  }, 60_000);
+
   it("keeps the task workspace when the old local writer is proven gone", async () => {
     const f = await unfinishedRun({ runtime: "legacy", errorCode: "process_lost" });
+    // A recorded local PID that is absent is positive proof, unlike no PID.
+    await recordStoppedLocalProcess(f.runId);
     expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused" }))
       .toMatchObject({ kind: "continued", isolation: "writer_ended" });
   }, 60_000);
@@ -1060,10 +1135,17 @@ suite("fresh-continuation fallback", () => {
     expect(note).toContain("FOLLOWUP-NEW");
   }, 60_000);
 
+  async function recordStoppedLocalProcess(runId: string) {
+    // Positive OS proof, not the absence of an execution identity.
+    await db.update(heartbeatRuns).set({ processPid: 2147483647, processHostHash: currentProcessSpaceHash(),
+      processStartedAt: new Date(Date.now() - 60_000) }).where(eq(heartbeatRuns.id, runId));
+  }
+
   it.each([true, false])("relies on saved input only while it still holds an undelivered message (already taken by the cut-off run: %s)", async taken => {
     // R2 cell t003: the cut-off run had taken the follow-up into its turn; the fallback chose saved_input,
     // promotion settled the message as delivered, and no run followed.
     const f = await unfinishedRun({ runtime: "native", errorCode: "native_restart_recovery_blocked" });
+    await recordStoppedLocalProcess(f.runId);
     const [comment] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user",
       authorUserId: userId, body: "Additional requirement: include FOLLOWUP-1" } as typeof issueComments.$inferInsert).returning();
     if (taken) await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeCommentIds: [comment!.id] } })
@@ -1088,6 +1170,8 @@ suite("fresh-continuation fallback", () => {
         source: "issue.comment", wakeReason: "issue_commented" } });
     const wakes = () => db.select().from(agentWakeupRequests).where(sql`${agentWakeupRequests.payload}->>'issueId' = ${f.issueId}`);
     expect((await wakes()).map(w => w.status)).toEqual(["deferred_issue_execution"]);
+    // Stop proof arrives after the input was durably held, not during wake admission.
+    await recordStoppedLocalProcess(f.runId);
     expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused" }))
       .toMatchObject({ kind: "continued", delivery: "saved_input" });
     await occupySlot();

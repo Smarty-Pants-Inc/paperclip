@@ -2942,7 +2942,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       taskRetryActorId = retry.actorId;
       enrichedContextSnapshot.forceFreshSession = true;
       // A continuous session otherwise keeps a binding that can never be resumed.
-      if (!retry.initiatedBy && issueId && await retryStartsFresh(db, { companyId: receipt.companyId, issueId, sourceRunId: retry.sourceRunId })) {
+      if (!retry.initiatedBy && retry.personRetry?.userId === retry.actorId && issueId && await retryStartsFresh(db, { companyId: receipt.companyId, issueId, sourceRunId: retry.sourceRunId })) {
         enrichedContextSnapshot.explicitFreshSession = true;
       }
       enrichedContextSnapshot.previousRunId = retry.sourceRunId;
@@ -3022,6 +3022,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           companyId: failed.companyId, runId: failed.id, actorId: opts.requestedByActorId,
         } });
       }
+      if (opts.personRetry?.userId === opts.requestedByActorId && issueId &&
+          await retryStartsFresh(db, { companyId: agent.companyId, issueId, sourceRunId: failed.id })) {
+        enrichedContextSnapshot.explicitFreshSession = true;
+        enrichedContextSnapshot.forceFreshSession = true;
+      }
       if (isConversationAdapter(agent.adapterType) || agent.adapterType === "paperclip_runner") {
         enrichedContextSnapshot.previousRunId = failed.id;
         enrichedContextSnapshot.forceFreshSession = true;
@@ -3067,6 +3072,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     }
     if (durableRequest?.failedRunRetry) {
       opts = { ...opts, allowRunCoalescing: false };
+      // This marker is supplied by the authorized durable board Retry worker,
+      // not by a chat message or the HTTP wake payload.
+      if (opts.personRetry?.userId && issueId &&
+          await retryStartsFresh(db, { companyId: agent.companyId, issueId,
+            sourceRunId: durableRequest.failedRunRetry.failedRunId })) {
+        enrichedContextSnapshot.explicitFreshSession = true;
+        enrichedContextSnapshot.forceFreshSession = true;
+      }
     }
     const dotRequest = opts.durableDotRequest;
     const museRequest = opts.durableMuseRequest;

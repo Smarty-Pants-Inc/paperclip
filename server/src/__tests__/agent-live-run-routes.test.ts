@@ -230,7 +230,9 @@ function createFailedChatRetryDb(chatBound = true) {
       predicates.push(new PgDialect().sqlToQuery(condition));
       return query;
     }),
-    limit: vi.fn(async () => (chatBound ? [{ id: "chat-conversation" }] : [])),
+    // The shared predicate projects a boolean for the known task, not a
+    // binding row (a missing task is conservatively chat in production).
+    limit: vi.fn(async () => [{ chat: chatBound }]),
   };
   const tx = { transactionMarker: "exact-retry-transaction" };
   const db = {
@@ -1075,6 +1077,7 @@ describe("agent live run routes", () => {
         responsibleUserId: "local-board",
         originIdentityContextId: null,
         forceFreshSession: true,
+        explicitFreshSession: true,
       },
     });
   });
@@ -1169,7 +1172,7 @@ describe("agent live run routes", () => {
       "rejects an ineligible exact review retry (%s)", async scenario => {
         let actor: Record<string, unknown> | undefined;
         if (scenario === "agent-caller") actor = { type: "agent", agentId: routeAgentId, companyId: "company-1" };
-        if (scenario === "denied-task") mockAccessService.decide.mockImplementation(async ({ action }) => ({ allowed: action !== "issue:comment", explanation: "Denied" }));
+        if (scenario === "denied-task") mockAccessService.decide.mockImplementation(async ({ action }) => ({ allowed: action !== "issue:mutate", explanation: "Denied" }));
         if (scenario === "foreign-company") mockHeartbeatService.getRun.mockResolvedValue({ ...selectedRun, companyId: "company-2" });
         if (scenario === "foreign-agent") mockHeartbeatService.getRun.mockResolvedValue({ ...selectedRun, agentId: "other-reviewer" });
         if (scenario === "foreign-issue") mockHeartbeatService.getRun.mockResolvedValue({ ...selectedRun, nativeIssueId: "other-task" });
@@ -1251,14 +1254,14 @@ describe("agent live run routes", () => {
         issueId: failedChatIssueId,
       } });
       mockAccessService.decide.mockImplementation(async ({ action }) => ({
-        allowed: action === "issue:comment" || action === "agent:wake", explanation: "Missing permission: agents:create",
+        allowed: action === "issue:mutate" || action === "agent:wake", explanation: "Missing permission: agents:create",
       }));
       const res = await requestApp(await createApp(fixture.db, {
         type: "board", userId: "operator", source: "session", companyIds: ["company-1"],
       }), url => request(url).post(`/api/agents/${routeAgentId}/wakeup`).send(retryBody));
       expect(res.status, JSON.stringify(res.body)).toBe(202);
       expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
-        action: "issue:comment", resource: expect.objectContaining({
+        action: "issue:mutate", resource: expect.objectContaining({
           type: "issue", companyId: "company-1", issueId: failedChatIssueId,
         }),
       }));
@@ -1405,7 +1408,7 @@ describe("agent live run routes", () => {
         expect(fixture.order).toEqual(["begin", "stage", "commit", "dispatch"]);
         expect(fixture.predicates).toEqual([
           {
-            sql: '("chat_conversations"."company_id" = $1 and "chat_conversations"."issue_id" = $2)',
+            sql: '("issues"."company_id" = $1 and "issues"."id" = $2)',
             params: ["company-1", failedChatIssueId],
             typings: ["uuid", "uuid"],
           },
@@ -1683,6 +1686,7 @@ describe("agent live run routes", () => {
         routeAgentId,
         expect.objectContaining({
           reason: "retry_failed_run",
+          personRetry: { userId: "local-board" },
           payload: {
             issueId: failedChatIssueId,
             taskId: failedChatIssueId,

@@ -2,6 +2,7 @@ import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, chatConversations, heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 import { FRESH_CONTINUATION_SCHEMA, settleCoalescedFreshContinuationHolds } from "./fresh-continuation-fallback.js";
+import { readTaskRetryIntent } from "./task-retry.js";
 import { sessionCannotContinue } from "./native-runtime/continued-session.js";
 
 const LIVE_CONTINUATION_STATUSES = ["queued", "running"];
@@ -11,21 +12,27 @@ function retrySourceRunId(payload: unknown): string | null {
   return typeof taskRetry?.sourceRunId === "string" ? taskRetry.sourceRunId : null;
 }
 
-/** A person's chat (Agent Chat or a connected chat); unknown counts as a chat. */
-export async function isChatTask(tx: Pick<Db, "select">, companyId: string, issueId: string) {
-  const [issue] = await tx.select({ conversationAgentId: issues.conversationAgentId, originKind: issues.originKind })
-    .from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
-  if (!issue || issue.conversationAgentId || issue.originKind === "chat_channel") return true;
-  const [chat] = await tx.select({ id: chatConversations.id }).from(chatConversations)
-    .where(and(eq(chatConversations.companyId, companyId), eq(chatConversations.issueId, issueId))).limit(1);
-  return Boolean(chat);
+/** One company-scoped chat rule for SQL readers and admission. Unknown = chat. */
+export function isChatTaskSql(companyId: string, issueId: string) {
+  return sql<boolean>`coalesce((select (candidate.conversation_agent_id is not null
+      or coalesce(candidate.origin_kind = 'chat_channel', false)
+      or exists (select 1 from ${chatConversations} chat
+        where chat.company_id = candidate.company_id and chat.issue_id = candidate.id))
+    from ${issues} candidate where candidate.company_id = ${companyId} and candidate.id = ${issueId}), true)`;
 }
 
-/** A person's Retry of a non-chat task whose session can never be resumed starts a new session. */
+/** A person's chat (Agent Chat or a connected chat); unknown counts as a chat. */
+export async function isChatTask(tx: Pick<Db, "select">, companyId: string, issueId: string) {
+  const [issue] = await tx.select({ chat: isChatTaskSql(companyId, issueId) })
+    .from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId))).limit(1);
+  return issue?.chat ?? true;
+}
+
+/** A person's Retry starts a new session when the source session cannot resume; the hold discloses this choice, including for chats. */
 export async function retryStartsFresh(tx: Pick<Db, "select">, input: { companyId: string; issueId: string; sourceRunId: string }) {
   const [source] = await tx.select({ error: heartbeatRuns.error, errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns)
     .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.sourceRunId)));
-  return sessionCannotContinue(source) && !(await isChatTask(tx, input.companyId, input.issueId));
+  return sessionCannotContinue(source);
 }
 
 export async function foldWaitingRetriesIntoContinuation(tx: Db, input: {
@@ -43,8 +50,11 @@ export async function foldWaitingRetriesIntoContinuation(tx: Db, input: {
     && retrySourceRunId(wake.payload) === input.sourceRunId).map(wake => wake.id);
   if (!retries.length) return;
   // A person's folded Retry starts a new session; carry that to the continuation that answers it.
-  const personRetry = waiting.some(wake => retries.includes(wake.id) &&
-    !(wake.payload as { taskRetry?: { initiatedBy?: unknown } } | null)?.taskRetry?.initiatedBy);
+  const personRetry = waiting.some(wake => {
+    const retry = readTaskRetryIntent(wake.payload);
+    return retries.includes(wake.id) && retry && !retry.initiatedBy
+      && retry.personRetry?.userId === retry.actorId;
+  });
   if (personRetry && await retryStartsFresh(tx, { ...input, sourceRunId: input.sourceRunId })) await tx.update(heartbeatRuns)
     .set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || '{"explicitFreshSession":true}'::jsonb` })
     .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.status, "queued")));
