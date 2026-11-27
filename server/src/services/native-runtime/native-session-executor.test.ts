@@ -16856,6 +16856,10 @@ describe("native warm session supervision", () => {
               delete decisions[path];
               expect(portableTarget.runnerTask.mock.calls.map(([operation]) => operation.kind)).toContain("describe");
               expect(state.execute).toHaveBeenCalledTimes(2);
+              const options = state.execute.mock.calls[1]![0];
+              expect(options.persistedSession?.providerSessionId).toBe("provider-reuse-key");
+              expect(options.persistedSession?.identity.runId).toBe(second.binding.runId);
+              expect(options.existingSession).toBeUndefined();
               expect(recoveredSession.close).not.toHaveBeenCalled();
             } finally { owners?.mockRestore(); resumeFrom?.mockRestore(); }
             continue;

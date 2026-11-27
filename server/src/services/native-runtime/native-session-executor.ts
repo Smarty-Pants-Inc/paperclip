@@ -13184,6 +13184,10 @@ async function executePaperclipNativeSessionAttempt(
       pluginTaskDescription = description;
       await finishStartupContextForFallback();
       persistedWarmSession = loadWarmNativeCheckpoint(input.execution, warmConfigDigest, target.kind);
+      if (!persistedWarmSession && releasedRecovery) {
+        const previousConfigDigest = nativeSessionConfigDigest(releasedRecovery.previousExecution, "remote");
+        persistedWarmSession = loadWarmNativeCheckpoint(input.execution, previousConfigDigest, "remote");
+      }
       if (!persistedWarmSession) throw new Error("native_runner_checkpoint_missing_after_unavailable_reuse");
       runnerdBackend = await createExecutionBackend();
       remoteCleanupLease = await readRemoteCleanupLease();
