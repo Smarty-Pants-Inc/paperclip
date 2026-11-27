@@ -8126,7 +8126,8 @@ registry.registerPath({
   method: "get",
   path: "/api/companies/{companyId}/assigned-work-invariant",
   tags: ["runs"],
-  summary: "Report open agent tasks without a live run, pending start or wait on a person (board only)",
+  summary: "Report readable open agent tasks without a live run, pending start or wait on a person",
+  description: "Company-scoped read using the caller's task visibility. Agent responses omit automaticWork and do not read the automatic-run brake. Board responses retain automaticWork.",
   request: { params: z.object({ companyId: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });

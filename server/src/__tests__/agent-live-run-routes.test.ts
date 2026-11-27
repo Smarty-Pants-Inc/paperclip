@@ -783,21 +783,30 @@ describe("agent live run routes", () => {
     expect(mockWorkspaceOperationService.listForRun).toHaveBeenCalledWith("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "workspace-one");
   });
 
-  it("lets a board operator read the assigned-work invariant for their company only", async () => {
-    mockHeartbeatService.reportAssignedWorkInvariant.mockResolvedValue({ checked: 3, violationCount: 1, violations: { no_pending_path: 1 } });
+  it("lets board and agent callers read the assigned-work invariant for their company only", async () => {
+    const automaticWork = { state: "closed", summary: "Automatic work is running normally." };
+    mockHeartbeatService.reportAssignedWorkInvariant.mockResolvedValue({ checked: 3, violationCount: 1, violations: { no_pending_path: 1 }, automaticWork });
     const board = await request(await createApp()).get("/api/companies/company-1/assigned-work-invariant");
     expect(board.status).toBe(200);
-    expect(board.body).toMatchObject({ checked: 3, violationCount: 1 });
+    expect(board.body).toMatchObject({ checked: 3, violationCount: 1, automaticWork });
     expect(mockHeartbeatService.reportAssignedWorkInvariant).toHaveBeenCalledWith("company-1", { readCondition: expect.anything() });
 
     mockHeartbeatService.reportAssignedWorkInvariant.mockClear();
     const member = { type: "board", userId: "member-1", companyIds: ["company-1"], source: "session", isInstanceAdmin: false };
     const otherCompany = await request(await createApp({}, member)).get("/api/companies/company-2/assigned-work-invariant");
     expect(otherCompany.status).toBe(403);
-    const agent = await request(await createApp({}, { type: "agent", agentId: routeAgentId, companyId: "company-1" }))
-      .get("/api/companies/company-1/assigned-work-invariant");
-    expect(agent.status).toBe(403);
+    const agentApp = await createApp({}, { type: "agent", agentId: routeAgentId, companyId: "company-1" });
+    const foreign = await request(agentApp).get("/api/companies/company-2/assigned-work-invariant");
+    expect(foreign.status).toBe(403);
     expect(mockHeartbeatService.reportAssignedWorkInvariant).not.toHaveBeenCalled();
+    const agent = await request(agentApp).get("/api/companies/company-1/assigned-work-invariant");
+    expect(agent.status).toBe(200);
+    expect(mockHeartbeatService.reportAssignedWorkInvariant).toHaveBeenCalledWith("company-1", {
+      readCondition: expect.anything(), includeAutomaticWork: false,
+    });
+    for (const method of ["post", "put", "patch", "delete"] as const) {
+      expect((await request(agentApp)[method]("/api/companies/company-1/assigned-work-invariant")).status).toBe(404);
+    }
   });
 
   it("caps company live run polling by default", async () => {
