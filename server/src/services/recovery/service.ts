@@ -107,6 +107,7 @@ import {
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { canContinueRecoveryRunAutomatically } from "../continuation-cause.js";
+import { hasUnchangedNativeInputRefusal, isNativeInputSizeRefusal } from "../native-input-refusal.js";
 import { STRANDED_CONTINUATION_MAX_AGE_MS, STRANDED_KIND, strandedRunCauseIsTemporary, type StrandedHoldRun } from "./stranded-hold-continuation.js";
 import { runningProcesses } from "../../adapters/index.js";
 import {
@@ -4442,6 +4443,7 @@ export function recoveryService(
             agentId: input.latestRun.agentId,
             status: input.latestRun.status,
             errorCode: input.latestRun.errorCode,
+            resultJson: parseObject(input.latestRun.resultJson),
             ...failureStage,
             errorSummary: input.latestRun.error
               ? redactSensitiveText(input.latestRun.error)
@@ -4978,6 +4980,13 @@ export function recoveryService(
       }
 
       let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+      // Waiting for the input owner, not a continuation-exhaustion escalation.
+      // In particular, never write a Press Retry notice for this refusal.
+      if (isNativeInputSizeRefusal(latestRun?.errorCode)
+        && await hasUnchangedNativeInputRefusal(db, { companyId: issue.companyId, issueId: issue.id })) {
+        result.skipped += 1;
+        continue;
+      }
       await deps.afterStrandedLatestRunRead?.({ issueId: issue.id, runId: latestRun?.id ?? null });
       // The run's own executor still settles it: it schedules the bounded retry
       // and releases the claim itself. Escalating in that window clears the

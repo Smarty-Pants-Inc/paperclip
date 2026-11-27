@@ -138,7 +138,24 @@ export function nativePromptCauseFromError(error: unknown): NativePromptRefusalC
   const match = (error instanceof Error ? error.message : "").match(/native_prompt_cause=([^\s:\[\]]+):(\d+)(?::count=(\d+))?(?::measure=([^\s:\[\]]+))?(?::remedies=([a-z_,]*))?(?=\]|$|\s)/);
   return match ? nativePromptRefusalCause({ kind: match[1], bytes: Number(match[2]), ...(match[3] ? { count: Number(match[3]) } : {}), ...(match[4] ? { measure: match[4] } : {}), ...(match[5] === undefined ? {} : { remedies: match[5] ? match[5].split(",") : [] }) }) : undefined;
 }
+export type NativeInputRevision = {
+  descriptionRevision: string;
+  messages: Array<{ id: string; revision: string; deleted: boolean }>;
+  fingerprint: string;
+};
+/** Source revisions, not wake kind or rendered task wrappers. No message text is saved. */
+export function nativeInputRevision(issue: { title: string; description: string | null },
+  messages: Array<{ id: string; authorType: string; createdByRunId?: string | null; updatedAt: string; deleted: boolean }>): NativeInputRevision {
+  const revision = {
+    descriptionRevision: createHash("sha256").update(JSON.stringify([issue.title, issue.description])).digest("hex"),
+    messages: messages.filter(message => message.authorType === "user" && !message.createdByRunId)
+      .map(message => ({ id: message.id, revision: message.updatedAt, deleted: message.deleted }))
+      .sort((a, b) => a.id.localeCompare(b.id)),
+  };
+  return { ...revision, fingerprint: createHash("sha256").update(JSON.stringify(revision)).digest("hex") };
+}
 export class NativeTurnPromptExceedsCommandBoundError extends Error {
+  inputRevision?: NativeInputRevision;
   readonly code = NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND;
   constructor(readonly promptCause?: NativePromptRefusalCause) {
     super(`${NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND}: ${nativePromptRefusalDetail(promptCause)}${promptCause ? ` [native_prompt_cause=${promptCause.kind}:${promptCause.bytes}${promptCause.count === undefined ? "" : `:count=${promptCause.count}`}${promptCause.measure === undefined ? "" : `:measure=${promptCause.measure}`}:remedies=${promptCause.remedies.join(",")}]` : ""}`);
