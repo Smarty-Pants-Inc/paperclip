@@ -1,4 +1,5 @@
 import { assertAgentInteraction } from "./agent-interaction-policy.js";
+import { retryDeadlockedTransactionOnce } from "./transient-lock-contention.js";
 import { notifyAttentionRetentionWork } from "./retention-work-notifications.js";
 import { type BudgetServiceHooks } from "./budgets.js";
 
@@ -31,7 +32,7 @@ export function agentService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
     getById
   } = agentRecordQueries(db);
   const updateAgent = (...args: Parameters<ReturnType<typeof createAgentLifecycle>["updateConfiguration"]>) =>
-    createAgentLifecycle(db, budgetHooks).updateConfiguration(...args);
+    retryDeadlockedTransactionOnce(() => createAgentLifecycle(db, budgetHooks).updateConfiguration(...args));
   return {
     list: async (companyId: string, options?: { includeTerminated?: boolean }) => {
       const allCompanyRows = await listCompanyAgentRows(companyId);
