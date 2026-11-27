@@ -189,6 +189,265 @@ async function settleThreadLayout() {
   });
 }
 
+describe("C31 standalone thread", () => {
+  beforeEach(() => {
+    nativeTranscriptState.hydratedRunIds = new Set(["refused"]);
+    transcriptState.hydratedRunIds = new Set(["refused"]);
+  });
+  const refusedCode = "native_turn_prompt_exceeds_command_bound";
+  const run = { runId: "refused", status: "failed", runtimeMode: "native" as const,
+    adapterType: "paperclip_runner", agentId: "agent", agentName: "Assistant", errorCode: refusedCode,
+    createdAt: "2026-11-26T10:00:01Z", startedAt: "2026-11-26T10:00:02Z", finishedAt: "2026-11-26T10:00:03Z",
+    resultJson: { nativeTurnPromptRefusalCause: { kind: "newest_message", bytes: 123456, measure: "prompt" } } };
+  const interruption = { intentId: null, responsibility: "system" as const, state: "failed" as const,
+    canRetry: false, nextRetryAt: null, userAction: null, sourceRunIds: [run.runId], observedRunId: run.runId,
+    failure: { code: refusedCode, title: "Newest message is too large", detail: "The newest message is 121 KB. If it is still queued, edit it in the task's message queue and send the remaining request as smaller messages. Otherwise ask the task's owner in the task's comments to split the request into smaller follow-up tasks. Saved task history remains available." } };
+  const person = { id: "person", companyId: "company", issueId: "issue", authorType: "user" as const,
+    authorAgentId: null, authorUserId: "board", body: "Please review this long message.", presentation: null, metadata: null,
+    createdAt: new Date("2026-11-26T10:00:00Z"), updatedAt: new Date("2026-11-26T10:00:00Z") };
+  const receipt = { ...person, id: "receipt", authorType: "system" as const, authorUserId: null,
+    clientRequestId: "native-output-without-result:refused", createdByRunId: run.runId, runId: run.runId,
+    body: "An old generic failed-run explanation.",
+    presentation: { kind: "system_notice" as const, tone: "danger" as const, title: "Run failed", detailsDefaultOpen: false },
+    createdAt: new Date("2026-11-26T10:00:04Z"), updatedAt: new Date("2026-11-26T10:00:04Z") };
+  it.each([true, false])("keeps the receipt title/detail/bytes expanded and removes all Retry routes (chat=%s)", async conversationMode => {
+    const retry = vi.fn(), retryTask = vi.fn();
+    render(<TaskChatThread issueId="issue" companyId="company" issueStatus="blocked" conversationMode={conversationMode}
+      comments={[person, receipt]} linkedRuns={[run]} interruption={interruption} onAdd={async () => {}}
+      onRetryFailedRun={retry} onTryAgainNoLiveExecutionPath={retryTask} />);
+    await settleThreadLayout();
+    expect(container.textContent).toContain(interruption.failure.title);
+    expect(container.textContent).toContain(interruption.failure.detail);
+    // v11 does not interpret a non-command's prompt label as an observed size.
+    expect(container.textContent).not.toContain(`Encoded prompt: ${(123456).toLocaleString()} bytes.`);
+    expect(container.textContent).not.toContain(receipt.body);
+    expect([...container.querySelectorAll("button")].some(button => /^(Retry|Try again|New session|Compact)$/.test(button.textContent ?? ""))).toBe(false);
+    expect(retry).not.toHaveBeenCalled(); expect(retryTask).not.toHaveBeenCalled();
+  });
+  // C31UI7 challenger C1: independently fetched projection/run windows can disagree.
+  describe.each(["native", "legacy"] as const)("C31 same-run blocked notice (%s)", runtimeMode => {
+    const observed = { ...run, runtimeMode,
+      resultJson: { nativeTurnPromptRefusalCause: { kind: "command", bytes: 600000, measure: "prompt" } } };
+    const projection = { ...interruption, canRetry: true, unansweredCommentId: person.id,
+      failure: { code: refusedCode, title: "Observed run refused", detail: "This run's encoded prompt is 586 KB." } };
+    it.each(["refused", "person_stopped", "ordinary"])("uses the projection's run, not a newer %s run, for words, bytes and Stop", async newestState => {
+      const newest = { ...run, runId: "newest", runtimeMode,
+        createdAt: "2026-11-26T11:00:01Z", startedAt: "2026-11-26T11:00:02Z", finishedAt: "2026-11-26T11:00:03Z",
+        status: newestState === "person_stopped" ? "cancelled" : "failed",
+        errorCode: newestState === "refused" ? refusedCode : newestState === "person_stopped" ? "cancelled" : "run_failed",
+        resultJson: newestState === "refused"
+          ? { nativeTurnPromptRefusalCause: { kind: "command", bytes: 777777, measure: "command" } }
+          : newestState === "person_stopped" ? { personStop: { requestedAt: "2026-11-26T11:00:02Z" } } : null };
+      // The later saved message makes the blocked-chat notice own the unanswered request.
+      const followup = { ...person, createdAt: new Date("2026-11-26T12:00:00Z") };
+      render(<TaskChatThread issueId="issue" companyId="company" issueStatus="blocked" conversationMode
+        comments={[followup]} linkedRuns={[newest, observed]} interruption={projection} onAdd={async () => {}}
+        onTryAgainNoLiveExecutionPath={vi.fn()} />);
+      await settleThreadLayout();
+      const status = container.querySelector('[role="status"][aria-label="Task status"]');
+      expect(status?.textContent).toBe(`${projection.failure.title}${projection.failure.detail}\n\nEncoded prompt: ${(600000).toLocaleString()} bytes.`);
+      expect(status?.textContent).not.toContain((777777).toLocaleString());
+      expect(status?.querySelector("button")).toBeNull();
+    });
+    it.each([null, "not-in-window"])("keeps only the projected words when its run is unavailable (%s)", async observedRunId => {
+      render(<TaskChatThread issueId="issue" companyId="company" issueStatus="blocked" conversationMode
+        comments={[person]} linkedRuns={[observed]} interruption={{ ...projection, observedRunId }} onAdd={async () => {}} />);
+      await settleThreadLayout();
+      expect(container.querySelector('[role="status"][aria-label="Task status"]')?.textContent)
+        .toBe(`${projection.failure.title}${projection.failure.detail}`);
+    });
+    it("honors Stop on the projection's run even when the newest run was refused", async () => {
+      const newest = { ...observed, runId: "newest", createdAt: "2026-11-26T11:00:01Z" };
+      render(<TaskChatThread issueId="issue" companyId="company" issueStatus="blocked" conversationMode
+        comments={[{ ...person, createdAt: new Date("2026-11-26T12:00:00Z") }]}
+        linkedRuns={[newest, { ...observed, resultJson: { personStop: { requestedAt: "2026-11-26T10:00:03Z" } } }]}
+        interruption={projection} onAdd={async () => {}} />);
+      await settleThreadLayout();
+      expect(container.querySelector('[role="status"][aria-label="Task status"]')).toBeNull();
+    });
+  });
+  it.each([false, true])("C31 dormant plumbing adds no description wrapper (refused=%s)", async refused => {
+    render(<TaskChatThread issueId="issue" companyId="company" issueStatus={refused ? "blocked" : "todo"}
+      comments={[]} linkedRuns={refused ? [run] : []} interruption={refused ? interruption : undefined} onAdd={async () => {}}
+      issueBrief={{ author: "agent", description: "The ordinary task description.", onSave: vi.fn() }} />);
+    await settleThreadLayout();
+    const description = container.querySelector('[data-testid="task-chat-description-bubble"]');
+    expect(description).not.toBeNull();
+    expect(description?.parentElement?.hasAttribute("data-thread-anchor")).toBe(true);
+    expect(description?.parentElement?.children).toHaveLength(1);
+  });
+  it("suppresses a stored receipt's Retry when the run code precedes the interruption projection", async () => {
+    render(<TaskChatThread issueId="issue" companyId="company" issueStatus="blocked" conversationMode
+      comments={[person, receipt]} linkedRuns={[run]} onAdd={async () => {}} onRetryFailedRun={vi.fn()} onTryAgainNoLiveExecutionPath={vi.fn()} />);
+    await settleThreadLayout();
+    expect([...container.querySelectorAll("button")].some(button => /^(Retry|Try again)$/.test(button.textContent ?? ""))).toBe(false);
+  });
+  it.each([true, false])("leaves another run's per-run Retry as base when an ordinary interruption forbids task Retry (chat=%s)", async conversationMode => {
+    const retry = vi.fn().mockResolvedValue(undefined);
+    render(<TaskChatThread issueId="issue" companyId="company" issueStatus="blocked" conversationMode={conversationMode}
+      comments={[person, receipt]} linkedRuns={[{ ...run, errorCode: "temporary", resultJson: null }]}
+      interruption={{ ...interruption, observedRunId: "another-run", failure: { code: "temporary", title: "Temporary error", detail: "Not a C31 refusal." } }}
+      onAdd={async () => {}} onRetryFailedRun={retry} />);
+    await settleThreadLayout();
+    const button = [...container.querySelectorAll("button")].find(button => button.textContent === "Retry");
+    expect(button).toBeDefined(); expect(button?.disabled).toBe(false);
+    await act(async () => button!.click());
+    await vi.waitFor(() => expect(retry).toHaveBeenCalledExactlyOnceWith("refused"));
+  });
+  it.each(["code", "cause", "projection"])("suppresses only the C31 run's per-run Retry classified by %s, not an unrelated failed run", async source => {
+    nativeTranscriptState.hydratedRunIds = new Set(["refused", "ordinary"]);
+    transcriptState.hydratedRunIds = new Set(["refused", "ordinary"]);
+    const retry = vi.fn().mockResolvedValue(undefined);
+    const ordinary = { ...run, runId: "ordinary", errorCode: "temporary", resultJson: null, createdAt: "2026-11-26T09:00:00Z" };
+    const oldReceipt = { ...receipt, id: "ordinary-receipt", runId: "ordinary", createdByRunId: "ordinary",
+      clientRequestId: "native-output-without-result:ordinary", createdAt: new Date("2026-11-26T09:00:04Z") };
+    render(<TaskChatThread issueId="issue" companyId="company" issueStatus="blocked" conversationMode
+      comments={[person, oldReceipt, receipt]} linkedRuns={[ordinary, { ...run,
+        errorCode: source === "code" ? refusedCode : "temporary", resultJson: source === "cause" ? run.resultJson : null }]}
+      interruption={source === "projection" ? interruption : undefined} onAdd={async () => {}} onRetryFailedRun={retry} />);
+    await settleThreadLayout();
+    const buttons = [...container.querySelectorAll("button")].filter(button => button.textContent === "Retry");
+    expect(buttons).toHaveLength(1); expect(buttons[0].disabled).toBe(false);
+    await act(async () => buttons[0].click());
+    await vi.waitFor(() => expect(retry).toHaveBeenCalledExactlyOnceWith("ordinary"));
+  });
+  const older = { ...run, runId: "ordinary", errorCode: "temporary", resultJson: null, createdAt: "2026-11-26T09:00:00Z" };
+  const olderReceipt = { ...receipt, id: "ordinary-receipt", runId: older.runId, createdByRunId: older.runId,
+    clientRequestId: "native-output-without-result:ordinary", createdAt: new Date("2026-11-26T09:00:04Z") };
+  const causes = ["task_description", "newest_message", "unread_message", "unread_messages", "queued_input", "human_response",
+    "protected_input", "protected_inputs", "command", "unmeasured_composition", "stale_copy"];
+  describe.each([false, true])("older-run Retry while C31 is current (chat=%s)", conversationMode => {
+    beforeEach(() => {
+      nativeTranscriptState.hydratedRunIds = new Set([run.runId, older.runId]);
+      transcriptState.hydratedRunIds = new Set([run.runId, older.runId]);
+    });
+    it.each(causes)("keeps older Retry for %s: kind alone cannot prove the older composition refuses", async kind => {
+      const retry = vi.fn().mockResolvedValue(undefined);
+      // Put the newest run first: API fetch order must not decide which refusal is current.
+      render(<TaskChatThread issueId="issue" companyId="company" issueStatus="blocked" conversationMode={conversationMode}
+        comments={[person, olderReceipt, receipt]} linkedRuns={[{ ...run,
+          resultJson: { nativeTurnPromptRefusalCause: { kind, bytes: 123456 } } }, older]}
+        interruption={interruption} onAdd={async () => {}} onRetryFailedRun={retry} />);
+      await settleThreadLayout();
+      const buttons = [...container.querySelectorAll("button")].filter(button => button.textContent === "Retry");
+      // C31's cause attributes a contributor, not an individually oversized
+      // input. Changing source origins can make other read history removable.
+      // Agent Chat selects older request IDs; its queued join is independent.
+      expect(buttons).toHaveLength(1); expect(buttons[0].disabled).toBe(false);
+      await act(async () => buttons[0].click());
+      await vi.waitFor(() => expect(retry).toHaveBeenCalledExactlyOnceWith(older.runId));
+    });
+    it("keeps older Retry as base after the current refusal clears", async () => {
+      const retry = vi.fn().mockResolvedValue(undefined);
+      const props = { issueId: "issue", companyId: "company", issueStatus: "blocked", conversationMode,
+        comments: [person, olderReceipt, receipt], linkedRuns: [older, run], onAdd: async () => {}, onRetryFailedRun: retry };
+      render(<TaskChatThread {...props} interruption={interruption} />);
+      await settleThreadLayout();
+      expect([...container.querySelectorAll("button")].filter(button => button.textContent === "Retry")).toHaveLength(1);
+      render(<TaskChatThread {...props} interruption={{ ...interruption, state: "resolved", failure: undefined }} />);
+      await settleThreadLayout();
+      const button = [...container.querySelectorAll("button")].find(button => button.textContent === "Retry");
+      expect(button).toBeDefined(); expect(button?.disabled).toBe(false);
+      await act(async () => button!.click());
+      await vi.waitFor(() => expect(retry).toHaveBeenCalledExactlyOnceWith(older.runId));
+    });
+  });
+  it.each(["run", "projection"])("does not turn a %s-only current cause into an older task Retry ban", async source => {
+    nativeTranscriptState.hydratedRunIds = new Set([run.runId, older.runId]);
+    transcriptState.hydratedRunIds = new Set([run.runId, older.runId]);
+    render(<TaskChatThread issueId="issue" companyId="company" issueStatus="blocked"
+      comments={[person, olderReceipt, receipt]} linkedRuns={[older, { ...run, resultJson: source === "run" ? run.resultJson : null }]}
+      interruption={source === "projection" ? { ...interruption, failure: { ...interruption.failure,
+        ...{ cause: { kind: "newest_message", bytes: 123456 } } } } : undefined}
+      onAdd={async () => {}} onRetryFailedRun={vi.fn()} />);
+    await settleThreadLayout();
+    expect([...container.querySelectorAll("button")].filter(button => button.textContent === "Retry")).toHaveLength(1);
+  });
+  it.each([null, {}, { kind: "future_kind", bytes: 123456 }, { kind: "newest_message", bytes: "123456" }])(
+    "keeps older task Retry as base for an unknown or malformed cause (%j)", async cause => {
+      nativeTranscriptState.hydratedRunIds = new Set([run.runId, older.runId]);
+      transcriptState.hydratedRunIds = new Set([run.runId, older.runId]);
+      render(<TaskChatThread issueId="issue" companyId="company" issueStatus="blocked"
+        comments={[person, olderReceipt, receipt]} linkedRuns={[older, { ...run, resultJson: { nativeTurnPromptRefusalCause: cause } }]}
+        interruption={interruption} onAdd={async () => {}} onRetryFailedRun={vi.fn()} />);
+      await settleThreadLayout();
+      expect([...container.querySelectorAll("button")].filter(button => button.textContent === "Retry")).toHaveLength(1);
+    });
+  describe.each(["native", "legacy"] as const)("ordinary %s failure stays base, not C31", runtimeMode => {
+    it.each(["run_failed", "agent_machine_unreachable"])("does not replace ordinary %s receipt or marker copy", async code => {
+      for (const hasReceipt of [true, false]) {
+        const props = { issueId: "issue", companyId: "company", issueStatus: "blocked", conversationMode: true,
+          comments: hasReceipt ? [person, receipt] : [person], linkedRuns: [{ ...run, runtimeMode, errorCode: code, resultJson: null }],
+          onAdd: async () => {}, onRetryFailedRun: vi.fn() };
+        const ordinary = { ...interruption, failure: undefined };
+        render(<TaskChatThread {...props} interruption={ordinary} />);
+        await settleThreadLayout();
+        const baseText = container.textContent;
+        const baseActions = [...container.querySelectorAll("button")].map(button => button.textContent);
+        render(<TaskChatThread {...props} interruption={{ ...ordinary,
+          failure: { code, title: "Server ordinary failure", detail: "An ordinary server explanation." } }} />);
+        await settleThreadLayout();
+        expect(container.textContent).toBe(baseText);
+        expect([...container.querySelectorAll("button")].map(button => button.textContent)).toEqual(baseActions);
+        expect(container.textContent).not.toMatch(/Server ordinary failure|An ordinary server explanation/);
+      }
+    });
+  });
+  describe.each(["native", "legacy"] as const)("non-C31 %s person Stop does not own a later saved message", runtimeMode => {
+    it.each([false, true])("keeps saved-message Retry after the stop (owed projection=%s)", async owed => {
+      const retryTask = vi.fn().mockResolvedValue(undefined), retryRun = vi.fn().mockResolvedValue(undefined);
+      render(<TaskChatThread issueId="issue" companyId="company" issueStatus="blocked" conversationMode
+        comments={[person]} linkedRuns={[{ ...run, runtimeMode, status: "cancelled", errorCode: "cancelled",
+          createdAt: "2026-11-26T09:00:00Z", startedAt: "2026-11-26T09:00:01Z", finishedAt: "2026-11-26T09:00:03Z",
+          resultJson: { personStop: { requestedAt: "2026-11-26T09:00:02Z" } } }]}
+        interruption={owed ? { ...interruption, canRetry: true, unansweredCommentId: person.id, failure: undefined } : undefined}
+        onAdd={async () => {}} onRetryFailedRun={retryRun} onTryAgainNoLiveExecutionPath={retryTask} />);
+      await settleThreadLayout();
+      expect(container.textContent).toContain("Your message is saved.");
+      const button = [...container.querySelectorAll("button")].find(button => button.textContent === "Retry");
+      expect(button).toBeDefined(); expect(button?.disabled).toBe(false);
+      await act(async () => button!.click());
+      await vi.waitFor(() => expect(retryTask).toHaveBeenCalledOnce());
+      expect(retryRun).not.toHaveBeenCalled();
+    });
+  });
+  describe("Friday gate keeps structured remedy routes disabled", () => {
+    it.each(["own_editable", "other_author", "not_editable", "not_discardable", "no_queue_id", "no_composer", "disabled_composer", "legacy_receipt", "agent_description"])(
+      "does not expose or dispatch a saved remedy without authoritative cause/message binding: %s", async boundary => {
+        const onAdd = vi.fn().mockResolvedValue(undefined), edit = vi.fn().mockResolvedValue(undefined), discard = vi.fn().mockResolvedValue(undefined);
+        const controls = { edit_task_description: vi.fn(), new_followup_task: vi.fn(), report_defect: vi.fn(), check_versions: vi.fn() };
+        const source = { ...run, runtimeMode: boundary === "legacy_receipt" ? "legacy" as const : "native" as const,
+          resultJson: { nativeTurnPromptRefusalCause: { kind: "newest_message", bytes: 123456,
+            remedies: ["edit_task_description", "edit_message", "delete_own_message", "new_followup_task", "report_defect", "check_versions"] } } };
+        const queue: IssueQueuedCommentQueue = { issueId: "issue", queueId: boundary === "no_queue_id" ? null : "queue",
+          state: "deferred", targetRunId: "refused", revision: "saved-revision", protocol: "paperclip_runner_v1", steeringDisposition: "available",
+          entries: [{ comment: person, position: 0, canEdit: boundary !== "not_editable", canDiscard: boundary !== "not_discardable" }] };
+        render(<TaskChatThread issueId="issue" companyId="company" issueStatus="blocked"
+          currentUserId={boundary === "other_author" ? "another-person" : "board"}
+          comments={[person, receipt]} linkedRuns={[source]} interruption={interruption} queuedCommentQueue={queue}
+          onAdd={onAdd} onEditQueuedComment={edit} onDiscardQueuedComment={discard} refusalRemedyControls={controls}
+          showComposer={boundary !== "no_composer"} composerDisabledReason={boundary === "disabled_composer" ? "Unavailable" : undefined}
+          issueBrief={boundary === "agent_description" ? { author: "agent", description: "Saved description.", onSave: vi.fn() } : undefined} />);
+        await settleThreadLayout();
+        expect(container.querySelector('[data-testid^="task-refusal-remedy-"]')).toBeNull();
+        expect(container.textContent).toContain(interruption.failure.detail);
+        expect(onAdd).not.toHaveBeenCalled(); expect(edit).not.toHaveBeenCalled(); expect(discard).not.toHaveBeenCalled();
+        for (const callback of Object.values(controls)) expect(callback).not.toHaveBeenCalled();
+      });
+  });
+  it("does not turn server prose into a new-session control or synthesize /new", async () => {
+    const onAdd = vi.fn<ComponentProps<typeof TaskChatThread>["onAdd"]>().mockResolvedValue(undefined);
+    render(<TaskChatThread issueId="issue" companyId="company" issueStatus="blocked" conversationMode
+      comments={[person, receipt]} linkedRuns={[run]} onAdd={onAdd} showComposer interruption={{ ...interruption,
+        failure: { ...interruption.failure, detail: "Start a new session before sending again." } }} />);
+    await settleThreadLayout();
+    const button = [...container.querySelectorAll("button")].find(button => button.textContent === "New session");
+    expect(button).toBeUndefined();
+    expect(container.textContent).toContain("Start a new session before sending again.");
+    expect(onAdd).not.toHaveBeenCalled();
+  });
+});
+
 describe.each(["legacy", "native"] as const)("historical %s system status", (runtimeMode) => {
   const run = (id: string, status: string, minute: number) => ({
     runId: id, status, runtimeMode, agentId: "agent", agentName: "Assistant",

@@ -2015,6 +2015,19 @@ describe("IssueDetail", () => {
     expect(mockIssuesApi.listAll).toHaveBeenCalledWith(issue.companyId, { createdFromIssueId: issue.id, includeRoutineExecutions: true });
   });
 
+  it("C31 dormant plumbing adds no wrapper around an ordinary Classic description", async () => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableStreamlinedUi: false, enableClassicTaskInterface: true });
+    const issue = createIssue({ description: "Ordinary Classic description", interruption: null });
+    mockIssuesApi.getCore.mockResolvedValue(issue);
+    mockIssuesApi.get.mockResolvedValue(issue);
+    await act(async () => renderIssueView());
+    await waitForAssertion(() => expect(container.textContent).toContain(issue.description));
+    const description = [...container.querySelectorAll("div")].find(element => element.textContent === issue.description && element.children.length === 0);
+    expect(description).toBeDefined();
+    expect(description?.parentElement?.matches('[data-testid="issue-detail-header"]')).toBe(true);
+    expect(container.querySelector('[data-testid="task-description-control"]')).toBeNull();
+  });
+
   it("uses Coordinator task presentation and panel scope without changing the Classic preference", async () => {
     coordinatorPreference.enabled = true;
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({

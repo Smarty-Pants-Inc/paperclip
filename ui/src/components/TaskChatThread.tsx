@@ -59,7 +59,7 @@ import { ProviderToolIconsProvider } from "@/components/ProviderToolIcon";
 import { McpAppTurnViews, mcpAppRunRefreshKey } from "@/components/mcp-app/McpAppTurnViews";
 import { ToolCallProgressProvider } from "@/components/task-chat/tool-call-progress";
 import { TaskChatRunnerHeader, TaskChatRunnerTurn } from "@/components/task-chat/TaskChatRunnerTurn";
-import { ExecutionBlockerNotice, nativeFailureNoticeRunId, isConversationRecovery, isPersonStoppedRun } from "./ExecutionBlockerNotice";
+import { ExecutionBlockerNotice, nativeFailureNoticeRunId, isConversationRecovery, isPersonStoppedRun, isExecutionRetryRefused, executionFailureDetail, type ExecutionRefusalRemedyControls } from "./ExecutionBlockerNotice";
 import type { TranscriptContentVersion, TranscriptEntry } from "@/adapters/types";
 import { isNoLiveExecutionPathNotice } from "./task-chat/adjacent-errors";
 import { partitionRunHealthItems } from "@/components/task-chat/TaskChatRunHealthBanner";
@@ -557,6 +557,8 @@ function resolvedWithoutUserFacingResponse(value: unknown): boolean {
 }
 
 export type TaskChatThreadProps = ComponentProps<typeof IssueChatThread> & {
+  /** Existing host controls only; explicit server remedies still own visibility. */
+  refusalRemedyControls?: ExecutionRefusalRemedyControls;
   onFailureNoticeChange?: (runId: string | null) => void;
   /** A person's Stop hands back the messages the agent hadn't taken (resultJson.personStop.returned). */
   onRestoreStoppedMessages?: (commentIds: readonly string[]) => Promise<boolean>;
@@ -811,6 +813,15 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       id: run.runId, companyId, status: run.status, runtimeMode: run.runtimeMode, resultJson: run.resultJson ?? null,
     }),
   ).map((run) => run.runId)), [companyId, linkedRuns]);
+  const retryRefusedRunIds = useMemo(() => {
+    const ids = new Set((linkedRuns ?? []).filter(run => isExecutionRetryRefused(null, run.errorCode, run.resultJson)).map(run => run.runId));
+    if (props.interruption?.observedRunId && isExecutionRetryRefused(props.interruption)) ids.add(props.interruption.observedRunId);
+    return ids;
+  }, [linkedRuns, props.interruption]);
+  const newestLinkedRun = linkedRuns?.reduce<(typeof linkedRuns)[number] | undefined>((latest, run) =>
+    !latest || toMs(run.createdAt) > toMs(latest.createdAt) ? run : latest, undefined);
+  const retryAllowed = !isExecutionRetryRefused(props.interruption) &&
+    !retryRefusedRunIds.has(props.interruption?.observedRunId ?? newestLinkedRun?.runId ?? "");
   const retryFailedRunHandler =
     isTerminalIssueStatus(issueStatus) ||
     interactions?.some((interaction) => interaction.status === "pending") ||
@@ -849,7 +860,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       ].includes(run.execution?.phase ?? "");
     })
       ? undefined
-      : onRetryFailedRun;
+      : onRetryFailedRun && ((runId: string) => retryRefusedRunIds.has(runId) ? Promise.resolve() : onRetryFailedRun(runId));
   const canRetryFailedRun = Boolean(retryFailedRunHandler);
   const queryClient = useQueryClient();
   const decisionReceipts = useCoordinatorChatDecisionReceipts(issueId, conversationMode);
@@ -1133,6 +1144,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     () => {
       return comments.flatMap((comment) => {
         if (hiddenThreadCommentIds?.has(comment.id) || imageReceipts.has(comment.id)) return [];
+        const failure = retryRefusedRunIds.has(props.interruption?.observedRunId ?? "") ? props.interruption?.failure : undefined;
+        if (failure && props.interruption?.observedRunId === nativeFailureNoticeRunId(comment)) return [{
+          ...comment, body: `${failure.title}\n\n${executionFailureDetail(failure, linkedRunMetaById.get(props.interruption.observedRunId ?? "")?.resultJson)}`,
+          presentation: { ...comment.presentation!, title: failure.title, detailsDefaultOpen: true },
+        }];
         if (comment.authorType === "system" && comment.metadata?.recoveryResponsibility === "system") return [];
         if (statusRelevance.isHistoricalNotice(comment) && !nativeFailureNoticeRunId(comment)) return [];
         if (isRedundantAiRecoveryNotice(comment, interactions)) return [];
@@ -1150,7 +1166,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         return [summary ? { ...comment, body: summary } : comment];
       });
     },
-    [comments, hiddenThreadCommentIds, interactions, linkedRunMetaById, statusRelevance, imageReceipts],
+    [comments, hiddenThreadCommentIds, interactions, linkedRunMetaById, statusRelevance, imageReceipts, props.interruption, retryRefusedRunIds],
   );
 
   const failureNoticeIds = useMemo(() => new Map(projectedComments.flatMap(comment => {
@@ -2485,7 +2501,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           (source.status === "timed_out"
             ? "native_runner_timed_out"
             : "native_runner_process_exited");
-        const label =
+        const failure = retryRefusedRunIds.has(source.id) && props.interruption?.observedRunId === source.id ? props.interruption.failure : undefined;
+        const label = failure?.title ?? (
           code === "native_provider_runtime_missing" && source.status === "failed"
             ? "Runtime missing"
             : code === "native_provider_model_rejected" && source.status === "failed"
@@ -2502,11 +2519,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                 ? "Run interrupted"
                 : source.status === "timed_out"
                   ? "Run timed out"
-                  : "Run failed";
+                  : "Run failed");
         const responseBoundary = sourceHasNativeResponse
           ? " after returning a final response"
           : "";
-        const detail =
+        const detail = failure ? executionFailureDetail(failure, meta?.resultJson) : (
           source.status === "cancelled"
             ? `The run was cancelled${responseBoundary}.`
             : source.status === "interrupted"
@@ -2528,7 +2545,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                     ? "Provider output exceeded the safe limit."
                     : source.status === "timed_out"
                       ? `The runner timed out${responseBoundary} (${code}).`
-                      : `The runner stopped${responseBoundary} (${code}).`;
+                      : `The runner stopped${responseBoundary} (${code}).`);
         const id = `${source.id}:failure`;
         const runAgent = meta?.agentId
           ? agentMap?.get(meta.agentId)
@@ -2550,10 +2567,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             tone: source.status === "cancelled" ? "neutral" : "error",
             label,
             detail,
-            retryable: code !== "native_session_cleanup_quarantined" && !diskFullBesideInterruption &&
+            retryable: !retryRefusedRunIds.has(source.id) && code !== "native_session_cleanup_quarantined" && !diskFullBesideInterruption &&
               !hasRetrySuccessor && !isConversationRecovery(props.interruption, source.status),
             ...(credentialAccess ? { credentialAccess, retryable: false } : {}),
-            collapsible: true,
+            collapsible: !failure,
             runId: source.id,
             createdAtIso: finishedAt
               ? new Date(finishedAt).toISOString()
@@ -2575,6 +2592,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       if (sourceHasLegacyStop && !isUserStop(source.id) && !failureNoticeIds.has(source.id)) {
         settledRunIds.add(source.id);
         const code = meta?.errorCode ?? "native_runner_process_exited";
+        const failure = retryRefusedRunIds.has(source.id) && props.interruption?.observedRunId === source.id ? props.interruption.failure : undefined;
         const retryDetail = meta?.scheduledRetryAt
           ? "Retry scheduled automatically."
           : canRetryFailedRun
@@ -2586,7 +2604,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           interaction.sourceRunId === source.id && interactionTargetsPlanRevision(interaction, planDocument),
         )));
         const aiRequest = interactions?.find((interaction) => interaction.kind === "connection_intent" && interaction.payload.purpose === "ai" && interaction.sourceRunId === source.id);
-        const detail = branchUnavailable
+        const detail = failure ? executionFailureDetail(failure, meta?.resultJson) : (branchUnavailable
           ? "Repair the starting branch below before retrying."
           : restoreFailed
           ? workspaceRestoreMarkerDetail({ result: meta?.resultJson, savedPlan, hasResponse: sourceHasPresentationComment || Boolean(acceptedSummary) })
@@ -2602,7 +2620,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             ? `Provider output exceeded the safe limit. ${retryDetail}`
             : code.startsWith("workspace_git_scan_")
             ? `Workspace setup failed before the agent started. ${retryDetail}`
-            : `The run failed (${code}). ${retryDetail}`;
+            : `The run failed (${code}). ${retryDetail}`);
         const id = `${source.id}:failure`;
         if (!historical && (!props.interruption || credentialAccess)) entriesWithFailures.push({
           ms: toMs(meta?.finishedAt ?? meta?.startedAt ?? meta?.createdAt),
@@ -2612,7 +2630,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             id,
             kind: "marker",
             variant: "interrupted",
-            label: branchUnavailable ? "Starting branch unavailable" : restoreFailed ? "Workspace restore failed" : aiRequest?.status === "pending" ? "AI connection needed" : isUserStop(source.id) ? "Stopped" : "Couldn't finish",
+            label: failure?.title ?? (branchUnavailable ? "Starting branch unavailable" : restoreFailed ? "Workspace restore failed" : aiRequest?.status === "pending" ? "AI connection needed" : isUserStop(source.id) ? "Stopped" : "Couldn't finish"),
             runId: source.status === "cancelled" ? undefined : source.id,
             retryable: source.status === "failed" || source.status === "timed_out",
             ...(branchUnavailable || aiRequest?.status === "pending" ? { retryable: false } : {}),
@@ -2628,6 +2646,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               retryable: false,
               runHref: `/agents/${encodeURIComponent(meta?.agentId ?? "")}/runs/${encodeURIComponent(source.id)}`,
             } : {}),
+            ...(retryRefusedRunIds.has(source.id) ? { retryable: false } : {}),
             tone: source.status === "cancelled" || aiRequest?.status === "pending" ? "neutral" : "error",
             detail,
           },
@@ -3126,6 +3145,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     props.interruption,
     statusRelevance,
     canRetryFailedRun,
+    retryRefusedRunIds,
     interactions,
     runs,
     runChainIdsById,
@@ -3896,18 +3916,32 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     !props.retryPreparing && !props.scheduledRetry && !composerPause &&
     !interactions?.some(interaction => interaction.status === "pending") &&
     (owedMessage || !props.interruption || props.interruption.state === "resolved");
-  const blockedRetry = blockedChat && owedMessage ? onTryAgainNoLiveExecutionPath
+  const blockedRetry = !retryAllowed ? undefined : blockedChat && owedMessage ? onTryAgainNoLiveExecutionPath
     : blockedChat && canRetryFailedRun
       ? onTryAgainNoLiveExecutionPath ?? (latestRun && ["failed", "timed_out"].includes(latestRunStatus ?? "") &&
         linkedRunMetaById.get(latestRun.id)?.errorCode !== "native_session_cleanup_quarantined"
         ? () => retryFailedRunHandler!(latestRun.id) : undefined) : undefined;
-  const blockedChatNotice = blockedChat ? <ExecutionBlockerNotice savedMessageBlocked conversationMode presentation={null}
+  // Only the run named by the projection owns its words, measurement and Stop
+  // evidence. Independently fetched run windows may already contain a newer run;
+  // missing identity must never borrow that run's facts.
+  const blockedNoticeRun = linkedRunMetaById.get(props.interruption?.observedRunId ?? "");
+  // A person-stopped older run must not hide Retry for a later ordinary message.
+  const blockedChatNotice = blockedChat ? <ExecutionBlockerNotice savedMessageBlocked conversationMode presentation={!retryAllowed ? props.interruption : null}
+    observedErrorCode={!retryAllowed ? blockedNoticeRun?.errorCode : undefined} observedResultJson={!retryAllowed ? blockedNoticeRun?.resultJson : undefined}
+    issueId={issueId ?? undefined}
     canRetry={!!blockedRetry} onRetry={() => { void Promise.resolve().then(blockedRetry).catch(() => undefined); }}
     optimistic={tryAgainNoLiveExecutionPathPending || retryFailedRunId === latestRun?.id} /> : null;
   const blockedNoticeItem = blockedChatNotice ? threadItems.slice(
     threadItems.findIndex(item => item.id === latestUserComment?.id) + 1,
   ).findLast(item => (item.kind === "marker" && item.variant === "interrupted" && item.tone !== "neutral" && !item.credentialAccess) ||
     (item.kind === "message" && isNoLiveExecutionPathNotice(item))) : undefined;
+  // A non-retryable receipt uses the same full-width explanation/action layout
+  // as the page notice, not the compact summary's single-Retry action slot.
+  const refusedReceiptNotice = noticeOwnedRunId && retryRefusedRunIds.has(noticeOwnedRunId) && props.interruption?.state === "failed" && props.interruption.failure
+    ? { itemId: failureNoticeIds.get(noticeOwnedRunId), content: <ExecutionBlockerNotice
+        presentation={props.interruption} observedResultJson={linkedRunMetaById.get(noticeOwnedRunId)?.resultJson}
+        canRetry={false} onRetry={() => undefined} issueId={issueId ?? undefined}
+        conversationMode={conversationMode} /> } : undefined;
 
   // Feedback votes keyed by the comment they target (targetType
   // "issue_comment"), mirroring IssueChatThread — the redesign attaches the
@@ -3929,7 +3963,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       const failedRunId = [...failureNoticeIds].find(([, id]) => id === item.id)?.[0];
       const retryAnswered = failedRunId && [...runChainIdsById].some(([id, chain]) => id !== failedRunId && chain.includes(failedRunId) &&
         linkedRunMetaById.get(id)?.status === "succeeded" && settledReplyRunIds.has(id));
-      if (failedRunId && onRetryFailedRun && !retryAnswered) return <Button type="button" variant="outline" size="xs"
+      if (failedRunId && !retryRefusedRunIds.has(failedRunId) && onRetryFailedRun && !retryAnswered) return <Button type="button" variant="outline" size="xs"
         disabled={!canRetryFailedRun || !!liveRun || !!retryFailedRunId || props.retryPreparing}
         onClick={() => { void Promise.resolve().then(() => retryFailedRunHandler?.(failedRunId)).catch(() => undefined); }}>
         {retryFailedRunId === failedRunId ? "Retrying…" : "Retry"}</Button>;
@@ -3952,7 +3986,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       );
     },
     [
-      failureNoticeIds, onRetryFailedRun, canRetryFailedRun, liveRun, retryFailedRunId, props.retryPreparing, retryFailedRunHandler,
+      failureNoticeIds, retryRefusedRunIds, onRetryFailedRun, canRetryFailedRun, liveRun, retryFailedRunId, props.retryPreparing, retryFailedRunHandler,
       runChainIdsById, linkedRunMetaById, settledReplyRunIds,
       onVote,
       feedbackVoteByTargetId,
@@ -4435,9 +4469,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                         renderMessageActions={renderMessageActions}
                         renderQueuedAction={renderQueuedAction}
                         renderTurn={renderRunnerSegment}
-                        executionNotice={blockedChatNotice ? { itemId: blockedNoticeItem?.id, content: blockedChatNotice } : undefined}
+                        executionNotice={refusedReceiptNotice ?? (blockedChatNotice ? { itemId: blockedNoticeItem?.id, content: blockedChatNotice } : undefined)}
                         onTryAgainNoLiveExecutionPath={
-                          issueStatus === "blocked" &&
+                          retryAllowed && issueStatus === "blocked" &&
                           !requiresExecutionReconciliation(
                             props.recoveryAction?.cause,
                           ) &&
