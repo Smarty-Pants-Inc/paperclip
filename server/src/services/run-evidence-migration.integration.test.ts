@@ -303,6 +303,50 @@ describe.skipIf(!endpoint || !databaseUrl)("run evidence migration (Postgres and
       expectedTrace,
     );
   }, 30_000);
+  // Keep reason: trace custody; old expiry stamps must not strand kept local bytes.
+  it.each(["0", "86400000"])("migrates an old-stamped local trace only when retention is disabled (%s ms)", async (retention) => {
+    const previousRetention = process.env.PAPERCLIP_PROVIDER_TRACE_RETENTION_MS;
+    vi.stubEnv("PAPERCLIP_PROVIDER_TRACE_RETENTION_MS", retention);
+    vi.resetModules();
+    try {
+      const { migrateRunEvidence: migrate } = await import("./run-evidence-migration.js");
+      const { PROVIDER_TRACE_RETENTION_MS, providerTraceStore } = await import("./provider-trace-store.js");
+      expect(PROVIDER_TRACE_RETENTION_MS).toBe(Number(retention));
+      const companyId = randomUUID(), agentId = randomUUID(), runId = randomUUID(), traceId = randomUUID();
+      const filename = `${randomUUID()}.ndjson`, file = path.join(directory, "traces", filename);
+      const bytes = Buffer.from('{"kind":"frame","frameId":1,"rawBase64":"a2VwdCBleGFjdCBieXRlcw=="}\n');
+      const expiry = new Date(Date.now() - 3600_000);
+      await fs.mkdir(path.dirname(file), { recursive: true });
+      await fs.writeFile(file, bytes);
+      await db.execute(sql`insert into heartbeat_runs(id,company_id,agent_id,status)
+        values(${runId},${companyId},${agentId},'succeeded')`);
+      await db.execute(sql`insert into provider_trace_records(id,company_id,run_id,status,provider,trace_ref,requested_by,expires_at,digest)
+        values(${traceId},${companyId},${runId},'complete','codex',${filename},'test',${expiry.toISOString()},
+        ${`sha256:${createHash("sha256").update(bytes).digest("hex")}`})`);
+      const result = await migrate(db, { apply: true, companyId, kinds: ["trace"] });
+      const [row] = await db.$client.unsafe("select trace_ref,expires_at,status,deleted_at from provider_trace_records where id=$1", [traceId]);
+      expect(row).toMatchObject({ status: "complete", deleted_at: null });
+      expect(new Date(row!.expires_at).getTime()).toBe(expiry.getTime());
+      if (retention === "0") {
+        expect(result.items).toContainEqual(expect.objectContaining({ id: traceId, kind: "trace", state: "migrated", bytes: bytes.length }));
+        expect(row!.trace_ref).toBe(`s3-segments-v1:${companyId}/${runId}/${filename}`);
+        await fs.unlink(file);
+        const provider = createS3StorageProvider({ endpoint, bucket, region: "us-east-1", forcePathStyle: true });
+        expect(await createProviderTraceObjectStore(provider).read(row!.trace_ref)).toEqual(bytes);
+        const store = providerTraceStore(db);
+        expect(await store.cleanupExpired()).toEqual([]);
+        expect(await store.getByRun(runId, companyId)).toMatchObject({ status: "complete", deletedAt: null, traceRef: row!.trace_ref });
+        expect((await store.download(runId, companyId))?.bytes).toEqual(bytes);
+      } else {
+        expect(result.items).toEqual([]);
+        expect(row!.trace_ref).toBe(filename);
+        expect(await fs.readFile(file)).toEqual(bytes);
+      }
+    } finally {
+      vi.stubEnv("PAPERCLIP_PROVIDER_TRACE_RETENTION_MS", previousRetention);
+      vi.resetModules();
+    }
+  });
   it("blocks a native archive with a missing committed tail and checkpoints only verified source coverage", async () => {
     const companyId = randomUUID(),
       agentId = randomUUID();
