@@ -21,6 +21,8 @@ import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_COMPLETED_TURN_CLEANUP_MESSAGE,
   nativeCheckpointRecordsCompletedTurn } from "./completed-turn-cleanup.js";
 import { prepareCursorCloudRuntime } from "./cursor-cloud-runtime.js";
 import { LocalRuntimeApiListenerClosedError, resolveLocalRuntimeApiUrl } from "../../runtime-api.js";
+import { digestBackupDirectoryStreamed } from "./native-harness-backup-digest.js";
+import { PI_HOME_CHECKPOINT_EXCLUDED_ENTRIES, piRunnerCheckpointExclusions } from "./native-pi-checkpoint-policy.js";
 import { providerFailureFromError } from "../../vendor/paperclip-runner/index.js";
 import { readProviderFailure } from "@paperclipai/shared";
 import { nativeCancellationHasUnsettledOwner, notifyNativeCancellation, waitForNativeCancellation } from "./native-cancellation-delivery.js";
@@ -775,6 +777,7 @@ type WarmNativeSession = {
   closeFailureEvidenceLogged?: boolean;
   /** A successor's retirement of this owner failed; it stays registered for its own sandbox. */
   retirementUnproven?: boolean;
+  preservationFailure?: NativeHarnessPreservationRequiredError;
   observabilityCompatibilityKey?: string;
   runId: string;
   issueId: string;
@@ -801,6 +804,33 @@ type WarmNativeSession = {
   idleTimer: ReturnType<typeof setTimeout> | null;
   lastActivityAt: string;
 };
+
+function isNativeHarnessArchiveInvalid(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return error.message === "native_harness_archive_invalid" ||
+    isNativeHarnessArchiveInvalid(error.cause) ||
+    error instanceof AggregateError && error.errors.some(isNativeHarnessArchiveInvalid);
+}
+
+const NATIVE_HARNESS_PRESERVATION_REQUIRED = "native_harness_preservation_required";
+export class NativeHarnessPreservationRequiredError extends Error {
+  readonly code = NATIVE_HARNESS_PRESERVATION_REQUIRED;
+  constructor(cause: unknown) {
+    super("The previous conversation is kept on its sandbox, but its session backup exceeded a safety limit or contains unsupported state. Automatic retries are stopped. Preserve or repair the session backup before continuing; do not reset the conversation.", { cause });
+    this.name = "NativeHarnessPreservationRequiredError";
+  }
+}
+
+function findHarnessPreservationFailure(error: unknown): NativeHarnessPreservationRequiredError | null {
+  const pending = [error];
+  for (let seen = 0; pending.length && seen < 16; seen++) {
+    const current = pending.shift();
+    if (current instanceof NativeHarnessPreservationRequiredError) return current;
+    if (current instanceof AggregateError) pending.push(...current.errors);
+    if (current instanceof Error && current.cause !== undefined) pending.push(current.cause);
+  }
+  return null;
+}
 
 const WARM_CLOSE_FAILURE_DETAIL_MAX = 2_000;
 const WARM_NATIVE_SESSION_CLOSE_CONCURRENCY = 4;
@@ -934,6 +964,7 @@ async function retireWarmPredecessor(entry: WarmNativeSession, reason: string,
     throw new NativePredecessorRetirementUnprovenError(entry.runId, entry.providerLeaseId,
       new Error("warm Runner stop unconfirmed (injected test fault)"));
   }
+  if (entry.preservationFailure) throw entry.preservationFailure;
   const directoryWaitDeadline = Date.now() + warmRetirementDirectoryWait.timeoutMs;
   for (;;) {
     try {
@@ -949,6 +980,12 @@ async function retireWarmPredecessor(entry: WarmNativeSession, reason: string,
           logger.warn({ err: receiptError, runId: entry.runId }, "could not keep the predecessor's agent files for later collection");
         });
         throw new NativePredecessorRetirementDirectoryBusyError(entry.runId, error);
+      }
+      if (isNativeHarnessArchiveInvalid(error) || findHarnessPreservationFailure(error)) {
+        entry.preservationFailure = findHarnessPreservationFailure(error) ?? new NativeHarnessPreservationRequiredError(error);
+        logger.error({ runId: entry.runId, issueId: entry.issueId, providerLeaseId: entry.providerLeaseId,
+          reason: entry.preservationFailure.code }, entry.preservationFailure.message);
+        throw entry.preservationFailure;
       }
       entry.retirementUnproven = true;
       throw new NativePredecessorRetirementUnprovenError(entry.runId, entry.providerLeaseId ?? null, error);
@@ -8138,6 +8175,10 @@ export function resolveNativeHarnessPersistenceProfile(
               excludeEntries: [
                 ...ACPX_RUNTIME_CHECKPOINT_EXCLUDED_ENTRIES.map((entry) =>
                   `acpx/${acpxRuntimeSessionDirectoryName(nativeSessionKey(execution))}/${entry}`),
+                ...(execution.provider.agent === "pi"
+                  ? PI_HOME_CHECKPOINT_EXCLUDED_ENTRIES.map(entry =>
+                      `acpx/${acpxRuntimeSessionDirectoryName(nativeSessionKey(execution))}/pi-home/${entry}`)
+                  : []),
                 ...(execution.provider.agent === "grok"
                   ? ["auth.json", "auth-refresh.json", "auth-refresh.json.tmp", "config.toml", "logs"].map((entry) =>
                     `acpx/${acpxRuntimeSessionDirectoryName(nativeSessionKey(execution))}/grok-home/${entry}`)
@@ -8154,7 +8195,9 @@ export function resolveNativeHarnessPersistenceProfile(
     providerKind: execution.provider.kind,
     driverKind: execution.session.driverKind,
     directories: [
-      { name: "runner", location: "runner", excludeEntries: [] },
+      { name: "runner", location: "runner", excludeEntries: execution.provider.kind === "pi_rpc"
+        ? piRunnerCheckpointExclusions(nativeSessionKey(execution))
+        : [] },
       ...(providerDirectory ? [providerDirectory] : []),
     ],
   };
@@ -8512,60 +8555,6 @@ function digestBackupDirectory(directory: string): {
     }
   };
   visit(directory, "");
-  return { sha256: `sha256:${hash.digest("hex")}`, bytes };
-}
-
-// `digestBackupDirectory` for run paths: the same digest, streamed. A harness
-// backup can hold large provider databases, and hashing it synchronously
-// blocked every lease renewal for the whole read.
-async function digestBackupDirectoryStreamed(directory: string): Promise<{
-  sha256: string;
-  bytes: number;
-}> {
-  let hash = createHash("sha256");
-  let bytes = 0;
-  const visit = async (current: string, relative: string): Promise<void> => {
-    const entries = (await readdir(current, { withFileTypes: true })).sort(
-      (left, right) => left.name.localeCompare(right.name),
-    );
-    if (entries.length === 0) hash.update(`directory:${relative}\0`);
-    for (const entry of entries) {
-      const entryPath = resolve(current, entry.name);
-      const entryRelative = relative ? `${relative}/${entry.name}` : entry.name;
-      const stats = await lstat(entryPath);
-      if (entry.isDirectory()) {
-        hash.update(`directory:${entryRelative}:${stats.mode & 0o777}\0`);
-        await visit(entryPath, entryRelative);
-      } else if (entry.isSymbolicLink()) {
-        hash.update(`symlink:${entryRelative}:${await readlink(entryPath)}\0`);
-      } else if (entry.isFile()) {
-        // The record names the byte count before the contents. Stream with the
-        // size from lstat; if the file changed size meanwhile, hash the bytes
-        // actually read, exactly as the synchronous digest would.
-        const before = hash.copy();
-        const header = (size: number) => `file:${entryRelative}:${stats.mode & 0o777}:${size}\0`;
-        hash.update(header(stats.size));
-        let fileBytes = 0;
-        for await (const chunk of createReadStream(entryPath)) {
-          fileBytes += (chunk as Buffer).byteLength;
-          hash.update(chunk as Buffer);
-        }
-        if (fileBytes !== stats.size) {
-          const contents = await readFile(entryPath);
-          hash = before;
-          hash.update(header(contents.byteLength));
-          hash.update(contents);
-          fileBytes = contents.byteLength;
-        }
-        bytes += fileBytes;
-      } else {
-        throw new Error(
-          `runner_harness_backup_unsupported_entry:${entryRelative}`,
-        );
-      }
-    }
-  };
-  await visit(directory, "");
   return { sha256: `sha256:${hash.digest("hex")}`, bytes };
 }
 
@@ -9188,6 +9177,7 @@ export function nativeSessionFailureDisposition(
     // A same-run retry would meet the same unretired owner on the same sandbox;
     // the next run starts on a fresh one instead.
     sourceFailureCode === NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE ||
+    sourceFailureCode === NATIVE_HARNESS_PRESERVATION_REQUIRED ||
     sourceFailureCode === "runner_task_admission_rejected" ||
     sourceFailureCode === "runner_ingress_access_rejected" ||
     sourceFailureCode === "native_provider_runtime_missing" ||
@@ -9440,8 +9430,10 @@ function classifyNativeSessionFailure(
   | "runner_ingress_startup_failed"
   | "local_runtime_api_listener_unavailable"
   | typeof NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE
+  | typeof NATIVE_HARNESS_PRESERVATION_REQUIRED
   | typeof NATIVE_FAILED_BEFORE_PROVIDER_TURN_CODE
   | "native_session_interrupted" {
+  if (findHarnessPreservationFailure(error)) return NATIVE_HARNESS_PRESERVATION_REQUIRED;
   if (error instanceof NativeTurnPromptExceedsCommandBoundError) return error.code;
   if (error instanceof Error && error.message.startsWith(`${NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND}:`)) return NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND;
   if (findNativePredecessorRetirementUnproven(error)) return NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE;
@@ -19062,14 +19054,25 @@ async function createRunnerdBackendWithinSessionClaim(
   // Set once the durable backup is stored. A later local publication, stamp,
   // or cleanup failure leaves that backup restorable, so it is not marked.
   let checkpointBackupStored = false;
+  let checkpointPreservationFailure: NativeHarnessPreservationRequiredError | undefined;
   const checkpointRemoteRunner = async (
     settlement: "settled" | "unsettled",
   ) => {
+    if (checkpointPreservationFailure) throw checkpointPreservationFailure;
     let saved: boolean;
     checkpointBackupStored = false;
     try {
       saved = await persistRemoteRunnerCheckpoint(settlement);
     } catch (error) {
+      // A warm generation can contain earlier turns even when this run never
+      // received input. Never discard it or silently mark it fresh. Cache
+      // filtering should cure known overflows; other archive refusals require
+      // one visible preservation decision, not another expensive capture.
+      if (isNativeHarnessArchiveInvalid(error)) {
+        checkpointPreservationFailure = new NativeHarnessPreservationRequiredError(error);
+        await Promise.resolve(input.onLog?.("stderr", `[paperclip-runner] ${checkpointPreservationFailure.message}\n`)).catch(() => undefined);
+        throw checkpointPreservationFailure;
+      }
       if (!checkpointBackupStored && remoteTarget?.transport === "sandbox" && remoteTarget.reusableLeaseConfigured !== true) {
         providerStateUnsavedMarked = await markAcceptedRunProviderStateUnsaved(input.db, input.execution.binding)
           .catch(() => false) || providerStateUnsavedMarked;

@@ -5,7 +5,7 @@ import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { currentProcessSpaceHash, currentProcessStartedAtMs } from "./controller-process-identity.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
-import { PROCESS_IDENTITY_RECORDED, recordedLocalExecutionStopped } from "./native-local-process-stop.js";
+import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED, recordedLocalExecutionStopped, unidentifiedLocalLaunchRefusal } from "./native-local-process-stop.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 
@@ -36,6 +36,24 @@ const support = await getEmbeddedPostgresTestSupport();
         processStartedAt: input.startedAt.toISOString() } });
     return run!;
   }
+  it("does not call a finished cancelled legacy run unfinished or authorize native attestation for it", async () => {
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "cancelled", runtimeMode: "legacy",
+      finishedAt: new Date() }).returning();
+    expect(await unidentifiedLocalLaunchRefusal(db, run)).toMatchObject({ code: "unsupported_runtime" });
+  });
+
+  it.each(["local", "other-host", "recorded-pid", "not-finished"] as const)(
+    "keeps cancelled native launch identity fences (%s)", async mode => {
+      const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "cancelled", runtimeMode: "native",
+        finishedAt: mode === "not-finished" ? null : new Date(), processPid: mode === "recorded-pid" ? process.pid : null }).returning();
+      await appendHeartbeatRunEvent(db, { companyId, agentId, runId: run.id, eventType: PROCESS_START_REQUESTED,
+        payload: { hostname: mode === "other-host" ? "another-host" : hostname() } });
+      const result = await unidentifiedLocalLaunchRefusal(db, run);
+      if (mode === "local") expect(result).toBeNull();
+      else expect(result).toMatchObject({ code: mode === "other-host" ? "launch_on_other_host" :
+        mode === "recorded-pid" ? "process_identity_recorded" : "run_not_finished" });
+    });
+
   const deadPid = 2_000_000_001;
   const minuteAgo = () => new Date(Date.now() - 60_000);
   const ownStart = async () => new Date((await currentProcessStartedAtMs())!);

@@ -116,7 +116,8 @@ async function migrateSource(db: Db, input: { storage: StorageService; signal: A
   const [current] = await db.select().from(nativeHarnessBackups).where(and(eq(nativeHarnessBackups.companyId, run.companyId),
     eq(nativeHarnessBackups.scopeDigest, scopeDigest), eq(nativeHarnessBackups.status, "current")));
   if (current) {
-    if (current.manifestSha256 !== manifestSha256) throw new Error("native_harness_migration_durable_source_conflict");
+    if (current.manifestSha256 !== manifestSha256 && current.reference.sourceManifestSha256 !== manifestSha256)
+      throw new Error("native_harness_migration_durable_source_conflict");
     await verifyDurableNativeHarnessBackup({ db, storage: input.storage, companyId: run.companyId,
       scopeDigest, manifestSha256: current.manifestSha256, signal: input.signal });
     return 1;
@@ -205,9 +206,10 @@ export async function prestageNativeHarnessBackups(db: Db, input: { storage: Sto
     const [current] = await db.select().from(nativeHarnessBackups).where(and(eq(nativeHarnessBackups.companyId, run.companyId),
       eq(nativeHarnessBackups.scopeDigest, source.scopeDigest), eq(nativeHarnessBackups.status, "current")));
     if (current) {
-      if (current.manifestSha256 !== source.manifestSha256) return "durable_source_changed";
+      if (current.manifestSha256 !== source.manifestSha256 && current.reference.sourceManifestSha256 !== source.manifestSha256)
+        return "durable_source_changed";
       await verifyDurableNativeHarnessBackup({ db, storage: input.storage, companyId: run.companyId,
-        scopeDigest: source.scopeDigest, manifestSha256: source.manifestSha256, signal });
+        scopeDigest: source.scopeDigest, manifestSha256: current.manifestSha256, signal });
       return "current";
     }
     if (run.status !== "succeeded" || !run.finishedAt) {

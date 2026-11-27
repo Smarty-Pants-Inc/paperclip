@@ -1,4 +1,5 @@
 import { publishNativeHarnessBackup } from "./native-harness-backup-publication.js";
+import { normalizePiHarnessBackupSnapshot } from "./native-pi-checkpoint-policy.js";
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
@@ -34,6 +35,7 @@ type Reference = Binding & {
   schema: typeof SCHEMA; objectKey: string; sha256: string; byteSize: number;
   material: Record<string, unknown>; manifestSha256: string;
   providerArtifacts?: NativeProviderArtifactReceipt;
+  sourceManifestSha256?: string;
 };
 type Row = typeof nativeHarnessBackups.$inferSelect;
 type OfflineOwner = { kind: "offline_migration"; companyId: string; issueId: string; runId: string;
@@ -226,7 +228,7 @@ async function persistNativeHarnessBackupOnce(input: PersistNativeHarnessBackupI
   if (source === null) fail("prestage_source_changed");
   const manifestBytes = source?.manifestBytes ?? await readFile(join(input.root, "manifest.json"));
   const providerArtifacts = JSON.parse(manifestBytes.toString("utf8")).providerArtifacts as NativeProviderArtifactReceipt | undefined;
-  const manifestSha256 = `sha256:${createHash("sha256").update(manifestBytes).digest("hex")}`;
+  let manifestSha256 = `sha256:${createHash("sha256").update(manifestBytes).digest("hex")}`;
   if ("kind" in input.owner && input.owner.kind === "settled_native_harness_backup"
     && manifestSha256 !== input.owner.manifestSha256) fail("preservation_source_changed");
   const inactiveSource = input.inactiveSource ? { ...input.inactiveSource, root: input.root, manifestSha256, scopeDigest: input.scopeDigest } : undefined;
@@ -236,11 +238,18 @@ async function persistNativeHarnessBackupOnce(input: PersistNativeHarnessBackupI
   const publications: ActivityPublication[] = [];
   try {
     const archive = join(scratch, "archive"), encrypted = join(scratch, "encrypted");
-    await captureNativeHarnessArchive(input.root, archive, input.signal, input.maxArchiveBytes, providerArtifacts ? ["provider-artifacts"] : []);
+    // Migration/prestage can start with a legacy unfiltered snapshot. Normalize
+    // a private copy, leaving its verified source and ownership hash untouched.
+    const snapshot = await normalizePiHarnessBackupSnapshot(input.root, join(scratch, "filtered"), input.signal);
+    if (snapshot.sourceManifestSha256) manifestSha256 = `sha256:${createHash("sha256").update(
+      await readFile(join(snapshot.root, "manifest.json"))).digest("hex")}`;
+    await captureNativeHarnessArchive(snapshot.root, archive, input.signal, input.maxArchiveBytes, providerArtifacts ? ["provider-artifacts"] : []);
     const plaintext = await digest(archive, input.signal), iv = randomBytes(12);
     const cipher = createCipheriv("aes-256-gcm", key, iv); cipher.setAAD(aad(binding));
     await pipeline(createReadStream(archive), cipher, createWriteStream(encrypted, { flags: "wx", mode: 0o600 }), { signal: input.signal });
-    const ref: Reference = { schema: SCHEMA, ...binding, manifestSha256, ...(providerArtifacts ? { providerArtifacts } : {}),
+    const ref: Reference = { schema: SCHEMA, ...binding, manifestSha256,
+      ...(snapshot.sourceManifestSha256 ? { sourceManifestSha256: snapshot.sourceManifestSha256 } : {}),
+      ...(providerArtifacts ? { providerArtifacts } : {}),
       objectKey: `${binding.companyId}/native-harness-backups/${binding.scopeDigest}/${binding.id}.pchn`,
       ...await digest(encrypted, input.signal),
       material: createLocalEncryptedCipher("write").encrypt(JSON.stringify({ schema: SCHEMA, ...binding,
@@ -474,7 +483,9 @@ export async function verifyDurableNativeHarnessBackup(input: {
   signal?: AbortSignal; downloadIdleTimeoutMs?: number;
 }): Promise<boolean> {
   const [row] = await input.db.select().from(nativeHarnessBackups).where(and(scope(input),
-    eq(nativeHarnessBackups.manifestSha256, input.manifestSha256), input.backupId ? eq(nativeHarnessBackups.id, input.backupId) : undefined,
+    or(eq(nativeHarnessBackups.manifestSha256, input.manifestSha256),
+      sql`${nativeHarnessBackups.reference}->>'sourceManifestSha256' = ${input.manifestSha256}`),
+    input.backupId ? eq(nativeHarnessBackups.id, input.backupId) : undefined,
     inArray(nativeHarnessBackups.status, ["current", "superseded"]))).limit(1);
   if (!row) return false;
   await withDownloadProgressDeadline(input, (storage, signal) => receive(storage, reference(row), undefined, signal));

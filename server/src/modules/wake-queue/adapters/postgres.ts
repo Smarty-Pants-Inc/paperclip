@@ -13,6 +13,7 @@ import { notifyChatRunMilestones } from "../../../services/chat-run-milestone-no
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../../services/delivery-work-notifications.js";
 import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop } from "../../../services/acknowledged-native-stop.js";
 import { readRunCancellation } from "../../../services/run-cancellation.js";
+import { recordStoppedBeforeFirstInput, reevaluateStoppedBeforeFirstInput, stoppedBeforeFirstInput } from "../../../services/heartbeat/pre-dispatch-stop-settlement.js";
 import { withRunRedactionHistory } from "../../../services/run-secret-redaction.js";
 import { CHAT_COMPLETION_WAKE_REASON, isCompletedOnboardingHandoffWake, settleReportedChatCompletions } from "../../../services/chat-completion-delivery.js";
 import { earlierDeclinedOutcomeReply } from "../../../services/chat-interaction-outcome-report.js";
@@ -916,7 +917,7 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: ReleaseRun, iss
     ["failed", "timed_out", "interrupted", "cancelled"].includes(run.status) &&
     issue.assigneeAgentId === run.agentId &&
     !["done", "cancelled"].includes(issue.status);
-  if (!applies || isAcknowledgedNativeStop(run) || isAcknowledgedNativeReassignmentStop(run)) return false;
+  if (!applies || stoppedBeforeFirstInput(run) || isAcknowledgedNativeStop(run) || isAcknowledgedNativeReassignmentStop(run)) return false;
   // The caller holds the issue lock. A held Pi conversation that already
   // answered every input owes no continuation: do not block it or open an
   // active_run_watchdog incident for the fresh-continuation sweep to restore.
@@ -985,6 +986,10 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: ReleaseRun, iss
           eq(nativeRunFinalizations.companyId, issue.companyId),
           eq(nativeRunFinalizations.runId, run.id),
           isNull(nativeRunFinalizations.resultId),
+          // Recovery projection is not a controller-retirement receipt. Never
+          // erase an active owner and let a later no-input proof mistake that
+          // generic clear for completed Stop containment.
+          or(isNull(nativeRunFinalizations.leaseOwner), sql`${nativeRunFinalizations.leaseExpiresAt} <= ${now.toISOString()}::timestamptz`),
         ),
       );
     await issueRecoveryActionService(tx).upsertSourceScoped({
@@ -1398,9 +1403,24 @@ export function createPostgresIssueWakeAdmission(db: Db) {
           lockedIssue,
           lockIssue,
           recovery: {
-            async readBlocker({ commentId, requestedByActorType, requestedByActorId }) {
-              const issue = lockedIssue;
+            async readBlocker({ commentId, requestedByActorType, requestedByActorId, reevaluatePersonStop }) {
+              let issue = lockedIssue;
               const userComment = requestedByActorType === "user" ? commentId : null;
+              // Revisit an already-recorded early Stop only on a real person's
+              // saved task message. Never infer input or execution authority
+              // from a timer, a recovery sweep, or caller-supplied comment ids.
+              if (reevaluatePersonStop && issue?.assigneeAgentId && userComment && requestedByActorId &&
+                  (!issue.conversationUserId || issue.conversationUserId === requestedByActorId)) {
+                const [message] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+                  eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
+                  eq(issueComments.id, userComment), eq(issueComments.authorType, "user"),
+                  eq(issueComments.authorUserId, requestedByActorId), isNull(issueComments.deletedAt),
+                  isNull(issueComments.createdByRunId),
+                )).limit(1);
+                if (message && await reevaluateStoppedBeforeFirstInput(tx as unknown as Db, {
+                  companyId, issueId, agentId: issue.assigneeAgentId,
+                })) issue = await lockIssue();
+              }
               const [resetComment] = isConversation(issue) && userComment && requestedByActorId
                 ? await tx.select({ body: issueComments.body }).from(issueComments).where(and(
                     eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
@@ -1559,6 +1579,13 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
               sql`${agentWakeupRequests.payload}->>'issueId' = ${issueRow.id}`,
             )).limit(1)
           : [];
+        // Same issue lock as Stop/first-input admission. Only settled exact-run
+        // proof exempts an undo-send; ordinary dispatched Stops stay strict.
+        if (await recordStoppedBeforeFirstInput(tx, input.companyId, run.id)) {
+          const [settled] = await tx.select({ resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns)
+            .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, run.id)));
+          run.resultJson = settled!.resultJson;
+        }
         const cancellation = readRunCancellation(run.resultJson);
         const queuedOperatorStop = run.runtimeMode === "legacy" && run.status === "cancelled" &&
           run.runtimeModeResolvedAt === null && run.startedAt === null && run.processStartedAt === null &&
@@ -1580,7 +1607,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           executionCancellationAcknowledged:
             isAcknowledgedNativeReassignmentStop(run) ||
             (run.status === "cancelled" &&
-            (queuedOperatorStop || parseObject(run.resultJson?.executionCancellation).state === "acknowledged" || isAcknowledgedNativeStop(run)) &&
+            (queuedOperatorStop || stoppedBeforeFirstInput(run) || parseObject(run.resultJson?.executionCancellation).state === "acknowledged" || isAcknowledgedNativeStop(run)) &&
             !interruptedQueue),
         };
         const preDrain = decidePreDrain(preDrainFacts);

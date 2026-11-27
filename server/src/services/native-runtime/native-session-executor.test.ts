@@ -4838,6 +4838,72 @@ describe("split durable provider checkpoint identity", () => {
 });
 
 describe("remote provider checkpoint snapshots", () => {
+  it.each(["live", "legacy"] as const)("captures and cold-restores an over-cap Pi cache tree without changing its conversation (%s)", async mode => {
+    const { captureNativeHarnessArchive, restoreNativeHarnessArchive, MAX_NATIVE_HARNESS_ENTRIES } = await import("./native-harness-backup-archive.js");
+    const { normalizePiHarnessBackupSnapshot, PI_HOME_CHECKPOINT_EXCLUDED_ENTRIES } = await import("./native-pi-checkpoint-policy.js");
+    const root = await mkdtemp(join(tmpdir(), "pi-over-cap-checkpoint-"));
+    try {
+      const source = join(root, "source"), pending = join(root, "pending"), restored = join(root, "new-box");
+      const sessionId = "existing-pi-session", sessionKey = createHash("sha256").update(sessionId).digest("hex");
+      const sessionPath = `pi-sessions/${sessionKey}`;
+      const current = { ...execution, provider: { kind: "pi_rpc", model: null },
+        session: { ...execution.session, normalizedSessionId: sessionId, driverKind: "pi_rpc" } } as unknown as NativeExecutionInputV1;
+      const retained = { "session.jsonl": '{"role":"assistant","content":"fixture history (not a model answer)"}\n',
+        "identity.json": JSON.stringify({ sessionId }), "paperclip-trailers": "task trailers", "run-context.sha256": "context",
+        "task-identifier": "TASK", ".gitignore": "pi-home/cache" };
+      for (const [path, value] of Object.entries(retained)) {
+        await mkdir(join(source, "runner", sessionPath), { recursive: true });
+        await writeFile(join(source, "runner", sessionPath, path), value);
+      }
+      for (const cache of PI_HOME_CHECKPOINT_EXCLUDED_ENTRIES) {
+        await mkdir(join(source, "runner", sessionPath, "pi-home", cache), { recursive: true });
+        await writeFile(join(source, "runner", sessionPath, "pi-home", cache, "regenerable"), "downloaded");
+      }
+      const store = join(source, "runner", sessionPath, "pi-home/data/pnpm/store");
+      // Real filesystem entries, not a mocked count or an increased safety cap.
+      for (let index = 0; index <= MAX_NATIVE_HARNESS_ENTRIES; index += 64)
+        await Promise.all(Array.from({ length: Math.min(64, MAX_NATIVE_HARNESS_ENTRIES + 1 - index) }, (_, offset) =>
+          writeFile(join(store, `cache-${index + offset}`), "")));
+      const manifestInput = { backupRoot: source, execution: current, runnerInstanceId: "same-runner",
+        sourceProviderLeaseId: "old-box", providerSessionIdentity: { providerSessionId: sessionId } };
+      // Baseline legacy snapshots hash the complete tree before durable capture.
+      await writeFile(join(source, "manifest.json"), JSON.stringify(await buildNativeHarnessBackupManifestStreamed(manifestInput)));
+      await expect(captureNativeHarnessArchive(source, join(root, "unfiltered.tar"))).rejects.toThrow("native_harness_archive_invalid");
+      let snapshot: string;
+      if (mode === "legacy") {
+        snapshot = (await normalizePiHarnessBackupSnapshot(source, pending)).root;
+      } else {
+        const execute = async ({ command, args }: { command: string; args: string[] }) => ({ exitCode: 0,
+          timedOut: false, stdout: execFileSync(command, args, { encoding: "utf8" }), stderr: "" });
+        const syncOut = async (operations: Array<{ files: Array<{ sourcePath: string; targetPath: string }> }>) => {
+          for (const operation of operations) for (const file of operation.files) await cp(file.sourcePath, file.targetPath, { recursive: true });
+        };
+        await syncRemoteRunnerDirectoryOut({ runner: { execute, syncOut } as never, sourcePath: join(source, "runner"),
+          targetPath: join(pending, "runner"), mode: 0o700,
+          excludeEntries: resolveNativeHarnessPersistenceProfile(current).directories[0]!.excludeEntries });
+        await writeFile(join(pending, "manifest.json"), JSON.stringify(await buildNativeHarnessBackupManifestStreamed({ ...manifestInput, backupRoot: pending })));
+        snapshot = pending;
+      }
+      const archive = join(root, "filtered.tar");
+      await captureNativeHarnessArchive(snapshot, archive);
+      await restoreNativeHarnessArchive(archive, restored);
+      for (const [path, value] of Object.entries(retained))
+        expect(await readFile(join(restored, "runner", sessionPath, path), "utf8")).toBe(value);
+      for (const cache of PI_HOME_CHECKPOINT_EXCLUDED_ENTRIES)
+        await expect(access(join(restored, "runner", sessionPath, "pi-home", cache))).rejects.toMatchObject({ code: "ENOENT" });
+      const restoredManifest = JSON.parse(await readFile(join(restored, "manifest.json"), "utf8"));
+      const rebuilt = await buildNativeHarnessBackupManifestStreamed({ ...manifestInput, backupRoot: restored });
+      expect(restoredManifest.directories).toEqual(rebuilt.directories);
+      expect(restoredManifest.normalizedSessionId).toBe(sessionId);
+      // The original box remains intact, including every omitted cache entry.
+      expect((await readdir(store)).length).toBe(MAX_NATIVE_HARNESS_ENTRIES + 2);
+      const build = spawnSync(process.execPath, ["-e", 'const fs=require("node:fs");fs.mkdirSync("pi-home/data/pnpm/store",{recursive:true});fs.writeFileSync("pi-home/data/pnpm/store/rebuilt","ok");console.log(JSON.parse(fs.readFileSync("identity.json")).sessionId)'],
+        { cwd: join(restored, "runner", sessionPath), encoding: "utf8" });
+      expect(build.status).toBe(0);
+      expect(build.stdout.trim()).toBe(sessionId);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }, 120_000);
+
   it.each(["codex", "grok"] as const)("excludes %s credentials and handoffs from real checkpoint copies while retaining sessions", async provider => {
     const root = await mkdtemp(join(tmpdir(), `${provider}-checkpoint-`));
     try {
@@ -14172,6 +14238,46 @@ describe("native warm session supervision", () => {
     close.mockResolvedValue(undefined);
     expect(await closeIdleWarmNativeSessionsForRestart()).toEqual({ closed: 1, busy: 0, failed: 0, failures: [] });
     expect(collectStopped).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a conversation after a non-cache archive refusal and never repeats same-owner capture", async () => {
+    const name = "warm-archive-preservation";
+    const current = { ...execution, binding: { ...execution.binding, runId: name, executionWorkspaceId: name },
+      session: { ...execution.session, normalizedSessionId: name, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } },
+    } as NativeExecutionInputV1;
+    let allowClose = false;
+    const close = vi.fn(async () => { if (!allowClose) throw new Error("native_harness_archive_invalid"); });
+    state.execute.mockReset().mockImplementationOnce(async options => {
+      await options.onSession?.({ close });
+      return { result: { summary: "earlier conversation" }, terminal: { runTerminalState: "succeeded" },
+        turnId: name, normalizedSessionId: name, providerSessionId: name, driverKind: "test", driverVersion: "1",
+        nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+    });
+    await expect(executePaperclipNativeSession({ db: leaseDb(current), execution: current, runnerInstanceId: name }))
+      .resolves.toMatchObject({ exitCode: 0 });
+    expect(close).not.toHaveBeenCalled();
+    const next = { ...current, binding: { ...current.binding, runId: `${name}-next`, executionWorkspaceId: `${name}-next` },
+      provider: { ...current.provider, model: "changed-model" } } as NativeExecutionInputV1;
+    const failures: unknown[] = [];
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try { await executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: name }); }
+        catch (error) { failures.push(error); }
+      }
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(state.execute).toHaveBeenCalledTimes(1); // No replacement provider input.
+      expect(failures).toHaveLength(2);
+      for (const error of failures) {
+        expect(nativeSessionFailureSourceCode(error)).toBe("native_harness_preservation_required");
+        expect(nativeSessionFailureDisposition(1, new Date(), nativeSessionFailureSourceCode(error)))
+          .toMatchObject({ phase: "terminal_failure", nextAttemptAt: null });
+        expect(String(error)).toContain("conversation is kept");
+      }
+      expect(readNativeSessionIdleWork()).toBe("present");
+    } finally {
+      allowClose = true;
+      await closeIdleWarmNativeSessionsForRestart();
+    }
   });
 
   it("an idle warm session whose close fails with runner_remote_process_identity_unavailable and whose Runner is proven gone is released at controller restart", async () => {
@@ -24705,6 +24811,125 @@ describe("runnerd provider runtime wiring", () => {
     expect(configuredEnvironment(environment)).toEqual({ TASK_FLAG: "kept", PAPERCLIP_CONFIGURED_ENV_KEYS: '["TASK_FLAG"]' });
     expect(runnerEnvironment).toMatchObject(paths);
   });
+
+  it.each(["cache", "non-cache"] as const)("ordinary stopped-run release checkpoints an over-cap Pi tree with one bounded outcome (%s)", async kind => {
+    // The remote filesystem, copy/filter, manifest, archive and restore are real.
+    // Runner/DB/object-store boundaries are fixtures: this is NOT a model answer.
+    const { captureNativeHarnessArchive, restoreNativeHarnessArchive, MAX_NATIVE_HARNESS_ENTRIES } = await import("./native-harness-backup-archive.js");
+    const remoteCwd = join(isolatedStateDirectory, `release-${kind}`), sessionId = randomUUID();
+    const current = { ...execution, binding: { ...execution.binding, runId: randomUUID(), issueId: randomUUID(), executionWorkspaceId: randomUUID() },
+      provider: { kind: "pi_rpc", model: "fixture/model" },
+      session: { ...execution.session, normalizedSessionId: sessionId, driverKind: "pi_rpc" } } as NativeExecutionInputV1;
+    const runnerInstanceId = `release-${kind}`, sandboxId = `sandbox-${kind}`;
+    const pack = join(isolatedStateDirectory, `release-pack-${kind}`);
+    await mkdir(pack, { recursive: true });
+    const sha = "sha256:" + createHash("sha256").update("fixture artifact\n").digest("hex");
+    const artifacts = Object.fromEntries(Object.entries({ grokLauncher: "dist/providers/grok/launcher.cjs", nodeCommand: "node_modules/node/bin/node",
+      productionLock: "pnpm-lock.yaml", opencodeCommand: "node_modules/.bin/opencode", opencodeExecutable: "node_modules/opencode-ai/bin/opencode.exe",
+      opencodeProxy: "dist/cli/opencode-app-server-proxy.cjs", acpxSidecar: "dist/cli/acpx-runtime-sidecar.cjs" }).map(([name, path]) => [name, { path, sha256: sha }]));
+    for (const artifact of Object.values(artifacts)) {
+      await mkdir(dirname(join(pack, artifact.path)), { recursive: true });
+      await writeFile(join(pack, artifact.path), "fixture artifact\n");
+    }
+    const distDigest = sha256DirectoryTree(join(pack, "dist"));
+    const payload = { compatibility: PROVIDER_PACK_COMPATIBILITY, contractDigest: sha, target: { platform: "linux", architecture: "x64" }, runnerSourceRevision: "a".repeat(40),
+      pins: { nodeMinimum: "24.11.0", codex: QUALIFIED_ACPX_PROFILES.codex.agentRuntimeVersion, opencode: "1.18.34", acpx: "0.22.0",
+        grok: QUALIFIED_ACPX_PROFILES.grok.agentRuntimeVersion, claudeAcp: QUALIFIED_ACPX_PROFILES.claude.agentServerVersion, codexAcp: QUALIFIED_ACPX_PROFILES.codex.agentServerVersion },
+      acpxProfileDigests: Object.fromEntries(["grok", "claude", "codex"].map(agent => [agent, QUALIFIED_ACPX_PROFILES[agent as "grok" | "claude" | "codex"].commandDigest])),
+      artifacts, distDigest, bridgeDigest: "sha256:" + createHash("sha256").update(sha + "\n" + sha + "\n" + distDigest).digest("hex") };
+    await writeFile(join(pack, "provider-pack.json"), JSON.stringify({ schema: "paperclip-runner/remote-provider-pack/v1", payload,
+      digest: "sha256:" + createHash("sha256").update(canonicalProviderPackJson(payload)).digest("hex") }));
+    const db = leaseDb(current, { leaseOwner: "release-owner", controllerGeneration: 1, controllerBootId: "release-boot" } as never,
+      {}, [], {}, "cancelled", [], [{ metadata: {}, providerLeaseId: sandboxId,
+        companyId: current.binding.companyId, heartbeatRunId: current.binding.runId }]);
+    const storage = vi.spyOn(harnessStorage, "durableNativeHarnessStorage").mockReturnValue({ provider: "s3" } as never);
+    const validateOwner = vi.spyOn(harnessStorage, "assertNativeHarnessBackupOwner").mockResolvedValue(undefined);
+    const checkpointRegistration = vi.spyOn(runnerCheckpoint, "nativeRunnerCheckpointRegistration").mockReturnValue(async () => undefined);
+    const archive = join(isolatedStateDirectory, `release-${kind}.tar`);
+    const persist = vi.spyOn(harnessStorage, "persistNativeHarnessBackup").mockImplementation(async input => {
+      await captureNativeHarnessArchive(input.root, archive);
+      return {} as never;
+    });
+    onTestFinished(() => { storage.mockRestore(); validateOwner.mockRestore(); checkpointRegistration.mockRestore(); persist.mockRestore(); });
+    let saving = false;
+    const copyTree = async (operations: Array<{ files: Array<{ sourcePath: string; targetPath: string }> }>) => {
+      for (const operation of operations) for (const file of operation.files) {
+        await mkdir(dirname(file.targetPath), { recursive: true });
+        await cp(file.sourcePath, file.targetPath, { recursive: true });
+      }
+    };
+    const remoteExecute = vi.fn(async (command: { command: string; args?: string[] }) => {
+      if (command.args?.[0] === "--build-metadata") return { exitCode: 0, timedOut: false, stderr: "", stdout: JSON.stringify({
+        schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd", packageName: "@paperclipai/paperclip-runner",
+        binaryContractVersion: 2, durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"],
+      }) };
+      if (command.args?.[0] === "--version") return { exitCode: 0, timedOut: false, stderr: "", stdout: "1.18.34\n" };
+      if (!saving) return { exitCode: 0, timedOut: false, stderr: "", stdout: "" };
+      try { return { exitCode: 0, timedOut: false, stdout: execFileSync(command.command, command.args ?? [], { encoding: "utf8" }), stderr: "" }; }
+      catch { return { exitCode: 1, timedOut: false, stdout: "", stderr: "fixture path not created yet" }; }
+    });
+    const onLog = vi.fn(async (_stream: "stdout" | "stderr", _message: string) => undefined);
+    const controllerArtifact = join(isolatedStateDirectory, `release-runnerd-${kind}`);
+    await writeFile(controllerArtifact, "fixture bootstrap artifact");
+    await createRunnerdBackend({ db, execution: current, runnerInstanceId, onLog, runnerRemoteProviderPackPath: pack,
+      runnerRemoteBinaryPath: controllerArtifact,
+      controllerPersistence: { bootId: "release-boot" }, runnerIngressAuthorized: true, runnerExecutionTarget: {
+        kind: "remote", transport: "sandbox", remoteCwd, environmentId: "environment", leaseId: `lease-${kind}`,
+        providerKey: "daytona", reusableLeaseConfigured: true,
+        sandboxLeaseAcquisition: { outcome: "replaced", providerLeaseId: sandboxId },
+        effectiveCapabilities: { runnerWebSocketIngress: true }, runner: { execute: remoteExecute, syncIn: vi.fn(async () => undefined), syncOut: copyTree },
+        getRunnerIngressEndpoint: async () => ({ kind: "authenticated_websocket", websocketUrl: "wss://sandbox.invalid/runner",
+          secretHeaders: [{ name: "Authorization", value: "fixture-ingress" }], generation: "1", refresh: vi.fn(), close: vi.fn(async () => undefined) }),
+      } as never });
+    state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+    const options = state.createTransport.mock.calls.at(-1)![0] as RunnerTransportOptions & {
+      controlPlaneRegistration: NonNullable<import("../../vendor/paperclip-runner/index.js").RunnerExecutionDriver["controlPlaneRegistration"]>;
+    };
+    const controller = new DurablePrpControlPlane({ stateDirectory: join(options.stateDirectory!, "control-plane"),
+      identity: options.prpIdentity! as ConstructorParameters<typeof DurablePrpControlPlane>[0]["identity"],
+      expectedRunnerVersion: "release-fixture", expectedRunnerDigest: `sha256:${"a".repeat(64)}` });
+    controller.queueCommand("run.prepare", {}); controller.queueCommand("session.open", { reuse: "same_session" });
+    let registration: Awaited<ReturnType<typeof options.controlPlaneRegistration>> | undefined;
+    onTestFinished(async () => { await registration?.release(); await controller.stop(); });
+    registration = await options.controlPlaneRegistration(controller);
+    saving = true;
+    const remoteSession = join(remoteCwd, ".paperclip-runtime/paperclip-runner/sessions", createHash("sha256").update(sessionId).digest("hex"));
+    const runnerRoot = join(remoteSession, "runner"), piSession = join(runnerRoot, "pi-sessions", createHash("sha256").update(sessionId).digest("hex"));
+    await mkdir(piSession, { recursive: true });
+    const runnerState = durableRunnerState({ ...options.prpIdentity!, runId: current.binding.runId,
+      normalizedSessionId: sessionId, runnerInstanceId }, "suspended");
+    await writeFile(join(runnerRoot, "runner-state.json"), JSON.stringify(runnerState));
+    await writeFile(join(runnerRoot, "codex-provider-state.json"), JSON.stringify({ schema: "paperclip.runner.codex-provider-state.v1",
+      lifecycle: "prepared", threadId: sessionId, providerSessionId: null, activeProviderTurnId: null,
+      config: { provider: "pi_rpc", driver: "pi_rpc" } }));
+    await writeFile(join(piSession, "session.jsonl"), "fixture retained history\n");
+    await writeFile(join(piSession, "identity.json"), JSON.stringify({ sessionId }));
+    const tree = join(piSession, kind === "cache" ? "pi-home/data/pnpm/store" : "required-history");
+    await mkdir(tree, { recursive: true });
+    for (let index = 0; index <= MAX_NATIVE_HARNESS_ENTRIES; index += 128)
+      await Promise.all(Array.from({ length: Math.min(128, MAX_NATIVE_HARNESS_ENTRIES + 1 - index) }, (_, offset) => writeFile(join(tree, `entry-${index + offset}`), "")));
+    if (kind === "cache") {
+      // Exactly the callback transport.close invokes after runner process exit.
+      await expect(registration.checkpoint!("settled")).resolves.toBeUndefined();
+      expect(persist).toHaveBeenCalledTimes(1);
+      const restored = join(isolatedStateDirectory, "same-session-restored");
+      await restoreNativeHarnessArchive(archive, restored);
+      expect(JSON.parse(await readFile(join(restored, "runner/runner-state.json"), "utf8")).normalizedSessionId).toBe(sessionId);
+      const restoredSession = join(restored, "runner/pi-sessions", createHash("sha256").update(sessionId).digest("hex"));
+      expect(JSON.parse(await readFile(join(restoredSession, "identity.json"), "utf8")).sessionId).toBe(sessionId);
+      expect(await readFile(join(restoredSession, "session.jsonl"), "utf8")).toBe("fixture retained history\n");
+      await expect(access(join(restoredSession, "pi-home/data/pnpm/store"))).rejects.toMatchObject({ code: "ENOENT" });
+    } else {
+      await expect(registration.checkpoint!("settled")).rejects.toMatchObject({ code: "native_harness_preservation_required" });
+      const attempts = remoteExecute.mock.calls.length;
+      for (let attempt = 0; attempt < 4; attempt++)
+        await expect(registration.checkpoint!("settled")).rejects.toMatchObject({ code: "native_harness_preservation_required" });
+      expect(persist).toHaveBeenCalledTimes(1);
+      expect(remoteExecute).toHaveBeenCalledTimes(attempts);
+      expect(onLog.mock.calls.filter(call => String(call[1]).includes("The previous conversation is kept"))).toHaveLength(1);
+      expect(await readFile(join(piSession, "session.jsonl"), "utf8")).toBe("fixture retained history\n");
+    }
+  }, 120_000);
 
   it("keeps the provider backup fence while its accepted result is saving the workspace", async () => {
     const current = { ...execution, binding: { ...execution.binding, runId: randomUUID(), issueId: randomUUID(),

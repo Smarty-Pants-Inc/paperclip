@@ -1,6 +1,7 @@
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { notifyNativeStatusReassessment } from "./native-status-reassessment-notifications.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-notifications.js";
+import { stoppedBeforeFirstInput } from "./person-stop-outcome.js";
 import { notifyDeferredWakesForIssue } from "./deferred-execution-notifications.js";
 import { notifyInstructionCollection } from "./instruction-collection-notifications.js";
 import { notifyExecutionRunWork } from "./execution-control-notifications.js";
@@ -72,8 +73,9 @@ export const legacyReconciliationRunFields = {
 /** Error families describe availability, not whether earlier actions happened. */
 export function legacyExecutionNeedsReconciliation(
   run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson">
-    & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot" | "controllerBootId" | "controllerProcess">>,
+    & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot" | "controllerBootId" | "controllerProcess" | "id" | "issueId" | "nativeIssueId">>,
 ): boolean {
+  if (typeof run.id === "string" && stoppedBeforeFirstInput({ ...run, id: run.id })) return false;
   if (
     run.runtimeMode === "native" ||
     !["failed", "timed_out", "interrupted", "cancelled"].includes(run.status)
@@ -117,7 +119,7 @@ export function legacyExecutionNeedsReconciliation(
 /** Admission-wait receipts are only exempt after retained execution evidence agrees.
  * The synchronous classifier stays conservative for callers without a DB proof. */
 export async function legacyExecutionNeedsReconciliationWithEvidence(db: Db, run: Run): Promise<boolean> {
-  if (await isInterruptedNativePreparation(db, run)) return false;
+  if (stoppedBeforeFirstInput(run) || await isInterruptedNativePreparation(db, run)) return false;
   return await hasUnrestoredRemoteWorkspace(db, run) ||
     (legacyExecutionNeedsReconciliation(run) && !(await isPreDispatchReviewWaitVerified(db, run))
       && !(await isPreDispatchExecutionWaitVerified(db, run)));

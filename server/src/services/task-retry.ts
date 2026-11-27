@@ -30,6 +30,7 @@ import { rearmExhaustedNativeFinalization } from "./native-runtime/exhausted-fin
 import { NativeChatReviewPresentationContentionError } from "./native-runtime/native-chat-review-presentation.js";
 import { isExternalChatWaitAuthorizationContention } from "./native-runtime/chat-attachment-reuse.js";
 import { selectTaskRetryInput } from "./chat-channels/task-retry-input.js";
+import { reevaluateStoppedBeforeFirstInput } from "./heartbeat/pre-dispatch-stop-settlement.js";
 
 export async function taskRetryMutationAllowed(db: Db, input: {
   companyId: string; issueId: string; actorId: string; actorSource: TaskRetryIntent["actorSource"];
@@ -291,10 +292,13 @@ export async function requestTaskRetry(input: TaskRetryRequest) {
 function admitTaskRetry(input: TaskRetryRequest) {
   return writeExecutionControl(input.db, DELIVERY_QUEUES.workspaceRecovery, async tx => {
     const db = tx as unknown as Db;
-    const [issue] = await tx.select().from(issues).where(and(eq(issues.companyId, input.companyId),
+    let [issue] = await tx.select().from(issues).where(and(eq(issues.companyId, input.companyId),
       eq(issues.id, input.issueId))).for("update");
     if (!issue) throw notFound("Task not found");
     assertTaskRetryConversationAllowed(issue, input.actorId);
+    if (!input.initiatedBy && issue.assigneeAgentId && await reevaluateStoppedBeforeFirstInput(db, {
+      companyId: input.companyId, issueId: input.issueId, agentId: issue.assigneeAgentId,
+    })) [issue] = await tx.select().from(issues).where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
     const key = `task-retry:${input.idempotencyKey}`;
     const [sameRequest] = await tx.select().from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.idempotencyKey, key)));
