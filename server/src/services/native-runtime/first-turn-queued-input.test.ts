@@ -133,13 +133,21 @@ describe.skipIf(!support.supported)("first-turn queued input", () => {
     const savedWake = (await readRun(f.runId)).contextSnapshot!.paperclipWake;
     expect(savedWake).toEqual(wake);
     expect(JSON.stringify(savedWake)).not.toBe(JSON.stringify(wake));
-    const bounded = budgetNativeFreshFallback(input, savedWake, { lastRunAt: "2026-01-02T00:00:00Z", readCommentIds: messages.map(m => m.id) });
-    if (chars > 100) expect(bounded!.messages.length).toBeLessThan(messages.length);
-    else expect(input.task.prompt).toBe(originalPrompt);
+    const readState = { nativeSessionId: "session", providerSessionId: "old-provider", lastRunAt: "2026-01-02T00:00:00Z", readCommentIds: messages.map(m => m.id) };
+    if (chars > 100) {
+      expect(() => budgetNativeFreshFallback(input, savedWake, readState)).toThrow(expect.objectContaining({
+        code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: expect.objectContaining({ kind: "unread_messages" }),
+      }));
+      expect(input.task.prompt).toBe(originalPrompt);
+      expect((savedWake as typeof wake).executionContinuation.messages).toEqual(messages);
+      console.info(JSON.stringify({ jsonbFallback: "fresh-refused-old-generation-cuts", chars, unicodeKeys, messagesKept: messages.length }));
+      return;
+    }
+    const bounded = budgetNativeFreshFallback(input, savedWake, readState);
+    expect(input.task.prompt).toBe(originalPrompt);
     expect(commandEnvelopeBytes(buildNativeModelEnvelope(input))).toBeLessThan(NATIVE_TURN_KNOWN_MAX_BYTES);
     expect(input.task.prompt.split(body)).toHaveLength(2);
     expect(input.task.prompt).toContain(body);
-    if (chars > 100) expect(input.task.prompt).toContain("History was cut");
     expect(input.continuationPrompt).toBeNull();
     console.info(JSON.stringify({ jsonbFallback: "fresh-cut", chars, unicodeKeys,
       ...(unicodeKeys ? { inputKeys: Object.keys(continuation.completedActions![0]!.result as object), savedKeys: Object.keys((savedWake as typeof wake).executionContinuation.completedActions![0]!.result as object) } : {}),
@@ -408,6 +416,8 @@ describe.skipIf(!support.supported)("first-turn queued input", () => {
     const sessionId = randomUUID();
     await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, f.agentId));
     await db.update(heartbeatRuns).set({ nativeSessionId: sessionId }).where(eq(heartbeatRuns.id, f.runId));
+    await appendHeartbeatRunEvent(db, { companyId: f.companyId, runId: f.runId, agentId: f.agentId, eventType: "session.started",
+      payload: { prpEvent: { normalizedSessionId: sessionId, payload: { providerSessionId: "provider-generation-1" } } } });
     const ids: string[] = [];
     for (const body of bodies) ids.push(await queueMessage(f, body));
     const text = await claimFirstTurnQueuedInput(db, binding(f, f.runId));
@@ -428,7 +438,8 @@ describe.skipIf(!support.supported)("first-turn queued input", () => {
     expect(queuedCommentIdsFromWakePayload(remainingWake!.payload)).toEqual([ids[2]]);
     const next = await startRun(f.companyId, f.agentId, f.issueId);
     let readIds: string[] = [];
-    const snapshot = await buildExecutionContinuation({ db, ...f, runId: next, previousContextRunId: f.runId, context: { wakeReason: "issue_commented" },
+    const snapshot = await buildExecutionContinuation({ db, ...f, runId: next, previousContextRunId: f.runId,
+      nativeSessionId: sessionId, nativeProviderSessionId: "provider-generation-1", context: { wakeReason: "issue_commented" },
       summary: null, exposeLowTrustRaw: false, onNativeReadState: state => { readIds = state.readCommentIds; } });
     expect(readIds.sort()).toEqual(ids.slice(0, 2).sort());
     expect(JSON.stringify((snapshot.coverage as { omitted?: unknown }).omitted ?? [])).not.toContain(ids[2]);

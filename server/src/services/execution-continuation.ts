@@ -398,9 +398,9 @@ export async function buildExecutionContinuation(input: {
   const deliveredMessages = Array.isArray(priorEnvelope.messages)
     ? priorEnvelope.messages.map(object)
     : null;
-  const [accepted] = input.previousContextRunId ? await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+  const [accepted] = input.previousContextRunId ? await db.select({ id: heartbeatRunEvents.id, seq: heartbeatRunEvents.seq }).from(heartbeatRunEvents).where(and(
     eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, input.previousContextRunId),
-    inArray(heartbeatRunEvents.eventType, ["turn.accepted", "turn.started"]))).limit(1) : [];
+    inArray(heartbeatRunEvents.eventType, ["turn.accepted", "turn.started"]))).orderBy(asc(heartbeatRunEvents.seq)).limit(1) : [];
   const priorCoverage = object(priorEnvelope.coverage);
   const omitted = accepted && input.nativeSessionId && input.nativeSessionId === previousRun?.nativeSessionId
     && priorCoverage.nativeSessionId === input.nativeSessionId
@@ -453,17 +453,27 @@ export async function buildExecutionContinuation(input: {
     )
     .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
   if (input.onNativeReadState) {
+    const generation = { nativeSessionId: input.nativeSessionId ?? null, providerSessionId: input.nativeProviderSessionId ?? null };
     const read = await readByEarlierTurnCommentIds(db, { companyId, issueId, agentId: input.agentId,
-      commentIds: messages.map(message => message.id), currentRunId: input.runId });
+      commentIds: messages.map(message => message.id), currentRunId: input.runId, retainedGeneration: generation });
+    const [previousGeneration] = input.previousContextRunId && accepted && generation.providerSessionId
+      ? await db.select({ payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents).where(and(
+        eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, input.previousContextRunId),
+        inArray(heartbeatRunEvents.eventType, ["session.started", "session.resumed", "session.reconciled"]),
+        sql`${heartbeatRunEvents.seq} <= ${accepted.seq}`,
+      )).orderBy(desc(heartbeatRunEvents.seq)).limit(1) : [];
+    const sameGeneration = !!generation.nativeSessionId && generation.nativeSessionId === previousRun?.nativeSessionId
+      && !!generation.providerSessionId
+      && object(object(object(previousGeneration?.payload).prpEvent).payload).providerSessionId === generation.providerSessionId;
     // A stored snapshot alone is not delivery proof: size refusal can precede
     // acceptance. Only a prior accepted turn can make its exact revisions read.
-    if (accepted && deliveredMessages) for (const message of messages) {
+    if (sameGeneration && accepted && deliveredMessages) for (const message of messages) {
       if (omittedRevision(message) || deliveredMessages.some(prior => prior.id === message.id && prior.updatedAt === message.updatedAt && prior.body === message.body
         && prior.deleted === message.deleted && prior.authorId === message.authorId
         && (prior.createdByRunId ?? null) === message.createdByRunId && JSON.stringify(prior.sourceTrust) === JSON.stringify(message.sourceTrust))) read.add(message.id);
     }
     const lastRun = priorRuns.findLast(run => run.id !== input.runId);
-    input.onNativeReadState({ lastRunAt: (lastRun?.startedAt ?? lastRun?.createdAt)?.toISOString() ?? null, readCommentIds: [...read] });
+    input.onNativeReadState({ ...generation, lastRunAt: (lastRun?.startedAt ?? lastRun?.createdAt)?.toISOString() ?? null, readCommentIds: [...read] });
   }
   const completedActions = priorRuns.flatMap((run) =>
     Object.entries(object(object(run.result).apiToolReceipts)).flatMap(

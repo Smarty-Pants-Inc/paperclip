@@ -862,6 +862,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
               boundCommandBytes: agent.adapterType === "paperclip_runner",
               inputRevision: context.nativeInputRevision as NativeInputRevision | undefined,
               continuationReadState: nativeContinuationReadState(context.nativeContinuationReadState),
+              continuationProviderSessionId: readNonEmptyString(parseObject(parseObject(previousNativeRun?.runnerProfileJson).sessionCheckpoint).providerSessionId),
               onContinuationBudgeted: bounded => {
                 // Called only for a full-render cut. Delta turns retain the
                 // unbounded snapshot so later deltas never resurrect old IDs.
