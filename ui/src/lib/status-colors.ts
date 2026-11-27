@@ -261,7 +261,8 @@ export const taskStatusVar: Record<string, string> = {
   done: "--status-task-done",
   blocked: "--status-task-blocked",
   cancelled: "--status-task-cancelled",
-  // Covered-blocked: the blocked shape on the in-progress blue (mirrors the icon var).
+  paused: "--muted-foreground",
+  // Waiting: the blocked shape on the in-progress blue (mirrors the icon var).
   in_queue: "--status-task-in_progress",
 };
 export const taskStatusVarDefault = "--status-task-backlog";
@@ -283,6 +284,7 @@ export const taskStatusIconVar: Record<string, string> = {
   done: "--status-task-icon-done",
   blocked: "--status-task-icon-blocked",
   cancelled: "--status-task-icon-cancelled",
+  paused: "--muted-foreground",
   in_queue: "--status-task-icon-in_queue",
 };
 export const taskStatusIconVarDefault = "--status-task-icon-backlog";

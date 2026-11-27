@@ -98,7 +98,7 @@ export function IssueStatusBadge(props: TaskStatusPresentationInput) {
       title={ariaLabel === label ? undefined : ariaLabel}
     >
       <StatusGlyph status={glyphStatus} size="sm" />
-      {sentenceCaseStatus(label.toLowerCase())}
+      {glyphStatus === "blocked" || glyphStatus === "in_queue" ? label : sentenceCaseStatus(label.toLowerCase())}
     </span>
   );
 }

@@ -13,7 +13,8 @@ import { ISSUE_HISTORY_HOVER_PREFETCH_DELAY_MS, useIssueNavigationPrefetch } fro
 import { queryKeys } from "@/lib/queryKeys";
 import { cn } from "@/lib/utils";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { StatusGlyph } from "@/components/StatusGlyph";
+import { StatusIcon } from "@/components/StatusIcon";
+import { taskStatusIconProps, type TaskStatusPresentationInput } from "@/lib/task-status-presentation";
 import { ProjectTile } from "@/components/ProjectTile";
 import { useFlyoutAppearance } from "@/components/ui/flyout-appearance";
 import { ANALYTICS_MASK_CLASS } from "@/lib/analytics/privacy";
@@ -95,9 +96,10 @@ export function quicklookAlignOffset(align: "start" | "center" | "end" = "start"
   return 0;
 }
 
-export type IssueQuicklookIssue = Pick<Issue, "id" | "title" | "updatedAt"> & {
+export type IssueQuicklookIssue = Pick<Issue, "id" | "title" | "updatedAt"> & TaskStatusPresentationInput & {
   identifier?: string | null;
   status: string;
+  displayStatus?: Issue["displayStatus"];
   priority: string;
   description?: string | null;
   blockerAttention?: Issue["blockerAttention"];
@@ -127,12 +129,6 @@ function QuicklookSeparator({ className }: { className?: string }) {
       ·
     </span>
   );
-}
-
-/** "in_review" -> "In review". The card states the status as a word, not a chip. */
-function statusLabel(status: string): string {
-  const words = status.replace(/_/g, " ");
-  return words.charAt(0).toUpperCase() + words.slice(1);
 }
 
 /**
@@ -179,7 +175,7 @@ export function IssueQuicklookCard({
     <div className={appearance === "refreshed" ? "task-hover-card" : cn("space-y-2", compact && "space-y-1.5")}>
       <div data-slot="task-preview-meta" className="flex items-center gap-1">
         <div data-slot="task-preview-identity" className="flex min-w-0 flex-1 items-center gap-1">
-          <StatusGlyph status={issue.status} size="md" title={statusLabel(issue.status)} />
+          <StatusIcon {...taskStatusIconProps(issue)} size="md" />
           <span data-slot="task-preview-id" className="shrink-0 font-mono text-(length:--text-micro) text-muted-foreground">
             {issue.identifier ?? issue.id.slice(0, 8)}
           </span>

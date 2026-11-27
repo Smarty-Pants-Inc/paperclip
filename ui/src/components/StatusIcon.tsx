@@ -31,13 +31,12 @@ export function getStatusIconLabel(status: string, externalConversationState?: "
  * sub-task / blocked-by pills, blocked inbox, quicklook, sibling nav, filters,
  * search, columns, dashboard.
  *
- * A "covered" blocked task (waiting on active work) maps to the `in_queue`
- * glyph — the blocked shape recoloured blue — while the full blocked reason
- * still rides on the accessible label.
+ * Only an evidenced human action is red. Other blocked tasks wait in blue,
+ * including sparse ownership reads. Labels and colours are resolved together.
  */
-export function StatusIcon({ status, displayStatus: presentationStatus, externalConversationState, blockerAttention, onChange, className, glyphContainerClassName, showLabel, size = "md" }: StatusIconProps) {
+export function StatusIcon({ onChange, className, glyphContainerClassName, showLabel, size = "md", ...presentation }: StatusIconProps) {
   const [open, setOpen] = useState(false);
-  const presentation = { status, displayStatus: presentationStatus, externalConversationState, blockerAttention };
+  const { status } = presentation;
   const { glyphStatus, label, ariaLabel } = resolveTaskStatusPresentation(presentation);
 
   const glyphIcon = (
