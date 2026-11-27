@@ -198,7 +198,7 @@ describe.skipIf(!support.supported)("first-turn queued input", () => {
       assertNativeQueuedTurnBound(f.runId, { task: { prompt: "request" } }, text,
         { attachmentPrompt: "late attachments: " + "a".repeat(490000) });
     }).catch(error => error);
-    expect(error).toMatchObject({ code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "queued_input" } });
+    expect(error).toMatchObject({ code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "queued_input", remedies: ["edit_message", "new_followup_task"] } });
     expect(nativePromptCauseFromError(new Error(String(error)))).toEqual(error.promptCause);
     const run = await readRun(f.runId);
     expect(readFirstTurnQueuedInputReceipt(run)).toBeNull();
@@ -212,7 +212,7 @@ describe.skipIf(!support.supported)("first-turn queued input", () => {
       assertNativeQueuedTurnBound(f.runId, { task: { prompt: "request" } }, text, { attachmentPrompt }))).resolves.toBeNull();
     expect(readFirstTurnQueuedInputReceipt(await readRun(f.runId))).toMatchObject({ commentIds: [], interactionIds: [] });
     expect(() => assertNativeTurnCommandBound("turn.start", { text: attachmentPrompt })).toThrow(expect.objectContaining({
-      code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "command", bytes: expect.any(Number), measure: "command" },
+      code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "command", bytes: expect.any(Number), measure: "command", remedies: ["edit_task_description", "new_followup_task", "report_defect"] },
     }));
   });
 
@@ -359,7 +359,7 @@ describe.skipIf(!support.supported)("first-turn queued input", () => {
     await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, f.agentId));
     const error = await claimFirstTurnQueuedInput(db, binding(f, f.runId),
       unmeasuredValidator(f.runId, "pi_rpc", "paperclip.native-execution-input.v10", undefined), { finalGuardInstalled }).catch(error => error);
-    expect(error).toMatchObject({ code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "unmeasured_composition", bytes: 0 } });
+    expect(error).toMatchObject({ code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "unmeasured_composition", bytes: 0, remedies: ["report_defect"] } });
     expect(nativePromptCauseFromError(new Error(String(error)))).toEqual(error.promptCause);
     expect(String(error)).not.toContain("too large");
     expect(readFirstTurnQueuedInputReceipt(await readRun(f.runId))).toBeNull();
