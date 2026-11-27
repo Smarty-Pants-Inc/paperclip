@@ -33,6 +33,14 @@ later retry cannot override a person's intervening decision. A caller still need
 the ordinary company, task, assignment and run permissions. Do not retry an
 uncertain write until the saved task and initialization state are reconciled.
 
+## Task list block fields
+
+`GET /api/companies/{companyId}/issues?view=compact` and `view=index` carry
+`displayStatus` and `unblockDescriptor` from the same task projection as detail.
+A missing descriptor is `null`. Index rows also carry the batched
+`blockerAttention` projection. Company and task visibility checks still apply;
+these fields do not grant access. Compact response ETags include the fields.
+
 ## Agent Invite Onboarding Endpoints
 
 Agent-oriented invite onboarding now exposes machine-readable API docs:

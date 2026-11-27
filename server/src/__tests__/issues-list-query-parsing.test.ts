@@ -36,6 +36,22 @@ describeEmbeddedPostgres("issue list status query parsing", () => {
     return (res.body as { status: string }[]).map((issue) => issue.status).sort();
   }
 
+  it("keeps person-owned block fields consistent in detail, compact and index lists", async () => {
+    const { companyId, userId, actor } = await seedCompanyWithBoardAccess(ctx.db, "Person-owned block");
+    const unblockDescriptor = { owner: { userId }, action: "Approve the deployment" };
+    const [task] = await ctx.db.insert(issues).values({ companyId, title: "Needs approval", status: "blocked", createdByUserId: userId, unblockDescriptor }).returning();
+    const app = routeApp(ctx.db, actor, issueRoutes);
+    const detail = (await request(app).get(`/api/issues/${task.id}`).expect(200)).body;
+    expect(detail).toMatchObject({ unblockDescriptor, displayStatus: "blocked", blockerAttention: expect.any(Object) });
+    for (const view of ["compact", "index"]) {
+      const path = `/api/companies/${companyId}/issues?view=${view}`;
+      const first = await request(app).get(path).expect(200);
+      expect(first.body.find((row: { id: string }) => row.id === task.id)).toMatchObject({ unblockDescriptor: detail.unblockDescriptor, displayStatus: detail.displayStatus, blockerAttention: detail.blockerAttention });
+      expect((await request(app).get(path).expect(200)).body).toEqual(first.body);
+      await request(app).get(path).set("If-None-Match", first.headers.etag).expect(304);
+    }
+  });
+
   it("accepts a single ?status=todo", async () => {
     expect(await listStatuses("?status=todo")).toEqual(["todo"]);
   });

@@ -1,4 +1,5 @@
 import { assertAgentInteraction } from "../services/agent-interaction-policy.js";
+import { issueAttentionVisibilityService } from "../services/issue-attention-visibility.js";
 import { isAppQuestionCardKey } from "../services/mcp-elicitation.js";
 import { listStalledDependencies } from "../services/recovery/blocker-stall-wakeups.js";
 import { confirmMcpAttachmentCleanup, recordMcpAttachmentCleanup, type McpAttachmentCleanup } from "../services/public-mcp/upload-cleanup.js";
@@ -3081,6 +3082,9 @@ function toCompactIssue(issue: any): CompactIssue {
     title: issue.title,
     description: issue.description,
     status: issue.status,
+    // Preserve the detail projection's block contract for both compact and index.
+    displayStatus: issue.displayStatus,
+    unblockDescriptor: issue.unblockDescriptor ?? null,
     workMode: issue.workMode,
     priority: issue.priority,
     reviewPolicy: issue.reviewPolicy,
@@ -3146,6 +3150,8 @@ function toCompactIssue(issue: any): CompactIssue {
 }
 
 function compactIssueListEtag(issues: CompactIssue[]): string {
+  // Hash the complete projection, including displayStatus and unblockDescriptor,
+  // so block-field changes cannot reuse a client's previous representation.
   const hash = createHash("sha256")
     .update(JSON.stringify(issues))
     .digest("base64url");
@@ -3371,6 +3377,9 @@ function issueListRequestKey(input: {
     companyId: input.companyId,
     query: normalizedQuery,
     route,
+    // Version the cached projection as well as its query/actor scope. The body
+    // and compact ETag both carry displayStatus and unblockDescriptor.
+    responseShape: "issue-list-block-fields-v1",
   });
   return {
     actor,
@@ -3689,6 +3698,7 @@ export function issueRoutes(
 ) {
   const router = Router();
   const svc = issueService(db);
+  const attentionVisibility = issueAttentionVisibilityService(db);
   const runRedactions = createRunSecretRedactionRegistry(db);
   const access = accessService(db);
   const secretProposals = createSecretProposalsService(db);
@@ -8463,6 +8473,7 @@ export function issueRoutes(
         identifier: row.identifier,
         status: row.status as IssueSummary["status"],
         displayStatus: row.displayStatus,
+        unblockDescriptor: row.unblockDescriptor ?? null,
         updatedAt: row.updatedAt,
         externalConversationState: row.externalConversationState,
         ...(navigation ? { parentId: row.parentId, ...navigation.get(row.id) } : {}),
@@ -8578,7 +8589,7 @@ export function issueRoutes(
     companyId: string,
     listFilters: IssueFilters,
     view: string | undefined,
-    options: { reportPagination?: boolean; listOptions?: IssueListOptions } = {},
+    options: { reportPagination?: boolean; listOptions?: IssueListOptions; deferAttention?: boolean } = {},
   ): Promise<IssueListPreparedResponse> {
     const compactView = view === "compact" || view === "index" || view === "rows";
     const canReadCompanyScope = await actorCanReadCompanyScope(req, companyId);
@@ -8611,10 +8622,13 @@ export function issueRoutes(
     const visibleRows = canReadCompanyScope
       ? rawResult
       : await filterIssuesForActor(req, rawResult);
-    const result = await redactIssueRelationEdgesOnRows(req, companyId, visibleRows);
+    // The composite Mine response batches its primary and context rows together below.
+    const safeAttentionRows = options.deferAttention ? visibleRows
+      : await attentionVisibility.redactRows(req.actor, companyId, visibleRows);
+    const result = await redactIssueRelationEdgesOnRows(req, companyId, safeAttentionRows);
     if (view === "index") {
       const body = result.map((issue) => ({ ...toCompactIssue(issue), listProjection: "index" as const }));
-      return { kind: "compact", body, etag: compactIssueListEtag(body), cacheControl: "private, must-revalidate", pagination };
+      return { kind: "compact", body, etag: options.deferAttention ? "" : compactIssueListEtag(body), cacheControl: "private, must-revalidate", pagination };
     }
     const issueIds = result.map((issue) => issue.id);
     const interruptions = await taskInterruptionPresentations(db, companyId, result);
@@ -8650,7 +8664,7 @@ export function issueRoutes(
       return {
         kind: "compact",
         body: compactResult,
-        etag: compactIssueListEtag(compactResult),
+        etag: options.deferAttention ? "" : compactIssueListEtag(compactResult),
         cacheControl: "private, must-revalidate",
         pagination,
       };
@@ -8707,7 +8721,7 @@ export function issueRoutes(
       includeRoutineExecutions: true, includeLiveDescendantSummary: true,
     };
     const readCompact = async (filters: IssueFilters, projection: "index" | "rows", listOptions?: IssueListOptions) => {
-      const prepared = await prepareIssueListForActor(req, companyId, filters, projection, { listOptions });
+      const prepared = await prepareIssueListForActor(req, companyId, filters, projection, { listOptions, deferAttention: true });
       if (prepared.kind !== "compact") throw new Error("Expected compact inbox rows");
       return prepared.body;
     };
@@ -8736,8 +8750,16 @@ export function issueRoutes(
             };
           },
         }) };
+        // One attention authorization batch for the entire response, including failed-run context.
+        // No ETag or response cache is built from the deferred, unredacted projections.
+        const safeRows = await attentionVisibility.redactRows(req.actor, companyId, [...body.issues, ...body.contextIssues]);
+        const safeBody = {
+          ...body,
+          issues: safeRows.slice(0, body.issues.length),
+          contextIssues: safeRows.slice(body.issues.length),
+        };
         // Requests that coalesce onto this read report its phases too.
-        return { kind: "inbox" as const, body, serverTimingPhases: timing.phases() };
+        return { kind: "inbox" as const, body: safeBody, serverTimingPhases: timing.phases() };
       },
     });
     res.setHeader("Cache-Control", "private, no-store");
@@ -9557,6 +9579,7 @@ export function issueRoutes(
       includeForIssueComment: wakeCommentId !== null,
     });
 
+    const [safeAttention] = await attentionVisibility.redactRows(req.actor, issue.companyId, [{ id: issue.id, blockerAttention }]);
     const response = {
       issue: {
         id: issue.id,
@@ -9566,7 +9589,7 @@ export function issueRoutes(
         description: issue.description,
         status: issue.status,
         workMode: issue.workMode,
-        ...(blockerAttention ? { blockerAttention } : {}),
+        ...(safeAttention.blockerAttention ? { blockerAttention: safeAttention.blockerAttention } : {}),
         ...(reviewAttention ? { reviewAttention } : {}),
         scheduledRetry,
         activeRecoveryAction: revalidatedActiveRecoveryAction,
@@ -9893,12 +9916,13 @@ export function issueRoutes(
     const executionBlocker = await timing.time("execution_blocker", () => getExecutionBlocker(db, issue.companyId, issue.id));
     await recordAgentChildTaskRead(db, req, issue);
     res.setHeader("Server-Timing", timing.header());
+    const [safeIssue] = await attentionVisibility.redactRows(req.actor, issue.companyId, [{ ...issue, blockerAttention }]);
     res.json({
-      ...issue,
+      ...safeIssue,
       ...inboxArchiveFields,
       goalId: goal?.id ?? issue.goalId,
       ancestors,
-      ...(blockerAttention ? { blockerAttention } : {}),
+      ...(safeIssue.blockerAttention ? { blockerAttention: safeIssue.blockerAttention } : {}),
       ...(reviewAttention ? { reviewAttention } : {}),
       successfulRunHandoff: successfulRunHandoffStates.get(issue.id) ?? null,
       executionBlocker,

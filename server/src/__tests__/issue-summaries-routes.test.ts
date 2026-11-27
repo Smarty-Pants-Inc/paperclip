@@ -6,10 +6,12 @@ import { drizzle } from "drizzle-orm/postgres-js";
 import * as schema from "@paperclipai/db/schema/index";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
 import {
-  activityLog, agents, chatConversations, chatEndpoints, companyMemberships, heartbeatRuns, issueComments, issueInboxArchives, issueReadStates, issueRelations, issues, issueThreadInteractions, toolApplications, toolConnections,
+  activityLog, agents, chatConversations, chatEndpoints, chatTaskHandoffs, companyMemberships, heartbeatRuns, issueComments, issueInboxArchives, issueReadStates, issueRelations, issues, issueThreadInteractions, toolApplications, toolConnections,
 } from "@paperclipai/db";
 import { ISSUE_SUMMARIES_MAX_IDS } from "@paperclipai/shared";
 import { issueRoutes } from "../routes/issues.js";
+import { activityRoutes } from "../routes/activity.js";
+import { attentionRoutes } from "../routes/attention.js";
 import * as issueServices from "../services/issues.js";
 import { errorHandler } from "../middleware/index.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
@@ -39,10 +41,72 @@ describeEmbeddedPostgres("bounded issue summaries", () => {
     result.use(express.json());
     result.use((req, _res, next) => { req.actor = actor as Express.Request["actor"]; next(); });
     result.use("/api", issueRoutes(ctx.db, {} as never));
+    result.use("/api", activityRoutes(ctx.db));
+    result.use("/api", attentionRoutes(ctx.db));
     result.use(errorHandler);
     return result;
   }
   const url = (companyId: string) => `/api/companies/${companyId}/issues/summaries`;
+
+  // Catch: all task glyph consumers must agree with the authorized detail route.
+  it.each(["compact", "index", "rows", "summaries", "search", "attention", "chat-handoffs", "run-activity", "run-context", "blockedBy", "blocks"] as const)(
+    "keeps blocked-sign parity on %s", async (surface) => {
+      const f = await fixture(), companyId = f.companyId, userId = f.actor.userId;
+      const [agent] = await ctx.db.insert(agents).values({ companyId, name: "Reader", role: "engineer", adapterType: "process" }).returning();
+      const descriptor = { owner: { userId }, action: "Share the release decision" };
+      const tasks = await ctx.db.insert(issues).values([
+        { companyId, title: "Parity person", status: "blocked", unblockDescriptor: descriptor, blockedTransitionAt: new Date(), assigneeAgentId: agent!.id },
+        { companyId, title: "Parity none", status: "blocked", assigneeAgentId: agent!.id },
+        { companyId, title: "Parity derived", status: "in_progress", assigneeAgentId: agent!.id },
+      ]).returning();
+      await ctx.db.insert(issueThreadInteractions).values(tasks.map(task => ({ companyId, issueId: task.id,
+        kind: "request_confirmation", addresseeUserId: userId, effectiveResolverPolicy: "human_only" as const,
+        payload: { version: 1 as const, prompt: "Confirm the release" } })));
+      const http = request(app(f.actor)), path = `/api/companies/${companyId}`;
+      const expected = new Map<string, { unblockDescriptor: unknown; displayStatus: string }>();
+      for (const task of tasks) {
+        const detail = (await http.get(`/api/issues/${task.id}`).query({ view: "core" }).expect(200)).body;
+        expect(detail.unblockDescriptor).toEqual(task.id === tasks[0]!.id ? descriptor : null);
+        expect(detail.displayStatus).toBe(task.status === "in_progress" ? "in_review" : "blocked");
+        expected.set(task.id, { unblockDescriptor: detail.unblockDescriptor, displayStatus: detail.displayStatus });
+      }
+      let rows: Array<{ id?: string; issueId?: string; unblockDescriptor?: unknown; displayStatus?: string }>;
+      if (surface === "compact" || surface === "index" || surface === "rows") {
+        rows = (await http.get(`${path}/issues`).query({ view: surface, ...(surface === "compact" ? { q: "Parity" } : { ids: tasks.map(task => task.id).join(",") }) }).expect(200)).body;
+      } else if (surface === "summaries") {
+        rows = (await http.get(url(companyId)).query({ ids: tasks.map(task => task.id).join(",") }).expect(200)).body;
+      } else if (surface === "search") {
+        rows = (await http.get(`${path}/search`).query({ q: "Parity", scope: "issues" }).expect(200)).body.results.map((result: { issue: unknown }) => result.issue);
+      } else if (surface === "attention") {
+        const feed = (await http.get(`${path}/attention`).query({ all: "true" }).expect(200)).body;
+        rows = feed.items.flatMap((item: { subject: { kind: string; id: string }; relatedIssue: { kind: string; id: string } | null }) =>
+          [item.subject, item.relatedIssue].filter(subject => subject?.kind === "issue" && expected.has(subject.id)));
+      } else if (surface === "chat-handoffs") {
+        const [chat] = await ctx.db.insert(issues).values({ companyId, title: "Chat", conversationAgentId: agent!.id, conversationUserId: userId, assigneeAgentId: agent!.id, conversationState: "active" }).returning();
+        await ctx.db.insert(chatTaskHandoffs).values(tasks.map(task => ({ companyId, taskId: task.id,
+          conversationId: chat!.id, agentId: agent!.id, sessionGeneration: 0 })));
+        rows = (await http.get(`/api/issues/${chat!.id}/chat-handoffs`).expect(200)).body.items;
+      } else if (surface === "run-activity") {
+        const [run] = await ctx.db.insert(heartbeatRuns).values({ companyId, agentId: agent!.id, status: "succeeded" }).returning();
+        await ctx.db.insert(activityLog).values(tasks.map(task => ({ companyId, runId: run!.id, entityType: "issue", entityId: task.id,
+          actorType: "user", actorId: userId, action: "issue.updated" })));
+        rows = (await http.get(`/api/heartbeat-runs/${run!.id}/issues`).expect(200)).body;
+      } else if (surface === "run-context") {
+        rows = [];
+        for (const task of tasks) {
+          const [run] = await ctx.db.insert(heartbeatRuns).values({ companyId, agentId: agent!.id, issueId: task.id, status: "succeeded" }).returning();
+          rows.push(...(await http.get(`/api/heartbeat-runs/${run!.id}/issues`).expect(200)).body);
+        }
+      } else {
+        const anchor = f.rows[0]!;
+        await ctx.db.insert(issueRelations).values(tasks.map(task => ({ companyId, type: "blocks" as const,
+          issueId: surface === "blockedBy" ? task.id : anchor.id, relatedIssueId: surface === "blockedBy" ? anchor.id : task.id })));
+        rows = (await http.get(`/api/issues/${anchor.id}`).expect(200)).body[surface];
+      }
+      expect(new Set(rows.map(row => row.issueId ?? row.id))).toEqual(new Set(expected.keys()));
+      for (const row of rows) expect(row).toMatchObject(expected.get((row.issueId ?? row.id)!)!);
+    },
+  );
 
   it("reports personal participation and archive state for navigation", async () => {
     const f = await fixture();
@@ -228,7 +292,7 @@ describeEmbeddedPostgres("bounded issue summaries", () => {
       expect(res.headers["cache-control"]).toBe("private, no-store");
       expect(res.body.map((row: { id: string }) => row.id)).toEqual([f.rows[1]!.id, f.rows[0]!.id]);
       expect(Object.keys(res.body[0]).sort()).toEqual([
-        "companyId", "displayStatus", "externalConversationState", "id", "identifier", "status", "title", "updatedAt",
+        "companyId", "displayStatus", "externalConversationState", "id", "identifier", "status", "title", "unblockDescriptor", "updatedAt",
       ]);
       expect(res.body[0].externalConversationState).toBeNull();
       expect(forbiddenRead).not.toHaveBeenCalled();
