@@ -989,6 +989,7 @@ async function materializeDecisionEffect(input: {
           or(eq(heartbeatRunEvents.eventType, "turn.completed"), and(
             eq(heartbeatRunEvents.eventType, "item.completed"),
             sql`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'kind' = 'agentMessage'`,
+            sql`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'channel' = 'final'`,
             sql`length(trim(coalesce(${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'text', ''))) > 0`,
           )),
         )).limit(1) : [];
