@@ -36,6 +36,8 @@ const transcriptState = vi.hoisted(() => ({
   isInitialHydrating: false,
   hydratedRunIds: undefined as Set<string> | undefined,
   truncatedRunIds: new Set<string>(),
+  catchingUpRunIds: new Set<string>(),
+  incompleteRunIds: new Set<string>(),
   errorsByRun: new Map<string, Error>(),
 }));
 const nativeTranscriptState = vi.hoisted(() => ({
@@ -73,6 +75,8 @@ vi.mock("@/components/transcript/useLiveRunTranscripts", () => ({
       // HIST10 reads both durable sources before selection; a completed mock read must report hydration, even for an empty log.
       hydratedRunIds: transcriptState.hydratedRunIds ?? new Set(transcriptState.isInitialHydrating ? [] : runs.map(run => run.id)),
       truncatedRunIds: transcriptState.truncatedRunIds,
+      catchingUpRunIds: transcriptState.catchingUpRunIds,
+      incompleteRunIds: transcriptState.incompleteRunIds,
       errorsByRun: new Map(transcriptState.errorsByRun),
       retry: () => {},
     };
@@ -144,6 +148,8 @@ beforeEach(() => {
   transcriptState.isInitialHydrating = false;
   transcriptState.hydratedRunIds = undefined;
   transcriptState.truncatedRunIds.clear();
+  transcriptState.catchingUpRunIds.clear();
+  transcriptState.incompleteRunIds.clear();
   transcriptState.errorsByRun.clear();
   nativeTranscriptState.transcriptByRun.clear();
   nativeTranscriptState.isInitialHydrating = false;
@@ -2198,6 +2204,80 @@ describe("bounded run output notes", () => {
         }
       }
       expect(expand).toHaveBeenCalledTimes(compactHistory ? 2 : 0);
+    },
+  );
+
+  it("keeps compact cut history and a live follow-up readable while its sequence gap is loading", async () => {
+    vi.useFakeTimers();
+    try {
+      const props = fixture();
+      props.linkedRuns = props.linkedRuns.filter(run => run.runId === "long");
+      transcriptState.truncatedRunIds.add("long");
+      transcriptState.catchingUpRunIds.add("follow-up");
+      transcriptState.hydratedRunIds!.add("follow-up");
+      nativeTranscriptState.hydratedRunIds!.add("follow-up");
+      transcriptState.transcriptByRun.set("follow-up", [assistantEntry("2026-08-25T18:03:01Z", "Working on the follow-up.", "progress")]);
+      const followUp = { ...nativeRunningRun(), id: "follow-up", createdAt: "2026-08-25T18:03:00Z", startedAt: "2026-08-25T18:03:00Z" };
+      const page = () => <TaskChatThread {...props} companyId="company" compactHistory onExpandHistory={() => {}}
+        activeRun={followUp} issueStatus="in_progress" />;
+      render(page());
+      await act(async () => vi.advanceTimersByTimeAsync(15_000));
+      expect(container.textContent).toContain("Response from long.");
+      expect(container.textContent).toContain(note);
+      expect(container.textContent).toContain("More run output");
+      expect(container.textContent).toContain("Some task history is still loading.");
+      expect(container.textContent).not.toContain("Some task history could not be loaded.");
+      transcriptState.errorsByRun.set("follow-up", new Error("HTTP 503"));
+      render(page());
+      expect(container.textContent).toContain("Some task history could not be loaded.");
+      expect([...container.querySelectorAll("button")].some(button => button.textContent === "Retry")).toBe(true);
+      transcriptState.errorsByRun.clear();
+      transcriptState.catchingUpRunIds.clear();
+      render(page());
+      expect(container.textContent).not.toContain("Some task history is still loading.");
+      expect(container.textContent).not.toContain("Some task history could not be loaded.");
+      expect(container.textContent).toContain("Response from long.");
+      expect(container.textContent).toContain(note);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each((["native", "legacy"] as const).flatMap(runtimeMode => [false, true].map(compactHistory => ({ runtimeMode, compactHistory }))))(
+    "reveals a terminal gap beside only its own run, without a loading or failure bar ($runtimeMode, compact=$compactHistory)",
+    async ({ runtimeMode, compactHistory }) => {
+      vi.useFakeTimers();
+      try {
+        const props = fixture(runtimeMode);
+        if (runtimeMode === "legacy") props.comments.push({ ...props.comments[0]!,
+          id: "long:reply", runId: "long", body: "Response from long.",
+          createdAt: new Date("2026-08-25T18:01:10Z"), updatedAt: new Date("2026-08-25T18:01:10Z"),
+        });
+        transcriptState.incompleteRunIds.add("long");
+        for (const key of ["open", "reload"]) {
+          render(<TaskChatThread key={key} {...props} issueStatus="done" compactHistory={compactHistory} />);
+          await act(async () => vi.advanceTimersByTimeAsync(60_000));
+          const marker = container.querySelector('[data-thread-anchor="long:history-missing"]');
+          expect(marker?.textContent).toBe("Part of this run's output is missing.");
+          expect(marker?.querySelector("svg.lucide-info")).not.toBeNull();
+          const anchors = [...container.querySelectorAll("[data-thread-anchor]")];
+          expect(anchors.indexOf(marker!)).toBeLessThan(anchors.findIndex(node => /^long:(turn|reply)/.test(node.getAttribute("data-thread-anchor") ?? "")));
+          expect(container.textContent?.split("Part of this run's output is missing.")).toHaveLength(2);
+          expect(container.querySelector('[data-thread-anchor="first:history-missing"]')).toBeNull();
+          expect(container.querySelector('[data-thread-anchor="last:history-missing"]')).toBeNull();
+          expect(container.textContent).toContain("Response from long.");
+          expect(container.textContent).toContain("Response from last.");
+          expect(container.textContent).not.toContain("Some task history is still loading.");
+          expect(container.textContent).not.toContain("Some task history could not be loaded.");
+          expect(container.querySelector('[data-testid="task-chat-history-loading"]')).toBeNull();
+        }
+        // Complete native events can cover a lost alternate log, just as they
+        // cover a bounded alternate log. The note follows the selected source.
+        if (runtimeMode === "native") nativeTranscriptState.transcriptByRun.set("long", transcriptState.transcriptByRun.get("long"));
+        else transcriptState.incompleteRunIds.clear();
+        render(<TaskChatThread {...props} issueStatus="done" compactHistory={compactHistory} />);
+        await act(async () => vi.advanceTimersByTimeAsync(60_000));
+        expect(container.textContent).not.toContain("Part of this run's output is missing.");
+        expect(container.textContent).toContain("Response from long.");
+      } finally { vi.useRealTimers(); }
     },
   );
 

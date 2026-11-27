@@ -1446,6 +1446,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     isInitialHydrating: logsAreInitiallyHydrating,
     hydratedRunIds: hydratedLogRunIds,
     truncatedRunIds,
+    catchingUpRunIds: logCatchingUpRunIds,
+    incompleteRunIds: incompleteLogRunIds,
     errorsByRun: logErrorsByRun,
     retry: retryLogs,
   } = useLiveRunTranscripts({ runs: logRuns, companyId, ...(props.compactHistory ? { logReadLimitBytes: COMPACT_RUN_LOG_READ_LIMIT_BYTES } : {}) });
@@ -1492,6 +1494,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     const selected = selectedTranscriptByRun.get(run.id);
     return selected && selected === nativeTranscriptByRun.get(run.id);
   }).map(run => run.id));
+  // Missing output belongs to the selected source and to this run, not the
+  // page-wide failed-read state. Complete native history can cover a lost log.
+  const missingOutputRunIds = useMemo(() => new Set(transcriptRuns.filter(run =>
+    incompleteLogRunIds?.has(run.id) && selectedTranscriptByRun.get(run.id) !== nativeTranscriptByRun.get(run.id),
+  ).map(run => run.id)), [transcriptRuns, incompleteLogRunIds, selectedTranscriptByRun, nativeTranscriptByRun]);
   // A bounded tail or a not-yet-hydrated source is not a failed read.
   const transcriptHistoryErrors = new Set(transcriptRuns.filter(run => selectedNativeRunIds.has(run.id)
     ? nativeTranscriptErrorsByRun.has(run.id)
@@ -2372,6 +2379,14 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       const entries = transcriptByRun.get(source.id) ?? [];
       const meta: NonNullable<TaskChatThreadProps["linkedRuns"]>[number] | undefined = linkedRunMetaById.get(source.id) ??
         (openSegments && liveRun ? { ...liveRun, runId: source.id } : undefined);
+      if (missingOutputRunIds.has(source.id)) {
+        const item: TaskChatMarkerItem = {
+          id: `${source.id}:history-missing`, kind: "marker", variant: "interrupted",
+          tone: "neutral", runId: source.id, retryable: false,
+          label: "Part of this run's output is missing.",
+        };
+        entriesWithFailures.push({ id: item.id, ms: toMs(meta?.startedAt ?? meta?.createdAt), order: 3, item });
+      }
       if (unavailableRunIds.has(source.id)) {
         const item: TaskChatMarkerItem = {
           id: `${source.id}:history-unavailable`, kind: "marker", variant: "interrupted",
@@ -3229,6 +3244,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     settlingRun,
     transcriptByRun,
     cutLogRunIds,
+    missingOutputRunIds,
     unavailableRunIds,
     terminalHydratedRunIds,
     linkedRunMetaById,
@@ -4298,6 +4314,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     );
   });
   const pendingTranscriptRuns = initialRuns.filter((run) => {
+    // A successful read can still trail the live stream's sequence watermark.
+    // It is loading, even after initial hydration, unless the repair read failed.
+    if (logCatchingUpRunIds?.has(run.id) && !logErrorsByRun.has(run.id) && !selectedNativeRunIds.has(run.id)) return true;
     if (unavailableRunIds.has(run.id)) return false;
     if (historyWaitExpired && isTerminalRunStatus(run.status) && rawTranscriptByRun.get(run.id)?.length &&
       !logsAreInitiallyHydrating && !(run.runtimeMode === "native" && nativeEventsAreInitiallyHydrating)) return false;
