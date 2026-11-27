@@ -68,6 +68,8 @@ type FreshIssueRunInput = {
   queuedCommentInterruptId?: string;
   queuedCommentRequestId?: string;
   boardRetryReceiptId?: string;
+  /** Server-validated source questions still owed by this person's Retry, not undelivered legacy input. */
+  retryQuestionCommentIds?: string[];
   failedChatRetryReceiptId?: string;
   ownsReconstructionContinuation: boolean;
   contextSnapshot: Record<string, unknown>;
@@ -135,6 +137,9 @@ export function createFreshIssueRunAdmission<Run extends { id: string }>(store: 
     if (input.queuedCommentRequestId || input.boardRetryReceiptId || handoffAgentId) {
       commentIds = await store.readUndeliveredLegacyCommentIds(issue.id, agentId, commentIds);
     }
+    // Delivery to a failed attempt is not an answer. Preserve the Retry's
+    // independently validated owed-question attribution after legacy filtering.
+    commentIds = [...new Set([...commentIds, ...(input.retryQuestionCommentIds ?? [])])];
 
     await store.notifyRunMilestones(issue.id);
     const responsibleUserId = await input.resolveResponsibleUserId();
