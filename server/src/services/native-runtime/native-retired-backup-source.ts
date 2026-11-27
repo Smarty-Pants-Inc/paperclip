@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { and, eq, gt, inArray, ne, notInArray, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
-import { retiredReusableLeasePredecessors } from "../environment-lease-handoff.js";
+import { retiredReusableLeasePredecessors, reusableLeaseHistoryWithDeletedTaskBindings } from "../environment-lease-handoff.js";
 import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js";
 import { hasConfirmedSandboxStopAndRetain } from "../sandbox-stop-and-retain.js";
 import { LEGACY_WORKSPACE_RECOVERY_KEY, LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "../workspace-restore-recovery-state.js";
@@ -58,10 +58,7 @@ export async function retiredSourceAuthorizesNativeBackupRestore(db: Db, input: 
 }): Promise<boolean> {
   if (!input.manifest.sourceProviderLeaseId || input.manifest.normalizedSessionId !== input.normalizedSessionId
     || input.manifest.sourceProviderLeaseId === input.targetProviderLeaseId) return false;
-  const leases = await db.select().from(environmentLeases).where(and(
-    eq(environmentLeases.companyId, input.companyId),
-    eq(environmentLeases.providerLeaseId, input.manifest.sourceProviderLeaseId),
-  ));
+  const leases = await reusableLeaseHistoryWithDeletedTaskBindings(db, input.companyId, input.manifest.sourceProviderLeaseId);
   const source = leases.filter(lease => lease.companyId === input.companyId
     && lease.providerLeaseId === input.manifest.sourceProviderLeaseId);
   const tips = source.filter(lease => !Object.hasOwn(lease.metadata ?? {}, "reusableLeaseSuccessor"));
@@ -77,10 +74,30 @@ export async function retiredSourceAuthorizesNativeBackupRestore(db: Db, input: 
     )).limit(1)).length;
   const destroyed = ["expired", "failed"].includes(lease.status) && hasRemoteTerminationReceipt(lease)
     && termination?.state === "destroyed";
-  const stamp = readNativeHarnessBackupStamp(lease.metadata?.nativeHarnessBackup, lease.providerLeaseId!);
-  if (!stamp || stamp.manifestSha256 !== input.manifestSha256
-    || stamp.normalizedSessionId !== input.normalizedSessionId
-    || stamp.runnerInstanceId !== input.manifest.runnerInstanceId) return false;
+  const matches = (stamp: ReturnType<typeof readNativeHarnessBackupStamp>) => stamp
+    && stamp.manifestSha256 === input.manifestSha256 && stamp.normalizedSessionId === input.normalizedSessionId
+    && stamp.runnerInstanceId === input.manifest.runnerInstanceId;
+  let stamp = readNativeHarnessBackupStamp(lease.metadata?.nativeHarnessBackup, lease.providerLeaseId!);
+  if (!matches(stamp)) {
+    // Several tasks can share one allocation. A verified predecessor's backup
+    // remains that task's restore authority after the tip retires the box; the
+    // tip's last task must not overwrite every other saved session's proof.
+    // The complete single-tip receipt chain above is mandatory, not arbitrary
+    // historical metadata, and a historical stamp must bind its own ended run.
+    const saved = source.find(row => row.id !== lease.id && matches(
+      readNativeHarnessBackupStamp(row.metadata?.nativeHarnessBackup, lease.providerLeaseId!)));
+    if (!saved?.heartbeatRunId) return false;
+    stamp = readNativeHarnessBackupStamp(saved.metadata?.nativeHarnessBackup, lease.providerLeaseId!);
+    const [run] = await db.select({ id: heartbeatRuns.id, finishedAt: heartbeatRuns.finishedAt,
+      createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, saved.heartbeatRunId),
+      eq(heartbeatRuns.nativeSessionId, input.normalizedSessionId),
+      eq(heartbeatRuns.runnerInstanceId, input.manifest.runnerInstanceId),
+      inArray(heartbeatRuns.status, [...TERMINAL_SOURCE_RUN_STATUSES]),
+    ));
+    if (!run || !stamp || Date.parse(stamp.completedAt) <= (run.finishedAt ?? run.createdAt).getTime()) return false;
+  }
+  if (!stamp || !matches(stamp)) return false;
   // A released lease can still be selected for resume; only a retired one is final.
   const idleSource = !destroyed && !obsoleteStopped && !await settledRestoreHoldRetiresSource(db, lease);
   if (idleSource && !await idleWarmSourceRetiresBackup(db, lease, input.currentRunId)) return false;
