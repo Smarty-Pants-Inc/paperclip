@@ -1,6 +1,6 @@
 import { useId, useState } from "react";
 import { cn } from "@/lib/utils";
-import { ChevronDown, CircleDot, FoldVertical, OctagonX, Square, Flag, KeyRound } from "lucide-react";
+import { ChevronDown, CircleDot, FoldVertical, OctagonX, Info, Flag, KeyRound } from "lucide-react";
 import { useStreamlinedTaskChatPresentation } from "./presentation-mode";
 import type { TaskChatMarkerItem } from "./task-chat-model";
 import { Button } from "@/components/ui/button";
@@ -32,7 +32,7 @@ export function TaskChatMarker({
   const [open, setOpen] = useState(false);
   const detailsId = useId();
   const streamlined = useStreamlinedTaskChatPresentation();
-  const Icon = item.tone === "neutral" ? Square : VARIANT_ICON[item.variant];
+  const Icon = item.tone === "neutral" ? Info : VARIANT_ICON[item.variant];
   const interrupted = item.variant === "interrupted" && item.tone !== "neutral";
   const relative = item.createdAtIso ? timeAgo(item.createdAtIso) : undefined;
   const label = useProviderLimitMessage(item.label);
@@ -164,12 +164,13 @@ export function TaskChatMarker({
       {item.variant !== "interrupted" ? <span className="h-px flex-1 bg-border" /> : null}
       <span
         className={cn(
-          "flex min-w-0 flex-wrap items-center gap-1.5",
+          "flex min-w-0 gap-1.5",
+          item.tone === "neutral" && !detail && !onTryAgain ? "items-start" : "flex-wrap items-center",
           interrupted && "text-destructive",
         )}
       >
-        <Icon className="h-3.5 w-3.5" />
-        <span className="font-medium">{label}</span>
+        <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden />
+        <span className="min-w-0 font-medium">{label}</span>
         {detail ? (
           <span className="text-muted-foreground">· {detail}</span>
         ) : null}

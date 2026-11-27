@@ -95,6 +95,44 @@ describe("useLiveRunTranscripts", () => {
     vi.useRealTimers();
   });
 
+  it("re-reads a missing warm-held log on terminal transition and replaces a cancelled read", async () => {
+    vi.useFakeTimers();
+    logMock.mockRejectedValueOnce(new ApiError("Run log not found", 404, { error: "Run log not found" }));
+    let cancelledSignal: AbortSignal | undefined;
+    logMock.mockImplementationOnce((_id, _offset, _limit, { signal }) => {
+      cancelledSignal = signal;
+      return new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError"))));
+    });
+    logMock.mockResolvedValue({ runId: "run-1", store: "memory", logRef: "log-1", content: "", nextOffset: 217_299 });
+    let latest!: ReturnType<typeof useLiveRunTranscripts>;
+    function Harness({ status, bytes }: { status: string; bytes?: number }) {
+      latest = useLiveRunTranscripts({
+        runs: [{ id: "run-1", status, adapterType: "paperclip_runner", logBytes: bytes }],
+        enableRealtimeUpdates: false,
+        logPollIntervalMs: 0,
+      });
+      return null;
+    }
+    const root = createRoot(document.createElement("div"));
+    try {
+      await act(async () => root.render(<Harness status="running" />));
+      expect(logMock).toHaveBeenCalledTimes(1);
+      expect(latest.hydratedRunIds.has("run-1")).toBe(true);
+      expect(latest.errorsByRun.size).toBe(0);
+      await act(async () => vi.advanceTimersByTimeAsync(600_000));
+      expect(logMock).toHaveBeenCalledTimes(1);
+      await act(async () => root.render(<Harness status="succeeded" bytes={217_299} />));
+      expect(logMock).toHaveBeenCalledTimes(2);
+      expect(latest.hydratedRunIds.has("run-1")).toBe(true);
+      await act(async () => root.render(<Harness status="succeeded" bytes={217_300} />));
+      expect(cancelledSignal?.aborted).toBe(true);
+      expect(logMock).toHaveBeenCalledTimes(3);
+      expect(latest.hydratedRunIds.has("run-1")).toBe(true);
+      expect(latest.isInitialHydrating).toBe(false);
+      expect(latest.errorsByRun.size).toBe(0);
+    } finally { await act(async () => root.unmount()); }
+  });
+
   it("pauses hidden-tab reads and resumes at the retained log offset", async () => {
     vi.useFakeTimers();
     const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");

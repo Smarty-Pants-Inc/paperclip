@@ -54,6 +54,7 @@ import {
 import { useNativeRunTranscripts } from "@/components/transcript/useNativeRunTranscripts";
 import { readTranscriptRequest } from "@/components/transcript/read-transcript-request";
 import { TaskChatLiveTail } from "@/components/task-chat/TaskChatLiveTail";
+import { TaskChatMarker } from "@/components/task-chat/TaskChatMarker";
 import { McpAppIssueProvider } from "@/components/mcp-app/McpAppIssueContext";
 import { ProviderToolIconsProvider } from "@/components/ProviderToolIcon";
 import { McpAppTurnViews, mcpAppRunRefreshKey } from "@/components/mcp-app/McpAppTurnViews";
@@ -105,6 +106,7 @@ import type {
   TaskChatInteractionItem,
   TaskChatItem,
   TaskChatMessageItem,
+  TaskChatMarkerItem,
   TaskChatPlanDocumentItem,
   TaskChatRuntimeRequestDecision,
   TaskChatRuntimeRequestItem,
@@ -177,6 +179,14 @@ import { isRunStopConfirmed } from "@/lib/wait-for-stopped-runs";
 
 const EMPTY_BROWSERS: TaskBrowser[] = [];
 const COMPACT_RUN_LOG_READ_LIMIT_BYTES = 32_000;
+
+function cutLogNote(runId: string): TaskChatMarkerItem {
+  return {
+    id: `${runId}:history-cut`, kind: "marker", variant: "interrupted", tone: "neutral", runId,
+    retryable: false,
+    label: "Earlier output from this run isn't shown: it's longer than the page loads.",
+  };
+}
 
 function toMs(value: Date | string | null | undefined): number {
   if (!value) return 0;
@@ -1439,13 +1449,17 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     errorsByRun: logErrorsByRun,
     retry: retryLogs,
   } = useLiveRunTranscripts({ runs: logRuns, companyId, ...(props.compactHistory ? { logReadLimitBytes: COMPACT_RUN_LOG_READ_LIMIT_BYTES } : {}) });
+  const historyKey = conversationMode && draftKey ? draftKey : issueId;
+  const [expiredHistoryWait, setExpiredHistoryWait] = useState<{ historyKey: typeof historyKey } | null>(null);
+  const historyWaitExpired = expiredHistoryWait !== null && expiredHistoryWait.historyKey === historyKey;
   const selectedTranscriptByRun = useMemo(() => {
     const next = new Map(logTranscriptByRun);
     for (const run of nativeRuns) {
       // A reload must not briefly draw the older source just because its HTTP
       // read won the race. Existing paint still bridges later refresh gaps.
-      if (!hydratedNativeRunIds.has(run.id) ||
-        (!["queued", "scheduled_retry"].includes(run.status) && !hydratedLogRunIds.has(run.id))) {
+      if ((!hydratedNativeRunIds.has(run.id) &&
+        !(historyWaitExpired && isTerminalRunStatus(run.status) && !nativeEventsAreInitiallyHydrating)) ||
+        (!["queued", "scheduled_retry"].includes(run.status) && !hydratedLogRunIds.has(run.id) && logsAreInitiallyHydrating)) {
         next.delete(run.id);
         continue;
       }
@@ -1469,6 +1483,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     nativeTranscriptErrorsByRun,
     hydratedNativeRunIds,
     hydratedLogRunIds,
+    historyWaitExpired,
+    nativeEventsAreInitiallyHydrating,
+    logsAreInitiallyHydrating,
   ]);
   // Read provenance from the selector's exact array, not from retained paint.
   const selectedNativeRunIds = new Set(nativeRuns.filter(run => {
@@ -1482,8 +1499,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       (nativeTranscriptErrorsByRun.has(run.id) && !(selectedTranscriptByRun.get(run.id)?.length))
   ).map(run => run.id));
   const drawnByRunRef = useRef(new Map<string, TranscriptEntry[]>());
-  const rawTranscriptByRun = useMemo(() => {
+  const drawnCutLogRunIdsRef = useRef(new Set<string>());
+  const { rawTranscriptByRun, cutLogRunIds } = useMemo(() => {
     const next = new Map(selectedTranscriptByRun);
+    const cutLogRunIds = new Set<string>();
     for (const run of transcriptRuns) {
       const selected = next.get(run.id) ?? [];
       const nativeSelected = selected === nativeTranscriptByRun.get(run.id);
@@ -1492,9 +1511,14 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         : hydratedLogRunIds.has(run.id) && !logErrorsByRun.has(run.id);
       // Only bridge a loading/failed-read gap. The freshness-selected source
       // owns content and placement; never union it with old paint.
-      next.set(run.id, !loaded && drawnByRunRef.current.has(run.id)
+      const retained = !loaded && drawnByRunRef.current.has(run.id);
+      next.set(run.id, retained
         ? drawnByRunRef.current.get(run.id)!
         : run.runtimeMode === "native" ? canonicalTranscript(selected) : selected);
+      // The note follows the drawn source through refresh gaps, just like its words.
+      if (retained ? drawnCutLogRunIdsRef.current.has(run.id) : !nativeSelected && truncatedRunIds.has(run.id)) {
+        cutLogRunIds.add(run.id);
+      }
     }
     // Keep the original attempt in place; omit only identity-and-payload-equal replay groups.
     // Whole groups prevent a replayed call being removed while its changed result survives alone.
@@ -1512,12 +1536,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       }
       return grouped;
     };
-    return new Map([...next].map(([id, entries]) => {
+    const rawTranscriptByRun = new Map([...next].map(([id, entries]) => {
       const prior = new Set((runChainIdsById.get(id) ?? []).slice(0, -1).flatMap(previous =>
         [...groups(next.get(previous) ?? []).values()].map(group => JSON.stringify(group))));
       const replayed = new Set([...groups(entries)].filter(([, group]) => prior.has(JSON.stringify(group))).map(([key]) => key));
       return [id, entries.filter(entry => !replayed.has(groupKey(entry) ?? ""))];
     }));
+    return { rawTranscriptByRun, cutLogRunIds };
   }, [
     runChainIdsById,
     selectedTranscriptByRun,
@@ -1527,7 +1552,21 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     nativeTranscriptErrorsByRun,
     hydratedLogRunIds,
     logErrorsByRun,
+    truncatedRunIds,
   ]);
+  // Hydration flags include real initial reads. Do not call an in-flight read
+  // unavailable merely because its reveal budget expired. Once no read is
+  // pending, a terminal run with no usable source needs its own honest note.
+  const unavailableRunIds = useMemo(() => new Set(transcriptRuns.filter(run =>
+    historyWaitExpired && isTerminalRunStatus(run.status) &&
+    !logsAreInitiallyHydrating && !(run.runtimeMode === "native" && nativeEventsAreInitiallyHydrating) &&
+    (!hydratedLogRunIds.has(run.id) || (run.runtimeMode === "native" && !hydratedNativeRunIds.has(run.id))) &&
+    !(hydratedNativeRunIds.has(run.id) && nativeTranscriptByRun.get(run.id)?.length) &&
+    !rawTranscriptByRun.get(run.id)?.length &&
+    !nativeTranscriptErrorsByRun.has(run.id) && !logErrorsByRun.has(run.id),
+  ).map(run => run.id)), [transcriptRuns, historyWaitExpired, logsAreInitiallyHydrating,
+    nativeEventsAreInitiallyHydrating, hydratedLogRunIds, hydratedNativeRunIds,
+    nativeTranscriptByRun, rawTranscriptByRun, nativeTranscriptErrorsByRun, logErrorsByRun]);
   const deliveryPointsByRun = useMemo(() => new Map([...rawTranscriptByRun]
     .map(([runId, entries]) => [runId, steeringDeliveryPoints(entries)])), [rawTranscriptByRun]);
   // A missing ACK/question never suppresses later output, finals or terminal.
@@ -2270,7 +2309,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // heavy assembly memo doesn't recompute on every parent render.
   const hasBrief = Boolean(issueBrief);
 
-  const { items, settledRunIds, settledReplyRunIds, emptyStoppedRunIds, runnerSegmentsById } = useMemo(() => {
+  const { items, settledRunIds, settledReplyRunIds, emptyStoppedRunIds, runnerSegmentsById, cutLogNoteRunIds } = useMemo(() => {
     // A native segment owns the same renderer in the chronological body while
     // streaming, after a steering bubble, and after persistence. No tail handoff.
     const runnerSegmentsById = new Map<string, ComponentProps<typeof TaskChatRunnerTurn>>();
@@ -2333,6 +2372,16 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       const entries = transcriptByRun.get(source.id) ?? [];
       const meta: NonNullable<TaskChatThreadProps["linkedRuns"]>[number] | undefined = linkedRunMetaById.get(source.id) ??
         (openSegments && liveRun ? { ...liveRun, runId: source.id } : undefined);
+      if (unavailableRunIds.has(source.id)) {
+        const item: TaskChatMarkerItem = {
+          id: `${source.id}:history-unavailable`, kind: "marker", variant: "interrupted",
+          tone: "neutral", runId: source.id, retryable: false,
+          label: "This run's output couldn't be loaded.",
+        };
+        entriesWithFailures.push({ id: item.id, ms: toMs(meta?.startedAt ?? meta?.createdAt), order: 3, item });
+        // Only the drawn work is unavailable. Keep assembling the empty-output
+        // run's failure/retry, credential notice and other per-run items below.
+      }
       const credentialAccess = credentialAccessNotice(meta ? {
         ...meta,
         agentName: meta.agentName || agentMap?.get(meta.agentId)?.name,
@@ -3119,6 +3168,19 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       out.splice(0, out.length, ...retained.slice(0, afterPrevious), ...following, ...retained.slice(afterPrevious));
     }
 
+    // Put the bounded-log note before the first drawn work owned by that run,
+    // not at the top of the page or once per steering segment. Keep it outside
+    // folded activity and insert before coalescing so run ownership stays clear.
+    const cutLogNoteRunIds = new Set<string>();
+    const drawnRunIds = new Set(settledTurns.map(turn => turn.sourceRunId));
+    for (let index = 0; index < out.length; index++) {
+      const runId = sourceRunByItemId.get(out[index]!.id);
+      if (!runId || !drawnRunIds.has(runId) || !cutLogRunIds.has(runId) ||
+        !transcriptByRun.get(runId)?.length || cutLogNoteRunIds.has(runId)) continue;
+      out.splice(index++, 0, cutLogNote(runId));
+      cutLogNoteRunIds.add(runId);
+    }
+
     // PAP-362: two runs replying back-to-back (same agent, nothing but the
     // agent's own bubbles between) fold into ONE "Worked" row below the last
     // reply; a user message or interaction keeps them apart.
@@ -3142,6 +3204,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       settledReplyRunIds,
       emptyStoppedRunIds,
       runnerSegmentsById,
+      cutLogNoteRunIds,
     };
   }, [
     orderedEntries,
@@ -3165,6 +3228,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     liveRun,
     settlingRun,
     transcriptByRun,
+    cutLogRunIds,
+    unavailableRunIds,
     terminalHydratedRunIds,
     linkedRunMetaById,
     lastCommentIdByRun,
@@ -4233,6 +4298,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     );
   });
   const pendingTranscriptRuns = initialRuns.filter((run) => {
+    if (unavailableRunIds.has(run.id)) return false;
+    if (historyWaitExpired && isTerminalRunStatus(run.status) && rawTranscriptByRun.get(run.id)?.length &&
+      !logsAreInitiallyHydrating && !(run.runtimeMode === "native" && nativeEventsAreInitiallyHydrating)) return false;
+    // A complete native source does not wait forever for an absent alternate
+    // log. Still wait for a real log read before choosing between fresh sources.
+    if (run.runtimeMode === "native" && hydratedNativeRunIds.has(run.id) &&
+      nativeTranscriptByRun.get(run.id)?.length && !logsAreInitiallyHydrating) return false;
     if (slowTranscriptRunIds.has(run.id) || isUserStop(run.id) || nativeTranscriptErrorsByRun.has(run.id) || logErrorsByRun?.has(run.id)) return false;
     // A scheduled retry has not started and has no log to hydrate yet.
     if (run.status === "scheduled_retry") return false;
@@ -4282,13 +4354,15 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     initialHistoryError ||
     planError ||
     transcriptHistoryErrors.size > 0 || questionReads.some(read => read.isError);
-  const historyKey = conversationMode && draftKey ? draftKey : issueId;
   const [revealedHistoryKey, setRevealedHistoryKey] = useState<string | null | undefined>(undefined);
   const revealCachedHeader = connectionStatus !== "online" && Boolean(threadHeader);
   const historyRevealed = revealedHistoryKey === historyKey || revealCachedHeader;
   useLayoutEffect(() => {
-    if (historyRevealed) drawnByRunRef.current = transcriptByRun;
-  }, [historyRevealed, transcriptByRun]);
+    if (historyRevealed) {
+      drawnByRunRef.current = transcriptByRun;
+      drawnCutLogRunIdsRef.current = cutLogRunIds;
+    }
+  }, [historyRevealed, transcriptByRun, cutLogRunIds]);
   useEffect(() => {
     if (revealCachedHeader) setRevealedHistoryKey(historyKey);
   }, [revealCachedHeader, historyKey]);
@@ -4319,8 +4393,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     return () => window.clearTimeout(timer);
   }, [historyRevealed, savedHistoryPending, hasBudgetedTranscriptRuns, historyKey, issueId]);
   const historyShellRef = useRef<HTMLDivElement>(null);
-  const [expiredHistoryWait, setExpiredHistoryWait] = useState<{ historyKey: typeof historyKey } | null>(null);
-  const historyWaitExpired = expiredHistoryWait !== null && expiredHistoryWait.historyKey === historyKey;
   const scrollTarget = taskChatHashAnchor(scrollNavigation.hash ?? "");
   const scrollCommentId = scrollTarget?.startsWith("comment-") ? scrollTarget.slice("comment-".length) : null;
   const scrollWaitKey = scrollCommentId ? JSON.stringify([issueId, scrollNavigation.key, scrollNavigation.hash]) : "";
@@ -4507,6 +4579,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                             <>
                               {!tailSegmentSettled && !recoveryOwnsStatus && (tailRunId || (optimisticRunnerStartup && !requestHasTurnSlot)) ? (
                                 <div data-testid="task-chat-live-transcript">
+                                  {tailRunId && tailEntries.length > 0 && cutLogRunIds.has(tailRunId) && !cutLogNoteRunIds.has(tailRunId)
+                                    ? <TaskChatMarker item={cutLogNote(tailRunId)} /> : null}
                                   <TaskChatShimmerScope items={tailItems}>
                                   <TaskChatRunnerHeader
                                     runId={tailRunId}

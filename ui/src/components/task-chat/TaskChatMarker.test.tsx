@@ -156,6 +156,21 @@ describe("TaskChatMarker", () => {
     ).toBe("View run");
   });
 
+  it.each([
+    "Earlier output from this run isn't shown: it's longer than the page loads.",
+    "This run's output couldn't be loaded.",
+  ])("renders the muted output note as information, not an unchecked task: %s", (label) => {
+    flushSync(() => root!.render(
+      <ThemeProvider>
+        <TaskChatMarker item={{ id: "output-note", kind: "marker", variant: "interrupted", tone: "neutral", label }} />
+      </ThemeProvider>,
+    ));
+    expect(container.textContent).toBe(label);
+    expect(container.querySelector(".lucide-square, input[type=checkbox], [role=checkbox]")).toBeNull();
+    expect(container.querySelector(".lucide-info")?.getAttribute("aria-hidden")).toBe("true");
+    expect(container.querySelector("button, .text-destructive")).toBeNull();
+  });
+
   it("keeps expected cancellation neutral when collapsed and expanded", () => {
     flushSync(() =>
       root!.render(

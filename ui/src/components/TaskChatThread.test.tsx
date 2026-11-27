@@ -40,6 +40,7 @@ const transcriptState = vi.hoisted(() => ({
 }));
 const nativeTranscriptState = vi.hoisted(() => ({
   transcriptByRun: new Map(),
+  isInitialHydrating: false,
   errorsByRun: new Map(),
   hydratedRunIds: undefined as Set<string> | undefined,
   terminalHydratedRunIds: undefined as Set<string> | undefined,
@@ -84,7 +85,7 @@ vi.mock("@/components/transcript/useNativeRunTranscripts", () => ({
       transcriptByRun: new Map(nativeTranscriptState.transcriptByRun),
       activityLabelByRun: new Map(),
       errorsByRun: new Map(nativeTranscriptState.errorsByRun),
-      isInitialHydrating: false,
+      isInitialHydrating: nativeTranscriptState.isInitialHydrating,
       retry: () => {},
       hydratedRunIds: nativeTranscriptState.hydratedRunIds ?? new Set(),
       terminalHydratedRunIds: nativeTranscriptState.terminalHydratedRunIds ??
@@ -145,6 +146,7 @@ beforeEach(() => {
   transcriptState.truncatedRunIds.clear();
   transcriptState.errorsByRun.clear();
   nativeTranscriptState.transcriptByRun.clear();
+  nativeTranscriptState.isInitialHydrating = false;
   nativeTranscriptState.errorsByRun.clear();
   nativeTranscriptState.hydratedRunIds = undefined;
   nativeTranscriptState.terminalHydratedRunIds = undefined;
@@ -2049,6 +2051,10 @@ describe("HISTFAIL durable-source failures", () => {
     vi.useFakeTimers();
     try {
       const props = historyFixture();
+      // A real pending hook reports its initial read in flight, not just a
+      // missing hydration receipt left after a cancelled read.
+      nativeTranscriptState.isInitialHydrating = source !== "log";
+      transcriptState.isInitialHydrating = source !== "native";
       if (source !== "log") nativeTranscriptState.hydratedRunIds!.delete("history-5");
       if (source !== "native") transcriptState.hydratedRunIds!.delete("history-5");
       render(<TaskChatThread {...props} />);
@@ -2062,6 +2068,8 @@ describe("HISTFAIL durable-source failures", () => {
       expect([...container.querySelectorAll("button")].some(button => button.textContent === "Retry")).toBe(false);
       nativeTranscriptState.hydratedRunIds!.add("history-5");
       transcriptState.hydratedRunIds!.add("history-5");
+      nativeTranscriptState.isInitialHydrating = false;
+      transcriptState.isInitialHydrating = false;
       render(<TaskChatThread {...props} />);
       expect(container.textContent).toContain("Saved response history-5.");
       expect(container.textContent).not.toContain("Some task history is still loading.");
@@ -2136,6 +2144,259 @@ describe("HISTFAIL durable-source failures", () => {
     expect(container.textContent).toContain("Saved response history-11.");
     expect(container.textContent).toContain("Some task history could not be loaded.");
     expect([...container.querySelectorAll("button")].some(button => button.textContent === "Retry")).toBe(true);
+  });
+});
+
+describe("bounded run output notes", () => {
+  const note = "Earlier output from this run isn't shown: it's longer than the page loads.";
+  function fixture(runtimeMode: "native" | "legacy" = "native") {
+    const linkedRuns = ["first", "long", "last"].map((runId, index) => ({
+      runId, runtimeMode, status: "succeeded", agentId: "agent-1", agentName: "Assistant",
+      adapterType: runtimeMode === "native" ? "paperclip_runner" : "claude_local",
+      createdAt: new Date(Date.UTC(2026, 7, 25, 18, index)).toISOString(),
+      startedAt: new Date(Date.UTC(2026, 7, 25, 18, index)).toISOString(),
+      finishedAt: new Date(Date.UTC(2026, 7, 25, 18, index, 10)).toISOString(),
+    }));
+    const ids = linkedRuns.map(run => run.runId);
+    nativeTranscriptState.hydratedRunIds = new Set(ids);
+    transcriptState.hydratedRunIds = new Set(ids);
+    for (const run of linkedRuns) transcriptState.transcriptByRun.set(run.runId, [
+      assistantEntry(run.startedAt, `Visible work from ${run.runId}.`, "progress"),
+      assistantEntry(run.finishedAt, `Response from ${run.runId}.`, "final"),
+    ]);
+    const comments = runtimeMode === "native" ? [] : linkedRuns.filter(run => run.runId !== "long").map(run => ({
+      id: `${run.runId}:reply`, body: `Response from ${run.runId}.`, runId: run.runId,
+      companyId: "company", issueId: "bounded-output", authorType: "agent" as const,
+      authorAgentId: "agent-1", authorUserId: null, presentation: null, metadata: null,
+      createdAt: new Date(run.finishedAt), updatedAt: new Date(run.finishedAt),
+    }));
+    return { issueId: "bounded-output", comments, onAdd: async () => {}, linkedRuns };
+  }
+
+  it.each((["native", "legacy"] as const).flatMap(runtimeMode => [false, true].map(compactHistory => ({ runtimeMode, compactHistory }))))(
+    "marks only the cut log's first drawn work on open and reload ($runtimeMode, compact=$compactHistory)",
+    async ({ runtimeMode, compactHistory }) => {
+      const props = fixture(runtimeMode);
+      transcriptState.truncatedRunIds.add("long");
+      const expand = vi.fn();
+      for (const key of ["open", "reload"]) {
+        render(<TaskChatThread key={key} {...props} compactHistory={compactHistory} onExpandHistory={expand} />);
+        await settleThreadLayout();
+        const marker = container.querySelector('[data-thread-anchor="long:history-cut"]');
+        expect(marker?.textContent).toBe(note);
+        expect(container.textContent?.split(note)).toHaveLength(2);
+        const anchors = [...container.querySelectorAll("[data-thread-anchor]")];
+        expect(anchors.indexOf(marker!)).toBeLessThan(anchors.findIndex(node => /^long:(turn|reply)/.test(node.getAttribute("data-thread-anchor") ?? "")));
+        expect(container.querySelector('[data-thread-anchor="first:history-cut"]')).toBeNull();
+        expect(container.querySelector('[data-thread-anchor="last:history-cut"]')).toBeNull();
+        expect(container.textContent).toContain("Response from last.");
+        expect(container.textContent).not.toContain("Some task history could not be loaded.");
+        if (compactHistory) {
+          const button = [...container.querySelectorAll("button")].find(button => button.textContent === "More run output");
+          expect(button).toBeDefined();
+          flushSync(() => button!.click());
+        }
+      }
+      expect(expand).toHaveBeenCalledTimes(compactHistory ? 2 : 0);
+    },
+  );
+
+  it.each([false, true])("does not mark complete native output even when its alternate log is cut (compact=%s)", async compactHistory => {
+    const props = fixture();
+    nativeTranscriptState.transcriptByRun.set("long", transcriptState.transcriptByRun.get("long"));
+    transcriptState.truncatedRunIds.add("long");
+    render(<TaskChatThread {...props} compactHistory={compactHistory} />);
+    await settleThreadLayout();
+    expect(container.textContent).toContain("Visible work from long.");
+    expect(container.textContent).not.toContain(note);
+  });
+
+  it("does not mark a whole selected log", async () => {
+    render(<TaskChatThread {...fixture()} />);
+    await settleThreadLayout();
+    expect(container.textContent).toContain("Response from long.");
+    expect(container.textContent).not.toContain(note);
+  });
+
+  it.each(["native complete", "selected cut log", "no source", "empty alternate", "log after cancelled native", "in flight"] as const)(
+    "settles a done task's history after 60 seconds: %s",
+    async shape => {
+      vi.useFakeTimers();
+      try {
+        const props = fixture();
+        const runId = "long";
+        if (shape === "native complete") {
+          nativeTranscriptState.transcriptByRun.set(runId, transcriptState.transcriptByRun.get(runId));
+          transcriptState.transcriptByRun.delete(runId);
+          transcriptState.hydratedRunIds!.delete(runId);
+        } else if (shape === "selected cut log") {
+          transcriptState.truncatedRunIds.add(runId);
+          props.linkedRuns = props.linkedRuns.map(run => run.runId === runId ? { ...run, logBytes: 417_337 } : run);
+        } else if (shape === "log after cancelled native") {
+          nativeTranscriptState.hydratedRunIds!.delete(runId);
+        } else {
+          transcriptState.transcriptByRun.delete(runId);
+          if (shape !== "empty alternate") transcriptState.hydratedRunIds!.delete(runId);
+          nativeTranscriptState.hydratedRunIds!.delete(runId);
+          nativeTranscriptState.isInitialHydrating = shape === "in flight";
+          transcriptState.isInitialHydrating = shape === "in flight";
+        }
+        render(<TaskChatThread {...props} issueStatus="done" />);
+        await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+        expect(container.querySelector('[data-testid="task-chat-history-loading"]')).toBeNull();
+        expect(container.textContent).not.toContain("Some task history could not be loaded.");
+        expect(container.textContent?.includes(note)).toBe(shape === "selected cut log");
+        expect(container.textContent?.includes("This run's output couldn't be loaded.")).toBe(shape === "no source" || shape === "empty alternate");
+        expect(container.textContent?.includes("Some task history is still loading.")).toBe(shape === "in flight");
+        if (shape === "native complete" || shape === "log after cancelled native") expect(container.textContent).toContain("Response from long.");
+        if (shape === "no source") {
+          expect(container.querySelector('[data-thread-anchor="long:history-unavailable"]')?.textContent).toBe("This run's output couldn't be loaded.");
+          transcriptState.hydratedRunIds!.add(runId);
+          transcriptState.transcriptByRun.set(runId, [assistantEntry("2026-08-25T18:01:10.000Z", "Recovered run output.", "final")]);
+          nativeTranscriptState.hydratedRunIds!.add(runId);
+          render(<TaskChatThread {...props} issueStatus="done" />);
+          expect(container.textContent).toContain("Recovered run output.");
+          expect(container.textContent).not.toContain("This run's output couldn't be loaded.");
+        }
+      } finally { vi.useRealTimers(); }
+    },
+  );
+
+  it.each([
+    { runtimeMode: "native", status: "failed", label: "Run failed" },
+    { runtimeMode: "native", status: "timed_out", label: "Run timed out" },
+    { runtimeMode: "native", status: "interrupted", label: "Run interrupted" },
+    { runtimeMode: "legacy", status: "failed", label: "Couldn't finish" },
+    { runtimeMode: "legacy", status: "timed_out", label: "Couldn't finish" },
+  ] as const)("keeps the empty-output failure and retry when output is unavailable ($runtimeMode, $status)", async ({ runtimeMode, status, label }) => {
+    vi.useFakeTimers();
+    try {
+      const props = fixture(runtimeMode);
+      props.linkedRuns = props.linkedRuns.filter(run => run.runId === "long").map(run => ({ ...run, status }));
+      transcriptState.transcriptByRun.clear();
+      const retry = vi.fn();
+      render(<TaskChatThread {...props} issueStatus="blocked" onRetryFailedRun={retry} />);
+      expect(container.querySelector('[data-thread-anchor="long:failure"]')?.textContent).toContain(label);
+      expect(container.querySelector('[data-testid="task-chat-run-failed-try-again"]')).not.toBeNull();
+      transcriptState.hydratedRunIds!.clear();
+      nativeTranscriptState.hydratedRunIds!.clear();
+      render(<TaskChatThread {...props} issueStatus="blocked" onRetryFailedRun={retry} />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+      expect(container.querySelector('[data-thread-anchor="long:history-unavailable"]')?.textContent).toBe("This run's output couldn't be loaded.");
+      expect(container.querySelector('[data-thread-anchor="long:failure"]')?.textContent).toContain(label);
+      const button = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-run-failed-try-again"]');
+      expect(button).not.toBeNull();
+      await act(async () => { button!.click(); await Promise.resolve(); });
+      expect(retry).toHaveBeenCalledWith("long");
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(["native", "legacy"] as const)("keeps the %s credential notice after unavailable output without bypassing its access gate", async runtimeMode => {
+    vi.useFakeTimers();
+    try {
+      const props = fixture(runtimeMode);
+      const linkedRuns = props.linkedRuns.filter(run => run.runId === "long").map(run => ({
+        ...run, status: "failed", errorCode: "configuration_incomplete", responsibleUserId: "board",
+        resultJson: { configurationIncomplete: { selectionFailure: "ai_connection_credential_not_shared",
+          credentialAccess: { connectionName: "Selected AI connection" } } },
+      }));
+      transcriptState.transcriptByRun.clear();
+      transcriptState.hydratedRunIds!.clear();
+      nativeTranscriptState.hydratedRunIds!.clear();
+      render(<TaskChatThread {...props} linkedRuns={linkedRuns} issueStatus="blocked" currentUserId="board" onRetryFailedRun={vi.fn()} />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+      const note = container.querySelector('[data-thread-anchor="long:history-unavailable"]');
+      expect(note?.textContent).toBe("This run's output couldn't be loaded.");
+      const notice = container.querySelector('[data-testid="task-chat-credential-access-notice"]');
+      expect(notice?.textContent).toContain("Selected AI connection");
+      expect(notice?.textContent).toContain("you don’t");
+      expect(notice?.querySelector('a[href="/agents/agent-1/runtime"]')).not.toBeNull();
+      expect(container.querySelector('[data-testid="task-chat-run-failed-try-again"]')).toBeNull();
+      const anchors = [...container.querySelectorAll("[data-thread-anchor]")];
+      expect(anchors.indexOf(note!)).toBeLessThan(anchors.findIndex(node => node.contains(notice)));
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("keeps an accepted response fallback after the unavailable-output note", async () => {
+    vi.useFakeTimers();
+    try {
+      const props = fixture();
+      const linkedRuns = props.linkedRuns.filter(run => run.runId === "long").map(run => ({ ...run,
+        resultJson: { acceptedResult: { schema: "paperclip.run_result.v1", summary: "Saved response without a readable transcript." } },
+      }));
+      transcriptState.transcriptByRun.clear();
+      transcriptState.hydratedRunIds!.clear();
+      nativeTranscriptState.hydratedRunIds!.clear();
+      render(<TaskChatThread {...props} linkedRuns={linkedRuns} />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+      expect(container.querySelector('[data-thread-anchor="long:history-unavailable"]')?.textContent).toBe("This run's output couldn't be loaded.");
+      expect(container.textContent).toContain("Saved response without a readable transcript.");
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("keeps a completed native reply visible through warm hold, terminal transition, and cancelled log refresh", async () => {
+    vi.useFakeTimers();
+    try {
+      const props = fixture();
+      nativeTranscriptState.transcriptByRun.set("long", transcriptState.transcriptByRun.get("long"));
+      transcriptState.transcriptByRun.delete("long");
+      transcriptState.hydratedRunIds!.delete("long");
+      for (const phase of ["open after reply", "ended", "cancelled read"] as const) {
+        const linkedRuns = props.linkedRuns.filter(run => run.runId === "long").map(run => ({
+          ...run, status: phase === "open after reply" ? "running" : "succeeded", logBytes: phase === "open after reply" ? 0 : 217_299,
+        }));
+        render(<TaskChatThread {...props} linkedRuns={linkedRuns}
+          comments={[{ id: "saved-final", body: "Response from long.", runId: "long", companyId: "company", issueId: props.issueId,
+            authorType: "agent", authorAgentId: "agent-1", authorUserId: null, presentation: null, metadata: null,
+            createdAt: new Date("2026-08-25T18:01:10Z"), updatedAt: new Date("2026-08-25T18:01:10Z") }]}
+          activeRun={phase === "open after reply" ? { ...nativeRunningRun(), id: "long" } : undefined}
+          issueStatus="done" />);
+        await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+        expect(container.textContent, phase).toContain("Response from long.");
+        expect(container.textContent, phase).not.toContain("Some task history is still loading.");
+        expect(container.textContent, phase).not.toContain("Some task history could not be loaded.");
+        expect(container.textContent, phase).not.toContain("This run's output couldn't be loaded.");
+        expect(container.textContent, phase).not.toContain(note);
+      }
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("marks a fresher selected log and removes the note when native events cover it", async () => {
+    const props = fixture();
+    nativeTranscriptState.transcriptByRun.set("long", [assistantEntry("2026-08-25T18:01:01.000Z", "Older native activity.", "progress")]);
+    transcriptState.truncatedRunIds.add("long");
+    render(<TaskChatThread {...props} />);
+    await settleThreadLayout();
+    expect(container.textContent?.split(note)).toHaveLength(2);
+    nativeTranscriptState.transcriptByRun.set("long", transcriptState.transcriptByRun.get("long"));
+    render(<TaskChatThread {...props} />);
+    expect(container.textContent).not.toContain(note);
+  });
+
+  it("keeps the note paired with retained log output through a failed refresh", async () => {
+    const props = fixture();
+    transcriptState.truncatedRunIds.add("long");
+    render(<TaskChatThread {...props} />);
+    await settleThreadLayout();
+    transcriptState.transcriptByRun.delete("long");
+    transcriptState.truncatedRunIds.clear();
+    transcriptState.errorsByRun.set("long", new Error("HTTP 500"));
+    render(<TaskChatThread {...props} />);
+    expect(container.textContent).toContain("Response from long.");
+    expect(container.textContent?.split(note)).toHaveLength(2);
+  });
+
+  it("does not mislabel retained native output while a cut log read fails", async () => {
+    const props = fixture();
+    nativeTranscriptState.transcriptByRun.set("long", transcriptState.transcriptByRun.get("long"));
+    render(<TaskChatThread {...props} />);
+    await settleThreadLayout();
+    transcriptState.transcriptByRun.set("long", [assistantEntry("2026-08-25T18:01:11.000Z", "Newer failed-read tail.", "final")]);
+    transcriptState.truncatedRunIds.add("long");
+    transcriptState.errorsByRun.set("long", new Error("HTTP 500"));
+    render(<TaskChatThread {...props} />);
+    expect(container.textContent).toContain("Response from long.");
+    expect(container.textContent).not.toContain(note);
   });
 });
 
