@@ -5677,6 +5677,76 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
 
   // Real PostgreSQL, runtime acquire/release/destroy and authenticated backup
   // bytes. Only the provider's remote process and model I/O are deterministic.
+  // Real PostgreSQL regressions for acquisition after terminal stop intent.
+  it.each(["undispatched", "stopped"] as const)("R-NULL projectless null-issue finalizer reopens the original conversation (%s)", async phase => {
+    const f = await terminalConversationFixture({ projectless: true });
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+    await db.update(environmentLeases).set({ issueId: null, status: "active" }).where(eq(environmentLeases.id, f.lease.id));
+    await f.runtime.releaseRunLeases(f.runId, "released", undefined, "destroy");
+    const pending = (await environmentService(db).getLeaseById(f.lease.id))!;
+    expect(pending.status).toBe("pending_cleanup");
+    expect(pending.metadata?.sandboxStopAndRetain).toMatchObject({ terminalPiSandbox: { priorStatus: "released" } });
+    if (phase === "stopped") {
+      await chSweep(f);
+      expect((await environmentService(db).getLeaseById(f.lease.id))!.status).toBe("released");
+    }
+    const result = await chReopen(f);
+    chRow("R-NULL", { phase, originalBox: f.originalBox, answer: f.answer, ...result });
+    expect(chCount(f, "environmentAcquireLease")).toBe(0);
+    if (result.error) expect(result.error).toBe("reusable_sandbox_terminal_stop_unsettled");
+    else { expect(result.box).toBe(f.originalBox); expect(result.reply).toBe(f.answer); }
+  });
+
+  it("R-MULTI-OLDER an older durable terminal conversation cannot replace the task source", async () => {
+    const f = await terminalConversationFixture();
+    const olderRun = randomUUID(), olderSession = randomUUID();
+    const olderAt = new Date(f.lease.createdAt.getTime() - 60_000);
+    await db.insert(heartbeatRuns).values({ id: olderRun, companyId: f.companyId, agentId: f.agentId,
+      issueId: f.issueId, nativeIssueId: f.issueId, nativeSessionId: olderSession, runtimeMode: "native",
+      status: "succeeded", invocationSource: "on_demand", createdAt: olderAt, finishedAt: olderAt,
+      runnerProfileJson: { nativeExecutionInput: { provider: { kind: "pi_rpc" } }, sessionCheckpoint: { sessionId: olderSession } } });
+    const [original] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+    const [older] = await db.insert(environmentLeases).values({ ...original!, id: randomUUID(), heartbeatRunId: olderRun,
+      providerLeaseId: "older-terminal-conversation", acquiredAt: olderAt, lastUsedAt: olderAt, createdAt: olderAt,
+      status: "released" }).returning();
+    await f.runtime.execute({ environment: f.environment, lease: (await environmentService(db).getLeaseById(older!.id))!,
+      command: "remember", args: ["older-conversation-only-answer"] });
+    await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, runId: olderRun, agentId: f.agentId,
+      seq: 1, eventType: "provider.event", createdAt: olderAt, payload: { answer: "older-conversation-only-answer" } });
+    await chTerminal(f, "done", 360_000);
+    const queued = await db.select().from(environmentLeases).where(eq(environmentLeases.companyId, f.companyId));
+    expect(queued.filter(lease => lease.status === "pending_cleanup" && lease.metadata?.sandboxStopAndRetain)).toHaveLength(2);
+    const result = await chReopen(f);
+    chRow("R-MULTI-OLDER", { originalBox: f.originalBox, olderBox: older!.providerLeaseId, answer: f.answer, ...result });
+    expect(chCount(f, "environmentAcquireLease")).toBe(0);
+    if (result.error) expect(result.error).toBe("reusable_sandbox_terminal_stop_unsettled");
+    else { expect(result.box).toBe(f.originalBox); expect(result.reply).toBe(f.answer); }
+  });
+
+  it.each(["pending", "stopped"] as const)("R-DIFFTASK a new task cannot consume another task's held conversation (%s)", async phase => {
+    const f = await terminalConversationFixture();
+    await chTerminal(f, "done", 360_000);
+    if (phase === "stopped") await chSweep(f);
+    const taskB = randomUUID(), runB = randomUUID();
+    await db.insert(issues).values({ id: taskB, companyId: f.companyId, title: "A new task", status: "in_progress" });
+    await db.insert(heartbeatRuns).values({ id: runB, companyId: f.companyId, agentId: f.agentId, issueId: taskB,
+      nativeIssueId: taskB, runtimeMode: "native", status: "running", invocationSource: "on_demand" });
+    const next = await f.runtime.acquireRunLease({ ...f.input, issueId: taskB, heartbeatRunId: runB });
+    const held = (await environmentService(db).getLeaseById(f.lease.id))!;
+    chRow("R-DIFFTASK-B", { phase, originalBox: f.originalBox, selected: next.lease.providerLeaseId,
+      heldStatus: held.status, stopIntent: held.metadata?.sandboxStopAndRetain, stopReceipt: held.metadata?.sandboxStopAndRetainReceipt });
+    expect(next.lease.providerLeaseId).not.toBe(f.originalBox);
+    expect(held.status).toBe(phase === "pending" ? "pending_cleanup" : "released");
+    expect(phase === "pending" ? held.metadata?.sandboxStopAndRetain : held.metadata?.sandboxStopAndRetainReceipt).toBeTruthy();
+    await f.runtime.releaseRunLeases(runB, "released", undefined, "keep_running");
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runB));
+    const result = await chReopen(f);
+    chRow("R-DIFFTASK-A", { phase, originalBox: f.originalBox, answer: f.answer, ...result });
+    expect(result.error).toBeNull();
+    expect(result.box).toBe(f.originalBox); expect(result.reply).toBe(f.answer);
+    expect(chCount(f, "environmentDestroyLease")).toBe(0);
+  });
+
   async function terminalConversationFixture(options: { backup?: boolean; session?: boolean; live?: boolean; projectless?: boolean } = {}) {
     const f = await seedReusablePluginSandboxLease("paperclip_runner");
     const issueId = randomUUID(), sessionId = randomUUID(), runnerInstanceId = randomUUID();
