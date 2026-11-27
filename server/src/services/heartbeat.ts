@@ -4132,6 +4132,8 @@ export function heartbeatService(
         }
         await cancelRunInternal(run.id, outerErr.code, {
           errorCode: outerErr.code,
+          ...(outerErr.code === "continuation_nothing_new" && outerErr.continuationNothingNew
+            ? { resultJson: { continuationNothingNew: outerErr.continuationNothingNew } } : {}),
           eventMessage: outerErr.code === "continuation_nothing_new"
             ? "continuation settled before dispatch: nothing new"
             : "stale execution continuation cancelled before dispatch",

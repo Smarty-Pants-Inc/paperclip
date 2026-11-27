@@ -2,6 +2,7 @@ export type { InboxMineSnapshot, InboxSourceError } from "./types/inbox-mine.js"
 export { CASE_HANDOFF_STATES, handoffCaseSchema, agentCaseHandoffSchema, doneCaseHandoffSchema, caseWorkflowDocumentTextSchema, caseInitialDocumentSchema, caseInitialDocumentsSchema, type CaseInitialDocument, type CaseHandoffState, type CaseHandoffDestinationKind, type AgentCaseHandoffInput, type DoneCaseHandoffInput, type HandoffCaseInput, type HandoffCaseResult, type CaseHandoff, type CaseWorkflowTransition } from "./case-handoffs.js";
 export * from "./slack-app-manifest.js";
 export * from "./analytics-consent.js";
+export { CONTINUATION_NOTHING_NEW_SCHEMA, type ContinuationNothingNew } from "./continuation-nothing-new.js";
 export * from "./routine-suggestions.js";
 export * from "./responsibility-automation.js";
 export * from "./standing-checks.js";

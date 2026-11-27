@@ -49,6 +49,9 @@ export interface ExecutionContinuationEnvelope {
   resumeDelta?: {
     baseRunId: string;
     messages: ExecutionContinuationEnvelope["messages"];
+    /** Same-generation provider receipts; bodies are deliberately not repeated.
+     * An ACK without later committed output still needs a reply turn. */
+    receivedComments?: Array<{ id: string; updatedAt: string; receivedAt: string; answered: boolean }>;
   };
   recoveryOutcomes?: Array<{ recoveryActionId: string; decision: unknown }>;
   completedWork: string | null;

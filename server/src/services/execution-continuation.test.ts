@@ -154,6 +154,26 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
     afterAll(async () => {
       await database?.cleanup();
     });
+    // Success status and turn admission are not transcript receipt. Model the
+    // committed output and checkpoint that these retained-session rows assume.
+    const commitRetainedOutput = async (sourceRunId: string, taskId: string, sessionId: string, providerSessionId: string) => {
+      const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, sourceRunId));
+      for (const event of events) await db.update(heartbeatRunEvents).set({
+        ...(event.sourceSeq === null ? { sourceSeq: event.seq + 1 } : {}),
+        ...(["turn.accepted", "turn.started"].includes(event.eventType) ? {
+          payload: { ...event.payload, prpEvent: { normalizedSessionId: sessionId, turnId: "first-turn", payload: {} } },
+        } : {}),
+      }).where(eq(heartbeatRunEvents.id, event.id));
+      const seq = Math.max(0, ...events.map(event => event.seq)) + 1;
+      const [output] = await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: sourceRunId, seq,
+        sourceSeq: seq + 1, sourceEventId: `saved-output-${seq}`, eventType: "item.completed",
+        payload: { prpEvent: { normalizedSessionId: sessionId, turnId: "first-turn", payload: { kind: "agentMessage", text: "Committed response" } } } }).returning();
+      await db.update(heartbeatRuns).set({ runnerProfileJson: { sessionCheckpoint: {
+        sessionId,
+        identity: { runId: sourceRunId, companyId, agentId, issueId: taskId, sessionId }, providerSessionId, cursor: String(seq + 1),
+      } } }).where(eq(heartbeatRuns.id, sourceRunId));
+      return output!.id;
+    };
     const build = () =>
       buildExecutionContinuation({
         db,
@@ -167,7 +187,7 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
     it("uses only accepted exact snapshot revisions as read, not a refused turn's saved input", async () => {
       const [prior] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       const delivered = await build();
-      let eventId: number | undefined;
+      let eventId: number | undefined, outputEventId: number | undefined;
       // A previously cut snapshot contains only the messages actually prepared.
       delivered.messages = delivered.messages.slice(0, 2);
       const sessionId = randomUUID(), providerSessionId = `pi-${randomUUID()}`;
@@ -184,6 +204,9 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
         const [event] = await db.insert(heartbeatRunEvents).values({ companyId, runId, agentId, seq: 1, eventType: "turn.accepted", stream: "system", level: "info" }).returning({ id: heartbeatRunEvents.id });
         eventId = event!.id;
         await read();
+        expect(state?.readCommentIds).toEqual([]);
+        outputEventId = await commitRetainedOutput(runId, issueId, sessionId, providerSessionId);
+        await read();
         expect(state?.readCommentIds).toEqual([notionId, gmailId]);
         expect(state?.lastRunAt).toBe(prior!.createdAt.toISOString());
         await db.update(issueComments).set({ updatedAt: new Date(Date.now() + 1000) }).where(eq(issueComments.id, notionId));
@@ -191,9 +214,10 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
         expect(state?.readCommentIds).toEqual([gmailId]);
       } finally {
         if (eventId !== undefined) await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.id, eventId));
+        if (outputEventId !== undefined) await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.id, outputEventId));
         await db.update(issueComments).set({ updatedAt: comment!.updatedAt }).where(eq(issueComments.id, notionId));
         await db.update(heartbeatRuns).set({ contextSnapshot: prior!.contextSnapshot, status: prior!.status, runtimeMode: prior!.runtimeMode,
-          nativeIssueId: prior!.nativeIssueId, nativeSessionId: prior!.nativeSessionId }).where(eq(heartbeatRuns.id, runId));
+          nativeIssueId: prior!.nativeIssueId, nativeSessionId: prior!.nativeSessionId, runnerProfileJson: prior!.runnerProfileJson }).where(eq(heartbeatRuns.id, runId));
       }
     });
     it.each([false, true])("keeps two ordinary comments delta-only on an oversized retained session (fresh cut: %s)", async freshCut => {
@@ -223,6 +247,7 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
         { companyId, runId: previousRunId, agentId, seq: 0, eventType: "session.started", payload: { prpEvent: { payload: { providerSessionId: "provider-generation-1" } } } },
         { companyId, runId: previousRunId, agentId, seq: 2, eventType: "task_history.read", payload: { comments: Object.fromEntries(history.map(message => [message.id, message.updatedAt.toISOString()])) } },
       ]);
+      await commitRetainedOutput(previousRunId, taskId, sessionId, "provider-generation-1");
       for (let turn = 1; turn <= 2; turn++) {
         const commentId = randomUUID(), nextRunId = randomUUID(), body = `Ordinary follow-up ${turn}`;
         await db.insert(issueComments).values({ id: commentId, companyId, issueId: taskId, authorType: "user", authorUserId: "local-board", body,
@@ -259,6 +284,7 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
         Object.assign(stored.coverage, { providerSessionId: "provider-generation-1" });
         await db.insert(heartbeatRuns).values({ id: nextRunId, companyId, agentId, runtimeMode: "native", nativeIssueId: taskId, nativeSessionId: sessionId, status: "succeeded", contextSnapshot: { issueId: taskId, executionContinuation: stored } });
         await db.insert(heartbeatRunEvents).values({ companyId, runId: nextRunId, agentId, seq: 1, eventType: "turn.accepted", stream: "system", level: "info" });
+        await commitRetainedOutput(nextRunId, taskId, sessionId, "provider-generation-1");
         previousRunId = nextRunId;
       }
     });
@@ -286,6 +312,7 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
           { companyId, runId: readerRunId, agentId, seq: 1, eventType: "turn.accepted" },
           { companyId, runId: readerRunId, agentId, seq: 2, eventType: "task_history.read", payload: { comments: { [originId]: revision.toISOString() } } },
         ]);
+        await commitRetainedOutput(readerRunId, taskId, sessionId, providerSessionId);
       }
       await db.insert(heartbeatRuns).values({ id: firstRunId, companyId, agentId, runtimeMode: "native", nativeIssueId: taskId,
         nativeSessionId: sessionId, status: "succeeded", createdAt: revision, contextSnapshot: { issueId: taskId, commentId: originId, executionContinuation: baseline },
@@ -299,6 +326,7 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
           payload: { prpEvent: { normalizedSessionId: sessionId, turnId: "first-turn", itemId: `first-turn:steer:${steeredId}`,
             payload: { kind: "steering_acknowledgement", status: "acknowledged" } } } },
       ]);
+      await commitRetainedOutput(firstRunId, taskId, sessionId, providerSessionId);
       await db.insert(issueComments).values({ id: steeredId, companyId, issueId: taskId, authorType: "user", authorUserId: "local-board",
         body: "Steered and answered during run one", createdAt: revision, updatedAt: steeredRevision });
       await db.insert(agentWakeupRequests).values({ id: queueId, companyId, agentId, source: "issue", reason: "issue_commented", status: "cancelled",
@@ -341,6 +369,7 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
             payload: { prpEvent: { normalizedSessionId: sessionId, payload: { providerSessionId } } } },
           { companyId, runId: nextRunId, agentId, seq: 1, eventType: "turn.accepted" },
         ]);
+        await commitRetainedOutput(nextRunId, taskId, sessionId, providerSessionId);
       }
     });
     it.each(["turn.accepted", "turn.started"])("replays an accepted-then-failed origin after %s", async eventType => {
@@ -398,6 +427,9 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
             payload: { prpEvent: { payload: { providerSessionId } } } },
           { companyId, runId: priorRunId, agentId, seq: 1, eventType: "turn.accepted" },
         ]);
+        await commitRetainedOutput(readerRunId, taskId, sessionId, mode === "earlier generation" ? "old-provider" :
+          mode === "generation changed before read" ? "other-provider" : providerSessionId);
+        await commitRetainedOutput(priorRunId, taskId, sessionId, providerSessionId);
         const snapshot = await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId, runId: randomUUID(),
           previousContextRunId: priorRunId, nativeSessionId: sessionId, nativeProviderSessionId: providerSessionId,
           context: { wakeReason: "issue_commented" }, summary: null, exposeLowTrustRaw: false });
