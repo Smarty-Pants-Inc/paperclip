@@ -1433,6 +1433,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     transcriptByRun: nativeTranscriptByRun,
     activityLabelByRun: nativeActivityLabelByRun,
     errorsByRun: nativeTranscriptErrorsByRun,
+    catchingUpRunIds: nativeCatchingUpRunIds,
     isInitialHydrating: nativeEventsAreInitiallyHydrating,
     hydratedRunIds: hydratedNativeRunIds,
     terminalHydratedRunIds,
@@ -4330,6 +4331,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     // A successful read can still trail the live stream's sequence watermark.
     // It is loading, even after initial hydration, unless the repair read failed.
     if (logCatchingUpRunIds?.has(run.id) && !logErrorsByRun.has(run.id) && !selectedNativeRunIds.has(run.id)) return true;
+    if (nativeCatchingUpRunIds?.has(run.id) && !nativeTranscriptErrorsByRun.has(run.id) && selectedNativeRunIds.has(run.id)) return true;
     if (unavailableRunIds.has(run.id)) return false;
     if (historyWaitExpired && isTerminalRunStatus(run.status) && rawTranscriptByRun.get(run.id)?.length &&
       !logsAreInitiallyHydrating && !(run.runtimeMode === "native" && nativeEventsAreInitiallyHydrating)) return false;
