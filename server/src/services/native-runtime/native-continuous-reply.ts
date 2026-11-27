@@ -1,4 +1,4 @@
-import { and, asc, eq, gte, inArray, isNull, lt, lte, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, lt, lte, sql } from "drizzle-orm";
 import { agentWakeupRequests, agents, heartbeatRunEvents, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import type { NativeExecutionInput, PrpEvent } from "../../vendor/paperclip-runner/index.js";
 import { completedPlanProposalIds, nativeFinalReplyKey, readCompletedAssistantMessageCandidate, resolveHeartbeatRunResponse } from "../heartbeat-run-summary.js";
@@ -175,17 +175,22 @@ export async function publishContinuousNativeReply(input: {
     // A tool may already have published this answer. Reuse only an unclaimed
     // comment inside this turn's first-event/final window, never an earlier answer
     // to a different input (even if its text is identical).
-    const [firstInput] = input.event.turnId ? await tx.select({ createdAt: heartbeatRunEvents.createdAt }).from(heartbeatRunEvents).where(and(
-      eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, runId), lt(heartbeatRunEvents.seq, input.cursor),
-      // A held turn answers many messages: start after this turn's previous
-      // final, else at its first event (turn.* events are not always persisted).
-      typeof previous?.cursor === "number" ? eq(heartbeatRunEvents.seq, Number(previous.cursor))
-        : sql`${heartbeatRunEvents.payload}->'prpEvent'->>'turnId' = ${input.event.turnId}`,
-    )).orderBy(asc(heartbeatRunEvents.seq)).limit(1) : [];
+    // One read: the window's start is a subquery, so recovery reads no extra
+    // event rows (the final-message projection stays its only event read).
+    const windowStart = typeof previous?.cursor === "number"
+      ? sql`(select ${heartbeatRunEvents.createdAt} from ${heartbeatRunEvents} where ${heartbeatRunEvents.companyId} = ${companyId}
+          and ${heartbeatRunEvents.runId} = ${runId} and ${heartbeatRunEvents.seq} = ${Number(previous.cursor)} and ${heartbeatRunEvents.seq} < ${input.cursor})`
+      : sql`(select ${heartbeatRunEvents.createdAt} from ${heartbeatRunEvents} where ${heartbeatRunEvents.companyId} = ${companyId}
+          and ${heartbeatRunEvents.runId} = ${runId} and ${heartbeatRunEvents.seq} < ${input.cursor}
+          and ${heartbeatRunEvents.payload}->'prpEvent'->>'turnId' = ${input.event.turnId ?? null}
+          order by ${heartbeatRunEvents.seq} asc limit 1)`;
     const claimedCommentIds = new Set(Object.values(replies).map(value => parseObject(value).commentId));
-    const candidates = firstInput ? await tx.select({ id: issueComments.id, body: issueComments.body }).from(issueComments).where(and(
+    // A tool may already have published this answer. Reuse only an unclaimed
+    // comment inside this turn's first-event/final window, never an earlier answer
+    // to a different input (even if its text is identical). No start = no reuse.
+    const candidates = input.event.turnId ? await tx.select({ id: issueComments.id, body: issueComments.body }).from(issueComments).where(and(
       eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), eq(issueComments.authorAgentId, agentId),
-      eq(issueComments.createdByRunId, runId), isNull(issueComments.deletedAt), gte(issueComments.createdAt, firstInput.createdAt),
+      eq(issueComments.createdByRunId, runId), isNull(issueComments.deletedAt), sql`${issueComments.createdAt} >= ${windowStart}`,
       lte(issueComments.createdAt, sql`coalesce((select ${heartbeatRunEvents.createdAt} from ${heartbeatRunEvents}
         where ${heartbeatRunEvents.companyId} = ${companyId} and ${heartbeatRunEvents.runId} = ${runId}
           and ${heartbeatRunEvents.seq} = ${input.cursor}), 'infinity'::timestamptz)`),
