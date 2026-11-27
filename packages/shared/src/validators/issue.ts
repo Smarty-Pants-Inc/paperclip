@@ -4,6 +4,7 @@ import { z } from "zod";
 import { maxStringLength } from "./text.js";
 import { ISSUE_CHAT_BOOTSTRAP_MAX_IDS, ISSUE_DOCUMENT_BATCH_MAX_IDS, ISSUE_SUMMARIES_MAX_IDS } from "../constants.js";
 import { normalizeIssueIdentifier } from "../issue-references.js";
+import { UNRECOVERED_FILES_NOTICE_KIND } from "../unrecovered-files-notice.js";
 
 import {
   ISSUE_EXECUTION_DECISION_OUTCOMES,
@@ -1175,6 +1176,14 @@ export const issueCommentMetadataSchema = z
     recoveryResponsibility: z.enum(["system", "user"]).optional(),
     attachmentPreparation: z.object({ attachmentId: z.uuid() }).strict().optional(),
     sourceChannel: z.enum(CHAT_PROVIDERS).optional(),
+    kind: z.literal(UNRECOVERED_FILES_NOTICE_KIND).optional(),
+    successorRunId: z.string().guid().nullable().optional(),
+    workspaceContinuity: z.object({
+      mode: z.enum(["fresh_isolated_workspace", "resume_preserved_workspace", "reuse_current_workspace",
+        "resume_stopped_native_workspace", "reuse_issue_workspace", "new_workspace", "unknown"]),
+      sourceRunId: z.string().guid().nullable(),
+      contentOrigin: z.enum(["configured_source", "empty", "existing_workspace", "unknown"]),
+    }).strict().optional(),
     sourceRunId: z.string().guid().nullable().optional(),
     authorizationReason: z
       .string()

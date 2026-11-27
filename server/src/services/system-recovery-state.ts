@@ -238,7 +238,7 @@ export function savedFilesUnrecoverable(state: SystemRecoveryState | null | unde
 }
 
 function unrecoverableSavedFilesReason(failure: RecoveryFailure) {
-  return recoveryRefusalReasons[failure.code] ?? "a safety check on the saved files did not pass";
+  return recoveryRefusalReasons[failure.code] ?? "your earlier saved files could not be checked safely";
 }
 
 export function unrecoverableSavedFilesNotice(failure: RecoveryFailure) {
@@ -252,10 +252,10 @@ export function isDeterministicRecoveryRefusal(state: Pick<SystemRecoveryState, 
 }
 
 const recoveryRefusalReasons: Partial<Record<RecoveryFailureCode, string>> = {
-  allocation_ownership_ambiguous: "Paperclip cannot prove which runs used the sandbox that holds the saved files",
-  source_binding_invalid: "the recorded source of the saved files does not match the run that saved them",
-  snapshot_verification_failed: "the saved snapshot of the files did not pass verification",
-  archive_unsafe: "the saved file archive contains entries that are not safe to apply",
-  source_unavailable: "the saved files are no longer available where the run recorded them",
-  historical_source_missing: "Paperclip has no record of where the run kept the saved files",
+  allocation_ownership_ambiguous: "your earlier work in this task's sandbox could not be recovered",
+  source_binding_invalid: "the saved files could not be matched safely to your earlier work",
+  snapshot_verification_failed: "the saved copy of your files could not be checked reliably",
+  archive_unsafe: "the saved copy contains files that cannot be opened safely",
+  source_unavailable: "your earlier saved files could not be found in their recorded location",
+  historical_source_missing: "the location of your earlier saved files was not recorded",
 };
