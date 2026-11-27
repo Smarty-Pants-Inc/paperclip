@@ -166,6 +166,7 @@ export const issueChatUxLiveRuns: LiveRunForIssue[] = [
   {
     id: "run-live-1",
     status: "running",
+    runModel: null,
     invocationSource: "manual",
     triggerDetail: null,
     startedAt: "2026-04-06T12:04:00.000Z",

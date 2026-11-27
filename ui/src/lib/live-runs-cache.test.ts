@@ -6,6 +6,7 @@ function run(id: string, status: string): LiveRunForIssue {
   return {
     id,
     status,
+    runModel: null,
     invocationSource: "automation",
     triggerDetail: null,
     startedAt: null,

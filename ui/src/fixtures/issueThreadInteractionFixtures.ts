@@ -1595,6 +1595,7 @@ export const issueThreadInteractionLiveRuns: LiveRunForIssue[] = [
   {
     id: "run-thread-live",
     status: "running",
+    runModel: null,
     invocationSource: "manual",
     triggerDetail: null,
     startedAt: "2026-04-20T14:26:00.000Z",
