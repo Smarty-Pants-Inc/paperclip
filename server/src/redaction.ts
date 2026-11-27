@@ -755,6 +755,42 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return proto === Object.prototype || proto === null;
 }
 
+/** Project a server-owned snapshot, not arbitrary policy objects or text. */
+export function withoutNativeTaskSnapshotRevisions<T>(value: T): T {
+  if (!isPlainObject(value)) return value;
+  const { paperclipFieldRevisions: _revisions, paperclipRevisionKeyId: _keyId, ...display } = value;
+  return display as T;
+}
+
+/** These are the ONLY context paths at which the server stores comparisons.
+ * Apply before projecting a run/context. Never search, parse or rewrite prose,
+ * or recursively delete a similarly named key from a person's executionPolicy.
+ */
+export function withoutNativeTaskRevisions<T>(value: T): T {
+  if (!isPlainObject(value)) return value;
+  const { paperclipTaskWrites: _writes, ...rest } = value;
+  const context: Record<string, unknown> = rest;
+  if (isPlainObject(context.paperclipIssue)) context.paperclipIssue = {
+    ...context.paperclipIssue,
+    ...(Object.hasOwn(context.paperclipIssue, "continuationSnapshot") ? {
+      continuationSnapshot: withoutNativeTaskSnapshotRevisions(context.paperclipIssue.continuationSnapshot),
+    } : {}),
+  };
+  if (isPlainObject(context.paperclipEndTaskSnapshot)) context.paperclipEndTaskSnapshot = {
+    ...context.paperclipEndTaskSnapshot,
+    taskSnapshot: withoutNativeTaskSnapshotRevisions(context.paperclipEndTaskSnapshot.taskSnapshot),
+  };
+  return context as T;
+}
+
+/** Full run rows have exactly one contextSnapshot carrier. Events/tool text do
+ * not contain server snapshots; they are not recursively interpreted as runs.
+ */
+export function withoutNativeRunTaskRevisions<T>(value: T): T {
+  if (!isPlainObject(value) || !Object.hasOwn(value, "contextSnapshot")) return value;
+  return { ...value, contextSnapshot: withoutNativeTaskRevisions(value.contextSnapshot) } as T;
+}
+
 function sanitizeValue(value: unknown): unknown {
   if (value === null || value === undefined) return value;
   // Adapter diagnostics are provider-controlled text. Secret-bearing header or

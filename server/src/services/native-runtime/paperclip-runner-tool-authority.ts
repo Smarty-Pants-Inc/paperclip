@@ -47,6 +47,7 @@ import { assertAssignableAgent } from "../agent-assignability.js";
 import { approvalReadSqlCondition, canActorReadApproval, authorizationService, issueReadSqlCondition, type AuthorizationActor } from "../authorization.js";
 import { resolveCoreTrustPreset } from "../trust-preset-resolver.js";
 import { normalizeIssueExecutionPolicy, redactIssueMonitorExternalRef } from "../issue-execution-policy.js";
+import { persistNativeTaskWriteReceipt } from "../native-task-write-receipts.js";
 import { buildLowTrustSourceTrust, isLowTrustQuarantined, LOW_TRUST_QUARANTINED_BODY, resolveActorSourceTrustForIssue, sanitizeQuarantinedCommentForHigherTrust } from "../source-trust.js";
 import { handoffPlanContext } from "./handoff-plan-context.js";
 import { callCreateSkillTool, callUpdateSkillDetailsTool, callUpdateSkillTool } from "../skill-tools.js";
@@ -489,6 +490,10 @@ export class PaperclipRunnerToolAuthority {
   }
 
   async recover(call: Parameters<PaperclipRunnerToolAuthority["execute"]>[0]): Promise<{ result: unknown; isError?: boolean } | null> {
+    return this.#recover(call);
+  }
+
+  async #recover(call: Parameters<PaperclipRunnerToolAuthority["execute"]>[0]): Promise<{ result: unknown; isError?: boolean } | null> {
     await this.#assertToolScope(call.tool);
     if (!this.binding.museRuntime) await this.binding.assertBridgeAuthority?.();
     const context = await this.#boundContext({ tool: call.tool });
@@ -672,6 +677,10 @@ export class PaperclipRunnerToolAuthority {
     callId: string;
     arguments: unknown;
   }): Promise<unknown> {
+    return this.#execute(call);
+  }
+
+  async #execute(call: Parameters<PaperclipRunnerToolAuthority["execute"]>[0]): Promise<unknown> {
     // Advertised schemas are plain objects so every model host shows their
     // arguments; their cross-field variants are checked here with named errors.
     if (!this.binding.assignedMcpTools?.has(call.tool) && !isConnectorTool(call.tool)) {
@@ -1038,7 +1047,15 @@ export class PaperclipRunnerToolAuthority {
           taskQuestionContext: await readTaskQuestionContext(this.db, {
             ...this.binding, conversationMode: isConversation(context.issue),
           }),
-          activeTask: redactedTask(context.issue),
+          // Detail only for ordinary assigned work. Restricted Muse, Dot,
+          // skill-test and review profiles retain their pre-v4 projection.
+          activeTask: { ...redactedTask(context.issue),
+            ...(!this.binding.museRuntime && !this.binding.dotRuntime && !this.binding.nativeReview ? {
+              executionPolicy: context.issue.executionPolicy, billingCode: context.issue.billingCode,
+              reviewPolicy: context.issue.reviewPolicy, responsibleUserId: context.issue.responsibleUserId,
+              conversationAgentId: context.issue.conversationAgentId,
+            } : {}),
+          },
           completionContinuation: monitorCheckAt ? {
             kind: "monitor",
             summary: "Wait for the saved task monitor.",
@@ -2531,7 +2548,7 @@ export class PaperclipRunnerToolAuthority {
       const updated = changed ? await issueService(tx).update(taskId, {
         companyGuard: this.binding.companyId, assigneeAgentId, assigneeUserId,
         status: target.status === "in_progress" ? "todo" : target.status,
-        statusVersion: target.statusVersion + 1, actorAgentId: this.binding.agentId,
+        statusVersion: target.statusVersion + 1, actorAgentId: this.binding.agentId, actorRunId: this.binding.runId,
       }, tx) : target;
       if (!updated) throw new Error("paperclip_runner_task_not_found");
       const receipt = {
@@ -2676,6 +2693,8 @@ export class PaperclipRunnerToolAuthority {
       const [updated] = await tx.update(issues).set({ ...patch, updatedAt: new Date() })
         .where(and(eq(issues.id, target.id), eq(issues.companyId, this.binding.companyId))).returning();
       if (!updated) throw notFound("Task not found");
+      await persistNativeTaskWriteReceipt(tx, { before: target, after: updated,
+        actorAgentId: this.binding.agentId, actorRunId: this.binding.runId });
       const monitor = summarizeIssueMonitor(updated, normalizeIssueExecutionPolicy(updated.executionPolicy));
       const activity = await persistActivity(tx, {
         companyId: this.binding.companyId, actorType: "agent", actorId: this.binding.agentId,

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns } from "@paperclipai/db";
-import { REDACTED_EVENT_VALUE } from "../redaction.js";
+import { REDACTED_EVENT_VALUE, withoutNativeRunTaskRevisions } from "../redaction.js";
 import { getSecretProvider } from "../secrets/provider-registry.js";
 import type { StoredSecretVersionMaterial } from "../secrets/types.js";
 import { credentialAccessConnectionNameSql } from "./credential-access-visibility.js";
@@ -225,16 +225,16 @@ export function createRunSecretRedactionRegistry(db: Db) {
       })));
       return runs.map((run) => {
         const disclosure = valuesByRun.get(run.id);
-        return redactRegisteredSecretValues(withoutSqlRunError(run), disclosure?.values ?? [], disclosure?.credentialConnectionName ?? null);
+        return redactRegisteredSecretValues(withoutNativeRunTaskRevisions(withoutSqlRunError(run)), disclosure?.values ?? [], disclosure?.credentialConnectionName ?? null);
       });
     },
     redactorForRun: async (companyId: string, runId: string, viewerUserId: string | null = null) => {
       const disclosure = await valuesForRun(companyId, runId, viewerUserId);
-      return <T>(value: T): T => redactRegisteredSecretValues(withoutSqlRunError(value), disclosure.values, disclosure.credentialConnectionName);
+      return <T>(value: T): T => redactRegisteredSecretValues(withoutNativeRunTaskRevisions(withoutSqlRunError(value)), disclosure.values, disclosure.credentialConnectionName);
     },
     redactForRun: async <T>(companyId: string, runId: string, value: T, viewerUserId: string | null = null): Promise<T> => {
       const disclosure = await valuesForRun(companyId, runId, viewerUserId);
-      return redactRegisteredSecretValues(withoutSqlRunError(value), disclosure.values, disclosure.credentialConnectionName);
+      return redactRegisteredSecretValues(withoutNativeRunTaskRevisions(withoutSqlRunError(value)), disclosure.values, disclosure.credentialConnectionName);
     },
     redactForIssueNotification: async <T>(companyId: string, issueId: string, value: T): Promise<T> =>
       redactRegisteredSecretValues(value, await notificationValuesForIssue(companyId, issueId)),

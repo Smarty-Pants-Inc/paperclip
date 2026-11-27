@@ -101,6 +101,7 @@ import type { createHeartbeatRunControl } from "./run-control.js";
 import type { createHeartbeatQueue } from "./queue.js";
 import { secretOutputForms, type createAgentIdentityRedactor } from "../agent-identity-redaction.js";
 import { createRunOutputSecretStore } from "../run-secret-redaction.js";
+import { withoutNativeTaskRevisions } from "../../redaction.js";
 import type { createAdapterExecutionControl } from "../adapter-execution-control.js";
 import type { executionWorkspaceService } from "../execution-workspaces.js";
 import type { workspaceOperationService } from "../workspace-operations.js";
@@ -835,7 +836,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       // adapters need it in their prompt, but the authoritative answers
       // remain on the interaction instead of being duplicated in the
       // heartbeat run snapshot.
-      const adapterContext: Record<string, unknown> = {
+      const adapterContext: Record<string, unknown> = withoutNativeTaskRevisions({
         ...context,
         ...(legacyQuestionResponse
           ? {
@@ -845,7 +846,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               },
             }
           : {}),
-      };
+      });
       const runtimeTools = createAdapterRuntimeToolAccess({
         agentId: agent.id,
         companyId: agent.companyId,

@@ -1,3 +1,4 @@
+import { persistNativeTaskWriteReceipt } from "./native-task-write-receipts.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { assertAgentInteraction } from "./agent-interaction-policy.js";
 import { notifyAttentionRetentionWork } from "./retention-work-notifications.js";
@@ -84,10 +85,12 @@ export async function setIssueTitle(
     operation: "edit", issueId, texts: title === issue.title ? [] : [title], lock: true });
   await notifyAttentionRetentionWork(tx, { companyId });
   await tx.update(issues).set({ title, titleNeedsGeneration: false, updatedAt: new Date() }).where(predicate);
+  await persistNativeTaskWriteReceipt(tx, { before: issue, after: { ...issue, title, titleNeedsGeneration: false },
+    actorAgentId: actor.actorType === "agent" ? actor.actorId : null, actorRunId: actor.runId });
   await issueReferenceService(tx).syncIssue(issueId, tx);
   const { publication } = await persistActivity(tx, {
     ...actor, companyId, action: "issue.updated", entityType: "issue", entityId: issueId,
-    details: { title, previous: { title: issue.title }, titleNeedsGeneration: false },
+    details: { title, previous: { title: issue.title, titleNeedsGeneration: issue.titleNeedsGeneration }, titleNeedsGeneration: false },
   });
   return { result: await saveReceipt({ id: issueId, title, titleNeedsGeneration: false, changed: true }), publication };
 }

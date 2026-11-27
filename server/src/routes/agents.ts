@@ -6622,7 +6622,8 @@ export function agentRoutes(
       });
     }
 
-    res.status(202).json(run);
+    res.status(202).json(await runRedactions.redactForRun(run.companyId, run.id, run,
+      req.actor.type === "board" ? getActorInfo(req).actorId : null));
   };
 
   router.post("/agents/:id/wakeup", validate(wakeAgentSchema), async (req, res) => {
@@ -6748,7 +6749,8 @@ export function agentRoutes(
       });
     }
 
-    res.status(202).json(run);
+    res.status(202).json(await runRedactions.redactForRun(run.companyId, run.id, run,
+      req.actor.type === "board" ? getActorInfo(req).actorId : null));
   });
 
   router.post("/agents/:id/claude-login", async (req, res) => {

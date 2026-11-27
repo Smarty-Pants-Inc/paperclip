@@ -1,5 +1,40 @@
-import { describe, expect, it } from "vitest";
-import { buildNativeContinuationPrompt } from "./native-continuation.js";
+import { describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { buildNativeContinuationPrompt, nativeTaskChanges, nativeTaskSnapshotFields, readNativeEndTaskSnapshot, withNativeTaskRevisions } from "./native-continuation.js";
+
+// Never-OK credential guard: an epoch change must not masquerade as task edits.
+describe("server-only task revision key", () => {
+  const snapshot = { ...Object.fromEntries(nativeTaskSnapshotFields.map(key => [key, null])),
+    title: "Task", description: "door code 4821", workMode: "standard", status: "in_progress", priority: "medium", titleNeedsGeneration: false };
+  it("v6: bootstraps once on key rotation, then settles; rejects old unkeyed and v5 receipts", () => {
+    try {
+      vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", "a".repeat(64));
+      const before = withNativeTaskRevisions(snapshot)!;
+      vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", "b".repeat(64));
+      const after = withNativeTaskRevisions(snapshot)!;
+      expect(nativeTaskChanges(after, before)).toBeNull();
+      expect(nativeTaskChanges(withNativeTaskRevisions(snapshot), after)).toEqual({});
+      const legacy = { ...snapshot, fieldRevisions: Object.fromEntries(nativeTaskSnapshotFields.map(key => [key, "a".repeat(64)])) };
+      for (const basis of ["turn_start_plus_own_changes_v2", "turn_start_plus_own_changes_v3"])
+        expect(readNativeEndTaskSnapshot({ issueId: "task", basis, taskSnapshot: legacy }, "task")).toBeNull();
+      expect(JSON.stringify(after)).not.toContain("b".repeat(64));
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it("v6: re-created missing key file also bootstraps instead of inventing seventeen edits", () => {
+    const directory = mkdtempSync(join(tmpdir(), "continuity-key-epoch-")), keyFile = join(directory, "dummy.key");
+    try {
+      vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", "");
+      vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY_FILE", keyFile);
+      const before = withNativeTaskRevisions(snapshot)!;
+      unlinkSync(keyFile);
+      const after = withNativeTaskRevisions(snapshot)!;
+      expect(nativeTaskChanges(after, before)).toBeNull();
+      expect(nativeTaskChanges(withNativeTaskRevisions(snapshot), after)).toEqual({});
+    } finally { vi.unstubAllEnvs(); rmSync(directory, { recursive: true, force: true }); }
+  });
+});
 
 const issue = { title: "Original task", description: "Retain my long task brief." };
 const message = { id: "new", body: "Yes, please proceed.", authorType: "user", authorId: "board", sourceTrust: "user", createdByRunId: null };

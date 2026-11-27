@@ -1,3 +1,4 @@
+import { projectPaperclipWakeMeaning } from "@paperclipai/adapter-utils/server-utils";
 import { isUniqueViolation } from "../../db-errors.js";
 import { skillPackageStore, skillVersionMetadataColumns } from "../skill-package-store.js";
 import { skillAccessService } from "../skill-access.js";
@@ -1658,6 +1659,9 @@ export function enrichWakeContextSnapshot(input: {
   payload: Record<string, unknown> | null;
 }) {
   const { contextSnapshot, reason, source, triggerDetail, payload } = input;
+  // The native committer writes event meaning in wake.payload, whereas the
+  // scheduler writes monitor metadata in contextSnapshot. Normalize once here.
+  Object.assign(contextSnapshot, projectPaperclipWakeMeaning({ ...payload, ...contextSnapshot }));
   const issueIdFromPayload =
     readNonEmptyString(payload?.["issueId"]) ??
     readNonEmptyString(payload?.["taskId"]);
@@ -2676,6 +2680,9 @@ export async function buildPaperclipWakePayload(input: {
         }))
     : [];
   const payload = {
+    // Wake meaning must survive normalization into a retained-session prompt;
+    // these are current event data, not a reason-name inference.
+    ...projectPaperclipWakeMeaning(input.contextSnapshot),
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
     executionContinuation: input.contextSnapshot.executionContinuation ?? null,
     chatCompletionUpdates: input.contextSnapshot.chatCompletionUpdates ?? null,
@@ -2939,6 +2946,9 @@ export function createHeartbeatRunPreparation(db: Db) {
         executionWorkspaceId: issues.executionWorkspaceId,
         executionWorkspacePreference: issues.executionWorkspacePreference,
         assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+        goalId: issues.goalId,
+        billingCode: issues.billingCode,
         assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
         executionPolicy: issues.executionPolicy,
         executionState: issues.executionState,

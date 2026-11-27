@@ -9,6 +9,7 @@ import { finishedIdleWake } from "./idle-work-proof.js";
 import { notifyDeferredExecutionEligibility } from "./deferred-execution-notifications.js";
 import { notifyIssueGraphRecovery } from "./issue-recovery-notifications.js";
 import { notifyRunDispatch } from "./run-dispatch-notifications.js";
+import { persistNativeTaskWriteReceipt } from "./native-task-write-receipts.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { notifyIssueAttentionRetentionWork } from "./retention-work-notifications.js";
 import { notifyRoutineExecutionStatus } from "./routine-execution-status-notifications.js";
@@ -12344,6 +12345,7 @@ export function issueService(db: Db) {
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;
+        await persistNativeTaskWriteReceipt(tx, { before: receiptExisting, after: updated, actorAgentId, actorRunId });
         if (updated.status === "done") {
           await completeTerminalCaseHandoffsForIssue(tx, { companyId: updated.companyId, issueId: updated.id,
             publications: activityPublications });
@@ -12925,6 +12927,7 @@ export function issueService(db: Db) {
           companyId: issueCompany.companyId, actorAgentId: agentId, operation: "assign",
           issueId: id, targetAgentId: agentId, lock: true,
         });
+        const [before] = await tx.select().from(issues).where(eq(issues.id, id)).for("update");
         await notifyStatusCardIssueChange(tx, issueCompany.companyId);
         await notifyIssueAttentionRetentionWork(tx, { companyId: issueCompany.companyId, issueId: id });
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueMonitors);
@@ -12932,7 +12935,7 @@ export function issueService(db: Db) {
         await notifyDeferredExecutionEligibility(tx, { companyId: issueCompany.companyId });
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentTimers);
         await notifyRoutineExecutionStatus(tx, id);
-        return tx
+        const changed = await tx
           .update(issues)
           .set({
             assigneeAgentId: agentId,
@@ -12963,6 +12966,10 @@ export function issueService(db: Db) {
           )
           .returning()
           .then((rows) => rows[0] ?? null);
+        if (before && changed) await persistNativeTaskWriteReceipt(tx as unknown as Db, {
+          before, after: changed, actorAgentId: agentId, actorRunId: checkoutRunId,
+        });
+        return changed;
       });
 
       if (updated) {
@@ -13076,6 +13083,7 @@ export function issueService(db: Db) {
               and ${issues.companyId} = ${issueCompany.companyId} for update`);
             if (await nativeManualAdmissionHoldsExecution(tx as unknown as Db,
               { companyId: issueCompany.companyId, runId: staleExecutionRunId, issueId: id })) return null;
+            const [before] = await tx.select().from(issues).where(eq(issues.id, id));
             await notifyStatusCardIssueChange(tx, issueCompany.companyId);
             await notifyIssueAttentionRetentionWork(tx, { companyId: issueCompany.companyId, issueId: id });
             await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueMonitors);
@@ -13083,7 +13091,7 @@ export function issueService(db: Db) {
             await notifyDeferredExecutionEligibility(tx, { companyId: issueCompany.companyId });
             await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentTimers);
             await notifyRoutineExecutionStatus(tx, id);
-            return tx
+            const changed = await tx
               .update(issues)
               .set(adoptionSet)
               .where(
@@ -13099,6 +13107,10 @@ export function issueService(db: Db) {
               )
               .returning()
               .then((rows) => rows[0] ?? null);
+            if (before && changed) await persistNativeTaskWriteReceipt(tx as unknown as Db, {
+              before, after: changed, actorAgentId: agentId, actorRunId: checkoutRunId,
+            });
+            return changed;
           });
           if (adopted) {
             const [enriched] = await withIssueLabels(db, [adopted]);
@@ -13358,6 +13370,7 @@ export function issueService(db: Db) {
           .returning()
           .then((rows) => rows[0] ?? null);
         if (!updated) return null;
+        await persistNativeTaskWriteReceipt(tx as unknown as Db, { before: existing, after: updated, actorAgentId, actorRunId });
         const [enriched] = await withIssueLabels(tx, [updated]);
         return enriched;
       }),

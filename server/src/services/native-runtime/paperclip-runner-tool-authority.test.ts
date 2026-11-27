@@ -1,7 +1,7 @@
 import * as connectorRuntime from "../connector-runtime.js";
 import * as cloudIdentity from "../cloud-runtime-identity.js";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { RESPONSIBILITY_TOOL_NAMES } from "../responsibility-tools.js";
 import { createServer } from "node:http";
 import { createPaperclipHttpServer } from "../../http/server.js";
@@ -1112,9 +1112,30 @@ describe("PaperclipRunnerToolAuthority", () => {
     }
   });
 
+  it("does not reinterpret a recovered workspace tool's user data as server snapshot metadata", async () => {
+    const call = { tool: "workspace_run", callId: "revision-replay-guard", arguments: {} };
+    const hash = (text: string) => createHash("sha256").update(text).digest("hex");
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    await db.update(heartbeatRuns).set({ resultJson: { ...run.resultJson, bridgeToolReceipts: {
+      [hash(call.callId)]: { state: "completed", tool: call.tool,
+        digest: hash('{"arguments":{},"tool":"workspace_run"}'),
+        result: { ok: true, contextSnapshot: { fieldRevisions: { description: "a person's notes" } } } },
+    } } }).where(eq(heartbeatRuns.id, runId));
+    try {
+      const authority = new PaperclipRunnerToolAuthority(db, { companyId, agentId, issueId, runId });
+      await expect(authority.recover(call)).resolves.toEqual({ result: { ok: true, contextSnapshot: { fieldRevisions: { description: "a person's notes" } } } });
+    } finally {
+      await db.update(heartbeatRuns).set({ resultJson: run.resultJson }).where(eq(heartbeatRuns.id, runId));
+    }
+  });
+
   it("relays assigned MCP calls only while the native run still owns its task", async () => {
     const tool = { name: "app_mem0_recall", description: "Recall memory", inputSchema: { type: "object" } };
-    const execute = vi.fn().mockResolvedValue({ content: "synthetic memory" });
+    const personJson = '{"fieldRevisions": {"description": "my own notes"}, "id": 12345678901234567890, "price": 1.50}';
+    const escaped = personJson.replace("fieldRevisions", "field\\u0052evisions");
+    const output = { content: [personJson, escaped, "```json\n" + personJson + "\n```", personJson + "\n" + personJson]
+      .map(text => ({ type: "text", text })), nested: [{ fieldRevisions: { description: "a person's notes" } }] };
+    const execute = vi.fn().mockResolvedValue(output);
     const close = vi.fn();
     const authority = new PaperclipRunnerToolAuthority(db, {
       companyId, agentId, issueId, runId,
@@ -1122,7 +1143,9 @@ describe("PaperclipRunnerToolAuthority", () => {
     });
     expect(authority.definitions()).toContainEqual(tool);
     const call = { tool: tool.name, callId: "assigned-mcp", arguments: { query: "compass" } };
-    await expect(authority.execute(call)).resolves.toEqual({ content: "synthetic memory" });
+    // External tools cannot synthesize the server's comparison metadata. Their
+    // words are data, not a serialization of a server-owned context projection.
+    await expect(authority.execute(call)).resolves.toEqual(output);
     expect(execute).toHaveBeenCalledWith(call, "standard");
     await db.update(issues).set({ workMode: "ask" }).where(eq(issues.id, issueId));
     try {
