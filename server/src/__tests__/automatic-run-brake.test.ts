@@ -4,10 +4,11 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { agentWakeupRequests, agents, automaticRunBrakes, companies, createDb, heartbeatRuns } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import {
-  AUTOMATIC_RUN_BRAKE, automaticRunOutcomeRules, automaticWorkStatusText, classifyAutomaticRunOutcome, createAutomaticRunBrake,
-  isAutomaticRun,
+  AUTOMATIC_RUN_BRAKE, automaticRunBrake, automaticRunOutcomeRules, automaticWorkStatusText, classifyAutomaticRunOutcome, createAutomaticRunBrake,
+  isAutomaticRun, reserveAutomaticRunStart,
 } from "../services/recovery/automatic-run-brake.js";
 import { taskAutomaticAttempts } from "../services/recovery/task-automatic-attempts.js";
+import { assignedWorkSweep } from "../services/recovery/assigned-work-sweep.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const suite = support.supported ? describe : describe.skip;
@@ -25,6 +26,8 @@ suite("automatic-run brake", () => {
   }, 60_000);
 
   afterEach(async () => {
+    vi.restoreAllMocks();
+    automaticRunBrake.reset();
     await db.execute(sql`truncate table automatic_run_brakes, agent_wakeup_requests, heartbeat_runs, agents, companies cascade`);
   }, 120_000);
 
@@ -117,6 +120,57 @@ suite("automatic-run brake", () => {
     });
     return { db: proxy as typeof db, queries: () => queries };
   }
+
+  const reportDeps = { enqueueWakeup: async () => { throw new Error("A report must not enqueue work"); } };
+
+  // catch: https://github.com/paperclipai/paperclip/issues/21443
+  it.each(["absent", "stale"])("reports a closed brake without creating a row with %s cache, then dispatch still opens it", async cache => {
+    const { companyId, agentIds: [agentId] } = await seedCompany();
+    if (cache === "stale") {
+      await automaticRunBrake.read(db, companyId);
+      vi.spyOn(Date, "now").mockReturnValue(Date.now() + AUTOMATIC_RUN_BRAKE.cacheTtlMs + 1);
+    }
+    await failedBeforeStarting(companyId, agentId!, 20);
+    const queued = await queuedAutomatic(companyId, agentId!, 2);
+    const before = await db.select().from(automaticRunBrakes);
+    const report = await assignedWorkSweep(db, reportDeps).report(companyId);
+    const after = await db.select().from(automaticRunBrakes);
+    console.info("closed report observation", { cache, beforeRows: before.length, afterRows: after.length, state: report.automaticWork.state });
+    expect(after).toEqual(before);
+    expect(report.automaticWork).toMatchObject({ state: "closed", pausedSince: null, nextTryAt: null,
+      recentAutomaticRuns: 20, failedBeforeStarting: 20, summary: "Automatic work is running normally." });
+
+    // Observing an unsettled closed state must not refresh the enforcement cache.
+    expect((await reserveAutomaticRunStart(db, queued[0]!, { personOrigin: false })).held).toBe(false);
+    expect((await reserveAutomaticRunStart(db, queued[1]!, { personOrigin: false })).held).toBe(true);
+    expect(await brakeRow(companyId)).toMatchObject({ state: "open", probeRunId: queued[0]!.id });
+  }, 60_000);
+
+  // catch: https://github.com/paperclipai/paperclip/issues/21443
+  it.each(["absent", "stale"])("reports the persisted probe without settling it with %s cache, then dispatch still resumes", async cache => {
+    const { companyId, agentIds: [agentId] } = await seedCompany();
+    const [probe] = await insertRuns(companyId, agentId!, 1, () => ({ status: "running", executionStage: "preparing",
+      createdAt: ago(2 * MINUTE), startedAt: ago(MINUTE) }));
+    await db.insert(automaticRunBrakes).values({ companyId, state: "open", stateChangedAt: ago(3 * MINUTE),
+      openedAt: ago(3 * MINUTE), probeRunId: probe!.id, nextProbeAt: new Date(Date.now() + MINUTE), updatedAt: ago(MINUTE) });
+    if (cache === "stale") {
+      await automaticRunBrake.read(db, companyId);
+      vi.spyOn(Date, "now").mockReturnValue(Date.now() + AUTOMATIC_RUN_BRAKE.cacheTtlMs + 1);
+    }
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: sql`now()` }).where(eq(heartbeatRuns.id, probe!.id));
+    const [queued] = await queuedAutomatic(companyId, agentId!, 1);
+    const before = await db.select().from(automaticRunBrakes);
+    const report = await assignedWorkSweep(db, reportDeps).report(companyId);
+    const after = await db.select().from(automaticRunBrakes);
+    console.info("probe report observation", { cache, beforeRows: before.length, afterRows: after.length,
+      beforeUpdatedAt: before[0]!.updatedAt, afterUpdatedAt: after[0]!.updatedAt, state: report.automaticWork.state });
+    expect(after).toEqual(before);
+    expect(report.automaticWork).toMatchObject({ state: "open", pausedSince: before[0]!.openedAt,
+      nextTryAt: before[0]!.nextProbeAt, recentAutomaticRuns: 1, failedBeforeStarting: 0 });
+
+    expect((await reserveAutomaticRunStart(db, queued!, { personOrigin: false })).held).toBe(false);
+    expect(await brakeRow(companyId)).toMatchObject({ state: "half_open", probeRunId: null, releaseWindowStarts: 1 });
+  }, 60_000);
 
   it("classifies automatic runs and outcomes with the shared person and restart rules", async () => {
     const rules = await automaticRunOutcomeRules();
