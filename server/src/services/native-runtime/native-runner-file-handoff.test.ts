@@ -48,6 +48,7 @@ import { issueService } from "../issues.js";
 import { findHeartbeatRunCompletionComment, resolveHeartbeatRunResponse } from "../heartbeat-run-summary.js";
 import {
   renderNativeRunnerStagedAttachmentPrompt,
+  readVerifiedWorkspaceFile,
   stageNativeRunnerAttachmentBytes,
   stageNativeRunnerWakeAttachments,
 } from "./native-runner-file-handoff.js";
@@ -129,6 +130,7 @@ describe("native runner file handoff", () => {
     overrides: Partial<{
       companyId: string;
       executionTargetKind: "local" | "remote";
+      maxDeliverableBytes: number;
       readRemoteTaskFile: (input: { contentRef: string; byteSize: number; sha256: string }) => Promise<Buffer>;
       readRemoteWorkspaceFile: (input: { contentRef: string; byteSize: number; sha256: string }) => Promise<Buffer>;
     }> = {},
@@ -140,6 +142,7 @@ describe("native runner file handoff", () => {
       runId,
       workspaceRoot,
       executionTargetKind: overrides.executionTargetKind ?? "local",
+      maxDeliverableBytes: overrides.maxDeliverableBytes,
       readRemoteWorkspaceFile: overrides.readRemoteWorkspaceFile,
       readRemoteTaskFile: overrides.readRemoteTaskFile,
       storage: createStorageService(
@@ -147,6 +150,24 @@ describe("native runner file handoff", () => {
       ),
     });
   }
+
+  it("refuses a Boat file over the bound cap before remote dispatch", async () => {
+    const reader = vi.fn().mockRejectedValue(new Error("reader must not run"));
+    const remote = authority({ executionTargetKind: "remote", maxDeliverableBytes: 6_291_456, readRemoteWorkspaceFile: reader });
+    const call = callFor("oversize.txt", Buffer.alloc(6_291_457, 37), "boat-over-cap");
+    await expect(remote.execute(call)).rejects.toThrow("6291456");
+    expect(reader).not.toHaveBeenCalled();
+  });
+
+  it("admits a Boat file exactly at the bound cap", async () => {
+    const bytes = Buffer.alloc(6_291_456, 37);
+    const reader = vi.fn().mockResolvedValue(bytes);
+    const remote = authority({ executionTargetKind: "remote", maxDeliverableBytes: bytes.length, readRemoteWorkspaceFile: reader });
+    const verified = await readVerifiedWorkspaceFile({ ...remote.binding, workspaceRoot, executionTargetKind: "remote" },
+      callFor("maximum.txt", bytes, "boat-at-cap").arguments);
+    expect(verified.body.equals(bytes)).toBe(true);
+    expect(reader).toHaveBeenCalledOnce();
+  });
 
   function callFor(relativePath: string, body: Buffer, idempotencyKey: string) {
     return {

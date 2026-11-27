@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
-import { MAX_REMOTE_DELIVERABLE_BYTES, readVerifiedRemoteWorkspaceFile } from "./remote-deliverable-file.js";
+import { MAX_REMOTE_DELIVERABLE_BYTES, remoteDeliverableByteLimit, readVerifiedRemoteWorkspaceFile } from "./remote-deliverable-file.js";
 
 const digest = (body: Buffer) => createHash("sha256").update(body).digest("hex");
 const image = "node:24-bookworm-slim";
@@ -24,6 +24,62 @@ describe("remote deliverable admission", () => {
     const execute = vi.fn();
     await expect(readVerifiedRemoteWorkspaceFile({ ...request, ...override, runner: { execute } })).rejects.toThrow(/paperclip_runner_file_handoff_/);
     expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("applies the command-output cap only to a Boat sandbox target", () => {
+    expect(remoteDeliverableByteLimit({ kind: "remote", transport: "sandbox", providerKey: "boat" })).toBe(6_291_456);
+    for (const target of [
+      { kind: "remote", transport: "sandbox", providerKey: "daytona" },
+      { kind: "remote", transport: "ssh", providerKey: "boat" },
+      { kind: "local" },
+    ] as const) expect(remoteDeliverableByteLimit(target)).toBe(MAX_REMOTE_DELIVERABLE_BYTES);
+  });
+
+  it.each([
+    [{ code: "ECONNRESET" }, "code=ECONNRESET"],
+    [{ code: -32000 }, "rpc_code=-32000"],
+    [{ status: 503 }, "http_status=503"],
+    [{ reason: "result_unconfirmed" }, "reason=result_unconfirmed"],
+    [{ code: "rpc_timeout" }, "code=rpc_timeout"],
+  ])("retains only bounded closed transport diagnostics: %j", async (fields, expected) => {
+    const execute = vi.fn().mockRejectedValue(Object.assign(new Error("/private/provider/details API_KEY=secret"), fields, {
+      command: "secret command", stdout: "secret output", credentials: "secret",
+    }));
+    const error = await readVerifiedRemoteWorkspaceFile({ ...request, runner: { execute } }).catch(error => error as Error);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain(expected);
+    expect((error as Error).message.length).toBeLessThanOrEqual(300);
+    expect(JSON.stringify(error)).not.toMatch(/secret|private|command|stdout|credentials/);
+    expect((error as Error).message).not.toMatch(/secret|private/);
+  });
+
+  it.each([
+    { outputTruncated: true }, { stdout: success.stdout.slice(0, -4) },
+    { outputTruncated: true, exitCode: 1, stdout: "/private/path" },
+  ])("names an output limit rather than a size denial or read failure: %j", async override => {
+    const execute = vi.fn().mockResolvedValue({ ...success, ...override });
+    await expect(readVerifiedRemoteWorkspaceFile({ ...request, runner: { execute } }))
+      .rejects.toThrow("paperclip_runner_file_handoff_output_limit");
+  });
+
+  it("retains a known result code without exposing failed command output", async () => {
+    const execute = vi.fn().mockResolvedValue({ ...success, exitCode: 1, errorCode: "result_unconfirmed", stdout: "secret output", stderr: "/private/path API_KEY=secret" });
+    await expect(readVerifiedRemoteWorkspaceFile({ ...request, runner: { execute } }))
+      .rejects.toThrow(new Error("paperclip_runner_file_handoff_remote_read_failed: code=result_unconfirmed"));
+  });
+
+  it("maps a transport's truncated-output reason to an output limit", async () => {
+    const execute = vi.fn().mockRejectedValue({ reason: "output_truncated", message: "/private/path API_KEY=secret" });
+    await expect(readVerifiedRemoteWorkspaceFile({ ...request, runner: { execute } }))
+      .rejects.toThrow(new Error("paperclip_runner_file_handoff_output_limit: reason=output_truncated"));
+  });
+
+  it("does not evaluate error getters or preserve arbitrary codes", async () => {
+    const error = Object.assign(new Error("API_KEY=secret"), { code: "API_KEY=secret", status: "secret", reason: "secret" });
+    Object.defineProperty(error, "statusCode", { get() { throw new Error("secret"); } });
+    const execute = vi.fn().mockRejectedValue(error);
+    await expect(readVerifiedRemoteWorkspaceFile({ ...request, runner: { execute } }))
+      .rejects.toThrow(new Error("paperclip_runner_file_handoff_remote_read_failed"));
   });
 
   it("sanitizes a rejected remote transport error", async () => {
@@ -202,6 +258,23 @@ describe.skipIf(!hasLinuxNode)("remote deliverable real Linux descriptor reads",
     `);
     await expect(readVerifiedRemoteWorkspaceFile({ ...request, workspaceRoot, runner })).rejects.toThrow(/paperclip_runner_file_handoff_file_changed/);
   });
+
+  it("accepts exactly the Boat hand-off cap with a real descriptor read", async () => {
+    const maximum = Buffer.alloc(6_291_456, 37);
+    await writeFile(join(workspaceRoot, "boat-maximum.bin"), maximum);
+    const verified = await readVerifiedRemoteWorkspaceFile({ runner, workspaceRoot, contentRef: "boat-maximum.bin", byteSize: maximum.length,
+      sha256: digest(maximum), maxBytes: 6_291_456 });
+    expect(verified.equals(maximum)).toBe(true);
+    expect(runner.execute).toHaveBeenCalledOnce();
+    vi.mocked(runner.execute).mockClear();
+    const oversize = Buffer.alloc(maximum.length + 1, 37);
+    await writeFile(join(workspaceRoot, "boat-maximum.bin"), oversize);
+    const admissionError = await readVerifiedRemoteWorkspaceFile({ runner, workspaceRoot, contentRef: "boat-maximum.bin", byteSize: oversize.length,
+      sha256: digest(oversize), maxBytes: 6_291_456 }).then(() => null, error => error as Error);
+    expect(admissionError).toBeInstanceOf(Error);
+    expect(admissionError?.message).toContain("6291456");
+    expect(runner.execute).not.toHaveBeenCalled();
+  }, 20_000);
 
   it("accepts the 10 MiB limit with exact bytes and hash", async () => {
     const maximum = Buffer.alloc(MAX_REMOTE_DELIVERABLE_BYTES, 37);

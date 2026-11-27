@@ -2093,6 +2093,13 @@ describe("deliverable tool location guidance", () => {
     expect(description).toContain("AGENT_HOME");
     expect(description).toContain("Create or copy");
   });
+  it("advertises the bound Boat hand-off cap and explains base64 overhead", () => {
+    const authority = new PaperclipRunnerToolAuthority(db, { ...binding, executionTargetKind: "remote", maxDeliverableBytes: 6_291_456,
+      readRemoteWorkspaceFile: async () => Buffer.alloc(0) });
+    const tool = authority.definitions().find(tool => tool.name === "register_deliverable")!;
+    expect((tool.inputSchema as { properties: { byteSize: { maximum: number } } }).properties.byteSize.maximum).toBe(6_291_456);
+    expect(tool.description).toContain("This sandbox's file hand-off accepts at most 6,291,456 bytes (6 MiB) per file, because its command output is limited to 8 MiB and the file is sent base64-encoded. Split or compress a larger file before calling.");
+  });
   it("preserves the granted-location reader contract", () => {
     const authority = new PaperclipRunnerToolAuthority(db, { ...binding, executionTargetKind: "remote", readRemoteTaskFile: async () => Buffer.alloc(0) });
     const tool = authority.definitions().find(tool => tool.name === "register_deliverable")!;

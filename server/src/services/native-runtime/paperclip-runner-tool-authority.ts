@@ -257,6 +257,8 @@ type Binding = {
   runtimeContext?: NativeRuntimeContextSnapshot;
   assertBridgeAuthority?: (database?: Db) => Promise<void>;
   executionTargetKind?: "local" | "remote";
+  /** Effective file hand-off cap derived from the execution target, never tool input. */
+  maxDeliverableBytes?: number;
   readRemoteWorkspaceFile?: RemoteWorkspaceFileReader;
   readRemoteTaskFile?: RemoteWorkspaceFileReader;
   installRemoteArtifact?: ArtifactInstaller;
@@ -415,6 +417,7 @@ export class PaperclipRunnerToolAuthority {
       ];
     }
     const workMode = this.binding.workMode ?? "standard";
+    const maxDeliverableBytes = Math.min(MAX_ATTACHMENT_BYTES, this.binding.maxDeliverableBytes ?? MAX_ATTACHMENT_BYTES);
     const definitions: Array<Record<string, unknown>> =
       CAPABILITY_SEMANTIC_TOOL_CATALOG.filter(
         (descriptor) =>
@@ -436,6 +439,9 @@ export class PaperclipRunnerToolAuthority {
         description:
           descriptor.operationId === "register_deliverable"
             ? "Prepare one verified workspace file for Paperclip's final task or external-chat response. This records the attachment, work product, and explicit same-run selection; it does not confirm provider delivery."
+              + (maxDeliverableBytes < MAX_ATTACHMENT_BYTES
+                ? " This sandbox's file hand-off accepts at most 6,291,456 bytes (6 MiB) per file, because its command output is limited to 8 MiB and the file is sent base64-encoded. Split or compress a larger file before calling."
+                : "")
             : descriptor.description,
         inputSchema:
           descriptor.operationId === "register_deliverable"
@@ -451,7 +457,7 @@ export class PaperclipRunnerToolAuthority {
                   byteSize: {
                     ...(descriptor.inputSchema.properties?.byteSize ?? {}),
                     minimum: 1,
-                    maximum: MAX_ATTACHMENT_BYTES,
+                    maximum: maxDeliverableBytes,
                   },
                   contentRef: {
                     ...(descriptor.inputSchema.properties?.contentRef ?? {}),
@@ -2750,6 +2756,7 @@ export class PaperclipRunnerToolAuthority {
       agentId: this.binding.agentId,
       workspaceRoot,
       executionTargetKind: this.binding.executionTargetKind ?? "local",
+      maxDeliverableBytes: this.binding.maxDeliverableBytes,
       readRemoteWorkspaceFile: this.binding.readRemoteWorkspaceFile,
       readRemoteTaskFile: this.binding.readRemoteTaskFile,
     } as const;

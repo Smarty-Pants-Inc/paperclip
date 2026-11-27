@@ -50,6 +50,12 @@ remote workspace. Supply a workspace-relative `contentRef`, basename `filename`,
 The tool verifies the file, stores an attachment and artifact work product, and
 binds it to the response. Generic API tools and a legacy API key are unnecessary.
 
+On a Boat sandbox, file hand-off accepts at most 6,291,456 bytes (6 MiB) per
+file: the command output is limited to 8 MiB and the file is sent base64-encoded.
+Split or compress a larger file before calling. Other execution providers keep
+the normal attachment limit. Truncated hand-off output reports `output_limit`;
+transport failures expose only known codes and numeric status, never raw output.
+
 `register_deliverable` stores the file on its current task. A completion report
 can also cite a file on a direct child task that is done, because the child's
 own completion verified that file. A parent that delegated a file to a child

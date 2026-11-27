@@ -1,4 +1,5 @@
 import { sandboxRestartMetadata } from "../sandbox-snapshot-restore.js";
+import { MAX_ATTACHMENT_BYTES } from "../../attachment-types.js";
 import { PROVIDER_PACK_COMPATIBILITY, type NativeSession } from "../../vendor/paperclip-runner/index.js";
 import * as continuousReply from "./native-continuous-reply.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
@@ -19084,6 +19085,14 @@ describe("runnerd provider runtime wiring", () => {
       session: { ...execution.session, normalizedSessionId: `session-${suffix}` },
     };
   }
+
+  it.each([["boat", 6_291_456], ["daytona", MAX_ATTACHMENT_BYTES]] as const)("binds the %s deliverable cap from the execution target", async (providerKey, maximum) => {
+    const current = scopedNativeExecution(`deliverable-cap-${providerKey}`);
+    await createRunnerdBackend({ db: leaseDb(current), execution: current, runnerInstanceId: `runner-${providerKey}`,
+      runnerExecutionTarget: { kind: "remote", transport: "sandbox", providerKey, remoteCwd: "/workspace",
+        environmentId: "environment", leaseId: "lease", runner: { execute: vi.fn() } } });
+    expect(state.toolAuthorityDefinitions).toHaveBeenLastCalledWith(expect.objectContaining({ maxDeliverableBytes: maximum }));
+  });
 
   it.each(["reuse", "unsettled-describe", "claim-delay", "claim-expired", "claim-rollback", "unsupported", "fallback-clear-failed", "fallback-clear-expired", "fallback-clear-stopped"])("owns retained plugin startup through %s", async mode => {
     const first = { ...scopedNativeExecution(`plugin-cold-then-warm-${mode}`),

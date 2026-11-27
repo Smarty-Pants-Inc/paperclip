@@ -614,6 +614,8 @@ export async function resolveEnvironmentExecutionTarget(input: {
                   timedOut: result.timedOut,
                   stdout: result.stdout,
                   stderr: result.stderr,
+                  ...(result.metadata?.outputTruncated === true || result.metadata?.output_truncated === true
+                    ? { outputTruncated: true } : {}),
                   pid: null,
                   startedAt,
                   finishedAt,
