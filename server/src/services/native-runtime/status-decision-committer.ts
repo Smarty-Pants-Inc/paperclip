@@ -1,5 +1,7 @@
 import { NativePullRequestCompletionError, verifyNativePullRequestCompletion } from "./native-pull-request-completion.js";
 import { notifyNativeStatusWakeWork } from "../deferred-execution-notifications.js";
+import { currentRunFailureText } from "./native-exact-resume-failure.js";
+import { redactSensitiveText } from "../../redaction.js";
 import { toolCallLoopContinuationKey } from "./repeated-tool-failure-guard.js";
 import { assertAgentInteraction } from "../agent-interaction-policy.js";
 import { forbidden, HttpError } from "../../errors.js";
@@ -41,6 +43,7 @@ import {
   agents,
   approvals,
   completionContracts,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueApprovals,
   issueRecoveryActions,
@@ -930,6 +933,48 @@ async function materializeDecisionEffect(input: {
       return { effectKind: effect.kind, targetType: "heartbeat_run", targetId: retryId,
         payload: { cause: effect.cause, summary: effect.summary } };
     }
+    let retrySummary = effect.summary;
+    let turnSubmitted = false;
+    let providerOutputObserved = false;
+    if (effect.cause === "native_run_failed") {
+      const [run] = await input.tx.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.agentId, effect.agentId), eq(heartbeatRuns.nativeIssueId, input.issue.id),
+      )).limit(1);
+      if (run?.nativeSessionId && run.runnerInstanceId) {
+        // PaperclipControlPlanePort commits these only after validating the
+        // run/session/source binding. Session/checkpoint existence is NOT a
+        // submitted-turn receipt: input preparation can fail between them.
+        const boundEvent = and(eq(heartbeatRunEvents.companyId, input.companyId),
+          eq(heartbeatRunEvents.runId, input.runId), eq(heartbeatRunEvents.agentId, effect.agentId),
+          eq(heartbeatRunEvents.sourceInstanceId, run.runnerInstanceId),
+          sql`${heartbeatRunEvents.sourceEventId} is not null`,
+          sql`${heartbeatRunEvents.payload}->'prpEvent'->>'runId' = ${input.runId}`,
+          sql`${heartbeatRunEvents.payload}->'prpEvent'->>'normalizedSessionId' = ${run.nativeSessionId}`,
+          sql`${heartbeatRunEvents.payload}->'prpEvent'->>'sourceKind' = 'runner'`);
+        const [submitted] = await input.tx.select({ turnId: sql<string | null>`${heartbeatRunEvents.payload}->'prpEvent'->>'turnId'` })
+          .from(heartbeatRunEvents).where(and(boundEvent, inArray(heartbeatRunEvents.eventType, ["turn.started", "turn.accepted"])))
+          .orderBy(desc(heartbeatRunEvents.sourceSeq)).limit(1);
+        turnSubmitted = !!submitted;
+        // Driver admission precedes host.startTurn. Only actual provider text
+        // from this same turn proves that the provider took the source input.
+        const [output] = submitted?.turnId ? await input.tx.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+          boundEvent, inArray(heartbeatRunEvents.eventType, ["item.delta", "item.completed"]),
+          sql`${heartbeatRunEvents.payload}->'prpEvent'->>'turnId' = ${submitted.turnId}`,
+          sql`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'kind' = 'agentMessage'`,
+          sql`length(trim(coalesce(${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'text', ''))) > 0`,
+        )).limit(1) : [];
+        providerOutputObserved = !!output;
+        const [failure] = await input.tx.select({ message: sql<string | null>`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->'error'->>'message'` })
+          .from(heartbeatRunEvents).where(and(boundEvent, eq(heartbeatRunEvents.eventType, "turn.failed")))
+          .orderBy(desc(heartbeatRunEvents.seq)).limit(1);
+        // Project one diagnostic line, not a stored stderr/stack tail. Reapply
+        // redaction because not every writer of run.error is PRP ingestion.
+        const reason = currentRunFailureText(run)?.trim() || failure?.message?.trim();
+        retrySummary = reason ? Array.from(redactSensitiveText(reason).split(/\r?\n/)[0]!.trim()).slice(0, 1_500).join("")
+          || "The failure reason was not recorded." : "The failure reason was not recorded.";
+      } else retrySummary = "The failure reason was not recorded.";
+    }
     const wakeId = await enqueueWake({
       tx: input.tx,
       companyId: input.companyId,
@@ -942,6 +987,9 @@ async function materializeDecisionEffect(input: {
         nativeDecisionId: input.decisionId,
         retryCause: effect.cause,
         retrySummary: effect.summary,
+      },
+      contextSnapshot: {
+        nativeStatusRetry: { cause: effect.cause, summary: retrySummary, sourceRunId: input.runId, turnSubmitted, providerOutputObserved },
       },
     });
     return {
