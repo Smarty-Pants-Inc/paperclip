@@ -153,7 +153,15 @@ export async function hasQueuedChatRequest(
   return Boolean(wake);
 }
 
-type QueuedMessage = { id: string; body: string; createdAt: Date; kind?: "interaction" };
+type QueuedMessage = { id: string; body: string; createdAt: Date; arrivalMicros?: string; kind?: "interaction" };
+
+function compareQueuedMessageArrival(a: QueuedMessage, b: QueuedMessage): number {
+  // Date truncates PostgreSQL timestamps to milliseconds. Do not turn two
+  // distinct arrivals within a millisecond into an id-ordered tie.
+  const aTime = a.arrivalMicros ? BigInt(a.arrivalMicros) : BigInt(a.createdAt.getTime()) * 1000n;
+  const bTime = b.arrivalMicros ? BigInt(b.arrivalMicros) : BigInt(b.createdAt.getTime()) * 1000n;
+  return aTime < bTime ? -1 : aTime > bTime ? 1 : a.id.localeCompare(b.id);
+}
 
 /** Same authority and fresh-session fences as ordinary queued person input. */
 async function readFirstTurnInteraction(tx: Db, binding: { companyId: string; issueId: string; agentId: string },
@@ -255,6 +263,7 @@ async function readQueuedMessages(
   if (input.commentIds.length === 0) return [];
   const rows = await tx.select({
     id: issueComments.id, body: issueComments.body, createdAt: issueComments.createdAt,
+    arrivalMicros: sql<string>`(extract(epoch from ${issueComments.createdAt}) * 1000000)::bigint::text`,
     sourceTrust: issueComments.sourceTrust,
   }).from(issueComments).where(and(inArray(issueComments.id, input.commentIds), firstTurnEligibleComment(input)));
   const delivered = input.excludeDelivered
@@ -266,7 +275,7 @@ async function readQueuedMessages(
     const row = byId.get(id);
     if (!row || delivered.has(id)) return [];
     const safe = sanitizeQuarantinedCommentForHigherTrust({ ...row, sourceTrust: row.sourceTrust as SourceTrustMetadata | null });
-    return [{ id, body: safe.body, createdAt: row.createdAt }];
+    return [{ id, body: safe.body, createdAt: row.createdAt, arrivalMicros: row.arrivalMicros }];
   });
 }
 
@@ -287,7 +296,7 @@ export async function claimFirstTurnQueuedInput(
     // while the seal holds its locks can wait forever on a one-connection pool.
     const redact = async (messages: QueuedMessage[]) => messages.length === 0 ? [] :
       createRunSecretRedactionRegistry(tx as unknown as Db).redactForIssue(binding.companyId, binding.issueId,
-        [...new Map(messages.map(message => [message.id, message])).values()].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime()));
+        [...new Map(messages.map(message => [message.id, message])).values()].sort(compareQueuedMessageArrival));
     // Lock in the queue routes' order (task, queue, run) so a concurrent
     // Interrupt and this seal serialize instead of deadlocking.
     const [issue] = await tx.select({ conversationAgentId: issues.conversationAgentId, executionRunId: issues.executionRunId,
@@ -351,7 +360,7 @@ export async function claimFirstTurnQueuedInput(
       commentIds, excludeDelivered: true })).filter(message => !pressedAt || message.createdAt.getTime() <= Date.parse(pressedAt));
     // Render before sealing: once the receipt commits, nothing can fail
     // between it and the turn input that the receipt describes.
-    if (handback) taken.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
+    taken.sort(compareQueuedMessageArrival);
     const takenInteractions = interactions.filter(message => !pressedAt || message.createdAt.getTime() <= Date.parse(pressedAt));
     const candidates = await redact([...taken, ...takenInteractions]);
     const validate: ValidateFirstTurnInput = text => {

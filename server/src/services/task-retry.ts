@@ -296,9 +296,6 @@ function admitTaskRetry(input: TaskRetryRequest) {
       eq(issues.id, input.issueId))).for("update");
     if (!issue) throw notFound("Task not found");
     assertTaskRetryConversationAllowed(issue, input.actorId);
-    if (!input.initiatedBy && issue.assigneeAgentId && await reevaluateStoppedBeforeFirstInput(db, {
-      companyId: input.companyId, issueId: input.issueId, agentId: issue.assigneeAgentId,
-    })) [issue] = await tx.select().from(issues).where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
     const key = `task-retry:${input.idempotencyKey}`;
     const [sameRequest] = await tx.select().from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.idempotencyKey, key)));
@@ -323,6 +320,17 @@ function admitTaskRetry(input: TaskRetryRequest) {
     if (["done", "cancelled"].includes(issue.status) || !issue.assigneeAgentId || !latest ||
         latest.agentId !== issue.assigneeAgentId || input.observedRunId !== latest.id) {
       return { requestId: null, accepted: false, stale: true, observedRunId: latest?.id ?? null, chatActionId: undefined };
+    }
+    // Validate idempotency, ownership and the observed attempt before granting
+    // a new status-version consent. Replayed/stale and automatic Retry do not.
+    if (!input.initiatedBy && await reevaluateStoppedBeforeFirstInput(db, {
+      companyId: input.companyId, issueId: input.issueId, agentId: issue.assigneeAgentId,
+      consent: { kind: "retry", userId: input.actorId, runId: latest.id, statusVersion: issue.statusVersion },
+    })) {
+      const [refreshed] = await tx.select().from(issues).where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
+      // Settlement changes status only under our issue lock; retain the
+      // validated non-null assignee while refreshing that disposition.
+      Object.assign(issue, refreshed);
     }
     if (input.retryAction === "move_forward" && !["queued", "running"].includes(latest.status) &&
         !(await undeliveredContinuation(tx, { companyId: issue.companyId, issueId: issue.id })))

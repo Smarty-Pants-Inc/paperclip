@@ -13,6 +13,7 @@ import { notifyChatRunMilestones } from "../../../services/chat-run-milestone-no
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../../services/delivery-work-notifications.js";
 import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop } from "../../../services/acknowledged-native-stop.js";
 import { readRunCancellation } from "../../../services/run-cancellation.js";
+import { deferredWakeJoinsFirstTurn } from "../../../services/native-runtime/first-turn-queued-input.js";
 import { recordStoppedBeforeFirstInput, reevaluateStoppedBeforeFirstInput, stoppedBeforeFirstInput } from "../../../services/heartbeat/pre-dispatch-stop-settlement.js";
 import { withRunRedactionHistory } from "../../../services/run-secret-redaction.js";
 import { CHAT_COMPLETION_WAKE_REASON, isCompletedOnboardingHandoffWake, settleReportedChatCompletions } from "../../../services/chat-completion-delivery.js";
@@ -71,6 +72,7 @@ import {
   DEFERRED_WAKE_CONTEXT_KEY,
   queuedCommentIdsFromRunContext,
   queuedCommentIdsFromWakePayload,
+  withQueuedCommentIdsInRunContext,
   withQueuedCommentIdsInWakePayload,
 } from "../../../lib/queued-comment-context.js";
 import { CHAT_CONVERSATION_ID_KEY, extractWakeCommentIds, readWakeChatConversationId } from "../../run-dispatch/index.js";
@@ -1152,13 +1154,33 @@ export function createWakeAdmissionWriter(rawTx: IssueAdmissionDbTransaction, ad
         eq(heartbeatRuns.agentId, input.agentId),
       )).for("update").limit(1);
       if (!current || current.status !== input.activeExecutionRunStatus || current.wakeupRequestId !== candidate.wakeupRequestId) return null;
-      const commentIds = queuedCommentIdsFromRunContext(input.mergedContextSnapshot);
+      let commentIds = queuedCommentIdsFromRunContext(input.mergedContextSnapshot);
       // A reviewed chat run attests one conversation. Never fold a message
       // into a run that already holds another conversation's messages; the
       // wake is saved behind the run instead.
       const mergedConversationId = readWakeChatConversationId(input.mergedContextSnapshot);
       if (mergedConversationId && commentIds.length > 0 && (await otherConversationCommentIds(tx, {
         companyId: input.companyId, conversationId: mergedConversationId, commentIds })).length > 0) return null;
+      if (current.status === "queued" && !mergedConversationId && commentIds.length) {
+        const pending = await tx.select().from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.agentId, current.agentId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId),
+          sql`${agentWakeupRequests.payload}->>'issueId' = ${input.mergedContextSnapshot.issueId}`,
+        ));
+        const pendingIds = pending.filter(wake => deferredWakeJoinsFirstTurn(wake, current))
+          .flatMap(wake => queuedCommentIdsFromWakePayload(wake.payload)).filter(id => !commentIds.includes(id));
+        const ordered = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+          eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, String(input.mergedContextSnapshot.issueId)),
+          inArray(issueComments.id, [...new Set([...commentIds, ...pendingIds])]), isNull(issueComments.deletedAt),
+        )).orderBy(asc(issueComments.createdAt), asc(issueComments.id));
+        // The initial request must be a prefix of the complete first-turn
+        // input. If an older message still belongs to the first-turn join,
+        // defer this newer Send too instead of appending it ahead of that join.
+        const lastInitial = ordered.findLastIndex(row => commentIds.includes(row.id));
+        if (ordered.slice(0, lastInitial).some(row => pendingIds.includes(row.id))) return null;
+        commentIds = ordered.filter(row => commentIds.includes(row.id)).map(row => row.id);
+        input.mergedContextSnapshot = withQueuedCommentIdsInRunContext(input.mergedContextSnapshot, commentIds);
+      }
       const synchronizeBatch = current.status === "queued" && commentIds.length > 0
         && primary?.status === "queued" && queuedCommentIdsFromWakePayload(primary.payload).length > 0;
       if (current.status === "queued" && commentIds.length && current.wakeupRequestId &&
@@ -1769,6 +1791,7 @@ export function createFreshIssueRunStore(
       const candidates = receiptScope
         ? await tx.select({
             id: agentWakeupRequests.id,
+            agentId: agentWakeupRequests.agentId,
             reason: agentWakeupRequests.reason,
             idempotencyKey: agentWakeupRequests.idempotencyKey,
             payload: agentWakeupRequests.payload,
@@ -1785,6 +1808,13 @@ export function createFreshIssueRunStore(
     },
     readUndeliveredLegacyCommentIds(issueId, agentId, commentIds) {
       return undeliveredLegacyUserCommentIds(tx, companyId, issueId, agentId, commentIds);
+    },
+    async orderCommentIds(issueId, commentIds) {
+      if (!commentIds.length) return [];
+      const rows = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+        eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, commentIds),
+      )).orderBy(asc(issueComments.createdAt), asc(issueComments.id));
+      return rows.map(row => row.id);
     },
     notifyRunMilestones(issueId) {
       return notifyChatRunMilestones(tx, { companyId, issueId });

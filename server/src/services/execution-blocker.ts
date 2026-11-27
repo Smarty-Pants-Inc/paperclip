@@ -492,12 +492,14 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     runId,
     // A stopped reviewer can differ from the task owner who receives the work back.
     agentId: run?.agentId ?? null,
-    cause: action.cause,
-    nextAction: workspaceRecovery?.message ?? (reconstructionPending ? "Continuation from saved sources is queued and waiting for execution checks." : nextAction),
+    cause: (action.evidence.stopSettlementRefusal as { code?: string } | undefined)?.code === "person_stop_task_status_changed"
+      ? "person_stop_task_status_changed" : action.cause,
+    nextAction: (action.evidence.stopSettlementRefusal as { code?: string } | undefined)?.code === "person_stop_task_status_changed"
+      ? action.nextAction : workspaceRecovery?.message ?? (reconstructionPending ? "Continuation from saved sources is queued and waiting for execution checks." : nextAction),
     ...(workspaceRecovery ? { workspaceRecovery } : {}),
     runStatus: run?.status ?? null,
     runError: runError?.slice(0, 1024) ?? null,
-    canContinue: eligibleContinuation && !chatBinding,
+    canContinue: !action.evidence.stopSettlementRefusal && eligibleContinuation && !chatBinding,
     canRetry: retryOffered,
     ...(restoreHold ? { workspaceRepairRequired, canRecordWorkspaceRepair: workspaceRepairRequired && hasRequiredWorkspaceRecovery(action.evidence) } : {}),
     savedMessageCount: saved.length,

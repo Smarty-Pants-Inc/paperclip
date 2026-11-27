@@ -192,6 +192,18 @@ export function ExecutionBlockerNotice({ presentation, observedStatus, observedR
   agentName?: string;
   projectName?: string;
 }) {
+  // A normal Stop is quiet, but this held-input refusal needs its concrete
+  // recovery action even when the observed attempt was stopped by the person.
+  if (blocker?.cause === "person_stop_task_status_changed") return <div className={cn("pt-4", className)}>
+    <div role="status" aria-label="Task status"
+      className="flex flex-col items-start gap-3 rounded-lg bg-destructive/10 p-4 text-sm text-foreground sm:flex-row sm:items-center">
+      <AlertCircle className="size-5 shrink-0 text-destructive" aria-hidden="true" />
+      <span className="min-w-0 flex-1 break-words">{blocker.nextAction}</span>
+      {canRetry && blocker.canRetry && <Button variant="outline" size="sm" className="shrink-0" disabled={optimistic}
+        onClick={onRetry} data-testid="task-execution-retry">{optimistic ? "Retrying…" : "Retry"}</Button>}
+      {error && <span role="alert" className="text-destructive">{describeError(error).body}</span>}
+    </div>
+  </div>;
   if (isPersonStoppedRun({ resultJson: observedResultJson, errorCode: observedErrorCode })) return null;
   const retryRefused = isExecutionRetryRefused(presentation, observedErrorCode ?? blocker?.cause, observedResultJson);
   canRetry = canRetry && !retryRefused;

@@ -12346,6 +12346,19 @@ export function issueService(db: Db) {
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;
+        if (issueData.status === "todo" && actorUserId && !actorAgentId && updated.assigneeAgentId) {
+          // The ordinary person's status edit is consent for this current
+          // version, not an automatic recovery or agent-authored status write.
+          const { reevaluateStoppedBeforeFirstInput } = await import("./heartbeat/pre-dispatch-stop-settlement.js");
+          const [stopped] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+            eq(heartbeatRuns.companyId, updated.companyId),
+            sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.issueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${updated.id}`,
+          )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+          if (stopped) await reevaluateStoppedBeforeFirstInput(tx as unknown as Db, {
+            companyId: updated.companyId, issueId: updated.id, agentId: updated.assigneeAgentId,
+            consent: { kind: "status_todo", userId: actorUserId, runId: stopped.id, statusVersion: updated.statusVersion },
+          });
+        }
         if (updated.status === "done") {
           await completeTerminalCaseHandoffsForIssue(tx, { companyId: updated.companyId, issueId: updated.id,
             publications: activityPublications });

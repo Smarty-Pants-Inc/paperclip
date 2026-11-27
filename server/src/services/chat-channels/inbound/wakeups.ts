@@ -541,6 +541,7 @@ export function createInboundWakeups(db: Db, options: WakeupOptions) {
       requestedByActorType: action.payload.requestedByActorType as "user" | "system",
       requestedByActorId: String(action.payload.requestedByActorId), requestedAt: action.createdAt,
       resumeDeferred: true,
+      ...(!sweep && action.payload.requestedByActorType === "user" ? { livePersonRequestId: scope.requestId } : {}),
       authorize: async tx => {
         const authorized = await authorizeAction(tx, action);
         await githubAdmission?.authorize(tx, authorized.issue);

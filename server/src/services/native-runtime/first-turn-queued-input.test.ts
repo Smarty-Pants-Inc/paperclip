@@ -3,7 +3,7 @@ import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { buildNativeExecutionInput, budgetNativeFreshFallback } from "./native-execution-input.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
 import { buildNativeModelEnvelope } from "../../vendor/paperclip-runner/index.js";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   agents, agentWakeupRequests, assets, authUsers, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issueAttachments,
@@ -91,6 +91,29 @@ describe.skipIf(!support.supported)("first-turn queued input", () => {
       requestedByActorType: "user", requestedByActorId: USER, payload });
     return comment!.id;
   }
+
+  it("orders database arrivals before the id tie-break without dropping timestamp precision", async () => {
+    const f = await seed();
+    const ids: string[] = [];
+    for (const body of ["first input", "second input", "third input"]) ids.push(await queueMessage(f, body));
+    ids.sort();
+    // Make the receipt id-ordered rather than arrival-ordered, then prove
+    // both the database's sub-millisecond order and an exact-timestamp tie.
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "automation",
+      reason: "issue_execution_deferred", status: "deferred_issue_execution", requestedByActorType: "user",
+      requestedByActorId: USER, payload: { issueId: f.issueId, _paperclipWakeContext: { issueId: f.issueId,
+        wakeReason: "issue_commented", wakeCommentIds: ids } } });
+    for (const [index, id] of ids.entries()) await db.update(issueComments).set({
+      createdAt: sql`${index === 0 ? "2026-01-01T00:00:00.000002Z" : "2026-01-01T00:00:00.000001Z"}::timestamptz`,
+    }).where(eq(issueComments.id, id));
+    const text = await claimFirstTurnQueuedInput(db, { ...f });
+    expect(readFirstTurnQueuedInputReceipt((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0])?.commentIds)
+      .toEqual([ids[1], ids[2], ids[0]]);
+    expect(text).toContain("first input");
+    expect(text).toContain("second input");
+    expect(text).toContain("third input");
+  });
 
   async function queueAnswer(f: Awaited<ReturnType<typeof seed>>, provider = "pi_rpc") {
     await db.update(agents).set({ adapterConfig: { provider, sessionContinuity: "continuous" } }).where(eq(agents.id, f.agentId));

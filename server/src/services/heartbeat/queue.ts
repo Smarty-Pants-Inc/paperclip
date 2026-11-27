@@ -2227,7 +2227,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         scope.requestId ? eq(agentWakeupRequests.id, scope.requestId) : undefined,
         eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId),
         eq(agentWakeupRequests.requestedByActorType, "user"),
-        sql`${agentWakeupRequests.payload}->'executionWait'->>'reason' = 'execution_recovery'`,
+        or(sql`${agentWakeupRequests.payload}->'executionWait'->>'reason' = 'execution_recovery'`,
+          and(sql`${agentWakeupRequests.payload}->'executionWait'->>'reason' = 'person_stop_task_status_changed'`,
+            sql`${issueRecoveryActions.evidence}->'stopSettlementRefusal' is null`,
+            sql`${issueRecoveryActions.evidence}->'stopSettlementConsent'->>'runId' = ${issueRecoveryActions.evidence}->>'runId'`,
+            sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'cancelled'`)),
         sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'chat-inbound:%'`,
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id)).limit(50);
@@ -2256,7 +2260,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         eq(heartbeatRuns.companyId, hinted.companyId),
         sql`${heartbeatRuns.id}::text = ${String(action.evidence.runId ?? action.evidence.sourceRunId ?? "")}`,
         sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`));
-      const predatesStop = source && recordedUserStop(source) && wake.requestedAt <= userStopBoundaryAt(source)!;
+      const consent = parseObject(action.evidence.stopSettlementConsent);
+      const renewedStopConsent = !action.evidence.stopSettlementRefusal && consent.runId === source?.id &&
+        ["retry", "status_todo"].includes(String(consent.kind)) &&
+        parseObject(action.evidence.automaticRecovery).replay === "cancelled";
+      const predatesStop = !renewedStopConsent && source && recordedUserStop(source) && wake.requestedAt <= userStopBoundaryAt(source)!;
       try {
         if (!predatesStop) await enqueueWakeup(wake.agentId, {
           source: wake.source as WakeupOptions["source"], triggerDetail: wake.triggerDetail as WakeupOptions["triggerDetail"],
@@ -2866,9 +2874,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string, savedInteractionOrigin?: unknown,
     admission?: { saved(): void }) {
     // Capture the live request boundary before receipt coalescing assigns an
-    // execution-wait id. A saved-receipt sweep enters with an id already set;
-    // it is not a new person's Send, even if that receipt has a user author.
-    const personRequestAdmission = opts.requestedByActorType === "user" && !executionWaitRequestId;
+    // execution-wait id. Chat sweeps enter through the inbound owner without
+    // that id, so a deferred chat resume must also carry a live person's wait
+    // identity. A saved comment's author is not a new act by that person.
+    const personRequestAdmission = opts.requestedByActorType === "user" && !executionWaitRequestId &&
+      (!opts.durableChatRequest?.resumeDeferred || Boolean(opts.durableChatRequest.livePersonRequestId));
     const wakeRequestedAt = new Date();
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
@@ -4175,7 +4185,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           };
           const explicitContinuationRunId = randomUUID();
           if (!personRequestAdmission && opts.requestedByActorType === "user" && wakeCommentId) {
-            logger.info({ issueId, runId: null, gate: "person_request_admission", field: "executionWaitRequestId",
+            logger.info({ issueId, runId: null, gate: "person_request_admission",
+              field: executionWaitRequestId ? "executionWaitRequestId" : "durableChatRequest.livePersonRequestId",
               reason: "saved_receipt_resume_not_new_person_request" }, "stop_repair_skipped");
           }
           const recovery = await prepareRecovery({

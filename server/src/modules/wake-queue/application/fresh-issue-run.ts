@@ -33,6 +33,7 @@ type SaveWakeReceipt =
 
 type DeferredCommentCandidate = {
   id: string;
+  agentId: string;
   reason: string | null;
   idempotencyKey: string | null;
   payload: unknown;
@@ -48,6 +49,7 @@ export type FreshIssueRunStore<Run> = {
     checkExecutionBlocker: boolean;
   }): Promise<{ handoffAgentId: string | null; candidates: DeferredCommentCandidate[] }>;
   readUndeliveredLegacyCommentIds(issueId: string, agentId: string, commentIds: string[]): Promise<string[]>;
+  orderCommentIds(issueId: string, commentIds: string[]): Promise<string[]>;
   notifyRunMilestones(issueId: string): Promise<void>;
   insertQueuedRun(seed: QueuedRunSeed): Promise<Run>;
   bindReceipts(input: {
@@ -83,11 +85,16 @@ type FreshIssueRunInput = {
   recordContinuationDelivery(runId: string): Promise<void>;
 };
 
-function isOrdinaryBoardComment(wake: DeferredCommentCandidate): boolean {
+function isOrdinaryBoardComment(wake: DeferredCommentCandidate, agentId: string): boolean {
   const payload = parseObject(wake.payload);
   const context = parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]);
-  // Durable chat and interaction wakes carry their own actor, source, and session.
-  return !wake.idempotencyKey?.startsWith("chat-inbound:") &&
+  // A chat SOURCE keeps its own actor/session contract. A durable receipt
+  // alone is not a chat source: unbound person comments share the ordinary
+  // input batch, including an earlier resumed Send racing a new board Send.
+  // Only the same executor's unbound task receipts share that batch; a
+  // former executor's durable chat receipt retains its handoff boundary.
+  return (!wake.idempotencyKey?.startsWith("chat-inbound:") || wake.agentId === agentId) &&
+    !readNonEmptyString(context.chatConversationId) && !readNonEmptyString(payload.externalChatProvider) &&
     !isInteractionResolutionWakePayload(payload) &&
     !hasInteractionContinuationWakeContext(context) &&
     ["issue_commented", "issue_reopened_via_comment"].includes(String(context.wakeReason ?? wake.reason)) &&
@@ -128,7 +135,7 @@ export function createFreshIssueRunAdmission<Run extends { id: string }>(store: 
     });
     const adopted = candidates.filter((wake) => wake.id === executionWaitRequestId ||
       wake.id === input.queuedCommentInterruptId || wake.id === input.queuedCommentRequestId ||
-      isOrdinaryBoardComment(wake));
+      isOrdinaryBoardComment(wake, agentId));
     const adoptedWakeIds = adopted.map((wake) => wake.id);
     let commentIds = [...new Set([
       ...adopted.flatMap((wake) => queuedCommentIdsFromWakePayload(wake.payload)),
@@ -139,7 +146,8 @@ export function createFreshIssueRunAdmission<Run extends { id: string }>(store: 
     }
     // Delivery to a failed attempt is not an answer. Preserve the Retry's
     // independently validated owed-question attribution after legacy filtering.
-    commentIds = [...new Set([...commentIds, ...(input.retryQuestionCommentIds ?? [])])];
+    commentIds = await store.orderCommentIds(issue.id,
+      [...new Set([...commentIds, ...(input.retryQuestionCommentIds ?? [])])]);
 
     await store.notifyRunMilestones(issue.id);
     const responsibleUserId = await input.resolveResponsibleUserId();
@@ -154,7 +162,7 @@ export function createFreshIssueRunAdmission<Run extends { id: string }>(store: 
       responsibleUserId,
       wakeupRequestId: primary.id,
       retryOfRunId: input.reconciledSourceRunId || input.retryOfRunId,
-      contextSnapshot: adopted.length ? withQueuedCommentIdsInRunContext(contextSnapshot, commentIds, adoptedWakeIds) : contextSnapshot,
+      contextSnapshot: commentIds.length ? withQueuedCommentIdsInRunContext(contextSnapshot, commentIds, adoptedWakeIds) : contextSnapshot,
       sessionIdBefore: input.explicitContinuationRunId ? null : await input.resolveSessionIdBefore(),
       continuationAttempt: input.continuationAttempt,
       ...(input.reconciledRestoreRetryCount !== null ? {

@@ -8,6 +8,7 @@ import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { taskInterruptionPresentation } from "../services/task-interruption-presentation.js";
 import { admitExplicitNativeContinuation } from "../services/explicit-native-continuation.js";
 import { deliverReconciledExecutions } from "../services/execution-recovery-resolution.js";
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
@@ -499,11 +500,11 @@ describeEmbeddedPostgres("environment lease release between sandbox acquire and 
   // Recorded gate-5 shape: Stop before staging, legacy hold already resolved
   // blocked, no captured old task version, and four messages already parked.
   it.each(["send", "retry", "newer-status", "successor", "live-owner", "provider-work", "changed-allocation", "foreign-hold",
-    "h-send", "h-retry", "h-wait-send", "h-wait-retry", "h-unsettled", "h-system", "startup-system", "startup-no-person", "startup-system-initiator"] as const)(
+    "h-send", "h-retry", "h-wait-send", "h-wait-retry", "h-wait-race", "h-wait-sweep", "h-unsettled", "h-system", "startup-system", "startup-no-person", "startup-system-initiator"] as const)(
     "re-evaluates an already-stuck early Stop only at a person's request (%s)", async scenario => {
       const liveShape = scenario.startsWith("h-") || scenario.startsWith("startup-");
       const waiting = scenario.startsWith("h-wait-");
-      const action = scenario === "h-send" || scenario === "h-wait-send" || scenario === "newer-status" ? "send" : scenario === "h-retry" || scenario === "h-wait-retry" ? "retry" : scenario;
+      const action = scenario === "h-send" || scenario === "h-wait-send" || scenario === "h-wait-race" || scenario === "h-wait-sweep" || scenario === "newer-status" ? "send" : scenario === "h-retry" || scenario === "h-wait-retry" ? "retry" : scenario;
       const f = await acquireReusable("replace");
       const now = new Date(), actionId = randomUUID();
       await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId));
@@ -568,16 +569,32 @@ describeEmbeddedPostgres("environment lease release between sandbox acquire and 
           authorType: "user", authorUserId: "operator", body: "new-edited-send", createdAt: new Date(now.getTime() + 10) });
         const durable = waiting ? createDurableChatWakeupRequest({ id: randomUUID(), companyId: f.companyId,
           agentId: f.agentId, issueId: f.issueId, commentId: id, requestedByActorType: "user", requestedByActorId: "operator",
-          requestedAt: new Date(now.getTime() + 10), resumeDeferred: true, authorize: async () => {} }) : undefined;
+          requestedAt: new Date(now.getTime() + 10), resumeDeferred: true,
+          // The live act carries its wait identity; a sweep has no live act.
+          ...(scenario !== "h-wait-sweep" ? { livePersonRequestId: id } : {}), authorize: async () => {} }) : undefined;
         if (durable) await db.insert(agentWakeupRequests).values({ id: durable.id, companyId: f.companyId, agentId: f.agentId,
           source: "on_demand", reason: "issue_commented", status: "deferred_issue_execution", requestedAt: durable.requestedAt,
           idempotencyKey: durable.idempotencyKey, requestedByActorType: "user", requestedByActorId: "operator",
           payload: { issueId: f.issueId, executionWait: { reason: "previous_execution_unverified", recoveryActionId: actionId }, _paperclipWakeContext: { issueId: f.issueId,
               wakeReason: "issue_commented", wakeCommentId: id, wakeCommentIds: [id] } } });
-        await heartbeat.wakeup(f.agentId, { source: "on_demand", reason: "issue_commented", requestedByActorType: "user",
+        const sendA = () => heartbeat.wakeup(f.agentId, { source: "on_demand", reason: "issue_commented", requestedByActorType: "user",
           ...(durable ? { durableChatRequest: durable } : {}),
           requestedByActorId: "operator", payload: { issueId: f.issueId, commentId: id },
           contextSnapshot: { issueId: f.issueId, wakeCommentId: id, wakeReason: "issue_commented" } });
+        if (scenario === "h-wait-race") {
+          const secondId = randomUUID(); commentIds.push(secondId);
+          await db.insert(issueComments).values({ id: secondId, companyId: f.companyId, issueId: f.issueId,
+            authorType: "user", authorUserId: "operator", body: "second-new-send", createdAt: new Date(now.getTime() + 11) });
+          const retry = async () => {
+            const receipt = await requestTaskRetry({ db, companyId: f.companyId, issueId: f.issueId, actorId: "operator",
+              actorSource: "local_implicit", observedRunId: f.runId, idempotencyKey: randomUUID() });
+            expect(receipt.accepted).toBe(true);
+            await heartbeat.resumeTaskRetry(f.companyId, receipt.requestId!);
+          };
+          await Promise.all([sendA(), heartbeat.wakeup(f.agentId, { source: "on_demand", reason: "issue_commented",
+            requestedByActorType: "user", requestedByActorId: "operator", payload: { issueId: f.issueId, commentId: secondId },
+            contextSnapshot: { issueId: f.issueId, wakeCommentId: secondId, wakeReason: "issue_commented" } }), retry(), retry()]);
+        } else await sendA();
       } else if (action === "retry") {
         const receipt = await requestTaskRetry({ db, companyId: f.companyId, issueId: f.issueId, actorId: "operator",
           actorSource: "local_implicit", observedRunId: f.runId, idempotencyKey: randomUUID() });
@@ -586,6 +603,14 @@ describeEmbeddedPostgres("environment lease release between sandbox acquire and 
       } else await reevaluateStoppedBeforeFirstInput(db, { companyId: f.companyId, issueId: f.issueId, agentId: f.agentId });
       const [task] = await db.select().from(issues).where(eq(issues.id, f.issueId));
       const [hold] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, actionId));
+      if (scenario === "h-wait-sweep") {
+        expect(hold.outcome).toBe("blocked");
+        expect(task.status).toBe("blocked");
+        expect((await run(f.runId)).resultJson).not.toHaveProperty("stoppedBeforeFirstInput");
+        expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+          .filter(row => row.status === "queued")).toHaveLength(0);
+        return;
+      }
       if (scenario === "newer-status") {
         expect(hold.outcome).toBe("blocked");
         expect(task.status).toBe("blocked");
@@ -612,7 +637,7 @@ describeEmbeddedPostgres("environment lease release between sandbox acquire and 
       expect(successors).toHaveLength(1);
       const next = successors[0];
       const ownIds = next.contextSnapshot?.wakeCommentIds as string[];
-      expect(ownIds).toEqual(action === "retry" ? commentIds : commentIds.slice(0, 1));
+      if (scenario !== "h-wait-race") expect(ownIds).toEqual(action === "retry" ? commentIds : commentIds.slice(0, 1));
       // Run the production first-input seal after the harness's launch boundary.
       await db.update(heartbeatRuns).set({ status: "running", runtimeMode: "native", nativeIssueId: f.issueId,
         startedAt: new Date(), responsibleUserId: "operator" })
@@ -622,12 +647,20 @@ describeEmbeddedPostgres("environment lease release between sandbox acquire and 
       const text = await claimFirstTurnQueuedInput(db, binding);
       const delivered = readFirstTurnQueuedInputReceipt(await run(next.id));
       const inputIds = [...ownIds, ...(delivered?.commentIds ?? [])];
+      if (process.env.STOP_EXIT_EVIDENCE_DIR) writeFileSync(join(process.env.STOP_EXIT_EVIDENCE_DIR, `${scenario}.json`),
+        JSON.stringify({ sourceRunId: f.runId, successorRunId: next.id, expected: commentIds, initial: ownIds,
+          firstTurn: delivered, observed: inputIds, text, modelAnswer: false }, null, 2));
       expect(inputIds).toEqual(commentIds);
       expect(new Set(inputIds).size).toBe(commentIds.length);
-      if (action === "send") {
+      if (action === "send" && scenario !== "h-wait-race") {
         expect(text).toContain("new-edited-send");
         for (let index = 1; index < heldCount; index++) expect(text!.indexOf(`held-message-${index}`))
           .toBeGreaterThan(index > 1 ? text!.indexOf(`held-message-${index - 1}`) : -1);
+      } else if (scenario === "h-wait-race") {
+        expect(ownIds).toEqual(commentIds.slice(0, ownIds.length));
+        expect(delivered?.commentIds).toEqual(commentIds.slice(ownIds.length));
+        if (ownIds.length === commentIds.length) expect(text).toBeNull();
+        else expect(text).toContain("second-new-send");
       } else expect(text).toBeNull();
       await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, agentId: f.agentId, runId: next.id,
         seq: 1, eventType: "turn.started", stream: "system" });
@@ -656,7 +689,7 @@ describeEmbeddedPostgres("environment lease release between sandbox acquire and 
     }, 60_000);
 
   // Investigative integration rows: reuse acquireReusable and the five-held h-wait fixture above.
-  it.each(["restored", "false_positive", "blocked", "cancelled", "retry", "status-back", "restored-evidence"] as const)(
+  it.each(["restored", "false_positive", "blocked", "cancelled", "retry", "status-back", "todo", "restored-evidence"] as const)(
     "records status-fenced Stop escape (%s)", async exit => {
       const f = await acquireReusable("replace");
       const now = new Date(), actionId = randomUUID();
@@ -684,6 +717,11 @@ describeEmbeddedPostgres("environment lease release between sandbox acquire and 
           freshContinuationCheck: { kind: "person_owned", reason: "stopped_on_request" },
           savedPersonWakeNoticeCommentId: randomUUID(),
           automaticRecovery: { policy: "preserve_without_replay_v1", runId: f.runId, replay: "blocked", actionOutcome: "unknown" } } });
+      // More than one matching action must settle under the same consent.
+      if (exit === "retry" || exit === "todo") {
+        const [matching] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, actionId));
+        await db.insert(issueRecoveryActions).values({ ...matching, id: randomUUID(), fingerprint: `second-${actionId}` });
+      }
       const commentIds: string[] = [], wakeIds: string[] = [];
       for (let index = 0; index < 5; index++) {
         const id = randomUUID(), wakeId = randomUUID(), at = new Date(now.getTime() + index + 1);
@@ -728,14 +766,30 @@ describeEmbeddedPostgres("environment lease release between sandbox acquire and 
       const before = { action: await action(), task: await task(), sourceRun: await run(f.runId), wakes: await wakes(), firstSend,
         blocker: await getExecutionBlocker(db, f.companyId, f.issueId),
         presentation: await taskInterruptionPresentation(db, await task()) };
+      expect(before.blocker).toMatchObject({ cause: "person_stop_task_status_changed", canContinue: false });
+      expect(before.blocker?.nextAction).toContain("Set the task to Todo or press Retry to deliver the held messages.");
+      for (const wake of before.wakes) expect(wake.payload?.executionWait).toMatchObject({
+        reason: "person_stop_task_status_changed", message: before.blocker!.nextAction,
+      });
       let result: unknown;
+      if (exit === "todo") {
+        const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => { throw error; } });
+        workers.push(coordinator);
+        await heartbeat.registerDeferredReceiptWork(coordinator, () => true).ready;
+      }
       if (exit === "retry") {
         const receipt = await requestTaskRetry({ db, companyId: f.companyId, issueId: f.issueId, actorId: "operator",
           actorSource: "local_implicit", observedRunId: f.runId, idempotencyKey: randomUUID() });
         await heartbeat.resumeTaskRetry(f.companyId, receipt.requestId!);
         result = receipt;
-      } else if (exit === "status-back") {
-        result = await issueService(db).update(f.issueId, { status: "in_progress" });
+      } else if (exit === "status-back" || exit === "todo") {
+        result = await issueService(db).update(f.issueId, { status: exit === "todo" ? "todo" : "in_progress", actorUserId: "operator" });
+        if (exit === "todo") {
+          // The existing deferred-receipt owner retains its 30-second wait deadline.
+          const deadline = Date.now() + 40_000;
+          while (Date.now() < deadline && !(await runs()).some(row => row.status === "queued"))
+            await new Promise(resolve => setTimeout(resolve, 25));
+        }
       } else {
         const app = express();
         app.use(express.json());
@@ -751,7 +805,7 @@ describeEmbeddedPostgres("environment lease release between sandbox acquire and 
         result = { status: response.status, body: response.body };
       }
       if (exit === "retry") expect(result).toMatchObject({ accepted: true });
-      else if (exit !== "status-back") expect(result).toMatchObject({ status: 200 });
+      else if (exit !== "status-back" && exit !== "todo") expect(result).toMatchObject({ status: 200 });
       const afterAct = { result, action: await action(), task: await task(), wakes: await wakes(), runs: await runs(),
         blocker: await getExecutionBlocker(db, f.companyId, f.issueId), presentation: await taskInterruptionPresentation(db, await task()) };
       const nextSend = await send("next-send-after-board-act");
@@ -760,16 +814,16 @@ describeEmbeddedPostgres("environment lease release between sandbox acquire and 
         blocker: await getExecutionBlocker(db, f.companyId, f.issueId), presentation: await taskInterruptionPresentation(db, await task()) };
       let delivery: Record<string, unknown> | null = null;
       const successors = after.runs.filter(row => row.status === "queued");
-      if (exit !== "restored-evidence") {
+      if (process.env.STOP_EXIT_EVIDENCE_DIR) writeFileSync(join(process.env.STOP_EXIT_EVIDENCE_DIR, `${exit}-before-delivery.json`),
+        JSON.stringify({ before, afterAct, after, commentIds, deliveredIds: [...await deliveredQueuedCommentIds(db,
+          { companyId: f.companyId, issueId: f.issueId, agentId: f.agentId, commentIds })] }, null, 2));
+      if (!["restored-evidence", "retry", "todo"].includes(exit)) {
         expect(afterAct.action.evidence).toHaveProperty("stopSettlementRefusal.code", "person_stop_task_status_changed");
         if (["restored", "false_positive", "blocked", "cancelled"].includes(exit)) {
           expect(afterAct.task.status).toBe("blocked");
           expect(afterAct.task.statusVersion).toBe(6);
           expect(afterAct.action).toEqual(before.action);
         }
-        if (exit === "retry") expect(afterAct.wakes.find(wake => wake.reason === "task_retry"))
-          .toMatchObject({ status: "deferred_issue_execution", runId: null,
-            payload: { executionWait: { reason: "person_stop_task_status_changed" } } });
         if (exit === "status-back") {
           expect(afterAct.task.status).toBe("in_progress");
           expect(afterAct.task.statusVersion).toBe(7);
@@ -779,14 +833,24 @@ describeEmbeddedPostgres("environment lease release between sandbox acquire and 
         expect(await deliveredQueuedCommentIds(db, { companyId: f.companyId, issueId: f.issueId,
           agentId: f.agentId, commentIds })).toEqual(new Set());
       } else {
-        expect((result as { status: number }).status).toBe(200);
+        if (exit === "restored-evidence") expect((result as { status: number }).status).toBe(200);
+        else {
+          expect(afterAct.action.evidence).not.toHaveProperty("stopSettlementRefusal");
+          const matching = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+          expect(matching).toHaveLength(2);
+          for (const hold of matching) {
+            expect(hold.outcome).toBe("cancelled");
+            expect(hold.evidence).not.toHaveProperty("stopSettlementRefusal");
+          }
+          expect(afterAct.runs.filter(row => row.status === "queued")).toHaveLength(1);
+        }
         expect(nextSend.refusal).toBeNull();
         expect(afterAct.task.status).toBe("todo");
         expect(afterAct.blocker).toBeNull();
         expect(successors).toHaveLength(1);
         const next = successors[0];
         const ownIds = next.contextSnapshot?.wakeCommentIds as string[];
-        expect(ownIds).toEqual(commentIds.slice(0, 1));
+        if (exit === "restored-evidence") expect(ownIds).toEqual(commentIds.slice(0, 1));
         await deliverReconciledExecutions(db, heartbeat.wakeup);
         await deliverReconciledExecutions(db, heartbeat.wakeup);
         expect((await runs()).filter(row => row.status === "queued")).toHaveLength(1);
@@ -799,14 +863,14 @@ describeEmbeddedPostgres("environment lease release between sandbox acquire and 
         const orderedInputIds = [...ownIds, ...(receipt?.commentIds ?? [])];
         expect(orderedInputIds).toEqual(commentIds);
         expect(new Set(orderedInputIds).size).toBe(7);
-        const bodies = ["held-message-1", "held-message-2", "held-message-3", "held-message-4",
-          "new-send-after-refusal", "next-send-after-board-act"];
+        const bodies = ["held-message-0", "held-message-1", "held-message-2", "held-message-3", "held-message-4",
+          "new-send-after-refusal", "next-send-after-board-act"].filter((_body, index) => !ownIds.includes(commentIds[index]));
         for (const [index, body] of bodies.entries()) {
           expect(text).toContain(body);
           expect(text!.split(body)).toHaveLength(2);
           if (index) expect(text!.indexOf(body)).toBeGreaterThan(text!.indexOf(bodies[index - 1]));
         }
-        expect(text).not.toContain("held-message-0"); // Already the run's own input.
+        for (const id of ownIds) expect(receipt?.commentIds).not.toContain(id);
         // Restart-before-acceptance repeats the same seal, not another queue claim.
         expect(await claimFirstTurnQueuedInput(db, binding)).toBe(text);
         expect(readFirstTurnQueuedInputReceipt(await run(next.id))).toEqual(receipt);

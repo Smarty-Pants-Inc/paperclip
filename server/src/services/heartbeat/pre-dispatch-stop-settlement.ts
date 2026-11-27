@@ -1,5 +1,5 @@
 import { and, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
-import { environmentLeases, heartbeatRuns, issues, issueRecoveryActions, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { agentWakeupRequests, environmentLeases, heartbeatRuns, issues, issueRecoveryActions, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { notifyDeferredWakesForIssue } from "../deferred-execution-notifications.js";
 import { nativeRunHasNoProviderWork } from "../native-runtime/native-session-resume.js";
@@ -12,6 +12,13 @@ import { issueService } from "../issues.js";
 import { logActivity } from "../activity-log.js";
 import { hasAcknowledgedNativeRunStopRequest } from "../acknowledged-native-stop.js";
 import { logger } from "../../middleware/logger.js";
+import { writeDeferredExecutionWait } from "../deferred-execution-wait.js";
+
+export const STOP_STATUS_CHANGED_MESSAGE = "The task status changed after Stop. Held messages have not been delivered. Set the task to Todo or press Retry to deliver the held messages.";
+
+type StopSettlementConsent = {
+  kind: "retry" | "status_todo"; userId: string; runId: string; statusVersion: number;
+};
 
 function repairRefused<T extends 0 | false>(value: T, issueId: string | null, runId: string | null,
   gate: string, field: string): T {
@@ -142,7 +149,8 @@ export async function recordStoppedBeforeFirstInput(db: Db, companyId: string, r
 /** The preparation owner calls this only after its dispatch gate unwound and
  * lease cleanup finished. Close only this run's conservative unwind hold, not
  * another run's reconciliation and never a hold backed by provider work. */
-export async function settlePreDispatchStopRecovery(db: Db, companyId: string, runId: string): Promise<number> {
+export async function settlePreDispatchStopRecovery(db: Db, companyId: string, runId: string,
+  consent?: StopSettlementConsent): Promise<number> {
   let issueId: string | null = null;
   const refuse = (field: string) => repairRefused(0, issueId, runId, "settlePreDispatchStopRecovery", field);
   return db.transaction(async transaction => {
@@ -203,15 +211,31 @@ export async function settlePreDispatchStopRecovery(db: Db, companyId: string, r
     const ownBlock = actions.some(action =>
       [action.evidence.nativeFailureBlock, action.evidence.nativeBootstrapFailureBlock, action.evidence.legacyCancellationBlock]
         .some(value => { const block = record(value); return block.runId === runId && block.statusVersion === task?.statusVersion; }));
-    if (firstInputStop && (!task || !(
+    // Only a newly authorized, exact-run Retry or person-owned Todo edit can
+    // replace Stop's status-version authority. Send and recovery sweeps cannot.
+    const renewedConsent = Boolean(firstInputStop && task && consent?.userId && consent.runId === runId &&
+      consent.statusVersion === task.statusVersion && task.assigneeAgentId === run.agentId && !task.assigneeUserId &&
+      (consent.kind === "retry" && !["done", "cancelled"].includes(task.status) ||
+        consent.kind === "status_todo" && task.status === "todo"));
+    const capturedCurrent = Boolean(task && (renewedConsent ||
       (task.status === "in_progress" || task.status === "todo") && captured.issueId === task.id &&
-        captured.assigneeAgentId === task.assigneeAgentId && captured.statusVersion === task.statusVersion ||
-      task.status === "blocked" && ownBlock))) {
+        captured.assigneeAgentId === task.assigneeAgentId && captured.statusVersion === task.statusVersion));
+    if (firstInputStop && (!task || !(capturedCurrent || task.status === "blocked" && ownBlock))) {
       for (const action of actions) await tx.update(issueRecoveryActions).set({
-        nextAction: "The task status changed after Stop. Held messages have not been delivered; review the task before continuing.",
+        nextAction: STOP_STATUS_CHANGED_MESSAGE,
         evidence: { ...action.evidence, stopSettlementRefusal: { code: "person_stop_task_status_changed", runId,
           currentStatusVersion: task?.statusVersion ?? null } }, updatedAt: new Date(),
       }).where(eq(issueRecoveryActions.id, action.id));
+      // Older held messages need the same explanation as the refused new Send.
+      const held = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, run.agentId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId),
+        sql`${agentWakeupRequests.payload}->>'issueId' = ${run.nativeIssueId}`,
+      )).for("update");
+      for (const wake of held) await writeDeferredExecutionWait(tx, { companyId, requestId: wake.id }, {
+        reason: "person_stop_task_status_changed", message: STOP_STATUS_CHANGED_MESSAGE,
+        recoveryActionId: actions[0]?.id, runId,
+      });
       return refuse("task.statusVersion");
     }
     let settled = 0;
@@ -220,10 +244,16 @@ export async function settlePreDispatchStopRecovery(db: Db, companyId: string, r
       if (firstInputStop && action.status === "resolved") {
         const recovery = record(action.evidence.workspaceRestoreRecovery);
         const automatic = record(action.evidence.automaticRecovery);
-        if (automatic.runId !== runId || automatic.replay !== "blocked" ||
-            action.evidence.executionReconciliation || action.evidence.freshContinuation ||
-            (action.evidence.workspaceRestoreRecovery != null && (!Array.isArray(recovery.leaseIds) ||
-              !recovery.leaseIds.every(id => remote.some(lease => lease.id === id))))) continue;
+        const field = automatic.runId !== runId ? "automaticRecovery.runId"
+          : automatic.replay !== "blocked" ? "automaticRecovery.replay"
+          : action.evidence.executionReconciliation ? "executionReconciliation"
+          : action.evidence.freshContinuation ? "freshContinuation"
+          : action.evidence.workspaceRestoreRecovery != null && (!Array.isArray(recovery.leaseIds) ||
+              !recovery.leaseIds.every(id => remote.some(lease => lease.id === id))) ? "workspaceRestoreRecovery.leaseIds" : null;
+        if (field) {
+          logger.info({ issueId, runId, recoveryActionId: action.id, gate: "settlePreDispatchStopRecovery.hold", field }, "stop_repair_refused");
+          continue;
+        }
         await tx.update(issueRecoveryActions).set({ outcome: "cancelled", resolutionNote: "stopped before first input",
           evidence: { ...action.evidence, workspaceRestoreFailure: null, workspaceRestoreRecovery: null,
             automaticRecovery: { ...record(action.evidence.automaticRecovery), replay: "cancelled" } }, updatedAt: new Date(),
@@ -236,6 +266,12 @@ export async function settlePreDispatchStopRecovery(db: Db, companyId: string, r
         sourceIssueId: run.nativeIssueId, actionId: action.id, cause: action.cause,
         status: "resolved", outcome: "cancelled", resolutionNote: "stopped before dispatch" }, tx);
       if (resolved) { settled++; settledActionIds.add(action.id); }
+    }
+    for (const action of actions.filter(action => settledActionIds.has(action.id))) {
+      await tx.update(issueRecoveryActions).set({
+        evidence: sql`(${issueRecoveryActions.evidence} - 'stopSettlementRefusal') ||
+          ${JSON.stringify(renewedConsent ? { stopSettlementConsent: consent } : {})}::jsonb`,
+      }).where(eq(issueRecoveryActions.id, action.id));
     }
     if (firstInputStop) {
       // Repair only this run's no-result finalizer and this run's false file flag.
@@ -277,9 +313,7 @@ export async function settlePreDispatchStopRecovery(db: Db, companyId: string, r
       )).limit(1);
       if (task && !successor && !otherHold && task.assigneeAgentId === run.agentId && !task.assigneeUserId &&
           (!task.executionRunId || task.executionRunId === runId) && (!task.checkoutRunId || task.checkoutRunId === runId) &&
-          (((task.status === "in_progress" || task.status === "todo") && captured.issueId === task.id &&
-              captured.assigneeAgentId === task.assigneeAgentId && captured.statusVersion === task.statusVersion) ||
-            task.status === "blocked" && settledOwnBlock)) {
+          (capturedCurrent || task.status === "blocked" && settledOwnBlock)) {
         if (task.status !== "todo") {
           await issueService(tx).update(task.id, { status: "todo" }, tx);
           await logActivity(tx, { companyId, actorType: "system", actorId: "person-stop-settlement",
@@ -300,6 +334,7 @@ export async function settlePreDispatchStopRecovery(db: Db, companyId: string, r
  * its existing hold are eligible; normal admission still owns every message. */
 export async function reevaluateStoppedBeforeFirstInput(db: Db, input: {
   companyId: string; issueId: string; agentId: string;
+  consent?: StopSettlementConsent;
 }): Promise<number> {
   let runId: string | null = null;
   const refuse = (field: string) => repairRefused(0, input.issueId, runId, "reevaluateStoppedBeforeFirstInput", field);
@@ -323,6 +358,8 @@ export async function reevaluateStoppedBeforeFirstInput(db: Db, input: {
         !["legacy_execution_requires_reconciliation", "native_continuation_requires_reconciliation"].includes(hold.cause) ||
         hold.evidence.executionReconciliation || hold.evidence.freshContinuation)) return refuse("holds.scope_or_authority");
     if (!await recordStoppedBeforeFirstInput(tx, input.companyId, latest.id)) return refuse("run.first_input_seal");
-    return settlePreDispatchStopRecovery(tx, input.companyId, latest.id);
+    if (input.consent && (input.consent.runId !== latest.id || input.consent.statusVersion !== task.statusVersion))
+      return refuse("consent.run_or_statusVersion");
+    return settlePreDispatchStopRecovery(tx, input.companyId, latest.id, input.consent);
   });
 }

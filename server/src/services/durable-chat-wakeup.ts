@@ -356,6 +356,8 @@ export interface DurableChatWakeupRequest {
   readonly failedRunRetry?: { readonly failedRunId: string };
   /** Only the current inbound owner may reconsider its already saved, unconsumed receipt. */
   readonly resumeDeferred?: true;
+  /** Server-owned wait identity from a live person's act, absent on recovery sweeps. */
+  readonly livePersonRequestId?: string;
   readonly authorize: (tx: Db) => Promise<void>;
   readonly onAdmitted?: (tx: Db, receipt: { runId: string | null }) => Promise<void>;
 }
