@@ -85,6 +85,25 @@ describe.skipIf(!support.supported)("execution blocker PostgreSQL read projectio
     expect(EXECUTION_BLOCKER_PERSON_RETRY_ACTION).toContain("Agents cannot retry it for them.");
   });
 
+  it("keeps legacy ACP continuation fields and guidance unchanged", async () => {
+    const f = await fixture({ status: "cancelled", resultJson: {
+      acpToolInventoryComplete: true, acpPendingToolCount: 0,
+      cancellation: { source: "provider", expected: false, initiator: { type: "provider" },
+        reason: "Provider cancelled execution", recordedAt: "2020-01-01T00:01:00Z" },
+    } });
+    expect(await compare(f)).toMatchObject({ canContinue: true, canRetry: true, nextAction: "Inspect the source run." });
+  });
+
+  it("keeps an intentional native Stop's existing guidance", async () => {
+    const f = await fixture({ runtimeMode: "native", status: "cancelled", nativeIssueId: null, resultJson: {
+      cancellation: { source: "operator", expected: true, initiator: { type: "user", userId: "board" },
+        reason: "Stopped by the person", recordedAt: "2020-01-01T00:01:00Z" },
+    } });
+    await db.update(agents).set({ adapterType: "paperclip_runner" }).where(eq(agents.id, f.agentId));
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ canRetry: false,
+      nextAction: "Inspect the source run. Inspect the run before sending a new message to request continuation." });
+  });
+
   it("shows plain wording and Retry for a finalization deadline saved by the previous release", async () => {
     const previousReleaseText = "Inspect the failed run and verify its provider has stopped. Reconcile any uncertain external action before explicitly continuing this task.";
     const f = await fixture({ runtimeMode: "native", errorCode: "execution_finalization_deadline_exceeded",

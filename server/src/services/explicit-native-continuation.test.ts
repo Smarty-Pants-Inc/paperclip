@@ -2662,6 +2662,57 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
       ...(origin === "task_retry" ? { taskRetryRequestId: requestId }
         : origin === "queued_message" ? { queuedCommentRequestId: requestId } : {}) };
   }
+  it("projects both person continuations for the recovered native provider-pack failure", async () => {
+    const f = await recoveredCopybackFixture("message");
+    const runError = "runner_remote_provider_artifact_incompatible: provider-pack.json is unreadable (permission_denied)";
+    await db.update(issueRecoveryActions).set({ cause: "native_continuation_requires_reconciliation" })
+      .where(eq(issueRecoveryActions.id, f.action.id));
+    await db.update(heartbeatRuns).set({ errorCode: "adapter_failed", error: runError, nativeSessionId: randomUUID() })
+      .where(eq(heartbeatRuns.id, f.sourceRunId));
+    const [before] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+    const [actionBefore] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.action.id));
+    const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
+    expect(blocker).toMatchObject({ cause: "native_continuation_requires_reconciliation", runStatus: "failed", runError,
+      canContinue: true, canRetry: true, savedMessageCount: 0,
+      nextAction: "Saved work recovered. Send a message or press Retry to continue.",
+      workspaceRecovery: { message: "Saved work recovered. Send a message or press Retry to continue." } });
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.action.id)))[0]).toEqual(actionBefore);
+    const preview = await admitExplicitNativeContinuation({ ...f, db, dryRun: true });
+    expect(blocker!.canContinue).toBe(Boolean(preview));
+    expect(preview).toMatchObject({ previousRunId: f.sourceRunId, commentId: f.commentId });
+    const admitted = await admitExplicitNativeContinuation({ ...f, db });
+    expect(admitted).toMatchObject({ previousRunId: f.sourceRunId, commentId: f.commentId });
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId)))[0]).toEqual(before);
+    const [settled] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.action.id));
+    expect(settled.evidence.explicitUserContinuation).toMatchObject({ previousRunId: f.sourceRunId,
+      runId: f.successorRunId, commentId: f.commentId, actorId: f.actorId });
+  });
+
+  it.each(["done", "cancelled", "another_assignee"] as const)(
+    "does not offer a native message that admission refuses for %s", async shape => {
+      const f = await recoveredCopybackFixture("message");
+      await db.update(issueRecoveryActions).set({ cause: "native_continuation_requires_reconciliation" })
+        .where(eq(issueRecoveryActions.id, f.action.id));
+      if (shape === "another_assignee") {
+        const agentId = randomUUID();
+        await db.insert(agents).values({ id: agentId, companyId: f.companyId, name: "Other owner", adapterType: "paperclip_runner" });
+        await db.update(issues).set({ assigneeAgentId: agentId }).where(eq(issues.id, f.issueId));
+      } else await db.update(issues).set({ status: shape }).where(eq(issues.id, f.issueId));
+      const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
+      expect(blocker).toMatchObject({ canContinue: false, canRetry: false, nextAction: "Saved work recovered." });
+      expect(blocker!.canContinue).toBe(Boolean(await admitExplicitNativeContinuation({ ...f, db, dryRun: true })));
+    },
+  );
+
+  it("names only a message when a native interrupted turn does not offer Retry", async () => {
+    const f = await seed();
+    await db.update(heartbeatRuns).set({ status: "interrupted" }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
+    expect(blocker).toMatchObject({ canContinue: true, canRetry: false, nextAction: "Send a message to continue." });
+    expect(blocker!.canContinue).toBe(Boolean(await admitExplicitNativeContinuation({ ...f, db, dryRun: true })));
+  });
+
   async function committedQueuedSendFixture() {
     const f = await recoveredCopybackFixture("queued_message");
     await db.update(nativeRunFinalizations).set({ phase: "committed", leaseOwner: null })

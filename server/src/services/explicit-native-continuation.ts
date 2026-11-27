@@ -15,6 +15,7 @@ import { preserveNativeFailedWorkspace, preserveTaskRemoteWorkspaceWriter } from
 import { createHash } from "node:crypto";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { canContinueCancelledRun, userStopBoundaryAt } from "./run-cancellation.js";
+import { explicitContinuationAdapterEligible, explicitContinuationSourceEligible, explicitContinuationTaskEligible } from "./explicit-native-continuation-eligibility.js";
 import { readQueuedInteractionResponse } from "./queued-interaction-response.js";
 import { isCancelledNativeStartup, isFailedNativePreparation, isFailedNativePreparationRetryAncestor } from "./cancelled-native-startup.js";
 import { hasNativeLocalProcessStop, hasHistoricalSuspendedNativeSession, nativeGatedRunNeverLaunched, nativeRunNeverLaunched, recordedLocalExecutionStopped, recordUnidentifiedLocalRunnerStop } from "./native-local-process-stop.js";
@@ -77,7 +78,6 @@ const continuationRunFields = {
   controllerBootId: heartbeatRuns.controllerBootId, controllerLeaseExpiresAt: heartbeatRuns.controllerLeaseExpiresAt,
   executionStage: heartbeatRuns.executionStage,
 };
-const terminal = ["failed", "interrupted", "timed_out", "cancelled"];
 const PREVIOUS_EXECUTION_UNVERIFIED = "Paperclip can't confirm that the previous attempt stopped before it started work, so Retry can't continue from it. Your message is saved.";
 
 export function isUserCommentContinuationReason(reason: string | null | undefined): boolean {
@@ -210,8 +210,7 @@ export async function admitExplicitNativeContinuation(input: {
   const [task] = await db.select().from(issues).where(and(
     eq(issues.companyId, companyId), eq(issues.id, issueId),
   ));
-  if (!task || task.assigneeAgentId !== agentId || task.status === "cancelled"
-    || task.status === "done" && !input.queuedCommentInterruptId) return null;
+  if (!explicitContinuationTaskEligible(task, agentId, Boolean(input.queuedCommentInterruptId))) return null;
   const [retryWake] = input.taskRetryRequestId ? await db.select().from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, input.taskRetryRequestId),
     eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
@@ -274,7 +273,7 @@ export async function admitExplicitNativeContinuation(input: {
   ));
   if (!retry && !taskRetry && !response && !comment?.body.trim()) return null;
   const [agent] = await db.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.id, agentId)));
-  if (!agent || (!isConversationAdapter(agent.adapterType) && agent.adapterType !== "paperclip_runner")) return null;
+  if (!agent || !explicitContinuationAdapterEligible(agent.adapterType)) return null;
   const agentIsNative = agent.adapterType === "paperclip_runner";
   const interruptIntent = interruptQueue?.payload?.queuedCommentInterrupt as Record<string, unknown> | undefined;
   const interruptRequestedAt = typeof interruptIntent?.requestedAt === "string" ? new Date(interruptIntent.requestedAt) : null;
@@ -379,9 +378,8 @@ export async function admitExplicitNativeContinuation(input: {
     let [run] = await db.select({ ...continuationRunFields, runnerProfileJson: preflightProfile }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, companyId), sql`${heartbeatRuns.id}::text = ${runId}`,
     ));
-    if (!run || run.agentId !== agentId || !terminal.includes(run.status) ||
-        (run.nativeIssueId ?? run.issueId ?? run.contextSnapshot?.issueId) !== issueId ||
-        !run.finishedAt) return blocked("source_unavailable", "The previous execution has not finished or its owner changed. Your message is saved.");
+    if (!explicitContinuationSourceEligible(run, issueId, agentId))
+      return blocked("source_unavailable", "The previous execution has not finished or its owner changed. Your message is saved.");
     if (!queuedInterrupt && !queuedRequest && authorizedAt <= userStopBoundaryAt(run)!) return blocked("message_predates_stop", "This message arrived before the previous run stopped. Send a new message to continue.");
     if (adapterExecutionControls.has(run.id)) return blocked("execution_settling", "Waiting for the previous run to stop. Your message will start automatically.");
     const [coordinator] = await db.select().from(nativeRunFinalizations).where(and(
