@@ -47,6 +47,7 @@ import { crashPoint } from "@paperclipai/shared/crash-points";
 import { NATIVE_PROVIDER_DURABLE_EVENT_TYPES } from "./native-retired-backup-source.js";
 import { recordRunEventCommitted } from "../server-metrics.js";
 import { NATIVE_FRESH_SESSION_MARKER } from "./continued-session.js";
+import { issueCommentMetadataSchema, type IssueCommentMetadata } from "@paperclipai/shared";
 import { queuedCommentIdsFromRunContext } from "../../lib/queued-comment-context.js";
 
 export interface PaperclipControlPlaneBinding {
@@ -547,6 +548,10 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
             sql`${issueComments.metadata}->>'sourceRunId' = ${run.id}`)).limit(1);
           if (prior && !marker) {
             const context = record(run.contextSnapshot);
+            const continuity = issueCommentMetadataSchema.shape.workspaceContinuity.safeParse(context.workspaceContinuity);
+            const workspaceContinuity: NonNullable<IssueCommentMetadata["workspaceContinuity"]> =
+              continuity.success && continuity.data ? continuity.data
+                : { mode: "unknown", sourceRunId: null, contentOrigin: "unknown" };
             const wakeIds = [...new Set([...queuedCommentIdsFromRunContext(context),
               ...[context.wakeCommentId, context.commentId].filter((id): id is string => typeof id === "string" && id.length > 0)])];
             const [wake] = wakeIds.length ? await tx.select({ createdAt: issueComments.createdAt }).from(issueComments)
@@ -572,13 +577,13 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
               conversationSessionGeneration: issue.conversationSessionGeneration,
               body: NATIVE_FRESH_SESSION_MARKER,
               presentation: { kind: "system_notice", tone: "neutral", detailsDefaultOpen: false },
-              metadata: { version: 1, sourceRunId: run.id, sections: [] }, createdAt: markerAt,
+              metadata: { version: 1, sourceRunId: run.id, workspaceContinuity, sections: [] }, createdAt: markerAt,
             });
             publication = (await persistActivity(tx as unknown as Db, {
               companyId: issue.companyId, actorType: "system", actorId: "conversation",
               action: "issue.conversation_session_started", entityType: "issue", entityId: issue.id, runId: run.id,
               details: { automatic: true, source: "session.started", generation: issue.conversationSessionGeneration,
-                commentId: comment!.id, sourceRunId: run.id },
+                commentId: comment!.id, sourceRunId: run.id, workspaceContinuity },
             })).publication;
           }
         }

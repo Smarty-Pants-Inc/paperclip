@@ -20,7 +20,7 @@ import { attachPreservedWorkspaceSnapshots } from "../workspace-recovery-snapsho
 import { describeRetainedPriorWorkspace, materializeFreshWorkspaceSeed } from "../fresh-workspace-seed.js";
 import { assertTaskWorkspaceExecutionAccess } from "../task-workspace-access.js";
 import { preparePluginWorkspace, type WorkspaceWorkers } from "../plugin-workspaces.js";
-import { readWorkspaceProviderBinding } from "@paperclipai/shared";
+import { readWorkspaceProviderBinding, type IssueCommentMetadata } from "@paperclipai/shared";
 import { nativeExecutionUsesTaskWorkspace } from "./external-provider.js";
 import { readGitCacheRestoration } from "../git-workspace-restoration.js";
 import { createHeartbeatPreparationTiming } from "./preparation-timing.js";
@@ -1467,8 +1467,20 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
       repoRef: preparedRefs.has(source.id) ? preparedRefs.get(source.id)! : readNonEmptyString(source.repoRef),
     }));
   }
-  if (persistedExecutionWorkspace) {
-    context.executionWorkspaceId = persistedExecutionWorkspace.id;
+  // Record what preparation actually selected, not what a new provider session
+  // might imply. In particular, a fresh workspace is not a restored task save.
+  const readiness = input.task.freshWorkspace;
+  const source = remoteSourceState.value?.source;
+  const workspaceContinuity: NonNullable<IssueCommentMetadata["workspaceContinuity"]> = {
+    mode: readiness?.mode ?? (reusedExecutionWorkspace ? "reuse_current_workspace" : "new_workspace"),
+    sourceRunId: readiness && "sourceRunId" in readiness ? readiness.sourceRunId : null,
+    contentOrigin: reusedExecutionWorkspace ? "existing_workspace"
+      : source?.kind === "git" ? "configured_source"
+      : source?.kind === "empty" ? "empty" : "unknown",
+  };
+  context.workspaceContinuity = workspaceContinuity;
+  if (persistedExecutionWorkspace || providerApiPlacement) {
+    if (persistedExecutionWorkspace) context.executionWorkspaceId = persistedExecutionWorkspace.id;
     await db
       .update(heartbeatRuns)
       .set({
