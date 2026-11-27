@@ -36,7 +36,8 @@ vi.mock("@/api/access", async importOriginal => ({
   ...await importOriginal<typeof import("@/api/access")>(), accessApi: { listUserDirectory: vi.fn(async () => ({ users: [] })) },
 }));
 vi.mock("@/components/transcript/useLiveRunTranscripts", () => ({
-  useLiveRunTranscripts: () => ({ transcriptByRun: new Map(), hydratedRunIds: new Set(state.transcripts.keys()), isInitialHydrating: false }),
+  useLiveRunTranscripts: () => ({ transcriptByRun: new Map(), hydratedRunIds: new Set(state.transcripts.keys()),
+    errorsByRun: new Map(), truncatedRunIds: new Set(), isInitialHydrating: false }),
 }));
 vi.mock("@/components/transcript/useNativeRunTranscripts", () => ({
   useNativeRunTranscripts: () => ({ transcriptByRun: new Map(state.transcripts), errorsByRun: new Map(),
@@ -89,6 +90,8 @@ const comment = (id: string, body: string, second: number, runId?: string) => ({
   id, body, companyId: "company", issueId: "chat", authorType: runId ? "agent" as const : "user" as const,
   authorAgentId: runId ? "agent" : null, authorUserId: runId ? null : "viewer", runId,
   createdByRunId: runId ?? null, presentation: null, metadata: null,
+  // This fixture's completion is a native response, not a tool-posted comment.
+  ...(id === "final" && runId ? { clientRequestId: `native-final:${runId}:answer` } : {}),
   createdAt: new Date(at(second)), updatedAt: new Date(at(second)),
 });
 const handoff = (id = "task", sourceRunId: string | null = "source-run", second = 3): ConversationTaskHandoff => ({
@@ -150,6 +153,17 @@ describe("Coordinator task creation ordering", () => {
     await paint({ conversationMode: false, companyId: "company", createdTasks: [createdTask({ status: "done" })] });
     expect(host.querySelector('[data-testid="task-chat-created-task"]')).toBe(card);
     expect(card.textContent).toContain("Done");
+  });
+
+  it("keeps an ordinary saved reply after the subtask created before it", async () => {
+    state.coordinator = false;
+    const reply = { ...comment("final", "The saved task update.", 9, "source-run"), clientRequestId: null };
+    state.transcripts.clear();
+    state.transcripts.set("source-run", []);
+    await paint({ conversationMode: false, companyId: "company", comments: [reply], createdTasks: [createdTask()] });
+    const card = host.querySelector('[data-testid="task-chat-created-task"]')!;
+    before(card, anchor("final"));
+    expect(host.textContent!.split(reply.body)).toHaveLength(2);
   });
 
   it("filters human and foreign-company tasks and links standalone follow-ups by ID", async () => {

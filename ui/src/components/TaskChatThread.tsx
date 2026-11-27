@@ -2782,8 +2782,14 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               summary: buildTurnSummary(entries, { durationMs, failed, personStopped: isUserStop(source.id) }),
             },
             anchorCommentId: null,
-            startMs: (sourceIsPaperclipRunner ? openingInputsByRun.get(source.id)?.placementMs : undefined) ||
-              (startedAtMs > 0 ? startedAtMs : Number.POSITIVE_INFINITY),
+            startMs: Math.max(
+              (sourceIsPaperclipRunner ? openingInputsByRun.get(source.id)?.placementMs : undefined) ||
+                (startedAtMs > 0 ? startedAtMs : Number.POSITIVE_INFINITY),
+              // Ordinary saved comments retain send order; only native reply
+              // receipts can assign a different opening/question slot.
+              sourceIsPaperclipRunner && sourcePresentationItem && !replyPlacementByCommentId.has(sourcePresentationItem.id)
+                ? toMs(sourcePresentationItem.createdAtIso) : 0,
+            ),
           });
           settledRunIds.add(source.id);
           if (acceptedSummary && !sourceHasPresentationComment) settledReplyRunIds.add(source.id);
@@ -3121,7 +3127,12 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           // Later slots follow the question's send, independently of late ACKs.
           startMs: sourceIsPaperclipRunner
             ? Math.max(openingMs, segmentIndex === 0 ? openingMs : questionSlot?.atMs ??
-              (finalResponse ? replyPlacementByCommentId.get(finalResponse.id)?.atMs : undefined) ?? openingMs)
+              (finalResponse ? replyPlacementByCommentId.get(finalResponse.id)?.atMs : undefined) ?? openingMs,
+              // A tool-authored saved comment has its own send position. It is
+              // not a native-final receipt and must not inherit the run's
+              // opening time above earlier comments or the question it answers.
+              savedFinal && !replyPlacementByCommentId.has(finalResponse.id)
+                ? toMs(finalResponse.createdAtIso) : 0)
             : segment.startMs,
         });
       }
