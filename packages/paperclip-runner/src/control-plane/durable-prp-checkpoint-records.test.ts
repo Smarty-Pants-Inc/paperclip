@@ -85,10 +85,14 @@ it("serialises only the new command when one command is added to a full journal"
     await core.flushCheckpoint();
     const recordCalls = stringify.mock.calls.filter(([value]) => value !== null && typeof value === "object"
       && ("controllerSeq" in value || "sourceSeq" in value));
+    const serialisedWholeState = stringify.mock.calls.some(([value]) => value === commands || value === events
+      || (value !== null && typeof value === "object" && ("commands" in value || "committedEvents" in value)));
     stringify.mockRestore();
     // The new command is serialised for its size check and once for the checkpoint.
     expect(recordCalls.filter(([value]) => existing.has(value as object))).toHaveLength(0);
     expect(recordCalls.length).toBeLessThanOrEqual(2);
+    // Journal admission must not serialise the entire state (or its arrays).
+    expect(serialisedWholeState).toBe(false);
 
     const checkpoint = saved.at(-1)!;
     expect(checkpoint.reset).toBe(false);
