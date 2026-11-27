@@ -22,6 +22,7 @@ import { nativeCompletionSource, buildNativeCompletionContract } from "./complet
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { buildNativeExecutionInput, budgetNativeFreshFallback } from "./native-execution-input.js";
 import { decideNativeContinuation } from "./continued-session.js";
+import { StaleExecutionContinuationError } from "../execution-continuation.js";
 import { runnerApiOperation } from "./runner-api-catalog.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
 import { buildNativeModelEnvelope, canonicalNativeRuntimeContextDigest, parseNativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
@@ -642,6 +643,37 @@ describe("native serialized-command budget", () => {
     expect(commandEnvelopeBytes(buildNativeModelEnvelope(input, { resumedSession: true }))).toBeLessThan(NATIVE_TURN_KNOWN_MAX_BYTES);
     expect(input.continuationPrompt).not.toContain("History was cut");
     expect(decideNativeContinuation({ ...args, ...extra, hasSession: true, previousRunId: "previous" }).promptOnly).toBe(sessionContinuity === "continuous");
+  });
+  it.each([false, true])("settles an empty plain-text successor without starting a model turn (own wake: %s)", ownWake => {
+    const c = shape(2, 100);
+    c.trigger.reason = "issue_commented";
+    c.resumeDelta = { baseRunId: "previous", messages: [] };
+    const body = "My new wake, not the saved task brief.";
+    const wakePayload = { reason: c.trigger.reason, commentIds: [c.messages.at(-1)!.id], executionContinuation: c,
+      comments: ownWake ? [{ ...c.messages.at(-1)!, body, fullBody: body }] : [] };
+    const construct = () => buildNativeExecutionInput({ ...args, boundCommandBytes: true, resumedSession: true,
+      previousTurn: { runId: "previous", task: args.issue }, wakePayload });
+    if (ownWake) {
+      const envelope = buildNativeModelEnvelope(construct(), { resumedSession: true });
+      expect(envelope).toMatchObject({ events: body });
+      expect(JSON.stringify(envelope)).not.toContain('{\\"messages\\":[]}');
+      console.log("empty delta successor evidence", JSON.stringify({ ownWake, events: "events" in envelope ? envelope.events : null }));
+    } else {
+      let observed: unknown;
+      try { construct(); } catch (error) { observed = error; }
+      expect(observed).toBeInstanceOf(StaleExecutionContinuationError);
+      expect(observed).toMatchObject({ code: "continuation_nothing_new" });
+      console.log("empty delta successor evidence", JSON.stringify({ ownWake, code: (observed as StaleExecutionContinuationError)?.code, modelTurnStarted: false }));
+    }
+  });
+  it("settles a genuinely empty successor even when no wake comment IDs select the plain-text road", () => {
+    const c = shape(2, 100);
+    c.trigger.reason = "issue_commented";
+    c.resumeDelta = { baseRunId: "previous", messages: [] };
+    expect(() => buildNativeExecutionInput({ ...args, resumedSession: true,
+      previousTurn: { runId: "previous", task: args.issue },
+      wakePayload: { reason: c.trigger.reason, commentIds: [], comments: [], executionContinuation: c } }))
+      .toThrowError(expect.objectContaining({ code: "continuation_nothing_new" }));
   });
   it("budgets a failed-resume full bootstrap only when that fallback is selected", () => {
     const c = shape(31, 900000);

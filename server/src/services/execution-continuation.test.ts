@@ -6,6 +6,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
+  agentWakeupRequests,
   applyPendingMigrations,
   companies,
   createDb,
@@ -25,6 +26,7 @@ import { resolveExternalTestDatabaseUrl } from "../__tests__/helpers/external-te
 import { commandEnvelopeBytes, NATIVE_TURN_KNOWN_MAX_BYTES, type NativeContinuationReadState } from "./native-runtime/native-turn-budget.js";
 import { buildNativeExecutionInput } from "./native-runtime/native-execution-input.js";
 import { decideNativeContinuation } from "./native-runtime/continued-session.js";
+import { withQueuedCommentIdsInWakePayload } from "./issue-queued-comment-queue.js";
 import { nativeRuntimeContextFixture } from "./native-runtime/runtime-context.test-fixture.js";
 import { buildNativeModelEnvelope } from "../vendor/paperclip-runner/index.js";
 import { StaleExecutionContinuationError, buildExecutionContinuation, currentContinuationOrigins, projectHumanInteractionResponse } from "./execution-continuation.js";
@@ -168,10 +170,13 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
       let eventId: number | undefined;
       // A previously cut snapshot contains only the messages actually prepared.
       delivered.messages = delivered.messages.slice(0, 2);
-      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, executionContinuation: delivered } }).where(eq(heartbeatRuns.id, runId));
+      const sessionId = randomUUID(), providerSessionId = `pi-${randomUUID()}`;
+      Object.assign(delivered.coverage, { nativeSessionId: sessionId, providerSessionId });
+      await db.update(heartbeatRuns).set({ status: "succeeded", runtimeMode: "native", nativeIssueId: issueId, nativeSessionId: sessionId,
+        contextSnapshot: { issueId, executionContinuation: delivered } }).where(eq(heartbeatRuns.id, runId));
       let state: NativeContinuationReadState | undefined;
       const read = () => buildExecutionContinuation({ db, companyId, issueId, agentId, runId: randomUUID(), previousContextRunId: runId,
-        context: { interactionId }, summary: null, exposeLowTrustRaw: false, onNativeReadState: value => { state = value; } });
+        nativeSessionId: sessionId, nativeProviderSessionId: providerSessionId, context: { interactionId }, summary: null, exposeLowTrustRaw: false, onNativeReadState: value => { state = value; } });
       const [comment] = await db.select().from(issueComments).where(eq(issueComments.id, notionId));
       try {
         await read();
@@ -187,7 +192,8 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
       } finally {
         if (eventId !== undefined) await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.id, eventId));
         await db.update(issueComments).set({ updatedAt: comment!.updatedAt }).where(eq(issueComments.id, notionId));
-        await db.update(heartbeatRuns).set({ contextSnapshot: prior!.contextSnapshot }).where(eq(heartbeatRuns.id, runId));
+        await db.update(heartbeatRuns).set({ contextSnapshot: prior!.contextSnapshot, status: prior!.status, runtimeMode: prior!.runtimeMode,
+          nativeIssueId: prior!.nativeIssueId, nativeSessionId: prior!.nativeSessionId }).where(eq(heartbeatRuns.id, runId));
       }
     });
     it.each([false, true])("keeps two ordinary comments delta-only on an oversized retained session (fresh cut: %s)", async freshCut => {
@@ -211,8 +217,12 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
         expect(delivered.coverage).toMatchObject({ nativeSessionId: sessionId, omitted: expect.arrayContaining([{ id: history[0]!.id, updatedAt: history[0]!.updatedAt.toISOString() }]) });
       }
       Object.assign(delivered.coverage, { providerSessionId: "provider-generation-1" });
-      await db.insert(heartbeatRuns).values({ id: previousRunId, companyId, agentId, nativeSessionId: sessionId, status: "succeeded", contextSnapshot: { issueId: taskId, executionContinuation: delivered } });
+      await db.insert(heartbeatRuns).values({ id: previousRunId, companyId, agentId, runtimeMode: "native", nativeIssueId: taskId, nativeSessionId: sessionId, status: "succeeded", contextSnapshot: { issueId: taskId, executionContinuation: delivered } });
       await db.insert(heartbeatRunEvents).values({ companyId, runId: previousRunId, agentId, seq: 1, eventType: "turn.accepted", stream: "system", level: "info" });
+      if (freshCut) await db.insert(heartbeatRunEvents).values([
+        { companyId, runId: previousRunId, agentId, seq: 0, eventType: "session.started", payload: { prpEvent: { payload: { providerSessionId: "provider-generation-1" } } } },
+        { companyId, runId: previousRunId, agentId, seq: 2, eventType: "task_history.read", payload: { comments: Object.fromEntries(history.map(message => [message.id, message.updatedAt.toISOString()])) } },
+      ]);
       for (let turn = 1; turn <= 2; turn++) {
         const commentId = randomUUID(), nextRunId = randomUUID(), body = `Ordinary follow-up ${turn}`;
         await db.insert(issueComments).values({ id: commentId, companyId, issueId: taskId, authorType: "user", authorUserId: "local-board", body,
@@ -246,11 +256,213 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
         expect(commandEnvelopeBytes(buildNativeModelEnvelope(input))).toBeGreaterThan(2 * NATIVE_TURN_KNOWN_MAX_BYTES);
         expect(buildNativeModelEnvelope(input, { resumedSession: true })).toMatchObject({ events: body });
         expect(decideNativeContinuation({ provider: "pi_rpc", hasSession: true, previousRunId, agentId, wakePayload })).toEqual({ continue: true, promptOnly: true });
-        await db.insert(heartbeatRuns).values({ id: nextRunId, companyId, agentId, nativeSessionId: sessionId, status: "succeeded", contextSnapshot: { issueId: taskId, executionContinuation: stored } });
+        Object.assign(stored.coverage, { providerSessionId: "provider-generation-1" });
+        await db.insert(heartbeatRuns).values({ id: nextRunId, companyId, agentId, runtimeMode: "native", nativeIssueId: taskId, nativeSessionId: sessionId, status: "succeeded", contextSnapshot: { issueId: taskId, executionContinuation: stored } });
         await db.insert(heartbeatRunEvents).values({ companyId, runId: nextRunId, agentId, seq: 1, eventType: "turn.accepted", stream: "system", level: "info" });
         previousRunId = nextRunId;
       }
     });
+    // PostgreSQL integration: retained-session input identity/revision is the
+    // boundary, not mocked DB/runner call counts.
+    it.each(["exact revision", "legacy pre-queue revision", "edited exact revision", "C31 origin cut"])("advances three retained native runs beyond the origin with a live steer (%s)", async receiptKind => {
+      const taskId = randomUUID(), sessionId = randomUUID(), firstRunId = randomUUID(), queueId = randomUUID();
+      const originId = randomUUID(), steeredId = randomUUID(), providerSessionId = `pi-${randomUUID()}`;
+      const revision = new Date("2026-01-01T00:00:00Z"), queuedAt = new Date("2026-01-01T00:01:00Z");
+      const steeredRevision = receiptKind === "edited exact revision" ? new Date("2026-01-01T00:01:30Z") : revision;
+      await db.insert(issues).values({ id: taskId, companyId, title: "Retained delta", status: "in_progress", assigneeAgentId: agentId });
+      await db.insert(issueComments).values({ id: originId, companyId, issueId: taskId, authorType: "user", authorUserId: "local-board",
+        body: "Original request", createdAt: revision, updatedAt: revision });
+      const baseline = await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId,
+        context: { commentId: originId }, summary: null, exposeLowTrustRaw: false });
+      if (receiptKind === "C31 origin cut") {
+        Object.assign(baseline.coverage, { nativeSessionId: sessionId, providerSessionId, omitted: [{ id: originId, updatedAt: revision.toISOString() }] });
+        baseline.messages = []; // Already-read origin cut out of the accepted command, not lost from task history.
+        const readerRunId = randomUUID();
+        await db.insert(heartbeatRuns).values({ id: readerRunId, companyId, agentId, runtimeMode: "native", nativeIssueId: taskId,
+          nativeSessionId: sessionId, status: "succeeded", createdAt: new Date(revision.getTime() - 1000), contextSnapshot: { issueId: taskId } });
+        await db.insert(heartbeatRunEvents).values([
+          { companyId, runId: readerRunId, agentId, seq: 0, eventType: "session.started",
+            payload: { prpEvent: { normalizedSessionId: sessionId, payload: { providerSessionId } } } },
+          { companyId, runId: readerRunId, agentId, seq: 1, eventType: "turn.accepted" },
+          { companyId, runId: readerRunId, agentId, seq: 2, eventType: "task_history.read", payload: { comments: { [originId]: revision.toISOString() } } },
+        ]);
+      }
+      await db.insert(heartbeatRuns).values({ id: firstRunId, companyId, agentId, runtimeMode: "native", nativeIssueId: taskId,
+        nativeSessionId: sessionId, status: "succeeded", createdAt: revision, contextSnapshot: { issueId: taskId, commentId: originId, executionContinuation: baseline },
+        resultJson: { queuedSteeringAcknowledgements: { [steeredId]: { status: "acknowledged", queueId, turnId: "first-turn",
+          ...(receiptKind !== "legacy pre-queue revision" ? { commentUpdatedAt: steeredRevision.toISOString() } : {}), acknowledgedAt: "2026-01-01T00:01:45.000Z" } } } });
+      await db.insert(heartbeatRunEvents).values([
+        { companyId, runId: firstRunId, agentId, seq: 0, eventType: "session.started", sourceEventId: "session",
+          payload: { prpEvent: { normalizedSessionId: sessionId, payload: { providerSessionId } } } },
+        { companyId, runId: firstRunId, agentId, seq: 1, eventType: "turn.accepted" },
+        { companyId, runId: firstRunId, agentId, seq: 2, eventType: "item.completed", sourceEventId: "steer-accepted",
+          payload: { prpEvent: { normalizedSessionId: sessionId, turnId: "first-turn", itemId: `first-turn:steer:${steeredId}`,
+            payload: { kind: "steering_acknowledgement", status: "acknowledged" } } } },
+      ]);
+      await db.insert(issueComments).values({ id: steeredId, companyId, issueId: taskId, authorType: "user", authorUserId: "local-board",
+        body: "Steered and answered during run one", createdAt: revision, updatedAt: steeredRevision });
+      await db.insert(agentWakeupRequests).values({ id: queueId, companyId, agentId, source: "issue", reason: "issue_commented", status: "cancelled",
+        createdAt: queuedAt, payload: withQueuedCommentIdsInWakePayload({ issueId: taskId }, [steeredId]) });
+      for (let turn = 2; turn <= 3; turn++) {
+        const wakeId = randomUUID(), nextRunId = randomUUID();
+        const at = new Date(Date.UTC(2026, 0, 1, 0, turn));
+        await db.insert(issueComments).values({ id: wakeId, companyId, issueId: taskId, authorType: "user", authorUserId: "local-board",
+          body: `New wake ${turn}`, createdAt: at, updatedAt: at });
+        // Keep the baseline pinned to the origin as on the reported row.
+        const snapshot = await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId, runId: nextRunId,
+          previousContextRunId: firstRunId, nativeSessionId: sessionId, nativeProviderSessionId: providerSessionId,
+          context: { previousRunId: firstRunId, commentId: wakeId, commentIds: [steeredId, wakeId], wakeReason: "issue_children_completed" }, summary: null, exposeLowTrustRaw: false });
+        expect(snapshot.originCommentIds).toContain(originId);
+        expect(snapshot.messages.map(message => message.id)).toContain(steeredId);
+        expect(snapshot.resumeDelta?.messages.map(message => message.id)).toEqual([wakeId]);
+        const issue = { id: taskId, identifier: null, title: "Retained delta", description: null, workMode: "standard" };
+        const options = { companyId, runId: nextRunId, agentId, provider: "pi_rpc" as const, normalizedSessionId: sessionId,
+          resumedSession: true, previousTurn: { runId: firstRunId, task: issue }, issue, taskPrompt: "Keep working.",
+          wakePayload: { reason: "issue_children_completed", commentIds: [steeredId, wakeId], executionContinuation: snapshot },
+          workspace: { id: "workspace", cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null }, runtimeContext: nativeRuntimeContextFixture(),
+          completionContract: { id: "contract", sha256: "a".repeat(64), schemaVersion: "paperclip.run-result.v1", contract: {
+            revision: "1", objective: "Continue", criteria: [{ id: "output", requirement: "Continue" }] } } };
+        const execution = buildNativeExecutionInput(options);
+        expect(JSON.stringify(buildNativeModelEnvelope(execution))).toContain("Steered and answered during run one");
+        const resumed = buildNativeModelEnvelope(execution, { resumedSession: true });
+        if (!("events" in resumed) || typeof resumed.events !== "string") throw new Error("expected retained continuation events");
+        expect(JSON.parse(resumed.events).messages.map((message: { id: string }) => message.id)).toEqual([wakeId]);
+        const plain = buildNativeExecutionInput({ ...options, wakePayload: { ...options.wakePayload, reason: "issue_commented" } });
+        const plainEnvelope = buildNativeModelEnvelope(plain, { resumedSession: true });
+        if (!("events" in plainEnvelope)) throw new Error("expected plain retained continuation events");
+        expect(plainEnvelope.events).toBe(`New wake ${turn}`);
+        console.log("retained successor PG evidence", JSON.stringify({ receiptKind, turn, taskId, sessionId, providerSessionId, previousContextRunId: firstRunId,
+          originId, steeredId, steeredRevision, wakeId, fullHistoryIds: snapshot.messages.map(message => message.id), delta: snapshot.resumeDelta?.messages.map(({ id, updatedAt }) => ({ id, updatedAt })),
+          plainEvents: plainEnvelope.events }));
+        await db.insert(heartbeatRuns).values({ id: nextRunId, companyId, agentId, runtimeMode: "native", nativeIssueId: taskId,
+          nativeSessionId: sessionId, status: "succeeded", createdAt: at, contextSnapshot: { issueId: taskId, executionContinuation: snapshot } });
+        await db.insert(heartbeatRunEvents).values([
+          { companyId, runId: nextRunId, agentId, seq: 0, eventType: "session.resumed", sourceEventId: "resumed",
+            payload: { prpEvent: { normalizedSessionId: sessionId, payload: { providerSessionId } } } },
+          { companyId, runId: nextRunId, agentId, seq: 1, eventType: "turn.accepted" },
+        ]);
+      }
+    });
+    it.each(["turn.accepted", "turn.started"])("replays an accepted-then-failed origin after %s", async eventType => {
+      const taskId = randomUUID(), sessionId = randomUUID(), priorRunId = randomUUID(), originId = randomUUID();
+      const providerSessionId = `pi-${randomUUID()}`;
+      await db.insert(issues).values({ id: taskId, companyId, title: "Failed carrier", status: "in_progress", assigneeAgentId: agentId });
+      await db.insert(issueComments).values({ id: originId, companyId, issueId: taskId, authorType: "user", authorUserId: "local-board", body: "Original request must survive carrier failure" });
+      const baseline = await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId, context: { commentId: originId }, summary: null, exposeLowTrustRaw: false });
+      Object.assign(baseline.coverage, { nativeSessionId: sessionId, providerSessionId });
+      await db.insert(heartbeatRuns).values({ id: priorRunId, companyId, agentId, runtimeMode: "native", nativeIssueId: taskId, nativeSessionId: sessionId,
+        status: "failed", contextSnapshot: { issueId: taskId, executionContinuation: baseline } });
+      await db.insert(heartbeatRunEvents).values([
+        { companyId, runId: priorRunId, agentId, seq: 0, eventType: "session.started", payload: { prpEvent: { payload: { providerSessionId } } } },
+        { companyId, runId: priorRunId, agentId, seq: 1, eventType },
+        { companyId, runId: priorRunId, agentId, seq: 2, eventType: "turn.failed" },
+      ]);
+      let state: NativeContinuationReadState | undefined;
+      const snapshot = await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId, runId: randomUUID(), previousContextRunId: priorRunId,
+        nativeSessionId: sessionId, nativeProviderSessionId: providerSessionId,
+        context: { wakeReason: "issue_continuation_needed", nativeTaskUnclaimed: true }, summary: null, exposeLowTrustRaw: false, onNativeReadState: value => { state = value; } });
+      expect(snapshot.resumeDelta?.messages.map(message => message.id)).toEqual([originId]);
+      expect(state?.readCommentIds).not.toContain(originId);
+      const prompt = renderPaperclipWakePrompt({ executionContinuation: snapshot }, { resumedSession: true });
+      expect(prompt).toContain("Original request must survive carrier failure");
+      console.log("failed carrier PG evidence", JSON.stringify({ taskId, sessionId, providerSessionId, priorRunId, originId, eventType, deltaIds: snapshot.resumeDelta?.messages.map(message => message.id) }));
+    });
+    it.each(["same generation", "earlier generation", "no read proof", "generation changed before read"])(
+      "scopes omitted-as-read successor coverage to its actual reader (%s)", async mode => {
+        const taskId = randomUUID(), sessionId = randomUUID(), readerRunId = randomUUID(), priorRunId = randomUUID();
+        const commentId = randomUUID(), providerSessionId = `pi-${randomUUID()}`;
+        const revision = new Date("2026-01-01T00:00:00Z");
+        await db.insert(issues).values({ id: taskId, companyId, title: "Omitted coverage", status: "in_progress", assigneeAgentId: agentId });
+        await db.insert(issueComments).values({ id: commentId, companyId, issueId: taskId, authorType: "user", authorUserId: "local-board",
+          body: "Direction read by a particular provider generation", createdAt: revision, updatedAt: revision });
+        const baseline = await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId,
+          context: { commentId }, summary: null, exposeLowTrustRaw: false });
+        baseline.messages = [];
+        Object.assign(baseline.coverage, { nativeSessionId: sessionId, providerSessionId,
+          omitted: [{ id: commentId, updatedAt: revision.toISOString() }] });
+        await db.insert(heartbeatRuns).values([
+          { id: readerRunId, companyId, agentId, runtimeMode: "native", nativeIssueId: taskId, nativeSessionId: sessionId,
+            status: "succeeded", finishedAt: new Date("2026-01-01T01:00:00Z"), contextSnapshot: { issueId: taskId } },
+          { id: priorRunId, companyId, agentId, runtimeMode: "native", nativeIssueId: taskId, nativeSessionId: sessionId,
+            status: "succeeded", contextSnapshot: { issueId: taskId, executionContinuation: baseline } },
+        ]);
+        await db.insert(heartbeatRunEvents).values([
+          { companyId, runId: readerRunId, agentId, seq: 0, eventType: "session.started",
+            payload: { prpEvent: { payload: { providerSessionId: mode === "earlier generation" ? "old-provider" : providerSessionId } } } },
+          { companyId, runId: readerRunId, agentId, seq: 1, eventType: "turn.accepted" },
+          ...(mode === "generation changed before read" ? [{ companyId, runId: readerRunId, agentId, seq: 2, eventType: "session.started",
+            payload: { prpEvent: { payload: { providerSessionId: "other-provider" } } } }] : []),
+          ...(mode === "no read proof" ? [] : [{ companyId, runId: readerRunId, agentId, seq: 3, eventType: "task_history.read",
+            payload: { comments: { [commentId]: revision.toISOString() } } }]),
+          { companyId, runId: priorRunId, agentId, seq: 0, eventType: "session.resumed",
+            payload: { prpEvent: { payload: { providerSessionId } } } },
+          { companyId, runId: priorRunId, agentId, seq: 1, eventType: "turn.accepted" },
+        ]);
+        const snapshot = await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId, runId: randomUUID(),
+          previousContextRunId: priorRunId, nativeSessionId: sessionId, nativeProviderSessionId: providerSessionId,
+          context: { wakeReason: "issue_commented" }, summary: null, exposeLowTrustRaw: false });
+        const deltaIds = snapshot.resumeDelta?.messages.map(message => message.id);
+        expect(deltaIds).toEqual(mode === "same generation" ? [] : [commentId]);
+        const readState: NativeContinuationReadState[] = [];
+        await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId, runId: randomUUID(), nativeSessionId: sessionId,
+          nativeProviderSessionId: providerSessionId, context: {}, summary: null, exposeLowTrustRaw: false,
+          onNativeReadState: value => { readState.push(value); } });
+        expect(readState[0]?.readCommentIds.includes(commentId)).toBe(mode === "same generation");
+        await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId, runId: randomUUID(), previousContextRunId: priorRunId,
+          context: {}, summary: null, exposeLowTrustRaw: false, onNativeReadState: value => { expect(value.readCommentIds).toEqual([]); } });
+        expect(snapshot.messages.map(message => message.id)).toEqual([commentId]);
+        console.log("omitted coverage generation PG evidence", JSON.stringify({ mode, taskId, sessionId, providerSessionId,
+          readerRunId, priorRunId, commentId, deltaIds }));
+      });
+    it.each(["edited", "edited before late legacy ACK", "refused", "uncertain", "wrong session", "wrong turn", "fresh session", "fresh provider", "Stop hand-back", "pending queue"])(
+      "retains owed successor input after %s", async mode => {
+        const taskId = randomUUID(), sessionId = randomUUID(), firstRunId = randomUUID(), queueId = randomUUID();
+        const originId = randomUUID(), steeredId = randomUUID(), wakeId = randomUUID(), providerSessionId = `pi-${randomUUID()}`;
+        const revision = new Date("2026-01-01T00:00:00Z"), queuedAt = new Date("2026-01-01T00:01:00Z"), editedAt = new Date("2026-01-01T00:02:00Z");
+        await db.insert(issues).values({ id: taskId, companyId, title: "Owed input", status: "in_progress", assigneeAgentId: agentId });
+        await db.insert(issueComments).values({ id: originId, companyId, issueId: taskId, authorType: "user", authorUserId: "local-board",
+          body: "Original request", createdAt: revision, updatedAt: revision });
+        const baseline = await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId,
+          context: { commentId: originId }, summary: null, exposeLowTrustRaw: false });
+        await db.insert(heartbeatRuns).values({ id: firstRunId, companyId, agentId, runtimeMode: "native", nativeIssueId: taskId,
+          nativeSessionId: sessionId, status: "succeeded", contextSnapshot: { issueId: taskId, executionContinuation: baseline },
+          resultJson: { queuedSteeringAcknowledgements: { [steeredId]: { status: "acknowledged", queueId, turnId: "first-turn",
+            ...(mode === "edited before late legacy ACK" ? {} : { commentUpdatedAt: revision.toISOString() }),
+            acknowledgedAt: new Date("2026-01-01T00:03:00Z").toISOString() } },
+            ...(mode === "Stop hand-back" ? { personStop: { returned: [steeredId, originId] } } : {}) } });
+        await db.insert(heartbeatRunEvents).values([
+          { companyId, runId: firstRunId, agentId, seq: 0, eventType: "session.started", sourceEventId: "session",
+            payload: { prpEvent: { normalizedSessionId: sessionId, payload: { providerSessionId } } } },
+          { companyId, runId: firstRunId, agentId, seq: 1, eventType: "turn.accepted" },
+          ...(mode === "uncertain" ? [] : [{ companyId, runId: firstRunId, agentId, seq: 2, eventType: "item.completed", sourceEventId: "steer",
+            payload: { prpEvent: { normalizedSessionId: mode === "wrong session" ? randomUUID() : sessionId,
+              turnId: mode === "wrong turn" ? "other-turn" : "first-turn", itemId: `first-turn:steer:${steeredId}`,
+              payload: { kind: "steering_acknowledgement", status: mode === "refused" ? "rejected" : "acknowledged" } } } }]),
+        ]);
+        await db.insert(issueComments).values([
+          { id: steeredId, companyId, issueId: taskId, authorType: "user", authorUserId: "local-board", body: mode.startsWith("edited") ? "Edited instruction" : "Steered instruction",
+            createdAt: revision, updatedAt: mode.startsWith("edited") ? editedAt : revision },
+          { id: wakeId, companyId, issueId: taskId, authorType: "user", authorUserId: "local-board", body: "Unread current wake",
+            createdAt: editedAt, updatedAt: editedAt },
+        ]);
+        await db.insert(agentWakeupRequests).values({ id: queueId, companyId, agentId, source: "issue", reason: "issue_commented",
+          status: mode === "pending queue" ? "deferred_issue_execution" : "cancelled", createdAt: queuedAt,
+          payload: withQueuedCommentIdsInWakePayload({ issueId: taskId }, [steeredId]) });
+        const snapshot = await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId, runId: randomUUID(),
+          previousContextRunId: firstRunId, nativeSessionId: mode === "fresh session" ? randomUUID() : sessionId,
+          nativeProviderSessionId: mode === "fresh provider" ? "new-provider" : providerSessionId,
+          context: { commentId: wakeId, wakeReason: "issue_children_completed" }, summary: null, exposeLowTrustRaw: false });
+        expect(snapshot.resumeDelta?.messages.map(message => message.id)).toEqual(expect.arrayContaining([steeredId, wakeId]));
+        if (mode === "Stop hand-back") expect(snapshot.resumeDelta?.messages.map(message => message.id)).toContain(originId);
+        if (mode.startsWith("fresh")) {
+          const prompt = renderPaperclipWakePrompt({ executionContinuation: snapshot }, { resumedSession: false });
+          expect(prompt).toContain("Original request"); expect(prompt).toContain("Steered instruction"); expect(prompt).toContain("Unread current wake");
+        }
+        expect(snapshot.messages).toHaveLength(3);
+        console.log("owed successor PG evidence", JSON.stringify({ mode, taskId, sessionId, providerSessionId, originId, steeredId, wakeId,
+          fullHistoryIds: snapshot.messages.map(message => message.id), delta: snapshot.resumeDelta?.messages.map(({ id, updatedAt }) => ({ id, updatedAt })) }));
+      },
+    );
     it("attests the exact latest user comment selected as the objective", async () => {
       const envelope = await build();
       const latest = await db.select().from(issueComments).where(eq(issueComments.id, laterId)).then(rows => rows[0]!);

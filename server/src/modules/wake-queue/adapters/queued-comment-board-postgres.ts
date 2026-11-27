@@ -494,6 +494,7 @@ export function createQueuedCommentSteeringAdapter(db: Db, options: { requireQue
         const [candidate] = runScope ? await tx.select().from(heartbeatRuns).where(runScope) : [];
         const run = candidate && runTargetsIssue(candidate, issue.id) ? candidate : null;
         const previousAcknowledgements = parseObject(parseObject(run?.resultJson).queuedSteeringAcknowledgements);
+        let commentUpdatedAt: string | undefined;
         return apply({
           previousAcknowledgement: parseObject(previousAcknowledgements[commentId]),
           readReplayQueue: () => readBoardQueuedComments({
@@ -517,6 +518,8 @@ export function createQueuedCommentSteeringAdapter(db: Db, options: { requireQue
             if (issue.conversationAgentId && queue.entries.some(({ comment }) => isConversationReset(comment.body))) {
               throw new QueuedCommentMutationError("queued_response_requires_fresh_session", "/new needs a new session and cannot be steered into this turn");
             }
+            const revision = queue.entries.find(entry => entry.comment.id === commentId)?.comment.updatedAt;
+            commentUpdatedAt = revision ? new Date(revision).toISOString() : undefined;
             return queue;
           },
           assertDeliveryAllowed: () => assertQueuedCommentInteractionDelivery(tx, {
@@ -553,7 +556,7 @@ export function createQueuedCommentSteeringAdapter(db: Db, options: { requireQue
                 ...result,
                 queuedSteeringAcknowledgements: {
                   ...parseObject(result.queuedSteeringAcknowledgements),
-                  [commentId]: { status: "acknowledged", queueId: wake.id, turnId, acknowledgedAt: now.toISOString(), afterEventSeq: providerAck?.afterEventSeq ?? acknowledgedRun.nextEventSeq - 1 },
+                  [commentId]: { status: "acknowledged", queueId: wake.id, turnId, commentUpdatedAt, acknowledgedAt: now.toISOString(), afterEventSeq: providerAck?.afterEventSeq ?? acknowledgedRun.nextEventSeq - 1 },
                 },
               },
               updatedAt: now,

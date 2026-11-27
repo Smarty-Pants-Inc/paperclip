@@ -5,6 +5,7 @@ import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { boundNativeExecutionContinuation, commandEnvelopeBytes, nativeInputRevision, nativePromptRefusalRemedies, NATIVE_HANDOFF_CUT_NOTE_RESERVE_BYTES, NATIVE_TURN_KNOWN_MAX_BYTES, NativeTurnPromptExceedsCommandBoundError, type NativeContinuationReadState, type NativeContinuationCoverage, type NativePromptRefusalCause, type NativeInputRevision } from "./native-turn-budget.js";
 import { runnerApiOperation } from "./runner-api-catalog.js";
 import { buildNativeContinuationPrompt } from "./native-continuation.js";
+import { StaleExecutionContinuationError } from "../execution-continuation.js";
 import { decideNativeContinuation, resolveSessionContinuity } from "./continued-session.js";
 import {
   caseExecutionMarkdown,
@@ -305,6 +306,14 @@ function buildNativeExecutionInputUnchecked(input: BuildNativeExecutionInput): N
     previousIssue: input.previousTurn.task, previousGitHubReviewConfigurationKeys: input.previousTurn.githubReviewConfigurationKeys,
     allowExternalChat: true, issue: input.issue, caseContext: input.caseContext, workflowCase,
   }) : null;
+  const continuationPrompt = composeContinuationPrompt(input.wakePayload);
+  if (continuationPrompt === JSON.stringify({ messages: [] }) ||
+      (continuationDecision.promptOnly && continuationPrompt === "" &&
+        (wake?.executionContinuation as ExecutionContinuationEnvelope | undefined)?.resumeDelta?.messages.length === 0)) {
+    // Reuse heartbeat's obsolete-continuation cancellation, not setup failure
+    // or a falsy continuationPrompt that would select the full bootstrap.
+    throw new StaleExecutionContinuationError("continuation_nothing_new");
+  }
   const prepared = {
     schema: input.grokEffort !== undefined || input.grokDisableWebSearch !== undefined ? "paperclip.native-execution-input.v10"
       : input.claudeEffort !== undefined ? "paperclip.native-execution-input.v9"
@@ -314,7 +323,7 @@ function buildNativeExecutionInputUnchecked(input: BuildNativeExecutionInput): N
       initialCommunicationGuidance: [input.initialCommunicationGuidance, input.freshSessionHandoff].filter(Boolean).join("\n\n"),
     } : {}),
     ...(continuationDecision.continue && input.previousTurn ? {
-      continuationPrompt: composeContinuationPrompt(input.wakePayload),
+      continuationPrompt,
     } : {}),
     executionMode,
     planningContext: input.planningContext ?? null,

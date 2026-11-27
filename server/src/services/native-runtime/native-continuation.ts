@@ -27,8 +27,21 @@ export function buildNativeContinuationPrompt(input: {
       const unseen = wake.executionContinuation?.resumeDelta?.messages.filter(message => message.authorType === "user") ?? [];
       return [retryPrompt, ...unseen.map(message => message.body)].join("\n\n");
     }
-    const messages = [...(wake.executionContinuation?.messages ?? wake.executionContinuation?.resumeDelta?.messages ?? []), ...wake.comments];
-    return wake.commentIds.map(id => wake.comments.find(comment => comment.id === id)?.fullBody ?? messages.find(message => message.id === id)!.body).join("\n\n");
+    const delta = wake.executionContinuation?.resumeDelta;
+    if (delta && delta.baseRunId !== input.previousRunId) return null;
+    const messages = [...(wake.executionContinuation?.messages ?? delta?.messages ?? []), ...wake.comments];
+    // A wake can still name a comment already steered into this session.
+    // The revision-aware delta is authoritative, even on the plain-text road.
+    const ids = wake.commentIds.filter(id => !delta || delta.messages.some(message => message.id === id));
+    if (ids.length) return ids.map(id => wake.comments.find(comment => comment.id === id)?.fullBody ?? messages.find(message => message.id === id)!.body).join("\n\n");
+    // An empty delta is not a JSON user instruction. Only this wake's own
+    // comment text may supply a turn; never resurrect its full-history backup.
+    // The constructor settles a verified empty result before model dispatch.
+    return delta && delta.messages.length === 0 ? wake.commentIds.flatMap(id => {
+      const comment = wake.comments.find(comment => comment.id === id);
+      const text = comment?.fullBody ?? comment?.body;
+      return text?.trim() ? [text] : [];
+    }).join("\n\n") : "";
   }
   const continuation = wake?.executionContinuation;
   const delta = continuation?.resumeDelta;
@@ -109,6 +122,6 @@ export function buildNativeContinuationPrompt(input: {
     "You are continuing the same conversation. The previous task turn ended without an accepted completion report. Do NOT repeat commands, scripts, or other work already done in this task, or re-answer consumed messages. If the work is complete, file your result against the current contract now. Otherwise finish only what remains, then file your result.",
     ...(events.messages.length || Object.keys(events).length > 1 ? [JSON.stringify(events)] : []),
   ].join("\n\n");
-  if (!events.messages.length && !humanResponses.length && !wake.childIssueSummaries.length && !Object.keys(taskChanges).length && !input.workflowCase) return null;
+  // An empty verified delta must not select the full-history fallback.
   return JSON.stringify(events);
 }

@@ -2084,8 +2084,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
   it.each([
     "continuation_task_ownership_changed",
+    "continuation_nothing_new",
   ] as const)("cancels obsolete continuation setup: %s", async (code) => {
-    const { agentId, runId, wakeupRequestId } = await seedQueuedIssueRunFixture();
+    const { companyId, issueId, agentId, runId, wakeupRequestId } = await seedQueuedIssueRunFixture();
+    const commentsBefore = await db.select({ id: issueComments.id }).from(issueComments).where(eq(issueComments.issueId, issueId));
     const build = vi.spyOn(executionContinuation, "buildExecutionContinuation")
       .mockRejectedValueOnce(new executionContinuation.StaleExecutionContinuationError(code));
     try {
@@ -2105,6 +2107,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       )).toBe(false);
       const runs = await selectRecoveryRunsByAgent(agentId);
       expect(runs).toHaveLength(1);
+      if (code === "continuation_nothing_new") {
+        expect(mockCaptureRunFailure.mock.calls.some(([event]) => event.runId === runId)).toBe(false);
+        const commentsAfter = await db.select({ id: issueComments.id }).from(issueComments).where(eq(issueComments.issueId, issueId));
+        expect(commentsAfter).toEqual(commentsBefore);
+        const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+        expect(issue.executionRunId).toBeNull();
+        console.log("nothing-new settlement PG evidence", JSON.stringify({ companyId, issueId, runId,
+          status: (await heartbeat.getRun(runId))?.status, wakeStatus: wakeup.status, agentStatus: agent.status,
+          issueExecutionRunId: issue.executionRunId, recoveryRunCount: runs.length, failureNoticeCount: commentsAfter.length - commentsBefore.length }));
+      }
     } finally {
       build.mockRestore();
     }
