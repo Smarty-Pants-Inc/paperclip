@@ -3585,6 +3585,14 @@ describe("remote provider pack manifest", () => {
   });
 
   describe("remote provider pack reattach and relaunch after deploy or restart", () => {
+    async function restoreArtifactFixture(input: Parameters<typeof providerArtifactStorage.restoreNativeProviderArtifacts>[0]) {
+      // The real restore materializes these files before size-budgeted sync-in.
+      await mkdir(input.targetRoot, { recursive: true, mode: 0o700 });
+      for (const name of ["nodeCommand", "opencodeProxy", "opencodeExecutable"]) {
+        await writeFile(join(input.targetRoot, name), "restored fixture artifact", { mode: 0o700 });
+      }
+    }
+
     function buildPackManifest(revision: string, overrides?: { proxyChar?: string; contractChar?: string; nodeChar?: string }) {
       const digest = "sha256:" + (overrides?.contractChar ?? "a").repeat(64);
       const artifacts = Object.fromEntries(Object.entries({
@@ -3599,7 +3607,7 @@ describe("remote provider pack manifest", () => {
           : digest,
       }])) as Record<"grokLauncher" | "nodeCommand" | "productionLock" | "opencodeCommand" | "opencodeExecutable" | "opencodeProxy" | "acpxSidecar", { path: string; sha256: string }>;
       const payload = {
-        compatibility: { opencode: 1, acpx: 1 }, contractDigest: digest,
+        compatibility: { opencode: 1, pi_rpc: 1, acpx: 1 }, contractDigest: digest,
         target: { platform: "linux", architecture: "x64" }, runnerSourceRevision: revision.repeat(40),
         pins: { nodeMinimum: "24.11.0", codex: QUALIFIED_ACPX_PROFILES.codex.agentRuntimeVersion,
           opencode: "1.18.34", acpx: "0.22.0", grok: QUALIFIED_ACPX_PROFILES.grok.agentRuntimeVersion,
@@ -3766,7 +3774,7 @@ describe("remote provider pack manifest", () => {
       };
       const storageMode = vi.spyOn(harnessStorage, "durableNativeHarnessStorage").mockReturnValue({} as never);
       const backupOwner = vi.spyOn(harnessStorage, "nativeHarnessBackupOwner").mockResolvedValue({} as never);
-      const restore = vi.spyOn(providerArtifactStorage, "restoreNativeProviderArtifacts").mockResolvedValue(undefined);
+      const restore = vi.spyOn(providerArtifactStorage, "restoreNativeProviderArtifacts").mockImplementation(restoreArtifactFixture);
       onTestFinished(() => { storageMode.mockRestore(); backupOwner.mockRestore(); restore.mockRestore(); });
 
       await createRunnerdBackend({
@@ -3797,7 +3805,7 @@ describe("remote provider pack manifest", () => {
       };
       const storageMode = vi.spyOn(harnessStorage, "durableNativeHarnessStorage").mockReturnValue({} as never);
       const backupOwner = vi.spyOn(harnessStorage, "nativeHarnessBackupOwner").mockResolvedValue({} as never);
-      const restore = vi.spyOn(providerArtifactStorage, "restoreNativeProviderArtifacts").mockResolvedValue(undefined);
+      const restore = vi.spyOn(providerArtifactStorage, "restoreNativeProviderArtifacts").mockImplementation(restoreArtifactFixture);
       onTestFinished(() => { storageMode.mockRestore(); backupOwner.mockRestore(); restore.mockRestore(); });
 
       const dbWithRecordedArtifacts = new Proxy(fixture.recoveryInput.db, {
@@ -19691,7 +19699,7 @@ describe("runnerd provider runtime wiring", () => {
       opencodeProxy: "dist/cli/opencode-app-server-proxy.cjs", acpxSidecar: "dist/cli/acpx-runtime-sidecar.cjs",
     }).map(([key, path]) => [key, { path, sha256: digest }]));
     const payload = {
-      compatibility: { opencode: 1, acpx: 1 }, contractDigest: digest,
+      compatibility: { opencode: 1, pi_rpc: 1, acpx: 1 }, contractDigest: digest,
       target: { platform: "linux", architecture: "x64" }, runnerSourceRevision: "a".repeat(40),
       pins: { nodeMinimum: "24.11.0", codex: QUALIFIED_ACPX_PROFILES.codex.agentRuntimeVersion,
         opencode: "1.18.34", acpx: "0.22.0", grok: QUALIFIED_ACPX_PROFILES.grok.agentRuntimeVersion,

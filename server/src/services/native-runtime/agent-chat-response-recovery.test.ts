@@ -239,7 +239,7 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
         await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, scope.agentId));
         const [sender] = await db.insert(agents).values({ companyId: scope.companyId, name: "Bridge author", adapterType: "process" }).returning();
         await expect(issueService(db).addComment(scope.issueId, "Untrusted assistant output", { agentId: sender.id }))
-          .rejects.toThrow("Only this conversation's agent can post agent messages");
+          .rejects.toThrow("Agent chat messages require an authenticated run");
         const [chat] = await db.select().from(issues).where(eq(issues.id, scope.issueId));
         const userId = chat.conversationUserId!;
         await db.insert(companyMemberships).values({ companyId: scope.companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "owner" });
@@ -252,7 +252,7 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
         const unrelated = buildHostServices(db, "unrelated-plugin-id", "paperclip.gateway", { forPlugin: () => ({ emit: async () => {}, subscribe: () => {} }) } as never,
           undefined, { heartbeatRuntimeEnv: {} });
         await expect(unrelated.issues.createComment({ companyId: scope.companyId, issueId: scope.issueId,
-          authorAgentId: sender.id, body: "Unapproved plugin input" })).rejects.toThrow("Only this conversation's agent");
+          authorAgentId: sender.id, body: "Unapproved plugin input" })).rejects.toThrow("Agent chat messages require an authenticated run");
         expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, scope.agentId))).toEqual([]);
         expect(heldSteering.sent).toEqual([]);
         heldSteering.onSend = async commentId => {
