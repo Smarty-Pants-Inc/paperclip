@@ -2689,6 +2689,54 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
       runId: f.successorRunId, commentId: f.commentId, actorId: f.actorId });
   });
 
+  it.each(["wakeCommentId", "wakeCommentIds", "answered", "earlier_agent_comment", "deleted", "agent_origin",
+    "foreign_issue", "foreign_company", "another_run", "malformed_ids", "retry_only", "retry_only_answered"] as const)(
+    "names the unanswered input of the recovered native provider-pack failure (%s)", async shape => {
+      const f = await recoveredCopybackFixture("message");
+      const runError = "runner_remote_provider_artifact_incompatible: provider-pack.json is unreadable (permission_denied)";
+      const combined = shape !== "retry_only" && shape !== "retry_only_answered";
+      const unanswered = ["wakeCommentId", "wakeCommentIds", "earlier_agent_comment", "retry_only"].includes(shape);
+      await db.update(issueRecoveryActions).set({ cause: "native_continuation_requires_reconciliation" })
+        .where(eq(issueRecoveryActions.id, f.action.id));
+      await db.update(issueComments).set({ createdAt: new Date("2020-01-01T09:30:00Z"),
+        ...(shape === "deleted" ? { deletedAt: new Date("2020-01-01T11:00:00Z") } : {}),
+        ...(shape === "agent_origin" ? { authorType: "agent", authorUserId: null, authorAgentId: f.agentId } : {}),
+      }).where(eq(issueComments.id, f.commentId));
+      let originId = f.commentId;
+      if (shape === "foreign_issue") {
+        const otherIssueId = randomUUID();
+        originId = randomUUID();
+        await db.insert(issues).values({ id: otherIssueId, companyId: f.companyId, title: "Other task", status: "todo" });
+        await db.insert(issueComments).values({ id: originId, companyId: f.companyId, issueId: otherIssueId,
+          authorType: "user", authorUserId: f.actorId, body: "A different task's message" });
+      } else if (shape === "foreign_company") originId = (await seed()).commentId;
+      const context = { issueId: f.issueId, ...(shape === "wakeCommentIds" ? { wakeCommentIds: [originId] }
+        : shape === "malformed_ids" ? { wakeCommentId: 42, wakeCommentIds: "not-an-array" }
+        : shape === "another_run" ? {} : { wakeCommentId: originId }) };
+      await db.update(heartbeatRuns).set({ errorCode: "adapter_failed", error: runError, nativeSessionId: randomUUID(),
+        contextSnapshot: context }).where(eq(heartbeatRuns.id, f.sourceRunId));
+      if (shape === "another_run") await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+        issueId: f.issueId, status: "failed", contextSnapshot: { issueId: f.issueId, wakeCommentId: f.commentId } });
+      if (shape === "answered" || shape === "retry_only_answered" || shape === "earlier_agent_comment") {
+        await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent",
+          authorAgentId: f.agentId, body: "The agent's answer", createdAt: new Date(shape === "earlier_agent_comment"
+            ? "2020-01-01T09:00:00Z" : "2020-01-01T11:00:00Z") });
+      }
+      if (!combined) await db.update(agents).set({ adapterType: "process" }).where(eq(agents.id, f.agentId));
+      const [before] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+      const expected = unanswered
+        ? combined ? "Saved work recovered. Press Retry to answer your last message, or send a new one."
+          : "Saved work recovered. Retry continues from it and answers your last message."
+        : combined ? "Saved work recovered. Send a message or press Retry to continue."
+          : "Saved work recovered. Retry continues from it.";
+      const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
+      expect(blocker).toMatchObject({ cause: "native_continuation_requires_reconciliation", runStatus: "failed", runError,
+        canContinue: combined, canRetry: true, savedMessageCount: 0, nextAction: expected,
+        workspaceRecovery: { message: expected } });
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId)))[0]).toEqual(before);
+    },
+  );
+
   it.each(["done", "cancelled", "another_assignee"] as const)(
     "does not offer a native message that admission refuses for %s", async shape => {
       const f = await recoveredCopybackFixture("message");
