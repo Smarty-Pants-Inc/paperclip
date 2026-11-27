@@ -1,23 +1,35 @@
 import { normalizePaperclipWakePayload } from "@paperclipai/adapter-utils/server-utils";
 import { currentRunFailureText } from "./native-exact-resume-failure.js";
 
-/**
- * A failed run whose own session can never be resumed: a person's Retry of it starts fresh.
- * A lost resume state has its own error code; the retained-binding refusal is a plain server
- * error finalized under a generic code, so the run's current failure text must be exactly it.
- */
+// Positive evidence only. The typed incompatible error also wraps unavailable
+// reads, unknown authority/lifecycle and arbitrary backend diagnostics. New or
+// opaque reasons must retain the saved session until their producer proves loss.
+const LOST_PROVIDER_STATE_REASONS = new Set([
+  "workspace_continuation_source_scope_mismatch",
+]);
+
+/** Positive qualified evidence only, not the incompatible code or free text alone.
+ * The historical unsuffixed binding refusal is ambiguous and must retain the session.
+ * Always inspect the current refusal, never an earlier error in a chained message. */
 export function sessionCannotContinue(run: { error?: string | null; errorCode?: string | null; resultJson?: unknown } | undefined) {
-  return run?.errorCode === "native_provider_state_incompatible"
-    || currentRunFailureText(run)?.trim() === "native_controller_recovery_missing_evidence:retained_sandbox_binding";
+  const failure = currentRunFailureText(run)?.trim();
+  if (run?.errorCode === "native_provider_state_incompatible") {
+    const reason = failure?.replace(/^native_session_recovery_failed:\s*/, "");
+    return reason !== undefined && LOST_PROVIDER_STATE_REASONS.has(reason);
+  }
+  // Even no recorded row is absence of evidence, not proof that the retained
+  // workspace was destroyed: row repair can restore the identical binding.
+  return failure === "native_controller_recovery_missing_evidence:retained_sandbox_binding:binding_lost";
 }
 
 /** Only the failed run's current refusal, never an earlier failure in a chained error. */
 export function isWarmRecoveryRefusal(run: { status: string; error?: string | null; errorCode?: string | null; resultJson?: unknown } | undefined) {
   if (run?.status !== "failed") return false;
-  if (sessionCannotContinue(run)) return true;
+  if (sessionCannotContinue(run) || run.errorCode === "native_provider_state_incompatible") return true;
   const failure = (currentRunFailureText(run) ?? run.errorCode ?? "").trim();
   return /^(?:runner_state_identity_mismatch:\s*)?(?:remote_warm_session_not_idle|current_run_not_admitted|prior_owner_terminal_state_indeterminate)(?:$|[;:\s])/.test(failure)
-    || failure.startsWith("native_controller_recovery_unsupported:");
+    || failure.startsWith("native_controller_recovery_unsupported:")
+    || /^native_controller_recovery_missing_evidence:retained_sandbox_binding(?:$|:)/.test(failure);
 }
 
 export function resolveSessionContinuity(provider: unknown, setting: unknown) {

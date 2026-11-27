@@ -291,7 +291,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
         // CHV7-6: realistic order. R2 completed ordinarily with the receipt;
         // a DISTINCT later R3 resumes S2 and throws a refusal, without a reset receipt.
         await db.update(heartbeatRuns).set({ nativeSessionId: s2, nativeIssueId: issue.id, status: "failed",
-          error: "native_controller_recovery_missing_evidence:retained_sandbox_binding", resultJson: {}, finishedAt: new Date() }).where(eq(heartbeatRuns.id, current!.id));
+          error: "native_controller_recovery_missing_evidence:retained_sandbox_binding:binding_lost", resultJson: {}, finishedAt: new Date() }).where(eq(heartbeatRuns.id, current!.id));
         const [recovery] = await db.insert(heartbeatRuns).values({ companyId: run.companyId, agentId: run.agentId,
           issueId: issue.id, status: "running", createdAt: new Date(current!.createdAt.getTime() + 1) }).returning();
         const refused = await prepareHeartbeatSession(db, { ...nextInput, run: recovery!,
