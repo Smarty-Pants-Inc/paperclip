@@ -118,6 +118,10 @@ async function materializeNativeFreshSessionRetry(input: NativeRetryTarget, lane
     issueId: input.issueId,
     taskId: input.issueId,
     forceFreshSession: true,
+    // A predecessor started by an earlier explicit-fresh retry carries the
+    // flag in its context; never inherit it, so the next lane retry keeps a
+    // continuous Pi session instead of starting fresh again.
+    explicitFreshSession: false,
     retryOfRunId: run.id,
     retryReason: lane.reason,
     wakeReason: lane.reason,
