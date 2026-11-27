@@ -1022,6 +1022,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
 
   const runnableEnvironments = useMemo(
     () => environments.filter((environment) => {
+      if (environment.status !== "active") return false;
       if (!supportedEnvironmentDrivers.has(environment.driver)) return false;
       if (environment.driver === "local") return false;
       if (environment.driver !== "sandbox") return true;
@@ -1818,7 +1819,8 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                     { value: "", label: `Default: ${inheritedEnvironmentLabel}` },
                     ...environmentOptions.map((environment) => ({
                       value: environment.id,
-                      label: environmentDisplayLabel(environment),
+                      label: `${environmentDisplayLabel(environment)}${environment.status === "archived" ? " (archived)" : ""}`,
+                      disabled: environment.status !== "active",
                     })),
                   ]}
                 />

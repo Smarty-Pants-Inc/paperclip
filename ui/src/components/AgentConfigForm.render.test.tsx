@@ -1864,8 +1864,8 @@ describe("AgentConfigForm environment selector", () => {
     expect(selector?.textContent).toContain("E2B · sandbox");
   });
 
-  it.each(["workers", "boat-default"].flatMap(current => [false, true].map(omitConfig => ({ current, omitConfig }))))(
-    "keeps every captured sandbox choice when its provider is unknown (current: $current, omit config: $omitConfig)",
+  it.each(["workers", "boat-default", "boat-spare"].flatMap(current => [false, true].map(omitConfig => ({ current, omitConfig }))))(
+    "keeps active captured sandbox choices and marks the archived current environment (current: $current, omit config: $omitConfig)",
     async ({ current, omitConfig }) => {
       // Gate-7's 200 list: 17 sandbox rows (one archived) + Local; no config keys.
       // Restricted readers intentionally receive config: {}, not provider credentials.
@@ -1885,16 +1885,37 @@ describe("AgentConfigForm environment selector", () => {
       roots.push(result.root);
       const options = await environmentOptions(result.container);
       expect([...options.querySelectorAll('[role="option"]')].map(option => option.textContent)).toEqual([
-        "Default: Local", ...names.map(name => `${name} · sandbox`),
+        "Default: Local", ...names.filter(name => name !== "boat-spare").map(name => `${name} · sandbox`),
+        ...(current === "boat-spare" ? ["boat-spare · sandbox (archived)"] : []),
       ]);
       expect(options.textContent).not.toContain("Internal probe");
       expect(options.querySelectorAll(`[data-value="${current}"]`)).toHaveLength(1);
+      expect([...options.querySelectorAll<HTMLButtonElement>('[role="option"]')].filter(option => option.disabled).map(option => option.dataset.value))
+        .toEqual(current === "boat-spare" ? ["boat-spare"] : []);
+      if (current === "boat-spare") {
+        expect(result.container.querySelector('[aria-label="Environment override"]')?.textContent).toContain("boat-spare · sandbox (archived)");
+      }
+      expect(result.onSave).not.toHaveBeenCalled();
       const next = current === "workers" ? "boat-small" : "workers";
       await clickElement(options.querySelector(`[data-value="${next}"]`));
       await clickByText(result.container, "Save");
       expect(result.onSave).toHaveBeenCalledWith({ defaultEnvironmentId: next });
     },
   );
+
+  it.each(["sandbox", "ssh", "plugin"] as const)("does not offer an archived %s environment when creating an agent", async driver => {
+    const result = await renderCreateForm([
+      makeEnvironment({ id: "archived", name: "Old computer", driver, status: "archived" }),
+      makeEnvironment({ id: "active", name: "Ready computer", driver: "sandbox" }),
+    ]);
+    roots.push(result.root);
+    const options = await environmentOptions(result.container);
+    expect([...options.querySelectorAll('[role="option"]')].map(option => option.textContent)).toEqual([
+      "Default: Local", "Ready computer · sandbox",
+    ]);
+    await clickElement(options.querySelector('[data-value="active"]'));
+    expect(result.onChange).toHaveBeenLastCalledWith({ defaultEnvironmentId: "active" });
+  });
 
   it("keeps an existing non-runnable override visible so it can be cleared", async () => {
     const result = await renderForm(
