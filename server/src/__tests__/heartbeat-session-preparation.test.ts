@@ -289,16 +289,19 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     } finally { await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false }); }
   });
   it.each([
-    { failure: "runner_state_identity_mismatch: remote_warm_session_not_idle", chat: false, fresh: true },
+    { failure: "runner_state_identity_mismatch: remote_warm_session_not_idle", chat: false, fresh: false },
     { failure: "runner_state_identity_mismatch: remote_warm_session_not_idle", chat: true, fresh: false },
     { failure: "ordinary model/tool failure", chat: false, fresh: false },
-    { failure: "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; warm_recovery_refused=current_run_not_admitted", chat: false, fresh: true },
-    { failure: "native_controller_recovery_unsupported:metadata_format", chat: false, fresh: true },
+    { failure: "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; warm_recovery_refused=current_run_not_admitted", chat: false, fresh: false },
+    { failure: "native_controller_recovery_unsupported:metadata_format", chat: false, fresh: false },
     { failure: "native_continuation_requires_reconciliation", chat: false, fresh: false },
     { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", chat: false, fresh: true },
     { failure: "workspace_continuation_source_missing", errorCode: "native_provider_state_incompatible", chat: false, fresh: true },
-    { failure: "current_run_not_admitted", chat: false, fresh: true },
-  ].flatMap(row => [true, false].map(reconciled => ({ ...row, reconciled }))))("stock reconciliation of a continuous Pi session: $failure, chat=$chat, fresh=$fresh, reconciled=$reconciled", async ({ failure, errorCode, chat, fresh, reconciled }) => {
+    { failure: "current_run_not_admitted", chat: false, fresh: false },
+  ].flatMap(row => [true, false].flatMap(reconciled => [true, false].map(enabled => ({
+    ...row, fresh: row.fresh && enabled, reconciled, enabled,
+  })))))("stock reconciliation of a continuous Pi session: $failure, chat=$chat, fresh=$fresh, reconciled=$reconciled, enabled=$enabled", async ({ failure, errorCode, chat, fresh, reconciled, enabled }) => {
+    await instanceSettingsService(db).updateExperimental({ autoFreshSessionOnRecovery: enabled });
     const f = await seed(), sessionId = randomUUID();
     await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", fixtureSessionId: sessionId } })
       .where(eq(agents.id, f.agentId));
@@ -329,6 +332,10 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
         previousRunId: failed.id, retryOfRunId: failed.id });
       expect(next.input.runtime.sessionId).toBe(fresh ? null : sessionId);
       expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: { reset: fresh, taskSessionReused: !fresh } } });
+      expect(Boolean(next.finished.contextSnapshot?.warmRecoveryFreshSession)).toBe(fresh);
+      process.stdout.write(`AUTO-FRESH-SCOPE ${JSON.stringify({ failure, errorCode, chat, reconciled, enabled,
+        sourceRunId: failed.id, recoveryRunId: next.finished.id, savedSessionId: sessionId,
+        resumes: next.input.runtime.sessionId, reset: fresh })}\n`);
       if (fresh) {
         expect(next.input.context.executionContinuation).toMatchObject({ messages: [expect.objectContaining({ body: "SAVED WORK: use the completed analysis" })] });
         expect(next.finished.error).toBeNull();
@@ -349,7 +356,8 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
         body: "SAVED BEFORE MUTE-BOX: carry this completed work into recovery." });
       registerServerAdapter({ ...adapter, type, execute: async input => {
         const result = await adapter.execute(input), sessionId = input.runtime.sessionId ?? s1;
-        return { ...result, exitCode: 1, sessionId, sessionParams: { sessionId }, errorMessage: "remote_warm_session_not_idle" };
+        return { ...result, exitCode: 1, sessionId, sessionParams: { sessionId },
+          errorMessage: "native_controller_recovery_missing_evidence:retained_sandbox_binding" };
       } });
       let previous = (await execute(f, {}, "failed", service)).finished.id;
       const resumes: unknown[] = [], runs: string[] = [];
@@ -408,7 +416,7 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     const [saved] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, f.agentId));
     const [refused] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
       nativeSessionId: oldSession, nativeIssueId: f.issueId, status: "failed", finishedAt: new Date(),
-      error: "remote_warm_session_not_idle", errorCode: "adapter_failed", contextSnapshot: { issueId: f.issueId } }).returning();
+      error: "native_controller_recovery_missing_evidence:retained_sandbox_binding", errorCode: "adapter_failed", contextSnapshot: { issueId: f.issueId } }).returning();
     const recover = async (sourceRunId: string, expectedStatus = "succeeded") => {
       signal.throwIfAborted();
       const actionId = randomUUID();
@@ -468,7 +476,7 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       expect(progress.input.runtime.sessionId).toBeNull();
       const [newRefusal] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
         nativeSessionId: progress.finished.sessionIdAfter, nativeIssueId: f.issueId, status: "failed", finishedAt: new Date(),
-        error: "remote_warm_session_not_idle", errorCode: "adapter_failed", contextSnapshot: { issueId: f.issueId } }).returning();
+        error: "native_controller_recovery_missing_evidence:retained_sandbox_binding", errorCode: "adapter_failed", contextSnapshot: { issueId: f.issueId } }).returning();
       const newIncident = await recover(newRefusal.id);
       expect(newIncident.input.runtime.sessionId).toBeNull();
     } finally {
@@ -604,7 +612,8 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       registerServerAdapter({ ...adapter, type, execute: async input => {
         const result = await adapter.execute(input);
         const sessionId = input.runtime.sessionId ?? freshSession;
-        return { ...result, exitCode: 1, sessionId, sessionParams: { sessionId }, errorMessage: "remote_warm_session_not_idle" };
+        return { ...result, exitCode: 1, sessionId, sessionParams: { sessionId },
+          errorMessage: "native_controller_recovery_missing_evidence:retained_sandbox_binding" };
       } });
       if (decision === "stock reset") await db.update(agents).set({ adapterConfig: { ...config, fixtureOption: "changed" } })
         .where(eq(agents.id, f.agentId));
@@ -732,7 +741,7 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     const f = await recoveryNoticeFixture(), sessionId = randomUUID(), laterId = randomUUID();
     const authorizedStart = started && authority !== "wrong credential run" && authority !== "none";
     const [later] = await db.insert(heartbeatRuns).values({ id: laterId, companyId: f.companyId, agentId: f.agentId,
-      issueId: f.issueId, nativeSessionId: sessionId, status: "failed", error: "remote_warm_session_not_idle",
+      issueId: f.issueId, nativeSessionId: sessionId, status: "failed", error: "native_controller_recovery_missing_evidence:retained_sandbox_binding",
       contextSnapshot: { issueId: f.issueId, ...(authority === "Retry" ? { explicitFreshSession: true } : {}) },
       resultJson: { configFreshness: { session: { reset: authority === "reset",
         ...(authority.includes("credential") ? { credentialIdentityResetRunId: authority === "credential" ? laterId : randomUUID() } : {}),

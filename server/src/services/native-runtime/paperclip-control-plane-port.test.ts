@@ -585,7 +585,7 @@ describe("PaperclipControlPlanePort conformance", () => {
         expect(ordinary.warmRecoveryRetainSessionId).toBeNull();
         expect(ordinary.taskResumeSessionId).toBe(sessionId);
         // Preserve CHPORT's existing refusal/new-incident check too.
-        await db.update(heartbeatRuns).set({ error: "remote_warm_session_not_idle" }).where(eq(heartbeatRuns.id, runId));
+        await db.update(heartbeatRuns).set({ error: "native_controller_recovery_missing_evidence:retained_sandbox_binding" }).where(eq(heartbeatRuns.id, runId));
         const next = await prepareHeartbeatSession(db, nextInput);
         const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, current.id));
         expect(next.resetTaskSession).toBe(true);
@@ -601,7 +601,8 @@ describe("PaperclipControlPlanePort conformance", () => {
         previousSessionId = sessionId;
         await db.insert(issueComments).values({ companyId, issueId, body: "Previous session reply", authorType: "agent",
           authorAgentId: agentId, createdByRunId: runId, createdAt: previousReplyAt });
-        if (taskRecovery) await db.update(heartbeatRuns).set({ status: "failed", error: "remote_warm_session_not_idle" })
+        if (taskRecovery) await db.update(heartbeatRuns).set({ status: "failed",
+          error: "native_controller_recovery_missing_evidence:retained_sandbox_binding" })
           .where(eq(heartbeatRuns.id, runId));
       }
       const comments = await markers();

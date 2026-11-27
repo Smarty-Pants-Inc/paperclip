@@ -6,7 +6,7 @@ import { getServerAdapter } from "../../adapters/index.js";
 import type { prepareManagedAiRuntime } from "../ai-connection-runtime.js";
 import { aiConnectionSessionCompatibilityInputs, managedAiSessionIdentityCompatible } from "../ai-connection-session.js";
 import { createNativeSessionHandoffLoader } from "../native-runtime/native-session-handoff.js";
-import { decideNativeContinuation, isWarmRecoveryRefusal, resolveSessionContinuity } from "../native-runtime/continued-session.js";
+import { decideNativeContinuation, isWarmRecoveryRefusal, resolveSessionContinuity, sessionCannotContinue } from "../native-runtime/continued-session.js";
 import { isChatTask } from "../fresh-continuation-retry-fold.js";
 import { issueService } from "../issues.js";
 import { instanceSettingsService } from "../instance-settings.js";
@@ -348,9 +348,11 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
         } catch (err) {
           logger.warn({ err, runId: run.id, issueId: issueRef.id }, "Could not record recovery notice; continuing recovery");
         }
-      } else if ((await instanceSettingsService(db).getExperimentalReadOnly()).autoFreshSessionOnRecovery === true) {
-        // Only the automatic fresh try is opt-in. Boundary recognition, receipts,
-        // and resuming an authorized newer session above are always active.
+      } else if (sessionCannotContinue(previous) &&
+          (await instanceSettingsService(db).getExperimentalReadOnly()).autoFreshSessionOnRecovery === true) {
+        // Spend only on a session that can never resume, not a self-clearing refusal.
+        // For incidents opened while ON, boundaries, receipts and authorized-newer
+        // selection remain active when the setting is later switched OFF.
         warmRecoveryResetRequired = true;
         context.warmRecoveryFreshSession = { runId: run.id, refusedRunId: previous!.id, retainedSessionId };
         // Write before workspace/provider startup can fail, and merge rather

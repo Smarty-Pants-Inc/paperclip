@@ -57,7 +57,7 @@ export const INSTANCE_FEATURE_CATALOG: Record<InstanceFeatureKey, FeatureCatalog
   },
   autoFreshSessionOnRecovery: {
     title: "Automatic fresh-session recovery",
-    description: "Try one new session automatically when a continuous Pi task cannot resume its saved session. Explicit Retry, session boundaries, and receipts are unchanged when off.",
+    description: "When ON, try one new session per incident only when a continuous Pi task's saved session can never resume: native_provider_state_incompatible or native_controller_recovery_missing_evidence:retained_sandbox_binding. Warm owner not idle, run not admitted, prior owner indeterminate and controller recovery unsupported keep retrying the saved session, with ON or OFF. OFF keeps stock automatic recovery. For an incident opened while ON, boundaries, receipts and authorized-newer selection remain active after switching OFF. The person sees the New session divider; a notice appears only if the fresh session is refused again. Explicit Retry and independent stock resets are unchanged.",
     tier: "managed", cloudDefault: false, selfHostedDefault: false,
   },
   enableNativeRunner: {
