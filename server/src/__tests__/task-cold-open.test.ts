@@ -189,6 +189,27 @@ const support = externalDatabase ? { supported: true } : await getEmbeddedPostgr
     ]; await db.insert(heartbeatRunEvents).values(rows.map(([eventType, payload], i) => ({ companyId, runId: compactRunId, agentId, seq: i + 1, eventType, payload: { prpEvent: { eventType, payload } } })));
     expect((await createHeartbeatRunState(db).listEvents(compactRunId, 0, 1000, true)).map(event => event.seq)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
   });
+  it("keeps user messages and steering acknowledgements in conversation, not file changes", async () => {
+    const inputRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: inputRunId, companyId, agentId, runtimeMode: "native", status: "succeeded" });
+    const rows: [string, string, Record<string, unknown>][] = [
+      ["item.started", "user", { kind: "userMessage", text: "Please continue" }],
+      ["item.delta", "user", { text: " with the fix" }],
+      ["item.completed", "user", { item: { type: "userMessage", text: "Please continue with the fix" } }],
+      ["item.started", "steer", { item: { kind: "steering_acknowledgement" } }],
+      ["item.delta", "steer", { text: "Steering acknowledged" }],
+      ["item.completed", "steer", { kind: "steering_acknowledgement", status: "acknowledged" }],
+      ["item.started", "file", { kind: "fileChange", path: "unrelated.txt" }],
+      ["item.delta", "file", { text: "unrelated change" }],
+      ["item.completed", "file", { kind: "fileChange", path: "unrelated.txt" }],
+    ];
+    await db.insert(heartbeatRunEvents).values(rows.map(([eventType, itemId, payload], i) => ({
+      companyId, runId: inputRunId, agentId, seq: i + 1, eventType, payload: { prpEvent: { eventType, itemId, payload } },
+    })));
+    const service = createHeartbeatRunState(db);
+    expect((await service.listEvents(inputRunId)).map(event => event.seq)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    expect((await service.listEvents(inputRunId, 0, 1000, true)).map(event => event.seq)).toEqual([1, 2, 3, 4, 5, 6]);
+  });
   it("pages conversation events with ordinary tools, identity-less deltas and requests", async () => {
     const event = (seq: number, eventType: string, payload: Record<string, unknown>, itemId?: string) => ({
       companyId, runId, agentId, seq, eventType, payload: { prpEvent: { schema: "paperclip.prp.event.v1", eventType, itemId, payload } },
