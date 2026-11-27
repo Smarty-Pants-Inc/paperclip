@@ -3,12 +3,20 @@ import type { CaseExecutionContext, projectCaseContinuation } from "../case-cont
 import { caseInstructionAlreadyRepresented } from "../case-context.js";
 import { nativeStatusRetryPrompt } from "./continued-session.js";
 
+/** Automatic wakes must act even when their retained-session delta is empty. */
+export const NATIVE_AUTOMATIC_CONTINUATION_WAKE_REASONS = [
+  "issue_continuation_needed", "issue_status_changed", "issue_assigned", "retry_failed_run",
+  "issue_blockers_resolved", "heartbeat_timer", "issue_monitor_due",
+] as const;
+
 /** Only new, authorized events belong in an already retained provider conversation.
  * Full bootstrap input is kept separately for an actual provider resume failure.
  */
 export function buildNativeContinuationPrompt(input: {
   wakePayload: unknown;
   promptOnly?: boolean;
+  /** The constructor verified the previous input belongs to this retained session. */
+  retainedSession?: boolean;
   previousRunId: string;
   issue: { title: string; description: string | null };
   previousIssue: { title: string; description: string | null };
@@ -19,7 +27,12 @@ export function buildNativeContinuationPrompt(input: {
   previousGitHubReviewConfigurationKeys?: readonly string[];
 }): string | null {
   const wake = normalizePaperclipWakePayload(input.wakePayload);
-  if (input.promptOnly && wake) {
+  const rawWake = input.wakePayload && typeof input.wakePayload === "object"
+    ? input.wakePayload as Record<string, unknown> : {};
+  const automaticWake = input.retainedSession === true &&
+    NATIVE_AUTOMATIC_CONTINUATION_WAKE_REASONS.some(reason => reason === wake?.reason) &&
+    !rawWake.nativeStatusRetry;
+  if (input.promptOnly && wake && !automaticWake) {
     const retryPrompt = nativeStatusRetryPrompt(input.wakePayload, input.previousRunId);
     if (retryPrompt) {
       // The failed run's own history is already present, but person messages
@@ -31,11 +44,12 @@ export function buildNativeContinuationPrompt(input: {
     return wake.commentIds.map(id => wake.comments.find(comment => comment.id === id)?.fullBody ?? messages.find(message => message.id === id)!.body).join("\n\n");
   }
   const continuation = wake?.executionContinuation;
-  const delta = continuation?.resumeDelta;
+  const delta = continuation?.resumeDelta ?? (automaticWake ? {
+    baseRunId: input.previousRunId,
+    messages: continuation?.messages.filter(message => wake!.commentIds.includes(message.id)) ?? [],
+  } : undefined);
   if (!wake || !delta || delta.baseRunId !== input.previousRunId) return null;
   if (input.caseContext && !input.workflowCase) return null;
-  const rawWake = input.wakePayload && typeof input.wakePayload === "object"
-    ? input.wakePayload as Record<string, unknown> : {};
   const unclaimedTask = wake.reason === "issue_continuation_needed" && rawWake.nativeTaskUnclaimed === true;
   // Attachment descriptors are intentionally omitted by the generic normalizer.
   // Retain the complete bootstrap framing whenever current input needs them or
@@ -66,13 +80,14 @@ export function buildNativeContinuationPrompt(input: {
   // Other provider, attachment, question, approval, and recovery paths keep
   // their specialized framing. A matching prior run still gates every delta.
   if (rawWake.chatCompletionUpdates || (wake.externalChatProvider && !externalChat) ||
-    (!['issue_commented', 'issue_children_completed'].includes(wake.reason ?? '') && !caseHandoff && !unclaimedTask &&
+    (!['issue_commented', 'issue_children_completed'].includes(wake.reason ?? '') && !caseHandoff && !unclaimedTask && !automaticWake &&
       !(externalChat && wake.reason === "External chat message received")) ||
     wake.fallbackFetchNeeded || wake.truncated || wake.recovery || continuation?.interruptedRunId ||
     (wake.externalChatExecutionBound && !externalChat) || wake.externalChatQuestionResponse ||
     wake.taskWatchdog || wake.livenessContinuation || wake.activeTreeHold ||
     wake.skillTest || wake.executionStage || wake.agentMessage ||
-    wake.documentReviewContext || wake.planReviewContext || wake.annotationDeltas.length > 0
+    wake.documentReviewContext || wake.planReviewContext || wake.annotationDeltas.length > 0 ||
+    (automaticWake && (hasAttachmentContext || wake.interactionId || wake.questionResponse || wake.dispositionRepair))
   ) return null;
   const taskChanges = Object.fromEntries(
     (["title", "description"] as const)
@@ -105,10 +120,16 @@ export function buildNativeContinuationPrompt(input: {
   const earlierRead = wake.comments.filter((comment) => comment.readByEarlierTurn && comment.id
     && events.messages.some((message) => message.id === comment.id)).map((comment) => comment.id!);
   if (earlierRead.length > 0) Object.assign(events, { readByEarlierTurn: { messageIds: earlierRead, note: PAPERCLIP_EARLIER_READ_COMMENT_NOTE } });
-  if (unclaimedTask) return [
-    "You are continuing the same conversation. The previous task turn ended without an accepted completion report. Do NOT repeat commands, scripts, or other work already done in this task, or re-answer consumed messages. If the work is complete, file your result against the current contract now. Otherwise finish only what remains, then file your result.",
-    ...(events.messages.length || Object.keys(events).length > 1 ? [JSON.stringify(events)] : []),
-  ].join("\n\n");
+  const resume = automaticWake
+    ? `Conversation resumed: ${wake.reason!.replaceAll("_", " ")}. Status: ${wake.issue?.status ?? "unknown"}. Continue the task from the recorded progress; do not repeat completed work.`
+    : null;
+  if (unclaimedTask) {
+    const instruction = "You are continuing the same conversation. The previous task turn ended without an accepted completion report. Do NOT repeat commands, scripts, or other work already done in this task, or re-answer consumed messages. If the work is complete, file your result against the current contract now. Otherwise finish only what remains, then file your result.";
+    if (resume) return JSON.stringify({ resume, instruction, ...events });
+    return [instruction, ...(events.messages.length || Object.keys(events).length > 1 ? [JSON.stringify(events)] : [])].join("\n\n");
+  }
+  // Keep the event envelope parseable by the selected-turn byte guard.
+  if (resume) return JSON.stringify({ resume, ...events });
   if (!events.messages.length && !humanResponses.length && !wake.childIssueSummaries.length && !Object.keys(taskChanges).length && !input.workflowCase) return null;
   return JSON.stringify(events);
 }

@@ -1,4 +1,13 @@
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { randomUUID } from "node:crypto";
+import { agents, companies, createDb, heartbeatRunEvents, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
+import { eq } from "drizzle-orm";
+import { EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
+import { buildExecutionContinuation } from "../execution-continuation.js";
+import { buildNativeExecutionInput } from "./native-execution-input.js";
+import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
+import { buildNativeModelEnvelope } from "../../vendor/paperclip-runner/index.js";
+const { executeNativeSession } = await import(new URL("../../../../packages/paperclip-runner/src/native-session-runtime.ts", import.meta.url).href) as Pick<typeof import("../../vendor/paperclip-runner/index.js"), "executeNativeSession">;
 import { buildNativeContinuationPrompt } from "./native-continuation.js";
 
 const issue = { title: "Original task", description: "Retain my long task brief." };
@@ -141,5 +150,146 @@ describe("plain-text external chat continuation projection", () => {
   });
   it("requires the constructor to explicitly opt into chat continuation", () => {
     expect(build(slackWake)).toBeNull();
+  });
+});
+
+// Embedded PostgreSQL rows exercise the saved-run coverage owner and real Runner turn composition.
+describe("retained automatic wake rows", () => {
+  const reasons = ["issue_continuation_needed", "issue_status_changed", "issue_assigned", "retry_failed_run", "issue_blockers_resolved", "heartbeat_timer", "issue_monitor_due"];
+  let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
+  let db: ReturnType<typeof createDb>;
+  const companyId = randomUUID(), agentId = randomUUID();
+  beforeAll(async () => {
+    database = await startEmbeddedPostgresTestDatabase("retained-automatic-wake-");
+    db = createDb(database.connectionString);
+    await db.insert(companies).values({ id: companyId, name: "Continuation rows", issuePrefix: `R${companyId.replaceAll("-", "")}` });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Executor", role: "engineer", adapterType: "paperclip_runner" });
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+  afterAll(async () => { await database?.cleanup(); });
+  async function fixture() {
+    const taskId = randomUUID(), sessionId = randomUUID();
+    const issue = { id: taskId, identifier: "RESUME-1", title: "Continue the requested work", description: null, workMode: "standard" };
+    await db.insert(issues).values({ id: taskId, companyId, title: issue.title, status: "in_progress", assigneeAgentId: agentId });
+    const history = Array.from({ length: 10 }, (_, index) => ({ id: randomUUID(), companyId, issueId: taskId, authorType: "user" as const, authorUserId: "board",
+      body: `SAVED_HISTORY_${index}:` + "h".repeat(34000), createdAt: new Date(Date.UTC(2026, 0, 1, 0, index)), updatedAt: new Date("2026-01-01T01:00:00Z") }));
+    await db.insert(issueComments).values(history);
+    const baseline = await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId, context: {}, summary: null, exposeLowTrustRaw: false });
+    const args = { companyId, agentId, provider: "pi_rpc" as const, normalizedSessionId: sessionId, issue, taskPrompt: "Continue the requested work.",
+      workspace: { id: "workspace", cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null }, runtimeContext: nativeRuntimeContextFixture(),
+      completionContract: { id: "contract", sha256: "a".repeat(64), schemaVersion: "paperclip.run-result.v1", contract: { revision: "1", objective: "Continue", criteria: [{ id: "output", requirement: "Finish the requested work" }] } } };
+    let priorId = randomUUID();
+    let previousInput = buildNativeExecutionInput({ ...args, runId: priorId, wakePayload: { reason: "issue_assigned", executionContinuation: baseline } });
+    async function save(runId: string, snapshot: typeof baseline) {
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeSessionId: sessionId, status: "succeeded", contextSnapshot: { issueId: taskId, executionContinuation: snapshot } });
+      await db.insert(heartbeatRunEvents).values([
+        { companyId, runId, agentId, seq: 0, eventType: "session.resumed", payload: { prpEvent: { payload: { providerSessionId: "provider-generation-1" } } } },
+        { companyId, runId, agentId, seq: 1, eventType: "turn.accepted", stream: "system", level: "info" },
+      ]);
+    }
+    await save(priorId, baseline);
+    return { args, taskId, sessionId, baseline, previousInput, priorId, historyBytes: Buffer.byteLength(history.map(m => m.body).join("")),
+      async next(reason: string, options: { noDelta?: boolean; newItems?: boolean; patch?: Record<string, unknown> } = {}) {
+        const runId = randomUUID(), previousRunId = priorId;
+        const body = "NEW_PERSON_ITEM", childResult = "NEW_CHILD_RESULT", appContext = "NEW_OWED_WIDGET_EVENT";
+        let commentId: string | undefined;
+        if (options.newItems) {
+          commentId = randomUUID();
+          await db.insert(issueComments).values({ id: commentId, companyId, issueId: taskId, authorType: "user", authorUserId: "board", body,
+            createdAt: new Date("2026-01-02T00:00:00Z"), updatedAt: new Date("2026-01-02T00:00:00Z") });
+        }
+        const snapshot = await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId, runId, previousContextRunId: priorId,
+          nativeSessionId: sessionId, nativeProviderSessionId: "provider-generation-1", context: { wakeReason: reason, ...(commentId ? { commentId } : {}) }, summary: null, exposeLowTrustRaw: false });
+        expect(snapshot.resumeDelta?.messages.map(m => m.id)).toEqual(commentId ? [commentId] : []);
+        if (options.noDelta) delete snapshot.resumeDelta;
+        const [current] = await db.select().from(issues).where(eq(issues.id, taskId));
+        const wakePayload = { reason, issue: { ...issue, status: current!.status }, executionContinuation: snapshot,
+          ...(commentId ? { commentIds: [commentId], latestCommentId: commentId, comments: [{ id: commentId, body, author: { type: "user", id: "board" } }],
+            childIssueSummaries: [{ id: "child", status: "done", summary: childResult }], unresolvedBlockerIssueIds: ["owed-blocker"], mcpAppContext: appContext } : {}) };
+        const input = buildNativeExecutionInput({ ...args, runId, resumedSession: true,
+          previousTurn: { runId: previousRunId, task: issue, nativeExecutionInput: previousInput }, wakePayload, ...options.patch });
+        const envelope = buildNativeModelEnvelope(input, { resumedSession: true });
+        const prompt = "events" in envelope ? envelope.events : envelope.task.prompt;
+        // This is the real Runner startTurn boundary, not a substitute prompt renderer.
+        const identity = { ...input.binding, sessionId };
+        const checkpoint = { backendKind: "mock" as const, sessionId: "driver", identity, providerSessionId: "provider-generation-1", cursor: "0", activeTurnId: null,
+          pendingRuntimeRequests: [], lineage: [], workingDirectory: "/workspace" };
+        let turnPrompt = "", turns = 0;
+        const session = { identity: () => identity, async capabilities() { return { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true }; },
+          async *events() {}, async result() { return null; }, async snapshot() { return checkpoint; }, async close() {},
+          async startTurn(turn: { message: { text: string } }) { turns++; turnPrompt = turn.message.text; throw new Error("captured-retained-turn"); } };
+        await expect(executeNativeSession({ input, persistedSession: checkpoint,
+          backend: { async descriptor() { return { kind: "mock", name: "retained-row", version: "1", capabilities: await session.capabilities(), runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" } }; },
+            async openSession() { return session; }, async recoverSession() { return { recovered: true, session }; } },
+          controlPlane: { async openRun() {}, async checkpointSession() {}, async completeRun() {}, async appendEvent(event) { const seq = "sourceSeq" in event ? event.sourceSeq : 0; return { cursor: seq, highestContiguousSourceSeq: seq, disposition: "committed" }; }, async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; } },
+          runnerInstanceId: "runner", controlPlaneInstanceId: "controller",
+        })).rejects.toThrow("captured-retained-turn");
+        console.info("AUTOMATIC_WAKE_ROW " + JSON.stringify({ reason, noDelta: !!options.noDelta, taskId, previousRunId, runId, sessionId, historyBytes: Buffer.byteLength(baseline.messages.map(m => m.body).join("")),
+          promptBytes: Buffer.byteLength(prompt), turnPromptBytes: Buffer.byteLength(turnPrompt), turns, containsHistory: turnPrompt.includes("SAVED_HISTORY_"), promptPreview: prompt.slice(0, 1200) }));
+        await save(runId, snapshot); priorId = runId; previousInput = input;
+        return { input, prompt, turnPrompt, turns, body, childResult, appContext };
+      } };
+  }
+  it.each(reasons.flatMap(reason => [false, true].map(noDelta => [reason, noDelta] as const)))("keeps %s small and starts a turn with every newly owed item once (no delta: %s)", async (reason, noDelta) => {
+    const f = await fixture();
+    const row = await f.next(reason, { newItems: true, noDelta });
+    expect(row.turns).toBe(1);
+    expect(Buffer.byteLength(row.prompt)).toBeLessThan(8192);
+    expect(row.turnPrompt).not.toContain("SAVED_HISTORY_");
+    expect(row.prompt).toContain(`resumed: ${reason.replaceAll("_", " ")}`);
+    expect(row.prompt).toContain("in_progress");
+    expect(row.prompt).toMatch(/continue/i);
+    for (const item of [row.body, row.childResult, row.appContext, "owed-blocker"]) expect(row.prompt.split(item)).toHaveLength(2);
+  });
+  it.each([false, true])("keeps the selected-turn byte guard and source attribution for automatic wakes (unclaimed: %s)", async unclaimed => {
+    const f = await fixture();
+    const newest = { ...f.baseline.messages.at(-1)!, id: randomUUID(), body: "NEW_OVERSIZED_PERSON_MESSAGE:" + "n".repeat(600000) };
+    const snapshot = { ...f.baseline, messages: [...f.baseline.messages, newest], resumeDelta: { baseRunId: f.priorId, messages: [newest] } };
+    try {
+      buildNativeExecutionInput({ ...f.args, runId: randomUUID(), resumedSession: true, boundCommandBytes: true,
+        previousTurn: { runId: f.priorId, task: f.args.issue, nativeExecutionInput: f.previousInput },
+        wakePayload: { reason: "issue_continuation_needed", issue: { ...f.args.issue, status: "in_progress" }, nativeTaskUnclaimed: unclaimed, executionContinuation: snapshot } });
+      throw new Error("oversized automatic wake admitted");
+    } catch (error) {
+      expect(error).toMatchObject({ code: "native_turn_prompt_exceeds_command_bound", promptCause: { kind: "newest_message", bytes: Buffer.byteLength(newest.body) } });
+    }
+  });
+  it.each(["fresh", "unknown previous session", "session mismatch", "run mismatch", "delta mismatch", "conversation reset", "attachment", "question", "approval", "provider update", "unclaimed"])("preserves required bootstrap or specialized framing: %s", async kind => {
+    const f = await fixture();
+    const snapshot = { ...f.baseline, resumeDelta: { baseRunId: f.priorId, messages: [] } };
+    const previous = structuredClone(f.previousInput);
+    if (kind === "session mismatch") previous.session.normalizedSessionId = randomUUID();
+    if (kind === "run mismatch") previous.binding.runId = randomUUID();
+    if (kind === "delta mismatch") snapshot.resumeDelta.baseRunId = randomUUID();
+    const wakePayload = { reason: "issue_continuation_needed", issue: { ...f.args.issue, status: "in_progress" }, executionContinuation: snapshot,
+      ...(kind === "attachment" ? { attachmentOmissions: [{ commentId: "file", notice: "Unavailable attachment" }] } : {}),
+      ...(kind === "question" ? { questionResponse: { interactionId: "question", summaryMarkdown: "Selected choice" } } : {}),
+      ...(kind === "approval" ? { interactionId: "approval", interactionKind: "request_confirmation" } : {}),
+      ...(kind === "provider update" ? { chatCompletionUpdates: [{ body: "Provider update" }] } : {}),
+      ...(kind === "unclaimed" ? { nativeTaskUnclaimed: true } : {}) };
+    const input = buildNativeExecutionInput({ ...f.args, runId: randomUUID(), resumedSession: kind !== "fresh", conversationMode: kind === "conversation reset",
+      previousTurn: { runId: f.priorId, task: f.args.issue, ...(kind === "unknown previous session" ? {} : { nativeExecutionInput: previous }) }, wakePayload });
+    if (kind === "unclaimed") {
+      expect(input.continuationPrompt).toContain("without an accepted completion report");
+      expect(input.continuationPrompt).not.toContain("SAVED_HISTORY_");
+    } else {
+      expect(input.continuationPrompt ?? null).toBeNull();
+      expect(input.task.prompt).toContain("SAVED_HISTORY_");
+    }
+  });
+  it.each(reasons.flatMap(reason => [false, true].map(noDelta => [reason, noDelta] as const)))("starts three flat %s turns on the same retained session (no delta: %s)", async (reason, noDelta) => {
+    const f = await fixture(), bytes: number[] = [];
+    expect(f.historyBytes).toBeGreaterThan(340000);
+    const rows = [];
+    for (let wake = 1; wake <= 3; wake++) rows.push(await f.next(reason, { noDelta }));
+    for (const row of rows) {
+      bytes.push(Buffer.byteLength(row.prompt));
+      expect(row.turns).toBe(1);
+      expect(row.turnPrompt).not.toContain("SAVED_HISTORY_");
+      expect(row.prompt).toContain(`resumed: ${reason.replaceAll("_", " ")}`);
+      expect(row.prompt).toMatch(/continue/i);
+      expect(row.prompt).toContain("in_progress");
+      expect(bytes.at(-1)).toBeLessThan(8192);
+    }
+    expect(new Set(bytes).size).toBe(1);
   });
 });
