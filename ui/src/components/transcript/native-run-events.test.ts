@@ -521,7 +521,14 @@ describe("nativeRunEventsToTranscript", () => {
     ]);
 
     expect(transcript).toEqual([
-      expect.objectContaining({ kind: "assistant", text: "Done safely." }),
+      expect.objectContaining({
+        kind: "assistant", text: "Done ", channel: "unknown",
+        delta: true, itemId: "message-1", eventSeq: 1,
+      }),
+      expect.objectContaining({
+        kind: "assistant", text: "safely.", channel: "unknown",
+        delta: true, itemId: "message-1", eventSeq: 2,
+      }),
       expect.objectContaining({
         kind: "tool_call",
         name: "Bash",
