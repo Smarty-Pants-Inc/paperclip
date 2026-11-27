@@ -12,6 +12,7 @@ import { buildExecutionContinuation } from "../execution-continuation.js";
 import { getIssueContinuationSummaryDocument } from "../issue-continuation-summary.js";
 import type { issueService } from "../issues.js";
 import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
+import { readNativeTaskSnapshot, restoreServerTaskRevisions, withNativeTaskRevisions } from "../native-task-snapshot.js";
 import { redactQuarantinedBodyForHigherTrust, sanitizeQuarantinedCommentForHigherTrust } from "../source-trust.js";
 import { getTaskPlanContext } from "../task-plan-context.js";
 import { loadResponsibilityBarGuidance } from "../responsibility-bar-guidance.js";
@@ -451,6 +452,27 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
       title: issueRef.title,
       description: isConversation(issueContext) ? null : issueRef.description,
       workMode: issueRef.workMode,
+      // Snapshot only agent-visible task context. Conversation framing hides
+      // the brief; the continuation must not expose it through change news.
+      ...(issueContext ? { continuationSnapshot: withNativeTaskRevisions({
+        identifier: issueRef.identifier,
+        title: issueRef.title,
+        description: isConversation(issueContext) ? null : issueRef.description,
+        workMode: issueRef.workMode,
+        status: issueContext.status,
+        priority: issueContext.priority,
+        assigneeAgentId: issueContext.assigneeAgentId,
+        assigneeUserId: issueContext.assigneeUserId,
+        parentId: issueContext.parentId,
+        projectId: issueContext.projectId,
+        goalId: issueContext.goalId,
+        conversationAgentId: issueContext.conversationAgentId,
+        titleNeedsGeneration: issueContext.titleNeedsGeneration,
+        reviewPolicy: issueContext.reviewPolicy,
+        executionPolicy: issueContext.executionPolicy,
+        responsibleUserId: issueContext.responsibleUserId,
+        billingCode: issueContext.billingCode,
+      }) } : {}),
     };
   } else {
     delete context.paperclipIssue;
@@ -482,6 +504,7 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
   }
   context.paperclipTaskCommunicationGuidance = [context.paperclipTaskCommunicationGuidance, FAST_RESPONSE_AGENT_GUIDANCE].filter(Boolean).join("\n\n");
   if (issueRef) {
+    const rawTaskSnapshot = readNativeTaskSnapshot(parseObject(context.paperclipIssue).continuationSnapshot);
     const redactedWakeContext = await createRunSecretRedactionRegistry(
       db,
     ).redactForIssue(agent.companyId, issueRef.id, {
@@ -494,7 +517,9 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
       paperclipTaskMarkdownAssignment: context.paperclipTaskMarkdownAssignment,
       paperclipTaskMarkdownAssignmentCompact: context.paperclipTaskMarkdownAssignmentCompact,
     });
-    context.paperclipIssue = redactedWakeContext.paperclipIssue;
+    const redactedIssue = parseObject(redactedWakeContext.paperclipIssue);
+    context.paperclipIssue = rawTaskSnapshot ? { ...redactedIssue, continuationSnapshot:
+      restoreServerTaskRevisions(rawTaskSnapshot, readNativeTaskSnapshot(redactedIssue.continuationSnapshot)) } : redactedWakeContext.paperclipIssue;
     if (redactedWakeContext.paperclipCase) context.paperclipCase = redactedWakeContext.paperclipCase;
     context.paperclipTaskCommunicationGuidance = redactedWakeContext.paperclipTaskCommunicationGuidance;
     if (redactedWakeContext.paperclipWakeComment) {

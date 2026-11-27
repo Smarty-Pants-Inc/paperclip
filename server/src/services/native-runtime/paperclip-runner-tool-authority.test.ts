@@ -1,7 +1,7 @@
 import * as connectorRuntime from "../connector-runtime.js";
 import * as cloudIdentity from "../cloud-runtime-identity.js";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { RESPONSIBILITY_TOOL_NAMES } from "../responsibility-tools.js";
 import { createServer } from "node:http";
 import { createPaperclipHttpServer } from "../../http/server.js";
@@ -1112,9 +1112,28 @@ describe("PaperclipRunnerToolAuthority", () => {
     }
   });
 
+  it("strips internal revisions from recovered pre-upgrade tool receipts", async () => {
+    const call = { tool: "workspace_run", callId: "revision-replay-guard", arguments: {} };
+    const hash = (text: string) => createHash("sha256").update(text).digest("hex");
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    await db.update(heartbeatRuns).set({ resultJson: { ...run.resultJson, bridgeToolReceipts: {
+      [hash(call.callId)]: { state: "completed", tool: call.tool,
+        digest: hash('{"arguments":{},"tool":"workspace_run"}'),
+        result: { ok: true, contextSnapshot: { fieldRevisions: { description: "a".repeat(64) } } } },
+    } } }).where(eq(heartbeatRuns.id, runId));
+    try {
+      const authority = new PaperclipRunnerToolAuthority(db, { companyId, agentId, issueId, runId });
+      await expect(authority.recover(call)).resolves.toEqual({ result: { ok: true, contextSnapshot: {} } });
+    } finally {
+      await db.update(heartbeatRuns).set({ resultJson: run.resultJson }).where(eq(heartbeatRuns.id, runId));
+    }
+  });
+
   it("relays assigned MCP calls only while the native run still owns its task", async () => {
     const tool = { name: "app_mem0_recall", description: "Recall memory", inputSchema: { type: "object" } };
-    const execute = vi.fn().mockResolvedValue({ content: "synthetic memory" });
+    const execute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: JSON.stringify({ contextSnapshot: {
+      paperclipEndTaskSnapshot: { taskSnapshot: { fieldRevisions: { description: "a".repeat(64) } } } }, memory: "synthetic memory" }) }],
+      nested: [{ fieldRevisions: { description: "a".repeat(64) } }] });
     const close = vi.fn();
     const authority = new PaperclipRunnerToolAuthority(db, {
       companyId, agentId, issueId, runId,
@@ -1122,7 +1141,9 @@ describe("PaperclipRunnerToolAuthority", () => {
     });
     expect(authority.definitions()).toContainEqual(tool);
     const call = { tool: tool.name, callId: "assigned-mcp", arguments: { query: "compass" } };
-    await expect(authority.execute(call)).resolves.toEqual({ content: "synthetic memory" });
+    // Never-OK credential guard: agent tools cannot relay internal revision evidence.
+    await expect(authority.execute(call)).resolves.toEqual({ content: [{ type: "text",
+      text: JSON.stringify({ contextSnapshot: { paperclipEndTaskSnapshot: { taskSnapshot: {} } }, memory: "synthetic memory" }) }], nested: [{}] });
     expect(execute).toHaveBeenCalledWith(call, "standard");
     await db.update(issues).set({ workMode: "ask" }).where(eq(issues.id, issueId));
     try {

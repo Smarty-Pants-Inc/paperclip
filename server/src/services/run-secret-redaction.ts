@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns } from "@paperclipai/db";
-import { REDACTED_EVENT_VALUE } from "../redaction.js";
+import { REDACTED_EVENT_VALUE, withoutNativeTaskRevisions } from "../redaction.js";
 import { getSecretProvider } from "../secrets/provider-registry.js";
 import type { StoredSecretVersionMaterial } from "../secrets/types.js";
 import { credentialAccessConnectionNameSql } from "./credential-access-visibility.js";
@@ -66,7 +66,7 @@ function redactText(input: string, values: string[]) {
 }
 
 export function redactRegisteredSecretValues<T>(input: T, values: string[], credentialConnectionName: string | null = null): T {
-  if (typeof input === "string") return redactText(input, values) as T;
+  if (typeof input === "string") return redactText(withoutNativeTaskRevisions(input), values) as T;
   if (Array.isArray(input)) return input.map((value) => redactRegisteredSecretValues(value, values, credentialConnectionName)) as T;
   // Dates carry no redactable text; rebuilding them via Object.entries would
   // collapse them to `{}` and break every timestamp in redacted responses.
@@ -75,7 +75,7 @@ export function redactRegisteredSecretValues<T>(input: T, values: string[], cred
   if (!record) return input;
   return Object.fromEntries(
     Object.entries(record)
-      .filter(([key]) => key !== REGISTRY_KEY && key !== OUTPUT_SECRET_KEY && key !== "nativeControllerRecovery" && key !== "nativeTaskSessionPublication" && key !== "legacyProcessSettlement")
+      .filter(([key]) => key !== "fieldRevisions" && key !== REGISTRY_KEY && key !== OUTPUT_SECRET_KEY && key !== "nativeControllerRecovery" && key !== "nativeTaskSessionPublication" && key !== "legacyProcessSettlement")
       .map(([key, value]) => [key, key === "credentialAccess"
         ? (credentialConnectionName ? { connectionName: redactText(credentialConnectionName, values) } : {})
         : redactRegisteredSecretValues(value, values, credentialConnectionName)]),

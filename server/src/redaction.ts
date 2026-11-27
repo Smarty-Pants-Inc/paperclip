@@ -755,6 +755,22 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return proto === Object.prototype || proto === null;
 }
 
+/** Internal comparison evidence is not part of any API, adapter or tool result.
+ * Keep this separate from text redaction: server-side snapshots must retain it.
+ */
+export function withoutNativeTaskRevisions<T>(value: T): T {
+  // MCP and recovered API receipts commonly wrap JSON in content[].text. A
+  // structured receipt must not bypass the boundary merely by being encoded.
+  if (typeof value === "string" && value.includes("fieldRevisions") && /^\s*[\[{]/.test(value)) {
+    try { return JSON.stringify(withoutNativeTaskRevisions(JSON.parse(value))) as T; } catch { /* ordinary prose */ }
+  }
+  if (Array.isArray(value)) return value.map(withoutNativeTaskRevisions) as T;
+  if (!isPlainObject(value)) return value;
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => key !== "fieldRevisions")
+    .map(([key, item]) => [key, withoutNativeTaskRevisions(item)])) as T;
+}
+
 function sanitizeValue(value: unknown): unknown {
   if (value === null || value === undefined) return value;
   // Adapter diagnostics are provider-controlled text. Secret-bearing header or
@@ -763,9 +779,10 @@ function sanitizeValue(value: unknown): unknown {
   // string leaf after validated protocol discriminators have had a chance to
   // opt in above in sanitizeRecord.
   if (typeof value === "string") {
-    return looksLikeCredentialJwt(value) && !isPublicExecutorToolSelector(value)
+    const text = withoutNativeTaskRevisions(value);
+    return looksLikeCredentialJwt(text) && !isPublicExecutorToolSelector(text)
       ? REDACTED_EVENT_VALUE
-      : redactSensitiveText(value);
+      : redactSensitiveText(text);
   }
   if (Array.isArray(value)) return value.map(sanitizeValue);
   if (isSecretRefBinding(value)) {
@@ -908,6 +925,7 @@ export function sanitizeRecord(
 ): Record<string, unknown> {
   const redacted: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(record)) {
+    if (key === "fieldRevisions") continue;
     if (COMMAND_ARGS_PAYLOAD_KEY_RE.test(key) && Array.isArray(value)) {
       redacted[key] = sanitizeCommandArgs(value);
       continue;

@@ -47,6 +47,7 @@ import { assertAssignableAgent } from "../agent-assignability.js";
 import { approvalReadSqlCondition, canActorReadApproval, authorizationService, issueReadSqlCondition, type AuthorizationActor } from "../authorization.js";
 import { resolveCoreTrustPreset } from "../trust-preset-resolver.js";
 import { normalizeIssueExecutionPolicy, redactIssueMonitorExternalRef } from "../issue-execution-policy.js";
+import { withoutNativeTaskRevisions } from "../../redaction.js";
 import { buildLowTrustSourceTrust, isLowTrustQuarantined, LOW_TRUST_QUARANTINED_BODY, resolveActorSourceTrustForIssue, sanitizeQuarantinedCommentForHigherTrust } from "../source-trust.js";
 import { handoffPlanContext } from "./handoff-plan-context.js";
 import { callCreateSkillTool, callUpdateSkillDetailsTool, callUpdateSkillTool } from "../skill-tools.js";
@@ -489,6 +490,10 @@ export class PaperclipRunnerToolAuthority {
   }
 
   async recover(call: Parameters<PaperclipRunnerToolAuthority["execute"]>[0]): Promise<{ result: unknown; isError?: boolean } | null> {
+    return withoutNativeTaskRevisions(await this.#recover(call));
+  }
+
+  async #recover(call: Parameters<PaperclipRunnerToolAuthority["execute"]>[0]): Promise<{ result: unknown; isError?: boolean } | null> {
     await this.#assertToolScope(call.tool);
     if (!this.binding.museRuntime) await this.binding.assertBridgeAuthority?.();
     const context = await this.#boundContext({ tool: call.tool });
@@ -672,6 +677,10 @@ export class PaperclipRunnerToolAuthority {
     callId: string;
     arguments: unknown;
   }): Promise<unknown> {
+    return withoutNativeTaskRevisions(await this.#execute(call));
+  }
+
+  async #execute(call: Parameters<PaperclipRunnerToolAuthority["execute"]>[0]): Promise<unknown> {
     // Advertised schemas are plain objects so every model host shows their
     // arguments; their cross-field variants are checked here with named errors.
     if (!this.binding.assignedMcpTools?.has(call.tool) && !isConnectorTool(call.tool)) {
@@ -1038,7 +1047,15 @@ export class PaperclipRunnerToolAuthority {
           taskQuestionContext: await readTaskQuestionContext(this.db, {
             ...this.binding, conversationMode: isConversation(context.issue),
           }),
-          activeTask: redactedTask(context.issue),
+          // Detail only for ordinary assigned work. Restricted Muse, Dot,
+          // skill-test and review profiles retain their pre-v4 projection.
+          activeTask: { ...redactedTask(context.issue),
+            ...(!this.binding.museRuntime && !this.binding.dotRuntime && !this.binding.nativeReview ? {
+              executionPolicy: context.issue.executionPolicy, billingCode: context.issue.billingCode,
+              reviewPolicy: context.issue.reviewPolicy, responsibleUserId: context.issue.responsibleUserId,
+              conversationAgentId: context.issue.conversationAgentId,
+            } : {}),
+          },
           completionContinuation: monitorCheckAt ? {
             kind: "monitor",
             summary: "Wait for the saved task monitor.",

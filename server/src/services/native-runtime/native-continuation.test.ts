@@ -1,5 +1,24 @@
-import { describe, expect, it } from "vitest";
-import { buildNativeContinuationPrompt } from "./native-continuation.js";
+import { describe, expect, it, vi } from "vitest";
+import { buildNativeContinuationPrompt, nativeTaskChanges, nativeTaskSnapshotFields, readNativeEndTaskSnapshot, withNativeTaskRevisions } from "./native-continuation.js";
+
+// Never-OK credential guard: key rotation cannot turn a secret change invisible.
+describe("server-only task revision key", () => {
+  it("reports each field changed once on key rotation, then settles; rejects old unkeyed receipts", () => {
+    const snapshot = { ...Object.fromEntries(nativeTaskSnapshotFields.map(key => [key, null])),
+      title: "Task", description: "door code 4821", workMode: "standard", status: "in_progress", priority: "medium", titleNeedsGeneration: false };
+    try {
+      vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", "a".repeat(64));
+      const before = withNativeTaskRevisions(snapshot)!;
+      vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", "b".repeat(64));
+      const after = withNativeTaskRevisions(snapshot)!;
+      expect(Object.keys(nativeTaskChanges(after, before)!)).toEqual([...nativeTaskSnapshotFields]);
+      expect(nativeTaskChanges(withNativeTaskRevisions(snapshot), after)).toEqual({});
+      const legacy = { ...before, fieldRevisions: Object.fromEntries(nativeTaskSnapshotFields.map(key => [key, "a".repeat(64)])) };
+      expect(readNativeEndTaskSnapshot({ issueId: "task", basis: "turn_start_plus_own_changes_v2", taskSnapshot: legacy }, "task")).toBeNull();
+      expect(JSON.stringify(after)).not.toContain("b".repeat(64));
+    } finally { vi.unstubAllEnvs(); }
+  });
+});
 
 const issue = { title: "Original task", description: "Retain my long task brief." };
 const message = { id: "new", body: "Yes, please proceed.", authorType: "user", authorId: "board", sourceTrust: "user", createdByRunId: null };

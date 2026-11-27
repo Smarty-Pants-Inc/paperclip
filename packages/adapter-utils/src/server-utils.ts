@@ -800,7 +800,45 @@ type PaperclipWakeRecovery = {
 export type PaperclipExternalChatProvider =
   "slack" | "github" | "discord" | "microsoft-teams" | "telegram" | "imessage-photon" | "speko";
 
-type PaperclipWakePayload = {
+/** Wake-owned event data shared by compact and full prompt rendering. */
+export const PAPERCLIP_WAKE_MEANING_FIELDS = ["reviewDecision", "notificationReason", "retryCause", "retrySummary", "unblockAction", "monitor"] as const;
+const monitorMeaningFields = ["nextCheckAt", "monitorAttemptCount", "monitorNotes", "serviceName", "timeoutAt", "maxAttempts", "recoveryPolicy"] as const;
+export function projectPaperclipWakeMeaning(value: unknown): Partial<Record<typeof PAPERCLIP_WAKE_MEANING_FIELDS[number], unknown>> {
+  const source = parseObject(value);
+  const meaning = Object.fromEntries(PAPERCLIP_WAKE_MEANING_FIELDS.filter(key => Object.hasOwn(source, key)).map(key => [key, source[key]]));
+  // The scheduler emits these at the context's top level, not under .monitor.
+  const monitor = Object.fromEntries(monitorMeaningFields.filter(key => Object.hasOwn(source, key)).map(key => [key, source[key]]));
+  if (Object.keys(monitor).length) {
+    const existing = parseObject(source.monitor);
+    const mergeable = source.monitor !== null && typeof source.monitor === "object" && !Array.isArray(source.monitor) &&
+      Object.keys(monitor).every(key => !Object.hasOwn(existing, key) || existing[key] === monitor[key]);
+    // Enrichment leaves the raw scheduler context intact. Re-project it without
+    // duplicating already canonical metadata, while preserving conflicting or
+    // new-shaped monitor data instead of silently overwriting it.
+    meaning.monitor = mergeable ? { ...existing, ...monitor } :
+      Object.hasOwn(source, "monitor") ? { ...monitor, wakeMonitor: source.monitor } : monitor;
+  }
+  return meaning;
+}
+
+/** UTF-8 byte bound, including the pointer; never split a Unicode code point. */
+export function boundedPaperclipWakeText(value: unknown, maxBytes = 8192): string {
+  const text = typeof value === "string" ? value : JSON.stringify(value) ?? "null";
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  const pointer = "\n[truncated; read the task for the rest with get_task_context({})]";
+  let prefix = Buffer.from(text, "utf8").subarray(0, maxBytes - Buffer.byteLength(pointer)).toString("utf8");
+  if (prefix.endsWith("\ufffd")) prefix = prefix.slice(0, -1);
+  return prefix + pointer;
+}
+export function renderPaperclipWakeMeaning(value: unknown): string[] {
+  const meaning = projectPaperclipWakeMeaning(value);
+  return PAPERCLIP_WAKE_MEANING_FIELDS.filter(key => Object.hasOwn(meaning, key))
+    // Event meaning is new input, not held task prose. The compact validator
+    // declines oversized values; the full renderer must keep them losslessly.
+    .map(key => `${key}: ${typeof meaning[key] === "string" ? meaning[key] : JSON.stringify(meaning[key]) ?? "null"}`);
+}
+
+type PaperclipWakePayload = Partial<Record<typeof PAPERCLIP_WAKE_MEANING_FIELDS[number], unknown>> & {
   githubReviewConfigurations: Array<{ key: string; instructions: string }>;
   executionContinuation: ExecutionContinuationEnvelope | null;
   reason: string | null;
@@ -1859,6 +1897,7 @@ export function normalizePaperclipWakePayload(
     Object.keys(parseObject(payload.skillTest)).length > 0;
   if (
     !payload.executionContinuation &&
+    Object.keys(projectPaperclipWakeMeaning(payload)).length === 0 &&
     comments.length === 0 &&
     commentIds.length === 0 &&
     annotationDeltas.length === 0 &&
@@ -1884,6 +1923,7 @@ export function normalizePaperclipWakePayload(
   }
 
   return {
+    ...projectPaperclipWakeMeaning(payload),
     reason: asString(payload.reason, "").trim() || null,
     // Server-owned delivery snapshots also restore instructions for board wakes.
     // This field does not authenticate an external-chat turn or grant tools.
@@ -2581,6 +2621,7 @@ function renderPaperclipWakePromptBody(
         ...wakeSummaryLines,
       ];
 
+  lines.push(...renderPaperclipWakeMeaning(normalized).flatMap(line => ["", line]));
   for (const config of normalized.githubReviewConfigurations) {
     lines.push("", "## Configured GitHub review instructions", config.instructions);
   }
@@ -2602,16 +2643,16 @@ function renderPaperclipWakePromptBody(
         : "History is complete through the coverage cursor. Prefer source messages over summaries.",
       "humanResponses contains server-verified user answers and decisions; apply each only to its question or approval scope.");
     const earlierRead = normalized.comments.filter((comment) => comment.readByEarlierTurn && comment.id
-      && continuation.messages.some((message) => message.id === comment.id && !message.deleted)).map((comment) => comment.id);
+      && Array.isArray(continuation.messages) && continuation.messages.some((message) => message && message.id === comment.id && !message.deleted)).map((comment) => comment.id);
     if (earlierRead.length > 0) {
       lines.push(`Messages ${earlierRead.join(", ")}: ${PAPERCLIP_EARLIER_READ_COMMENT_NOTE}`);
     }
     const { interactionOutcomes, completedActions, completedWork, recoveryOutcomes, objective, objectiveSource, ...requestContextBase } = continuation;
     const objectiveOwnedByDisplayedSource = continuation.objectiveSource?.kind === "comment" &&
       continuation.issueId === normalized.issue?.id &&
-      Boolean(continuation.objectiveSource.revision) &&
+      Boolean(continuation.objectiveSource.revision) && Array.isArray(continuation.messages) &&
       continuation.messages.some((message) =>
-        message.id === continuation.objectiveSource?.id &&
+        message && message.id === continuation.objectiveSource?.id &&
         message.updatedAt === continuation.objectiveSource.revision &&
         !message.deleted,
       );

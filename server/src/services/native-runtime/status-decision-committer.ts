@@ -31,6 +31,9 @@ import { readNativePlanWait, type NativePlanWaitSource } from "./native-plan-wai
 import { activeIssueInteractionCondition } from "../issue-question-context.js";
 import { questionsAwaitedByAgentBlock } from "../blocked-question-answer.js";
 import { isConversation } from "../agent-conversations.js";
+import { NATIVE_TASK_SNAPSHOT_BASIS, nativeTaskFieldRevision, nativeTaskSnapshotFields, readNativeTaskSnapshot, restoreServerTaskRevisions, withNativeTaskRevisions, type NativeTaskField } from "../native-task-snapshot.js";
+import { readNativeTaskWrites } from "../native-task-write-receipts.js";
+import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
 import { hasPendingNativeChildCompletion, type NativeChildCompletionRecipient } from "./native-child-completion-delivery.js";
 import { and, asc, desc, eq, inArray, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -1780,7 +1783,10 @@ export async function commitNativeStatusDecision(input: {
       .limit(1)
       .then((rows) => rows[0] ?? null);
     if (!issue) throw new NativeStatusRaceError();
-    const [originRun] = await tx.select({ agentId: heartbeatRuns.agentId }).from(heartbeatRuns)
+    const [originRun] = await tx.select({ agentId: heartbeatRuns.agentId,
+      startIssueId: sql<string | null>`${heartbeatRuns.contextSnapshot} #>> '{paperclipIssue,id}'`,
+      startTaskSnapshot: sql<unknown>`${heartbeatRuns.contextSnapshot} #> '{paperclipIssue,continuationSnapshot}'`,
+    }).from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId)));
     if (input.requireReassessmentSource) {
       const expected = input.requireReassessmentSource;
@@ -2721,6 +2727,50 @@ export async function commitNativeStatusDecision(input: {
       },
     });
     publications.push(publication);
+    // A commit-time row also contains edits made by other actors DURING the
+    // turn. It is not what the retained session knows. Start with its delivered
+    // snapshot and advance only keyed receipts captured atomically with the
+    // successful mutation, plus this transaction's writes under the issue lock.
+    const [endIssue] = await tx.select().from(issues).where(and(
+      eq(issues.id, input.issueId), eq(issues.companyId, input.companyId),
+    ));
+    const [writeReceipt] = await tx.select({ writes: sql<unknown>`${heartbeatRuns.contextSnapshot} -> 'paperclipTaskWrites'` })
+      .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId)));
+    const ownWrites = readNativeTaskWrites(writeReceipt?.writes, input.issueId);
+    // Compute keyed revisions BEFORE redaction: different secrets may redact
+    // alike. Only redacted values are persisted/rendered; HMACs stay internal.
+    const raw = {
+      start: originRun?.startIssueId === input.issueId ? readNativeTaskSnapshot(originRun.startTaskSnapshot) : null,
+      before: withNativeTaskRevisions({ ...issue, description: isConversation(issue) ? null : issue.description }),
+      after: withNativeTaskRevisions({ ...endIssue, description: isConversation(endIssue) ? null : endIssue.description }),
+    };
+    const display = await createRunSecretRedactionRegistry(tx as unknown as Db).redactForIssue(input.companyId, input.issueId, raw);
+    const safe = { start: restoreServerTaskRevisions(raw.start, display.start),
+      before: restoreServerTaskRevisions(raw.before, display.before), after: restoreServerTaskRevisions(raw.after, display.after) };
+    const baseline = safe.start?.fieldRevisions ? safe.start : null;
+    if (baseline?.fieldRevisions && safe.before?.fieldRevisions && safe.after?.fieldRevisions) {
+      const revisions = baseline.fieldRevisions, uncertain = new Set<string>();
+      const advance = (key: NativeTaskField, from: string, to: string, value: unknown) => {
+        if (uncertain.has(key) || revisions[key] === to) return;
+        // A broken raw-value chain may cross a person's or unrecorded edit.
+        if (revisions[key] !== from) { uncertain.add(key); return; }
+        Object.assign(baseline, { [key]: value });
+        revisions[key] = to;
+      };
+      for (const write of ownWrites) advance(write.key, write.from, write.to, write.value);
+      for (const key of nativeTaskSnapshotFields) if (safe.before.fieldRevisions[key] !== safe.after.fieldRevisions[key])
+        advance(key, safe.before.fieldRevisions[key], safe.after.fieldRevisions[key], safe.after[key]);
+      if (isConversation(endIssue)) { baseline.description = null; revisions.description = nativeTaskFieldRevision(null); }
+    }
+    // Without a valid start, keep the old diagnostic row shape but no trusted
+    // basis: selection must bootstrap in full. Replays never refresh the receipt.
+    const taskSnapshot = safe.before && safe.after ? readNativeTaskSnapshot(baseline) : null;
+    const endContext = { paperclipEndTaskSnapshot: { issueId: input.issueId,
+      basis: taskSnapshot ? NATIVE_TASK_SNAPSHOT_BASIS : null, taskSnapshot: taskSnapshot ?? safe.after } };
+    await tx.update(heartbeatRuns).set({
+      contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify(endContext)}::jsonb`,
+    }).where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId),
+      sql`${heartbeatRuns.contextSnapshot} -> 'paperclipEndTaskSnapshot' is null`));
     return {
       decision: { ...decisionRow, applicationState },
       issue: updated,

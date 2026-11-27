@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { REDACTED_EVENT_VALUE } from "../redaction.js";
+import { REDACTED_EVENT_VALUE, redactEventPayload } from "../redaction.js";
 import type { Db } from "@paperclipai/db";
 import { PgDialect } from "drizzle-orm/pg-core";
 import { createRunSecretRedactionRegistry, redactRegisteredSecretValues } from "../services/run-secret-redaction.js";
@@ -104,6 +104,26 @@ describe("batched run secret redaction", () => {
     return { registry: createRunSecretRedactionRegistry({ select } as unknown as Db), select, where };
   }
 
+  // Never-OK credential guard, including old unkeyed saved receipts and no registry.
+  it.each([false, true])("strips nested field revisions from every outbound run projection (registered=%s)", async registered => {
+    const opaqueRevision = "hmac-sha256:v1:4821" + "a".repeat(60);
+    const input = { id: "a", contextSnapshot: {
+      paperclipIssue: { continuationSnapshot: { description: "door code 4821", fieldRevisions: { description: opaqueRevision } } },
+      paperclipEndTaskSnapshot: { taskSnapshot: { fieldRevisions: { description: "b".repeat(64) }, title: "Task" } },
+    }, resultJson: { nested: [{ fieldRevisions: { description: "c".repeat(64) }, ok: true }],
+      encoded: JSON.stringify({ contextSnapshot: { fieldRevisions: { description: "d".repeat(64) } }, ok: true }) } };
+    const rows = [{ id: "a", contextSnapshot: registered ? { paperclipSecretRedactions: [{ fingerprintSha256: "one", material: { value: "4821" } }] } : {} }];
+    const { registry } = fixture(rows);
+    const results = [await registry.redactForRun("company", "a", input), await registry.redactForRuns("company", [input]),
+      (await registry.redactorForRun("company", "a"))(input), await registry.redactForIssue("company", "task", input),
+      redactRegisteredSecretValues(input, []), redactEventPayload(input)];
+    for (const result of results) expect(JSON.stringify(result)).not.toContain("fieldRevisions");
+    expect(input.contextSnapshot.paperclipIssue.continuationSnapshot.fieldRevisions.description).toBe(opaqueRevision);
+    const display = await registry.redactForIssue("company", "task", input);
+    expect(display.contextSnapshot.paperclipIssue.continuationSnapshot).not.toHaveProperty("fieldRevisions");
+    expect(display.contextSnapshot.paperclipIssue.continuationSnapshot.description).toBe(registered ? "door code " + REDACTED_EVENT_VALUE : "door code 4821");
+  });
+
   it("reads only registry JSON once for 200 runs and resolves shared secrets once", async () => {
     const contextSnapshot = { paperclipSecretRedactions: [{ fingerprintSha256: "shared", material: { value: secret } }] };
     const rows = Array.from({ length: 200 }, (_, i) => ({ id: `run-${i}`, contextSnapshot }));
@@ -165,7 +185,8 @@ describe("bounded task notification redaction", () => {
   it("deduplicates overlapping histories and resolves repeated secrets once", async () => {
     const rows = Array.from({ length: 128 }, (_, id) => run(id));
     const { registry, limit } = fixture([rows, rows]);
-    expect(await registry.redactForIssueNotification("company", "task", { body: secret })).toEqual({ body: REDACTED_EVENT_VALUE });
+    expect(await registry.redactForIssueNotification("company", "task", { body: secret, nested: [{ fieldRevisions: { description: "a".repeat(64) } }] }))
+      .toEqual({ body: REDACTED_EVENT_VALUE, nested: [{}] });
     expect(limit).toHaveBeenCalledTimes(2);
     expect(resolveVersion).toHaveBeenCalledTimes(1);
   });
