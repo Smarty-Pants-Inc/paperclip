@@ -39,6 +39,70 @@ beforeEach(() => {
 });
 afterEach(async () => { await act(() => root.unmount()); client.clear(); host.remove(); });
 describe("open chat task snapshot", () => {
+  it("does not read an unpersisted draft chat or expose a loading/error tray", async () => {
+    api.list.mockRejectedValue(Object.assign(new Error("Conversation not found"), { status: 404 }));
+    await paint({ ...scope, conversationIssueId: "chat:agent" }); await settle();
+    expect(result.enabled).toBe(false);
+    expect(result.loading).toBe(false); expect(result.stale).toBe(false);
+    expect(result.items).toEqual([]);
+    expect(api.list).not.toHaveBeenCalled();
+    api.list.mockResolvedValue({ items: [item(1)], nextCursor: null });
+    await paint(); await settle();
+    expect(result.enabled).toBe(true); expect(result.items.map(row => row.issueId)).toEqual(["task-1"]);
+    await paint({ ...scope, conversationIssueId: "chat:agent" }); await settle();
+    expect(result.enabled).toBe(false); expect(result.items).toEqual([]);
+    expect(result.loading).toBe(false); expect(result.stale).toBe(false);
+  });
+  it.each([false, true])("has no tray for a missing or another viewer's real conversation (cached tasks: %s)", async cachedTasks => {
+    if (cachedTasks) {
+      api.list.mockResolvedValue({ items: [item(1)], nextCursor: null });
+      await paint(); await settle(); expect(result.items).toHaveLength(1);
+    }
+    api.list.mockRejectedValue(Object.assign(new Error("Conversation not found"), { status: 404 }));
+    if (cachedTasks) { await refresh(); } else { await paint(); }
+    await settle();
+    expect(result.items).toEqual([]); expect(result.enabled).toBe(false);
+    expect(result.loading).toBe(false); expect(result.stale).toBe(false);
+  });
+  it.each([401, 403, 500, null])("keeps real read errors actionable, rather than treating them as empty (%s)", async status => {
+    api.list.mockRejectedValue(Object.assign(new Error("Read failed"), status === null ? {} : { status }));
+    await paint(); await settle();
+    expect(result.enabled).toBe(true); expect(result.stale).toBe(true); expect(result.loading).toBe(false);
+    api.list.mockResolvedValue({ items: [item(1)], nextCursor: null });
+    await act(() => result.retry()); await settle();
+    expect(result.stale).toBe(false); expect(result.items.map(row => row.issueId)).toEqual(["task-1"]);
+  });
+  it("keeps a successful empty real conversation healthy, but exposes a real read failure and Retry", async () => {
+    api.list.mockResolvedValue({ items: [], nextCursor: null });
+    await paint(); await settle();
+    expect(result.enabled).toBe(true); expect(result.items).toEqual([]);
+    expect(result.loading).toBe(false); expect(result.stale).toBe(false);
+    api.list.mockRejectedValue(Object.assign(new Error("Unavailable"), { status: 500 }));
+    await refresh(); await settle();
+    expect(result.loading).toBe(false); expect(result.stale).toBe(true);
+    api.list.mockResolvedValue({ items: [item(1)], nextCursor: null });
+    await act(() => result.retry()); await settle();
+    expect(result.stale).toBe(false); expect(result.items.map(row => row.issueId)).toEqual(["task-1"]);
+  });
+  it.each([false, true])("reverts a cancelled mid-page refresh without a false unavailable state (has tasks: %s)", async hasTasks => {
+    const items = hasTasks ? [item(1)] : [];
+    api.list.mockResolvedValue({ items, nextCursor: null });
+    await paint(); await settle();
+    let pendingSignal: AbortSignal | undefined;
+    api.list.mockImplementation((_id, filters, { signal }) => filters.cursor
+      ? new Promise((_resolve, reject) => {
+        pendingSignal = signal;
+        signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+      }) : Promise.resolve({ items: [item(2)], nextCursor: "next" }));
+    await live("heartbeat.run.status", { issueId: "task-1", runId: "run-1", status: "succeeded" });
+    // Empty trays have no relevant task ID, so start their equivalent refetch explicitly.
+    if (!hasTasks) await act(() => { void client.invalidateQueries({ queryKey: ["issues", "chat-handoffs"] }); });
+    await settle(); expect(pendingSignal).toBeDefined();
+    await act(async () => { await client.cancelQueries({ queryKey: ["issues", "chat-handoffs"] }); });
+    await settle();
+    expect(pendingSignal!.aborted).toBe(true);
+    expect(result.items).toEqual(items); expect(result.loading).toBe(false); expect(result.stale).toBe(false);
+  });
   it("drains 205 tasks atomically, uses tray/100, dedupes task id and does not shimmer on load or paging", async () => {
     let release!: (value: unknown) => void;
     api.list.mockImplementation((_id, filters) => filters.cursor === "page-3"

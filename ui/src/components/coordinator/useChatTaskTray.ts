@@ -55,7 +55,9 @@ export function useChatTaskTray(scope: ChatTaskTrayScope) {
   const current = activation.scopeKey === scopeKey ? activation : { scopeKey, epoch: activation.epoch + 1 };
   if (current !== activation) setActivation(current);
   const key = `${scopeKey}:${current.epoch}`;
-  const enabled = !!scope.companyId && !!scope.conversationIssueId && !!scope.viewerUserId;
+  // An unsent chat's ephemeral key is not a persisted conversation issue.
+  const enabled = !!scope.companyId && !!scope.conversationIssueId && !!scope.viewerUserId
+    && !scope.conversationIssueId.startsWith("chat:");
   const queryKey = ["issues", "chat-handoffs", scope.conversationIssueId, scope.viewerUserId,
     "tray", scope.companyId, scope.sessionGeneration, instance, current.epoch];
   const query = useQuery({ queryKey, queryFn: ({ signal }) => loadChatTaskTray(scope.conversationIssueId, signal),
@@ -151,11 +153,14 @@ export function useChatTaskTray(scope: ChatTaskTrayScope) {
     if (added) setPulse(old => ({ key, sequence: (old.key === key ? old.sequence : 0) + added }));
   }, [enabled, key, query.data, query.isFetching, query.isError, signal]);
   const accessUnavailable = query.error && "status" in query.error && [401, 403, 404].includes(Number(query.error.status));
+  // The owner-only endpoint returns 404 when this viewer has no conversation tray.
+  // Do not present that absence as a failed task status, or hide real read errors.
+  const available = enabled && !(query.error && "status" in query.error && Number(query.error.status) === 404);
   return {
-    items: enabled && !accessUnavailable ? items : EMPTY_ITEMS,
-    loading: enabled && !query.data && !query.isError,
-    stale: enabled && query.isError,
-    enabled, retry: () => { void query.refetch(); },
-    newTaskSequence: enabled && pulse.key === key ? pulse.sequence : 0,
+    items: available && !accessUnavailable ? items : EMPTY_ITEMS,
+    loading: available && !query.data && !query.isError,
+    stale: available && query.isError,
+    enabled: available, retry: () => { void query.refetch(); },
+    newTaskSequence: available && pulse.key === key ? pulse.sequence : 0,
   };
 }
