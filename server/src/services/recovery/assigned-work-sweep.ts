@@ -983,7 +983,7 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
    * may read (`readCondition`, the caller's issue-privacy predicate). Private
    * tasks the caller cannot read are left out of every count and sample. The
    * sweep itself evaluates all tasks. */
-  async function report(companyId: string, options: { readCondition?: SQL<boolean> } = {}) {
+  async function report(companyId: string, options: { readCondition?: SQL<boolean>; includeAutomaticWork?: boolean } = {}) {
     const rows = await loadIssues(companyId, undefined, ASSIGNED_WORK_REPORT_LIMIT + 1, options.readCondition);
     const truncated = rows.length > ASSIGNED_WORK_REPORT_LIMIT;
     if (truncated) rows.length = ASSIGNED_WORK_REPORT_LIMIT;
@@ -1040,7 +1040,8 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
     const queuedByAgent = new Map(queuedRows.map(row => [row.agentId, Number(row.queuedRuns)]));
     const slotRows = stalledRows.map(row => ({ agentName: row.agentName, stalledRuns: Number(row.stalledRuns),
       queuedRuns: queuedByAgent.get(row.agentId) ?? 0 }));
-    return { ...summary, agentsWithStalledSlots: slotRows, automaticWork: await readAutomaticWorkStatus(db, companyId) };
+    return { ...summary, agentsWithStalledSlots: slotRows,
+      ...(options.includeAutomaticWork === false ? {} : { automaticWork: await readAutomaticWorkStatus(db, companyId) }) };
   }
 
   return { checkIssue, listSuspects, report, loadFacts, flushPassLog: passLog.flush };

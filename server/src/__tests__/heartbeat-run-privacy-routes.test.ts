@@ -36,6 +36,7 @@ import { authorizationService } from "../services/authorization.js";
 import { canActorReadWorkspaceOperation, getHeartbeatRunReadDecisions } from "../services/heartbeat-run-privacy.js";
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 import { claimCancellationRequest } from "../services/native-runtime/native-cancellation-request.js";
+import { automaticRunBrake } from "../services/recovery/automatic-run-brake.js";
 
 const externalDatabaseUrl = resolveExternalTestDatabaseUrl("PAPERCLIP_RUN_LOG_PRIVACY_TEST_DATABASE_URL");
 const embeddedPostgresSupport = externalDatabaseUrl ? { supported: true } : await getEmbeddedPostgresTestSupport();
@@ -264,6 +265,34 @@ describeEmbeddedPostgres("heartbeat run privacy routes", { concurrent: false }, 
     app.use(errorHandler);
     return app;
   }
+
+  it("reads the assigned-work invariant within task privacy without reaching the brake for agents", async () => {
+    const f = await seedFixture();
+    const automaticWork = { state: "closed", pausedSince: null, nextTryAt: null,
+      recentAutomaticRuns: 0, failedBeforeStarting: 0, summary: "Automatic work is running normally." };
+    const brakeRead = vi.spyOn(automaticRunBrake, "read").mockResolvedValue({ state: "closed", pausedSince: null,
+      evidence: { counted: 0, failedBeforeStarting: 0 } } as Awaited<ReturnType<typeof automaticRunBrake.read>>);
+    const earlier = new Date(Date.now() - 3_600_000);
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: earlier })
+      .where(eq(heartbeatRuns.id, f.privateRunId));
+    await db.insert(issues).values({ companyId: f.companyId, identifier: "RPR-2", title: "Visible assigned task",
+      status: "in_progress", assigneeAgentId: f.otherAgentId, createdAt: earlier, updatedAt: earlier });
+    const app = createApp(f.companyId, f.otherAgentId);
+    const path = `/api/companies/${f.companyId}/assigned-work-invariant`;
+    const response = await request(app).get(path).expect(200);
+    expect(response.body).toMatchObject({ checked: 1, openTasks: 1,
+      sample: [expect.objectContaining({ identifier: "RPR-2" })] });
+    expect(brakeRead).not.toHaveBeenCalled();
+    expect(response.body).not.toHaveProperty("automaticWork");
+    expect(JSON.stringify(response.body)).not.toContain("RPR-1");
+    await request(app).get(`/api/companies/${randomUUID()}/assigned-work-invariant`).expect(403);
+    expect(brakeRead).not.toHaveBeenCalled();
+
+    const board = await request(createBoardApp(f.companyId, f.ownerUserId)).get(path).expect(200);
+    expect(board.body).toMatchObject({ checked: 2, openTasks: 2, automaticWork });
+    expect(board.body.sample.map((item: { identifier: string }) => item.identifier)).toContain("RPR-1");
+    expect(brakeRead).toHaveBeenCalledExactlyOnceWith(db, f.companyId);
+  });
 
   it("lists workspace operations with small run reads and checks a revoked issue grant again", async () => {
     const f = await seedFixture(), payload = "workspace-operation-saved-input🙂".repeat(25_000);
