@@ -1,3 +1,4 @@
+import { hasUnchangedNativeInputRefusal, latestTaskRunIsNativeInputSizeRefusal } from "../native-input-refusal.js";
 import { QUEUED_MESSAGES_DELIVERED_REASON } from "../../modules/wake-queue/index.js";
 import { connectionIntentService } from "../connection-intents.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
@@ -2957,6 +2958,22 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
     let agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
+    if (issueId && (source === "automation" || opts.requestedByActorType !== "user")
+      && await latestTaskRunIsNativeInputSizeRefusal(db, { companyId: agent.companyId, issueId })
+      && await hasUnchangedNativeInputRefusal(db, { companyId: agent.companyId, issueId })) {
+      // Keep wake-only child/routine/agent context, not just task comments.
+      // The hold refuses admission, never consumes the saved work request.
+      if (!executionWaitRequestId) await db.insert(agentWakeupRequests).values({
+        companyId: agent.companyId, agentId, source, triggerDetail, reason,
+        payload: { ...payload, issueId, [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot,
+          nativeInputRefusalHold: true },
+        status: "deferred_issue_execution",
+        requestedByActorType: opts.requestedByActorType ?? null,
+        requestedByActorId: opts.requestedByActorId ?? null,
+        idempotencyKey: opts.idempotencyKey ?? null,
+      }).onConflictDoNothing();
+      return null;
+    }
     if (issueId && await hasAutomaticInteractionDeliveryHold(db, {
       companyId: agent.companyId, issueId, agentId, payload, context: enrichedContextSnapshot,
       actorType: opts.requestedByActorType, actorId: opts.requestedByActorId,

@@ -47,6 +47,7 @@ export const WAITING_REASONS = [
   "awaiting_first_message",
   "board_confirmation",
   "board_response",
+  "input_change",
 ] as const;
 export type WaitingReason = (typeof WAITING_REASONS)[number];
 
@@ -157,6 +158,8 @@ export type AssignedWorkFacts = {
     operatorStopped: boolean;
     boardResponseWaiting?: boolean;
   } | null;
+  /** A size refusal whose person-owned source revisions have not changed. */
+  inputChangeRequired?: boolean;
   pendingWakes: number;
   nativeRecoveryPending: boolean;
   pendingHandoff: boolean;
@@ -327,6 +330,7 @@ function settlingUntil(facts: AssignedWorkFacts, now: Date): Date | null {
 
 function waitingReason(facts: AssignedWorkFacts, now: Date): WaitingReason | null {
   const { issue, interruption } = facts;
+  if (facts.inputChangeRequired) return "input_change";
   if (interruption?.responsibility === "user" && interruption.state === "waiting_for_user" && interruption.userAction) {
     const mapped = PERSON_ACTIONS[interruption.userAction];
     if (mapped) return mapped;

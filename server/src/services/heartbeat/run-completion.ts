@@ -1,3 +1,4 @@
+import { isNativeInputSizeRefusal, nativeInputRefusalEvidence } from "../native-input-refusal.js";
 import { NativeTurnPromptExceedsCommandBoundError, nativePromptCauseFromError } from "../native-runtime/native-turn-budget.js";
 import { PI_MODEL_PROVIDER_REQUIRED } from "../../adapters/pi-model-selection.js";
 import { ensurePiModelSelectionFailureNotice } from "../pi-model-selection-failure.js";
@@ -1419,6 +1420,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     const nativePreDispatchFailure = !stoppedDuringFailure && nativeTerminalFailureCode === null
       ? await nativePreDispatchFailureResult(run.id, nativeDispatchMayHaveStarted) : null;
     const configFreshnessReceipt = await sessionConfigReceipt(run, configFreshnessResultMetadata, false);
+    const promptRefusalEvidence = await nativeInputRefusalEvidence(db, run, err, failureErrorCode);
     const failedRunWrite = await measureRunPhase("completion.terminal_write", () => setRunStatusIfRunning(run.id, failureOutcome, {
       error: message,
       errorCode: stopSnapshot?.errorCode ?? failureErrorCode,
@@ -1430,6 +1432,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           ...parseObject(stopSnapshot?.resultJson),
           ...(failureCause && !stoppedDuringFailure ? { failureCause } : {}),
           ...(nativePromptCauseFromError(err) ? { nativeTurnPromptRefusalCause: nativePromptCauseFromError(err) } : {}),
+          ...promptRefusalEvidence,
           ...(providerFailure ? { providerFailure: { ...providerFailure,
             message: redactCurrentUserText(identityRedactor.redact(providerFailure.message), currentUserRedactionOptions) } } : {}),
           ...(interruptedExactResume ? { nativeExactResumeRefusal: {
@@ -1554,7 +1557,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         // exhaustion. Once its durable coordinator has classified a
         // terminal failure, generic issue recovery must not create a
         // replacement retryOfRunId chain for the same provider work.
-        suppressImmediateRecovery: nativeTerminalFailureCode !== null || storageWait?.outcome === "scheduled"
+        suppressImmediateRecovery: isNativeInputSizeRefusal(livenessRun.errorCode) || nativeTerminalFailureCode !== null || storageWait?.outcome === "scheduled"
           || storageWait?.outcome === "retry_exhausted" || nativePreDispatchRetry?.outcome === "scheduled",
       });
       await handleIssueReviewPathDisposition(livenessRun);
@@ -1795,6 +1798,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     const setupFailureResultJson = {
       ...setupFailureDetails,
       ...(nativePromptCauseFromError(outerErr) ? { nativeTurnPromptRefusalCause: nativePromptCauseFromError(outerErr) } : {}),
+      ...await nativeInputRefusalEvidence(db, run, outerErr, setupFailureErrorCode),
       ...(nonRetryablePreflightCode === PI_MODEL_PROVIDER_REQUIRED && outerErr instanceof HttpError
         ? { modelSelection: { model: parseObject(outerErr.details).model, retryability: "requires_action" } } : {}),
       ...(failureCause ? { failureCause } : {}),
@@ -1967,7 +1971,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       }
       await settleStorageWaitMessage(livenessRun, storageWait, outerErr);
       await releaseIssueExecutionAndPromote(livenessRun, {
-        suppressImmediateRecovery: storageWaitScheduled || nativePreDispatchRetryScheduled ||
+        suppressImmediateRecovery: isNativeInputSizeRefusal(livenessRun.errorCode) || storageWaitScheduled || nativePreDispatchRetryScheduled ||
           readNonEmptyString(
             parseObject(livenessRun.contextSnapshot).goalControlRequestId,
           ) !== null ||
