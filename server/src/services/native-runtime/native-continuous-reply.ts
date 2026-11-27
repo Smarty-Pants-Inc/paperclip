@@ -115,10 +115,14 @@ export async function publishContinuousNativeReply(input: {
     // Submitted IDs alias the sealed first-turn inputs even after earlier
     // finals answered nothing or something else. Only steer-ACK ownership is
     // restricted by a nonempty explicit answers list.
+    // Context also records person IDs adopted by steering for page/no-op
+    // identity. An adopted ID is not part of the original submitted command;
+    // its answer still needs explicit or same-turn ACK attribution above.
+    const steeredIds = new Set(Object.keys(parseObject(result.queuedSteeringAcknowledgements)));
     const submittedInputIds = [
       ...(Array.isArray(row.run.contextSnapshot?.wakeCommentIds) ? row.run.contextSnapshot.wakeCommentIds : []),
       ...(typeof wakeId === "string" ? [wakeId] : []),
-    ].filter((id): id is string => typeof id === "string");
+    ].filter((id): id is string => typeof id === "string" && !steeredIds.has(id));
     const firstInputIds = Object.keys(replies).length === 0
       ? [...submittedInputIds, ...sealedIds].filter(id => !answered.has(id)) : [];
     const continued = parseObject(result.continuedSessionInput);

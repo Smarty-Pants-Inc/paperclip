@@ -168,7 +168,17 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
       const [output] = await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: sourceRunId, seq,
         sourceSeq: seq + 1, sourceEventId: `saved-output-${seq}`, eventType: "item.completed",
         payload: { prpEvent: { normalizedSessionId: sessionId, turnId: "first-turn", payload: { kind: "agentMessage", text: "Committed response" } } } }).returning();
-      await db.update(heartbeatRuns).set({ runnerProfileJson: { sessionCheckpoint: {
+      const [carrier] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, sourceRunId));
+      const continuation = carrier!.contextSnapshot?.executionContinuation as Awaited<ReturnType<typeof buildExecutionContinuation>>;
+      // These fixtures model a committed reply, not arbitrary agent progress.
+      // Publish its explicit question attribution just as reply publication does.
+      const questionCommentIds = [...new Set([
+        ...(continuation?.messages.map(message => message.id) ?? []),
+        ...((continuation?.coverage as { omitted?: Array<{ id: string }> } | undefined)?.omitted?.map(message => message.id) ?? []),
+        ...(continuation?.resumeDelta?.receivedComments?.map(receipt => receipt.id) ?? []),
+        ...Object.keys(carrier!.resultJson?.queuedSteeringAcknowledgements ?? {}),
+      ])];
+      await db.update(heartbeatRuns).set({ resultJson: { ...carrier!.resultJson, continuousReplies: { committed: { questionCommentIds } } }, runnerProfileJson: { sessionCheckpoint: {
         sessionId,
         identity: { runId: sourceRunId, companyId, agentId, issueId: taskId, sessionId }, providerSessionId, cursor: String(seq + 1),
       } } }).where(eq(heartbeatRuns.id, sourceRunId));
@@ -331,21 +341,23 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
         body: "Steered and answered during run one", createdAt: revision, updatedAt: steeredRevision });
       await db.insert(agentWakeupRequests).values({ id: queueId, companyId, agentId, source: "issue", reason: "issue_commented", status: "cancelled",
         createdAt: queuedAt, payload: withQueuedCommentIdsInWakePayload({ issueId: taskId }, [steeredId]) });
+      let selectedRunId = firstRunId;
       for (let turn = 2; turn <= 3; turn++) {
         const wakeId = randomUUID(), nextRunId = randomUUID();
         const at = new Date(Date.UTC(2026, 0, 1, 0, turn));
         await db.insert(issueComments).values({ id: wakeId, companyId, issueId: taskId, authorType: "user", authorUserId: "local-board",
           body: `New wake ${turn}`, createdAt: at, updatedAt: at });
-        // Keep the baseline pinned to the origin as on the reported row.
+        // Keep the origin hint pinned, but use the actual selected resume
+        // checkpoint. Resuming firstRunId on turn three must replay turn two.
         const snapshot = await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId, runId: nextRunId,
-          previousContextRunId: firstRunId, nativeSessionId: sessionId, nativeProviderSessionId: providerSessionId,
+          previousContextRunId: selectedRunId, nativeSessionId: sessionId, nativeProviderSessionId: providerSessionId,
           context: { previousRunId: firstRunId, commentId: wakeId, commentIds: [steeredId, wakeId], wakeReason: "issue_children_completed" }, summary: null, exposeLowTrustRaw: false });
         expect(snapshot.originCommentIds).toContain(originId);
         expect(snapshot.messages.map(message => message.id)).toContain(steeredId);
         expect(snapshot.resumeDelta?.messages.map(message => message.id)).toEqual([wakeId]);
         const issue = { id: taskId, identifier: null, title: "Retained delta", description: null, workMode: "standard" };
         const options = { companyId, runId: nextRunId, agentId, provider: "pi_rpc" as const, normalizedSessionId: sessionId,
-          resumedSession: true, previousTurn: { runId: firstRunId, task: issue }, issue, taskPrompt: "Keep working.",
+          resumedSession: true, previousTurn: { runId: selectedRunId, task: issue }, issue, taskPrompt: "Keep working.",
           wakePayload: { reason: "issue_children_completed", commentIds: [steeredId, wakeId], executionContinuation: snapshot },
           workspace: { id: "workspace", cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null }, runtimeContext: nativeRuntimeContextFixture(),
           completionContract: { id: "contract", sha256: "a".repeat(64), schemaVersion: "paperclip.run-result.v1", contract: {
@@ -359,7 +371,7 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
         const plainEnvelope = buildNativeModelEnvelope(plain, { resumedSession: true });
         if (!("events" in plainEnvelope)) throw new Error("expected plain retained continuation events");
         expect(plainEnvelope.events).toBe(`New wake ${turn}`);
-        console.log("retained successor PG evidence", JSON.stringify({ receiptKind, turn, taskId, sessionId, providerSessionId, previousContextRunId: firstRunId,
+        console.log("retained successor PG evidence", JSON.stringify({ receiptKind, turn, taskId, sessionId, providerSessionId, previousContextRunId: selectedRunId,
           originId, steeredId, steeredRevision, wakeId, fullHistoryIds: snapshot.messages.map(message => message.id), delta: snapshot.resumeDelta?.messages.map(({ id, updatedAt }) => ({ id, updatedAt })),
           plainEvents: plainEnvelope.events }));
         await db.insert(heartbeatRuns).values({ id: nextRunId, companyId, agentId, runtimeMode: "native", nativeIssueId: taskId,
@@ -370,6 +382,7 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
           { companyId, runId: nextRunId, agentId, seq: 1, eventType: "turn.accepted" },
         ]);
         await commitRetainedOutput(nextRunId, taskId, sessionId, providerSessionId);
+        selectedRunId = nextRunId;
       }
     });
     it.each(["turn.accepted", "turn.started"])("replays an accepted-then-failed origin after %s", async eventType => {

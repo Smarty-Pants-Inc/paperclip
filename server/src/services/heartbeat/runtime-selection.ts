@@ -1,4 +1,5 @@
 import { resolveSessionContinuity } from "../native-runtime/continued-session.js";
+import { retainedSessionCommentCoverage } from "../native-runtime/continuous-session-input.js";
 import { assertPaperclipRunnerBinaryConfiguration } from "../native-runtime/native-codex-runner.js";
 import { readNativeWorkspaceMigration, migratedNativeExecutionCwd } from "../native-runtime/native-workspace-migration.js";
 import { resolveProviderApiPlacement } from "../native-runtime/provider-api-placement.js";
@@ -838,6 +839,24 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
       }
       const workspaceMigration = persistedExecutionWorkspace?.metadata?.nativeWorkspaceMigration
         ? await readNativeWorkspaceMigration(db, { companyId: agent.companyId, id: nativeExecutionWorkspaceId }) : null;
+      // Task-session lastRunId is only a preparation hint. Bind omission to
+      // the exact source selected above, before either constructor can settle
+      // nothing-new. Never union another run's covering save into this resume.
+      if (executionContinuation && previousNativeRun && !nativeReviewRequest) {
+        const selectedCheckpoint = parseObject(previousNativeRun.runnerProfileJson).sessionCheckpoint;
+        const providerSessionId = readNonEmptyString(parseObject(selectedCheckpoint).providerSessionId);
+        const retained = providerSessionId ? await retainedSessionCommentCoverage(db, {
+          companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id, runId: run.id,
+          previousRunId: previousNativeRun.id, sessionId: nativeSessionId, providerSessionId,
+          selectedCheckpoint, messages: executionContinuation.messages,
+        }) : null;
+        executionContinuation.resumeDelta = { baseRunId: previousNativeRun.id,
+          receivedComments: retained?.receipts ?? [],
+          messages: executionContinuation.messages.filter(message => !retained?.received.has(message.id)),
+        };
+        context.executionContinuation = executionContinuation;
+        parseObject(context.paperclipWake).executionContinuation = executionContinuation;
+      }
       const buildExecution = ({ normalizedSessionId, resumedSession }: { normalizedSessionId: string; resumedSession: boolean }) =>
             buildNativeExecutionInput({
               agentKeyId: agentIdentity?.keyId,

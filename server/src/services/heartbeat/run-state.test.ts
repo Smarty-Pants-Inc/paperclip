@@ -85,7 +85,8 @@ describe("heartbeat run state module", () => {
     const projectedSql = (column: unknown) => new PgDialect().sqlToQuery((column as SQL.Aliased).sql).sql;
     expect(ascii.execute).toHaveBeenCalledTimes(1);
     expect(utf8.execute).toHaveBeenCalledTimes(1);
-    expect(projectedSql(ascii.columns[0].resultJson)).toBe("NULL");
+    expect(projectedSql(ascii.columns[0].resultJson)).toContain("continuationNothingNew");
+    expect(projectedSql(ascii.columns[0].resultJson)).not.toContain("'stdout'");
     expect(projectedSql(utf8.columns[0].resultJson)).toContain("pg_column_size");
     await asciiState.getRun("evidence", { includeExecutionEvidence: true });
     expect(projectedSql(ascii.columns[2].resultJson)).toContain("startupPreparationSettledAt");
@@ -172,6 +173,30 @@ describePostgres("heartbeat run state database wiring", () => {
     const [issue] = await db.insert(issues).values({ companyId, title: "Session task", assigneeAgentId: agent.id }).returning();
     return { companyId, agent, issue, state: extracted.createHeartbeatRunState(db) };
   }
+
+  it.each(["UTF8", "SQL_ASCII"])("preserves nothing-new classification in bounded %s page reads", async encoding => {
+    const { companyId, agent, state } = await fixture();
+    const id = randomUUID();
+    const continuationNothingNew = { schema: "paperclip.continuation-nothing-new.v1", namedCommentIds: [id], answeredCommentIds: [id], cause: "all_named_answered" };
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, status: "cancelled",
+      resultJson: { continuationNothingNew, providerDiagnostics: randomBytes(160 * 1024).toString("base64") } }).returning();
+    if (encoding === "UTF8") {
+      const page = await state.getRun(run.id);
+      expect(page?.resultJson).toMatchObject({ continuationNothingNew, truncationReason: "oversized_result_json" });
+      expect(page?.resultJson).not.toHaveProperty("providerDiagnostics");
+    } else {
+      // Compile the actual SQL_ASCII projection, then execute that exact SQL
+      // against PostgreSQL. No separate SQL_ASCII cluster/provider is claimed.
+      const reader = readingDatabase("SQL_ASCII");
+      await extracted.createHeartbeatRunState(reader.db).getRun(run.id);
+      const column = reader.columns[0].resultJson as SQL.Aliased;
+      const [row] = await db.select({ resultJson: column }).from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+      expect(row.resultJson).toEqual({ continuationNothingNew });
+      await db.update(heartbeatRuns).set({ resultJson: { continuationNothingNew: { ...continuationNothingNew, unsafe: "é" } } }).where(eq(heartbeatRuns.id, run.id));
+      expect((await db.select({ resultJson: column }).from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0].resultJson).toBeNull();
+    }
+    console.log("NOTHING_NEW_PAGE_ROW", JSON.stringify({ encoding, runId: run.id, continuationNothingNew }));
+  });
 
   it("reads current execution-wait evidence without transferring saved input or output", async () => {
     const { companyId, agent, issue } = await fixture();

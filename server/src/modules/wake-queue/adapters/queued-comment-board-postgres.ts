@@ -10,6 +10,7 @@ import {
   buildQueuedCommentQueueSnapshot,
   decideQueuedCommentQueueSteering,
   queuedCommentIdsFromWakePayload,
+  queuedCommentIdsFromRunContext,
   withQueuedCommentIdsInWakePayload,
 } from "../../../services/issue-queued-comment-queue.js";
 import {
@@ -552,6 +553,13 @@ export function createQueuedCommentSteeringAdapter(db: Db, options: { requireQue
               nextWake = updated ?? wake;
             }
             await tx.update(heartbeatRuns).set({
+              // Steering adopts this input into an existing run rather than
+              // creating a successor. Keep the page's input identity there too.
+              contextSnapshot: { ...acknowledgedRun.contextSnapshot,
+                wakeCommentId: acknowledgedRun.contextSnapshot?.wakeCommentId ?? commentId,
+                wakeCommentIds: [...new Set([...queuedCommentIdsFromRunContext(acknowledgedRun.contextSnapshot), commentId])],
+                ...(queuedInteractionId(wake.payload) ? { interactionId: queuedInteractionId(wake.payload) } : {}),
+              },
               resultJson: {
                 ...result,
                 queuedSteeringAcknowledgements: {
