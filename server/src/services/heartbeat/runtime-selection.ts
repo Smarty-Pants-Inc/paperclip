@@ -577,10 +577,12 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         : null;
     // The previous provider must be witnessed by the reading run itself, not
     // context.nativeContinuationReadState (rebuilt for the selected provider).
+    // The subquery binds the run by value: an outer column reference renders
+    // unqualified and would resolve to the event table's own columns.
     const [previousNativeGeneration] = previousNativeRun ? await db.select({ providerSessionId: sql<string | null>`coalesce(
       (select generation_event.payload->'prpEvent'->'payload'->>'providerSessionId'
         from ${heartbeatRunEvents} generation_event
-        where generation_event.company_id = ${heartbeatRuns.companyId} and generation_event.run_id = ${heartbeatRuns.id}
+        where generation_event.company_id = ${agent.companyId} and generation_event.run_id = ${previousNativeRun.id}
           and generation_event.event_type in ('session.started', 'session.resumed', 'session.reconciled')
         order by generation_event.seq desc limit 1),
       ${heartbeatRuns.contextSnapshot}->'nativeContinuationReadState'->>'providerSessionId',
