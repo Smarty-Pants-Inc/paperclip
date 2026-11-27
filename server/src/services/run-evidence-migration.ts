@@ -26,6 +26,11 @@ import {
 import { inspectNativeLogArchiveSource, withNativeLogArchiveSource } from "./native-runtime/native-log-archive-source.js";
 import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { logger } from "../middleware/logger.js";
+import { PROVIDER_TRACE_RETENTION_MS } from "./provider-trace-store.js";
+
+// With retention 0 every trace is kept, including rows an earlier build
+// stamped with an expiry, so a stored stamp never stops a trace's move.
+const traceStillKept = () => PROVIDER_TRACE_RETENTION_MS === 0 ? undefined : gt(providerTraceRecords.expiresAt, new Date());
 
 const SETTLED = ["succeeded", "failed", "cancelled", "timed_out", "interrupted"];
 export interface RunEvidenceMigrationItem {
@@ -332,7 +337,7 @@ export async function migrateRunEvidence(
             and(
               sql`${providerTraceRecords.traceRef} not like 's3-segments-v1:%'`,
               isNull(providerTraceRecords.deletedAt),
-              gt(providerTraceRecords.expiresAt, new Date()),
+              traceStillKept(),
               options.companyId ? eq(providerTraceRecords.companyId, options.companyId) : undefined,
               options.afterTraceId ? gt(providerTraceRecords.id, options.afterTraceId) : undefined,
             ),
@@ -425,7 +430,7 @@ export async function migrateRunEvidence(
                   eq(providerTraceRecords.id, trace.id),
                   eq(providerTraceRecords.traceRef, trace.traceRef),
                   isNull(providerTraceRecords.deletedAt),
-                  gt(providerTraceRecords.expiresAt, new Date()),
+                  traceStillKept(),
                 ),
               )
               .returning({ id: providerTraceRecords.id });
@@ -446,7 +451,7 @@ export async function migrateRunEvidence(
                   eq(providerTraceRecords.id, trace.id),
                   eq(providerTraceRecords.traceRef, trace.traceRef),
                   isNull(providerTraceRecords.deletedAt),
-                  gt(providerTraceRecords.expiresAt, new Date()),
+                  traceStillKept(),
                 ),
               );
             if (!current) throw new Error("trace_migration_authority_changed");
@@ -473,7 +478,7 @@ export async function migrateRunEvidence(
                 eq(providerTraceRecords.id, trace.id),
                 eq(providerTraceRecords.traceRef, trace.traceRef),
                 isNull(providerTraceRecords.deletedAt),
-                gt(providerTraceRecords.expiresAt, new Date()),
+                traceStillKept(),
                 sql`exists (select 1 from ${heartbeatRuns} where ${and(
                   eq(heartbeatRuns.id, trace.runId),
                   eq(heartbeatRuns.companyId, trace.companyId),
