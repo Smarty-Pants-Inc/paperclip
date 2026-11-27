@@ -5,12 +5,36 @@ import * as sessionFingerprintInputs from "../services/heartbeat/session-fingerp
 import * as aiRuntime from "../services/ai-connection-runtime.js";
 import { aiConnectionService } from "../services/ai-connections.js";
 import { createHash, randomUUID } from "node:crypto";
+import { connect, createServer as createNetServer } from "node:net";
+import express from "express";
+import request from "supertest";
+import { environmentRoutes } from "../routes/environments.js";
+import { projectRoutes } from "../routes/projects.js";
+import { projectGitAuthorizationService } from "../services/project-git-authorization.js";
+import { projectService } from "../services/projects.js";
+import { agentService } from "../services/agents.js";
+import { routineService } from "../services/routines.js";
+import { createRoutineSchema } from "@paperclipai/shared";
+import { environmentService } from "../services/environments.js";
+import { readExecutionConfigurationRows, assertExecutionConfigurationCurrent } from "../services/heartbeat/execution-configuration-fence.js";
+import { currentControllerBootId } from "../services/controller-process-identity.js";
+import * as cloudInstance from "../services/cloud-instance.js";
+import * as heldConfiguration from "../services/native-runtime/held-native-turn.js";
+import * as executionConfiguration from "../services/heartbeat/execution-configuration.js";
+import * as configurationSupersession from "../services/heartbeat/configuration-supersession.js";
+import { currentControllerProcess } from "../services/controller-process-identity.js";
+import { spawn } from "node:child_process";
+import * as nativeExecutor from "../services/native-runtime/native-session-executor.js";
+import { errorHandler } from "../middleware/index.js";
+import { secretService } from "../services/secrets.js";
+import { SANDBOX_PLATFORM_PROBE_METADATA_KEY } from "../services/environment-custom-image-runtime.js";
+import { initializeRunIdentity, reserveSteeredIdentity, acceptSteeredIdentity } from "../services/run-identity.js";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { eq } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, agentTaskSessions, authUsers, companies, companyMemberships, createDb, executionWorkspaces, environments, heartbeatRuns, issueComments, issues, plugins, projects } from "@paperclipai/db";
+import { agents, agentTaskSessions, agentWakeupRequests, authUsers, companies, companyMemberships, companySecretBindings, userSecretDeclarations, nativeRunFinalizations, routines, routineRuns, builtInManagedResources, createDb, executionWorkspaces, environments, heartbeatRuns, issueComments, issues, plugins, projects } from "@paperclipai/db";
 import { getServerAdapter, registerServerAdapter, unregisterServerAdapter, type AdapterExecutionContext } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
@@ -33,6 +57,7 @@ if (!support.supported) console.warn(`Skipping session preparation tests: ${supp
 describePostgres("heartbeat session preparation through adapter dispatch", () => {
   const adapterType = "session_preparation_test";
   const captured = new Map<string, AdapterExecutionContext>();
+  const dispatchCounts = new Map<string, number>();
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
   let heartbeat: ReturnType<typeof heartbeatService>;
@@ -41,11 +66,18 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     temporary = await startEmbeddedPostgresTestDatabase("heartbeat-session-preparation-");
     db = createDb(temporary.connectionString);
     heartbeat = heartbeatService(db);
+    // Record committed lifecycle transitions, not just the final task status.
+    await db.execute(sql`create table configuration_status_probe (issue_id uuid, status text)`);
+    await db.execute(sql`create function configuration_status_probe_record() returns trigger language plpgsql as $$
+      begin insert into configuration_status_probe values (new.id, new.status); return new; end $$`);
+    await db.execute(sql`create trigger configuration_status_probe_trigger after update of status on issues
+      for each row execute function configuration_status_probe_record()`);
     registerServerAdapter({
       type: adapterType,
       supportsLocalAgentJwt: false,
       execute: async (input) => {
         captured.set(input.runId, input);
+        dispatchCounts.set(input.runId, (dispatchCounts.get(input.runId) ?? 0) + 1);
         // Settle the fixture's work so no automatic unfinished-task retry
         // competes with the next explicit session-continuation wake.
         const [issue] = await db.select().from(issues).where(eq(issues.id, String(input.context.issueId)));
@@ -684,6 +716,1677 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     }
   });
 
+  it.each(["environment", "project", "agent"] as const)("secret rotation ends held runs using its %s binding, not unrelated runs", async targetType => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "held-secret-binding-"));
+    const previousKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = join(cwd, "master.key");
+    try {
+      const secrets = secretService(db);
+      const secret = await secrets.create(f.companyId, { name: "Held revision", key: "HELD_REVISION", provider: "local_encrypted", value: randomUUID() });
+      const [environment] = await db.select().from(environments).where(eq(environments.driver, "local"));
+      const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Held project" }).returning();
+      await db.update(issues).set({ projectId: project.id }).where(eq(issues.id, f.issueId));
+      const targetId = targetType === "environment" ? environment.id : targetType === "project" ? project.id : f.agentId;
+      await secrets.syncEnvBindingsForTarget(f.companyId, { targetType, targetId }, {
+        HELD_REVISION: { type: "secret_ref", secretId: secret.id, version: "latest" },
+      });
+      const [otherAgent] = await db.insert(agents).values({ companyId: f.companyId, name: "Unrelated holder" }).returning();
+      const [otherIssue] = await db.insert(issues).values({ companyId: f.companyId, title: "Unrelated hold", assigneeAgentId: otherAgent.id }).returning();
+      const [held, other] = await db.insert(heartbeatRuns).values([
+        { companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId, runtimeMode: "native", status: "running",
+          contextSnapshot: { paperclipEnvironment: { id: environment.id }, paperclipWorkspace: { projectId: project.id } }, resultJson: { retained: "receipt" } },
+        { companyId: f.companyId, agentId: otherAgent.id, nativeIssueId: otherIssue.id, runtimeMode: "native", status: "running",
+          contextSnapshot: { paperclipEnvironment: { id: randomUUID() } }, resultJson: { retained: "other receipt" } },
+      ]).returning();
+      await secrets.rotate(secret.id, { value: randomUUID() });
+      expect((await heartbeat.getRun(held.id))?.resultJson).toEqual({ retained: "receipt", heldNativeConfigurationEnd: true });
+      expect((await heartbeat.getRun(other.id))?.resultJson).toEqual({ retained: "other receipt" });
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.companyId, f.companyId));
+    } finally {
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.companyId, f.companyId));
+      await db.delete(companySecretBindings).where(eq(companySecretBindings.companyId, f.companyId));
+      if (previousKey === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE; else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKey;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  // Real project PATCH, binding rewrite and durable fence must commit/roll back together.
+  it.each([false, true])("project environment save fences its held consumer atomically (rollback=%s)", async rollback => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "project-env-transaction-"));
+    const previousKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = join(cwd, "master.key");
+    let fail: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const secrets = secretService(db);
+      const secret = await secrets.create(f.companyId, { name: "Project revision", key: "PROJECT_REVISION", provider: "local_encrypted", value: randomUUID() });
+      const reference = { type: "secret_ref" as const, secretId: secret.id, version: "latest" as const };
+      const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Held project",
+        env: { CONTEXT_NOTE: "old", PROJECT_REVISION: reference } }).returning();
+      await secrets.syncEnvBindingsForTarget(f.companyId, { targetType: "project", targetId: project.id }, project.env);
+      const [beforeBinding] = await db.select().from(companySecretBindings).where(eq(companySecretBindings.targetId, project.id));
+      await db.update(issues).set({ projectId: project.id }).where(eq(issues.id, f.issueId));
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+        runtimeMode: "native", status: "running", contextSnapshot: { paperclipWorkspace: { projectId: project.id } } }).returning();
+      const app = express(); app.use(express.json());
+      app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: f.userId }; next(); });
+      app.use("/api", projectRoutes(db)); app.use(errorHandler);
+      const fence = heldConfiguration.requestHeldNativeConfigurationEndForTargets;
+      fail = rollback ? vi.spyOn(heldConfiguration, "requestHeldNativeConfigurationEndForTargets").mockImplementation(async (tx, targets) => {
+        await fence(tx, targets); throw new Error("injected fence rollback");
+      }) : undefined;
+      const response = await request(app).patch(`/api/projects/${project.id}`).send({ env: { CONTEXT_NOTE: "new", PROJECT_REVISION: reference } });
+      expect(response.status).toBe(rollback ? 500 : 200);
+      expect((await db.select().from(projects).where(eq(projects.id, project.id)))[0].env?.CONTEXT_NOTE).toEqual(rollback ? "old" : { type: "plain", value: "new" });
+      const bindings = await db.select().from(companySecretBindings).where(eq(companySecretBindings.targetId, project.id));
+      expect(bindings).toHaveLength(1);
+      expect(bindings[0].id === beforeBinding.id).toBe(rollback);
+      expect(bindings[0].secretId).toBe(secret.id);
+      expect((await heartbeat.getRun(run.id))?.resultJson?.heldNativeConfigurationEnd).toBe(rollback ? undefined : true);
+    } finally {
+      fail?.mockRestore();
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.companyId, f.companyId));
+      if (previousKey === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE; else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKey;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("environment save does not fence a native run with no admitted environment", async () => {
+    const f = await seed();
+    const [environment] = await db.select().from(environments).where(eq(environments.driver, "local"));
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+      runtimeMode: "native", status: "running", contextSnapshot: { issueId: f.issueId } }).returning();
+    const app = express(); app.use(express.json());
+    app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: f.userId }; next(); });
+    app.use("/api", environmentRoutes(db)); app.use(errorHandler);
+    try {
+      expect((await request(app).patch(`/api/environments/${environment.id}?companyId=${f.companyId}`)
+        .send({ envVars: { CONTEXT_NOTE: "current" } })).status).toBe(200);
+      expect((await heartbeat.getRun(run.id))?.resultJson?.heldNativeConfigurationEnd).toBeUndefined();
+    } finally {
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, run.id));
+      await db.update(environments).set({ envVars: environment.envVars }).where(eq(environments.id, environment.id));
+    }
+  });
+
+  it("instance environment save only fences exact admitted consumers", async () => {
+    const first = await seed(), second = await seed();
+    const [environment] = await db.select().from(environments).where(eq(environments.driver, "local"));
+    const app = express(); app.use(express.json());
+    app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: first.userId }; next(); });
+    app.use("/api", environmentRoutes(db)); app.use(errorHandler);
+    const cases = [
+      { name: "exact active consumer", owner: first, contextSnapshot: { paperclipEnvironment: { id: environment.id } }, nativePhase: "provider_running", createdAt: new Date(0), resultJson: {}, close: true },
+      { name: "recent missing environment first company", owner: first, contextSnapshot: {}, nativePhase: null, createdAt: new Date(), resultJson: {}, close: false },
+      { name: "recent missing environment second company", owner: second, contextSnapshot: {}, nativePhase: null, createdAt: new Date(), resultJson: {}, close: false },
+      { name: "old missing environment", owner: second, contextSnapshot: {}, nativePhase: null, createdAt: new Date(Date.now() - 60 * 60_000), resultJson: {}, close: false },
+      { name: "provider running without environment", owner: second, contextSnapshot: {}, nativePhase: "provider_running", createdAt: new Date(), resultJson: {}, close: false },
+      { name: "first turn dispatched without environment", owner: second, contextSnapshot: {}, nativePhase: null, createdAt: new Date(), resultJson: { firstTurnDispatchCommitted: true }, close: false },
+      { name: "other environment", owner: second, contextSnapshot: { paperclipEnvironment: { id: randomUUID() } }, nativePhase: null, createdAt: new Date(), resultJson: {}, close: false },
+    ];
+    const issueIds = cases.map(() => randomUUID());
+    await db.insert(issues).values(cases.map((row, index) => ({ id: issueIds[index], companyId: row.owner.companyId,
+      title: row.name, assigneeAgentId: row.owner.agentId })));
+    const runs = await db.insert(heartbeatRuns).values(cases.map((row, index) => ({ companyId: row.owner.companyId, agentId: row.owner.agentId,
+      nativeIssueId: issueIds[index], runtimeMode: "native", status: "running", contextSnapshot: row.contextSnapshot,
+      nativePhase: row.nativePhase, createdAt: row.createdAt, resultJson: row.resultJson }))).returning();
+    try {
+      // The query company resolves secret bindings only. The instance save's
+      // held-consumer target deliberately has no companyId and spans companies.
+      const saved = await request(app).patch(`/api/environments/${environment.id}?companyId=${first.companyId}`)
+        .send({ envVars: { CONTEXT_NOTE: "current instance value" } });
+      expect(saved.status, JSON.stringify(saved.body)).toBe(200);
+      for (const [index, row] of cases.entries()) {
+        const after = await heartbeat.getRun(runs[index].id);
+        expect(after?.resultJson?.heldNativeConfigurationEnd === true, row.name).toBe(row.close);
+        expect(after?.resultJson?.personStop, row.name).toBeUndefined();
+      }
+    } finally {
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(and(eq(heartbeatRuns.companyId, first.companyId), eq(heartbeatRuns.agentId, first.agentId)));
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(and(eq(heartbeatRuns.companyId, second.companyId), eq(heartbeatRuns.agentId, second.agentId)));
+      await db.update(environments).set({ envVars: environment.envVars }).where(eq(environments.id, environment.id));
+    }
+  });
+
+  it.each(["identity", "previous-release manifest"])("user secret rotation fences the admitted owner after steering changes the responsible user (%s)", async identitySource => {
+    const f = await seed(), other = await seed(), cwd = await mkdtemp(join(tmpdir(), "admitted-secret-owner-"));
+    const previousKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = join(cwd, "master.key");
+    try {
+      const secrets = secretService(db);
+      await secrets.createUserSecretDefinition(f.companyId, { key: "context_revision", name: "Context revision", provider: "local_encrypted" });
+      await secrets.syncEnvBindingsForTarget(f.companyId, { targetType: "agent", targetId: f.agentId }, {
+        CONTEXT_REVISION: { type: "user_secret_ref", key: "context_revision", version: "latest" },
+      });
+      const secret = await secrets.createCurrentUserSecretValue(f.companyId, f.userId, { definitionKey: "context_revision", value: randomUUID() });
+      const admitted = await secrets.resolveEnvBindings(f.companyId, {
+        CONTEXT_REVISION: { type: "user_secret_ref", key: "context_revision", version: "latest" },
+      }, { consumerType: "agent", consumerId: f.agentId, actorType: "agent", actorId: f.agentId, responsibleUserId: f.userId });
+      expect(admitted.manifest.map(entry => entry.secretId)).toEqual([secret.id]);
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+        runtimeMode: "native", status: "running", responsibleUserId: f.userId,
+        contextSnapshot: identitySource === "identity" ? { paperclipSecretIdentity: { responsibleUserId: f.userId } }
+          : { paperclipSecrets: { manifest: admitted.manifest } } }).returning();
+      await db.insert(companyMemberships).values({ companyId: f.companyId, principalId: other.userId, principalType: "user", status: "active", membershipRole: "member" });
+      await initializeRunIdentity(db, { companyId: f.companyId, runId: run.id, issueId: f.issueId, responsibleUserId: f.userId, cause: "instruction" });
+      const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+        authorType: "user", authorUserId: other.userId, body: "Continue with this instruction" }).returning();
+      const steered = await reserveSteeredIdentity(db, { companyId: f.companyId, runId: run.id, issueId: f.issueId, messageId: comment.id });
+      expect(steered).not.toBeNull();
+      await db.transaction(async tx => {
+        await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)).for("update");
+        await acceptSteeredIdentity(tx, steered!);
+      });
+      expect((await heartbeat.getRun(run.id))?.responsibleUserId).toBe(other.userId);
+      await secrets.rotate(secret.id, { value: randomUUID() });
+      expect((await heartbeat.getRun(run.id))?.resultJson?.heldNativeConfigurationEnd).toBe(true);
+    } finally {
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.companyId, f.companyId));
+      if (previousKey === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE; else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKey;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  // Every mutable plain-env source, through both actual dispatch handoffs.
+  // Only provider I/O is substituted; preparation, saves and PG fencing are real.
+  it.each([
+    { source: "agent", native: false }, { source: "agent", native: true },
+    { source: "issue", native: false }, { source: "issue", native: true },
+    { source: "live routine", native: false }, { source: "live routine", native: true },
+    { source: "pinned routine", native: false }, { source: "pinned routine", native: true },
+    { source: "project selector", native: false }, { source: "project selector", native: true },
+    { source: "environment selector", native: false }, { source: "environment selector", native: true },
+  ] as const)("v6 plain launch content: $source save after preparation (native=$native)", async ({ source, native }) => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "plain-launch-content-"));
+    const mode = native ? undefined : vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
+    const nativeValues: unknown[] = [];
+    const provider = native ? vi.spyOn(nativeExecutor, "executePaperclipNativeSession").mockImplementation(async input => {
+      nativeValues.push(input.runnerEnvironment?.CONTEXT_NOTE);
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, sessionId: "saved-session", resultJson: {} };
+    }) : undefined;
+    let pause: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const config = { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", cwd,
+        ...(source === "agent" || source === "environment selector" ? { env: { CONTEXT_NOTE: { type: "plain", value: source === "agent" ? "old" : "current" } } } : {}) };
+      await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: config }).where(eq(agents.id, f.agentId));
+      if (source === "issue") await db.update(issues).set({ assigneeAdapterOverrides: {
+        adapterConfig: { env: { CONTEXT_NOTE: { type: "plain", value: "old" } } },
+      } }).where(eq(issues.id, f.issueId));
+      const selectorProjects = source === "project selector" ? await db.insert(projects).values([
+        { companyId: f.companyId, name: "Original project", env: { CONTEXT_NOTE: "old" } },
+        { companyId: f.companyId, name: "Current project", env: { CONTEXT_NOTE: "current" } },
+      ]).returning() : [];
+      if (selectorProjects.length) await db.update(issues).set({ projectId: selectorProjects[0].id }).where(eq(issues.id, f.issueId));
+      const [localEnvironment] = await db.select().from(environments).where(eq(environments.driver, "local"));
+      const routinesSvc = routineService(db);
+      const routine = source.includes("routine") ? await routinesSvc.create(f.companyId, createRoutineSchema.parse({
+        title: "Launch content", assigneeAgentId: f.agentId, env: { CONTEXT_NOTE: "old" },
+      }), { userId: f.userId }) : null;
+      if (routine) {
+        const [routineRun] = source === "pinned routine" ? await db.insert(routineRuns).values({
+          companyId: f.companyId, routineId: routine.id, source: "manual", routineRevisionId: routine.latestRevisionId,
+          responsibleUserId: f.userId,
+        }).returning() : [];
+        await db.update(issues).set({ originKind: "routine_execution", originId: routine.id, originRunId: routineRun?.id ?? null }).where(eq(issues.id, f.issueId));
+      }
+      const prepare = executionConfiguration.prepareHeartbeatExecutionConfiguration;
+      let preparations = 0;
+      pause = vi.spyOn(executionConfiguration, "prepareHeartbeatExecutionConfiguration").mockImplementation(async (...args) => {
+        const result = await prepare(...args);
+        if (++preparations !== 1) return result;
+        expect(result.prepared).toBe(true);
+        if (source === "agent") await agentService(db).update(f.agentId, { adapterConfig: {
+          ...config, env: { CONTEXT_NOTE: { type: "plain", value: "current" } },
+        } });
+        else if (source === "issue") await db.update(issues).set({ assigneeAdapterOverrides: {
+          adapterConfig: { env: { CONTEXT_NOTE: { type: "plain", value: "current" } } },
+        } }).where(eq(issues.id, f.issueId));
+        else if (source === "project selector") await db.update(issues).set({ projectId: selectorProjects[1].id }).where(eq(issues.id, f.issueId));
+        else if (source === "environment selector") await db.update(agents).set({ defaultEnvironmentId: localEnvironment.id }).where(eq(agents.id, f.agentId));
+        else await routinesSvc.update(routine!.id, { env: { CONTEXT_NOTE: "current" } }, { userId: f.userId });
+        return result;
+      });
+      const starting = await heartbeat.wakeup(f.agentId, { source: "on_demand", triggerDetail: "manual", reason: "manual",
+        payload: { issueId: f.issueId }, contextSnapshot: { issueId: f.issueId } });
+      await heartbeat.drainActiveRunExecutions();
+      const finished = await heartbeat.getRun(starting!.id);
+      expect(finished?.status, finished?.error ?? undefined).toBe("succeeded");
+      const pinned = source === "pinned routine";
+      expect(preparations).toBe(pinned ? 1 : 2);
+      if (pinned) expect(finished?.resultJson?.configurationSupersession).toBeUndefined();
+      else expect(finished?.resultJson?.configurationSupersession).toMatchObject({ attempt: 1 });
+      const values = native ? nativeValues : [(captured.get(starting!.id)?.config.env as Record<string, unknown> | undefined)?.CONTEXT_NOTE];
+      expect(values).toEqual([pinned ? "old" : "current"]);
+      expect(native ? provider!.mock.calls.length : dispatchCounts.get(starting!.id)).toBe(1);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, starting!.wakeupRequestId!))).toHaveLength(1);
+    } finally {
+      await heartbeat.drainActiveRunExecutions(); pause?.mockRestore(); provider?.mockRestore(); mode?.mockRestore();
+      unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { selector: "instance default", native: false }, { selector: "instance default", native: true },
+    { selector: "issue environment", native: false }, { selector: "issue environment", native: true },
+    { selector: "managed sandbox switch", native: false }, { selector: "managed sandbox switch", native: true },
+    { selector: "managed slot", native: false }, { selector: "managed slot", native: true },
+    { selector: "forced Kubernetes slot", native: false }, { selector: "forced Kubernetes slot", native: true },
+    { selector: "issue trust preset", native: false }, { selector: "issue trust preset", native: true },
+    { selector: "settings during handoff", native: false }, { selector: "settings during handoff", native: true },
+  ] as const)("v9 selection freshness: $selector after preparation (native=$native)", async ({ selector, native }) => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "selection-freshness-"));
+    const settings = instanceSettingsService(db), original = await settings.get();
+    const local = await environmentService(db).ensureLocalEnvironment(f.companyId);
+    const lowTrust = selector === "issue environment";
+    const trustChange = selector === "issue trust preset";
+    const inHandoff = selector === "settings during handoff";
+    const slot = selector === "managed slot" || selector === "forced Kubernetes slot";
+    const marker = selector === "forced Kubernetes slot" ? "managedKubernetesSandbox" : "managedByPaperclip";
+    const envs = await db.insert(environments).values([
+      { name: `Selection A ${f.companyId}`, driver: "sandbox", status: "active", config: { provider: selector === "forced Kubernetes slot" ? "kubernetes" : "fixture" }, envVars: { CONTEXT_NOTE: "old" },
+        metadata: slot ? { [marker]: true } : null },
+      { name: `Selection B ${f.companyId}`, driver: "sandbox", status: "active", config: { provider: selector === "forced Kubernetes slot" ? "kubernetes" : "fixture" }, envVars: { CONTEXT_NOTE: "current" },
+        metadata: selector === "managed sandbox switch" ? { managedByPaperclip: true } : null },
+    ]).returning();
+    const mode = native ? undefined : vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    const values: unknown[] = [], selections: unknown[] = [];
+    const fixture = getServerAdapter(adapterType);
+    registerServerAdapter({ ...fixture, type: "paperclip_runner", execute: async input => {
+      values.push((input.config.env as Record<string, unknown>)?.CONTEXT_NOTE); return fixture.execute(input);
+    } });
+    const provider = native ? vi.spyOn(nativeExecutor, "executePaperclipNativeSession").mockImplementation(async input => {
+      values.push(input.runnerEnvironment?.CONTEXT_NOTE);
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, sessionId: "saved-session", resultJson: {} };
+    }) : undefined;
+    // Only allocation/realization/provider I/O is substituted. Selection, trust
+    // resolution, preparation, committed settings writes and dispatch fences use PG.
+    const createOrchestrator = environmentOrchestrator.environmentRunOrchestrator;
+    const transport = vi.spyOn(environmentOrchestrator, "environmentRunOrchestrator").mockImplementation((...args) => ({
+      ...createOrchestrator(...args),
+      acquireForRun: async input => {
+        selections.push(input.selectedEnvironmentId);
+        const result = await createOrchestrator(...args).acquireForRun({ ...input, selectedEnvironmentId: input.localEnvironmentId });
+        return { ...result, environment: (await environmentService(db).getById(input.selectedEnvironmentId!))! };
+      },
+      realizeForRun: async input => ({ lease: input.lease, persistedExecutionWorkspace: input.persistedExecutionWorkspace,
+        workspaceRealization: {}, executionTarget: null, remoteExecution: null }),
+    }));
+    const originalHeartbeat = heartbeat;
+    heartbeat = heartbeatService(db);
+    const prepare = executionConfiguration.prepareHeartbeatExecutionConfiguration;
+    let preparations = 0, pause: ReturnType<typeof vi.spyOn> | undefined;
+    let fenceReached!: () => void, releaseFence!: () => void;
+    const reached = new Promise<void>(resolve => { fenceReached = resolve; });
+    const release = new Promise<void>(resolve => { releaseFence = resolve; });
+    const trustPolicy = { mode: "normal", commentRequired: false, stages: [], trustPreset: "low_trust_review", authorizationPolicy: { trustPreset: "low_trust_review",
+      trustBoundary: { mode: "low_trust_review", companyId: f.companyId, rootIssueId: f.issueId,
+        issueIds: [f.issueId], allowedAgentIds: [f.agentId], allowedToolClasses: [], allowedSecretBindingIds: [] } } };
+    try {
+      await settings.updateGeneral({ executionMode: selector === "forced Kubernetes slot" ? "kubernetes" : "any" });
+      await settings.updateExperimental({ enableManagedSandboxOnly: selector === "managed slot", remoteWorkspaceStorageEnabled: false, enableIsolatedWorkspaces: true });
+      await settings.update({ defaultEnvironmentId: selector === "instance default" || trustChange || inHandoff ? envs[0].id : null });
+      await db.update(environments).set({ envVars: { CONTEXT_NOTE: "old" } }).where(eq(environments.id, local.id));
+      await db.update(agents).set({ adapterType: "paperclip_runner", defaultEnvironmentId: null,
+        adapterConfig: { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", ...(lowTrust || trustChange ? {} : { cwd }) } }).where(eq(agents.id, f.agentId));
+      if (lowTrust || trustChange) await db.update(issues).set({
+        ...(lowTrust ? { executionPolicy: trustPolicy } : {}),
+        executionWorkspaceSettings: { mode: "isolated_workspace", workspaceStrategy: { type: "project_primary" }, environmentId: envs[trustChange ? 1 : 0].id },
+        workspaceSelection: { version: 1, source: "explicit", selection: { kind: "task_directory" } },
+      }).where(eq(issues.id, f.issueId));
+      pause = vi.spyOn(executionConfiguration, "prepareHeartbeatExecutionConfiguration").mockImplementation(async (...args) => {
+        const result = await prepare(...args);
+        if (++preparations === 1) {
+          expect(result.prepared).toBe(true);
+          if (inHandoff && result.prepared) {
+            const fence = result.assertConfigurationCurrent;
+            result.assertConfigurationCurrent = async (...fenceArgs) => {
+              const checked = await fence(...fenceArgs);
+              fenceReached(); await release;
+              return checked;
+            };
+          } else if (selector === "instance default") await settings.update({ defaultEnvironmentId: envs[1].id });
+          else if (lowTrust) await db.update(issues).set({ executionWorkspaceSettings: { mode: "isolated_workspace", workspaceStrategy: { type: "project_primary" }, environmentId: envs[1].id } }).where(eq(issues.id, f.issueId));
+          else if (slot) {
+            await db.transaction(async tx => {
+              await tx.update(environments).set({ metadata: null }).where(eq(environments.id, envs[0].id));
+              await tx.update(environments).set({ metadata: { [marker]: true }, updatedAt: new Date() }).where(eq(environments.id, envs[1].id));
+            });
+          } else if (trustChange) await db.update(issues).set({ executionPolicy: trustPolicy }).where(eq(issues.id, f.issueId));
+          else await settings.updateExperimental({ enableManagedSandboxOnly: true });
+        }
+        return result;
+      });
+      const run = await heartbeat.wakeup(f.agentId, { source: "on_demand", triggerDetail: "manual", reason: "manual",
+        requestedByActorType: "user", requestedByActorId: f.userId, manualUserWake: true,
+        payload: { issueId: f.issueId }, contextSnapshot: { issueId: f.issueId } });
+      expect(run, JSON.stringify(await db.select({ status: agentWakeupRequests.status, error: agentWakeupRequests.error,
+        reason: agentWakeupRequests.reason }).from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId)))).not.toBeNull();
+      if (inHandoff) {
+        await Promise.race([reached, heartbeat.drainActiveRunExecutions().then(() => { throw new Error("No fence reached"); })]);
+        const start = performance.now();
+        await db.transaction(async tx => {
+          await tx.execute(sql`set local lock_timeout = '1000ms'`);
+          await settings.update({ defaultEnvironmentId: envs[1].id }, { db: tx });
+        });
+        const ms = performance.now() - start;
+        process.stdout.write(`V10_SETTINGS_SAVE ${JSON.stringify({ native, ms })}\n`);
+        expect(ms).toBeLessThan(1000);
+        releaseFence();
+      }
+      await heartbeat.drainActiveRunExecutions();
+      const finished = await heartbeat.getRun(run!.id);
+      expect(finished?.status, JSON.stringify({ error: finished?.error, preparations, selections })).toBe("succeeded");
+      if (inHandoff) {
+        expect(values).toEqual(["old"]);
+        expect(finished?.resultJson?.configurationSupersession).toBeUndefined();
+        await db.update(issues).set({ status: "todo" }).where(eq(issues.id, f.issueId));
+        const next = await heartbeat.wakeup(f.agentId, { source: "on_demand", triggerDetail: "manual", reason: "manual",
+          requestedByActorType: "user", requestedByActorId: f.userId, manualUserWake: true,
+          payload: { issueId: f.issueId }, contextSnapshot: { issueId: f.issueId } });
+        await heartbeat.drainActiveRunExecutions();
+        expect((await heartbeat.getRun(next!.id))?.status).toBe("succeeded");
+        expect(values).toEqual(["old", "current"]);
+      } else {
+        expect(values).toEqual(["current"]);
+        expect(finished?.resultJson?.configurationSupersession).toMatchObject({ attempt: 1 });
+      }
+      expect(preparations).toBe(2);
+      expect(selections.at(-1)).toBe(envs[1].id);
+    } finally {
+      releaseFence();
+      await heartbeat.drainActiveRunExecutions(); pause?.mockRestore(); transport.mockRestore(); provider?.mockRestore(); mode?.mockRestore();
+      heartbeat = originalHeartbeat;
+      unregisterServerAdapter("paperclip_runner");
+      await db.update(environments).set({ metadata: null }).where(inArray(environments.id, envs.map(env => env.id)));
+      await settings.updateGeneral({ executionMode: original.general.executionMode ?? "any" });
+      await settings.update({ defaultEnvironmentId: original.defaultEnvironmentId });
+      await settings.updateExperimental({ enableManagedSandboxOnly: original.experimental.enableManagedSandboxOnly,
+        remoteWorkspaceStorageEnabled: original.experimental.remoteWorkspaceStorageEnabled, enableIsolatedWorkspaces: original.experimental.enableIsolatedWorkspaces });
+      await db.update(environments).set({ envVars: local.envVars }).where(eq(environments.id, local.id));
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  // Same post-final-compare pause as "settings during handoff" above. Plain
+  // agent env saves belong to the next fresh admission; secret versions retain
+  // their SHARE fence until handoff. Only provider I/O is substituted.
+  it.each([
+    { change: "remove plain", native: false }, { change: "remove plain", native: true },
+    { change: "change plain", native: false }, { change: "change plain", native: true },
+    { change: "rotate secret", native: false }, { change: "rotate secret", native: true },
+  ] as const)("post-compare agent env: $change during handoff (native=$native)", async ({ change, native }) => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "post-compare-agent-env-"));
+    const previousKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = join(cwd, "master.key");
+    const secretControl = change === "rotate secret";
+    const mode = native ? undefined : vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    const values: unknown[] = [], unchanged: unknown[] = [], hasK: boolean[] = [], preparedEnvs: Record<string, unknown>[] = [];
+    const fixture = getServerAdapter(adapterType);
+    registerServerAdapter({ ...fixture, type: "paperclip_runner", execute: async input => {
+      const env = input.config.env as Record<string, unknown>;
+      values.push(env.K); unchanged.push(env.UNCHANGED); hasK.push(Object.hasOwn(env, "K"));
+      expect(input.config).toMatchObject({ provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", cwd });
+      return fixture.execute(input);
+    } });
+    const provider = native ? vi.spyOn(nativeExecutor, "executePaperclipNativeSession").mockImplementation(async input => {
+      values.push(input.runnerEnvironment?.K); unchanged.push(input.runnerEnvironment?.UNCHANGED);
+      hasK.push(Object.hasOwn(input.runnerEnvironment ?? {}, "K"));
+      expect(input.execution.provider.model).toBe("fixture/model");
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, sessionId: "saved-session", resultJson: {} };
+    }) : undefined;
+    const prepare = executionConfiguration.prepareHeartbeatExecutionConfiguration;
+    let preparations = 0, fencePid = 0;
+    let pause: ReturnType<typeof vi.spyOn> | undefined, rotation: Promise<unknown> | undefined;
+    let fenceReached!: () => void, releaseFence!: () => void;
+    const reached = new Promise<void>(resolve => { fenceReached = resolve; });
+    const release = new Promise<void>(resolve => { releaseFence = resolve; });
+    try {
+      const secrets = secretService(db);
+      const secret = secretControl ? await secrets.create(f.companyId, {
+        name: "Post-compare control", key: "POST_COMPARE_CONTROL", provider: "local_encrypted", value: "old",
+      }) : null;
+      const env = { K: secret ? { type: "secret_ref" as const, secretId: secret.id, version: "latest" as const }
+        : { type: "plain" as const, value: "old" }, UNCHANGED: { type: "plain" as const, value: "steady" } };
+      const config = { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", cwd, env };
+      await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: config }).where(eq(agents.id, f.agentId));
+      if (secret) await secrets.syncEnvBindingsForTarget(f.companyId, { targetType: "agent", targetId: f.agentId }, env);
+      pause = vi.spyOn(executionConfiguration, "prepareHeartbeatExecutionConfiguration").mockImplementation(async (...args) => {
+        const result = await prepare(...args);
+        preparations++;
+        expect(result.prepared).toBe(true);
+        if (result.prepared) {
+          preparedEnvs.push(result.configuredTaskEnvironment);
+          if (preparations === 1) {
+            const fence = result.assertConfigurationCurrent;
+            result.assertConfigurationCurrent = async (...fenceArgs) => {
+              const checked = await fence(...fenceArgs);
+              const [backend] = await (fenceArgs[0] as typeof db).execute(sql`select pg_backend_pid() as pid`);
+              fencePid = Number(backend.pid);
+              fenceReached(); await release;
+              return checked;
+            };
+          }
+        }
+        return result;
+      });
+      const wake = () => heartbeat.wakeup(f.agentId, { source: "on_demand", triggerDetail: "manual", reason: "manual",
+        requestedByActorType: "user", requestedByActorId: f.userId, manualUserWake: true,
+        payload: { issueId: f.issueId }, contextSnapshot: { issueId: f.issueId } });
+      const run = await wake();
+      expect(run).not.toBeNull();
+      await Promise.race([reached, heartbeat.drainActiveRunExecutions().then(() => { throw new Error("No final compare reached"); })]);
+      expect(values).toEqual([]);
+      const start = performance.now();
+      let saveMs: number | undefined, blockedMs: number | undefined;
+      if (secret) {
+        let committed = false, blockedAt = 0;
+        rotation = secrets.rotate(secret.id, { value: "new" }, { userId: f.userId }).then(result => {
+          committed = true; saveMs = performance.now() - start; blockedMs = performance.now() - blockedAt;
+          return result;
+        });
+        // Observe the actual writer blocked by THIS dispatch transaction, not
+        // an assumed delay or an unrelated database lock.
+        await vi.waitFor(async () => {
+          const waiting = await db.execute(sql`select pid from pg_stat_activity where datname = current_database()
+            and wait_event_type = 'Lock' and ${fencePid} = any(pg_blocking_pids(pid))
+            and query ilike '%update%company_secrets%'`);
+          expect(waiting).toHaveLength(1);
+        }, { timeout: 10_000, interval: 10 });
+        blockedAt = performance.now();
+        await new Promise(resolve => setTimeout(resolve, 150));
+        expect(committed).toBe(false);
+        expect(values).toEqual([]);
+        releaseFence();
+        await Promise.all([rotation, heartbeat.drainActiveRunExecutions()]);
+        expect(blockedMs).toBeGreaterThanOrEqual(150);
+      } else {
+        const nextEnv = change === "remove plain" ? { UNCHANGED: env.UNCHANGED }
+          : { ...env, K: { type: "plain", value: "new" } };
+        await db.transaction(async tx => {
+          await tx.execute(sql`set local lock_timeout = '1000ms'`);
+          await tx.update(agents).set({ adapterConfig: { ...config, env: nextEnv } }).where(eq(agents.id, f.agentId));
+        });
+        saveMs = performance.now() - start;
+        expect(saveMs).toBeLessThan(1000);
+        expect(values).toEqual([]); // save committed while handoff is still paused
+        expect((await db.select().from(agents).where(eq(agents.id, f.agentId)))[0].adapterConfig).toEqual({ ...config, env: nextEnv });
+        releaseFence(); await heartbeat.drainActiveRunExecutions();
+      }
+      const totalMs = performance.now() - start;
+      const first = await heartbeat.getRun(run!.id);
+      expect(first?.status, first?.error ?? undefined).toBe("succeeded");
+      expect(first?.resultJson?.configurationSupersession).toBeUndefined();
+      expect(values).toEqual(["old"]);
+      await db.update(issues).set({ status: "todo" }).where(eq(issues.id, f.issueId));
+      const next = await wake(); expect(next).not.toBeNull();
+      await heartbeat.drainActiveRunExecutions();
+      const second = await heartbeat.getRun(next!.id);
+      expect(second?.status, second?.error ?? undefined).toBe("succeeded");
+      expect(second?.resultJson?.configurationSupersession).toBeUndefined();
+      expect(values).toEqual(["old", change === "remove plain" ? undefined : "new"]);
+      expect(unchanged).toEqual(["steady", "steady"]);
+      expect(hasK).toEqual([true, change !== "remove plain"]);
+      expect(preparations).toBe(2);
+      expect(preparedEnvs[0]).toEqual({ K: "old", UNCHANGED: "steady" });
+      expect(preparedEnvs[1]).toEqual({ ...(change === "remove plain" ? {} : { K: "new" }), UNCHANGED: "steady" });
+      process.stdout.write(`POST_COMPARE_AGENT_ENV ${JSON.stringify({ change, native, saveMs, blockedMs, firstHandoffMs: totalMs, preparations, values, hasK })}\n`);
+    } finally {
+      releaseFence(); await rotation?.catch(() => {}); await heartbeat.drainActiveRunExecutions();
+      pause?.mockRestore(); provider?.mockRestore(); mode?.mockRestore(); unregisterServerAdapter("paperclip_runner");
+      if (previousKey === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE; else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKey;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it.each([false, true])("v8 model-change seam: preparation-window change launches old model once, next message uses new (native=%s)", async native => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "model-change-seam-"));
+    const values: unknown[] = [];
+    const mode = native ? undefined : vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    const fixture = getServerAdapter(adapterType);
+    registerServerAdapter({ ...fixture, type: "paperclip_runner", execute: async input => {
+      values.push(input.config.model); return fixture.execute(input);
+    } });
+    const provider = native ? vi.spyOn(nativeExecutor, "executePaperclipNativeSession").mockImplementation(async input => {
+      values.push(input.execution.provider.model);
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, sessionId: "saved-session", resultJson: {} };
+    }) : undefined;
+    const prepare = executionConfiguration.prepareHeartbeatExecutionConfiguration;
+    let preparations = 0;
+    let pause: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const config = { provider: "pi_rpc", model: "fixture/model-a", sessionContinuity: "continuous", cwd };
+      await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: config }).where(eq(agents.id, f.agentId));
+      pause = vi.spyOn(executionConfiguration, "prepareHeartbeatExecutionConfiguration").mockImplementation(async (...args) => {
+        const result = await prepare(...args);
+        if (++preparations === 1) await db.update(agents).set({ adapterConfig: { ...config, model: "fixture/model-b" } }).where(eq(agents.id, f.agentId));
+        return result;
+      });
+      for (let message = 0; message < 2; message++) {
+        await db.update(issues).set({ status: "todo" }).where(eq(issues.id, f.issueId));
+        const run = await heartbeat.wakeup(f.agentId, { source: "on_demand", triggerDetail: "manual", reason: "manual",
+          payload: { issueId: f.issueId }, contextSnapshot: { issueId: f.issueId } });
+        await heartbeat.drainActiveRunExecutions();
+        const finished = await heartbeat.getRun(run!.id);
+        expect(finished?.status, finished?.error ?? undefined).toBe("succeeded");
+        expect(finished?.resultJson?.configurationSupersession).toBeUndefined();
+      }
+      expect(values).toEqual(["fixture/model-a", "fixture/model-b"]);
+      expect(preparations).toBe(2);
+    } finally {
+      await heartbeat.drainActiveRunExecutions(); pause?.mockRestore(); provider?.mockRestore(); mode?.mockRestore();
+      unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  // Real agent/settings services commit in both old windows. Only provisioner/provider I/O is substituted.
+  it.each(["before final compare", "after final compare"].flatMap(window =>
+    ["agent env", "agent default", "instance default"].flatMap(source =>
+      [false, true].map(native => ({ window, source, native }))),
+  ))("v11 committed save: $source $window (native=$native)", async ({ window, source, native }) => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "v11-save-window-"));
+    const settings = instanceSettingsService(db), original = await settings.get();
+    const envs = await db.insert(environments).values([
+      { name: `V11 old ${f.companyId}`, driver: "sandbox", status: "active", config: { provider: "fixture" }, envVars: { CONTEXT_NOTE: "old" } },
+      { name: `V11 new ${f.companyId}`, driver: "sandbox", status: "active", config: { provider: "fixture" }, envVars: { CONTEXT_NOTE: "current" } },
+    ]).returning();
+    const values: unknown[] = [], holds: boolean[] = [];
+    const mode = native ? undefined : vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    const fixture = getServerAdapter(adapterType);
+    registerServerAdapter({ ...fixture, type: "paperclip_runner", execute: async input => {
+      values.push((input.config.env as Record<string, unknown>)?.CONTEXT_NOTE); return fixture.execute(input);
+    } });
+    const provider = native ? vi.spyOn(nativeExecutor, "executePaperclipNativeSession").mockImplementation(async input => {
+      values.push(input.runnerEnvironment?.CONTEXT_NOTE);
+      holds.push((await heldConfiguration.readHeldNativeTurnWork(db, input.execution.binding))?.endRequested === true);
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, sessionId: "saved-session", resultJson: {} };
+    }) : undefined;
+    const createOrchestrator = environmentOrchestrator.environmentRunOrchestrator;
+    const transport = vi.spyOn(environmentOrchestrator, "environmentRunOrchestrator").mockImplementation((...args) => ({
+      ...createOrchestrator(...args), acquireForRun: async input => {
+        const result = await createOrchestrator(...args).acquireForRun({ ...input, selectedEnvironmentId: input.localEnvironmentId });
+        return { ...result, environment: (await environmentService(db).getById(input.selectedEnvironmentId!))! };
+      }, realizeForRun: async input => ({ lease: input.lease, persistedExecutionWorkspace: input.persistedExecutionWorkspace,
+        workspaceRealization: {}, executionTarget: null, remoteExecution: null }),
+    }));
+    const originalHeartbeat = heartbeat;
+    heartbeat = heartbeatService(db);
+    const prepare = executionConfiguration.prepareHeartbeatExecutionConfiguration;
+    let preparations = 0, pause: ReturnType<typeof vi.spyOn> | undefined;
+    let reached!: () => void, release!: () => void;
+    let saving: Promise<unknown> | undefined, saveDeadline: ReturnType<typeof setTimeout> | undefined;
+    const paused = new Promise<void>(resolve => { reached = resolve; }), resumed = new Promise<void>(resolve => { release = resolve; });
+    const config = { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", cwd,
+      ...(source === "agent env" ? { env: { CONTEXT_NOTE: { type: "plain", value: "old" } } } : {}) };
+    try {
+      await settings.updateGeneral({ executionMode: "any" });
+      await settings.updateExperimental({ enableManagedSandboxOnly: false, remoteWorkspaceStorageEnabled: false });
+      await settings.update({ defaultEnvironmentId: envs[0].id });
+      await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: config,
+        defaultEnvironmentId: source === "instance default" ? null : envs[0].id }).where(eq(agents.id, f.agentId));
+      pause = vi.spyOn(executionConfiguration, "prepareHeartbeatExecutionConfiguration").mockImplementation(async (...args) => {
+        const result = await prepare(...args);
+        if (++preparations === 1 && result.prepared) {
+          const fence = result.assertConfigurationCurrent;
+          result.assertConfigurationCurrent = async (tx, issueId, lockIssue) => {
+            if (window === "before final compare") return fence(tx, issueId, async () => { reached(); await resumed; await lockIssue(); });
+            await fence(tx, issueId, lockIssue); reached(); await resumed;
+          };
+        }
+        return result;
+      });
+      const wake = () => heartbeat.wakeup(f.agentId, { source: "on_demand", triggerDetail: "manual", reason: "manual",
+        requestedByActorType: "user", requestedByActorId: f.userId, manualUserWake: true,
+        payload: { issueId: f.issueId }, contextSnapshot: { issueId: f.issueId } });
+      const run = await wake(); expect(run).not.toBeNull();
+      await Promise.race([paused, heartbeat.drainActiveRunExecutions().then(() => { throw new Error("No fence pause reached"); })]);
+      const start = performance.now();
+      saving = source === "agent env" ? agentService(db).update(f.agentId, { adapterConfig: { ...config, env: { CONTEXT_NOTE: { type: "plain", value: "current" } } } })
+        : source === "agent default" ? agentService(db).update(f.agentId, { defaultEnvironmentId: envs[1].id })
+        : settings.update({ defaultEnvironmentId: envs[1].id });
+      await Promise.race([saving, new Promise((_, reject) => { saveDeadline = setTimeout(() => reject(new Error("Save could not commit during the paused handoff")), 1500); })]);
+      clearTimeout(saveDeadline);
+      const saveMs = performance.now() - start;
+      expect(values).toEqual([]); release(); await heartbeat.drainActiveRunExecutions();
+      const first = await heartbeat.getRun(run!.id);
+      expect(first?.status, first?.error ?? undefined).toBe("succeeded");
+      const early = window === "before final compare";
+      if (early) {
+        expect(values).toEqual(["current"]);
+        expect(first?.resultJson?.configurationSupersession).toMatchObject({ attempt: 1 });
+        if (native) expect(holds).toEqual([false]);
+      } else {
+        expect(values).toEqual(["old"]);
+        // At attachment/hold start the committed save must retire this old admission.
+        if (native) expect(holds).toEqual([true]);
+        await db.update(issues).set({ status: "todo" }).where(eq(issues.id, f.issueId));
+        const next = await wake(); await heartbeat.drainActiveRunExecutions();
+        expect((await heartbeat.getRun(next!.id))?.status).toBe("succeeded");
+        expect(values).toEqual(["old", "current"]);
+        if (native) expect(holds).toEqual([true, false]);
+      }
+      expect(preparations).toBe(2);
+      process.stdout.write(`V11_SAVE_WINDOW ${JSON.stringify({ window, source, native, saveMs, preparations, values, holds })}\n`);
+    } finally {
+      clearTimeout(saveDeadline); release(); await saving?.catch(() => {}); await heartbeat.drainActiveRunExecutions(); pause?.mockRestore(); transport.mockRestore(); provider?.mockRestore(); mode?.mockRestore();
+      heartbeat = originalHeartbeat;
+      unregisterServerAdapter("paperclip_runner");
+      await settings.update({ defaultEnvironmentId: original.defaultEnvironmentId });
+      await settings.updateGeneral({ executionMode: original.general.executionMode ?? "any" });
+      await settings.updateExperimental({ enableManagedSandboxOnly: original.experimental.enableManagedSandboxOnly,
+        remoteWorkspaceStorageEnabled: original.experimental.remoteWorkspaceStorageEnabled });
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["agent env", "agent default"])("v11 %s save commits before native attachment; the saved admission closes without replacing its session", async source => {
+    const f = await seed(), sessionId = randomUUID();
+    const [local] = await db.select().from(environments).where(eq(environments.driver, "local"));
+    const [next] = await db.insert(environments).values({ name: `V11 late ${f.companyId}`, driver: "sandbox", status: "active", config: { provider: "fixture" } }).returning();
+    const config = { provider: "pi_rpc", sessionContinuity: "continuous", env: { CONTEXT_NOTE: { type: "plain", value: "old" } } };
+    await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: config, defaultEnvironmentId: local.id }).where(eq(agents.id, f.agentId));
+    const snapshot = await readExecutionConfigurationRows(db, { companyId: f.companyId, environmentId: local.id, projectId: null,
+      plainSources: { agentId: f.agentId, agentEnv: config.env, agentDefaultEnvironmentId: local.id, issue: null, liveRoutine: null } });
+    const contextSnapshot = { issueId: f.issueId, paperclipEnvironment: { id: local.id }, paperclipHeldConfiguration: {
+      agentEnvFingerprint: snapshot.agentEnvFingerprint, agentDefaultEnvironmentId: local.id, selection: null } };
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+      nativeSessionId: sessionId, runtimeMode: "legacy", status: "running", contextSnapshot }).returning();
+    try {
+      if (source === "agent env") await agentService(db).update(f.agentId, { adapterConfig: { ...config, env: { CONTEXT_NOTE: { type: "plain", value: "current" } } } });
+      else await agentService(db).update(f.agentId, { defaultEnvironmentId: next.id });
+      expect((await heartbeat.getRun(run.id))?.resultJson?.heldNativeConfigurationEnd).toBeUndefined();
+      await db.update(heartbeatRuns).set({ runtimeMode: "native" }).where(eq(heartbeatRuns.id, run.id));
+      expect((await heldConfiguration.readHeldNativeTurnWork(db, { ...f, runId: run.id }))?.endRequested).toBe(true);
+      const after = await heartbeat.getRun(run.id);
+      expect(after?.resultJson?.heldNativeConfigurationEnd).toBe(true);
+      expect(after?.resultJson?.personStop).toBeUndefined();
+      expect(after?.nativeSessionId).toBe(sessionId);
+      expect(after?.contextSnapshot).toEqual(contextSnapshot);
+    } finally { await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, run.id)); }
+  });
+
+  it.each([false, true])("v11 instance default save retires only its prepared consumers, atomically; recovery sees the same close (previous release=%s)", async previousRelease => {
+    const inherited = await seed(), own = await seed();
+    const settings = instanceSettingsService(db), original = await settings.get();
+    const [environment] = await db.select().from(environments).where(eq(environments.driver, "local"));
+    const [changedEnvironment] = await db.insert(environments).values({ name: `V11 settings ${inherited.companyId}`,
+      driver: "sandbox", status: "active", config: { provider: "fixture" } }).returning();
+    const runs: string[] = [];
+    try {
+      await settings.update({ defaultEnvironmentId: null });
+      for (const f of [inherited, own]) {
+        await db.update(agents).set({ defaultEnvironmentId: f === own ? environment.id : null }).where(eq(agents.id, f.agentId));
+        const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+          runtimeMode: "native", status: "running", contextSnapshot: { issueId: f.issueId, paperclipEnvironment: { id: environment.id },
+            ...(!previousRelease ? { paperclipHeldConfiguration: {
+              selection: { localEnvironmentId: environment.id, executionMode: "any", managedSandboxOnly: false,
+                ...(f === inherited ? { instanceDefaultEnvironmentId: null } : {}) },
+            } } : {}) } }).returning();
+        runs.push(run.id);
+      }
+      await expect(db.transaction(async tx => {
+        await settings.update({ defaultEnvironmentId: changedEnvironment.id }, { db: tx });
+        expect((await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runs[0])))[0].resultJson?.heldNativeConfigurationEnd).toBe(true);
+        throw new Error("rollback-settings");
+      })).rejects.toThrow("rollback-settings");
+      expect((await heartbeat.getRun(runs[0]))?.resultJson?.heldNativeConfigurationEnd).toBeUndefined();
+      await settings.update({ defaultEnvironmentId: changedEnvironment.id });
+      expect((await heartbeat.getRun(runs[0]))?.resultJson?.heldNativeConfigurationEnd).toBe(true);
+      expect((await heartbeat.getRun(runs[1]))?.resultJson?.heldNativeConfigurationEnd).toBeUndefined();
+      // Simulate a save that committed before admission/recovery attached:
+      // no producer flag survives, but the admitted snapshot still does.
+      const admitted = (await heartbeat.getRun(runs[0]))?.contextSnapshot;
+      await db.update(heartbeatRuns).set({ resultJson: {} }).where(eq(heartbeatRuns.id, runs[0]));
+      expect((await heldConfiguration.readHeldNativeTurnWork(db, { ...inherited, runId: runs[0] }))?.endRequested).toBe(true);
+      expect((await heartbeat.getRun(runs[0]))?.resultJson?.heldNativeConfigurationEnd).toBe(true);
+      expect((await heartbeat.getRun(runs[0]))?.contextSnapshot).toEqual(admitted);
+      expect((await heldConfiguration.readHeldNativeTurnWork(db, { ...own, runId: runs[1] }))?.endRequested).toBe(false);
+    } finally {
+      if (runs.length) await db.update(heartbeatRuns).set({ status: "succeeded" }).where(inArray(heartbeatRuns.id, runs));
+      await settings.update({ defaultEnvironmentId: original.defaultEnvironmentId });
+    }
+  });
+
+  it("v6 agent env save fences an admitted held turn in the save transaction", async () => {
+    const f = await seed();
+    await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous" } }).where(eq(agents.id, f.agentId));
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+      runtimeMode: "native", status: "running", contextSnapshot: { issueId: f.issueId } }).returning();
+    try {
+      await agentService(db).update(f.agentId, { adapterConfig: { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", env: { CONTEXT_NOTE: "current" } } });
+      expect((await heartbeat.getRun(run.id))?.resultJson?.heldNativeConfigurationEnd).toBe(true);
+      expect((await heartbeat.getRun(run.id))?.resultJson?.personStop).toBeUndefined();
+    } finally { await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, run.id)); }
+  });
+
+  async function seedPendingConfiguration() {
+    const f = await seed();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", nativeIssueId: f.issueId,
+      controllerBootId: currentControllerBootId(), contextSnapshot: { issueId: f.issueId }, responsibleUserId: f.userId }).returning();
+    await db.update(issues).set({ executionRunId: run.id }).where(eq(issues.id, f.issueId));
+    expect(await configurationSupersession.parkConfigurationSupersession(db, run)).toBe(true);
+    await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(0) }).where(eq(heartbeatRuns.id, run.id));
+    return { ...f, run };
+  }
+
+  it("v6 recovery spaces substantive attempts despite three rapid passes", async () => {
+    const f = await seedPendingConfiguration();
+    let cleanups = 0;
+    try {
+      for (let pass = 0; pass < 3; pass++) await configurationSupersession.recoverConfigurationSupersessions(db, {
+        runIds: [f.run.id], isExecuting: () => false,
+        cleanup: async () => { cleanups++; throw new Error("cleanup still pending"); }, resume: async () => { throw new Error("unexpected resume"); },
+      });
+      expect(cleanups).toBe(1);
+      expect(await heartbeat.getRun(f.run.id)).toMatchObject({ status: "scheduled_retry", resultJson: { configurationSupersession: { recoveryAttempts: 1 } } });
+    } finally { await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, f.run.id)); }
+  });
+
+  it.each(["backend terminated", "serialization", "deadlock", "wrapped connection", "08006", "08004", "57P01", "57P02", "57P03"] as const)("v6 recovery DB unavailable: %s does not spend an attempt", async failure => {
+    const f = await seedPendingConfiguration();
+    const errors: string[] = [];
+    let fail = true, resumed = 0;
+    const recover = () => configurationSupersession.recoverConfigurationSupersessions(db, {
+      runIds: [f.run.id], isExecuting: () => false,
+      cleanup: async () => {
+        if (!fail) return;
+        try {
+          if (failure === "backend terminated") await db.transaction(async tx => { await tx.execute(sql`select pg_terminate_backend(pg_backend_pid())`); });
+          else if (failure === "serialization") await db.execute(sql`do $$ begin raise exception 'retry transaction' using errcode = '40001'; end $$`);
+          else if (failure === "deadlock") await db.execute(sql`do $$ begin raise exception 'retry transaction' using errcode = '40P01'; end $$`);
+          else if (failure.length === 5) await db.execute(sql.raw(`do $$ begin raise exception 'database availability failure' using errcode = '${failure}'; end $$`));
+          else {
+            try { await db.transaction(async tx => { await tx.execute(sql`select pg_terminate_backend(pg_backend_pid())`); }); }
+            catch (cause) { throw new Error("database operation unavailable", { cause }); }
+          }
+        } catch (error) {
+          const codes: string[] = []; let cause: unknown = error;
+          while (cause && typeof cause === "object") { const value = cause as { code?: string; cause?: unknown }; if (value.code) codes.push(value.code); cause = value.cause; }
+          errors.push(...codes); throw error;
+        }
+      }, resume: async () => { resumed++; },
+    });
+    try {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(0) }).where(eq(heartbeatRuns.id, f.run.id));
+        await recover();
+        const pending = await heartbeat.getRun(f.run.id);
+        expect(pending?.status).toBe("scheduled_retry");
+        expect(pending?.resultJson?.configurationSupersession).not.toHaveProperty("recoveryAttempts");
+      }
+      expect(errors).toHaveLength(3);
+      expect(errors.every(code => failure === "serialization" ? code === "40001" : failure === "deadlock" ? code === "40P01" : failure.length === 5 ? code === failure : ["CONNECTION_CLOSED", "57P01"].includes(code))).toBe(true);
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(0);
+      fail = false;
+      await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(0) }).where(eq(heartbeatRuns.id, f.run.id));
+      await recover();
+      expect(resumed).toBe(1);
+      expect(await heartbeat.getRun(f.run.id)).toMatchObject({ status: "queued", resultJson: { configurationSupersession: { state: "ready" } } });
+    } finally { await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, f.run.id)); }
+  });
+
+  it.each(["ECONNREFUSED", "EHOSTUNREACH", "ETIMEDOUT", "EPIPE", "40001", "40P01", "57P01", "08006", "CONNECTION_CLOSED", "spoofed PostgresError"])(
+    "v8 non-database cleanup code %s spends its bounded budget", async code => {
+      const f = await seedPendingConfiguration();
+      try {
+        for (let pass = 0; pass < 3; pass++) {
+          await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(0) }).where(eq(heartbeatRuns.id, f.run.id));
+          await configurationSupersession.recoverConfigurationSupersessions(db, { runIds: [f.run.id], isExecuting: () => false,
+            cleanup: async () => { throw new Error("runner lease release unavailable", { cause: Object.assign(new Error("runner failure"),
+              code === "spoofed PostgresError" ? { code: "40001", name: "PostgresError", severity: "ERROR" } : { code }) }); },
+            resume: async () => { throw new Error("unexpected resume"); } });
+        }
+        expect(await heartbeat.getRun(f.run.id)).toMatchObject({ status: "failed", errorCode: "configuration_incomplete",
+          resultJson: { configurationSupersession: { recoveryAttempts: 3 } } });
+        const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+        expect(comments).toHaveLength(1);
+        expect(comments[0].body).toContain("Owner: Session owner; Agent: Session reader.");
+      } finally { await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, f.run.id)); }
+    });
+
+  it.each(["08P01", "53400", "53300", "55P03"])("v8 genuine non-availability database state %s stops after three failures", async code => {
+    const f = await seedPendingConfiguration();
+    try {
+      for (let pass = 0; pass < 3; pass++) {
+        await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(0) }).where(eq(heartbeatRuns.id, f.run.id));
+        await configurationSupersession.recoverConfigurationSupersessions(db, { runIds: [f.run.id], isExecuting: () => false,
+          cleanup: async () => { await db.execute(sql.raw(`do $$ begin raise exception 'permanent database failure' using errcode = '${code}'; end $$`)); },
+          resume: async () => { throw new Error("unexpected resume"); } });
+      }
+      expect(await heartbeat.getRun(f.run.id)).toMatchObject({ status: "failed", resultJson: { configurationSupersession: { recoveryAttempts: 3 } } });
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(1);
+    } finally { await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, f.run.id)); }
+  });
+
+  it("v8 an unreachable runner host ends within the cap with a person-named notice", async () => {
+    const f = await seedPendingConfiguration();
+    const server = createNetServer();
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Expected fixture port");
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    const startedAt = Date.now(), codes: string[] = [];
+    try {
+      for (let pass = 0; pass < 3; pass++) {
+        await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(0) }).where(eq(heartbeatRuns.id, f.run.id));
+        await configurationSupersession.recoverConfigurationSupersessions(db, { runIds: [f.run.id], isExecuting: () => false,
+          cleanup: () => new Promise<void>((resolve, reject) => {
+            const socket = connect({ host: "127.0.0.1", port: address.port });
+            socket.once("connect", () => { socket.destroy(); resolve(); });
+            socket.once("error", error => { socket.destroy(); codes.push((error as NodeJS.ErrnoException).code!); reject(error); });
+          }), resume: async () => { throw new Error("unexpected resume"); } });
+      }
+      expect(codes).toEqual(["ECONNREFUSED", "ECONNREFUSED", "ECONNREFUSED"]);
+      expect(Date.now() - startedAt).toBeLessThan(15 * 60_000);
+      expect(await heartbeat.getRun(f.run.id)).toMatchObject({ status: "failed", errorCode: "configuration_incomplete" });
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+      expect(comments).toHaveLength(1);
+      expect(comments[0].body).toContain("Owner: Session owner; Agent: Session reader.");
+    } finally { await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, f.run.id)); }
+  });
+
+  it.each(["database still failing", "healthy after pause", "cleanup now failing"] as const)("v9 deadline recovery: %s", async cause => {
+    const f = await seedPendingConfiguration();
+    let cleanups = 0, resumed = 0;
+    const recover = () => configurationSupersession.recoverConfigurationSupersessions(db, { runIds: [f.run.id], isExecuting: () => false,
+      cleanup: async () => {
+        cleanups++;
+        if (cleanups > 1 && cause === "healthy after pause") return;
+        if (cleanups > 1 && cause === "cleanup now failing") throw new Error("runner cleanup failed");
+        await db.transaction(async tx => { await tx.execute(sql`select pg_terminate_backend(pg_backend_pid())`); });
+      }, resume: async () => { resumed++; } });
+    try {
+      await recover();
+      const pending = await heartbeat.getRun(f.run.id);
+      expect(pending?.resultJson?.configurationSupersession).not.toHaveProperty("recoveryAttempts");
+      expect(pending?.resultJson?.configurationSupersession).toHaveProperty("availabilityFailureAt");
+      // Age the durable first-failure timestamp, not the wall clock or the
+      // due scheduler: simulate a stopped server missing all intervening passes.
+      await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(0), resultJson: {
+        ...pending!.resultJson, configurationSupersession: { ...pending!.resultJson!.configurationSupersession as object,
+          availabilityFailureAt: new Date(Date.now() - 15 * 60_000 - 1).toISOString() },
+      } }).where(eq(heartbeatRuns.id, f.run.id));
+      await recover();
+      expect(cleanups).toBe(2);
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+      if (cause === "healthy after pause") {
+        expect(resumed).toBe(1);
+        expect(await heartbeat.getRun(f.run.id)).toMatchObject({ status: "queued", resultJson: { configurationSupersession: { state: "ready" } } });
+        expect(comments).toHaveLength(0);
+      } else {
+        expect(resumed).toBe(0);
+        expect(await heartbeat.getRun(f.run.id)).toMatchObject({ status: "failed", errorCode: "configuration_incomplete",
+          resultJson: { configurationIncomplete: { reason: cause === "database still failing" ? "configuration_recovery_unavailable" : "configuration_recovery_stalled" },
+            configurationSupersession: { state: "recovery_exhausted" } } });
+        expect(comments).toHaveLength(1);
+        expect(comments[0].body).toContain(cause === "database still failing" ? "a database operation still failed" : "execution ownership or cleanup still failed");
+        expect(comments[0].body).not.toContain("restore database access");
+        expect(comments[0].body).not.toContain("three recovery attempts");
+        expect(comments[0].body).toContain("Owner: Session owner; Agent: Session reader.");
+      }
+    } finally { await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, f.run.id)); }
+  });
+
+  it("v6 retryable requeue transaction errors do not spend recovery attempts", async () => {
+    const f = await seedPendingConfiguration();
+    let resumed = 0;
+    const recover = () => configurationSupersession.recoverConfigurationSupersessions(db, {
+      runIds: [f.run.id], isExecuting: () => false, cleanup: async () => {}, resume: async () => { resumed++; },
+    });
+    try {
+      // A real failed UPDATE/rollback in the requeue transaction (not cleanup).
+      await db.execute(sql.raw(`create function v6_requeue_unavailable() returns trigger language plpgsql as $$
+        begin
+          if NEW.id = '${f.run.id}'::uuid and NEW.status = 'queued' and OLD.error_code = 'configuration_superseded' then
+            raise exception 'retry requeue transaction' using errcode = '40001';
+          end if;
+          return NEW;
+        end $$`));
+      await db.execute(sql`create trigger v6_requeue_unavailable before update on heartbeat_runs for each row execute function v6_requeue_unavailable()`);
+      for (let attempt = 0; attempt < 3; attempt++) {
+        await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(0) }).where(eq(heartbeatRuns.id, f.run.id));
+        await recover();
+        const pending = await heartbeat.getRun(f.run.id);
+        expect(pending?.status).toBe("scheduled_retry");
+        expect(pending?.resultJson?.configurationSupersession).not.toHaveProperty("recoveryAttempts");
+      }
+      expect(resumed).toBe(0);
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(0);
+      await db.execute(sql`drop trigger v6_requeue_unavailable on heartbeat_runs`);
+      await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(0) }).where(eq(heartbeatRuns.id, f.run.id));
+      await recover();
+      expect(resumed).toBe(1);
+      expect(await heartbeat.getRun(f.run.id)).toMatchObject({ status: "queued", resultJson: { configurationSupersession: { state: "ready" } } });
+    } finally {
+      await db.execute(sql`drop trigger if exists v6_requeue_unavailable on heartbeat_runs`);
+      await db.execute(sql`drop function if exists v6_requeue_unavailable()`);
+      await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, f.run.id));
+    }
+  });
+
+  it("v6 simultaneous recovery passes claim only one due interval", async () => {
+    const f = await seedPendingConfiguration();
+    let cleanups = 0;
+    const recover = () => configurationSupersession.recoverConfigurationSupersessions(db, {
+      runIds: [f.run.id], isExecuting: () => false,
+      cleanup: async () => { cleanups++; throw new Error("cleanup still pending"); }, resume: async () => {},
+    });
+    try {
+      await Promise.all([recover(), recover(), recover()]);
+      expect(cleanups).toBe(1);
+      const pending = await heartbeat.getRun(f.run.id);
+      expect(pending).toMatchObject({ status: "scheduled_retry", resultJson: { configurationSupersession: { recoveryAttempts: 1 } } });
+      expect(pending!.scheduledRetryAt!.getTime()).toBeGreaterThan(Date.now());
+    } finally { await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, f.run.id)); }
+  });
+
+  it.each(["issue", "run"] as const)("v6 real terminal callback preserves a live successor of the same agent (responsible person from %s)", async responsibleSource => {
+    const f = await seedPendingConfiguration();
+    const [successor] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running",
+      nativeIssueId: f.issueId, contextSnapshot: { issueId: f.issueId } }).returning();
+    await db.update(agents).set({ status: "running" }).where(eq(agents.id, f.agentId));
+    await db.update(issues).set({ executionRunId: successor.id, status: "in_progress",
+      ...(responsibleSource === "run" ? { responsibleUserId: null } : {}),
+    }).where(eq(issues.id, f.issueId));
+    try {
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(0) }).where(eq(heartbeatRuns.id, f.run.id));
+        // Public entry point: actual cleanup, finalizeAgentStatus and issue
+        // release/promotion; no substituted terminal callback.
+        await heartbeat.promoteDueScheduledRetries();
+        expect((await heartbeat.getRun(f.run.id))?.resultJson?.configurationSupersession).toMatchObject({ recoveryAttempts: attempt });
+      }
+      expect(await heartbeat.getRun(f.run.id)).toMatchObject({ status: "failed", errorCode: "configuration_incomplete" });
+      expect(await heartbeat.getRun(successor.id)).toMatchObject({ status: "running", errorCode: null });
+      const [agent] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+      expect(agent.status).toBe("running");
+      const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+      expect(issue).toMatchObject({ executionRunId: successor.id, status: "in_progress" });
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+      expect(comments).toHaveLength(1);
+      expect(comments[0].body).toContain("Owner: Session owner; Agent: Session reader.");
+      expect(comments[0].body).not.toContain(f.userId); expect(comments[0].body).not.toContain(f.agentId);
+    } finally { await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.companyId, f.companyId)); }
+  });
+
+  // Real PG writes after value resolution must not retire an unchanged launch.
+  // Provider I/O alone is substituted, as in the existing preparation-window rows.
+  it.each([
+    "environment status", "environment metadata", "environment probe proof", "environment RPC timeout",
+    "project workspace sync", "project budget pause/release", "project git authorization", "project repository replace", "environment status PATCH",
+    "environment identical save", "project identical save", "user declaration identical save", "secret display name", "pinned secret rotation",
+  ] as const)("preparation content: %s does not supersede unchanged inputs", async change => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "preparing-content-"));
+    const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    const previousKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = join(cwd, "master.key");
+    registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
+    const [environment] = await db.select().from(environments).where(eq(environments.driver, "local"));
+    let pause: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const secrets = secretService(db), value = randomUUID();
+      const secret = await secrets.create(f.companyId, { name: "Content fixture", key: "CONTENT_FIXTURE", provider: "local_encrypted", value });
+      const app = express(); app.use(express.json());
+      app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: f.userId }; next(); });
+      app.use("/api", environmentRoutes(db)); app.use("/api", projectRoutes(db)); app.use(errorHandler);
+      if (change === "user declaration identical save") {
+        await secrets.createUserSecretDefinition(f.companyId, { key: "user_content_fixture", name: "User content fixture", provider: "local_encrypted" });
+        await secrets.createCurrentUserSecretValue(f.companyId, f.userId, { definitionKey: "user_content_fixture", value: randomUUID() });
+      }
+      const version = change === "pinned secret rotation" ? 1 : "latest";
+      const envVars = { CONTENT_FIXTURE: { type: "secret_ref", secretId: secret.id, version }, CONTEXT_NOTE: "unchanged",
+        ...(change === "user declaration identical save" ? { USER_CONTENT_FIXTURE: { type: "user_secret_ref", key: "user_content_fixture", version: "latest" } } : {}),
+      };
+      expect((await request(app).patch(`/api/environments/${environment.id}?companyId=${f.companyId}`).send({ envVars })).status).toBe(200);
+      const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Content project" }).returning();
+      const projectEnv = { PROJECT_FIXTURE: { type: "secret_ref", secretId: secret.id, version } };
+      expect((await request(app).patch(`/api/projects/${project.id}`).send({ env: projectEnv })).status).toBe(200);
+      await db.update(issues).set({ projectId: project.id }).where(eq(issues.id, f.issueId));
+      await db.update(agents).set({ adapterType: "paperclip_runner", defaultEnvironmentId: environment.id,
+        adapterConfig: { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", cwd } }).where(eq(agents.id, f.agentId));
+      const prepare = executionConfiguration.prepareHeartbeatExecutionConfiguration;
+      let preparations = 0;
+      pause = vi.spyOn(executionConfiguration, "prepareHeartbeatExecutionConfiguration").mockImplementation(async (...args) => {
+        const result = await prepare(...args);
+        preparations++;
+        if (preparations !== 1) return result;
+        expect(result.prepared).toBe(true);
+        if (change === "environment status") await db.update(environments).set({ status: "active", updatedAt: new Date() }).where(eq(environments.id, environment.id));
+        else if (change === "environment metadata" || change === "environment probe proof") await db.update(environments).set({
+          metadata: { ...environment.metadata, ...(change === "environment metadata" ? { displayNote: "changed" } : { [SANDBOX_PLATFORM_PROBE_METADATA_KEY]: { [f.companyId]: { v: 2, testedAt: new Date().toISOString() } } }) }, updatedAt: new Date(),
+        }).where(eq(environments.id, environment.id));
+        else if (change === "environment RPC timeout") await db.update(environments).set({ config: { ...environment.config, timeoutMs: 123456 }, updatedAt: new Date() }).where(eq(environments.id, environment.id));
+        else if (change === "environment status PATCH") {
+          expect((await request(app).patch(`/api/environments/${environment.id}?companyId=${f.companyId}`).send({ status: "active" })).status).toBe(200);
+        }
+        else if (change === "project repository replace") expect(await projectService(db).replaceRepositories(project.id, [])).not.toBeNull();
+        else if (change === "project workspace sync") await db.update(projects).set({ updatedAt: new Date() }).where(eq(projects.id, project.id));
+        else if (change === "project budget pause/release") {
+          // Both budget-owned writes commit while preparation is in flight.
+          // Release the budget hold before dispatch; this is not a budget bypass.
+          await db.update(projects).set({ pauseReason: "budget", pausedAt: new Date(), updatedAt: new Date() }).where(eq(projects.id, project.id));
+          await db.update(projects).set({ pauseReason: null, pausedAt: null, updatedAt: new Date() }).where(eq(projects.id, project.id));
+        } else if (change === "project git authorization") await projectGitAuthorizationService(db).set(f.companyId, project.id, f.userId, null);
+        else if (change === "secret display name") await secrets.update(secret.id, { name: "Renamed content fixture" });
+        else if (change === "pinned secret rotation") await secrets.rotate(secret.id, { value: randomUUID() });
+        else if (change === "user declaration identical save") {
+          const [before] = await db.select().from(userSecretDeclarations).where(eq(userSecretDeclarations.companyId, f.companyId));
+          expect((await request(app).patch(`/api/environments/${environment.id}?companyId=${f.companyId}`).send({ envVars })).status).toBe(200);
+          const [after] = await db.select().from(userSecretDeclarations).where(eq(userSecretDeclarations.companyId, f.companyId));
+          expect(after.id).not.toBe(before.id);
+        }
+        else {
+          const targetId = change === "environment identical save" ? environment.id : project.id;
+          const before = await db.select().from(companySecretBindings).where(and(eq(companySecretBindings.companyId, f.companyId), eq(companySecretBindings.targetId, targetId)));
+          const response = change === "environment identical save"
+            ? await request(app).patch(`/api/environments/${environment.id}?companyId=${f.companyId}`).send({ envVars })
+            : await request(app).patch(`/api/projects/${project.id}`).send({ env: projectEnv });
+          expect(response.status).toBe(200);
+          const after = await db.select().from(companySecretBindings).where(and(eq(companySecretBindings.companyId, f.companyId), eq(companySecretBindings.targetId, targetId)));
+          expect(after).toHaveLength(1);
+          expect(after[0].id).not.toBe(before[0].id);
+        }
+        return result;
+      });
+      const next = await execute(f);
+      expect(preparations, "unchanged content must not cause another preparation").toBe(1);
+      expect(next.finished.resultJson?.configurationSupersession).toBeUndefined();
+      expect(dispatchCounts.get(next.finished.id)).toBe(1);
+      const delivered = next.input.config.env as Record<string, unknown>;
+      expect(delivered.CONTENT_FIXTURE === value && delivered.PROJECT_FIXTURE === value).toBe(true);
+      const [reads] = await db.execute(sql`select count(*)::int as n from secret_access_events
+        where heartbeat_run_id = ${next.finished.id} and secret_id = ${secret.id} and outcome = 'success'`);
+      expect(reads.n, "one resolve per admitted binding, not another preparation or freshness resolve").toBe(2);
+      expect(await db.execute(sql`select status from configuration_status_probe where issue_id = ${f.issueId} and status = 'blocked'`)).toHaveLength(0);
+    } finally {
+      await heartbeat.drainActiveRunExecutions(); pause?.mockRestore();
+      await db.update(environments).set({ envVars: environment.envVars, config: environment.config, status: environment.status, metadata: environment.metadata }).where(eq(environments.id, environment.id));
+      await db.delete(companySecretBindings).where(eq(companySecretBindings.companyId, f.companyId));
+      if (previousKey === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE; else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKey;
+      mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { target: "environment", changed: false }, { target: "project", changed: false },
+    { target: "environment", changed: true }, { target: "project", changed: true },
+    { target: "agent", changed: false }, { target: "issue", changed: false }, { target: "routine", changed: false },
+    { target: "agent", changed: true }, { target: "issue", changed: true }, { target: "routine", changed: true },
+  ] as const)("preparation content fence: open $target write waits for its row lock, changed=$changed", async ({ target, changed }) => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "content-share-fence-"));
+    const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
+    const [environment] = await db.select().from(environments).where(eq(environments.driver, "local"));
+    let commit: (() => void) | undefined, writer: Promise<void> | undefined;
+    let pause: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Open content write", env: { PROJECT_NOTE: "old" } }).returning();
+      const routine = target === "routine" ? await routineService(db).create(f.companyId, createRoutineSchema.parse({
+        title: "Open routine content write", assigneeAgentId: f.agentId, env: { CONTEXT_NOTE: "old" },
+      }), { userId: f.userId }) : null;
+      await db.update(issues).set({ projectId: project.id,
+        ...(target === "issue" ? { assigneeAdapterOverrides: { adapterConfig: { env: { CONTEXT_NOTE: { type: "plain", value: "old" } } } } } : {}),
+        ...(routine ? { originKind: "routine_execution", originId: routine.id } : {}),
+      }).where(eq(issues.id, f.issueId));
+      await db.update(environments).set({ envVars: { ENV_NOTE: "old" } }).where(eq(environments.id, environment.id));
+      await db.update(agents).set({ adapterType: "paperclip_runner", defaultEnvironmentId: environment.id,
+        adapterConfig: { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", cwd,
+          ...(target === "agent" ? { env: { CONTEXT_NOTE: { type: "plain", value: "old" } } } : {}),
+        } }).where(eq(agents.id, f.agentId));
+      const prepare = executionConfiguration.prepareHeartbeatExecutionConfiguration;
+      let preparations = 0;
+      const gate = new Promise<void>(resolve => { commit = resolve; });
+      pause = vi.spyOn(executionConfiguration, "prepareHeartbeatExecutionConfiguration").mockImplementation(async (...args) => {
+        const result = await prepare(...args);
+        if (++preparations === 1 && result.prepared) {
+          const assertCurrent = result.assertConfigurationCurrent;
+          result.assertConfigurationCurrent = async (transaction, ownershipIssueId, lockIssue) => {
+            // Start at the final fence: earlier workspace preparation also
+            // locks the environment, and is not the SHARE boundary under test.
+            let written = false;
+            writer = db.transaction(async tx => {
+              if (target === "environment") await tx.update(environments).set(changed ? { envVars: { ENV_NOTE: "current" } }
+                : { metadata: { [SANDBOX_PLATFORM_PROBE_METADATA_KEY]: { [f.companyId]: { v: 2 } } }, updatedAt: new Date() }).where(eq(environments.id, environment.id));
+              else if (target === "project") await tx.update(projects).set(changed ? { env: { PROJECT_NOTE: "current" } }
+                : { updatedAt: new Date() }).where(eq(projects.id, project.id));
+              else if (target === "agent") await tx.update(agents).set(changed ? {
+                adapterConfig: { ...args[1].agent.adapterConfig, env: { CONTEXT_NOTE: { type: "plain", value: "current" } } },
+              } : { updatedAt: new Date() }).where(eq(agents.id, f.agentId));
+              else if (target === "issue") await tx.update(issues).set(changed ? {
+                assigneeAdapterOverrides: { adapterConfig: { env: { CONTEXT_NOTE: { type: "plain", value: "current" } } } },
+              } : { updatedAt: new Date() }).where(eq(issues.id, f.issueId));
+              else await tx.update(routines).set(changed ? { env: { CONTEXT_NOTE: "current" } }
+                : { updatedAt: new Date() }).where(eq(routines.id, routine!.id));
+              written = true; await gate;
+            });
+            await vi.waitFor(() => expect(written).toBe(true), { timeout: 10_000 });
+            return assertCurrent(transaction, ownershipIssueId, lockIssue);
+          };
+        }
+        return result;
+      });
+      const starting = await heartbeat.wakeup(f.agentId, { source: "on_demand", triggerDetail: "manual", reason: "manual",
+        payload: { issueId: f.issueId }, contextSnapshot: { issueId: f.issueId } });
+      await vi.waitFor(async () => {
+        const waiting = await db.execute(sql`select pid from pg_stat_activity where datname = current_database()
+          and wait_event_type = 'Lock' and query ilike ${`%"${{ environment: "environments", project: "projects", agent: "agents", issue: "issues", routine: "routines" }[target]}"%`} and query ilike '%for share%'`);
+        expect(waiting.length).toBeGreaterThan(0);
+      }, { timeout: 15_000 });
+      expect(captured.has(starting!.id)).toBe(false);
+      commit!(); await writer; await heartbeat.drainActiveRunExecutions();
+      const finished = await heartbeat.getRun(starting!.id);
+      expect(finished?.status, finished?.error ?? undefined).toBe("succeeded");
+      expect(preparations).toBe(changed ? 2 : 1);
+      if (changed) expect(finished?.resultJson?.configurationSupersession).toMatchObject({ attempt: 1 });
+      else expect(finished?.resultJson?.configurationSupersession).toBeUndefined();
+      expect(dispatchCounts.get(starting!.id)).toBe(1);
+      const env = captured.get(starting!.id)!.config.env as Record<string, unknown>;
+      expect(env[target === "environment" ? "ENV_NOTE" : target === "project" ? "PROJECT_NOTE" : "CONTEXT_NOTE"]).toBe(changed ? "current" : "old");
+    } finally {
+      commit?.(); await writer?.catch(() => {}); await heartbeat.drainActiveRunExecutions(); pause?.mockRestore();
+      await db.update(environments).set({ envVars: environment.envVars, metadata: environment.metadata }).where(eq(environments.id, environment.id));
+      mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("preparation content fence: concurrent dispatch transactions on one issue wait without a lock-upgrade deadlock", async () => {
+    const f = await seed();
+    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    const snapshot = await readExecutionConfigurationRows(db, {
+      companyId: f.companyId, environmentId: null, projectId: null,
+      plainSources: { agentId: f.agentId, agentEnv: null, agentDefaultEnvironmentId: null, issue, liveRoutine: null },
+    });
+    let releaseFirst!: () => void;
+    const gate = new Promise<void>(resolve => { releaseFirst = resolve; });
+    let firstPid = 0, secondPid = 0;
+    const ownershipOrder: number[] = [];
+    const dispatch = (index: number) => db.transaction(async tx => {
+      const [backend] = await tx.execute(sql`select pg_backend_pid() as pid`);
+      if (index === 1) firstPid = Number(backend.pid); else secondPid = Number(backend.pid);
+      await assertExecutionConfigurationCurrent(tx as unknown as typeof db, snapshot, [], 0, f.issueId, async () => {
+        await tx.select({ id: issues.id }).from(issues)
+          .where(and(eq(issues.id, f.issueId), eq(issues.companyId, f.companyId))).for("update");
+      });
+      if (index === 1) await gate;
+      ownershipOrder.push(index);
+    });
+    const first = dispatch(1);
+    let second: Promise<void> | undefined;
+    // Observe rejections immediately, but retain the original promises below.
+    void first.catch(() => {});
+    try {
+      await vi.waitFor(async () => {
+        const waiting = await db.execute(sql`select 1 from pg_stat_activity where pid = ${firstPid}
+          and state = 'idle in transaction' and query ilike '%"agents"%';`);
+        expect(waiting).toHaveLength(1);
+      }, { timeout: 10_000 });
+      second = dispatch(2);
+      void second.catch(() => {});
+      await vi.waitFor(async () => {
+        const waiting = await db.execute(sql`select 1 from pg_stat_activity where pid = ${secondPid}
+          and wait_event_type = 'Lock' and ${firstPid} = any(pg_blocking_pids(pid))
+          and query ilike '%"issues"%for%';`);
+        expect(waiting).toHaveLength(1);
+      }, { timeout: 10_000 });
+      expect(ownershipOrder).toEqual([]);
+      releaseFirst();
+      // No retry or swallowed error: a PostgreSQL 40P01 fails this assertion.
+      await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined]);
+      expect(ownershipOrder).toEqual([1, 2]);
+    } finally {
+      releaseFirst();
+      await Promise.allSettled([first, ...(second ? [second] : [])]);
+    }
+  });
+
+  it.each(["image", "futureDriverInput"])("preparation config content: kept %s changes supersede", async key => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "preparing-config-content-"));
+    const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
+    const [environment] = await db.select().from(environments).where(eq(environments.driver, "local"));
+    let pause: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      await db.update(agents).set({ adapterType: "paperclip_runner", defaultEnvironmentId: environment.id,
+        adapterConfig: { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", cwd } }).where(eq(agents.id, f.agentId));
+      const prepare = executionConfiguration.prepareHeartbeatExecutionConfiguration;
+      let preparations = 0;
+      pause = vi.spyOn(executionConfiguration, "prepareHeartbeatExecutionConfiguration").mockImplementation(async (...args) => {
+        const result = await prepare(...args);
+        if (++preparations === 1) await db.update(environments).set({ config: { ...environment.config, [key]: "current" } }).where(eq(environments.id, environment.id));
+        return result;
+      });
+      const next = await execute(f);
+      expect(preparations).toBe(2);
+      expect(next.finished.resultJson?.configurationSupersession).toMatchObject({ attempt: 1 });
+      expect(dispatchCounts.get(next.finished.id)).toBe(1);
+    } finally {
+      await heartbeat.drainActiveRunExecutions(); pause?.mockRestore();
+      await db.update(environments).set({ config: environment.config }).where(eq(environments.id, environment.id));
+      mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  // Pause the assembled heartbeat AFTER old-value resolution, before snapshot publication.
+  // The adapter substitutes provider I/O only; admission, resolution, save and follow-up are real.
+  it.each([
+    { change: "plain", conversation: false, recovery: "none" }, { change: "rotation", conversation: false, recovery: "none" },
+    { change: "plain", conversation: true, recovery: "none" }, { change: "rotation", conversation: true, recovery: "none" },
+    { change: "open rotation", conversation: true, recovery: "none" },
+    { change: "rotation", conversation: true, recovery: "reaper" },
+    { change: "rotation", conversation: true, recovery: "restart" },
+  ] as const)("preparation window: $change automatically supersedes the SAME wake (chat=$conversation, recovery=$recovery)", async ({ change, conversation, recovery }) => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "preparing-env-save-"));
+    let mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    const previousKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = join(cwd, "master.key");
+    registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
+    const [environment] = await db.select().from(environments).where(eq(environments.driver, "local"));
+    let resume: (() => void) | undefined;
+    let pause: ReturnType<typeof vi.spyOn> | undefined;
+    let providerGuard: ReturnType<typeof vi.spyOn> | undefined;
+    let fencePause: ReturnType<typeof vi.spyOn> | undefined;
+    let finishRotation: (() => void) | undefined;
+    let rotation: Promise<unknown> | undefined;
+    let requeuePause: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const secrets = secretService(db), previousValue = randomUUID(), currentValue = randomUUID();
+      const secret = await secrets.create(f.companyId, { name: "Preparing revision", key: "PREPARING_REVISION", provider: "local_encrypted", value: previousValue });
+      await db.update(agents).set({ adapterType: "paperclip_runner", defaultEnvironmentId: environment.id,
+        adapterConfig: { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", cwd } }).where(eq(agents.id, f.agentId));
+      if (conversation) await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: f.userId, conversationState: "active" }).where(eq(issues.id, f.issueId));
+      const app = express(); app.use(express.json());
+      app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: f.userId }; next(); });
+      app.use("/api", environmentRoutes(db)); app.use(errorHandler);
+      const envVars = { CONTEXT_NOTE: "old", PREPARING_REVISION: { type: "secret_ref", secretId: secret.id, version: "latest" } };
+      expect((await request(app).patch(`/api/environments/${environment.id}?companyId=${f.companyId}`).send({ envVars })).status).toBe(200);
+      const first = await execute(f);
+      // The stale attempt takes REAL native selection. Only the automatically
+      // re-prepared attempt substitutes provider I/O via the fixture adapter.
+      mode.mockRestore();
+      const resolveMode = nativeRuntimeMode.resolveHeartbeatNativeRuntimeMode;
+      mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockImplementationOnce(resolveMode).mockReturnValue({
+        kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+      providerGuard = vi.spyOn(nativeExecutor, "executePaperclipNativeSession").mockImplementation(async () => {
+        throw new Error("stale provider dispatch reached");
+      });
+      let didResolve = false;
+      const gate = new Promise<void>(resolve => { resume = resolve; });
+      const prepare = executionConfiguration.prepareHeartbeatExecutionConfiguration;
+      pause = vi.spyOn(executionConfiguration, "prepareHeartbeatExecutionConfiguration").mockImplementationOnce(async (...args) => {
+        const result = await prepare(...args);
+        expect(result.prepared).toBe(true);
+        if (result.prepared) expect(result.configuredTaskEnvironment.PREPARING_REVISION === previousValue).toBe(true);
+        didResolve = true; await gate; return result;
+      });
+      await db.update(issues).set({ status: "todo", ...(conversation ? { conversationState: "active" as const } : {}) }).where(eq(issues.id, f.issueId));
+      const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+        authorUserId: f.userId, authorType: "user", body: "Use the current configuration for this same message." }).returning();
+      const starting = await heartbeat.wakeup(f.agentId, { source: "on_demand", triggerDetail: "manual", reason: "manual",
+        payload: { issueId: f.issueId, commentId: comment.id }, contextSnapshot: { issueId: f.issueId, queuedCommentIds: [comment.id] } });
+      await vi.waitFor(() => expect(didResolve).toBe(true), { timeout: 10_000 });
+      const [wakeBefore] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, starting!.wakeupRequestId!));
+      const preparing = await heartbeat.getRun(starting!.id);
+      expect(preparing?.status).toBe("running");
+      expect(preparing?.contextSnapshot?.paperclipEnvironment).toBeUndefined();
+      expect(preparing?.contextSnapshot?.paperclipSecretIdentity).toEqual({ responsibleUserId: f.userId });
+      if (change === "plain") expect((await request(app).patch(`/api/environments/${environment.id}?companyId=${f.companyId}`)
+        .send({ envVars: { ...envVars, CONTEXT_NOTE: "current" } })).status).toBe(200);
+      else if (change === "rotation") await secrets.rotate(secret.id, { value: currentValue });
+      else {
+        let rotationAtFence = false;
+        const holdRotation = new Promise<void>(resolve => { finishRotation = resolve; });
+        const fence = heldConfiguration.requestHeldNativeConfigurationEndForTargets;
+        fencePause = vi.spyOn(heldConfiguration, "requestHeldNativeConfigurationEndForTargets").mockImplementationOnce(async (...args) => {
+          await fence(...args); rotationAtFence = true; await holdRotation;
+        });
+        rotation = secrets.rotate(secret.id, { value: currentValue });
+        await vi.waitFor(() => expect(rotationAtFence).toBe(true), { timeout: 10_000 });
+        resume!();
+        // Deterministic PG schedule: the rotation already scanned consumers
+        // while the run was legacy, but has NOT committed. The dispatch query
+        // must be waiting on that transaction, not launching the old secret.
+        await vi.waitFor(async () => {
+          const waiting = await db.execute(sql`select pid from pg_stat_activity where datname = current_database()
+            and wait_event_type = 'Lock' and query ilike '%company_secrets%' and query ilike '%for share%'`);
+          expect(waiting.length).toBeGreaterThan(0);
+        }, { timeout: 15_000 });
+        expect(providerGuard).not.toHaveBeenCalled();
+        expect(captured.has(starting!.id)).toBe(false);
+        finishRotation!(); await rotation;
+      }
+      if (recovery !== "none") requeuePause = vi.spyOn(configurationSupersession, "requeueConfigurationSupersession").mockResolvedValueOnce(false);
+      resume!(); await heartbeat.drainActiveRunExecutions();
+      if (recovery !== "none") {
+        const pending = await heartbeat.getRun(starting!.id);
+        expect(pending?.status).toBe("scheduled_retry");
+        expect(pending?.resultJson?.configurationSupersession).toMatchObject({ attempt: 1, state: "cleanup_pending" });
+        expect(captured.has(starting!.id)).toBe(false);
+        expect(await db.execute(sql`select run_id from native_run_finalizations where run_id = ${starting!.id}`)).toHaveLength(0);
+        requeuePause!.mockRestore();
+        await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(0) }).where(eq(heartbeatRuns.id, starting!.id));
+        if (recovery === "restart") {
+          // The exact recorded controller really exits in this PID space.
+          // No fake liveness verdict and no elapsed-lease ownership guess.
+          const child = spawn(process.execPath, ["-e", "process.exit(0)"]);
+          const pid = child.pid!;
+          await new Promise<void>((resolve, reject) => { child.once("error", reject); child.once("exit", code => code === 0 ? resolve() : reject(new Error("controller fixture failed"))); });
+          const oldBoot = randomUUID(), controller = { ...await currentControllerProcess(), bootId: oldBoot, pid, processStartedAt: null };
+          await db.update(heartbeatRuns).set({ resultJson: { ...pending!.resultJson,
+            configurationSupersession: { ...(pending!.resultJson!.configurationSupersession as object), controllerBootId: oldBoot, controllerProcess: controller } } }).where(eq(heartbeatRuns.id, starting!.id));
+          await heartbeat.recoverNativeRunsAfterRestart(new Date(), [starting!.id], { skipDelegatedWork: true });
+        } else await heartbeat.promoteDueScheduledRetries();
+        await heartbeat.drainActiveRunExecutions();
+      }
+      const finished = await heartbeat.getRun(starting!.id);
+      expect(providerGuard).not.toHaveBeenCalled();
+      expect(finished?.status, finished?.error ?? undefined).toBe("succeeded");
+      expect(finished?.resultJson?.configurationSupersession).toMatchObject({ attempt: 1 });
+      expect(dispatchCounts.get(starting!.id), "exactly one paid/provider dispatch for this wake").toBe(1);
+      const reservations = await db.execute(sql`select id from budget_reservations where run_id = ${starting!.id}`);
+      expect(reservations).toHaveLength(1);
+      expect(finished?.resultJson?.configurationSupersession).toMatchObject({ reservationId: reservations[0].id });
+      expect(finished?.sessionIdBefore).toBe(first.finished.sessionIdAfter);
+      const next = captured.get(starting!.id)!;
+      expect(next.runtime.sessionId).toBe("saved-session");
+      expect((next.config.env as Record<string, unknown>).CONTEXT_NOTE).toBe(change === "plain" ? "current" : "old");
+      expect((next.config.env as Record<string, unknown>).PREPARING_REVISION === (change !== "plain" ? currentValue : previousValue)).toBe(true);
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, starting!.wakeupRequestId!));
+      expect(runs.map(row => row.id)).toEqual([starting!.id]);
+      const [wakeAfter] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, starting!.wakeupRequestId!));
+      expect(wakeAfter.runId).toBe(starting!.id);
+      expect(wakeAfter.payload).toEqual(wakeBefore.payload);
+      expect(wakeAfter.claimedAt).toEqual(wakeBefore.claimedAt);
+      expect(finished?.contextSnapshot?.queuedCommentIds).toEqual([comment.id]);
+      expect(finished?.contextSnapshot?.firstTurnQueuedInput).toBeUndefined();
+      const [reads] = await db.execute(sql`select count(*)::int as n from secret_access_events
+        where heartbeat_run_id = ${starting!.id} and secret_id = ${secret.id} and outcome = 'success'`);
+      expect(reads.n, "one provider resolve per preparation, never a freshness re-resolve").toBe(2);
+      expect(await db.execute(sql`select status from configuration_status_probe where issue_id = ${f.issueId} and status = 'blocked'`)).toHaveLength(0);
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+      expect(comments.some(row => row.body.includes("a secret it needs is not set"))).toBe(false);
+      expect(comments.find(row => row.id === comment.id)).toEqual(comment);
+    } finally {
+      finishRotation?.(); resume?.(); await rotation?.catch(() => {}); await heartbeat.drainActiveRunExecutions();
+      fencePause?.mockRestore(); pause?.mockRestore(); providerGuard?.mockRestore(); requeuePause?.mockRestore();
+      await db.update(environments).set({ envVars: environment.envVars }).where(eq(environments.id, environment.id));
+      await db.delete(companySecretBindings).where(eq(companySecretBindings.companyId, f.companyId));
+      if (previousKey === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE; else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKey;
+      mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["missing", "revoked"] as const)("pre-launch genuine %s secret remains a configuration blocker", async failure => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "configuration-blocker-"));
+    const previousKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = join(cwd, "master.key");
+    const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
+    const [environment] = await db.select().from(environments).where(eq(environments.driver, "local"));
+    let preparation: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const secrets = secretService(db);
+      const secret = await secrets.create(f.companyId, { name: "Required fixture", key: "REQUIRED_FIXTURE", provider: "local_encrypted", value: randomUUID() });
+      await db.update(agents).set({ adapterType: "paperclip_runner", defaultEnvironmentId: environment.id,
+        adapterConfig: { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", cwd } }).where(eq(agents.id, f.agentId));
+      const app = express(); app.use(express.json());
+      app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: f.userId }; next(); });
+      app.use("/api", environmentRoutes(db)); app.use(errorHandler);
+      expect((await request(app).patch(`/api/environments/${environment.id}?companyId=${f.companyId}`)
+        .send({ envVars: { REQUIRED_FIXTURE: { type: "secret_ref", secretId: secret.id, version: "latest" } } })).status).toBe(200);
+      if (failure === "missing") await db.delete(companySecretBindings).where(eq(companySecretBindings.secretId, secret.id));
+      else {
+        const prepare = executionConfiguration.prepareHeartbeatExecutionConfiguration;
+        preparation = vi.spyOn(executionConfiguration, "prepareHeartbeatExecutionConfiguration").mockImplementationOnce(async (...args) => {
+          const result = await prepare(...args);
+          await secrets.update(secret.id, { status: "disabled" });
+          return result;
+        });
+      }
+      const starting = await heartbeat.wakeup(f.agentId, { source: "on_demand", triggerDetail: "manual", reason: "manual",
+        payload: { issueId: f.issueId }, contextSnapshot: { issueId: f.issueId } });
+      await heartbeat.drainActiveRunExecutions();
+      const finished = await heartbeat.getRun(starting!.id);
+      expect(finished).toMatchObject({ status: "failed", errorCode: "configuration_incomplete", resultJson: {
+        configurationIncomplete: { reason: failure === "missing" ? "secret_binding_missing" : "secret_inactive" },
+      } });
+      expect(captured.has(starting!.id)).toBe(false);
+      expect(finished?.resultJson?.configurationSupersession).toBeUndefined();
+      const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+      expect(issue.status).toBe("blocked");
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+      expect(comments.some(row => row.body.includes(failure === "missing" ? "a secret it needs is not set" : "removed or revoked"))).toBe(true);
+    } finally {
+      await heartbeat.drainActiveRunExecutions(); preparation?.mockRestore();
+      await db.update(environments).set({ envVars: environment.envVars }).where(eq(environments.id, environment.id));
+      await db.delete(companySecretBindings).where(eq(companySecretBindings.companyId, f.companyId));
+      if (previousKey === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE; else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKey;
+      mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("preparation churn is bounded to three SAME-wake supersessions and reports the true blocker", async () => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "configuration-churn-"));
+    const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
+    const [environment] = await db.select().from(environments).where(eq(environments.driver, "local"));
+    let preparation: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      await db.update(agents).set({ adapterType: "paperclip_runner", defaultEnvironmentId: environment.id,
+        adapterConfig: { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", cwd } }).where(eq(agents.id, f.agentId));
+      const app = express(); app.use(express.json());
+      app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: f.userId }; next(); });
+      app.use("/api", environmentRoutes(db)); app.use(errorHandler);
+      const prepare = executionConfiguration.prepareHeartbeatExecutionConfiguration;
+      let revisions = 0;
+      preparation = vi.spyOn(executionConfiguration, "prepareHeartbeatExecutionConfiguration").mockImplementation(async (...args) => {
+        const result = await prepare(...args);
+        expect((await request(app).patch(`/api/environments/${environment.id}?companyId=${f.companyId}`)
+          .send({ envVars: { REVISION: String(++revisions) } })).status).toBe(200);
+        return result;
+      });
+      const starting = await heartbeat.wakeup(f.agentId, { source: "on_demand", triggerDetail: "manual", reason: "manual",
+        payload: { issueId: f.issueId }, contextSnapshot: { issueId: f.issueId } });
+      await heartbeat.drainActiveRunExecutions();
+      const finished = await heartbeat.getRun(starting!.id);
+      expect(finished).toMatchObject({ status: "failed", errorCode: "configuration_incomplete", resultJson: {
+        configurationIncomplete: { reason: "configuration_churn", supersessions: 3 }, configurationSupersession: { attempt: 3 },
+      } });
+      expect(revisions).toBe(4);
+      expect(captured.has(starting!.id)).toBe(false);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, starting!.wakeupRequestId!))).toHaveLength(1);
+      const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+      expect(issue.status).toBe("blocked");
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+      expect(comments.some(row => row.body.includes("three automatic retries"))).toBe(true);
+      expect(comments.some(row => row.body.includes("a secret it needs is not set"))).toBe(false);
+    } finally {
+      await heartbeat.drainActiveRunExecutions(); preparation?.mockRestore();
+      await db.update(environments).set({ envVars: environment.envVars }).where(eq(environments.id, environment.id));
+      mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["ownership moved", "coordinator exists", "cleanup fails", "person owns"] as const)("steer recovery: %s stops after three failures with a named owner", async cause => {
+    const f = await seed();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", nativeIssueId: f.issueId,
+      controllerBootId: currentControllerBootId(), contextSnapshot: { issueId: f.issueId }, responsibleUserId: f.userId }).returning();
+    await db.update(issues).set({ executionRunId: run.id, ...(cause === "person owns" ? { assigneeAgentId: null, assigneeUserId: f.userId } : {}) }).where(eq(issues.id, f.issueId));
+    expect(await configurationSupersession.parkConfigurationSupersession(db, run)).toBe(true);
+    let successor: string | null = null;
+    if (cause === "ownership moved") {
+      const [next] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", contextSnapshot: { issueId: f.issueId } }).returning();
+      successor = next.id;
+      await db.update(issues).set({ executionRunId: successor }).where(eq(issues.id, f.issueId));
+    } else if (cause === "coordinator exists") await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: run.id, phase: "observed" });
+    let resumed = 0, terminal = 0;
+    const recover = () => configurationSupersession.recoverConfigurationSupersessions(db, {
+      runIds: [run.id], isExecuting: () => false,
+      cleanup: async () => { if (cause === "cleanup fails" || cause === "person owns") throw new Error("private fixture diagnostic"); },
+      resume: async () => { resumed++; }, terminal: async () => { terminal++; },
+    });
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(0) }).where(eq(heartbeatRuns.id, run.id));
+      await recover();
+      const current = await heartbeat.getRun(run.id);
+      expect(current?.resultJson?.configurationSupersession).toMatchObject({ recoveryAttempts: attempt });
+      expect(current?.status).toBe(attempt === 3 ? "failed" : "scheduled_retry");
+    }
+    await recover();
+    const final = await heartbeat.getRun(run.id);
+    expect(final).toMatchObject({ status: "failed", errorCode: "configuration_incomplete", scheduledRetryAt: null, scheduledRetryReason: null,
+      resultJson: { configurationIncomplete: { reason: "configuration_recovery_stalled" }, configurationSupersession: { state: "recovery_exhausted", recoveryAttempts: 3 } } });
+    expect(resumed).toBe(0); expect(terminal).toBe(1); expect(captured.has(run.id)).toBe(false);
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0].body).toContain("Owner: Session owner; Agent: Session reader.");
+    expect(comments[0].body).not.toContain(f.userId);
+    expect(comments[0].body).not.toContain(f.agentId);
+    expect(comments[0].body).toContain("three recovery attempts");
+    expect(comments[0].body).not.toContain("private fixture diagnostic");
+    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    expect(issue.executionRunId).toBe(successor);
+    if (cause === "coordinator exists") expect(await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, run.id))).toHaveLength(1);
+  });
+
+  it("steer refused park has a truthful configuration outcome, never a promised retry", async () => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "configuration-refused-"));
+    const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
+    const [environment] = await db.select().from(environments).where(eq(environments.driver, "local"));
+    let pause: ReturnType<typeof vi.spyOn> | undefined;
+    const refusal = vi.spyOn(configurationSupersession, "parkConfigurationSupersession").mockResolvedValueOnce(false);
+    try {
+      await db.update(agents).set({ adapterType: "paperclip_runner", defaultEnvironmentId: environment.id,
+        adapterConfig: { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", cwd } }).where(eq(agents.id, f.agentId));
+      const prepare = executionConfiguration.prepareHeartbeatExecutionConfiguration;
+      pause = vi.spyOn(executionConfiguration, "prepareHeartbeatExecutionConfiguration").mockImplementationOnce(async (...args) => {
+        const result = await prepare(...args);
+        await db.update(environments).set({ envVars: { REFUSED_NOTE: "changed" } }).where(eq(environments.id, environment.id));
+        return result;
+      });
+      const starting = await heartbeat.wakeup(f.agentId, { source: "on_demand", triggerDetail: "manual", reason: "manual",
+        payload: { issueId: f.issueId }, contextSnapshot: { issueId: f.issueId } });
+      await heartbeat.drainActiveRunExecutions();
+      const final = await heartbeat.getRun(starting!.id);
+      expect(refusal).toHaveBeenCalledOnce();
+      expect(final).toMatchObject({ status: "failed", errorCode: "configuration_incomplete", resultJson: { configurationIncomplete: { reason: "configuration_supersession_refused" } } });
+      expect(final?.error).not.toContain("preparing the same wake again");
+      expect(captured.has(starting!.id)).toBe(false);
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+      expect(comments.some(comment => comment.body.includes("no longer permits an automatic restart"))).toBe(true);
+    } finally {
+      await heartbeat.drainActiveRunExecutions(); pause?.mockRestore(); refusal.mockRestore();
+      await db.update(environments).set({ envVars: environment.envVars }).where(eq(environments.id, environment.id));
+      mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["probe proof", "archive", "reactivate", "adopt"] as const)("steer real environment writer: %s preserves configuration freshness", async change => {
+    const f = await seed(), service = environmentService(db);
+    if (change === "adopt") {
+      const [local] = await db.select().from(environments).where(eq(environments.driver, "local"));
+      const cloudMode = vi.spyOn(cloudInstance, "isCloudManagedInstance").mockReturnValue(true);
+      try {
+        await db.update(environments).set({ metadata: { owner: "operator" } }).where(eq(environments.id, local.id));
+        const snapshot = await readExecutionConfigurationRows(db, { companyId: f.companyId, environmentId: local.id, projectId: null });
+        expect((await service.ensureLocalEnvironment(f.companyId)).metadata).toEqual({ owner: "operator", managedByPaperclip: true });
+        await db.transaction(tx => assertExecutionConfigurationCurrent(tx as unknown as typeof db, snapshot, [], 0));
+      } finally {
+        cloudMode.mockRestore();
+        await db.update(environments).set({ metadata: local.metadata }).where(eq(environments.id, local.id));
+      }
+      return;
+    }
+    const provider = `fixture-${randomUUID()}`;
+    const input = { companyId: f.companyId, name: `Managed ${provider}`, provider, config: {} };
+    const created = (await service.ensureManagedSandboxEnvironment(input)).environment;
+    try {
+      if (change === "reactivate") expect((await service.archiveManagedSandboxEnvironment({ companyId: f.companyId, provider }))?.id).toBe(created.id);
+      const snapshot = await readExecutionConfigurationRows(db, { companyId: f.companyId, environmentId: created.id, projectId: null });
+      if (change === "probe proof") expect(await service.recordSandboxPlatformProbe({ environmentId: created.id, companyId: f.companyId, config: created.config, proof: { v: 2, testedAt: new Date().toISOString() } })).toBe(true);
+      else if (change === "archive") expect((await service.archiveManagedSandboxEnvironment({ companyId: f.companyId, provider }))?.id).toBe(created.id);
+      else expect((await service.ensureManagedSandboxEnvironment(input)).environment.id).toBe(created.id);
+      await db.transaction(tx => assertExecutionConfigurationCurrent(tx as unknown as typeof db, snapshot, [], 0));
+    } finally {
+      await db.delete(builtInManagedResources).where(eq(builtInManagedResources.resourceId, created.id));
+      await db.delete(environments).where(eq(environments.id, created.id));
+    }
+  });
+
+  // Real PATCH/reminted bindings and real secret resolution; only provider dispatch is substituted.
+  it.each([
+    { change: "plain", conversation: false }, { change: "rotation", conversation: false },
+    { change: "plain", conversation: true }, { change: "rotation", conversation: true },
+  ])("environment route: $change keeps the continuous Pi session and delivers current values (chat=$conversation)", async ({ change, conversation }) => {
+    const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "pi-env-route-"));
+    const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
+      kind: "legacy", reason: "persisted_legacy_selection", resolverVersion: nativeRuntimeMode.NATIVE_RUNTIME_PROFILE_RESOLVER_VERSION });
+    const previousKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = join(cwd, "master.key");
+    registerServerAdapter({ ...getServerAdapter(adapterType), type: "paperclip_runner" });
+    const [environment] = await db.select().from(environments).where(eq(environments.driver, "local"));
+    try {
+      const secrets = secretService(db), previousValue = randomUUID(), currentValue = randomUUID(), plainValue = randomUUID();
+      const secret = await secrets.create(f.companyId, { name: "Environment revision", key: "ENV_REVISION", provider: "local_encrypted", value: previousValue });
+      await db.update(agents).set({ adapterType: "paperclip_runner", defaultEnvironmentId: environment.id,
+        adapterConfig: { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous", cwd },
+      }).where(eq(agents.id, f.agentId));
+      if (conversation) await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: f.userId, conversationState: "active" }).where(eq(issues.id, f.issueId));
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: f.userId }; next(); });
+      app.use("/api", environmentRoutes(db)); app.use(errorHandler);
+      const envVars = { CONTEXT_NOTE: { type: "plain", value: "original" },
+        ENV_REVISION: { type: "secret_ref", secretId: secret.id, version: "latest" } };
+      expect((await request(app).patch(`/api/environments/${environment.id}?companyId=${f.companyId}`).send({ envVars })).status).toBe(200);
+      const first = await execute(f);
+      expect((first.input.config.env as Record<string, unknown>).ENV_REVISION === previousValue).toBe(true);
+      const [binding] = await db.select().from(companySecretBindings).where(and(eq(companySecretBindings.companyId, f.companyId), eq(companySecretBindings.targetId, environment.id)));
+      if (change === "plain") {
+        expect((await request(app).patch(`/api/environments/${environment.id}?companyId=${f.companyId}`)
+          .send({ envVars: { ...envVars, NEXT_NOTE: { type: "plain", value: plainValue } } })).status).toBe(200);
+        const [reminted] = await db.select().from(companySecretBindings).where(and(eq(companySecretBindings.companyId, f.companyId), eq(companySecretBindings.targetId, environment.id)));
+        expect(reminted.id).not.toBe(binding.id);
+      } else {
+        await secrets.rotate(secret.id, { value: currentValue });
+        expect((await secrets.getById(secret.id))?.latestVersion).toBe(2);
+      }
+      const next = await execute(f);
+      expect(next.input.runtime.sessionId).toBe("saved-session");
+      expect(next.finished.sessionIdBefore).toBe(first.finished.sessionIdAfter);
+      expect(next.finished.resultJson).toMatchObject({ configFreshness: { session: {
+        reset: false, taskSessionAvailable: true, taskSessionReused: true,
+        changedCategories: expect.arrayContaining(["envBindings", "secrets"]),
+      } } });
+      const delivered = next.input.config.env as Record<string, unknown>;
+      if (change === "plain") expect(delivered.NEXT_NOTE === plainValue).toBe(true);
+      // Boolean-only assertions deliberately cannot dump secret bytes on failure.
+      expect(delivered.ENV_REVISION === (change === "rotation" ? currentValue : previousValue), "matches current revision").toBe(true);
+      if (change === "rotation") expect(delivered.ENV_REVISION === previousValue, "matches previous revision").toBe(false);
+    } finally {
+      await db.update(environments).set({ envVars: environment.envVars }).where(eq(environments.id, environment.id));
+      await db.delete(companySecretBindings).where(eq(companySecretBindings.companyId, f.companyId));
+      if (previousKey === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE; else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKey;
+      mode.mockRestore(); unregisterServerAdapter("paperclip_runner"); await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it.each([false, true])("pre-filter environment fingerprint preserves unchanged inputs, not unknown changes (%s)", async changed => {
     const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "pi-env-fingerprint-compat-"));
     const mode = vi.spyOn(nativeRuntimeMode, "resolveHeartbeatNativeRuntimeMode").mockReturnValue({
@@ -761,7 +2464,7 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     { category: "runtimeSkills", retain: true },
     { category: "agentRuntimeConfig", retain: false },
     { category: "workspaceConfig", retain: false },
-    { category: "secrets", retain: false },
+    { category: "secrets", retain: true },
     { category: "issueOverrides", retain: false },
     { category: "adapter", retain: false },
     { category: "instructions,runtimeSkills", retain: true },
