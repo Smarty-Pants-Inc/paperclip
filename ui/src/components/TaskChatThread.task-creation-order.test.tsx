@@ -215,13 +215,24 @@ describe("Coordinator task creation ordering", () => {
 
   it("puts cards after transcript-only responses and every segment of a steered turn", async () => {
     state.handoffs = [handoff()];
+    // 2fcb19e25: placement follows session reads, not the steering acknowledgement alone.
+    state.transcripts.set("source-run", [
+      { kind: "system", text: "", ts: at(0), steeringEvent: { kind: "input", turnId: "turn" } },
+      ...state.transcripts.get("source-run")!.slice(0, 2),
+      { kind: "system", text: "", ts: at(5), steeringEvent: { kind: "ack", turnId: "turn", commentId: "steer" } },
+      { kind: "system", text: "", ts: at(5), steeringEvent: { kind: "input", turnId: "turn" } },
+      ...state.transcripts.get("source-run")!.slice(2),
+    ]);
     await paint({ comments: [
       { ...comment("steer", "Keep the task small.", 5), steeredIntoRunId: "source-run", conversationAnchorAt: at(5) },
       comment("next", "A later question.", 20),
     ] });
-    before(anchor("source-run:turn:1"), anchor("chat_handoff:task"));
+    before(anchor("source-run:turn:0"), anchor("steer"));
+    before(anchor("steer"), anchor("source-run:turn:question:steer"));
+    before(anchor("source-run:turn:question:steer"), anchor("chat_handoff:task"));
     before(anchor("chat_handoff:task"), anchor("next"));
-    expect(anchor("source-run:turn:1").textContent).toContain("Your task is ready.");
+    expect(anchor("source-run:turn:question:steer").textContent).toContain("Your task is ready.");
+    expect(host.querySelectorAll('[data-thread-anchor="chat_handoff:task"]')).toHaveLength(1);
   });
 
   it("keeps a suggestion in the same end-of-turn slot when acceptance creates its task", async () => {
