@@ -86,7 +86,7 @@ describe("heartbeat run preparation module", () => {
       "company-one",
       { originKind: "routine_execution", originId: "routine-one", originRunId: "routine-run-one" },
     );
-    expect(result).toEqual({ routineId: "routine-one", env: { PINNED_FLAG: "original" }, responsibleUserId: "run-owner" });
+    expect(result).toEqual({ routineId: "routine-one", liveRoutineId: null, env: { PINNED_FLAG: "original" }, responsibleUserId: "run-owner" });
     expect(database.scopes[0]).toEqual(expect.arrayContaining(["company-one", "routine-one", "routine-run-one"]));
     expect(database.scopes[1]).toEqual(expect.arrayContaining(["company-one", "routine-one", "revision-one"]));
     expect(database.select).toHaveBeenCalledTimes(2);

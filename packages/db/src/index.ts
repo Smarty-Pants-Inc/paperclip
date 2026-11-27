@@ -1,5 +1,6 @@
 export {
   createDb,
+  databaseClientErrorCode,
   databaseClientOptionsFromEnv,
   type DatabaseClientOptions,
   withDedicatedDbConnection,

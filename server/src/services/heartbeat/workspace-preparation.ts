@@ -1140,7 +1140,7 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
     ) {
       nextIssuePatch.executionWorkspacePreference = "reuse_existing";
       nextIssuePatch.executionWorkspaceSettings = {
-        ...(issueExecutionWorkspaceSettings ?? {}),
+        // Runtime binding owns mode, not the person's saved workspace policy.
         mode: nextIssueWorkspaceMode,
       };
     }
