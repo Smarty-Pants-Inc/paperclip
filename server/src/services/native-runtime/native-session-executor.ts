@@ -13112,7 +13112,7 @@ async function executePaperclipNativeSessionAttempt(
         trace.activate(runnerSessionStartupScope);
         const providerTurnWait = nativeProviderStartedTurns(input.execution.provider)
           ? await nativeProviderTurnWaitOptions(input.db, input.execution.binding) : undefined;
-        const runExecution = () =>
+        const runExecution = async () =>
           executeNativeSession({
             resumeInterruptedTurn: input.restartRecovery?.kind === "resume_dead_runner"
               || input.restartRecovery?.kind === "reattach_remote_runner" || scheduledResumeContinuation,
@@ -13186,7 +13186,11 @@ async function executePaperclipNativeSessionAttempt(
               crashPoint("native.process_start.after_requested_before_spawn", { fail: () => Object.assign(
                 new Error("spawn paperclip-runnerd EAGAIN"), { code: "EAGAIN", syscall: "spawn paperclip-runnerd" }) });
             },
-            input: runnerExecution,
+            // Resolve the actual state source before Runner parses/copies the
+            // input. A recovered provider ID alone does not prove turn coverage.
+            input: runnerExecution.provider.kind === "pi_rpc" && "continuationPrompt" in runnerExecution && runnerExecution.continuationPrompt
+              ? await runnerdBackend?.prepareRetryInput?.(runnerExecution, existingWarmSession?.identity()) ?? runnerExecution
+              : runnerExecution,
             startup: executionContext && (!usesPluginTask || executionContext.pluginSupported) ? executionContext : undefined,
             remoteCleanupScope: remoteCleanupLease ? remoteLeaseCleanupScope(remoteCleanupLease) : undefined,
             retainedRunnerReattachment: input.restartRecovery?.kind === "reattach_remote_runner"
@@ -17297,6 +17301,7 @@ type ManagedRunnerdBackend = NativeSessionBackend & {
   providerAdmissionPersisted?(signal?: AbortSignal): Promise<void>;
   providerAdmissionRequired?(): boolean;
   providerTurnNeverIssued?(): boolean;
+  prepareRetryInput?(execution: NativeExecutionInput, liveSession?: ReturnType<NativeSession["identity"]>): Promise<NativeExecutionInput>;
 };
 
 async function createRunnerdBackendWithinSessionClaim(
@@ -18010,6 +18015,7 @@ async function createRunnerdBackendWithinSessionClaim(
       : sourceRuntimeContext;
   let remotePrepared = false;
   let remoteHarnessStatePrepared = false;
+  let harnessStateRestored = false;
   // Set when this invocation's authority rotation moved the live Runner state
   // into its epoch archive. Later host preparation validates that snapshot
   // instead of requiring, or re-staging, the retired live state.
@@ -18548,6 +18554,11 @@ async function createRunnerdBackendWithinSessionClaim(
     const cursorConflict = nativeHarnessBackupCursorConflict({ backupRoot: backup.root, stateRoot: root,
       controllerState: runnerControlPlane?.store.state });
     if (cursorConflict) throw new Error(cursorConflict);
+    // Record provenance BEFORE copying. A failure during copy/inspection must
+    // not leave restored files looking like an untouched own-box continuation
+    // to this invocation or to a later invocation of the same retry run.
+    await recordHarnessBackupStampForCurrentLease(backup);
+    harnessStateRestored = true;
     await measureNativeRunnerSpan(
       input.trace,
       "harness_state.failover_restore",
@@ -18584,11 +18595,6 @@ async function createRunnerdBackendWithinSessionClaim(
     ) {
       throw new Error("runner_harness_state_mismatch: restored_provider_identity_changed");
     }
-    // A deliberately non-reusable environment receives a fresh provider lease
-    // for every turn. Stamp that new lease as soon as the verified host backup
-    // has been restored so a later provider/bootstrap failure can still clean
-    // the ephemeral sandbox up without discarding the only durable copy.
-    await recordHarnessBackupStampForCurrentLease(backup);
     return backup;
   };
 
@@ -18833,6 +18839,7 @@ async function createRunnerdBackendWithinSessionClaim(
                           directory.name === "runner" ? "file" : "directory",
                       })))
                     ) {
+                      harnessStateRestored = true;
                       await stageRemoteRunnerDirectory({
                         target: remoteTarget,
                         runner: remoteCommandRunner,
@@ -19909,6 +19916,67 @@ async function createRunnerdBackendWithinSessionClaim(
           stagedRecoveryPending = false;
         }
       }
+    },
+    prepareRetryInput: async (execution, liveSession) => {
+      if (replacementBackend) return replacementBackend.prepareRetryInput?.(execution, liveSession) ?? execution;
+      const retry = record(reviewRun?.contextSnapshot?.nativeStatusRetry);
+      if (execution.provider.kind !== "pi_rpc" || !("continuationPrompt" in execution) ||
+          !execution.continuationPrompt || retry.cause !== "native_run_failed") return execution;
+      let containsSourceTurn = retry.turnSubmitted === true && retry.sourceTurnCompleted === true &&
+        typeof retry.sourceRunId === "string" && typeof retry.sourceTurnId === "string" && !!retry.sourceTurnId.trim();
+      if (containsSourceTurn && liveSession) containsSourceTurn = liveSession.runId === retry.sourceRunId &&
+        liveSession.sessionId === nativeSessionKey(execution) && liveSession.companyId === execution.binding.companyId &&
+        liveSession.agentId === execution.binding.agentId && liveSession.issueId === execution.binding.issueId;
+      if (containsSourceTurn && !liveSession) {
+        // This can restore an older backup. Inspect the state actually selected,
+        // not the newer server checkpoint or merely the same provider session ID.
+        let state: Record<string, unknown> | null = null;
+        if (remoteTarget) {
+          await prepareExternalRunnerState?.();
+          try {
+            state = remoteCommandRunner && remoteStateDirectory
+              ? await readRemoteRunnerState({ runner: remoteCommandRunner, stateDirectory: remoteStateDirectory }) : null;
+          } catch { /* Missing/unreadable selected state is unknown: keep the full task. */ }
+        } else {
+          try { state = record(JSON.parse(await readFile(resolve(root, "runner", "runner-state.json"), "utf8"))); }
+          catch { /* Missing or archived-only state does not prove turn coverage. */ }
+        }
+        const [sourceRun] = await input.db.select({ runnerInstanceId: heartbeatRuns.runnerInstanceId, sessionId: heartbeatRuns.nativeSessionId })
+          .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, retry.sourceRunId as string),
+            eq(heartbeatRuns.companyId, execution.binding.companyId), eq(heartbeatRuns.agentId, execution.binding.agentId),
+            eq(heartbeatRuns.nativeIssueId, execution.binding.issueId))).limit(1);
+        const matchesSource = !!state && state.runId === retry.sourceRunId && state.normalizedSessionId === nativeSessionKey(execution) &&
+          state.normalizedSessionId === sourceRun?.sessionId && state.runnerInstanceId === sourceRun?.runnerInstanceId;
+        const [receipt] = matchesSource
+          ? await input.db.select({ sourceSeq: heartbeatRunEvents.sourceSeq }).from(heartbeatRunEvents).where(and(
+              eq(heartbeatRunEvents.companyId, execution.binding.companyId), eq(heartbeatRunEvents.agentId, execution.binding.agentId),
+              eq(heartbeatRunEvents.runId, retry.sourceRunId as string), eq(heartbeatRunEvents.sourceInstanceId, String(state!.runnerInstanceId)),
+              sql`${heartbeatRunEvents.sourceEventId} is not null`,
+              sql`${heartbeatRunEvents.payload}->'prpEvent'->>'runId' = ${retry.sourceRunId}`,
+              sql`${heartbeatRunEvents.payload}->'prpEvent'->>'normalizedSessionId' = ${nativeSessionKey(execution)}`,
+              sql`${heartbeatRunEvents.payload}->'prpEvent'->>'sourceKind' = 'runner'`,
+              sql`${heartbeatRunEvents.payload}->'prpEvent'->>'turnId' = ${retry.sourceTurnId}`,
+              inArray(heartbeatRunEvents.eventType, ["turn.failed", "turn.completed", "turn.cancelled", "turn.interrupted"]),
+            )).orderBy(desc(heartbeatRunEvents.sourceSeq)).limit(1) : [];
+        // The invocation flag alone cannot prove no restore: a previous
+        // invocation may have copied a backup and stopped before Runner wrote
+        // new state. The lease's durable backup stamp survives that boundary.
+        // Conservatively require END for ANY recorded stamp (including an
+        // own-box backup publication), malformed metadata, or a missing lease.
+        const [lease] = remoteTarget?.transport === "sandbox" && remoteTarget.leaseId
+          ? await input.db.select({ metadata: environmentLeases.metadata }).from(environmentLeases).where(and(
+              eq(environmentLeases.id, remoteTarget.leaseId), eq(environmentLeases.companyId, execution.binding.companyId),
+              eq(environmentLeases.heartbeatRunId, execution.binding.runId), eq(environmentLeases.issueId, execution.binding.issueId),
+              eq(environmentLeases.providerLeaseId, sandboxLeaseAcquisition?.providerLeaseId ?? ""),
+            )).limit(1) : [];
+        const noRecordedRestore = !!lease && lease.metadata !== null && typeof lease.metadata === "object" &&
+          !Array.isArray(lease.metadata) && !Object.hasOwn(lease.metadata, "nativeHarnessBackup");
+        containsSourceTurn = matchesSource &&
+          (remoteTarget && remoteHarnessStatePrepared && !harnessStateRestored && noRecordedRestore ||
+            typeof receipt?.sourceSeq === "number" && Number.isSafeInteger(receipt.sourceSeq) && receipt.sourceSeq > 0 &&
+            typeof state?.nextSourceSeq === "number" && Number.isSafeInteger(state.nextSourceSeq) && state.nextSourceSeq > receipt.sourceSeq);
+      }
+      return containsSourceTurn ? execution : { ...execution, continuationPrompt: null };
     },
     descriptor: () => (replacementBackend ?? backend).descriptor(),
     openSession: async (sessionInput) => {
