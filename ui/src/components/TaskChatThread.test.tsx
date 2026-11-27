@@ -3749,6 +3749,111 @@ describe("TaskChatThread runtime transcript selection", () => {
         }
       }
     });
+    it("keeps an edited comment drawn when only its previous revision was answered", () => {
+      const request = { ...person("edited-request"), body: "The edited question still needs an answer.",
+        consumedByRunId: "answered-v1", updatedAt: new Date("2026-09-07T18:00:02.000Z") };
+      const oldAnswer = { ...person("v1-answer"), authorType: "agent" as const, authorAgentId: "agent-1",
+        authorUserId: null, runId: "answered-v1", body: "The answer to the original question.",
+        createdAt: new Date("2026-09-07T18:00:01.000Z"), updatedAt: new Date("2026-09-07T18:00:01.000Z") };
+      nativeTranscriptState.hydratedRunIds = new Set(["answered-v1", "edited-continuation"]);
+      nativeTranscriptState.terminalHydratedRunIds = new Set(["answered-v1", "edited-continuation"]);
+      renderThread({ comments: [request, oldAnswer], onAdd: async () => {}, issueStatus: "in_progress", linkedRuns: [{
+        runId: "answered-v1", runtimeMode, status: "succeeded", startedAt: "2026-09-07T18:00:00.000Z",
+        agentId: "agent-1", adapterType: "paperclip_runner",
+        createdAt: "2026-09-07T18:00:00.000Z", finishedAt: "2026-09-07T18:00:01.000Z",
+        resultJson: { continuousReplies: { v1: { questionCommentIds: [request.id] } } },
+      }, {
+        runId: "edited-continuation", runtimeMode, status: "cancelled", errorCode: "continuation_nothing_new",
+        startedAt: null, agentId: "agent-1", adapterType: "paperclip_runner", ...{ wakeCommentIds: [request.id] },
+        // The server qualifies answers by revision: the v1 publication is not
+        // an answeredCommentId for the current edited question. Fail open if
+        // a cancellation reaches the page without a current-revision answer.
+        resultJson: { continuationNothingNew: receipt([request.id], []) },
+        createdAt: "2026-09-07T18:00:03.000Z", finishedAt: "2026-09-07T18:00:04.000Z",
+      }] });
+      expect(container.textContent).toContain(request.body);
+      expect(container.textContent).toContain(oldAnswer.body);
+      expect(container.textContent).toContain("Couldn't finish");
+    });
+
+    it("does not quiet a named stopped request as answered", () => {
+      const request = person("stopped-request");
+      nativeTranscriptState.hydratedRunIds = new Set(["named-stopped-request"]);
+      nativeTranscriptState.terminalHydratedRunIds = new Set(["named-stopped-request"]);
+      renderThread({ comments: [request], onAdd: async () => {}, issueStatus: "in_progress", linkedRuns: [{
+        runId: "named-stopped-request", runtimeMode, status: "cancelled", errorCode: "continuation_nothing_new",
+        startedAt: null, agentId: "agent-1", adapterType: "paperclip_runner",
+        ...{ wakeCommentIds: [request.id], contextSnapshot: { executionContinuation: { resumeDelta: { receivedComments: [{
+          id: request.id, updatedAt: request.updatedAt.toISOString(), receivedAt: request.createdAt.toISOString(),
+          answered: false, stopped: true,
+        }] } } } },
+        // A stopped receipt is separate from an answer. If this run still
+        // names the request, it cannot borrow the other run's Stop as proof.
+        resultJson: { continuationNothingNew: receipt([request.id], []) },
+        createdAt: "2026-09-07T18:00:00.000Z", finishedAt: "2026-09-07T18:00:01.000Z",
+      }] });
+      expect(container.textContent).toContain(request.body);
+      expect(container.textContent).toContain("Couldn't finish");
+      expect(container.textContent).not.toContain("Stopped");
+    });
+
+    it.each(["unprojected", "completed Stop", "quiet successor"] as const)(
+      "keeps the person's Stopped marker when a successor omits the retired request and settles quietly (%s)", projection => {
+      const request = { ...person("retired-request"), consumedByRunId: "stopped-run-a" };
+      const stoppedRun = {
+        runId: "stopped-run-a", runtimeMode, status: "cancelled", errorCode: "cancelled",
+        startedAt: "2026-09-07T18:00:00.000Z", agentId: "agent-1", agentName: "Runner", adapterType: "paperclip_runner",
+        wakeCommentIds: [request.id],
+        resultJson: { personStop: { requestedAt: "2026-09-07T18:00:01.000Z" } },
+        // An acknowledged legacy Stop is projected as completed/Stopped, not
+        // as a successfully answered turn. Keep its marker in either shape.
+        ...(projection !== "unprojected" ? { execution: {
+          phase: "completed" as const, label: "Stopped", cause: null, lastConfirmedActivityAt: null, retryAt: null,
+          attempt: 1, maxAttempts: 3, recoveryOwner: null, nextAction: "Send a new message to continue from saved work.",
+          permittedActions: ["inspect_run" as const], predecessorRunId: null, successorRunId: null,
+        } } : {}),
+        createdAt: "2026-09-07T18:00:00.000Z", finishedAt: "2026-09-07T18:00:01.000Z",
+      };
+      (runtimeMode === "native" ? nativeTranscriptState : transcriptState).transcriptByRun.set(stoppedRun.runId, [
+        assistantEntry("2026-09-07T18:00:00.500Z", "Work before Stop, not an answer.", "progress"),
+      ]);
+      nativeTranscriptState.hydratedRunIds = new Set([stoppedRun.runId, "quiet-run-b"]);
+      nativeTranscriptState.terminalHydratedRunIds = new Set([stoppedRun.runId, "quiet-run-b"]);
+      renderThread({ comments: [request], onAdd: async () => {}, issueStatus: "in_progress", linkedRuns: [stoppedRun] });
+      expect(container.textContent?.match(/Stopped/g)).toHaveLength(1);
+      expect(container.textContent).toContain(request.body);
+      const beforeSuccessor = container.textContent;
+      const rowSelector = '[data-testid="task-chat-turn"], [data-testid="task-chat-runner-turn"], [data-testid="task-chat-collapsible-marker"]';
+      const beforeRows = container.querySelectorAll(rowSelector).length;
+      const projectedStoppedRun = projection === "quiet successor"
+        ? { ...stoppedRun, execution: { ...stoppedRun.execution!, successorRunId: "quiet-run-b" } } : stoppedRun;
+      renderThread({ comments: [request], onAdd: async () => {}, issueStatus: "in_progress", linkedRuns: [projectedStoppedRun, {
+        runId: "quiet-run-b", runtimeMode, status: "cancelled", errorCode: "continuation_nothing_new",
+        startedAt: null, agentId: "agent-1", adapterType: "paperclip_runner",
+        // Pass 6 retires a person's stopped revision instead of calling it
+        // answered. The successor names nothing; run A still owns the Stop.
+        resultJson: { continuationNothingNew: { ...receipt([], []), cause: "empty_system_wake" } },
+        createdAt: "2026-09-07T18:00:02.000Z", finishedAt: "2026-09-07T18:00:03.000Z",
+      }] });
+      expect(container.textContent?.match(/Stopped/g)).toHaveLength(1);
+      expect(container.textContent).toContain(request.body);
+      expect(container.textContent).not.toContain("Couldn't finish");
+      expect(container.textContent).toBe(beforeSuccessor);
+      expect(container.querySelectorAll(rowSelector)).toHaveLength(beforeRows);
+      if (runtimeMode === "legacy") {
+        // This does not pin old Stop labels forever: normal task completion
+        // and a real newer attempt still make the legacy status historical.
+        renderThread({ comments: [request], onAdd: async () => {}, issueStatus: "done", linkedRuns: [projectedStoppedRun] });
+        expect(container.textContent).not.toContain("Stopped");
+        renderThread({ comments: [request], onAdd: async () => {}, issueStatus: "in_progress", linkedRuns: [stoppedRun, {
+          runId: "real-next-attempt", runtimeMode, status: "succeeded", agentId: "agent-1", adapterType: "paperclip_runner",
+          startedAt: "2026-09-07T18:00:04.000Z", createdAt: "2026-09-07T18:00:04.000Z", finishedAt: "2026-09-07T18:00:05.000Z",
+        }] });
+        expect(container.textContent).not.toContain("Stopped");
+        expect(container.textContent).toContain(request.body);
+      }
+    });
+
     it.each([
       { name: "server cancellation fixture: answered person", proof: receipt(["one"], ["one"]), wakeIds: ["one"], quiet: true },
       { name: "empty system proof", proof: { ...receipt([], []), cause: "empty_system_wake" }, wakeIds: [], quiet: true, wakeReason: "heartbeat" },

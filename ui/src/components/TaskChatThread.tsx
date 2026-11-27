@@ -1128,11 +1128,30 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   }, [linkedRuns]);
 
   const statusRelevance = useMemo(
-    () => taskChatStatusRelevance(issueStatus, [
-      ...(linkedRuns ?? []).map((run) => ({ ...run, id: run.runId })),
-      ...(liveRuns ?? []),
-      ...(activeRun ? [activeRun] : []),
-    ], props.recoveryAction),
+    () => {
+      const statusRuns: Parameters<typeof taskChatStatusRelevance>[1] = [
+        ...(linkedRuns ?? []).map((run) => ({ ...run, id: run.runId })),
+        ...(liveRuns ?? []),
+        ...(activeRun ? [activeRun] : []),
+      ];
+      const noOpRunIds = new Set(statusRuns.filter(run => run.status === "cancelled" &&
+        run.errorCode === "continuation_nothing_new" && !isPersonStoppedRun(run)).map(run => run.id));
+      const personStopRuns = statusRuns.filter(run => !noOpRunIds.has(run.id)).map(run => {
+        const execution = run.execution;
+        // The Stop projection may itself say completed, or point at the
+        // no-op successor. Neither is evidence that stopped work resumed.
+        return isPersonStoppedRun(run) && execution?.phase === "completed" &&
+          (!execution.successorRunId || noOpRunIds.has(execution.successorRunId))
+          ? { ...run, execution: null } : run;
+      });
+      return {
+        ...taskChatStatusRelevance(issueStatus, statusRuns, props.recoveryAction),
+        // A no-op continuation did not resume the person's stopped work. It
+        // cannot retire that Stop marker, even when it is newer. A real next
+        // attempt or terminal task still makes the old status historical.
+        isHistoricalPersonStop: taskChatStatusRelevance(issueStatus, personStopRuns, props.recoveryAction).isHistoricalRun,
+      };
+    },
     [issueStatus, linkedRuns, liveRuns, activeRun, props.recoveryAction],
   );
 
@@ -2391,7 +2410,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         ...meta,
         agentName: meta.agentName || agentMap?.get(meta.agentId)?.name,
       } : undefined, currentUserId, userLabelMap);
-      const historical = statusRelevance.isHistoricalRun(source.id);
+      const historical = isUserStop(source.id)
+        ? statusRelevance.isHistoricalPersonStop(source.id)
+        : statusRelevance.isHistoricalRun(source.id);
       const acceptedSummary = acceptedSemanticResultSummary(meta?.resultJson);
       const parsedSource = transcriptToTaskChatItems(entries, {
         runId: source.id,
