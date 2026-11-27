@@ -364,6 +364,88 @@ it.skipIf(!tar || !hasZstd).each(["v1", "v2"])("installs verified %s archive byt
   expect(verifyUploaded).toHaveBeenCalledOnce();
 });
 
+it.skipIf(!tar || !hasZstd)("renames the old pack before upload and tolerates late stale cleanup failures", async () => {
+  for (const outcome of ["success", "nonzero", "timeout", "throw"] as const) {
+    const { root, pack } = await fixture();
+    const remote = await runner(root), targetPath = path.join(root, "uploaded' pack");
+    await fs.mkdir(targetPath);
+    await fs.writeFile(path.join(targetPath, "old"), "previous pack");
+    await fs.utimes(targetPath, 0, 0);
+    const older = `${targetPath}.stale-older`, concurrent = `${targetPath}.stale-concurrent`, otherPack = `${targetPath}-other.stale-older`;
+    await fs.mkdir(older); await fs.mkdir(concurrent); await fs.mkdir(otherPack);
+    await fs.utimes(older, 0, 0); await fs.utimes(otherPack, 0, 0);
+    const execute = remote.execute.getMockImplementation()!;
+    let stalePath = "", verified = false;
+    remote.execute.mockImplementation(async command => {
+      const script = command.args?.[1] ?? "";
+      if (script.startsWith("rm -rf -- ")) {
+        expect(verified).toBe(true);
+        expect(command.timeoutMs).toBe(300_000);
+        expect(script).toContain(".stale-");
+        expect(script).toContain("-mmin +10");
+        if (outcome === "throw") throw Error("cleanup transport failed");
+        if (outcome !== "success") return { exitCode: outcome === "nonzero" ? 1 : 0,
+          timedOut: outcome === "timeout", signal: null, pid: null, startedAt: null, stdout: "", stderr: "" };
+      }
+      return execute(command);
+    });
+    const verifyUploaded = vi.fn(async () => {
+      expect(await fs.readFile(path.join(targetPath, "bin/tool"), "utf8")).toContain("fixture");
+      expect(await fs.readFile(path.join(stalePath, "old"), "utf8")).toBe("previous pack");
+      verified = true;
+    });
+    const syncIn = remote.syncIn.getMockImplementation()!;
+    remote.syncIn.mockImplementation(async (...args) => {
+      const first = remote.execute.mock.calls[0][0];
+      expect(first.args?.[1]).toContain("mv -- ");
+      expect(first.args?.[1]).not.toContain("rm -rf");
+      expect(first.timeoutMs).toBe(10_000);
+      const entries = await fs.readdir(root);
+      stalePath = path.join(root, entries.find(name => /^uploaded' pack\.stale-[0-9a-f-]{36}$/.test(name))!);
+      expect(await fs.readFile(path.join(stalePath, "old"), "utf8")).toBe("previous pack");
+      expect((await fs.stat(stalePath)).mtimeMs).toBeGreaterThan(Date.now() - 60_000);
+      return syncIn(...args);
+    });
+    await expect(uploadVerifiedProviderPack({ root: pack, sourceDigest: digest, expectedDigest: digest, runner: remote, cwd: root,
+      targetPath, reuseRoots: [], verifyDirectory: () => {}, stageDirectory: async () => {}, verifyUploaded })).resolves.toBeUndefined();
+    expect(verifyUploaded).toHaveBeenCalledOnce();
+    expect(remote.execute.mock.calls.at(-1)![0].args?.[1]).toMatch(/^rm -rf -- /);
+    expect(await fs.readFile(path.join(targetPath, "bin/tool"), "utf8")).toContain("fixture");
+    expect((await fs.stat(concurrent)).isDirectory()).toBe(true);
+    expect((await fs.stat(otherPack)).isDirectory()).toBe(true);
+    if (outcome === "success") {
+      await expect(fs.stat(stalePath)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(fs.stat(older)).rejects.toMatchObject({ code: "ENOENT" });
+    } else expect((await fs.stat(stalePath)).isDirectory()).toBe(true);
+  }
+  const { root, pack } = await fixture();
+  const { logger } = await import("../../middleware/logger.js");
+  const warn = vi.spyOn(logger, "warn");
+  try {
+    for (const targetPath of ["", "relative", "/", "/tmp/..", "/tmp/pack/"]) {
+      const remote = await runner(await fs.mkdtemp(path.join(root, "guard-")));
+      const stageDirectory = vi.fn(), verifyUploaded = vi.fn();
+      await expect(uploadVerifiedProviderPack({ root: pack, sourceDigest: digest, expectedDigest: digest, runner: remote, cwd: root,
+        targetPath, reuseRoots: [], verifyDirectory: () => {}, stageDirectory, verifyUploaded })).rejects.toThrow("stale provider pack could not be replaced");
+      expect(remote.execute).not.toHaveBeenCalled();
+      expect(remote.syncIn).not.toHaveBeenCalled();
+      expect(stageDirectory).not.toHaveBeenCalled();
+      expect(verifyUploaded).not.toHaveBeenCalled();
+    }
+    expect(warn).toHaveBeenCalledTimes(5);
+  } finally { warn.mockRestore(); }
+  for (const result of [{ exitCode: 1, timedOut: false }, { exitCode: 0, timedOut: true }]) {
+    const remote = { syncIn: vi.fn(), execute: vi.fn().mockResolvedValue(result) };
+    const verifyUploaded = vi.fn();
+    await expect(uploadVerifiedProviderPack({ root: pack, sourceDigest: digest, expectedDigest: digest, runner: remote, cwd: root,
+      targetPath: path.join(root, "failed"), reuseRoots: [], verifyDirectory: () => {}, stageDirectory: async () => {}, verifyUploaded }))
+      .rejects.toThrow("stale provider pack could not be replaced");
+    expect(remote.execute).toHaveBeenCalledOnce();
+    expect(remote.syncIn).not.toHaveBeenCalled();
+    expect(verifyUploaded).not.toHaveBeenCalled();
+  }
+});
+
 it.each(["absent", "unsupported"])("verifies directory bytes before fallback when the archive is %s", async mode => {
   const { root, pack } = await fixture();
   if (mode === "absent") await fs.unlink(`${pack}.archive.json`);
