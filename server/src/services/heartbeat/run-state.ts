@@ -1,3 +1,4 @@
+import { retryStartsNewSessionColumn } from "../run-retry-presentation.js";
 import { notifyExternalConversationSettlement } from "../external-conversation-settlement-notifications.js";
 import { preservedAccountRuntimeState } from "../agent-provider-rate-limits.js";
 import { readRuntimeAccountingTotals } from "../runtime-accounting-totals.js";
@@ -67,6 +68,7 @@ const heartbeatRunProcessGroupIdColumn =
   heartbeatRuns.processGroupId ?? sql<number | null>`NULL`.as("processGroupId");
 
 const heartbeatRunListColumns = {
+  retryStartsNewSession: retryStartsNewSessionColumn,
   id: heartbeatRuns.id,
   responsibleUserId: heartbeatRuns.responsibleUserId,
   companyId: heartbeatRuns.companyId,
@@ -338,12 +340,14 @@ const heartbeatRunExecutionEvidenceColumn = sql<Record<string, unknown> | null>`
 `.as("resultJson");
 
 const heartbeatRunSafeColumns = {
+  retryStartsNewSession: retryStartsNewSessionColumn,
   ...getTableColumns(heartbeatRuns),
   processGroupId: heartbeatRunProcessGroupIdColumn,
   resultJson: heartbeatRunSafeResultJsonColumn,
 } as const;
 
 const heartbeatRunSqlAsciiSafeColumns = {
+  retryStartsNewSession: retryStartsNewSessionColumn,
   ...getTableColumns(heartbeatRuns),
   processGroupId: heartbeatRunProcessGroupIdColumn,
   error: sql<string | null>`NULL`.as("error"),
@@ -384,6 +388,7 @@ const heartbeatRunIssueControlColumns = {
 } as const;
 
 const heartbeatRunIssueSummaryColumns = {
+  retryStartsNewSession: retryStartsNewSessionColumn,
   id: heartbeatRuns.id,
   runtimeMode: heartbeatRuns.runtimeMode,
   wakeupRequestId: heartbeatRuns.wakeupRequestId,
@@ -1133,11 +1138,11 @@ export function createHeartbeatRunState(db: Db) {
   async function getRun(
     runId: string,
     opts?: { unsafeFullResultJson?: boolean; includeExecutionEvidence?: boolean },
-  ) {
+  ): Promise<typeof heartbeatRuns.$inferSelect & { retryStartsNewSession?: boolean }> {
     const safeForLegacyEncoding =
       !opts?.unsafeFullResultJson && (await hasUnsafeTextProjectionDatabase());
     const columns = opts?.unsafeFullResultJson
-      ? getTableColumns(heartbeatRuns)
+      ? { ...getTableColumns(heartbeatRuns), retryStartsNewSession: retryStartsNewSessionColumn }
       : safeForLegacyEncoding ? heartbeatRunSqlAsciiSafeColumns : heartbeatRunSafeColumns;
     return db
       .select(opts?.includeExecutionEvidence

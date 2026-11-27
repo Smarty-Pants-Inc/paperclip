@@ -1,3 +1,4 @@
+import { retryStartsNewSessionColumn } from "./run-retry-presentation.js";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { agents as agentsTable, heartbeatRuns, type Db } from "@paperclipai/db";
 import { agentAvatarUrl, resolveAgentAppearance } from "@paperclipai/shared";
@@ -43,6 +44,7 @@ export function issueRunPresenceService(
     const rows = await db
       .select({
         id: heartbeatRuns.id,
+        retryStartsNewSession: retryStartsNewSessionColumn,
         runtimeMode: heartbeatRuns.runtimeMode,
         wakeupRequestId: heartbeatRuns.wakeupRequestId,
         queuedCommentSourceWakeIds: sql<string[] | null>`${heartbeatRuns.contextSnapshot} -> 'queuedCommentSourceWakeIds'`.as("queuedCommentSourceWakeIds"),

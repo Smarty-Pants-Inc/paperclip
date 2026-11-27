@@ -1,10 +1,12 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { agents, companies, createDb, heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
+import { agents, chatConversations, chatEndpoints, companies, createDb, heartbeatRuns, issueRecoveryActions, issues, toolApplications, toolConnections, type Db } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { EXECUTION_BLOCKER_PERSON_RETRY_ACTION, getExecutionBlocker } from "./execution-blocker.js";
 import { EXECUTION_FINALIZATION_DEADLINE_MESSAGE } from "./execution-control-deadline.js";
+import { NEW_SESSION_RETRY_NEXT_ACTION } from "./workspace-recovery-receipt.js";
+import { isChatTask } from "./fresh-continuation-retry-fold.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 describe.skipIf(!support.supported)("execution blocker PostgreSQL read projection", () => {
@@ -83,6 +85,99 @@ describe.skipIf(!support.supported)("execution blocker PostgreSQL read projectio
     expect(blocker!.nextAction).toBe(`Inspect the source run. ${EXECUTION_BLOCKER_PERSON_RETRY_ACTION}`);
     expect(EXECUTION_BLOCKER_PERSON_RETRY_ACTION).toMatch(/^A person can use Retry on this task/);
     expect(EXECUTION_BLOCKER_PERSON_RETRY_ACTION).toContain("Agents cannot retry it for them.");
+  });
+
+  it.each([
+    { chat: false, errorCode: "adapter_failed", error: "native_controller_recovery_missing_evidence:retained_sandbox_binding", fresh: true },
+    { chat: true, errorCode: "native_provider_state_incompatible", error: "lost resume state", fresh: true },
+    { chat: true, errorCode: "adapter_failed", error: "ordinary provider failure", fresh: false },
+  ])("discloses a fresh-session Retry before the press: chat=$chat, fresh=$fresh", async ({ chat, errorCode, error, fresh }) => {
+    const f = await fixture({ errorCode, error });
+    if (chat) await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: "board", conversationState: "waiting" })
+      .where(eq(issues.id, f.issueId));
+    const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
+    expect(blocker).toMatchObject({ canRetry: true });
+    expect(blocker?.retryStartsNewSession).toBe(fresh ? true : undefined);
+    expect(blocker!.nextAction).toBe(`Inspect the source run. ${EXECUTION_BLOCKER_PERSON_RETRY_ACTION}`);
+    expect(blocker?.retryDisclosure).toBe(fresh
+      ? "Retry starts a new session. It gets this conversation's messages and replies (the oldest are left out if the conversation is very long), not the agent's tool steps; the old session is not resumed."
+      : undefined);
+    expect(JSON.stringify(blocker).match(/Retry starts a new session/g)?.length ?? 0).toBe(fresh ? 1 : 0);
+  });
+
+  it("keeps the shared safety classification and ordinary Retry offer for Agent Chat without a channel binding", async () => {
+    const f = await fixture();
+    expect(await isChatTask(db, f.companyId, f.issueId)).toBe(false);
+    expect(await isChatTask(db, f.companyId, randomUUID())).toBe(true);
+    await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: "board", conversationState: "waiting" })
+      .where(eq(issues.id, f.issueId));
+    expect(await isChatTask(db, f.companyId, f.issueId)).toBe(true);
+    const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
+    expect(blocker).toMatchObject({ canRetry: true, canContinue: false,
+      nextAction: `Inspect the source run. ${EXECUTION_BLOCKER_PERSON_RETRY_ACTION}` });
+    expect(blocker?.retryDisclosure).toBeUndefined();
+  });
+
+  it.each([false, true].flatMap(connected => ["failed", "cancelled"].map(status => ({ connected, status }))))(
+    "preserves today's ordinary Retry / Continue offers, connected=$connected, status=$status", async ({ connected, status }) => {
+    const f = await fixture(status === "cancelled" ? { status, resultJson: {
+      cancellation: { source: "provider", expected: false, initiator: { type: "provider" },
+        reason: "Provider disconnected", recordedAt: "2020-01-01T00:01:00Z" },
+      acpToolInventoryComplete: true, acpPendingToolCount: 0,
+    } } : {});
+    await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: "board", conversationState: "waiting" })
+      .where(eq(issues.id, f.issueId));
+    if (connected) {
+      const applicationId = randomUUID(), connectionId = randomUUID(), endpointId = randomUUID();
+      await db.insert(toolApplications).values({ id: applicationId, companyId: f.companyId,
+        applicationKey: `chat:discord:${endpointId}`, name: "Discord", type: "chat", status: "active" });
+      await db.insert(toolConnections).values({ id: connectionId, companyId: f.companyId, applicationId,
+        uid: endpointId, name: "Discord", connectionPurpose: "channel", transport: "chat_sdk", status: "active", enabled: true });
+      await db.insert(chatEndpoints).values({ id: endpointId, companyId: f.companyId, connectionId,
+        provider: "discord", publicId: randomUUID(), assignedAgentId: f.agentId, status: "active" });
+      await db.insert(chatConversations).values({ companyId: f.companyId, endpointId, issueId: f.issueId,
+        externalConversationId: "discord-thread", externalLabel: "Discord thread", state: "active" });
+    }
+    expect(await isChatTask(db, f.companyId, f.issueId)).toBe(true);
+    const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
+    expect(blocker).toMatchObject({ canRetry: !connected,
+      canContinue: status === "cancelled" && !connected });
+    if (connected) expect(blocker?.nextAction).toBe("Send a new chat message to continue this conversation.");
+    expect(blocker?.retryStartsNewSession).toBeUndefined();
+    expect(blocker?.retryDisclosure).toBeUndefined();
+    console.info("chat-offer-proof", JSON.stringify({ issueId: f.issueId, runId: f.run.id, connected, status,
+      canRetry: blocker?.canRetry, canContinue: blocker?.canContinue, safetyChat: true }));
+  });
+
+  it("does not disclose a new-session Retry when no Retry is offered", async () => {
+    const f = await fixture({ errorCode: "native_provider_state_incompatible", error: "Original failure reason" });
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+    const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
+    expect(blocker).toMatchObject({ canRetry: false, runError: "Original failure reason", nextAction: "Inspect the source run." });
+    expect(blocker?.retryStartsNewSession).toBeUndefined();
+    expect(blocker?.retryDisclosure).toBeUndefined();
+    expect(JSON.stringify(blocker)).not.toContain("Retry starts a new session");
+  });
+
+  it("keeps an exhausted chat blocked with an honest /new stop-proof instruction", async () => {
+    const f = await fixture({}, { systemRecovery: { state: "exhausted", failure: { retryClass: "recheck_evidence" } } });
+    await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: "board", conversationState: "waiting" })
+      .where(eq(issues.id, f.issueId));
+    const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
+    expect(blocker?.nextAction).toContain("Send /new to request a new session; it can start only after Paperclip confirms the stop.");
+    expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].status).toBe("blocked");
+  });
+
+  it.each([true, false])("removes legacy action disclosure from persisted reasons, Retry offered=%s", async offered => {
+    const f = await fixture({ errorCode: "native_provider_state_incompatible", error: `Original reason. ${NEW_SESSION_RETRY_NEXT_ACTION}` });
+    await db.update(issueRecoveryActions).set({ nextAction: `Saved reason. ${NEW_SESSION_RETRY_NEXT_ACTION}` })
+      .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    if (!offered) await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+    const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
+    expect(blocker).toMatchObject({ canRetry: offered, runError: "Original reason." });
+    expect(blocker!.nextAction).toBe(`Saved reason.${offered ? ` ${EXECUTION_BLOCKER_PERSON_RETRY_ACTION}` : ""}`);
+    expect(blocker?.retryDisclosure).toBe(offered ? NEW_SESSION_RETRY_NEXT_ACTION : undefined);
+    expect(JSON.stringify(blocker).match(/Retry starts a new session/g)?.length ?? 0).toBe(offered ? 1 : 0);
   });
 
   it("shows plain wording and Retry for a finalization deadline saved by the previous release", async () => {

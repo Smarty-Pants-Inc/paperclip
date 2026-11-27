@@ -1,3 +1,4 @@
+import { retryStartsNewSessionColumn } from "./run-retry-presentation.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { skillAccessService } from "./skill-access.js";
 import { credentialAccessConnectionNameSql } from "./credential-access-visibility.js";
@@ -520,6 +521,7 @@ export function activityService(db: Db) {
       const runsQuery = db
         .select({
           runId: heartbeatRuns.id,
+          retryStartsNewSession: retryStartsNewSessionColumn,
           runtimeMode: heartbeatRuns.runtimeMode,
           wakeupRequestId: heartbeatRuns.wakeupRequestId,
           status: heartbeatRuns.status,

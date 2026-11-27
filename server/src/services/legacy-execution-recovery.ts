@@ -43,7 +43,7 @@ export const UNRESTORED_FILES_NEXT_ACTION = "The task's saved files could not be
   + "They are kept where they were and are not applied. Press Retry to continue from the last saved version in a new workspace.";
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 
-async function workspaceRecoveryNextAction(db: Pick<Db, "select">, run: Pick<Run, "id" | "companyId" | "errorCode">) {
+async function workspaceRecoveryNextAction(db: Pick<Db, "select">, run: Pick<Run, "id" | "companyId" | "errorCode" | "error" | "resultJson">) {
   // Containing a prepared workspace does not mean its files caused the failure.
   const failure = classifiedRunFailure({ errorCode: run.errorCode,
     ...(run.errorCode === "native_session_interrupted" ? await readRunFailureStage(db, run.companyId, run.id) : undefined) });

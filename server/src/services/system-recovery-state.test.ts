@@ -25,6 +25,37 @@ describe("durable system recovery budget", () => {
     expect(state.retriesUsed).toBe(5);
     expect(reserveSystemRecoveryAttempt(state, now + 1_000_000)).toBeNull();
   });
+  it.each(["agent_stop_unconfirmed", "copyback_stop_unconfirmed", "workspace_writer_active", "effect_unresolved"] as const)("a failed forced stop check preserves the exact backoff, and the scheduled check spends only its ordinary retry: %s", code => {
+    const failure = new SystemRecoveryFailure(code, "recheck_evidence");
+    let ordinary = failSystemRecovery(reserveSystemRecoveryAttempt(createSystemRecovery(randomUUID()), 0)!, failure, { now: 0 });
+    for (let step = 0; step < 3; step++) {
+      const due = ordinary.nextAttemptAt!, early = due - 1_000;
+      const pulled = { ...ordinary, nextAttemptAt: early,
+        commentRecheck: { scheduledAt: due, retriesUsed: ordinary.retriesUsed, pending: true } };
+      const reserved = reserveSystemRecoveryAttempt(pulled, early)!;
+      const restarted = readSystemRecovery(JSON.parse(JSON.stringify({ systemRecovery: reserved })))!;
+      expect(reserveSystemRecoveryAttempt(restarted, early)).toMatchObject({ attempts: reserved.attempts, retriesUsed: reserved.retriesUsed });
+      const failed = failSystemRecovery(restarted, failure, { now: early });
+      expect(failed).toMatchObject({ retriesUsed: ordinary.retriesUsed, nextAttemptAt: due, deadlineAt: ordinary.deadlineAt,
+        commentRecheck: { pending: false } });
+      expect(reserveSystemRecoveryAttempt(failed, due - 1)).toBeNull();
+      const expected = failSystemRecovery(reserveSystemRecoveryAttempt(ordinary, due)!, failure, { now: due });
+      const actual = failSystemRecovery(reserveSystemRecoveryAttempt(failed, due)!, failure, { now: due });
+      expect(actual).toMatchObject({ retriesUsed: expected.retriesUsed, nextAttemptAt: expected.nextAttemptAt,
+        failure: expected.failure, deadlineAt: expected.deadlineAt, commentRecheck: undefined });
+      ordinary = actual;
+    }
+  });
+  it("a forced check that proves stop but fails later spends its ordinary retry, not a free extra attempt", () => {
+    const stop = new SystemRecoveryFailure("agent_stop_unconfirmed", "recheck_evidence");
+    const held = failSystemRecovery(reserveSystemRecoveryAttempt(createSystemRecovery(randomUUID()), 0)!, stop, { now: 0 });
+    const early = held.nextAttemptAt! - 1_000;
+    const reserved = reserveSystemRecoveryAttempt({ ...held, nextAttemptAt: early,
+      commentRecheck: { scheduledAt: held.nextAttemptAt!, retriesUsed: held.retriesUsed, pending: true } }, early)!;
+    const failed = failSystemRecovery(reserved, new SystemRecoveryFailure("export_interrupted", "retry_transient"), { now: early });
+    expect(failed.retriesUsed).toBe(held.retriesUsed + 1);
+    expect(failed.commentRecheck).toBeUndefined();
+  });
   it("never retries ahead of a provider cooldown or after the generation deadline", () => {
     const state = reserveSystemRecoveryAttempt(createSystemRecovery(randomUUID()), 0)!;
     const later = failSystemRecovery(state, new SystemRecoveryFailure("provider_unavailable", "retry_transient"),

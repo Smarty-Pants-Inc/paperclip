@@ -1,3 +1,9 @@
+import express from "express";
+import request from "supertest";
+import { agentRoutes } from "../routes/agents.js";
+import { issueRoutes } from "../routes/issues.js";
+import { getStorageService } from "../storage/index.js";
+import { errorHandler } from "../middleware/index.js";
 import { NativeProviderStateIncompatibleError } from "../vendor/paperclip-runner/index.js";
 import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES, PluginWorkspaceOperationError, workspaceOperationErrorData } from "@paperclipai/plugin-sdk";
 import * as nativeRuntimeMode from "../services/native-runtime/runtime-mode.js";
@@ -192,10 +198,12 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
   });
 
   it.each([
-    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", fresh: true, org: "example-org", chat: false },
-    { failure: "ordinary provider failure", fresh: false, org: "second-org", chat: false },
-    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", fresh: false, org: "second-org", chat: true },
-  ])("a person's validated continuous-Pi Retry: $org, chat=$chat, fresh=$fresh", async ({ failure, fresh, org, chat }) => {
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", fresh: true, org: "example-org", chat: false, person: true, initiatedBy: undefined },
+    { failure: "ordinary provider failure", fresh: false, org: "second-org", chat: false, person: true, initiatedBy: undefined },
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", fresh: true, org: "second-org", chat: true, person: true, initiatedBy: undefined },
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", fresh: false, org: "budget_automatic", chat: true, person: false, initiatedBy: undefined },
+    { failure: "native_controller_recovery_missing_evidence:retained_sandbox_binding", fresh: false, org: "second-org", chat: true, person: false, initiatedBy: "restart_recovery" as const },
+  ])("validated continuous-Pi Retry: $org, chat=$chat, person=$person, initiatedBy=$initiatedBy, fresh=$fresh", async ({ failure, fresh, org, chat, person, initiatedBy }) => {
     const f = await seed(), sessionId = randomUUID();
     await db.update(companies).set({ name: org }).where(eq(companies.id, f.companyId));
     if (chat) await db.update(issues).set({ originKind: "chat_channel" }).where(eq(issues.id, f.issueId));
@@ -210,12 +218,14 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       await db.update(heartbeatRuns).set({ status: "failed", error: failure, errorCode: "native_continuation_requires_reconciliation" }).where(eq(heartbeatRuns.id, first.finished.id));
       await db.update(issues).set({ status: "todo" }).where(eq(issues.id, f.issueId));
       const receipt = await requestTaskRetry({ db, companyId: f.companyId, issueId: f.issueId, actorId: f.userId,
-        actorSource: "local_implicit", observedRunId: first.finished.id, idempotencyKey: randomUUID() });
+        actorSource: "local_implicit", observedRunId: first.finished.id, idempotencyKey: randomUUID(), initiatedBy,
+        personRetry: person ? { userId: f.userId } : undefined });
       expect(receipt).toMatchObject({ accepted: true, stale: false });
       await heartbeat.resumeTaskRetry(f.companyId, receipt.requestId!);
       await heartbeat.drainActiveRunExecutions();
       const retries = [...captured.values()].filter(input => input.context.taskRetryRequestId === receipt.requestId);
       expect(retries.map(input => input.runtime.sessionId)).toEqual([fresh ? null : sessionId]);
+      expect(retries.map(input => input.context.explicitFreshSession)).toEqual([fresh ? true : undefined]);
     } finally { await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false }); }
   });
   it("keeps a workspace source refusal typed before provider startup", async () => {
@@ -796,6 +806,35 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       if (cwd) await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it.each(["issues", "agents"] as const)("authenticated %s Retry freshens the same cannot-continue Agent Chat advertised by the run", async route => {
+    const f = await seed(), sessionId = randomUUID();
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", model: "fixture/model",
+      sessionContinuity: "continuous", fixtureSessionId: sessionId } }).where(eq(agents.id, f.agentId));
+    await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: f.userId,
+      conversationState: "active" }).where(eq(issues.id, f.issueId));
+    const first = await execute(f);
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "native_provider_state_incompatible",
+      error: "lost resume state" }).where(eq(heartbeatRuns.id, first.finished.id));
+    expect(await heartbeat.getRun(first.finished.id)).toMatchObject({ retryStartsNewSession: true });
+    const app = express(); app.use(express.json());
+    app.use((req, _res, next) => { req.actor = { type: "board", userId: f.userId, source: "local_implicit",
+      companyIds: [f.companyId], isInstanceAdmin: true }; next(); });
+    app.use("/api", route === "issues" ? issueRoutes(db, getStorageService()) : agentRoutes(db, {})); app.use(errorHandler);
+    const response = route === "issues"
+      ? await request(app).post(`/api/issues/${f.issueId}/retry`).send({ observedRunId: first.finished.id,
+        idempotencyKey: randomUUID() })
+      : await request(app).post(`/api/agents/${f.agentId}/wakeup`).send({ reason: "retry_failed_run",
+        failedRunId: first.finished.id, personRetry: { userId: "forged" }, payload: { personRetry: { userId: "forged" } } });
+    expect(response.status, JSON.stringify(response.body)).toBe(202);
+    await heartbeat.drainActiveRunExecutions();
+    const retries = [...captured.values()].filter(input => input.runId !== first.finished.id && input.context.issueId === f.issueId);
+    expect(retries.map(input => input.runtime.sessionId)).toEqual([null]);
+    expect(retries.map(input => input.context.explicitFreshSession)).toEqual([true]);
+    expect(JSON.stringify(retries[0].context)).not.toContain("forged");
+    console.info("authenticated-retry-proof", JSON.stringify({ route, sourceRunId: first.finished.id,
+      successorRunId: retries[0].runId, sessionIdBefore: retries[0].runtime.sessionId, explicitFreshSession: true }));
+  }, 60_000);
 
   it("starts fresh when effective model configuration changes and persists the reason", async () => {
     const f = await seed();
