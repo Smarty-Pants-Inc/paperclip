@@ -3,7 +3,10 @@ import { notifyNativeStatusWakeWork } from "../deferred-execution-notifications.
 import { currentRunFailureText } from "./native-exact-resume-failure.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { toolCallLoopContinuationKey } from "./repeated-tool-failure-guard.js";
+import { nativeRunHasStopRequest } from "./native-tool-receipt-limit.js";
+import { hasUnclaimedTaskPersonInput, PI_UNCLAIMED_CONTINUATION_KEY, UNCLAIMED_TASK_OWNER_REASON, UNCLAIMED_TASK_OWNER_MISSING_REASON, UNCLAIMED_TASK_OWNER_MISSING_NOTICE } from "./unclaimed-task.js";
 import { assertAgentInteraction } from "../agent-interaction-policy.js";
+import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { forbidden, HttpError } from "../../errors.js";
 import { agentInteractionDeliveryDenial, agentWakeInteractionTexts, INTERACTION_DELIVERY_DENIED, withInteractionDeliveryOrigin } from "../agent-interaction-delivery.js";
 import { notifyExternalAgentSettlement } from "../../modules/external-agents/index.js";
@@ -46,6 +49,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueApprovals,
+  issueComments,
   issueRecoveryActions,
   issueThreadInteractions,
   issues,
@@ -758,6 +762,17 @@ async function materializeDecisionEffect(input: {
     };
   }
   if (effect.kind === "notify_owner") {
+    // Reuse the scoped review wake when governance permits it. A human-only
+    // company cap can suppress that wake; then use the existing owner notice
+    // below, without granting reviewer execution or retrying finalization.
+    if (effect.reason === UNCLAIMED_TASK_OWNER_REASON) {
+      const [reviewWake] = await input.tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.agentId, effect.agentId),
+        sql`${agentWakeupRequests.payload}->>'nativeReviewDecisionId' = ${input.decisionId}`,
+      )).limit(1);
+      if (reviewWake) return { effectKind: effect.kind, targetType: "agent_wakeup_request", targetId: reviewWake.id,
+        payload: { reason: effect.reason } };
+    }
     const wakeId = await enqueueWake({
       tx: input.tx,
       originRunId: input.runId,
@@ -855,7 +870,8 @@ async function materializeDecisionEffect(input: {
       companyId: input.companyId,
       issueId: input.issue.id,
       agentId: effect.agentId,
-      reason: "issue_status_changed",
+      reason: effect.idempotencyKey === PI_UNCLAIMED_CONTINUATION_KEY ? "issue_continuation_needed" : "issue_status_changed",
+      contextSnapshot: effect.idempotencyKey === PI_UNCLAIMED_CONTINUATION_KEY ? { nativeTaskUnclaimed: true } : undefined,
       idempotencyKey: `native-status:${input.decisionId}:continuation`,
       payload: {
         nativeDecisionId: input.decisionId,
@@ -1702,14 +1718,15 @@ async function materializeDecisionEffect(input: {
   }
   if (effect.kind === "record_recovery") {
     failAt("recovery_materialization", input.failpoint);
+    const ownerlessTask = effect.cause === UNCLAIMED_TASK_OWNER_MISSING_REASON;
     const recovery = await issueRecoveryActionService(
       input.tx,
     ).upsertSourceScoped({
       companyId: input.companyId,
       sourceIssueId: input.issue.id,
       kind: "active_run_watchdog",
-      ownerType: "agent",
-      ownerAgentId: effect.agentId,
+      ownerType: ownerlessTask ? "board" : "agent",
+      ownerAgentId: ownerlessTask ? null : effect.agentId,
       cause: effect.cause,
       fingerprint: nativeSha256({
         runId: input.runId,
@@ -1718,7 +1735,7 @@ async function materializeDecisionEffect(input: {
       }),
       evidence: { runId: input.runId, decisionId: input.decisionId },
       nextAction: effect.nextAction,
-      wakePolicy: { kind: "resume_native_run", runId: input.runId },
+      wakePolicy: ownerlessTask ? null : { kind: "resume_native_run", runId: input.runId },
       maxAttempts: 3,
     });
     return {
@@ -1928,6 +1945,29 @@ export async function commitNativeStatusDecision(input: {
       issue.lastStatusDecisionId !== input.priorDecisionId
     ) {
       throw new NativeStatusRaceError();
+    }
+    const unclaimedTask = reasonCode === UNCLAIMED_TASK_OWNER_MISSING_REASON || input.decision.effects.some(effect =>
+      (effect.kind === "enqueue_continuation" && effect.idempotencyKey === PI_UNCLAIMED_CONTINUATION_KEY) ||
+      (effect.kind === "bind_reviewer" && effect.requestKey === UNCLAIMED_TASK_OWNER_REASON));
+    if (unclaimedTask) {
+      // A Stop or person message may have landed after the finalizer read it.
+      // Retry assessment under the issue lock instead of committing stale repair.
+      const [run] = await tx.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId),
+      )).for("share");
+      if (!run || nativeRunHasStopRequest(run.resultJson) || record(run.resultJson?.personStop).requestedAt !== undefined ||
+          await hasUnclaimedTaskPersonInput(tx as unknown as Db, run, input.issueId)) throw new NativeStatusRaceError();
+      if (reasonCode === UNCLAIMED_TASK_OWNER_MISSING_REASON) {
+        if (issue.responsibleUserId || issue.createdByUserId) throw new NativeStatusRaceError();
+        if (issue.createdByAgentId && issue.createdByAgentId !== run.agentId) {
+          const [creator] = await tx.select().from(agents).where(and(
+            eq(agents.companyId, input.companyId), eq(agents.id, issue.createdByAgentId),
+          ));
+          // The finalizer deliberately skips a non-invokable creator. Only a
+          // now-invokable owner invalidates its ownerless Blocked assessment.
+          if (creator && (await evaluateAgentInvokabilityFromDb(tx as unknown as Db, creator)).invokable) throw new NativeStatusRaceError();
+        }
+      }
     }
     const unblockOwner = input.decision.unblockDescriptor?.owner;
     const assessedUserId = unblockOwner && typeof unblockOwner === "object" && "userId" in unblockOwner
@@ -2388,6 +2428,19 @@ export async function commitNativeStatusDecision(input: {
     }
     if (!decisionRow) throw new Error("native_status_decision_not_persisted");
 
+    if (reasonCode === UNCLAIMED_TASK_OWNER_MISSING_REASON) {
+      // The issue lock and decision transaction fence notice replay, including
+      // a crash before the finalizer projects the run's committed phase.
+      const clientRequestId = `native-unclaimed-task-owner-missing:${input.runId}`;
+      const [notice] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+        eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
+        eq(issueComments.authorType, "system"), eq(issueComments.clientRequestId, clientRequestId),
+      )).limit(1);
+      if (!notice) await issueService(tx as unknown as Db).addComment(input.issueId,
+        UNCLAIMED_TASK_OWNER_MISSING_NOTICE,
+        {}, { authorType: "system", clientRequestId,
+          presentation: { kind: "system_notice", tone: "warning", detailsDefaultOpen: false } }, tx);
+    }
     if (planWait) {
       await issueService(tx as unknown as Db).addComment(
         input.issueId, planWait.result.summary,
