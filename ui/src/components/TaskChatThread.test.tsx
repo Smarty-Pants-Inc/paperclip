@@ -15,6 +15,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConnectivityProvider, createConnectivityStore } from "@/lib/connectivity";
 import { INITIAL_TRANSCRIPT_REVEAL_BUDGET_MS, TaskChatThread } from "./TaskChatThread";
 import { IssueChatThread } from "./IssueChatThread";
+import { CONTINUATION_NOTHING_NEW_SCHEMA, type ContinuationNothingNew } from "@paperclipai/shared";
 import type {
   Agent,
   IssueDocument,
@@ -22,6 +23,7 @@ import type {
   IssueThreadInteraction,
   TaskBrowser,
 } from "@paperclipai/shared";
+import type { RunForIssue } from "@/api/activity";
 import { heartbeatsApi } from "@/api/heartbeats";
 import { nativeRunEventsToTranscript } from "./transcript/native-run-events";
 import { genericPendingRequestConfirmationInteraction, pendingConnectionIntentInteraction } from "@/fixtures/issueThreadInteractionFixtures";
@@ -3696,6 +3698,282 @@ describe("TaskChatThread runtime transcript selection", () => {
       expect(container.textContent).not.toContain("Couldn't start");
       expect(container.textContent).not.toContain("Run cancelled");
       expect(container.textContent).not.toContain("before returning an answer");
+    },
+  );
+
+  describe.each(["legacy", "native"] as const)("continuation_nothing_new server proof (%s)", runtimeMode => {
+    const person = (id: string) => ({
+      id, companyId: "company-1", issueId: "issue-1", authorType: "user" as const,
+      authorAgentId: null, authorUserId: "person-1", body: `Person's request ${id}.`,
+      presentation: null, metadata: null,
+      createdAt: new Date("2026-09-07T17:59:59.000Z"), updatedAt: new Date("2026-09-07T17:59:59.000Z"),
+    });
+    // Shared-type fixture from heartbeat-process-recovery.test.ts's
+    // "cancels obsolete continuation setup: continuation_nothing_new" row.
+    // The real constructor imports Node-only DB/Runner code that jsdom cannot load.
+    const receipt = (namedCommentIds: string[], answeredCommentIds: string[]): ContinuationNothingNew => ({
+      schema: CONTINUATION_NOTHING_NEW_SCHEMA, namedCommentIds, answeredCommentIds, cause: "all_named_answered",
+    });
+    it("uses the issue-runs summary: all answered stays quiet, unanswered stays drawn", () => {
+      const request = person("fb44e44f-201e-4fce-b186-bfda75bdf1ab");
+      const runId = "8d8d37f0-b25e-4f08-8b3e-94d1fd50e195";
+      nativeTranscriptState.hydratedRunIds = new Set([runId]);
+      nativeTranscriptState.terminalHydratedRunIds = new Set([runId]);
+      for (const answered of [true, false]) {
+        // Same bounded result shape as issue-runs-read-cost.test.ts's
+        // "nothing-new" fixture: summarizedResultJson keeps stopReason and
+        // continuationNothingNew, not stdout or the original result object.
+        const summary: RunForIssue = {
+          runId, runtimeMode, status: "cancelled", errorCode: "continuation_nothing_new",
+          agentId: "agent-1", adapterType: "paperclip_runner", invocationSource: "on_demand",
+          startedAt: null, finishedAt: "2026-09-07T18:00:01.000Z", createdAt: "2026-09-07T18:00:00.000Z",
+          wakeCommentId: request.id, wakeCommentIds: [request.id], firstTurnCommentIds: null,
+          contextCommentId: null, usageJson: null, logBytes: 0,
+          resultJson: { stopReason: "end_turn", continuationNothingNew: receipt([request.id], answered ? [request.id] : []) },
+        };
+        // IssueDetail's timelineRuns spreads the HTTP summary and adds only
+        // hasStoredOutput. No single-run hydration or contextSnapshot supplies proof.
+        const httpSummary: RunForIssue = JSON.parse(JSON.stringify(summary));
+        renderThread({ comments: [request], onAdd: async () => {}, issueStatus: "in_progress",
+          linkedRuns: [{ ...httpSummary, hasStoredOutput: (httpSummary.logBytes ?? 0) > 0 }],
+        });
+        expect(container.textContent).toContain(request.body);
+        if (answered) {
+          expect(container.querySelector('[data-testid="task-chat-turn"]')).toBeNull();
+          expect(container.querySelector('[data-testid="task-chat-runner-turn"]')).toBeNull();
+          expect(container.querySelector('[data-testid="task-chat-collapsible-marker"]')).toBeNull();
+          expect(container.textContent).not.toContain("Couldn't finish");
+          expect(container.textContent).not.toContain("Stopped");
+        } else {
+          expect(container.textContent).toContain("Couldn't finish");
+        }
+      }
+    });
+    it.each([
+      { name: "server cancellation fixture: answered person", proof: receipt(["one"], ["one"]), wakeIds: ["one"], quiet: true },
+      { name: "empty system proof", proof: { ...receipt([], []), cause: "empty_system_wake" }, wakeIds: [], quiet: true, wakeReason: "heartbeat" },
+      { name: "all named people answered", proof: receipt(["one", "two"], ["one", "two"]), wakeIds: ["one", "two"], quiet: true },
+      { name: "answered named person without wake IDs", proof: receipt(["one"], ["one"]), wakeIds: [], quiet: true },
+      { name: "answered wake person not in named IDs", proof: receipt([], ["one"]), wakeIds: ["one"], quiet: true },
+      { name: "one named person unanswered", proof: receipt(["one", "two"], ["one"]), wakeIds: ["one"], quiet: false },
+      { name: "one wake person unanswered", proof: receipt(["one"], ["one"]), wakeIds: ["one", "two"], quiet: false },
+      { name: "unloaded named ID even if answered", proof: receipt(["missing"], ["missing", "one"]), wakeIds: ["one"], quiet: false },
+      { name: "unloaded wake ID even if answered", proof: receipt(["one"], ["one", "missing"]), wakeIds: ["missing"], quiet: false },
+      { name: "agent and system need no person answer", proof: receipt(["agent", "system"], []), wakeIds: ["agent", "system"], quiet: true },
+      { name: "unknown schema cannot prove a person answered", proof: { ...receipt(["one"], ["one"]), schema: "future-schema" }, wakeIds: ["one"], quiet: false },
+      { name: "unknown schema uses non-user wake rule", proof: { ...receipt(["missing"], []), schema: "future-schema" }, wakeIds: ["agent", "system"], quiet: true },
+      { name: "absent proof cannot hide a person", proof: undefined, wakeIds: ["one"], quiet: false },
+      { name: "known schema missing named IDs", proof: { schema: CONTINUATION_NOTHING_NEW_SCHEMA, answeredCommentIds: [] }, wakeIds: ["agent"], quiet: false },
+      { name: "known schema missing answered IDs", proof: { schema: CONTINUATION_NOTHING_NEW_SCHEMA, namedCommentIds: [] }, wakeIds: ["agent"], quiet: false },
+      { name: "malformed named ID", proof: { ...receipt([], []), namedCommentIds: [null] }, wakeIds: ["agent"], quiet: false },
+      { name: "person Stop wins over proof", proof: receipt(["one"], ["one"]), wakeIds: ["one"], quiet: false, stopped: true },
+    ])("$name", ({ proof, wakeIds, quiet, stopped, wakeReason }) => {
+      const runId = "proved-nothing-new";
+      if (stopped) (runtimeMode === "native" ? nativeTranscriptState : transcriptState).transcriptByRun.set(runId, [
+        assistantEntry("2026-09-07T18:00:00.500Z", "Work before the person stopped it.", "progress"),
+      ]);
+      nativeTranscriptState.hydratedRunIds = new Set([runId]);
+      nativeTranscriptState.terminalHydratedRunIds = new Set([runId]);
+      renderThread({
+        comments: [person("one"), person("two"),
+          { ...person("agent"), authorType: "agent", authorUserId: null, authorAgentId: "agent-2" },
+          { ...person("system"), authorType: "system", authorUserId: null }],
+        onAdd: async () => {}, issueStatus: "in_progress",
+        linkedRuns: [{
+          runId, runtimeMode, status: "cancelled", errorCode: "continuation_nothing_new", startedAt: null,
+          agentId: "agent-1", agentName: "Runner", adapterType: "paperclip_runner",
+          ...{ contextSnapshot: { wakeReason: wakeReason ?? "issue_commented", wakeCommentId: wakeIds[0], wakeCommentIds: wakeIds } },
+          resultJson: { existingEvidence: "preserved", continuationNothingNew: proof, ...(stopped ? { personStop: true } : {}) },
+          createdAt: "2026-09-07T18:00:00.000Z", finishedAt: "2026-09-07T18:00:01.000Z",
+        }],
+      });
+      if (quiet) {
+        expect(container.querySelector('[data-testid="task-chat-turn"]')).toBeNull();
+        expect(container.querySelector('[data-testid="task-chat-runner-turn"]')).toBeNull();
+        expect(container.querySelector('[data-testid="task-chat-collapsible-marker"]')).toBeNull();
+        expect(container.textContent).not.toContain("Couldn't finish");
+        expect(container.textContent).not.toContain("Stopped");
+      } else if (stopped) {
+        expect(container.textContent?.match(/Stopped/g)).toHaveLength(1);
+        expect(container.textContent).not.toContain("Couldn't finish");
+      } else {
+        expect(container.textContent).toContain("Couldn't finish");
+      }
+      expect(container.textContent).toContain(person("one").body);
+      expect(container.textContent).toContain(person("two").body);
+    });
+
+    it.each([
+      { wakeReason: "issue_commented" }, { wakeReason: "queued_comment_drain" },
+      { wakeReason: "queued_comment_steer" }, { wakeReason: "interaction_resolved" },
+      { source: "queued_comment_send" }, { source: "issue.queued_comment_steered" },
+      { source: "issue.interaction.respond" },
+    ].flatMap(contextSnapshot => [undefined, receipt([], []), { ...receipt([], []), schema: "future-schema" }]
+      .map(proof => ({ contextSnapshot, proof }))))(
+      "keeps person input with no comment IDs visible ($contextSnapshot, proof=$proof)",
+      ({ contextSnapshot, proof }) => {
+        const runId = "unnamed-person-input";
+        nativeTranscriptState.hydratedRunIds = new Set([runId]);
+        nativeTranscriptState.terminalHydratedRunIds = new Set([runId]);
+        renderThread({ comments: [], onAdd: async () => {}, issueStatus: "in_progress", linkedRuns: [{
+          runId, runtimeMode, status: "cancelled", errorCode: "continuation_nothing_new", startedAt: null,
+          agentId: "agent-1", agentName: "Runner", adapterType: "paperclip_runner", ...{ contextSnapshot },
+          resultJson: { continuationNothingNew: proof },
+          createdAt: "2026-09-07T18:00:00.000Z", finishedAt: "2026-09-07T18:00:01.000Z",
+        }] });
+        expect(container.textContent).toContain("Couldn't finish");
+      },
+    );
+  });
+
+  it.each(([
+    { runtimeMode: "legacy", hydrated: true },
+    { runtimeMode: "native", hydrated: false },
+    { runtimeMode: "native", hydrated: true },
+  ] as const).flatMap(shape => [null, "2026-09-07T18:00:00.500Z"].map(startedAt => ({ ...shape, startedAt }))))(
+    "draws nothing for continuation_nothing_new ($runtimeMode, hydrated=$hydrated, startedAt=$startedAt)",
+    ({ runtimeMode, hydrated, startedAt }) => {
+      const runId = "nothing-new-continuation";
+      nativeTranscriptState.hydratedRunIds = new Set(hydrated ? [runId] : []);
+      nativeTranscriptState.terminalHydratedRunIds = new Set(hydrated ? [runId] : []);
+      renderThread({
+        comments: [], onAdd: async () => {}, issueStatus: "in_progress",
+        linkedRuns: [{
+          runId, runtimeMode, status: "cancelled", errorCode: "continuation_nothing_new", startedAt,
+          agentId: "agent-1", agentName: "Runner", adapterType: "paperclip_runner",
+          createdAt: "2026-09-07T18:00:00.000Z", finishedAt: "2026-09-07T18:00:01.000Z",
+        }],
+      });
+      expect(container.querySelector('[data-testid="task-chat-turn"]')).toBeNull();
+      expect(container.querySelector('[data-testid="task-chat-runner-turn"]')).toBeNull();
+      expect(container.querySelector('[data-testid="task-chat-collapsible-marker"]')).toBeNull();
+      for (const text of ["Couldn't finish", "Stopped", "Run cancelled", "Run failed", "Run completed", "cancelled before it returned a response"]) {
+        expect(container.textContent).not.toContain(text);
+      }
+    },
+  );
+
+  describe.each(["legacy", "native"] as const)("continuation_nothing_new wake authors (%s)", runtimeMode => {
+    it.each([
+      "wakeCommentId", "wakeCommentIds", "firstTurnCommentIds", "contextCommentId",
+      "snapshot wakeCommentId", "snapshot wakeCommentIds", "snapshot firstTurnCommentIds", "linked input",
+    ].flatMap(field => ["user", "agent", "system", "unloaded"].map(author => ({ field, author }))))(
+      "$field with $author author fails toward showing unless the wake is known non-user",
+      ({ field, author }) => {
+        const runId = "nothing-new-wake";
+        const commentId = "wake-comment";
+        const wakeMeta = field === "linked input" ? {} : field.startsWith("snapshot ")
+          ? { contextSnapshot: { [field.slice("snapshot ".length)]: field.endsWith("Ids") ? [commentId] : commentId } }
+          : { [field]: field.endsWith("Ids") ? [commentId] : commentId };
+        nativeTranscriptState.hydratedRunIds = new Set([runId]);
+        nativeTranscriptState.terminalHydratedRunIds = new Set([runId]);
+        const comment = {
+          id: commentId, companyId: "company-1", issueId: "issue-1",
+          authorType: author === "user" ? "user" as const : author === "system" ? "system" as const : "agent" as const,
+          authorAgentId: author === "agent" ? "agent-2" : null,
+          authorUserId: author === "user" ? "person-1" : null,
+          body: "Wake input remains in the conversation.", presentation: null, metadata: null,
+          consumedByRunId: field === "linked input" ? runId : null,
+          createdAt: new Date("2026-09-07T17:59:59.000Z"), updatedAt: new Date("2026-09-07T17:59:59.000Z"),
+        };
+        // No linked input can name an unloaded row without another wake ID.
+        if (field === "linked input" && author === "unloaded") Object.assign(wakeMeta, { wakeCommentId: commentId });
+        renderThread({
+          comments: author === "unloaded" ? [] : [comment], onAdd: async () => {}, issueStatus: "in_progress",
+          linkedRuns: [{
+            runId, runtimeMode, status: "cancelled", errorCode: "continuation_nothing_new", startedAt: null,
+            agentId: "agent-1", agentName: "Runner", adapterType: "paperclip_runner", ...wakeMeta,
+            createdAt: "2026-09-07T18:00:00.000Z", finishedAt: "2026-09-07T18:00:01.000Z",
+          }],
+        });
+        if (author === "user" || author === "unloaded") {
+          expect(container.textContent).toContain("Couldn't finish");
+        } else {
+          expect(container.querySelector('[data-testid="task-chat-turn"]')).toBeNull();
+          expect(container.querySelector('[data-testid="task-chat-runner-turn"]')).toBeNull();
+          expect(container.querySelector('[data-testid="task-chat-collapsible-marker"]')).toBeNull();
+          expect(container.textContent).not.toContain("Couldn't finish");
+        }
+        if (author !== "unloaded") expect(container.textContent).toContain(comment.body);
+      },
+    );
+
+    it.each(["user", "unloaded"])("checks every wake ID, not just a loaded agent's first ID (%s)", author => {
+      const runId = "mixed-wake";
+      const agent = { id: "agent-wake", companyId: "company-1", issueId: "issue-1", authorType: "agent" as const,
+        authorAgentId: "agent-2", authorUserId: null, body: "Agent wake.", presentation: null, metadata: null,
+        createdAt: new Date("2026-09-07T17:59:58.000Z"), updatedAt: new Date("2026-09-07T17:59:58.000Z") };
+      const person = { ...agent, id: "person-wake", authorType: "user" as const, authorAgentId: null, authorUserId: "person-1", body: "Unanswered request." };
+      nativeTranscriptState.hydratedRunIds = new Set([runId]);
+      nativeTranscriptState.terminalHydratedRunIds = new Set([runId]);
+      renderThread({
+        comments: author === "user" ? [agent, person] : [agent], onAdd: async () => {}, issueStatus: "in_progress",
+        linkedRuns: [{
+          runId, runtimeMode, status: "cancelled", errorCode: "continuation_nothing_new", startedAt: null,
+          agentId: "agent-1", agentName: "Runner", adapterType: "paperclip_runner",
+          ...{ wakeCommentId: agent.id, wakeCommentIds: [agent.id, person.id] },
+          createdAt: "2026-09-07T18:00:00.000Z", finishedAt: "2026-09-07T18:00:01.000Z",
+        }],
+      });
+      expect(container.textContent).toContain("Couldn't finish");
+    });
+  });
+
+  it.each((["legacy", "native"] as const).flatMap(runtimeMode =>
+    ["cancelled", "continuation_nothing_new"].map(errorCode => ({ runtimeMode, errorCode }))))(
+    "keeps one Stopped row for a person-stopped run ($runtimeMode, $errorCode)",
+    ({ runtimeMode, errorCode }) => {
+      const runId = "person-stopped-continuation";
+      const entries = [assistantEntry("2026-09-07T18:00:00.500Z", "Work before the person stopped it.", "progress")];
+      (runtimeMode === "native" ? nativeTranscriptState : transcriptState).transcriptByRun.set(runId, entries);
+      nativeTranscriptState.hydratedRunIds = new Set([runId]);
+      renderThread({
+        comments: [], onAdd: async () => {}, issueStatus: "in_progress",
+        linkedRuns: [{
+          runId, runtimeMode, status: "cancelled", errorCode, startedAt: "2026-09-07T18:00:00.000Z",
+          resultJson: { personStop: true },
+          agentId: "agent-1", agentName: "Runner", adapterType: "paperclip_runner",
+          createdAt: "2026-09-07T18:00:00.000Z", finishedAt: "2026-09-07T18:00:01.000Z",
+        }],
+      });
+      expect(container.textContent?.match(/Stopped/g)).toHaveLength(1);
+      expect(container.textContent).not.toContain("Couldn't finish");
+      expect(container.querySelector('[data-testid="task-chat-run-failed-try-again"]')).toBeNull();
+    },
+  );
+
+  it.each((["legacy", "native"] as const).flatMap(runtimeMode =>
+    ["transcript", "comment"].map(content => ({ runtimeMode, content }))))(
+    "preserves $content on a continuation_nothing_new run ($runtimeMode)",
+    ({ runtimeMode, content }) => {
+      const runId = "continuation-with-content";
+      const body = "Retained work from the continuation.";
+      if (content === "transcript") {
+        (runtimeMode === "native" ? nativeTranscriptState : transcriptState).transcriptByRun.set(runId, [
+          assistantEntry("2026-09-07T18:00:00.500Z", body, "progress"),
+        ]);
+      }
+      nativeTranscriptState.hydratedRunIds = new Set([runId]);
+      renderThread({
+        comments: content === "comment" ? [{
+          id: "continuation-comment", companyId: "company-1", issueId: "issue-1", runId,
+          authorType: "agent", authorAgentId: "agent-1", authorUserId: null, body,
+          presentation: null, metadata: null,
+          createdAt: new Date("2026-09-07T18:00:00.500Z"), updatedAt: new Date("2026-09-07T18:00:00.500Z"),
+        }] : [],
+        onAdd: async () => {}, issueStatus: "in_progress",
+        linkedRuns: [{
+          runId, runtimeMode, status: "cancelled", errorCode: "continuation_nothing_new", startedAt: null,
+          agentId: "agent-1", agentName: "Runner", adapterType: "paperclip_runner",
+          createdAt: "2026-09-07T18:00:00.000Z", finishedAt: "2026-09-07T18:00:01.000Z",
+        }],
+      });
+      if (runtimeMode === "legacy" && content === "transcript") {
+        const activity = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-turn-summary"]');
+        expect(activity).not.toBeNull();
+        flushSync(() => activity!.click());
+      }
+      expect(container.textContent).toContain(body);
     },
   );
 

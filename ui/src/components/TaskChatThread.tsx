@@ -5,6 +5,7 @@ import {
   semanticProgressCommentIds,
 } from "@/lib/run-answer-visibility";
 import { imagePreparationReceiptIds } from "./task-chat/image-resources";
+import type { RunForIssue } from "@/api/activity";
 import type { ScrollingHistory } from "@/components/task-chat/TaskMessageScroller";
 import { TaskChatShimmerScope } from "@/components/task-chat/TaskChatShimmer";
 import { TaskChatStatusContext, TaskChatStatusLine, taskChatActivityLabel, taskChatLineState, taskChatTurnStart } from "@/components/task-chat/TaskChatStatusLine";
@@ -17,7 +18,7 @@ import {
   scheduleIssueDetailPaintMeasure,
   recordIssueDetailReadiness,
 } from "@/lib/issue-detail-performance";
-import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
+import { CONTINUATION_NOTHING_NEW_SCHEMA, hasWorkspaceRestoreFailure, type ContinuationNothingNew } from "@paperclipai/shared";
 import { workspaceRestoreMarkerDetail } from "@/lib/workspace-restore-marker";
 import { credentialAccessNotice } from "@/lib/credential-access-notice";
 import type { ActivityEvent, Issue, IssueQueuedCommentQueue, TaskBrowser } from "@paperclipai/shared";
@@ -809,6 +810,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   [suppliedComments, joinedQuestionKey]);
   const commentsById = useMemo(() => new Map(comments.map(comment => [comment.id, comment])), [comments]);
+  const isKnownNonUserWakeComment = useCallback((id: unknown) => {
+    const authorType = typeof id === "string" ? commentsById.get(id)?.authorType : undefined;
+    return authorType === "agent" || authorType === "system";
+  }, [commentsById]);
   const {
     data: planDocument,
     isLoading: planLoading,
@@ -2415,13 +2420,42 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       // /new is represented by its durable comment boundary, not an empty
       // model response or a completed-run notice.
       if (meta?.resultJson?.conversationReset === true) { settledRunIds.add(source.id); continue; }
-      // A queued continuation can become unnecessary while another turn finishes
-      // the task. Keep that cancellation in the run log, not the conversation.
+      // Read loaded history only; unresolved IDs must never hide a person's
+      // request. Only the shared server proof can settle a named user comment.
+      const wake = meta as Partial<RunForIssue> | undefined;
+      const wakeCommentIds = [
+        wake?.wakeCommentId, wake?.wakeCommentIds, wake?.firstTurnCommentIds, wake?.contextCommentId,
+        wake?.contextSnapshot?.wakeCommentId, wake?.contextSnapshot?.wakeCommentIds,
+        wake?.contextSnapshot?.firstTurnCommentIds,
+        ...(openingInputsByRun.get(source.id)?.questionIds ?? []),
+      ].flatMap(value => value == null ? [] : Array.isArray(value) ? value : [value]);
+      const proof = meta?.resultJson?.continuationNothingNew as Partial<ContinuationNothingNew> | undefined;
+      const knownProof = proof?.schema === CONTINUATION_NOTHING_NEW_SCHEMA;
+      const namedCommentIds = knownProof && Array.isArray(proof.namedCommentIds) ? proof.namedCommentIds : [];
+      const allCommentIds = [...wakeCommentIds, ...namedCommentIds];
+      // Older person-action wakes may not name their input. Empty arrays are
+      // not evidence that a queued message, steer or interaction was answered.
+      const unnamedPersonInput = allCommentIds.length === 0 && (
+        [wake?.contextSnapshot?.wakeReason, wake?.contextSnapshot?.source, wake?.contextSnapshot?.wakeSource,
+          wake?.invocationSource].some(value => typeof value === "string" &&
+            /(?:^|[._])(?:comment(?:ed)?|queued_comments?|steer(?:ed|ing)?|interaction)(?:[._]|$)/.test(value)) ||
+        typeof wake?.contextSnapshot?.interactionId === "string"
+      );
+      const answeredCommentIds = knownProof && Array.isArray(proof.answeredCommentIds) ? proof.answeredCommentIds : null;
+      const answeredIds = new Set(answeredCommentIds ?? []);
+      const quietNothingNew = meta?.errorCode === "continuation_nothing_new" && !unnamedPersonInput && (knownProof
+        ? Array.isArray(proof.namedCommentIds) && answeredCommentIds !== null &&
+          answeredCommentIds.every(id => typeof id === "string") && allCommentIds.every(id => {
+            if (isKnownNonUserWakeComment(id)) return true;
+            return typeof id === "string" && commentsById.get(id)?.authorType === "user" && answeredIds.has(id);
+          })
+        : wakeCommentIds.every(isKnownNonUserWakeComment));
       // Apply this before native stop markers are assembled as well.
       if (
         source.status === "cancelled" &&
         entries.length === 0 &&
         (meta?.errorCode === "issue_not_in_progress" ||
+          (quietNothingNew && !isUserStop(source.id) && !lastCommentIdByRun.has(source.id)) ||
           (meta?.errorCode === "issue_terminal_status" && !meta.startedAt))
       ) {
         settledRunIds.add(source.id);
@@ -3233,6 +3267,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     terminalHydratedRunIds,
     linkedRunMetaById,
     lastCommentIdByRun,
+    isKnownNonUserWakeComment,
+    commentsById,
     comments,
     commentItems,
     projectedComments,
