@@ -1,6 +1,7 @@
 import { isPaperclipExternalChatContractTurn, normalizePaperclipWakePayload, PAPERCLIP_EARLIER_READ_COMMENT_NOTE } from "@paperclipai/adapter-utils/server-utils";
 import type { CaseExecutionContext, projectCaseContinuation } from "../case-context.js";
 import { caseInstructionAlreadyRepresented } from "../case-context.js";
+import { nativeStatusRetryPrompt } from "./continued-session.js";
 
 /** Only new, authorized events belong in an already retained provider conversation.
  * Full bootstrap input is kept separately for an actual provider resume failure.
@@ -19,6 +20,13 @@ export function buildNativeContinuationPrompt(input: {
 }): string | null {
   const wake = normalizePaperclipWakePayload(input.wakePayload);
   if (input.promptOnly && wake) {
+    const retryPrompt = nativeStatusRetryPrompt(input.wakePayload, input.previousRunId);
+    if (retryPrompt) {
+      // The failed run's own history is already present, but person messages
+      // arriving since its coverage cursor have not been read by that turn.
+      const unseen = wake.executionContinuation?.resumeDelta?.messages.filter(message => message.authorType === "user") ?? [];
+      return [retryPrompt, ...unseen.map(message => message.body)].join("\n\n");
+    }
     const messages = [...(wake.executionContinuation?.messages ?? wake.executionContinuation?.resumeDelta?.messages ?? []), ...wake.comments];
     return wake.commentIds.map(id => wake.comments.find(comment => comment.id === id)?.fullBody ?? messages.find(message => message.id === id)!.body).join("\n\n");
   }
