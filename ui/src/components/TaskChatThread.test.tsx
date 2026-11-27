@@ -1894,7 +1894,7 @@ describe("request-comment anchor", () => {
   const run = { runId, runtimeMode: "native" as const, adapterType: "paperclip_runner", status: "succeeded",
     agentId: "agent", agentName: "Agent", createdAt: at(0), startedAt: at(0), finishedAt: at(20),
     resultJson: { continuousReplies: { answer: { commentId: reply.id, questionCommentIds: [request.id] } } } };
-  const requestedRun = { ...run, wakeCommentId: request.id };
+  const requestedRun = { ...run, ...({ wakeCommentId: request.id } as object) };
   const entries = (readAt: number, source: string, versionAt = 20) => [
     { kind: "system", text: "", ts: at(readAt), steeringEvent: { kind: "input", turnId: "turn" } },
     { kind: "assistant", text: `${source} activity.`, channel: "progress", ts: at(15), itemId: "progress" },
@@ -6688,7 +6688,7 @@ describe("native opening placement and segment order", () => {
     ];
     const props = { issueId: "issue", currentUserId: "viewer", onAdd: async () => {},
       comments: [request, steer, ...folded, opening, later],
-      linkedRuns: [{ ...run, wakeCommentId: request.id, resultJson: { continuousReplies: {
+      linkedRuns: [{ ...run, ...({ wakeCommentId: request.id } as object), resultJson: { continuousReplies: {
         opening: { commentId: opening.id, questionCommentIds: [request.id] },
         later: { commentId: later.id, questionCommentIds: [steer.id] },
       } } }] };
@@ -6721,7 +6721,7 @@ describe("native opening placement and segment order", () => {
       { kind: "assistant", text: answer.body, channel: "final", ts: at(25), itemId: answer.id },
     ]);
     render(<TaskChatThread issueId="issue" currentUserId="viewer" onAdd={async () => {}}
-      comments={[request, folded, answer]} linkedRuns={[{ ...run, wakeCommentId: request.id,
+      comments={[request, folded, answer]} linkedRuns={[{ ...run, ...({ wakeCommentId: request.id } as object),
         resultJson: { continuousReplies: { opening: { commentId: answer.id, questionCommentIds: [request.id, folded.id] } } } }]} />);
     await settleThreadLayout();
     assertBefore(folded.body, answer.body);
@@ -6733,7 +6733,7 @@ describe("native opening placement and segment order", () => {
     const answer = reply("opening", "The review is complete.", 40);
     nativeTranscriptState.hydratedRunIds = new Set([runId]);
     render(<TaskChatThread issueId="issue" currentUserId="viewer" onAdd={async () => {}}
-      comments={[request, answer]} linkedRuns={[{ ...run, wakeCommentId: request.id }]} />);
+      comments={[request, answer]} linkedRuns={[{ ...run, ...({ wakeCommentId: request.id } as object) }]} />);
     await settleThreadLayout();
     assertBefore(request.body, answer.body);
     expect(container.querySelector('[data-testid="task-chat-turn-summary"]')?.textContent).toContain("Worked for 40s");
