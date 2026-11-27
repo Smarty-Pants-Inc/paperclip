@@ -1111,7 +1111,7 @@ const SETTLING_REUSABLE_LEASE_RECENT_MS = 2 * 60_000;
 /** The allocation census used by terminal retention and reopen selection.
  * Lease.issueId is not source authority: a shared box can have earlier owners. */
 async function terminalPiSandboxSources(db: Db, lease: Pick<EnvironmentLease, "companyId" | "provider" | "providerLeaseId">) {
-  return db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId, issueId: boundRunIssueIdSql(), sessionId: heartbeatRuns.nativeSessionId })
+  return db.select({ id: heartbeatRuns.id, createdAt: heartbeatRuns.createdAt, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId, issueId: boundRunIssueIdSql(), sessionId: heartbeatRuns.nativeSessionId })
     .from(heartbeatRuns).innerJoin(environmentLeases, eq(environmentLeases.heartbeatRunId, heartbeatRuns.id))
     .where(and(eq(environmentLeases.companyId, lease.companyId), eq(environmentLeases.provider, lease.provider!),
       eq(environmentLeases.providerLeaseId, lease.providerLeaseId!), eq(heartbeatRuns.companyId, lease.companyId),
@@ -1129,35 +1129,41 @@ async function latestDurableTerminalPiSource(db: Db, sources: Awaited<ReturnType
   return null;
 }
 
+async function terminalPiTaskResetBoundary(db: Db, input: { companyId: string; issueId: string | null; agentId: string | null }) {
+  if (!input.issueId || !input.agentId) return null;
+  // A real task-session reset is an authority boundary even before the new
+  // conversation has recorded provider work. Historical held boxes stay held.
+  const [reset] = await db.select({ createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId),
+    eq(boundRunIssueIdSql(), input.issueId),
+    sql`(${heartbeatRuns.contextSnapshot}->>'explicitFreshSession' = 'true'
+      or ${heartbeatRuns.contextSnapshot}->>'conversationReset' = 'true')`,
+  )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+  return reset?.createdAt ?? null;
+}
+
 /** Reopen authority is the task's latest durable Pi session, not lease order. */
 async function latestDurableTerminalPiTaskSource(db: Db, input: { companyId: string; issueId: string | null; agentId: string | null }) {
   if (!input.issueId || !input.agentId) return null;
-  const sources = await db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId,
+  const reset = await terminalPiTaskResetBoundary(db, input);
+  const sources = await db.select({ id: heartbeatRuns.id, createdAt: heartbeatRuns.createdAt, companyId: heartbeatRuns.companyId,
     agentId: heartbeatRuns.agentId, issueId: boundRunIssueIdSql(), sessionId: heartbeatRuns.nativeSessionId })
     .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId),
       eq(boundRunIssueIdSql(), input.issueId), eq(heartbeatRuns.runtimeMode, "native"), isNotNull(heartbeatRuns.nativeSessionId),
+      reset ? sql`${heartbeatRuns.createdAt} >= ${reset.toISOString()}::timestamptz` : undefined,
       sql`${heartbeatRuns.runnerProfileJson}#>>'{nativeExecutionInput,provider,kind}' = 'pi_rpc'`,
     )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id));
   return latestDurableTerminalPiSource(db, sources);
 }
 
-/** A null lease task uses exactly the run binding used by terminal finalization. */
-async function bindReusableLeaseTask(db: Db, lease: EnvironmentLease, issueId: string | null) {
+/** A null lease task uses exactly the run binding used by terminal finalization.
+ * Candidate checks are read-only; only the selected ownership handoff binds it. */
+async function reusableLeaseTaskMatches(db: Db, lease: EnvironmentLease, issueId: string | null) {
   if (lease.issueId) return lease.issueId === issueId;
   if (!lease.heartbeatRunId) return issueId === null;
   const [run] = await db.select({ issueId: boundRunIssueIdSql() }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, lease.companyId), eq(heartbeatRuns.id, lease.heartbeatRunId))).limit(1);
-  if ((run?.issueId ?? null) !== issueId) return false;
-  if (!issueId) return true;
-  // Reuse's ownership CAS compares the stored selector, including after a
-  // confirmed stop has removed the intent. Fill only this verified null binding.
-  const [bound] = await db.update(environmentLeases).set({ issueId }).where(and(
-    eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, lease.companyId),
-    eq(environmentLeases.heartbeatRunId, lease.heartbeatRunId), isNull(environmentLeases.issueId),
-  )).returning({ id: environmentLeases.id });
-  if (!bound) return false;
-  lease.issueId = issueId;
-  return true;
+  return (run?.issueId ?? null) === issueId;
 }
 
 async function reusableTerminalLeaseMatchesTask(db: Db, lease: EnvironmentLease, input: {
@@ -1167,9 +1173,11 @@ async function reusableTerminalLeaseMatchesTask(db: Db, lease: EnvironmentLease,
     && !lease.metadata?.terminalPiSandboxOrigin) return true;
   const sources = await terminalPiSandboxSources(db, lease);
   const source = await latestDurableTerminalPiSource(db, sources);
-  // Non-Pi stop receipts retain their existing reusable behavior. An unused
-  // Pi bootstrap, however, cannot authorize reuse of a held conversation.
-  if (!source) return sources.length === 0;
+  // Without durable provider work, retain the ordinary pre-fence reuse path.
+  if (!source) {
+    const reset = await terminalPiTaskResetBoundary(db, input);
+    return !reset || !sources[0] || sources[0].createdAt >= reset;
+  }
   const taskSource = await latestDurableTerminalPiTaskSource(db, input);
   return source.issueId === input.issueId && source.agentId === input.agentId && source.sessionId === taskSource?.sessionId;
 }
@@ -1190,11 +1198,17 @@ async function waitForSettlingReusableLease(db: Db, input: {
       const [current] = await db.select().from(environmentLeases).where(and(eq(environmentLeases.id, terminalStop.lease.id),
         eq(environmentLeases.companyId, input.companyId))).limit(1);
       if (!current || current.provider !== terminalStop.lease.provider
-        || current.providerLeaseId !== terminalStop.lease.providerLeaseId) throw unsettled(terminalStop.lease);
+        || current.providerLeaseId !== terminalStop.lease.providerLeaseId) return null;
       const requestId = readStopOnlyCleanup(terminalStop.lease)?.requestId;
       if (hasConfirmedSandboxStopAndRetain({ ...current, expiresAt: null })
         && (current.metadata?.sandboxStopAndRetainReceipt as Record<string, unknown>)?.requestId === requestId) return toEnvironmentLeaseSnapshot(current);
-      if (current.status !== "pending_cleanup" || current.metadata?.pendingCleanupInFlight !== true
+      const currentIntent = current.metadata?.[SANDBOX_STOP_AND_RETAIN_KEY];
+      if (current.status !== "pending_cleanup" || !isRecord(currentIntent) || !isRecord(currentIntent.terminalPiSandbox)) return null;
+      const taskSource = await latestDurableTerminalPiTaskSource(db, input);
+      const source = await latestDurableTerminalPiSource(db, await terminalPiSandboxSources(db, current));
+      if (!source || source.issueId !== input.issueId || source.agentId !== input.agentId
+        || source.sessionId !== taskSource?.sessionId) return null;
+      if (current.metadata?.pendingCleanupInFlight !== true
         || readStopOnlyCleanup(current)?.requestId !== requestId || Date.now() >= terminalStop.deadline) throw unsettled(current);
       await delay(250);
       continue;
@@ -1224,9 +1238,10 @@ async function waitForSettlingReusableLease(db: Db, input: {
         sql`${environmentLeases.metadata}->>'agentId' = ${input.agentId}`,
       )).orderBy(environmentLeases.id);
     const ordinary: typeof environmentLeases.$inferSelect[] = [];
-    const terminalCandidates: typeof environmentLeases.$inferSelect[] = [];
-    let taskStop: typeof environmentLeases.$inferSelect | undefined;
+    const terminalCandidates: Array<{ lease: typeof environmentLeases.$inferSelect;
+      source: NonNullable<Awaited<ReturnType<typeof latestDurableTerminalPiSource>>> }> = [];
     const taskSource = await latestDurableTerminalPiTaskSource(db, input);
+    const reset = await terminalPiTaskResetBoundary(db, input);
     for (const { lease } of selected) {
       const raw = lease.metadata?.[SANDBOX_STOP_AND_RETAIN_KEY];
       const terminal = isRecord(raw) && isRecord(raw.terminalPiSandbox);
@@ -1240,43 +1255,30 @@ async function waitForSettlingReusableLease(db: Db, input: {
       // never hand off another task's conversation or an empty second box.
       const durableSource = await latestDurableTerminalPiSource(db, sources);
       if (durableSource?.issueId === input.issueId && durableSource.agentId === input.agentId) {
-        taskStop ??= lease;
-        if (durableSource.sessionId === taskSource?.sessionId) terminalCandidates.push(lease);
+        if (durableSource.sessionId === taskSource?.sessionId) terminalCandidates.push({ lease, source: durableSource });
+      } else if (!durableSource && !taskSource && sources[0]?.issueId === input.issueId
+        && sources[0]?.agentId === input.agentId && (!reset || sources[0].createdAt >= reset)) {
+        // No provider work is not a terminal-stop fence. It may still use the
+        // existing unattempted-stop handoff and ordinary reusable-box path.
+        ordinary.push(lease);
       }
-      else if (!durableSource && sources[0]?.issueId === input.issueId) taskStop ??= lease;
     }
-    if (terminalCandidates.length > 1) throw unsettled(terminalCandidates[0]!);
-    if (taskStop && terminalCandidates.length === 0) {
-      // A first reopen can already have handed the real source off and ended.
-      // An empty second box must neither fence the next message nor win reuse.
-      const reusable = await db.select({ lease: environmentLeases }).from(environmentLeases)
-        .innerJoin(heartbeatRuns, and(eq(heartbeatRuns.id, environmentLeases.heartbeatRunId),
-          eq(heartbeatRuns.companyId, environmentLeases.companyId))).where(and(
-        eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.environmentId, input.environmentId),
-        eq(environmentLeases.leasePolicy, "reuse_by_environment"), inArray(environmentLeases.status, ["released", "retained"]),
-        input.executionWorkspaceId ? eq(environmentLeases.executionWorkspaceId, input.executionWorkspaceId)
-          : and(isNull(environmentLeases.executionWorkspaceId),
-            sql`coalesce(${environmentLeases.issueId}::text, ${boundRunIssueIdSql()}) = ${input.issueId}`),
-        sql`${environmentLeases.metadata}->>'agentId' = ${input.agentId}`,
-      ));
-      const sources: typeof reusable = [];
-      for (const { lease } of reusable) {
-        const source = lease.provider && lease.providerLeaseId
-          ? await latestDurableTerminalPiSource(db, await terminalPiSandboxSources(db, lease)) : null;
-        if (source?.issueId === input.issueId && source.agentId === input.agentId
-          && source.sessionId === taskSource?.sessionId) sources.push({ lease });
-      }
-      if (sources.length !== 1) throw unsettled(taskStop);
-      return toEnvironmentLeaseSnapshot(sources[0]!.lease);
-    }
-    const settling = terminalCandidates[0] ?? ordinary[0];
+    // A census ambiguity is not an unfinished stop. Prefer the newest durable
+    // source deterministically; only its actual pending terminal stop fences.
+    terminalCandidates.sort((a, b) => b.source.createdAt.getTime() - a.source.createdAt.getTime()
+      || b.source.id.localeCompare(a.source.id) || a.lease.id.localeCompare(b.lease.id));
+    const settling = terminalCandidates[0]?.lease ?? ordinary[0];
     if (!settling) return null;
     if (["released", "retained"].includes(settling.status)) return toEnvironmentLeaseSnapshot(settling);
     const intent = readStopOnlyCleanup(settling);
     const raw = settling.metadata?.[SANDBOX_STOP_AND_RETAIN_KEY];
     const terminal = isRecord(raw) && isRecord(raw.terminalPiSandbox) ? raw.terminalPiSandbox : null;
     if (terminal) {
-      if (!intent || !["released", "retained"].includes(String(terminal.priorStatus))) throw unsettled(settling);
+      const fenceAuthorized = terminalCandidates[0]?.lease.id === settling.id;
+      if (!intent || !["released", "retained"].includes(String(terminal.priorStatus))) {
+        if (fenceAuthorized) throw unsettled(settling);
+        return null;
+      }
       // Preparation uses requestId as a placeholder attempt. Dispatch replaces
       // it while setting in-flight in the same CAS. Never cancel an attempted
       // stop, even when its failed dispatch has already cleared in-flight.
@@ -1284,7 +1286,10 @@ async function waitForSettlingReusableLease(db: Db, input: {
         && (settling.metadata?.pendingCleanupAttemptId == null || settling.metadata.pendingCleanupAttemptId === intent.requestId)
         && (settling.metadata?.pendingCleanupRetryAttempts ?? 0) === 0;
       if (unattempted) {
-        if (Date.now() >= deadline) throw unsettled(settling);
+        if (Date.now() >= deadline) {
+          if (fenceAuthorized) throw unsettled(settling);
+          return null;
+        }
         const cancelled = await writeEnvironmentCleanup(db, async tx => {
           const [previous] = await tx.update(environmentLeases).set({
             status: terminal.priorStatus as "released" | "retained", cleanupStatus: "success", failureReason: null, updatedAt: new Date(),
@@ -1312,6 +1317,7 @@ async function waitForSettlingReusableLease(db: Db, input: {
         if (cancelled) return cancelled;
         continue; // A racing dispatcher won the CAS; observe its claim.
       }
+      if (!fenceAuthorized) return null;
       const config = sandboxConfigFromLeaseMetadataLoose(toEnvironmentLeaseSnapshot(settling));
       terminalStop = { lease: settling, deadline: Date.now() + Math.min(resolvePluginSandboxRpcTimeoutMs({ ...config }) ?? 60_000, 60_000) };
       continue;
@@ -1319,6 +1325,18 @@ async function waitForSettlingReusableLease(db: Db, input: {
     if (Date.now() >= deadline) return null;
     await delay(250);
   }
+}
+
+async function obsoleteReusableCleanupCandidates(db: Db, leases: EnvironmentLease[]) {
+  const candidates: EnvironmentLease[] = [];
+  for (const lease of leases) {
+    // Historical null-task matches and durable Pi conversations are not
+    // destruction authority. The selected handoff owns eventual retirement.
+    if ((lease.issueId === null && lease.executionWorkspaceId === null)
+      || await latestDurableTerminalPiSource(db, await terminalPiSandboxSources(db, lease))) continue;
+    candidates.push(lease);
+  }
+  return candidates;
 }
 
 async function resumeLeaseLastRun(db: Db, lease: Pick<EnvironmentLease, "companyId" | "heartbeatRunId" | "metadata">) {
@@ -2035,7 +2053,7 @@ function createSandboxEnvironmentDriver(
         for (let index = reusableCandidateLeases.length - 1; index >= 0; index--) {
           // Protected allocations must stay out of both selection and obsolete cleanup.
           const lease = reusableCandidateLeases[index]!;
-          if ((input.executionWorkspaceId === null && !await bindReusableLeaseTask(db, lease, input.issueId))
+          if ((input.executionWorkspaceId === null && !await reusableLeaseTaskMatches(db, lease, input.issueId))
             || !await reusableTerminalLeaseMatchesTask(db, lease, input)
             || await nativeWorkspaceExportPendingForResource(db, lease, input.heartbeatRunId)
             || await legacyShutdownWorkspaceResourceProtected(db, reusableCandidateLeases[index]!))
@@ -2059,13 +2077,12 @@ function createSandboxEnvironmentDriver(
               lease.heartbeatRunId === input.heartbeatRunId,
           }),
         );
-        if (terminalReusableLease && !reusableExistingLeases.some(lease => lease.id === terminalReusableLease.id))
-          throw new ReusableSandboxResumeError({ provider: terminalReusableLease.provider!, providerLeaseId: terminalReusableLease.providerLeaseId!,
-            reason: "reusable_sandbox_terminal_stop_unsettled" });
+        if (terminalReusableLease && !reusableExistingLeases.some(lease => lease.id === terminalReusableLease?.id))
+          terminalReusableLease = null;
         if (reusableCandidateLeases.length > reusableExistingLeases.length) {
           await cleanupObsoleteReusableSandboxLeases({
             environment: input.environment,
-            leases: reusableCandidateLeases,
+            leases: await obsoleteReusableCleanupCandidates(db, reusableCandidateLeases),
             reusableLeases: reusableExistingLeases,
           });
         }
@@ -2368,6 +2385,9 @@ function createSandboxEnvironmentDriver(
             acquiredLease.expiresAt ? new Date(acquiredLease.expiresAt) : undefined,
           ),
           metadata: pluginLeaseMetadata,
+          reusableLeaseTaskBinding: reusableLease && providerLease && input.executionWorkspaceId === null
+            && !reusableLease.issueId && reusableLease.heartbeatRunId
+            ? { leaseId: reusableLease.id, heartbeatRunId: reusableLease.heartbeatRunId } : undefined,
           reusesReusableLeaseId:
             providerLease &&
             reusableLease?.heartbeatRunId === input.heartbeatRunId
@@ -2453,7 +2473,7 @@ function createSandboxEnvironmentDriver(
       for (let index = reusableCandidateLeases.length - 1; index >= 0; index--) {
         // Protected allocations must stay out of both selection and obsolete cleanup.
         const lease = reusableCandidateLeases[index]!;
-        if ((input.executionWorkspaceId === null && !await bindReusableLeaseTask(db, lease, input.issueId))
+        if ((input.executionWorkspaceId === null && !await reusableLeaseTaskMatches(db, lease, input.issueId))
           || !await reusableTerminalLeaseMatchesTask(db, lease, input)
           || await nativeWorkspaceExportPendingForResource(db, lease, input.heartbeatRunId)
           || await legacyShutdownWorkspaceResourceProtected(db, reusableCandidateLeases[index]!))
@@ -2477,13 +2497,12 @@ function createSandboxEnvironmentDriver(
             lease.heartbeatRunId === input.heartbeatRunId,
         }),
       );
-      if (terminalReusableLease && !reusableExistingLeases.some(lease => lease.id === terminalReusableLease.id))
-        throw new ReusableSandboxResumeError({ provider: terminalReusableLease.provider!, providerLeaseId: terminalReusableLease.providerLeaseId!,
-          reason: "reusable_sandbox_terminal_stop_unsettled" });
+      if (terminalReusableLease && !reusableExistingLeases.some(lease => lease.id === terminalReusableLease?.id))
+        terminalReusableLease = null;
       if (reusableCandidateLeases.length > reusableExistingLeases.length) {
         await cleanupObsoleteReusableSandboxLeases({
           environment: input.environment,
-          leases: reusableCandidateLeases,
+          leases: await obsoleteReusableCleanupCandidates(db, reusableCandidateLeases),
           reusableLeases: reusableExistingLeases,
         });
       }
@@ -2605,6 +2624,9 @@ function createSandboxEnvironmentDriver(
           providerLease.expiresAt ? new Date(providerLease.expiresAt) : undefined,
         ),
         metadata: builtinLeaseMetadata,
+        reusableLeaseTaskBinding: reusableLease && providerLease.providerLeaseId === reusableLease.providerLeaseId
+          && input.executionWorkspaceId === null && !reusableLease.issueId && reusableLease.heartbeatRunId
+          ? { leaseId: reusableLease.id, heartbeatRunId: reusableLease.heartbeatRunId } : undefined,
         reusesReusableLeaseId:
           reusableLease &&
           providerLease.providerLeaseId === reusableLease.providerLeaseId &&

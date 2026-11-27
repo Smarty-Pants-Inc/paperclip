@@ -1,3 +1,4 @@
+import { prepareConversationTurn } from "../services/agent-conversations.js";
 import { buildStrandedRecoveryEscalationNotice } from "../services/recovery/stranded-notice.js";
 import { JsonRpcCallError, environmentResumeErrorData } from "@paperclipai/plugin-sdk";
 import { collectRunFailureDiagnostics } from "../services/run-failure-diagnostics.js";
@@ -7,8 +8,8 @@ import { createSandboxOrphanCleanupSpool } from "../services/sandbox-orphan-clea
 import { idleWorkSnapshot } from "../services/task-admission.js";
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
 import { createHash, randomUUID } from "node:crypto";
-import { execFile, spawn } from "node:child_process";
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { execFile, execFileSync, spawn } from "node:child_process";
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -76,7 +77,7 @@ import { closeIdleWarmNativeSessionsForRestart } from "../services/native-runtim
 import type { NativeRunIdentity, NativeSession, PrpEvent } from "@paperclipai/paperclip-runner";
 import { secretService } from "../services/secrets.ts";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.ts";
-import type { Environment, EnvironmentDriver, EnvironmentStatus } from "@paperclipai/shared";
+import type { Environment, EnvironmentDriver, EnvironmentLease, EnvironmentStatus } from "@paperclipai/shared";
 import {
   getActiveStepContext,
   runWithRuntimeParent,
@@ -84,7 +85,11 @@ import {
 } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import { traceparentFromContextToken } from "../instrumentation.ts";
 import { ROOT_CONTEXT, trace } from "@opentelemetry/api";
-import { buildNativeHarnessBackupManifest } from "../services/native-runtime/native-session-executor.ts";
+import { buildNativeHarnessBackupManifest, createRunnerdBackend, nativeSessionWorkspaceScope, providerSessionIdentityFromDurableProviderState, scopedRunnerdStateRoot } from "../services/native-runtime/native-session-executor.ts";
+import * as runnerVendor from "../vendor/paperclip-runner/index.js";
+import * as runtimeApi from "../runtime-api.js";
+import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
+import { canonicalProviderPackJson } from "../services/native-runtime/remote-provider-pack-verification.js";
 import { createNativeHarnessBackupStamp } from "../services/native-runtime/native-harness-backup-stamp.ts";
 import { environmentRunOrchestrator } from "../services/environment-run-orchestrator.js";
 import { claimNativeRestartRecoveries } from "../services/native-runtime/native-restart-recovery.js";
@@ -5747,6 +5752,295 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(chCount(f, "environmentDestroyLease")).toBe(0);
   });
 
+  // Real native harness admission, verification and directory restoration. Only
+  // the remote command/file transport and provider/model boundary are controlled.
+  async function probeLatestSessionHarness(f: Awaited<ReturnType<typeof terminalConversationFixture>>,
+    lease: EnvironmentLease, runId: string, backup: boolean) {
+    const root = await mkdtemp(path.join(os.tmpdir(), "latest-session-harness-")); fixtureRoots.push(root);
+    vi.stubEnv("PAPERCLIP_RUNNER_STATE_DIR", path.join(root, "controller"));
+    const execution = runnerVendor.parseNativeExecutionInput({ schema: "paperclip.native-execution-input.v3", executionMode: "default", planningContext: null,
+      binding: { companyId: f.companyId, agentId: f.agentId, issueId: f.issueId, runId, executionWorkspaceId: f.executionWorkspaceId },
+      provider: { kind: "pi_rpc", model: "fixture/model" },
+      task: { identifier: "RECALL", title: "Recall latest conversation", description: null, prompt: "Recall", workMode: "standard" },
+      workspace: { cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
+      session: { normalizedSessionId: f.sessionId, driverKind: "pi_rpc", protocolVersion: 1, lifecyclePolicy: { mode: "warm", idleTimeoutMs: 300_000 } },
+      completionContract: { id: "contract", sha256: "saved", schemaVersion: "paperclip.completion-contract.v1",
+        contract: { revision: "1", objective: "Recall", criteria: [{ id: "recall", requirement: "Recall" }] } },
+      runtimeContext: nativeRuntimeContextFixture(), interactionResponses: [], credentialBindings: [] });
+    const sha = `sha256:${"a".repeat(64)}`;
+    const artifacts = Object.fromEntries(Object.entries({ grokLauncher: "dist/providers/grok/launcher.cjs",
+      nodeCommand: "node_modules/node/bin/node", productionLock: "pnpm-lock.yaml", opencodeCommand: "node_modules/.bin/opencode",
+      opencodeExecutable: "node_modules/opencode-ai/bin/opencode.exe", opencodeProxy: "dist/cli/opencode-app-server-proxy.cjs",
+      acpxSidecar: "dist/cli/acpx-runtime-sidecar.cjs" }).map(([name, p]) => [name, { path: p, sha256: sha }]));
+    const profiles = runnerVendor.QUALIFIED_ACPX_PROFILES;
+    const payload = { compatibility: { opencode: 1, acpx: 1, pi_rpc: 1 }, contractDigest: sha,
+      target: { platform: "linux", architecture: "x64" }, runnerSourceRevision: "a".repeat(40),
+      pins: { nodeMinimum: "24.11.0", codex: profiles.codex.agentRuntimeVersion, opencode: "1.18.34",
+        acpx: runnerVendor.QUALIFIED_ACPX_VERSION, grok: profiles.grok.agentRuntimeVersion,
+        claudeAcp: profiles.claude.agentServerVersion, codexAcp: profiles.codex.agentServerVersion },
+      acpxProfileDigests: Object.fromEntries((["grok", "claude", "codex"] as const).map(agent => [agent, profiles[agent].commandDigest])),
+      artifacts, distDigest: sha, bridgeDigest: `sha256:${createHash("sha256").update(`${sha}\n${sha}\n${sha}`).digest("hex")}` };
+    const pack = { schema: "paperclip-runner/remote-provider-pack/v1", payload,
+      digest: `sha256:${createHash("sha256").update(canonicalProviderPackJson(payload)).digest("hex")}` };
+    await writeFile(path.join(root, "provider-pack.json"), JSON.stringify(pack));
+    const binary = path.join(root, "fixture-runnerd"), elf = Buffer.alloc(64);
+    elf.set([0x7f, 0x45, 0x4c, 0x46, 2, 1]); elf.writeUInt16LE(62, 18); await writeFile(binary, elf);
+    const remoteCwd = path.join(root, "remote");
+    const copy = async (operations: Array<{ files: Array<{ sourcePath: string; targetPath: string }> }>) => {
+      for (const operation of operations) for (const file of operation.files) {
+        await mkdir(path.dirname(file.targetPath), { recursive: true });
+        await cp(file.sourcePath, file.targetPath, { recursive: true });
+      }
+    };
+    const runner = { syncIn: copy, syncOut: copy, async execute(command: { command: string; args?: string[] }) {
+      if (command.args?.[0] === "--build-metadata") return { exitCode: 0, timedOut: false, stderr: "", stdout: JSON.stringify({
+        schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd", packageName: "@paperclipai/paperclip-runner",
+        binaryContractVersion: 2, durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"],
+        providerPacks: [{ root: "/opt/paperclip-runner/provider-pack", manifest: pack, immutable: true }],
+      }) };
+      if (command.args?.[1]?.includes("base64")) {
+        try { return { exitCode: 0, timedOut: false, stderr: "", stdout: execFileSync("sh", command.args, { encoding: "utf8" }) }; }
+        catch { return { exitCode: 1, timedOut: false, stderr: "", stdout: "" }; }
+      }
+      return { exitCode: 0, timedOut: false, stderr: "", stdout: "" };
+    } };
+    let backendOptions: any, transportOptions: any;
+    const backendSpy = vi.spyOn(runnerVendor, "createNativeSessionBackend").mockImplementation(((_execution: any, options: any) => {
+      backendOptions = options; return {};
+    }) as any);
+    const transportSpy = vi.spyOn(runnerVendor, "createRunnerdCodexTransport").mockImplementation(((options: any) => {
+      transportOptions = options; return { transport: {} };
+    }) as any);
+    const runtimeApiSpy = vi.spyOn(runtimeApi, "resolveLocalRuntimeApiUrl").mockReturnValue("http://127.0.0.1:3100");
+    try {
+      // The conversation fixture records provider progress, not a controller
+      // checkpoint. Do not misrepresent its minimal display checkpoint as one.
+      await db.update(heartbeatRuns).set({ runnerProfileJson: sql`${heartbeatRuns.runnerProfileJson} - 'sessionCheckpoint'` })
+        .where(eq(heartbeatRuns.id, f.runId));
+      await createRunnerdBackend({ db, execution, runnerInstanceId: f.runnerInstanceId,
+        restartRecovery: { kind: "bootstrap_incomplete", runId, leaseOwner: "controlled-controller",
+          controllerGeneration: 1, providerAttempt: 1, restartKind: "hard", recoveryRequestId: null },
+        runnerRemoteBinaryPath: binary, runnerRemoteProviderPackPath: root, runnerIngressAuthorized: true,
+        runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd, environmentId: f.environment.id,
+          leaseId: lease.id, providerKey: "fake-plugin", reusableLeaseConfigured: true,
+          effectiveCapabilities: { runnerWebSocketIngress: true }, runner,
+          sandboxLeaseAcquisition: { ...(lease.metadata?.sandboxLeaseAcquisition as Record<string, unknown>), providerLeaseId: lease.providerLeaseId },
+        } as never });
+      backendOptions.codexTransportFactory();
+      if (backup) {
+        const backupRoot = path.join(scopedRunnerdStateRoot(execution), "failover-backups/current");
+        await mkdir(path.join(backupRoot, "runner"), { recursive: true });
+        const providerState = { schema: "paperclip.runner.codex-provider-state.v1", lifecycle: "prepared", threadId: "saved-latest-provider-session",
+          providerSessionId: null, activeProviderTurnId: null, config: { provider: "pi_rpc", driver: "pi_rpc" } };
+        await writeFile(path.join(backupRoot, "runner/runner-state.json"), JSON.stringify({ schema: "paperclip.runner.durable.state.v1",
+          runId: f.runId, normalizedSessionId: f.sessionId, runnerInstanceId: f.runnerInstanceId, lifecycle: "suspended",
+          nextSourceSeq: 2, ackedSourceSeq: 0, outbox: [], pendingTerminalDelivery: null }));
+        await writeFile(path.join(backupRoot, "runner/codex-provider-state.json"), JSON.stringify(providerState));
+        await writeFile(path.join(backupRoot, "runner/conversation.json"), JSON.stringify({ sessionId: f.sessionId, answer: f.answer }));
+        const manifest = buildNativeHarnessBackupManifest({ backupRoot, execution, runnerInstanceId: f.runnerInstanceId,
+          sourceProviderLeaseId: f.originalBox, providerSessionIdentity: providerSessionIdentityFromDurableProviderState({ execution, providerState }) });
+        const manifestPath = path.join(backupRoot, "manifest.json"); await writeFile(manifestPath, JSON.stringify(manifest));
+        const stamp = createNativeHarnessBackupStamp({ manifestPath, sessionScopeId: stableStringify({
+          schema: "paperclip.native-session-scope.v2", companyId: f.companyId, agentId: f.agentId,
+          workspace: nativeSessionWorkspaceScope(execution), provider: { driverKind: "pi_rpc", identity: { kind: "pi_rpc" } },
+          normalizedSessionId: f.sessionId,
+        }),
+          authorizedProviderLeaseId: f.originalBox, normalizedSessionId: f.sessionId, runnerInstanceId: f.runnerInstanceId, completedAt: manifest.completedAt });
+        // This is the retired source's verified backup, not the older held box.
+        const source = (await environmentService(db).getLeaseById(f.lease.id))!;
+        await environmentService(db).updateLeaseMetadata(source.id, { ...source.metadata, nativeHarnessBackup: stamp });
+      }
+      await transportOptions.prepareExternalRunnerState();
+      const remoteSession = path.join(remoteCwd, ".paperclip-runtime/paperclip-runner/sessions", createHash("sha256").update(f.sessionId).digest("hex"));
+      // Controlled model reads only the files the PRODUCTION restore staged.
+      return JSON.parse(await readFile(path.join(remoteSession, "runner/conversation.json"), "utf8")) as { sessionId: string; answer: string };
+    } finally { backendSpy.mockRestore(); transportSpy.mockRestore(); runtimeApiSpy.mockRestore(); }
+  }
+
+  it.each((["released", "expired"] as const).flatMap(status => [false, true].map(backup => ({ status, backup }))))(
+    "older-session warm stop does not fence the latest missing sandbox ($status, backup=$backup)", async ({ status, backup }) => {
+    const f = await terminalConversationFixture({ backup });
+    const oldRun = randomUUID(), oldSession = randomUUID(), oldAt = new Date(Date.now() - 600_000);
+    await db.insert(heartbeatRuns).values({ id: oldRun, companyId: f.companyId, agentId: f.agentId,
+      issueId: f.issueId, nativeIssueId: f.issueId, nativeSessionId: oldSession, runtimeMode: "native",
+      status: "succeeded", invocationSource: "on_demand", createdAt: oldAt, finishedAt: oldAt,
+      runnerProfileJson: { nativeExecutionInput: { provider: { kind: "pi_rpc" } } } });
+    await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, runId: oldRun, agentId: f.agentId,
+      seq: 1, eventType: "provider.event", createdAt: oldAt, payload: { answer: "older session" } });
+    const [source] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+    const metadata = { ...source!.metadata }; delete metadata.nativeHarnessBackup;
+    const [old] = await db.insert(environmentLeases).values({ ...source!, id: randomUUID(), heartbeatRunId: oldRun,
+      providerLeaseId: "older-warm-box", status: "active", metadata,
+      createdAt: oldAt, acquiredAt: oldAt, lastUsedAt: oldAt }).returning();
+    // A normal warm-window stop, not a terminal-task stop.
+    await f.runtime.releaseRunLeases(oldRun, "released", undefined, "stop_and_retain");
+    // Persist the historical ordering: X stopped before the later S2 run on Y.
+    await db.update(environmentLeases).set({ lastUsedAt: oldAt, updatedAt: oldAt }).where(eq(environmentLeases.id, old!.id));
+    const before = (await environmentService(db).getLeaseById(old!.id))!;
+    expect(before.metadata?.sandboxStopAndRetainReceipt).toBeTruthy();
+    expect(before.metadata?.terminalPiSandboxOrigin).toBeUndefined();
+    await db.update(environmentLeases).set({ status, ...(status === "expired" ? { releasedAt: new Date(), cleanupStatus: "success", metadata: {
+      ...f.lease.metadata, remoteExecutionTermination: remoteTerminationReceipt(f.lease, { providerLeaseId: f.originalBox, state: "destroyed" }),
+    } } : {}) }).where(eq(environmentLeases.id, f.lease.id));
+    const dispatch = f.call.getMockImplementation()!;
+    f.call.mockImplementation(async (id: string, method: string, params: any) => {
+      if (method === "environmentResumeLease" && params.providerLeaseId === f.originalBox)
+        return { providerLeaseId: null, metadata: { expired: true } } as any;
+      return dispatch(id, method, params);
+    });
+    const attempts: Array<Record<string, unknown>> = [];
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const selected = await createHeartbeatRunState(db).getTaskSession(f.companyId, f.agentId, "paperclip_runner", f.issueId);
+        const runId = randomUUID();
+        await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId,
+          issueId: f.issueId, nativeIssueId: f.issueId, nativeSessionId: selected!.sessionDisplayId,
+          runtimeMode: "native", status: "running", invocationSource: "on_demand" });
+        const next = await f.runtime.acquireRunLease({ ...f.input, heartbeatRunId: runId });
+        if (next.lease.providerLeaseId === before.providerLeaseId) {
+          attempts.push({ attempt, error: "older_session_box_selected", box: next.lease.providerLeaseId,
+            sessionId: selected!.sessionDisplayId, acquisition: next.lease.metadata?.sandboxLeaseAcquisition });
+          break;
+        }
+        const restored = await probeLatestSessionHarness(f, next.lease, runId, backup);
+        attempts.push({ attempt, box: next.lease.providerLeaseId, sessionId: selected!.sessionDisplayId,
+          restoredSessionId: restored?.sessionId, reply: restored?.answer ?? null, error: null,
+          acquisition: next.lease.metadata?.sandboxLeaseAcquisition });
+        break;
+      } catch (error: any) {
+        attempts.push({ attempt, error: error.reason ?? error.code ?? error.message.split(":")[0], code: error.code, words: error.message });
+      }
+    }
+    const after = (await environmentService(db).getLeaseById(old!.id))!;
+    chRow("OLDER_SESSION", { status, backup, task: f.issueId, olderSession: oldSession, latestSession: f.sessionId,
+      olderBox: before.providerLeaseId, latestMissingBox: f.originalBox, attempts,
+      olderUnchanged: JSON.stringify(before) === JSON.stringify(after), order: chOrder(f) });
+    expect(after).toEqual(before);
+    expect(attempts.every(row => row.error !== "reusable_sandbox_terminal_stop_unsettled")).toBe(true);
+    if (backup) {
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]).toMatchObject({ error: null, sessionId: f.sessionId, restoredSessionId: f.sessionId,
+        reply: f.answer, acquisition: status === "released" ? { outcome: "replacement", reason: "not_found" } : { outcome: "created" } });
+    } else if (status === "released") {
+      expect(attempts).toHaveLength(3);
+      expect(attempts.every(row => row.error === "runner_harness_backup_unavailable")).toBe(true);
+    } else {
+      expect(attempts).toHaveLength(3);
+      expect(attempts.every(row => row.error === "runner_harness_state_mismatch"
+        && row.words === "runner_harness_state_mismatch: created_not_suspended")).toBe(true);
+    }
+  });
+
+  it.each(["handoff", "same-run", "lost-handoff"] as const)("candidate filtering does not bind an unselected projectless lease (%s)", async mode => {
+    const f = await terminalConversationFixture({ projectless: true });
+    const oldRun = randomUUID(), oldAt = new Date(Date.now() - 600_000);
+    await db.insert(heartbeatRuns).values({ id: oldRun, companyId: f.companyId, agentId: f.agentId,
+      issueId: f.issueId, nativeIssueId: f.issueId, runtimeMode: "native", status: "succeeded",
+      invocationSource: "on_demand", createdAt: oldAt, finishedAt: oldAt });
+    const [source] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+    const [old] = await db.insert(environmentLeases).values({ ...source!, id: randomUUID(), issueId: null,
+      heartbeatRunId: oldRun, providerLeaseId: "unselected-projectless-box", status: "released",
+      createdAt: oldAt, acquiredAt: oldAt, lastUsedAt: oldAt }).returning();
+    await db.update(environmentLeases).set({ issueId: null }).where(eq(environmentLeases.id, f.lease.id));
+    if (mode === "lost-handoff") {
+      const dispatch = f.call.getMockImplementation()!;
+      f.call.mockImplementation(async (id: string, method: string, params: any) => {
+        if (method === "environmentResumeLease") await db.update(environmentLeases).set({ status: "pending_cleanup" })
+          .where(eq(environmentLeases.id, f.lease.id));
+        return dispatch(id, method, params);
+      });
+      await expect(f.reopen()).rejects.toThrow("ownership changed during acquisition");
+      const source = (await environmentService(db).getLeaseById(f.lease.id))!;
+      const unselected = (await environmentService(db).getLeaseById(old!.id))!;
+      chRow("FILTER_WRITE_ROLLBACK", { source: source.id, sourceIssue: source.issueId,
+        sourceStatus: source.status, unselected: old!.id, unselectedIssue: unselected.issueId });
+      expect(source.issueId).toBeNull(); expect(unselected.issueId).toBeNull();
+      return;
+    }
+    const next = mode === "same-run" ? await f.runtime.acquireRunLease(f.input) : (await f.reopen()).next;
+    expect(next.lease.providerLeaseId).toBe(f.originalBox);
+    const unselected = (await environmentService(db).getLeaseById(old!.id))!;
+    const selectedSource = (await environmentService(db).getLeaseById(f.lease.id))!;
+    // This is the issue route's actual selector, not merely a column read.
+    const destroyed = await f.runtime.destroyReusableSandboxLeases({ companyId: f.companyId, issueId: f.issueId,
+      failureReason: "issue_terminal_done" });
+    const after = (await environmentService(db).getLeaseById(old!.id))!;
+    chRow("FILTER_WRITE", { mode, task: f.issueId, selected: next.lease.id, selectedSource: selectedSource.id,
+      selectedSourceIssue: selectedSource.issueId, selectedIssue: next.lease.issueId,
+      unselected: old!.id, unselectedIssue: unselected.issueId, unselectedBeforeStatus: unselected.status,
+      unselectedAfterStatus: after.status, destroyed: destroyed.map(row => row.lease.id) });
+    expect(unselected.issueId).toBeNull();
+    expect(after).toEqual(unselected);
+    expect(selectedSource.issueId).toBe(f.issueId);
+    expect(next.lease.issueId).toBe(f.issueId);
+  });
+
+  it.each((["done", "cancelled"] as const).flatMap(status => [false, true].map(drain => ({ status, drain }))))(
+    "held Pi bootstrap without provider work resumes ($status, drain=$drain)", async ({ status, drain }) => {
+      const f = await terminalConversationFixture();
+      await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.runId));
+      await chTerminal(f, status, 360_000);
+      if (drain) await chSweep(f);
+      const result = await chReopen(f);
+      chRow("NO_PROVIDER_WORK", { status, drain, ...result, originalBox: f.originalBox, answer: f.answer });
+      expect(result.error).toBeNull(); expect(result.box).toBe(f.originalBox); expect(result.reply).toBe(f.answer);
+      expect(chCount(f, "environmentDestroyLease")).toBe(0);
+      expect(chCount(f, "environmentAcquireLease")).toBe(0);
+  });
+
+  it("real conversation reset clears an older held-session fence without touching its box", async () => {
+    const f = await terminalConversationFixture();
+    await chTerminal(f, "done", 360_000); await chSweep(f);
+    const held = (await environmentService(db).getLeaseById(f.lease.id))!;
+    const newer = randomUUID(), now = new Date();
+    await db.insert(heartbeatRuns).values({ id: newer, companyId: f.companyId, agentId: f.agentId,
+      issueId: f.issueId, nativeIssueId: f.issueId, nativeSessionId: randomUUID(), runtimeMode: "native",
+      status: "succeeded", invocationSource: "on_demand", createdAt: now, finishedAt: now,
+      runnerProfileJson: { nativeExecutionInput: { provider: { kind: "pi_rpc" } } } });
+    await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, runId: newer, agentId: f.agentId,
+      seq: 1, eventType: "provider.event", payload: { answer: "gone latest session" } });
+    const resetId = randomUUID(), commentId = randomUUID(), userId = randomUUID();
+    await db.update(issues).set({ status: "in_progress", conversationAgentId: f.agentId, assigneeAgentId: f.agentId,
+      conversationUserId: userId, conversationState: "active" }).where(eq(issues.id, f.issueId));
+    await db.insert(issueComments).values({ id: commentId, companyId: f.companyId, issueId: f.issueId,
+      authorUserId: userId, body: "/new" });
+    const [resetRun] = await db.insert(heartbeatRuns).values({ id: resetId, companyId: f.companyId, agentId: f.agentId,
+      issueId: f.issueId, status: "running", invocationSource: "on_demand",
+      contextSnapshot: { issueId: f.issueId, wakeCommentId: commentId } }).returning();
+    const reset = await prepareConversationTurn(db, resetRun!);
+    expect(reset.reset).toBe(true);
+    // Same persistence as heartbeat's /new completion, not a synthetic lease edit.
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(),
+      contextSnapshot: { ...reset.context, conversationReset: true } }).where(eq(heartbeatRuns.id, resetId));
+    const nextId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: nextId, companyId: f.companyId, agentId: f.agentId,
+      issueId: f.issueId, status: "running", invocationSource: "on_demand", contextSnapshot: {
+        issueId: f.issueId, conversationSessionGeneration: 1 } });
+    const next = await f.runtime.acquireRunLease({ ...f.input, heartbeatRunId: nextId });
+    const after = (await environmentService(db).getLeaseById(f.lease.id))!;
+    chRow("REAL_RESET", { reset, box: next.lease.providerLeaseId, heldUnchanged: JSON.stringify(held) === JSON.stringify(after),
+      destroys: chCount(f, "environmentDestroyLease") });
+    expect(next.lease.providerLeaseId).not.toBe(f.originalBox);
+    expect(after).toEqual(held); expect(chCount(f, "environmentDestroyLease")).toBe(0);
+  });
+
+  it.each([false, true])("obsolete fingerprint cleanup preserves an unselected conversation (null task=%s)", async nullTask => {
+    const f = await terminalConversationFixture({ projectless: true });
+    const before = (await environmentService(db).getLeaseById(f.lease.id))!;
+    await db.update(environmentLeases).set({ issueId: nullTask ? null : f.issueId, metadata: {
+      ...before.metadata, reusableSandboxLease: { ...(before.metadata?.reusableSandboxLease as Record<string, unknown>),
+        runtimeFingerprint: "seeded-mismatch", leaseFingerprint: "seeded-mismatch" },
+    } }).where(eq(environmentLeases.id, before.id));
+    const seeded = (await environmentService(db).getLeaseById(before.id))!;
+    const result = await chReopen(f);
+    const after = (await environmentService(db).getLeaseById(before.id))!;
+    chRow("OBSOLETE_PROTECTION", { nullTask, result, before: seeded, after,
+      destroys: chCount(f, "environmentDestroyLease") });
+    expect(after).toEqual(seeded);
+    expect(chCount(f, "environmentDestroyLease")).toBe(0);
+    expect(result.error).not.toBe("reusable_sandbox_terminal_stop_unsettled");
+  });
+
   async function terminalConversationFixture(options: { backup?: boolean; session?: boolean; live?: boolean; projectless?: boolean } = {}) {
     const f = await seedReusablePluginSandboxLease("paperclip_runner");
     const issueId = randomUUID(), sessionId = randomUUID(), runnerInstanceId = randomUUID();
@@ -6422,15 +6716,23 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         nativeIssueId: f.issueId, nativeSessionId: f.sessionId, runtimeMode: "native", status: "succeeded", finishedAt: new Date(),
         invocationSource: "on_demand", runnerProfileJson: { nativeExecutionInput: { provider: { kind: "pi_rpc" } } } } as never);
       const [src] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
-      await db.insert(environmentLeases).values({ ...src!, id: randomUUID(), heartbeatRunId: run2,
-        providerLeaseId: "second-durable-box", status: "released" });
+      const [second] = await db.insert(environmentLeases).values({ ...src!, id: randomUUID(), heartbeatRunId: run2,
+        providerLeaseId: "second-durable-box", status: "released" }).returning();
+      await f.runtime.execute({ environment: f.environment, lease: (await environmentService(db).getLeaseById(second!.id))!,
+        command: "remember", args: ["a different conversation"] });
       await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, runId: run2, agentId: f.agentId,
         seq: 1, eventType: "provider.event", payload: { answer: "a different conversation" } });
     }
     await chTerminal(f, "done", 360_000);
-    expect((await chReopen(f)).error).toBe("reusable_sandbox_terminal_stop_unsettled");
+    await chSweep(f);
+    const result = await chReopen(f);
+    chRow("NON_STOP_CENSUS", { kind, ...result, originalBox: f.originalBox, answer: f.answer });
+    // Original names stay for baseline accounting; the required outcome is now
+    // the pre-fence path rather than the formerly asserted false refusal.
+    expect(result.error).toBeNull();
+    expect(result.box).toBe(kind === "missing" ? f.originalBox : "second-durable-box");
+    expect(result.reply).toBe(kind === "missing" ? f.answer : "a different conversation");
     expect(chCount(f, "environmentAcquireLease")).toBe(0);
-    expect(chCount(f, "environmentResumeLease")).toBe(1); // initial fixture acquisition only
     expect(chCount(f, "environmentDestroyLease")).toBe(0);
   });
 
