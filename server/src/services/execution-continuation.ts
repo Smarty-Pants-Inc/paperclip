@@ -23,6 +23,7 @@ import { readTaskRetryIntent } from "./task-retry.js";
 import { readByEarlierTurnCommentIds } from "./queued-comment-delivery.js";
 import type { NativeContinuationReadState } from "./native-runtime/native-turn-budget.js";
 import { continuationResultIdentityKeys } from "./execution-continuation-identity.js";
+import { foldRepeatedFailedWrites } from "./execution-continuation-failed-writes.js";
 export { continuationResultIdentityKeys } from "./execution-continuation-identity.js";
 
 const retryWakeReasons = new Set(["task_retry", "retry_failed_run"]);
@@ -40,6 +41,7 @@ function continuationApiResult(operationId: string, result: unknown, companyId: 
   const data = object(response.data);
   if (!savedRecordOperations.has(operationId) || response.operationId !== operationId
     || response.ok !== true || typeof response.status !== "number" || response.status < 200 || response.status >= 300
+    || Object.hasOwn(response, "error") || Object.hasOwn(data, "error")
     || data.companyId !== companyId || !z.string().uuid().safeParse(data.id).success) return result;
   const serialized = JSON.stringify(data);
   if (Buffer.byteLength(serialized) <= 4 * 1024) return result;
@@ -73,7 +75,7 @@ const historyResult = sql<Record<string, unknown> | null>`case
         select coalesce(jsonb_object_agg(receipt.key, (
           select jsonb_object_agg(detail.key, detail.value)
           from jsonb_each(receipt.value) as detail(key, value)
-          where detail.key in ('state', 'operationId', 'result')
+          where detail.key in ('state', 'operationId', 'digest', 'result')
         )), '{}'::jsonb)
         from jsonb_each(field.value) as receipt(key, value)
         where receipt.value->'state' = '"completed"'::jsonb
@@ -504,24 +506,25 @@ export async function buildExecutionContinuation(input: {
     const lastRun = priorRuns.findLast(run => run.id !== input.runId);
     input.onNativeReadState({ ...generation, lastRunAt: (lastRun?.startedAt ?? lastRun?.createdAt)?.toISOString() ?? null, readCommentIds: [...read] });
   }
-  const completedActions = priorRuns.flatMap((run) =>
+  const completedActionReceipts = priorRuns.flatMap((run) =>
     Object.entries(object(object(run.result).apiToolReceipts)).flatMap(
       ([receiptId, receipt]) => {
         const value = object(receipt);
         return value.state === "completed" &&
           typeof value.operationId === "string"
           ? [
-              {
+              { digest: value.digest, action: {
                 runId: run.id,
                 receiptId,
                 operationId: value.operationId,
                 result: continuationApiResult(value.operationId, value.result, companyId),
-              },
+              } },
             ]
           : [];
       },
     ),
   );
+  const completedActions = await foldRepeatedFailedWrites(db, companyId, issueId, completedActionReceipts);
   completedActions.push(...await githubRecoveryReceipts(db, companyId, issueId));
   const reconciliations = await db
     .select({
