@@ -411,6 +411,25 @@ describe.skipIf(!support.supported)("first-turn queued input", () => {
       admitted: true, delivered: [id], receiptUnchanged: true }));
   });
 
+  it.each(["no-session-event", "missing-provider", "known-provider"] as const)("C31 first-turn read authority requires event provider evidence: %s", async shape => {
+    const f = await seed(), sessionId = randomUUID();
+    const id = await queueMessage(f, "Only the reading provider received this message");
+    await db.update(heartbeatRuns).set({ nativeSessionId: sessionId }).where(eq(heartbeatRuns.id, f.runId));
+    if (shape !== "no-session-event") await appendHeartbeatRunEvent(db, { companyId: f.companyId, runId: f.runId, agentId: f.agentId,
+      eventType: "session.started", payload: { prpEvent: { payload: shape === "known-provider" ? { providerSessionId: "reading-provider" } : {} } } });
+    await claimFirstTurnQueuedInput(db, binding(f, f.runId));
+    await accept(f, f.runId);
+    const next = await startRun(f.companyId, f.agentId, f.issueId);
+    for (const providerSessionId of ["reading-provider", "replacement-provider"]) {
+      let readIds: string[] = [];
+      await buildExecutionContinuation({ db, ...f, runId: next, previousContextRunId: f.runId,
+        nativeSessionId: sessionId, nativeProviderSessionId: providerSessionId, context: {}, summary: null,
+        exposeLowTrustRaw: false, onNativeReadState: state => { readIds = state.readCommentIds; } });
+      expect(readIds).toEqual(shape === "known-provider" && providerSessionId === "reading-provider" ? [id] : []);
+      console.info(JSON.stringify({ firstTurnProviderEvidence: shape, readingRunId: f.runId, nextRunId: next, sessionId, providerSessionId, messageId: id, readIds }));
+    }
+  });
+
   it("delivers the first two whole messages and leaves the third owed for the next turn", async () => {
     const f = await seed(), bodies = [0, 1, 2].map(i => `PERSON ${i} ` + '"'.repeat(10000));
     const sessionId = randomUUID();
