@@ -80,7 +80,7 @@ fn invalid_tool_call_result(
 }
 
 fn serialize_provider_state(state: &CodexProviderState) -> Result<Vec<u8>, DurableRunnerError> {
-    let bytes = serde_json::to_vec_pretty(state).map_err(|error| {
+    let bytes = serde_json::to_vec(state).map_err(|error| {
         DurableRunnerError::invalid(format!("failed to serialize Codex provider state: {error}"))
     })?;
     if bytes.len() as u64 > MAX_PROVIDER_STATE_BYTES {
@@ -8388,6 +8388,68 @@ done
         ] {
             assert_eq!(payload.pointer(path), Some(&Value::Null), "{path}");
         }
+    }
+
+    // Unit test agreed: the serializer must preserve nested durable results without pretty-print overhead.
+    #[test]
+    fn compact_provider_state_round_trips_nested_bridge_results() {
+        let mut state = opencode_result_state();
+        state.config.provider = "codex".to_owned();
+        state.config.driver = "codex_app_server".to_owned();
+        let operation = crate::provider_bridge::AuthorizedTool {
+            operation_id: "get_task_context".to_owned(),
+            version: 1,
+            description: "Read the active task context.".to_owned(),
+            input_schema: json!({"type": "object"}),
+            response_schema: json!({"type": "object"}),
+        };
+        state
+            .tool_bridge
+            .prepare(AuthorizedToolSet {
+                schema: TOOL_SET_SCHEMA.to_owned(),
+                schema_version: 1,
+                catalog_digest: authorized_tool_catalog_digest(std::slice::from_ref(&operation))
+                    .unwrap(),
+                operations: vec![operation],
+            })
+            .unwrap();
+        for index in 0..128 {
+            let call_id = format!("call-{index}");
+            state
+                .tool_bridge
+                .begin_call(call_id.clone(), "get_task_context".to_owned(), json!({}))
+                .unwrap();
+            state
+                .tool_bridge
+                .apply_result(ToolResult {
+                    call_id,
+                    operation_id: "get_task_context".to_owned(),
+                    result: json!({"task": {"id": index, "status": "completed",
+                        "details": {"summary": "Finished the assigned work.",
+                            "evidence": [{"path": "result.txt", "verified": true}]}}}),
+                    is_error: false,
+                })
+                .unwrap();
+        }
+        let pretty = serde_json::to_vec_pretty(&state).unwrap();
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-compact-provider-state-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let executor = CodexCommandExecutor::new(&directory);
+        executor.persist_state(&state).unwrap();
+        let bytes = fs::read(executor.state_path()).unwrap();
+        let mut restored = CodexCommandExecutor::new(&directory);
+        restored.load_state_without_provider().unwrap();
+        assert_eq!(restored.state.as_ref(), Some(&state));
+        fs::remove_dir_all(directory).unwrap();
+        println!(
+            "provider state with 128 completed nested bridge results: pretty={} compact={} reduction={:.2}%",
+            pretty.len(),
+            bytes.len(),
+            100.0 * (pretty.len() - bytes.len()) as f64 / pretty.len() as f64
+        );
+        assert!(bytes.len() < pretty.len());
     }
 
     #[test]
