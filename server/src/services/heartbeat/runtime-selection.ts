@@ -92,7 +92,7 @@ import { normalizePaperclipWakePayload, selectPaperclipTaskMarkdown } from "@pap
 import type { ProviderResourceDisposition } from "../environment-runtime.js";
 import { stageNativeRuntimeSkillAssets, bindStagedNativeRuntimeSkillAssets } from "../native-runtime/runtime-skill-preservation.js";
 import { configuredSecretGuidance } from "../native-runtime/configured-secret-guidance.js";
-import { nativeContinuationReadState, type NativeInputRevision } from "../native-runtime/native-turn-budget.js";
+import { nativeContinuationProviderSessionId, nativeContinuationReadState, type NativeInputRevision } from "../native-runtime/native-turn-budget.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 type Agent = typeof agents.$inferSelect;
@@ -862,7 +862,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
               boundCommandBytes: agent.adapterType === "paperclip_runner",
               inputRevision: context.nativeInputRevision as NativeInputRevision | undefined,
               continuationReadState: nativeContinuationReadState(context.nativeContinuationReadState),
-              continuationProviderSessionId: readNonEmptyString(parseObject(parseObject(previousNativeRun?.runnerProfileJson).sessionCheckpoint).providerSessionId),
+              continuationProviderSessionId: nativeContinuationProviderSessionId(previousNativeRun, normalizedSessionId, context.nativeContinuationReadState),
               onContinuationBudgeted: bounded => {
                 // Called only for a full-render cut. Delta turns retain the
                 // unbounded snapshot so later deltas never resurrect old IDs.

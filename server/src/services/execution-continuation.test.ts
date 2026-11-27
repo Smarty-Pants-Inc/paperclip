@@ -23,7 +23,8 @@ import {
 } from "../__tests__/helpers/embedded-postgres.js";
 import { resolveExternalTestDatabaseUrl } from "../__tests__/helpers/external-test-database.js";
 import { commandEnvelopeBytes, NATIVE_TURN_KNOWN_MAX_BYTES, type NativeContinuationReadState } from "./native-runtime/native-turn-budget.js";
-import { buildNativeExecutionInput } from "./native-runtime/native-execution-input.js";
+import * as nativeTurnBudget from "./native-runtime/native-turn-budget.js";
+import { budgetNativeFreshFallback, buildNativeExecutionInput } from "./native-runtime/native-execution-input.js";
 import { decideNativeContinuation } from "./native-runtime/continued-session.js";
 import { nativeRuntimeContextFixture } from "./native-runtime/runtime-context.test-fixture.js";
 import { buildNativeModelEnvelope } from "../vendor/paperclip-runner/index.js";
@@ -216,6 +217,81 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
         await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId, runId: randomUUID(), previousContextRunId: readerRunId, nativeSessionId,
           nativeProviderSessionId: providerSessionId, context: {}, summary: null, exposeLowTrustRaw: false, onNativeReadState: value => { state = value; } });
         expect(state).toMatchObject({ nativeSessionId, providerSessionId, readCommentIds: providerSessionId === "old-provider" ? [commentId] : [] });
+      }
+    });
+    it.each(["same-row", "same-checkpoint", "same-read-state-only", "legacy-event-rows", "missing-checkpoint-provider", "different-session", "unknown-session", "known-null-generation", "different-provider", "different-event-provider"] as const)("C31 pre-upgrade saved reads retain omission only in the saving session: %s", async scenario => {
+      const taskId = randomUUID(), sessionId = randomUUID(), previousRunId = randomUUID(), nextRunId = randomUUID();
+      const oldId = randomUUID(), latestId = randomUUID(), providerSessionId = "legacy-provider";
+      const oldAt = new Date("2026-01-01T00:00:00Z"), lastRunAt = "2026-01-02T00:00:00Z";
+      await db.insert(issues).values({ id: taskId, companyId, title: "Pre-upgrade large task", status: "in_progress", assigneeAgentId: agentId });
+      await db.insert(issueComments).values([
+        { id: oldId, companyId, issueId: taskId, authorType: "user", authorUserId: "local-board", body: "LEGACY_ALREADY_READ " + "x".repeat(400000), createdAt: oldAt, updatedAt: oldAt },
+        { id: latestId, companyId, issueId: taskId, authorType: "user", authorUserId: "local-board", body: "Continue this task", createdAt: new Date("2026-01-03T00:00:00Z"), updatedAt: new Date("2026-01-03T00:00:00Z") },
+      ]);
+      const baseline = await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId, context: { commentId: latestId }, summary: null, exposeLowTrustRaw: false });
+      const saved = { ...baseline, messages: scenario === "same-read-state-only" ? baseline.messages : baseline.messages.filter(message => message.id !== oldId),
+        coverage: { ...baseline.coverage, nativeSessionId: sessionId, omitted: scenario === "same-read-state-only" ? [] : [{ id: oldId, updatedAt: oldAt.toISOString() }] } };
+      if (scenario === "missing-checkpoint-provider") Object.assign(saved.coverage, { providerSessionId });
+      const legacyState = { lastRunAt, readCommentIds: [oldId], ...(scenario === "known-null-generation" ? { nativeSessionId: null, providerSessionId: null }
+        : scenario === "missing-checkpoint-provider" ? { nativeSessionId: sessionId, providerSessionId } : {}) };
+      await db.insert(heartbeatRuns).values({ id: previousRunId, companyId, agentId, nativeIssueId: taskId,
+        nativeSessionId: scenario === "same-checkpoint" || scenario === "unknown-session" ? null : scenario === "different-session" ? randomUUID() : sessionId,
+        status: "succeeded", createdAt: new Date("2026-01-02T01:00:00Z"), finishedAt: new Date("2026-01-02T02:00:00Z"),
+        runnerProfileJson: scenario === "same-checkpoint" ? { sessionCheckpoint: { sessionId, providerSessionId } }
+          : scenario === "missing-checkpoint-provider" ? { sessionCheckpoint: { sessionId } }
+          : scenario === "different-provider" ? { sessionCheckpoint: { sessionId, providerSessionId: "other-provider" } } : {},
+        contextSnapshot: { issueId: taskId, executionContinuation: saved, ...(scenario === "legacy-event-rows" ? {} : { nativeContinuationReadState: legacyState }) } });
+      // A saved read state describes reads predating this run; its authority
+      // survives even if the saving run itself never got a turn accepted.
+      if (scenario !== "same-read-state-only") await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: previousRunId, seq: 1, eventType: "turn.accepted" });
+      if (["different-event-provider", "legacy-event-rows", "missing-checkpoint-provider"].includes(scenario)) await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: previousRunId,
+        seq: 0, eventType: "session.started", payload: { prpEvent: { payload: scenario === "legacy-event-rows" ? {} : { providerSessionId: scenario === "different-event-provider" ? "other-provider" : providerSessionId } } } });
+      if (scenario === "legacy-event-rows" || scenario === "missing-checkpoint-provider") await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: previousRunId,
+        seq: 2, eventType: "task_history.read", payload: { comments: { [oldId]: oldAt.toISOString() } } });
+      const [savingRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, previousRunId));
+      let readState: NativeContinuationReadState | undefined;
+      const continuation = await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId, runId: nextRunId, previousContextRunId: previousRunId,
+        nativeSessionId: sessionId, nativeProviderSessionId: providerSessionId, context: { commentId: latestId }, summary: null, exposeLowTrustRaw: false,
+        onNativeReadState: state => { readState = state; } });
+      const wakePayload = { reason: "issue_commented", commentIds: [latestId], executionContinuation: continuation };
+      const buildInput = () => buildNativeExecutionInput({ companyId, runId: nextRunId, agentId, provider: "pi_rpc", normalizedSessionId: sessionId,
+        resumedSession: true, continuationProviderSessionId: scenario === "missing-checkpoint-provider"
+          ? nativeTurnBudget.nativeContinuationProviderSessionId(savingRun, sessionId, readState) : providerSessionId,
+        issue: { id: taskId, identifier: null, title: "Pre-upgrade large task", description: null, workMode: "standard" }, taskPrompt: "Continue this task", wakePayload,
+        boundCommandBytes: true, continuationReadState: readState, onContinuationBudgeted: bounded => { wakePayload.executionContinuation = bounded; },
+        workspace: { id: "workspace", cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null }, runtimeContext: nativeRuntimeContextFixture(),
+        completionContract: { id: "contract", sha256: "a".repeat(64), schemaVersion: "paperclip.run-result.v1", contract: { revision: "1", objective: "Continue", criteria: [{ id: "output", requirement: "Continue" }] } } });
+      const sameSession = ["same-row", "same-checkpoint", "same-read-state-only", "legacy-event-rows", "missing-checkpoint-provider"].includes(scenario);
+      console.log("LEGACY_READ_ROW " + JSON.stringify({ scenario, taskId, previousRunId, nextRunId, oldId, latestId, sessionId, providerSessionId, legacyState, readState, deltaIds: continuation.resumeDelta?.messages.map(message => message.id) }));
+      if (sameSession) {
+        expect(readState?.readCommentIds).toContain(oldId);
+        expect(continuation.resumeDelta?.messages.map(message => message.id)).not.toContain(oldId);
+        const input = buildInput();
+        const envelope = buildNativeModelEnvelope(input, { resumedSession: true });
+        expect(commandEnvelopeBytes(envelope)).toBeLessThanOrEqual(NATIVE_TURN_KNOWN_MAX_BYTES);
+        expect(JSON.stringify(envelope)).not.toContain("LEGACY_ALREADY_READ");
+        expect(JSON.stringify(envelope)).toContain("Continue this task");
+        console.log("LEGACY_COMMAND_ROW " + JSON.stringify({ scenario, previousRunId, nextRunId, bytes: commandEnvelopeBytes(envelope),
+          omittedIds: (wakePayload.executionContinuation.coverage as { omitted?: Array<{ id: string }> }).omitted?.map(message => message.id),
+          omittedOldInput: !JSON.stringify(envelope).includes("LEGACY_ALREADY_READ"), retainedLatestInput: JSON.stringify(envelope).includes("Continue this task") }));
+        expect(() => budgetNativeFreshFallback(input, wakePayload, readState)).toThrow("native_turn_prompt_exceeds_command_bound");
+        // Editing a formerly read row after the saved read timestamp revokes its authority.
+        await db.update(issueComments).set({ updatedAt: new Date("2026-01-04T00:00:00Z") }).where(eq(issueComments.id, oldId));
+        let editedState: NativeContinuationReadState | undefined;
+        await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId, previousContextRunId: previousRunId, nativeSessionId: sessionId,
+          nativeProviderSessionId: providerSessionId, context: {}, summary: null, exposeLowTrustRaw: false, onNativeReadState: state => { editedState = state; } });
+        expect(editedState?.readCommentIds).not.toContain(oldId);
+        await db.update(issueComments).set({ updatedAt: oldAt }).where(eq(issueComments.id, oldId));
+        let otherSessionState: NativeContinuationReadState | undefined;
+        const otherSessionId = randomUUID();
+        await buildExecutionContinuation({ db, companyId, issueId: taskId, agentId, previousContextRunId: previousRunId, nativeSessionId: otherSessionId,
+          nativeProviderSessionId: providerSessionId, context: {}, summary: null, exposeLowTrustRaw: false, onNativeReadState: state => { otherSessionState = state; } });
+        expect(otherSessionState?.readCommentIds).not.toContain(oldId);
+        if (scenario === "missing-checkpoint-provider") expect(nativeTurnBudget.nativeContinuationProviderSessionId(savingRun, otherSessionId, otherSessionState)).toBeNull();
+      } else {
+        expect(readState?.readCommentIds).not.toContain(oldId);
+        expect(continuation.resumeDelta?.messages.map(message => message.id)).toContain(oldId);
+        expect(buildInput).toThrow("native_turn_prompt_exceeds_command_bound");
       }
     });
     it.each([false, true])("keeps two ordinary comments delta-only on an oversized retained session (fresh cut: %s)", async freshCut => {

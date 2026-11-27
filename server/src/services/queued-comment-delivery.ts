@@ -126,14 +126,16 @@ export async function readByEarlierTurnCommentIds(tx: Pick<Db, "select">, input:
   const { companyId, issueId, agentId } = input;
   const notCurrent = input.currentRunId ? sql`and reading_run.id <> ${input.currentRunId}` : sql``;
   // A run can replace its provider session after reading. Use the generation
-  // at the read event, not the run's last provider generation.
-  const generationCondition = generation ? sql`and reading_run.native_session_id = ${generation.nativeSessionId}
-      and (select generation_event.payload->'prpEvent'->'payload'->>'providerSessionId'
+  // at the read event, not the run's last provider generation. Legacy events
+  // without a provider ID inherit only the saving run's exact native session.
+  const generationCondition = generation ? sql`and coalesce(reading_run.native_session_id::text,
+      reading_run.runner_profile_json->'sessionCheckpoint'->>'sessionId') = ${generation.nativeSessionId}
+      and coalesce((select generation_event.payload->'prpEvent'->'payload'->>'providerSessionId'
         from ${heartbeatRunEvents} generation_event
         where generation_event.run_id = reading_run.id and generation_event.company_id = ${companyId}
           and generation_event.event_type in ('session.started', 'session.resumed', 'session.reconciled')
           and generation_event.seq <= history_read.seq
-        order by generation_event.seq desc limit 1) = ${generation.providerSessionId}` : sql``;
+        order by generation_event.seq desc limit 1), ${generation.providerSessionId}) = ${generation.providerSessionId}` : sql``;
   const rows = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
     inArray(issueComments.id, input.commentIds),
@@ -202,13 +204,14 @@ function firstTurnDeliveredSql(companyId: string, issueId: string, agentId: stri
         and exists (select 1 from ${heartbeatRunEvents} accepted
           where accepted.company_id = ${companyId} and accepted.run_id = first_turn_run.id
             and accepted.event_type in ('turn.accepted', 'turn.started')
-            ${generation ? sql`and first_turn_run.native_session_id = ${generation.nativeSessionId}
-              and (select generation_event.payload->'prpEvent'->'payload'->>'providerSessionId'
+            ${generation ? sql`and coalesce(first_turn_run.native_session_id::text,
+                first_turn_run.runner_profile_json->'sessionCheckpoint'->>'sessionId') = ${generation.nativeSessionId}
+              and coalesce((select generation_event.payload->'prpEvent'->'payload'->>'providerSessionId'
                 from ${heartbeatRunEvents} generation_event
                 where generation_event.company_id = ${companyId} and generation_event.run_id = first_turn_run.id
                   and generation_event.event_type in ('session.started', 'session.resumed', 'session.reconciled')
                   and generation_event.seq <= accepted.seq
-                order by generation_event.seq desc limit 1) = ${generation.providerSessionId}` : sql``}))`;
+                order by generation_event.seq desc limit 1), ${generation.providerSessionId}) = ${generation.providerSessionId}` : sql``}))`;
 }
 
 /**

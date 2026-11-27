@@ -382,7 +382,7 @@ export async function buildExecutionContinuation(input: {
   const previousRun = input.previousContextRunId
     ? (
         await db
-          .select({ context: heartbeatRuns.contextSnapshot, nativeSessionId: heartbeatRuns.nativeSessionId })
+          .select({ context: heartbeatRuns.contextSnapshot, nativeSessionId: heartbeatRuns.nativeSessionId, profile: heartbeatRuns.runnerProfileJson })
           .from(heartbeatRuns)
           .where(
             and(
@@ -401,10 +401,35 @@ export async function buildExecutionContinuation(input: {
   const [accepted] = input.previousContextRunId ? await db.select({ id: heartbeatRunEvents.id, seq: heartbeatRunEvents.seq }).from(heartbeatRunEvents).where(and(
     eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, input.previousContextRunId),
     inArray(heartbeatRunEvents.eventType, ["turn.accepted", "turn.started"]))).orderBy(asc(heartbeatRunEvents.seq)).limit(1) : [];
+  const [previousGeneration] = input.previousContextRunId && accepted && input.nativeProviderSessionId
+    ? await db.select({ payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents).where(and(
+      eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, input.previousContextRunId),
+      inArray(heartbeatRunEvents.eventType, ["session.started", "session.resumed", "session.reconciled"]),
+      sql`${heartbeatRunEvents.seq} <= ${accepted.seq}`,
+    )).orderBy(desc(heartbeatRunEvents.seq)).limit(1) : [];
   const priorCoverage = object(priorEnvelope.coverage);
-  const omitted = accepted && input.nativeSessionId && input.nativeSessionId === previousRun?.nativeSessionId
+  const savedReadState = object(previousRun?.context?.nativeContinuationReadState);
+  const checkpoint = object(object(previousRun?.profile).sessionCheckpoint);
+  const savingSessionId = previousRun?.nativeSessionId ?? string(checkpoint.sessionId);
+  // Pre-upgrade read states had no generation fields. Infer their authority
+  // only from the saving run loaded above, never from caller context or the
+  // requested session alone. Explicit null/partial generation is not legacy.
+  const legacySameSession = !!input.nativeSessionId && !!input.nativeProviderSessionId
+    && savingSessionId === input.nativeSessionId
+    && (!string(checkpoint.sessionId) || checkpoint.sessionId === input.nativeSessionId)
+    && (!string(checkpoint.providerSessionId) || checkpoint.providerSessionId === input.nativeProviderSessionId)
+    && (!string(object(object(object(previousGeneration?.payload).prpEvent).payload).providerSessionId)
+      || object(object(object(previousGeneration?.payload).prpEvent).payload).providerSessionId === input.nativeProviderSessionId)
+    && !Object.hasOwn(savedReadState, "nativeSessionId") && !Object.hasOwn(savedReadState, "providerSessionId");
+  const legacyReadIds = new Set<string>(legacySameSession && Array.isArray(savedReadState.readCommentIds)
+    ? (savedReadState.readCommentIds as unknown[]).filter((id): id is string => typeof id === "string") : []);
+  const legacyReadAt = Date.parse(typeof savedReadState.lastRunAt === "string" ? savedReadState.lastRunAt : "");
+  const legacyReadRevision = (message: ExecutionContinuationEnvelope["messages"][number]) => legacyReadIds.has(message.id)
+    && Number.isFinite(legacyReadAt) && Date.parse(message.createdAt) < legacyReadAt && Date.parse(message.updatedAt) < legacyReadAt;
+  const omitted = accepted && input.nativeSessionId && savingSessionId === input.nativeSessionId
     && priorCoverage.nativeSessionId === input.nativeSessionId
-    && input.nativeProviderSessionId && priorCoverage.providerSessionId === input.nativeProviderSessionId
+    && input.nativeProviderSessionId && (priorCoverage.providerSessionId === input.nativeProviderSessionId
+      || (!Object.hasOwn(priorCoverage, "providerSessionId") && legacySameSession))
     && Array.isArray(priorCoverage.omitted)
     ? priorCoverage.omitted.map(object) : [];
   const omittedRevision = (message: ExecutionContinuationEnvelope["messages"][number]) => omitted.some(prior => prior.id === message.id && prior.updatedAt === message.updatedAt);
@@ -456,15 +481,12 @@ export async function buildExecutionContinuation(input: {
     const generation = { nativeSessionId: input.nativeSessionId ?? null, providerSessionId: input.nativeProviderSessionId ?? null };
     const read = await readByEarlierTurnCommentIds(db, { companyId, issueId, agentId: input.agentId,
       commentIds: messages.map(message => message.id), currentRunId: input.runId, retainedGeneration: generation });
-    const [previousGeneration] = input.previousContextRunId && accepted && generation.providerSessionId
-      ? await db.select({ payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents).where(and(
-        eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, input.previousContextRunId),
-        inArray(heartbeatRunEvents.eventType, ["session.started", "session.resumed", "session.reconciled"]),
-        sql`${heartbeatRunEvents.seq} <= ${accepted.seq}`,
-      )).orderBy(desc(heartbeatRunEvents.seq)).limit(1) : [];
-    const sameGeneration = !!generation.nativeSessionId && generation.nativeSessionId === previousRun?.nativeSessionId
+    // Carry old saved reads forward only while the same native session is
+    // retained. The budgeter's explicit fresh target still drops all reads.
+    for (const message of messages) if (legacyReadRevision(message)) read.add(message.id);
+    const sameGeneration = legacySameSession || (!!generation.nativeSessionId && generation.nativeSessionId === previousRun?.nativeSessionId
       && !!generation.providerSessionId
-      && object(object(object(previousGeneration?.payload).prpEvent).payload).providerSessionId === generation.providerSessionId;
+      && object(object(object(previousGeneration?.payload).prpEvent).payload).providerSessionId === generation.providerSessionId);
     // A stored snapshot alone is not delivery proof: size refusal can precede
     // acceptance. Only a prior accepted turn can make its exact revisions read.
     if (sameGeneration && accepted && deliveredMessages) for (const message of messages) {

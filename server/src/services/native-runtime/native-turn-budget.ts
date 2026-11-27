@@ -201,6 +201,20 @@ export function nativeContinuationReadState(value: unknown, target?: {
       ? state.readCommentIds.filter((id): id is string => typeof id === "string") : [] };
 }
 
+/** Legacy checkpoints may omit the provider ID. The saving run's database
+ * native session, not caller-selected context alone, authorizes this fallback. */
+export function nativeContinuationProviderSessionId(
+  savingRun: { nativeSessionId: string | null; runnerProfileJson: unknown } | null | undefined,
+  normalizedSessionId: string,
+  readState: unknown,
+): string | null {
+  const checkpoint = record(record(savingRun?.runnerProfileJson).sessionCheckpoint);
+  if (typeof checkpoint.providerSessionId === "string" && checkpoint.providerSessionId) return checkpoint.providerSessionId;
+  const state = nativeContinuationReadState(readState);
+  return savingRun?.nativeSessionId === normalizedSessionId && state.nativeSessionId === normalizedSessionId
+    ? state.providerSessionId ?? null : null;
+}
+
 /** Pure rendering budget: unknown read state protects everything, never guesses. */
 export function boundNativeExecutionContinuation(
   original: ExecutionContinuationEnvelope,
