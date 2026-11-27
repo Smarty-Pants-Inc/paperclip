@@ -1,4 +1,4 @@
-import { deferNativeInputRefusalWake, latestTaskRunIsNativeInputSizeRefusal } from "../native-input-refusal.js";
+import { deferNativeInputRefusalWake, deferUnchangedNativeInputRunClaim, heldNativeInputWakeIsUnchanged, latestTaskRunIsNativeInputSizeRefusal } from "../native-input-refusal.js";
 import { QUEUED_MESSAGES_DELIVERED_REASON } from "../../modules/wake-queue/index.js";
 import { connectionIntentService } from "../connection-intents.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
@@ -1427,6 +1427,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       }).from(issues).where(and(
         eq(issues.id, issueId), eq(issues.companyId, run.companyId),
       )).for("update") : [];
+      if (issueId && await deferUnchangedNativeInputRunClaim(tx, run, issueId)) return { ownsIssue: false, blocked: true };
       const ownsIssue = owner?.assigneeAgentId === run.agentId &&
         context.wakeReason !== "source_scoped_recovery_action";
       const [handoff] = issueId ? await tx.select().from(caseHandoffs).where(and(eq(caseHandoffs.companyId, run.companyId), eq(caseHandoffs.issueId, issueId),
@@ -1865,10 +1866,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             updatedAt: claimedAt,
           };
           if (nativeReviewContext) {
-            if (run.scheduledRetryReason === "native_provider_overloaded") {
-              const predecessor = await lockIssueExecutionClaim(tx);
-              if (predecessor.blocked) return null;
-            }
+            const predecessor = await lockIssueExecutionClaim(tx);
+            if (predecessor.blocked) return null;
             return tx.transaction(async (reviewTx) => {
               const reviewClaim = await claimQueuedNativeReviewRun(reviewTx as unknown as Db, {
                 run, claimedAt, claimValues,
@@ -2325,6 +2324,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
         sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
         or(eq(issues.assigneeAgentId, agentWakeupRequests.agentId),
+          sql`${agentWakeupRequests.payload}->>'nativeInputRefusalHold' = 'true'`,
           sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,wakeReason}' = 'issue_comment_mentioned'`)))
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
       .where(and(scope.companyId ? eq(agentWakeupRequests.companyId, scope.companyId) : undefined,
@@ -5611,8 +5611,26 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         continue;
       }
 
-      const claimed = await db
-        .update(agentWakeupRequests)
+      const claimed = await db.transaction(async rawTx => {
+        const tx = rawTx as unknown as Db;
+        if (issueId) {
+          await tx.select({ id: issues.id }).from(issues).where(and(eq(issues.companyId, candidate.companyId), eq(issues.id, issueId))).for("update");
+          const [lockedWake] = await tx.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, candidate.companyId), eq(agentWakeupRequests.id, candidate.id))).for("update");
+          if (!lockedWake || lockedWake.runId || !["queued", "claimed"].includes(lockedWake.status)) return [];
+          if (await heldNativeInputWakeIsUnchanged(tx, { companyId: candidate.companyId, issueId, agentId: candidate.agentId }, lockedWake.payload)) {
+            await tx.update(agentWakeupRequests).set({ status: "deferred_issue_execution", claimedAt: null, finishedAt: null,
+              payload: { ...parseObject(lockedWake.payload), issueId, nativeInputRefusalHold: true,
+                nativeInputRefusalWakes: Array.isArray(lockedWake.payload?.nativeInputRefusalWakes) ? lockedWake.payload.nativeInputRefusalWakes : [{
+                  source: lockedWake.source, triggerDetail: lockedWake.triggerDetail, reason: lockedWake.reason,
+                  requestedByActorType: lockedWake.requestedByActorType, requestedByActorId: lockedWake.requestedByActorId,
+                  payload: lockedWake.payload, contextSnapshot: parseObject(lockedWake.payload?._paperclipWakeContext),
+                }] }, updatedAt: now,
+            }).where(and(eq(agentWakeupRequests.id, candidate.id), isNull(agentWakeupRequests.runId)));
+            await notifyDeferredExecutionWork(tx, { companyId: candidate.companyId });
+            return [];
+          }
+        }
+        return tx.update(agentWakeupRequests)
         .set({
           status: "claimed",
           claimedAt: now,
@@ -5629,6 +5647,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           ),
         )
         .returning({ id: agentWakeupRequests.id });
+      });
       if (claimed.length === 0) continue;
 
       const scopeKey = issueId

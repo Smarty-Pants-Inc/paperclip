@@ -211,7 +211,15 @@ describe("PaperclipRunnerToolAuthority", () => {
       issueId,
       runId,
     });
-    expect(authority.definitions()).toHaveLength(57);
+    expect(authority.definitions()).toHaveLength(58);
+    const retained = new PaperclipRunnerToolAuthority(db, {
+      companyId, agentId, issueId, runId, savedAutomaticWakeReaderAvailable: false,
+    });
+    expect(retained.definitions()).toHaveLength(57);
+    expect(retained.definitions().map(tool => tool.name)).toEqual(
+      authority.definitions().map(tool => tool.name).filter(name => name !== "read_saved_automatic_wakes"),
+    );
+    retained.close();
     expect(authority.definitions().map(tool => tool.name)).toEqual(expect.arrayContaining([
       "get_workspace", "list_workspaces", "select_workspace", "prepare_repository",
       "search_skills", "load_skill", "list_routines", "update_routine", "update_skill_details",

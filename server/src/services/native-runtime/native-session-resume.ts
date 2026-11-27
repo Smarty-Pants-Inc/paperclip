@@ -31,38 +31,57 @@ export function nativeRuntimeContractForProvider(
  * changes. The execution target remains part of compatibility because local and
  * remote files use different server-bound readers.
  */
+export type NativeToolContractVersion = "v19" | "v20";
+
+// Retained provider threads keep the catalog they received at thread/start.
+// Keep the previous policy executable: target/provider hashes are never pins.
+export const NATIVE_TOOL_ADVERTISEMENT_POLICY_V19 = {
+  readCurrentWakeComments: "always_advertised_binding_gated.v2",
+  historicalChatAttachments: "always_advertised_conversation_binding_gated.v1",
+  registerDeliverable: "verified_local_or_remote_workspace.v2",
+  generateImage: "codex_openai_api_key_connection_server_key.v1",
+  readChatAttachment: "always_advertised_run_scope_local_staging.v2",
+  structuredHumanInput: "always_advertised_run_issue_agent_binding_gated_current_task_description.v2",
+  semanticCompletion: "finish_accessible_deliverable_evidence.v4",
+  opencodeAssignedMcpTools: "server_gateway_prp_on_demand_exact_names.v2",
+  connectorTools: "assigned_resources_and_pinned_skill_bundle.v1",
+  chatTaskTools: "durable_task_binding_and_accepted_origin.v1",
+  githubResponses: "bound_working_comment_progress_and_final.v1",
+  githubInstructionSkills: "trusted_configuration_native_selection.v1",
+  assignedMcpTools: "codex_server_gateway_prp_relay.v1",
+} as const;
+
+export function nativeToolContractVersionForProfile(
+  profile: unknown,
+  target: NativeToolExecutionTargetKind,
+  provider?: NativeExecutionInput["provider"]["kind"],
+): NativeToolContractVersion {
+  return record(profile).nativeToolContractFingerprint === nativeToolContractFingerprintForTarget(target, provider, "v19")
+    ? "v19" : "v20";
+}
+
 export function nativeToolContractFingerprintForTarget(
   executionTargetKind: NativeToolExecutionTargetKind,
   providerKind?: NativeExecutionInput["provider"]["kind"],
+  version: NativeToolContractVersion = "v20",
 ): string {
+  const { readCurrentWakeComments, ...otherV19Policies } = NATIVE_TOOL_ADVERTISEMENT_POLICY_V19;
   return `sha256:${createHash("sha256")
     .update(
       JSON.stringify({
-        schema: "paperclip.native-tool-contract.v19",
+        schema: `paperclip.native-tool-contract.${version}`,
         executionTargetKind,
         advertisementPolicy: {
           // Direct provider threads retain declarations from thread/start.
           // Keep this explicit so changing a tool from conditional to stable
           // advertisement rotates checkpoints even when its schema is unchanged.
-          readCurrentWakeComments: "always_advertised_binding_gated.v2",
-          historicalChatAttachments:
-            "always_advertised_conversation_binding_gated.v1",
-          registerDeliverable: "verified_local_or_remote_workspace.v2",
-          // Advertised only to Codex runs admitted on an OpenAI API-key
-          // connection; the key stays in the server.
-          generateImage: "codex_openai_api_key_connection_server_key.v1",
-          readChatAttachment: "always_advertised_run_scope_local_staging.v2",
-          structuredHumanInput:
-            "always_advertised_run_issue_agent_binding_gated_current_task_description.v2",
-          semanticCompletion: "finish_accessible_deliverable_evidence.v4",
-          ...(providerKind === "opencode"
-            ? { opencodeAssignedMcpTools: "server_gateway_prp_on_demand_exact_names.v2" }
-            : {}),
-          connectorTools: "assigned_resources_and_pinned_skill_bundle.v1",
-          chatTaskTools: "durable_task_binding_and_accepted_origin.v1",
-          githubResponses: "bound_working_comment_progress_and_final.v1",
-          githubInstructionSkills: "trusted_configuration_native_selection.v1",
-          assignedMcpTools: "codex_server_gateway_prp_relay.v1",
+          readCurrentWakeComments,
+          ...(version === "v20" ? { readSavedAutomaticWakes: "always_advertised_active_run_paged_untrusted_data.v1" } : {}),
+          ...otherV19Policies,
+          // Undefined is omitted by JSON.stringify, preserving the deployed
+          // property order and the provider-specific v19/v20 fingerprints.
+          opencodeAssignedMcpTools: providerKind === "opencode"
+            ? NATIVE_TOOL_ADVERTISEMENT_POLICY_V19.opencodeAssignedMcpTools : undefined,
         },
         tools: [
           { name: "register_deliverable", version: 2 },
@@ -88,6 +107,7 @@ export function nativeToolContractFingerprintForTarget(
             version: 1,
           },
           { name: "request_human_input", version: 1 },
+          ...(version === "v20" ? [{ name: "read_saved_automatic_wakes", version: 1 }] : []),
         ],
       }),
     )
@@ -596,15 +616,21 @@ export function buildNativeExecutionWithCheckpoint(input: {
   buildExecution: (options: {
     normalizedSessionId: string;
     resumedSession: boolean;
+    nativeToolContractVersion: NativeToolContractVersion;
   }) => NativeExecutionInput;
 }): {
   execution: NativeExecutionInput;
   checkpoint: PersistedNativeSession | null;
   normalizedSessionId: string;
+  nativeToolContractVersion: NativeToolContractVersion;
 } {
+  const previousProfile = record(input.previousRun?.runnerProfileJson);
+  const previousProvider = record(record(previousProfile.nativeExecutionInput).provider).kind as NativeExecutionInput["provider"]["kind"] | undefined;
+  const nativeToolContractVersion = nativeToolContractVersionForProfile(previousProfile, input.executionTargetKind ?? "local", previousProvider);
   const execution = input.buildExecution({
     normalizedSessionId: input.normalizedSessionId,
     resumedSession: input.previousRun !== null,
+    nativeToolContractVersion,
   });
   // A presentation-only upgrade must not rotate a healthy provider session or
   // lose a durable goal. Keep its v4/v5 format until that session naturally ends.
@@ -622,7 +648,7 @@ export function buildNativeExecutionWithCheckpoint(input: {
         toolRefreshOnResume: input.toolRefreshOnResume,
         refreshTools: input.refreshTools,
       });
-      if (retainedCheckpoint) return { execution: retainedFormat, checkpoint: retainedCheckpoint, normalizedSessionId: input.normalizedSessionId };
+      if (retainedCheckpoint) return { execution: retainedFormat, checkpoint: retainedCheckpoint, normalizedSessionId: input.normalizedSessionId, nativeToolContractVersion };
     }
   }
   const checkpoint = input.previousRun
@@ -640,6 +666,7 @@ export function buildNativeExecutionWithCheckpoint(input: {
       execution,
       checkpoint,
       normalizedSessionId: input.normalizedSessionId,
+      nativeToolContractVersion,
     };
   // Rebuild both task context and wake instructions. Merely rotating the ID
   // leaves a fresh provider with a compact delta and missing task context.
@@ -648,9 +675,11 @@ export function buildNativeExecutionWithCheckpoint(input: {
     execution: input.buildExecution({
       normalizedSessionId,
       resumedSession: false,
+      nativeToolContractVersion: "v20",
     }),
     checkpoint: null,
     normalizedSessionId,
+    nativeToolContractVersion: "v20",
   };
 }
 
@@ -709,7 +738,9 @@ export function rebindNativeSessionCheckpoint(input: {
   if (isNativeProviderStateUnsaved(previousProfile)) return null;
   if (
     previousProfile.nativeToolContractFingerprint !==
-    nativeToolContractFingerprintForTarget(input.executionTargetKind ?? "local", input.currentExecution.provider.kind)
+    nativeToolContractFingerprintForTarget(input.executionTargetKind ?? "local", input.currentExecution.provider.kind) &&
+    previousProfile.nativeToolContractFingerprint !==
+    nativeToolContractFingerprintForTarget(input.executionTargetKind ?? "local", input.currentExecution.provider.kind, "v19")
   ) {
     return null;
   }

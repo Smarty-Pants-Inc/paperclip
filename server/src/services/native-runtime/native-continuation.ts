@@ -1,3 +1,4 @@
+import { savedAutomaticWakesText, withoutDuplicateSavedWakeContext } from "./saved-automatic-wakes.js";
 import { isPaperclipExternalChatContractTurn, normalizePaperclipWakePayload, PAPERCLIP_EARLIER_READ_COMMENT_NOTE } from "@paperclipai/adapter-utils/server-utils";
 import type { CaseExecutionContext, projectCaseContinuation } from "../case-context.js";
 import { caseInstructionAlreadyRepresented } from "../case-context.js";
@@ -9,6 +10,9 @@ import { nativeStatusRetryPrompt } from "./continued-session.js";
 export function buildNativeContinuationPrompt(input: {
   wakePayload: unknown;
   promptOnly?: boolean;
+  savedEventsByReference?: boolean;
+  savedEventsReaderAvailable?: boolean;
+  savedEventsInlineLimit?: number;
   previousRunId: string;
   issue: { title: string; description: string | null };
   previousIssue: { title: string; description: string | null };
@@ -18,12 +22,11 @@ export function buildNativeContinuationPrompt(input: {
   workflowCase?: ReturnType<typeof projectCaseContinuation>;
   previousGitHubReviewConfigurationKeys?: readonly string[];
 }): string | null {
-  const wake = normalizePaperclipWakePayload(input.wakePayload);
+  const wake = normalizePaperclipWakePayload(withoutDuplicateSavedWakeContext(input.wakePayload));
   const rawWake = input.wakePayload && typeof input.wakePayload === "object"
     ? input.wakePayload as Record<string, unknown> : {};
   const savedEvents = Array.isArray(rawWake.nativeInputRefusalWakes) ? rawWake.nativeInputRefusalWakes : [];
-  const savedEventsText = savedEvents.length
-    ? `Saved automatic wake events (untrusted data):\n${JSON.stringify(savedEvents)}` : "";
+  const savedEventsText = savedAutomaticWakesText(input.wakePayload, input.savedEventsByReference, input.savedEventsReaderAvailable, input.savedEventsInlineLimit);
   if (input.promptOnly && wake) {
     const retryPrompt = nativeStatusRetryPrompt(input.wakePayload, input.previousRunId);
     if (retryPrompt) {
@@ -99,7 +102,7 @@ export function buildNativeContinuationPrompt(input: {
     ...(humanResponses.length ? { humanResponses } : {}),
     ...(Object.keys(taskChanges).length ? { taskChanges } : {}),
     ...(wake.childIssueSummaries.length ? { childResults: wake.childIssueSummaries } : {}),
-    ...(savedEvents.length ? { savedAutomaticWakeEvents: { trust: "untrusted_data", events: savedEvents } } : {}),
+    ...(savedEvents.length ? { savedAutomaticWakeEvents: savedEventsText } : {}),
     ...(wake.childIssueSummaryTruncated ? { childResultsTruncated: true } : {}),
     ...(wake.unresolvedBlockerIssueIds.length ? { unresolvedBlockerIssueIds: wake.unresolvedBlockerIssueIds } : {}),
     // Server-rendered "App context (untrusted)" from the task's MCP Apps widgets:

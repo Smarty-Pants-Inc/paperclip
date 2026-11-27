@@ -1,3 +1,4 @@
+import { deferUnchangedNativeInputRunClaim } from "../native-input-refusal.js";
 import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js";
 import { withExternalAdmissionGuard, assertNoExternalOverlap } from "../../modules/external-agents/index.js";
 import { agentWakeupRequests, heartbeatRuns, issues, type Db } from "@paperclipai/db";
@@ -22,6 +23,7 @@ export async function claimQueuedNativeReviewRun(db: Db, input: {
       eq(issues.id, issueId), eq(issues.companyId, input.run.companyId),
     )).for("update");
     if (!issue) return null;
+    if (await deferUnchangedNativeInputRunClaim(tx as unknown as Db, input.run, issueId)) return null;
     if (input.run.wakeupRequestId) {
       const [wake] = await tx.select().from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.id, input.run.wakeupRequestId),

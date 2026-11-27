@@ -313,7 +313,7 @@ import {
   renderNativeRunnerStagedAttachmentPrompt,
   stageNativeRunnerWakeAttachments,
 } from "./native-runner-file-handoff.js";
-import { NATIVE_PROVIDER_SIDE_EFFECT_PENDING, NATIVE_PROVIDER_STATE_INCOMPATIBLE, nativeSessionProvidersMatch, nativeRuntimeContextsMatch, nativeRuntimeContractForProvider, nativeToolContractFingerprintForTarget } from "./native-session-resume.js";
+import { NATIVE_PROVIDER_SIDE_EFFECT_PENDING, NATIVE_PROVIDER_STATE_INCOMPATIBLE, nativeSessionProvidersMatch, nativeRuntimeContextsMatch, nativeRuntimeContractForProvider, nativeToolContractFingerprintForTarget, nativeToolContractVersionForProfile } from "./native-session-resume.js";
 import { clearRunProviderStateUnsaved, markAcceptedRunProviderStateUnsaved } from "./native-provider-state-unsaved.js";
 import { verifyRetainedMaintenanceNoLaunch } from "./native-maintenance-no-launch.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
@@ -17495,7 +17495,7 @@ async function createRunnerdBackendWithinSessionClaim(
   ));
   const pinnedSkills = new Set("runtimeContext" in input.execution ? input.execution.runtimeContext.skills.map((skill) => skill.key) : []);
   const connectorAssignments = input.execution.provider.kind !== "muse" ? connectorToolDefinitionsForSkills(pinnedSkills) : [];
-  const reviewRun = await input.db.select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+  const reviewRun = await input.db.select({ contextSnapshot: heartbeatRuns.contextSnapshot, runnerProfileJson: heartbeatRuns.runnerProfileJson })
     .from(heartbeatRuns).where(and(
       eq(heartbeatRuns.id, input.execution.binding.runId),
       eq(heartbeatRuns.companyId, input.execution.binding.companyId),
@@ -17570,6 +17570,7 @@ async function createRunnerdBackendWithinSessionClaim(
     runId: input.execution.binding.runId,
     agentId: input.execution.binding.agentId,
     normalizedSessionId: nativeSessionKey(input.execution),
+    savedAutomaticWakeReaderAvailable: nativeToolContractVersionForProfile(reviewRun?.runnerProfileJson, target.kind, input.execution.provider.kind) !== "v19",
     pinnedMcpDigest:
       "runtimeContext" in input.execution
         ? input.execution.runtimeContext.mcp.digest

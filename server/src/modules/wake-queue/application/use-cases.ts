@@ -814,6 +814,7 @@ async function runReleaseRecoveryTail(
       sessionBefore,
       now: input.now,
     });
+    if (!queuedRun) return { outcome: { kind: "released" }, postCommitEffects };
     postCommitEffects.push({ kind: "run_queued", run: queuedRun });
     return {
       outcome: { kind: "queued_review_participant_recovery", run: queuedRun },
