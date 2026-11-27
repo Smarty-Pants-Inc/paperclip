@@ -1,8 +1,12 @@
 import type { ComponentType } from "react";
 import type { CreateConfigValues, TranscriptEntry as SharedTranscriptEntry } from "@paperclipai/adapter-utils";
 
-// Placement keeps the first visible timestamp; completion still owns the clock.
-export type TranscriptEntry = SharedTranscriptEntry & { completedAt?: string };
+// Placement keeps event order across session reads; completion owns the clock.
+export type TranscriptEntry = SharedTranscriptEntry & {
+  completedAt?: string;
+  eventSeq?: number;
+  steeringEvent?: { kind: "ack" | "input" | "end"; turnId: string | null; commentId?: string };
+};
 export type { StdoutLineParser, CreateConfigValues } from "@paperclipai/adapter-utils";
 
 export interface StatefulStdoutParser {

@@ -50,6 +50,59 @@ export function isTerminalRunStatus(
   return status != null && TERMINAL_STATUSES.has(status);
 }
 
+/** ACK identifies an input; only a session read can open its output slot. */
+export function steeringDeliveryPoints(entries: readonly TranscriptEntry[]) {
+  type Point = { atMs: number; afterEventSeq?: number };
+  type Turn = {
+    inputSeen: boolean;
+    acks: string[]; ackHead: number;
+    reads: { point: Point; generation: number }[]; readHead: number;
+  };
+  const byQuestion = new Map<string, Point>();
+  const turns = new Map<string | null, Turn>();
+  const seen = new Set<string>();
+  let generation = 0;
+  let hasInputs = false;
+  let opening: Point | undefined;
+  for (const entry of entries) {
+    const event = entry.steeringEvent;
+    if (!event || event.kind === "end") {
+      // Never hold a suffix waiting for an identity. Once output is drawable,
+      // an unnamed read cannot retroactively claim it. A later ACK consumes
+      // that read's FIFO position but does not move those words. This decision
+      // uses the durable stream prefix, not mount-local memory or a timeout.
+      generation++;
+      continue;
+    }
+    let turn = turns.get(event.turnId);
+    if (!turn) {
+      turn = { inputSeen: false, acks: [], ackHead: 0, reads: [], readHead: 0 };
+      turns.set(event.turnId, turn);
+    }
+    if (event.kind === "ack") {
+      if (!event.commentId || seen.has(event.commentId)) continue;
+      seen.add(event.commentId);
+      const read = turn.reads[turn.readHead];
+      if (read) {
+        turn.readHead++;
+        if (read.generation === generation) byQuestion.set(event.commentId, read.point);
+      } else turn.acks.push(event.commentId);
+      continue;
+    }
+    hasInputs = true;
+    const point = { atMs: Date.parse(entry.ts), afterEventSeq: entry.eventSeq };
+    // The first userMessage is the turn's own starting input, NOT a steer.
+    // Its actual read position also puts the opening work below comments
+    // folded into that input, even if the polled fold receipt arrives later.
+    opening ??= point;
+    if (!turn.inputSeen) { turn.inputSeen = true; continue; }
+    const id = turn.acks[turn.ackHead];
+    if (id) { turn.ackHead++; byQuestion.set(id, point); }
+    else turn.reads.push({ point, generation });
+  }
+  return { byQuestion, hasInputs, opening };
+}
+
 export interface TranscriptTimeSegment {
   startMs: number;
   endMs: number;
@@ -57,26 +110,27 @@ export interface TranscriptTimeSegment {
 }
 
 /**
- * Split one provider run at durable in-turn input timestamps. Each boundary
- * belongs to the segment after it. Boundaries are acknowledged input slots;
- * reply ownership can name a question's segment. Tool updates keep their call even when
- * the result arrives after a boundary. Live and settled use the same projector.
+ * Split at session-read cursors, never ACK time. A final keeps its first
+ * output position; saved attribution cannot move it. Tool updates keep their
+ * call even when the result arrives after a read. Live and reload agree.
  */
 export function splitTranscriptAtAnchors(
   entries: readonly TranscriptEntry[],
   startMs: number,
   rawAnchors: readonly number[],
-  replySegments?: ReadonlyMap<string, number>,
+  _replySegments?: ReadonlyMap<string, number>,
+  anchorCursors?: readonly (number | undefined)[],
 ): TranscriptTimeSegment[] {
-  const anchors = [...new Set(rawAnchors.filter(Number.isFinite))].sort(
-    (a, b) => a - b,
-  );
+  // Callers supply ordered question slots, not unique clock values. Equal
+  // timestamps still represent distinct inputs; Infinity reserves a reply
+  // slot with no session-read point, without splitting activity speculatively.
+  const anchors = rawAnchors;
   if (anchors.length === 0) {
     return [
       {
         startMs,
         endMs: Number.POSITIVE_INFINITY,
-        entries: [...entries],
+        entries: entries.filter(entry => !entry.steeringEvent),
       },
     ];
   }
@@ -87,26 +141,24 @@ export function splitTranscriptAtAnchors(
   }));
   const toolSegments = new Map<string, number>();
   const authoredSegments = new Map<string, number>();
-  // Multi-block messages use :bN item suffixes. A mapped final also owns the
-  // preceding blocks of that message (not unrelated work at the same time).
-  const messageReplies = new Map<string, { block: number; segment: number }[]>();
-  for (const [itemId, segment] of replySegments ?? []) {
-    const match = /^(.*):b(\d+)$/.exec(itemId);
-    if (!match) continue;
-    const replies = messageReplies.get(match[1]!) ?? [];
-    replies.push({ block: Number(match[2]), segment });
-    messageReplies.set(match[1]!, replies);
-  }
-  for (const replies of messageReplies.values()) replies.sort((a, b) => a.block - b.block);
+  // Finals have one owner. Reasoning/progress do not inherit that owner:
+  // their deltas on either side of a read are different visible groups.
   for (const entry of entries) {
+    if (entry.steeringEvent) continue;
     const parsed = Date.parse(entry.ts);
     const entryMs = Number.isFinite(parsed) ? parsed : 0;
-    let index = anchors.findIndex(anchor => entryMs < anchor);
-    if (index < 0) index = anchors.length;
-    if ((entry.kind === "assistant" || entry.kind === "thinking") && entry.itemId) {
-      const block = /^(.*):b(\d+)$/.exec(entry.itemId);
-      const messageSegment = block && messageReplies.get(block[1]!)?.find(reply => reply.block >= Number(block[2]))?.segment;
-      index = Math.min(anchors.length, replySegments?.get(entry.itemId) ?? messageSegment ?? authoredSegments.get(entry.itemId) ?? index);
+    let low = 0, high = anchors.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      const cursor = anchorCursors?.[middle];
+      const before = cursor !== undefined && entry.eventSeq !== undefined
+        ? entry.eventSeq <= cursor : entryMs < anchors[middle]!;
+      if (before) high = middle;
+      else low = middle + 1;
+    }
+    let index = low;
+    if (entry.kind === "assistant" && entry.channel === "final" && entry.itemId) {
+      index = authoredSegments.get(entry.itemId) ?? index;
       authoredSegments.set(entry.itemId, index);
     }
     if ((entry.kind === "tool_call" || entry.kind === "tool_result" || entry.kind === "diff") && entry.toolUseId) {
@@ -854,7 +906,9 @@ export function transcriptToTaskChatItems(
           // waiting for one leaves every earlier brain blue and shimmering.
           finishThinking();
           items.push({
-            id: `${runId}:think:${entry.itemId ?? i}`,
+            // One protocol item can resume after a tool or other surface.
+            // Each visible burst needs its own stable key, not the shared ID.
+            id: `${runId}:think:${entry.itemId ?? "anonymous"}:${entry.eventSeq ?? i}`,
             kind: "thinking",
             lines: entry.text ? entry.text.split("\n") : [],
             streaming: running && entry.lifecycle !== "completed",
@@ -899,7 +953,7 @@ export function transcriptToTaskChatItems(
           finishThinking();
           const atMs = Date.parse(entry.completedAt ?? entry.ts);
           items.push({
-            id: `${runId}:msg:${entry.itemId ?? i}`,
+            id: `${runId}:msg:${entry.itemId ?? "anonymous"}:${entry.eventSeq ?? i}`,
             kind: "message",
             author: "agent",
             authorName: agentName,

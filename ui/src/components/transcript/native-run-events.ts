@@ -1043,6 +1043,8 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
   }
 
   const itemIdentityById = new Map<string, ItemIdentity>();
+  const inlineOffsets = new Map<string, number>();
+  const inputItemIds = new Set<string>();
   // Context occupancy rides on usage items. A compaction divider takes its
   // "before" size from the last report and its "after" size from the next.
   let latestContextUsedTokens: number | null = null;
@@ -1052,6 +1054,12 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
   const proposalMarkdownById = new Map<string, string>();
   const completedProposalIds = new Set<string>();
   for (const event of orderedEvents) {
+    // Every row keeps its durable cursor, including tools/cards whose clock
+    // can equal a delivery event's clock. Preserve object identity for updates.
+    const append = (...rows: TranscriptEntry[]) => {
+      for (const row of rows) row.eventSeq ??= event.seq;
+      entries.push(...rows);
+    };
     const envelope = record(event.payload?.prpEvent);
     if (
       !envelope
@@ -1072,6 +1080,35 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
       itemIdentityById.set(itemId, itemIdentity);
     }
     const itemKind = itemIdentity.kind;
+
+    if (event.eventType === "turn.completed" || event.eventType === "turn.failed" || event.eventType === "turn.cancelled") {
+      append({ kind: "system", text: "", ts, steeringEvent: { kind: "end", turnId: text(envelope.turnId) } });
+      continue;
+    }
+
+    // Keep delivery evidence in the projection, not as a visible system row.
+    // The ACK item names the question; userMessage marks when the session read
+    // it. These are the same events used by unreadSteeredMessageIds on recovery.
+    if (itemKind === "usermessage") {
+      // Some saved streams retain only completed items. The first occurrence
+      // is the read point; started+completed for one input must not split twice.
+      // Empty input content is control evidence, never a chat bubble.
+      if ((event.eventType === "item.started" || event.eventType === "item.completed") &&
+          itemId && !inputItemIds.has(itemId)) {
+        inputItemIds.add(itemId);
+        append({ kind: "system", text: "", ts, steeringEvent: {
+          kind: "input", turnId: text(envelope.turnId),
+        } });
+      }
+      continue;
+    }
+    if (event.eventType === "item.completed" && itemKind === "steeringacknowledgement") {
+      append({ kind: "system", text: "", ts, steeringEvent: {
+        kind: "ack", turnId: text(envelope.turnId),
+        commentId: /:steer:(.+)$/.exec(itemId ?? "")?.[1],
+      } });
+      continue;
+    }
 
     if (event.eventType === "item.completed" && payload.kind === "usage") {
       const context = contextUsageFromUsagePayload(payload.usage);
@@ -1101,7 +1138,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
       };
       if (compaction.postTokens === null) awaitingPostCompaction = compaction;
       lastCompaction = compaction;
-      entries.push({
+      append({
         kind: "provider_activity",
         ts,
         family: "context",
@@ -1114,23 +1151,35 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
       continue;
     }
 
-    // A completion replaces streamed content at its FIRST visible event, not
-    // at its later completion time. Otherwise a final/reasoning item crosses a
-    // steering bubble when its deltas disappear, including on a fresh reload.
+    // A final answer has one owner. Inline reasoning/progress instead keeps
+    // each delta's durable event time/cursor, so a long item can continue below
+    // a steer without pulling its earlier words down (or later words up).
+    // Completion supplies canonical text but must not erase those boundaries.
     if ((event.eventType === "item.delta" || event.eventType === "item.completed") &&
       (isAssistantItemKind(itemKind) || itemKind === "reasoning")) {
       if (event.eventType === "item.delta" && !itemId) continue;
       const completion = itemId ? (itemKind === "reasoning" ? completedReasoning : completedAgentMessages).get(itemId) : undefined;
-      if (completion && itemId && emittedCompletedItems.has(itemId)) continue;
-      const raw = normalizedItemText(completion?.payload ?? payload) ?? "";
+      const contentIdentity = completion ? resolveItemIdentity(completion.payload, itemIdentity) : itemIdentity;
+      const inline = itemKind === "reasoning" || contentIdentity.assistantChannel !== "final";
+      if (!inline && completion && itemId && emittedCompletedItems.has(itemId)) continue;
+      let raw = normalizedItemText(completion?.payload ?? payload) ?? "";
+      if (inline && itemId) {
+        const offset = inlineOffsets.get(itemId) ?? 0;
+        const length = event.eventType === "item.delta" ? (normalizedItemText(payload) ?? "").length : raw.length - offset;
+        raw = completion ? raw.slice(offset, offset + Math.max(0, length)) : raw;
+        inlineOffsets.set(itemId, offset + raw.length);
+        if (event.eventType === "item.completed" && !raw) {
+          const last = entries.findLast(entry => entry.kind === "thinking" && entry.itemId === itemId);
+          if (last?.kind === "thinking") last.lifecycle = "completed";
+        }
+      }
       const value = itemId && proposedMessageIds.has(itemId) ? withoutProposedPlanBlock(raw) : raw;
       if (!value) continue;
-      if (completion && itemId) emittedCompletedItems.add(itemId);
-      const delta = !completion && event.eventType === "item.delta";
-      const contentIdentity = completion ? resolveItemIdentity(completion.payload, itemIdentity) : itemIdentity;
-      entries.push(itemKind === "reasoning" ? {
+      if (!inline && completion && itemId) emittedCompletedItems.add(itemId);
+      const delta = inline || (!completion && event.eventType === "item.delta");
+      append(itemKind === "reasoning" ? {
         kind: "thinking", ts, text: value, ...(delta ? { delta: true } : {}), completedAt: completion?.ts,
-        lifecycle: delta ? "started" : "completed",
+        lifecycle: event.eventType === "item.completed" ? "completed" : "started",
         channel: contentIdentity.reasoningChannel,
         ...(itemId ? { itemId } : {}),
       } : {
@@ -1143,7 +1192,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
 
     if (event.eventType === "item.completed" && payload.kind === "verification") {
       const entry = verificationActivityEntry(payload, itemId, ts);
-      if (entry) entries.push(entry);
+      if (entry) append(entry);
       continue;
     }
 
@@ -1164,7 +1213,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
       const presentation = toolPresentation({}, nativeToolItem);
       if (!startedToolIds.has(toolId)) {
         startedToolIds.add(toolId);
-        entries.push({
+        append({
           kind: "tool_call",
           ts,
           name: presentation.name,
@@ -1179,7 +1228,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
         && !completedToolIds.has(toolId)
       ) {
         completedToolIds.add(toolId);
-        entries.push({
+        append({
           kind: "tool_result",
           ts,
           toolUseId: toolId,
@@ -1195,7 +1244,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
     // and category for the shared notice row instead of serializing an input blob.
     if (event.eventType === "provider.notice.recorded" && payload.schema === "paperclip.provider.notice.v1") {
       if (isRunLogOnlyProviderEvent(event.eventType, payload)) continue;
-      entries.push({
+      append({
         kind: "provider_activity",
         ts,
         family: "provider_notice",
@@ -1211,7 +1260,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
     // The plan carries its steps to the turn plan card, so keep the full
     // snapshot instead of flattening it into a generic tool row.
     if (event.eventType === "plan.updated" && payload.schema === "paperclip.plan.updated.v1" && text(payload.planId)) {
-      entries.push({
+      append({
         kind: "provider_activity",
         ts,
         family: "plan",
@@ -1240,7 +1289,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
       const markdown = text(payload.markdown) ?? proposedPlanMarkdown(proposalMarkdownById.get(proposalId) ?? "");
       if (completed) completedProposalIds.add(proposalId);
       proposalMarkdownById.set(proposalId, markdown);
-      entries.push(planProposalEntry(ts, event.eventType, proposalId, markdown, completed, payload));
+      append(planProposalEntry(ts, event.eventType, proposalId, markdown, completed, payload));
       continue;
     }
 
@@ -1250,7 +1299,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
       if (completedProposalIds.has(itemId)) continue;
       const accumulated = (proposalMarkdownById.get(itemId) ?? "") + (normalizedItemText(payload) ?? "");
       proposalMarkdownById.set(itemId, accumulated);
-      entries.push(planProposalEntry(ts, "plan.proposed", itemId, proposedPlanMarkdown(accumulated), false, {}));
+      append(planProposalEntry(ts, "plan.proposed", itemId, proposedPlanMarkdown(accumulated), false, {}));
       continue;
     }
 
@@ -1259,7 +1308,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
     if ((event.eventType === "hook.started" || event.eventType === "hook.completed")
       && payload.schema === "paperclip.hook.v1" && text(payload.hookId)) {
       const outcome = text(payload.outcome) ?? text(payload.status);
-      entries.push({
+      append({
         kind: "provider_activity",
         ts,
         family: "hook",
@@ -1274,7 +1323,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
     if ((event.eventType === "safety.review.started" || event.eventType === "safety.review.completed")
       && payload.schema === "paperclip.safety.review.v1" && text(payload.reviewId)) {
       const decision = text(payload.decision);
-      entries.push({
+      append({
         kind: "provider_activity",
         ts,
         family: "safety",
@@ -1296,7 +1345,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
       && text(payload.delegationId)
     ) {
       const status = text(payload.status);
-      entries.push({
+      append({
         kind: "provider_activity",
         ts,
         family: "delegation",
@@ -1317,7 +1366,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
 
     const cardActivity = cardProviderActivityEntry(event, payload, ts);
     if (cardActivity) {
-      entries.push(cardActivity);
+      append(cardActivity);
       continue;
     }
 
@@ -1325,7 +1374,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
     if (providerActivity) {
       if (!startedToolIds.has(providerActivity.id)) {
         startedToolIds.add(providerActivity.id);
-        entries.push({
+        append({
           kind: "tool_call",
           ts,
           name: providerActivity.name,
@@ -1334,7 +1383,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
         });
       }
       if (providerActivity.terminal) {
-        entries.push({
+        append({
           kind: "tool_result",
           ts,
           toolUseId: providerActivity.id,
@@ -1350,7 +1399,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
       (event.eventType === "workspace.change.updated" || event.eventType === "workspace.diff.recorded")
       && payload.schema === "paperclip.workspace.diff.v1"
     ) {
-      entries.push(workspaceChangeEntry(payload, ts));
+      append(workspaceChangeEntry(payload, ts));
       continue;
     }
 
@@ -1379,7 +1428,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
         startedToolIds.add(executionId);
         const fileChanges = fileChangesByExecutionId.get(executionId);
         const editedPath = text(record(fileChanges?.[0])?.path);
-        entries.push({
+        append({
           kind: "tool_call",
           ts,
           name: presentation.name,
@@ -1391,7 +1440,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
           detail,
           ...(parentToolUseId ? { parentToolUseId } : {}),
         });
-        if (firstEmission) entries.push(...fileChangeDiffEntries(fileChanges, executionId, ts));
+        if (firstEmission) append(...fileChangeDiffEntries(fileChanges, executionId, ts));
       }
       if (event.eventType === "tool.execution.completed" && !completedToolIds.has(executionId)) {
         completedToolIds.add(executionId);
@@ -1399,7 +1448,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
         const content = output ?? (nativeToolItem
           ? serializedNativeToolResult(nativeToolItem)
           : "");
-        entries.push({
+        append({
           kind: "tool_result",
           ts,
           toolUseId: executionId,
@@ -1463,7 +1512,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
       });
       if (entry) {
         runtimeRequests.set(entry.requestId, entry);
-        entries.push(entry);
+        append(entry);
       }
       continue;
     }
@@ -1471,7 +1520,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
     if (event.eventType === "run.terminal") {
       const terminal = runTerminalEntry(payload, ts);
       if (terminal) {
-        entries.push(terminal);
+        append(terminal);
         terminalsByRun.set(event.runId, {
           entry: terminal,
           seq: event.seq,
@@ -1500,7 +1549,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
       }
       if (!hasRunResult) {
         const entry = runResultEntry(result, ts);
-        entries.push(entry);
+        append(entry);
         const continuation = record(result.continuation);
         const sourceEventId = text(envelope.sourceEventId);
         const sourceInstanceId = text(envelope.sourceInstanceId);

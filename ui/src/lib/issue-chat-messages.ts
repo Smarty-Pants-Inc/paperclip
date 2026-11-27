@@ -47,6 +47,8 @@ export interface IssueChatComment extends IssueComment {
 }
 
 export interface IssueChatLinkedRun {
+  /** Existing first-turn receipt: these comments were folded into the opening input. */
+  firstTurnCommentIds?: string[] | null;
   retryOfRunId?: string | null;
   execution?: ExecutionProjection | null;
   runId: string;

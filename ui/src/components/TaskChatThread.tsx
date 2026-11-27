@@ -52,6 +52,7 @@ import {
   type RunTranscriptSource,
 } from "@/components/transcript/useLiveRunTranscripts";
 import { useNativeRunTranscripts } from "@/components/transcript/useNativeRunTranscripts";
+import { readTranscriptRequest } from "@/components/transcript/read-transcript-request";
 import { TaskChatLiveTail } from "@/components/task-chat/TaskChatLiveTail";
 import { McpAppIssueProvider } from "@/components/mcp-app/McpAppIssueContext";
 import { ProviderToolIconsProvider } from "@/components/ProviderToolIcon";
@@ -88,6 +89,7 @@ import {
   settledCompactionMarkers,
   settledRunChildren,
   splitTranscriptAtAnchors,
+  steeringDeliveryPoints,
   transcriptToTaskChatItems,
   runtimeRequestSegmentContext,
   reconcileSegmentRuntimeRequests,
@@ -167,7 +169,7 @@ import {
 import { heartbeatsApi, type RuntimeRequestResolution } from "@/api/heartbeats";
 import { issuesApi } from "@/api/issues";
 import { queryKeys } from "@/lib/queryKeys";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQueries, useQueryClient } from "@tanstack/react-query";
 import { TaskChatPresentationProvider } from "@/components/task-chat/presentation-mode";
 import { isRunStopConfirmed } from "@/lib/wait-for-stopped-runs";
 
@@ -263,6 +265,23 @@ function threadOwnsPlanPreview(
   return runnerTurnOwnsPlanPreview(interaction, renderedRunIds, tailRunId);
 }
 
+function replyRunId(comment: TaskChatThreadProps["comments"][number] | undefined): string | null | undefined {
+  return comment?.runId ?? comment?.createdByRunId ?? comment?.derivedCreatedByRunId;
+}
+
+function nativeReplyKey(comment: TaskChatThreadProps["comments"][number], knownIds: ReadonlySet<string>) {
+  const runId = replyRunId(comment);
+  const key = comment.clientRequestId;
+  const prefix = `native-final:${runId}:`;
+  if (!runId || !key?.startsWith(prefix)) return;
+  const separator = key.lastIndexOf(":");
+  if (separator < prefix.length) return;
+  const suffix = key.slice(separator + 1);
+  const questionIds = suffix === "opening" ? [] : suffix.split(",");
+  if (!questionIds.every(id => knownIds.has(id) || /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(id))) return;
+  return { runId, itemId: key.slice(prefix.length, separator), questionIds };
+}
+
 function isRunnerResponseComment(params: {
   comment: TaskChatThreadProps["comments"][number];
   runId: string;
@@ -271,8 +290,9 @@ function isRunnerResponseComment(params: {
 }): boolean {
   const { comment, runId, runStartedAtMs, finalText } = params;
   if (comment.deletedAt || comment.authorType === "user") return false;
-  if (comment.runId === runId) return true;
-  if (comment.runId || !finalText) return false;
+  const owner = replyRunId(comment);
+  if (owner === runId) return true;
+  if (owner || !finalText) return false;
   const commentAtMs = toMs(comment.createdAt);
   if (runStartedAtMs != null && commentAtMs < runStartedAtMs - 5_000)
     return false;
@@ -536,7 +556,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     initialHistoryPending = false,
     initialHistoryError = false,
     onRetryInitialHistory,
-    comments,
+    comments: suppliedComments,
     interactions: storedInteractions,
     documents = [],
     workProducts = [],
@@ -618,6 +638,52 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     onOpenSkill,
     onRestoreStoppedMessages,
   } = props;
+  // A reply's question can be on an unfetched history page. Fetch that exact
+  // row, without gating the whole transcript on its availability. Admission,
+  // ACK and save time are not a substitute for the question's send time.
+  const replyQuestions = useMemo(() => {
+    const knownIds = new Set(suppliedComments.map(comment => comment.id));
+    const interactionIds = new Set(storedInteractions?.map(interaction => interaction.id));
+    const ids = new Set<string>();
+    for (const run of linkedRuns ?? []) {
+      for (const id of run.firstTurnCommentIds ?? []) ids.add(id);
+      for (const id of Object.keys(run.resultJson?.queuedSteeringAcknowledgements ?? {})) ids.add(id);
+      const replies = run.resultJson?.continuousReplies;
+      if (!replies || typeof replies !== "object" || Array.isArray(replies)) continue;
+      for (const value of Object.values(replies)) {
+        const reply = value as { commentId?: unknown; questionCommentIds?: unknown } | null;
+        if (typeof reply?.commentId !== "string" || !Array.isArray(reply.questionCommentIds)) continue;
+        const questions = reply.questionCommentIds.filter((id): id is string => typeof id === "string");
+        for (const id of questions) ids.add(id);
+      }
+    }
+    for (const comment of suppliedComments) {
+      const key = nativeReplyKey(comment, knownIds);
+      if (!key) continue;
+      for (const id of key.questionIds) ids.add(id);
+    }
+    // Interaction-delivery IDs are not comments and have no comment endpoint.
+    const missing = [...ids].filter(id => !knownIds.has(id) && !interactionIds.has(id) && /^[0-9a-f-]{36}$/i.test(id)).sort();
+    return { missing, interactionIds };
+  }, [suppliedComments, linkedRuns, storedInteractions]);
+  const questionReads = useQueries({ queries: replyQuestions.missing.map(id => ({
+    queryKey: ["issues", issueId, "reply-question", id],
+    queryFn: ({ signal }: { signal: AbortSignal }) => readTranscriptRequest(async signal => {
+      const comment = await issuesApi.getComment(issueId!, id, { signal });
+      if (comment.id !== id || comment.issueId !== issueId) throw new Error("Reply question could not be loaded.");
+      return comment;
+    }, signal),
+    enabled: Boolean(issueId), staleTime: Infinity, retry: false,
+  })) });
+  const joinedQuestions = questionReads.map(read => read.data).filter((comment): comment is NonNullable<typeof comment> =>
+    Boolean(comment && comment.issueId === issueId));
+  const joinedQuestionKey = joinedQuestions.map(comment => `${comment.id}:${comment.updatedAt}`).join(",");
+  const comments = useMemo<TaskChatThreadProps["comments"]>(() => [...suppliedComments, ...joinedQuestions]
+    .sort((a, b) => toMs(a.createdAt) - toMs(b.createdAt) || a.id.localeCompare(b.id)),
+  // Query observers produce a fresh array; only changed server rows invalidate projection.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  [suppliedComments, joinedQuestionKey]);
+  const commentsById = useMemo(() => new Map(comments.map(comment => [comment.id, comment])), [comments]);
   const {
     data: planDocument,
     isLoading: planLoading,
@@ -956,9 +1022,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         if (comment.authorType === "system" && comment.metadata?.recoveryResponsibility === "system") return [];
         if (statusRelevance.isHistoricalNotice(comment) && !nativeFailureNoticeRunId(comment)) return [];
         if (isRedundantAiRecoveryNotice(comment, interactions)) return [];
-        if (comment.body !== LEGACY_WITHHELD_RUN_COMMENT || !comment.runId)
+        const runId = replyRunId(comment);
+        if (comment.body !== LEGACY_WITHHELD_RUN_COMMENT || !runId)
           return [comment];
-        const resultJson = linkedRunMetaById.get(comment.runId)?.resultJson;
+        const resultJson = linkedRunMetaById.get(runId)?.resultJson;
         // Historical native runs wrote a placeholder comment even when the
         // accepted result only yielded for interaction. Do not turn that
         // control-plane wait into an ordinary assistant bubble.
@@ -982,6 +1049,18 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     return () => props.onFailureNoticeChange?.(null);
   }, [props.onFailureNoticeChange, noticeOwnedRunId]);
 
+  const replyCommentsByRun = useMemo(() => {
+    const byRun = new Map<string, typeof projectedComments>();
+    for (const comment of projectedComments) {
+      const runId = replyRunId(comment);
+      if (!runId || comment.deletedAt || comment.authorType !== "agent" || comment.presentation?.kind === "system_notice") continue;
+      const owned = byRun.get(runId) ?? [];
+      owned.push(comment);
+      byRun.set(runId, owned);
+    }
+    return byRun;
+  }, [projectedComments]);
+
   const commentItems = useMemo(
     () =>
       commentsToTaskChatItems(projectedComments.map(comment =>
@@ -1004,6 +1083,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       verificationCaveatsByRunId,
     ],
   );
+
+  const messageItemsById = useMemo(() => new Map(commentItems
+    .filter((item): item is TaskChatMessageItem => item.kind === "message")
+    .map(item => [item.id, item])), [commentItems]);
 
   const [terminalStatuses, setTerminalStatuses] = useState(new Map<string, string>());
   const previousLinkedRunMeta = useRef(linkedRunMetaById);
@@ -1067,25 +1150,33 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     }
     return byRun;
   }, [linkedRuns, liveRuns, activeRun]);
-  const stoppedRunIds = useRef(new Set<string>());
+  const [stoppedRunIds, setStoppedRunIds] = useState(() => new Set<string>());
+  const [stoppingRunId, setStoppingRunId] = useState<string | null>(null);
+  useEffect(() => {
+    if (stoppingRunId && isTerminalRunStatus(terminalStatuses.get(stoppingRunId) ?? linkedRunMetaById.get(stoppingRunId)?.status ?? "")) {
+      setStoppingRunId(null);
+    }
+  }, [stoppingRunId, terminalStatuses, linkedRunMetaById]);
   const isUserStop = useCallback((id: string) => {
-    return stoppedRunIds.current.has(id) || isPersonStoppedRun(linkedRunMetaById.get(id));
-  }, [linkedRunMetaById]);
+    return stoppedRunIds.has(id) || isPersonStoppedRun(linkedRunMetaById.get(id));
+  }, [linkedRunMetaById, stoppedRunIds]);
   // Retries of one request join runs; session continuity across new messages does not.
   const runChainIdsById = useMemo(() => {
     const predecessors = new Map<string, string | null | undefined>();
-    for (const run of linkedRuns ?? []) predecessors.set(run.runId, run.retryOfRunId ?? run.execution?.predecessorRunId);
+    const explicitRetries = new Map<string, string>();
+    for (const run of linkedRuns ?? []) {
+      predecessors.set(run.runId, run.retryOfRunId ?? run.execution?.predecessorRunId);
+      if (run.retryOfRunId) explicitRetries.set(run.runId, run.retryOfRunId);
+    }
     for (const run of [...(liveRuns ?? []), ...(activeRun ? [activeRun] : [])]) {
-      predecessors.set(run.id, "retryOfRunId" in run && typeof run.retryOfRunId === "string"
-        ? run.retryOfRunId : run.execution?.predecessorRunId ?? predecessors.get(run.id));
+      if ("retryOfRunId" in run && typeof run.retryOfRunId === "string") explicitRetries.set(run.id, run.retryOfRunId);
+      predecessors.set(run.id, explicitRetries.get(run.id) ?? run.execution?.predecessorRunId ?? predecessors.get(run.id));
     }
     for (const [runId, predecessorId] of predecessors) {
       const request = requestCommentByRun.get(runId);
       const previousRequest = predecessorId && requestCommentByRun.get(predecessorId);
-      const explicitRetry = linkedRunMetaById.get(runId)?.retryOfRunId === predecessorId ||
-        [...(liveRuns ?? []), ...(activeRun ? [activeRun] : [])].some(run => run.id === runId &&
-          "retryOfRunId" in run && run.retryOfRunId === predecessorId);
-      if (!(request && request === previousRequest) && (!explicitRetry || (request && previousRequest))) {
+      const explicitRetry = !!predecessorId && explicitRetries.get(runId) === predecessorId;
+      if (!explicitRetry && !(request && request === previousRequest)) {
         predecessors.delete(runId);
       }
     }
@@ -1093,7 +1184,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     for (const run of [...runs].sort((a, b) => toMs(a.createdAt) - toMs(b.createdAt))) {
       const commentId = requestCommentByRun.get(run.id);
       if (!commentId || !comments.some(comment => comment.id === commentId && comment.authorUserId && !comment.authorAgentId)) continue;
-      if (previousByComment.has(commentId)) predecessors.set(run.id, previousByComment.get(commentId));
+      if (previousByComment.has(commentId) && !explicitRetries.has(run.id)) predecessors.set(run.id, previousByComment.get(commentId));
       previousByComment.set(commentId, run.id);
     }
     // A failed continuous run may have taken this request by Steer, not at admission.
@@ -1104,18 +1195,27 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         Object.prototype.hasOwnProperty.call(candidate.resultJson?.queuedSteeringAcknowledgements ?? {}, request));
       if (previous && !predecessors.get(run.id)) predecessors.set(run.id, previous.runId);
     }
+    // A post-card wake can name the same request as the completed run. That
+    // is continuation, not a retry: importing its transcript into the new
+    // tail would draw its saved reply a second time and remove its old slot.
+    // Success without a saved final is not ownership. Index comments once;
+    // progress receipts and presentation decisions are checked per owner.
+    const replyOwners = new Set(runs.filter(run => hasVisibleRunAnswer(
+      replyCommentsByRun.get(run.id) ?? [], run.id, linkedRunMetaById.get(run.id)?.resultJson,
+    )).map(run => run.id));
     const chains = new Map<string, string[]>();
     for (const run of runs) {
       const ids = [run.id];
       let predecessor = predecessors.get(run.id);
-      while (predecessor && !ids.includes(predecessor) && !isUserStop(predecessor)) {
+      while (predecessor && !ids.includes(predecessor) && !isUserStop(predecessor) &&
+        (explicitRetries.get(ids[0]!) === predecessor || !replyOwners.has(predecessor))) {
         ids.unshift(predecessor);
         predecessor = predecessors.get(predecessor);
       }
       chains.set(run.id, ids);
     }
     return chains;
-  }, [runs, linkedRuns, liveRuns, activeRun, requestCommentByRun, linkedRunMetaById, comments, isUserStop]);
+  }, [runs, linkedRuns, liveRuns, activeRun, requestCommentByRun, linkedRunMetaById, comments, replyCommentsByRun, isUserStop]);
 
   // Pi's Stop (Esc): the messages it hadn't taken go back into the stopping person's input box, once.
   // Keyed on state (his returned messages still exist), so a reload or another of his devices restores too.
@@ -1223,7 +1323,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const fallbackByRunRef = useRef(
     new Map<string, NonNullable<ReturnType<typeof logTranscriptByRun.get>>>(),
   );
-  const transcriptByRun = useMemo(() => {
+  const rawTranscriptByRun = useMemo(() => {
     const next = new Map(logTranscriptByRun);
     for (const run of transcriptRuns) {
       const nativeTranscript = nativeTranscriptByRun.get(run.id) ?? [];
@@ -1277,6 +1377,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     nativeTranscriptByRun,
     hydratedNativeRunIds,
   ]);
+  const deliveryPointsByRun = useMemo(() => new Map([...rawTranscriptByRun]
+    .map(([runId, entries]) => [runId, steeringDeliveryPoints(entries)])), [rawTranscriptByRun]);
+  // A missing ACK/question never suppresses later output, finals or terminal.
+  const transcriptByRun = rawTranscriptByRun;
 
   useCompanyLiveEvent((event) => {
     const { runId, status } = event.payload;
@@ -1308,7 +1412,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       ["failed", "cancelled", "timed_out", "interrupted"].includes(terminalStatuses.get(run.id) ?? run.status)).map(run => run.id));
   }, [runChainIdsById, props.interruption, runs, isUserStop, terminalStatuses, transcriptByRun]);
   const stoppingReply = !!liveRun && !isTerminalRunStatus(linkedRunMetaById.get(liveRun.id)?.status ?? liveRun.status) &&
-    ((stopPending && stoppedRunIds.current.has(liveRun.id)) || Boolean(linkedRunMetaById.get(liveRun.id)?.resultJson?.personStop));
+    (stoppingRunId === liveRun.id || (stopPending && stoppedRunIds.has(liveRun.id)) || Boolean(linkedRunMetaById.get(liveRun.id)?.resultJson?.personStop));
 
   // The live runner turn remains the sole owner of its response until the
   // canonical comment and settled activity are both ready. This state is
@@ -1365,7 +1469,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // Runs observed non-terminal while mounted: their turns ANIMATE the fold when
   // they settle. Runs already terminal at mount collapse instantly.
   const liveSeenRef = useRef<Set<string>>(new Set());
-  const drawnRunnerSegments = useRef(new Set<string>());
   useEffect(() => {
     if (liveRun) liveSeenRef.current.add(liveRun.id);
   }, [liveRun]);
@@ -1378,8 +1481,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const lastCommentIdByRun = useMemo(() => {
     const map = new Map<string, string>();
     for (const comment of projectedComments) {
-      if (comment.deletedAt || !comment.runId || !comment.id) continue;
-      map.set(comment.runId, comment.id);
+      const runId = replyRunId(comment);
+      if (comment.deletedAt || !runId || !comment.id) continue;
+      map.set(runId, comment.id);
     }
     // A settled Paperclip turn normally attaches to its durable final reply.
     // Same-turn steering splits that causal interval into timestamped segments,
@@ -1394,64 +1498,221 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     return map;
   }, [projectedComments]);
 
-  const { steeringAnchorsByRun, steeringAnchorByCommentId } = useMemo(() => {
-    const steeringAnchorsByRun = new Map<string, number[]>();
-    const steeringAnchorByCommentId = new Map<string, number>();
+  // Native saved keys carry the same question IDs as continuousReplies, even
+  // when the comment query beats the run receipt (or the question's own page).
+  const nativeReplyKeysByCommentId = useMemo(() => {
+    const knownIds = new Set([...commentsById.keys(), ...[...requestCommentByRun.values()].filter((id): id is string => Boolean(id))]);
+    const result = new Map<string, { runId: string; itemId: string; questionIds: string[] }>();
     for (const comment of comments) {
-      if (comment.deletedAt || comment.authorType !== "user") continue;
-      // The receipt splits agent output, not the person's immediate Send echo.
-      // It fixes ONE boundary; later provider consumption never re-splits.
-      const run = runs.find(run => Object.prototype.hasOwnProperty.call(
-        linkedRunMetaById.get(run.id)?.resultJson?.queuedSteeringAcknowledgements ?? {}, comment.id));
-      const receipt = run ? (linkedRunMetaById.get(run.id)?.resultJson?.queuedSteeringAcknowledgements as
-        Record<string, { acknowledgedAt?: string }> | undefined)?.[comment.id] : undefined;
-      const runId = run?.id ?? comment.steeredIntoRunId;
-      const anchorMs = toMs(receipt?.acknowledgedAt ?? (comment.steeredIntoRunId ? comment.conversationAnchorAt : undefined));
-      if (!runId || !Number.isFinite(anchorMs) || anchorMs <= 0) continue;
-      steeringAnchorByCommentId.set(comment.id, anchorMs);
-      const anchors = steeringAnchorsByRun.get(runId) ?? [];
-      if (!anchors.includes(anchorMs)) anchors.push(anchorMs);
-      steeringAnchorsByRun.set(runId, anchors);
+      const key = nativeReplyKey(comment, knownIds);
+      if (key) result.set(comment.id, key);
     }
-    for (const anchors of steeringAnchorsByRun.values()) anchors.sort((a, b) => a - b);
-    return { steeringAnchorsByRun, steeringAnchorByCommentId };
-  }, [comments, runs, linkedRunMetaById]);
+    return result;
+  }, [comments, commentsById, requestCommentByRun]);
 
-  const visibleQueuedMessageQueue = queuedMessageQueue ?? emptyQueuedCommentQueue;
+  const openingInputsByRun = useMemo(() => {
+    const inputs = new Map<string, { questionIds: Set<string>; atMs: number }>();
+    for (const run of runs) {
+      const meta = linkedRunMetaById.get(run.id);
+      const readMs = deliveryPointsByRun.get(run.id)?.opening?.atMs;
+      // The first input is the stable opening position. A run can be admitted
+      // before a later comment joins its starting input; admission is too early.
+      // Older packs retain their original placement, never an ACK boundary.
+      inputs.set(run.id, {
+        atMs: readMs && Number.isFinite(readMs) ? readMs : toMs(meta?.createdAt ?? run.createdAt),
+        questionIds: new Set([requestCommentByRun.get(run.id), ...(meta?.firstTurnCommentIds ?? [])]
+          .filter((id): id is string => Boolean(id))),
+      });
+    }
+    // IssueDetail also exposes the structured first-turn/starting-request
+    // provenance on comments before the polled run receipt catches up.
+    for (const comment of comments) if (comment.consumedByRunId && !comment.steeredIntoRunId) {
+      inputs.get(comment.consumedByRunId)?.questionIds.add(comment.id);
+    }
+    return inputs;
+  }, [runs, linkedRunMetaById, deliveryPointsByRun, requestCommentByRun, comments]);
 
-  const continuousReplyPlacements = useMemo(() => {
-    const placements = new Map<string, { byItem: Map<string, number>; bySegment: Map<number, string>; questionsBySegment: Map<number, string[]> }>();
+  const { steeringAnchorsByRun, steeringAnchorByCommentId, steeringSlotsByRun, steeringSlotByQuestionId } = useMemo(() => {
+    type Slot = { id: string; atMs: number | undefined; readMs: number; afterEventSeq?: number };
+    const steeringSlotsByRun = new Map<string, Slot[]>();
+    const steeringAnchorByCommentId = new Map<string, number>();
+    const steeringSlotByQuestionId = new Map<string, number>();
+    const receiptsByCommentId = new Map<string, { runId: string; acknowledgedAt?: Date | string | null; afterEventSeq?: number }>();
+    for (const run of runs) {
+      const receipts = linkedRunMetaById.get(run.id)?.resultJson?.queuedSteeringAcknowledgements as
+        Record<string, { acknowledgedAt?: string; afterEventSeq?: number }> | undefined;
+      for (const [commentId, receipt] of Object.entries(receipts ?? {})) {
+        if (!receiptsByCommentId.has(commentId)) receiptsByCommentId.set(commentId, { runId: run.id, ...receipt });
+      }
+    }
+    for (const comment of comments) {
+      if (comment.deletedAt) continue;
+      // Delivery provenance, not the author, identifies steering input (which
+      // may come from another agent or a bridge). Reserve identity here;
+      // only the stream's read point can split activity.
+      const receipt = receiptsByCommentId.get(comment.id);
+      const runId = receipt?.runId ?? comment.steeredIntoRunId;
+      if (runId) receiptsByCommentId.set(comment.id, { ...receipt, runId,
+        acknowledgedAt: receipt?.acknowledgedAt ?? (comment.steeredIntoRunId ? comment.conversationAnchorAt : undefined) });
+    }
+    // Reserve the named question's slot before a lagging ACK query arrives.
+    // These are server facts, not a browser memory of which query won a race.
+    const reserveQuestions = (runId: string, questionIds: readonly string[]) => {
+      const admissionMs = toMs(linkedRunMetaById.get(runId)?.createdAt);
+      for (const id of questionIds) {
+        if (openingInputsByRun.get(runId)?.questionIds.has(id) || receiptsByCommentId.has(id) || replyQuestions.interactionIds.has(id)) continue;
+        const sentMs = toMs(commentsById.get(id)?.createdAt);
+        // Earlier input belongs to the opening slot, including cards whose
+        // continuation is a new run rather than an in-run steer.
+        if (sentMs > 0 && sentMs <= admissionMs) continue;
+        receiptsByCommentId.set(id, { runId });
+      }
+    };
     for (const run of linkedRuns ?? []) {
       const replies = run.resultJson?.continuousReplies;
       if (!replies || typeof replies !== "object" || Array.isArray(replies)) continue;
-      const anchors = steeringAnchorsByRun.get(run.runId) ?? [];
-      const byItem = new Map<string, number>();
-      const bySegment = new Map<number, string>();
-      const questionsBySegment = new Map<number, string[]>();
+      for (const reply of Object.values(replies)) {
+        const ids = (reply as { questionCommentIds?: unknown } | null)?.questionCommentIds;
+        if (Array.isArray(ids)) reserveQuestions(run.runId, ids.filter((id): id is string => typeof id === "string"));
+      }
+    }
+    for (const { runId, questionIds } of nativeReplyKeysByCommentId.values()) reserveQuestions(runId, questionIds);
+    // Stream ACKs carry the ID even when the polled run receipt lags. Reserve
+    // that question before drawing its first post-read output.
+    for (const [runId, delivery] of deliveryPointsByRun) {
+      for (const id of delivery.byQuestion.keys()) {
+        if (!receiptsByCommentId.has(id)) receiptsByCommentId.set(id, { runId });
+      }
+    }
+    const interactionsById = new Map(interactions?.map(interaction => [interaction.id, interaction]));
+    // Each question owns a slot; an unread reservation cannot split activity.
+    for (const [commentId, { runId }] of receiptsByCommentId) {
+      const delivery = deliveryPointsByRun.get(runId);
+      const read = delivery?.byQuestion.get(commentId);
+      // ACK is never a read, including older packs with no input events.
+      // Their activity keeps its v6 opening placement; saved replies can still
+      // name a question without inventing a split in the session's work.
+      const readMs = read?.atMs ?? Infinity;
+      const interaction = interactionsById.get(commentId);
+      const atMs = toMs(commentsById.get(commentId)?.createdAt ?? interaction?.resolvedAt ?? interaction?.createdAt) || read?.atMs;
+      steeringAnchorByCommentId.set(commentId, readMs);
+      const slots = steeringSlotsByRun.get(runId) ?? [];
+      slots.push({ id: commentId, atMs, readMs, afterEventSeq: read?.afterEventSeq });
+      steeringSlotsByRun.set(runId, slots);
+    }
+    const steeringAnchorsByRun = new Map<string, number[]>();
+    for (const [runId, slots] of steeringSlotsByRun) {
+      slots.sort((a, b) => (a.afterEventSeq ?? Infinity) - (b.afterEventSeq ?? Infinity) || a.readMs - b.readMs ||
+        (a.atMs ?? Infinity) - (b.atMs ?? Infinity) || a.id.localeCompare(b.id));
+      slots.forEach((slot, index) => steeringSlotByQuestionId.set(`${runId}:${slot.id}`, index + 1));
+      steeringAnchorsByRun.set(runId, slots.map(slot => slot.readMs));
+    }
+    return { steeringAnchorsByRun, steeringAnchorByCommentId, steeringSlotsByRun, steeringSlotByQuestionId };
+  }, [comments, commentsById, runs, linkedRuns, linkedRunMetaById, openingInputsByRun, nativeReplyKeysByCommentId, deliveryPointsByRun, replyQuestions, interactions]);
+  const runnerSegmentId = useCallback((runId: string, index: number) => {
+    const slot = steeringSlotsByRun.get(runId)?.[index - 1];
+    return `${runId}:turn:${slot ? `question:${slot.id}` : index}`;
+  }, [steeringSlotsByRun]);
+
+  const visibleQueuedMessageQueue = queuedMessageQueue ?? emptyQueuedCommentQueue;
+
+  // Reply ownership comes from the server's question map (also encoded in the
+  // saved native key). Neither browser storage nor the order in which history,
+  // comments and ACKs arrived may choose a different slot on another device.
+  const { continuousReplyPlacements, replyPlacementByCommentId } = useMemo(() => {
+    const replyPlacementByCommentId = new Map<string, { segmentIndex: number; atMs: number }>();
+    const placements = new Map<string, { byItem: Map<string, number>; bySegment: Map<number, string> }>();
+    const authoredByKey = new Map<string, Extract<TranscriptEntry, { kind: "assistant" }>>();
+    const authoredSlotsByRun = new Map<string, Map<string, number>>();
+    for (const [runId, entries] of transcriptByRun) {
+      const authoredSlots = new Map<string, number>();
+      const slots = steeringSlotsByRun.get(runId) ?? [];
+      splitTranscriptAtAnchors(entries, 0, slots.map(slot => slot.readMs), undefined,
+        slots.map(slot => slot.afterEventSeq)).forEach((segment, index) => {
+        for (const entry of segment.entries) if (entry.kind === "assistant" && entry.channel === "final" && entry.itemId) {
+          if (!authoredSlots.has(entry.itemId)) authoredSlots.set(entry.itemId, index);
+        }
+      });
+      authoredSlotsByRun.set(runId, authoredSlots);
+      for (const entry of entries) {
+        if (entry.kind !== "assistant" || !entry.itemId || toMs(entry.ts) <= 0) continue;
+        const key = `native-final:${runId}:${entry.itemId}`;
+        if (!authoredByKey.has(key)) authoredByKey.set(key, entry);
+      }
+    }
+    const placementForRun = (runId: string) => {
+      let placement = placements.get(runId);
+      if (!placement) {
+        placement = { byItem: new Map(), bySegment: new Map() };
+        placements.set(runId, placement);
+      }
+      return placement;
+    };
+    const runsById = new Map(runs.map(run => [run.id, run]));
+    const placeReply = (commentId: string, runId: string, itemId: string | undefined, questionIds?: string[]) => {
+      const comment = commentsById.get(commentId);
+      if (comment && (comment.deletedAt || comment.authorType !== "agent" || comment.presentation?.kind === "system_notice")) return;
+      const run = linkedRunMetaById.get(runId) ?? runsById.get(runId);
+      const openingMs = openingInputsByRun.get(runId)?.atMs || toMs(run?.createdAt) ||
+        toMs(commentsById.get(requestCommentByRun.get(runId) ?? "")?.createdAt) || 1;
+      // A resumed turn replies below ALL its attributed inputs. The server
+      // freezes the IDs, not their order (explicit answers can name them in
+      // any order). Select the last question in canonical send order when
+      // the transcript is unavailable. If the item has already been authored,
+      // its stream position below wins over later attribution metadata.
+      const slots = steeringSlotsByRun.get(runId) ?? [];
+      let questionSlot: number | undefined;
+      for (const id of questionIds ?? []) {
+        const index = steeringSlotByQuestionId.get(`${runId}:${id}`);
+        if (index === undefined) continue;
+        const slot = slots[index - 1]!;
+        const previous = questionSlot === undefined ? undefined : slots[questionSlot - 1];
+        if (!previous || slot.atMs === undefined || (previous.atMs !== undefined &&
+            (slot.atMs > previous.atMs || (slot.atMs === previous.atMs && slot.id > previous.id)))) questionSlot = index;
+      }
+      // Legacy per-run (unsuffixed) completions belong to the opening request.
+      // A saved answer needs no transcript wait: the server already supplies
+      // its owner. Timeout, Stop and recovery therefore cannot change it.
+      // A saved receipt may enrich already-authored text, never relocate it.
+      const segmentIndex = (itemId ? authoredSlotsByRun.get(runId)?.get(itemId) : undefined) ?? questionSlot ?? 0;
+      const atMs = segmentIndex === 0 ? openingMs : (slots[segmentIndex - 1]?.atMs ?? toMs(comment?.createdAt));
+      const placement = placementForRun(runId);
+      if (itemId) placement.byItem.set(itemId, segmentIndex);
+      if (comment && atMs !== undefined) {
+        placement.bySegment.set(segmentIndex, commentId);
+        replyPlacementByCommentId.set(commentId, { segmentIndex, atMs });
+      }
+    };
+    for (const run of linkedRuns ?? []) {
+      const replies = run.resultJson?.continuousReplies;
+      if (!replies || typeof replies !== "object" || Array.isArray(replies)) continue;
       for (const [itemId, value] of Object.entries(replies)) {
         if (!value || typeof value !== "object") continue;
         const reply = value as { questionCommentIds?: unknown; commentId?: unknown };
-        if (!Array.isArray(reply.questionCommentIds) || typeof reply.commentId !== "string") continue;
-        const first = transcriptByRun.get(run.runId)?.find(entry => entry.kind === "assistant" && entry.itemId === itemId);
-        // ACK is queue admission, not consumption: several steers can precede
-        // the first output. Their reply receipts, not that timestamp, own it.
-        const questionSegment = Math.max(0, ...reply.questionCommentIds.map(id =>
-          anchors.indexOf(steeringAnchorByCommentId.get(String(id)) ?? NaN) + 1));
-        // A later steer cannot claim text already streaming before its ACK.
-        // Keep that first slot (also on reload), but not a later timestamp slot
-        // that would put an earlier question's answer below a second question.
-        const segmentIndex = first && toMs(first.ts) < (anchors[questionSegment - 1] ?? -Infinity)
-          ? anchors.filter(anchor => anchor <= toMs(first.ts)).length : questionSegment;
-        byItem.set(itemId, segmentIndex);
-        bySegment.set(segmentIndex, reply.commentId);
-        if (first?.kind === "assistant" && first.channel === "final" && first.text.trim()) {
-          questionsBySegment.set(segmentIndex, reply.questionCommentIds.filter((id): id is string => typeof id === "string"));
-        }
+        if (!Array.isArray(reply.questionCommentIds) || typeof reply.commentId !== "string" ||
+          (commentsById.has(reply.commentId) && replyRunId(commentsById.get(reply.commentId)) !== run.runId)) continue;
+        placeReply(reply.commentId, run.runId, itemId,
+          reply.questionCommentIds.filter((id): id is string => typeof id === "string"));
       }
-      placements.set(run.runId, { byItem, bySegment, questionsBySegment });
     }
-    return placements;
-  }, [linkedRuns, steeringAnchorsByRun, steeringAnchorByCommentId, transcriptByRun]);
+    // The comment page can beat its receipt. Look up the native key, removing
+    // optional suffixes longest-first, rather than scanning every transcript.
+    for (const comment of comments) {
+      const runId = replyRunId(comment);
+      if (!runId || !comment.clientRequestId?.startsWith(`native-final:${runId}:`) ||
+        replyPlacementByCommentId.has(comment.id)) continue;
+      let key = comment.clientRequestId;
+      const prefix = `native-final:${runId}:`;
+      while (!authoredByKey.has(key) && key.lastIndexOf(":") >= prefix.length) {
+        key = key.slice(0, key.lastIndexOf(":"));
+      }
+      const nativeKey = nativeReplyKeysByCommentId.get(comment.id);
+      const itemId = nativeKey?.itemId ?? authoredByKey.get(key)?.itemId;
+      placeReply(comment.id, runId, itemId, nativeKey?.questionIds);
+    }
+    return { continuousReplyPlacements: placements, replyPlacementByCommentId };
+  }, [linkedRuns, steeringSlotByQuestionId, steeringSlotsByRun, nativeReplyKeysByCommentId, transcriptByRun, projectedComments,
+    comments, commentsById, linkedRunMetaById, runs, requestCommentByRun, openingInputsByRun]);
 
   // A native-runner Plan is part of the turn that wrote its current revision.
   // Legacy adapters do not expose the semantic write_document boundary needed
@@ -1558,13 +1819,16 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       // the turns, by the saved replies actually selected as their finals.
       const item = commentItems[index];
       if (!item || (queuedCommentIds.has(comment.id) && (returnedCommentIds.has(comment.id) || !steeringAnchorByCommentId.has(comment.id)))) return;
+      const isInput = comment.authorType === "user" || steeringAnchorByCommentId.has(comment.id);
       entries.push({
-        // Human messages keep send order. ACK time splits agent output only.
-        ms: comment.authorType !== "user" && comment.conversationAnchorAt
-          ? toMs(comment.conversationAnchorAt)
-          : toMs(comment.createdAt),
+        // Steering input keeps send order. Session reads split output only.
+        ms: !isInput && replyPlacementByCommentId.has(comment.id)
+          ? replyPlacementByCommentId.get(comment.id)!.atMs
+          : !isInput && comment.conversationAnchorAt
+            ? toMs(comment.conversationAnchorAt)
+            : toMs(comment.createdAt),
         order:
-          1 + Math.min(comment.authorType === "user" ? 0 : comment.conversationAnchorSequence ?? 0, 999) / 1000,
+          1 + Math.min(isInput ? 0 : comment.conversationAnchorSequence ?? 0, 999) / 1000,
         id: comment.clientId ?? item.id,
         item,
       });
@@ -1772,6 +2036,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     planDocumentSourceRunId,
     queuedCommentIds,
     steeringAnchorByCommentId,
+    replyPlacementByCommentId,
     returnedCommentIds,
   ]);
 
@@ -1845,7 +2110,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const { items, settledRunIds, settledReplyRunIds, emptyStoppedRunIds, runnerSegmentsById } = useMemo(() => {
     // A native segment owns the same renderer in the chronological body while
     // streaming, after a steering bubble, and after persistence. No tail handoff.
-    const runnerSegmentsById = new Map<string, ComponentProps<typeof TaskChatRunnerTurn> & { emptyContinuation: boolean }>();
+    const runnerSegmentsById = new Map<string, ComponentProps<typeof TaskChatRunnerTurn>>();
     // Runs whose settled turn made it into the assembled thread — the live tail
     // hands off to this as its "the settled turn has rendered" signal (PAP-462
     // B4), so the transcript stays mounted through the settle gap without ever
@@ -1858,7 +2123,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     for (const { item } of orderedEntries) {
       if (item.kind !== "message" || item.author !== "agent") continue;
       const comment = commentsById.get(item.id);
-      const runId = comment?.createdByRunId ?? comment?.runId ?? comment?.derivedCreatedByRunId;
+      const runId = replyRunId(comment);
       if (runId) sourceRunByItemId.set(item.id, runId);
     }
     const entriesWithFailures = [...orderedEntries];
@@ -1921,6 +2186,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       if (isUserStop(source.id) &&
           (isTerminalRunStatus(source.status) || entries.some(entry => entry.kind === "run_terminal")) &&
           !lastCommentIdByRun.has(source.id) &&
+          !continuousReplyPlacements.get(source.id)?.bySegment.size &&
           !(source.id === planDocumentSourceRunId && planTurnItem) &&
           buildTurnTimelineRows(paperclipRunnerTimelineItems(parsedSource), false).length === 0 &&
           !paperclipRunnerFinalResponse(parsedSource, { runId: source.id, fallbackSummary: acceptedSummary })) {
@@ -2019,7 +2285,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                 (comment) =>
                   !comment.deletedAt && comment.authorType === "agent" &&
                   comment.presentation?.kind !== "system_notice" &&
-                  comment.runId === source.id &&
+                  replyRunId(comment) === source.id &&
                   !progressCommentIds.has(comment.id),
               )?.id ?? null)
           : decidedCommentId !== null &&
@@ -2027,7 +2293,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                 (comment) =>
                   !comment.deletedAt && comment.authorType === "agent" &&
                   comment.presentation?.kind !== "system_notice" &&
-                  comment.runId === source.id &&
+                  replyRunId(comment) === source.id &&
                   comment.id === decidedCommentId,
               )
             ? decidedCommentId
@@ -2335,9 +2601,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       const startSlotRaw = meta?.startedAt ??
         (source.id === liveRun?.id ? liveRun.startedAt : undefined) ??
         meta?.createdAt ?? source.createdAt;
-      const startSlotMs = startSlotRaw
-        ? toMs(startSlotRaw)
-        : Number.POSITIVE_INFINITY;
+      const startSlotMs = (sourceIsPaperclipRunner ? openingInputsByRun.get(source.id)?.atMs : undefined) ??
+        (startSlotRaw ? toMs(startSlotRaw) : Number.POSITIVE_INFINITY);
       const timelineAnchors = sourceIsPaperclipRunner
         ? (steeringAnchorsByRun.get(source.id) ?? [])
         : (legacyTimelineAnchorsByRun.get(source.id) ?? []);
@@ -2346,16 +2611,22 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         startSlotMs,
         timelineAnchors,
         continuousReplyPlacements.get(source.id)?.byItem,
+        steeringSlotsByRun.get(source.id)?.map(slot => slot.afterEventSeq),
       );
+      const activeSegmentIndex = Math.max(0, segments.findLastIndex((segment, index) =>
+        segment.entries.some(entry => entry.kind !== "run_terminal") || continuousReplyPlacements.get(source.id)?.bySegment.has(index)));
       const runtimeRequests = runtimeRequestSegmentContext(entries, {
         runId: source.id, agentName: meta?.agentName, running: false,
       });
-      const projectedSegments = segments.map((segment) => {
+      const projectedSegments = segments.map((segment, index) => {
         const parsedTranscript = reconcileSegmentRuntimeRequests(transcriptToTaskChatItems(segment.entries, {
           runId: source.id,
           agentName: meta?.agentName,
+          // A tool belongs to its call's segment, not the latest input. Only
+          // its own result (or the run ending) settles that lifecycle.
           running: openSegments,
-        }), segment.entries, runtimeRequests, openSegments);
+        }).map(item => index !== activeSegmentIndex && (item.kind === "thinking" || item.kind === "message")
+          ? { ...item, streaming: false } : item), segment.entries, runtimeRequests, openSegments);
         const parsed =
           source.id === planDocumentSourceRunId && planTurnItem
             ? embedPlanDocumentAtWriteBoundary(parsedTranscript, planTurnItem)
@@ -2379,24 +2650,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             : visibleActivity,
         };
       });
-      const sourceResponseText =
-        sourceIsPaperclipRunner && sourceYielded
-          ? sourceYieldedResponse?.text
-          : sourceIsPaperclipRunner
-          ? (sourcePresentationText ??
-            paperclipRunnerFinalResponse(parsedSource, {
-              runId: source.id,
-              agentName: meta?.agentName,
-              fallbackSummary: acceptedSummary,
-              allowFallback: sourceAllowSummaryFallback,
-            })?.text)
-          : undefined;
-      const timelineItemsBySegment = sourceIsPaperclipRunner
-        ? omitProgressRepeatedByResponseAcrossSegments(
-            projectedSegments.map(({ timelineItems }) => timelineItems),
-            sourceResponseText,
-          )
-        : projectedSegments.map(({ timelineItems }) => timelineItems);
+      // Dedupe only within an owner below. A later answer must not erase an
+      // earlier painted work group merely because the words happen to match.
+      const timelineItemsBySegment = projectedSegments.map(({ timelineItems }) => timelineItems);
       let lastPopulatedSegmentIndex = -1;
       for (let index = projectedSegments.length - 1; index >= 0; index -= 1) {
         if ((projectedSegments[index]?.segment.entries.length ?? 0) > 0) {
@@ -2419,31 +2675,55 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         ? projectedSegments.findLastIndex(({ parsed }) =>
             Boolean(paperclipRunnerFinalResponse(parsed, yieldedOptions)))
         : -1;
-      const authoredFinalTexts = new Set(projectedSegments.map(({ parsed }) =>
-        normalizedMessageText(paperclipRunnerFinalResponse(parsed, yieldedOptions)?.text ?? "")).filter(Boolean));
+      const authoredFinals = projectedSegments.map(({ parsed }) =>
+        paperclipRunnerFinalResponse(parsed, { ...yieldedOptions, yielded: sourceYielded }));
+      const authoredFinalTexts = new Set(authoredFinals.map(final => normalizedMessageText(final?.text ?? "")).filter(Boolean));
+      const occurrences = new Map<string, number>();
+      const finalOccurrences = authoredFinals.map(final => {
+        const text = normalizedMessageText(final?.text ?? "");
+        const occurrence = occurrences.get(text) ?? 0;
+        occurrences.set(text, occurrence + 1);
+        return occurrence;
+      });
+      const repliesByText = new Map<string, typeof projectedComments>();
+      const replyByItem = new Map<string, typeof projectedComments[number]>();
+      const sourceReplies = replyCommentsByRun.get(source.id) ?? [];
+      for (const comment of sourceReplies) {
+        if (progressCommentIds.has(comment.id)) continue;
+        const text = normalizedMessageText(comment.body);
+        const matching = repliesByText.get(text) ?? [];
+        matching.push(comment);
+        repliesByText.set(text, matching);
+        const nativeKey = nativeReplyKeysByCommentId.get(comment.id);
+        if (nativeKey) replyByItem.set(nativeKey.itemId, comment);
+        else if (comment.clientRequestId?.startsWith(`native-final:${source.id}:`))
+          replyByItem.set(comment.clientRequestId.slice(`native-final:${source.id}:`.length), comment);
+      }
+      for (const replies of repliesByText.values()) replies.sort((a, b) => toMs(a.createdAt) - toMs(b.createdAt));
       const settledSegmentFinalResponse = (
         segmentIndex: number,
         parsed: readonly TaskChatItem[],
       ): TaskChatMessageItem | undefined => {
         if (!sourceIsPaperclipRunner) return undefined;
         const mappedReplyId = continuousReplyPlacements.get(source.id)?.bySegment.get(segmentIndex);
-        const mappedReply = commentItems.find((item): item is TaskChatMessageItem => item.kind === "message" && item.author === "agent" && item.presentation?.kind !== "system_notice" && item.id === mappedReplyId);
-        const final = paperclipRunnerFinalResponse(parsed, { ...yieldedOptions, yielded: sourceYielded });
+        const mappedReply = mappedReplyId ? messageItemsById.get(mappedReplyId) : undefined;
+        const final = authoredFinals[segmentIndex];
         const finalEntry = final?.transcriptIndex == null ? undefined : segments[segmentIndex]!.entries[final.transcriptIndex];
         const finalItemId = finalEntry?.kind === "assistant" ? finalEntry.itemId : undefined;
         const receipt = finalItemId ? (meta?.resultJson?.continuousReplies as Record<string, { commentId?: string }> | undefined)?.[finalItemId] : undefined;
-        const replyKey = finalItemId ? `native-final:${source.id}:${finalItemId}` : null;
         // Saving can rewrite links or redact text. The native item receipt owns
         // that saved reply even while the final event or run metadata is lagging.
-        const ownedReply = finalItemId ? projectedComments.find(comment => !comment.deletedAt && comment.authorType === "agent" &&
-          comment.presentation?.kind !== "system_notice" && (comment.createdByRunId ?? comment.runId) === source.id && (comment.id === receipt?.commentId ||
-            (replyKey && (comment.clientRequestId === replyKey || comment.clientRequestId?.startsWith(`${replyKey}:`))))) : undefined;
-        const ownedItem = commentItems.find((item): item is TaskChatMessageItem => item.kind === "message" && item.id === ownedReply?.id);
-        if (ownedItem) return { ...ownedItem, atMs: final?.atMs ?? ownedItem.atMs };
-        // A continuous run can resume with only the new turn's transcript.
-        // Its old placement map is not proof that this segment draws that reply.
-        if (mappedReply && final && normalizedMessageText(mappedReply.text) === normalizedMessageText(final.text)) {
-          return { ...mappedReply, atMs: final.atMs ?? mappedReply.atMs };
+        const ownedReply = finalItemId ? replyByItem.get(finalItemId) : undefined;
+        const ownedItem = (receipt?.commentId && replyRunId(commentsById.get(receipt.commentId)) === source.id
+          ? messageItemsById.get(receipt.commentId) : undefined) ??
+          (ownedReply ? messageItemsById.get(ownedReply.id) : undefined);
+        // Placement uses the question slot; the response clock still ends at
+        // completion, never at that slot's opening timestamp.
+        if (ownedItem) return { ...ownedItem, atMs: final?.atMs ?? toMs(ownedItem.createdAtIso) };
+        // The server's reply map owns the saved answer even with empty/partial
+        // history. A recovered transcript item uses that same question slot.
+        if (mappedReply) {
+          return { ...mappedReply, atMs: final?.atMs ?? toMs(mappedReply.createdAtIso) };
         }
         if (openSegments && !final) return undefined;
         const lastSegment = segmentIndex === lastPopulatedSegmentIndex;
@@ -2451,14 +2731,16 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           const segment = segments[segmentIndex]!;
           // Persistence may lag the next question; pair repeated answers in transcript order.
           const sameText = (text: string) => normalizedMessageText(text) === normalizedMessageText(final?.text ?? "");
-          const occurrence = final ? projectedSegments.slice(0, segmentIndex).filter(({ parsed }) =>
-            sameText(paperclipRunnerFinalResponse(parsed, { ...yieldedOptions, yielded: sourceYielded })?.text ?? "")).length : 0;
-          const reply = projectedComments.filter(comment => !comment.deletedAt && comment.authorType === "agent" &&
-            comment.presentation?.kind !== "system_notice" && (comment.createdByRunId ?? comment.runId) === source.id && !progressCommentIds.has(comment.id) &&
+          const occurrence = final ? finalOccurrences[segmentIndex]! : 0;
+          const reply = (final ? repliesByText.get(normalizedMessageText(final.text)) ?? [] : sourceReplies).filter(comment => !comment.deletedAt && comment.authorType === "agent" &&
+            comment.presentation?.kind !== "system_notice" && replyRunId(comment) === source.id &&
+            !progressCommentIds.has(comment.id) &&
+            (!replyPlacementByCommentId.has(comment.id) || replyPlacementByCommentId.get(comment.id)!.segmentIndex === segmentIndex) &&
             (final ? sameText(comment.body) : !authoredFinalTexts.has(normalizedMessageText(comment.body)) &&
-              toMs(comment.createdAt) >= segment.startMs && toMs(comment.createdAt) < segment.endMs))
+              (replyPlacementByCommentId.has(comment.id) ||
+                (toMs(comment.createdAt) >= segment.startMs && toMs(comment.createdAt) < segment.endMs))))
             .sort((a, b) => toMs(a.createdAt) - toMs(b.createdAt))[occurrence];
-          const saved = commentItems.find((item): item is TaskChatMessageItem => item.kind === "message" && item.id === reply?.id);
+          const saved = reply ? messageItemsById.get(reply.id) : undefined;
           return saved ? { ...saved, atMs: final?.atMs ?? toMs(reply?.createdAt) } : final;
         }
         if (sourceYielded) {
@@ -2483,19 +2765,33 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           allowFallback: sourceAllowSummaryFallback,
         });
       };
+      const segmentFinalResponses = projectedSegments.map(({ parsed }, index) => settledSegmentFinalResponse(index, parsed));
+      const completedSegmentFinals = segments.map((segment, index) =>
+        messageItemsById.has(segmentFinalResponses[index]?.id ?? "") ||
+        segment.entries.some(entry => entry.kind === "assistant" && entry.channel === "final" && !entry.delta));
+      let answerStartIndex = 0;
+      const answerStartTimes = segments.map((_, index) => {
+        const startMs = segments[answerStartIndex]!.startMs;
+        if (completedSegmentFinals[index]) answerStartIndex = index + 1;
+        return startMs;
+      });
+      const openingMs = openingInputsByRun.get(source.id)?.atMs || toMs(meta?.createdAt ?? source.createdAt) || segments[0]!.startMs;
       for (const [segmentIndex, projected] of projectedSegments.entries()) {
         const { segment, parsed } = projected;
-        const personStopped = isUserStop(source.id) && segmentIndex === segments.length - 1;
-        const failed = segmentIndex === segments.length - 1 && ((!openSegments && source.status !== "succeeded") || personStopped);
+        const questionSlot = steeringSlotsByRun.get(source.id)?.[segmentIndex - 1];
+        const personStopped = isUserStop(source.id) && segmentIndex === activeSegmentIndex;
+        const failed = segmentIndex === activeSegmentIndex && ((!openSegments && source.status !== "succeeded") || personStopped);
         const stableRunnerSegment = sourceIsPaperclipRunner;
         if (segment.entries.length === 0 && !stableRunnerSegment) continue;
-        const finalResponse = settledSegmentFinalResponse(segmentIndex, parsed);
+        const finalResponse = segmentFinalResponses[segmentIndex];
         const finalEntry = segment.entries.findLast(entry => entry.kind === "assistant" && entry.channel === "final");
         // A committed reply is complete even if event history still has its partial stream.
-        const savedFinal = finalResponse && commentItems.some(item => item.kind === "message" && item.id === finalResponse.id);
+        const savedFinal = finalResponse && messageItemsById.has(finalResponse.id);
         const finalStreaming = finalEntry?.kind === "assistant" && finalEntry.delta === true && !savedFinal;
-        const segmentStreaming = openSegments && segmentIndex === segments.length - 1 &&
-          (!finalResponse || finalStreaming);
+        const runningTool = parsed.some(item => item.kind === "tool" &&
+          (item.status === "in_progress" || item.status === "pending"));
+        const segmentStreaming = openSegments && (runningTool || (segmentIndex === activeSegmentIndex &&
+          (!finalResponse || finalStreaming)));
         const runHealth = {
           failures: projectedSegments[segmentIndex]?.mcpStartupFailures ?? [],
           rest: partitionRunHealthItems(omitProgressRepeatedByResponseAcrossSegments(
@@ -2503,34 +2799,16 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           )[0] ?? []).rest,
         };
         const children = settledRunChildren(runHealth.rest);
-        // Only an explicit answer receipt can continue a question below. An ACK
-        // alone says nothing about whether the model answered that question.
-        const segmentQuestions = segmentIndex === 0 ? [requestCommentByRun.get(source.id)] : comments
-          .filter(comment => steeringAnchorByCommentId.get(comment.id) === segment.startMs &&
-            (comment.steeredIntoRunId === source.id || Object.prototype.hasOwnProperty.call(
-              meta?.resultJson?.queuedSteeringAcknowledgements ?? {}, comment.id)))
-          .map(comment => comment.id);
-        const coveredByLaterReply = segmentQuestions.length > 0 &&
-          [...(continuousReplyPlacements.get(source.id)?.questionsBySegment ?? [])].some(([index, ids]) =>
-            index > segmentIndex && segmentQuestions.every(id => id !== undefined && ids.includes(id)) &&
-            Boolean(settledSegmentFinalResponse(index, projectedSegments[index]!.parsed)));
-        // Never remove a painted slot or a non-successful run's last work segment.
-        const emptyContinuation = sourceIsPaperclipRunner && !segmentStreaming && !failed && coveredByLaterReply &&
-          (segmentIndex !== lastPopulatedSegmentIndex || source.status === "succeeded") &&
-          children.length === 0 && !finalResponse && runHealth.failures.length === 0;
-        if (
-          (emptyContinuation && !drawnRunnerSegments.current.has(`${source.id}:turn:${segmentIndex}`)) ||
-          (!sourceIsPaperclipRunner && children.length === 0 && !finalResponse)
-        ) {
+        // Reserved/read input is not work. Empty slots draw no group.
+        if (children.length === 0 && !finalResponse && runHealth.failures.length === 0) {
           if (sourceIsPaperclipRunner || compactionMarkers.length > 0) settledRunIds.add(source.id);
           continue;
         }
         settledRunIds.add(source.id);
         if (finalResponse) settledReplyRunIds.add(source.id);
         const segmented = sourceIsPaperclipRunner || timelineAnchors.length > 0;
-        const turnId = segmented
-          ? `${source.id}:turn:${segmentIndex}`
-          : `${source.id}:turn`;
+        const turnId = sourceIsPaperclipRunner ? runnerSegmentId(source.id, segmentIndex)
+          : segmented ? `${source.id}:turn:${segmentIndex}` : `${source.id}:turn`;
         const answerComplete = finalResponse && !finalStreaming;
         // The answer owns its end, even while its run remains held or replays.
         const segmentFinishedMs = (segmented && answerComplete
@@ -2538,17 +2816,15 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           : undefined) ?? (Number.isFinite(segment.endMs)
           ? segment.endMs
           : finished);
-        const answerStartMs = sourceIsPaperclipRunner ? segments[segments.slice(0, segmentIndex).findLastIndex(({ entries }) =>
-          entries.some(entry => entry.kind === "assistant" && entry.channel === "final" && !entry.delta)) + 1]!.startMs : segment.startMs;
+        const answerStartMs = sourceIsPaperclipRunner ? answerStartTimes[segmentIndex]! : segment.startMs;
         const segmentDurationMs =
           Number.isFinite(answerStartMs) && Number.isFinite(segmentFinishedMs)
             ? Math.max(0, segmentFinishedMs - answerStartMs)
             : durationMs;
         const continuedAfterSteering = sourceIsPaperclipRunner && segmentIndex > 0 &&
-          !segments[segmentIndex - 1]!.entries.some(entry => entry.kind === "assistant" && entry.channel === "final" && !entry.delta) &&
-          [...steeringAnchorByCommentId.values()].includes(segment.startMs);
+          !completedSegmentFinals[segmentIndex - 1] &&
+          Boolean(questionSlot);
         if (stableRunnerSegment) runnerSegmentsById.set(turnId, {
-          emptyContinuation,
           runId: source.id,
           finalResponse: finalResponse ?? null,
           items: finalResponse && !paperclipRunnerFinalResponse(parsed, yieldedOptions)
@@ -2556,7 +2832,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             : parsed,
           status: segmentStreaming ? source.status : failed ? source.status : "succeeded",
           ...(source.status === "queued" ? { execution: meta?.execution } : {}),
-          startedAtMs: answerStartMs,
+          startedAtMs: Number.isFinite(answerStartMs) ? answerStartMs : null,
           finishedAtMs: Number.isFinite(segmentFinishedMs) ? segmentFinishedMs : null,
           continuedAfterSteering,
           allowSummaryFallback: sourceAllowSummaryFallback,
@@ -2598,16 +2874,16 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               personStopped,
             }),
           },
-          // Admission already owns a response slot under this request. Starting
-          // the provider later must not move that slot past a newer question.
-          anchorCommentId: sourceIsPaperclipRunner && segmentIndex === 0 &&
-            orderedEntries.some(entry => entry.id === requestCommentByRun.get(source.id))
-            ? requestCommentByRun.get(source.id)!
-            : segmented ? null : (lastCommentIdByRun.get(source.id) ?? null),
-          // Later segments follow their acknowledged human boundary. Without
-          // request provenance, admission time is stable across queued → running.
-          startMs: sourceIsPaperclipRunner && segmentIndex === 0
-            ? toMs(meta?.createdAt ?? source.createdAt) || segment.startMs
+          // Native turns always use durable chronology, never adjacency to a
+          // request: a continuation can reuse that id while an intervening card
+          // is still in flight. Admission and the card's own time order them
+          // identically live and after reload, without a mount-local anchor.
+          anchorCommentId: segmented ? null : (lastCommentIdByRun.get(source.id) ?? null),
+          // Provider startup must not move an admitted slot past newer input.
+          // Later slots follow the question's send, independently of late ACKs.
+          startMs: sourceIsPaperclipRunner
+            ? segmentIndex === 0 ? openingMs : questionSlot?.atMs ??
+              (finalResponse ? replyPlacementByCommentId.get(finalResponse.id)?.atMs : undefined) ?? openingMs
             : segment.startMs,
         });
       }
@@ -2618,7 +2894,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     const chainAnchors = new Map<string, number>();
     for (const [runId, anchors] of steeringAnchorsByRun) {
       const chainId = runChainIdsById.get(runId)?.[0] ?? runId;
-      chainAnchors.set(chainId, Math.max(chainAnchors.get(chainId) ?? 0, ...anchors));
+      chainAnchors.set(chainId, Math.max(chainAnchors.get(chainId) ?? 0, ...anchors.filter(Number.isFinite)));
     }
     for (const settled of settledTurns) {
       if (!settled.turn.standaloneHeader || (steeringAnchorsByRun.get(settled.sourceRunId)?.length ?? 0) > 0) continue;
@@ -2725,7 +3001,15 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     queuedCommentIds,
     steeringAnchorsByRun,
     steeringAnchorByCommentId,
+    steeringSlotsByRun,
+    openingInputsByRun,
+    runnerSegmentId,
     continuousReplyPlacements,
+    replyPlacementByCommentId,
+    nativeReplyKeysByCommentId,
+    messageItemsById,
+    replyCommentsByRun,
+    commentsById,
     legacyTimelineAnchorsByRun,
     hasBrief,
     planDocument,
@@ -2755,7 +3039,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             runStartedAtMs: settlingRun.startedAtMs,
             finalText: heldPaperclipRunnerFinalText,
           })
-        : comment.runId === settlingRun.id && !comment.deletedAt,
+        : replyRunId(comment) === settlingRun.id && !comment.deletedAt,
     );
   const settlingHasDurableInteraction =
     settlingRun != null &&
@@ -2853,17 +3137,23 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       : (legacyTimelineAnchorsByRun.get(tailRunId) ?? [])
     : [];
   const tailSegments = splitTranscriptAtAnchors(tailRunId ? (transcriptByRun.get(tailRunId) ?? []) : [],
-    toMs(linkedRunMetaById.get(tailRunId ?? "")?.startedAt ?? tailRunSource?.createdAt), tailTimelineAnchors,
-    continuousReplyPlacements.get(tailRunId ?? "")?.byItem);
-  const tailSegment = tailSegments[tailSegments.length - 1]!;
+    (paperclipRunnerTail ? openingInputsByRun.get(tailRunId ?? "")?.atMs : undefined) ??
+      toMs(linkedRunMetaById.get(tailRunId ?? "")?.startedAt ?? tailRunSource?.createdAt), tailTimelineAnchors,
+    continuousReplyPlacements.get(tailRunId ?? "")?.byItem,
+    steeringSlotsByRun.get(tailRunId ?? "")?.map(slot => slot.afterEventSeq));
+  const tailSegmentIndex = Math.max(0, tailSegments.findLastIndex((segment, index) =>
+    segment.entries.some(entry => entry.kind !== "run_terminal") || continuousReplyPlacements.get(tailRunId ?? "")?.bySegment.has(index)));
+  const tailSegment = tailSegments[tailSegmentIndex]!;
   const tailSegmentSettled = (paperclipRunnerTail && threadItems.some(item =>
-    item.kind === "turn" && item.id === `${tailRunId}:turn:${tailSegments.length - 1}`)) ||
+    item.kind === "turn" && item.id === runnerSegmentId(tailRunId ?? "", tailSegmentIndex))) ||
     emptyStoppedRunIds.has(tailRunId ?? "");
   const tailEntries = paperclipRunnerTail ? tailSegment.entries : (tailRunId ? (transcriptByRun.get(tailRunId) ?? []) : []);
-  const tailContinued = paperclipRunnerTail && tailTimelineAnchors.length > 0 &&
-    !tailSegments[tailSegments.length - 2]?.entries.some(entry => entry.kind === "assistant" && entry.channel === "final" && !entry.delta);
-  const tailSegmentKey = paperclipRunnerTail ? `${tailRunId}:${tailSegment.startMs}` : tailRunId;
-  const tailAnswerStartMs = tailSegments[tailSegments.slice(0, -1).findLastIndex(({ entries }) =>
+  const tailContinued = paperclipRunnerTail && tailSegmentIndex > 0 &&
+    !messageItemsById.has(runnerSegmentsById.get(runnerSegmentId(tailRunId ?? "", tailSegmentIndex - 1))?.finalResponse?.id ?? "") &&
+    !tailSegments[tailSegmentIndex - 1]?.entries.some(entry => entry.kind === "assistant" && entry.channel === "final" && !entry.delta);
+  const tailSegmentKey = paperclipRunnerTail ? runnerSegmentId(tailRunId ?? "", tailSegmentIndex) : tailRunId;
+  const tailAnswerStartMs = tailSegments[tailSegments.slice(0, tailSegmentIndex).findLastIndex(({ entries }, index) =>
+    messageItemsById.has(runnerSegmentsById.get(runnerSegmentId(tailRunId ?? "", index))?.finalResponse?.id ?? "") ||
     entries.some(entry => entry.kind === "assistant" && entry.channel === "final" && !entry.delta)) + 1]!.startMs;
   // A reply that has ended (its terminal event is in) is finishing, not stoppable.
   // The interruption projection can still say "working" for a run whose end the page
@@ -2953,7 +3243,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     : isTerminalIssueStatus(issueStatus) ? (issueStatus === "cancelled" ? "cancelled" : "succeeded")
     : (runs.find((run) => run.id === settlingRun?.id)?.status ?? "succeeded"));
   // Admission is not execution, and a pending send must not inherit the last run's clock.
-  const tailStartedAtMs = !tailRunId ? null : paperclipRunnerTail && tailTimelineAnchors.length > 0 ? tailAnswerStartMs :
+  const tailStartedAtMs = !tailRunId ? null : paperclipRunnerTail && tailTimelineAnchors.length > 0
+    ? Number.isFinite(tailAnswerStartMs) ? tailAnswerStartMs : null :
     (liveRun
       ? (liveRun.startedAt ? toMs(liveRun.startedAt) : null)
       : (settlingRun?.startedAtMs ?? null));
@@ -3063,7 +3354,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const tailReadReceipt = useMemo(() => {
     if (!tailReplyKey) return undefined;
     const reply = projectedComments.find(comment => !comment.deletedAt && comment.authorType === "agent" &&
-      comment.presentation?.kind !== "system_notice" && (comment.createdByRunId ?? comment.runId) === tailRunId &&
+      comment.presentation?.kind !== "system_notice" && replyRunId(comment) === tailRunId &&
       (comment.clientRequestId === tailReplyKey || comment.clientRequestId?.startsWith(`${tailReplyKey}:`)) &&
       normalizedMessageText(comment.body) === normalizedMessageText(tailFinalResponse?.text ?? ""));
     return commentItems.find((item): item is TaskChatMessageItem => item.kind === "message" && item.id === reply?.id);
@@ -3190,7 +3481,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const renderRunnerSegment = (item: TaskChatTurnItem) => {
     const segment = runnerSegmentsById.get(item.id);
     if (!segment) return undefined;
-    const current = segment.runId === tailRunId && item.id === `${tailRunId}:turn:${tailSegments.length - 1}`;
+    const current = segment.runId === tailRunId && item.id === runnerSegmentId(tailRunId ?? "", tailSegmentIndex);
     const presentation = current ? {
       ...segment,
       items: item.finalResponse && !tailFinalResponse ? segment.items : tailItems,
@@ -3202,13 +3493,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       activityUnavailable: tailActivityUnavailable,
       awaitingContinuation: paperclipRunnerTailAwaitingContinuation,
     } : segment;
-    return <div ref={node => { if (node) drawnRunnerSegments.current.add(item.id); }}
-      data-testid={current ? "task-chat-live-transcript" : undefined}>
+    return <div data-testid={current ? "task-chat-live-transcript" : undefined}>
       <TaskChatShimmerScope items={presentation.items}>
       <TaskChatRunnerHeader {...presentation} agentName={item.agentName} agentIcon={item.agentIcon} agent={item.agent}
-        statusContent={segment.emptyContinuation
-          ? <span className="text-sm font-normal text-muted-foreground" data-conversation-meta="">Continued below</span>
-          : undefined}
         personStopped={item.summary.personStopped === true} />
       {presentation.items.length > 0 || !presentation.preparationLabel ?
         <TaskChatRunnerTurn {...presentation} showHeader={false} agentName={item.agentName} agentIcon={item.agentIcon} agent={item.agent}
@@ -3755,7 +4042,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     );
   });
   const pendingTranscriptRuns = initialRuns.filter((run) => {
-    if (slowTranscriptRunIds.has(run.id)) return false;
+    if (slowTranscriptRunIds.has(run.id) || isUserStop(run.id) || nativeTranscriptErrorsByRun.has(run.id) || logErrorsByRun?.has(run.id)) return false;
     // A scheduled retry has not started and has no log to hydrate yet.
     if (run.status === "scheduled_retry") return false;
     if (
@@ -3812,7 +4099,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       run.runtimeMode === "native"
         ? nativeTranscriptErrorsByRun.has(run.id)
         : Boolean(logErrorsByRun?.has(run.id)),
-    );
+    ) || questionReads.some(read => read.isError);
   const historyKey = conversationMode && draftKey ? draftKey : issueId;
   const [revealedHistoryKey, setRevealedHistoryKey] = useState<string | null | undefined>(undefined);
   const revealCachedHeader = connectionStatus !== "online" && Boolean(threadHeader);
@@ -3906,6 +4193,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     onRetryInitialHistory?.();
     retryLogs?.();
     retryNativeEvents?.();
+    for (const read of questionReads) if (read.isError) void read.refetch();
     void retryPlan();
   };
 
@@ -4234,7 +4522,17 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                             comment.authorUserId === currentUserId && comment.clientRequestId &&
                             !comment.id.startsWith("optimistic-")
                           ).map((comment) => comment.clientRequestId!))}
-                          onStop={liveRun && !tailEnded && !tailHasFinalResponse && onCancelRun ? () => { stoppedRunIds.current.add(liveRun.id); return onCancelRun(); } : undefined}
+                          onStop={liveRun && !tailEnded && !tailHasFinalResponse && onCancelRun ? () => {
+                            const id = liveRun.id;
+                            setStoppedRunIds(ids => new Set(ids).add(id));
+                            setStoppingRunId(id);
+                            return Promise.resolve().then(() => onCancelRun()).catch(error => {
+                              // A rejected Stop is not an ended run. Keep the clock and current activity live.
+                              setStoppedRunIds(ids => { const next = new Set(ids); next.delete(id); return next; });
+                              setStoppingRunId(null);
+                              throw error;
+                            });
+                          } : undefined}
                           confirmedStoppedRunIds={confirmedStoppedRunIds}
                           stopPending={stoppingReply}
                           stopScope={stopScope}
