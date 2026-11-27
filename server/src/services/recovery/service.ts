@@ -4983,7 +4983,7 @@ export function recoveryService(
       // Waiting for the input owner, not a continuation-exhaustion escalation.
       // In particular, never write a Press Retry notice for this refusal.
       if (isNativeInputSizeRefusal(latestRun?.errorCode)
-        && await hasUnchangedNativeInputRefusal(db, { companyId: issue.companyId, issueId: issue.id })) {
+        && await hasUnchangedNativeInputRefusal(db, { companyId: issue.companyId, issueId: issue.id, agentId })) {
         result.skipped += 1;
         continue;
       }

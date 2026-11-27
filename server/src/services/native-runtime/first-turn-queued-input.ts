@@ -113,6 +113,7 @@ export function deferredWakeJoinsFirstTurn(
     wake.agentId === run.agentId &&
     Boolean(run.responsibleUserId) && requester &&
     reason !== null && COMMENT_WAKE_REASONS.has(reason) &&
+    payload.nativeInputRefusalHold !== true &&
     !payload.interactionId && !context.interactionId && !context.interactionStatus &&
     !payload.queuedCommentInterrupt && context.resumeIntent !== true &&
     !deferredWakeIsChatRequest(payload) &&
@@ -162,7 +163,7 @@ async function readFirstTurnInteraction(tx: Db, binding: { companyId: string; is
   const interactionId = queuedInteractionId(payload);
   const requester = wake.requestedByActorType === "user" ? wake.requestedByActorId === responsibleUserId
     : wake.requestedByActorType === "system" || wake.requestedByActorType === null;
-  if (!interactionId || !requester || queuedCommentIdsFromWakePayload(payload).length > 0 ||
+  if (payload.nativeInputRefusalHold === true || !interactionId || !requester || queuedCommentIdsFromWakePayload(payload).length > 0 ||
       (Array.isArray(payload.interactionIds) && payload.interactionIds.some(id => id !== interactionId)) ||
       payload.resumeIntent === true || context.resumeIntent === true || payload.forceFreshSession === true || context.forceFreshSession === true ||
       payload.queuedCommentInterrupt || deferredWakeIsChatRequest(payload)) return null;
