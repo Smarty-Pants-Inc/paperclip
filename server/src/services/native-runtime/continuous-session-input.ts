@@ -80,6 +80,9 @@ export async function settleContinuousSessionInput(tx: Db, scope: Scope, evidenc
     ? [...new Set([...saved.commentIds.filter((id): id is string => typeof id === "string"), ...evidence.commentIds])] : evidence.commentIds;
   const consumed = new Set(ids), now = new Date();
   for (const wake of wakes) {
+    // A held aggregate can contain other children's/routines' owed content.
+    // A comment acknowledgement cannot settle that independent delivery.
+    if (wake.payload?.nativeInputRefusalHold === true) continue;
     const interactionId = queuedInteractionId(wake.payload);
     if (interactionId && consumed.has(interactionId)) {
       await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: now, updatedAt: now })

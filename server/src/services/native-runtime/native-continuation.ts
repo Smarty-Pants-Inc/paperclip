@@ -1,3 +1,4 @@
+import { savedAutomaticWakesText, withoutDuplicateSavedWakeContext } from "./saved-automatic-wakes.js";
 import { isPaperclipExternalChatContractTurn, normalizePaperclipWakePayload, PAPERCLIP_EARLIER_READ_COMMENT_NOTE } from "@paperclipai/adapter-utils/server-utils";
 import type { CaseExecutionContext, projectCaseContinuation } from "../case-context.js";
 import { caseInstructionAlreadyRepresented } from "../case-context.js";
@@ -9,6 +10,9 @@ import { nativeStatusRetryPrompt } from "./continued-session.js";
 export function buildNativeContinuationPrompt(input: {
   wakePayload: unknown;
   promptOnly?: boolean;
+  savedEventsByReference?: boolean;
+  savedEventsReaderAvailable?: boolean;
+  savedEventsInlineLimit?: number;
   previousRunId: string;
   issue: { title: string; description: string | null };
   previousIssue: { title: string; description: string | null };
@@ -18,24 +22,26 @@ export function buildNativeContinuationPrompt(input: {
   workflowCase?: ReturnType<typeof projectCaseContinuation>;
   previousGitHubReviewConfigurationKeys?: readonly string[];
 }): string | null {
-  const wake = normalizePaperclipWakePayload(input.wakePayload);
+  const wake = normalizePaperclipWakePayload(withoutDuplicateSavedWakeContext(input.wakePayload));
+  const rawWake = input.wakePayload && typeof input.wakePayload === "object"
+    ? input.wakePayload as Record<string, unknown> : {};
+  const savedEvents = Array.isArray(rawWake.nativeInputRefusalWakes) ? rawWake.nativeInputRefusalWakes : [];
+  const savedEventsText = savedAutomaticWakesText(input.wakePayload, input.savedEventsByReference, input.savedEventsReaderAvailable, input.savedEventsInlineLimit);
   if (input.promptOnly && wake) {
     const retryPrompt = nativeStatusRetryPrompt(input.wakePayload, input.previousRunId);
     if (retryPrompt) {
       // The failed run's own history is already present, but person messages
       // arriving since its coverage cursor have not been read by that turn.
       const unseen = wake.executionContinuation?.resumeDelta?.messages.filter(message => message.authorType === "user") ?? [];
-      return [retryPrompt, ...unseen.map(message => message.body)].join("\n\n");
+      return [retryPrompt, ...unseen.map(message => message.body), savedEventsText].filter(Boolean).join("\n\n");
     }
     const messages = [...(wake.executionContinuation?.messages ?? wake.executionContinuation?.resumeDelta?.messages ?? []), ...wake.comments];
-    return wake.commentIds.map(id => wake.comments.find(comment => comment.id === id)?.fullBody ?? messages.find(message => message.id === id)!.body).join("\n\n");
+    return [...wake.commentIds.map(id => wake.comments.find(comment => comment.id === id)?.fullBody ?? messages.find(message => message.id === id)!.body), savedEventsText].filter(Boolean).join("\n\n");
   }
   const continuation = wake?.executionContinuation;
   const delta = continuation?.resumeDelta;
   if (!wake || !delta || delta.baseRunId !== input.previousRunId) return null;
   if (input.caseContext && !input.workflowCase) return null;
-  const rawWake = input.wakePayload && typeof input.wakePayload === "object"
-    ? input.wakePayload as Record<string, unknown> : {};
   const unclaimedTask = wake.reason === "issue_continuation_needed" && rawWake.nativeTaskUnclaimed === true;
   // Attachment descriptors are intentionally omitted by the generic normalizer.
   // Retain the complete bootstrap framing whenever current input needs them or
@@ -96,6 +102,7 @@ export function buildNativeContinuationPrompt(input: {
     ...(humanResponses.length ? { humanResponses } : {}),
     ...(Object.keys(taskChanges).length ? { taskChanges } : {}),
     ...(wake.childIssueSummaries.length ? { childResults: wake.childIssueSummaries } : {}),
+    ...(savedEvents.length ? { savedAutomaticWakeEvents: savedEventsText } : {}),
     ...(wake.childIssueSummaryTruncated ? { childResultsTruncated: true } : {}),
     ...(wake.unresolvedBlockerIssueIds.length ? { unresolvedBlockerIssueIds: wake.unresolvedBlockerIssueIds } : {}),
     // Server-rendered "App context (untrusted)" from the task's MCP Apps widgets:
@@ -109,6 +116,6 @@ export function buildNativeContinuationPrompt(input: {
     "You are continuing the same conversation. The previous task turn ended without an accepted completion report. Do NOT repeat commands, scripts, or other work already done in this task, or re-answer consumed messages. If the work is complete, file your result against the current contract now. Otherwise finish only what remains, then file your result.",
     ...(events.messages.length || Object.keys(events).length > 1 ? [JSON.stringify(events)] : []),
   ].join("\n\n");
-  if (!events.messages.length && !humanResponses.length && !wake.childIssueSummaries.length && !Object.keys(taskChanges).length && !input.workflowCase) return null;
+  if (!events.messages.length && !humanResponses.length && !wake.childIssueSummaries.length && !savedEvents.length && !Object.keys(taskChanges).length && !input.workflowCase) return null;
   return JSON.stringify(events);
 }

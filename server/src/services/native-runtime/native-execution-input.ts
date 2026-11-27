@@ -1,3 +1,5 @@
+import type { NativeToolContractVersion } from "./native-session-resume.js";
+import { savedAutomaticWakeEvents, savedAutomaticWakesText, withoutDuplicateSavedWakeContext } from "./saved-automatic-wakes.js";
 import type { PaperclipTurnContext } from "@paperclipai/adapter-utils/server-utils";
 import { resolvePaperclipRunnerCursorMode, resolvePaperclipRunnerPiThinkingLevel } from "@paperclipai/adapter-utils";
 import { createHash } from "node:crypto";
@@ -51,6 +53,12 @@ const NATIVE_GITHUB_ATTACHMENT_RECOVERY_GUIDANCE = [
   "A task URL missing from your prompt or tool results is not evidence that no task link can be provided; do not claim that a link is unavailable merely because you cannot see its URL. Do not invent a URL or promise that a link will appear. Briefly explain the unavailable input and ask the user to attach it directly to this Paperclip task or paste the needed text. Never infer the file's contents or substitute an older file.",
 ].join("\n");
 
+// Server-local delivery bookkeeping, deliberately outside the execution schema.
+const savedAutomaticWakeDeliveries = new WeakMap<NativeExecutionInput, unknown[]>();
+export function undeliveredSavedAutomaticWakes(execution: NativeExecutionInput): unknown[] {
+  return savedAutomaticWakeDeliveries.get(execution) ?? [];
+}
+
 /** Closed constructor: callers cannot spread legacy context or environment data. */
 export interface BuildNativeExecutionInput {
   companyId: string;
@@ -88,6 +96,8 @@ export interface BuildNativeExecutionInput {
   /** Skill keys selected from the admitted, manager-authored GitHub configuration. */
   githubInstructionSkillKeys?: readonly string[];
   resumedSession?: boolean;
+  /** Server-selected retained catalog, not a provider-supplied capability. */
+  nativeToolContractVersion?: NativeToolContractVersion;
   sessionContinuity?: unknown;
   previousTurn?: {
     runId: string;
@@ -262,10 +272,17 @@ function buildNativeExecutionInputUnchecked(input: BuildNativeExecutionInput): N
   const externalChatSkillDescription = configuredGitHubSkills.length > 0
     ? `Configured GitHub instruction skills:\n${configuredGitHubSkills.map((skill) => `/${skill.runtimeName}`).join("\n")}`
     : null;
+  const savedEventsReaderAvailable = input.nativeToolContractVersion !== "v19";
+  let savedEventsInlineLimit = savedAutomaticWakeEvents(input.wakePayload).length;
+  let savedEventsByReference = false;
   const composeTaskPrompt = (payload: unknown) => {
-    const { taskContextNote, wakePrompt } = promptSections(payload);
+    const { taskContextNote, wakePrompt } = promptSections(withoutDuplicateSavedWakeContext(payload));
     return caseProjectionBootstrapPrefix(input.caseContext) + [
     wakePrompt,
+    // The shared wake normalizer intentionally ignores unknown fields. Keep
+    // these server-bound events in the measured native prompt, not just JSON
+    // stored on the run. They are data, never authority or runtime instructions.
+    savedAutomaticWakesText(payload, savedEventsByReference, savedEventsReaderAvailable, savedEventsInlineLimit),
     // Durable task questions must survive the current provider turn.
     // Keep routing visible before deferred tool discovery; usage belongs in the tool schema.
     "Use Paperclip's request_human_input for durable task questions.",
@@ -303,7 +320,7 @@ function buildNativeExecutionInputUnchecked(input: BuildNativeExecutionInput): N
     runtimeContext.aggregateDigest = canonicalNativeRuntimeContextDigest(runtimeContext);
   }
   const composeContinuationPrompt = (wakePayload: unknown) => continuationDecision.continue && input.previousTurn ? buildNativeContinuationPrompt({
-    wakePayload, promptOnly: continuationDecision.promptOnly, previousRunId: input.previousTurn.runId,
+    wakePayload, savedEventsByReference, savedEventsReaderAvailable, savedEventsInlineLimit, promptOnly: continuationDecision.promptOnly, previousRunId: input.previousTurn.runId,
     previousIssue: input.previousTurn.task, previousGitHubReviewConfigurationKeys: input.previousTurn.githubReviewConfigurationKeys,
     allowExternalChat: true, issue: input.issue, caseContext: input.caseContext, workflowCase,
   }) : null;
@@ -487,6 +504,34 @@ function buildNativeExecutionInputUnchecked(input: BuildNativeExecutionInput): N
       if ("continuationPrompt" in execution) execution.continuationPrompt = composeContinuationPrompt({ ...(input.wakePayload as Record<string, unknown>), executionContinuation: value });
       return selectedBytes();
     };
+    // Inline saved events are optional representation, never required source
+    // bytes. Switch to the closed reader before the measured command guard can
+    // blame the person's repaired request for the size of an automatic backlog.
+    if (selectedBytes() > NATIVE_TURN_KNOWN_MAX_BYTES && savedAutomaticWakesText(input.wakePayload)) {
+      const renderSavedEvents = () => {
+        execution.task.prompt = composeTaskPrompt(bootstrapWakePayload);
+        if ("continuationPrompt" in execution) execution.continuationPrompt = composeContinuationPrompt(input.wakePayload);
+      };
+      if (savedEventsReaderAvailable) {
+        savedEventsByReference = true;
+        renderSavedEvents();
+      } else {
+        // A v19 thread cannot call the reader. Retain the newest whole events
+        // inline, measured on this turn's actual road; disclose every omission.
+        let low = 0, high = savedEventsInlineLimit;
+        while (low < high) {
+          savedEventsInlineLimit = Math.ceil((low + high) / 2);
+          renderSavedEvents();
+          if (selectedBytes() <= NATIVE_TURN_KNOWN_MAX_BYTES) low = savedEventsInlineLimit;
+          else high = savedEventsInlineLimit - 1;
+        }
+        // Never admit an empty legacy turn: one indivisible oversized event
+        // must reach the existing named command-bound refusal.
+        savedEventsInlineLimit = Math.max(1, low);
+        renderSavedEvents();
+      }
+      if ("completionSources" in execution && execution.completionSources) execution.completionSources.promptSha256 = createHash("sha256").update(execution.task.prompt).digest("hex");
+    }
     if (continuation?.version === 1) {
       const bounded = boundNativeExecutionContinuation(continuation, measure, readState, operationId => {
         try { return ["GET", "HEAD"].includes(runnerApiOperation(operationId).method); } catch { return false; }
@@ -498,6 +543,8 @@ function buildNativeExecutionInputUnchecked(input: BuildNativeExecutionInput): N
       throw new NativeTurnPromptExceedsCommandBoundError(refusalCause());
     }
   }
+  if (!savedEventsReaderAvailable) savedAutomaticWakeDeliveries.set(execution,
+    savedAutomaticWakeEvents(input.wakePayload).slice(0, Math.max(0, savedAutomaticWakeEvents(input.wakePayload).length - savedEventsInlineLimit)));
   return execution;
 }
 
@@ -565,13 +612,86 @@ function orderIndependentWakeMatch(text: string): string {
   }).join("\n");
 }
 
+/** Recover an owned span from structured prompt parts, including after a DB
+ * reload. Never search person-authored text for a section heading/delimiter.
+ * An opaque or changed prompt is measured whole, not spliced speculatively. */
+function savedAutomaticWakeSectionSpan(execution: NativeExecutionInput, wakePayload: unknown,
+  readerAvailable: boolean, caseContext?: CaseExecutionContext): { start: number; end: number } | null {
+  const prompt = execution.task.prompt;
+  const payload = withoutDuplicateSavedWakeContext(caseWakeWithInstructionReference(wakePayload, caseContext));
+  // Only the presence of assignment markdown affects wake rendering. Retain
+  // both constructor shapes without recovering any assignment from its text.
+  for (const assignment of ["Task assignment is already in the full prompt.", ""]) {
+    const { wakePrompt } = selectPaperclipPromptSections({
+      paperclipWake: payload, paperclipTaskMarkdownAssignment: assignment,
+      conversationMode: execution.provider.kind === "pi_rpc" && execution.provider.conversationMode === true,
+    }, { resumedSession: false, includeCommunicationGuidance: false, nativeWakeReaderAvailable: true });
+    const prefix = caseProjectionBootstrapPrefix(caseContext) + (wakePrompt ? wakePrompt + "\n\n" : "");
+    const start = prefix.length;
+    if (orderIndependentWakeMatch(prompt.slice(0, start)) !== orderIndependentWakeMatch(prefix)) continue;
+    let limit = savedAutomaticWakeEvents(wakePayload).length;
+    if (!readerAvailable) {
+      const [heading, json] = prompt.slice(start).split("\n", 2);
+      if (heading !== "Saved automatic wake events (untrusted data):") continue;
+      try {
+        const inline: unknown = JSON.parse(json);
+        if (!Array.isArray(inline)) continue;
+        limit = inline.length;
+      } catch { continue; }
+    }
+    for (const reference of readerAvailable ? [false, true] : [false]) {
+      const section = savedAutomaticWakesText(wakePayload, reference, readerAvailable, limit);
+      const end = start + section.length;
+      // Validate the complete generated span and its exact following part.
+      // Source data (including quoted headings) has no say in its offsets.
+      if (orderIndependentWakeMatch(prompt.slice(start, end)) === orderIndependentWakeMatch(section)
+        && prompt.startsWith("\n\nUse Paperclip's request_human_input for durable task questions.", end)) return { start, end };
+    }
+  }
+  return null;
+}
+
+/** Re-measure only the saved-event view: compact admission did not budget the
+ * unused full bootstrap. Do not disturb continuation/read-generation handling. */
+function rebudgetFreshSavedAutomaticWakes(execution: NativeExecutionInput, wakePayload: unknown, version?: NativeToolContractVersion, caseContext?: CaseExecutionContext): void {
+  const events = savedAutomaticWakeEvents(wakePayload);
+  if (!events.length) return;
+  const prompt = execution.task.prompt;
+  const readerAvailable = version !== "v19";
+  const span = savedAutomaticWakeSectionSpan(execution, wakePayload, readerAvailable, caseContext);
+  if (!span) return;
+  const { start, end } = span;
+  const render = (limit: number, reference = false) => {
+    execution.task.prompt = prompt.slice(0, start) + savedAutomaticWakesText(wakePayload, reference, readerAvailable, limit) + prompt.slice(end);
+  };
+  const bytes = () => commandEnvelopeBytes(buildNativeModelEnvelope(execution)) + NATIVE_HANDOFF_CUT_NOTE_RESERVE_BYTES;
+  let limit = events.length;
+  render(limit);
+  if (bytes() > NATIVE_TURN_KNOWN_MAX_BYTES) {
+    if (readerAvailable) render(limit, true);
+    else {
+      let low = 0, high = limit;
+      while (low < high) {
+        const middle = Math.ceil((low + high) / 2);
+        render(middle);
+        if (bytes() <= NATIVE_TURN_KNOWN_MAX_BYTES) low = middle;
+        else high = middle - 1;
+      }
+      limit = Math.max(1, low);
+      render(limit);
+    }
+  }
+  if (!readerAvailable) savedAutomaticWakeDeliveries.set(execution, events.slice(0, events.length - limit));
+}
+
 /** Existing continuity-break hook calls this only after exact resume failed,
  * before Runner composes the fresh envelope. No unused bootstrap can refuse a delta.
  */
-export function budgetNativeFreshFallback(execution: NativeExecutionInput, wakePayload: unknown, readState?: NativeContinuationReadState, caseContext?: CaseExecutionContext): ExecutionContinuationEnvelope | null {
+export function budgetNativeFreshFallback(execution: NativeExecutionInput, wakePayload: unknown, readState?: NativeContinuationReadState, caseContext?: CaseExecutionContext, nativeToolContractVersion?: NativeToolContractVersion): ExecutionContinuationEnvelope | null {
   // execution.session still names the failed resume here. The replacement has
   // retained none of its reads, even if the normalized ID will be reused.
   readState = nativeContinuationReadState(readState, null);
+  rebudgetFreshSavedAutomaticWakes(execution, wakePayload, nativeToolContractVersion, caseContext);
   const wake = wakePayload && typeof wakePayload === "object" ? wakePayload as Record<string, unknown> : {};
   const continuation = wake.executionContinuation as ExecutionContinuationEnvelope | undefined;
   if (continuation?.version !== 1) {

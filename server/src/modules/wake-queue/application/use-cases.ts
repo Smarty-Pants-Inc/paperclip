@@ -182,7 +182,7 @@ async function runReleaseDrain(
     const sourceCommentId = readNonEmptyString(candidate.payload.sourceCommentId);
     const interactionIds = candidate.payload.interactionIds;
     if (
-      run.status === "succeeded" &&
+      candidate.payload.nativeInputRefusalHold !== true && run.status === "succeeded" &&
       run.agentId === issue.assigneeAgentId && candidate.agentId === run.agentId &&
       run.contextSnapshot.issueId === issue.id && !candidate.authorizedFailedChatRetry &&
       candidate.payload.mutation === "interaction" &&
@@ -227,7 +227,7 @@ async function runReleaseDrain(
 
     // An earlier reply in this conversation already reported this wake's
     // outcome. Settle it here so a duplicate report never becomes a run.
-    if (await ports.transaction.skipAlreadyReportedChatWake({ companyId: run.companyId, issueId: issue.id, wake: candidate, now: input.now })) {
+    if (candidate.payload.nativeInputRefusalHold !== true && await ports.transaction.skipAlreadyReportedChatWake({ companyId: run.companyId, issueId: issue.id, wake: candidate, now: input.now })) {
       continue;
     }
 
@@ -540,6 +540,11 @@ async function promoteDeferredWake(
   delete promotedPayload["queuedCommentInterrupt"];
 
   const promotedContextSeed: Record<string, unknown> = { ...workingCandidate.deferredContextSeed };
+  // The aggregate is claimed together with this receipt. A second drain can
+  // never deliver its wake-only content to a second run.
+  if (workingCandidate.payload.nativeInputRefusalHold === true) {
+    promotedContextSeed.nativeInputRefusalWakes = workingCandidate.payload.nativeInputRefusalWakes;
+  }
   if (pauseHold.activePauseHold) {
     promotedContextSeed.treeHoldInteraction = true;
     promotedContextSeed.activeTreeHold = {
@@ -809,6 +814,7 @@ async function runReleaseRecoveryTail(
       sessionBefore,
       now: input.now,
     });
+    if (!queuedRun) return { outcome: { kind: "released" }, postCommitEffects };
     postCommitEffects.push({ kind: "run_queued", run: queuedRun });
     return {
       outcome: { kind: "queued_review_participant_recovery", run: queuedRun },

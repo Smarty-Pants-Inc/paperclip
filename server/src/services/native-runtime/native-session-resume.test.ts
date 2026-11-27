@@ -310,7 +310,7 @@ describe("capability-gated connection tool refresh", () => {
     expect(result.checkpoint).toBeNull();
     expect(result.normalizedSessionId).not.toBe(normalizedSessionId);
     expect(result.execution.task.prompt).toContain("complete handoff");
-    expect(buildExecution).toHaveBeenLastCalledWith({ normalizedSessionId: result.normalizedSessionId, resumedSession: false });
+    expect(buildExecution).toHaveBeenLastCalledWith({ normalizedSessionId: result.normalizedSessionId, resumedSession: false, nativeToolContractVersion: "v20" });
   });
 });
 
@@ -1642,6 +1642,28 @@ const recoveryFakeCodex = resolve(
 );
 
 describe("rebindNativeSessionCheckpoint", () => {
+  // Never OK: a deploy must not discard a held conversation to add a tool.
+  it("V17 saved automatic wake reader retains pre-reader checkpoints and their catalog", () => {
+    const oldFingerprint = "sha256:2365e29c560a199f396c638003cf4f3c3b55ca3ce0fbc498d07754950a66659d";
+    expect(nativeToolContractFingerprintForTarget("local")).not.toBe(oldFingerprint);
+    expect(nativeToolContractFingerprintForTarget("local", "codex", "v19")).toBe(oldFingerprint);
+    expect(rebindNativeSessionCheckpoint({ previousRun: previousRun(), currentExecution: execution(currentRunId) })).not.toBeNull();
+    const source = previousRun(); source.runnerProfileJson.nativeToolContractFingerprint = oldFingerprint;
+    const calls: boolean[] = [];
+    const versions: string[] = [];
+    const result = buildNativeExecutionWithCheckpoint({ previousRun: source, normalizedSessionId, buildExecution: options => {
+      calls.push(options.resumedSession);
+      versions.push(options.nativeToolContractVersion);
+      const current = execution(currentRunId);
+      return { ...current, session: { ...current.session, normalizedSessionId: options.normalizedSessionId },
+        task: { ...current.task, prompt: options.resumedSession ? "Compact delta" : "Full task context with read_saved_automatic_wakes" } };
+    } });
+    expect(calls).toEqual([true]); expect(versions).toEqual(["v19"]);
+    expect(result.checkpoint).toMatchObject({ sessionId: "provider-thread-123", identity: { runId: currentRunId } });
+    expect(result.normalizedSessionId).toBe(normalizedSessionId);
+    expect(result.execution.task.prompt).toBe("Compact delta");
+    expect(result.nativeToolContractVersion).toBe("v19");
+  });
   it.each(["instructions", "mcp", "skills"])("workspace continuation still checks current Pi context (%s)", key => {
     const prior = execution(previousRunId), current = execution(currentRunId, "/workspace-next");
     for (const value of [prior, current]) {
@@ -2268,9 +2290,47 @@ describe("rebindNativeSessionCheckpoint", () => {
   it.each([
     ["codex", "sha256:07b116cd7f04b0c9a53b87818a910be32682d5df6181c2019cb1ba8e0077be99"],
     ["opencode", "sha256:310dd0367d7157669e9fbf4c41698372a9977ef94183330317167fe07a8987cb"],
-  ] as const)("keeps a remote %s checkpoint that already relayed its assigned gateway", (providerKind, retainedFingerprint) => {
-    expect(nativeToolContractFingerprintForTarget("remote", providerKind)).toBe(retainedFingerprint);
-    expect(nativeToolContractFingerprintForTarget("local", providerKind)).not.toBe(retainedFingerprint);
+  ] as const)("retains a remote %s assigned-gateway checkpoint without declaring the saved automatic wake reader", (providerKind, retainedFingerprint) => {
+    // Retain the conversation AND the provider's admitted tool declarations.
+    expect(nativeToolContractFingerprintForTarget("remote", providerKind, "v19")).toBe(retainedFingerprint);
+    const currentFingerprint = nativeToolContractFingerprintForTarget("remote", providerKind);
+    expect(currentFingerprint).not.toBe(retainedFingerprint);
+    expect(nativeToolContractFingerprintForTarget("local", providerKind)).not.toBe(currentFingerprint);
+    const currentExecution = execution(currentRunId);
+    if (providerKind === "opencode") {
+      currentExecution.provider = { kind: "opencode", model: "openrouter/deepseek/deepseek-v4.1-flash-1017", permissionMode: "allow" };
+      currentExecution.session.driverKind = "opencode_server";
+    }
+    const source = previousRun({
+      nativeToolContractFingerprint: retainedFingerprint,
+      nativeExecutionInput: { ...execution(previousRunId), provider: currentExecution.provider, session: currentExecution.session },
+    });
+    source.runnerProfileJson.sessionCheckpoint.driverKind = currentExecution.session.driverKind;
+    const snapshot = structuredClone(source);
+    const modes: boolean[] = [];
+    const rebuilt = buildNativeExecutionWithCheckpoint({
+      previousRun: source,
+      normalizedSessionId,
+      executionTargetKind: "remote",
+      buildExecution: options => {
+        modes.push(options.resumedSession);
+        return { ...currentExecution,
+          session: { ...currentExecution.session, normalizedSessionId: options.normalizedSessionId },
+          task: { ...currentExecution.task, prompt: options.resumedSession ? "Compact delta" : "Full task context with read_saved_automatic_wakes" },
+        };
+      },
+    });
+    expect(modes).toEqual([true]);
+    expect(rebuilt.checkpoint).toMatchObject({ sessionId: "provider-thread-123", identity: { runId: currentRunId } });
+    expect(rebuilt.normalizedSessionId).toBe(normalizedSessionId);
+    expect(rebuilt.execution.task.prompt).toBe("Compact delta");
+    expect(rebuilt.nativeToolContractVersion).toBe("v19");
+    expect(source).toEqual(snapshot);
+    // A remote checkpoint with the reader already declared remains resumable.
+    source.runnerProfileJson.nativeToolContractFingerprint = currentFingerprint;
+    expect(rebindNativeSessionCheckpoint({ previousRun: source, currentExecution, executionTargetKind: "remote" }))
+      .toMatchObject({ sessionId: "provider-thread-123", identity: { runId: currentRunId } });
+    expect(rebindNativeSessionCheckpoint({ previousRun: source, currentExecution, executionTargetKind: "local" })).toBeNull();
   });
 
   it("binds the provider tool catalog to the local or remote execution target", () => {

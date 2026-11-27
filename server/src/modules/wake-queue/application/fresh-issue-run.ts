@@ -128,7 +128,14 @@ export function createFreshIssueRunAdmission<Run extends { id: string }>(store: 
     });
     const adopted = candidates.filter((wake) => wake.id === executionWaitRequestId ||
       wake.id === input.queuedCommentInterruptId || wake.id === input.queuedCommentRequestId ||
-      isOrdinaryBoardComment(wake));
+      parseObject(wake.payload).nativeInputRefusalHold === true || isOrdinaryBoardComment(wake));
+    // The store only returns held receipts after their source revision changed.
+    // Adopt their whole content with the repair's run, not just comment IDs.
+    const heldEvents = adopted.flatMap(wake => {
+      const events = parseObject(wake.payload).nativeInputRefusalWakes;
+      return Array.isArray(events) ? events : [];
+    });
+    if (heldEvents.length) contextSnapshot.nativeInputRefusalWakes = heldEvents;
     const adoptedWakeIds = adopted.map((wake) => wake.id);
     let commentIds = [...new Set([
       ...adopted.flatMap((wake) => queuedCommentIdsFromWakePayload(wake.payload)),

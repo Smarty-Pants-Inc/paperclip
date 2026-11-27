@@ -364,6 +364,62 @@ its process-wide execution and wakeup promise sets. Forwarding callbacks preserv
 construction order for retry and recovery services. Keep queue policy changes
 separate from this extraction and from adapter execution changes.
 
+Native input-size refusals hold automatic task wakes for the refused agent until
+its attempted source revision changes. Enqueue, deferred promotion claims and
+run insertion use the same revision decision. Ordinary, agent-comment and native
+review execution claims re-check it under the issue lock, including already
+queued hold-marked receipts. A refused claim cancels only the unstarted attempt
+and returns its full receipt to pending; it never consumes the held event. The locked release drain skips held receipts before
+comment cleanup; a size refusal is not a native ownership-reconciliation incident.
+Held wakes coalesce under the issue lock into one pending receipt per task/agent.
+`nativeInputRefusalWakes` keeps each distinct event's full payload and context;
+identical content does not add another event. There is no lossy size cap on owed
+content. A repaired-input admission adopts this content into its run, or the
+existing deferred-receipt worker promotes the held aggregate once through the
+normal release transaction. The run's rebuilt wake payload exposes the saved
+structured events. New sessions and sessions already using the v20 tool contract
+inline at most 32,000 bytes of saved event JSON; larger backlogs use a digest/count
+reference and the run-scoped `read_saved_automatic_wakes` reader. A smaller inline
+backlog also switches to that reader if the measured command needs the space.
+Each reader page is bounded and reconstructs the complete immutable event JSON;
+its narrowly run-scoped read is also available in skill-test mode. A healthy
+pre-reader v19 checkpoint keeps its provider session and its v19 fingerprint,
+including on later follow-ups. That session never advertises or mentions the
+reader. Its saved events remain inline, retaining the newest whole events that
+fit the selected command's turn budget and explicitly reporting
+`N earlier automatic events not shown` if older events cannot fit. The full saved
+aggregate remains intact. Pi sessions use this same conservative compatibility
+path; a refresh capability flag alone is not proof of per-turn tool declaration. Events are
+untrusted data, not instructions. The first event's child summary is not rendered
+again as ordinary wake context. If an adopting run is refused for size, release
+restores its aggregate to pending, and the next wake merges with it rather than
+starting over. First-turn comment claims and comment acknowledgements cannot
+consume an aggregate's independent event content. Explicit person attempts retain
+their authority but do not consume held automatic content before a repair.
+Source fingerprints include the named messages regardless of author; comparison
+also recognizes new person input, without treating unrelated system bookkeeping
+as a repair. Review-participant recovery uses the same locked hold check before
+creating a run. A recovery escalation records the exact status version it blocked
+for a size refusal; repair resolves that recovery action and restores that status
+only while no later status decision or independent recovery hold owns it.
+Pure assignment version changes and repeated escalations of that same owned
+cause carry its marker forward; a later explicit Blocked or blocker edit does not.
+Reassignment does not apply the previous agent's refusal to its new assignee's
+ordinary work. It transfers the held aggregate to the new assignee (merging any
+held content there), retaining the original source revision gates until repair.
+Unassign/reassign to the same refused agent is not an input repair: system/agent
+assignment wakes stay held, whereas a person's assignment authorizes its own
+single attempt. At the common assignment-write boundary, undelivered person
+messages behind a refusal are copied to a system-owned owed receipt before the
+old human grant is cancelled. This preserves full message/context data without
+lending the person's revoked execution authority to a new assignee. Such content
+stays pending while unassigned (including if repaired), then is handed over and
+delivered after repair. Independent blocked decisions are not reopened or drained
+by that owed receipt.
+Existing Stop, pause, budget, cleanup and responsible-user gates remain
+independent. These persistence/queue contracts are covered by real PostgreSQL
+regressions; they are not installed UI or real-provider acceptance.
+
 Run lifecycle handling is in `server/src/services/heartbeat/run-lifecycle.ts`.
 It owns status transitions, run events and progress, liveness classification,
 completion handoffs, issue-comment finalization, and runtime/cost settlement.

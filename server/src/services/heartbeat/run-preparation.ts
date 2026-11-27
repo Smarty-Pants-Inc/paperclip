@@ -2773,6 +2773,10 @@ export async function buildPaperclipWakePayload(input: {
       : [],
     childIssueSummaryTruncated:
       input.contextSnapshot.childIssueSummaryTruncated === true,
+    // Saved wake-only event data is input, not runtime instructions. Keep its
+    // payload/context boundaries and every distinct event after a repair.
+    ...(Array.isArray(input.contextSnapshot.nativeInputRefusalWakes)
+      ? { nativeInputRefusalWakes: input.contextSnapshot.nativeInputRefusalWakes } : {}),
     blockerStall: input.contextSnapshot.blockerStall ?? null,
     dispositionRepair:
       buildReviewPathRecoveryDisposition(input.contextSnapshot) ??

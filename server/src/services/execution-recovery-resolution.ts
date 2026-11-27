@@ -572,8 +572,8 @@ export async function deliverReconciledExecutions(
             continue;
           }
         }
-        if (await latestTaskRunIsNativeInputSizeRefusal(db, { companyId: action.companyId, issueId: task.id })
-          && await hasUnchangedNativeInputRefusal(db, { companyId: action.companyId, issueId: task.id })) continue;
+        if (await latestTaskRunIsNativeInputSizeRefusal(db, { companyId: action.companyId, issueId: task.id, agentId: action.returnOwnerAgentId })
+          && await hasUnchangedNativeInputRefusal(db, { companyId: action.companyId, issueId: task.id, agentId: action.returnOwnerAgentId })) continue;
         if (await deferForUnwakeableAssignee(db, action)) { seenAgents.add(action.returnOwnerAgentId); continue; }
         if (!await agentHasRoom(action, action.returnOwnerAgentId, kind)) {
           seenAgents.add(action.returnOwnerAgentId);

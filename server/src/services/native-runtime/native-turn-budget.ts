@@ -149,8 +149,7 @@ export function nativeInputRevision(issue: { title: string; description: string 
   messages: Array<{ id: string; authorType: string; createdByRunId?: string | null; updatedAt: string; deleted: boolean }>): NativeInputRevision {
   const revision = {
     descriptionRevision: createHash("sha256").update(JSON.stringify([issue.title, issue.description])).digest("hex"),
-    messages: messages.filter(message => message.authorType === "user" && !message.createdByRunId)
-      .map(message => ({ id: message.id, revision: message.updatedAt, deleted: message.deleted }))
+    messages: messages.map(message => ({ id: message.id, revision: message.updatedAt, deleted: message.deleted }))
       .sort((a, b) => a.id.localeCompare(b.id)),
   };
   return { ...revision, fingerprint: createHash("sha256").update(JSON.stringify(revision)).digest("hex") };

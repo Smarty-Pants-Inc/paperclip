@@ -4357,6 +4357,16 @@ export function recoveryService(
       companyGuard: input.issue.companyId,
     }, tx, publications, postCommitActions);
     if (!updated) return null;
+    // Only this automatic status transition may be undone by a source repair.
+    // A later person/status decision changes statusVersion and is never ours.
+    const priorRefusalBlock = parseObject(recoveryAction.evidence.nativeInputRefusalBlock);
+    if (isNativeInputSizeRefusal(input.latestRun?.errorCode) && (input.issue.status !== "blocked"
+      || priorRefusalBlock.statusVersion === input.issue.statusVersion)) {
+      await tx.update(issueRecoveryActions).set({ evidence: { ...recoveryAction.evidence,
+        nativeInputRefusalBlock: { runId: input.latestRun!.id, agentId: input.latestRun!.agentId,
+          statusVersion: updated.statusVersion, previousStatus: input.issue.status === "blocked" ? priorRefusalBlock.previousStatus : input.issue.status },
+      }, updatedAt: new Date() }).where(and(eq(issueRecoveryActions.companyId, input.issue.companyId), eq(issueRecoveryActions.id, recoveryAction.id)));
+    }
     if (isProviderQuotaWait) return updated;
     const sourceAssigneePreserved =
       updated.assigneeAgentId === input.issue.assigneeAgentId &&
@@ -4983,7 +4993,7 @@ export function recoveryService(
       // Waiting for the input owner, not a continuation-exhaustion escalation.
       // In particular, never write a Press Retry notice for this refusal.
       if (isNativeInputSizeRefusal(latestRun?.errorCode)
-        && await hasUnchangedNativeInputRefusal(db, { companyId: issue.companyId, issueId: issue.id })) {
+        && await hasUnchangedNativeInputRefusal(db, { companyId: issue.companyId, issueId: issue.id, agentId })) {
         result.skipped += 1;
         continue;
       }

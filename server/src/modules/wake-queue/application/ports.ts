@@ -248,7 +248,7 @@ export interface WakeQueueTransaction {
     recoveryAgent: InvokableAgentSnapshot;
     sessionBefore: string | null;
     now: Date;
-  }): Promise<RunSummary>;
+  }): Promise<RunSummary | null>;
   /**
    * Queues the run with the context snapshot and the responsible user the
    * caller already resolved.
