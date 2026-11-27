@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
+import { continuationResultIdentityKeys } from "../execution-continuation-identity.js";
 import type { DurablePrpControlPlane, NativeSession } from "../../vendor/paperclip-runner/index.js";
 
 // One split, in encoded UTF-8 journal-command bytes (not prompt characters).
@@ -173,17 +174,48 @@ export function nativeSessionHandoffMaxBytes(promptOrEnvelope: string | object):
   return Math.min(NATIVE_WHOLE_HANDOFF_MAX_BYTES, room);
 }
 
-export type NativeContinuationReadState = { lastRunAt: string | null; readCommentIds: string[] };
+export type NativeContinuationReadState = {
+  lastRunAt: string | null;
+  readCommentIds: string[];
+  nativeSessionId?: string | null;
+  providerSessionId?: string | null;
+};
 export type NativeContinuationCoverage = ExecutionContinuationEnvelope["coverage"] & {
   omitted?: Array<{ id: string; updatedAt: string }>;
   nativeSessionId?: string;
   providerSessionId?: string;
 };
 const record = (v: unknown): Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : {};
-export function nativeContinuationReadState(value: unknown): NativeContinuationReadState {
+export function nativeContinuationReadState(value: unknown, target?: {
+  nativeSessionId: string | null; providerSessionId: string | null;
+} | null): NativeContinuationReadState {
   const state = record(value);
+  const nativeSessionId = typeof state.nativeSessionId === "string" ? state.nativeSessionId : null;
+  const providerSessionId = typeof state.providerSessionId === "string" ? state.providerSessionId : null;
+  // null is an explicitly fresh generation. Missing/legacy provenance never
+  // authorizes cuts in a selected session; parsing alone preserves old state.
+  const sameGeneration = target === undefined || !!(target && nativeSessionId && providerSessionId
+    && nativeSessionId === target.nativeSessionId && providerSessionId === target.providerSessionId);
   return { lastRunAt: typeof state.lastRunAt === "string" ? state.lastRunAt : null,
-    readCommentIds: Array.isArray(state.readCommentIds) ? state.readCommentIds.filter((id): id is string => typeof id === "string") : [] };
+    nativeSessionId, providerSessionId,
+    readCommentIds: sameGeneration && Array.isArray(state.readCommentIds)
+      ? state.readCommentIds.filter((id): id is string => typeof id === "string") : [] };
+}
+
+/** Resolve the previous provider from the saving run's own evidence, never
+ * from a read projection stamped with the currently selected provider. */
+export function nativeContinuationProviderSessionId(
+  savingRun: { nativeSessionId: string | null; runnerProfileJson: unknown; contextSnapshot?: unknown } | null | undefined,
+  normalizedSessionId: string,
+  savingEventProviderId?: string | null,
+): string | null {
+  const checkpoint = record(record(savingRun?.runnerProfileJson).sessionCheckpoint);
+  if ((savingRun?.nativeSessionId ?? checkpoint.sessionId) !== normalizedSessionId) return null;
+  if (typeof checkpoint.providerSessionId === "string" && checkpoint.providerSessionId) return checkpoint.providerSessionId;
+  if (typeof savingEventProviderId === "string" && savingEventProviderId) return savingEventProviderId;
+  const context = record(savingRun?.contextSnapshot);
+  const state = nativeContinuationReadState(context.nativeContinuationReadState);
+  return state.nativeSessionId === normalizedSessionId ? state.providerSessionId ?? null : null;
 }
 
 /** Pure rendering budget: unknown read state protects everything, never guesses. */
@@ -193,6 +225,7 @@ export function boundNativeExecutionContinuation(
   readState?: NativeContinuationReadState,
   isReadOperation: (operationId: string) => boolean = () => false,
   refusalCause?: NativePromptRefusalCause | (() => NativePromptRefusalCause),
+  isWriteOperation: (operationId: string) => boolean = () => false,
 ): ExecutionContinuationEnvelope {
   if (measure(original) <= NATIVE_TURN_KNOWN_MAX_BYTES) return original;
   const continuation = { ...original, messages: [...original.messages], completedActions: [...(original.completedActions ?? [])],
@@ -202,18 +235,54 @@ export function boundNativeExecutionContinuation(
   };
   const mark = () => { coverage.truncated = true; coverage.omittedMessages ??= 0;
     coverage.omittedCompletedActions ??= 0; coverage.shortenedCompletedActions ??= 0; };
-  // Caller uses runner-api-catalog's method/operation registry, not a verb guess.
-  // Everything else (including unknown operation IDs) retains its STOCK result.
-  for (let i = 0; i < continuation.completedActions.length; i++) {
-    const receipt = continuation.completedActions[i]!;
-    if (!isReadOperation(receipt.operationId)) continue;
+  // Callers classify through runner-api-catalog, not a verb guess. Reads go
+  // first, then writes, before any message omission. Unknown operations stay
+  // stock; receipts never disappear or move, even when the largest body goes first.
+  const receipts = continuation.completedActions.map((receipt, index) => ({ receipt, index,
+    serialized: JSON.stringify(receipt.result) ?? "null" }))
+    .map(value => ({ ...value, bytes: commandTextBytes(value.serialized) }))
+    .sort((a, b) => b.bytes - a.bytes);
+  const pick = (value: Record<string, unknown>, keys: readonly string[]) => Object.fromEntries(keys.filter(key => key in value).map(key => [key, value[key]]));
+  const identity = (value: unknown) => pick(record(value), continuationResultIdentityKeys);
+  const locator = (value: unknown) => typeof value === "string" && value.trim().length > 0
+    || typeof value === "number" && Number.isSafeInteger(value);
+  const findable = (value: Record<string, unknown>) => locator(value.id) || locator(value.key)
+    || locator(value.identifier) || locator(value.number);
+  // Keep the wrapper shape and each child's identity, never its response body.
+  const resourceIdentity = (value: unknown) => {
+    const resource = record(value);
+    return { ...identity(resource), ...Object.fromEntries(Object.entries(resource)
+      .filter(([, child]) => findable(record(child))).map(([key, child]) => [key, identity(child)])) };
+  };
+  for (const write of [false, true]) for (const { receipt, index, serialized, bytes } of receipts) {
+    if (write ? isReadOperation(receipt.operationId) || !isWriteOperation(receipt.operationId) : !isReadOperation(receipt.operationId)) continue;
     const result = record(receipt.result);
     if (result.resultOmittedForSize === true) continue;
-    const shortened = { ...Object.fromEntries(["operationId", "ok", "status", "kind", "target"].filter(key => key in result).map(key => [key, result[key]])),
-      resultOmittedForSize: true, note: "Result omitted for size; re-read if needed.",
-      resultSha256: `sha256:${createHash("sha256").update(JSON.stringify(receipt.result) ?? "null").digest("hex")}` };
-    if (commandTextBytes(JSON.stringify(shortened)) >= commandTextBytes(JSON.stringify(receipt.result) ?? "null")) continue;
-    continuation.completedActions[i] = { ...receipt, result: shortened };
+    // Failed/unknown writes are evidence, not successful save receipts. Keep
+    // their errors, outcome and retry guidance whole, even under size pressure.
+    if (write && (result.ok !== true || result.status !== undefined
+      && !(typeof result.status === "number" && result.status >= 200 && result.status < 300)
+      || result.outcome === "unknown" || result.error)) continue;
+    if (write && Array.isArray(result.data) && (result.data.length > 20 || result.data.length === 0)) continue;
+    const topIdentity = write ? identity(result) : {};
+    const dataIdentity = write ? (Array.isArray(result.data) ? result.data.map(resourceIdentity) : resourceIdentity(result.data)) : {};
+    const hasResourceIdentity = (value: Record<string, unknown>) => findable(value) || Object.values(value).some(child => findable(record(child)));
+    // Every bulk target must remain findable. In particular, never hide the
+    // targets after the 20-element cap behind a misleading re-read note.
+    if (write && Array.isArray(dataIdentity) && !dataIdentity.every(hasResourceIdentity)) continue;
+    const artifact = record(result.artifact);
+    if (write && !findable(topIdentity) && !(Array.isArray(dataIdentity)
+      ? dataIdentity.length > 0 : hasResourceIdentity(dataIdentity))
+      && !locator(artifact.artifactId) && !locator(artifact.url)) continue;
+    const shortened = { ...pick(result, ["operationId", "ok", "status", "kind", "target"]), ...topIdentity,
+      ...(Object.keys(dataIdentity).length ? { data: dataIdentity } : {}),
+      ...(write && result.artifact !== undefined ? { artifact: result.artifact } : {}),
+      resultOmittedForSize: true, note: write
+        ? "Result omitted for size; the write succeeded. Re-read the target by its id if needed."
+        : "Result omitted for size; re-read if needed.",
+      resultSha256: `sha256:${createHash("sha256").update(serialized).digest("hex")}` };
+    if (commandTextBytes(JSON.stringify(shortened)) >= bytes) continue;
+    continuation.completedActions[index] = { ...receipt, result: shortened };
     mark(); coverage.shortenedCompletedActions! += 1;
     if (measure(continuation) <= NATIVE_TURN_KNOWN_MAX_BYTES) return continuation;
   }

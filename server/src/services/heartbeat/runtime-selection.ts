@@ -92,7 +92,7 @@ import { normalizePaperclipWakePayload, selectPaperclipTaskMarkdown } from "@pap
 import type { ProviderResourceDisposition } from "../environment-runtime.js";
 import { stageNativeRuntimeSkillAssets, bindStagedNativeRuntimeSkillAssets } from "../native-runtime/runtime-skill-preservation.js";
 import { configuredSecretGuidance } from "../native-runtime/configured-secret-guidance.js";
-import { nativeContinuationReadState, type NativeInputRevision } from "../native-runtime/native-turn-budget.js";
+import { nativeContinuationProviderSessionId, nativeContinuationReadState, type NativeInputRevision } from "../native-runtime/native-turn-budget.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 type Agent = typeof agents.$inferSelect;
@@ -575,6 +575,19 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
             beforeCreatedAt: run.createdAt,
           }))
         : null;
+    // The previous provider must be witnessed by the reading run itself, not
+    // context.nativeContinuationReadState (rebuilt for the selected provider).
+    const [previousNativeGeneration] = previousNativeRun ? await db.select({ providerSessionId: sql<string | null>`coalesce(
+      (select generation_event.payload->'prpEvent'->'payload'->>'providerSessionId'
+        from ${heartbeatRunEvents} generation_event
+        where generation_event.company_id = ${heartbeatRuns.companyId} and generation_event.run_id = ${heartbeatRuns.id}
+          and generation_event.event_type in ('session.started', 'session.resumed', 'session.reconciled')
+        order by generation_event.seq desc limit 1),
+      ${heartbeatRuns.contextSnapshot}->'nativeContinuationReadState'->>'providerSessionId',
+      ${heartbeatRuns.contextSnapshot}->'executionContinuation'->'coverage'->>'providerSessionId')` })
+      .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, agent.companyId),
+        eq(heartbeatRuns.agentId, agent.id), eq(heartbeatRuns.id, previousNativeRun.id))).limit(1) : [];
+    const previousProviderSessionId = readNonEmptyString(previousNativeGeneration?.providerSessionId);
     nativeRunnerInstanceId =
       previousNativeRun?.runnerInstanceId &&
       previousNativeRun.nativeSessionId ===
@@ -862,6 +875,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
               boundCommandBytes: agent.adapterType === "paperclip_runner",
               inputRevision: context.nativeInputRevision as NativeInputRevision | undefined,
               continuationReadState: nativeContinuationReadState(context.nativeContinuationReadState),
+              continuationProviderSessionId: nativeContinuationProviderSessionId(previousNativeRun, normalizedSessionId, previousProviderSessionId),
               onContinuationBudgeted: bounded => {
                 // Called only for a full-render cut. Delta turns retain the
                 // unbounded snapshot so later deltas never resurrect old IDs.
