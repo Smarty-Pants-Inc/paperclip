@@ -31,6 +31,7 @@ type NativeRetryLane = {
   exhaustedError: string;
   context?: (run: typeof heartbeatRuns.$inferSelect) => Record<string, unknown>;
   refuseStopped?: boolean;
+  explicitFreshSession?: boolean;
 };
 
 /** Called under the finalizer's issue/coordinator locks, in the status-effect transaction. */
@@ -71,6 +72,7 @@ export async function materializeNativeEnvironmentBlockerRetry(input: NativeRetr
     idempotencyPrefix: "native-environment-blocker",
     exhaustedError: "native_environment_blocker_retry_exhausted",
     refuseStopped: true,
+    explicitFreshSession: true,
     context: run => ({
       livenessContinuationSourceRunId: run.id,
       livenessContinuationReason: NATIVE_ENVIRONMENT_BLOCKER_CODE,
@@ -88,6 +90,7 @@ export async function materializeNativeAgentBlockerContinuation(input: NativeRet
     idempotencyPrefix: "native-agent-blocker",
     exhaustedError: "native_agent_blocker_continuation_exhausted",
     refuseStopped: true,
+    explicitFreshSession: true,
     context: run => ({
       livenessContinuationSourceRunId: run.id,
       livenessContinuationReason: NATIVE_AGENT_BLOCKER_CONTINUATION_CODE,
@@ -118,6 +121,7 @@ async function materializeNativeFreshSessionRetry(input: NativeRetryTarget, lane
     issueId: input.issueId,
     taskId: input.issueId,
     forceFreshSession: true,
+    explicitFreshSession: lane.explicitFreshSession === true,
     retryOfRunId: run.id,
     retryReason: lane.reason,
     wakeReason: lane.reason,
