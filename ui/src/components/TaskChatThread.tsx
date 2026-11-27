@@ -2987,7 +2987,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                 (toMs(comment.createdAt) >= segment.startMs && toMs(comment.createdAt) < segment.endMs))))
             .sort((a, b) => toMs(a.createdAt) - toMs(b.createdAt))[occurrence];
           const saved = reply ? messageItemsById.get(reply.id) : undefined;
-          return saved ? { ...saved, atMs: final?.atMs ?? toMs(reply?.createdAt) } : final;
+          if (saved || final || !sourceAcceptedResponseWake) {
+            return saved ? { ...saved, atMs: final?.atMs ?? toMs(reply?.createdAt) } : final;
+          }
+          // An input reservation may split acceptance from its terminal. With
+          // no authored or saved reply here, keep the whole-run proof below.
         }
         if (sourceYielded) {
           if (!sourceYieldedResponse) return undefined;
