@@ -180,6 +180,24 @@ it.skipIf(!tar || !hasZstd)("reuses only byte-matched image files, keeps modes, 
   expect(await fs.readlink(path.join(targetPath, "tool"))).toBe("bin/tool");
 });
 
+it.skipIf(!tar || !hasZstd)("budgets reuse hashing by total layered file bytes and keeps the floor for small packs", async () => {
+  for (const sizes of [[], [1024 * 1024 + 1, 2 * 1024 * 1024 + 1]]) {
+    const { root, pack } = await fixture();
+    for (const [index, bytes] of sizes.entries()) {
+      await fs.writeFile(path.join(pack, "bin", `large-${index}`), Buffer.alloc(bytes, 42));
+    }
+    await createProviderPackLayers(pack);
+    const archive = (await readProviderPackArchive(pack, digest))!;
+    if (!("kind" in archive)) throw Error("Expected layered archive");
+    const remote = await runner(root);
+    expect(await stageProviderPackArchive({ archive, runner: remote, targetPath: path.join(root, "fresh"), reuseRoots: [pack] })).toBe(true);
+    const totalBytes = sizes.reduce((sum, bytes) => sum + bytes, 0);
+    expect(remote.execute.mock.calls.find(([input]) => input.command === "node")?.[0]).toMatchObject({
+      timeoutMs: 60_000 + Math.ceil(totalBytes / 1024 ** 2) * 1_000,
+    });
+  }
+});
+
 it.skipIf(!tar || !hasZstd)("stages a complete layered pack into a fresh nested runtime directory", async () => {
   const { root, pack, archive } = await layeredFixture();
   const remote = await runner(root);

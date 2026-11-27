@@ -144,8 +144,10 @@ export async function stageProviderPackLayers(input: {
     bypassSession: true, timeoutMs: 10_000,
   }));
   if (capability.exitCode !== 0 || capability.timedOut) return false;
+  const reuseBytes = archive.files.reduce((sum, file) => sum + file.bytes, 0);
   const reused = await measure("provider_pack.archive.reuse", () => runner.execute({
-    command: "node", args: ["-e", reuseScript, spec], bypassSession: true, timeoutMs: 60_000,
+    command: "node", args: ["-e", reuseScript, spec], bypassSession: true,
+    timeoutMs: sandboxSyncMinimumTimeoutMs(Number.isSafeInteger(reuseBytes) ? reuseBytes : undefined),
   }));
   if (reused.exitCode !== 0 || reused.timedOut) throw Error("runner_remote_provider_archive_reuse_failed");
   let missing: number[];
