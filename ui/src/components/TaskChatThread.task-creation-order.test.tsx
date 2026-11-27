@@ -245,7 +245,7 @@ describe("Coordinator task creation ordering", () => {
     state.handoffs = [{ ...handoff(), status }, { ...handoff("suggested-task"), status, suggestionInteractionId: "suggestion" }];
     const live: LiveRunForIssue = { id: "source-run", agentId: "agent", agentName: "Assistant", adapterType: "paperclip_runner",
       runtimeMode: "native", status: "running", invocationSource: "on_demand", triggerDetail: null,
-      createdAt: at(0), startedAt: at(0), finishedAt: null };
+      createdAt: at(0), startedAt: at(0), finishedAt: null, runModel: null };
     await paint({ comments: [], interactions: [suggestion("accepted")],
       linkedRuns: [{ ...sourceRun, status: "running", finishedAt: null }], liveRuns: [live] });
     expect(host.querySelectorAll('[data-thread-anchor="chat_handoff:task"]')).toHaveLength(1);
@@ -259,7 +259,7 @@ describe("Coordinator task creation ordering", () => {
   it("retains an accepted suggestion when its tasks are not known to the tray", async () => {
     const live: LiveRunForIssue = { id: "source-run", agentId: "agent", agentName: "Assistant", adapterType: "paperclip_runner",
       runtimeMode: "native", status: "running", invocationSource: "on_demand", triggerDetail: null,
-      createdAt: at(0), startedAt: at(0), finishedAt: null };
+      createdAt: at(0), startedAt: at(0), finishedAt: null, runModel: null };
     await paint({ comments: [], interactions: [suggestion("accepted")],
       linkedRuns: [{ ...sourceRun, status: "running", finishedAt: null }], liveRuns: [live] });
     expect(host.querySelectorAll('[data-thread-anchor="interaction:suggestion"]')).toHaveLength(1);
@@ -270,7 +270,7 @@ describe("Coordinator task creation ordering", () => {
     if (mode !== "not-mounted") state.trayMode = mode;
     const live: LiveRunForIssue = { id: "source-run", agentId: "agent", agentName: "Assistant", adapterType: "paperclip_runner",
       runtimeMode: "native", status: "running", invocationSource: "on_demand", triggerDetail: null,
-      createdAt: at(0), startedAt: at(0), finishedAt: null };
+      createdAt: at(0), startedAt: at(0), finishedAt: null, runModel: null };
     await paint({ comments: [], interactions: [suggestion("accepted")],
       ...(mode === "not-mounted" ? { composerAccessory: null } : {}),
       linkedRuns: [{ ...sourceRun, status: "running", finishedAt: null }], liveRuns: [live] });
@@ -287,7 +287,7 @@ describe("Coordinator task creation ordering", () => {
       { clientKey: "missing", issueId: "missing-task", identifier: "PAPER-missing", title: "Missing task" }] };
     const live: LiveRunForIssue = { id: "source-run", agentId: "agent", agentName: "Assistant", adapterType: "paperclip_runner",
       runtimeMode: "native", status: "running", invocationSource: "on_demand", triggerDetail: null,
-      createdAt: at(0), startedAt: at(0), finishedAt: null };
+      createdAt: at(0), startedAt: at(0), finishedAt: null, runModel: null };
     await paint({ comments: [], interactions: [accepted], linkedRuns: [{ ...sourceRun, status: "running", finishedAt: null }], liveRuns: [live] });
     expect(host.querySelectorAll('[data-thread-anchor="chat_handoff:task"]')).toHaveLength(0);
     expect(host.querySelectorAll('[data-thread-anchor="chat_handoff:unreadable"]')).toHaveLength(1);
@@ -302,7 +302,7 @@ describe("Coordinator task creation ordering", () => {
   it("retains accepted suggestions in an ordinary Coordinator task's live tail", async () => {
     const live: LiveRunForIssue = { id: "source-run", agentId: "agent", agentName: "Assistant", adapterType: "paperclip_runner",
       runtimeMode: "native", status: "running", invocationSource: "on_demand", triggerDetail: null,
-      createdAt: at(0), startedAt: at(0), finishedAt: null };
+      createdAt: at(0), startedAt: at(0), finishedAt: null, runModel: null };
     await paint({ conversationMode: false, comments: [], linkedRuns: [{ ...sourceRun, status: "running", finishedAt: null }],
       liveRuns: [live], interactions: [suggestion("accepted")] });
     expect(anchor("interaction:suggestion")).not.toBeNull();
@@ -312,7 +312,7 @@ describe("Coordinator task creation ordering", () => {
   it("keeps pending suggestions and consent forms actionable while a reply runs", async () => {
     const live: LiveRunForIssue = { id: "source-run", agentId: "agent", agentName: "Assistant", adapterType: "paperclip_runner",
       runtimeMode: "native", status: "running", invocationSource: "on_demand", triggerDetail: null,
-      createdAt: at(0), startedAt: at(0), finishedAt: null };
+      createdAt: at(0), startedAt: at(0), finishedAt: null, runModel: null };
     await paint({ comments: [], linkedRuns: [{ ...sourceRun, status: "running", finishedAt: null }], liveRuns: [live],
       interactions: [suggestion("pending"), { ...pendingRequestConfirmationInteraction, id: "consent", sourceRunId: "source-run", issueId: "chat" },
         { ...pendingAskUserQuestionsInteraction, id: "questions", sourceRunId: "source-run", issueId: "chat" }] });
