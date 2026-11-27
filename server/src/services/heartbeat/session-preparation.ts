@@ -350,7 +350,11 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
         }
       } else if (sessionCannotContinue(previous) &&
           (await instanceSettingsService(db).getExperimentalReadOnly()).autoFreshSessionOnRecovery === true) {
-        // Spend only on a session that can never resume, not a self-clearing refusal.
+        // Spend only on qualified lost provider/binding evidence, not transient
+        // reads, unsettled finalizers or ambiguous historical binding refusals.
+        // The four other refusal families may clear; ON retries their saved session.
+        // An incident opens only when this fresh try is spent: without its marker,
+        // authorized-newer selection does not override a lagging pointer for them.
         // For incidents opened while ON, boundaries, receipts and authorized-newer
         // selection remain active when the setting is later switched OFF.
         warmRecoveryResetRequired = true;

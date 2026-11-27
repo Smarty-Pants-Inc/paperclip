@@ -232,16 +232,22 @@ export async function assertNativeRetainedSandboxBinding(db: Db, input: {
     eq(environmentLeases.heartbeatRunId, input.runId), eq(environmentLeases.environmentId, target.environmentId),
     eq(environmentLeases.provider, target.providerKey), eq(environmentLeases.providerLeaseId, target.sandboxLeaseAcquisition.providerLeaseId)));
   const recordedCwd = leases.length === 1 ? leases[0].metadata?.remoteCwd : undefined;
-  if (!owner || !owner.resultId || owner.recoveryState || typeof recordedCwd !== "string"
-    || !sameSandboxWorkspaceAllocation(recordedCwd, target.remoteCwd)
-    || !["active", "released", "expired"].includes(leases[0].status)) {
-    throw new Error("native_controller_recovery_missing_evidence:retained_sandbox_binding");
+  // A finalizer can still publish its result/binding; unknown ownership is not
+  // evidence that replacing the saved session is safe.
+  if (!owner || !owner.resultId || owner.recoveryState) {
+    throw new Error("native_controller_recovery_missing_evidence:retained_sandbox_binding:finalizer_unsettled");
   }
   if (owner.leaseOwner && owner.leaseExpiresAt && owner.leaseExpiresAt > new Date()) {
     throw new NativeControllerRecoveryWaitingError(owner.leaseExpiresAt);
   }
   if (owner.leaseOwner || owner.phase !== "committed") {
-    throw new Error("native_controller_recovery_missing_evidence:retained_sandbox_binding");
+    throw new Error("native_controller_recovery_missing_evidence:retained_sandbox_binding:finalizer_unsettled");
+  }
+  if (leases.length === 1 && !["active", "released", "expired"].includes(leases[0].status)) {
+    throw new Error("native_controller_recovery_missing_evidence:retained_sandbox_binding:lease_unsettled");
+  }
+  if (typeof recordedCwd !== "string" || !sameSandboxWorkspaceAllocation(recordedCwd, target.remoteCwd)) {
+    throw new Error("native_controller_recovery_missing_evidence:retained_sandbox_binding:binding_lost");
   }
   return { remoteCwd: recordedCwd };
 }

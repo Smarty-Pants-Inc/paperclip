@@ -576,11 +576,12 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
     };
     await ordinary(inspect({ execution: { ...current, binding: { ...current.binding, companyId: randomUUID() } } }));
     await ordinary(inspect({ matchesExecution: () => false }));
-    await expect(readSandbox({ remoteCwd: "/unrelated" })).rejects.toThrow("retained_sandbox_binding");
+    // A live finalizer remains a wait even if the binding is not yet published.
+    await expect(readSandbox({ remoteCwd: "/unrelated" })).rejects.toMatchObject({ retryAt: deadline });
     for (const leaseExpiresAt of [null, new Date(Date.now() - 1_000)]) {
       await db.update(nativeRunFinalizations).set({ leaseExpiresAt }).where(eq(nativeRunFinalizations.runId, fixture.scope.runId));
       await ordinary(inspect());
-      await expect(readSandbox()).rejects.toThrow("retained_sandbox_binding");
+      await expect(readSandbox()).rejects.toThrow("retained_sandbox_binding:finalizer_unsettled");
     }
     await db.update(nativeRunFinalizations).set({ leaseExpiresAt: deadline }).where(eq(nativeRunFinalizations.runId, fixture.scope.runId));
     await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, fixture.scope.runId));
@@ -596,6 +597,13 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
     expect(await claimNativeSessionResumptions({ db, runnerInstanceId: "successor", runIds: [runId] })).toEqual([]);
     await db.update(nativeRunFinalizations).set({ phase: "committed", leaseOwner: null, leaseExpiresAt: null })
       .where(eq(nativeRunFinalizations.runId, fixture.scope.runId));
+    await expect(readSandbox()).resolves.toEqual({ remoteCwd: "/workspace" });
+    await expect(readSandbox({ remoteCwd: "/unrelated" })).rejects.toThrow("retained_sandbox_binding:binding_lost");
+    await db.update(environmentLeases).set({ status: "provisioning", metadata: {} })
+      .where(eq(environmentLeases.heartbeatRunId, fixture.scope.runId));
+    await expect(readSandbox()).rejects.toThrow("retained_sandbox_binding:lease_unsettled");
+    await db.update(environmentLeases).set({ status: "released", metadata: { remoteCwd: "/workspace" } })
+      .where(eq(environmentLeases.heartbeatRunId, fixture.scope.runId));
     await expect(readSandbox()).resolves.toEqual({ remoteCwd: "/workspace" });
     const readUnsettledControlState = () => ({ identity, commands: [{ status: "pending" }],
       committedEvents: [{ eventType: "run.terminal", envelope: identity }] });
