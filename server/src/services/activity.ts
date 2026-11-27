@@ -157,7 +157,7 @@ export function activityService(db: Db) {
   // A denied user needs the selected connection's name to repair their task.
   // Other readers need the connection's existing human sharing permission.
   // A malformed present Stop receipt must stay unconfirmed, not disappear.
-  const summarizedResultJson = (viewerUserId: string | null) => sql<Record<string, unknown> | null>`
+  const summarizedResultJson = (viewerUserId: string | null) => sql<(Record<string, unknown> & { continuationNothingNew?: unknown }) | null>`
     case
       when ${heartbeatRuns.resultJson} is null then null
       else jsonb_strip_nulls(jsonb_build_object(
