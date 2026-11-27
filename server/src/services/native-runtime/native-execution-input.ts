@@ -311,11 +311,12 @@ function buildNativeExecutionInputUnchecked(input: BuildNativeExecutionInput): N
       (continuationDecision.promptOnly && continuationPrompt === "")) {
     const continuation = wake?.executionContinuation as ExecutionContinuationEnvelope | undefined;
     const delta = continuation?.resumeDelta;
-    // Prompt-only projection includes unnamed person input too. Empty text
-    // cannot settle it unless the current revision has an answered receipt.
+    // Every road accounts for unnamed person input and interaction identity.
+    // Empty text cannot settle it without an attributable answered receipt.
     const namedCommentIds = [...new Set([
       ...(Array.isArray(wake?.commentIds) ? wake.commentIds.filter((id): id is string => typeof id === "string") : []),
-      ...(continuationDecision.promptOnly ? delta?.messages.filter(message => message.authorType === "user").map(message => message.id) ?? [] : []),
+      ...(delta?.messages.filter(message => message.authorType === "user").map(message => message.id) ?? []),
+      ...(typeof wake?.interactionId === "string" ? [wake.interactionId] : []),
     ])];
     const answeredCommentIds = namedCommentIds.filter(id => delta?.receivedComments?.some(receipt =>
       receipt.id === id && receipt.answered && (!continuation?.messages.some(message =>

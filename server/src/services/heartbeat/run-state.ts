@@ -206,6 +206,14 @@ function boundedRunDiagnosticText(field: "title" | "details", maxBytes: number) 
       || E'\\n[truncated for run retrieval; full text in run error/transcript]' end`;
 }
 
+// Server-authored classification contains only schema/cause and input IDs.
+// Keep it small and ASCII-only even when provider diagnostics cannot be read.
+const continuationNothingNewResult = sql`case
+  when ${heartbeatRuns.resultJson} #>> '{continuationNothingNew,schema}' = 'paperclip.continuation-nothing-new.v1'
+    and pg_column_size(${heartbeatRuns.resultJson}->'continuationNothingNew') <= 16384
+    and (${heartbeatRuns.resultJson}->'continuationNothingNew')::text ~ '^[ -~]*$'
+  then ${heartbeatRuns.resultJson}->'continuationNothingNew' end`;
+
 const heartbeatRunSafeResultJsonColumn = sql<Record<string, unknown> | null>`
   case
     when ${heartbeatRuns.resultJson} is null then null
@@ -213,6 +221,7 @@ const heartbeatRunSafeResultJsonColumn = sql<Record<string, unknown> | null>`
       then ${heartbeatRuns.resultJson}
     else jsonb_strip_nulls(
       jsonb_build_object(
+        'continuationNothingNew', ${continuationNothingNewResult},
         'summary', left(${heartbeatRuns.resultJson} ->> 'summary', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS}),
         'result', left(${heartbeatRuns.resultJson} ->> 'result', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS}),
         'message', left(${heartbeatRuns.resultJson} ->> 'message', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS}),
@@ -348,7 +357,8 @@ const heartbeatRunSqlAsciiSafeColumns = {
   ...getTableColumns(heartbeatRuns),
   processGroupId: heartbeatRunProcessGroupIdColumn,
   error: sql<string | null>`NULL`.as("error"),
-  resultJson: sql<Record<string, unknown> | null>`NULL`.as("resultJson"),
+  resultJson: sql<Record<string, unknown> | null>`case when ${continuationNothingNewResult} is not null
+    then jsonb_build_object('continuationNothingNew', ${continuationNothingNewResult}) end`.as("resultJson"),
   stdoutExcerpt: sql<string | null>`NULL`.as("stdoutExcerpt"),
   stderrExcerpt: sql<string | null>`NULL`.as("stderrExcerpt"),
 } as const;

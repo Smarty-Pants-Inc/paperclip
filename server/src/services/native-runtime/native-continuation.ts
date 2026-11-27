@@ -20,6 +20,13 @@ export function buildNativeContinuationPrompt(input: {
   previousGitHubReviewConfigurationKeys?: readonly string[];
 }): string | null {
   const wake = normalizePaperclipWakePayload(input.wakePayload);
+  const rawWake = input.wakePayload && typeof input.wakePayload === "object"
+    ? input.wakePayload as Record<string, unknown> : {};
+  // Reopen/resume is independent work even when its named comment already
+  // has a reply. Both roads retain the specialized bootstrap framing.
+  const unclaimedTask = wake?.reason === "issue_continuation_needed" && rawWake.nativeTaskUnclaimed === true;
+  if ((["issue_reopened_via_comment", "issue_continuation_needed"].includes(wake?.reason ?? "") && !unclaimedTask) ||
+      rawWake.resumeIntent || rawWake.followUpRequested === true || rawWake.reopenedFrom) return null;
   const continuation = wake?.executionContinuation;
   const delta = continuation?.resumeDelta;
   const receipts = new Map((delta?.receivedComments ?? []).filter(receipt => {
@@ -34,7 +41,7 @@ export function buildNativeContinuationPrompt(input: {
   // Wake IDs are not an exhaustive list of owed input. A prompt-only turn
   // must also account for every person's message carried by the delta.
   const namedCommentIds = [...new Set([...(wake?.commentIds ?? []),
-    ...(input.promptOnly ? delta?.messages.filter(message => message.authorType === "user").map(message => message.id) ?? [] : []),
+    ...(delta?.messages.filter(message => message.authorType === "user").map(message => message.id) ?? []),
   ])];
   const unseenNamed = namedCommentIds.filter(id => !receipts.has(id));
   const messages = (delta?.messages ?? []).filter(message => !receipts.has(message.id) &&
@@ -48,7 +55,7 @@ export function buildNativeContinuationPrompt(input: {
       body: comment.fullBody ?? comment.body, createdAt: comment.createdAt ?? "", updatedAt: comment.createdAt ?? "",
       deleted: false, sourceTrust: null });
   }
-  if (input.promptOnly && wake) {
+  if (input.promptOnly && wake && !unclaimedTask) {
     const retryPrompt = nativeStatusRetryPrompt(input.wakePayload, input.previousRunId);
     if (retryPrompt) {
       // The failed run's own history is already present, but person messages
@@ -65,9 +72,6 @@ export function buildNativeContinuationPrompt(input: {
   }
   if (!wake || !delta || delta.baseRunId !== input.previousRunId) return null;
   if (input.caseContext && !input.workflowCase) return null;
-  const rawWake = input.wakePayload && typeof input.wakePayload === "object"
-    ? input.wakePayload as Record<string, unknown> : {};
-  const unclaimedTask = wake.reason === "issue_continuation_needed" && rawWake.nativeTaskUnclaimed === true;
   // Attachment descriptors are intentionally omitted by the generic normalizer.
   // Retain the complete bootstrap framing whenever current input needs them or
   // an omission notice. The compact path never guesses an unavailable file.

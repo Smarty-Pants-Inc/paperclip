@@ -166,7 +166,8 @@ export async function answeredContinuousHeldRun(db: Db, scope: Scope): Promise<b
 export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, scope: {
   companyId: string; issueId: string; agentId: string; runId?: string;
   previousRunId: string; sessionId: string; providerSessionId: string;
-  messages: ReadonlyArray<{ id: string; updatedAt: string }>;
+  selectedCheckpoint: unknown;
+  messages: ReadonlyArray<{ id: string; updatedAt: string; createdAt: string }>;
 }): Promise<{ received: Set<string>; owed: Set<string>; receipts: Array<{
   id: string; updatedAt: string; receivedAt: string; answered: boolean;
 }> } | null> {
@@ -184,6 +185,7 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
           then ${heartbeatRuns.contextSnapshot} #> '{executionContinuation,messages}'
         else '[]'::jsonb end) message)`,
     result: sql<Record<string, unknown>>`jsonb_build_object(
+      'continuousReplies', ${heartbeatRuns.resultJson}->'continuousReplies',
       'queuedSteeringAcknowledgements', ${heartbeatRuns.resultJson}->'queuedSteeringAcknowledgements',
       'personStop', ${heartbeatRuns.resultJson}->'personStop')`,
   }).from(heartbeatRuns).where(and(
@@ -199,7 +201,7 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
     payload: heartbeatRunEvents.payload,
   }).from(heartbeatRunEvents).where(and(
     eq(heartbeatRunEvents.companyId, scope.companyId), inArray(heartbeatRunEvents.runId, runs.map(run => run.id)),
-    or(inArray(heartbeatRunEvents.eventType, ["turn.accepted", "turn.started", "session.started", "session.resumed", "session.reconciled", "task_history.read"]),
+    or(inArray(heartbeatRunEvents.eventType, ["turn.accepted", "turn.started", "session.started", "session.resumed", "session.reconciled", "task_history.read", "context.compacted", "provider.notice.recorded"]),
       and(eq(heartbeatRunEvents.eventType, "item.completed"),
         sql`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'kind' in ('steering_acknowledgement', 'agentMessage', 'assistant_message', 'agent_message')`)),
   )).orderBy(asc(heartbeatRunEvents.seq));
@@ -227,6 +229,22 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
   ));
   const wakesById = new Map(wakes.map(wake => [wake.id, wake]));
   const revisions = new Map(scope.messages.map(message => [message.id, message.updatedAt]));
+  const createdTimes = new Map(scope.messages.map(message => [message.id, message.createdAt]));
+  // Delivery and answering are separate facts. Only publication's explicit
+  // question attribution answers input; arbitrary progress text never does.
+  const answeredIds = new Set(runs.filter(run => sameGeneration(run)).flatMap(run =>
+    Object.values(parseObject(run.result.continuousReplies)).flatMap(reply => {
+      const ids = parseObject(reply).questionCommentIds;
+      return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : [];
+    })));
+  const compactedAfter = (after: typeof events[number]) => events.some(event => {
+    const run = runs.find(run => run.id === event.runId);
+    const payload = parseObject(parseObject(event.payload?.prpEvent).payload);
+    return run && sameGeneration(run, event.seq) &&
+      (event.eventType === "context.compacted" ||
+        event.eventType === "provider.notice.recorded" && payload.category === "pi.compaction_end") &&
+      (event.runId === after.runId ? event.seq > after.seq : event.timestamp > after.timestamp);
+  });
   // A budget cut says the board had read this revision, not which provider
   // generation read it. Require the read's own retained-generation evidence.
   const readRevisions = new Set<string>();
@@ -235,8 +253,10 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
   // A logged output is not proof that the next resume can load it. The saved
   // checkpoint must bind this run and generation and cover the source event.
   // Missing/legacy checkpoints fail open to delivery, never to silent omission.
-  const checkpointCovers = (run: typeof runs[number], event: typeof events[number]) => {
-    const saved = parseObject(run.checkpoint), identity = parseObject(saved.identity);
+  const sourceCheckpointCovers = (checkpoint: unknown, run: typeof runs[number], event: typeof events[number]) => {
+    const saved = parseObject(checkpoint), identity = parseObject(saved.identity);
+    // Runner serializes lastSourceSequence as string | null. In particular,
+    // null is not zero, and another same-generation run's save is not selected.
     const cursor = typeof saved.cursor === "string" && saved.cursor.trim() ? Number(saved.cursor) : NaN;
     return typeof saved.sessionId === "string" && saved.sessionId.trim().length > 0
       && identity.runId === run.id && identity.companyId === scope.companyId && identity.issueId === scope.issueId
@@ -244,7 +264,9 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
       && saved.providerSessionId === scope.providerSessionId && Number.isSafeInteger(cursor)
       && typeof event.sourceSeq === "number" && event.sourceSeq > 0 && cursor >= event.sourceSeq;
   };
-  const outputAfter = (run: typeof runs[number], after: typeof events[number]) =>
+  const checkpointCovers = (run: typeof runs[number], event: typeof events[number]) =>
+    run.id === scope.previousRunId && sourceCheckpointCovers(scope.selectedCheckpoint, run, event);
+  const outputAfter = (run: typeof runs[number], after: typeof events[number], historicalRead = false) =>
     (eventsByRun.get(run.id) ?? []).some(event => {
       const prp = parseObject(event.payload?.prpEvent), payload = parseObject(prp.payload);
       const afterTurn = parseObject(after.payload?.prpEvent).turnId;
@@ -253,13 +275,16 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
         && typeof payload.text === "string" && payload.text.trim().length > 0
         && prp.normalizedSessionId === scope.sessionId
         && (typeof afterTurn === "string" ? prp.turnId === afterTurn : after.eventType === "task_history.read")
-        && checkpointCovers(run, event);
+        && (historicalRead ? sourceCheckpointCovers(run.checkpoint, run, event) : checkpointCovers(run, event));
     });
   for (const run of runs) {
     const runEvents = eventsByRun.get(run.id) ?? [];
     if (!sameGeneration(run) || !runEvents.some(event =>
       ["turn.accepted", "turn.started"].includes(event.eventType) && sameGeneration(run, event.seq))) continue;
-    for (const event of runEvents) if (event.eventType === "task_history.read" && sameGeneration(run, event.seq) && outputAfter(run, event)) {
+    for (const event of runEvents) if (event.eventType === "task_history.read" && sameGeneration(run, event.seq) && outputAfter(run, event, true)) {
+      // This proves only who read the omitted revision. Omitting it still
+      // requires outputAfter on the selected carrier below, covered by the
+      // selected checkpoint, not this historical reader's save.
       for (const [id, revision] of Object.entries(parseObject(event.payload?.comments))) {
         if (typeof revision === "string") readRevisions.add(JSON.stringify([id, revision]));
       }
@@ -269,7 +294,8 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
     if (typeof id === "string" && typeof revision === "string" && revisions.get(id) === revision) {
       received.add(id); owed.delete(id);
       const prior = receipts.get(id);
-      receipts.set(id, { id, updatedAt: revision, receivedAt: prior?.receivedAt ?? event.timestamp.toISOString(),
+      if (!answered && compactedAfter(event)) { received.delete(id); owed.add(id); return; }
+      receipts.set(id, { id, updatedAt: revision, receivedAt: prior?.receivedAt ?? createdTimes.get(id) ?? event.timestamp.toISOString(),
         answered: answered || prior?.answered === true });
     }
   };
@@ -281,14 +307,14 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
       const start = runEvents.find(event => ["turn.accepted", "turn.started"].includes(event.eventType) && sameGeneration(run, event.seq));
       if (start && outputAfter(run, start)) {
         // A successor's full history is fallback data, not its delivered delta.
-        for (const message of run.messages) accept(message.id, message.updatedAt, start, true);
+        for (const message of run.messages) accept(message.id, message.updatedAt, start, answeredIds.has(message.id));
         // A reply-only successor carries receipt references, not the old text.
-        for (const receipt of run.replyReceipts ?? []) accept(receipt.id, receipt.updatedAt, start, true);
+        for (const receipt of run.replyReceipts ?? []) accept(receipt.id, receipt.updatedAt, start, answeredIds.has(receipt.id));
         const coverage = run.coverage;
         if (coverage?.nativeSessionId === scope.sessionId && coverage.providerSessionId === scope.providerSessionId && Array.isArray(coverage.omitted)) {
           for (const value of coverage.omitted) {
             const message = parseObject(value);
-            if (readRevisions.has(JSON.stringify([message.id, message.updatedAt]))) accept(message.id, message.updatedAt, start, true);
+            if (readRevisions.has(JSON.stringify([message.id, message.updatedAt]))) accept(message.id, message.updatedAt, start, answeredIds.has(String(message.id)));
           }
         }
       }
@@ -304,13 +330,13 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
             && checkpointCovers(run, event);
         });
         if (!acknowledged) continue;
-        if (typeof receipt.commentUpdatedAt === "string") accept(id, receipt.commentUpdatedAt, acknowledged, outputAfter(run, acknowledged));
+        if (typeof receipt.commentUpdatedAt === "string") accept(id, receipt.commentUpdatedAt, acknowledged, answeredIds.has(id));
         else {
           // Older ACKs stored no revision. Only the unchanged pre-queue
           // revision is provable; a later edit can never be hidden by its ACK.
           const wake = typeof receipt.queueId === "string" ? wakesById.get(receipt.queueId) : undefined;
           const revision = revisions.get(id);
-          if (wake && revision && Date.parse(revision) <= wake.createdAt.getTime()) accept(id, revision, acknowledged, outputAfter(run, acknowledged));
+          if (wake && revision && Date.parse(revision) <= wake.createdAt.getTime()) accept(id, revision, acknowledged, answeredIds.has(id));
         }
       }
     }

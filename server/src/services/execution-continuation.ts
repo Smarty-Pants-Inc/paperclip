@@ -384,7 +384,8 @@ export async function buildExecutionContinuation(input: {
   const previousRun = input.previousContextRunId
     ? (
         await db
-          .select({ context: heartbeatRuns.contextSnapshot, nativeSessionId: heartbeatRuns.nativeSessionId })
+          .select({ context: heartbeatRuns.contextSnapshot, nativeSessionId: heartbeatRuns.nativeSessionId,
+            checkpoint: sql<unknown>`${heartbeatRuns.runnerProfileJson}->'sessionCheckpoint'` })
           .from(heartbeatRuns)
           .where(
             and(
@@ -414,7 +415,7 @@ export async function buildExecutionContinuation(input: {
     && previousRun?.nativeSessionId === input.nativeSessionId
     ? await retainedSessionCommentCoverage(db, { companyId, issueId, agentId: input.agentId, runId: input.runId,
         previousRunId: input.previousContextRunId, sessionId: input.nativeSessionId,
-        providerSessionId: input.nativeProviderSessionId, messages }) : null;
+        providerSessionId: input.nativeProviderSessionId, selectedCheckpoint: previousRun.checkpoint, messages }) : null;
   const resumeDelta =
     deliveredMessages && input.previousContextRunId
       ? {

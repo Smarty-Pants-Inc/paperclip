@@ -768,7 +768,10 @@ describe.skipIf(!support.supported)("committed Agent Chat reply recovery", () =>
       expect(heldSteering.sent).toEqual(inherited ? [] : [commentId]);
       const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retryId));
       const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
-      expect(retry.contextSnapshot).not.toHaveProperty("wakeCommentIds");
+      // Fresh delivery adopts the input identity into this run; retained
+      // reconciliation does not re-deliver or manufacture a wake identity.
+      if (inherited) expect(retry.contextSnapshot).not.toHaveProperty("wakeCommentIds");
+      else expect(retry.contextSnapshot?.wakeCommentIds).toContain(commentId);
       const board = await readBoardQueuedComments({ executor: db, issue, activeRun: retry,
         actor: { actorType: "user", actorId: f.userId, agentId: null, runId: null, agentApiKeyId: null } });
       expect(board.entries.map(entry => entry.comment.id)).toEqual(mode === "same-final-first" ? [commentId] : []);

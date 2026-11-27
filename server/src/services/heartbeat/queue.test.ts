@@ -20,6 +20,13 @@ import { createDurableChatWakeupRequest } from "../durable-chat-wakeup.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { createHeartbeatRunControl } from "./run-control.js";
 import { callbacks as runControlCallbacks } from "./__tests__/run-control-fixtures.js";
+import { buildExecutionContinuation, StaleExecutionContinuationError } from "../execution-continuation.js";
+import { buildPaperclipWakePayload } from "./run-preparation.js";
+import { buildNativeExecutionInput } from "../native-runtime/native-execution-input.js";
+import { nativeRuntimeContextFixture } from "../native-runtime/runtime-context.test-fixture.js";
+import { createHeartbeatRunState } from "./run-state.js";
+import { readBoardQueuedComments, createQueuedCommentSteeringAdapter } from "../../modules/wake-queue/adapters/queued-comment-board-postgres.js";
+import { createSteerQueuedComment } from "../../modules/wake-queue/application/queued-comment-use-cases.js";
 
 import { createHeartbeatQueueTestDependencies as callbacks } from "../../__tests__/helpers/heartbeat-queue.js";
 import { DELIVERY_QUEUES, subscribeDeliveryWork } from "../delivery-work-notifications.js";
@@ -785,6 +792,97 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     }
     return { ...f, queue, comments, defer, enqueue, complete, runs, release };
   }
+
+  async function provePersonWakeIdentity(run: typeof heartbeatRuns.$inferSelect, inputId: string, interaction = false) {
+    const issueId = String(run.contextSnapshot?.issueId);
+    const snapshot = await buildExecutionContinuation({ db, companyId: run.companyId, issueId, agentId: run.agentId,
+      context: run.contextSnapshot ?? {}, summary: null, exposeLowTrustRaw: false });
+    snapshot.resumeDelta = { baseRunId: "prior-run", messages: [], receivedComments: snapshot.messages.map(message => ({
+      id: message.id, updatedAt: message.updatedAt, receivedAt: message.createdAt, answered: true })) };
+    const wakePayload = await buildPaperclipWakePayload({ db, companyId: run.companyId, agentId: run.agentId, retainFullCommentBodies: true,
+      contextSnapshot: { ...run.contextSnapshot, executionContinuation: snapshot } });
+    const issue = { id: issueId, identifier: null, title: "Person input", description: null, workMode: "standard" };
+    let observed: StaleExecutionContinuationError | undefined;
+    let prepared: ReturnType<typeof buildNativeExecutionInput> | undefined;
+    try {
+      prepared = buildNativeExecutionInput({ companyId: run.companyId, runId: run.id, agentId: run.agentId,
+        provider: "pi_rpc", sessionContinuity: "continuous", normalizedSessionId: "retained-session", resumedSession: true,
+        previousTurn: { runId: "prior-run", task: issue }, issue, taskPrompt: "Continue", wakePayload,
+        workspace: { id: "workspace", cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null }, runtimeContext: nativeRuntimeContextFixture(),
+        completionContract: { id: "contract", sha256: "a".repeat(64), schemaVersion: "paperclip.run-result.v1", contract: { revision: "1", objective: "Continue", criteria: [{ id: "output", requirement: "Continue" }] } } });
+    } catch (error) { if (!(error instanceof StaleExecutionContinuationError)) throw error; observed = error; }
+    if (interaction) {
+      // Answered interactions are independent humanResponses, not an empty
+      // comment wake. They must start a turn, never a nothing-new settlement.
+      expect(run.contextSnapshot?.interactionId).toBe(inputId);
+      expect(observed).toBeUndefined();
+      expect(JSON.stringify(prepared)).toContain(inputId);
+    } else {
+      expect(run.contextSnapshot).toMatchObject({ wakeCommentId: inputId, wakeCommentIds: expect.arrayContaining([inputId]) });
+      expect(observed?.code).toBe("continuation_nothing_new");
+      expect(observed?.continuationNothingNew?.namedCommentIds).toContain(inputId);
+      const deps = runControlCallbacks(db);
+      await createHeartbeatRunControl(db, deps).cancelRunInternal(run.id, observed!.code, {
+        errorCode: observed!.code, resultJson: { continuationNothingNew: observed!.continuationNothingNew },
+      });
+      const page = await createHeartbeatRunState(db).getRun(run.id);
+      expect(page?.resultJson?.continuationNothingNew).toMatchObject({ namedCommentIds: expect.arrayContaining([inputId]) });
+    }
+    console.log("PERSON_WAKE_ID_ROW", JSON.stringify({ runId: run.id, inputId, interaction, context: run.contextSnapshot,
+      nothingNew: observed?.continuationNothingNew ?? null, workRetained: !!prepared }));
+  }
+
+  it("keeps queued-comment release-drain input IDs on the admitted run and its nothing-new page receipt", async () => {
+    const f = await fifoFixture(["First input", "Queued person input"]);
+    const first = await f.enqueue(0);
+    expect(first).not.toBeNull();
+    await f.defer(1);
+    await f.complete(first!);
+    const runs = await f.runs();
+    expect(runs).toHaveLength(2);
+    await provePersonWakeIdentity(runs[1], f.comments[1].id);
+  });
+
+  it("keeps manually steered person input IDs on the adopting run and its nothing-new page receipt", async () => {
+    const f = await waitingConversationFixture();
+    const [recipient] = await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } })
+      .where(eq(agents.id, f.agent.id)).returning();
+    f.deps.getAgent.mockResolvedValue(recipient);
+    const [issue] = await db.update(issues).set({ conversationAgentId: null, conversationUserId: null, conversationState: null, status: "in_progress" }).where(eq(issues.id, f.issue.id)).returning();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: recipient.id, nativeIssueId: issue.id,
+      status: "running", runtimeMode: "native", contextSnapshot: { issueId: issue.id, wakeReason: "issue_commented" } }).returning();
+    await db.update(issues).set({ executionRunId: run.id }).where(eq(issues.id, issue.id));
+    const [comment] = await db.insert(issueComments).values({ companyId: f.company.id, issueId: issue.id, authorType: "user", authorUserId: f.user.id, body: "Please steer this input" }).returning();
+    automaticSteering.available = true; automaticSteering.closing = false; automaticSteering.sent = [];
+    try {
+      await f.queue.enqueueWakeup(recipient.id, { source: "on_demand", triggerDetail: "manual", reason: "issue_commented",
+        requestedByActorType: "user", requestedByActorId: f.user.id, payload: { issueId: issue.id, commentId: comment.id } });
+      const actor = { actorType: "user" as const, actorId: f.user.id, userId: f.user.id, agentId: null, runId: null, agentApiKeyId: null };
+      const board = await readBoardQueuedComments({ executor: db, issue, activeRun: run, actor });
+      expect(board.queueId).toBeTruthy();
+      await createSteerQueuedComment(createQueuedCommentSteeringAdapter(db))({ issue, actor, queueId: board.queueId!, revision: board.revision, targetRunId: run.id, commentId: comment.id });
+      const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+      expect(automaticSteering.sent).toContain(comment.id);
+      // The native transport is a fixture. Move only this fixture to queued so
+      // page settlement uses the stock pre-dispatch cancellation, not a provider.
+      await db.update(heartbeatRuns).set({ status: "queued", runtimeMode: "legacy" }).where(eq(heartbeatRuns.id, run.id));
+      await provePersonWakeIdentity({ ...saved, status: "queued", runtimeMode: "legacy" }, comment.id);
+    } finally { automaticSteering.available = false; automaticSteering.closing = false; }
+  });
+
+  it("keeps an interaction answer ID on the admitted run and never calls that work nothing-new", async () => {
+    const f = await waitingConversationFixture();
+    const [interaction] = await db.insert(issueThreadInteractions).values({ companyId: f.company.id, issueId: f.issue.id,
+      createdByAgentId: f.agent.id, kind: "ask_user_questions", status: "answered", resolvedByUserId: f.user.id, resolvedAt: new Date(),
+      payload: { version: 1, questions: [{ id: "q", prompt: "Continue?", selectionMode: "single", options: [{ id: "a", label: "Continue" }] }] },
+      result: { version: 1, answers: [{ questionId: "q", optionIds: ["a"] }] } }).returning();
+    const admitted = await f.queue.enqueueWakeup(f.agent.id, { source: "automation", triggerDetail: "system", reason: "issue_commented",
+      requestedByActorType: "system", payload: { issueId: f.issue.id, mutation: "interaction", interactionId: interaction.id },
+      contextSnapshot: { issueId: f.issue.id, source: "issue.interaction.respond", interactionId: interaction.id, interactionKind: interaction.kind, interactionStatus: interaction.status } });
+    expect(admitted).not.toBeNull();
+    const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, admitted!.id));
+    await provePersonWakeIdentity(saved, interaction.id, true);
+  });
 
   it("FIFO admission: deferred /new precedes a question five seconds later and resets before its new-session answer", async () => {
     const f = await fifoFixture(["/new", "What session is this?"]);
