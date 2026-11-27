@@ -284,7 +284,7 @@ export {
   type EnvironmentDriverCapabilitySupport,
 } from "./environment-driver-traits.js";
 import { ENVIRONMENT_DRIVER_CAPABILITY_SUPPORT } from "./environment-driver-traits.js";
-import { warmSandboxWindowMetadata } from "./warm-sandbox-expiry.js";
+import { stopTerminalNativeTaskWarmSandboxes, warmSandboxWindowMetadata } from "./warm-sandbox-expiry.js";
 
 /**
  * The one general capability classifier. It resolves each of the eight effective
@@ -4384,6 +4384,11 @@ export function environmentRuntimeService(
               unstartedStop ? "released" : "retained",
               { cleanupStatus: "success" },
             );
+            if (lease?.status === "retained" && lease.issueId) {
+              await stopTerminalNativeTaskWarmSandboxes(db, {
+                companyId: lease.companyId, issueId: lease.issueId, runId: heartbeatRunId,
+              });
+            }
             if (lease) {
               released.push({
                 environment,

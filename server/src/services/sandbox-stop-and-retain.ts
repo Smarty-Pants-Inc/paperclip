@@ -175,10 +175,11 @@ function stopOnlyAttempt(lease: Lease, attemptId: string) {
 /** A warm sandbox kept running for reuse whose task moved to another workspace:
  * stop it through the stop-only contract so the provider confirms the stop
  * before anything destroys it. The ownership settle verifies the move. */
-export async function prepareSupersededWarmSandboxStop(db: Db, lease: typeof environmentLeases.$inferSelect, recovery: Record<string, unknown>) {
+export async function prepareSupersededWarmSandboxStop(db: Db, lease: typeof environmentLeases.$inferSelect,
+  recovery: Record<string, unknown>, guard?: SQL) {
   if (lease.status !== "retained" || lease.leasePolicy !== "reuse_by_environment" || !lease.heartbeatRunId
     || !lease.providerLeaseId || lease.metadata?.pendingCleanupInFlight === true) return null;
-  return prepareStopAndRetain(db, lease, "retained", recovery);
+  return prepareStopAndRetain(db, lease, "retained", recovery, undefined, guard);
 }
 
 /** An ended run still owes unsaved files from this sandbox, and no stop-and-retain
@@ -195,7 +196,7 @@ export async function prepareUnconfirmedSourceSandboxStop(db: Db, lease: typeof 
 }
 
 async function prepareStopAndRetain(db: Db, lease: Lease, fromStatus: string, recovery: Record<string, unknown> = {},
-  retention?: { leasePolicy: string; metadata: Record<string, unknown> }) {
+  retention?: { leasePolicy: string; metadata: Record<string, unknown> }, guard?: SQL) {
   const requestId = randomUUID(), now = new Date();
   const intent = { schema: "paperclip.sandbox-stop-and-retain.v1", requestId,
     companyId: lease.companyId, runId: lease.heartbeatRunId, leaseId: lease.id,
@@ -213,7 +214,7 @@ async function prepareStopAndRetain(db: Db, lease: Lease, fromStatus: string, re
       pendingCleanupRetryAfterMs: 0, pendingCleanupRetryAttempts: 0, pendingCleanupRetryCapWarned: false,
       ...retention?.metadata,
     })}::jsonb`,
-  }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, lease.companyId),
+  }).where(and(guard, eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, lease.companyId),
     eq(environmentLeases.heartbeatRunId, lease.heartbeatRunId!), eq(environmentLeases.status, fromStatus),
     sql`${environmentLeases.provider} is not distinct from ${lease.provider}`,
     sql`${environmentLeases.providerLeaseId} is not distinct from ${lease.providerLeaseId}`,
