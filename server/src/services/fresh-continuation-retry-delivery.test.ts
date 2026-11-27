@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
-  activityLog, agentWakeupRequests, agents, authUsers, companies, createDb, heartbeatRuns, issueRecoveryActions, issues,
+  activityLog, agentWakeupRequests, agents, authUsers, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issues,
   nativeRunFinalizations,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
@@ -119,6 +119,26 @@ suite("a person's Retry while a continuation waits for delivery", () => {
     expect((await record(f.actionId)).evidence).toMatchObject({ continuationDelivery: "delivered", continuationRunId: run.id });
     return run;
   }
+
+  it.each([false, true])("fence11: a person's Retry of held_box_lost explicitly starts fresh and keeps earlier messages (chat=%s)", async chat => {
+    const issueId = randomUUID(), runId = randomUUID(), sessionId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Keep the visible conversation", status: "blocked", assigneeAgentId: agentId,
+      ...(chat ? { originKind: "chat_channel" } : {}) });
+    const [message] = await db.insert(issueComments).values({ companyId, issueId, body: "The earlier message stays.",
+      authorUserId: userId }).returning();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, issueId, nativeIssueId: issueId,
+      nativeSessionId: sessionId, runtimeMode: "native", status: "failed", nativePhase: "terminal_failure",
+      errorCode: "held_box_lost", error: "The sandbox holding this task's conversation is gone and no backup could be restored.",
+      responsibleUserId: userId, finishedAt: new Date(), contextSnapshot: { issueId } });
+    await db.insert(nativeRunFinalizations).values({ companyId, issueId, runId, phase: "terminal_failure", failureCode: "held_box_lost" });
+    await occupySlot();
+    const requestId = await pressRetry({ issueId, runId });
+    const receipt = await wake(requestId);
+    expect(receipt.runId).toBeTruthy();
+    const [next] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, receipt.runId!));
+    expect(next.contextSnapshot).toMatchObject({ explicitFreshSession: true, wakeReason: "task_retry" });
+    expect((await db.select().from(issueComments).where(eq(issueComments.id, message.id)))[0]?.body).toBe("The earlier message stays.");
+  }, 60_000);
 
   it.each(KINDS)("runs a Retry pressed before delivery as the recorded continuation itself, ranked as person work (%s)", async kind => {
     const f = await pendingContinuation(kind);

@@ -12,19 +12,7 @@ import { terminalRunLeaseReleaseReadiness } from "./environment-lease-release-de
 import { adapterExecutionControls } from "./adapter-execution-control.js";
 import { runningProcesses } from "../adapters/index.js";
 
-export const REPLACEMENT_DEFERRED_CONVERSATION = "replacement_deferred_unexported_conversation";
-
-/** A named, non-destructive operator state, not an unbounded raw retry error. */
-export class ReusableConversationHeldError extends Error {
-  readonly code = REPLACEMENT_DEFERRED_CONVERSATION;
-  readonly retryable = false;
-  constructor() {
-    super(`${REPLACEMENT_DEFERRED_CONVERSATION}: A Pi conversation still holds the source sandbox. `
-      + "Continue with its original configuration, or ask an operator to complete a preservation handoff before replacing it. "
-      + "Reset the task only if you intend to start a new conversation; a saved backup alone does not authorize release.");
-    this.name = "ReusableConversationHeldError";
-  }
-}
+export { REPLACEMENT_DEFERRED_CONVERSATION, ReusableConversationHeldError } from "./held-conversation-state.js";
 const record = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 

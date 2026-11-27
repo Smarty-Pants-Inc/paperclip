@@ -17,6 +17,8 @@ import { nativePostResultFailureCategory, type NativePostResultFailureCategory }
 import { logger } from "../../middleware/logger.js";
 import { canRestoreMigratedNativeSession } from "./native-workspace-migration.js";
 import { NATIVE_PROVIDER_DURABLE_EVENT_TYPES, nativeHarnessBackupManifestSha256, readNativeProviderEventCursors, retiredSourceAuthorizesNativeBackupRestore } from "./native-retired-backup-source.js";
+import { HELD_BOX_LOST, REPLACEMENT_DEFERRED_CONVERSATION, HeldBoxLostError, heldConversationFailureCode, type HeldConversationFailureCode } from "../held-conversation-state.js";
+import { findLostNativeConversationSource, settleLostNativeConversation } from "./lost-native-conversation.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_COMPLETED_TURN_CLEANUP_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED,
   nativeCheckpointRecordsCompletedTurn } from "./completed-turn-cleanup.js";
 import { prepareCursorCloudRuntime } from "./cursor-cloud-runtime.js";
@@ -7973,7 +7975,8 @@ export async function restoreRemoteSuspendedRunnerCheckpoint(input: {
   if (target?.kind !== "remote" || target.transport !== "sandbox" || target.sandboxLeaseAcquisition?.outcome !== "resumed"
     || !durableIdentityMatchesSession(prior, input.execution) || prior.runId === input.execution.binding.runId
     || runnerdAuthorityLifecycle(root, prior) !== "absent") return;
-  let state: Record<string, unknown>;
+  let state: Record<string, unknown> | null = null;
+  let restoredLostSource = false;
   // A Runner left in an abandoned allocation is never adopted live: the new
   // execution restored the last save into its own root of the same sandbox.
   let movedAllocation = false;
@@ -7987,11 +7990,39 @@ export async function restoreRemoteSuspendedRunnerCheckpoint(input: {
     if (!target.runner) throw new Error("native_controller_recovery_dependency_unavailable:runner_state_reader");
     // The retained Runner wrote under its own lease's directory, which differs
     // from this target when the workspace moved within the same sandbox.
-    const retained = await assertNativeRetainedSandboxBinding(input.db, { ...input.execution.binding, runId: prior.runId, target });
-    movedAllocation = retained.remoteCwd !== target.remoteCwd;
-    state = await readRemoteRunnerState({ runner: target.runner,
-      stateDirectory: remoteRunnerStateDirectory(retained.remoteCwd, nativeSessionKey(input.execution)) });
+    let retained: Awaited<ReturnType<typeof assertNativeRetainedSandboxBinding>> | null = null;
+    try {
+      retained = await assertNativeRetainedSandboxBinding(input.db, { ...input.execution.binding, runId: prior.runId, target });
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== "native_controller_recovery_missing_evidence:retained_sandbox_binding") throw error;
+      const candidates = compatibleNativeHarnessBackupManifests({ root, execution: input.execution, runnerInstanceId: prior.runnerInstanceId });
+      const source = await findLostNativeConversationSource(input.db, { companyId: input.execution.binding.companyId,
+        currentRunId: input.execution.binding.runId, normalizedSessionId: nativeSessionKey(input.execution),
+        sourceProviderLeaseId: candidates[0]?.manifest.sourceProviderLeaseId }) ?? (candidates.length
+          ? await findLostNativeConversationSource(input.db, { companyId: input.execution.binding.companyId,
+            currentRunId: input.execution.binding.runId, normalizedSessionId: nativeSessionKey(input.execution) }) : null);
+      if (!source) throw error; // Missing binding alone is still not permission to start fresh.
+      const stamp = await settleLostNativeConversation(input.db, { source, currentRunId: input.execution.binding.runId,
+        normalizedSessionId: nativeSessionKey(input.execution), runnerInstanceId: prior.runnerInstanceId,
+        targetProviderLeaseId: target.sandboxLeaseAcquisition?.providerLeaseId });
+      const backup = await verifyNativeHarnessBackupStreamed({ root, execution: input.execution, runnerInstanceId: prior.runnerInstanceId,
+        manifestSha256: stamp.manifestSha256 });
+      if (!backup || nativeHarnessBackupCursorConflict({ backupRoot: backup.root, stateRoot: root })) throw new HeldBoxLostError({ cause: error });
+      // The old box is gone. Read only its verified local save, never this new
+      // empty target as though it were the retained source. Provider preparation
+      // restores these same bytes and checks the same provider identity below.
+      state = JSON.parse(readBoundedNativeFile(resolve(backup.root, "runner", "runner-state.json"),
+        NATIVE_RUNNER_STATE_MAX_BYTES, "runner_durable_state_too_large").toString("utf8")) as Record<string, unknown>;
+      movedAllocation = true;
+      restoredLostSource = true;
+    }
+    if (retained) {
+      movedAllocation = retained.remoteCwd !== target.remoteCwd;
+      state = await readRemoteRunnerState({ runner: target.runner,
+        stateDirectory: remoteRunnerStateDirectory(retained.remoteCwd, nativeSessionKey(input.execution)) });
+    }
   }
+  if (!state) throw new Error("native_controller_recovery_missing_evidence:runner_not_settled");
   await reconcileControllerJournalWithRunner({ ...controllerProjectionInput(input, { runId: prior.runId, issueId: input.execution.binding.issueId }), runnerState: state });
   // A running warm source keeps the existing live-adoption identity, idle,
   // controller-fencing and physical-process checks. Only suspension is cached.
@@ -7999,7 +8030,7 @@ export async function restoreRemoteSuspendedRunnerCheckpoint(input: {
   if (state.lifecycle !== "suspended" || !Array.isArray(state.outbox) || state.outbox.length !== 0
     || (state.pendingTerminalDelivery != null && !isUndeliveredSuspendReceipt(state, root))
     || state.pendingProviderCleanup != null || state.warmTransition != null) {
-    throw new Error("native_controller_recovery_missing_evidence:runner_not_settled");
+    throw restoredLostSource ? new HeldBoxLostError() : new Error("native_controller_recovery_missing_evidence:runner_not_settled");
   }
   savePluginRunnerCheckpoint(root, state, prior);
 }
@@ -8807,11 +8838,13 @@ export async function verifyNativeHarnessBackupStreamed(input: {
   root: string;
   execution: NativeExecutionInput;
   runnerInstanceId: string;
+  manifestSha256?: string;
 }): Promise<VerifiedHarnessBackup | null> {
   for (const {
     root: candidateRoot,
     manifest,
   } of compatibleNativeHarnessBackupManifests(input)) {
+    if (input.manifestSha256 && nativeHarnessBackupManifestSha256(readFileSync(resolve(candidateRoot, "manifest.json"))) !== input.manifestSha256) continue;
     let bytes = 0;
     let valid = true;
     for (const declared of manifest.directories) {
@@ -9259,6 +9292,8 @@ export function nativeSessionFailureDisposition(
   const permanentFailure =
     // A same-run retry would meet the same unretired owner on the same sandbox;
     // the next run starts on a fresh one instead.
+    sourceFailureCode === HELD_BOX_LOST ||
+    sourceFailureCode === REPLACEMENT_DEFERRED_CONVERSATION ||
     sourceFailureCode === NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE ||
     sourceFailureCode === "runner_task_admission_rejected" ||
     sourceFailureCode === "runner_ingress_access_rejected" ||
@@ -9513,7 +9548,10 @@ function classifyNativeSessionFailure(
   | "local_runtime_api_listener_unavailable"
   | typeof NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE
   | typeof NATIVE_FAILED_BEFORE_PROVIDER_TURN_CODE
-  | "native_session_interrupted" {
+  | "native_session_interrupted"
+  | HeldConversationFailureCode {
+  const heldCode = heldConversationFailureCode(error);
+  if (heldCode) return heldCode;
   if (error instanceof NativeTurnPromptExceedsCommandBoundError) return error.code;
   if (error instanceof Error && error.message.startsWith(`${NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND}:`)) return NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND;
   if (findNativePredecessorRetirementUnproven(error)) return NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE;
@@ -18599,7 +18637,7 @@ async function createRunnerdBackendWithinSessionClaim(
       }) : "";
       throw new Error(`runner_harness_state_mismatch: provider_identity_incomplete (${durableProviderCheckpointFailureReason(input.execution, providerState)}${restartRefusal})`);
     }
-    const previousManifest = compatibleNativeHarnessBackupManifests({
+    const previousManifest = retiredSourceBackup?.manifest ?? compatibleNativeHarnessBackupManifests({
       root,
       execution: input.execution,
       runnerInstanceId: input.runnerInstanceId,
@@ -18754,9 +18792,30 @@ async function createRunnerdBackendWithinSessionClaim(
   // hashed once.
   let retiredSourceBackup: VerifiedHarnessBackup | null = null;
   const retiredSourceBackupAuthorized = async (): Promise<boolean> => {
-    const backup = await verifyNativeHarnessBackupStreamed({ root, execution: input.execution, runnerInstanceId: input.runnerInstanceId });
+    let backup = await verifyNativeHarnessBackupStreamed({ root, execution: input.execution, runnerInstanceId: input.runnerInstanceId });
     const sessionId = nativeSessionKey(input.execution);
-    if (!backup || !sessionId) return false;
+    if (!sessionId) return false;
+    const candidate = backup ?? compatibleNativeHarnessBackupManifests({ root, execution: input.execution,
+      runnerInstanceId: input.runnerInstanceId })[0];
+    const lostSource = await findLostNativeConversationSource(input.db, { companyId: input.execution.binding.companyId,
+      normalizedSessionId: sessionId, currentRunId: input.execution.binding.runId,
+      sourceProviderLeaseId: candidate?.manifest.sourceProviderLeaseId }) ?? (candidate
+        ? await findLostNativeConversationSource(input.db, { companyId: input.execution.binding.companyId,
+          normalizedSessionId: sessionId, currentRunId: input.execution.binding.runId }) : null);
+    if (lostSource) {
+      const stamp = await settleLostNativeConversation(input.db, { source: lostSource, currentRunId: input.execution.binding.runId,
+        normalizedSessionId: sessionId, runnerInstanceId: input.runnerInstanceId,
+        targetProviderLeaseId: sandboxLeaseAcquisition?.providerLeaseId });
+      // A newer local current directory can be an uncommitted save. Restore
+      // exactly the source's committed manifest, including a verified previous.
+      if (!backup || nativeHarnessBackupManifestSha256(readFileSync(resolve(backup.root, "manifest.json"))) !== stamp.manifestSha256)
+        backup = await verifyNativeHarnessBackupStreamed({ root, execution: input.execution,
+          runnerInstanceId: input.runnerInstanceId, manifestSha256: stamp.manifestSha256 });
+      if (!backup) throw new HeldBoxLostError();
+      retiredSourceBackup = backup;
+      return true;
+    }
+    if (!backup) return false;
     retiredSourceBackup = backup;
     return retiredSourceAuthorizesNativeBackupRestore(input.db, {
       companyId: input.execution.binding.companyId, currentRunId: input.execution.binding.runId,
@@ -18770,6 +18829,9 @@ async function createRunnerdBackendWithinSessionClaim(
     if (!remoteTarget || !remoteCommandRunner) {
       throw new Error("runner_harness_backup_unavailable");
     }
+    // A lost-source replacement must select the same committed source proof
+    // as a created/resumed target, not whichever local manifest is first.
+    if (!retiredSourceBackup && sandboxLeaseAcquisition?.outcome === "replacement") await retiredSourceBackupAuthorized();
     const backup = retiredSourceBackup ?? await verifyNativeHarnessBackupStreamed({
       root,
       execution: input.execution,
@@ -18861,6 +18923,19 @@ async function createRunnerdBackendWithinSessionClaim(
                     (candidate) =>
                       existsSync(resolve(candidate, "manifest.json")),
                   );
+                  // A missing local save never makes a known lost session a
+                  // new provider conversation. This also closes a save-vanished
+                  // race between acquisition's byte check and preparation.
+                  if (!backupAvailable && ["created", "replacement"].includes(sandboxLeaseAcquisition?.outcome ?? "")) {
+                    const source = await findLostNativeConversationSource(input.db, { companyId: input.execution.binding.companyId,
+                      currentRunId: input.execution.binding.runId, normalizedSessionId: nativeSessionKey(input.execution) });
+                    if (source) {
+                      await settleLostNativeConversation(input.db, { source, currentRunId: input.execution.binding.runId,
+                        normalizedSessionId: nativeSessionKey(input.execution), runnerInstanceId: input.runnerInstanceId,
+                        targetProviderLeaseId: sandboxLeaseAcquisition?.providerLeaseId });
+                      throw new HeldBoxLostError(); // no compatible save exists at this execution's root
+                    }
+                  }
                   // Workspace replacement is independent of provider-session
                   // continuity. Decide the source before recording acquisition.
                   const freshReplacement =

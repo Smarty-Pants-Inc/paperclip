@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { nativeProviderRecoveryEvidence, nativeSessionFailureSourceCode, restoreRemoteSuspendedRunnerCheckpoint,
+import { buildNativeHarnessBackupManifest, resolveNativeHarnessPersistenceProfile, nativeProviderRecoveryEvidence, nativeSessionFailureSourceCode, restoreRemoteSuspendedRunnerCheckpoint,
   verifyRemoteRunnerReattachment } from "./native-session-executor.js";
 import { readRemoteRunnerRecoveryError } from "./remote-runner-recovery-diagnostics.js";
 import { RunnerIngressConnectionError } from "../../realtime/runner-prp-outbound.js";
@@ -9,7 +9,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq, sql } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, onTestFinished, vi } from "vitest";
 import { agentTaskSessions, agents, companies, controllerInstances, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, nativeRunResults, nativeRunnerCheckpoints } from "@paperclipai/db";
 import { DurablePrpControlPlane, parseNativeExecutionInput, type NativeExecutionInput, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
 import { startRecoveryPostgres, recoveryPostgresSupport } from "../../__tests__/helpers/recovery-postgres.js";
@@ -30,6 +30,7 @@ import { registerControllerInstanceDb, resetControllerInstanceLeaseForTests } fr
 import { readProcessStartedAt } from "../hot-restart.js";
 import { PROCESS_START_REQUESTED } from "../native-process-start-events.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
+import { createNativeHarnessBackupStamp } from "./native-harness-backup-stamp.js";
 
 describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable discovery and import", () => {
   let database: Awaited<ReturnType<typeof startRecoveryPostgres>>;
@@ -1409,6 +1410,68 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
     }
     await expect(readSandbox({ sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: randomUUID() } }))
       .rejects.toThrow("retained_sandbox_binding");
+  });
+
+  it.each([true, false])("fence11: recovery of a cleanup-expired source uses the verified backup or one held_box_lost state (valid=%s)", async valid => {
+    const fixture = await seed(), environmentId = randomUUID(), sourceLeaseId = fixture.native.environmentLeaseId, runId = randomUUID();
+    const providerLeaseId = randomUUID(), targetProviderLeaseId = randomUUID();
+    await db.insert(environments).values({ id: environmentId, name: `Lost ${environmentId}`, driver: "sandbox" });
+    const execution = parseNativeExecutionInput({
+      schema: "paperclip.native-execution-input.v1", provider: { kind: "codex", model: null },
+      binding: { companyId, agentId, issueId: fixture.scope.issueId, runId, executionWorkspaceId: randomUUID() },
+      task: { identifier: "NCD-1", title: "Continue the same conversation", description: null, prompt: "Continue.", workMode: "standard" },
+      workspace: { cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
+      session: { normalizedSessionId: fixture.scope.normalizedSessionId, driverKind: "codex_app_server", protocolVersion: 1,
+        lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 } },
+      completionContract: { id: randomUUID(), sha256: "fixture", schemaVersion: "paperclip.completion-contract.v1",
+        contract: { revision: "1", objective: "Continue the saved work", criteria: [{ id: "objective", requirement: "Save the result" }] } },
+      credentialBindings: [], interactionResponses: [],
+    });
+    const identity = { runId: fixture.scope.runId, normalizedSessionId: fixture.scope.normalizedSessionId,
+      runnerInstanceId: fixture.native.runnerInstanceId, environmentLeaseId: fixture.native.environmentLeaseId,
+      turnId: fixture.native.turnId, itemId: fixture.native.itemId };
+    const scopeId = `${companyId}:${fixture.scope.issueId}:${fixture.scope.normalizedSessionId}`;
+    const previousState = process.env.PAPERCLIP_RUNNER_STATE_DIR;
+    process.env.PAPERCLIP_RUNNER_STATE_DIR = root;
+    onTestFinished(() => {
+      if (previousState === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
+      else process.env.PAPERCLIP_RUNNER_STATE_DIR = previousState;
+    });
+    const controller = join(root, createHash("sha256").update(scopeId).digest("hex")), backupRoot = join(controller, "failover-backups/current");
+    await mkdir(join(controller, "control-plane"), { recursive: true });
+    await writeFile(join(controller, "control-plane/control-plane-state.json"), JSON.stringify({
+      schema: "paperclip.runner.durable.control-plane-state.v2", identity }));
+    for (const directory of resolveNativeHarnessPersistenceProfile(execution).directories)
+      await mkdir(join(backupRoot, directory.name), { recursive: true });
+    await writeFile(join(backupRoot, "runner/runner-state.json"), JSON.stringify({ schema: "paperclip.runner.durable.state.v1",
+      ...identity, lifecycle: "suspended", outbox: [], pendingTerminalDelivery: null, pendingProviderCleanup: null, warmTransition: null }));
+    await writeFile(join(backupRoot, "runner/codex-provider-state.json"), JSON.stringify({
+      schema: "paperclip.runner.codex-provider-state.v1", lifecycle: "prepared", threadId: "same-provider-thread",
+      providerSessionId: null, activeProviderTurnId: null, config: { provider: "codex", driver: "codex_app_server" } }));
+    await writeFile(join(backupRoot, "manifest.json"), JSON.stringify(buildNativeHarnessBackupManifest({ backupRoot, execution,
+      runnerInstanceId: fixture.native.runnerInstanceId, sourceProviderLeaseId: providerLeaseId,
+      providerSessionIdentity: { providerSessionId: "same-provider-thread", providerBackendSessionId: null, providerSessionIdentity: null } })));
+    // Exact, hash-bound backup bytes under the same private scope the verifier reads.
+    const stamp = createNativeHarnessBackupStamp({ manifestPath: join(backupRoot, "manifest.json"),
+      sessionScopeId: `${companyId}:${fixture.scope.issueId}:${fixture.scope.normalizedSessionId}`,
+      authorizedProviderLeaseId: providerLeaseId, normalizedSessionId: fixture.scope.normalizedSessionId,
+      runnerInstanceId: fixture.native.runnerInstanceId, completedAt: JSON.parse(await readFile(join(backupRoot, "manifest.json"), "utf8")).completedAt });
+    await db.insert(environmentLeases).values({ id: sourceLeaseId, companyId, environmentId, issueId: fixture.scope.issueId,
+      heartbeatRunId: fixture.scope.runId, provider: "daytona", providerLeaseId, status: "expired", cleanupStatus: "success",
+      leasePolicy: "reuse_by_environment", failureReason: "pending_cleanup_retry", metadata: { nativeHarnessBackup: {
+        ...stamp, ...(valid ? {} : { manifestSha256: `sha256:${"c".repeat(64)}` }) } } });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: fixture.scope.issueId,
+      nativeSessionId: fixture.scope.normalizedSessionId, status: "running", runtimeMode: "native" });
+    const execute = vi.fn(async () => { throw new Error("The empty replacement must not be read as the retained source"); });
+    const target = { kind: "remote", transport: "sandbox", environmentId, leaseId: randomUUID(), providerKey: "daytona",
+      remoteCwd: "/workspace", reusableLeaseConfigured: true, sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: targetProviderLeaseId }, runner: { execute } };
+    const restore = () => restoreRemoteSuspendedRunnerCheckpoint({ db, execution, runnerExecutionTarget: target as never }, controller);
+    if (valid) {
+      await expect(restore()).resolves.toBeUndefined();
+      expect(JSON.parse(await readFile(join(controller, "plugin-runner-state.json"), "utf8")))
+        .toMatchObject({ normalizedSessionId: fixture.scope.normalizedSessionId, lifecycle: "suspended" });
+    } else await expect(restore()).rejects.toMatchObject({ code: "held_box_lost", retryable: false });
+    expect(execute).not.toHaveBeenCalled();
   });
 
   // The same move, driven through the changed read with sandbox confinement:

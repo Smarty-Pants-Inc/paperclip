@@ -1,4 +1,5 @@
 import { isNativeInputSizeRefusal, nativeInputRefusalEvidence } from "../native-input-refusal.js";
+import { HELD_BOX_LOST, HELD_BOX_LOST_MESSAGE, REUSABLE_CONVERSATION_HELD_MESSAGE, heldConversationFailureCode } from "../held-conversation-state.js";
 import { NativeTurnPromptExceedsCommandBoundError, nativePromptCauseFromError } from "../native-runtime/native-turn-budget.js";
 import { PI_MODEL_PROVIDER_REQUIRED } from "../../adapters/pi-model-selection.js";
 import { ensurePiModelSelectionFailureNotice } from "../pi-model-selection-failure.js";
@@ -1363,7 +1364,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     const remoteWorkspacePreparationTimeout = !legacyAdapterEntered && run.runtimeMode === "legacy"
       && run.nativeSessionId === null && run.runnerInstanceId === null && err instanceof RemoteWorkspacePreparationTimeoutError
       ? err : null;
+    const heldConversationCode = heldConversationFailureCode(err);
     const failureErrorCode =
+      heldConversationCode ??
       (err instanceof NativeTurnPromptExceedsCommandBoundError ? err.code : null) ??
       workspaceValidationFailure?.code ??
       configurationIncompleteFailure?.code ??
@@ -1376,7 +1379,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     // Only a `storage_unavailable` run gets a storage wait. Under any other code
     // (for example a native recovery hold that keeps the files without
     // replaying an unfinished turn) nothing retries it, so offer Retry instead.
-    const message = interruptedExactResume
+    const message = heldConversationCode
+      ? heldConversationCode === HELD_BOX_LOST ? HELD_BOX_LOST_MESSAGE : REUSABLE_CONVERSATION_HELD_MESSAGE
+      : interruptedExactResume
       ? describeRefusedExactResume(interruptedExactResume, thrownMessage)
       : !storageUnavailable ? thrownMessage
         : failureErrorCode === STORAGE_UNAVAILABLE_CODE ? storageUnavailableMessage(err) : storageUnavailableHeldMessage(err);
@@ -1649,11 +1654,14 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     const providerFailure = providerFailureFromError(outerErr);
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
     const storageUnavailable = isStorageUnavailableError(outerErr);
+    const heldConversationCode = heldConversationFailureCode(outerErr);
     // Bounded code from the error or its first three causes; never message text.
     const thrownFailureCause = failureCauseFromError(outerErr, providerFailure);
     // A lost controller lease takes the code below and its own retry, so only a
     // `storage_unavailable` failure carries the storage wait's text.
-    const message = storageUnavailable && !controllerLeaseLost ? storageUnavailableMessage(outerErr) : withoutSqlStatementText(redactCurrentUserText(
+    const message = heldConversationCode
+      ? heldConversationCode === HELD_BOX_LOST ? HELD_BOX_LOST_MESSAGE : REUSABLE_CONVERSATION_HELD_MESSAGE
+      : storageUnavailable && !controllerLeaseLost ? storageUnavailableMessage(outerErr) : withoutSqlStatementText(redactCurrentUserText(
       identityRedactor.redact(outerErr instanceof Error
         ? outerErr.message
         : "Unknown setup failure"),
@@ -1730,6 +1738,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     const setupFailureErrorCode =
       (outerErr instanceof NativeTurnPromptExceedsCommandBoundError ? outerErr.code : null) ??
       (controllerLeaseLost && !ownedAiSelectionRejection ? CONTROLLER_LEASE_LOST_FAILURE_CODE : null) ??
+      heldConversationCode ??
       (storageUnavailable ? STORAGE_UNAVAILABLE_CODE : null) ??
       remoteWorkspacePreparationTimeout?.code ??
       reusableSandboxResumeFailure?.code ??

@@ -7,13 +7,13 @@ import { currentRunFailureText } from "./native-exact-resume-failure.js";
  * error finalized under a generic code, so the run's current failure text must be exactly it.
  */
 export function sessionCannotContinue(run: { error?: string | null; errorCode?: string | null; resultJson?: unknown } | undefined) {
-  return run?.errorCode === "native_provider_state_incompatible"
+  return run?.errorCode === "held_box_lost" || run?.errorCode === "native_provider_state_incompatible"
     || currentRunFailureText(run)?.trim() === "native_controller_recovery_missing_evidence:retained_sandbox_binding";
 }
 
 /** Only the failed run's current refusal, never an earlier failure in a chained error. */
 export function isWarmRecoveryRefusal(run: { status: string; error?: string | null; errorCode?: string | null; resultJson?: unknown } | undefined) {
-  if (run?.status !== "failed") return false;
+  if (run?.status !== "failed" || run.errorCode === "held_box_lost") return false;
   if (sessionCannotContinue(run)) return true;
   const failure = (currentRunFailureText(run) ?? run.errorCode ?? "").trim();
   return /^(?:runner_state_identity_mismatch:\s*)?(?:remote_warm_session_not_idle|current_run_not_admitted|prior_owner_terminal_state_indeterminate)(?:$|[;:\s])/.test(failure)

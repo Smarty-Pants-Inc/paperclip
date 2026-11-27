@@ -384,6 +384,146 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
       clearConversations: () => conversations.clear() };
   }
 
+  // RED catch: authoritative loss used to rethrow source_resume_failed forever.
+  it.each(["empty", "expired", "not-found"] as const)("fence11: deferred held source %s settles without a backup and never allocates on three runs", async shape => {
+    const f = await conversationFixture();
+    await f.change({ image: "fake:changed" });
+    f.clearConversations();
+    const original = f.call.getMockImplementation()!;
+    f.call.mockImplementation(async (pluginId, method, params) => {
+      if (method === "environmentResumeLease") {
+        if (shape === "not-found") throw new Error("Sandbox not found");
+        return shape === "expired" ? { metadata: { expired: true } } : {};
+      }
+      return original(pluginId, method, params);
+    });
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const runId = attempt === 0 ? f.runId : randomUUID();
+      if (attempt) await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId,
+        invocationSource: "assignment", status: "running", runtimeMode: "native", nativeIssueId: f.issueId,
+        sessionIdBefore: f.sessionId, runnerInstanceId: randomUUID() });
+      await expect(acquire(f, f.runtime, runId)).rejects.toMatchObject({ code: "held_box_lost", retryable: false,
+        message: expect.stringContaining("The sandbox holding this task's conversation is gone and no backup could be restored. Retry starts a fresh conversation; the earlier messages stay on the task.") });
+      await db.update(heartbeatRuns).set({ status: "failed", errorCode: "held_box_lost" }).where(eq(heartbeatRuns.id, runId));
+    }
+    const source = (await environmentService(db).getLeaseById(f.lease.id))!;
+    expect(source).toMatchObject({ status: "expired", failureReason: "held_box_lost" });
+    expect(f.call.mock.calls.filter(([, method]) => method === "environmentResumeLease")).toHaveLength(1);
+    expect(f.call.mock.calls.some(([, method]) => method === "environmentAcquireLease" || method === "environmentDestroyLease")).toBe(false);
+  });
+
+  it.each(["empty", "expired", "not-found"] as const)("fence11: deferred held source %s restores the exact verified session", async shape => {
+    const f = await conversationFixture();
+    await f.preserve({ controller: false }); // a save alone cannot retire a live held box
+    await f.change({ image: "fake:changed" });
+    f.clearConversations();
+    const original = f.call.getMockImplementation()!;
+    f.call.mockImplementation(async (pluginId, method, params) => {
+      if (method === "environmentResumeLease") {
+        if (shape === "not-found") throw new Error("Sandbox not found");
+        return shape === "expired" ? { metadata: { expired: true } } : {};
+      }
+      return original(pluginId, method, params);
+    });
+    const acquired = await acquire(f, f.runtime);
+    expect(acquired.lease.providerLeaseId).toBe("replacement-sandbox");
+    expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toMatchObject({ outcome: "replacement" });
+    expect((await environmentService(db).getLeaseById(f.lease.id))!.failureReason).toBe("held_box_lost");
+    expect(f.call.mock.calls.some(([, method]) => method === "environmentDestroyLease")).toBe(false);
+    // Restore authorization must preserve session/provider identity, not merely permit a new box.
+    const [source] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+    const stamp = source.metadata!.nativeHarnessBackup as ReturnType<typeof createNativeHarnessBackupStamp>;
+    expect(await retiredSourceAuthorizesNativeBackupRestore(db, { companyId: f.companyId, currentRunId: f.runId,
+      normalizedSessionId: f.sessionId, manifest: stamp, manifestSha256: stamp.manifestSha256,
+      targetProviderLeaseId: acquired.lease.providerLeaseId })).toBe(true);
+    expect(JSON.parse(await readFile(join(f.backupRoot()!, "runner/conversation.json"), "utf8")))
+      .toEqual({ sessionId: f.sessionId, remembered: f.remembered });
+  });
+
+  it.each(["uncovered-event", "corrupt-bytes", "another-session"] as const)("fence11: lost held source refuses %s backup rather than losing newer memory", async fault => {
+    const f = await conversationFixture();
+    await f.preserve({ controller: false });
+    if (fault === "uncovered-event") await db.insert(heartbeatRunEvents).values({ companyId: f.companyId,
+      runId: f.previousRunId, agentId: f.agentId, seq: 2, eventType: "provider.event" });
+    if (fault === "corrupt-bytes") await writeFile(join(f.backupRoot()!, "runner/conversation.json"), "corrupt");
+    if (fault === "another-session") {
+      const lease = (await environmentService(db).getLeaseById(f.lease.id))!;
+      await environmentService(db).updateLeaseMetadata(lease.id, { ...lease.metadata,
+        nativeHarnessBackup: { ...(lease.metadata!.nativeHarnessBackup as Record<string, unknown>), normalizedSessionId: randomUUID() } });
+    }
+    await f.change({ image: "fake:changed" });
+    f.clearConversations();
+    const original = f.call.getMockImplementation()!;
+    f.call.mockImplementation(async (pluginId, method, params) => method === "environmentResumeLease" ? {} : original(pluginId, method, params));
+    await expect(acquire(f, f.runtime)).rejects.toMatchObject({ code: "held_box_lost", retryable: false });
+    expect(f.call.mock.calls.some(([, method]) => method === "environmentAcquireLease" || method === "environmentDestroyLease")).toBe(false);
+  });
+
+  it.each([true, false])("fence11: a cleanup-expired source settles before native session selection and before another acquisition (backup=%s)", async saved => {
+    const f = await conversationFixture();
+    if (saved) await f.preserve({ controller: false });
+    f.clearConversations();
+    await db.update(environmentLeases).set({ status: "expired", cleanupStatus: "success", failureReason: "pending_cleanup_retry" })
+      .where(eq(environmentLeases.id, f.lease.id));
+    // Real acquisition precedes runtime selection: only admission's session is set.
+    await db.update(heartbeatRuns).set({ nativeSessionId: null, sessionIdBefore: f.sessionId }).where(eq(heartbeatRuns.id, f.runId));
+    if (saved) {
+      const next = await acquire(f, f.runtime);
+      expect(next.lease.metadata?.sandboxLeaseAcquisition).toMatchObject({ outcome: "replacement" });
+      expect(next.lease.metadata?.nativeHarnessBackup).toMatchObject({ normalizedSessionId: f.sessionId });
+      expect(JSON.parse(await readFile(join(f.backupRoot()!, "runner/conversation.json"), "utf8")))
+        .toEqual({ sessionId: f.sessionId, remembered: f.remembered });
+    } else {
+      for (let attempt = 0; attempt < 3; attempt++) await expect(acquire(f, f.runtime))
+        .rejects.toMatchObject({ code: "held_box_lost", retryable: false });
+      expect(f.call.mock.calls.some(([, method]) => method === "environmentAcquireLease")).toBe(false);
+    }
+    expect(f.call.mock.calls.some(([, method]) => method === "environmentResumeLease" || method === "environmentDestroyLease")).toBe(false);
+  });
+
+  it.each([false, true])("fence11: failed empty successor allocations do not hide the source's verified session (backup=%s)", async saved => {
+    const f = await conversationFixture();
+    if (saved) await f.preserve({ controller: false });
+    const emptyRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: emptyRunId, companyId: f.companyId, agentId: f.agentId,
+      status: "failed", runtimeMode: "native", nativeIssueId: f.issueId, nativeSessionId: f.sessionId,
+      errorCode: "native_session_interrupted", finishedAt: new Date() });
+    const source = (await environmentService(db).getLeaseById(f.lease.id))!;
+    await db.insert(environmentLeases).values({ ...source, id: randomUUID(), heartbeatRunId: emptyRunId,
+      providerLeaseId: "empty-successor", status: "expired", cleanupStatus: "success", failureReason: "pending_cleanup_retry" });
+    await db.update(environmentLeases).set({ status: "expired", cleanupStatus: "success", failureReason: "pending_cleanup_retry" })
+      .where(eq(environmentLeases.id, f.lease.id));
+    f.clearConversations();
+    if (saved) {
+      const next = await acquire(f, f.runtime);
+      expect(next.lease.metadata?.nativeHarnessBackup).toMatchObject({ normalizedSessionId: f.sessionId,
+        sourceProviderLeaseId: f.providerLeaseId });
+      expect(next.lease.providerLeaseId).toBe("replacement-sandbox");
+    } else await expect(acquire(f, f.runtime)).rejects.toMatchObject({ code: "held_box_lost", retryable: false });
+    expect(f.call.mock.calls.some(([, method]) => method === "environmentResumeLease" || method === "environmentDestroyLease")).toBe(false);
+  });
+
+  it("fence11: a consumer's terminal lost state blocks later messages before another empty box", async () => {
+    const f = await conversationFixture();
+    await f.preserve({ controller: false });
+    await db.update(environmentLeases).set({ status: "expired", cleanupStatus: "success", failureReason: "pending_cleanup_retry" })
+      .where(eq(environmentLeases.id, f.lease.id));
+    await db.insert(heartbeatRuns).values({ id: randomUUID(), companyId: f.companyId, agentId: f.agentId,
+      status: "failed", runtimeMode: "native", nativeIssueId: f.issueId, sessionIdBefore: f.sessionId,
+      errorCode: "held_box_lost", finishedAt: new Date() });
+    await expect(acquire(f, f.runtime)).rejects.toMatchObject({ code: "held_box_lost", retryable: false });
+    expect(f.call.mock.calls.some(([, method]) => method === "environmentAcquireLease" || method === "environmentResumeLease")).toBe(false);
+  });
+
+  it("fence11: a thrown ambiguous held resume records the attempt without claiming loss", async () => {
+    const f = await conversationFixture();
+    await f.change({ image: "fake:changed" });
+    f.call.mockImplementation(async () => { throw new Error("DNS lookup failed"); });
+    await expect(acquire(f, f.runtime)).rejects.toThrow("source_resume_failed");
+    expect(await environmentService(db).getLeaseById(f.lease.id)).toMatchObject({ status: "retained",
+      failureReason: "source_resume_failed", metadata: expect.objectContaining({ heldSourceResumeAttempts: 1 }) });
+  });
+
   it("replacement fence v7 Q: legacy manifest does not authorize destruction even for events before save", async () => {
     const f = await conversationFixture();
     await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, runId: f.previousRunId,

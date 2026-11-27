@@ -27,6 +27,9 @@ it("projects the continuous Pi open-turn default while preserving configured ove
 
 it("recognizes only an unrecoverable session's code or retained-binding refusal", () => {
   expect(sessionCannotContinue({ errorCode: "native_provider_state_incompatible" })).toBe(true);
+  expect(sessionCannotContinue({ errorCode: "held_box_lost" })).toBe(true);
+  // A person's Retry may reset; optional automatic fresh-session recovery must not.
+  expect(isWarmRecoveryRefusal({ status: "failed", errorCode: "held_box_lost" })).toBe(false);
   expect(sessionCannotContinue({ error: "native_controller_recovery_missing_evidence:retained_sandbox_binding" })).toBe(true);
   expect(sessionCannotContinue({ error: "native_session_interrupted: x; exact checkpoint resume refused: native_controller_recovery_missing_evidence:retained_sandbox_binding",
     resultJson: { nativeExactResumeRefusal: { refusal: "native_controller_recovery_missing_evidence:retained_sandbox_binding" } } })).toBe(true);

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
-import { and, eq, gt, inArray, ne, notInArray, sql } from "drizzle-orm";
-import { environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
+import { nativeConversationSourceIsLost } from "../held-conversation-state.js";
+import { and, eq, gt, inArray, ne, notInArray, or, sql } from "drizzle-orm";
+import { environmentLeases, heartbeatRunEvents, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { retiredReusableLeasePredecessors, reusableLeaseHistoryWithDeletedTaskBindings } from "../environment-lease-handoff.js";
 import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js";
 import { hasConfirmedSandboxStopAndRetain } from "../sandbox-stop-and-retain.js";
@@ -103,6 +104,18 @@ export async function retiredSourceAuthorizesNativeBackupRestore(db: Db, input: 
     )).limit(1)).length;
   const destroyed = ["expired", "failed"].includes(lease.status) && hasRemoteTerminationReceipt(lease)
     && termination?.state === "destroyed";
+  // A stock cleanup retry can expire a box without leaving a termination receipt.
+  // Only successful cleanup, or our exact provider-miss marker, makes this final.
+  const lost = nativeConversationSourceIsLost(lease);
+  if (lost && (await db.select({ activeSourceRunId: heartbeatRuns.id }).from(heartbeatRuns)
+    .leftJoin(environmentLeases, and(eq(environmentLeases.companyId, heartbeatRuns.companyId), eq(environmentLeases.heartbeatRunId, heartbeatRuns.id)))
+    .leftJoin(nativeRunFinalizations, and(eq(nativeRunFinalizations.companyId, heartbeatRuns.companyId), eq(nativeRunFinalizations.runId, heartbeatRuns.id)))
+    .where(and(eq(heartbeatRuns.companyId, input.companyId), ne(heartbeatRuns.id, input.currentRunId),
+      or(eq(heartbeatRuns.nativeSessionId, input.normalizedSessionId), eq(environmentLeases.providerLeaseId, lease.providerLeaseId!)),
+      or(notInArray(heartbeatRuns.status, [...TERMINAL_SOURCE_RUN_STATUSES]),
+        sql`${nativeRunFinalizations.leaseOwner} is not null and (${nativeRunFinalizations.leaseExpiresAt} is null
+          or ${nativeRunFinalizations.leaseExpiresAt} > clock_timestamp())`),
+    )).limit(1)).length) return false;
   const matches = (stamp: ReturnType<typeof readNativeHarnessBackupStamp>) => stamp
     && stamp.manifestSha256 === input.manifestSha256 && stamp.normalizedSessionId === input.normalizedSessionId
     && stamp.runnerInstanceId === input.manifest.runnerInstanceId;
@@ -128,7 +141,7 @@ export async function retiredSourceAuthorizesNativeBackupRestore(db: Db, input: 
   }
   if (!stamp || !matches(stamp)) return false;
   // A released lease can still be selected for resume; only a retired one is final.
-  const idleSource = !destroyed && !obsoleteStopped && !await settledRestoreHoldRetiresSource(db, lease);
+  const idleSource = !destroyed && !lost && !obsoleteStopped && !await settledRestoreHoldRetiresSource(db, lease);
   if (idleSource && !await idleWarmSourceRetiresBackup(db, lease, input.currentRunId)) return false;
   const covered = nativeHarnessBackupEventCursors(stamp);
   if (covered === undefined) {

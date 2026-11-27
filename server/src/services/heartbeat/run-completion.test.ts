@@ -201,6 +201,15 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
   }
   const read = (id: string) => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)).then(rows => rows[0]!);
 
+  it.each(["held_box_lost", "replacement_deferred_unexported_conversation"])("fence11: wrapped %s survives setup completion without automatic retry", async code => {
+    const f = await fixture({ runtimeMode: "native", nativeSessionId: randomUUID(), runnerInstanceId: randomUUID() });
+    const cause = Object.assign(new Error(`${code}: The task's conversation is held.`), { code, retryable: false });
+    await f.completion.failRunSetup(f.setup(new Error("lease_acquire_failed", { cause })));
+    const saved = await read(f.run.id);
+    expect(saved).toMatchObject({ status: "failed", errorCode: code });
+    expect(f.deps.scheduleBoundedRetryForRun).not.toHaveBeenCalled();
+  });
+
   it("replays saved user intent through normal Retry after a first-attempt retained runner failure", async () => {
     for (const mode of ["unattached", "archive_failed", "provider_started", "system_wake", "stopped", "stopped_failed", "promoted"] as const) {
       const f = await fixture({ runtimeMode: mode === "promoted" ? "legacy" : "native" }, `CMP${randomUUID().slice(0, 6)}`);

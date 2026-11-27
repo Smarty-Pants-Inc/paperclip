@@ -1,4 +1,5 @@
 import { isNativeInputSizeRefusal } from "../native-input-refusal.js";
+import { HELD_BOX_LOST, HELD_BOX_LOST_MESSAGE, REPLACEMENT_DEFERRED_CONVERSATION, REUSABLE_CONVERSATION_HELD_MESSAGE } from "../held-conversation-state.js";
 import { NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, nativePromptRefusalCause, nativePromptRefusalDetail, nativePromptRefusalTitle, type NativePromptRefusalCause } from "../native-runtime/native-turn-budget.js";
 import type { IssueCommentMetadata, IssueCommentPresentation, TaskInterruptionPresentation } from "@paperclipai/shared";
 import { ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE } from "../environment-provider-unavailable-error.js";
@@ -74,6 +75,10 @@ export function classifiedRunFailure(run: {
 }): NonNullable<TaskInterruptionPresentation["failure"]> & { cause?: NativePromptRefusalCause } {
   let code = run.resultJson?.reusableSandboxResumeReason === "reusable_sandbox_terminal_stop_unsettled"
     ? "reusable_sandbox_terminal_stop_unsettled" : run.errorCode ?? "run_failed";
+  if (code === HELD_BOX_LOST || code === REPLACEMENT_DEFERRED_CONVERSATION) {
+    const notice = SETUP_FAILURE_NOTICES[code]!;
+    return { code, title: notice.title!, detail: notice.body };
+  }
   if (code === "reusable_sandbox_terminal_stop_unsettled") {
     const notice = WORKSPACE_SCAN_NOTICES[code]!;
     return { code, title: notice.title, detail: notice.nextAction };
@@ -127,6 +132,8 @@ const WORKSPACE_SCAN_NOTICES: Record<string, { title: string; nextAction: string
 };
 
 const SETUP_FAILURE_NOTICES: Record<string, StrandedRecoveryNoticeSeed> = {
+  [HELD_BOX_LOST]: { title: "Conversation sandbox lost", body: HELD_BOX_LOST_MESSAGE, tone: "danger" },
+  [REPLACEMENT_DEFERRED_CONVERSATION]: { title: "Conversation kept in its original sandbox", body: REUSABLE_CONVERSATION_HELD_MESSAGE, tone: "danger" },
   runner_revision_mismatch: {
     title: "Remote Runner is out of date",
     body: "The remote Runner does not match this Paperclip version, which is expected for a few minutes while a release updates the Runner. "

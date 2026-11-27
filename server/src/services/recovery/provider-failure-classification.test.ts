@@ -10,6 +10,10 @@ import { legacyExecutionNeedsReconciliation } from "../legacy-execution-recovery
 import { isConfigurationIncompleteFailedRun } from "../../modules/wake-queue/domain/values.js";
 
 describe("classifyAdapterFailureForRecovery", () => {
+  it.each(["held_box_lost", "replacement_deferred_unexported_conversation"])("fence11: %s never queues automatic conversation replacement", errorCode => {
+    expect(classifyContinuationFailure({ errorCode, resultJson: null } as never))
+      .toMatchObject({ kind: "non_retryable", maxAttempts: 0 });
+  });
   it("does not retry a permanently refused agent interaction delivery", () => {
     expect(classifyContinuationFailure({ errorCode: "agent_interaction_delivery_denied", resultJson: null } as never))
       .toMatchObject({ kind: "non_retryable", maxAttempts: 0 });

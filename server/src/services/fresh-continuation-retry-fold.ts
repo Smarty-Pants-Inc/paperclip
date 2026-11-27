@@ -21,11 +21,12 @@ export async function isChatTask(tx: Pick<Db, "select">, companyId: string, issu
   return Boolean(chat);
 }
 
-/** A person's Retry of a non-chat task whose session can never be resumed starts a new session. */
+/** Only a person's Retry opts into a fresh session. A confirmed lost box also permits a chat's Retry;
+ * ordinary chat recovery must never discard a still-held conversation. */
 export async function retryStartsFresh(tx: Pick<Db, "select">, input: { companyId: string; issueId: string; sourceRunId: string }) {
   const [source] = await tx.select({ error: heartbeatRuns.error, errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns)
     .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.sourceRunId)));
-  return sessionCannotContinue(source) && !(await isChatTask(tx, input.companyId, input.issueId));
+  return source?.errorCode === "held_box_lost" || sessionCannotContinue(source) && !(await isChatTask(tx, input.companyId, input.issueId));
 }
 
 /** A Retry is not a new question. Carry the source's still-owed question into

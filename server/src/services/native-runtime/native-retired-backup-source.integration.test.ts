@@ -33,7 +33,7 @@ describeDb("retired native backup source authority", () => {
   let lastSourceLeaseId = "";
   const completedAt = new Date("2026-11-05T05:02:50.000Z");
 
-  async function fixture(options: { termination?: "destroyed" | "stopped" | null; status?: string; stampSha?: string;
+  async function fixture(options: { termination?: "destroyed" | "stopped" | null; status?: string; stampSha?: string; cleanupRetry?: boolean;
     providerEventAt?: Date; sourceAdvancedAt?: Date; coversSourceAdvance?: boolean; legacyManifest?: boolean; cursorFault?: "empty" | "null"; secondLease?: boolean; handoffs?: number;
     handoffFault?: "missing_receipt" | "changed_receipt" | "active_predecessor" | "missing_predecessor";
     restoreHold?: "settled" | "no_marker" | "foreign_marker" | "reusable_policy" | "no_stop_receipt" | "dirty_writer";
@@ -62,6 +62,7 @@ describeDb("retired native backup source authority", () => {
       invocationSource: "assignment", triggerDetail: "system" });
     const lease = (id: string) => ({ id, companyId, heartbeatRunId: sourceRunId, provider: "daytona", providerLeaseId,
       status: options.status ?? "expired", cleanupStatus: "success", releasedAt: new Date(),
+      ...(options.cleanupRetry ? { failureReason: "pending_cleanup_retry" } : {}),
       metadata: {
         nativeHarnessBackup: { ...stamp, manifestSha256: options.stampSha ?? manifestSha256 },
         ...(options.termination === null ? {} : { remoteExecutionTermination: { schema: "paperclip.remote-termination.v1", companyId,
@@ -155,6 +156,19 @@ describeDb("retired native backup source authority", () => {
       manifest: { sourceProviderLeaseId: providerLeaseId, runnerInstanceId, normalizedSessionId: sessionId }, manifestSha256,
       targetProviderLeaseId: options.idleWarm === "same_target" ? providerLeaseId : randomUUID() });
   }
+
+  it("fence11: an expired successful cleanup retry restores the verified backup without inventing a provider session", async () => {
+    await expect(fixture({ termination: null, cleanupRetry: true })).resolves.toBe(true);
+  });
+
+  it.each([
+    { status: "pending_cleanup" },
+    { providerEventAt: new Date(completedAt.getTime() + 1) },
+    { stampSha: `sha256:${"c".repeat(64)}` },
+    { secondLease: true },
+  ])("fence11: cleanup retry does not waive source identity and causal coverage (%j)", async fault => {
+    await expect(fixture({ termination: null, cleanupRetry: true, ...fault })).resolves.toBe(false);
+  });
 
   it("authorizes a destroyed source lease whose stamp names the backup", async () => {
     await expect(fixture()).resolves.toBe(true);

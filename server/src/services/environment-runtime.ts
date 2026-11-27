@@ -2,7 +2,9 @@ import { readPluginLoginCredential } from "./plugin-login-credential.js";
 import { preserveReusableSandboxConversation, reusableAllocationHasActiveSiblingSql, reusableAllocationHasHeldSibling,
   reusableConversationCoverageSql, REPLACEMENT_DEFERRED_CONVERSATION, ReusableConversationHeldError } from "./reusable-sandbox-conversation.js";
 import { sandboxRestartMetadata } from "./sandbox-snapshot-restore.js";
-import { nativeRunHasNoProviderWork } from "./native-runtime/native-session-resume.js";
+import { HeldBoxLostError } from "./held-conversation-state.js";
+import { findLostNativeConversationSource, recordLostNativeConversationSource, settleLostNativeConversation } from "./native-runtime/lost-native-conversation.js";
+import { isNativeSessionId, nativeRunHasNoProviderWork } from "./native-runtime/native-session-resume.js";
 import { ENVIRONMENT_LEASE_CONTROLLER_KEY } from "./environment-lease-controller.js";
 import { RetainedSandboxAbsentError, resumeReplyConfirmsAbsence } from "./retained-sandbox-absent-error.js";
 import { readNativeWorkspaceMigration } from "./native-runtime/native-workspace-migration.js";
@@ -1352,18 +1354,6 @@ async function waitForSettlingReusableLease(db: Db, input: {
   }
 }
 
-async function obsoleteReusableCleanupCandidates(db: Db, leases: EnvironmentLease[]) {
-  const candidates: EnvironmentLease[] = [];
-  for (const lease of leases) {
-    // Historical null-task matches and durable Pi conversations are not
-    // destruction authority. The selected handoff owns eventual retirement.
-    if ((lease.issueId === null && lease.executionWorkspaceId === null)
-      || await latestDurableTerminalPiSource(db, await terminalPiSandboxSources(db, lease))) continue;
-    candidates.push(lease);
-  }
-  return candidates;
-}
-
 async function resumeLeaseLastRun(db: Db, lease: Pick<EnvironmentLease, "companyId" | "heartbeatRunId" | "metadata">) {
   const runId = readString(lease.metadata?.terminalPiSandboxPreviousRunId) ?? lease.heartbeatRunId;
   if (!runId) return null;
@@ -1874,6 +1864,10 @@ function createSandboxEnvironmentDriver(
     for (const lease of input.leases) {
       if (reusableIds.has(lease.id)) continue;
       if (!reusableLeaseCanBeCleanedUp(lease)) continue;
+      // Keep the final terminal-hold base's unbound-history exclusion. A null
+      // task and workspace do not authorize obsolete cleanup. Bound durable
+      // conversations now need the stronger v10 preservation/dispatch proof.
+      if (lease.issueId === null && lease.executionWorkspaceId === null) continue;
       await destroyReusableSandboxLease({
         environment: input.environment,
         lease,
@@ -2055,6 +2049,23 @@ function createSandboxEnvironmentDriver(
                 },
               })
             : null;
+        // Settle a recorded loss BEFORE acquiring another empty box. Only an
+        // explicit person's fresh/reset request waives the old conversation.
+        const [conversationRun] = input.adapterType === "paperclip_runner" && input.heartbeatRunId
+          ? await db.select({ sessionId: heartbeatRuns.nativeSessionId, sessionBefore: heartbeatRuns.sessionIdBefore, context: heartbeatRuns.contextSnapshot })
+            .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.heartbeatRunId))) : [];
+        // Acquisition precedes native runtime selection; admission's saved
+        // session is therefore authoritative even before nativeSessionId is set.
+        const conversationSessionId = conversationRun?.sessionId
+          ?? (isNativeSessionId(conversationRun?.sessionBefore) ? conversationRun.sessionBefore : null);
+        let lostSourceBackup: Awaited<ReturnType<typeof settleLostNativeConversation>> | null = null;
+        if (conversationSessionId && conversationRun?.context?.explicitFreshSession !== true
+          && conversationRun?.context?.conversationReset !== true) {
+          const source = await findLostNativeConversationSource(db, { companyId: input.companyId,
+            normalizedSessionId: conversationSessionId, currentRunId: input.heartbeatRunId! });
+          if (source) lostSourceBackup = await settleLostNativeConversation(db, { source,
+            currentRunId: input.heartbeatRunId!, normalizedSessionId: conversationSessionId });
+        }
         // Ad-hoc tests (heartbeatRunId === null) must never resume an existing
         // provider lease. If they did, releasing the test lease at the end of
         // the probe would tear down the live heartbeat run that owns it.
@@ -2128,14 +2139,14 @@ function createSandboxEnvironmentDriver(
             environment: input.environment, leases: reusableCandidateLeases,
             reusableLeases: reusableExistingLeases, heartbeatRunId: input.heartbeatRunId,
           }) : [];
-        if (deferred.length > 1) throw new Error(`${REPLACEMENT_DEFERRED_CONVERSATION}: ambiguous_source`);
-        const deferredLease = deferred[0];
+        if (deferred.length > 1) throw new ReusableConversationHeldError("ambiguous_source");
+        let deferredLease: EnvironmentLease | undefined = deferred[0];
         if (deferredLease) {
           const scope = deferredLease.metadata?.reusableSandboxLease;
           // A different provider/plugin/agent cannot operate the exact source.
           if (!isRecord(scope) || scope.provider !== parsed.config.provider || scope.adapterType !== input.adapterType
             || deferredLease.metadata?.pluginId !== pluginProvider.resolved.plugin.id) {
-            throw new Error(`${REPLACEMENT_DEFERRED_CONVERSATION}: source_driver_unavailable`);
+            throw new ReusableConversationHeldError("source_driver_unavailable");
           }
           reusableExistingLeases.push(deferredLease);
         }
@@ -2148,7 +2159,7 @@ function createSandboxEnvironmentDriver(
           ? terminalReusableLease?.providerLeaseId ?? findReusableSandboxLeaseId({ config: storedConfig, leases: reusableExistingLeases })
           : null);
         const reusableLease = reusableProviderLeaseId
-          ? reusableExistingLeases.find((lease) => terminalReusableLease
+          ? reusableExistingLeases.find((lease) => deferredLease ? lease.id === deferredLease.id : terminalReusableLease
               ? lease.id === terminalReusableLease.id : lease.providerLeaseId === reusableProviderLeaseId)
           : null;
         const resumeConfig = deferredLease ? stripSandboxProviderEnvelope(await resolvePluginSandboxRuntimeConfig({
@@ -2178,7 +2189,7 @@ function createSandboxEnvironmentDriver(
             "environmentResumeLease",
           );
           if (!workerVerifiesResume) {
-            if (deferredLease) throw new Error(`${REPLACEMENT_DEFERRED_CONVERSATION}: source_driver_unavailable`);
+            if (deferredLease) throw new ReusableConversationHeldError("source_driver_unavailable");
             throw new ReusableSandboxResumeError({
               provider: parsed.config.provider,
               providerLeaseId: reusableLease.providerLeaseId,
@@ -2259,8 +2270,12 @@ function createSandboxEnvironmentDriver(
                 retryDelayMs = nextResumeRetryBaseDelayMs(retryDelayMs);
               }
             }
+            if (deferredLease && (!resumed.providerLeaseId && (resumeReplyConfirmsAbsence(resumed)
+              || (resumed as { expired?: unknown }).expired === true || Object.keys(resumed).length === 0))) {
+              throw new RetainedSandboxAbsentError();
+            }
             if (deferredLease && resumed.providerLeaseId !== deferredLease.providerLeaseId) {
-              throw new Error(`${REPLACEMENT_DEFERRED_CONVERSATION}: source_identity_unconfirmed`);
+              throw new ReusableConversationHeldError("source_identity_unconfirmed");
             }
             providerLease =
               typeof resumed.providerLeaseId === "string" && resumed.providerLeaseId.length > 0
@@ -2277,25 +2292,44 @@ function createSandboxEnvironmentDriver(
                   : "expired";
             }
           } catch (error) {
-            if (deferredLease) throw new Error(`${REPLACEMENT_DEFERRED_CONVERSATION}: source_resume_failed`, { cause: error });
-            // A refusal is not proof the sandbox is lost. Replace it only when
-            // nothing lives solely on it; otherwise preserve it for the retry.
-            replacementPlan = await reusableSandboxReplacementPlan({
-              db, lease: reusableLease, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
-              executionWorkspaceId: input.executionWorkspaceId, adapterType: input.adapterType, cause: error,
-              providerCannotStart: idleStartWaitSpent,
-            });
-            if (!replacementPlan) {
-              throw new ReusableSandboxResumeError({
-                provider: parsed.config.provider,
-                providerLeaseId: reusableLease.providerLeaseId,
-                cause: error,
+            if (deferredLease) {
+              // Count failed logical resume attempts even when the provider throws.
+              await db.update(environmentLeases).set({ failureReason: "source_resume_failed", updatedAt: new Date(),
+                metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || jsonb_build_object('heldSourceResumeAttempts',
+                  coalesce((${environmentLeases.metadata}->>'heldSourceResumeAttempts')::integer, 0) + 1)`,
+              }).where(and(eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.id, deferredLease.id),
+                eq(environmentLeases.providerLeaseId, deferredLease.providerLeaseId!), eq(environmentLeases.status, deferredLease.status)));
+              const absence = error instanceof RetainedSandboxAbsentError
+                || error instanceof Error && /^(?:daytona_sandbox_not_found|Sandbox not found)(?:$|:)/i.test(error.message);
+              if (!absence) throw new ReusableConversationHeldError("source_resume_failed", { cause: error });
+              const latest = await environmentsSvc.getLeaseById(deferredLease.id);
+              if (!latest || !input.heartbeatRunId) throw new HeldBoxLostError();
+              const lost = await recordLostNativeConversationSource(db, latest, "provider_resume_absent");
+              if (!conversationSessionId) throw new HeldBoxLostError();
+              lostSourceBackup = await settleLostNativeConversation(db, { source: lost, currentRunId: input.heartbeatRunId,
+                normalizedSessionId: conversationSessionId });
+              deferredLease = undefined;
+              replacementReason = "not_found";
+            } else {
+              // A refusal is not proof the sandbox is lost. Replace it only when
+              // nothing lives solely on it; otherwise preserve it for the retry.
+              replacementPlan = await reusableSandboxReplacementPlan({
+                db, lease: reusableLease, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
+                executionWorkspaceId: input.executionWorkspaceId, adapterType: input.adapterType, cause: error,
+                providerCannotStart: idleStartWaitSpent,
               });
+              if (!replacementPlan) {
+                throw new ReusableSandboxResumeError({
+                  provider: parsed.config.provider,
+                  providerLeaseId: reusableLease.providerLeaseId,
+                  cause: error,
+                });
+              }
+              replacementReason = "resume_failed";
             }
-            replacementReason = "resume_failed";
           }
-          if (!providerLease && deferredLease) throw new Error(`${REPLACEMENT_DEFERRED_CONVERSATION}: source_resume_unavailable`);
-          if (!providerLease && replacementReason !== "resume_failed") {
+          if (!providerLease && deferredLease) throw new ReusableConversationHeldError("source_resume_unavailable");
+          if (!providerLease && !lostSourceBackup && replacementReason !== "resume_failed") {
             if (
               input.adapterType === "paperclip_runner" &&
               !await verifyRecoverableNativeHarnessBackup({ db, companyId: reusableLease.companyId,
@@ -2423,7 +2457,7 @@ function createSandboxEnvironmentDriver(
           sandboxLeaseAcquisition: providerLease
             ? { outcome: "resumed", ...sandboxRestartMetadata(providerLease),
                 ...(deferredLease ? { reason: REPLACEMENT_DEFERRED_CONVERSATION } : {}) }
-            : reusableLease?.providerLeaseId
+            : reusableLease?.providerLeaseId || lostSourceBackup
               ? {
                   outcome: "replacement",
                   reason: replacementReason ?? "resume_failed",
@@ -2432,9 +2466,8 @@ function createSandboxEnvironmentDriver(
               : {
                   outcome: "created",
                 },
-          ...(reusableLease?.metadata?.nativeHarnessBackup
-            ? { nativeHarnessBackup: reusableLease.metadata.nativeHarnessBackup }
-            : {}),
+          ...(lostSourceBackup ? { nativeHarnessBackup: lostSourceBackup }
+            : reusableLease?.metadata?.nativeHarnessBackup ? { nativeHarnessBackup: reusableLease.metadata.nativeHarnessBackup } : {}),
           ...(providerLease && reusableLease?.metadata?.nativeWorkspaceSync
             ? {
                 nativeWorkspaceSync: reusableLease.metadata.nativeWorkspaceSync,

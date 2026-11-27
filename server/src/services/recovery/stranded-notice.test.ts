@@ -150,6 +150,17 @@ describe("stranded recovery notice seeds", () => {
 });
 
 describe("buildStrandedRecoveryEscalationNotice", () => {
+  it.each([
+    ["held_box_lost", "Conversation sandbox lost", "Retry starts a fresh conversation; the earlier messages stay on the task."],
+    ["replacement_deferred_unexported_conversation", "Conversation kept in its original sandbox", "Restore the original configuration"],
+  ])("fence11: %s has a real action and plain words", (errorCode, title, words) => {
+    const run = { id: "held-run", status: "failed", errorCode };
+    const notice = buildStrandedRecoveryEscalationNotice({ recoveryActionId: "held-action", recoveryOwner: null, sourceRun: run });
+    expect(notice.presentation.title).toBe(title);
+    expect(notice.body).toContain(words);
+    expect(notice.body).not.toContain("preservation handoff");
+    expect(classifiedRunFailure(run)).toMatchObject({ code: errorCode, title, detail: expect.stringContaining(words) });
+  });
   it.each(["runner.ingress.acquire", "runner.transport.connect"])("does not choose a saved-files notice for failed %s", failedStage => {
     const notice = buildStrandedRecoveryEscalationNotice({ recoveryActionId: "connection-failure", recoveryOwner: null,
       seed: { title: "Recovering saved work…", tone: "danger",

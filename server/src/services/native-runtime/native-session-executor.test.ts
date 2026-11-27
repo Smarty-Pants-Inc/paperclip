@@ -17840,6 +17840,13 @@ describe("native warm session supervision", () => {
 });
 
 describe("native session bounded recovery", () => {
+  it.each(["held_box_lost", "replacement_deferred_unexported_conversation"])("fence11: %s is one terminal native state, not a same-run retry", code => {
+    const failure = Object.assign(new Error(`${code}: conversation cannot continue`), { code, retryable: false });
+    const classified = nativeSessionFailureSourceCode(new Error("runner setup failed", { cause: failure }));
+    expect(classified).toBe(code);
+    expect(nativeSessionFailureDisposition(1, new Date(), classified)).toMatchObject({
+      phase: "terminal_failure", failureCode: code, nextAttemptAt: null });
+  });
   it("owns renewal from fresh claim commit through preparation failure", async () => {
     const fresh = { ...structuredClone(execution), provider: { kind: "acpx", agent: "claude",
       model: "claude-sonnet-4-6", profile: QUALIFIED_ACPX_PROFILES.claude } } as NativeExecutionInput;
@@ -25249,9 +25256,14 @@ describe("runnerd provider runtime wiring", () => {
     // run left without any harness state. It takes the backup under the same proof.
     ["a resumed lease never held the session and the warm source is idle", "none", "matching", false, true, "resumed_idle_warm"],
     ["a resumed lease lost the state the backup came from", "none", "matching", false, false, "resumed_own_source"],
-  ] as const)("restores a warm backup into a created lease only when %s", async (_label, terminationState, stampKind, laterProviderWork, restores, hold?: "settled_hold" | "unconfirmed_hold" | "idle_warm" | "idle_warm_export_pending" | "idle_warm_run_active" | "idle_warm_claim_lost" | "resumed_idle_warm" | "resumed_own_source") => {
+    // RED catch: the stock cleanup retry expired this lease after a pre-model failure.
+    ["fence11 expired pending_cleanup_retry retained a verified backup", "none", "matching", false, true, "cleanup_retry"],
+    ["fence11 expired pending_cleanup_retry has no matching verified backup", "none", "foreign", false, false, "cleanup_retry"],
+    ["fence11 expired pending_cleanup_retry restores the latest committed previous save, not an uncommitted current save", "none", "matching", false, true, "cleanup_retry_previous"],
+  ] as const)("restores a warm backup into a created lease only when %s", async (_label, terminationState, stampKind, laterProviderWork, restores, hold?: "settled_hold" | "unconfirmed_hold" | "idle_warm" | "idle_warm_export_pending" | "idle_warm_run_active" | "idle_warm_claim_lost" | "resumed_idle_warm" | "resumed_own_source" | "cleanup_retry" | "cleanup_retry_previous") => {
     const restoreHold = hold === "settled_hold" || hold === "unconfirmed_hold";
-    const idleWarm = !!hold && !restoreHold;
+    const cleanupRetry = hold === "cleanup_retry" || hold === "cleanup_retry_previous";
+    const idleWarm = !!hold && !restoreHold && !cleanupRetry;
     const resumed = hold === "resumed_idle_warm" || hold === "resumed_own_source";
     const targetProviderLeaseId = hold === "resumed_own_source" ? "prior-sandbox" : "sandbox-created";
     // Regression: a legacy follow-up retired the warm sandbox as an obsolete lease, so the
@@ -25270,6 +25282,7 @@ describe("runnerd provider runtime wiring", () => {
       id: "source-lease", companyId: current.binding.companyId, heartbeatRunId: "source-run", provider: "daytona",
       providerLeaseId: "prior-sandbox", status: idleWarm ? "retained" : restoreHold ? "released" : "expired", cleanupStatus: "success",
       leasePolicy: restoreHold ? "retain_on_failure" : "reuse_by_environment",
+      ...(cleanupRetry ? { failureReason: "pending_cleanup_retry" } : {}),
       acquiredAt: new Date(Date.now() - 60_000), releasedAt: idleWarm ? null : new Date(Date.now() + 1_000), expiresAt: null,
       metadata: {
         nativeHarnessBackup: { schema: "paperclip.native-harness-backup-stamp.v2", normalizedSessionId: current.session.normalizedSessionId,
@@ -25296,14 +25309,14 @@ describe("runnerd provider runtime wiring", () => {
     const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
     const db = leaseDb(current, {}, {}, updates), ordinarySelect = db.select.bind(db);
     db.select = ((fields?: Record<string, unknown>) => ({ from: (table: unknown) => {
-      const sourceRunQuery = Boolean(table === heartbeatRuns && fields && "sourceRunStatus" in fields);
+      const sourceRunQuery = Boolean(table === heartbeatRuns && fields && ("sourceRunStatus" in fields || "activeSourceRunId" in fields || "heldLossRunId" in fields));
       if (table !== executionWorkspaces && table !== environmentLeases && table !== heartbeatRunEvents && !sourceRunQuery)
         return ordinarySelect(fields as never).from(table as never);
       const manifest = backupDirectory.root ? readFileSync(join(backupDirectory.root, "manifest.json")) : "";
       const sha = `sha256:${createHash("sha256").update(stampKind === "matching" ? manifest : "other").digest("hex")}`;
       // No unsaved remote writer is bound to the held allocation, unless the
       // previous run's workspace export is still observed on the warm sandbox.
-      const rows = sourceRunQuery ? [{ sourceRunStatus: hold === "idle_warm_run_active" ? "running" : "succeeded" }]
+      const rows = sourceRunQuery ? fields?.activeSourceRunId || fields?.heldLossRunId ? [] : [{ sourceRunStatus: hold === "idle_warm_run_active" ? "running" : "succeeded" }]
         : fields?.run ? (hold === "idle_warm_export_pending" ? [{ lease: sourceLease(sha),
           run: { id: "source-run", runtimeMode: "native", observedRemoteWorkspace: true, reference: null }, workspace: null }] : [])
         : table === executionWorkspaces ? []
@@ -25367,12 +25380,27 @@ describe("runnerd provider runtime wiring", () => {
       backupRoot, execution: current, runnerInstanceId, sourceProviderLeaseId: "prior-sandbox", completedAt,
       providerSessionIdentity: { providerSessionId: "retained-provider-thread", providerBackendSessionId: null, providerSessionIdentity: null },
     })));
+    if (hold === "cleanup_retry_previous") {
+      const previous = join(dirname(backupRoot), "previous");
+      await cp(backupRoot, previous, { recursive: true });
+      backupDirectory.root = previous; // only this saved manifest is committed on the source lease
+      await writeFile(join(backupRoot, "runner/codex-provider-state.json"), JSON.stringify({
+        schema: "paperclip.runner.codex-provider-state.v1", lifecycle: "prepared", threadId: "uncommitted-provider-thread",
+        providerSessionId: null, activeProviderTurnId: null, config: { provider: "codex", driver: "codex_app_server" },
+      }));
+      await writeFile(join(backupRoot, "manifest.json"), JSON.stringify(buildNativeHarnessBackupManifest({
+        backupRoot, execution: current, runnerInstanceId, sourceProviderLeaseId: "prior-sandbox", completedAt,
+        providerSessionIdentity: { providerSessionId: "uncommitted-provider-thread", providerBackendSessionId: null, providerSessionIdentity: null },
+      })));
+    }
     if (restores) {
       await expect(options.prepareExternalRunnerState()).resolves.toBeUndefined();
       const remoteSession = join(remoteCwd, ".paperclip-runtime/paperclip-runner/sessions",
         createHash("sha256").update(current.session.normalizedSessionId!).digest("hex"));
       expect(JSON.parse(await readFile(join(remoteSession, "runner/runner-state.json"), "utf8"))).toEqual(runnerState);
       expect(await readFile(join(remoteSession, "filesystem/codex-home/sentinel.txt"), "utf8")).toBe("retained provider home");
+      if (cleanupRetry) expect(JSON.parse(await readFile(join(remoteSession, "runner/codex-provider-state.json"), "utf8")))
+        .toMatchObject({ threadId: "retained-provider-thread" });
       expect(updates.filter(update => update.table === environmentLeases)).toEqual([
         // The idle source is claimed first: its reuse scope moves into a superseded
         // receipt, so it is never resumed with the older state again.
@@ -25388,9 +25416,9 @@ describe("runnerd provider runtime wiring", () => {
           supersededByRunId: current.binding.runId, supersededByProviderLeaseId: "sandbox-created",
           reusableSandboxLease: { version: 1, executionWorkspaceId: current.binding.executionWorkspaceId } }) }));
     } else {
-      await expect(options.prepareExternalRunnerState()).rejects.toThrow(resumed ? "resumed_unavailable" : "backup_without_reusable_lease");
+      await expect(options.prepareExternalRunnerState()).rejects.toThrow(cleanupRetry ? "held_box_lost" : resumed ? "resumed_unavailable" : "backup_without_reusable_lease");
       expect(syncIn).not.toHaveBeenCalled();
-      expect(updates.filter(update => update.table === environmentLeases)).toEqual([]);
+      if (!cleanupRetry) expect(updates.filter(update => update.table === environmentLeases)).toEqual([]);
     }
   });
 
