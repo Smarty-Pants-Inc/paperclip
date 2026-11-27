@@ -1,7 +1,8 @@
 import { readAiConnectionConfigurationFailure } from "../../../lib/ai-connection-configuration-failure.js";
 import type { LifecycleFailure } from "./ports.js";
+import { redactDiagnosticText } from "@paperclipai/adapter-utils";
 
-// Only fixed text may leave this boundary. Provider errors can contain secrets.
+// Public copy stays fixed. Provider errors can contain secrets.
 const connectionReasons = {
   ai_connection_responsible_user_missing: "Set the responsible user before selecting this agent's AI connection.",
   ai_connection_default_missing: "Connect an AI account and choose the responsible user's personal default for this provider.",
@@ -73,6 +74,15 @@ export function lifecycleFailureCode(error: unknown): string | undefined {
   const candidate = error as { code?: unknown; cause?: { code?: unknown } } | null;
   return [candidate?.code, candidate?.cause?.code].find((code): code is string =>
     typeof code === "string" && (Object.hasOwn(reasons, code) || transientCodes.has(code)));
+}
+
+/** Private setup diagnostic from an already-redacted native probe, never public action copy. */
+export function lifecycleFailureReason(error: unknown): string | undefined {
+  const reason = (error as { redactedNativeProbeReason?: unknown } | null)?.redactedNativeProbeReason;
+  if (typeof reason !== "string" || !lifecycleFailureCode(error)?.startsWith("harness_")) return undefined;
+  const redacted = redactDiagnosticText(reason, "[REDACTED]")
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/]*@/gi, "$1[REDACTED]@");
+  return Array.from(redacted.split(/[\r\n\u2028\u2029]/u, 1)[0] ?? "").slice(0, 300).join("") || undefined;
 }
 
 export function lifecycleFailureMessage(context: LifecycleFailure, error: unknown): string {
