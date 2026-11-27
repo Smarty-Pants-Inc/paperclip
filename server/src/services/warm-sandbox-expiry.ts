@@ -1,12 +1,8 @@
 import { PAPERCLIP_RUNNER_IDLE_TIMEOUT_MAX_MS } from "@paperclipai/adapter-utils";
 import { and, asc, eq, sql } from "drizzle-orm";
-import { environmentLeases, heartbeatRuns, type Db } from "@paperclipai/db";
+import { environmentLeases, type Db } from "@paperclipai/db";
 import { REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY } from "./reusable-sandbox-kept-marker.js";
 import { prepareSupersededWarmSandboxStop } from "./sandbox-stop-and-retain.js";
-import { logger } from "../middleware/logger.js";
-import { nativeWorkspaceExportPendingForLease } from "./native-runtime/native-workspace-finalization-state.js";
-import { allowLegacyShutdownWorkspaceCleanup } from "./legacy-shutdown-workspace-settlement.js";
-import { DEFERRED_WAKE_CONTEXT_KEY } from "../lib/queued-comment-context.js";
 
 /**
  * Warm sandbox expiry.
@@ -95,108 +91,6 @@ export function warmSandboxExpiryCandidateCondition() {
       and ${environmentLeases.issueId} is not null
       and (other.issue_id = ${environmentLeases.issueId} or other.native_issue_id = ${environmentLeases.issueId}))`,
   );
-}
-
-/** The terminal task and its workspace must both have committed. This also
- * fences a successor that is queued but has not acquired a lease yet. */
-function terminalNativeTaskCondition() {
-  return and(warmSandboxExpiryCandidateCondition(),
-    sql`exists (select 1 from issues task where task.company_id = ${environmentLeases.companyId}
-      and task.id = ${environmentLeases.issueId} and task.conversation_agent_id is null
-      and task.status in ('done', 'cancelled'))`,
-    sql`exists (select 1 from heartbeat_runs run where run.id = ${environmentLeases.heartbeatRunId}
-      and run.company_id = ${environmentLeases.companyId} and run.runtime_mode = 'native'
-      and run.native_issue_id = ${environmentLeases.issueId})`,
-    sql`(select operation.status from workspace_operations operation
-      where operation.company_id = ${environmentLeases.companyId}
-        and operation.heartbeat_run_id = ${environmentLeases.heartbeatRunId}
-        and operation.issue_id = ${environmentLeases.issueId} and operation.phase = 'workspace_finalize'
-      order by operation.created_at desc limit 1) = 'succeeded'`,
-    sql`not exists (select 1 from heartbeat_runs other where other.company_id = ${environmentLeases.companyId}
-      and other.status in ('queued', 'scheduled_retry', 'running')
-      and (other.issue_id = ${environmentLeases.issueId} or other.native_issue_id = ${environmentLeases.issueId}
-        or (${environmentLeases.executionWorkspaceId} is not null and (
-          other.context_snapshot->>'executionWorkspaceId' = ${environmentLeases.executionWorkspaceId}::text
-          or exists (select 1 from issues sharing where sharing.company_id = ${environmentLeases.companyId}
-            and sharing.execution_workspace_id = ${environmentLeases.executionWorkspaceId}
-            and (sharing.id = other.issue_id or sharing.id = other.native_issue_id))))))`,
-    // A person wake may still be outside heartbeat_runs. Repeat these fences
-    // in the very UPDATE that creates the stop intent, not just before close.
-    sql`not exists (select 1 from agent_wakeup_requests wake
-      where wake.company_id = ${environmentLeases.companyId}
-        and wake.status in ('queued', 'deferred_issue_execution')
-        and (wake.payload->>'issueId' = ${environmentLeases.issueId}::text
-          or wake.payload->>'taskId' = ${environmentLeases.issueId}::text
-          or wake.payload->${DEFERRED_WAKE_CONTEXT_KEY}->>'issueId' = ${environmentLeases.issueId}::text
-          or wake.payload->${DEFERRED_WAKE_CONTEXT_KEY}->>'taskId' = ${environmentLeases.issueId}::text))`,
-    // Cover input committed even before its wake has been persisted. A comment
-    // that predates the triggering run is already part of that run's input.
-    sql`not exists (select 1 from issue_comments comment
-      where comment.company_id = ${environmentLeases.companyId} and comment.issue_id = ${environmentLeases.issueId}
-        and (comment.author_type = 'user' or comment.author_user_id is not null or comment.on_behalf_of_user_id is not null)
-        and comment.created_at > (select run.created_at from heartbeat_runs run
-          where run.id = ${environmentLeases.heartbeatRunId} and run.company_id = ${environmentLeases.companyId}))`,
-  );
-}
-
-/** Expire a terminal native task's warm window now. Called after status commit
- * and again after lease release (either boundary may arrive first). The ordinary
- * expiry's stop-only intent and cleanup worker own provider I/O and retries.
- * A failed checkpoint never authorizes a stop; the original idle deadline stays. */
-export async function stopTerminalNativeTaskWarmSandboxes(db: Db, input: {
-  companyId: string; issueId: string; runId: string;
-}): Promise<{ stopping: number }> {
-  let stopping = 0;
-  try {
-    const condition = and(terminalNativeTaskCondition(), eq(environmentLeases.companyId, input.companyId),
-      eq(environmentLeases.issueId, input.issueId), eq(environmentLeases.heartbeatRunId, input.runId));
-    const leases = await db.select().from(environmentLeases).where(condition);
-    for (const lease of leases) {
-      if (!lease.environmentId) continue;
-      if (await nativeWorkspaceExportPendingForLease(db, lease)
-        || !await allowLegacyShutdownWorkspaceCleanup(db, lease)) continue;
-      const { closeWarmNativeSessionsForEnvironment } = await import("./native-runtime/native-session-executor.js");
-      const closeStartedAt = Date.now();
-      const previousStamp = lease.metadata?.nativeHarnessBackup as Record<string, unknown> | undefined;
-      const closed = await closeWarmNativeSessionsForEnvironment({ db, companyId: input.companyId,
-        runId: input.runId, environmentId: lease.environmentId, providerLeaseId: lease.providerLeaseId!,
-        reason: "terminal native task warm window ended", requireCheckpoint: true });
-      if (closed.busy || closed.failed || closed.closed === 0) {
-        // A per-turn backup alone does not prove a remote warm owner has
-        // suspended. Never stop an allocation we did not checkpoint here.
-        logger.warn({ ...input, leaseId: lease.id, closed }, "terminal native task owner was not checkpointed; keeping normal idle expiry");
-        continue;
-      }
-      // Closing publishes a new backup on this exact lease. Re-read it rather
-      // than accidentally compare-and-swapping the pre-checkpoint metadata.
-      const [checkpointed] = await db.select().from(environmentLeases)
-        .where(and(condition, eq(environmentLeases.id, lease.id)));
-      if (!checkpointed || await nativeWorkspaceExportPendingForLease(db, checkpointed)
-        || !await allowLegacyShutdownWorkspaceCleanup(db, checkpointed)) continue;
-      const { verifyRecoverableNativeHarnessBackup } = await import("./native-runtime/native-harness-backup-storage.js");
-      const [owner] = await db.select({ sessionId: heartbeatRuns.nativeSessionId, runnerId: heartbeatRuns.runnerInstanceId })
-        .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId)));
-      const stamp = checkpointed.metadata?.nativeHarnessBackup as Record<string, unknown> | undefined;
-      const completedAt = typeof stamp?.completedAt === "string" ? Date.parse(stamp.completedAt) : NaN;
-      // Matching owner identities alone can describe an earlier capture. This
-      // close must have published a new, completed backup before we may stop.
-      if (!owner || stamp?.normalizedSessionId !== owner.sessionId || stamp?.runnerInstanceId !== owner.runnerId
-        || !Number.isFinite(completedAt) || completedAt < closeStartedAt || completedAt > Date.now()
-        || stamp?.manifestSha256 === previousStamp?.manifestSha256
-        || !await verifyRecoverableNativeHarnessBackup({ db, companyId: input.companyId,
-        stamp: checkpointed.metadata?.nativeHarnessBackup, providerLeaseId: checkpointed.providerLeaseId! })) {
-        logger.warn({ ...input, leaseId: lease.id }, "terminal native task has no recoverable owner checkpoint; keeping normal idle expiry");
-        continue;
-      }
-      const prepared = await prepareSupersededWarmSandboxStop(db, checkpointed, {
-        [WARM_WINDOW_EXPIRED_KEY]: true, warmWindowEndedAt: new Date().toISOString(), terminalNativeTask: true,
-      }, condition);
-      if (prepared) stopping++;
-    }
-  } catch (err) {
-    logger.warn({ err, ...input }, "terminal native task warm expiry failed; normal idle expiry remains responsible");
-  }
-  return { stopping };
 }
 
 /** When the next retained warm sandbox's window ends, or null when none waits. */

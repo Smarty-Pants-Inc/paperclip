@@ -101,7 +101,6 @@ import { NATIVE_AGENT_BLOCKER_CONTINUATION_CODE, NATIVE_AGENT_BLOCKER_HANDOFF_CO
 import { NATIVE_PROVIDER_OVERLOADED_CODE } from "./native-provider-failure.js";
 import { NATIVE_TOOL_RECEIPT_LIMIT_CODE } from "./native-tool-receipt-limit.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
-import { stopTerminalNativeTaskWarmSandboxes } from "../warm-sandbox-expiry.js";
 
 export class NativeStatusRaceError extends Error {
   readonly code = "native_status_race" as const;
@@ -2801,13 +2800,5 @@ export async function commitNativeStatusDecision(input: {
   for (const publication of publications) publishActivity(publication);
   for (const terminalRun of terminalRunsToEmit)
     await emitAgentTaskRun(input.db, terminalRun);
-  // Never do controller/provider work under the status transaction. Usually the
-  // run still owns an active lease here; its later release retries this door.
-  if (committed.issue && !committed.issue.conversationAgentId
-    && ["done", "cancelled"].includes(committed.issue.status)) {
-    await stopTerminalNativeTaskWarmSandboxes(input.db, {
-      companyId: input.companyId, issueId: input.issueId, runId: input.runId,
-    });
-  }
   return committed;
 }
