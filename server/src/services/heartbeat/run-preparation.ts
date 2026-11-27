@@ -2675,8 +2675,26 @@ export async function buildPaperclipWakePayload(input: {
           notice: externalAttachmentOmissionNotice(omission),
         }))
     : [];
+  const nativeStatusRetry = input.contextSnapshot.source === "native_status_decision" &&
+    input.contextSnapshot.statusDecisionSource === "native_status_decision" && input.contextSnapshot.nativeStatusRetry
+    ? parseObject(input.contextSnapshot.nativeStatusRetry) : null;
+  const retryDelta = parseObject(parseObject(input.contextSnapshot.executionContinuation).resumeDelta);
+  const retryPersonIds = nativeStatusRetry && Array.isArray(retryDelta.messages)
+    ? [...new Set(retryDelta.messages.flatMap(message => {
+      const entry = parseObject(message);
+      const id = readNonEmptyString(entry.id);
+      return entry.authorType === "user" && id ? [id] : [];
+    }))] : [];
+  // Status wakes need not name a comment, and continuation deltas omit file
+  // descriptors. Check unseen person input too before offering plain text.
+  const [retryAttachment] = issueId && retryPersonIds.length
+    ? await input.db.select({ id: issueAttachments.id }).from(issueAttachments).where(and(
+      eq(issueAttachments.companyId, input.companyId), eq(issueAttachments.issueId, issueId),
+      inArray(issueAttachments.issueCommentId, retryPersonIds),
+    )).limit(1) : [];
   const payload = {
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
+    ...(nativeStatusRetry ? { nativeStatusRetry: { ...nativeStatusRetry, hasUnseenAttachments: !!retryAttachment } } : {}),
     executionContinuation: input.contextSnapshot.executionContinuation ?? null,
     chatCompletionUpdates: input.contextSnapshot.chatCompletionUpdates ?? null,
     attachmentOmissions,

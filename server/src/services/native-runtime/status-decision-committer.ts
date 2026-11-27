@@ -1,5 +1,6 @@
 import { NativePullRequestCompletionError, verifyNativePullRequestCompletion } from "./native-pull-request-completion.js";
 import { notifyNativeStatusWakeWork } from "../deferred-execution-notifications.js";
+import { currentRunFailureText } from "./native-exact-resume-failure.js";
 import { toolCallLoopContinuationKey } from "./repeated-tool-failure-guard.js";
 import { assertAgentInteraction } from "../agent-interaction-policy.js";
 import { forbidden, HttpError } from "../../errors.js";
@@ -41,6 +42,7 @@ import {
   agents,
   approvals,
   completionContracts,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueApprovals,
   issueRecoveryActions,
@@ -930,6 +932,37 @@ async function materializeDecisionEffect(input: {
       return { effectKind: effect.kind, targetType: "heartbeat_run", targetId: retryId,
         payload: { cause: effect.cause, summary: effect.summary } };
     }
+    let retrySummary = effect.summary;
+    let turnSubmitted = false;
+    if (effect.cause === "native_run_failed") {
+      const [run] = await input.tx.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.agentId, effect.agentId), eq(heartbeatRuns.nativeIssueId, input.issue.id),
+      )).limit(1);
+      if (run?.nativeSessionId && run.runnerInstanceId) {
+        // PaperclipControlPlanePort commits these only after validating the
+        // run/session/source binding. Session/checkpoint existence is NOT a
+        // submitted-turn receipt: input preparation can fail between them.
+        const boundEvent = and(eq(heartbeatRunEvents.companyId, input.companyId),
+          eq(heartbeatRunEvents.runId, input.runId), eq(heartbeatRunEvents.agentId, effect.agentId),
+          eq(heartbeatRunEvents.sourceInstanceId, run.runnerInstanceId),
+          sql`${heartbeatRunEvents.sourceEventId} is not null`,
+          sql`${heartbeatRunEvents.payload}->'prpEvent'->>'runId' = ${input.runId}`,
+          sql`${heartbeatRunEvents.payload}->'prpEvent'->>'normalizedSessionId' = ${run.nativeSessionId}`,
+          sql`${heartbeatRunEvents.payload}->'prpEvent'->>'sourceKind' = 'runner'`);
+        const [submitted] = await input.tx.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+          boundEvent, inArray(heartbeatRunEvents.eventType, ["turn.started", "turn.accepted"]),
+        )).limit(1);
+        turnSubmitted = !!submitted;
+        const [failure] = await input.tx.select({ message: sql<string | null>`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->'error'->>'message'` })
+          .from(heartbeatRunEvents).where(and(boundEvent, eq(heartbeatRunEvents.eventType, "turn.failed")))
+          .orderBy(desc(heartbeatRunEvents.seq)).limit(1);
+        // Run errors and committed PRP payloads have already been redacted.
+        // Finalization can reach here before the run's error is projected.
+        const reason = currentRunFailureText(run)?.trim() || failure?.message?.trim();
+        retrySummary = reason ? Array.from(reason).slice(0, 1_500).join("") : "The failure reason was not recorded.";
+      } else retrySummary = "The failure reason was not recorded.";
+    }
     const wakeId = await enqueueWake({
       tx: input.tx,
       companyId: input.companyId,
@@ -942,6 +975,9 @@ async function materializeDecisionEffect(input: {
         nativeDecisionId: input.decisionId,
         retryCause: effect.cause,
         retrySummary: effect.summary,
+      },
+      contextSnapshot: {
+        nativeStatusRetry: { cause: effect.cause, summary: retrySummary, sourceRunId: input.runId, turnSubmitted },
       },
     });
     return {
