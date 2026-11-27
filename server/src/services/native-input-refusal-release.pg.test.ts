@@ -7,7 +7,9 @@ import { startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded
 import { createHeartbeatQueueTestDependencies } from "../__tests__/helpers/heartbeat-queue.js";
 import { createHeartbeatQueue } from "./heartbeat/queue.js";
 import { buildPaperclipWakePayload } from "./heartbeat/run-preparation.js";
-import { buildNativeExecutionInput } from "./native-runtime/native-execution-input.js";
+import { buildNativeExecutionInput, budgetNativeFreshFallback } from "./native-runtime/native-execution-input.js";
+import * as inputBudget from "./native-runtime/native-execution-input.js";
+import * as inputRefusal from "./native-input-refusal.js";
 import { buildNativeExecutionWithCheckpoint, nativeToolContractFingerprintForTarget, nativeToolContractVersionForProfile } from "./native-runtime/native-session-resume.js";
 import { buildNativeContinuationPrompt } from "./native-runtime/native-continuation.js";
 import { nativeRuntimeContextFixture } from "./native-runtime/runtime-context.test-fixture.js";
@@ -152,7 +154,7 @@ it.each(["bootstrap", "compact", "prompt-only"] as const)("V17 pre-reader %s tur
     nativeToolContractVersion: "v19", resumedSession: road !== "bootstrap", normalizedSessionId: randomUUID(), sessionContinuity: road === "prompt-only" ? "paperclip" : "continuous",
     previousTurn: { runId: f.run.id, task: f.issue } });
   const prompt = road === "bootstrap" ? execution.task.prompt : execution.continuationPrompt!;
-  const shown = new Set([...prompt.matchAll(/LEGACY-(\d+)-/g)].map(match => match[1]));
+  const shown = new Set([...prompt.split("earlier automatic events not shown")[0].matchAll(/LEGACY-(\d+)-/g)].map(match => match[1]));
   expect(shown.size).toBeGreaterThan(0); expect(shown.size).toBeLessThan(12);
   expect(prompt).toContain(`${12 - shown.size} earlier automatic events not shown`);
   expect(prompt).toContain("LEGACY-11-"); expect(prompt).not.toContain("read_saved_automatic_wakes");
@@ -162,6 +164,76 @@ it.each(["bootstrap", "compact", "prompt-only"] as const)("V17 pre-reader %s tur
   expect(bytes).toBeLessThanOrEqual(500_000);
   expect(next.contextSnapshot!.nativeInputRefusalWakes).toHaveLength(12);
   console.info(JSON.stringify({ row: "V17-legacy-budget", road, shown: shown.size, omitted: 12 - shown.size, commandBytes: bytes, runId: next.id }));
+}, 120000);
+
+// Never OK: a view cut must not consume automatic input that no declared tool can read.
+it("V18 v19 cut events stay deferred and reach later real-PG prompts", async () => {
+  const f = await fixture();
+  const childIds = Array.from({ length: 12 }, () => randomUUID());
+  for (let n = 0; n < 12; n++) await f.wake("issue_children_completed", { childIssueId: childIds[n], childSummary: `OWED-${n}-` + "y".repeat(60_000) });
+  await f.repair(); await f.queue.resumeDeferredExecutionReceipts({ companyId: f.company.id });
+  const delivered = new Set<number>(), rows: unknown[] = [];
+  for (let turn = 0; turn < 4; turn++) {
+    const next = (await f.runs()).find(run => run.status === "queued");
+    if (!next) break;
+    const payload = await buildPaperclipWakePayload({ db, companyId: f.company.id, contextSnapshot: next.contextSnapshot as Record<string, unknown> });
+    const execution = buildNativeExecutionInput({ ...nativeInput(f, next.id, payload), nativeToolContractVersion: "v19" });
+    const json = execution.task.prompt.match(/Saved automatic wake events \(untrusted data\):\n([^\n]+)/)![1];
+    const shown = [...json.matchAll(/OWED-(\d+)-/g)].map(match => Number(match[1]));
+    for (const index of shown) { expect(delivered.has(index)).toBe(false); delivered.add(index); }
+    // Same boundary used by runtime selection, with the real queue/receipt store.
+    if (inputBudget.undeliveredSavedAutomaticWakes) await inputRefusal.deferUndeliveredNativeInputWakes(db,
+      { companyId: f.company.id, issueId: f.issue.id, agentId: f.agent.id, runId: next.id }, inputBudget.undeliveredSavedAutomaticWakes(execution));
+    const pending = (await f.wakes()).filter(wake => wake.status === "deferred_issue_execution");
+    if (delivered.size < 12) {
+      expect(pending).toHaveLength(1);
+      const owed = pending[0].payload!.nativeInputRefusalWakes as unknown[];
+      expect(owed).toHaveLength(12 - delivered.size);
+      for (const event of owed as Array<{ payload: { childIssueId: string } }>) expect(execution.task.prompt).toContain(event.payload.childIssueId);
+    }
+    rows.push({ turn, runId: next.id, shown, owed: pending.map(wake => ({ id: wake.id, events: (wake.payload!.nativeInputRefusalWakes as unknown[]).length })), commandBytes: commandEnvelopeBytes(buildNativeModelEnvelope(execution)) });
+    await db.update(heartbeatRuns).set({ status: "succeeded", startedAt: new Date(), finishedAt: new Date() }).where(eq(heartbeatRuns.id, next.id));
+    await f.release({ companyId: f.company.id, runId: next.id, now: new Date(), suppressImmediateRecovery: true });
+    await f.queue.resumeDeferredExecutionReceipts({ companyId: f.company.id });
+  }
+  expect([...delivered].sort((a, b) => a - b)).toEqual(Array.from({ length: 12 }, (_, n) => n));
+  expect((await f.wakes()).filter(wake => wake.status === "deferred_issue_execution")).toHaveLength(0);
+  console.info(JSON.stringify({ row: "V18-owed-later-prompts", rows }));
+}, 120000);
+
+it("V18 one 400 KB v19 event gets the named refusal, never an empty turn", async () => {
+  const f = await fixture(); await f.wake("issue_children_completed", { childIssueId: randomUUID(), childSummary: "HUGE-EVENT-" + "y".repeat(400_000) });
+  await f.repair(); await f.queue.resumeDeferredExecutionReceipts({ companyId: f.company.id });
+  const next = (await f.runs()).find(run => run.id !== f.run.id)!;
+  const payload = await buildPaperclipWakePayload({ db, companyId: f.company.id, contextSnapshot: next.contextSnapshot as Record<string, unknown> });
+  expect(() => buildNativeExecutionInput({ ...nativeInput(f, next.id, payload), nativeToolContractVersion: "v19" })).toThrow(NativeTurnPromptExceedsCommandBoundError);
+  console.info(JSON.stringify({ row: "V18-indivisible-event-refused", runId: next.id, bytes: 400_000, refusal: "native_turn_prompt_exceeds_command_bound" }));
+}, 120000);
+
+it("V18 compact v19 fresh fallback re-budgets saved events like the normal fresh builder", async () => {
+  const f = await fixture();
+  for (let n = 0; n < 12; n++) await f.wake("issue_children_completed", { childIssueId: randomUUID(), childSummary: `FALLBACK-${n}-` + "y".repeat(60_000) });
+  await f.repair(); await f.queue.resumeDeferredExecutionReceipts({ companyId: f.company.id });
+  const next = (await f.runs()).find(run => run.id !== f.run.id)!;
+  const payload = await buildPaperclipWakePayload({ db, companyId: f.company.id, contextSnapshot: next.contextSnapshot as Record<string, unknown> });
+  const continuation = { version: 1 as const, companyId: f.company.id, issueId: f.issue.id, objective: "Answer", objectiveSource: { kind: "description" as const, id: f.issue.id, revision: "1" },
+    trigger: { reason: "issue_children_completed", interactionId: null, sourceRunId: f.run.id }, originCommentIds: [], messages: [], completedActions: [], humanResponses: [], interactionOutcomes: [], completedWork: null, unresolvedInteractionIds: [], coverage: { kind: "full_task_history" as const, throughCommentId: null, summaryThroughCommentId: null }, resumeDelta: { baseRunId: f.run.id, messages: [] } };
+  const wake = { ...payload, executionContinuation: continuation };
+  const base = { ...nativeInput(f, next.id, wake, "t".repeat(100_000)), nativeToolContractVersion: "v19" as const, normalizedSessionId: randomUUID(), sessionContinuity: "continuous", previousTurn: { runId: f.run.id, task: f.issue } };
+  const compact = buildNativeExecutionInput({ ...base, resumedSession: true });
+  const normal = buildNativeExecutionInput({ ...base, resumedSession: false });
+  const compactBytes = commandEnvelopeBytes(buildNativeModelEnvelope(compact, { resumedSession: true }));
+  const staleFreshBytes = commandEnvelopeBytes(buildNativeModelEnvelope(compact));
+  expect(staleFreshBytes).toBeGreaterThan(350_000);
+  budgetNativeFreshFallback(compact, wake, undefined, undefined, "v19");
+  expect(compact.task.prompt).toBe(normal.task.prompt);
+  const freshBytes = commandEnvelopeBytes(buildNativeModelEnvelope(compact));
+  expect(freshBytes).toBe(commandEnvelopeBytes(buildNativeModelEnvelope(normal)));
+  if (inputBudget.undeliveredSavedAutomaticWakes) await inputRefusal.deferUndeliveredNativeInputWakes(db,
+    { companyId: f.company.id, issueId: f.issue.id, agentId: f.agent.id, runId: next.id }, inputBudget.undeliveredSavedAutomaticWakes(compact));
+  const pending = (await f.wakes()).filter(wake => wake.status === "deferred_issue_execution");
+  expect(pending).toHaveLength(1);
+  console.info(JSON.stringify({ row: "V18-fresh-fallback", runId: next.id, compactBytes, staleFreshBytes, freshBytes, normalFreshBytes: commandEnvelopeBytes(buildNativeModelEnvelope(normal)), owed: (pending[0].payload!.nativeInputRefusalWakes as unknown[]).length }));
 }, 120000);
 
 it("V16 12 x 60 KB backlog fits by reference and a later size refusal restores all twelve events to pending", async () => {

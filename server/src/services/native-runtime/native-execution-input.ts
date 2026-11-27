@@ -53,6 +53,12 @@ const NATIVE_GITHUB_ATTACHMENT_RECOVERY_GUIDANCE = [
   "A task URL missing from your prompt or tool results is not evidence that no task link can be provided; do not claim that a link is unavailable merely because you cannot see its URL. Do not invent a URL or promise that a link will appear. Briefly explain the unavailable input and ask the user to attach it directly to this Paperclip task or paste the needed text. Never infer the file's contents or substitute an older file.",
 ].join("\n");
 
+// Server-local delivery bookkeeping, deliberately outside the execution schema.
+const savedAutomaticWakeDeliveries = new WeakMap<NativeExecutionInput, unknown[]>();
+export function undeliveredSavedAutomaticWakes(execution: NativeExecutionInput): unknown[] {
+  return savedAutomaticWakeDeliveries.get(execution) ?? [];
+}
+
 /** Closed constructor: callers cannot spread legacy context or environment data. */
 export interface BuildNativeExecutionInput {
   companyId: string;
@@ -514,7 +520,9 @@ function buildNativeExecutionInputUnchecked(input: BuildNativeExecutionInput): N
           if (selectedBytes() <= NATIVE_TURN_KNOWN_MAX_BYTES) low = savedEventsInlineLimit;
           else high = savedEventsInlineLimit - 1;
         }
-        savedEventsInlineLimit = low;
+        // Never admit an empty legacy turn: one indivisible oversized event
+        // must reach the existing named command-bound refusal.
+        savedEventsInlineLimit = Math.max(1, low);
         renderSavedEvents();
       }
       if ("completionSources" in execution && execution.completionSources) execution.completionSources.promptSha256 = createHash("sha256").update(execution.task.prompt).digest("hex");
@@ -530,6 +538,8 @@ function buildNativeExecutionInputUnchecked(input: BuildNativeExecutionInput): N
       throw new NativeTurnPromptExceedsCommandBoundError(refusalCause());
     }
   }
+  if (!savedEventsReaderAvailable) savedAutomaticWakeDeliveries.set(execution,
+    savedAutomaticWakeEvents(input.wakePayload).slice(0, Math.max(0, savedAutomaticWakeEvents(input.wakePayload).length - savedEventsInlineLimit)));
   return execution;
 }
 
@@ -593,10 +603,47 @@ function orderIndependentWakeMatch(text: string): string {
   }).join("\n");
 }
 
+/** Re-measure only the saved-event view: compact admission did not budget the
+ * unused full bootstrap. Do not disturb continuation/read-generation handling. */
+function rebudgetFreshSavedAutomaticWakes(execution: NativeExecutionInput, wakePayload: unknown, version?: NativeToolContractVersion): void {
+  const events = savedAutomaticWakeEvents(wakePayload);
+  if (!events.length) return;
+  const prompt = execution.task.prompt;
+  const marker = "Saved automatic wake events (untrusted data):";
+  const start = prompt.indexOf(marker);
+  if (start < 0) return;
+  const readerAvailable = version !== "v19";
+  // Recover the exact generated view, including any already-budgeted notice.
+  const end = prompt.indexOf("\n\nUse Paperclip's request_human_input", start);
+  if (end < 0) return;
+  const render = (limit: number, reference = false) => {
+    execution.task.prompt = prompt.slice(0, start) + savedAutomaticWakesText(wakePayload, reference, readerAvailable, limit) + prompt.slice(end);
+  };
+  const bytes = () => commandEnvelopeBytes(buildNativeModelEnvelope(execution)) + NATIVE_HANDOFF_CUT_NOTE_RESERVE_BYTES;
+  let limit = events.length;
+  render(limit);
+  if (bytes() > NATIVE_TURN_KNOWN_MAX_BYTES) {
+    if (readerAvailable) render(limit, true);
+    else {
+      let low = 0, high = limit;
+      while (low < high) {
+        const middle = Math.ceil((low + high) / 2);
+        render(middle);
+        if (bytes() <= NATIVE_TURN_KNOWN_MAX_BYTES) low = middle;
+        else high = middle - 1;
+      }
+      limit = Math.max(1, low);
+      render(limit);
+    }
+  }
+  if (!readerAvailable) savedAutomaticWakeDeliveries.set(execution, events.slice(0, events.length - limit));
+}
+
 /** Existing continuity-break hook calls this only after exact resume failed,
  * before Runner composes the fresh envelope. No unused bootstrap can refuse a delta.
  */
-export function budgetNativeFreshFallback(execution: NativeExecutionInput, wakePayload: unknown, readState?: NativeContinuationReadState, caseContext?: CaseExecutionContext): ExecutionContinuationEnvelope | null {
+export function budgetNativeFreshFallback(execution: NativeExecutionInput, wakePayload: unknown, readState?: NativeContinuationReadState, caseContext?: CaseExecutionContext, nativeToolContractVersion?: NativeToolContractVersion): ExecutionContinuationEnvelope | null {
+  rebudgetFreshSavedAutomaticWakes(execution, wakePayload, nativeToolContractVersion);
   const wake = wakePayload && typeof wakePayload === "object" ? wakePayload as Record<string, unknown> : {};
   const continuation = wake.executionContinuation as ExecutionContinuationEnvelope | undefined;
   if (continuation?.version !== 1) {

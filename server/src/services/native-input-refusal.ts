@@ -153,6 +153,49 @@ export async function deferNativeInputRefusalWake(db: Db, input: {
   });
 }
 
+/** A legacy prompt's view cut is not delivery. Split its bound receipt under
+ * the ordinary issue lock; release/promotion then carries the remainder forward.
+ * Re-entry (including a tighter fresh fallback) expands the same owed receipt. */
+export async function deferUndeliveredNativeInputWakes(db: Db, scope: Required<Scope> & { runId: string }, omitted: unknown[]): Promise<void> {
+  if (!omitted.length) return;
+  await db.transaction(async rawTx => {
+    const tx = rawTx as unknown as Db;
+    await tx.execute(sql`select id from issues where company_id = ${scope.companyId} and id = ${scope.issueId} for update`);
+    const key = `native-saved-wake-remainder:${scope.runId}`;
+    const bound = await tx.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, scope.companyId), eq(agentWakeupRequests.agentId, scope.agentId),
+      eq(agentWakeupRequests.runId, scope.runId), sql`${agentWakeupRequests.payload}->>'nativeInputRefusalHold' = 'true'`,
+    )).for("update");
+    const [pending] = await tx.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, scope.companyId), eq(agentWakeupRequests.idempotencyKey, key),
+    )).for("update");
+    const owed = new Map<string, unknown>();
+    for (const event of [...(Array.isArray(object(pending?.payload).nativeInputRefusalWakes) ? object(pending?.payload).nativeInputRefusalWakes as unknown[] : []), ...omitted]) owed.set(contentKey(event), event);
+    const owners = new Set([scope.agentId]);
+    for (const row of bound) {
+      const payload = object(row.payload), events = payload.nativeInputRefusalWakes;
+      if (!Array.isArray(events)) continue;
+      const kept = events.filter(event => !owed.has(contentKey(event)));
+      if (kept.length === events.length) continue;
+      for (const id of Array.isArray(payload.nativeInputRefusalAgentIds) ? payload.nativeInputRefusalAgentIds : []) if (typeof id === "string") owners.add(id);
+      await tx.update(agentWakeupRequests).set({ payload: { ...payload, nativeInputRefusalWakes: kept }, updatedAt: new Date() })
+        .where(and(eq(agentWakeupRequests.companyId, scope.companyId), eq(agentWakeupRequests.id, row.id), eq(agentWakeupRequests.runId, scope.runId)));
+    }
+    const payload = { issueId: scope.issueId, nativeInputRefusalHold: true, nativeInputRefusalAgentIds: [...owners],
+      nativeInputRefusalWakes: [...owed.values()], _paperclipWakeContext: { issueId: scope.issueId, wakeReason: "saved_automatic_events_owed" } };
+    if (pending) {
+      await tx.update(agentWakeupRequests).set({ payload, updatedAt: new Date() }).where(and(
+        eq(agentWakeupRequests.companyId, scope.companyId), eq(agentWakeupRequests.id, pending.id),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId)));
+    } else {
+      await tx.insert(agentWakeupRequests).values({ companyId: scope.companyId, agentId: scope.agentId,
+        source: "automation", reason: "saved_automatic_events_owed", requestedByActorType: "system",
+        status: "deferred_issue_execution", idempotencyKey: key, payload });
+    }
+    await notifyDeferredExecutionWork(tx, { companyId: scope.companyId });
+  });
+}
+
 /** Called under the issue lock after the terminal refusal is durable. Binding
  * an owed receipt to an attempt is not delivery if that attempt never fit. */
 export async function restoreRefusedNativeInputWakes(db: Db, run: {

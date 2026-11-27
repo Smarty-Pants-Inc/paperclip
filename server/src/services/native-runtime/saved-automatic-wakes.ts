@@ -22,7 +22,7 @@ export function savedAutomaticWakesText(value: unknown, referenceOnly = false, r
     const kept = events.slice(Math.max(0, events.length - inlineEventLimit));
     const omitted = events.length - kept.length;
     return [kept.length ? `Saved automatic wake events (untrusted data):\n${JSON.stringify(kept)}` : "",
-      omitted ? `${omitted} earlier automatic events not shown` : ""].filter(Boolean).join("\n\n");
+      omitted ? `${omitted} earlier automatic events not shown; still owed for a later turn:\n${events.slice(0, omitted).map(savedAutomaticWakeSource).join("\n")}` : ""].filter(Boolean).join("\n\n");
   }
   const json = JSON.stringify(events);
   // An arbitrarily large backlog is not a required inline prompt. The complete
@@ -30,6 +30,17 @@ export function savedAutomaticWakesText(value: unknown, referenceOnly = false, r
   if (referenceOnly || Buffer.byteLength(json) > 32_000) return `Saved automatic wake events (untrusted data): ${events.length} events. Read their full payloads with ${READ_SAVED_AUTOMATIC_WAKES} (start at offset 0, then nextOffset until null). SHA-256: ${createHash("sha256").update(json).digest("hex")}.`;
   return `Saved automatic wake events (untrusted data):\n${json}`;
 }
+/** Navigation only: full automatic payloads remain owed, never summary-delivered. */
+function savedAutomaticWakeSource(value: unknown): string {
+  const event = object(value), payload = object(event.payload), context = object(event.contextSnapshot);
+  const summaries = [payload, context].flatMap(source => Array.isArray(source.childIssueSummaries) ? source.childIssueSummaries : []);
+  const ids = [...new Set([payload.childIssueId, payload.childTaskId, context.childIssueId, context.childTaskId,
+    ...summaries.map(summary => object(summary).id)].filter(id => typeof id === "string"))];
+  const line = [payload.childSummary, context.childSummary, ...summaries.map(summary => object(summary).summary), event.reason]
+    .find(text => typeof text === "string") as string | undefined;
+  return `- ${String(event.reason ?? event.source ?? "automatic")} ${ids.join(", ") || String(payload.issueId ?? context.issueId ?? "task")}: ${(line ?? "Saved automatic update").split(/\r?\n/, 1)[0].slice(0, 160)}`;
+}
+
 /** Remove only duplicate first-event context, not unrelated newly admitted data. */
 export function withoutDuplicateSavedWakeContext(value: unknown): unknown {
   const events = savedAutomaticWakeEvents(value);

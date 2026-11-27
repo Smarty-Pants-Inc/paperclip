@@ -4,7 +4,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { activityLog, agents, agentTaskSessions, authUsers, companyMemberships, companySkillRepositorySnapshots, principalPermissionGrants, environments, environmentLeases, companies, completionContracts, costEvents, createDb, applyPendingMigrations, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, workspaceOperations, type Db } from "@paperclipai/db";
+import { activityLog, agents, agentWakeupRequests, agentTaskSessions, authUsers, companyMemberships, companySkillRepositorySnapshots, principalPermissionGrants, environments, environmentLeases, companies, completionContracts, costEvents, createDb, applyPendingMigrations, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, workspaceOperations, type Db } from "@paperclipai/db";
 import { accountRunCost } from "../run-cost-accounting.js";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -638,6 +638,35 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       authority.close();
       console.info(JSON.stringify({ row: "V17-persisted-catalog", provider, target, version, turn, sessionId, runId: saved.id, fingerprint, readerAvailable }));
     }
+  });
+
+  it("V18 real runtime selection splits a retained v19 receipt before native admission", async () => {
+    const { input, run, issue, agent } = await fixture();
+    const first = await selectHeartbeatRuntime(db, input);
+    if (!first.selected || !first.nativeExecution) throw new Error("Expected fresh selection");
+    const saved = await read(run.id), sessionId = saved.nativeSessionId!;
+    const priorInput = first.nativeExecution;
+    const fingerprint = nativeToolContractFingerprintForTarget("local", priorInput.provider.kind, "v19");
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(), runnerProfileJson: {
+      ...saved.runnerProfileJson, nativeToolContractFingerprint: fingerprint,
+      sessionCheckpoint: { backendKind: "runner", driverKind: priorInput.session.driverKind, sessionId: "legacy-thread", providerSessionId: "legacy-thread", identity: { ...priorInput.binding, sessionId } },
+    } }).where(eq(heartbeatRuns.id, saved.id));
+    const [next] = await db.insert(heartbeatRuns).values({ companyId: agent.companyId, agentId: agent.id, issueId: issue.id,
+      scopeKind: "issue", status: "running", nativeSessionId: sessionId, createdAt: new Date(saved.createdAt.getTime() + 1000) }).returning();
+    const events = Array.from({ length: 12 }, (_, n) => ({ reason: "issue_children_completed", payload: { issueId: issue.id, childIssueId: randomUUID(), childSummary: `SELECT-${n}-` + "y".repeat(60_000) } }));
+    const [receipt] = await db.insert(agentWakeupRequests).values({ companyId: agent.companyId, agentId: agent.id, runId: next.id, source: "automation", status: "queued",
+      payload: { issueId: issue.id, nativeInputRefusalHold: true, nativeInputRefusalWakes: events } }).returning();
+    input.run = next;
+    input.task.context.paperclipWake = { reason: "issue_children_completed", nativeInputRefusalWakes: events };
+    const selected = await selectHeartbeatRuntime(db, input);
+    if (!selected.selected || !selected.nativeExecution) throw new Error("Expected legacy selection");
+    const all = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, agent.companyId));
+    const owed = all.filter(wake => wake.status === "deferred_issue_execution");
+    expect(owed).toHaveLength(1);
+    expect(owed[0].payload!.nativeInputRefusalWakes).toHaveLength(7);
+    expect(all.find(wake => wake.id === receipt.id)!.payload!.nativeInputRefusalWakes).toHaveLength(5);
+    expect((await read(next.id)).runnerProfileJson!.nativeToolContractFingerprint).toBe(fingerprint);
+    console.info(JSON.stringify({ row: "V18-selector-receipt-split", runId: next.id, boundReceipt: receipt.id, owedReceipt: owed[0].id, shown: 5, owed: 7, sameSession: (await read(next.id)).nativeSessionId === sessionId }));
   });
 
   it.each([true, false])("records which earlier run a follow-up's process identity came from (prior identity: %s)", async priorIdentity => {
