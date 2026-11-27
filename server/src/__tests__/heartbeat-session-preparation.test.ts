@@ -9,6 +9,10 @@ import { connect, createServer as createNetServer } from "node:net";
 import express from "express";
 import request from "supertest";
 import { environmentRoutes } from "../routes/environments.js";
+import { instanceSettingsRoutes } from "../routes/instance-settings.js";
+import { createAgentLifecycle } from "../services/agent-lifecycle.js";
+import { subscribeCompanyLiveEvents } from "../services/live-events.js";
+import { activityLog, companySecrets } from "@paperclipai/db";
 import { projectRoutes } from "../routes/projects.js";
 import { projectGitAuthorizationService } from "../services/project-git-authorization.js";
 import { projectService } from "../services/projects.js";
@@ -1632,6 +1636,175 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
       await settings.update({ defaultEnvironmentId: original.defaultEnvironmentId });
     }
   });
+
+  // Replay the designer's real cycle: settings owns issue -> waits at singleton;
+  // agent owns agent -> records binding -> waits at issue. No injected SQLSTATE.
+  it.each([false, true])("v15 real deadlock publishes one committed binding event (status PATCH=%s)", async withStatus => {
+    const configModule = await import("../services/agent-configuration.js");
+    const prepare = configModule.prepareAgentConfiguration;
+    const f = await seed(), settings = instanceSettingsService(db), original = await settings.get();
+    const local = await environmentService(db).ensureLocalEnvironment(f.companyId);
+    const [next] = await db.insert(environments).values({ name: `V15 replay ${f.companyId}`, driver: "sandbox", status: "active", config: { provider: "fixture" } }).returning();
+    await settings.update({ defaultEnvironmentId: null });
+    await db.update(agents).set({ defaultEnvironmentId: null }).where(eq(agents.id, f.agentId));
+    // Metadata only: no provider, key material or credential access is needed.
+    const [secret] = await db.insert(companySecrets).values({ companyId: f.companyId, key: "REPLAY_REF", name: "Replay metadata", managedMode: "external_reference" }).returning();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId, runtimeMode: "native", status: "running",
+      contextSnapshot: { issueId: f.issueId, paperclipEnvironment: { id: local.id }, paperclipHeldConfiguration: { selection: { localEnvironmentId: local.id, executionMode: "any", managedSandboxOnly: false, instanceDefaultEnvironmentId: null } } } }).returning();
+    const events: unknown[] = [], codes: string[] = [];
+    const unsubscribe = subscribeCompanyLiveEvents(f.companyId, event => {
+      if (event.type === "activity.logged" && event.payload.action === "secret.binding.created") events.push(event);
+    });
+    let attempts = 0, agentPid = 0;
+    const observe = vi.spyOn(configModule, "prepareAgentConfiguration").mockImplementation(async (...args) => {
+      if (args[1].id === f.agentId) { attempts++; agentPid = Number((await args[0].execute(sql`select pg_backend_pid() as pid`))[0].pid); }
+      return prepare(...args);
+    });
+    const transaction = db.transaction.bind(db);
+    const errors = vi.spyOn(db, "transaction").mockImplementation(((...args: Parameters<Db["transaction"]>) => transaction(...args).catch(error => {
+      for (let cause = error; cause && typeof cause === "object"; cause = cause.cause) if (cause.code) codes.push(String(cause.code));
+      throw error;
+    })) as Db["transaction"]);
+    let release!: () => void, acquired!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; }), held = new Promise<void>(resolve => { acquired = resolve; });
+    const holder = db.transaction(async tx => { await tx.execute(sql`select id from instance_settings for update`); acquired(); await gate; });
+    let saving: Promise<unknown> | undefined, agentSave: Promise<unknown> | undefined;
+    try {
+      await held;
+      saving = settings.update({ defaultEnvironmentId: next.id });
+      await vi.waitFor(async () => {
+        const locked = await db.transaction(async tx => { await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, f.issueId)).for("no key update", { noWait: true }); return false; }).catch(() => true);
+        expect(locked).toBe(true);
+      }, { timeout: 5_000, interval: 10 });
+      const patch = { adapterConfig: { model: "model-a", env: { REPLAY_REF: { type: "secret_ref" as const, secretId: secret.id, version: "latest" as const } } } };
+      agentSave = (withStatus ? createAgentLifecycle(db).updateAndTransition(f.agentId, "pause", patch) : agentService(db).update(f.agentId, patch))
+        .then(() => "committed", error => ({ error: String(error) }));
+      await vi.waitFor(async () => {
+        const waiting = await db.execute(sql`select pid from pg_stat_activity where pid = ${agentPid} and wait_event_type = 'Lock'`);
+        expect(waiting.length).toBe(1);
+      }, { timeout: 5_000, interval: 10 });
+      release(); await holder;
+      const outcomes = await Promise.all([saving.then(() => "committed"), agentSave]);
+      const rows = await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.agentId), eq(activityLog.action, "secret.binding.created")));
+      const [after] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+      process.stdout.write(`V15_REAL_DEADLOCK_PUBLICATION ${JSON.stringify({ ...f, runId: run.id, secretId: secret.id, withStatus, attempts, codes, outcomes, liveEvents: events.length, activityRows: rows.length, activityIds: rows.map(row => row.id), events, defaultSaved: (await settings.getReadOnly())?.defaultEnvironmentId === next.id, agentStatus: after.status })}\n`);
+      expect(codes).toContain("40P01");
+      expect(attempts).toBe(2);
+      expect(outcomes).toEqual(["committed", "committed"]);
+      expect(events).toHaveLength(1);
+      expect(rows).toHaveLength(1);
+      expect((await settings.getReadOnly())?.defaultEnvironmentId).toBe(next.id);
+      expect(after.adapterConfig).toMatchObject({ env: { REPLAY_REF: { secretId: secret.id } } });
+      if (withStatus) expect(after.status).toBe("paused");
+    } finally {
+      release(); await holder; await saving; await agentSave; unsubscribe(); observe.mockRestore(); errors.mockRestore();
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, run.id));
+      await settings.update({ defaultEnvironmentId: original.defaultEnvironmentId });
+    }
+  }, 30_000);
+
+  it("ch14-unwrapped-race: 150 real settings saves and status-carrying agent PATCH saves commit", async () => {
+    const settings = instanceSettingsService(db), original = await settings.get();
+    const f = await seed(), filler = await seed({});
+    const local = await environmentService(db).ensureLocalEnvironment(f.companyId);
+    await db.insert(agents).values(Array.from({ length: 150 }, (_, i) => ({ companyId: filler.companyId, name: `CH14 race filler ${i}`, adapterType, status: "idle" as const, adapterConfig: { model: "model-a" } })));
+    await db.update(agents).set({ defaultEnvironmentId: null }).where(eq(agents.id, f.agentId));
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId, runtimeMode: "native", status: "running",
+      contextSnapshot: { issueId: f.issueId, paperclipEnvironment: { id: local.id }, paperclipHeldConfiguration: { selection: { localEnvironmentId: local.id, executionMode: "any", managedSandboxOnly: false, instanceDefaultEnvironmentId: null } } } }).returning();
+    const outcomes: unknown[] = [];
+    try {
+      for (let k = 0; k < 150; k++) {
+        await db.update(heartbeatRuns).set({ resultJson: {} }).where(eq(heartbeatRuns.id, run.id));
+        const [next] = await db.insert(environments).values({ name: `CH14 unwrapped race ${f.companyId} ${k}`, driver: "sandbox", status: "active", config: { provider: "fixture" } }).returning();
+        const [before] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+        const command = before.status === "paused" ? "resume" : "pause";
+        const saves = await Promise.allSettled([
+          settings.update({ defaultEnvironmentId: next.id }),
+          new Promise(resolve => setTimeout(resolve, (k % 6) * 2)).then(() => createAgentLifecycle(db).updateAndTransition(f.agentId, command, { adapterConfig: { model: "model-a", env: { CONTEXT_NOTE: { type: "plain", value: `urace-${k}` } } } })),
+        ]);
+        const [after] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+        // Lifecycle completion is asynchronous; the durable command's manual
+        // hold, not an immediate ready/idle worker result, is the save contract.
+        expect(after.lifecycleHolds.includes("manual")).toBe(command === "pause");
+        outcomes.push({ round: k, outcomes: saves.map(value => value.status === "fulfilled" ? "committed" : String(value.reason)), envSaved: JSON.stringify(after.adapterConfig).includes(`urace-${k}`), status: after.status, command, manualHold: after.lifecycleHolds.includes("manual"), defaultSaved: (await settings.getReadOnly())?.defaultEnvironmentId === next.id });
+      }
+      process.stdout.write(`CH14_UNWRAPPED_RACE ${JSON.stringify({ ...f, runId: run.id, rounds: 150, outcomes })}\n`);
+      expect(outcomes).toEqual(Array.from({ length: 150 }, (_, round) => expect.objectContaining({ round, outcomes: ["committed", "committed"], envSaved: true, defaultSaved: true })));
+    } finally {
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, run.id));
+      await settings.update({ defaultEnvironmentId: original.defaultEnvironmentId });
+    }
+  }, 280_000);
+
+  // Known limit, NOT a promise of three-writer recovery. Reuse CH14_DOUBLE's
+  // two witnessed real cycles, through the actual settings route/error handler.
+  it("CH14_DOUBLE known limit: two deadlocks return an HTTP error, never a saved settings receipt", async () => {
+    const configModule = await import("../services/agent-configuration.js");
+    const prepare = configModule.prepareAgentConfiguration;
+    const settings = instanceSettingsService(db), original = await settings.get();
+    const fs = [await seed({}), await seed({})];
+    const local = await environmentService(db).ensureLocalEnvironment(fs[0].companyId);
+    const [next] = await db.insert(environments).values({ name: `CH14 double ${randomUUID()}`, driver: "sandbox", status: "active", config: { provider: "fixture" } }).returning();
+    await settings.update({ defaultEnvironmentId: null });
+    const runs: string[] = [];
+    for (const f of fs) {
+      await db.update(agents).set({ defaultEnvironmentId: null }).where(eq(agents.id, f.agentId));
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId, runtimeMode: "native", status: "running",
+        contextSnapshot: { issueId: f.issueId, paperclipEnvironment: { id: local.id }, paperclipHeldConfiguration: { selection: { localEnvironmentId: local.id, executionMode: "any", managedSandboxOnly: false, instanceDefaultEnvironmentId: null } } } }).returning();
+      runs.push(run.id);
+    }
+    const gates = fs.map(() => { let release!: () => void, reached!: () => void; const gate = new Promise<void>(r => { release = r; }), ready = new Promise<void>(r => { reached = r; }); return { release, reached, gate, ready, pid: 0, passes: 0 }; });
+    const pause = vi.spyOn(configModule, "prepareAgentConfiguration").mockImplementation(async (...args) => {
+      const i = fs.findIndex(f => f.agentId === args[1].id);
+      if (i >= 0) { const g = gates[i]; g.passes++; if (g.passes === 1) { g.pid = Number((await args[0].execute(sql`select pg_backend_pid() as pid`))[0].pid); g.reached(); await g.gate; } }
+      return prepare(...args);
+    });
+    const lockConsumers = heldConfiguration.lockHeldNativeSettingsConsumers; let settingsAttempts = 0;
+    const count = vi.spyOn(heldConfiguration, "lockHeldNativeSettingsConsumers").mockImplementation(tx => { settingsAttempts++; return lockConsumers(tx); });
+    const app = express(); app.use(express.json());
+    app.use((req, _res, nextMiddleware) => { req.actor = { type: "board", source: "local_implicit", isInstanceAdmin: true, userId: fs[0].userId }; nextMiddleware(); });
+    const routeErrorCodes: string[] = [];
+    app.use("/api", instanceSettingsRoutes(db));
+    app.use((error: unknown, _req: express.Request, _res: express.Response, nextMiddleware: express.NextFunction) => {
+      for (let cause = error; cause && typeof cause === "object"; cause = (cause as { cause?: unknown }).cause) {
+        if ("code" in cause) routeErrorCodes.push(String(cause.code));
+      }
+      nextMiddleware(error);
+    });
+    app.use(errorHandler);
+    const agentSaves = fs.map(f => agentService(db).update(f.agentId, { adapterConfig: { model: "model-a", env: { CONTEXT_NOTE: { type: "plain", value: "double" } } } })
+      .then(() => "committed", error => String(error)));
+    let response: request.Response | undefined, saving: Promise<void> | undefined;
+    try {
+      await Promise.all(gates.map(g => g.ready));
+      saving = request(app).patch("/api/instance/settings").send({ defaultEnvironmentId: next.id }).then(value => { response = value; });
+      const released = new Set<number>(), steps: unknown[] = [];
+      for (let step = 0; step < 2; step++) {
+        let idx = -1;
+        await vi.waitFor(async () => {
+          const rows = await db.execute(sql`select pg_blocking_pids(pid) as blockers from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock'`);
+          const blockers = rows.flatMap(row => (row.blockers as number[]).map(Number));
+          idx = gates.findIndex((g, j) => !released.has(j) && blockers.includes(g.pid));
+          expect(idx).toBeGreaterThanOrEqual(0);
+        }, { timeout: 5_000, interval: 10 });
+        released.add(idx); steps.push({ step, blockedOnAgent: idx, settingsAttempt: settingsAttempts }); gates[idx].release();
+      }
+      gates.forEach(g => g.release()); await saving;
+      const agentResults = await Promise.all(agentSaves);
+      const defaultSaved = (await settings.getReadOnly())?.defaultEnvironmentId === next.id;
+      process.stdout.write(`CH14_DOUBLE ${JSON.stringify({ limit: "KNOWN LIMIT, NOT FIXED", fixtures: fs, runs, steps, settingsAttempts, agentAttempts: gates.map(g => g.passes), agentResults, defaultSaved, route: { status: response?.status, body: response?.body, errorCodes: routeErrorCodes } })}\n`);
+      expect(settingsAttempts).toBe(2);
+      expect(agentResults).toEqual(["committed", "committed"]);
+      expect(defaultSaved).toBe(false);
+      expect(routeErrorCodes).toContain("40P01");
+      expect(response?.status).toBe(500);
+      expect(response?.body).toEqual({ error: "Internal server error" });
+    } finally {
+      gates.forEach(g => g.release()); await saving; await Promise.all(agentSaves); pause.mockRestore(); count.mockRestore();
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(inArray(heartbeatRuns.id, runs));
+      await settings.update({ defaultEnvironmentId: original.defaultEnvironmentId });
+    }
+  }, 30_000);
 
   it("v14 inverse lock: real agent save paused after its agent lock and settings save both commit", async () => {
     const configModule = await import("../services/agent-configuration.js");
