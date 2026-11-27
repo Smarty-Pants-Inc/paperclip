@@ -7343,15 +7343,17 @@ export function agentRoutes(
     res.json(traces);
   });
 
-  // Operator read of the assigned-work invariant: how many open assigned tasks
+  // Read of the assigned-work invariant: how many open assigned tasks
   // have nothing running, nothing pending and no one else's move. Read-only;
   // the sweep repairs violations by itself. Expect 0 violations after a deploy.
   router.get("/companies/:companyId/assigned-work-invariant", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    assertBoard(req);
-    // Only tasks this caller may read count, so private tasks stay private.
-    res.json(await heartbeat.reportAssignedWorkInvariant(companyId, { readCondition: await issueReadSqlCondition(db, req.actor) }));
+    // Only tasks this caller may read count; agents omit automaticWork and never read the brake.
+    res.json(await heartbeat.reportAssignedWorkInvariant(companyId, {
+      readCondition: await issueReadSqlCondition(db, req.actor),
+      ...(req.actor.type === "board" ? {} : { includeAutomaticWork: false }),
+    }));
   });
 
   router.get("/companies/:companyId/live-runs", async (req, res) => {
