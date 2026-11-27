@@ -55,6 +55,11 @@ export const INSTANCE_FEATURE_CATALOG: Record<InstanceFeatureKey, FeatureCatalog
     description: "Allow experimental plugin connections to choose task-pinned accounts and harnesses.",
     tier: "managed", cloudDefault: false, selfHostedDefault: false,
   },
+  autoFreshSessionOnRecovery: {
+    title: "Automatic fresh-session recovery",
+    description: "Try one new session automatically when a continuous Pi task cannot resume its saved session. Explicit Retry, session boundaries, and receipts are unchanged when off.",
+    tier: "managed", cloudDefault: false, selfHostedDefault: false,
+  },
   enableNativeRunner: {
     title: "Paperclip Runner",
     description:
