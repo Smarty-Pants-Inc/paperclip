@@ -1,15 +1,5 @@
 import type { TaskChatItem } from "./task-chat-model";
 
-/** Suppress a live receipt only while the selected, healthy tray represents every task. */
-export function isPassiveTaskCreationItem(item: TaskChatItem, openTaskIds: ReadonlySet<string> | null): boolean {
-  if (!openTaskIds) return false;
-  if (item.kind === "task_handoff") return openTaskIds.has(item.handoff.issueId);
-  if (item.kind !== "interaction" || item.interaction.kind !== "suggest_tasks"
-      || item.interaction.status !== "accepted") return false;
-  const tasks = item.interaction.result?.createdTasks;
-  return !!tasks?.length && tasks.every(task => openTaskIds.has(task.issueId));
-}
-
 /** Suggestions retain this owner when acceptance morphs them into created tasks. */
 export function taskCreationSourceRunId(item: TaskChatItem): string | null {
   if (item.kind === "task_handoff") return item.handoff.sourceRunId ?? null;

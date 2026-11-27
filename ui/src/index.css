@@ -210,8 +210,6 @@
 
 :root {
   --breadcrumb-parent-max-width: 40%;
-  --chat-task-tray-panel-max-height: 50dvh;
-  --chat-task-tray-panel-mobile-max-height: 60dvh;
   color-scheme: light;
   --font-paper-mono: "Paper Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   --file-tree-indent-base: calc(var(--spacing) * 2);

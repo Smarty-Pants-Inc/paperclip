@@ -1670,7 +1670,6 @@ export const PLUGIN_UI_SLOT_TYPES = [
   "projectSidebarItem",
   "globalToolbarButton",
   "appShellOverlay",
-  "chatComposerAccessory",
   "organizationSwitcher",
   "toolbarButton",
   "contextMenuItem",

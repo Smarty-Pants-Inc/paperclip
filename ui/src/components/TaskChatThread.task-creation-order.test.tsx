@@ -6,7 +6,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConversationTaskHandoff, Issue, IssueDocument, IssueThreadInteraction } from "@paperclipai/shared";
 import { TaskChatThread } from "./TaskChatThread";
 import { CoordinatorPresentation } from "./coordinator/CoordinatorPresentation";
-import { CoordinatorChatTaskTray } from "./coordinator/CoordinatorChatTaskTray";
 import { ThemeProvider } from "@/context/ThemeContext";
 import { pendingSuggestedTasksInteraction, pendingRequestConfirmationInteraction, pendingAskUserQuestionsInteraction } from "@/fixtures/issueThreadInteractionFixtures";
 import type { TranscriptEntry } from "@/adapters";
@@ -18,22 +17,6 @@ const state = vi.hoisted(() => ({
   transcripts: new Map<string, TranscriptEntry[]>(),
   handoffs: [] as ConversationTaskHandoff[],
   plan: null as IssueDocument | null,
-  trayMode: "ready" as "ready" | "loading" | "unavailable" | "error",
-  trayIds: null as string[] | null,
-}));
-vi.mock("./coordinator/useChatTaskTray", async importOriginal => ({
-  ...await importOriginal<typeof import("./coordinator/useChatTaskTray")>(),
-  useChatTaskTray: () => ({
-    items: state.handoffs.filter(item => state.trayIds == null || state.trayIds.includes(item.issueId))
-      .map(item => state.trayMode === "unavailable" ? { ...item, status: "in_progress", displayStatus: "done" } as ConversationTaskHandoff : item),
-    loading: state.trayMode === "loading", stale: state.trayMode === "error", enabled: state.coordinator, retry: vi.fn(), newTaskSequence: 0,
-  }),
-}));
-vi.mock("@/api/agents", async importOriginal => ({
-  ...await importOriginal<typeof import("@/api/agents")>(), agentsApi: { list: vi.fn(async () => []) },
-}));
-vi.mock("@/api/access", async importOriginal => ({
-  ...await importOriginal<typeof import("@/api/access")>(), accessApi: { listUserDirectory: vi.fn(async () => ({ users: [] })) },
 }));
 vi.mock("@/components/transcript/useLiveRunTranscripts", () => ({
   useLiveRunTranscripts: () => ({ transcriptByRun: new Map(), hydratedRunIds: new Set(state.transcripts.keys()),
@@ -41,8 +24,7 @@ vi.mock("@/components/transcript/useLiveRunTranscripts", () => ({
 }));
 vi.mock("@/components/transcript/useNativeRunTranscripts", () => ({
   useNativeRunTranscripts: () => ({ transcriptByRun: new Map(state.transcripts), errorsByRun: new Map(),
-    terminalHydratedRunIds: new Set(state.transcripts.keys()), hydratedRunIds: new Set(state.transcripts.keys()),
-    activityLabelByRun: new Map() }),
+    terminalHydratedRunIds: new Set(state.transcripts.keys()) }),
 }));
 vi.mock("@/hooks/useIssuePlanDocument", () => ({ useIssuePlanDocument: () => ({ data: state.plan }) }));
 vi.mock("@/context/SidebarContext", () => ({ useSidebar: () => ({ isMobile: false }) }));
@@ -110,7 +92,7 @@ const suggestion = (status: "pending" | "accepted"): IssueThreadInteraction => (
 beforeEach(() => {
   state.coordinator = true;
   state.handoffs = [];
-  state.plan = null; state.trayMode = "ready"; state.trayIds = null;
+  state.plan = null;
   state.transcripts.clear();
   state.transcripts.set("source-run", [
     { kind: "assistant", channel: "progress", text: "Preparing the task.", ts: at(2) },
@@ -126,16 +108,13 @@ afterEach(async () => { await act(() => root.unmount()); host.remove(); client.c
 async function paint(overrides: Partial<React.ComponentProps<typeof TaskChatThread>> = {}) {
   await act(() => root.render(<QueryClientProvider client={client}><ThemeProvider>
     <CoordinatorPresentation value={state.coordinator}>
-      <TaskChatThread issueId="chat" companyId="company" conversationMode currentUserId="viewer"
-        composerAccessory={<CoordinatorChatTaskTray companyId="company" conversationIssueId="chat" viewerUserId="viewer"
-          sessionGeneration={1} onOpenConversationTasks={() => {}} />} comments={[
+      <TaskChatThread issueId="chat" conversationMode currentUserId="viewer" comments={[
         comment("final", "Your task is ready.", 9, "source-run"), comment("next", "A later question.", 20),
       ]} linkedRuns={[sourceRun]} onAdd={async () => {}} {...overrides} />
     </CoordinatorPresentation>
   </ThemeProvider></QueryClientProvider>));
 }
-// The updated base retains native replies in the unified turn rather than a saved-comment bubble.
-const anchor = (id: string) => host.querySelector(`[data-thread-anchor="${id === "final" ? "source-run:turn:0" : id}"]`)!;
+const anchor = (id: string) => host.querySelector(`[data-thread-anchor="${id}"]`)!;
 const before = (earlier: Element, later: Element) => expect(earlier.compareDocumentPosition(later) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 
 describe("Coordinator task creation ordering", () => {
@@ -147,8 +126,8 @@ describe("Coordinator task creation ordering", () => {
     expect(card.textContent).toContain("Verify the repair");
     expect(card.textContent).toContain("Todo");
     expect(card.getAttribute("href")).toBe("/issues/PAPER-102");
-    before(anchor("final"), card);
-    before(card, anchor("next"));
+    before(card, anchor("final"));
+    before(anchor("final"), anchor("next"));
     expect(host.querySelectorAll('[data-testid="task-chat-created-task"]')).toHaveLength(1);
     await paint({ conversationMode: false, companyId: "company", createdTasks: [createdTask({ status: "done" })] });
     expect(host.querySelector('[data-testid="task-chat-created-task"]')).toBe(card);
@@ -209,7 +188,7 @@ describe("Coordinator task creation ordering", () => {
     await paint();
     before(anchor("final"), anchor("chat_handoff:task"));
     before(anchor("chat_handoff:task"), anchor("next"));
-    before(anchor("chat_handoff:unknown"), anchor("next"));
+    before(anchor("chat_handoff:unknown"), anchor("final"));
     expect(host.querySelectorAll('[data-thread-anchor="chat_handoff:task"]')).toHaveLength(1);
   });
 
@@ -238,18 +217,14 @@ describe("Coordinator task creation ordering", () => {
     before(card, anchor("next"));
   });
 
-  it("omits passive cards from a tray chat's live tail and restores each once after settling", async () => {
-    state.handoffs = [handoff(), { ...handoff("suggested-task"), suggestionInteractionId: "suggestion" }];
+  it("follows the live tail and stays after the final reply when the turn settles", async () => {
+    state.handoffs = [handoff()];
     const live: LiveRunForIssue = { id: "source-run", agentId: "agent", agentName: "Assistant", adapterType: "paperclip_runner",
       runModel: null, runtimeMode: "native", status: "running", invocationSource: "on_demand", triggerDetail: null,
       createdAt: at(0), startedAt: at(0), finishedAt: null };
-    await paint({ comments: [], interactions: [suggestion("accepted")], linkedRuns: [{ ...sourceRun, status: "running", finishedAt: null }], liveRuns: [live] });
-    expect(host.querySelector('[data-thread-anchor="chat_handoff:task"]')).toBeNull();
-    expect(host.querySelector('[data-thread-anchor="interaction:suggestion"]')).toBeNull();
-    await paint({ interactions: [suggestion("accepted")] });
-    expect(host.querySelectorAll('[data-thread-anchor="interaction:suggestion"]')).toHaveLength(1);
-    expect(host.querySelector('[data-thread-anchor="chat_handoff:suggested-task"]')).toBeNull();
-    before(anchor("final"), anchor("interaction:suggestion"));
+    await paint({ comments: [], linkedRuns: [{ ...sourceRun, status: "running", finishedAt: null }], liveRuns: [live] });
+    before(host.querySelector('[data-testid="task-chat-live-transcript"]')!, anchor("chat_handoff:task"));
+    await paint();
     before(anchor("final"), anchor("chat_handoff:task"));
     before(anchor("chat_handoff:task"), anchor("next"));
     expect(host.querySelectorAll('[data-thread-anchor="chat_handoff:task"]')).toHaveLength(1);
@@ -279,40 +254,6 @@ describe("Coordinator task creation ordering", () => {
     expect(host.querySelectorAll('[data-thread-anchor="interaction:suggestion"]')).toHaveLength(1);
   });
 
-  it.each(["loading", "unavailable", "error", "not-mounted"] as const)("keeps every live creation card when the current tray is %s", async mode => {
-    state.handoffs = [handoff(), { ...handoff("suggested-task"), suggestionInteractionId: "suggestion" }];
-    if (mode !== "not-mounted") state.trayMode = mode;
-    const live: LiveRunForIssue = { id: "source-run", agentId: "agent", agentName: "Assistant", adapterType: "paperclip_runner",
-      runtimeMode: "native", status: "running", invocationSource: "on_demand", triggerDetail: null,
-      createdAt: at(0), startedAt: at(0), finishedAt: null, runModel: null };
-    await paint({ comments: [], interactions: [suggestion("accepted")],
-      ...(mode === "not-mounted" ? { composerAccessory: null } : {}),
-      linkedRuns: [{ ...sourceRun, status: "running", finishedAt: null }], liveRuns: [live] });
-    expect(host.querySelectorAll('[data-thread-anchor="chat_handoff:task"]')).toHaveLength(1);
-    expect(host.querySelectorAll('[data-thread-anchor="interaction:suggestion"]')).toHaveLength(1);
-  });
-
-  it("keeps mixed accepted results and unreadable/missing handoffs, then shows each creation once in settled history", async () => {
-    state.handoffs = [handoff(), handoff("unreadable"), { ...handoff("suggested-task"), suggestionInteractionId: "suggestion" }];
-    state.trayIds = ["task", "suggested-task"];
-    const accepted = suggestion("accepted");
-    if (!accepted.result || !("createdTasks" in accepted.result)) throw new Error("Expected accepted suggestion result");
-    accepted.result = { version: 1, createdTasks: [...accepted.result.createdTasks!,
-      { clientKey: "missing", issueId: "missing-task", identifier: "PAPER-missing", title: "Missing task" }] };
-    const live: LiveRunForIssue = { id: "source-run", agentId: "agent", agentName: "Assistant", adapterType: "paperclip_runner",
-      runtimeMode: "native", status: "running", invocationSource: "on_demand", triggerDetail: null,
-      createdAt: at(0), startedAt: at(0), finishedAt: null, runModel: null };
-    await paint({ comments: [], interactions: [accepted], linkedRuns: [{ ...sourceRun, status: "running", finishedAt: null }], liveRuns: [live] });
-    expect(host.querySelectorAll('[data-thread-anchor="chat_handoff:task"]')).toHaveLength(0);
-    expect(host.querySelectorAll('[data-thread-anchor="chat_handoff:unreadable"]')).toHaveLength(1);
-    expect(host.querySelectorAll('[data-thread-anchor="interaction:suggestion"]')).toHaveLength(1);
-    await paint({ interactions: [accepted] });
-    expect(host.querySelectorAll('[data-thread-anchor="chat_handoff:task"]')).toHaveLength(1);
-    expect(host.querySelectorAll('[data-thread-anchor="chat_handoff:unreadable"]')).toHaveLength(1);
-    expect(host.querySelectorAll('[data-thread-anchor="interaction:suggestion"]')).toHaveLength(1);
-    expect(host.querySelectorAll('[data-thread-anchor="chat_handoff:suggested-task"]')).toHaveLength(0);
-  });
-
   it("retains accepted suggestions in an ordinary Coordinator task's live tail", async () => {
     const live: LiveRunForIssue = { id: "source-run", agentId: "agent", agentName: "Assistant", adapterType: "paperclip_runner",
       runtimeMode: "native", status: "running", invocationSource: "on_demand", triggerDetail: null,
@@ -336,10 +277,9 @@ describe("Coordinator task creation ordering", () => {
     before(host.querySelector('[data-testid="task-chat-live-transcript"]')!, anchor("interaction:suggestion"));
   });
 
-  it("keeps classic suggestions in history when Coordinator is disabled", async () => {
+  it("keeps classic suggestion chronology when Coordinator is disabled", async () => {
     state.coordinator = false;
     await paint({ interactions: [suggestion("accepted")] });
-    before(anchor("final"), anchor("interaction:suggestion"));
-    before(anchor("interaction:suggestion"), anchor("next"));
+    before(anchor("interaction:suggestion"), anchor("final"));
   });
 });

@@ -644,22 +644,6 @@ describe("issue thread interaction routes", () => {
       expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
     });
 
-    if (route === "chat-handoffs") {
-      it("accepts the tray view and returns projected status evidence unchanged", async () => {
-        const page = { items: [{ id: `chat_handoff:${OTHER_ISSUE_ID}`, issueId: OTHER_ISSUE_ID, status: "blocked",
-          displayStatus: "blocked", externalConversationState: null, blockerAttention: { state: "covered" },
-          unblockDescriptor: null, interruption: null, blockedInboxAttention: null,
-          assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null, updatedAt: "2026-11-26T08:00:00.000Z" }], nextCursor: null };
-        list.mockResolvedValue(page);
-        const response = await request(await createApp(owner)).get(path).query({ view: "tray", limit: 100 });
-        expect(response.status).toBe(200);
-        expect(response.body).toEqual(page);
-        expect(list).toHaveBeenCalledWith("company-1", ISSUE_ID, { actor: owner, userId: owner.userId, view: "tray", limit: 100 });
-        expect(mockLogActivity).not.toHaveBeenCalled();
-        expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
-      });
-    }
-
     it("leaves omitted pagination to the history service defaults", async () => {
       const response = await request(await createApp(owner)).get(path);
       expect(response.status).toBe(200);
@@ -707,7 +691,7 @@ describe("issue thread interaction routes", () => {
 
     it.each([
       { limit: 0 }, { limit: 101 }, { limit: 1.5 }, { limit: "not-a-number" },
-      { cursor: "x".repeat(1001) }, { agentId: ASSIGNEE_AGENT_ID }, { view: "unknown" }, { view: ["tray", "tray"] },
+      { cursor: "x".repeat(1001) }, { agentId: ASSIGNEE_AGENT_ID },
     ])("rejects unsupported or unbounded conversation query %j", async (query) => {
       expect((await request(await createApp(owner)).get(path).query(query)).status).toBe(400);
       expect(list).not.toHaveBeenCalled();

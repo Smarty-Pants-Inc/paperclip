@@ -273,8 +273,6 @@ import {
   type IssuePropertiesDocumentDeepLink,
 } from "../components/IssueProperties";
 import { TaskSidePanel, type TaskSidePanelProps } from "../components/task-side-panel";
-import { ChatComposerAccessoryHost } from "../components/chat-composer/ChatComposerAccessoryHost";
-import { CoordinatorChatTaskTray } from "../components/coordinator/CoordinatorChatTaskTray";
 import { SidePanelToggleButton } from "../components/side-panel";
 import {
   TaskTreeControlDialog,
@@ -3392,11 +3390,6 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   const [moreOpen, setMoreOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const [mobilePropsOpen, setMobilePropsOpen] = useState(false);
-  const conversationTasksRequestSequence = useRef(0);
-  const [conversationTasksRequest, setConversationTasksRequest] = useState<{ issueId: string; requestId: number } | null>(null);
-  const handleConversationTasksOpened = useCallback((requestId: number) => {
-    setConversationTasksRequest(current => current?.requestId === requestId ? null : current);
-  }, []);
   const [artifactsOpenRequest, setArtifactsOpenRequest] = useState<{
     issueId: string;
     requestId: number;
@@ -4248,12 +4241,6 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     }
     setPanelVisible(true);
   }, [issue?.id, setPanelVisible, suppressPanelUntilPlan]);
-  const onOpenConversationTasks = useCallback(() => {
-    if (!issue?.conversationAgentId) return;
-    setConversationTasksRequest({ issueId: issue.id, requestId: ++conversationTasksRequestSequence.current });
-    if (isMobile) setMobilePropsOpen(true);
-    else openTaskSidePanel();
-  }, [issue?.id, issue?.conversationAgentId, isMobile, openTaskSidePanel]);
   const handleAttachmentOpened = useCallback(() => setOpenAttachment(null), []);
   const handleOpenTextAttachment = useCallback((id: string, title: string) => {
     if (!issue?.id) return;
@@ -6637,8 +6624,6 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
             artifactsOpenRequestId={!isMobile && !artifactsOpenRequest?.handled && artifactsOpenRequest?.issueId === panelIssue.id
               ? artifactsOpenRequest.requestId : undefined}
             onArtifactsOpened={handleArtifactsOpened}
-            conversationTasksOpenRequestId={!isMobile && conversationTasksRequest?.issueId === panelIssue.id ? conversationTasksRequest.requestId : undefined}
-            onConversationTasksOpened={handleConversationTasksOpened}
           />
         </IssueGalleryContext.Provider>,
         { contentMode: "full-bleed" },
@@ -6692,8 +6677,6 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     resolvedTasksTab,
     artifactsOpenRequest,
     handleArtifactsOpened,
-    conversationTasksRequest,
-    handleConversationTasksOpened,
     isMobile,
   ]);
 
@@ -9005,16 +8988,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                   onLoadOlderComments={loadOlderComments}
                   onRefreshLatestComments={refetchLatestComments}
                   composerRef={commentComposerRef}
-                  composerAccessory={<>
-                    {coordinatorWorkspaceEnabled && issue.conversationAgentId ? (
-                      <ChatComposerAccessoryHost key={`${issue.companyId}:${issue.id}:${currentUserId}:${issue.conversationSessionGeneration}`}
-                        companyId={issue.companyId} conversationIssueId={issue.id} agentId={issue.conversationAgentId}>
-                        <CoordinatorChatTaskTray companyId={issue.companyId} conversationIssueId={issue.id}
-                          viewerUserId={currentUserId ?? null} sessionGeneration={issue.conversationSessionGeneration ?? null}
-                          onOpenConversationTasks={onOpenConversationTasks} />
-                      </ChatComposerAccessoryHost>
-                    ) : null}
-                    {hasVisibleMonitorSurface(issue) ? (
+                  composerAccessory={
+                    hasVisibleMonitorSurface(issue) ? (
                       <IssueMonitorComposerStrip
                         issue={issue}
                         hasActiveRun={hasLiveRuns}
@@ -9023,8 +8998,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                         onCheckNow={() => checkIssueMonitorNow.mutate()}
                         checkingNow={checkIssueMonitorNow.isPending}
                       />
-                    ) : null}
-                  </>}
+                    ) : null
+                  }
                   footer={
                     !taskChatShellEnabled && siblingNavigation ? (
                       <IssueSiblingNavigation
@@ -9356,8 +9331,6 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                     artifactsOpenRequestId={isMobile && !artifactsOpenRequest?.handled && artifactsOpenRequest?.issueId === issue.id
                       ? artifactsOpenRequest.requestId : undefined}
                     onArtifactsOpened={handleArtifactsOpened}
-                    conversationTasksOpenRequestId={isMobile && conversationTasksRequest?.issueId === issue.id ? conversationTasksRequest.requestId : undefined}
-                    onConversationTasksOpened={handleConversationTasksOpened}
                     onAttachmentOpened={handleAttachmentOpened}
                     openAttachment={openAttachment?.issueId === issue.id ? openAttachment : null}
                     openSkillId={openSkill?.id ?? null}

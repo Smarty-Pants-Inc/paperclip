@@ -124,8 +124,7 @@ import {
   isOutdatedPlanConfirmation,
   isSuppressedThreadInteraction,
 } from "@/components/task-chat/interaction-thread-order";
-import { isPassiveTaskCreationItem, orderTaskCreationItems, taskCreationSourceRunId } from "@/components/task-chat/task-creation-order";
-import { ChatTaskTrayMembershipContext, useChatTaskTrayMembership } from "@/components/coordinator/useChatTaskTray";
+import { orderTaskCreationItems, taskCreationSourceRunId } from "@/components/task-chat/task-creation-order";
 import {
   interactionReplacesComposerSkip,
   shouldHideInteractionCard,
@@ -876,7 +875,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const decisionReceipts = useCoordinatorChatDecisionReceipts(issueId, conversationMode);
   const pendingQuestions = useCoordinatorChatPendingQuestions(issueId, conversationMode);
   const taskHandoffs = useCoordinatorChatTaskHandoffs(issueId, conversationMode === true);
-  const { taskIds: trayTaskIds, publish: publishTrayMembership } = useChatTaskTrayMembership(companyId, issueId, currentUserId);
   const scrollingHistory: ScrollingHistory | undefined = props.scrollingHistory ? {
     hasMore: props.scrollingHistory.hasMore || !!decisionReceipts.hasNextPage || !!taskHandoffs.hasNextPage,
     loading: props.scrollingHistory.loading || decisionReceipts.isFetchingNextPage || taskHandoffs.isFetchingNextPage,
@@ -4490,7 +4488,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
 
   return (
     <TaskChatStatusContext.Provider value={statusLineRun?.id ?? null}>
-    <ChatTaskTrayMembershipContext.Provider value={publishTrayMembership}>
     <TaskChatRequestHistoryContext.Provider value={issueId ?? "unknown"}>
     <McpAppIssueProvider issueId={issueId} sendMessage={composerDisabledReason ? null : sendMcpAppMessage}>
     <ProviderToolIconsProvider companyId={companyId}>
@@ -4702,9 +4699,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                 <TaskChatShimmerScope items={[]}><TaskChatRunnerHeader status="queued" startedAtMs={null}
                                   agentName={tailAgent?.name} agent={tailAgent} working={requestWorking} preparationLabel={requestLabel} /></TaskChatShimmerScope>
                               </div> : null}
-                              {tailTaskCreationItems.filter(item =>
-                                !(coordinatorEnabled && conversationMode && isPassiveTaskCreationItem(item, trayTaskIds)),
-                              ).map(item => (
+                              {tailTaskCreationItems.map(item => (
                                 <div key={item.id} data-thread-anchor={item.id} data-thread-item-kind={item.kind} className="mt-4">
                                   {item.kind === "task_handoff"
                                     ? <CoordinatorChatTaskHandoff handoff={item.handoff} animateEntry={item.animateEntry} />
@@ -4886,7 +4881,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     </ProviderToolIconsProvider>
     </McpAppIssueProvider>
     </TaskChatRequestHistoryContext.Provider>
-    </ChatTaskTrayMembershipContext.Provider>
     </TaskChatStatusContext.Provider>
   );
 }

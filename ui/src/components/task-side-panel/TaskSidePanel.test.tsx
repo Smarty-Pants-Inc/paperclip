@@ -205,30 +205,6 @@ describe("TaskSidePanel", () => {
     );
   }
 
-  it.each([false, true])("opens and reopens the conversation Tasks tab on a one-shot request (mobile=%s)", async mobile => {
-    const chat = issue({ conversationAgentId: "agent-1" });
-    writeTaskSidePanelState("user-1", "company-1", chat.id, {
-      state: { tabs: [taskPanelArtifactsTab()], activeTabId: "artifacts" },
-      launcherOpen: false, userInteracted: true, autoPlanHandled: false, updatedAt: 1,
-    });
-    const acknowledged = vi.fn();
-    await render(panel({ issue: chat, mobile }));
-    expect(container.textContent).not.toContain("Agent tasks agent-1");
-    const requestProps = { issue: chat, mobile, conversationTasksOpenRequestId: 1, onConversationTasksOpened: acknowledged };
-    await render(panel(requestProps));
-    expect(container.textContent).toContain("Agent tasks agent-1 excluding task-1");
-    expect(acknowledged).toHaveBeenCalledExactlyOnceWith(1);
-    await render(panel(requestProps));
-    expect(acknowledged).toHaveBeenCalledTimes(1);
-    if (mobile) await act(() => container.querySelector<HTMLButtonElement>('button[aria-label^="Switch tabs"]')!.click());
-    const close = document.querySelector<HTMLButtonElement>('button[aria-label="Close Tasks"]');
-    expect(close).not.toBeNull();
-    await act(() => close!.click());
-    await render(panel({ ...requestProps, conversationTasksOpenRequestId: 2 }));
-    expect(container.textContent).toContain("Agent tasks agent-1 excluding task-1");
-    expect(acknowledged).toHaveBeenLastCalledWith(2);
-  });
-
   it.each([false, true])("owns document authoring in the resolved chat shell (coordinator: %s)", async coordinatorEnabled => {
     coordinator.enabled = coordinatorEnabled;
     const documentEditor = { imageUploadHandler: vi.fn(async () => "/api/attachments/image/content"), externalReferences: {} };
