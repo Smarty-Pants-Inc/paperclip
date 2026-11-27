@@ -34,6 +34,17 @@ import { canonicalNativeRuntimeContextDigest, parseNativeExecutionInput } from "
 import { snapshotFile } from "../services/skill-snapshot.js";
 import { hasLocalRuntimeSkillObligations } from "../services/native-runtime/runtime-skill-preservation.js";
 
+// This suite includes explicit expiry qualification; set policy before imports load.
+const originalRetention = vi.hoisted(() => {
+  const original = process.env.PAPERCLIP_PROVIDER_TRACE_RETENTION_MS;
+  process.env.PAPERCLIP_PROVIDER_TRACE_RETENTION_MS = "86400000";
+  return original;
+});
+afterAll(() => {
+  if (originalRetention === undefined) delete process.env.PAPERCLIP_PROVIDER_TRACE_RETENTION_MS;
+  else process.env.PAPERCLIP_PROVIDER_TRACE_RETENTION_MS = originalRetention;
+});
+
 // Explicit real-dependency qualification. Never contacts off-host storage in
 // the default test path; use a disposable S3-compatible service and PostgreSQL.
 describe.skipIf(!process.env.PAPERCLIP_TEST_S3_ENDPOINT)("existing-volume enrollment with PostgreSQL and S3", () => {
