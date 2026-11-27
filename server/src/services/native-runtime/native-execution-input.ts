@@ -317,10 +317,11 @@ function buildNativeExecutionInputUnchecked(input: BuildNativeExecutionInput): N
       ...(Array.isArray(wake?.commentIds) ? wake.commentIds.filter((id): id is string => typeof id === "string") : []),
       ...(delta?.messages.filter(message => message.authorType === "user").map(message => message.id) ?? []),
       ...(typeof wake?.interactionId === "string" ? [wake.interactionId] : []),
-    ])];
+    ])].filter(id => !delta?.receivedComments?.some(receipt => receipt.id === id && receipt.stopped &&
+      continuation?.messages.some(message => message.id === id && message.updatedAt === receipt.updatedAt)));
     const answeredCommentIds = namedCommentIds.filter(id => delta?.receivedComments?.some(receipt =>
-      receipt.id === id && receipt.answered && (!continuation?.messages.some(message =>
-        message.id === id && message.updatedAt !== receipt.updatedAt))));
+      receipt.id === id && receipt.answered && !receipt.stopped && continuation?.messages.some(message =>
+        message.id === id && message.updatedAt === receipt.updatedAt)));
     // The constructor and heartbeat share the same proof; a page must never
     // infer a benign cancellation from the absence of text or a status badge.
     if (answeredCommentIds.length === namedCommentIds.length) {

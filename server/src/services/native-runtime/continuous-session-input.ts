@@ -1,5 +1,6 @@
 import { and, asc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, agents, heartbeatRunEvents, heartbeatRuns, issueComments, issueQuestionResponseDeliveries, issueThreadInteractions, issues, type Db } from "@paperclipai/db";
+import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { parseObject } from "../../adapters/utils.js";
 import { queuedCommentIdsFromRunContext, queuedCommentIdsFromWakePayload, withQueuedCommentIdsInWakePayload } from "../issue-queued-comment-queue.js";
 import { resolveSessionContinuity } from "./continued-session.js";
@@ -160,6 +161,8 @@ export async function answeredContinuousHeldRun(db: Db, scope: Scope): Promise<b
   return !response && [...pending].every(id => answered.has(id));
 }
 
+type RetainedCommentReceipt = NonNullable<NonNullable<ExecutionContinuationEnvelope["resumeDelta"]>["receivedComments"]>[number];
+
 /** Exact revisions accepted by the selected retained session, not the frozen
  * origin envelope. Queue receipts alone are not provider delivery evidence.
  * This read is DB-only: it runs before the successor's native session opens. */
@@ -168,12 +171,11 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
   previousRunId: string; sessionId: string; providerSessionId: string;
   selectedCheckpoint: unknown;
   messages: ReadonlyArray<{ id: string; updatedAt: string; createdAt: string }>;
-}): Promise<{ received: Set<string>; owed: Set<string>; receipts: Array<{
-  id: string; updatedAt: string; receivedAt: string; answered: boolean;
-}> } | null> {
+}): Promise<{ received: Set<string>; owed: Set<string>; receipts: RetainedCommentReceipt[] } | null> {
   const runs = await db.select({ id: heartbeatRuns.id,
     checkpoint: sql<Record<string, unknown> | null>`${heartbeatRuns.runnerProfileJson}->'sessionCheckpoint'`,
-    replyReceipts: sql<Array<{ id: string; updatedAt: string; receivedAt: string; answered: boolean }> | null>`${heartbeatRuns.contextSnapshot} #> '{executionContinuation,resumeDelta,receivedComments}'`,
+    replyReceipts: sql<RetainedCommentReceipt[] | null>`${heartbeatRuns.contextSnapshot} #> '{executionContinuation,resumeDelta,receivedComments}'`,
+    baseRunId: sql<string | null>`${heartbeatRuns.contextSnapshot} #>> '{executionContinuation,resumeDelta,baseRunId}'`,
     coverage: sql<Record<string, unknown> | null>`${heartbeatRuns.contextSnapshot} #> '{executionContinuation,coverage}'`,
     // Transfer revision identities, not N copies of the task's message bodies.
     messages: sql<Array<{ id: string; updatedAt: string }>>`(select coalesce(jsonb_agg(jsonb_build_object(
@@ -214,7 +216,7 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
     const session = eventsByRun.get(run.id)?.findLast(event => event.seq <= throughSeq && event.eventType.startsWith("session."));
     // A later session event overrides saved coverage after a failed resume.
     return (session ? parseObject(parseObject(session.payload?.prpEvent).payload).providerSessionId
-      : run.coverage?.providerSessionId) === scope.providerSessionId;
+      : run.coverage?.providerSessionId ?? parseObject(run.checkpoint).providerSessionId) === scope.providerSessionId;
   };
   if (!sameGeneration(runs.find(run => run.id === scope.previousRunId)!)) return null;
   const queueIds = runs.flatMap(run => Object.values(parseObject(run.result.queuedSteeringAcknowledgements))
@@ -230,13 +232,65 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
   const wakesById = new Map(wakes.map(wake => [wake.id, wake]));
   const revisions = new Map(scope.messages.map(message => [message.id, message.updatedAt]));
   const createdTimes = new Map(scope.messages.map(message => [message.id, message.createdAt]));
-  // Delivery and answering are separate facts. Only publication's explicit
-  // question attribution answers input; arbitrary progress text never does.
-  const answeredIds = new Set(runs.filter(run => sameGeneration(run)).flatMap(run =>
-    Object.values(parseObject(run.result.continuousReplies)).flatMap(reply => {
-      const ids = parseObject(reply).questionCommentIds;
-      return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : [];
-    })));
+  // Legacy publication ledgers name IDs. Qualify each attribution with the
+  // revision in THAT answering run's submitted input/ACK, never today's row.
+  // A reply-reference successor can answer the revision it was asked about;
+  // arbitrary output on the original carrier still does not answer it.
+  const revisionKey = (id: unknown, revision: unknown) => JSON.stringify([id, revision]);
+  const answeredRevisions = new Set<string>(), requestedRevisions = new Set<string>(), stoppedRevisions = new Set<string>();
+  const inputRevisions = (run: typeof runs[number], beforeSeq = Number.POSITIVE_INFINITY) => new Map<string, string>([
+    ...(Array.isArray(run.coverage?.omitted) ? run.coverage.omitted.map(parseObject) : []),
+    ...(run.replyReceipts ?? []), ...run.messages,
+    ...Object.entries(parseObject(run.result.queuedSteeringAcknowledgements)).flatMap(([id, value]) => {
+      const ack = parseObject(value);
+      const accepted = eventsByRun.get(run.id)?.find(event => {
+        const prp = parseObject(event.payload?.prpEvent), payload = parseObject(prp.payload);
+        return event.eventType === "item.completed" && event.sourceEventId !== null && sameGeneration(run, event.seq) &&
+          prp.normalizedSessionId === scope.sessionId && prp.turnId === ack.turnId && prp.itemId === `${ack.turnId}:steer:${id}` &&
+          payload.kind === "steering_acknowledgement" && payload.status === "acknowledged";
+      });
+      const seq = accepted?.seq;
+      // Held runs may receive a later edit after answering v1. Only ACKs
+      // BEFORE this particular publication can qualify its answer to v2.
+      const wake = typeof ack.queueId === "string" ? wakesById.get(ack.queueId) : undefined;
+      const currentRevision = revisions.get(id);
+      const revision = typeof ack.commentUpdatedAt === "string" ? ack.commentUpdatedAt :
+        wake && currentRevision && Date.parse(currentRevision) <= wake.createdAt.getTime() ? currentRevision : undefined;
+      return ack.status === "acknowledged" && typeof seq === "number" && seq < beforeSeq
+        ? [{ id, updatedAt: revision }] : [];
+    }),
+  ].flatMap(message => typeof message.id === "string" && typeof message.updatedAt === "string" ? [[message.id, message.updatedAt] as [string, string]] : []));
+  for (const run of runs) {
+    const revisionsInRun = inputRevisions(run);
+    const stop = parseObject(run.result.personStop);
+    if (Object.keys(stop).length) {
+      for (const message of run.messages) if (typeof stop.requestedAt !== "string" || Date.parse(message.updatedAt) <= Date.parse(stop.requestedAt))
+        stoppedRevisions.add(revisionKey(message.id, message.updatedAt));
+      for (const id of Array.isArray(stop.returned) ? stop.returned : []) {
+        // A returned startup input may not have a continuation snapshot. The
+        // person's click cutoff qualifies that legacy revision, not a later edit.
+        const revision = revisionsInRun.get(String(id)) ?? (typeof stop.requestedAt === "string" &&
+          Date.parse(revisions.get(String(id)) ?? "") <= Date.parse(stop.requestedAt) ? revisions.get(String(id)) : undefined);
+        if (revision && (typeof stop.requestedAt !== "string" || Date.parse(revision) <= Date.parse(stop.requestedAt)))
+          stoppedRevisions.add(revisionKey(id, revision));
+      }
+    }
+    if (!sameGeneration(run)) continue;
+    for (const reply of Object.values(parseObject(run.result.continuousReplies))) {
+      const attribution = parseObject(reply), ids = attribution.questionCommentIds;
+      // Old ID-only receipts without a publication cursor can prove only the
+      // frozen carried revision, not any later ACK in the same held run.
+      const atPublication = inputRevisions(run, typeof attribution.cursor === "number" ? attribution.cursor : 0);
+      for (const id of Array.isArray(ids) ? ids : []) {
+        const revision = typeof id === "string" ? atPublication.get(id) : undefined;
+        if (revision) answeredRevisions.add(revisionKey(id, revision));
+      }
+    }
+    const start = eventsByRun.get(run.id)?.find(event => ["turn.accepted", "turn.started"].includes(event.eventType) && sameGeneration(run, event.seq));
+    if (start) for (const receipt of run.replyReceipts ?? []) {
+      if (!receipt.answered && !receipt.stopped) requestedRevisions.add(revisionKey(receipt.id, receipt.updatedAt));
+    }
+  }
   const compactedAfter = (after: typeof events[number]) => events.some(event => {
     const run = runs.find(run => run.id === event.runId);
     const payload = parseObject(parseObject(event.payload?.prpEvent).payload);
@@ -249,14 +303,14 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
   // generation read it. Require the read's own retained-generation evidence.
   const readRevisions = new Set<string>();
   const received = new Set<string>(), owed = new Set<string>();
-  const receipts = new Map<string, { id: string; updatedAt: string; receivedAt: string; answered: boolean }>();
+  const receipts = new Map<string, RetainedCommentReceipt>();
   // A logged output is not proof that the next resume can load it. The saved
   // checkpoint must bind this run and generation and cover the source event.
   // Missing/legacy checkpoints fail open to delivery, never to silent omission.
-  const sourceCheckpointCovers = (checkpoint: unknown, run: typeof runs[number], event: typeof events[number]) => {
+  const sourceCheckpointCovers = (checkpoint: unknown, run: typeof runs[number], event: Pick<typeof events[number], "sourceSeq">) => {
     const saved = parseObject(checkpoint), identity = parseObject(saved.identity);
     // Runner serializes lastSourceSequence as string | null. In particular,
-    // null is not zero, and another same-generation run's save is not selected.
+    // null is not zero. Cross-run retention additionally requires lineage below.
     const cursor = typeof saved.cursor === "string" && saved.cursor.trim() ? Number(saved.cursor) : NaN;
     return typeof saved.sessionId === "string" && saved.sessionId.trim().length > 0
       && identity.runId === run.id && identity.companyId === scope.companyId && identity.issueId === scope.issueId
@@ -264,15 +318,39 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
       && saved.providerSessionId === scope.providerSessionId && Number.isSafeInteger(cursor)
       && typeof event.sourceSeq === "number" && event.sourceSeq > 0 && cursor >= event.sourceSeq;
   };
+  const selectedRun = runs.find(run => run.id === scope.previousRunId)!;
+  const selectedCheckpoint = parseObject(scope.selectedCheckpoint);
+  // Follow the actual carried envelope chain, with a monotone checkpoint for
+  // the SAME driver/provider session at every hop. No unrelated covering save
+  // and no selected run's own assistant output is needed to retain its parent.
+  const ancestors = new Set<string>();
+  let child = selectedRun;
+  let childCheckpoint = selectedCheckpoint;
+  while (child.baseRunId && !ancestors.has(child.baseRunId)) {
+    const parent = runs.find(run => run.id === child.baseRunId);
+    if (!parent || parent.id === selectedRun.id || !sameGeneration(parent)) break;
+    const parentCheckpoint = parseObject(parent.checkpoint);
+    const parentCursor = typeof parentCheckpoint.cursor === "string" && parentCheckpoint.cursor.trim() ? Number(parentCheckpoint.cursor) : NaN;
+    const childCursor = typeof childCheckpoint.cursor === "string" && childCheckpoint.cursor.trim() ? Number(childCheckpoint.cursor) : NaN;
+    const sourceIdentity = parseObject(parentCheckpoint.identity), childIdentity = parseObject(childCheckpoint.identity);
+    if (childIdentity.runId !== child.id || sourceIdentity.runId !== parent.id ||
+        !sourceCheckpointCovers(childCheckpoint, child, { sourceSeq: 1 }) ||
+        !sourceCheckpointCovers(parentCheckpoint, parent, { sourceSeq: 1 }) ||
+        childCheckpoint.sessionId !== parentCheckpoint.sessionId || !Number.isSafeInteger(parentCursor) || childCursor < parentCursor) break;
+    ancestors.add(parent.id); child = parent; childCheckpoint = parentCheckpoint;
+  }
   const checkpointCovers = (run: typeof runs[number], event: typeof events[number]) =>
-    run.id === scope.previousRunId && sourceCheckpointCovers(scope.selectedCheckpoint, run, event);
-  const outputAfter = (run: typeof runs[number], after: typeof events[number], historicalRead = false) =>
+    run.id === scope.previousRunId ? sourceCheckpointCovers(scope.selectedCheckpoint, run, event) :
+      ancestors.has(run.id) && sourceCheckpointCovers(run.checkpoint, run, event) &&
+      sourceCheckpointCovers(scope.selectedCheckpoint, selectedRun, event);
+  const outputAfter = (run: typeof runs[number], after: typeof events[number], historicalRead = false, replyOnly = false) =>
     (eventsByRun.get(run.id) ?? []).some(event => {
       const prp = parseObject(event.payload?.prpEvent), payload = parseObject(prp.payload);
       const afterTurn = parseObject(after.payload?.prpEvent).turnId;
       return event.seq > after.seq && event.eventType === "item.completed" && sameGeneration(run, event.seq)
         && ["agentMessage", "assistant_message", "agent_message"].includes(String(payload.kind))
         && typeof payload.text === "string" && payload.text.trim().length > 0
+        && (!replyOnly || payload.channel === "final" || payload.channel == null)
         && prp.normalizedSessionId === scope.sessionId
         && (typeof afterTurn === "string" ? prp.turnId === afterTurn : after.eventType === "task_history.read")
         && (historicalRead ? sourceCheckpointCovers(run.checkpoint, run, event) : checkpointCovers(run, event));
@@ -296,7 +374,8 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
       const prior = receipts.get(id);
       if (!answered && compactedAfter(event)) { received.delete(id); owed.add(id); return; }
       receipts.set(id, { id, updatedAt: revision, receivedAt: prior?.receivedAt ?? createdTimes.get(id) ?? event.timestamp.toISOString(),
-        answered: answered || prior?.answered === true });
+        answered: answered || prior?.answered === true,
+        ...(requestedRevisions.has(revisionKey(id, revision)) ? { replyRequested: true } : {}) });
     }
   };
   for (const run of runs) {
@@ -307,14 +386,17 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
       const start = runEvents.find(event => ["turn.accepted", "turn.started"].includes(event.eventType) && sameGeneration(run, event.seq));
       if (start && outputAfter(run, start)) {
         // A successor's full history is fallback data, not its delivered delta.
-        for (const message of run.messages) accept(message.id, message.updatedAt, start, answeredIds.has(message.id));
-        // A reply-only successor carries receipt references, not the old text.
-        for (const receipt of run.replyReceipts ?? []) accept(receipt.id, receipt.updatedAt, start, answeredIds.has(receipt.id));
+        for (const message of run.messages) accept(message.id, message.updatedAt, start, answeredRevisions.has(revisionKey(message.id, message.updatedAt)));
+        // A saved successor reply to a carried instruction owns precisely that
+        // receipt's revision, including providers without continuousReplies.
+        for (const receipt of run.replyReceipts ?? []) accept(receipt.id, receipt.updatedAt, start,
+          receipt.answered || answeredRevisions.has(revisionKey(receipt.id, receipt.updatedAt)) ||
+          !receipt.replyRequested && !receipt.stopped && outputAfter(run, start, false, true));
         const coverage = run.coverage;
         if (coverage?.nativeSessionId === scope.sessionId && coverage.providerSessionId === scope.providerSessionId && Array.isArray(coverage.omitted)) {
           for (const value of coverage.omitted) {
             const message = parseObject(value);
-            if (readRevisions.has(JSON.stringify([message.id, message.updatedAt]))) accept(message.id, message.updatedAt, start, answeredIds.has(String(message.id)));
+            if (readRevisions.has(revisionKey(message.id, message.updatedAt))) accept(message.id, message.updatedAt, start, answeredRevisions.has(revisionKey(message.id, message.updatedAt)));
           }
         }
       }
@@ -330,13 +412,13 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
             && checkpointCovers(run, event);
         });
         if (!acknowledged) continue;
-        if (typeof receipt.commentUpdatedAt === "string") accept(id, receipt.commentUpdatedAt, acknowledged, answeredIds.has(id));
+        if (typeof receipt.commentUpdatedAt === "string") accept(id, receipt.commentUpdatedAt, acknowledged, answeredRevisions.has(revisionKey(id, receipt.commentUpdatedAt)));
         else {
           // Older ACKs stored no revision. Only the unchanged pre-queue
           // revision is provable; a later edit can never be hidden by its ACK.
           const wake = typeof receipt.queueId === "string" ? wakesById.get(receipt.queueId) : undefined;
           const revision = revisions.get(id);
-          if (wake && revision && Date.parse(revision) <= wake.createdAt.getTime()) accept(id, revision, acknowledged, answeredIds.has(id));
+          if (wake && revision && Date.parse(revision) <= wake.createdAt.getTime()) accept(id, revision, acknowledged, answeredRevisions.has(revisionKey(id, revision)));
         }
       }
     }
@@ -347,6 +429,12 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
   // output still owes a reply, not a duplicate copy of the comment's text.
   for (const wake of wakes) if (["queued", "deferred_issue_execution"].includes(wake.status)) {
     for (const id of queuedCommentIdsFromWakePayload(wake.payload)) if (!received.has(id)) owed.add(id);
+  }
+  // Stop is retirement, not answering. Keep a separate receipt so neither
+  // constructor can restore the stopped body or manufacture a reply request.
+  for (const message of scope.messages) if (stoppedRevisions.has(revisionKey(message.id, message.updatedAt))) {
+    received.add(message.id); owed.delete(message.id);
+    receipts.set(message.id, { id: message.id, updatedAt: message.updatedAt, receivedAt: message.createdAt, answered: false, stopped: true });
   }
   return { received, owed, receipts: [...receipts.values()] };
 }

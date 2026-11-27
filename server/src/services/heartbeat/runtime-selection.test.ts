@@ -4,7 +4,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { activityLog, agents, agentTaskSessions, authUsers, companyMemberships, companySkillRepositorySnapshots, principalPermissionGrants, environments, environmentLeases, companies, completionContracts, costEvents, createDb, applyPendingMigrations, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, workspaceOperations, type Db } from "@paperclipai/db";
+import { activityLog, agents, agentTaskSessions, authUsers, companyMemberships, companySkillRepositorySnapshots, principalPermissionGrants, environments, environmentLeases, companies, completionContracts, costEvents, createDb, applyPendingMigrations, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issueComments, issues, nativeRunFinalizations, workspaceOperations, type Db } from "@paperclipai/db";
 import { accountRunCost } from "../run-cost-accounting.js";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -37,6 +37,7 @@ import { prepareHeartbeatSession, resolveHeartbeatAdapterSession, type Heartbeat
 import { getAdapterSessionCodec } from "./run-state.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { attachPaperclipSessionMetadataToSessionParams } from "./workspaces.js";
+import { buildExecutionContinuation } from "../execution-continuation.js";
 
 // Keep the real contract, session, and runtime-selection transactions. Replace only
 // filesystem materialization and sandbox synchronization at their external boundaries.
@@ -638,6 +639,59 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       expect(saved.processPid).toBeNull();
       expect(saved.runnerProfileJson?.inheritedProcessIdentityRunId).toBeUndefined();
     }
+  });
+
+  it.each([false, true])("recomputes retained input through the actual override when selection advances past the preparation hint (null checkpoint provider: %s)", async nullable => {
+    const { input, run, agent, issue } = await fixture();
+    const companyId = agent.companyId, sessionId = randomUUID(), providerSessionId = "retained-provider-thread";
+    const [origin] = await db.insert(issueComments).values({ companyId, issueId: issue.id, authorType: "user", authorUserId: "local-board", body: "RETAINED_ORIGIN_NOT_TO_BE_RESENT" }).returning();
+    const [retainedOld] = await db.insert(issueComments).values({ companyId, issueId: issue.id, authorType: "user", authorUserId: "local-board", body: "RETAINED_NON_ORIGIN_HISTORY" }).returning();
+    const full = await buildExecutionContinuation({ db, companyId, issueId: issue.id, agentId: agent.id, context: { commentId: origin!.id }, summary: null, exposeLowTrustRaw: false });
+    const first = await selectHeartbeatRuntime(db, input);
+    if (!first.selected || !first.nativeExecution) throw new Error("Expected initial native selection");
+    const firstInput = { ...first.nativeExecution, session: { ...first.nativeExecution.session, normalizedSessionId: sessionId } };
+    const profile = (await read(run.id)).runnerProfileJson!;
+    const checkpoint = (id: string, savedProviderId: string | null = providerSessionId) => ({ backendKind: "runner", driverKind: "codex_app_server", sessionId: providerSessionId, providerSessionId: savedProviderId, cursor: "3",
+      identity: { companyId, issueId: issue.id, agentId: agent.id, runId: id, sessionId } });
+    await db.update(heartbeatRuns).set({ status: "succeeded", nativeIssueId: issue.id, nativeSessionId: sessionId,
+      contextSnapshot: { issueId: issue.id, executionContinuation: full }, resultJson: { continuousReplies: { answer: { questionCommentIds: [origin!.id, retainedOld!.id] } } },
+      runnerProfileJson: { ...profile, nativeExecutionInput: firstInput, sessionCheckpoint: checkpoint(run.id) } }).where(eq(heartbeatRuns.id, run.id));
+    const events = (id: string, seq: number) => [
+      { companyId, agentId: agent.id, runId: id, seq, sourceSeq: seq + 1, sourceEventId: `${id}:session`, eventType: "session.resumed", payload: { prpEvent: { normalizedSessionId: sessionId, payload: { providerSessionId } } } },
+      { companyId, agentId: agent.id, runId: id, seq: seq + 1, sourceSeq: seq + 2, sourceEventId: `${id}:turn`, eventType: "turn.accepted", payload: { prpEvent: { normalizedSessionId: sessionId, turnId: "turn", payload: {} } } },
+    ];
+    await db.insert(heartbeatRunEvents).values([...events(run.id, 0), { companyId, agentId: agent.id, runId: run.id, seq: 2, sourceSeq: 3, sourceEventId: "origin-answer", eventType: "item.completed",
+      payload: { prpEvent: { normalizedSessionId: sessionId, turnId: "turn", payload: { kind: "agentMessage", text: "Origin answered" } } } }]);
+    const inherited = await buildExecutionContinuation({ db, companyId, issueId: issue.id, agentId: agent.id, previousContextRunId: run.id, nativeSessionId: sessionId, nativeProviderSessionId: providerSessionId,
+      context: { commentId: origin!.id }, summary: null, exposeLowTrustRaw: false });
+    const selectedId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: selectedId, companyId, agentId: agent.id, issueId: issue.id, scopeKind: "issue", runtimeMode: "native", nativeIssueId: issue.id, nativeSessionId: sessionId,
+      status: "failed", createdAt: new Date(run.createdAt.getTime() + 1000), contextSnapshot: { issueId: issue.id, executionContinuation: inherited },
+      runnerProfileJson: { ...profile, nativeExecutionInput: { ...firstInput, binding: { ...firstInput.binding, runId: selectedId, executionWorkspaceId: selectedId } }, sessionCheckpoint: checkpoint(selectedId, nullable ? null : providerSessionId) } });
+    await db.insert(heartbeatRunEvents).values(events(selectedId, 10));
+    const [freshComment] = await db.insert(issueComments).values({ companyId, issueId: issue.id, authorType: "user", authorUserId: "local-board", body: "ONLY_NEW_RUNTIME_INPUT" }).returning();
+    const [current] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, issueId: issue.id, scopeKind: "issue", status: "running", createdAt: new Date(run.createdAt.getTime() + 2000) }).returning();
+    const prepared = await buildExecutionContinuation({ db, companyId, issueId: issue.id, agentId: agent.id, previousContextRunId: run.id, runId: current!.id,
+      nativeSessionId: sessionId, nativeProviderSessionId: providerSessionId, context: { commentId: freshComment!.id, executionContinuation: full }, summary: null, exposeLowTrustRaw: false });
+    expect(prepared.resumeDelta?.baseRunId).toBe(run.id);
+    input.run = current!; input.session.taskResumeSessionId = sessionId;
+    const wake = { reason: "issue_commented", commentIds: [freshComment!.id], executionContinuation: prepared };
+    input.task.executionContinuation = prepared;
+    input.task.context = { issueId: issue.id, executionContinuation: prepared, paperclipWake: wake, paperclipTaskMarkdown: "Complete this task" };
+    input.task.paperclipWakePayload = wake as never;
+    const selected = await selectHeartbeatRuntime(db, input);
+    if (!selected.selected || !selected.nativeExecution) throw new Error("Expected successor native selection");
+    expect(prepared.resumeDelta?.baseRunId).toBe(selectedId);
+    expect(prepared.resumeDelta?.messages.map(m => m.id)).toEqual(nullable ? [origin!.id, freshComment!.id] : [freshComment!.id]);
+    if (nullable) expect(prepared.resumeDelta?.receivedComments).toEqual([]);
+    else expect(prepared.resumeDelta?.receivedComments?.find(r => r.id === origin!.id)?.answered).toBe(true);
+    const envelope = buildNativeModelEnvelope(selected.nativeExecution, { resumedSession: true });
+    expect(JSON.stringify(envelope)).toContain("ONLY_NEW_RUNTIME_INPUT");
+    if (nullable) expect(JSON.stringify(envelope)).toContain("RETAINED_ORIGIN_NOT_TO_BE_RESENT");
+    else expect(JSON.stringify(envelope)).not.toContain("RETAINED_ORIGIN_NOT_TO_BE_RESENT");
+    expect(JSON.stringify(envelope)).not.toContain("RETAINED_NON_ORIGIN_HISTORY");
+    expect((await read(current!.id)).contextSnapshot?.executionContinuation).toEqual(prepared);
+    console.log("RUNTIME_SELECTED_OVERRIDE_ROW", JSON.stringify({ nullable, hint: run.id, selected: selectedId, current: current!.id, delta: prepared.resumeDelta, envelope }));
   });
 
   it.each(["matching", "different-session", "absent"])("persists the migrated logical cwd only for the receipt's exact session: %s", async receipt => {

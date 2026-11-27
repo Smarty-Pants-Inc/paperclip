@@ -178,7 +178,7 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
         ...(continuation?.resumeDelta?.receivedComments?.map(receipt => receipt.id) ?? []),
         ...Object.keys(carrier!.resultJson?.queuedSteeringAcknowledgements ?? {}),
       ])];
-      await db.update(heartbeatRuns).set({ resultJson: { ...carrier!.resultJson, continuousReplies: { committed: { questionCommentIds } } }, runnerProfileJson: { sessionCheckpoint: {
+      await db.update(heartbeatRuns).set({ resultJson: { ...carrier!.resultJson, continuousReplies: { committed: { questionCommentIds, cursor: seq } } }, runnerProfileJson: { sessionCheckpoint: {
         sessionId,
         identity: { runId: sourceRunId, companyId, agentId, issueId: taskId, sessionId }, providerSessionId, cursor: String(seq + 1),
       } } }).where(eq(heartbeatRuns.id, sourceRunId));
@@ -497,8 +497,15 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
           previousContextRunId: firstRunId, nativeSessionId: mode === "fresh session" ? randomUUID() : sessionId,
           nativeProviderSessionId: mode === "fresh provider" ? "new-provider" : providerSessionId,
           context: { commentId: wakeId, wakeReason: "issue_children_completed" }, summary: null, exposeLowTrustRaw: false });
-        expect(snapshot.resumeDelta?.messages.map(message => message.id)).toEqual(expect.arrayContaining([steeredId, wakeId]));
-        if (mode === "Stop hand-back") expect(snapshot.resumeDelta?.messages.map(message => message.id)).toContain(originId);
+        if (mode === "Stop hand-back") {
+          // Stop retires the returned revisions; only the post-Stop person
+          // input is owed. Do not resurrect the request as text or a reference.
+          expect(snapshot.resumeDelta?.messages.map(message => message.id)).toEqual([wakeId]);
+          expect(snapshot.resumeDelta?.receivedComments).toEqual(expect.arrayContaining([
+            expect.objectContaining({ id: originId, updatedAt: revision.toISOString(), stopped: true, answered: false }),
+            expect.objectContaining({ id: steeredId, updatedAt: revision.toISOString(), stopped: true, answered: false }),
+          ]));
+        } else expect(snapshot.resumeDelta?.messages.map(message => message.id)).toEqual(expect.arrayContaining([steeredId, wakeId]));
         if (mode.startsWith("fresh")) {
           const prompt = renderPaperclipWakePrompt({ executionContinuation: snapshot }, { resumedSession: false });
           expect(prompt).toContain("Original request"); expect(prompt).toContain("Steered instruction"); expect(prompt).toContain("Unread current wake");

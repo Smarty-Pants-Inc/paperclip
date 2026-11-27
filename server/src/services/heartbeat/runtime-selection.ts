@@ -850,9 +850,27 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
           previousRunId: previousNativeRun.id, sessionId: nativeSessionId, providerSessionId,
           selectedCheckpoint, messages: executionContinuation.messages,
         }) : null;
+        // Resume selection deliberately projects history out of its result.
+        // Read only the selected run's history branch for the nullable-ID
+        // fallback; do not accidentally turn that projection into an empty diff.
+        const [selectedHistory] = !providerSessionId ? await db.select({
+          messages: sql<unknown>`${heartbeatRuns.contextSnapshot} #> '{executionContinuation,messages}'`,
+        }).from(heartbeatRuns).where(and(eq(heartbeatRuns.id, previousNativeRun.id),
+          eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.agentId, agent.id),
+          eq(heartbeatRuns.nativeIssueId, issueRef.id), eq(heartbeatRuns.nativeSessionId, nativeSessionId))) : [];
+        // Nullable-provider serializers retain pass 4's delivered-input diff;
+        // they do not claim generation-qualified receipt/no-op coverage. Bind
+        // even that fallback to the selected run, not the preparation hint.
+        const delivered = Array.isArray(selectedHistory?.messages) ? selectedHistory.messages.map(parseObject) : [];
         executionContinuation.resumeDelta = { baseRunId: previousNativeRun.id,
           receivedComments: retained?.receipts ?? [],
-          messages: executionContinuation.messages.filter(message => !retained?.received.has(message.id)),
+          messages: executionContinuation.messages.filter(message => retained
+            ? retained.owed.has(message.id) || !retained.received.has(message.id)
+            : providerSessionId || executionContinuation.originCommentIds.includes(message.id) || !delivered.some(prior =>
+              prior.id === message.id && prior.updatedAt === message.updatedAt && prior.body === message.body &&
+              prior.deleted === message.deleted && prior.authorId === message.authorId &&
+              (prior.createdByRunId ?? null) === (message.createdByRunId ?? null) &&
+              JSON.stringify(prior.sourceTrust) === JSON.stringify(message.sourceTrust))),
         };
         context.executionContinuation = executionContinuation;
         parseObject(context.paperclipWake).executionContinuation = executionContinuation;

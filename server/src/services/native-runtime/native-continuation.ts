@@ -33,8 +33,7 @@ export function buildNativeContinuationPrompt(input: {
     const message = continuation?.messages.find(message => message.id === receipt.id);
     return !message || message.updatedAt === receipt.updatedAt;
   }).map(receipt => [receipt.id, receipt]));
-  const replyInstructions = [...receipts.values()].filter(receipt => !receipt.answered)
-    .map(receipt => `Reply to the comment you received at ${receipt.receivedAt} (id ${receipt.id}).`);
+  const stopped = new Set([...receipts.values()].filter(receipt => receipt.stopped).map(receipt => receipt.id));
   // An empty delta alone does not prove that a named person's input was seen.
   // Restore only unseen named input, never bodies backed by provider receipts.
   if (wake?.comments.some(comment => comment.authorType === "user" && !comment.id)) return null;
@@ -42,7 +41,12 @@ export function buildNativeContinuationPrompt(input: {
   // must also account for every person's message carried by the delta.
   const namedCommentIds = [...new Set([...(wake?.commentIds ?? []),
     ...(delta?.messages.filter(message => message.authorType === "user").map(message => message.id) ?? []),
-  ])];
+  ])].filter(id => !stopped.has(id));
+  // System wakes cannot revive an old instruction-only turn. A newly named
+  // person input can request the first reply, once per exact revision.
+  const replyInstructions = namedCommentIds.length ? [...receipts.values()]
+    .filter(receipt => !receipt.answered && !receipt.stopped && !receipt.replyRequested)
+    .map(receipt => `Reply to the comment you received at ${receipt.receivedAt} (id ${receipt.id}).`) : [];
   const unseenNamed = namedCommentIds.filter(id => !receipts.has(id));
   const messages = (delta?.messages ?? []).filter(message => !receipts.has(message.id) &&
     !(message.authorType === "agent" && message.authorId === input.agentId) && !message.freshSessionMarker);
@@ -147,7 +151,8 @@ export function buildNativeContinuationPrompt(input: {
   ].join("\n\n");
   // Child completion is independent work intent. Its producer does not
   // guarantee summaries; keep the pass-1 bootstrap if there is no delta.
-  if (wake.reason === "issue_children_completed" && events.messages.length === 0 && Object.keys(events).length === 1) return null;
+  if (wake.reason === "issue_children_completed" && events.messages.length === 0 &&
+      Object.keys(events).every(key => key === "messages" || key === "replyInstructions")) return null;
   // Missing named input must never masquerade as an empty system wake.
   if (unseenNamed.some(id => !messages.some(message => message.id === id))) return null;
   return JSON.stringify(events);

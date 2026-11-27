@@ -51,7 +51,13 @@ export interface ExecutionContinuationEnvelope {
     messages: ExecutionContinuationEnvelope["messages"];
     /** Same-generation provider receipts; bodies are deliberately not repeated.
      * An ACK without later committed output still needs a reply turn. */
-    receivedComments?: Array<{ id: string; updatedAt: string; receivedAt: string; answered: boolean }>;
+    receivedComments?: Array<{
+      id: string; updatedAt: string; receivedAt: string; answered: boolean;
+      /** A prior accepted turn already carried this revision's reply request. */
+      replyRequested?: boolean;
+      /** A person's Stop retired this revision; it is not an answer. */
+      stopped?: boolean;
+    }>;
   };
   recoveryOutcomes?: Array<{ recoveryActionId: string; decision: unknown }>;
   completedWork: string | null;
