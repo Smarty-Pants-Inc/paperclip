@@ -254,6 +254,7 @@ describe.skipIf(!support.supported && !externalDatabaseUrl)("heartbeat workspace
 
   it.each([
     { kind: "empty", repoUrl: null, branchMode: null, fresh: false, strategyChange: false, ephemeral: true },
+    { kind: "empty", repoUrl: null, branchMode: null, fresh: true, strategyChange: false, ephemeral: true },
     { kind: "git", repoUrl: "https://github.com/example/remote.git", branchMode: null, fresh: false, strategyChange: false },
     { kind: "git", repoUrl: "ssh://git@github.com/example/remote.git", branchMode: null, fresh: false, strategyChange: false },
     { kind: "git", repoUrl: "git@github.com:example/remote.git", branchMode: null, fresh: false, strategyChange: false },
@@ -326,6 +327,13 @@ describe.skipIf(!support.supported && !externalDatabaseUrl)("heartbeat workspace
       const [workspace] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.sourceIssueId, issue.id));
       expect(workspace.mode).toBe(branchMode ? "isolated_workspace" : "shared_workspace");
       expect(workspace.metadata?.remoteWorkspace).toMatchObject({ source: { kind }, writerRunId: input.run.id });
+      const [preparedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.run.id));
+      expect(preparedRun.contextSnapshot?.workspaceContinuity).toEqual({
+        mode: fresh ? "fresh_isolated_workspace" : "new_workspace",
+        sourceRunId: fresh && input.task.freshWorkspace && "sourceRunId" in input.task.freshWorkspace
+          ? input.task.freshWorkspace.sourceRunId : null,
+        contentOrigin: kind === "git" ? "configured_source" : "empty",
+      });
       if (branchMode) expect(workspace.metadata?.remoteWorkspace).toMatchObject({ source: {
         ref: "main", branchMode,
         ...(strategyChange ? {} : { branchName: branchMode === "existing" ? "feature/diverged" : "test-WSP-1" }),

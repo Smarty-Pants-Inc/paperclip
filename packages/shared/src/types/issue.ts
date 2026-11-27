@@ -1284,6 +1284,17 @@ export interface IssueCommentMetadata {
   attachmentPreparation?: { attachmentId: string };
   /** Inbound channel attribution; never an authorization input. */
   sourceChannel?: ChatProvider;
+  /** Semantic classification, independent of the generic system-notice presentation. */
+  kind?: typeof import("../unrecovered-files-notice.js").UNRECOVERED_FILES_NOTICE_KIND;
+  /** On unrecovered-files notices, sourceRunId is the stopped run. */
+  successorRunId?: string | null;
+  /** Display evidence only; a new session alone never proves files were restored. */
+  workspaceContinuity?: {
+    mode: "fresh_isolated_workspace" | "resume_preserved_workspace" | "reuse_current_workspace"
+      | "resume_stopped_native_workspace" | "reuse_issue_workspace" | "new_workspace" | "unknown";
+    sourceRunId: string | null;
+    contentOrigin: "configured_source" | "empty" | "existing_workspace" | "unknown";
+  };
   sourceRunId?: string | null;
   sourceIdentityContextId?: string | null;
   authorizationReason?: string | null;
