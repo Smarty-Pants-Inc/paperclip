@@ -253,6 +253,8 @@ export interface NativeSession {
     message: NativeUserMessage;
     /** Set by orchestration only after successful provider-session recovery. */
     continuation?: true;
+    /** Consume the one-shot marker only for orchestration's semantic-result recovery submission. */
+    dispositionOnlyRecovery?: true;
     requestedCollaborationMode?: "default" | "plan";
     /** OpenCode/OpenRouter only. Applies to this turn, never subsequent turns. */
     reasoningMode?: "default" | "disabled";

@@ -1,6 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 
-import type { NativeExecutionInputV1 } from "./contracts/native-execution.js";
+import { createHash } from "node:crypto";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { NativeExecutionInputV1, NativeExecutionInputV5 } from "./contracts/native-execution.js";
+import { createRunnerdNativeSessionBackend } from "./backends/codex-native-backend.js";
+import { collectUntilTerminal, FakeCodexTransport, WORKSPACE } from "./drivers/codex/codex-app-server-driver.test-support.js";
+import { canonicalNativeRuntimeContextDigest, NATIVE_RUNTIME_ASSET_SCHEMA, PAPERCLIP_EXECUTION_PROMPT,
+  PAPERCLIP_EXECUTION_PROMPT_REVISION, nativeRuntimePromptDigest } from "./contracts/runtime-context.js";
+import type { ControlPlanePort } from "./contracts/control-plane-port.js";
 import type { NativeSession, PersistedNativeSession } from "./contracts/native-session-backend.js";
 import { executeNativeSession } from "./native-session-runtime.js";
 import { providerTurnWaitDeadline, PROVIDER_TURN_WAIT_TIMEOUT_MARGIN_MS, type ProviderTurnWaitOptions } from "./native-provider-turn-wait.js";
@@ -239,6 +248,166 @@ async function run(options: {
 
 const types = (events: PrpEvent[]) => events.map(value => value.eventType);
 const waitFor = async (condition: () => boolean) => vi.waitFor(() => expect(condition()).toBe(true), { timeout: 5_000, interval: 5 });
+
+describe("prepared recovery with the real server-side driver and durable checkpoints", () => {
+  async function durableCheckpoint(value: PersistedNativeSession): Promise<PersistedNativeSession> {
+    const directory = await mkdtemp(join(tmpdir(), "prepared-recovery-"));
+    const path = join(directory, "checkpoint.json");
+    try {
+      await writeFile(path, JSON.stringify(value), { mode: 0o600, flush: true });
+      return JSON.parse(await readFile(path, "utf8")) as PersistedNativeSession;
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+
+  function preparedTask(kind: "pi_rpc" | "codex"): NativeExecutionInputV5 {
+    const digest = "0".repeat(64);
+    const context = {
+      prompt: { revision: PAPERCLIP_EXECUTION_PROMPT_REVISION, text: PAPERCLIP_EXECUTION_PROMPT, digest: nativeRuntimePromptDigest() },
+      instructions: { entryPath: "AGENTS.md", bundle: { schema: NATIVE_RUNTIME_ASSET_SCHEMA, digest, manifestDigest: digest,
+        rootPath: "/runtime/instructions", fileCount: 1, totalBytes: 1 } },
+      skills: [], mcp: { assignmentSetId: "none", digest, bindingId: null },
+    };
+    const requirement = input.completionContract.contract.criteria[0]!.requirement;
+    const prompt = `${input.task.prompt}\n\n${requirement}`;
+    return { ...input, schema: "paperclip.native-execution-input.v5", executionMode: "default", planningContext: null,
+      task: { ...input.task, description: requirement, prompt }, workspace: { ...input.workspace, cwd: WORKSPACE },
+      session: { ...input.session, driverKind: kind === "pi_rpc" ? "pi_rpc" : "codex_app_server" },
+      provider: kind === "pi_rpc" ? { kind, model: "test/pi", sessionContinuity: "continuous" } : { kind, model: null, approvalPolicy: "never" },
+      runtimeContext: { ...context, aggregateDigest: canonicalNativeRuntimeContextDigest(context) },
+      completionSources: { promptSha256: createHash("sha256").update(prompt).digest("hex"), contractRevision: "1",
+        criteria: [{ id: "objective", source: { kind: "description", id: identity.issueId,
+          revision: createHash("sha256").update(requirement).digest("hex") } }] } };
+  }
+
+  function history(transport: FakeCodexTransport, ids: string[]) {
+    transport.readResponse = { thread: { id: "thread-1", sessionId: "provider-session-1", cwd: WORKSPACE,
+      turns: ids.map(id => ({ id, status: "completed", error: null, items: [] })) } };
+  }
+
+  async function finish(session: NativeSession, transport: FakeCodexTransport, id: string, withResult = false) {
+    if (withResult) transport.push("paperclip/runResult", { threadId: "thread-1", turnId: id, result });
+    transport.push("turn/completed", { threadId: "thread-1", turn: { id, status: "completed", error: null, items: [] } });
+    return collectUntilTerminal(session.events());
+  }
+
+  it("R0: submits exactly one resultless continuous-Pi disposition repair across attempts 2 and 3", async () => {
+    const executionInput = preparedTask("pi_rpc");
+    const transports = [new FakeCodexTransport(), new FakeCodexTransport(), new FakeCodexTransport()];
+    const pending = [...transports];
+    const backend = createRunnerdNativeSessionBackend(executionInput, {
+      retainedSystemInstructions: "Fixture instructions.", runnerInstanceId: "runner-provider-turn", transportFactory: () => pending.shift()!,
+    });
+    const original = await backend.openSession({ identity, workingDirectory: WORKSPACE });
+    await original.startTurn({ message: { role: "user", text: "Do the task." } });
+    transports[0]!.push("item/completed", { threadId: "thread-1", turnId: "turn-1",
+      item: { id: "old-answer", type: "agentMessage", text: "The task is already done." } });
+    const replay = await finish(original, transports[0]!, "turn-1");
+    let checkpoint = await durableCheckpoint(await original.snapshot());
+    expect(transports[0]!.calls.find(call => call.method === "turn/start")!.params.input)
+      .toMatchObject([{ type: "text", text: "Do the task." }]);
+    await original.close({ reason: "controller restart" });
+    const checkpoints: PersistedNativeSession[] = [];
+    const completeRun = vi.fn(async () => undefined);
+    const port: ControlPlanePort = {
+      async openRun() {},
+      async checkpointSession(value) { checkpoint = await durableCheckpoint(value); checkpoints.push(checkpoint); },
+      async appendEvent(value) { replay.push(structuredClone(value)); return { cursor: value.sourceSeq,
+        highestContiguousSourceSeq: value.sourceSeq, disposition: "committed" }; },
+      async replayEvents(request) { const events = replay.filter(value => value.sourceInstanceId === request.sourceInstanceId
+        && value.sourceSeq > request.afterSourceSeq); return { events, highestContiguousSourceSeq: Math.max(0, ...events.map(value => value.sourceSeq)) }; },
+      completeRun,
+    };
+    const accepted = ["turn-1"];
+    const outcomes: string[] = [];
+    for (const attempt of [2, 3]) {
+      const transport = transports[attempt - 1]!;
+      history(transport, accepted);
+      const turnId = `repair-${attempt}`;
+      transport.turnStartResponse = Promise.resolve({ turn: { id: turnId, status: "inProgress", items: [] } });
+      let settled = false;
+      const execution = executeNativeSession({ input: executionInput, backend, controlPlane: port,
+        persistedSession: structuredClone(checkpoint), runnerInstanceId: "runner-provider-turn", controlPlaneInstanceId: "control-provider-turn",
+        timeoutMs: 5_000, resumeInterruptedTurn: true,
+      }).then(() => "finalized", error => String(error instanceof Error ? error.message : error)).finally(() => { settled = true; });
+      const starts = () => transport.calls.filter(call => call.method === "turn/start");
+      await waitFor(() => settled || starts().length > 0);
+      if (starts().length) {
+        expect(JSON.stringify(starts()[0]!.params)).toContain("Paperclip semantic-result recovery for a prior completed provider turn.");
+        expect(JSON.stringify(starts()[0]!.params)).not.toContain(executionInput.task.prompt);
+        transport.push("turn/completed", { threadId: "thread-1", turn: { id: turnId, status: "completed", error: null, items: [] } });
+        accepted.push(turnId);
+      }
+      outcomes.push(await execution);
+      expect(outcomes.at(-1)).toContain("native_finalization_missing:");
+    }
+    const submissions = transports.slice(1).flatMap(transport => transport.calls.filter(call => call.method === "turn/start"));
+    console.info("R0 durable proof", JSON.stringify({ submissions: submissions.length, outcomes,
+      checkpoint: { consumed: checkpoint.dispositionOnlyRecoveryConsumed, turnId: checkpoint.dispositionOnlyRecoveryTurnId,
+        terminalTurns: checkpoint.terminalTurns }, checkpoints: checkpoints.length, replayEvents: replay.length }));
+    expect(submissions).toHaveLength(1);
+    expect(checkpoint).toMatchObject({ dispositionOnlyRecoveryConsumed: true, dispositionOnlyRecoveryTurnId: "repair-2" });
+    expect(completeRun).not.toHaveBeenCalled();
+  });
+
+  it.each(["pi_rpc", "codex"] as const)("Ra/Rc: ordinary prepared %s turns survive two resumes and finish normally", async kind => {
+    const transports = [new FakeCodexTransport(), new FakeCodexTransport(), new FakeCodexTransport()];
+    const pending = [...transports];
+    const backend = createRunnerdNativeSessionBackend(preparedTask(kind), {
+      retainedSystemInstructions: "Fixture instructions.", runnerInstanceId: "runner-provider-turn", transportFactory: () => pending.shift()!,
+    });
+    const first = await backend.openSession({ identity, workingDirectory: WORKSPACE });
+    await first.startTurn({ message: { role: "user", text: "Initial task." } });
+    await finish(first, transports[0]!, "turn-1");
+    const before = await durableCheckpoint(await first.snapshot());
+    expect(transports[0]!.calls.find(call => call.method === "turn/start")!.params.input)
+      .toMatchObject([{ type: "text", text: "Initial task." }]);
+    await first.close({ reason: "first resume" });
+    history(transports[1]!, ["turn-1"]);
+    const resumed = (await backend.recoverSession!(before, { signal: new AbortController().signal })).session!;
+    transports[1]!.turnStartResponse = Promise.resolve({ turn: { id: "person-2", status: "inProgress", items: [] } });
+    await expect(resumed.startTurn({ message: { role: "user", text: "A person's ordinary follow-up." } }))
+      .resolves.toMatchObject({ turnId: "person-2" });
+    await finish(resumed, transports[1]!, "person-2");
+    const after = await durableCheckpoint(await resumed.snapshot());
+    await resumed.close({ reason: "second resume" });
+    history(transports[2]!, ["turn-1", "person-2"]);
+    const again = (await backend.recoverSession!(after, { signal: new AbortController().signal })).session!;
+    transports[2]!.turnStartResponse = Promise.resolve({ turn: { id: "person-3", status: "inProgress", items: [] } });
+    await expect(again.startTurn({ message: { role: "user", text: "The next message is still accepted." } }))
+      .resolves.toMatchObject({ turnId: "person-3" });
+    expect(after.dispositionOnlyRecoveryConsumed).toBe(false);
+    await finish(again, transports[2]!, "person-3", true);
+    expect(await again.result()).toMatchObject({ result, turnId: "person-3" });
+    console.info("Ra/Rc durable proof", JSON.stringify({ kind, afterOrdinaryTurnConsumed: after.dispositionOnlyRecoveryConsumed,
+      finalTurn: (await again.result())?.turnId }));
+    await again.close({ reason: "fixture complete" });
+  });
+
+  it("Rb: manual compaction works after a prepared continuous-Pi resume", async () => {
+    const first = new FakeCodexTransport();
+    const second = new FakeCodexTransport();
+    const pending = [first, second];
+    const backend = createRunnerdNativeSessionBackend(preparedTask("pi_rpc"), {
+      retainedSystemInstructions: "Fixture instructions.", runnerInstanceId: "runner-provider-turn", transportFactory: () => pending.shift()!,
+    });
+    const original = await backend.openSession({ identity, workingDirectory: WORKSPACE });
+    await original.startTurn({ message: { role: "user", text: "Initial task." } });
+    await finish(original, first, "turn-1");
+    const checkpoint = await durableCheckpoint(await original.snapshot());
+    await original.close({ reason: "resume for manual compaction" });
+    history(second, ["turn-1"]);
+    const resumed = (await backend.recoverSession!(checkpoint, { signal: new AbortController().signal })).session!;
+    await expect(resumed.startTurn({ message: { role: "user", text: "" }, continuation: true, compact: true }))
+      .resolves.toMatchObject({ turnId: "turn-compact" });
+    await finish(resumed, second, "turn-compact");
+    expect(second.calls.filter(call => call.method === "thread/compact/start")).toHaveLength(1);
+    expect((await resumed.snapshot()).dispositionOnlyRecoveryConsumed).toBe(false);
+    console.info("Rb durable proof", JSON.stringify({ compactRequests: 1, consumed: (await resumed.snapshot()).dispositionOnlyRecoveryConsumed }));
+    await resumed.close({ reason: "fixture complete" });
+  });
+});
 
 describe("the controller consumer with provider-started turn sequences", () => {
   it.each([

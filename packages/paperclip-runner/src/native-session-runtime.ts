@@ -3515,6 +3515,10 @@ export async function executeNativeSession(
           if (recovered) await checkpoint();
           const startedTaskTurn = await session.startTurn({
             message: { role: "user", text: JSON.stringify(modelEnvelope) },
+            // Prepared sessions stay reusable. Bind the durable one-shot marker
+            // to this recovery submission, not to recovery of the session itself.
+            ...(dispositionOnlyRecovery && !effectFreeInitialAcpxTurn && input.provider.kind === "pi_rpc"
+              && input.provider.sessionContinuity !== "paperclip" ? { dispositionOnlyRecovery: true as const } : {}),
             ...(recovered && modelEnvelope.schema === "paperclip.native-continuation.v1"
               ? { continuation: true as const } : {}),
             requestedCollaborationMode:
