@@ -2,6 +2,9 @@ import { Worker } from "node:worker_threads";
 import { HttpError } from "../../../errors.js";
 import { onePasswordArguments } from "./catalog.js";
 
+// Defined only by the runtime bundler, relative to the emitted chunk.
+declare const __PAPERCLIP_BUNDLED_WORKER_BASE_URL__: string;
+
 const messages: Record<string, [number, string]> = {
   onepassword_request_failed: [502, "1Password could not complete the action. Check the service account token and its vault permissions. A write may have completed; inspect the item before retrying."],
   onepassword_auth_expired: [401, "The 1Password service account token expired or was revoked. Reconnect with a new token."],
@@ -33,8 +36,10 @@ export async function callOnePassword(headers: Record<string, string>, tool: str
   const args = onePasswordArguments(tool, parameters);
   if (signal?.aborted) throw failure("onepassword_timeout");
   const token = serviceAccountToken(headers.Authorization);
-  const source = import.meta.url.endsWith(".ts");
-  const url = new URL(source ? "./worker.ts" : "./worker.js", import.meta.url);
+  const bundledUrl = typeof __PAPERCLIP_BUNDLED_WORKER_BASE_URL__ === "undefined"
+    ? undefined : new URL("./onepassword-worker.js", __PAPERCLIP_BUNDLED_WORKER_BASE_URL__);
+  const source = !bundledUrl && import.meta.url.endsWith(".ts");
+  const url = bundledUrl ?? new URL(source ? "./worker.ts" : "./worker.js", import.meta.url);
   const worker = source
     ? new Worker(`import(${JSON.stringify(import.meta.resolve("tsx/esm/api"))}).then(({tsImport}) => tsImport(${JSON.stringify(url.href)}, ${JSON.stringify(import.meta.url)}));`, {
       eval: true, workerData: { token, tool, parameters: args }, env: {}, execArgv: [], stdout: true, stderr: true,

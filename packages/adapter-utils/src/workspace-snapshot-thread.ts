@@ -7,6 +7,9 @@ import path from "node:path";
 import type { SerializedDirectorySnapshot } from "./workspace-restore-merge.js";
 import type { WorkspacePaths } from "./workspace-manifest.js";
 
+// Defined only by the runtime bundler, relative to the emitted chunk.
+declare const __PAPERCLIP_BUNDLED_WORKER_BASE_URL__: string;
+
 export interface SnapshotThreadRequest {
   rootDir: string;
   exclude?: string[];
@@ -41,8 +44,10 @@ export async function runSnapshotThread(request: SnapshotThreadRequest): Promise
   let published = false;
   try {
     directory = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-snapshot-thread-"));
-    const source = new URL(import.meta.url).pathname.endsWith(".ts");
-    const url = new URL(source ? "./workspace-snapshot-thread-worker.ts" : "./workspace-snapshot-thread-worker.js", import.meta.url);
+    const bundledUrl = typeof __PAPERCLIP_BUNDLED_WORKER_BASE_URL__ === "undefined"
+      ? undefined : new URL("./workspace-snapshot-thread-worker.js", __PAPERCLIP_BUNDLED_WORKER_BASE_URL__);
+    const source = !bundledUrl && new URL(import.meta.url).pathname.endsWith(".ts");
+    const url = bundledUrl ?? new URL(source ? "./workspace-snapshot-thread-worker.ts" : "./workspace-snapshot-thread-worker.js", import.meta.url);
     const options = { workerData: request, env: { ...process.env, TMPDIR: directory, TMP: directory, TEMP: directory } };
     worker = source
       ? new Worker(`import(${JSON.stringify(pathToFileURL(createRequire(import.meta.url).resolve("tsx/esm/api")).href)}).then(({tsImport}) => tsImport(${JSON.stringify(url.href)}, ${JSON.stringify(import.meta.url)}));`, { ...options, eval: true })

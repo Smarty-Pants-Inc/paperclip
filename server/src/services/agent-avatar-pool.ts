@@ -1,6 +1,9 @@
 import { Worker } from "node:worker_threads";
 import type { AgentAvatarRequest } from "./agent-avatars.js";
 
+// Defined only by the runtime bundler, relative to the emitted chunk.
+declare const __PAPERCLIP_BUNDLED_WORKER_BASE_URL__: string;
+
 type Job = { request: AgentAvatarRequest; resolve: (png: Buffer) => void; reject: (error: Error) => void };
 /** Lazy, bounded workers isolate geometry/rasterization from the API event loop. */
 export function createAgentAvatarPool(concurrency = 2, maxQueue = 64) {
@@ -11,10 +14,12 @@ export function createAgentAvatarPool(concurrency = 2, maxQueue = 64) {
   const workers = new Set<Worker>();
   let closed = false;
   function spawn() {
-    const source = new URL(import.meta.url).pathname.endsWith(".ts");
-    const url = new URL(source ? "./agent-avatar-worker.ts" : "./agent-avatar-worker.js", import.meta.url);
+    const bundledUrl = typeof __PAPERCLIP_BUNDLED_WORKER_BASE_URL__ === "undefined"
+      ? undefined : new URL("./agent-avatar-worker.js", __PAPERCLIP_BUNDLED_WORKER_BASE_URL__);
+    const source = !bundledUrl && new URL(import.meta.url).pathname.endsWith(".ts");
+    const url = bundledUrl ?? new URL(source ? "./agent-avatar-worker.ts" : "./agent-avatar-worker.js", import.meta.url);
     const loaderInherited = process.execArgv.some((arg) => arg.includes("tsx"));
-    const worker = source || !loaderInherited
+    const worker = !bundledUrl && (source || !loaderInherited)
       ? new Worker(`import(${JSON.stringify(import.meta.resolve('tsx/esm/api'))}).then(({tsImport}) => tsImport(${JSON.stringify(url.href)}, ${JSON.stringify(import.meta.url)}));`, { eval: true })
       : new Worker(url);
     workers.add(worker);

@@ -75,13 +75,8 @@ function externalizeThirdParty(isBundled, runtimeDir) {
  * nativeHarnessPrestageEntry?: string, onlineWorkspaceMigrationEntry?: string, isBundled?: (specifier: string) => boolean }} options */
 export async function bundleRuntime({ entry, outdir, maintenanceEntry, ephemeralMigrationEntry, nativeHarnessPrestageEntry, onlineWorkspaceMigrationEntry, isBundled = (specifier) => specifier.startsWith("@paperclipai/") }) {
   await rm(outdir, { recursive: true, force: true });
-  const result = await build({
-    entryPoints: { index: "paperclip-runtime-entry", server: entry, ...(maintenanceEntry ? { "agent-files": maintenanceEntry } : {}),
-      ...(ephemeralMigrationEntry ? { "ephemeral-migration": ephemeralMigrationEntry } : {}),
-      ...(nativeHarnessPrestageEntry ? { "native-harness-prestage": nativeHarnessPrestageEntry } : {}),
-      ...(onlineWorkspaceMigrationEntry ? { "online-workspace-migration": onlineWorkspaceMigrationEntry } : {}) },
+  const options = {
     outdir,
-    outExtension: { ".js": ".mjs" },
     chunkNames: "chunk-[hash]",
     bundle: true,
     splitting: true,
@@ -94,13 +89,33 @@ export async function bundleRuntime({ entry, outdir, maintenanceEntry, ephemeral
     sourcemap: "linked",
     metafile: true,
     logLevel: "error",
+    // Defines are substituted after keepModuleLocations: workers belong beside
+    // emitted chunks, while other assets still belong beside their source.
+    define: { __PAPERCLIP_BUNDLED_WORKER_BASE_URL__: "import.meta.url" },
     plugins: [runtimeEntry(entry), keepModuleLocations, externalizeThirdParty(isBundled, dirname(entry))],
+  };
+  const result = await build({
+    ...options,
+    entryPoints: { index: "paperclip-runtime-entry", server: entry, ...(maintenanceEntry ? { "agent-files": maintenanceEntry } : {}),
+      ...(ephemeralMigrationEntry ? { "ephemeral-migration": ephemeralMigrationEntry } : {}),
+      ...(nativeHarnessPrestageEntry ? { "native-harness-prestage": nativeHarnessPrestageEntry } : {}),
+      ...(onlineWorkspaceMigrationEntry ? { "online-workspace-migration": onlineWorkspaceMigrationEntry } : {}) },
+    outExtension: { ".js": ".mjs" },
   });
-  const outputs = Object.keys(result.metafile.outputs).filter((file) => file.endsWith(".mjs"));
+  const workers = await build({
+    ...options,
+    entryPoints: {
+      "workspace-snapshot-thread-worker": join(serverDir, "..", "packages", "adapter-utils", "src", "workspace-snapshot-thread-worker.ts"),
+      "onepassword-worker": join(serverDir, "src", "services", "connectors", "onepassword", "worker.ts"),
+      "agent-avatar-worker": join(serverDir, "src", "services", "agent-avatar-worker.ts"),
+    },
+  });
+  const outputs = [...Object.keys(result.metafile.outputs), ...Object.keys(workers.metafile.outputs)]
+    .filter((file) => /\.m?js$/.test(file));
   return {
     outfile: join(outdir, "index.mjs"),
     serverModule: join(outdir, "server.mjs"),
-    inputs: Object.keys(result.metafile.inputs).length,
+    inputs: new Set([...Object.keys(result.metafile.inputs), ...Object.keys(workers.metafile.inputs)]).size,
     chunks: outputs.length,
   };
 }
