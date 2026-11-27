@@ -1338,7 +1338,7 @@ export class PaperclipRunnerToolAuthority {
       companyId: this.binding.companyId, actorType: "agent", actorId: this.binding.agentId,
       agentId: this.binding.agentId, runId: this.binding.runId, issueId: this.binding.issueId,
       action: "runner.api_called", entityType: "issue", entityId: this.binding.issueId,
-      details: { operationId: operation.operationId, requestFingerprint: digest, pathParams: input.pathParams ?? {}, status: result.status, outcome: record(result).outcome ?? (result.ok ? "succeeded" : "failed") },
+      details: { receiptId: key, operationId: operation.operationId, requestFingerprint: digest, pathParams: input.pathParams ?? {}, status: result.status, outcome: record(result).outcome ?? (result.ok ? "succeeded" : "failed") },
     });
     publishActivity(apiActivity.publication);
     await this.db.transaction(async (tx) => {
