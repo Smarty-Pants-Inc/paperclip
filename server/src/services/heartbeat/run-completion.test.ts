@@ -85,7 +85,11 @@ vi.mock("../../vendor/paperclip-runner/index.js", async importOriginal => {
     executeNativeSession: async (options: Parameters<typeof actual.executeNativeSession>[0]) => {
       if (!diagnosticNativeFixture.enabled) return actual.executeNativeSession(options);
       const transport = diagnosticNativeFixture.backendOptions!.codexTransportFactory!();
-      const session = { close: async ({ reason }: { reason: string }) => { await transport.close(reason); } };
+      const session = {
+        snapshot: async () => ({ backendKind: "mock" as const, sessionId: options.input.session.normalizedSessionId!,
+          identity: { ...options.input.binding, sessionId: options.input.session.normalizedSessionId! } }),
+        close: async ({ reason }: { reason: string }) => { await transport.close(reason); },
+      };
       await options.onSession?.(session as never);
       await diagnosticNativeFixture.beforeWarmClose?.();
       if (diagnosticNativeFixture.retireWarm) await closeIdleWarmNativeSessionsForRestart();
