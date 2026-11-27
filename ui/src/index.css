@@ -2198,6 +2198,65 @@ html:has(.paperclip-app-shell[data-keyboard-open="true"] [data-classic-task-shel
   white-space: normal;
 }
 
+/* Phone composer row: one 44px control line in a 52px card; text grows to five lines. */
+@media (max-width: 767px) {
+.paperclip-task-chat-composer[data-composer-layout="phone-row"] {
+  --tc-phone-row-line-height: calc(var(--spacing) * 6);
+  --tc-phone-row-text-inset: calc(var(--spacing) * 2.5);
+  --tc-composer-editor-max-height: calc(5 * var(--tc-phone-row-line-height) + 2 * var(--tc-phone-row-text-inset));
+  min-height: var(--sz-52px);
+  border-width: var(--sz-1px);
+  padding: var(--sz-3px);
+}
+[data-composer-layout="phone-row"] .task-chat-composer-row {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--spacing);
+  min-width: 0;
+}
+[data-composer-layout="phone-row"] [data-testid="task-chat-composer-input"] {
+  flex: 1;
+  min-width: 0;
+}
+[data-composer-layout="phone-row"] .task-chat-phone-controls {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--spacing);
+  min-width: 0;
+}
+[data-composer-layout="phone-row"] [data-testid="task-chat-composer-selection"] {
+  flex: 0 1 auto;
+  max-width: calc(var(--spacing) * 32);
+}
+[data-composer-layout="phone-row"] .task-chat-composer-row button {
+  min-height: var(--sz-44px);
+}
+[data-composer-layout="phone-row"] :is([data-testid="task-chat-composer-add"], [data-testid="task-chat-composer-mode"], [data-testid="task-chat-composer-send"], [data-testid="task-chat-composer-stop"]) {
+  width: var(--sz-44px);
+  min-width: var(--sz-44px);
+  height: var(--sz-44px);
+}
+[data-composer-layout="phone-row"] .task-chat-phone-editor {
+  min-height: var(--sz-44px);
+  max-height: var(--tc-composer-editor-max-height);
+  overflow-y: auto;
+  line-height: var(--tc-phone-row-line-height);
+  /* Borders reserve the inset outside the scrollport; padding would let a
+     sixth line paint into that inset once the caret scrolls the field. */
+  padding: 0 !important;
+  border-block: var(--tc-phone-row-text-inset) solid transparent;
+}
+[data-composer-layout="phone-row"] .paperclip-mdxeditor-content p + p {
+  margin-top: 0;
+}
+[data-composer-layout="phone-row"] .paperclip-mdxeditor [class*="_placeholder_"] {
+  padding: var(--tc-phone-row-text-inset) 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+}
+
 .paperclip-mdxeditor-content {
   font-size: inherit;
   line-height: inherit;

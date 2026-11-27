@@ -717,9 +717,10 @@ export function TaskChatComposer({
     reassignOptions?.find((o) => o.id === assigneeValue)?.label ?? "Unassigned";
   const assigneeName =
     assigneeLabel === "Unassigned" ? "the agent" : assigneeLabel;
+  const phoneRow = mobile && !creation && !queuedEdit;
   const effectivePlaceholder = queuedEdit
     ? "Edit queued message…"
-    : (placeholder ?? modePlaceholder(pendingMode, assigneeName, mobile));
+    : (placeholder ?? (phoneRow && pendingMode === "standard" ? "Message…" : modePlaceholder(pendingMode, assigneeName, mobile)));
   const goalUnavailable = runnerGoalCapability?.availability !== "available";
   const goalCommandOption: ActionCommandOption = {
     id: "action:goal",
@@ -1327,6 +1328,60 @@ export function TaskChatComposer({
     </Button>
   ) : null;
 
+  // Share the editor instance/handlers between the legacy layout and the phone row.
+  const composerInput = (
+    <div
+      data-testid="task-chat-composer-input"
+      onScrollEndCapture={phoneRow ? (event) => {
+        const field = event.target;
+        if (!(field instanceof HTMLElement) || !field.classList.contains("task-chat-phone-editor")) return;
+        // Lexical scrolls the caret's glyph rect, which can stop halfway
+        // through a line. Keep the five-line phone scrollport on whole lines,
+        // after a wheel/touch gesture ends, without fighting the gesture or
+        // moving the page. Desktop and non-row editors retain native scrolling.
+        const lineHeight = Number.parseFloat(getComputedStyle(field).lineHeight);
+        if (lineHeight > 0 && field.scrollHeight > field.clientHeight) {
+          const snapped = Math.round(field.scrollTop / lineHeight) * lineHeight;
+          if (Math.abs(field.scrollTop - snapped) > 0.5) field.scrollTop = snapped;
+        }
+      } : undefined}
+    >
+      <MarkdownEditor
+        ref={editorRef}
+        value={body}
+        onChange={(value) => {
+          if (!value && bodyRef.current && draftKey && !queuedEdit && !submittingRef.current && !uncertainSubmission)
+            discardStoppedCommentDrafts(draftKey);
+          changeBody(value);
+        }}
+        placeholder={
+          disabled
+            ? (disabledReason ?? "Composer disabled")
+            : effectivePlaceholder
+        }
+        readOnly={disabled || !!uncertainSubmission || Boolean(creation && (submitting || creation.readOnly))}
+        mentions={mentions}
+        actionCommands={creation ? [] : conversationMode ? [{
+          id: "action:new", kind: "action", command: "new", name: "New session",
+          description: "Start fresh context here, preserving conversation history.", aliases: ["new"],
+          disabled,
+        }] : [goalCommandOption]}
+        onSubmit={() => void submit()}
+        submitKey={submitKey}
+        fileDropTarget="parent"
+        bordered={false}
+        className={cn(disabled && "opacity-60")}
+        contentClassName={
+          phoneRow
+            ? "task-chat-phone-editor max-h-(--tc-composer-editor-max-height) overflow-y-auto text-base scrollbar-auto-hide"
+            : mobile
+            ? "max-h-(--tc-composer-editor-max-height) min-h-(--sz-48px) overflow-y-auto px-1 py-1 text-base scrollbar-auto-hide"
+            : "max-h-(--sz-28dvh) min-h-(--sz-48px) overflow-y-auto px-1 py-1 text-sm scrollbar-auto-hide"
+        }
+      />
+    </div>
+  );
+
   if (pause && (!conversationMode || queuedEdit)) {
     return <TaskChatPausedTakeover {...pause} hasDraft={Boolean(body.trim() || attachments.length)} />;
   }
@@ -1416,13 +1471,29 @@ export function TaskChatComposer({
       ) : null}
       <div
         data-editor-autocomplete-anchor=""
-        className={taskChatComposerSurfaceClasses(mobile, streamlined)}
+        data-composer-layout={phoneRow ? "phone-row" : undefined}
+        className={taskChatComposerSurfaceClasses(mobile, streamlined, phoneRow)}
         onKeyDownCapture={(e) => {
         // Capture mode shortcuts on the wrapper so they work while the rich
         // editor is focused and win over Lexical/browser bindings. Match the
         // period by key and code because hardware keyboards on iOS can omit
         // `code` for Cmd+Period.
         if (disabled || queuedEdit) return;
+        // Lexical otherwise inserts a tab into the draft. In the phone row,
+        // forward Tab leaves the field for the selector (or the send/stop
+        // control when there is no selector). Keep autocomplete's Tab binding.
+        if (phoneRow && e.key === "Tab" && !e.shiftKey && !e.altKey && !e.metaKey && !e.ctrlKey
+          && e.target instanceof HTMLElement && e.target.closest('[contenteditable="true"], textarea')
+          && !document.querySelector('[data-testid="mention-autocomplete-menu"]')) {
+          const nextControl = e.currentTarget.querySelector<HTMLButtonElement>(
+            '[data-testid="task-chat-composer-selection"] button:not(:disabled), [data-testid="task-chat-composer-send"]:not(:disabled), [data-testid="task-chat-composer-stop"]:not(:disabled)',
+          );
+          if (nextControl) {
+            e.preventDefault();
+            e.stopPropagation();
+            nextControl.focus();
+          }
+        }
         const isPeriod = e.key === "." || e.code === "Period";
         const isModeShortcut =
           (isPeriod && (e.metaKey || e.ctrlKey)) ||
@@ -1481,39 +1552,7 @@ export function TaskChatComposer({
               if (image) retryUpload(image);
             }}
           />
-          <div data-testid="task-chat-composer-input">
-            <MarkdownEditor
-              ref={editorRef}
-              value={body}
-              onChange={(value) => {
-                if (!value && bodyRef.current && draftKey && !queuedEdit && !submittingRef.current && !uncertainSubmission)
-                  discardStoppedCommentDrafts(draftKey);
-                changeBody(value);
-              }}
-              placeholder={
-                disabled
-                  ? (disabledReason ?? "Composer disabled")
-                  : effectivePlaceholder
-              }
-              readOnly={disabled || !!uncertainSubmission || Boolean(creation && (submitting || creation.readOnly))}
-              mentions={mentions}
-              actionCommands={creation ? [] : conversationMode ? [{
-                id: "action:new", kind: "action", command: "new", name: "New session",
-                description: "Start fresh context here, preserving conversation history.", aliases: ["new"],
-                disabled,
-              }] : [goalCommandOption]}
-              onSubmit={() => void submit()}
-              submitKey={submitKey}
-              fileDropTarget="parent"
-              bordered={false}
-              className={cn(disabled && "opacity-60")}
-              contentClassName={
-                mobile
-                  ? "max-h-(--tc-composer-editor-max-height) min-h-(--sz-48px) overflow-y-auto px-1 py-1 text-base scrollbar-auto-hide"
-                  : "max-h-(--sz-28dvh) min-h-(--sz-48px) overflow-y-auto px-1 py-1 text-sm scrollbar-auto-hide"
-              }
-            />
-          </div>
+          {!phoneRow ? composerInput : null}
 
           {actionError ? (
             <p
@@ -1598,9 +1637,10 @@ export function TaskChatComposer({
           {creation?.details}
 
           <div
-            className={cn("mt-2 flex items-center gap-x-2 gap-y-3", mobile && !queuedEdit ? "flex-nowrap" : "flex-wrap")}
+            className={phoneRow ? undefined : cn("mt-2 flex items-center gap-x-2 gap-y-3", mobile && !queuedEdit ? "flex-nowrap" : "flex-wrap")}
             data-testid="task-chat-composer-actions"
           >
+            <div className={phoneRow ? "task-chat-composer-row" : "contents"} data-testid={phoneRow ? "task-chat-composer-row" : undefined}>
             <div className="flex min-w-0 max-w-full items-center gap-2">
             {canAcceptFiles ? (
               <input ref={fileInputRef} type="file" className="hidden" multiple onChange={handleFileInputChange} />
@@ -1631,7 +1671,8 @@ export function TaskChatComposer({
             )}
             </div>
 
-            <div className={cn("ml-auto flex min-w-0 max-w-full items-center gap-2", mobile && !queuedEdit && "flex-1 justify-end")}>
+            {phoneRow ? composerInput : null}
+            <div className={phoneRow ? "task-chat-phone-controls" : cn("ml-auto flex min-w-0 max-w-full items-center gap-2", mobile && !queuedEdit && "flex-1 justify-end")}>
 
             {(showAssignee || showConversationModel) && !queuedEdit && companyId && modelAgents ? (
               <ComposerRunSettingsPicker
@@ -1645,6 +1686,8 @@ export function TaskChatComposer({
                 onSettingsChange={setRunSettings}
                 onAssigneeChange={updatePendingAssignee}
                 allowAssigneeChange={showAssignee && !conversationMode}
+                triggerLayout={phoneRow ? "stacked" : "inline"}
+                replyRunning={showStop}
                 renderAssigneeIdentity={(value, label, placement) => (
                   <AssigneeIdentityAvatar
                     assigneeValue={value}
@@ -1776,6 +1819,7 @@ export function TaskChatComposer({
                 <ArrowUp className="h-4 w-4" aria-hidden />
               )}
             </button>
+            </div>
             </div>
           </div>
           {stopControl.error ? (

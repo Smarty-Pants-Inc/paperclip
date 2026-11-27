@@ -35,6 +35,10 @@ interface Props {
   allowAssigneeChange?: boolean;
   disabled?: boolean;
   mobile?: boolean;
+  /** The phone row uses a single two-line model/level trigger. */
+  triggerLayout?: "inline" | "stacked";
+  /** Level changes affect the next message, never an in-flight reply. */
+  replyRunning?: boolean;
   triggerRef?: Ref<HTMLButtonElement>;
   /** Storybook can supply a fixed catalog; the app loads it for the selected harness. */
   modelOptionsOverride?: readonly (AdapterModel & { detail?: string })[];
@@ -90,6 +94,7 @@ function AnimatedBody({ children }: { children: ReactNode }) {
 export function ComposerRunSettingsPicker({
   companyId, assigneeValue, currentAssigneeValue, options, agents, overrides,
   settings, onSettingsChange, onAssigneeChange, allowAssigneeChange = true, disabled = false, mobile: mobileProp, triggerRef, modelOptionsOverride, renderAssigneeIdentity,
+  triggerLayout = "inline", replyRunning = false,
   initialOpen = false, initialView = "settings", initialModelSearch = "", initialAssigneeSearch = "",
 }: Props) {
   const [open, setOpen] = useState(initialOpen);
@@ -160,6 +165,12 @@ export function ComposerRunSettingsPicker({
   const effectiveEffort = piLevel ? selected.effort ?? defaultEffort : effort;
   const effectiveEffortLabel = effectiveEffort ? EFFORT_LABELS[effectiveEffort] ?? effectiveEffort : "Default";
   const effortLabel = effort ? EFFORT_LABELS[effort] ?? effort : piLevel ? `Default (${effectiveEffortLabel})` : "Default";
+  const nextEffort = effort ?? defaultEffort;
+  const nextEffortLabel = nextEffort ? EFFORT_LABELS[nextEffort] ?? nextEffort : "Default";
+  // Catalog labels are preferred. Until discovery returns, omit provider prefixes
+  // without guessing a friendlier name for a custom model ID.
+  const shortModelName = (modelName || "Default").split("/").pop() || "Default";
+  const stacked = triggerLayout === "stacked";
   const fastAvailable = composerFastAvailable(agent, model);
   const effortChoicesKey = choices.join(",");
   useEffect(() => {
@@ -217,6 +228,16 @@ export function ComposerRunSettingsPicker({
   };
   const closeButton = mobile ? <DialogClose asChild><button type="button" aria-label="Close picker" className="grid size-8 place-items-center rounded-md text-muted-foreground hover:bg-accent"><X className="size-4" /></button></DialogClose> : null;
   const Trigger = mobile ? DialogTrigger : PopoverTrigger;
+  const stackedModelTrigger = <Trigger asChild><button ref={triggerRef} type="button" disabled={disabled}
+    aria-label={choices.length ? `Model and level: ${shortModelName}, ${nextEffortLabel}` : `Model: ${shortModelName}`}
+    aria-haspopup="dialog" aria-expanded={open && view !== "agents"} onClick={() => setView("settings")}
+    className="composer-run-settings-stacked-trigger flex min-w-0 max-w-full items-center justify-between gap-1 rounded-lg px-1 text-left hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50">
+    <span className="min-w-0">
+      <span data-testid="task-chat-composer-model-label" className="composer-run-settings-model-label block min-w-0 truncate text-foreground">{shortModelName}</span>
+      {choices.length ? <span data-testid="task-chat-composer-level-label" className="composer-run-settings-level-label block truncate text-muted-foreground">{nextEffortLabel}</span> : null}
+    </span>
+    <ChevronDown className="size-3 shrink-0 text-muted-foreground" aria-hidden />
+  </button></Trigger>;
   const modelTrigger = <button ref={allowAssigneeChange ? undefined : triggerRef} type="button" disabled={disabled} aria-label="Select model and effort" aria-haspopup="dialog" aria-expanded={open && view !== "agents"} onClick={() => { setView("settings"); if (allowAssigneeChange) setOpen(true); }}
     className="flex h-8 min-w-0 max-w-full items-center gap-1.5 rounded-full px-2.5 text-muted-foreground hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50">
     <span data-testid="task-chat-composer-model-label" className="min-w-0 truncate text-foreground/70">{open && !piLevel ? "Select model" : modelName || "Default"}</span>
@@ -224,7 +245,8 @@ export function ComposerRunSettingsPicker({
     <ChevronDown className="size-3 shrink-0" aria-hidden />
   </button>;
   const AssigneeHeader = allowAssigneeChange ? "button" : "div";
-  const triggers = <div data-testid="task-chat-composer-selection" className="flex min-w-0 max-w-full items-center rounded-full bg-muted text-xs font-medium">
+  const triggers = <div data-testid="task-chat-composer-selection" className={cn("flex min-w-0 max-w-full items-center text-xs font-medium", stacked ? "composer-run-settings-stacked" : "rounded-full bg-muted")}>
+    {stacked && modelSupported ? stackedModelTrigger : <>
     {allowAssigneeChange ? <Trigger asChild><button ref={triggerRef} type="button" disabled={disabled} aria-label="Select assignee" data-testid="task-chat-composer-assignee"
       onClick={() => { setView("agents"); setHighlightedAssignee(0); }}
       className="flex h-8 min-w-0 max-w-full items-center gap-1.5 rounded-full px-2.5 hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50">
@@ -235,6 +257,7 @@ export function ComposerRunSettingsPicker({
     {modelSupported ? <>
       {allowAssigneeChange ? <><span className="text-muted-foreground" aria-hidden>·</span>{modelTrigger}</> : <Trigger asChild>{modelTrigger}</Trigger>}
     </> : null}
+    </>}
   </div>;
 
   const body = view === "settings" ? <div className="min-h-0 overflow-y-auto overscroll-contain touch-pan-y p-3" data-testid="composer-run-settings-view">
@@ -254,19 +277,32 @@ export function ComposerRunSettingsPicker({
       </button>
       {choices.length ? <div className="mt-3">
         <div className="flex items-center gap-2">
-          {fastAvailable ? <button type="button" aria-label="Fast mode" aria-pressed={selected.fast} title="Fast mode" onClick={() => onSettingsChange({ ...selected, fast: !selected.fast })} className={cn("grid size-8 shrink-0 place-items-center rounded-md hover:bg-accent", selected.fast ? "composer-run-settings-accent bg-accent" : "text-muted-foreground")}><Zap className="size-4" /></button> : <span className="size-8 shrink-0" aria-hidden />}
-          <label htmlFor="composer-run-effort" data-testid="selected-effort" className="composer-run-settings-accent min-w-0 flex-1 text-center text-sm font-medium">{piLevel ? "Reasoning level · " : ""}{effortLabel}</label>
+          <label htmlFor="composer-run-effort" data-testid="selected-effort" className="flex min-w-0 flex-1 items-center justify-between gap-2 text-sm">
+            <span className="text-muted-foreground">Reasoning level</span><strong className="font-semibold">{effortLabel}</strong>
+          </label>
+          {fastAvailable ? <button type="button" aria-label="Fast mode" aria-pressed={selected.fast} title="Fast mode" onClick={() => onSettingsChange({ ...selected, fast: !selected.fast })} className={cn("grid size-8 shrink-0 place-items-center rounded-md hover:bg-accent", selected.fast ? "composer-run-settings-accent bg-accent" : "text-muted-foreground")}><Zap className="size-4" /></button> : null}
           <button type="button" aria-label="Reset to agent default" title="Reset to agent default" disabled={!changed} onClick={reset} className="grid size-8 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-accent disabled:opacity-40"><RotateCcw className="size-4" /></button>
         </div>
-        <input id="composer-run-effort" type="range" min={0} max={choices.length} step={1} value={effortIndex} aria-label={piLevel ? "Reasoning level" : "Effort"} aria-valuetext={effortLabel}
-          onChange={(event) => {
-            const nextEffort = Number(event.target.value) === 0 ? null : choices[Number(event.target.value) - 1]!;
-            rememberComposerEffort(companyId, nextEffort);
-            onSettingsChange({ ...selected, effort: nextEffort });
-          }}
-          className="composer-run-effort-range mt-3 w-full" style={{ "--fill": `${effortIndex / choices.length * 100}%` } as CSSProperties} />
+        <div className="composer-run-effort-control" style={{ "--fill": `${effortIndex / choices.length * 100}%` } as CSSProperties}>
+          <div className="composer-run-effort-rail" aria-hidden="true" />
+          <div className="composer-run-effort-marks" aria-hidden="true">
+            {[null, ...choices].map((choice, index) => <span key={choice ?? "default"} data-selected={index <= effortIndex} />)}
+          </div>
+          <input id="composer-run-effort" type="range" min={0} max={choices.length} step={1} value={effortIndex} aria-label={piLevel ? "Reasoning level" : "Effort"} aria-valuetext={effort ? EFFORT_LABELS[effort] ?? effort : "Default"} aria-describedby="composer-run-effort-notes"
+            onChange={(event) => {
+              const nextEffort = Number(event.target.value) === 0 ? null : choices[Number(event.target.value) - 1]!;
+              rememberComposerEffort(companyId, nextEffort);
+              onSettingsChange({ ...selected, effort: nextEffort });
+            }}
+            className="composer-run-effort-range" />
+        </div>
+        <div data-testid="composer-run-effort-ends" className="flex justify-between text-xs text-muted-foreground"><span>Default</span><span>{EFFORT_LABELS[choices[choices.length - 1]!] ?? choices[choices.length - 1]}</span></div>
+        <div id="composer-run-effort-notes" role="status" className="mt-3 text-xs text-muted-foreground">
+          <p><strong className="font-semibold text-foreground">{nextEffortLabel}</strong> applies to your next message.</p>
+          <p>Earlier messages are unchanged.</p>
+          {replyRunning ? <p>The current reply is unchanged.</p> : null}
+        </div>
       </div> : null}
-      {piLevel ? <p role="status" className="mt-3 px-1 text-xs text-muted-foreground">Takes effect at your next message</p> : null}
     </> : agent ? <div className="mt-3 rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground" data-testid="model-unavailable">{unavailableModelReason(agent)}</div> : null}
     {reasoning.supported ? <label className="mt-3 flex items-center gap-2 px-1 text-sm">
       <span className="flex-1 text-muted-foreground">Reasoning display</span>
@@ -300,6 +336,8 @@ export function ComposerRunSettingsPicker({
   </div>;
 
   const onOpenChange = (next: boolean) => { setOpen(next); if (!next) { setView("settings"); setModelSearch(""); setAssigneeSearch(""); } };
+  // A fixed agent without model settings has no selector in the phone row.
+  if (stacked && !modelSupported && !allowAssigneeChange) return null;
   // The desktop portal needs its own scroll lock inside the new-task dialog.
   return mobile ? <Dialog open={open} onOpenChange={onOpenChange}>{triggers}<DialogContent aria-describedby={undefined} showCloseButton={false} style={mobileViewportStyle} className="composer-mobile-dialog gap-0 overflow-hidden p-0" data-testid="composer-mobile-dialog"><DialogTitle className="sr-only">{view === "agents" ? "Select assignee" : modelSupported ? "Select model and effort" : "Agent run settings"}</DialogTitle><AnimatedBody>{body}</AnimatedBody></DialogContent></Dialog>
     : <Popover modal open={open} onOpenChange={onOpenChange}><PopoverAnchor asChild>{triggers}</PopoverAnchor><PopoverContent side="top" align="end" sideOffset={8} className="w-80 max-w-full p-0 shadow-sm" data-testid="composer-model-popover"><AnimatedBody>{body}</AnimatedBody></PopoverContent></Popover>;
