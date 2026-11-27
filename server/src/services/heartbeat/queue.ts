@@ -2865,6 +2865,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string, savedInteractionOrigin?: unknown,
     admission?: { saved(): void }) {
+    // Capture the live request boundary before receipt coalescing assigns an
+    // execution-wait id. A saved-receipt sweep enters with an id already set;
+    // it is not a new person's Send, even if that receipt has a user author.
+    const personRequestAdmission = opts.requestedByActorType === "user" && !executionWaitRequestId;
     const wakeRequestedAt = new Date();
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
@@ -4170,8 +4174,15 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             });
           };
           const explicitContinuationRunId = randomUUID();
+          if (!personRequestAdmission && opts.requestedByActorType === "user" && wakeCommentId) {
+            logger.info({ issueId, runId: null, gate: "person_request_admission", field: "executionWaitRequestId",
+              reason: "saved_receipt_resume_not_new_person_request" }, "stop_repair_skipped");
+          }
           const recovery = await prepareRecovery({
-            reevaluatePersonStop: !executionWaitRequestId && !durableRequest?.resumeDeferred,
+            // The adapter still verifies the saved comment, matching person
+            // author/requester and absence of a run author. Coalescing or a
+            // trusted inbound owner's deferred resume must not erase intent.
+            reevaluatePersonStop: personRequestAdmission,
             agentId, actorType: taskRetryActorId ? "user" : opts.requestedByActorType, actorId: taskRetryActorId ?? opts.requestedByActorId,
             requestedByActorType: opts.requestedByActorType, requestedByActorId: opts.requestedByActorId,
             reason: taskRetryActorId ? "task_retry" : durableRequest && !failedChatRetry ? "issue_commented" : reason,

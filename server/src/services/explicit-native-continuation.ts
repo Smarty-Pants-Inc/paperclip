@@ -309,6 +309,11 @@ export async function admitExplicitNativeContinuation(input: {
           and result.schema_status = 'accepted' and result.result_json#>>'{terminal,runTerminalState}' = 'succeeded')`,
     )),
   )).for("update");
+  // A new Send must not bypass the early-Stop version fence through the
+  // generic explicit-continuation fallback and clear the same held messages.
+  const stopRefusal = actions.find(action =>
+    (action.evidence.stopSettlementRefusal as { code?: string } | undefined)?.code === "person_stop_task_status_changed");
+  if (stopRefusal) return blocked("person_stop_task_status_changed", stopRefusal.nextAction);
   const sourceChecks: Array<{ id?: string; cause: string; evidence: Record<string, unknown> }> =
     actions.map(action => ({ id: action.id, cause: action.cause, evidence: action.evidence }));
   if (nativeQueuedSend) {

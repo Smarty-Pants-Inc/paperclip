@@ -14273,7 +14273,7 @@ describe("native warm session supervision", () => {
     } finally { await closeIdleWarmNativeSessionsForRestart(); }
   });
 
-  it("keeps a conversation after a non-cache archive refusal and never repeats same-owner capture", async () => {
+  it("keeps a conversation after a non-cache archive refusal and retries capture only on explicit retirement", async () => {
     const name = "warm-archive-preservation";
     const current = { ...execution, binding: { ...execution.binding, runId: name, executionWorkspaceId: name },
       session: { ...execution.session, normalizedSessionId: name, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } },
@@ -14298,7 +14298,7 @@ describe("native warm session supervision", () => {
         try { await executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: name }); }
         catch (error) { failures.push(error); }
       }
-      expect(close).toHaveBeenCalledTimes(1);
+      expect(close).toHaveBeenCalledTimes(2);
       expect(state.execute).toHaveBeenCalledTimes(1); // No replacement provider input.
       expect(failures).toHaveLength(2);
       for (const error of failures) {
@@ -14311,6 +14311,47 @@ describe("native warm session supervision", () => {
     } finally {
       allowClose = true;
       await closeIdleWarmNativeSessionsForRestart();
+    }
+  });
+
+  it("retires a latched warm owner after its oversized cache is deleted", async () => {
+    const name = "warm-archive-repaired";
+    const root = await mkdtemp(join(tmpdir(), `${name}-`));
+    const tree = join(root, "tree"), cache = join(tree, "cache");
+    const { captureNativeHarnessArchive, MAX_NATIVE_HARNESS_BYTES } = await import("./native-harness-backup-archive.js");
+    await mkdir(cache, { recursive: true });
+    await writeFile(join(tree, "history"), "the same saved conversation");
+    await writeFile(join(cache, "oversized"), "");
+    await truncate(join(cache, "oversized"), MAX_NATIVE_HARNESS_BYTES + 1);
+    const current = { ...execution, binding: { ...execution.binding, runId: name, executionWorkspaceId: name },
+      session: { ...execution.session, normalizedSessionId: name, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } },
+    } as NativeExecutionInputV1;
+    const close = vi.fn(async () => {
+      await rm(join(root, "saved.tar"), { force: true });
+      await captureNativeHarnessArchive(tree, join(root, "saved.tar"));
+    });
+    state.execute.mockReset().mockImplementation(async options => {
+      await options.onSession?.({ close });
+      return { result: { summary: "same conversation" }, terminal: { runTerminalState: "succeeded" },
+        turnId: name, normalizedSessionId: name, providerSessionId: name, driverKind: "test", driverVersion: "1",
+        nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+    });
+    try {
+      await executePaperclipNativeSession({ db: leaseDb(current), execution: current, runnerInstanceId: name });
+      const next = { ...current, binding: { ...current.binding, runId: `${name}-next`, executionWorkspaceId: `${name}-next` },
+        provider: { ...current.provider, model: "changed-model" } } as NativeExecutionInputV1;
+      await expect(executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: name }))
+        .rejects.toMatchObject({ code: "native_harness_preservation_required" });
+      expect(state.execute).toHaveBeenCalledTimes(1);
+      await rm(cache, { recursive: true });
+      await expect(executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: name }))
+        .resolves.toMatchObject({ exitCode: 0 });
+      expect(close).toHaveBeenCalledTimes(2);
+      expect(await readFile(join(tree, "history"), "utf8")).toBe("the same saved conversation");
+    } finally {
+      await rm(cache, { recursive: true, force: true });
+      await closeIdleWarmNativeSessionsForRestart();
+      await rm(root, { recursive: true, force: true });
     }
   });
 
@@ -24970,8 +25011,8 @@ describe("runnerd provider runtime wiring", () => {
       await expect(registration.checkpoint!("settled")).rejects.toMatchObject({ code: "native_harness_preservation_required" });
       expect(persist).toHaveBeenCalledTimes(1);
       await rm(tree, { recursive: true, force: true });
-      // An explicit later capture is allowed to recover; normal retirement
-      // remains latched until that capture succeeds.
+      // An explicit later capture (including retirement) may recover;
+      // idle-close retries remain off while preservation is latched.
       await rm(archive, { force: true });
       await expect(registration.checkpoint!("settled")).resolves.toBeUndefined();
       expect(persist).toHaveBeenCalledTimes(2);

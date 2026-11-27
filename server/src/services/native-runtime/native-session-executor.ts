@@ -969,11 +969,13 @@ async function retireWarmPredecessor(entry: WarmNativeSession, reason: string,
     throw new NativePredecessorRetirementUnprovenError(entry.runId, entry.providerLeaseId,
       new Error("warm Runner stop unconfirmed (injected test fault)"));
   }
-  if (entry.preservationFailure) throw entry.preservationFailure;
+  // Idle timers stay suppressed while latched, but an explicit retirement
+  // gets one fresh capture: the oversized tree may have been removed.
   const directoryWaitDeadline = Date.now() + warmRetirementDirectoryWait.timeoutMs;
   for (;;) {
     try {
       await closeWarmNativeSession(entry, reason, options);
+      entry.preservationFailure = undefined;
       return;
     } catch (error) {
       if (error instanceof AgentDirectoryOperationBusyError) {
@@ -986,7 +988,8 @@ async function retireWarmPredecessor(entry: WarmNativeSession, reason: string,
         });
         throw new NativePredecessorRetirementDirectoryBusyError(entry.runId, error);
       }
-      if (isNativeHarnessArchiveOverCapacity(error) || findHarnessPreservationFailure(error)) {
+      entry.preservationFailure = undefined;
+      if (isNativeHarnessArchiveOverCapacity(error)) {
         entry.preservationFailure = findHarnessPreservationFailure(error) ?? new NativeHarnessPreservationRequiredError(error);
         logger.error({ runId: entry.runId, issueId: entry.issueId, providerLeaseId: entry.providerLeaseId,
           reason: entry.preservationFailure.code }, entry.preservationFailure.message);

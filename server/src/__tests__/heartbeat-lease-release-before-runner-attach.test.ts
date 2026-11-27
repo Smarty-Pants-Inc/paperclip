@@ -31,6 +31,7 @@ import { heartbeatService } from "../services/heartbeat.ts";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { createOwnedSandbox } from "../services/sandbox-creation-operations.js";
+import { createDurableChatWakeupRequest } from "../services/durable-chat-wakeup.js";
 import { reevaluateStoppedBeforeFirstInput, settlePreDispatchStopRecovery } from "../services/heartbeat/pre-dispatch-stop-settlement.js";
 import { settleStartupStop } from "../services/person-stop-before-turn.js";
 import { canRetryStoppedRun } from "../services/cancelled-native-startup.js";
@@ -407,6 +408,7 @@ describeEmbeddedPostgres("environment lease release between sandbox acquire and 
         leaseExpiresAt: new Date(Date.now() + 60_000) }).where(eq(nativeRunFinalizations.runId, fixture.runId));
       if (boundary === "newer-status") await db.update(issues).set({ status: "blocked", statusVersion: 77 })
         .where(eq(issues.id, fixture.issueId));
+      const [beforeReleaseTask] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
       const heartbeat = heartbeatService(db, { pluginWorkerManager: fixture.manager });
       // Exercise the stock release writer before cleanup, as the real Stop does.
       await createPostgresWakeQueueAdapter(db, { resolveResponsibleUserId: async () => null,
@@ -418,8 +420,16 @@ describeEmbeddedPostgres("environment lease release between sandbox acquire and 
       await settlePreDispatchStopRecovery(db, fixture.companyId, fixture.runId);
       const [task] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
       const stopped = await run(fixture.runId);
-      if (boundary === "before-input" || boundary === "legacy-preparation" || boundary === "newer-status") {
-        expect(task!.status).toBe(boundary === "newer-status" ? "blocked" : "todo");
+      if (boundary === "newer-status") {
+        expect(task!.status).toBe("blocked");
+        const holds = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, fixture.issueId));
+        // This release has no reconciliation hold to settle. Refusal must
+        // still preserve the newer version and the unsurrendered file proof.
+        expect(holds).toHaveLength(0);
+        expect(task!.statusVersion).toBe(beforeReleaseTask!.statusVersion);
+        expect(stopped.runnerProfileJson).toHaveProperty("nativeWorkspaceSync.state", "prepared");
+      } else if (boundary === "before-input" || boundary === "legacy-preparation") {
+        expect(task!.status).toBe("todo");
         expect(stopped.resultJson).toHaveProperty("stoppedBeforeFirstInput.runId", fixture.runId);
         expect(stopped.resultJson).not.toHaveProperty("workspaceRestoreRecovery");
         expect(stopped.runnerProfileJson).not.toHaveProperty("nativeWorkspaceSync");
@@ -480,23 +490,26 @@ describeEmbeddedPostgres("environment lease release between sandbox acquire and 
   // Recorded gate-5 shape: Stop before staging, legacy hold already resolved
   // blocked, no captured old task version, and four messages already parked.
   it.each(["send", "retry", "newer-status", "successor", "live-owner", "provider-work", "changed-allocation", "foreign-hold",
-    "h-send", "h-retry", "h-unsettled", "h-system"] as const)(
+    "h-send", "h-retry", "h-wait-send", "h-wait-retry", "h-unsettled", "h-system", "startup-system", "startup-no-person", "startup-system-initiator"] as const)(
     "re-evaluates an already-stuck early Stop only at a person's request (%s)", async scenario => {
-      const liveShape = scenario.startsWith("h-");
-      const action = scenario === "h-send" ? "send" : scenario === "h-retry" ? "retry" : scenario;
+      const liveShape = scenario.startsWith("h-") || scenario.startsWith("startup-");
+      const waiting = scenario.startsWith("h-wait-");
+      const action = scenario === "h-send" || scenario === "h-wait-send" || scenario === "newer-status" ? "send" : scenario === "h-retry" || scenario === "h-wait-retry" ? "retry" : scenario;
       const f = await acquireReusable("replace");
       const now = new Date(), actionId = randomUUID();
       await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId));
       await db.update(heartbeatRuns).set({ runtimeMode: "legacy", runtimeModeResolvedAt: null,
-        nativeIssueId: null, executionStage: "preparing", status: "cancelled", errorCode: liveShape ? null : "cancelled", finishedAt: now,
+        nativeIssueId: null, executionStage: "preparing", status: "cancelled", errorCode: scenario.startsWith("h-") ? null : "cancelled", finishedAt: now,
         runnerProfileJson: { adapterDispatch: { adapterType: "paperclip_runner" } },
         resultJson: { startupCancellation: { requestedAt: now.toISOString(), beforeNativeSelection: true },
           cancelledByActorType: "user", cancelledByUserId: "operator",
-          ...(liveShape ? { personStop: { userId: "operator", returned: [], requestedAt: now.toISOString() },
+          ...(liveShape ? { ...(scenario === "startup-no-person" ? {} : { personStop: { userId: "operator", returned: [], requestedAt: now.toISOString() } }),
             startupPreparationSettledAt: new Date(now.getTime() + (scenario === "h-unsettled" ? -1 : 1)).toISOString(),
-            cancellation: { reason: "Execution stopped", source: scenario === "h-system" ? "system" : "operator",
-              expected: true, initiator: "user", recordedAt: now.toISOString() } }
-            : { preDispatchCancellationSettledAt: now.toISOString() }) },
+            cancellation: { reason: "Execution stopped", source: scenario === "h-system" || scenario === "startup-system" ? "system" : "operator",
+              ...(scenario === "startup-system-initiator" ? { source: null, initiator: { type: "system" } } : { initiator: "user" }),
+              expected: true, recordedAt: now.toISOString() } }
+            : { personStop: { userId: "operator", returned: [], requestedAt: now.toISOString() },
+              preDispatchCancellationSettledAt: now.toISOString() }) },
       }).where(eq(heartbeatRuns.id, f.runId));
       await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success", releasedAt: now })
         .where(eq(environmentLeases.id, f.leaseId));
@@ -511,7 +524,8 @@ describeEmbeddedPostgres("environment lease release between sandbox acquire and 
             freshContinuationCheck: { kind: "person_owned", reason: "stopped_on_request" }, savedPersonWakeNoticeCommentId: randomUUID() } : {}),
           automaticRecovery: { policy: "preserve_without_replay_v1", runId: f.runId, replay: "blocked", actionOutcome: "unknown" } } });
       const commentIds: string[] = [], wakeIds: string[] = [];
-      for (let index = 0; index < 4; index++) {
+      const heldCount = waiting ? 5 : 4;
+      for (let index = 0; index < heldCount; index++) {
         const id = randomUUID(), wakeId = randomUUID(), at = new Date(now.getTime() + index + 1);
         commentIds.push(id); wakeIds.push(wakeId);
         await db.insert(issueComments).values({ id, companyId: f.companyId, issueId: f.issueId,
@@ -519,9 +533,10 @@ describeEmbeddedPostgres("environment lease release between sandbox acquire and 
         await db.insert(agentWakeupRequests).values({ id: wakeId, companyId: f.companyId, agentId: f.agentId,
           source: "issue", reason: "issue_commented", status: "deferred_issue_execution", requestedAt: at,
           requestedByActorType: "user", requestedByActorId: "operator", payload: { issueId: f.issueId,
+            ...(waiting ? { executionWait: { reason: "previous_execution_unverified", recoveryActionId: actionId } } : {}),
             _paperclipWakeContext: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: id, wakeCommentIds: [id] } } });
       }
-      if (action === "newer-status") await db.update(issues).set({ statusVersion: blockedTask.statusVersion + 1 }).where(eq(issues.id, f.issueId));
+      if (scenario === "newer-status") await db.update(issues).set({ statusVersion: blockedTask.statusVersion + 1 }).where(eq(issues.id, f.issueId));
       if (action === "successor") await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
         issueId: f.issueId, status: "failed", createdAt: new Date(now.getTime() + 1000) });
       if (action === "live-owner") await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: new Date(Date.now() + 60_000) })
@@ -542,7 +557,16 @@ describeEmbeddedPostgres("environment lease release between sandbox acquire and 
         const id = randomUUID(); commentIds.push(id);
         await db.insert(issueComments).values({ id, companyId: f.companyId, issueId: f.issueId,
           authorType: "user", authorUserId: "operator", body: "new-edited-send", createdAt: new Date(now.getTime() + 10) });
+        const durable = waiting ? createDurableChatWakeupRequest({ id: randomUUID(), companyId: f.companyId,
+          agentId: f.agentId, issueId: f.issueId, commentId: id, requestedByActorType: "user", requestedByActorId: "operator",
+          requestedAt: new Date(now.getTime() + 10), resumeDeferred: true, authorize: async () => {} }) : undefined;
+        if (durable) await db.insert(agentWakeupRequests).values({ id: durable.id, companyId: f.companyId, agentId: f.agentId,
+          source: "on_demand", reason: "issue_commented", status: "deferred_issue_execution", requestedAt: durable.requestedAt,
+          idempotencyKey: durable.idempotencyKey, requestedByActorType: "user", requestedByActorId: "operator",
+          payload: { issueId: f.issueId, executionWait: { reason: "previous_execution_unverified", recoveryActionId: actionId }, _paperclipWakeContext: { issueId: f.issueId,
+              wakeReason: "issue_commented", wakeCommentId: id, wakeCommentIds: [id] } } });
         await heartbeat.wakeup(f.agentId, { source: "on_demand", reason: "issue_commented", requestedByActorType: "user",
+          ...(durable ? { durableChatRequest: durable } : {}),
           requestedByActorId: "operator", payload: { issueId: f.issueId, commentId: id },
           contextSnapshot: { issueId: f.issueId, wakeCommentId: id, wakeReason: "issue_commented" } });
       } else if (action === "retry") {
@@ -553,15 +577,27 @@ describeEmbeddedPostgres("environment lease release between sandbox acquire and 
       } else await reevaluateStoppedBeforeFirstInput(db, { companyId: f.companyId, issueId: f.issueId, agentId: f.agentId });
       const [task] = await db.select().from(issues).where(eq(issues.id, f.issueId));
       const [hold] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, actionId));
-      if (!["send", "retry", "newer-status"].includes(action)) {
+      if (scenario === "newer-status") {
+        expect(hold.outcome).toBe("blocked");
+        expect(task.status).toBe("blocked");
+        expect(hold.nextAction).toContain("task status changed");
+        expect(hold.evidence).toMatchObject({ stopSettlementRefusal: {
+          code: "person_stop_task_status_changed", runId: f.runId, currentStatusVersion: blockedTask.statusVersion + 1,
+        } });
+        const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+        expect(wakes.filter(wake => wakeIds.includes(wake.id)).every(wake => wake.status === "deferred_issue_execution")).toBe(true);
+        expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+          .filter(row => row.status === "queued")).toHaveLength(0);
+        return;
+      }
+      if (!["send", "retry"].includes(action)) {
         expect(hold.outcome).toBe("blocked");
         expect((await run(f.runId)).resultJson).not.toHaveProperty("stoppedBeforeFirstInput");
         return;
       }
       expect(hold.outcome).toBe("cancelled");
-      expect(task.status).toBe(action === "newer-status" ? "blocked" : "todo");
+      expect(task.status).toBe("todo");
       expect(await reevaluateStoppedBeforeFirstInput(db, { companyId: f.companyId, issueId: f.issueId, agentId: f.agentId })).toBe(0);
-      if (action === "newer-status") return;
       const successors = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
         .filter(row => row.status === "queued");
       expect(successors).toHaveLength(1);
@@ -581,7 +617,7 @@ describeEmbeddedPostgres("environment lease release between sandbox acquire and 
       expect(new Set(inputIds).size).toBe(commentIds.length);
       if (action === "send") {
         expect(text).toContain("new-edited-send");
-        for (let index = 1; index < 4; index++) expect(text!.indexOf(`held-message-${index}`))
+        for (let index = 1; index < heldCount; index++) expect(text!.indexOf(`held-message-${index}`))
           .toBeGreaterThan(index > 1 ? text!.indexOf(`held-message-${index - 1}`) : -1);
       } else expect(text).toBeNull();
       await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, agentId: f.agentId, runId: next.id,
@@ -590,8 +626,8 @@ describeEmbeddedPostgres("environment lease release between sandbox acquire and 
       // consumption ledger; this is not a provider/model answer.
       await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, next.id));
       const accepted = await deliveredQueuedCommentIds(db, { companyId: f.companyId, issueId: f.issueId,
-        agentId: f.agentId, commentIds: commentIds.slice(0, 4) });
-      expect([...accepted].sort()).toEqual(commentIds.slice(0, 4).sort());
+        agentId: f.agentId, commentIds: commentIds.slice(0, heldCount) });
+      expect([...accepted].sort()).toEqual(commentIds.slice(0, heldCount).sort());
       const followupId = randomUUID(), followupRunId = randomUUID();
       await db.insert(issueComments).values({ id: followupId, companyId: f.companyId, issueId: f.issueId,
         authorType: "user", authorUserId: "operator", body: "one-follow-up" });
