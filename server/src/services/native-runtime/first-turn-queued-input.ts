@@ -101,7 +101,7 @@ export function firstTurnClaimedCommentIds(run: { id: string; status?: string | 
  */
 export function deferredWakeJoinsFirstTurn(
   wake: { agentId: string; status: string; requestedByActorType: string | null; requestedByActorId: string | null; reason: string | null; payload: unknown },
-  run: { agentId: string; responsibleUserId: string | null },
+  run: { id?: string; agentId: string; responsibleUserId: string | null },
 ): boolean {
   const payload = record(wake.payload);
   const context = record(payload[DEFERRED_WAKE_CONTEXT_KEY]);
@@ -110,6 +110,7 @@ export function deferredWakeJoinsFirstTurn(
     ? wake.requestedByActorId === run.responsibleUserId
     : wake.requestedByActorType === "system" || wake.requestedByActorType === null;
   return wake.status === DEFERRED_WAKE_STATUS &&
+    (!run.id || payload.claimReturnedSourceRunId !== run.id) &&
     wake.agentId === run.agentId &&
     Boolean(run.responsibleUserId) && requester &&
     reason !== null && COMMENT_WAKE_REASONS.has(reason) &&
@@ -426,7 +427,8 @@ export const firstTurnWakeColumns = {
 export function firstTurnWakePayloadFields(payload: typeof agentWakeupRequests.payload) {
   return sql`'interactionId', ${payload}->'interactionId',
     'queuedCommentInterrupt', ${payload}->'queuedCommentInterrupt'->'requestedAt',
-    'externalChatProvider', ${payload}->'externalChatProvider'`;
+    'externalChatProvider', ${payload}->'externalChatProvider',
+    'claimReturnedSourceRunId', ${payload}->'claimReturnedSourceRunId'`;
 }
 
 /** The lean `_paperclipWakeContext` fields `deferredWakeJoinsFirstTurn` reads. */

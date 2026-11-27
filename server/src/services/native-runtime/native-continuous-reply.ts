@@ -137,6 +137,7 @@ export async function publishContinuousNativeReply(input: {
         ...(input.event.turnId ? firstInputIds : []),
         ...sameTurnAcknowledgements,
       ])];
+    questionCommentIds = questionCommentIds.filter(id => !parseObject(result.claimReturnedInput)[id]);
     if (handback && questionCommentIds.length) {
       const chronological = (await tx.select({ id: issueComments.id }).from(issueComments).where(and(
         eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, questionCommentIds),

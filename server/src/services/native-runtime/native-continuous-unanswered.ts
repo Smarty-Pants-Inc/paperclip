@@ -1,5 +1,6 @@
+import { createHash } from "node:crypto";
 import { and, asc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
-import { agentWakeupRequests, agents, heartbeatRuns, issueComments, issues, nativeRunResults, type Db } from "@paperclipai/db";
+import { agentWakeupRequests, agents, heartbeatRunEvents, heartbeatRuns, issueComments, issues, nativeRunResults, runIdentityContexts, type Db } from "@paperclipai/db";
 import { parseObject } from "../../adapters/utils.js";
 import { isUuidLike } from "@paperclipai/shared";
 import { queuedCommentIdsFromRunContext, queuedCommentIdsFromWakePayload, withQueuedCommentIdsInRunContext, withQueuedCommentIdsInWakePayload } from "../issue-queued-comment-queue.js";
@@ -11,10 +12,34 @@ import { hasNativePreDispatchFailureRecord } from "../heartbeat/run-failure-caus
 import { resolveSessionContinuity } from "./continued-session.js";
 import { recoverContinuousNativeReplies } from "./native-continuous-reply.js";
 import { issueService } from "../issues.js";
+import { rejectSteeredIdentity, storedSteeringAcknowledgement } from "../run-identity.js";
+import { returnWakeComments } from "../person-stop-before-turn.js";
+
+/** Replay only notices persisted by this run's bound runner, including after a crash between event and observer. */
+export async function settleClaimReturnedInput(db: Db, scope: { id: string; companyId: string }) {
+  const notices = await db.select({ payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents)
+    .innerJoin(heartbeatRuns, and(eq(heartbeatRuns.id, heartbeatRunEvents.runId), eq(heartbeatRuns.companyId, heartbeatRunEvents.companyId)))
+    .where(and(eq(heartbeatRuns.id, scope.id), eq(heartbeatRuns.companyId, scope.companyId),
+      eq(heartbeatRunEvents.eventType, "provider.notice.recorded"), sql`${heartbeatRunEvents.sourceEventId} is not null`,
+      sql`${heartbeatRunEvents.sourceInstanceId} = ${heartbeatRuns.runnerInstanceId}::text`,
+      sql`${heartbeatRunEvents.payload} #>> '{prpEvent,sourceKind}' = 'runner'`,
+      sql`${heartbeatRunEvents.payload} #>> '{prpEvent,normalizedSessionId}' = ${heartbeatRuns.nativeSessionId}::text`,
+      sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,category}' = 'pi_claim_returned_input'`));
+  for (const notice of notices) {
+    const details = parseObject(parseObject(notice.payload?.prpEvent).payload).details;
+    const ids = (Array.isArray(details) ? details : []).filter(detail => parseObject(detail).name === "returnedCommentIds")
+      .flatMap(detail => String(parseObject(detail).value ?? "").split(",")).map(id => id.trim()).filter(isUuidLike);
+    if (ids.length) await requeueContinuousUnanswered(db, scope, ids);
+  }
+}
 
 /** Hand unanswered delivery receipts back to the ordinary deferred queue before release. */
-export async function requeueContinuousUnanswered(db: Db, scope: { id: string; companyId: string }) {
-  await recoverContinuousNativeReplies(db, scope);
+export async function requeueContinuousUnanswered(db: Db, scope: { id: string; companyId: string }, claimReturnedIds?: string[]) {
+  const claimReturn = claimReturnedIds !== undefined;
+  if (!claimReturn) {
+    await settleClaimReturnedInput(db, scope);
+    await recoverContinuousNativeReplies(db, scope);
+  }
   const [source] = await db.select({ issueId: sql<string | null>`coalesce(${heartbeatRuns.nativeIssueId}::text,
     ${heartbeatRuns.issueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId')` }).from(heartbeatRuns)
     .where(and(eq(heartbeatRuns.id, scope.id), eq(heartbeatRuns.companyId, scope.companyId)));
@@ -27,9 +52,10 @@ export async function requeueContinuousUnanswered(db: Db, scope: { id: string; c
       .innerJoin(agents, and(eq(agents.id, heartbeatRuns.agentId), eq(agents.companyId, scope.companyId)))
       .where(and(eq(heartbeatRuns.id, scope.id), eq(heartbeatRuns.companyId, scope.companyId)))
       .for("update", { of: heartbeatRuns });
-    if (!issue || !row || !["failed", "cancelled", "timed_out", "interrupted"].includes(row.run.status) ||
-        row.config.provider !== "pi_rpc") return;
+    if (!issue || !row || (!claimReturn && !["failed", "cancelled", "timed_out", "interrupted"].includes(row.run.status)) ||
+        (claimReturn ? row.run.runtimeMode !== "native" : row.config.provider !== "pi_rpc")) return;
     const result = parseObject(row.run.resultJson);
+    const returnedReceipts = { ...parseObject(result.claimReturnedInput) };
     const contextSnapshot = parseObject(row.run.contextSnapshot);
     // Bootstrap failure is unconsumed input, not a failed delivery. Keep the
     // stock execution-evidence fence: a setup error label alone proves nothing.
@@ -42,14 +68,14 @@ export async function requeueContinuousUnanswered(db: Db, scope: { id: string; c
       !(await tx.select({ id: nativeRunResults.id }).from(nativeRunResults).where(and(
         eq(nativeRunResults.companyId, scope.companyId), eq(nativeRunResults.runId, scope.id))).limit(1)).length;
     // Post-provider failures keep their existing continuous steering contract.
-    if (!preDispatch && (row.run.runtimeMode !== "native" ||
+    if (!claimReturn && !preDispatch && (row.run.runtimeMode !== "native" ||
         resolveSessionContinuity("pi_rpc", row.config.sessionContinuity) !== "continuous")) return;
-    if (preDispatch && (issue.assigneeAgentId !== row.run.agentId || ["done", "cancelled"].includes(issue.status) ||
+    if ((preDispatch || claimReturn) && (issue.assigneeAgentId !== row.run.agentId || (!claimReturn && ["done", "cancelled"].includes(issue.status)) ||
       issue.conversationAgentId && (issue.conversationAgentId !== row.run.agentId ||
         contextSnapshot.conversationSessionGeneration !== issue.conversationSessionGeneration))) return;
     // Nothing self-starts after a person's Stop (0260): whatever was not taken went back to their input box.
-    if (result.continuousUnansweredWakeId || parseObject(result.personStop).requestedAt !== undefined) return;
-    const outputWithoutResult = !preDispatch && row.run.errorCode === "native_provider_output_without_result";
+    if (!claimReturn && (result.continuousUnansweredWakeId || parseObject(result.personStop).requestedAt !== undefined)) return;
+    const outputWithoutResult = !claimReturn && !preDispatch && row.run.errorCode === "native_provider_output_without_result";
     const answered = new Set(Object.values(parseObject(result.continuousReplies)).flatMap(value => {
       const ids = parseObject(value).questionCommentIds;
       return Array.isArray(ids) ? ids : [];
@@ -67,11 +93,19 @@ export async function requeueContinuousUnanswered(db: Db, scope: { id: string; c
         .map(([id]) => id),
       ...inheritedIds,
     ])].filter(id => !answered.has(id));
-    if (preDispatch) {
+    if (claimReturn) {
+      ids = [];
+      for (const id of new Set(claimReturnedIds)) {
+        if (returnedReceipts[id] || !isUuidLike(id)) continue;
+        if (parseObject(parseObject(result.queuedSteeringAcknowledgements)[id]).status === "acknowledged" ||
+            await storedSteeringAcknowledgement(tx, { companyId: scope.companyId, runId: scope.id, messageId: id })) ids.push(id);
+      }
+    }
+    if (preDispatch || claimReturn) {
       const [wake] = row.run.wakeupRequestId ? await tx.select({ payload: agentWakeupRequests.payload })
         .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, scope.companyId),
           eq(agentWakeupRequests.id, row.run.wakeupRequestId))) : [];
-      ids = [...new Set([...queuedCommentIdsFromRunContext(contextSnapshot), contextSnapshot.wakeCommentId,
+      ids = claimReturn ? ids : [...new Set([...queuedCommentIdsFromRunContext(contextSnapshot), contextSnapshot.wakeCommentId,
         ...queuedCommentIdsFromWakePayload(wake?.payload), wake?.payload?.commentId,
         parseObject(wake?.payload?._paperclipWakeContext).wakeCommentId,
         ...(readFirstTurnQueuedInputReceipt(row.run)?.commentIds ?? []), ...ids])]
@@ -90,13 +124,11 @@ export async function requeueContinuousUnanswered(db: Db, scope: { id: string; c
           ? parseObject(parseObject(owner.context).firstTurnQueuedInput).commentIds as string[] : []),
         ...Object.keys(parseObject(parseObject(owner.result).queuedSteeringAcknowledgements)),
       ]));
-      const pending = await tx.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
+      const pending = await tx.select({ id: agentWakeupRequests.id, payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.companyId, scope.companyId), eq(agentWakeupRequests.agentId, row.run.agentId),
         eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId),
         sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`));
       for (const wake of pending) for (const id of queuedCommentIdsFromWakePayload(wake.payload)) owned.add(id);
-      const delivered = await deliveredQueuedCommentIds(tx, { companyId: scope.companyId, issueId: issue.id,
-        agentId: row.run.agentId, commentIds: ids });
       // Messages, not the system retry's requester, carry the person's authority.
       // Re-read authors/generation/boundary and chronology, never arbitrary IDs
       // copied into a run context. Stop-returned inputs were removed above.
@@ -107,9 +139,41 @@ export async function requeueContinuousUnanswered(db: Db, scope: { id: string; c
         isNull(issueComments.createdByRunId), isNull(issueComments.deletedAt), isNull(issueComments.conversationSessionGeneration),
         sql`btrim(${issueComments.body}) <> '/new'`, currentConversationCommentCondition(),
       )).orderBy(asc(issueComments.createdAt), asc(issueComments.id)) : [];
-      ids = comments.map(comment => comment.id).filter(id => !owned.has(id) && !delivered.has(id));
+      ids = comments.map(comment => comment.id);
+      if (claimReturn && ids.length) {
+        // Invalidate only this run's queue acceptance before asking any delivery
+        // reader. A later run's genuine receipt must still win over replay.
+        const acknowledgements = { ...parseObject(result.queuedSteeringAcknowledgements) };
+        for (const id of ids) { returnedReceipts[id] = { ...parseObject(acknowledgements[id]) }; delete acknowledgements[id]; }
+        result.queuedSteeringAcknowledgements = acknowledgements;
+        result.claimReturnedInput = returnedReceipts;
+        for (const wake of pending) if (queuedCommentIdsFromWakePayload(wake.payload).some(id => ids.includes(id)))
+          await tx.update(agentWakeupRequests).set({ payload: { ...wake.payload, claimReturnedSourceRunId: scope.id } })
+            .where(eq(agentWakeupRequests.id, wake.id));
+        const continued = parseObject(result.continuedSessionInput);
+        if (Array.isArray(continued.commentIds)) result.continuedSessionInput = { ...continued,
+          commentIds: continued.commentIds.filter(id => !ids.includes(id)) };
+        result.continuousReplies = Object.fromEntries(Object.entries(parseObject(result.continuousReplies)).map(([key, value]) => {
+          const reply = parseObject(value);
+          return [key, { ...reply, questionCommentIds: Array.isArray(reply.questionCommentIds)
+            ? reply.questionCommentIds.filter(id => !ids.includes(id)) : [] }];
+        }));
+        const identities = await tx.select().from(runIdentityContexts).where(and(
+          eq(runIdentityContexts.companyId, scope.companyId), eq(runIdentityContexts.runId, scope.id),
+          eq(runIdentityContexts.cause, "steering"), inArray(runIdentityContexts.messageId, ids)));
+        for (const identity of identities) await rejectSteeredIdentity(tx as unknown as Db, identity, { returnedInput: true });
+        await tx.update(heartbeatRuns).set({ resultJson: result }).where(eq(heartbeatRuns.id, scope.id));
+      }
+      const delivered = await deliveredQueuedCommentIds(tx, { companyId: scope.companyId, issueId: issue.id,
+        agentId: row.run.agentId, commentIds: ids });
+      ids = ids.filter(id => !owned.has(id) && !delivered.has(id));
     }
-    if (!ids.length) return;
+    if (!ids.length) {
+      const stop = parseObject(result.personStop);
+      if (claimReturn && typeof stop.requestedAt === "string") await returnWakeComments(tx as unknown as Db,
+        { ...row.run, resultJson: result }, { pressedAt: stop.requestedAt, userId: typeof stop.userId === "string" ? stop.userId : null }, true);
+      return;
+    }
     const context = withQueuedCommentIdsInRunContext({ issueId: issue.id, source: "issue.comment",
       wakeReason: "issue_commented", forceFreshSession: false,
       ...(issue.conversationAgentId ? { conversationSessionGeneration: issue.conversationSessionGeneration } : {}),
@@ -124,9 +188,10 @@ export async function requeueContinuousUnanswered(db: Db, scope: { id: string; c
       // existing bounded retry scheduler (or the person's next message/Retry)
       // may start a successor; its first turn claims these saved inputs.
       payload: withQueuedCommentIdsInWakePayload({ issueId: issue.id, _paperclipWakeContext: context,
-        ...(preDispatch ? { preDispatchInputOnly: true, preDispatchSourceRunId: scope.id } : {}) }, ids),
+        ...(preDispatch ? { preDispatchInputOnly: true, preDispatchSourceRunId: scope.id } : {}),
+        ...(claimReturn ? { claimReturnedSourceRunId: scope.id } : {}) }, ids),
       requestedByActorType: row.run.responsibleUserId ? "user" : "system", requestedByActorId: row.run.responsibleUserId,
-      idempotencyKey: `continuous-unanswered:${scope.id}` }).returning({ id: agentWakeupRequests.id });
+      idempotencyKey: claimReturn ? `claim-returned:${scope.id}:${createHash("sha256").update(ids.slice().sort().join(",")).digest("hex")}` : `continuous-unanswered:${scope.id}` }).returning({ id: agentWakeupRequests.id });
     if (outputWithoutResult) {
       // Use the existing system-notice path rather than silently dropping ACKed
       // messages or misreporting a person's Stop. Same transaction/idempotency
@@ -136,7 +201,13 @@ export async function requeueContinuousUnanswered(db: Db, scope: { id: string; c
         {}, { authorType: "system", clientRequestId: `native-unanswered:${scope.id}:${id}`,
           presentation: { kind: "system_notice", tone: "danger", detailsDefaultOpen: false } }, tx);
     }
-    await tx.update(heartbeatRuns).set({ resultJson: { ...result, continuousUnansweredWakeId: wake.id } })
-      .where(eq(heartbeatRuns.id, scope.id));
+    if (claimReturn) {
+      for (const id of ids) returnedReceipts[id] = { ...parseObject(returnedReceipts[id]), wakeId: wake.id };
+      result.claimReturnedInput = returnedReceipts;
+    } else result.continuousUnansweredWakeId = wake.id;
+    await tx.update(heartbeatRuns).set({ resultJson: result }).where(eq(heartbeatRuns.id, scope.id));
+    const stop = parseObject(result.personStop);
+    if (claimReturn && typeof stop.requestedAt === "string") await returnWakeComments(tx as unknown as Db,
+      { ...row.run, resultJson: result }, { pressedAt: stop.requestedAt, userId: typeof stop.userId === "string" ? stop.userId : null }, true);
   });
 }

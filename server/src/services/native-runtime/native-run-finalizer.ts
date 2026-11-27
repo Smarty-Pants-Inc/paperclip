@@ -1,3 +1,4 @@
+import { settleClaimReturnedInput } from "./native-continuous-unanswered.js";
 import { recoverContinuousNativeReplies } from "./native-continuous-reply.js";
 import { settleProviderReturnedStopInput } from "../person-stop-before-turn.js";
 import { notifyNativeEnvironmentSettlement } from "../native-environment-settlement-notifications.js";
@@ -1030,6 +1031,7 @@ async function recoverCommittedNativeChatResponseInScope(
   db: Db,
   input: { companyId: string; issueId: string; runId: string; onlyWhenDue?: boolean },
 ): Promise<boolean> {
+  await settleClaimReturnedInput(db, { id: input.runId, companyId: input.companyId });
   await recoverContinuousNativeReplies(db, { id: input.runId, companyId: input.companyId });
   let agentId: string | null = null;
   let materialized = false;
@@ -1476,6 +1478,7 @@ export async function finalizeNativeRun(input: {
     .then((rows) => rows[0] ?? null);
   if (!admittedRun || admittedRun.runtimeMode !== "native")
     throw new Error("native_finalization_run_missing");
+  await settleClaimReturnedInput(input.db, admittedRun);
   await recoverContinuousNativeReplies(input.db, admittedRun);
   const claim = await claimCoordinator({
     db: input.db,

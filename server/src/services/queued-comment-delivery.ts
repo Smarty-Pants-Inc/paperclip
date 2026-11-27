@@ -35,6 +35,7 @@ export async function deliveredQueuedCommentIds(tx: Pick<Db, "select">, input: {
     sql`(exists (select 1 from ${heartbeatRuns} delivered_run
       where delivered_run.company_id = ${companyId} and delivered_run.agent_id = ${input.agentId}
         and delivered_run.status = 'succeeded'
+        and not (coalesce(delivered_run.result_json->'claimReturnedInput', '{}'::jsonb) ? ${issueComments.id}::text)
         and (delivered_run.native_issue_id = ${issueId} or delivered_run.context_snapshot->>'issueId' = ${issueId})
         and delivered_run.started_at > ${issueComments.createdAt}
         and delivered_run.started_at >= ${issueComments.updatedAt}
@@ -113,6 +114,7 @@ function historyReadSql(companyId: string, agentId: string, binding: SQL, condit
         limit 1) read_revision
       where reading_run.company_id = ${companyId} and ${binding}
         and reading_run.agent_id = ${agentId} ${condition}
+        and not (coalesce(reading_run.result_json->'claimReturnedInput', '{}'::jsonb) ? ${issueComments.id}::text)
         and reading_run.finished_at >= date_trunc('milliseconds', ${issueComments.updatedAt}) offset 0)`;
 }
 
@@ -155,7 +157,7 @@ export function taskHistoryHandlingGuidance(commentIds: readonly string[],
   // This is an in-progress read projection, not a consumption receipt.
   // Saved answers and inputs returned by Stop are no longer being answered here.
   const returned = parseObject(result.personStop).returned;
-  const excluded = new Set([...answered, ...(Array.isArray(returned) ? returned : [])]);
+  const excluded = new Set([...answered, ...(Array.isArray(returned) ? returned : []), ...Object.keys(parseObject(result.claimReturnedInput))]);
   const delivered = Object.entries(parseObject(result.queuedSteeringAcknowledgements))
     .filter(([, receipt]) => parseObject(receipt).status === "acknowledged").map(([id]) => id);
   const current = [...new Set([
@@ -186,6 +188,7 @@ function firstTurnDeliveredSql(companyId: string, issueId: string, agentId: stri
         and first_turn_run.context_snapshot->'firstTurnQueuedInput'->>'runId' = first_turn_run.id::text
         and first_turn_run.context_snapshot->'firstTurnQueuedInput'->'commentIds' ? ${issueComments.id}::text
         and (first_turn_run.context_snapshot->'firstTurnQueuedInput'->>'claimedAt')::timestamptz >= date_trunc('milliseconds', ${issueComments.updatedAt})
+        and not (coalesce(first_turn_run.result_json->'claimReturnedInput', '{}'::jsonb) ? ${issueComments.id}::text)
         and exists (select 1 from ${heartbeatRunEvents} accepted
           where accepted.company_id = ${companyId} and accepted.run_id = first_turn_run.id
             and accepted.event_type in ('turn.accepted', 'turn.started')))`;

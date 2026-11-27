@@ -48,6 +48,7 @@ async function findQueuedCommentWake(
   executor: IssueQueueDb,
   issue: { id: string; companyId: string; assigneeAgentId: string | null },
   claimedIds: Set<string> = new Set(),
+  activeRunId?: string,
 ): Promise<IssueQueueState | null> {
   if (!issue.assigneeAgentId) return null;
   const rows = await executor
@@ -119,6 +120,7 @@ async function findQueuedCommentWake(
   for (const wake of rows) {
     if (
       parseObject(wake.payload).issueId !== issue.id ||
+      (activeRunId !== undefined && parseObject(wake.payload).claimReturnedSourceRunId === activeRunId) ||
       (queuedCommentIdsFromWakePayload(wake.payload).length === 0 && !queuedInteractionId(wake.payload))
     )
       continue;
@@ -252,7 +254,7 @@ export async function readBoardQueuedComments(input: {
 }): Promise<IssueQueuedCommentQueue> {
   const queueState =
     input.queueState === undefined
-      ? await findQueuedCommentWake(input.executor, input.issue, firstTurnClaimedCommentIds(input.activeRun))
+      ? await findQueuedCommentWake(input.executor, input.issue, firstTurnClaimedCommentIds(input.activeRun), input.activeRun?.id)
       : input.queueState;
   const wake = queueState?.wake ?? null;
   // Read an interaction receipt once per snapshot.
@@ -500,12 +502,14 @@ export function createQueuedCommentSteeringAdapter(db: Db, options: { requireQue
             executor: tx, issue, actor, activeRun: run?.status === "running" ? run : null,
           }),
           async readPendingQueue() {
+            if (parseObject(wake?.payload).claimReturnedSourceRunId === targetRunId)
+              throw new QueuedCommentMutationError("steering_unsupported", "Claim-returned input belongs to the next run");
             const { queue } = await readLockedBoardQueue({ ...input, tx, issue }, wake, run);
             // Admission also takes this issue lock. Recheck the global FIFO
             // after locking, not just the optimistic snapshot: a concurrent
             // older person wake must not be overtaken by automatic delivery.
             if (options.requireQueueHead) {
-              const first = await findQueuedCommentWake(tx, issue, firstTurnClaimedCommentIds(run));
+              const first = await findQueuedCommentWake(tx, issue, firstTurnClaimedCommentIds(run), run?.id);
               if (first?.wake.id !== input.queueId || queue.entries[0]?.comment.id !== commentId) {
                 throw new QueuedCommentMutationError("queued_comment_order_mismatch", "Older queued input must be delivered first");
               }
@@ -535,7 +539,11 @@ export function createQueuedCommentSteeringAdapter(db: Db, options: { requireQue
             if (!acknowledgedRun || !runTargetsIssue(acknowledgedRun, issue.id)) return null;
             const result = parseObject(acknowledgedRun.resultJson);
             const providerAck = await storedSteeringAcknowledgement(tx, { companyId, runId: targetRunId, messageId: commentId });
-            if (identity) await acceptSteeredIdentity(tx, identity);
+            const returned = Boolean(parseObject(result.claimReturnedInput)[commentId]);
+            if (identity) {
+              if (returned) await rejectSteeredIdentity(tx as unknown as Db, identity, { returnedInput: true });
+              else await acceptSteeredIdentity(tx, identity);
+            }
 
             const now = new Date();
             const wakeScope = and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, companyId));
@@ -553,7 +561,7 @@ export function createQueuedCommentSteeringAdapter(db: Db, options: { requireQue
                 ...result,
                 queuedSteeringAcknowledgements: {
                   ...parseObject(result.queuedSteeringAcknowledgements),
-                  [commentId]: { status: "acknowledged", queueId: wake.id, turnId, acknowledgedAt: now.toISOString(), afterEventSeq: providerAck?.afterEventSeq ?? acknowledgedRun.nextEventSeq - 1 },
+                  ...(!returned ? { [commentId]: { status: "acknowledged", queueId: wake.id, turnId, acknowledgedAt: now.toISOString(), afterEventSeq: providerAck?.afterEventSeq ?? acknowledgedRun.nextEventSeq - 1 } } : {}),
                 },
               },
               updatedAt: now,
