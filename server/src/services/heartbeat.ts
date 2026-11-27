@@ -3662,6 +3662,7 @@ export function heartbeatService(
             persistedNativeExecutionInput,
             persistedRunnerProfile,
             taskResumeSessionId: preparedSession.taskResumeSessionId,
+            warmRecoveryRetainSessionId: preparedSession.resetTaskSession ? null : preparedSession.warmRecoveryRetainSessionId,
             isFailedChatRunRetry,
             getFreshSessionHandoff,
           },
@@ -4077,7 +4078,7 @@ export function heartbeatService(
           output: runOutput,
           session: { runtimeForAdapter, previousSessionParams, taskKey, configuredModel, sessionConfigMetadata },
           readFailureReportSecrets,
-          runId, err, identityRedactor, requiredWorkspaceRestoreEvidence, legacyAdapterEntered,
+          runId, err, identityRedactor, requiredWorkspaceRestoreEvidence, legacyAdapterEntered, configFreshnessResultMetadata,
           nativeDispatchMayHaveStarted: nativeDispatchMayHaveStarted(),
           goalCheckpointSession, previousSessionDisplayId, taskSession, predecessorRetirementFallback,
         });

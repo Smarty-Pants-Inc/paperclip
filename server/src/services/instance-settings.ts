@@ -251,6 +251,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
       enableEnvironments: parsed.data.enableEnvironments ?? false,
       enableNativeRunner: parsed.data.enableNativeRunner ?? true,
       enableAiConnectionRouters: parsed.data.enableAiConnectionRouters ?? false,
+      autoFreshSessionOnRecovery: parsed.data.autoFreshSessionOnRecovery ?? false,
       enableManagedSandboxOnly: parsed.data.enableManagedSandboxOnly ?? false,
       enableIsolatedWorkspaces: parsed.data.enableIsolatedWorkspaces ?? false,
       remoteWorkspaceStorageEnabled: parsed.data.remoteWorkspaceStorageEnabled ?? true,
@@ -313,6 +314,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     enableEnvironments: false,
     enableNativeRunner: true,
     enableAiConnectionRouters: false,
+    autoFreshSessionOnRecovery: false,
     enableManagedSandboxOnly: false,
     enableIsolatedWorkspaces: false,
     // An unrelated malformed field must not erase an explicit enrollment opt-out.

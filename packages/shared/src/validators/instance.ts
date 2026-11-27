@@ -50,6 +50,7 @@ export const instanceExperimentalSettingsSchema = z.object({
   enableEnvironments: z.boolean().default(false),
   enableNativeRunner: z.boolean().default(true),
   enableAiConnectionRouters: z.boolean().default(false),
+  autoFreshSessionOnRecovery: z.boolean().default(false),
   enableManagedSandboxOnly: z.boolean().default(false),
   enableIsolatedWorkspaces: z.boolean().default(false),
   remoteWorkspaceStorageEnabled: z.boolean().default(true),

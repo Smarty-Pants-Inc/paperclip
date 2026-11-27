@@ -160,6 +160,7 @@ export interface CompleteHeartbeatRunInput extends RunCompletionInput {
 }
 
 export interface FailHeartbeatRunInput extends RunCompletionInput {
+  configFreshnessResultMetadata?: Record<string, unknown>;
   runId: string;
   err: unknown;
   identityRedactor: Pick<ReturnType<typeof createAgentIdentityRedactor>, "redact">;
@@ -444,12 +445,31 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     failedProcessRunCancellations,
   } = dependencies;
 
+  // Both terminal paths persist server-prepared authority, never adapter-supplied
+  // receipts. Completion also publishes legacy session state; a throw cannot do
+  // that, so it needs the durable, matching native start before keeping a receipt.
+  async function sessionConfigReceipt(run: Run, metadata: Record<string, unknown> | undefined, completed: boolean) {
+    if (!metadata) return {};
+    if (!completed) {
+      const [started] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.agentId, run.agentId),
+        sql`exists (select 1 from ${heartbeatRunEvents}
+          where ${heartbeatRunEvents.companyId} = ${heartbeatRuns.companyId} and ${heartbeatRunEvents.runId} = ${heartbeatRuns.id}
+            and ${heartbeatRunEvents.eventType} = 'session.started'
+            and ${heartbeatRunEvents.payload}#>>'{prpEvent,normalizedSessionId}' = ${heartbeatRuns.nativeSessionId}::text)`,
+      )).limit(1);
+      if (!started) return {};
+    }
+    return { configFreshness: metadata };
+  }
+
   async function completeRun(input: CompleteHeartbeatRunInput) {
     const { run, agent, issueId, issueRef, signal, output, session, readFailureReportSecrets, adapterResult, sessionCodec, taskSessionForRun, sessionCompaction,
       configFreshnessResultMetadata, runLedgerScope, currentUserRedactionOptions,
       providerTraceCapture, onProviderTraceFinalized, issueContext, onLog } = input;
     const { runtimeForAdapter, previousSessionParams, taskKey, configuredModel, sessionConfigMetadata } = session;
     const { handle, outputProgressState, flushOutputProgress } = output;
+    const configFreshnessReceipt = await sessionConfigReceipt(run, configFreshnessResultMetadata, true);
     const processCancellation =
       processRunCancellationSettlements.get(run.id) ??
       failedProcessRunCancellations.get(run.id);
@@ -687,7 +707,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
               : {}),
             ...(outcome === "cancelled" ? controllerLeaseLossResultJson(signal) : {}),
             ...(failureCause ? { failureCause } : {}),
-            configFreshness: configFreshnessResultMetadata,
+            ...configFreshnessReceipt,
           },
           errorFamily: adapterResult.errorFamily ?? null,
           retryNotBefore: adapterResult.retryNotBefore ?? null,
@@ -1273,7 +1293,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
   async function failRun(input: FailHeartbeatRunInput): Promise<{ preserveFailedWorkspace: true } | undefined> {
     const { run, agent, issueId, issueRef, signal, output, session, readFailureReportSecrets, runId, err, identityRedactor, requiredWorkspaceRestoreEvidence,
       legacyAdapterEntered, nativeDispatchMayHaveStarted, goalCheckpointSession, previousSessionDisplayId, taskSession,
-      predecessorRetirementFallback } = input;
+      predecessorRetirementFallback, configFreshnessResultMetadata } = input;
     const { runtimeForAdapter, previousSessionParams, taskKey, configuredModel, sessionConfigMetadata } = session;
     const { handle, outputProgressState, flushOutputProgress } = output;
     // A process adapter may throw while its owned Stop is joining the
@@ -1398,6 +1418,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     const failureOutcome = stoppedDuringFailure ? "cancelled" : "failed";
     const nativePreDispatchFailure = !stoppedDuringFailure && nativeTerminalFailureCode === null
       ? await nativePreDispatchFailureResult(run.id, nativeDispatchMayHaveStarted) : null;
+    const configFreshnessReceipt = await sessionConfigReceipt(run, configFreshnessResultMetadata, false);
     const failedRunWrite = await measureRunPhase("completion.terminal_write", () => setRunStatusIfRunning(run.id, failureOutcome, {
       error: message,
       errorCode: stopSnapshot?.errorCode ?? failureErrorCode,
@@ -1423,6 +1444,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
             {}),
           ...(stoppedDuringFailure ? controllerLeaseLossResultJson(signal) : {}),
           ...nativePreDispatchFailure,
+          ...configFreshnessReceipt,
           ...(!legacyAdapterEntered && run.runtimeMode !== "native"
             ? {
                 executionRecovery: {

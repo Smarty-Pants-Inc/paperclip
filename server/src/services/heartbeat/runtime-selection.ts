@@ -73,6 +73,7 @@ import {
 import { readRemoteCodexModelCliVersion } from "../native-runtime/codex-model-fallback.js";
 import {
   describeRunnerdNativeSessionBackend,
+  NativeProviderStateIncompatibleError,
   parseNativeExecutionInput,
   type NativeExecutionInput,
 } from "../../vendor/paperclip-runner/index.js";
@@ -123,6 +124,8 @@ export interface HeartbeatRuntimeSelectionInput {
     persistedNativeExecutionInput: NativeExecutionInput | null;
     persistedRunnerProfile: Record<string, unknown>;
     taskResumeSessionId: string | null;
+    /** An automatic fresh attempt already spent this incident's one replacement. */
+    warmRecoveryRetainSessionId?: string | null;
     isFailedChatRunRetry: boolean;
     getFreshSessionHandoff: (() => Promise<string | null>) | undefined;
   };
@@ -961,6 +964,13 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         nativeRunnerInstanceId = randomUUID();
       }
       nativeSessionId = nativeExecutionWithCheckpoint.normalizedSessionId;
+    }
+    // Missing/incompatible checkpoints normally rotate here. An automatic
+    // recovery that already tried fresh must not silently spend another session
+    // (and another whole hand-over) through that stock fallback. Keep saved state
+    // and let the existing bounded recovery policy handle this named refusal.
+    if (input.session.warmRecoveryRetainSessionId && nativeSessionId !== input.session.warmRecoveryRetainSessionId) {
+      throw new NativeProviderStateIncompatibleError("warm_recovery_fresh_session_already_attempted");
     }
     if (nativeResumeCheckpoint && previousNativeRun && nativeExecution.provider.kind === "pi_rpc" &&
       resolveSessionContinuity("pi_rpc", parseObject(agent.adapterConfig).sessionContinuity) === "continuous" &&
