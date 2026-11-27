@@ -843,7 +843,8 @@ describe("native serialized-command budget", () => {
       prepare(c, kind === "task_description" ? { issue: { ...args.issue, description: "x".repeat(600000) }, taskPrompt: "x".repeat(600000) } : {});
       throw new Error("oversized protected input was accepted");
     } catch (error) {
-      expect(error).toMatchObject({ code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind, bytes: 600000, remedies: kind === "task_description" ? ["edit_task_description", "new_followup_task"] : ["edit_message", "delete_own_message", "new_followup_task"] } });
+      expect(error).toMatchObject({ code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind, bytes: 600000, remedies: kind === "task_description" ? ["edit_task_description", "new_followup_task"] : ["edit_message", "delete_own_message", "new_followup_task"],
+        ...(kind === "newest_message" ? { commentIds: [c.messages.at(-1)!.id] } : {}) } });
       expect(String(error)).not.toMatch(/new session|compact/);
     }
   });
@@ -985,8 +986,8 @@ describe("native serialized-command budget", () => {
     c.originCommentIds = [];
     for (const message of c.messages) { message.authorType = "user"; message.body = "x".repeat(600_000 / count); }
     expect(() => prepare(c, { continuationReadState: { lastRunAt: null, readCommentIds: [] } })).toThrow(expect.objectContaining({
-      promptCause: count === 10 ? { kind: "unread_messages", bytes: 600_000, count, remedies: ["edit_message", "delete_own_message", "new_followup_task"] }
-        : { kind: "unread_message", bytes: 300_000, remedies: ["edit_message", "delete_own_message", "new_followup_task"] },
+      promptCause: count === 10 ? { kind: "unread_messages", bytes: 600_000, count, commentIds: c.messages.map(message => message.id), remedies: ["edit_message", "delete_own_message", "new_followup_task"] }
+        : { kind: "unread_message", bytes: 300_000, commentIds: [c.messages[0]!.id], remedies: ["edit_message", "delete_own_message", "new_followup_task"] },
     }));
     const short = buildNativeExecutionInput({ ...args, boundCommandBytes: true,
       issue: { ...args.issue, id: "follow-up", title: "Read linked request", description: "Read the long request at https://example.test/saved-text" },
@@ -996,7 +997,7 @@ describe("native serialized-command budget", () => {
       const ownerAsk = "@owner please split this request";
       c.messages.push({ ...c.messages[0]!, id: "owner-ask", body: ownerAsk });
       expect(() => prepare(c, { continuationReadState: { lastRunAt: null, readCommentIds: [] } })).toThrow(expect.objectContaining({
-        promptCause: { kind: "unread_messages", bytes: 600_000 + Buffer.byteLength(ownerAsk), count: 11, remedies: ["edit_message", "delete_own_message", "new_followup_task"] },
+        promptCause: { kind: "unread_messages", bytes: 600_000 + Buffer.byteLength(ownerAsk), count: 11, commentIds: c.messages.map(message => message.id), remedies: ["edit_message", "delete_own_message", "new_followup_task"] },
       }));
       console.info(JSON.stringify({ recoveryRow: "owner-ask-adds-to-combined-refusal", count: 11, bytes: 600_000 + Buffer.byteLength(ownerAsk) }));
     }
@@ -1013,7 +1014,7 @@ describe("native serialized-command budget", () => {
     expect(wakes).toBe(true);
     const readState = { lastRunAt: null, readCommentIds: [] };
     expect(() => prepare(c, { continuationReadState: readState })).toThrow(expect.objectContaining({
-      promptCause: { kind: "unread_message", bytes: 600_000, remedies: ["edit_message", "delete_own_message", "new_followup_task"] },
+      promptCause: { kind: "unread_message", bytes: 600_000, commentIds: [c.messages[0]!.id], remedies: ["edit_message", "delete_own_message", "new_followup_task"] },
     }));
     // execution-continuation projects a tombstoned comment as deleted + empty body.
     c.messages[0]!.body = "";
@@ -1037,7 +1038,7 @@ describe("native serialized-command budget", () => {
     for (const message of c.messages) message.body = "u".repeat(250000);
     c.originCommentIds = [];
     expect(() => prepare(c, { continuationReadState: { lastRunAt: "2026-01-02T00:00:00Z", readCommentIds: [] } })).toThrow(expect.objectContaining({
-      promptCause: { kind: "unread_messages", bytes: 750000, count: 3, remedies: ["edit_message", "delete_own_message", "new_followup_task"] },
+      promptCause: { kind: "unread_messages", bytes: 750000, count: 3, commentIds: c.messages.map(message => message.id), remedies: ["edit_message", "delete_own_message", "new_followup_task"] },
     }));
   });
   it("names combined required inputs rather than blaming the largest insufficient part", () => {
@@ -1077,7 +1078,7 @@ describe("native serialized-command budget", () => {
       budgetNativeFreshFallback(input, wakePayload, { lastRunAt: "2026-01-02T00:00:00Z", readCommentIds: [] });
       throw new Error("oversized unread fallback was accepted");
     } catch (error) {
-      expect(error).toMatchObject({ promptCause: { kind: "unread_message", bytes: 600000 } });
+      expect(error).toMatchObject({ promptCause: { kind: "unread_message", bytes: 600000, commentIds: [c.messages[1]!.id] } });
       expect(String(error)).toMatch(/unread message.*new short follow-up task/);
     }
   });
@@ -1087,7 +1088,7 @@ describe("native serialized-command budget", () => {
     expect(prepare(c, { continuationReadState: readState }).input.task.prompt).toContain(c.messages[1]!.body);
     c.messages[1]!.body = "u".repeat(600000);
     expect(() => prepare(c, { continuationReadState: readState })).toThrow(expect.objectContaining({
-      code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "unread_message", bytes: 600000, remedies: ["edit_message", "delete_own_message", "new_followup_task"] },
+      code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "unread_message", bytes: 600000, commentIds: [c.messages[1]!.id], remedies: ["edit_message", "delete_own_message", "new_followup_task"] },
     }));
   });
   it.each(["humanResponses", "interactionResponses"] as const)("carries long %s answers whole or refuses with the answer cause", channel => {
@@ -1131,13 +1132,15 @@ describe("native serialized-command budget", () => {
     expect(retained.completedActions![0]!.result).toMatchObject({ resultOmittedForSize: true, resultSha256: expect.stringMatching(/^sha256:/) });
     expect(retained.coverage).toMatchObject({ shortenedCompletedActions: 2, omittedCompletedActions: 3 });
   });
-  it("never cuts unread, new, or edited-after-last-run messages; refuses an irreducible known prompt", () => {
+  // Same four original guard assertions, separately timed. Do not raise the
+  // existing timeout or omit a case: each full-size preparation remains real.
+  it.each(["unread", "new", "irreducible", "edited"] as const)("never cuts protected messages or admits an irreducible prompt (%s)", mode => {
     const c = shape(10, 690000);
-    for (const extra of [{ continuationReadState: { lastRunAt: "2026-01-02T00:00:00Z", readCommentIds: [] } },
-      { continuationReadState: { lastRunAt: "2025-01-01T00:00:00Z", readCommentIds: c.messages.map(m => m.id) } },
-      { taskPrompt: "x".repeat(600000) }]) expect(() => prepare(c, extra)).toThrow(NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND);
-    for (const message of c.messages) message.updatedAt = "2026-01-03T00:00:00Z";
-    expect(() => prepare(c)).toThrow(NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND);
+    if (mode === "edited") for (const message of c.messages) message.updatedAt = "2026-01-03T00:00:00Z";
+    const extra = mode === "unread" ? { continuationReadState: { lastRunAt: "2026-01-02T00:00:00Z", readCommentIds: [] } }
+      : mode === "new" ? { continuationReadState: { lastRunAt: "2025-01-01T00:00:00Z", readCommentIds: c.messages.map(m => m.id) } }
+      : mode === "irreducible" ? { taskPrompt: "x".repeat(600000) } : {};
+    expect(() => prepare(c, extra)).toThrow(NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND);
   });
   it("counts both escaping passes and UTF-8 in multibyte, escape-heavy history", () => {
     const c = shape(50, 300000);

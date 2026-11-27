@@ -150,6 +150,7 @@ export type {
   InstanceExperimentalSettings,
   InstanceExperimentalSettingsWithManaged,
   InstanceGeneralSettings,
+  DefectReportDestination,
   InstanceSettings,
   ManagedExperimentalFeatureKey,
   ManagedSettingMetadata,

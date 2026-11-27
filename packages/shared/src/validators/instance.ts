@@ -22,7 +22,15 @@ export const backupRetentionPolicySchema = z.object({
   monthlyMonths: presetSchema(MONTHLY_RETENTION_PRESETS, "monthlyMonths").default(DEFAULT_BACKUP_RETENTION.monthlyMonths),
 });
 
+/** must be a private place on this instance; a run link and a task title are private content */
+export const defectReportDestinationSchema = z.object({
+  label: z.string().trim().min(1).max(200).refine(value => !/[\r\n\u0000-\u001f\u007f]/.test(value)),
+  // Root-relative only: no external origin, protocol-relative URL or backslash.
+  url: z.string().min(1).max(2000).regex(/^\/(?!\/)[^\\\s\u0000-\u001f\u007f]*$/),
+}).strict();
+
 export const instanceGeneralSettingsSchema = z.object({
+  defectReportDestination: defectReportDestinationSchema.nullable().optional(),
   censorUsernameInLogs: z.boolean().default(false),
   feedbackDataSharingPreference: feedbackDataSharingPreferenceSchema.default(
     DEFAULT_FEEDBACK_DATA_SHARING_PREFERENCE,

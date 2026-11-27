@@ -174,7 +174,8 @@ describe.skipIf(!support.supported)("first-turn queued input", () => {
     if (answer) await db.update(issueThreadInteractions).set({ result: { version: 1,
       answers: [{ questionId: "color", optionIds: [], otherText: body }] } }).where(eq(issueThreadInteractions.id, id));
     await expect(claimFirstTurnQueuedInput(db, binding(f, f.runId))).rejects.toMatchObject({
-      code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: kind === "interaction" ? "human_response" : "queued_input", bytes: expect.any(Number) },
+      code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: kind === "interaction" ? "human_response" : "queued_input", bytes: expect.any(Number),
+        ...(kind === "comment" ? { commentIds: [id] } : {}) },
     });
     const run = await readRun(f.runId);
     expect(readFirstTurnQueuedInputReceipt(run)).toBeNull();
@@ -198,7 +199,7 @@ describe.skipIf(!support.supported)("first-turn queued input", () => {
       assertNativeQueuedTurnBound(f.runId, { task: { prompt: "request" } }, text,
         { attachmentPrompt: "late attachments: " + "a".repeat(490000) });
     }).catch(error => error);
-    expect(error).toMatchObject({ code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "queued_input", remedies: ["edit_message", "new_followup_task"] } });
+    expect(error).toMatchObject({ code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, promptCause: { kind: "queued_input", commentIds: [id], remedies: ["edit_message", "new_followup_task"] } });
     expect(nativePromptCauseFromError(new Error(String(error)))).toEqual(error.promptCause);
     const run = await readRun(f.runId);
     expect(readFirstTurnQueuedInputReceipt(run)).toBeNull();

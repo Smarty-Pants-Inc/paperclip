@@ -1,5 +1,7 @@
 import { promises as fs } from "node:fs";
-import { runFailureMessage } from "@paperclipai/shared";
+import { runFailureMessage, patchInstanceGeneralSettingsSchema } from "@paperclipai/shared";
+import { instanceSettingsService } from "../instance-settings.js";
+import { projectTaskInterruption, taskInterruptionPresentations } from "../task-interruption-presentation.js";
 import { NativeTurnPromptExceedsCommandBoundError, type NativePromptRefusalCause } from "../native-runtime/native-turn-budget.js";
 import { createDurableRunLogStore } from "../run-log-store.js";
 import { createServer } from "node:http";
@@ -857,7 +859,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
   });
 
   it.each(["execution", "setup"] as const)("keeps the named prompt refusal and way out on the %s failed-run page", async phase => {
-    const cause: NativePromptRefusalCause = { kind: "newest_message", bytes: 600000, remedies: ["edit_message", "delete_own_message", "new_followup_task"] };
+    const cause: NativePromptRefusalCause = { kind: "newest_message", bytes: 600000, commentIds: [randomUUID()], remedies: ["edit_message", "delete_own_message", "new_followup_task"] };
     const f = await fixture(), error = new NativeTurnPromptExceedsCommandBoundError(cause);
     expect(nativeSessionFailureSourceCode(error)).toBe(error.code);
     expect(nativeSessionFailureDisposition(1, new Date(), error.code)).toMatchObject({ phase: "terminal_failure", failureCode: error.code, nextAttemptAt: null });
@@ -867,6 +869,32 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(failed).toMatchObject({ status: "failed", errorCode: error.code, error: error.message,
       resultJson: { nativeTurnPromptRefusalCause: cause } });
     expect(runFailureMessage(failed)).toMatch(/newest message.*if you wrote it.*new short follow-up task/i);
+    const presentation = projectTaskInterruption({ id: "task", companyId: f.run.companyId, status: "blocked", assigneeAgentId: f.agent.id, projectId: null },
+      { run: failed, agent: { status: "idle", pauseReason: null }, paused: false, approval: false });
+    expect(presentation?.failure?.cause?.commentIds).toEqual(cause.commentIds);
+    expect(presentation?.failure?.cause?.remedies).toEqual(cause.remedies);
+  });
+
+  it("C31 v12 reads, saves, clears and projects the private instance report destination without changing old diagnostics", async () => {
+    const f = await fixture(), settings = instanceSettingsService(db);
+    const [issue] = await db.insert(issues).values({ companyId: f.run.companyId, title: "Keep this report private",
+      status: "blocked", assigneeAgentId: f.agent.id }).returning();
+    await db.update(heartbeatRuns).set({ issueId: issue.id }).where(eq(heartbeatRuns.id, f.run.id));
+    const error = new NativeTurnPromptExceedsCommandBoundError({ kind: "stale_copy", bytes: 25, remedies: ["report_defect"] });
+    await f.completion.failRun(f.failure(error));
+    const saved = (await read(f.run.id)).resultJson;
+    const destination = { label: "Private instance support", url: "/issues/private-support" };
+    const project = async () => (await taskInterruptionPresentations(db, issue.companyId, [issue])).get(issue.id)?.failure;
+    for (const selected of [null, destination, null]) {
+      await settings.updateGeneral(patchInstanceGeneralSettingsSchema.parse({ defectReportDestination: selected }));
+      expect((await instanceSettingsService(db).getGeneral()).defectReportDestination).toEqual(selected);
+      // An unrelated patch preserves the setting too.
+      await settings.updateGeneral({ censorUsernameInLogs: false });
+      const failure = await project();
+      expect(failure?.cause?.remedies).toEqual([{ kind: "report_defect", destination: selected }]);
+      expect(failure?.detail).toContain(selected ? "Private instance support (/issues/private-support)" : "Tell your instance admin (on most instances that is the person who set it up)");
+      expect((await read(f.run.id)).resultJson).toEqual(saved);
+    }
   });
 
   it.each(["execution", "setup"] as const)("retains a provider startup cause at the outer %s settlement boundary", async phase => {

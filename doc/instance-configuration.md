@@ -44,6 +44,36 @@ credentials, query strings, fragments, and wildcards are ignored. Matching is
 by exact normalized origin, so allowing one port does not allow another.
 Link-local destinations remain denied even when explicitly listed.
 
+## Private defect-report destination
+
+Instance admins may set the optional `defectReportDestination` in the existing
+`PATCH /api/instance/settings/general` body:
+
+```json
+{"defectReportDestination":{"label":"Private instance support","url":"/issues/private-support"}}
+```
+
+The place must be private on this instance: run links and task titles are
+private content. Use the real private task or report place your instance
+maintainers have chosen, not the example path above. URLs must be root-relative;
+absolute URLs, protocol-relative URLs, backslashes and whitespace are rejected.
+The server does not submit a report or copy diagnostics automatically.
+
+Absent or `null` means the plain instance-admin handoff sentence, with no public
+tracker default. Set `null` to clear an existing destination. Refusal projection
+reads the current setting, so an old run shows the current destination without
+rewriting its saved evidence. `report_defect` is projected as
+`{kind: "report_defect", destination: {label, url} | null}`; other routes remain
+labels. The shared page contract is `TaskInterruptionPresentation.failure.cause`.
+A missing legacy remedies field projects to `[]` (text only). Unknown kinds or
+measurements with remedies use this reader's kind/measure-specific routes, not
+a newer writer's saved action list.
+
+Message-specific causes carry `commentIds` for the inputs actually counted.
+These are targets, not permissions. The page must check the current message's
+author, queued/editable and deleted state before offering edit/delete. Legacy
+causes may have no IDs; do not guess the target from the newest visible message.
+
 ## Company Deletion Toggle
 
 Company deletion is intended as a dev/debug capability and can be disabled at runtime:

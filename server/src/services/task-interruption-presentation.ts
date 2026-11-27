@@ -10,7 +10,7 @@ import { agents, agentWakeupRequests, approvals, chatActions, companies, environ
   issues, issueThreadInteractions, issueTreeHoldMembers, issueTreeHolds, nativeRunFinalizations, projects, statusDecisions, type Db } from "@paperclipai/db";
 import { NATIVE_AGENT_BLOCKER_HANDOFF_CODE } from "./native-runtime/native-agent-blocker.js";
 import { unionAll } from "drizzle-orm/pg-core";
-import { EXECUTION_RECONCILIATION_CAUSES, HEARTBEAT_RUN_STATUSES, readProviderFailure, type TaskInterruptionPresentation } from "@paperclipai/shared";
+import { EXECUTION_RECONCILIATION_CAUSES, HEARTBEAT_RUN_STATUSES, readProviderFailure, type DefectReportDestination, type TaskInterruptionPresentation } from "@paperclipai/shared";
 import { captureTaskInterruptionFailure } from "../sentry.js";
 import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
 import { conversationOwedInputs } from "./conversation-owed-input.js";
@@ -90,6 +90,8 @@ type ProjectionWait = { id: string; requestedAt: Date; sourceRunId?: string | nu
   queuedInterruptRequestedAt?: string | null;
   queuedComment?: boolean };
 type ProjectionState = {
+  /** Current instance setting, not a URL supplied by a saved run/provider. */
+  defectReportDestination?: DefectReportDestination | null;
   run?: ProjectionRun;
   action?: typeof issueRecoveryActions.$inferSelect;
   wait?: ProjectionWait;
@@ -128,7 +130,7 @@ type ProjectionState = {
   owedInput?: { commentId: string; createdAt: Date; deliveryOwner: boolean };
   /** Latest failed attempt in this input's current session, even if a later
    * successful resource-only attempt still left the person unanswered. */
-  failureRun?: Pick<ProjectionRun, "id" | "errorCode" | "failedStage" | "previousSessionUnconfirmed"> | null;
+  failureRun?: Pick<ProjectionRun, "id" | "errorCode" | "failedStage" | "previousSessionUnconfirmed"> & { resultJson?: ProjectionRun["resultJson"] } | null;
 };
 
 // A task read reports the change that made a task fail, not every later read of
@@ -275,12 +277,12 @@ export function projectTaskInterruption(issue: ProjectionIssue, input: Projectio
   // classified, safe reason even though ordinary failures attach it only when
   // retryable; never let the owed-input fallback re-offer Retry for this code.
   if (presentation?.state === "failed" && input.run?.errorCode === NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND)
-    return { ...presentation, canRetry: false, failure: classifiedRunFailure(input.run) };
+    return { ...presentation, canRetry: false, failure: classifiedRunFailure(input.run, input.defectReportDestination) };
   if (presentation?.state === "failed" && presentation.canRetry) {
     const failed = input.failureRun === undefined ? (input.run?.status === "failed"
       && (!owed || (input.run.createdAt ?? input.run.finishedAt ?? new Date(0)) >= owed.createdAt) ? input.run : undefined)
       : input.failureRun;
-    if (failed) presentation = { ...presentation, failure: classifiedRunFailure(failed),
+    if (failed) presentation = { ...presentation, failure: classifiedRunFailure(failed, input.defectReportDestination),
       ...(failed.errorCode === NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND ? { canRetry: false } : {}) };
   }
   return presentation;
@@ -907,6 +909,8 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
   // run can be a succeeded resource-only recovery rather than an answer.
   const owedFailures = owedInputs.size ? await db.selectDistinctOn([issues.id], { issueId: issues.id,
     id: heartbeatRuns.id, errorCode: heartbeatRuns.errorCode,
+    resultJson: sql<Record<string, unknown> | null>`case when ${heartbeatRuns.errorCode} = ${NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND}
+      then jsonb_build_object('nativeTurnPromptRefusalCause', ${heartbeatRuns.resultJson}->'nativeTurnPromptRefusalCause') end`,
     failedStage: failedRunStage(), previousSessionUnconfirmed: previousSessionUnconfirmed() })
     .from(issues).innerJoin(heartbeatRuns, and(eq(heartbeatRuns.companyId, issues.companyId),
       eq(heartbeatRuns.agentId, issues.assigneeAgentId), eq(heartbeatRuns.status, "failed"), taskAttemptCondition(),
@@ -919,13 +923,17 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     )).where(and(eq(issues.companyId, companyId), inArray(issues.id, [...owedInputs.keys()])))
     .orderBy(issues.id, desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)) : [];
   const failureRunMap = new Map(owedFailures.map(run => [run.issueId, run]));
+  // Resolve once per batch, and only for this failure family. The existing
+  // general-settings service owns persistence, admin writes and cache refresh.
+  const defectReportDestination = [...runs, ...owedFailures].some(run => run.errorCode === NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND)
+    ? (await instanceSettingsService(db).getGeneral()).defectReportDestination ?? null : null;
   const now = Date.now();
   for (const issue of selected) {
     const required = requirements.get(issue.id);
     const denied = required?.projectIds.filter(projectId => currentAccess.get(`${issue.assigneeAgentId}:${projectId}`) !== true);
     const facts = { run: runMap.get(issue.id), action: actionMap.get(issue.id), wait: waitMap.get(issue.id),
       retryWait: retryWaitMap.get(issue.id) };
-    const presentation = projectTaskInterruption(issue, { ...facts,
+    const presentation = projectTaskInterruption(issue, { ...facts, defectReportDestination,
       owedInput: owedInputs.get(issue.id), failureRun: owedInputs.has(issue.id) ? failureRunMap.get(issue.id) ?? null : undefined,
       freshContinuation: freshContinuationFor(issue.id, facts.run?.id),
       automaticDispositionAt: automaticDispositionAt.get(issue.id),
