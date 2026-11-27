@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import { notifyDeferredExecutionWork } from "./deferred-execution-notifications.js";
@@ -155,7 +156,8 @@ export async function deferNativeInputRefusalWake(db: Db, input: {
 
 /** A legacy prompt's view cut is not delivery. Split its bound receipt under
  * the ordinary issue lock; release/promotion then carries the remainder forward.
- * Re-entry (including a tighter fresh fallback) expands the same owed receipt. */
+ * Re-entry expands pending debt only. Once a successor adopts a generation,
+ * its snapshot owns those events; additional debt needs a new pending receipt. */
 export async function deferUndeliveredNativeInputWakes(db: Db, scope: Required<Scope> & { runId: string }, omitted: unknown[]): Promise<void> {
   if (!omitted.length) return;
   await db.transaction(async rawTx => {
@@ -166,11 +168,25 @@ export async function deferUndeliveredNativeInputWakes(db: Db, scope: Required<S
       eq(agentWakeupRequests.companyId, scope.companyId), eq(agentWakeupRequests.agentId, scope.agentId),
       eq(agentWakeupRequests.runId, scope.runId), sql`${agentWakeupRequests.payload}->>'nativeInputRefusalHold' = 'true'`,
     )).for("update");
-    const [pending] = await tx.select().from(agentWakeupRequests).where(and(
-      eq(agentWakeupRequests.companyId, scope.companyId), eq(agentWakeupRequests.idempotencyKey, key),
+    const generations = await tx.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, scope.companyId), eq(agentWakeupRequests.agentId, scope.agentId),
+      or(eq(agentWakeupRequests.idempotencyKey, key), sql`${agentWakeupRequests.idempotencyKey} like ${key + ":%"}`),
     )).for("update");
+    const eventsOf = (row: typeof generations[number] | undefined): unknown[] => {
+      const events = object(row?.payload).nativeInputRefusalWakes;
+      return Array.isArray(events) ? events : [];
+    };
+    const pending = generations.find(row => row.status === "deferred_issue_execution" && row.runId === null);
+    // Historical generations are delivery obligations already transferred to
+    // another receipt/run. Do not enlarge them or copy their events back out
+    // of the successor's immutable snapshot on repeated fallback admission.
+    const transferred = new Set(generations.filter(row => row !== pending).flatMap(eventsOf).map(contentKey));
     const owed = new Map<string, unknown>();
-    for (const event of [...(Array.isArray(object(pending?.payload).nativeInputRefusalWakes) ? object(pending?.payload).nativeInputRefusalWakes as unknown[] : []), ...omitted]) owed.set(contentKey(event), event);
+    for (const event of [...eventsOf(pending), ...omitted]) {
+      const identity = contentKey(event);
+      if (!transferred.has(identity)) owed.set(identity, event);
+    }
+    if (!owed.size) return;
     const owners = new Set([scope.agentId]);
     for (const row of bound) {
       const payload = object(row.payload), events = payload.nativeInputRefusalWakes;
@@ -183,14 +199,20 @@ export async function deferUndeliveredNativeInputWakes(db: Db, scope: Required<S
     }
     const payload = { issueId: scope.issueId, nativeInputRefusalHold: true, nativeInputRefusalAgentIds: [...owners],
       nativeInputRefusalWakes: [...owed.values()], _paperclipWakeContext: { issueId: scope.issueId, wakeReason: "saved_automatic_events_owed" } };
-    if (pending) {
-      await tx.update(agentWakeupRequests).set({ payload, updatedAt: new Date() }).where(and(
-        eq(agentWakeupRequests.companyId, scope.companyId), eq(agentWakeupRequests.id, pending.id),
-        eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId)));
-    } else {
+    const updated = pending ? await tx.update(agentWakeupRequests).set({ payload, updatedAt: new Date() }).where(and(
+      eq(agentWakeupRequests.companyId, scope.companyId), eq(agentWakeupRequests.id, pending.id),
+      eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId)))
+      .returning({ id: agentWakeupRequests.id }) : [];
+    if (!updated.length) {
+      // The locked transition must actually retain custody. Never silently
+      // treat a zero-row update as preservation. If custody moved, only the
+      // extra events belong in the new generation, not the adopted events.
+      if (pending) for (const event of eventsOf(pending)) owed.delete(contentKey(event));
+      if (!owed.size) return;
       await tx.insert(agentWakeupRequests).values({ companyId: scope.companyId, agentId: scope.agentId,
         source: "automation", reason: "saved_automatic_events_owed", requestedByActorType: "system",
-        status: "deferred_issue_execution", idempotencyKey: key, payload });
+        status: "deferred_issue_execution", idempotencyKey: generations.length ? `${key}:${randomUUID()}` : key,
+        payload: { ...payload, nativeInputRefusalWakes: [...owed.values()] } });
     }
     await notifyDeferredExecutionWork(tx, { companyId: scope.companyId });
   });

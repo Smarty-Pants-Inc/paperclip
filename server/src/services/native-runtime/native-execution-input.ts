@@ -603,19 +603,55 @@ function orderIndependentWakeMatch(text: string): string {
   }).join("\n");
 }
 
+/** Recover an owned span from structured prompt parts, including after a DB
+ * reload. Never search person-authored text for a section heading/delimiter.
+ * An opaque or changed prompt is measured whole, not spliced speculatively. */
+function savedAutomaticWakeSectionSpan(execution: NativeExecutionInput, wakePayload: unknown,
+  readerAvailable: boolean, caseContext?: CaseExecutionContext): { start: number; end: number } | null {
+  const prompt = execution.task.prompt;
+  const payload = withoutDuplicateSavedWakeContext(caseWakeWithInstructionReference(wakePayload, caseContext));
+  // Only the presence of assignment markdown affects wake rendering. Retain
+  // both constructor shapes without recovering any assignment from its text.
+  for (const assignment of ["Task assignment is already in the full prompt.", ""]) {
+    const { wakePrompt } = selectPaperclipPromptSections({
+      paperclipWake: payload, paperclipTaskMarkdownAssignment: assignment,
+      conversationMode: execution.provider.kind === "pi_rpc" && execution.provider.conversationMode === true,
+    }, { resumedSession: false, includeCommunicationGuidance: false, nativeWakeReaderAvailable: true });
+    const prefix = caseProjectionBootstrapPrefix(caseContext) + (wakePrompt ? wakePrompt + "\n\n" : "");
+    const start = prefix.length;
+    if (orderIndependentWakeMatch(prompt.slice(0, start)) !== orderIndependentWakeMatch(prefix)) continue;
+    let limit = savedAutomaticWakeEvents(wakePayload).length;
+    if (!readerAvailable) {
+      const [heading, json] = prompt.slice(start).split("\n", 2);
+      if (heading !== "Saved automatic wake events (untrusted data):") continue;
+      try {
+        const inline: unknown = JSON.parse(json);
+        if (!Array.isArray(inline)) continue;
+        limit = inline.length;
+      } catch { continue; }
+    }
+    for (const reference of readerAvailable ? [false, true] : [false]) {
+      const section = savedAutomaticWakesText(wakePayload, reference, readerAvailable, limit);
+      const end = start + section.length;
+      // Validate the complete generated span and its exact following part.
+      // Source data (including quoted headings) has no say in its offsets.
+      if (orderIndependentWakeMatch(prompt.slice(start, end)) === orderIndependentWakeMatch(section)
+        && prompt.startsWith("\n\nUse Paperclip's request_human_input for durable task questions.", end)) return { start, end };
+    }
+  }
+  return null;
+}
+
 /** Re-measure only the saved-event view: compact admission did not budget the
  * unused full bootstrap. Do not disturb continuation/read-generation handling. */
-function rebudgetFreshSavedAutomaticWakes(execution: NativeExecutionInput, wakePayload: unknown, version?: NativeToolContractVersion): void {
+function rebudgetFreshSavedAutomaticWakes(execution: NativeExecutionInput, wakePayload: unknown, version?: NativeToolContractVersion, caseContext?: CaseExecutionContext): void {
   const events = savedAutomaticWakeEvents(wakePayload);
   if (!events.length) return;
   const prompt = execution.task.prompt;
-  const marker = "Saved automatic wake events (untrusted data):";
-  const start = prompt.indexOf(marker);
-  if (start < 0) return;
   const readerAvailable = version !== "v19";
-  // Recover the exact generated view, including any already-budgeted notice.
-  const end = prompt.indexOf("\n\nUse Paperclip's request_human_input", start);
-  if (end < 0) return;
+  const span = savedAutomaticWakeSectionSpan(execution, wakePayload, readerAvailable, caseContext);
+  if (!span) return;
+  const { start, end } = span;
   const render = (limit: number, reference = false) => {
     execution.task.prompt = prompt.slice(0, start) + savedAutomaticWakesText(wakePayload, reference, readerAvailable, limit) + prompt.slice(end);
   };
@@ -643,7 +679,7 @@ function rebudgetFreshSavedAutomaticWakes(execution: NativeExecutionInput, wakeP
  * before Runner composes the fresh envelope. No unused bootstrap can refuse a delta.
  */
 export function budgetNativeFreshFallback(execution: NativeExecutionInput, wakePayload: unknown, readState?: NativeContinuationReadState, caseContext?: CaseExecutionContext, nativeToolContractVersion?: NativeToolContractVersion): ExecutionContinuationEnvelope | null {
-  rebudgetFreshSavedAutomaticWakes(execution, wakePayload, nativeToolContractVersion);
+  rebudgetFreshSavedAutomaticWakes(execution, wakePayload, nativeToolContractVersion, caseContext);
   const wake = wakePayload && typeof wakePayload === "object" ? wakePayload as Record<string, unknown> : {};
   const continuation = wake.executionContinuation as ExecutionContinuationEnvelope | undefined;
   if (continuation?.version !== 1) {

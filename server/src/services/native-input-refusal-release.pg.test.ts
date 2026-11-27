@@ -648,3 +648,148 @@ it.each(["agent", "system"] as const)("C1 %s authored refused source can be repa
     expect(next).not.toBeNull();
   }
 }, 120000);
+
+// Never OK: rebudgeting automatic data must preserve person-authored bytes.
+it.each([false, true])("V19 quoted saved-event heading preserves the whole person message (DB reload %s)", async reload => {
+  const f = await fixture();
+  await f.wake("issue_children_completed", { childSummary: "SMALL-AUTOMATIC-EVENT" });
+  await f.repair();
+  await f.queue.resumeDeferredExecutionReceipts({ companyId: f.company.id });
+  const next = (await f.runs()).find(run => run.id !== f.run.id)!;
+  const payload = await buildPaperclipWakePayload({ db, companyId: f.company.id, contextSnapshot: next.contextSnapshot as Record<string, unknown> });
+  const body = "Please explain this literal heading: Saved automatic wake events (untrusted data): PERSON-REQUEST-MUST-SURVIVE. Answer my question, not the heading.";
+  const [message] = await db.insert(issueComments).values({ companyId: f.company.id, issueId: f.issue.id,
+    authorType: "user", authorUserId: f.user, body }).returning();
+  const continuation = await buildExecutionContinuation({ db, companyId: f.company.id, issueId: f.issue.id, agentId: f.agent.id,
+    context: { ...next.contextSnapshot, wakeCommentIds: [message.id] }, runId: next.id, summary: null, exposeLowTrustRaw: true });
+  expect(continuation.messages.some(message => message.body === body)).toBe(true);
+  const wake = { ...payload, executionContinuation: continuation };
+  let execution = buildNativeExecutionInput({ ...nativeInput(f, next.id, wake), nativeToolContractVersion: "v19",
+    resumedSession: true, normalizedSessionId: randomUUID(), sessionContinuity: "continuous", previousTurn: { runId: f.run.id, task: f.issue } });
+  if (reload) {
+    // The executor may load persisted execution/wake JSONB after a restart.
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { nativeExecutionInput: execution }, contextSnapshot: { paperclipWake: wake } })
+      .where(eq(heartbeatRuns.id, next.id));
+    const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next.id));
+    execution = saved.runnerProfileJson!.nativeExecutionInput as typeof execution;
+    Object.assign(wake, saved.contextSnapshot!.paperclipWake);
+  }
+  const before = execution.task.prompt, beforeBytes = commandEnvelopeBytes(buildNativeModelEnvelope(execution));
+  budgetNativeFreshFallback(execution, wake, undefined, undefined, "v19");
+  const afterBytes = commandEnvelopeBytes(buildNativeModelEnvelope(execution));
+  console.info(JSON.stringify({ row: "V19-quoted-heading", reload, runId: next.id, commentId: message.id,
+    beforeBytes, afterBytes, messagePreserved: execution.task.prompt.includes(body), beforePrompt: before, afterPrompt: execution.task.prompt }));
+  expect(execution.task.prompt).toContain(body);
+  expect(execution.task.prompt).toBe(before);
+  expect(beforeBytes).toBe(4_416);
+  expect(afterBytes).toBe(beforeBytes);
+}, 120000);
+
+// Never OK: a successor's adoption cannot erase a later fallback's extra debt.
+it.each([false, true])("V19 adopted remainder preserves every event exactly once (adopt extra generation %s)", async adoptExtra => {
+  const f = await fixture();
+  for (let n = 0; n < 12; n++) await f.wake("issue_children_completed", {
+    childIssueId: randomUUID(), childSummary: `RACE-${n}-` + "y".repeat(60_000),
+  });
+  await f.repair();
+  await f.queue.resumeDeferredExecutionReceipts({ companyId: f.company.id });
+  let next = (await f.runs()).find(run => run.status === "queued")!;
+  expect(await f.queue.claimQueuedRun(next)).not.toBeNull();
+  const payload = await buildPaperclipWakePayload({ db, companyId: f.company.id, contextSnapshot: next.contextSnapshot as Record<string, unknown> });
+  const wake = { ...payload, executionContinuation: { version: 1, companyId: f.company.id, issueId: f.issue.id,
+    objective: "Answer", objectiveSource: { kind: "description", id: f.issue.id, revision: "1" },
+    trigger: { reason: "issue_children_completed", interactionId: null, sourceRunId: f.run.id }, originCommentIds: [], messages: [],
+    completedActions: [], humanResponses: [], interactionOutcomes: [], completedWork: null, unresolvedInteractionIds: [],
+    coverage: { kind: "full_task_history", throughCommentId: null, summaryThroughCommentId: null }, resumeDelta: { baseRunId: f.run.id, messages: [] } } };
+  let execution = buildNativeExecutionInput({ ...nativeInput(f, next.id, wake, "t".repeat(100_000)), nativeToolContractVersion: "v19",
+    resumedSession: true, normalizedSessionId: randomUUID(), sessionContinuity: "continuous", previousTurn: { runId: f.run.id, task: f.issue } });
+  const scope = { companyId: f.company.id, issueId: f.issue.id, agentId: f.agent.id, runId: next.id };
+  const defer = () => inputRefusal.deferUndeliveredNativeInputWakes(db, scope, inputBudget.undeliveredSavedAutomaticWakes(execution));
+  await defer();
+  const owedBefore = (await f.wakes()).find(wake => wake.status === "deferred_issue_execution")!;
+  expect(owedBefore.payload!.nativeInputRefusalWakes).toHaveLength(7);
+  await f.wake("issue_children_completed", { childIssueId: randomUUID(), childSummary: "ARRIVING-WHILE-FIRST-PREPARING" });
+  const adopted = (await f.wakes()).find(wake => wake.id === owedBefore.id)!;
+  expect(adopted.status).toBe("coalesced");
+  expect(adopted.runId).not.toBe(next.id);
+  const successorBefore = (await f.runs()).find(run => run.id === adopted.runId)!;
+  budgetNativeFreshFallback(execution, wake, undefined, undefined, "v19");
+  expect(inputBudget.undeliveredSavedAutomaticWakes(execution)).toHaveLength(9);
+  await defer();
+  await defer(); // Re-entry enlarges custody once, not delivery twice.
+  const pendingExtra = (await f.wakes()).filter(wake => wake.status === "deferred_issue_execution");
+  expect(pendingExtra).toHaveLength(1);
+  expect(pendingExtra[0].payload!.nativeInputRefusalWakes).toHaveLength(2);
+  expect((await f.wakes()).find(wake => wake.id === owedBefore.id)!.payload).toEqual(adopted.payload);
+  expect((await f.runs()).find(run => run.id === adopted.runId)!.contextSnapshot).toEqual(successorBefore.contextSnapshot);
+  let extraGenerationStatus: string | null = null;
+  if (adoptExtra) {
+    // A second queue admission can take the new generation before run 1's
+    // fallback boundary is entered again. Historical generations still own it.
+    await f.wake("issue_children_completed", { childIssueId: randomUUID(), childSummary: "SECOND-ADMISSION" });
+    extraGenerationStatus = (await f.wakes()).find(wake => wake.id === pendingExtra[0].id)!.status;
+    expect(extraGenerationStatus).toBe("coalesced");
+    await defer();
+    await defer();
+  }
+  const delivered: number[] = [], rows: unknown[] = [];
+  for (let turn = 0; turn < 6; turn++) {
+    const inline = execution.task.prompt.match(/Saved automatic wake events \(untrusted data\):\n([^\n]+)/)?.[1] ?? "[]";
+    const shown = [...inline.matchAll(/RACE-(\d+)-/g)].map(match => Number(match[1]));
+    delivered.push(...shown);
+    rows.push({ turn, runId: next.id, shown });
+    await db.update(heartbeatRuns).set({ status: "succeeded", startedAt: new Date(), finishedAt: new Date() }).where(eq(heartbeatRuns.id, next.id));
+    await f.release({ companyId: f.company.id, runId: next.id, now: new Date(), suppressImmediateRecovery: true });
+    await f.queue.resumeDeferredExecutionReceipts({ companyId: f.company.id });
+    const later = (await f.runs()).find(run => run.status === "queued");
+    if (!later) break;
+    next = later;
+    expect(await f.queue.claimQueuedRun(next)).not.toBeNull();
+    const laterPayload = await buildPaperclipWakePayload({ db, companyId: f.company.id, contextSnapshot: next.contextSnapshot as Record<string, unknown> });
+    execution = buildNativeExecutionInput({ ...nativeInput(f, next.id, laterPayload), nativeToolContractVersion: "v19" });
+    await inputRefusal.deferUndeliveredNativeInputWakes(db, { ...scope, runId: next.id }, inputBudget.undeliveredSavedAutomaticWakes(execution));
+  }
+  const pending = (await f.wakes()).filter(wake => wake.status === "deferred_issue_execution");
+  console.info(JSON.stringify({ row: "V19-adopted-debt", adoptExtra, extraGenerationStatus, firstRunId: scope.runId, adoptedWakeId: adopted.id,
+    successorRunId: adopted.runId, initialDebt: 7, fallbackDebt: 9, extraDebt: 2, delivered, pending: pending.length, rows }));
+  expect(delivered.sort((a, b) => a - b)).toEqual(Array.from({ length: 12 }, (_, n) => n));
+  expect(pending).toHaveLength(0);
+}, 120000);
+
+it.each(["failed", "cancelled"] as const)("V19 owed input promotes on %s release when execution is settled, not when outcomes are unknown", async status => {
+  for (const settled of [false, true]) {
+    const f = await fixture();
+    for (let n = 0; n < 3; n++) await f.wake("issue_children_completed", { childSummary: `RELEASE-${n}-` + "y".repeat(200_000) });
+    await f.repair();
+    await f.queue.resumeDeferredExecutionReceipts({ companyId: f.company.id });
+    const next = (await f.runs()).find(run => run.status === "queued")!;
+    expect(await f.queue.claimQueuedRun(next)).not.toBeNull();
+    const payload = await buildPaperclipWakePayload({ db, companyId: f.company.id, contextSnapshot: next.contextSnapshot as Record<string, unknown> });
+    const execution = buildNativeExecutionInput({ ...nativeInput(f, next.id, payload), nativeToolContractVersion: "v19" });
+    await inputRefusal.deferUndeliveredNativeInputWakes(db, { companyId: f.company.id, issueId: f.issue.id,
+      agentId: f.agent.id, runId: next.id }, inputBudget.undeliveredSavedAutomaticWakes(execution));
+    const owed = (await f.wakes()).find(wake => wake.status === "deferred_issue_execution")!;
+    expect(owed.payload!.nativeInputRefusalWakes).toHaveLength(2);
+    await db.update(heartbeatRuns).set({ status, finishedAt: new Date(), errorCode: status === "failed" ? "adapter_failed" : null,
+      resultJson: settled ? { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } : null }).where(eq(heartbeatRuns.id, next.id));
+    await f.release({ companyId: f.company.id, runId: next.id, now: new Date(), suppressImmediateRecovery: true });
+    // No additional wake or deferred sweep: release itself must promote safe debt.
+    const successor = (await f.runs()).find(run => run.status === "queued");
+    const receipt = (await f.wakes()).find(wake => wake.id === owed.id)!;
+    console.info(JSON.stringify({ row: "V19-terminal-release", status, settled, runId: next.id, owedWakeId: owed.id,
+      successorRunId: successor?.id ?? null, receiptStatus: receipt.status }));
+    if (settled) {
+      expect(successor).toBeDefined();
+      expect(successor!.wakeupRequestId).toBe(owed.id);
+      const laterPayload = await buildPaperclipWakePayload({ db, companyId: f.company.id, contextSnapshot: successor!.contextSnapshot as Record<string, unknown> });
+      const later = buildNativeExecutionInput({ ...nativeInput(f, successor!.id, laterPayload), nativeToolContractVersion: "v19" });
+      expect(later.task.prompt).toContain("RELEASE-1-");
+      expect(later.task.prompt).not.toContain("RELEASE-2-");
+    } else {
+      // Owed data is not authority to bypass uncertain-execution reconciliation.
+      expect(successor).toBeUndefined();
+      expect(receipt.status).toBe("deferred_issue_execution");
+      expect(receipt.payload!.nativeInputRefusalWakes).toHaveLength(2);
+    }
+  }
+}, 120000);
