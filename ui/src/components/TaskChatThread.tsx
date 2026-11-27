@@ -4281,7 +4281,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const historyError =
     initialHistoryError ||
     planError ||
-    transcriptHistoryErrors.size > 0 || questionReads.some(read => read.isError);
+    runs.some((run) =>
+      run.runtimeMode === "native"
+        ? nativeTranscriptErrorsByRun.has(run.id)
+        : Boolean(logErrorsByRun?.has(run.id)),
+    ) || questionReads.some(read => read.isError);
   const historyKey = conversationMode && draftKey ? draftKey : issueId;
   const [revealedHistoryKey, setRevealedHistoryKey] = useState<string | null | undefined>(undefined);
   const revealCachedHeader = connectionStatus !== "online" && Boolean(threadHeader);
