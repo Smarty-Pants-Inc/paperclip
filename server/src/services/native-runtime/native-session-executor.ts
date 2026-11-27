@@ -1180,6 +1180,13 @@ export async function closeWarmNativeSessionsForEnvironment(input: {
   return closeIdleWarmNativeSessions(input);
 }
 
+/** A failed retirement fences native reuse (see the warm admission check).
+ * Keeping its allocation is safe; promising this run can reuse its owner isn't. */
+export function warmNativeRetirementPending(input: { environmentId: string; providerLeaseId: string }): boolean {
+  return [...warmNativeSessions.values()].some(entry => entry.environmentId === input.environmentId
+    && entry.providerLeaseId === input.providerLeaseId && entry.closeOnReleaseReason !== undefined);
+}
+
 async function warmSandboxTerminated(db: Db, entry: WarmNativeSession): Promise<boolean> {
   if (!entry.providerLeaseId || !entry.environmentId) return false;
   const leases = await db.select().from(environmentLeases).where(and(

@@ -449,6 +449,7 @@ import {
   buildNativeHarnessBackupManifestStreamed,
   cancelNativeSession,
   closeWarmNativeSessionsForEnvironment,
+  warmNativeRetirementPending,
   claimWarmNativeInstructionCopy,
   warmRetirementDirectoryWait,
   warmSessionReleaseWait,
@@ -13219,6 +13220,7 @@ describe("native warm session supervision", () => {
     const name = "warm-retained-runner-survives";
     const close = vi.fn<() => Promise<void>>(async () => { throw refusedSuspend(); });
     const { sandbox, finishedDb } = await startRetainedWarmOwner(name, close, { stopsOn: "never" });
+    expect(warmNativeRetirementPending({ environmentId: name, providerLeaseId: name })).toBe(false);
     const wait = { ...warmRetainedRunnerStopWait };
     Object.assign(warmRetainedRunnerStopWait, { waitMs: 20, pollMs: 5 });
     try {
@@ -13228,8 +13230,10 @@ describe("native warm session supervision", () => {
     expect(sandbox.signals).toEqual(["TERM", "KILL"]);
     expect(sandbox.labels).not.toContain("paperclip-runner-exit-check");
     expect(readNativeSessionIdleWork()).toBe("present");
+    expect(warmNativeRetirementPending({ environmentId: name, providerLeaseId: name })).toBe(true);
     close.mockResolvedValue(undefined);
     expect(await closeWarmNativeSessionsForEnvironment({ environmentId: name, reason: "test cleanup" })).toMatchObject({ closed: 1 });
+    expect(warmNativeRetirementPending({ environmentId: name, providerLeaseId: name })).toBe(false);
   });
 
   it("never stops the retained Runner of a warm owner whose run has not finished", async () => {
