@@ -2,13 +2,14 @@
 // probes with actual normalized output + saved checkpoint evidence. Real PG;
 // provider events/checkpoints are fixtures, not a live Pi/provider session.
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, heartbeatRunEvents, issueComments, issues } from "@paperclipai/db";
 import { CONTINUATION_NOTHING_NEW_SCHEMA } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
 import { buildNativeExecutionInput } from "./native-runtime/native-execution-input.js";
+import * as continuedSession from "./native-runtime/continued-session.js";
 import { nativeRuntimeContextFixture } from "./native-runtime/runtime-context.test-fixture.js";
 import { buildNativeModelEnvelope } from "../vendor/paperclip-runner/index.js";
 import { withQueuedCommentIdsInWakePayload } from "./issue-queued-comment-queue.js";
@@ -121,6 +122,47 @@ describe.skipIf(!support.supported)("retained successor receipt rule", () => {
       }
       console.log("RECEIPT_THREE_CASES", JSON.stringify({ road, state, runId: s.runId, wakeRunId, commentId: s.commentId,
         storedWakeIds: { wakeCommentId: storedWake!.context?.wakeCommentId, wakeCommentIds: storedWake!.context?.wakeCommentIds }, delta: snapshot.resumeDelta, result }));
+    }
+  });
+  it.each(["unseen", "seen answered", "seen unanswered", "stale receipt", "agent only", "named answered plus unnamed owed", "empty user body"] as const)("keeps unnamed prompt-only delta input owed: %s", async state => {
+    const s = await setup(), snapshot = await first(s);
+    const message = { ...snapshot.messages[0]!, body: state === "empty user body" ? "" : "UNNAMED_PERSON_TEXT $& exact" };
+    if (state === "agent only") Object.assign(message, { authorType: "agent", authorId: agentId, body: "Own previous reply" });
+    snapshot.messages = [message];
+    snapshot.resumeDelta = { baseRunId: s.runId, messages: [message],
+      receivedComments: ["seen answered", "seen unanswered", "stale receipt"].includes(state)
+        ? [{ id: message.id, updatedAt: state === "stale receipt" ? t1.toISOString() : message.updatedAt,
+          receivedAt: message.createdAt, answered: state !== "seen unanswered" }] : [] };
+    const namedCommentIds: string[] = [];
+    if (state === "named answered plus unnamed owed") {
+      const named = { ...message, id: s.commentId, body: "ANSWERED_NAMED_TEXT" };
+      snapshot.messages.push(named);
+      snapshot.resumeDelta.receivedComments!.push({ id: named.id, updatedAt: named.updatedAt, receivedAt: named.createdAt, answered: true });
+      namedCommentIds.push(named.id);
+    }
+    // Exercise the prompt-only projection/settlement contract explicitly. The
+    // current selector sends unnamed deltas to JSON; do not widen that selector
+    // just to reproduce this branch's missing-input failure.
+    const selection = vi.spyOn(continuedSession, "decideNativeContinuation").mockReturnValueOnce({ continue: true, promptOnly: true });
+    let result: ReturnType<typeof turn>;
+    try { result = turn(s, { reason: "issue_commented", commentIds: namedCommentIds, executionContinuation: snapshot }, "plain"); }
+    finally { selection.mockRestore(); }
+    console.log("UNNAMED_DELTA_ROW", JSON.stringify({ state, promptOnly: true, selectorStubbed: true, runId: s.runId, messageId: message.id, delta: snapshot.resumeDelta, result }));
+    if (state === "seen answered") {
+      expect(result.code).toBe("continuation_nothing_new");
+      expect(result.noop).toEqual({ schema: CONTINUATION_NOTHING_NEW_SCHEMA, namedCommentIds: [message.id], answeredCommentIds: [message.id], cause: "all_named_answered" });
+    } else if (state === "agent only") {
+      expect(result.code).toBe("continuation_nothing_new");
+      expect(result.noop).toEqual({ schema: CONTINUATION_NOTHING_NEW_SCHEMA, namedCommentIds: [], answeredCommentIds: [], cause: "own_reply_only" });
+    } else {
+      expect(result.code).toBeUndefined();
+      if (state === "seen unanswered") {
+        expect(result.events).toBe(`Reply to the comment you received at ${message.createdAt} (id ${message.id}).`);
+        expect(result.events).not.toContain(message.body);
+      } else if (state !== "empty user body") {
+        expect(result.events).toBe(message.body);
+      }
+      expect(result.events).not.toContain("ANSWERED_NAMED_TEXT");
     }
   });
   it("does not call an unproved named user comment nothing-new on either road", async () => {

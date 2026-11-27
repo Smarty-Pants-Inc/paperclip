@@ -31,7 +31,12 @@ export function buildNativeContinuationPrompt(input: {
   // An empty delta alone does not prove that a named person's input was seen.
   // Restore only unseen named input, never bodies backed by provider receipts.
   if (wake?.comments.some(comment => comment.authorType === "user" && !comment.id)) return null;
-  const unseenNamed = (wake?.commentIds ?? []).filter(id => !receipts.has(id));
+  // Wake IDs are not an exhaustive list of owed input. A prompt-only turn
+  // must also account for every person's message carried by the delta.
+  const namedCommentIds = [...new Set([...(wake?.commentIds ?? []),
+    ...(input.promptOnly ? delta?.messages.filter(message => message.authorType === "user").map(message => message.id) ?? [] : []),
+  ])];
+  const unseenNamed = namedCommentIds.filter(id => !receipts.has(id));
   const messages = (delta?.messages ?? []).filter(message => !receipts.has(message.id) &&
     !(message.authorType === "agent" && message.authorId === input.agentId) && !message.freshSessionMarker);
   for (const id of unseenNamed) {
