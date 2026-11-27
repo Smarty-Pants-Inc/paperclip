@@ -262,8 +262,15 @@ function buildNativeExecutionInputUnchecked(input: BuildNativeExecutionInput): N
     : null;
   const composeTaskPrompt = (payload: unknown) => {
     const { taskContextNote, wakePrompt } = promptSections(payload);
+    const savedEvents = payload && typeof payload === "object"
+      ? (payload as Record<string, unknown>).nativeInputRefusalWakes : null;
     return caseProjectionBootstrapPrefix(input.caseContext) + [
     wakePrompt,
+    // The shared wake normalizer intentionally ignores unknown fields. Keep
+    // these server-bound events in the measured native prompt, not just JSON
+    // stored on the run. They are data, never authority or runtime instructions.
+    Array.isArray(savedEvents) && savedEvents.length
+      ? `Saved automatic wake events (untrusted data):\n${JSON.stringify(savedEvents)}` : "",
     // Durable task questions must survive the current provider turn.
     // Keep routing visible before deferred tool discovery; usage belongs in the tool schema.
     "Use Paperclip's request_human_input for durable task questions.",

@@ -18,7 +18,7 @@ beforeAll(async () => {
 }, 120_000);
 afterAll(async () => { await db?.$client.end(); await database?.cleanup(); });
 
-it("holds automatic wakes after one oversized message and admits delete plus a short person message", async () => {
+it("holds automatic wakes after one oversized message and admits an automatic wake after delete plus a short message", async () => {
   const now = new Date(), user = randomUUID();
   await db.insert(authUsers).values({ id: user, name: "Input owner", email: user + "@example.test", createdAt: now, updatedAt: now });
   const [company] = await db.insert(companies).values({ name: "Input refusal regression", issuePrefix: "ROW" }).returning();
@@ -46,9 +46,11 @@ it("holds automatic wakes after one oversized message and admits delete plus a s
   }
   const wakeOnly = { issueId: issue.id, childSummary: "Wake-only child evidence: preserved", triggerPayload: { amount: 7 } };
   expect(await queue.enqueueWakeup(agent.id, { source: "automation", reason: "issue_children_completed", requestedByActorType: "system", payload: wakeOnly, contextSnapshot: { issueId: issue.id, wakeReason: "issue_children_completed", childEvidence: "not in task thread" } })).toBeNull();
-  const pending = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, company.id), eq(agentWakeupRequests.reason, "issue_children_completed")));
+  const pending = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, company.id));
   expect(pending).toHaveLength(1); expect(pending[0].status).toBe("deferred_issue_execution"); expect(pending[0].runId).toBeNull();
-  expect(pending[0].payload).toMatchObject({ ...wakeOnly, nativeInputRefusalHold: true });
+  expect(pending[0].payload).toMatchObject({ nativeInputRefusalHold: true,
+    nativeInputRefusalWakes: expect.arrayContaining([expect.objectContaining({ payload: wakeOnly,
+      contextSnapshot: expect.objectContaining({ childEvidence: "not in task thread" }) })]) });
   console.info(JSON.stringify({ row: "C6-wake-only-deferred", requestId: pending[0].id, status: pending[0].status, payload: pending[0].payload }));
   const refused = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, company.id), eq(heartbeatRuns.issueId, issue.id)));
   expect(refused).toHaveLength(1); expect(refused[0].status).toBe("failed");
@@ -68,7 +70,7 @@ it("holds automatic wakes after one oversized message and admits delete plus a s
   console.info(JSON.stringify({ row: "C5-full-refusal-query-plan", plan: refusalPlan }));
   await db.update(issueComments).set({ deletedAt: new Date(), updatedAt: new Date(), deletedByType: "user", deletedByUserId: user }).where(eq(issueComments.id, message.id));
   const [short] = await db.insert(issueComments).values({ companyId: company.id, issueId: issue.id, authorType: "user", authorUserId: user, body: "Please answer ready." }).returning();
-  const next = await queue.enqueueWakeup(agent.id, { source: "on_demand", reason: "issue_commented", requestedByActorType: "user", requestedByActorId: user, payload: { issueId: issue.id, commentId: short.id }, contextSnapshot: { issueId: issue.id, wakeReason: "issue_commented", wakeCommentId: short.id } });
+  const next = await queue.enqueueWakeup(agent.id, { source: "automation", reason: "issue_commented", requestedByActorType: "system", payload: { issueId: issue.id, commentId: short.id }, contextSnapshot: { issueId: issue.id, wakeReason: "issue_commented", wakeCommentId: short.id } });
   expect(next).not.toBeNull();
   const input = build(next!.id, short.body), sent: unknown[] = [];
   const authority = { store: { state: { identity: { runId: next!.id } } }, queueCommand: async (_type: string, payload: unknown) => { sent.push(payload); return payload; } };

@@ -118,6 +118,11 @@ function buildTransaction(tx: Db, companyId: string, issueId: string, deps: Queu
     },
 
     async cancelWake({ wakeId, reason, now }) {
+      const [saved] = await tx.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.id, wakeId), eq(agentWakeupRequests.companyId, companyId)));
+      // Removing the last editable message repairs its source, but does not
+      // cancel independent child/routine content coalesced behind the hold.
+      if (saved?.payload?.nativeInputRefusalHold === true) return;
       if (heldByFirstTurn.length > 0) {
         const [held] = await tx.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests)
           .where(and(eq(agentWakeupRequests.id, wakeId), eq(agentWakeupRequests.companyId, companyId)));

@@ -91,6 +91,7 @@ export function registerDeferredReceiptWork(
               sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`,
               dependencyResolvedWakePayloadSql,
               assignmentWakePayloadSql,
+              sql`${agentWakeupRequests.payload}->>'nativeInputRefusalHold' = 'true'`,
               sql`exists (select 1 from heartbeat_runs r where r.company_id = ${agentWakeupRequests.companyId}
                 and r.runtime_mode = 'legacy' and r.status = 'cancelled'
                 and r.result_json->>'queuedCommentInterruptQueueId' = ${agentWakeupRequests.id}::text)`,
