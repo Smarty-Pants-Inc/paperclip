@@ -1358,6 +1358,15 @@ export async function closeIdleWarmNativeSessionsForRestart(input: {
   });
 }
 
+/** Smarty seam: checkpoint every idle warm owner now, released ones included, with no shutdown budget, so a restart's
+ * bounded sweep finds nothing idle left to leave unsuspended (smarty-dev#4605, 11-27). Busy owners are skipped and
+ * counted: call again until busy and closed are both 0, then stop the controller. */
+export async function suspendIdleWarmNativeSessions(): Promise<WarmNativeSessionCloseResult & { released: number }> {
+  let released = 0;
+  const result = await closeIdleWarmNativeSessions({ reason: "operator suspend before restart", onReleasedClose: () => { released += 1; } });
+  return { ...result, released };
+}
+
 export async function prepareIdleWarmNativeSessionsForSleep(input: {
   canRetire: () => boolean;
 }): Promise<WarmNativeSessionCloseResult> {
@@ -1374,6 +1383,7 @@ async function closeIdleWarmNativeSessions(input: {
   canRetire?: () => boolean;
   forceStopUnsettled?: boolean;
   db?: Db;
+  onReleasedClose?: () => void;
 }): Promise<WarmNativeSessionCloseResult> {
   let closed = 0;
   let busy = 0;
@@ -1394,6 +1404,7 @@ async function closeIdleWarmNativeSessions(input: {
     // The host owns retention after release; a quiet local handle needs no retirement for sleep.
     if (input.canRetire && entry.released && !entry.closeOnReleaseReason) return;
     const detach = input.detachReleased === true && entry.released === true && !entry.closeOnReleaseReason;
+    if (!detach && entry.released === true) input.onReleasedClose?.();
     if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
     // Keep a fenced owner until both retirement and stopped collection succeed.
     // Failure must not make a live directory eligible for a replacement owner.

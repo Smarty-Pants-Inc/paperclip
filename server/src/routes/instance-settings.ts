@@ -350,6 +350,12 @@ export function instanceSettingsRoutes(
     res.json(heartbeat.getTaskDrainStatus());
   };
   router.get("/instance/task-drain", readTaskDrainStatus);
+  // Smarty seam: before a restart, an instance admin checkpoints every idle warm conversation at its own pace (no
+  // shutdown budget); repeat until closed and busy are 0, then stop the controller (smarty-dev#4605, 11-27).
+  router.post("/instance/warm-native-sessions/suspend-idle", async (req, res) => {
+    assertCanManageInstanceSettings(req);
+    res.json(await heartbeat.suspendIdleWarmNativeSessions());
+  });
   router.post("/instance/task-drain/status", async (req, res, next) => {
     if (req.actor.source !== "cloud_control" || verifiedCloudControlClaims(req)?.action !== "task-drain:read-body") {
       throw forbidden("Cloud body-bound read authority is required");
