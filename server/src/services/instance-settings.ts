@@ -35,8 +35,6 @@ export type InstanceSettingsWriteDb = Pick<
   "select" | "insert" | "update"
 >;
 import {
-  DEFAULT_FEEDBACK_DATA_SHARING_PREFERENCE,
-  DEFAULT_BACKUP_RETENTION,
   PAPERCLIP_CLOUD_MANAGED_BY,
   instanceGeneralSettingsSchema,
   type InstanceGeneralSettings,
@@ -225,23 +223,20 @@ export async function resolveWorktreeRunExecutionActivationState(options: {
 }
 
 function normalizeGeneralSettings(raw: unknown): InstanceGeneralSettings {
-  const parsed = instanceGeneralSettingsStorageSchema.safeParse(raw ?? {});
-  if (parsed.success) {
-    return {
-      ...(parsed.data.defectReportDestination === undefined ? {} : { defectReportDestination: parsed.data.defectReportDestination }),
-      censorUsernameInLogs: parsed.data.censorUsernameInLogs ?? false,
-      feedbackDataSharingPreference:
-        parsed.data.feedbackDataSharingPreference ?? DEFAULT_FEEDBACK_DATA_SHARING_PREFERENCE,
-      backupRetention: parsed.data.backupRetention ?? DEFAULT_BACKUP_RETENTION,
-      // Absent => unrestricted; only carry through an explicit policy.
-      ...(parsed.data.executionMode ? { executionMode: parsed.data.executionMode } : {}),
-    };
+  const source = raw !== null && typeof raw === "object" && !Array.isArray(raw)
+    ? raw as Record<string, unknown> : {};
+  const normalized = instanceGeneralSettingsStorageSchema.parse({});
+  // A future or damaged field must not reset unrelated policy, especially the
+  // execution-mode pin. Unknown storage keys are ignored; PATCH stays strict.
+  for (const key of Object.keys(instanceGeneralSettingsStorageSchema.shape) as Array<keyof InstanceGeneralSettings>) {
+    const parsed = instanceGeneralSettingsStorageSchema.shape[key].safeParse(source[key]);
+    if (parsed.success) {
+      if (parsed.data !== undefined) Object.assign(normalized, { [key]: parsed.data });
+    } else if (key === "defectReportDestination") {
+      normalized.defectReportDestination = null;
+    }
   }
-  return {
-    censorUsernameInLogs: false,
-    feedbackDataSharingPreference: DEFAULT_FEEDBACK_DATA_SHARING_PREFERENCE,
-    backupRetention: DEFAULT_BACKUP_RETENTION,
-  };
+  return normalized;
 }
 
 export function normalizeExperimentalSettings(raw: unknown): InstanceExperimentalSettings {

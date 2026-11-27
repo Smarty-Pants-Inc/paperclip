@@ -28,13 +28,13 @@ describe("C31 v10 refusal measures and supported exits", () => {
   };
 
   it.each([
-    { kind: "future-input_v12", bytes: 25, remedies: [] },
-    { kind: "command", bytes: 123, measure: "future-measure_v12", remedies: [] },
-    { kind: "stale_copy", bytes: 25, measure: "future_measure", remedies: [] },
+    { kind: "future-input_v12", bytes: 25, remedies: [], remediesVersion: 2 },
+    { kind: "command", bytes: 123, measure: "future-measure_v12", remedies: [], remediesVersion: 2 },
+    { kind: "stale_copy", bytes: 25, measure: "future_measure", remedies: [], remediesVersion: 2 },
   ])("C31 v11 preserves readable fields through version skew: %j", cause => {
     expect(nativePromptRefusalCause(cause)).toEqual({ ...cause, remedies: nativePromptRefusalRemedies(cause.kind, "measure" in cause ? cause.measure : undefined) });
-    const parsed = nativePromptCauseFromError(new Error(`native_prompt_cause=${cause.kind}:${cause.bytes}${"measure" in cause ? `:measure=${cause.measure}` : ""}`));
-    const { remedies: _legacyMissing, ...legacy } = cause;
+    const parsed = nativePromptCauseFromError(new Error(`[native_prompt_cause=${cause.kind}:${cause.bytes}${"measure" in cause ? `:measure=${cause.measure}` : ""}]`));
+    const { remedies: _legacyMissing, remediesVersion: _legacyVersion, ...legacy } = cause;
     expect(parsed).toEqual(legacy);
     const presentation = projectCause(parsed!);
     expect(presentation).toMatchObject({ canRetry: false, failure: { cause: pageCause(legacy) } });
@@ -63,7 +63,7 @@ describe("C31 v10 refusal measures and supported exits", () => {
     const cause = refusal(() => assertNativeTurnCommandBound("turn.start", payload, "measured-command"));
     const compared = { schema: "paperclip.prp.command.v1", commandId: "measured-command", controllerSeq: Number.MAX_SAFE_INTEGER,
       type: "turn.start", issuedAt: new Date().toISOString(), payload, status: "pending", result: null };
-    expect(cause).toEqual({ kind: "command", bytes: Buffer.byteLength(JSON.stringify(compared)), measure: "command", remedies: ["edit_task_description", "new_followup_task", "report_defect"] });
+    expect(cause).toEqual({ kind: "command", bytes: Buffer.byteLength(JSON.stringify(compared)), measure: "command", remediesVersion: 2, remedies: ["edit_task_description", "new_followup_task", "report_defect"] });
     expect(cause.bytes).toBeGreaterThan(Buffer.byteLength(JSON.stringify(payload)));
     expect(nativePromptCauseFromError(new Error(String(new NativeTurnPromptExceedsCommandBoundError(cause))))).toEqual(cause);
     expect(projectCause(cause)?.failure?.detail).toContain("serialized command measured by the guard");
@@ -73,7 +73,7 @@ describe("C31 v10 refusal measures and supported exits", () => {
     const text = '"'.repeat(140_000);
     const cause = refusal(() => nativeSessionHandoffMaxBytes(measure === "prompt" ? text : { task: { prompt: text } }));
     const bytes = Buffer.byteLength(JSON.stringify(JSON.stringify(measure === "prompt" ? text : { task: { prompt: text } }))) - (measure === "prompt" ? 6 : 2);
-    expect(cause).toEqual({ kind: "command", bytes, measure, remedies: ["edit_task_description", "new_followup_task", "report_defect"] });
+    expect(cause).toEqual({ kind: "command", bytes, measure, remediesVersion: 2, remedies: ["edit_task_description", "new_followup_task", "report_defect"] });
     expect(projectCause(cause)?.failure?.detail).toContain(measure === "prompt" ? "encoded prompt" : "encoded envelope");
     expect(projectCause(cause)?.failure?.detail).not.toContain("complete encoded turn");
     expect(nativePromptCauseFromError(new Error(String(new NativeTurnPromptExceedsCommandBoundError(cause))))).toEqual(cause);
@@ -90,13 +90,13 @@ describe("C31 v10 refusal measures and supported exits", () => {
   it("names the pre-seal whole-command upper bound, including its reserves", () => {
     const envelope = { task: { prompt: "x".repeat(510_000) } };
     const cause = refusal(() => assertNativeQueuedTurnBound("run", envelope, "short queued message"));
-    expect(cause).toEqual({ kind: "command", bytes: nativeQueuedTurnUpperBound("run", envelope, "short queued message"), measure: "command_upper_bound", remedies: ["edit_task_description", "new_followup_task", "report_defect"] });
+    expect(cause).toEqual({ kind: "command", bytes: nativeQueuedTurnUpperBound("run", envelope, "short queued message"), measure: "command_upper_bound", remediesVersion: 2, remedies: ["edit_task_description", "new_followup_task", "report_defect"] });
     expect(projectCause(cause)?.failure?.detail).toContain("command upper bound, including reserved room");
     expect(nativePromptCauseFromError(new Error(String(new NativeTurnPromptExceedsCommandBoundError(cause))))).toEqual(cause);
   });
 
   it("keeps an under-cap stale copy distinct from every size refusal", () => {
-    const cause: NativePromptRefusalCause = { kind: "stale_copy", bytes: 25, remedies: ["report_defect"] };
+    const cause: NativePromptRefusalCause = { kind: "stale_copy", bytes: 25, remediesVersion: 2, remedies: ["report_defect"] };
     expect(nativePromptRefusalCause(cause)).toEqual(cause);
     expect(nativePromptCauseFromError(new Error(String(new NativeTurnPromptExceedsCommandBoundError(cause))))).toEqual(cause);
     const presentation = projectCause(cause);
@@ -108,11 +108,11 @@ describe("C31 v10 refusal measures and supported exits", () => {
   it("reads old causes without inventing a measurement and retains future labels", () => {
     const legacy = { kind: "command" as const, bytes: 123, remedies: [] };
     expect(nativePromptRefusalCause(legacy)).toEqual(legacy);
-    expect(nativePromptCauseFromError(new Error("native_prompt_cause=command:123"))).toEqual({ kind: "command", bytes: 123 });
+    expect(nativePromptCauseFromError(new Error("[native_prompt_cause=command:123]"))).toEqual({ kind: "command", bytes: 123 });
     expect(projectCause(legacy)?.failure?.detail).not.toMatch(/123|1 KB|complete encoded turn/);
-    expect(nativePromptRefusalCause({ ...legacy, measure: "payload_masquerading_as_command" })).toEqual({ ...legacy, measure: "payload_masquerading_as_command", remedies: nativePromptRefusalRemedies("command") });
-    expect(nativePromptCauseFromError(new Error("native_prompt_cause=unknown:123"))).toEqual({ kind: "unknown", bytes: 123 });
-    expect(nativePromptCauseFromError(new Error("native_prompt_cause=command:123:measure=unknown"))).toEqual({ kind: "command", bytes: 123, measure: "unknown" });
+    expect(nativePromptRefusalCause({ ...legacy, measure: "payload_masquerading_as_command" })).toEqual({ ...legacy, measure: "payload_masquerading_as_command" });
+    expect(nativePromptCauseFromError(new Error("[native_prompt_cause=unknown:123]"))).toEqual({ kind: "unknown", bytes: 123 });
+    expect(nativePromptCauseFromError(new Error("[native_prompt_cause=command:123:measure=unknown]"))).toEqual({ kind: "command", bytes: 123, measure: "unknown" });
   });
 
   it.each([
@@ -128,7 +128,7 @@ describe("C31 v10 refusal measures and supported exits", () => {
     ["unmeasured_composition", "defect in the agent's runtime or Paperclip"],
     ["stale_copy", "defect in the agent's runtime or Paperclip"],
   ] as const)("gives %s a supported edit or named escalation path", (kind, wayOut) => {
-    const cause: NativePromptRefusalCause = { kind, remedies: nativePromptRefusalRemedies(kind), bytes: kind === "unmeasured_composition" ? 0 : kind === "stale_copy" ? 25 : 750_000,
+    const cause: NativePromptRefusalCause = { kind, remediesVersion: 2, remedies: nativePromptRefusalRemedies(kind), bytes: kind === "unmeasured_composition" ? 0 : kind === "stale_copy" ? 25 : 750_000,
       ...(kind === "unread_messages" ? { count: 3 } : {}), ...(kind === "command" ? { measure: "command" as const } : {}) };
     const presentation = projectCause(cause);
     expect(presentation).toMatchObject({ canRetry: false, failure: { cause: pageCause(cause) } });
@@ -146,6 +146,48 @@ describe("C31 v10 refusal measures and supported exits", () => {
 // Unit test agreed in task: closed pure-data repair routes and legacy validation
 // cannot be proven more cheaply through a provider or UI flow.
 describe("C31 server-owned remedies", () => {
+  it.each([
+    "https://github.com/acme/public/issues/new", "www.example.test", "support@example.test", "example.test",
+    "127.0.0.1", "[support](/public)", "<b>Support</b>", "Support\nunsafe", "x".repeat(201), " ",
+    "https：／／example．test", "support＠example．test", "_Support_", "**Support**", "`Support`", "Support\n", "\nSupport",
+  ])("C31 v13 rejects address-shaped or non-plain report labels: %j", label => {
+    expect(patchInstanceGeneralSettingsSchema.safeParse({ defectReportDestination: { label, url: "/" } }).success).toBe(false);
+  });
+  it.each(["Private instance support", "Maintainers (private)", "L'équipe privée", "運用窓口"])("C31 v13 accepts plain private-place labels: %j", label => {
+    expect(patchInstanceGeneralSettingsSchema.parse({ defectReportDestination: { label, url: "/issues/private-support" } }).defectReportDestination).toEqual({ label, url: "/issues/private-support" });
+  });
+  it.each(["future_kind", "task_description"])("C31 v13 keeps a v11-saved ambiguous empty remedies list text-only: %s", kind => {
+    const saved = { kind, bytes: 123, remedies: [], ...(kind === "task_description" ? { measure: "future_measure" } : {}) };
+    const decoded = nativePromptRefusalCause(saved)!;
+    expect(decoded).toEqual(saved);
+    const resultJson = JSON.parse(JSON.stringify({ nativeTurnPromptRefusalCause: decoded }));
+    const presentation = projectTaskInterruption(issue, { run: { ...run, errorCode: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, resultJson }, agent, paused: false, approval: false });
+    expect(presentation?.failure?.cause?.remedies).toEqual([]);
+  });
+  it.each([
+    ["future_kind", undefined, ["check_versions"]],
+    ["task_description", "future_measure", ["new_followup_task"]],
+  ])("C31 v13 derives marked modern skewed remedies as before: %s", (kind, measure, expected) => {
+    const cause = { kind, bytes: 123, remedies: [], remediesVersion: 2, ...(measure ? { measure } : {}) };
+    const decoded = nativePromptRefusalCause(cause)!;
+    expect(decoded).toEqual({ ...cause, remedies: expected });
+    expect(nativePromptRefusalCause(JSON.parse(JSON.stringify(decoded)))).toEqual(decoded);
+  });
+  it("C31 v13 marks new error writes without upgrading ambiguous legacy empties", () => {
+    const error = new NativeTurnPromptExceedsCommandBoundError({ kind: "unread_messages", bytes: 123, count: 2,
+      remedies: nativePromptRefusalRemedies("unread_messages"), commentIds: ["message-1", "message-2"] });
+    expect(error.promptCause).toMatchObject({ remediesVersion: 2 });
+    expect(nativePromptCauseFromError(new Error(error.message))).toEqual(error.promptCause);
+    const legacy = { kind: "future_kind", bytes: 123, remedies: [] };
+    expect(nativePromptCauseFromError(new Error(new NativeTurnPromptExceedsCommandBoundError(legacy).message))).toEqual(legacy);
+  });
+  it.each(["22222222", "", "22222222-2222-4222-8222-222222222222 trailing text"])("C31 v13 rejects a cut serialized marker, not partial message targets: %j", tail => {
+    const message = `refusal [native_prompt_cause=unread_messages:123:count=2:remedies=edit_message,delete_own_message,new_followup_task:commentIds=11111111-1111-4111-8111-111111111111,${tail}`;
+    expect(nativePromptCauseFromError(new Error(message))).toBeUndefined();
+    const presentation = projectTaskInterruption(issue, { run: { ...run, errorCode: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, error: message }, agent, paused: false, approval: false });
+    expect(presentation?.failure?.cause).toBeUndefined();
+    expect(presentation?.failure?.detail).toContain("no readable explanation");
+  });
   it("C31 v12 keeps the optional destination private and absent by default", () => {
     expect(instanceGeneralSettingsSchema.parse({}).defectReportDestination).toBeUndefined();
     const destination = { label: "Private instance support", url: "/issues/private-support" };
@@ -160,7 +202,7 @@ describe("C31 server-owned remedies", () => {
     expect(nativePromptRefusalCause({ kind: "unread_message", bytes: 123, remedies: ["edit_message"], commentIds })).toBeUndefined();
   });
   it.each([
-    [{ kind: "future_kind", bytes: 123, remedies: [] }, ["check_versions"]],
+    [{ kind: "future_kind", bytes: 123, remedies: [], remediesVersion: 2 }, ["check_versions"]],
     [{ kind: "future_kind", bytes: 123, remedies: ["edit_message", "future_remedy"] }, ["check_versions"]],
     [{ kind: "task_description", bytes: 123, measure: "future_measure", remedies: ["edit_task_description", "new_followup_task"] }, ["new_followup_task"]],
     [{ kind: "protected_input", bytes: 123, remedies: ["edit_task_description", "new_followup_task"] }, ["new_followup_task"]],
@@ -195,7 +237,7 @@ describe("C31 server-owned remedies", () => {
   });
 
   it.each(["newest_message", "unread_message", "unread_messages", "queued_input"])("C31 v12 preserves %s counted message IDs through a serialized error, saved run and shared projection", kind => {
-    const cause = { kind, bytes: 123, remedies: nativePromptRefusalRemedies(kind), commentIds: ["message-1", "message-2"] };
+    const cause = { kind, bytes: 123, remediesVersion: 2, remedies: nativePromptRefusalRemedies(kind), commentIds: ["message-1", "message-2"] };
     const error = new NativeTurnPromptExceedsCommandBoundError(cause);
     expect(nativePromptCauseFromError(new Error(String(error)))).toEqual(cause);
     const resultJson = JSON.parse(JSON.stringify({ nativeTurnPromptRefusalCause: nativePromptCauseFromError(error) }));
@@ -215,12 +257,12 @@ describe("C31 server-owned remedies", () => {
     ["unmeasured_composition", ["report_defect"]],
     ["stale_copy", ["report_defect"]],
   ] as const)("persists and serializes %s supported routes without reading prose", (kind, expected) => {
-    const cause: NativePromptRefusalCause = { kind, bytes: 123, remedies: nativePromptRefusalRemedies(kind),
+    const cause: NativePromptRefusalCause = { kind, bytes: 123, remediesVersion: 2, remedies: nativePromptRefusalRemedies(kind),
       ...(kind === "unread_messages" ? { count: 3 } : {}), ...(kind === "command" ? { measure: "command" as const } : {}) };
     expect(cause.remedies).toEqual(expected);
     const error = new NativeTurnPromptExceedsCommandBoundError(cause);
     expect(nativePromptCauseFromError(error)).toEqual(cause);
-    expect(error.message).toContain(`:remedies=${expected.join(",")}]`);
+    expect(error.message).toContain(`:remedies=${expected.join(",")}:remediesVersion=2]`);
     expect(nativePromptCauseFromError(new Error(String(error)))).toEqual(cause);
     const resultJson = JSON.parse(JSON.stringify({ nativeTurnPromptRefusalCause: nativePromptCauseFromError(error) }));
     const presentation = projectTaskInterruption(issue, {
@@ -233,7 +275,7 @@ describe("C31 server-owned remedies", () => {
     const legacy = { kind: "newest_message", bytes: 123, count: 2 };
     expect(nativePromptRefusalCause(legacy)).toEqual(legacy);
     expect(nativePromptCauseFromError({ promptCause: legacy })).toEqual(legacy);
-    expect(nativePromptCauseFromError(new Error("native_prompt_cause=newest_message:123:count=2")))
+    expect(nativePromptCauseFromError(new Error("[native_prompt_cause=newest_message:123:count=2]")))
       .toEqual(legacy);
     const resultJson = JSON.parse(JSON.stringify({ nativeTurnPromptRefusalCause: nativePromptRefusalCause(legacy) }));
     expect(projectTaskInterruption(issue, { run: { ...run, errorCode: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, resultJson }, agent, paused: false, approval: false })?.failure?.cause?.remedies).toEqual([]);
@@ -248,13 +290,13 @@ describe("C31 server-owned remedies", () => {
   );
   it.each([",", "edit_message,", ",edit_message", "edit_message,,report_defect", "bad:route", "edit_message:extra"])(
     "rejects malformed serialized remedies instead of parsing a legacy prefix: %s", remedies => {
-      expect(nativePromptCauseFromError(new Error(`native_prompt_cause=command:123:remedies=${remedies}`))).toBeUndefined();
+      expect(nativePromptCauseFromError(new Error(`[native_prompt_cause=command:123:remedies=${remedies}]`))).toBeUndefined();
     },
   );
   it("keeps readable evidence when a future writer names an unsupported route", () => {
     const expected = { kind: "command", bytes: 123, remedies: ["new_followup_task"] };
     expect(nativePromptRefusalCause({ ...expected, remedies: ["future_route", "new_followup_task"] })).toEqual(expected);
-    expect(nativePromptCauseFromError(new Error("native_prompt_cause=command:123:remedies=future_route,new_followup_task"))).toEqual(expected);
+    expect(nativePromptCauseFromError(new Error("[native_prompt_cause=command:123:remedies=future_route,new_followup_task]"))).toEqual(expected);
   });
   it("does not guess a version-skewed input's edit route", () => {
     expect(nativePromptRefusalRemedies("future-input_v12")).toEqual(["check_versions"]);
@@ -317,7 +359,7 @@ describe("classified failure of an unanswered message", () => {
     expect(presentation?.failure?.detail).not.toMatch(/new session|compact/i);
   });
   it.each(["unread_messages", "protected_input", "protected_inputs", "command"] as const)("supplies specific safe copy and serialized cause for %s", kind => {
-    const cause = { kind, remedies: nativePromptRefusalRemedies(kind), bytes: 750000, ...(kind === "unread_messages" ? { count: 3 } : {}), ...(kind === "command" ? { measure: "command" as const } : {}) };
+    const cause = { kind, remediesVersion: 2, remedies: nativePromptRefusalRemedies(kind), bytes: 750000, ...(kind === "unread_messages" ? { count: 3 } : {}), ...(kind === "command" ? { measure: "command" as const } : {}) };
     const error = new NativeTurnPromptExceedsCommandBoundError(cause);
     expect(nativePromptCauseFromError(new Error(String(error)))).toEqual(cause);
     const presentation = project({ errorCode: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, resultJson: { nativeTurnPromptRefusalCause: cause } });
@@ -328,7 +370,7 @@ describe("classified failure of an unanswered message", () => {
     if (kind === "protected_input") expect(presentation?.failure?.title).toBe("Required task input is too large");
   });
   it("presents an unmeasured handback refusal truthfully, not as an oversized request", () => {
-    const cause = { kind: "unmeasured_composition" as const, bytes: 0, remedies: nativePromptRefusalRemedies("unmeasured_composition") };
+    const cause = { kind: "unmeasured_composition" as const, bytes: 0, remediesVersion: 2, remedies: nativePromptRefusalRemedies("unmeasured_composition") };
     const error = new NativeTurnPromptExceedsCommandBoundError(cause);
     expect(nativePromptCauseFromError(new Error(String(error)))).toEqual(cause);
     const presentation = project({ errorCode: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND,

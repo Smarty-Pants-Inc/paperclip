@@ -1,6 +1,8 @@
 import { promises as fs } from "node:fs";
 import { runFailureMessage, patchInstanceGeneralSettingsSchema } from "@paperclipai/shared";
 import { instanceSettingsService } from "../instance-settings.js";
+import { invalidateInstanceSettingsCache } from "../instance-settings-cache.js";
+import { instanceSettings } from "@paperclipai/db";
 import { projectTaskInterruption, taskInterruptionPresentations } from "../task-interruption-presentation.js";
 import { NativeTurnPromptExceedsCommandBoundError, type NativePromptRefusalCause } from "../native-runtime/native-turn-budget.js";
 import { createDurableRunLogStore } from "../run-log-store.js";
@@ -871,12 +873,41 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     else await f.completion.failRun(f.failure(error));
     const failed = await read(f.run.id);
     expect(failed).toMatchObject({ status: "failed", errorCode: error.code, error: error.message,
-      resultJson: { nativeTurnPromptRefusalCause: cause } });
+      resultJson: { nativeTurnPromptRefusalCause: { ...cause, remediesVersion: 2 } } });
     expect(runFailureMessage(failed)).toMatch(/newest message.*if you wrote it.*new short follow-up task/i);
     const presentation = projectTaskInterruption({ id: "task", companyId: f.run.companyId, status: "blocked", assigneeAgentId: f.agent.id, projectId: null },
       { run: failed, agent: { status: "idle", pauseReason: null }, paused: false, approval: false });
     expect(presentation?.failure?.cause?.commentIds).toEqual(cause.commentIds);
     expect(presentation?.failure?.cause?.remedies).toEqual(cause.remedies);
+  });
+
+  it.each([
+    { label: "Private support", url: "/issues/private-support", futureField: true },
+    { label: "Private support", url: "https://example.test/public" },
+    { label: "support@example.test", url: "/issues/private-support" },
+  ])("C31 v13 retains the execution-mode pin and other settings around an unreadable destination: %j", async destination => {
+    const settings = instanceSettingsService(db);
+    await settings.get();
+    const [before] = await db.select().from(instanceSettings);
+    onTestFinished(async () => {
+      await db.update(instanceSettings).set({ general: before.general }).where(eq(instanceSettings.id, before.id));
+      invalidateInstanceSettingsCache();
+    });
+    await settings.updateGeneral({ executionMode: "kubernetes", censorUsernameInLogs: true,
+      feedbackDataSharingPreference: "not_allowed", backupRetention: { dailyDays: 14, weeklyWeeks: 4, monthlyMonths: 3 } });
+    await db.update(instanceSettings).set({ general: {
+      executionMode: "kubernetes", censorUsernameInLogs: true, feedbackDataSharingPreference: "not_allowed",
+      backupRetention: { dailyDays: 14, weeklyWeeks: 4, monthlyMonths: 3 }, defectReportDestination: destination,
+    } });
+    invalidateInstanceSettingsCache();
+    const expected = { executionMode: "kubernetes", censorUsernameInLogs: true, feedbackDataSharingPreference: "not_allowed",
+      backupRetention: { dailyDays: 14, weeklyWeeks: 4, monthlyMonths: 3 }, defectReportDestination: null };
+    expect(await instanceSettingsService(db).getGeneral()).toEqual(expected);
+    await settings.updateGeneral({ censorUsernameInLogs: false });
+    invalidateInstanceSettingsCache();
+    expect(await instanceSettingsService(db).getGeneral()).toEqual({ ...expected, censorUsernameInLogs: false });
+    const [row] = await db.select().from(instanceSettings);
+    expect(row.general).toMatchObject({ ...expected, censorUsernameInLogs: false });
   });
 
   it("C31 v12 reads, saves, clears and projects the private instance report destination without changing old diagnostics", async () => {

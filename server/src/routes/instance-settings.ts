@@ -253,6 +253,11 @@ export function instanceSettingsRoutes(
           }),
         ),
       );
+      if (req.body.defectReportDestination) {
+        // Keep the settings JSON shape stable for existing clients; the admin
+        // API save returns the privacy warning even without a settings UI.
+        res.set("Warning", '299 Paperclip "Only a private place on this instance: run links and task titles are private content"');
+      }
       res.json(updated.general);
     },
   );

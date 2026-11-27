@@ -24,7 +24,10 @@ export const backupRetentionPolicySchema = z.object({
 
 /** must be a private place on this instance; a run link and a task title are private content */
 export const defectReportDestinationSchema = z.object({
-  label: z.string().trim().min(1).max(200).refine(value => !/[\r\n\u0000-\u001f\u007f]/.test(value)),
+  // A name, not another destination: disallow URL/email/domain punctuation,
+  // markup and controls (including Unicode lookalikes), before trimming.
+  label: z.string().max(200).refine(value => !/[^\p{L}\p{M}\p{N} '&(),-]/u.test(value),
+    "Use a plain place name, not an address, email, domain or link").trim().min(1),
   // Root-relative only: no external origin, protocol-relative URL or backslash.
   url: z.string().min(1).max(2000).regex(/^\/(?!\/)[^\\\s\u0000-\u001f\u007f]*$/),
 }).strict();

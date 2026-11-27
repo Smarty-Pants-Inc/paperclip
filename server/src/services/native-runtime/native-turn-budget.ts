@@ -102,16 +102,22 @@ export function nativePromptRefusalCause(value: unknown): NativePromptRefusalCau
   if (!(typeof v.kind === "string" && /^[^\s:\[\]]+$/.test(v.kind) && Number.isSafeInteger(v.bytes) && Number(v.bytes) >= 0
     && (v.count === undefined || Number.isSafeInteger(v.count) && Number(v.count) > 0)
     && (v.measure === undefined || typeof v.measure === "string" && /^[^\s:\[\]]+$/.test(v.measure))
+    && (v.remediesVersion === undefined || Number.isSafeInteger(v.remediesVersion) && Number(v.remediesVersion) > 0)
     && (v.commentIds === undefined || Array.isArray(v.commentIds) && v.commentIds.every(id => typeof id === "string" && /^[a-zA-Z0-9_-]+$/.test(id)))
     && (v.remedies === undefined || Array.isArray(v.remedies)
       && v.remedies.every(remedy => typeof remedy === "string" && /^[a-z_]+$/.test(remedy))))) return undefined;
   const cause: NativePromptRefusalCause = { kind: v.kind, bytes: Number(v.bytes),
     ...(v.count === undefined ? {} : { count: Number(v.count) }),
     ...(v.measure === undefined ? {} : { measure: v.measure as string }),
-    ...(v.commentIds === undefined ? {} : { commentIds: [...v.commentIds as string[]] }) };
-  // Missing differs from an explicitly saved empty list. Preserve that absence
-  // across decode/save/decode, so legacy unknown labels still mean text only.
+    ...(v.commentIds === undefined ? {} : { commentIds: [...v.commentIds as string[]] }),
+    ...(v.remediesVersion === undefined ? {} : { remediesVersion: Number(v.remediesVersion) }) };
+  // v11 saved missing remedies as []. Without provenance that empty list is
+  // ambiguous, not permission to derive actions. Preserve it across saves.
   if (v.remedies === undefined) return cause;
+  if (v.remediesVersion !== 2 && ((v.remedies as string[]).length === 0 || v.remediesVersion !== undefined)) {
+    cause.remedies = [];
+    return cause;
+  }
   const supported = nativePromptRefusalRemedies(cause.kind, cause.measure);
   const knownKind = Object.hasOwn(nativePromptRefusalTitles, cause.kind);
   const knownMeasure = !cause.measure || (cause.kind === "command" ? nativePromptMeasures.some(measure => measure === cause.measure)
@@ -127,13 +133,21 @@ export function nativePromptCauseFromError(error: unknown): NativePromptRefusalC
   const direct = nativePromptRefusalCause(record(error).promptCause);
   if (direct) return direct;
   // Read unfamiliar labels too; presentation, not parsing, owns known labels.
-  const match = (error instanceof Error ? error.message : "").match(/native_prompt_cause=([^\s:\[\]]+):(\d+)(?::count=(\d+))?(?::measure=([^\s:\[\]]+))?(?::remedies=([a-z_,]*))?(?::commentIds=([a-zA-Z0-9_,\-]*))?(?=\]|$|\s)/);
-  return match ? nativePromptRefusalCause({ kind: match[1], bytes: Number(match[2]), ...(match[3] ? { count: Number(match[3]) } : {}), ...(match[4] ? { measure: match[4] } : {}), ...(match[5] === undefined ? {} : { remedies: match[5] ? match[5].split(",") : [] }), ...(match[6] === undefined ? {} : { commentIds: match[6] ? match[6].split(",") : [] }) }) : undefined;
+  // Only a complete marker can attest exact targets. End-of-string or a space
+  // may be a transport cut in the middle of an ID, never a closing boundary.
+  const match = (error instanceof Error ? error.message : "").match(/native_prompt_cause=([^\s:\[\]]+):(\d+)(?::count=(\d+))?(?::measure=([^\s:\[\]]+))?(?::remedies=([a-z_,]*))?(?::commentIds=([a-zA-Z0-9_,\-]*))?(?::remediesVersion=(\d+))?\]/);
+  return match ? nativePromptRefusalCause({ kind: match[1], bytes: Number(match[2]), ...(match[3] ? { count: Number(match[3]) } : {}), ...(match[4] ? { measure: match[4] } : {}), ...(match[5] === undefined ? {} : { remedies: match[5] ? match[5].split(",") : [] }), ...(match[6] === undefined ? {} : { commentIds: match[6] ? match[6].split(",") : [] }), ...(match[7] === undefined ? {} : { remediesVersion: Number(match[7]) }) }) : undefined;
 }
 export class NativeTurnPromptExceedsCommandBoundError extends Error {
   readonly code = NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND;
-  constructor(readonly promptCause?: NativePromptRefusalCause) {
-    super(`${NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND}: ${nativePromptRefusalDetail(promptCause)}${promptCause ? ` [native_prompt_cause=${promptCause.kind}:${promptCause.bytes}${promptCause.count === undefined ? "" : `:count=${promptCause.count}`}${promptCause.measure === undefined ? "" : `:measure=${promptCause.measure}`}${promptCause.remedies === undefined ? "" : `:remedies=${promptCause.remedies.join(",")}`}${promptCause.commentIds === undefined ? "" : `:commentIds=${promptCause.commentIds.join(",")}`}]` : ""}`);
+  readonly promptCause?: NativePromptRefusalCause;
+  constructor(promptCause?: NativePromptRefusalCause) {
+    // Central write boundary: mark new action-bearing evidence, but never
+    // promote a rewrapped legacy [] whose original absence is unknowable.
+    const saved = promptCause?.remedies?.length && promptCause.remediesVersion === undefined
+      ? { ...promptCause, remediesVersion: 2 } : promptCause;
+    super(`${NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND}: ${nativePromptRefusalDetail(saved)}${saved ? ` [native_prompt_cause=${saved.kind}:${saved.bytes}${saved.count === undefined ? "" : `:count=${saved.count}`}${saved.measure === undefined ? "" : `:measure=${saved.measure}`}${saved.remedies === undefined ? "" : `:remedies=${saved.remedies.join(",")}`}${saved.commentIds === undefined ? "" : `:commentIds=${saved.commentIds.join(",")}`}${saved.remediesVersion === undefined ? "" : `:remediesVersion=${saved.remediesVersion}`}]` : ""}`);
+    this.promptCause = saved;
   }
 }
 
