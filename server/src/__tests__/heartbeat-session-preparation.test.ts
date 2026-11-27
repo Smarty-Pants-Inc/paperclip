@@ -167,12 +167,17 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     { lane: "environment", provider: "pi_rpc", fresh: false },
     { lane: "agent", provider: "codex", fresh: true },
     { lane: "environment", provider: "codex", fresh: true },
-  ])("native blocker retry session: lane=$lane provider=$provider fresh=$fresh", async ({ lane, provider, fresh }) => {
+    // An older explicit-fresh retry must not make the next blocker retry fresh again.
+    { lane: "environment", provider: "pi_rpc", fresh: false, predecessorExplicitFresh: true },
+    { lane: "environment", provider: "codex", fresh: true, predecessorExplicitFresh: true },
+  ])("native blocker retry session: lane=$lane provider=$provider fresh=$fresh predecessorExplicitFresh=$predecessorExplicitFresh", async ({ lane, provider, fresh, predecessorExplicitFresh }) => {
     const f = await seed(), sessionId = randomUUID();
     await db.update(agents).set({ adapterConfig: { provider, model: "fixture/model",
       sessionContinuity: provider === "pi_rpc" ? "continuous" : "paperclip", fixtureSessionId: sessionId } })
       .where(eq(agents.id, f.agentId));
-    const first = await execute(f);
+    const first = await execute(f, predecessorExplicitFresh
+      ? { forceFreshSession: true, explicitFreshSession: true } : {});
+    expect(first.finished.contextSnapshot?.explicitFreshSession).toBe(predecessorExplicitFresh);
     await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: f.issueId,
       nativeSessionId: sessionId, status: "failed", error: "Agent-reported blocker" })
       .where(eq(heartbeatRuns.id, first.finished.id));
@@ -193,10 +198,12 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     expect(finished.status, finished.error ?? undefined).toBe("succeeded");
     const input = captured.get(retryId)!;
     expect(input).toBeDefined();
-    process.stdout.write(`BLOCKER-SESSION ${JSON.stringify({ lane, provider, sourceRunId: first.finished.id, retryRunId: retryId,
+    process.stdout.write(`BLOCKER-SESSION ${JSON.stringify({ lane, provider, predecessorExplicitFresh: first.finished.contextSnapshot?.explicitFreshSession ?? null,
+      sourceRunId: first.finished.id, retryRunId: retryId,
       savedSessionId: sessionId, resumedSessionId: input.runtime.sessionId, forceFreshSession: context.forceFreshSession,
       explicitFreshSession: context.explicitFreshSession ?? null, message: retry.error, hint: context.livenessContinuationInstruction,
       freshness: finished.resultJson?.configFreshness })}\n`);
+    if (predecessorExplicitFresh) expect(context.explicitFreshSession).toBe(false);
     expect(input.runtime.sessionId).toBe(fresh ? null : sessionId);
     expect(finished.resultJson).toMatchObject({ configFreshness: { session: { reset: fresh, taskSessionReused: !fresh } } });
     expect(input.context.livenessContinuationInstruction).toBe(context.livenessContinuationInstruction);
