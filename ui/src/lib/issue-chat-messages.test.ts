@@ -781,6 +781,7 @@ describe("buildIssueChatMessages", () => {
       {
         id: "run-live-1",
         status: "running",
+        runModel: null,
         invocationSource: "manual",
         triggerDetail: null,
         startedAt: "2026-04-06T12:04:00.000Z",
@@ -837,6 +838,7 @@ describe("buildIssueChatMessages", () => {
   it("suppresses live-run Working messages for terminal issues", () => {
     const liveRun: LiveRunForIssue = {
       id: "run-live-terminal",
+      runModel: null,
       status: "running",
       invocationSource: "manual",
       triggerDetail: null,
@@ -901,6 +903,7 @@ describe("buildIssueChatMessages", () => {
       liveRuns: [
         {
           id: "run-live-1",
+          runModel: null,
           status: "running",
           invocationSource: "manual",
           triggerDetail: null,
@@ -1028,6 +1031,7 @@ describe("buildIssueChatMessages", () => {
   it("preserves ephemeral active-run status metadata for rendering", () => {
     const activeRun: ActiveRunForIssue = {
       id: "run-active-1",
+      runModel: null,
       status: "running",
       invocationSource: "manual",
       triggerDetail: null,
@@ -1421,7 +1425,7 @@ describe("buildIssueChatMessages", () => {
   ])("settles a $status $adapterType run once while its live cache is stale", ({ adapterType, status }) => {
     const startedAt = "2026-11-03T14:22:22.000Z";
     const live: LiveRunForIssue = {
-      id: "run-stop", status: "running", invocationSource: "manual", triggerDetail: null,
+      runModel: null, id: "run-stop", status: "running", invocationSource: "manual", triggerDetail: null,
       createdAt: startedAt, startedAt, finishedAt: null,
       agentId: "agent-1", agentName: "Agent", adapterType,
     };
@@ -1453,7 +1457,7 @@ describe("buildIssueChatMessages", () => {
       comments: [], timelineEvents: [], issueStatus: "in_progress",
       linkedRuns: [{ runId: "run-active", status: "queued", agentId: "agent-1", adapterType: "paperclip_runner", createdAt, startedAt: null }],
       liveRuns: [{ id: "run-active", status: "running", agentId: "agent-1", agentName: "Agent", adapterType: "paperclip_runner",
-        invocationSource: "manual", triggerDetail: null, createdAt, startedAt: createdAt, finishedAt: null }],
+        runModel: null, invocationSource: "manual", triggerDetail: null, createdAt, startedAt: createdAt, finishedAt: null }],
     });
 
     expect(messages).toHaveLength(1);
@@ -1466,7 +1470,7 @@ describe("buildIssueChatMessages", () => {
   it("keeps distinct runs when one stopped run hands off from live history", () => {
     const createdAt = "2026-11-03T14:22:22.000Z";
     const live = { status: "running" as const, agentId: "agent-1", agentName: "Agent", adapterType: "paperclip_runner",
-      invocationSource: "manual" as const, triggerDetail: null, createdAt, startedAt: createdAt, finishedAt: null };
+      runModel: null, invocationSource: "manual" as const, triggerDetail: null, createdAt, startedAt: createdAt, finishedAt: null };
     const messages = buildIssueChatMessages({
       comments: [], timelineEvents: [], issueStatus: "in_progress",
       linkedRuns: [{ runId: "run-stop", status: "cancelled", agentId: live.agentId, adapterType: live.adapterType,
@@ -1487,6 +1491,7 @@ describe("buildIssueChatMessages", () => {
       liveRuns: [
         {
           id: "run-1",
+          runModel: null,
           status: "running",
           invocationSource: "manual",
           triggerDetail: null,
@@ -1741,6 +1746,7 @@ describe("stabilizeThreadMessages", () => {
 
     const liveRun: LiveRunForIssue = {
       id: "run-live-retract",
+      runModel: null,
       status: "running",
       invocationSource: "manual",
       triggerDetail: null,

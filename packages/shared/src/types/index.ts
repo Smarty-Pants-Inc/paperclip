@@ -1033,6 +1033,7 @@ export type {
   HeartbeatRun,
   HeartbeatRunEvent,
   HeartbeatRunStatusPhase,
+  RunModel,
   ProviderTraceDebugRequest,
   ProviderTraceDirection,
   ProviderTraceDisposition,

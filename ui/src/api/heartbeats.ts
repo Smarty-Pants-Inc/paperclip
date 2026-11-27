@@ -4,6 +4,7 @@ import type { IssueRecoveryAction } from "@paperclipai/shared";
 import type {
   HeartbeatRun,
   HeartbeatRunEvent,
+  RunModel,
   WorkspaceOperation,
   ProviderTraceFrame,
   ProviderTraceMetadata,
@@ -21,6 +22,7 @@ export interface RunLivenessFields {
 
 export interface ActiveRunForIssue {
   execution?: HeartbeatRun["execution"];
+  runModel: RunModel | null;
   id: string;
   runtimeMode?: "legacy" | "native";
   wakeupRequestId?: string | null;
@@ -56,6 +58,7 @@ export interface ActiveRunForIssue {
 
 export interface LiveRunForIssue {
   execution?: HeartbeatRun["execution"];
+  runModel: RunModel | null;
   id: string;
   runtimeMode?: "legacy" | "native";
   wakeupRequestId?: string | null;

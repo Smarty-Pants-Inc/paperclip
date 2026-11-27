@@ -8,6 +8,12 @@ import type {
   WakeupRequestStatus,
 } from "../constants.js";
 
+/** A saved launch selection is not proof of the model answering this run. */
+export interface RunModel {
+  name: string;
+  source: "launch" | "provider";
+}
+
 export interface ProviderTraceDebugRequest {
   providerTrace: "raw";
 }

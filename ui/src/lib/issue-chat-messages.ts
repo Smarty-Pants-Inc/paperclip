@@ -1072,6 +1072,7 @@ function normalizeLiveRuns(
     deduped.set(activeRun.id, {
       id: activeRun.id,
       status: activeRun.status,
+      runModel: activeRun.runModel,
       invocationSource: activeRun.invocationSource,
       triggerDetail: activeRun.triggerDetail,
       contextCommentId: activeRun.contextCommentId,
