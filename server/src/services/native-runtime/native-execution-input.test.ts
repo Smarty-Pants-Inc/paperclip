@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1121,7 +1122,112 @@ describe("native serialized-command budget", () => {
     const large = shape(10, 690000);
     expect(commandEnvelopeBytes(buildNativeModelEnvelope(prepare(large, { boundCommandBytes: false }).input))).toBeGreaterThan(NATIVE_TURN_KNOWN_MAX_BYTES);
   });
-  it("preserves stock write and unknown receipts and counts only shortened READ results", () => {
+  // Pure rendering regression: the production refusal was dominated by the
+  // agent's own write responses, not removable messages or a large objective.
+  function writeHeavyShape(): ExecutionContinuationEnvelope {
+    const c = shape(32, 93000);
+    const operations = [
+      ...Array<string>(26).fill("POST /api/issues/{id}/comments"),
+      ...Array<string>(9).fill("POST /api/companies/{companyId}/skill-sources/{sourceId}/refresh"),
+      ...Array<string>(6).fill("PATCH /api/companies/{companyId}/skill-sources/{sourceId}/settings"),
+      ...Array<string>(7).fill("PATCH /api/companies/{companyId}/skill-sources/{sourceId}"),
+      ...Array<string>(8).fill("POST /api/companies/{companyId}/skills/{skillId}/install-update"),
+      ...Array<string>(8).fill("POST /api/issues/{id}/work-products"),
+    ];
+    c.completedActions = operations.map((operationId, i) => ({ runId: "old-run", receiptId: `write-${i}`, operationId,
+      result: { operationId, ok: true, status: 200, kind: "resource", target: `target-${i}`,
+        data: { id: `resource-${i}`, key: `key-${i}`, identifier: `RESOURCE-${i}`, number: i,
+          name: `Resource ${i}`, title: `Saved ${i}`, url: `https://example.test/resources/${i}`,
+          // Nine refresh responses total about 91 KB, with a 24 KB largest body.
+          body: "w".repeat(i === 26 ? 24000 : i >= 27 && i < 35 ? 8375 : 2600),
+          nested: { id: "not-the-resource", body: "not retained" } } } }));
+    return c;
+  }
+  it.each([false, true])("fits 64 production-shaped write receipts without omitting any message or resource identity (messages read: %s)", messagesRead => {
+    const c = writeHeavyShape(), before = JSON.stringify(c), description = "d".repeat(5000);
+    const extra = { issue: { ...args.issue, description }, taskPrompt: description,
+      continuationReadState: { lastRunAt: "2026-01-02T00:00:00Z", readCommentIds: messagesRead ? c.messages.map(message => message.id) : [] } };
+    const stock = buildNativeExecutionInput({ ...args, ...extra, wakePayload: { reason: c.trigger.reason, executionContinuation: c } });
+    const beforeBytes = commandEnvelopeBytes(buildNativeModelEnvelope(stock));
+    expect(c.completedActions).toHaveLength(64);
+    for (const receipt of c.completedActions!) expect(runnerApiOperation(receipt.operationId).method).toMatch(/^(POST|PATCH)$/);
+    const receiptBytes = Buffer.byteLength(JSON.stringify(c.completedActions));
+    expect(receiptBytes).toBeGreaterThan(250000);
+    expect(receiptBytes).toBeLessThan(280000);
+    expect(beforeBytes).toBeGreaterThan(NATIVE_TURN_KNOWN_MAX_BYTES);
+    const { input, retained } = prepare(c, extra);
+    const afterBytes = commandEnvelopeBytes(buildNativeModelEnvelope(input));
+    expect(afterBytes).toBeLessThanOrEqual(NATIVE_TURN_KNOWN_MAX_BYTES);
+    expect(retained.messages).toEqual(c.messages);
+    expect(retained.completedActions).toHaveLength(64);
+    expect(retained.coverage).toMatchObject({ omittedMessages: 0, omittedCompletedActions: 0 });
+    expect(JSON.stringify(c)).toBe(before);
+    for (const [i, receipt] of retained.completedActions!.entries()) {
+      const original = c.completedActions![i]!;
+      expect(receipt).toMatchObject({ runId: original.runId, receiptId: original.receiptId, operationId: original.operationId });
+      const result = receipt.result as Record<string, unknown>;
+      expect(result).toMatchObject({ operationId: original.operationId, ok: true, status: 200, kind: "resource", target: `target-${i}`,
+        data: { id: `resource-${i}`, key: `key-${i}`, identifier: `RESOURCE-${i}`, number: i,
+          name: `Resource ${i}`, title: `Saved ${i}`, url: `https://example.test/resources/${i}` } });
+      if (result.resultOmittedForSize) {
+        expect(result.resultSha256).toBe(`sha256:${createHash("sha256").update(JSON.stringify(original.result)).digest("hex")}`);
+        expect(result.note).toBe("Result omitted for size; the write is done. Re-read the target by id if needed.");
+        expect(result.data).not.toHaveProperty("body");
+        expect(result.data).not.toHaveProperty("nested");
+      }
+    }
+    console.info(JSON.stringify({ writeReceiptRegression: true, messagesRead, receipts: 64, receiptBytes, beforeBytes, afterBytes,
+      messages: retained.messages.length, coverage: retained.coverage }));
+  });
+  it("also shortens write receipts when a failed resume selects the full bootstrap", () => {
+    const c = writeHeavyShape(), description = "d".repeat(5000);
+    const wake = { reason: c.trigger.reason, executionContinuation: c };
+    const input = buildNativeExecutionInput({ ...args, issue: { ...args.issue, description }, taskPrompt: description, wakePayload: wake });
+    expect(commandEnvelopeBytes(buildNativeModelEnvelope(input))).toBeGreaterThan(NATIVE_TURN_KNOWN_MAX_BYTES);
+    const retained = budgetNativeFreshFallback(input, wake, { lastRunAt: "2026-01-02T00:00:00Z", readCommentIds: [] })!;
+    expect(commandEnvelopeBytes(buildNativeModelEnvelope(input))).toBeLessThanOrEqual(NATIVE_TURN_KNOWN_MAX_BYTES);
+    expect(retained.messages).toEqual(c.messages);
+    expect(retained.completedActions).toHaveLength(64);
+    expect(retained.coverage).toMatchObject({ omittedMessages: 0, omittedCompletedActions: 0, shortenedCompletedActions: expect.any(Number) });
+    expect(retained.completedActions!.some(receipt => (receipt.result as Record<string, unknown>).resultOmittedForSize === true)).toBe(true);
+  });
+  it("leaves under-bound write receipts and the complete input byte-identical", () => {
+    const c = writeHeavyShape();
+    c.completedActions = c.completedActions!.slice(0, 2);
+    const before = JSON.stringify(c);
+    const stock = buildNativeExecutionInput({ ...args, wakePayload: { reason: c.trigger.reason, executionContinuation: c } });
+    const { input, retained } = prepare(c);
+    expect(retained).toBe(c);
+    expect(JSON.stringify(retained)).toBe(before);
+    expect(JSON.stringify(input)).toBe(JSON.stringify(stock));
+  });
+  it("shortens reads before larger writes, without omitting read messages", () => {
+    const c = shape(3, 100, 1);
+    c.completedActions![0]!.result = { ok: true, data: "r".repeat(30000) };
+    c.completedActions!.push({ runId: "old-run", receiptId: "write", operationId: "POST /api/issues/{id}/comments",
+      result: { ok: true, data: { id: "saved", body: "w".repeat(315000) } } });
+    const { retained } = prepare(c);
+    expect(retained.messages).toEqual(c.messages);
+    expect(retained.completedActions![0]!.result).toMatchObject({ resultOmittedForSize: true });
+    expect(retained.completedActions![1]).toEqual(c.completedActions![1]);
+    expect(retained.coverage).toMatchObject({ shortenedCompletedActions: 1, omittedMessages: 0 });
+  });
+  it("shortens the largest write first and keeps top-level identity and failed status", () => {
+    const c = shape(3, 100);
+    c.completedActions = [
+      { runId: "old-run", receiptId: "small", operationId: "POST /api/issues/{id}/comments", result: { id: "small", body: "s".repeat(20000) } },
+      { runId: "old-run", receiptId: "large", operationId: "PATCH /api/companies/{companyId}/skill-sources/{sourceId}",
+        result: { ok: false, status: 409, id: "large", key: "source", identifier: "RESOURCE-0", number: 0,
+          name: "Source", title: "Saved source", url: "https://example.test/source", body: "l".repeat(330000) } },
+    ];
+    const { retained } = prepare(c);
+    expect(retained.messages).toEqual(c.messages);
+    expect(retained.completedActions![0]).toEqual(c.completedActions![0]);
+    expect(retained.completedActions![1]!.result).toMatchObject({ ok: false, status: 409, id: "large", key: "source",
+      identifier: "RESOURCE-0", number: 0, name: "Source", title: "Saved source", url: "https://example.test/source", resultOmittedForSize: true });
+    expect(retained.coverage).toMatchObject({ shortenedCompletedActions: 1, omittedMessages: 0, omittedCompletedActions: 0 });
+  });
+  it("preserves small write and unknown receipts and counts only shortened results", () => {
     const c = shape(30, 400000, 2);
     Object.assign(c.coverage, { omittedCompletedActions: 3 });
     c.completedActions!.push({ runId: "r", receiptId: "write", operationId: "POST /api/issues/{id}/comments", result: { id: "saved", contentOmitted: true } },

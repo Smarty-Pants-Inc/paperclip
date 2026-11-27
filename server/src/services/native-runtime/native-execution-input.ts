@@ -485,7 +485,7 @@ function buildNativeExecutionInputUnchecked(input: BuildNativeExecutionInput): N
     if (continuation?.version === 1) {
       const bounded = boundNativeExecutionContinuation(continuation, measure, input.continuationReadState, operationId => {
         try { return ["GET", "HEAD"].includes(runnerApiOperation(operationId).method); } catch { return false; }
-      }, refusalCause);
+      }, refusalCause, isNativeWriteOperation);
       // Never replace the saved baseline with a full-snapshot cut on a delta
       // turn: the next delta would resurrect history already in this session.
       if (!usesDelta && bounded !== continuation) input.onContinuationBudgeted?.(bounded);
@@ -496,6 +496,10 @@ function buildNativeExecutionInputUnchecked(input: BuildNativeExecutionInput): N
   return execution;
 }
 
+
+function isNativeWriteOperation(operationId: string): boolean {
+  try { return ["POST", "PUT", "PATCH", "DELETE"].includes(runnerApiOperation(operationId).method); } catch { return false; }
+}
 
 function protectedNativePromptCause(description: string, assignment: string, continuation?: ExecutionContinuationEnvelope, readState?: NativeContinuationReadState, interactionResponses?: NativeInteractionResponseEnvelope[], totalBytes = Number.POSITIVE_INFINITY, rendered = ""): NativePromptRefusalCause {
   const newest = continuation?.messages.findLast(message => message.authorType === "user" && !message.createdByRunId && !message.deleted);
@@ -589,7 +593,7 @@ export function budgetNativeFreshFallback(execution: NativeExecutionInput, wakeP
     if (value !== continuation) (value.coverage as NativeContinuationCoverage).nativeSessionId = execution.session.normalizedSessionId ?? undefined;
     execution.task.prompt = originalWake && value !== continuation ? originalPrompt.replace(originalWake, () => render(value)) : originalPrompt;
     return commandEnvelopeBytes(buildNativeModelEnvelope(execution)) + NATIVE_HANDOFF_CUT_NOTE_RESERVE_BYTES;
-  }, readState, operationId => { try { return ["GET", "HEAD"].includes(runnerApiOperation(operationId).method); } catch { return false; } }, cause);
+  }, readState, operationId => { try { return ["GET", "HEAD"].includes(runnerApiOperation(operationId).method); } catch { return false; } }, cause, isNativeWriteOperation);
   if ("completionSources" in execution) delete execution.completionSources;
   if ("continuationPrompt" in execution) execution.continuationPrompt = null;
   return bounded;

@@ -193,6 +193,7 @@ export function boundNativeExecutionContinuation(
   readState?: NativeContinuationReadState,
   isReadOperation: (operationId: string) => boolean = () => false,
   refusalCause?: NativePromptRefusalCause | (() => NativePromptRefusalCause),
+  isWriteOperation: (operationId: string) => boolean = () => false,
 ): ExecutionContinuationEnvelope {
   if (measure(original) <= NATIVE_TURN_KNOWN_MAX_BYTES) return original;
   const continuation = { ...original, messages: [...original.messages], completedActions: [...(original.completedActions ?? [])],
@@ -202,18 +203,30 @@ export function boundNativeExecutionContinuation(
   };
   const mark = () => { coverage.truncated = true; coverage.omittedMessages ??= 0;
     coverage.omittedCompletedActions ??= 0; coverage.shortenedCompletedActions ??= 0; };
-  // Caller uses runner-api-catalog's method/operation registry, not a verb guess.
-  // Everything else (including unknown operation IDs) retains its STOCK result.
-  for (let i = 0; i < continuation.completedActions.length; i++) {
-    const receipt = continuation.completedActions[i]!;
-    if (!isReadOperation(receipt.operationId)) continue;
+  // Callers classify through runner-api-catalog, not a verb guess. Reads go
+  // first, then writes, before any message omission. Unknown operations stay
+  // stock; receipts never disappear or move, even when the largest body goes first.
+  const receipts = continuation.completedActions.map((receipt, index) => ({ receipt, index,
+    serialized: JSON.stringify(receipt.result) ?? "null" }))
+    .map(value => ({ ...value, bytes: commandTextBytes(value.serialized) }))
+    .sort((a, b) => b.bytes - a.bytes);
+  const identityKeys = ["id", "key", "identifier", "number", "name", "title", "url"];
+  const pick = (value: Record<string, unknown>, keys: string[]) => Object.fromEntries(keys.filter(key => key in value).map(key => [key, value[key]]));
+  for (const write of [false, true]) for (const { receipt, index, serialized, bytes } of receipts) {
+    if (write ? isReadOperation(receipt.operationId) || !isWriteOperation(receipt.operationId) : !isReadOperation(receipt.operationId)) continue;
     const result = record(receipt.result);
     if (result.resultOmittedForSize === true) continue;
-    const shortened = { ...Object.fromEntries(["operationId", "ok", "status", "kind", "target"].filter(key => key in result).map(key => [key, result[key]])),
-      resultOmittedForSize: true, note: "Result omitted for size; re-read if needed.",
-      resultSha256: `sha256:${createHash("sha256").update(JSON.stringify(receipt.result) ?? "null").digest("hex")}` };
-    if (commandTextBytes(JSON.stringify(shortened)) >= commandTextBytes(JSON.stringify(receipt.result) ?? "null")) continue;
-    continuation.completedActions[i] = { ...receipt, result: shortened };
+    // REST responses wrap the resource in data; other tools return it directly.
+    // Keep only that resource's top-level identity, never nested response bodies.
+    const identity = write ? pick(record(result.data), identityKeys) : {};
+    const shortened = { ...pick(result, ["operationId", "ok", "status", "kind", "target", ...(write ? identityKeys : [])]),
+      ...(Object.keys(identity).length ? { data: identity } : {}),
+      resultOmittedForSize: true, note: write
+        ? "Result omitted for size; the write is done. Re-read the target by id if needed."
+        : "Result omitted for size; re-read if needed.",
+      resultSha256: `sha256:${createHash("sha256").update(serialized).digest("hex")}` };
+    if (commandTextBytes(JSON.stringify(shortened)) >= bytes) continue;
+    continuation.completedActions[index] = { ...receipt, result: shortened };
     mark(); coverage.shortenedCompletedActions! += 1;
     if (measure(continuation) <= NATIVE_TURN_KNOWN_MAX_BYTES) return continuation;
   }
