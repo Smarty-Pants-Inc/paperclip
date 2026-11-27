@@ -14,6 +14,7 @@ import { getServerAdapter, registerServerAdapter, unregisterServerAdapter, type 
 import { heartbeatService } from "../services/heartbeat.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { companySkillService } from "../services/company-skills.js";
+import * as companySkillsRuntime from "../services/company-skills.js";
 import * as sessionMetadata from "../services/heartbeat/workspaces.js";
 import { previousSessionMetadata } from "./helpers/previous-session-fingerprint.js";
 import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
@@ -30,6 +31,13 @@ if (!support.supported) console.warn(`Skipping session preparation tests: ${supp
 describePostgres("heartbeat session preparation through adapter dispatch", () => {
   const adapterType = "session_preparation_test";
   const captured = new Map<string, AdapterExecutionContext>();
+  // This custom adapter exercises session preparation, not legacy bundled-skill copying.
+  const createCompanySkills = companySkillsRuntime.companySkillService;
+  const skills = vi.spyOn(companySkillsRuntime, "companySkillService").mockImplementation((...args) => {
+    const service = createCompanySkills(...args);
+    return { ...service, withRuntimeSkillEntries: (companyId, options, callback) =>
+      service.withRuntimeSkillEntries(companyId, { ...options, includeLegacy: false }, callback) };
+  });
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
   let heartbeat: ReturnType<typeof heartbeatService>;
@@ -58,6 +66,7 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
   afterAll(async () => {
     await heartbeat?.drainActiveRunExecutions();
     unregisterServerAdapter(adapterType);
+    skills.mockRestore();
     await db?.$client.end({ timeout: 0 });
     await temporary?.cleanup();
   });

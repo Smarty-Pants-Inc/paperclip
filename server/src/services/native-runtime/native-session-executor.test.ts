@@ -16660,14 +16660,15 @@ describe("native warm session supervision", () => {
     { name: "rotated provider key", firstEnvironment: { OPENAI_API_KEY: "fixture-key" }, secondEnvironment: { OPENAI_API_KEY: "fixture-rotated-key" }, reuse: false },
     { name: "rotated Claude token", firstEnvironment: { CLAUDE_CODE_OAUTH_TOKEN: "fixture-token" }, secondEnvironment: { CLAUDE_CODE_OAUTH_TOKEN: "fixture-rotated-token" }, reuse: false },
     { name: "tool refresh", refreshTools: true, reuse: false },
+    { name: "tool refresh checkpoint changed", refreshTools: true, checkpointChanged: true, reuse: false },
     { name: "unsupported tool refresh", refreshTools: true, unsupportedRefresh: true, reuse: false },
     { name: "network access change", firstEnvironment: { PAPERCLIP_RUNNER_NETWORK_ACCESS: "disabled" }, secondEnvironment: { PAPERCLIP_RUNNER_NETWORK_ACCESS: "enabled" }, reuse: false },
     { name: "run-scoped environment broker", firstEnvironment: { PAPERCLIP_GITHUB_BROKER_TOKEN: "first-run-capability" }, secondEnvironment: { PAPERCLIP_GITHUB_BROKER_TOKEN: "second-run-capability" }, reuse: false },
     { name: "Core-hosted GitHub access", managedGitHub: true, reuse: true, adoptionReuse: false },
   ] as Array<{ name: string; firstEnvironment?: Record<string, string>; secondEnvironment?: Record<string, string>;
-    refreshTools?: boolean; unsupportedRefresh?: boolean; managedGitHub?: boolean; reuse: boolean; adoptionReuse?: boolean }>)(
+    refreshTools?: boolean; checkpointChanged?: boolean; unsupportedRefresh?: boolean; managedGitHub?: boolean; reuse: boolean; adoptionReuse?: boolean }>)(
     "decides warm and adopted process reuse from one key: $name",
-    async ({ name, firstEnvironment = {}, secondEnvironment = {}, refreshTools, unsupportedRefresh = false,
+    async ({ name, firstEnvironment = {}, secondEnvironment = {}, refreshTools, checkpointChanged = false, unsupportedRefresh = false,
       managedGitHub = false, reuse, adoptionReuse = reuse }) => {
       const decisions: Record<string, boolean> = {};
       for (const path of ["warm", "adoption", ...(refreshTools ? ["portable", "portable-bootstrap", "legacy-plugin"] as const : []),
@@ -16736,6 +16737,13 @@ describe("native warm session supervision", () => {
               expect(request.matchesExecution(changed)).toBe(false);
             }
             const checkpoint = request.loadCheckpoint(first);
+            if (releasedUnavailable && checkpointChanged) {
+              const directory = join(resolvePaperclipInstanceRoot(), "runtime/paperclip-runner/sessions");
+              const checkpointPath = join(directory, (await readdir(directory))[0]!);
+              const envelope = JSON.parse(await readFile(checkpointPath, "utf8"));
+              envelope.snapshot.cursor = "7";
+              await writeFile(checkpointPath, JSON.stringify(envelope));
+            }
             expect(checkpoint?.identity.runId).toBe(first.binding.runId);
             recoveredSession.snapshot.mockResolvedValue(checkpoint);
             return { identity: request.identity as Record<string, string>, checkpoint: checkpoint!,
@@ -16852,6 +16860,11 @@ describe("native warm session supervision", () => {
           }
           if (releasedUnavailable) {
             try {
+              if (checkpointChanged) {
+                await expect(continuation).rejects.toThrow("native_runner_checkpoint_missing_after_unavailable_reuse");
+                expect(state.execute).toHaveBeenCalledTimes(1);
+                continue;
+              }
               await continuation;
               delete decisions[path];
               expect(portableTarget.runnerTask.mock.calls.map(([operation]) => operation.kind)).toContain("describe");

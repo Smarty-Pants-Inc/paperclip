@@ -195,6 +195,7 @@ import {
 } from "node:fs";
 import { lstat, readFile, readdir, readlink, stat } from "node:fs/promises";
 import { hostname, tmpdir, userInfo } from "node:os";
+import { isDeepStrictEqual } from "node:util";
 import { DatabaseSync } from "node:sqlite";
 import { NATIVE_CHECKPOINT_HEADER_INSPECTION_MAX_BYTES, loadNativeRunnerCheckpoint, loadNativeRunnerCheckpointHeader, loadNativeUnclaimedBootstrapCheckpoint, nativeRunnerCheckpointPersistence, nativeRunnerCheckpointRemoteBootstrapEvidence, nativeRunnerNeverAuthenticated, nativeRunnerCheckpointRegistration, restoreNativeRunnerCheckpoint } from "./native-runner-checkpoint.js";
 import { REMOTE_CONTROLLER_LEASE_MS, REMOTE_RUNNER_RECONNECT_GRACE_MS, localRunnerProcessReconnectGraceMs } from "./native-runner-recovery-contract.js";
@@ -9015,6 +9016,7 @@ function loadWarmNativeCheckpoint(
   execution: NativeExecutionInput,
   configDigest: string,
   executionTargetKind: "local" | "remote" = "local",
+  admitted?: PersistedNativeSession,
 ): PersistedNativeSession | null {
   const scopedPath = nativeSessionCheckpointPath(execution);
   const path = [
@@ -9065,6 +9067,25 @@ function loadWarmNativeCheckpoint(
     envelope.configDigest !== legacyDigest
   ) {
     return null;
+  }
+  if (admitted) {
+    const source = envelope.snapshot;
+    // Match the runtime's checkpointCursor normalization before comparing progress.
+    const checkpointCursor = (cursor: PersistedNativeSession["cursor"]): number => {
+      if (cursor === undefined || cursor === null || cursor === "") return 0;
+      const parsed = Number(cursor);
+      return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0;
+    };
+    // Compare the admitted source before rebinding clears run-scoped authority.
+    if (
+      source.identity.runId !== admitted.identity.runId ||
+      source.driverKind !== admitted.driverKind ||
+      source.providerSessionId !== admitted.providerSessionId ||
+      !isDeepStrictEqual(source.providerIdentity, admitted.providerIdentity) ||
+      checkpointCursor(source.cursor) !== checkpointCursor(admitted.cursor) ||
+      source.activeTurnId !== admitted.activeTurnId ||
+      !isDeepStrictEqual(source.pendingRuntimeRequests, admitted.pendingRuntimeRequests)
+    ) return null;
   }
   const sameRunRecovery =
     persistedIdentity.runId === execution.binding.runId &&
@@ -13183,10 +13204,10 @@ async function executePaperclipNativeSessionAttempt(
       existingWarmSession = undefined;
       pluginTaskDescription = description;
       await finishStartupContextForFallback();
-      persistedWarmSession = loadWarmNativeCheckpoint(input.execution, warmConfigDigest, target.kind);
+      persistedWarmSession = loadWarmNativeCheckpoint(input.execution, warmConfigDigest, target.kind, releasedRecovery?.checkpoint);
       if (!persistedWarmSession && releasedRecovery) {
         const previousConfigDigest = nativeSessionConfigDigest(releasedRecovery.previousExecution, "remote");
-        persistedWarmSession = loadWarmNativeCheckpoint(input.execution, previousConfigDigest, "remote");
+        persistedWarmSession = loadWarmNativeCheckpoint(input.execution, previousConfigDigest, "remote", releasedRecovery.checkpoint);
       }
       if (!persistedWarmSession) throw new Error("native_runner_checkpoint_missing_after_unavailable_reuse");
       runnerdBackend = await createExecutionBackend();
