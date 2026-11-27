@@ -4,6 +4,7 @@ import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { parseObject } from "../../adapters/utils.js";
 import { queuedCommentIdsFromRunContext, queuedCommentIdsFromWakePayload, withQueuedCommentIdsInWakePayload } from "../issue-queued-comment-queue.js";
 import { resolveSessionContinuity } from "./continued-session.js";
+import { nativeReplyInstruction } from "./native-continuation.js";
 import { queuedInteractionId, unansweredResolvedInteractionIds } from "../queued-interaction-response.js";
 
 type Scope = { companyId: string; issueId: string; runId: string; agentId?: string };
@@ -174,6 +175,15 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
 }): Promise<{ received: Set<string>; owed: Set<string>; receipts: RetainedCommentReceipt[] } | null> {
   const runs = await db.select({ id: heartbeatRuns.id,
     checkpoint: sql<Record<string, unknown> | null>`${heartbeatRuns.runnerProfileJson}->'sessionCheckpoint'`,
+    // Read the submitted delta, not the unused full-bootstrap history. A saved
+    // receipt alone says nothing about what this successor asked the model.
+    continuationPrompt: sql<string | null>`${heartbeatRuns.runnerProfileJson} #>> '{nativeExecutionInput,continuationPrompt}'`,
+    hasResumeDelta: sql<boolean>`jsonb_typeof(${heartbeatRuns.contextSnapshot} #> '{executionContinuation,resumeDelta}') = 'object'`,
+    requestContext: sql<Record<string, unknown>>`jsonb_build_object(
+      'wakeCommentIds', ${heartbeatRuns.contextSnapshot}->'wakeCommentIds',
+      'wakeCommentId', ${heartbeatRuns.contextSnapshot}->'wakeCommentId',
+      'commentId', ${heartbeatRuns.contextSnapshot}->'commentId',
+      'firstTurnQueuedInput', ${heartbeatRuns.contextSnapshot}->'firstTurnQueuedInput')`,
     replyReceipts: sql<RetainedCommentReceipt[] | null>`${heartbeatRuns.contextSnapshot} #> '{executionContinuation,resumeDelta,receivedComments}'`,
     baseRunId: sql<string | null>`${heartbeatRuns.contextSnapshot} #>> '{executionContinuation,resumeDelta,baseRunId}'`,
     coverage: sql<Record<string, unknown> | null>`${heartbeatRuns.contextSnapshot} #> '{executionContinuation,coverage}'`,
@@ -238,6 +248,25 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
   // arbitrary output on the original carrier still does not answer it.
   const revisionKey = (id: unknown, revision: unknown) => JSON.stringify([id, revision]);
   const answeredRevisions = new Set<string>(), requestedRevisions = new Set<string>(), stoppedRevisions = new Set<string>();
+  const replyOwedRevisions = new Set<string>();
+  const submittedByRun = new Map(runs.map(run => {
+    const prompt = run.continuationPrompt;
+    let events: Record<string, unknown> | null = null;
+    if (typeof prompt === "string") {
+      try { events = parseObject(JSON.parse(prompt)); } catch { /* Plain prompt-only input. */ }
+    }
+    return [run.id, {
+      instructions: new Set(events
+        ? Array.isArray(events.replyInstructions) ? events.replyInstructions.filter((value): value is string => typeof value === "string") : []
+        : typeof prompt === "string" ? prompt.split("\n\n") : []),
+      messages: events && Array.isArray(events.messages) ? events.messages.map(parseObject) : [],
+    }];
+  }));
+  const instructionSent = (run: typeof runs[number], receipt: RetainedCommentReceipt) =>
+    submittedByRun.get(run.id)?.instructions.has(nativeReplyInstruction(receipt)) === true;
+  const textSent = (run: typeof runs[number], receipt: RetainedCommentReceipt) =>
+    submittedByRun.get(run.id)?.messages.some(message => message.id === receipt.id && message.updatedAt === receipt.updatedAt &&
+      typeof message.body === "string" && message.body.trim().length > 0) === true;
   const inputRevisions = (run: typeof runs[number], beforeSeq = Number.POSITIVE_INFINITY) => new Map<string, string>([
     ...(Array.isArray(run.coverage?.omitted) ? run.coverage.omitted.map(parseObject) : []),
     ...(run.replyReceipts ?? []), ...run.messages,
@@ -264,9 +293,21 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
     const revisionsInRun = inputRevisions(run);
     const stop = parseObject(run.result.personStop);
     if (Object.keys(stop).length) {
-      for (const message of run.messages) if (typeof stop.requestedAt !== "string" || Date.parse(message.updatedAt) <= Date.parse(stop.requestedAt))
-        stoppedRevisions.add(revisionKey(message.id, message.updatedAt));
-      for (const id of Array.isArray(stop.returned) ? stop.returned : []) {
+      // Stop withdraws the request, not every earlier comment in a first
+      // carrier's fallback envelope. With no cursor those earlier inputs are
+      // still owed; let the ordinary retention proof decide their coverage.
+      const requestIds = new Set([
+        ...queuedCommentIdsFromRunContext(run.requestContext),
+        ...[run.requestContext.wakeCommentId, run.requestContext.commentId].filter((id): id is string => typeof id === "string"),
+        ...(parseObject(run.requestContext.firstTurnQueuedInput).runId === run.id &&
+          Array.isArray(parseObject(run.requestContext.firstTurnQueuedInput).commentIds)
+          ? parseObject(run.requestContext.firstTurnQueuedInput).commentIds as string[] : []),
+        ...(Array.isArray(stop.returned) ? stop.returned : []),
+      ]);
+      // A delta is the legacy request fallback only when no explicit request
+      // identity survived. It must not widen a known Stop to other owed input.
+      if (!requestIds.size && run.hasResumeDelta) for (const message of run.messages) requestIds.add(message.id);
+      for (const id of requestIds) {
         // A returned startup input may not have a continuation snapshot. The
         // person's click cutoff qualifies that legacy revision, not a later edit.
         const revision = revisionsInRun.get(String(id)) ?? (typeof stop.requestedAt === "string" &&
@@ -288,7 +329,8 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
     }
     const start = eventsByRun.get(run.id)?.find(event => ["turn.accepted", "turn.started"].includes(event.eventType) && sameGeneration(run, event.seq));
     if (start) for (const receipt of run.replyReceipts ?? []) {
-      if (!receipt.answered && !receipt.stopped) requestedRevisions.add(revisionKey(receipt.id, receipt.updatedAt));
+      if (!receipt.answered && !receipt.stopped && instructionSent(run, receipt))
+        replyOwedRevisions.add(revisionKey(receipt.id, receipt.updatedAt));
     }
   }
   const compactedAfter = (after: typeof events[number]) => events.some(event => {
@@ -355,6 +397,16 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
         && (typeof afterTurn === "string" ? prp.turnId === afterTurn : after.eventType === "task_history.read")
         && (historicalRead ? sourceCheckpointCovers(run.checkpoint, run, event) : checkpointCovers(run, event));
     });
+  // A request that failed before any retained output is still retryable.
+  // Only actual submitted instructions can suppress another request; carrying
+  // receipt metadata on a bootstrap/child-results turn is not delivery.
+  for (const run of runs) {
+    const start = eventsByRun.get(run.id)?.find(event => ["turn.accepted", "turn.started"].includes(event.eventType) && sameGeneration(run, event.seq));
+    if (sameGeneration(run) && start && outputAfter(run, start)) for (const receipt of run.replyReceipts ?? []) {
+      if (!receipt.answered && !receipt.stopped && instructionSent(run, receipt))
+        requestedRevisions.add(revisionKey(receipt.id, receipt.updatedAt));
+    }
+  }
   for (const run of runs) {
     const runEvents = eventsByRun.get(run.id) ?? [];
     if (!sameGeneration(run) || !runEvents.some(event =>
@@ -368,13 +420,14 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
       }
     }
   }
-  const accept = (id: unknown, revision: unknown, event: typeof events[number], answered: boolean) => {
+  const accept = (id: unknown, revision: unknown, event: typeof events[number], answered: boolean, replyOwed = false) => {
     if (typeof id === "string" && typeof revision === "string" && revisions.get(id) === revision) {
       received.add(id); owed.delete(id);
       const prior = receipts.get(id);
       if (!answered && compactedAfter(event)) { received.delete(id); owed.add(id); return; }
       receipts.set(id, { id, updatedAt: revision, receivedAt: prior?.receivedAt ?? createdTimes.get(id) ?? event.timestamp.toISOString(),
         answered: answered || prior?.answered === true,
+        ...(replyOwed || prior?.replyOwed || replyOwedRevisions.has(revisionKey(id, revision)) ? { replyOwed: true } : {}),
         ...(requestedRevisions.has(revisionKey(id, revision)) ? { replyRequested: true } : {}) });
     }
   };
@@ -387,11 +440,13 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
       if (start && outputAfter(run, start)) {
         // A successor's full history is fallback data, not its delivered delta.
         for (const message of run.messages) accept(message.id, message.updatedAt, start, answeredRevisions.has(revisionKey(message.id, message.updatedAt)));
-        // A saved successor reply to a carried instruction owns precisely that
-        // receipt's revision, including providers without continuousReplies.
+        // A saved final reply owns only revisions this successor actually
+        // instructed. Child-results-only output cannot answer fallback receipts,
+        // including on providers that write no continuousReplies attribution.
         for (const receipt of run.replyReceipts ?? []) accept(receipt.id, receipt.updatedAt, start,
           receipt.answered || answeredRevisions.has(revisionKey(receipt.id, receipt.updatedAt)) ||
-          !receipt.replyRequested && !receipt.stopped && outputAfter(run, start, false, true));
+          !receipt.stopped && (instructionSent(run, receipt) || textSent(run, receipt)) && outputAfter(run, start, false, true),
+          receipt.replyOwed);
         const coverage = run.coverage;
         if (coverage?.nativeSessionId === scope.sessionId && coverage.providerSessionId === scope.providerSessionId && Array.isArray(coverage.omitted)) {
           for (const value of coverage.omitted) {
@@ -412,13 +467,13 @@ export async function retainedSessionCommentCoverage(db: Pick<Db, "select">, sco
             && checkpointCovers(run, event);
         });
         if (!acknowledged) continue;
-        if (typeof receipt.commentUpdatedAt === "string") accept(id, receipt.commentUpdatedAt, acknowledged, answeredRevisions.has(revisionKey(id, receipt.commentUpdatedAt)));
+        if (typeof receipt.commentUpdatedAt === "string") accept(id, receipt.commentUpdatedAt, acknowledged, answeredRevisions.has(revisionKey(id, receipt.commentUpdatedAt)), true);
         else {
           // Older ACKs stored no revision. Only the unchanged pre-queue
           // revision is provable; a later edit can never be hidden by its ACK.
           const wake = typeof receipt.queueId === "string" ? wakesById.get(receipt.queueId) : undefined;
           const revision = revisions.get(id);
-          if (wake && revision && Date.parse(revision) <= wake.createdAt.getTime()) accept(id, revision, acknowledged, answeredRevisions.has(revisionKey(id, revision)));
+          if (wake && revision && Date.parse(revision) <= wake.createdAt.getTime()) accept(id, revision, acknowledged, answeredRevisions.has(revisionKey(id, revision)), true);
         }
       }
     }

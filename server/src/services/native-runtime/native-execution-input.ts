@@ -324,7 +324,10 @@ function buildNativeExecutionInputUnchecked(input: BuildNativeExecutionInput): N
         message.id === id && message.updatedAt === receipt.updatedAt)));
     // The constructor and heartbeat share the same proof; a page must never
     // infer a benign cancellation from the absence of text or a status badge.
-    if (answeredCommentIds.length === namedCommentIds.length) {
+    // Only comment wakes settle quietly today (all-named-answered,
+    // own-reply-only, or empty_system_wake). Automatic work intent must keep a
+    // turn even when a future delta projector returns these same empty bytes.
+    if (wake?.reason === "issue_commented" && answeredCommentIds.length === namedCommentIds.length) {
       throw new StaleExecutionContinuationError("continuation_nothing_new", {
         schema: CONTINUATION_NOTHING_NEW_SCHEMA, namedCommentIds, answeredCommentIds,
         cause: namedCommentIds.length > 0 ? "all_named_answered" :

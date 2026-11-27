@@ -53,7 +53,10 @@ export interface ExecutionContinuationEnvelope {
      * An ACK without later committed output still needs a reply turn. */
     receivedComments?: Array<{
       id: string; updatedAt: string; receivedAt: string; answered: boolean;
-      /** A prior accepted turn already carried this revision's reply request. */
+      /** An ACK'd steer or actual reply request, not merely carried history. */
+      replyOwed?: boolean;
+      /** An accepted turn actually sent the instruction and retained output.
+       * Acceptance without output leaves the reply request retryable. */
       replyRequested?: boolean;
       /** A person's Stop retired this revision; it is not an answer. */
       stopped?: boolean;

@@ -3,6 +3,17 @@ import type { CaseExecutionContext, projectCaseContinuation } from "../case-cont
 import { caseInstructionAlreadyRepresented } from "../case-context.js";
 import { nativeStatusRetryPrompt } from "./continued-session.js";
 
+/** Independent work intent: an empty delta must still produce a model turn.
+ * Shared with the next consumer that widens automatic delta routing. */
+export const NATIVE_AUTOMATIC_CONTINUATION_REASONS: readonly string[] = [
+  "issue_continuation_needed", "issue_status_changed", "issue_assigned", "issue_blockers_resolved",
+  "retry_failed_run", "heartbeat_timer", "issue_monitor_due",
+];
+
+export function nativeReplyInstruction(receipt: { id: string; receivedAt: string }): string {
+  return `Reply to the comment you received at ${receipt.receivedAt} (id ${receipt.id}).`;
+}
+
 /** Only new, authorized events belong in an already retained provider conversation.
  * Full bootstrap input is kept separately for an actual provider resume failure.
  */
@@ -42,11 +53,13 @@ export function buildNativeContinuationPrompt(input: {
   const namedCommentIds = [...new Set([...(wake?.commentIds ?? []),
     ...(delta?.messages.filter(message => message.authorType === "user").map(message => message.id) ?? []),
   ])].filter(id => !stopped.has(id));
-  // System wakes cannot revive an old instruction-only turn. A newly named
-  // person input can request the first reply, once per exact revision.
+  // Merely carrying full history does not request replies to that history.
+  // A new person wake may also pick up an ACK'd steer or a failed reply request;
+  // a system wake cannot manufacture an instruction-only turn for either.
   const replyInstructions = namedCommentIds.length ? [...receipts.values()]
-    .filter(receipt => !receipt.answered && !receipt.stopped && !receipt.replyRequested)
-    .map(receipt => `Reply to the comment you received at ${receipt.receivedAt} (id ${receipt.id}).`) : [];
+    .filter(receipt => !receipt.answered && !receipt.stopped && !receipt.replyRequested &&
+      (namedCommentIds.includes(receipt.id) || receipt.replyOwed))
+    .map(nativeReplyInstruction) : [];
   const unseenNamed = namedCommentIds.filter(id => !receipts.has(id));
   const messages = (delta?.messages ?? []).filter(message => !receipts.has(message.id) &&
     !(message.authorType === "agent" && message.authorId === input.agentId) && !message.freshSessionMarker);

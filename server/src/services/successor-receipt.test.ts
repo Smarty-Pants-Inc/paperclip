@@ -10,6 +10,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
 import { buildNativeExecutionInput } from "./native-runtime/native-execution-input.js";
 import * as continuedSession from "./native-runtime/continued-session.js";
+import * as nativeContinuation from "./native-runtime/native-continuation.js";
 import { nativeRuntimeContextFixture } from "./native-runtime/runtime-context.test-fixture.js";
 import { buildNativeModelEnvelope } from "../vendor/paperclip-runner/index.js";
 import { withQueuedCommentIdsInWakePayload } from "./issue-queued-comment-queue.js";
@@ -39,7 +40,7 @@ describe.skipIf(!support.supported)("retained successor receipt rule", () => {
     sourceEventId: `session-${seq}`, eventType: "session.started", payload: { prpEvent: { normalizedSessionId: s.sessionId, payload: { providerSessionId: provider } } } });
   const event = (s: S, seq: number, eventType: string, payload: Record<string, unknown> = {}, turnId = "turn-1") => ({ companyId, agentId, runId: s.runId,
     seq, sourceSeq: seq + 1, sourceEventId: `event-${seq}`, eventType, payload: { prpEvent: { normalizedSessionId: s.sessionId, turnId, payload } } });
-  const checkpoint = (s: S, cursor = "99") => ({ sessionCheckpoint: { sessionId: s.sessionId, identity: { runId: s.runId, companyId, agentId, issueId: s.taskId, sessionId: s.sessionId }, providerSessionId: s.provider, cursor } });
+  const checkpoint = (s: S, cursor: string | null = "99") => ({ sessionCheckpoint: { sessionId: s.sessionId, identity: { runId: s.runId, companyId, agentId, issueId: s.taskId, sessionId: s.sessionId }, providerSessionId: s.provider, cursor } });
   const first = (s: S) => buildExecutionContinuation({ db, companyId, issueId: s.taskId, agentId, context: { commentId: s.originId }, summary: null, exposeLowTrustRaw: false });
   const next = (s: S, id = s.commentId) => buildExecutionContinuation({ db, companyId, issueId: s.taskId, agentId, runId: randomUUID(), previousContextRunId: s.runId,
     nativeSessionId: s.sessionId, nativeProviderSessionId: s.provider, context: { commentId: id, commentIds: [id], wakeReason: "issue_commented" }, summary: null, exposeLowTrustRaw: false });
@@ -51,7 +52,7 @@ describe.skipIf(!support.supported)("retained successor receipt rule", () => {
         workspace: { id: "workspace", cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null }, runtimeContext: nativeRuntimeContextFixture(),
         completionContract: { id: "contract", sha256: "a".repeat(64), schemaVersion: "paperclip.run-result.v1", contract: { revision: "1", objective: "Continue", criteria: [{ id: "output", requirement: "Continue" }] } } });
       const envelope = buildNativeModelEnvelope(execution, { resumedSession: true });
-      return { events: "events" in envelope ? String(envelope.events) : JSON.stringify(envelope), noop: null };
+      return { events: "events" in envelope ? String(envelope.events) : JSON.stringify(envelope), noop: null, continuationPrompt: execution.continuationPrompt };
     } catch (error) {
       if (!(error instanceof StaleExecutionContinuationError)) throw error;
       return { events: null, noop: error.continuationNothingNew, code: error.code };
@@ -307,7 +308,7 @@ describe.skipIf(!support.supported)("retained successor receipt rule", () => {
   it.each([true, false])("does not revive a person's stopped input (returned ledger: %s)", async returned => {
     const s = await setup();
     await db.insert(heartbeatRuns).values({ id: s.runId, companyId, agentId, runtimeMode: "native", nativeIssueId: s.taskId, nativeSessionId: s.sessionId, status: "cancelled",
-      contextSnapshot: { issueId: s.taskId, executionContinuation: await first(s) }, runnerProfileJson: checkpoint(s),
+      contextSnapshot: { issueId: s.taskId, wakeCommentIds: [s.originId], executionContinuation: await first(s) }, runnerProfileJson: checkpoint(s),
       resultJson: { personStop: { requestedAt: t1.toISOString(), ...(returned ? { returned: [s.originId] } : {}) } } });
     await db.insert(heartbeatRunEvents).values([session(s, 0), event(s, 1, "turn.accepted"), event(s, 2, "item.completed", { kind: "agentMessage", text: "Work before Stop, no answer" })]);
     await db.insert(issueComments).values({ id: s.commentId, companyId, issueId: s.taskId, ...user, body: "No, do this instead.", createdAt: t1, updatedAt: t1 });
@@ -318,6 +319,60 @@ describe.skipIf(!support.supported)("retained successor receipt rule", () => {
       else expect(JSON.parse(result.events!).messages.map((m: { id: string }) => m.id)).toEqual([s.commentId]);
       expect(result.events).not.toContain(s.originId); expect(result.events).not.toContain("STOPPED_ORIGINAL_REQUEST");
       console.log("STOP_NO_REVIVAL_ROW", JSON.stringify({ returned, road, delta: snapshot.resumeDelta, result }));
+    }
+  });
+  it.each(["never accepted", "accepted without output", "saved output"])("Stop on the first carrier retires only its request: %s", async mode => {
+    const s = await setup(), earlierId = randomUUID(), requestId = randomUUID();
+    await db.insert(issueComments).values([
+      { id: earlierId, companyId, issueId: s.taskId, ...user, body: "EARLIER_NEVER_HELD", createdAt: new Date(t0.getTime() + 1000), updatedAt: new Date(t0.getTime() + 1000) },
+      { id: requestId, companyId, issueId: s.taskId, ...user, body: "WITHDRAWN_REQUEST", createdAt: new Date(t0.getTime() + 2000), updatedAt: new Date(t0.getTime() + 2000) },
+    ]);
+    const initial = await buildExecutionContinuation({ db, companyId, issueId: s.taskId, agentId,
+      context: { commentId: requestId }, summary: null, exposeLowTrustRaw: false });
+    await db.insert(heartbeatRuns).values({ id: s.runId, companyId, agentId, runtimeMode: "native", nativeIssueId: s.taskId, nativeSessionId: s.sessionId, status: "cancelled",
+      contextSnapshot: { issueId: s.taskId, wakeCommentId: requestId, wakeCommentIds: [requestId], executionContinuation: initial },
+      runnerProfileJson: mode === "never accepted" ? checkpoint(s, null) : checkpoint(s),
+      resultJson: { personStop: { requestedAt: t1.toISOString() } } });
+    await db.insert(heartbeatRunEvents).values([session(s, 0),
+      ...(mode === "never accepted" ? [] : [event(s, 1, "turn.accepted")]),
+      ...(mode === "saved output" ? [event(s, 2, "item.completed", { kind: "agentMessage", text: "Saved work before Stop" })] : [])]);
+    await db.insert(issueComments).values({ id: s.commentId, companyId, issueId: s.taskId, ...user, body: "No, do this instead.", createdAt: t1, updatedAt: t1 });
+    const snapshot = await next(s);
+    const ids = snapshot.resumeDelta?.messages.map(m => m.id);
+    expect(ids).toEqual(mode === "saved output" ? [s.commentId] : [s.originId, earlierId, s.commentId]);
+    expect(snapshot.resumeDelta?.receivedComments?.filter(r => r.stopped).map(r => r.id)).toEqual([requestId]);
+    for (const road of ["plain", "JSON"] as const) {
+      const result = turn(s, { reason: "issue_commented", commentIds: [s.commentId], executionContinuation: snapshot }, road);
+      expect(result.events).not.toContain("WITHDRAWN_REQUEST");
+      expect(result.events).toContain("No, do this instead.");
+      if (mode !== "saved output") {
+        expect(result.events).toContain("EARLIER_NEVER_HELD");
+        expect(result.events).toContain("STOPPED_ORIGINAL_REQUEST");
+      }
+      expect(result.events).not.toContain("Reply to the comment you received at");
+      console.log("FIRST_STOP_ROW", JSON.stringify({ mode, road, runId: s.runId, requestId, earlierId, delta: snapshot.resumeDelta, result }));
+    }
+  });
+  it("does not widen a named Stop to other still-owed delta messages", async () => {
+    const s = await setup(), correctionId = randomUUID();
+    await db.insert(issueComments).values({ id: s.commentId, companyId, issueId: s.taskId, ...user, body: "WITHDRAWN_DELTA_REQUEST", createdAt: t1, updatedAt: t1 });
+    const initial = await first(s);
+    initial.resumeDelta = { baseRunId: randomUUID(), messages: initial.messages };
+    await db.insert(heartbeatRuns).values({ id: s.runId, companyId, agentId, runtimeMode: "native", nativeIssueId: s.taskId, nativeSessionId: s.sessionId, status: "cancelled",
+      contextSnapshot: { issueId: s.taskId, wakeCommentIds: [s.commentId], executionContinuation: initial,
+        firstTurnQueuedInput: { schema: "paperclip.first-turn-queued-input.v1", runId: randomUUID(), wakeupRequestIds: [], commentIds: [s.originId], claimedAt: t0.toISOString() } },
+      runnerProfileJson: checkpoint(s, null),
+      resultJson: { personStop: { requestedAt: new Date(t1.getTime() + 1000).toISOString() } } });
+    await db.insert(heartbeatRunEvents).values(session(s, 0));
+    await db.insert(issueComments).values({ id: correctionId, companyId, issueId: s.taskId, ...user, body: "CORRECTION_AFTER_DELTA_STOP", createdAt: new Date(t1.getTime() + 2000), updatedAt: new Date(t1.getTime() + 2000) });
+    const snapshot = await next(s, correctionId);
+    expect(snapshot.resumeDelta?.messages.map(m => m.id)).toEqual([s.originId, correctionId]);
+    expect(snapshot.resumeDelta?.receivedComments?.filter(r => r.stopped).map(r => r.id)).toEqual([s.commentId]);
+    for (const road of ["plain", "JSON"] as const) {
+      const result = turn(s, { reason: "issue_commented", commentIds: [correctionId], executionContinuation: snapshot }, road);
+      expect(result.events).toContain("STOPPED_ORIGINAL_REQUEST"); expect(result.events).toContain("CORRECTION_AFTER_DELTA_STOP");
+      expect(result.events).not.toContain("WITHDRAWN_DELTA_REQUEST");
+      console.log("DELTA_STOP_ROW", JSON.stringify({ road, runId: s.runId, delta: snapshot.resumeDelta, result }));
     }
   });
   it.each(["no output", "output after checkpoint", "tool only"])("carries inherited receipts through a selected checkpoint chain: %s", async mode => {
@@ -342,13 +397,90 @@ describe.skipIf(!support.supported)("retained successor receipt rule", () => {
       console.log("CHECKPOINT_CHAIN_ROW", JSON.stringify({ mode, road, source: s.runId, selected: selected.runId, delta: snapshot.resumeDelta, result }));
     }
   });
+  it.each([true, false])("only requests a reply to new input after a full-history carrier (attributed: %s)", async attributed => {
+    const s = await setup();
+    const historyIds = Array.from({ length: 5 }, () => randomUUID());
+    await db.insert(issueComments).values(historyIds.map((id, i) => ({ id, companyId, issueId: s.taskId, ...user,
+      body: `OLD_HISTORY_${i}`, createdAt: new Date(t0.getTime() + (i + 1) * 1000), updatedAt: new Date(t0.getTime() + (i + 1) * 1000) })));
+    await db.insert(heartbeatRuns).values({ id: s.runId, companyId, agentId, runtimeMode: "native", nativeIssueId: s.taskId, nativeSessionId: s.sessionId, status: "succeeded",
+      contextSnapshot: { issueId: s.taskId, wakeCommentIds: [s.originId], executionContinuation: await first(s) }, runnerProfileJson: checkpoint(s),
+      resultJson: attributed ? { continuousReplies: { first: { questionCommentIds: [s.originId] } } } : {} });
+    await db.insert(heartbeatRunEvents).values([session(s, 0), event(s, 1, "turn.accepted"), event(s, 2, "item.completed", { kind: "agentMessage", channel: "final", text: "First reply" })]);
+    await db.insert(issueComments).values({ id: s.commentId, companyId, issueId: s.taskId, ...user, body: "Thanks, one more thing.", createdAt: t1, updatedAt: t1 });
+    const snapshot = await next(s);
+    expect(snapshot.resumeDelta?.messages.map(m => m.id)).toEqual([s.commentId]);
+    for (const road of ["plain", "JSON"] as const) {
+      const result = turn(s, { reason: "issue_commented", commentIds: [s.commentId], executionContinuation: snapshot }, road);
+      expect(result.events).toContain("Thanks, one more thing.");
+      expect(result.events).not.toContain("Reply to the comment you received at");
+      for (const id of historyIds) expect(result.events).not.toContain(id);
+      console.log("NEW_AFTER_HISTORY_ROW", JSON.stringify({ attributed, road, delta: snapshot.resumeDelta, result }));
+    }
+  });
+  it.each(["plain", "JSON"] as const)("keeps a reply owed after an accepted request fails before output on %s", async road => {
+    const { s, snapshot: envelope } = await acknowledgedSteer("failed", "progress");
+    const initial = turn(s, { reason: "issue_commented", commentIds: [s.commentId], executionContinuation: envelope }, road);
+    expect(initial.events).toContain(`(id ${s.commentId})`);
+    const selected = { ...s, runId: randomUUID() };
+    await db.insert(heartbeatRuns).values({ id: selected.runId, companyId, agentId, runtimeMode: "native", nativeIssueId: s.taskId, nativeSessionId: s.sessionId, status: "failed",
+      contextSnapshot: { issueId: s.taskId, executionContinuation: envelope },
+      runnerProfileJson: { ...checkpoint(selected), nativeExecutionInput: { continuationPrompt: initial.continuationPrompt } } });
+    await db.insert(heartbeatRunEvents).values([session(selected, 10), event(selected, 11, "turn.accepted", {}, "turn-2")]);
+    const snapshot = await next(selected, s.commentId);
+    const receipt = snapshot.resumeDelta?.receivedComments?.find(r => r.id === s.commentId);
+    expect(receipt?.answered).toBe(false); expect(receipt?.replyRequested).not.toBe(true);
+    const result = turn(selected, { reason: "issue_commented", commentIds: [s.commentId], executionContinuation: snapshot }, road);
+    expect(result.events?.match(/Reply to the comment you received at/g)).toHaveLength(1);
+    expect(result.events).toContain(`(id ${s.commentId})`);
+    console.log("RETRY_REPLY_ROW", JSON.stringify({ road, receipt, initial, result }));
+  });
+  it.each(["plain", "JSON"] as const)("child-results-only output never answers an uninstructed person revision on %s", async road => {
+    const { s, snapshot: envelope } = await acknowledgedSteer("failed", "progress");
+    const child = turn(s, { reason: "issue_children_completed", commentIds: [], childIssueSummaries: [{ id: "child", status: "done", summary: "Child build passed" }], executionContinuation: envelope }, road);
+    expect(JSON.parse(child.continuationPrompt!)).toMatchObject({ messages: [], childResults: [{ id: "child", summary: "Child build passed" }] });
+    expect(child.continuationPrompt).not.toContain("PERSON_STEER_OWED");
+    expect(child.continuationPrompt).not.toContain("replyInstructions");
+    const selected = { ...s, runId: randomUUID() };
+    await db.insert(heartbeatRuns).values({ id: selected.runId, companyId, agentId, runtimeMode: "native", nativeIssueId: s.taskId, nativeSessionId: s.sessionId, status: "succeeded",
+      contextSnapshot: { issueId: s.taskId, executionContinuation: envelope },
+      runnerProfileJson: { ...checkpoint(selected), nativeExecutionInput: { continuationPrompt: child.continuationPrompt } }, resultJson: {} });
+    await db.insert(heartbeatRunEvents).values([session(selected, 10), event(selected, 11, "turn.accepted", {}, "turn-2"),
+      event(selected, 12, "item.completed", { kind: "agentMessage", channel: "final", text: "Child build passed; unrelated to the person's question." }, "turn-2")]);
+    const snapshot = await next(selected, s.commentId);
+    const receipt = snapshot.resumeDelta?.receivedComments?.find(r => r.id === s.commentId);
+    const result = turn(selected, { reason: "issue_commented", commentIds: [s.commentId], executionContinuation: snapshot }, road);
+    console.log("CHILD_FALSE_ANSWER_ROW", JSON.stringify({ road, sourceRun: s.runId, selectedRun: selected.runId, child, receipt, result }));
+    expect(receipt?.answered).toBe(false); expect(receipt?.replyRequested).not.toBe(true);
+    expect(result.code).toBeUndefined();
+    expect(result.events?.match(/Reply to the comment you received at/g)).toHaveLength(1);
+    expect(result.events).toContain(`(id ${s.commentId})`);
+  });
+  it.each(["plain", "JSON"] as const)("a bootstrap carrier does not claim it sent a reply instruction on %s", async road => {
+    const { s, snapshot: envelope } = await acknowledgedSteer("failed", "progress");
+    const bootstrap = turn(s, { reason: "heartbeat_timer", commentIds: [], executionContinuation: envelope }, road);
+    expect(bootstrap.continuationPrompt).toBeNull();
+    expect(bootstrap.events).not.toContain("Reply to the comment you received at");
+    const selected = { ...s, runId: randomUUID() };
+    await db.insert(heartbeatRuns).values({ id: selected.runId, companyId, agentId, runtimeMode: "native", nativeIssueId: s.taskId, nativeSessionId: s.sessionId, status: "failed",
+      contextSnapshot: { issueId: s.taskId, executionContinuation: envelope },
+      runnerProfileJson: { ...checkpoint(selected), nativeExecutionInput: { continuationPrompt: bootstrap.continuationPrompt } } });
+    await db.insert(heartbeatRunEvents).values([session(selected, 10), event(selected, 11, "turn.accepted", {}, "turn-2"),
+      event(selected, 12, "item.completed", { kind: "agentMessage", channel: "final", text: "Unrelated bootstrap output" }, "turn-2")]);
+    const snapshot = await next(selected, s.commentId);
+    const receipt = snapshot.resumeDelta?.receivedComments?.find(r => r.id === s.commentId);
+    expect(receipt?.answered).toBe(false); expect(receipt?.replyRequested).not.toBe(true);
+    const result = turn(selected, { reason: "issue_commented", commentIds: [s.commentId], executionContinuation: snapshot }, road);
+    expect(result.events?.match(/Reply to the comment you received at/g)).toHaveLength(1);
+    console.log("BOOTSTRAP_REPLY_ROW", JSON.stringify({ road, receipt, bootstrap, result }));
+  });
   it.each(["reply", "no output", "progress only"])("sends a reply instruction once and clears a carried instruction after %s", async mode => {
     const { s, snapshot: envelope } = await acknowledgedSteer("failed", "progress");
     const initial = turn(s, { reason: "issue_commented", commentIds: [s.commentId], executionContinuation: envelope }, "plain");
     expect(initial.events).toContain(`(id ${s.commentId})`);
     const selected = { ...s, runId: randomUUID() };
     await db.insert(heartbeatRuns).values({ id: selected.runId, companyId, agentId, runtimeMode: "native", nativeIssueId: s.taskId, nativeSessionId: s.sessionId, status: mode === "reply" ? "succeeded" : "failed",
-      contextSnapshot: { issueId: s.taskId, executionContinuation: envelope }, runnerProfileJson: checkpoint(selected), resultJson: {} });
+      contextSnapshot: { issueId: s.taskId, executionContinuation: envelope },
+      runnerProfileJson: { ...checkpoint(selected), nativeExecutionInput: { continuationPrompt: initial.continuationPrompt } }, resultJson: {} });
     await db.insert(heartbeatRunEvents).values([session(selected, 10), event(selected, 11, "turn.accepted", {}, "turn-2"),
       ...(mode === "no output" ? [] : [event(selected, 12, "item.completed", { kind: "agentMessage", channel: mode === "reply" ? "final" : "commentary", text: mode === "reply" ? "Replied to the carried reference" : "Unrelated progress only" }, "turn-2")])]);
     const snapshot = await next(selected, s.commentId);
@@ -371,7 +503,11 @@ describe.skipIf(!support.supported)("retained successor receipt rule", () => {
     const later = await next(selected, newId);
     for (const road of ["plain", "JSON"] as const) {
       const result = turn(selected, { reason: "issue_commented", commentIds: [newId], executionContinuation: later }, road);
-      expect(result.events).toContain("ONLY_NEW_PERSON_TEXT"); expect(result.events).not.toContain(`(id ${s.commentId})`);
+      expect(result.events).toContain("ONLY_NEW_PERSON_TEXT");
+      if (mode === "no output") {
+        expect(result.events).toContain(`(id ${s.commentId})`);
+        expect(result.events?.match(/Reply to the comment you received at/g)).toHaveLength(1);
+      } else expect(result.events).not.toContain(`(id ${s.commentId})`);
     }
   });
   it("keeps pass-4 delivered-input behavior for an actual null-provider-id serializer", async () => {
@@ -401,6 +537,24 @@ describe.skipIf(!support.supported)("retained successor receipt rule", () => {
     const s = await setup(), snapshot = await first(s);
     snapshot.resumeDelta = { baseRunId: s.runId, messages: [] };
     for (const road of ["plain", "JSON"] as const) expect(turn(s, { reason: "issue_commented", commentIds: [s.originId], executionContinuation: snapshot }, road).events).toContain("STOPPED_ORIGINAL_REQUEST");
+  });
+  it.each(["issue_continuation_needed", "issue_status_changed", "issue_assigned", "issue_blockers_resolved", "retry_failed_run", "heartbeat_timer", "issue_monitor_due"])("never settles automatic work as an empty wake: %s", async reason => {
+    const s = await setup(), snapshot = await first(s);
+    snapshot.resumeDelta = { baseRunId: s.runId, messages: [] };
+    for (const road of ["plain", "JSON"] as const) {
+      const wake = { reason, commentIds: [], executionContinuation: snapshot };
+      const current = turn(s, wake, road);
+      expect(current.code).toBeUndefined(); expect(current.events).not.toBeNull();
+      // The next delta-road consumer can return empty text for these reasons.
+      // Exercise that constructor boundary now, without widening routing here.
+      const projection = vi.spyOn(nativeContinuation, "buildNativeContinuationPrompt").mockReturnValueOnce(road === "plain" ? "" : '{"messages":[]}');
+      const selection = vi.spyOn(continuedSession, "decideNativeContinuation").mockReturnValueOnce({ continue: true, promptOnly: road === "plain" });
+      let projected: ReturnType<typeof turn>;
+      try { projected = turn(s, wake, road); } finally { projection.mockRestore(); selection.mockRestore(); }
+      expect(projected.code).toBeUndefined(); expect(projected.events).not.toBeNull();
+      expect(projected.events!.length).toBeGreaterThan(0);
+      console.log("AUTOMATIC_EMPTY_ROW", JSON.stringify({ reason, road, current, projected }));
+    }
   });
   it("settles own-reply-only and empty system wakes, but exempts child completion without summaries", async () => {
     const s = await setup(), snapshot = await first(s);
