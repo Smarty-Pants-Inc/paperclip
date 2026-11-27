@@ -31,6 +31,17 @@ import type { VerifiedIdleCapabilities } from "../services/idle-incoming-wake-ca
 import { claimDueTimerHeartbeatForAgent } from "../services/heartbeat/queue.js";
 import { createHeartbeatTimerPolicy } from "../services/heartbeat/timer-policy.js";
 import { pluginJobStore } from "../services/plugin-job-store.js";
+// The trace owner's deadline exists only under an expiring retention policy;
+// the default (0) keeps every trace and schedules no trace deadline.
+const originalRetention = vi.hoisted(() => {
+  const original = process.env.PAPERCLIP_PROVIDER_TRACE_RETENTION_MS;
+  process.env.PAPERCLIP_PROVIDER_TRACE_RETENTION_MS = "86400000";
+  return original;
+});
+afterAll(() => {
+  if (originalRetention === undefined) delete process.env.PAPERCLIP_PROVIDER_TRACE_RETENTION_MS;
+  else process.env.PAPERCLIP_PROVIDER_TRACE_RETENTION_MS = originalRetention;
+});
 
 const external = resolveExternalTestDatabaseUrl("PAPERCLIP_IDLE_DEADLINE_TEST_DATABASE_URL");
 const support = external ? { supported: true } : await getEmbeddedPostgresTestSupport();
