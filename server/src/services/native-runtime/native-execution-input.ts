@@ -2,7 +2,7 @@ import type { PaperclipTurnContext } from "@paperclipai/adapter-utils/server-uti
 import { resolvePaperclipRunnerCursorMode, resolvePaperclipRunnerPiThinkingLevel } from "@paperclipai/adapter-utils";
 import { createHash } from "node:crypto";
 import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
-import { boundNativeExecutionContinuation, commandEnvelopeBytes, nativePromptRefusalRemedies, NATIVE_HANDOFF_CUT_NOTE_RESERVE_BYTES, NATIVE_TURN_KNOWN_MAX_BYTES, NativeTurnPromptExceedsCommandBoundError, type NativeContinuationReadState, type NativeContinuationCoverage, type NativePromptRefusalCause } from "./native-turn-budget.js";
+import { boundNativeExecutionContinuation, commandEnvelopeBytes, nativeInputRevision, nativePromptRefusalRemedies, NATIVE_HANDOFF_CUT_NOTE_RESERVE_BYTES, NATIVE_TURN_KNOWN_MAX_BYTES, NativeTurnPromptExceedsCommandBoundError, type NativeContinuationReadState, type NativeContinuationCoverage, type NativePromptRefusalCause, type NativeInputRevision } from "./native-turn-budget.js";
 import { runnerApiOperation } from "./runner-api-catalog.js";
 import { buildNativeContinuationPrompt } from "./native-continuation.js";
 import { decideNativeContinuation, resolveSessionContinuity } from "./continued-session.js";
@@ -76,6 +76,8 @@ export interface BuildNativeExecutionInput {
   wakePayload?: unknown;
   /** Only paperclip_runner opts into its journal-byte admission contract. */
   boundCommandBytes?: boolean;
+  /** Canonical source identity, before review/other provider prompt projection. */
+  inputRevision?: NativeInputRevision;
   continuationReadState?: NativeContinuationReadState;
   /** Full-render cuts only: delta turns must retain their unbounded delivery baseline. */
   onContinuationBudgeted?: (continuation: ExecutionContinuationEnvelope) => void;
@@ -159,6 +161,18 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput & { p
 export function buildNativeExecutionInput(input: BuildNativeExecutionInput & { provider?: Exclude<BuildNativeExecutionInput["provider"], "openai_dot" | "grok_bot" | "muse"> }): NativeExecutionInputV5 | NativeExecutionInputV7 | NativeExecutionInputV9 | NativeExecutionInputV10;
 export function buildNativeExecutionInput(input: BuildNativeExecutionInput): NativeExecutionInputV5 | NativeExecutionInputV6 | NativeExecutionInputV7 | NativeExecutionInputV8 | NativeExecutionInputV9 | NativeExecutionInputV10;
 export function buildNativeExecutionInput(input: BuildNativeExecutionInput): NativeExecutionInputV5 | NativeExecutionInputV6 | NativeExecutionInputV7 | NativeExecutionInputV8 | NativeExecutionInputV9 | NativeExecutionInputV10 {
+  try {
+    return buildNativeExecutionInputUnchecked(input);
+  } catch (error) {
+    if (error instanceof NativeTurnPromptExceedsCommandBoundError) {
+      const wake = input.wakePayload as { executionContinuation?: ExecutionContinuationEnvelope } | undefined;
+      error.inputRevision = input.inputRevision ?? (wake?.executionContinuation?.version === 1
+        ? nativeInputRevision(input.issue, wake.executionContinuation.messages) : undefined);
+    }
+    throw error;
+  }
+}
+function buildNativeExecutionInputUnchecked(input: BuildNativeExecutionInput): NativeExecutionInputV5 | NativeExecutionInputV6 | NativeExecutionInputV7 | NativeExecutionInputV8 | NativeExecutionInputV9 | NativeExecutionInputV10 {
   if (input.issue.workMode !== "standard" && input.issue.workMode !== "planning" && input.issue.workMode !== "ask" && input.issue.workMode !== "skill_test") {
     throw new Error("native_execution_input_invalid: issue work mode must be standard, planning, ask, or skill_test");
   }
@@ -486,14 +500,26 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
 function protectedNativePromptCause(description: string, assignment: string, continuation?: ExecutionContinuationEnvelope, readState?: NativeContinuationReadState, interactionResponses?: NativeInteractionResponseEnvelope[], totalBytes = Number.POSITIVE_INFINITY, rendered = ""): NativePromptRefusalCause {
   const newest = continuation?.messages.findLast(message => message.authorType === "user" && !message.createdByRunId && !message.deleted);
   const read = new Set(readState?.readCommentIds ?? []), lastRunAt = Date.parse(readState?.lastRunAt ?? "");
-  // Raw sanitized UTF-8 is a LOWER bound on the bytes saved by removing a
-  // rendered part (the journal adds JSON escaping). Never blame one part unless
-  // removing it ALONE demonstrably leaves room, after all eligible cuts.
+  const renderedBuffer = Buffer.from(rendered);
+  // Compare the same encoded bytes as commandEnvelopeBytes. Raw UTF-8 is not
+  // the saving: a message in the full task prompt is JSON-escaped more times
+  // than a prompt-only comment turn. That must not change its source or remedy.
+  // Never blame one part unless removing it ALONE leaves room after the cuts.
   const part = (kind: NativePromptRefusalCause["kind"], text: string, unread = false, commentIds?: string[]) => {
     const sanitized = text.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "");
     const encoded = JSON.stringify(sanitized).slice(1, -1).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
-    const present = sanitized.length > 0 && [sanitized, encoded, JSON.stringify(encoded).slice(1, -1)].some(value => rendered.includes(value));
-    return { kind, bytes: Buffer.byteLength(text), saving: present ? Buffer.byteLength(sanitized) : 0, unread, commentIds };
+    // Byte search avoids quadratic near-matches in long repeated person text.
+    let saving = 0;
+    if (sanitized.length > 0) for (const value of new Set([JSON.stringify(encoded).slice(1, -1), encoded, sanitized])) {
+      const needle = Buffer.from(value);
+      if (renderedBuffer.indexOf(needle) < 0) continue;
+      // JSON string encoding is additive across these UTF-8 substring boundaries.
+      // Count the removed slice's encoded bytes, not the whole envelope twice
+      // per candidate (quadratic work on a large unread message set).
+      saving = Buffer.byteLength(JSON.stringify(value)) - 2;
+      break;
+    }
+    return { kind, bytes: Buffer.byteLength(text), saving, unread, commentIds };
   };
   const candidates = [
     part("task_description", description), part("protected_input", description ? assignment.replace(description, "") : assignment),

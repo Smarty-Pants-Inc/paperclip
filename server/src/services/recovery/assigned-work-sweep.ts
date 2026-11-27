@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { hasUnchangedNativeInputRefusal, isNativeInputSizeRefusal } from "../native-input-refusal.js";
 import { and, desc, eq, gte, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
 import {
   activityLog,
@@ -462,6 +463,8 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
             // Seam 0260: a person's Stop that ended the turn (0233, run succeeded) is the person's move too.
             || (latest.status === "succeeded" && json(latest.resultJson).personStop != null)),
         } : null,
+        inputChangeRequired: isNativeInputSizeRefusal(latest?.errorCode)
+          && await hasUnchangedNativeInputRefusal(database, { companyId, issueId: issue.id }),
         pendingWakes: (wakeCounts.get(issue.id) ?? 0) + (chatWakeIds.has(issue.id) ? 1 : 0),
         nativeRecoveryPending: nativeIds.has(issue.id),
         pendingHandoff: handoffIds.has(issue.id),

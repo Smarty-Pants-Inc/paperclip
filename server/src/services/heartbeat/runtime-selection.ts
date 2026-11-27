@@ -91,7 +91,7 @@ import { normalizePaperclipWakePayload, selectPaperclipTaskMarkdown } from "@pap
 import type { ProviderResourceDisposition } from "../environment-runtime.js";
 import { stageNativeRuntimeSkillAssets, bindStagedNativeRuntimeSkillAssets } from "../native-runtime/runtime-skill-preservation.js";
 import { configuredSecretGuidance } from "../native-runtime/configured-secret-guidance.js";
-import { nativeContinuationReadState } from "../native-runtime/native-turn-budget.js";
+import { nativeContinuationReadState, type NativeInputRevision } from "../native-runtime/native-turn-budget.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 type Agent = typeof agents.$inferSelect;
@@ -857,6 +857,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
               initialCommunicationGuidance: nativeReviewRequest ? null : readNonEmptyString(context.paperclipTaskCommunicationGuidance),
               wakePayload: context.paperclipWake,
               boundCommandBytes: agent.adapterType === "paperclip_runner",
+              inputRevision: context.nativeInputRevision as NativeInputRevision | undefined,
               continuationReadState: nativeContinuationReadState(context.nativeContinuationReadState),
               onContinuationBudgeted: bounded => {
                 // Called only for a full-render cut. Delta turns retain the

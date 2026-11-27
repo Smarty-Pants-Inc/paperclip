@@ -21,6 +21,8 @@ export const PERSON_OWNED_FAILURE_CODES = [
   "acpx_auth_required", "codex_auth_required", "claude_auth_required", "provider_auth_failed", "hermes_gateway_auth_failed",
   // A configuration choice the person must change.
   "native_provider_model_rejected", "provider_tool_definition_invalid", "turn_limit_exhausted",
+  // An input only the person can shorten.
+  "native_turn_prompt_exceeds_command_bound", "command_payload_too_large",
   // Budget stops.
   "budget_blocked", "budget_hard_stop", "budget_exceeded",
   // Provider usage limits that wait (and resume) as designed.

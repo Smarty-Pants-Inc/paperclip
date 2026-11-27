@@ -1,3 +1,4 @@
+import { hasUnchangedNativeInputRefusal } from "../native-input-refusal.js";
 import { QUEUED_MESSAGES_DELIVERED_REASON } from "../../modules/wake-queue/index.js";
 import { connectionIntentService } from "../connection-intents.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
@@ -2953,6 +2954,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
     let agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
+    if (issueId && (source === "automation" || opts.requestedByActorType !== "user") && await hasUnchangedNativeInputRefusal(db, {
+      companyId: agent.companyId, issueId,
+    })) return null;
     if (issueId && await hasAutomaticInteractionDeliveryHold(db, {
       companyId: agent.companyId, issueId, agentId, payload, context: enrichedContextSnapshot,
       actorType: opts.requestedByActorType, actorId: opts.requestedByActorId,

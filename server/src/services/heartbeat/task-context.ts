@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { nativeInputRevision } from "../native-runtime/native-turn-budget.js";
 import { eq } from "drizzle-orm";
 import { companies } from "@paperclipai/db";
 import type { Db, agents, agentTaskSessions, heartbeatRuns } from "@paperclipai/db";
@@ -159,6 +160,10 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
         })
       : null;
   context.executionContinuation = executionContinuation;
+  // Server-owned canonical revisions, before provider/review projections.
+  // Always replace caller context; no message body goes into the fingerprint.
+  context.nativeInputRevision = agent.adapterType === "paperclip_runner" && issueRef && executionContinuation
+    ? nativeInputRevision(issueRef, executionContinuation.messages) : undefined;
   const paperclipWakePayload = await buildPaperclipWakePayload({
     db,
     companyId: agent.companyId,

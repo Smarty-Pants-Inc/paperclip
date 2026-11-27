@@ -1,3 +1,4 @@
+import { isNativeInputSizeRefusal } from "../native-input-refusal.js";
 import { NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, nativePromptRefusalCause, nativePromptRefusalDetail, nativePromptRefusalTitle } from "../native-runtime/native-turn-budget.js";
 import type { DefectReportDestination, IssueCommentMetadata, IssueCommentPresentation, TaskInterruptionPresentation } from "@paperclipai/shared";
 import { ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE } from "../environment-provider-unavailable-error.js";
@@ -331,6 +332,7 @@ export function buildStrandedRecoveryEscalationNotice(input: {
     errorSummary?: string | null;
     failedStage?: string | null;
     previousSessionUnconfirmed?: boolean;
+    resultJson?: Record<string, unknown> | null;
   } | null | undefined;
 }): StrandedRecoveryEscalationNotice {
   const scanNotice = WORKSPACE_SCAN_NOTICES[input.sourceRun?.errorCode ?? ""];
@@ -341,7 +343,12 @@ export function buildStrandedRecoveryEscalationNotice(input: {
   const failure = input.sourceRun ? classifiedRunFailure(input.sourceRun) : null;
   const connectionFailure = failure && ["agent_machine_unreachable", "agent_machine_unavailable", "previous_session_unconfirmed"].includes(failure.code)
     ? { title: failure.title, body: failure.detail, nextAction: "Press Retry to start it again.", tone: "danger" as const } : null;
-  const seed = connectionFailure ?? (workspaceScan ? {
+  const inputFailure = isNativeInputSizeRefusal(input.sourceRun?.errorCode)
+    ? { title: nativePromptRefusalTitle(nativePromptRefusalCause(input.sourceRun?.resultJson?.nativeTurnPromptRefusalCause)),
+      body: nativePromptRefusalDetail(nativePromptRefusalCause(input.sourceRun?.resultJson?.nativeTurnPromptRefusalCause)),
+      nextAction: nativePromptRefusalDetail(nativePromptRefusalCause(input.sourceRun?.resultJson?.nativeTurnPromptRefusalCause)), tone: "danger" as const }
+    : null;
+  const seed = inputFailure ?? connectionFailure ?? (workspaceScan ? {
     ...workspaceScan,
     body: retriesItself
       ? `Paperclip could not prepare the workspace before the agent started. ${workspaceScan.nextAction}`
@@ -349,7 +356,7 @@ export function buildStrandedRecoveryEscalationNotice(input: {
     tone: "danger" as const,
   } : SETUP_FAILURE_NOTICES[input.sourceRun?.errorCode ?? ""] ?? input.seed);
   const fallbackBody = input.fallbackBody?.trim();
-  const honest = (text: string) => input.retryOffered === false ? withoutRetryInstruction(text) : text;
+  const honest = (text: string) => !inputFailure && input.retryOffered === false ? withoutRetryInstruction(text) : text;
   const body = honest(seed?.body ?? (fallbackBody || DEFAULT_STRANDED_RECOVERY_NOTICE_BODY));
   const title =
     STRANDED_RECOVERY_NOTICE_TITLES_BY_RUN_ERROR_CODE[input.sourceRun?.errorCode?.trim() ?? ""] ??
@@ -379,7 +386,7 @@ export function buildStrandedRecoveryEscalationNotice(input: {
     runRows.push(runLinkRow("Source run", input.sourceRun));
     const failureCode = input.sourceRun.errorCode?.trim();
     if (failureCode) runRows.push(keyValueRow("Failure code", failureCode));
-    const failureSummary = connectionFailure ? null : input.sourceRun.errorSummary?.trim();
+    const failureSummary = connectionFailure || inputFailure ? null : input.sourceRun.errorSummary?.trim();
     if (failureSummary) runRows.push(keyValueRow("Failure summary", failureSummary));
   }
 
