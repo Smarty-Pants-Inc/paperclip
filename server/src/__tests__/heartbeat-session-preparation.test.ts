@@ -45,6 +45,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { activityLog, agents, agentTaskSessions, agentWakeupRequests, authUsers, companies, companyMemberships, companySecretBindings, userSecretDeclarations, nativeRunFinalizations, routines, routineRuns, builtInManagedResources, createDb, executionWorkspaces, environments, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions, issues, plugins, projects, type Db } from "@paperclipai/db";
 import { getServerAdapter, registerServerAdapter, unregisterServerAdapter, type AdapterExecutionContext } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { createRunDispatch } from "../modules/run-dispatch/index.js";
 import { prepareHeartbeatSession, type HeartbeatSessionPreparationInput } from "../services/heartbeat/session-preparation.js";
 import * as sessionPreparation from "../services/heartbeat/session-preparation.js";
 import { getAdapterSessionCodec } from "../services/heartbeat/run-state.js";
@@ -169,43 +170,55 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     { lane: "environment", provider: "codex", fresh: true },
   ])("native blocker retry session: lane=$lane provider=$provider fresh=$fresh", async ({ lane, provider, fresh }) => {
     const f = await seed(), sessionId = randomUUID();
-    await db.update(agents).set({ adapterConfig: { provider, model: "fixture/model",
-      sessionContinuity: provider === "pi_rpc" ? "continuous" : "paperclip", fixtureSessionId: sessionId } })
-      .where(eq(agents.id, f.agentId));
-    const first = await execute(f);
-    await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: f.issueId,
-      nativeSessionId: sessionId, status: "failed", error: "Agent-reported blocker" })
-      .where(eq(heartbeatRuns.id, first.finished.id));
-    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.issueId));
-    const materialize = lane === "agent" ? materializeNativeAgentBlockerContinuation : materializeNativeEnvironmentBlockerRetry;
-    const retryId = await db.transaction(tx => materialize({ tx: tx as unknown as Db,
-      ...f, runId: first.finished.id }));
-    const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retryId));
-    const context = retry.contextSnapshot!;
-    expect(context.forceFreshSession).toBe(true);
-    expect(context.livenessContinuationInstruction).toBe(lane === "agent" ? NATIVE_AGENT_BLOCKER_HINT : NATIVE_ENVIRONMENT_BLOCKER_HINT);
-    // Advance only this durable retry's deadline; dispatch the actual materialized run.
-    await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(Date.now() - 1_000) }).where(eq(heartbeatRuns.id, retryId));
-    await heartbeat.promoteDueScheduledRetries();
-    await heartbeat.resumeQueuedRunsForAgent(f.companyId, f.agentId);
-    await heartbeat.drainActiveRunExecutions();
-    const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retryId));
-    expect(finished.status, finished.error ?? undefined).toBe("succeeded");
-    const input = captured.get(retryId)!;
-    expect(input).toBeDefined();
-    process.stdout.write(`BLOCKER-SESSION ${JSON.stringify({ lane, provider, sourceRunId: first.finished.id, retryRunId: retryId,
-      savedSessionId: sessionId, resumedSessionId: input.runtime.sessionId, forceFreshSession: context.forceFreshSession,
-      explicitFreshSession: context.explicitFreshSession ?? null, message: retry.error, hint: context.livenessContinuationInstruction,
-      freshness: finished.resultJson?.configFreshness })}\n`);
-    expect(input.runtime.sessionId).toBe(fresh ? null : sessionId);
-    expect(finished.resultJson).toMatchObject({ configFreshness: { session: { reset: fresh, taskSessionReused: !fresh } } });
-    expect(input.context.livenessContinuationInstruction).toBe(context.livenessContinuationInstruction);
-    if (provider === "pi_rpc") expect(context.explicitFreshSession).not.toBe(true);
-    expect(retry.error).toBe(lane === "agent"
-      ? "The agent reported a blocker it owns. Paperclip continues the task once."
-      : "The agent reported a blocker in its execution environment, tools or platform. Paperclip continues the task.");
-    expect(context.livenessContinuationInstruction).toContain("Paperclip continued this task after that blocker. Earlier attempts may already have completed some steps:");
-    expect(context.livenessContinuationInstruction).not.toContain("fresh session");
+    try {
+      await db.update(agents).set({ adapterConfig: { provider, model: "fixture/model",
+        sessionContinuity: provider === "pi_rpc" ? "continuous" : "paperclip", fixtureSessionId: sessionId } })
+        .where(eq(agents.id, f.agentId));
+      const first = await execute(f);
+      await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: f.issueId,
+        nativeSessionId: sessionId, status: "failed", error: "Agent-reported blocker" })
+        .where(eq(heartbeatRuns.id, first.finished.id));
+      await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.issueId));
+      const materialize = lane === "agent" ? materializeNativeAgentBlockerContinuation : materializeNativeEnvironmentBlockerRetry;
+      const retryId = await db.transaction(tx => materialize({ tx: tx as unknown as Db,
+        ...f, runId: first.finished.id }));
+      const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retryId));
+      const context = retry.contextSnapshot!;
+      expect(context.forceFreshSession).toBe(true);
+      expect(context.livenessContinuationInstruction).toBe(lane === "agent" ? NATIVE_AGENT_BLOCKER_HINT : NATIVE_ENVIRONMENT_BLOCKER_HINT);
+      // Promote only this materialized retry, never the suite's global scheduled queue.
+      expect(await createRunDispatch(db).promoteScheduledRetry({ companyId: f.companyId, runId: retryId,
+        now: new Date(retry.scheduledRetryAt!.getTime() + 1) })).toMatchObject({ outcome: "promoted" });
+      await heartbeat.resumeQueuedRunsForAgent(f.companyId, f.agentId);
+      await heartbeat.drainActiveRunExecutions();
+      const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retryId));
+      expect(finished.status, finished.error ?? undefined).toBe("succeeded");
+      const input = captured.get(retryId)!;
+      expect(input).toBeDefined();
+      process.stdout.write(`BLOCKER-SESSION ${JSON.stringify({ lane, provider, sourceRunId: first.finished.id, retryRunId: retryId,
+        savedSessionId: sessionId, resumedSessionId: input.runtime.sessionId, forceFreshSession: context.forceFreshSession,
+        explicitFreshSession: context.explicitFreshSession ?? null, message: retry.error, hint: context.livenessContinuationInstruction,
+        freshness: finished.resultJson?.configFreshness })}\n`);
+      expect(input.runtime.sessionId).toBe(fresh ? null : sessionId);
+      expect(finished.resultJson).toMatchObject({ configFreshness: { session: { reset: fresh, taskSessionReused: !fresh } } });
+      expect(input.context.livenessContinuationInstruction).toBe(context.livenessContinuationInstruction);
+      if (provider === "pi_rpc") expect(context.explicitFreshSession).not.toBe(true);
+      expect(retry.error).toBe(lane === "agent"
+        ? "The agent reported a blocker it owns. Paperclip continues the task once."
+        : "The agent reported a blocker in its execution environment, tools or platform. Paperclip continues the task.");
+      expect(context.livenessContinuationInstruction).toContain("Paperclip continued this task after that blocker. Earlier attempts may already have completed some steps:");
+      expect(context.livenessContinuationInstruction).not.toContain("fresh session");
+    } finally {
+      // A failed assertion must not leave a queued retry or execution for a later
+      // row to pick up after its provider/adapter fixtures have been restored.
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+      await heartbeat.cancelInvocationsForAgents([f.agentId], "Blocker retry fixture cleanup");
+      await heartbeat.drainActiveRunExecutions();
+      const runs = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns)
+        .where(eq(heartbeatRuns.companyId, f.companyId));
+      for (const run of runs) { captured.delete(run.id); dispatchCounts.delete(run.id); }
+      expect(runs.filter(run => ["scheduled_retry", "queued", "running"].includes(run.status))).toEqual([]);
+    }
   });
 
   it.each(["continuous", "paperclip"])("a Pi workspace change preserves resume fields only in %s mode", async sessionContinuity => {
