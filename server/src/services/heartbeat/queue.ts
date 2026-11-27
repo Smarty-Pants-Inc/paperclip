@@ -1,4 +1,4 @@
-import { hasUnchangedNativeInputRefusal, latestTaskRunIsNativeInputSizeRefusal } from "../native-input-refusal.js";
+import { deferNativeInputRefusalWake, latestTaskRunIsNativeInputSizeRefusal } from "../native-input-refusal.js";
 import { QUEUED_MESSAGES_DELIVERED_REASON } from "../../modules/wake-queue/index.js";
 import { connectionIntentService } from "../connection-intents.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
@@ -2186,6 +2186,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId),
         sql`${agentWakeupRequests.payload}->>'issueId' = ${issueKeyId}`));
       for (const receipt of saved) {
+        if (receipt.payload?.nativeInputRefusalHold === true) continue;
         const commentIds = queuedCommentIdsFromWakePayload(receipt.payload);
         const delivered = await deliveredQueuedCommentIds(db, { companyId: wake.companyId, issueId: issueKeyId,
           agentId: wake.agentId, commentIds: commentIds.filter(isUuidLike) });
@@ -2335,7 +2336,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           sql`jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'`,
           sql`${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
         ), sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`,
-        dependencyResolvedWakePayloadSql, assignmentWakePayloadSql),
+        dependencyResolvedWakePayloadSql, assignmentWakePayloadSql,
+        sql`${agentWakeupRequests.payload}->>'nativeInputRefusalHold' = 'true'`),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
         scope.requestId ? undefined : sql`coalesce((${agentWakeupRequests.payload} #>> ${`{${DEFERRED_CHAT_WAKE_RETRY_KEY},nextAttemptAt}`})::timestamptz <= now(), true)`,
         sql`NOT EXISTS (SELECT 1 FROM heartbeat_runs live_issue_run
@@ -2349,7 +2351,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     for (const { wake } of strandedQueues) {
       if (!wake.idempotencyKey?.startsWith("chat-inbound:") &&
           resolvedPersonQueues.has(`${wake.companyId}:${String(wake.payload?.issueId)}:${wake.agentId}`)) continue;
-      const ownerWake = isDependencyResolvedWakePayload(wake.payload) || isAssignmentWakePayload(wake.payload);
+      const ownerWake = isDependencyResolvedWakePayload(wake.payload) || isAssignmentWakePayload(wake.payload)
+        || wake.payload?.nativeInputRefusalHold === true;
       if (!ownerWake && !queuedCommentIdsFromWakePayload(wake.payload).length &&
           !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload)) continue;
       const [latest] = await db.select({
@@ -2958,22 +2961,15 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
     let agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
-    if (issueId && (source === "automation" || opts.requestedByActorType !== "user")
-      && await latestTaskRunIsNativeInputSizeRefusal(db, { companyId: agent.companyId, issueId })
-      && await hasUnchangedNativeInputRefusal(db, { companyId: agent.companyId, issueId })) {
-      // Keep wake-only child/routine/agent context, not just task comments.
-      // The hold refuses admission, never consumes the saved work request.
-      if (!executionWaitRequestId) await db.insert(agentWakeupRequests).values({
-        companyId: agent.companyId, agentId, source, triggerDetail, reason,
-        payload: { ...payload, issueId, [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot,
-          nativeInputRefusalHold: true },
-        status: "deferred_issue_execution",
+    if (issueId && (payload.nativeInputRefusalHold === true || source === "automation" || opts.requestedByActorType !== "user")
+      && await latestTaskRunIsNativeInputSizeRefusal(db, { companyId: agent.companyId, issueId, agentId })
+      && await deferNativeInputRefusalWake(db, {
+        companyId: agent.companyId, issueId, agentId, source, triggerDetail, reason,
+        payload: { ...payload, issueId }, contextSnapshot: enrichedContextSnapshot,
         requestedByActorType: opts.requestedByActorType ?? null,
         requestedByActorId: opts.requestedByActorId ?? null,
-        idempotencyKey: opts.idempotencyKey ?? null,
-      }).onConflictDoNothing();
-      return null;
-    }
+        idempotencyKey: opts.idempotencyKey ?? null, requestId: executionWaitRequestId,
+      })) return null;
     if (issueId && await hasAutomaticInteractionDeliveryHold(db, {
       companyId: agent.companyId, issueId, agentId, payload, context: enrichedContextSnapshot,
       actorType: opts.requestedByActorType, actorId: opts.requestedByActorId,

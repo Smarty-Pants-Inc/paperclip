@@ -364,6 +364,26 @@ its process-wide execution and wakeup promise sets. Forwarding callbacks preserv
 construction order for retry and recovery services. Keep queue policy changes
 separate from this extraction and from adapter execution changes.
 
+Native input-size refusals hold automatic task wakes for the refused agent until
+its attempted source revision changes. Enqueue and deferred run insertion use
+the same revision decision. The locked release drain skips held receipts before
+comment cleanup; a size refusal is not a native ownership-reconciliation incident.
+Held wakes coalesce under the issue lock into one pending receipt per task/agent.
+`nativeInputRefusalWakes` keeps each distinct event's full payload and context;
+identical content does not add another event. There is no lossy size cap on owed
+content. A repaired-input admission adopts this content into its run, or the
+existing deferred-receipt worker promotes the held aggregate once through the
+normal release transaction. The run's rebuilt wake payload exposes the saved
+structured events. First-turn comment claims and comment acknowledgements cannot
+consume an aggregate's independent event content. Explicit person attempts retain
+their authority but do not consume held automatic content before a repair.
+Source fingerprints include the named messages regardless of author; comparison
+also recognizes new person input, without treating unrelated system bookkeeping
+as a repair. Reassignment does not apply the previous agent's refusal to its new
+assignee. Existing Stop, pause, budget, cleanup and responsible-user gates remain
+independent. These persistence/queue contracts are covered by real PostgreSQL
+regressions; they are not installed UI or real-provider acceptance.
+
 Run lifecycle handling is in `server/src/services/heartbeat/run-lifecycle.ts`.
 It owns status transitions, run events and progress, liveness classification,
 completion handoffs, issue-comment finalization, and runtime/cost settlement.

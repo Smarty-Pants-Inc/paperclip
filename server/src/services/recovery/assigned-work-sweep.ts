@@ -464,7 +464,7 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
             || (latest.status === "succeeded" && json(latest.resultJson).personStop != null)),
         } : null,
         inputChangeRequired: isNativeInputSizeRefusal(latest?.errorCode)
-          && await hasUnchangedNativeInputRefusal(database, { companyId, issueId: issue.id }),
+          && await hasUnchangedNativeInputRefusal(database, { companyId, issueId: issue.id, agentId: issue.assigneeAgentId ?? undefined }),
         pendingWakes: (wakeCounts.get(issue.id) ?? 0) + (chatWakeIds.has(issue.id) ? 1 : 0),
         nativeRecoveryPending: nativeIds.has(issue.id),
         pendingHandoff: handoffIds.has(issue.id),
