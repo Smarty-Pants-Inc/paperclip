@@ -954,7 +954,10 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       waitingOnOpenSubtasks: waitingOnOpenSubtasks.has(issue.id),
       cleanupSettling: cleanupSettling.has(issue.id),
     }, now);
-    result.set(issue.id, presentation);
+    // A successfully completed attempt is no longer an interruption. Preserve
+    // resolved Stop/settled-work states; owed-input failures are decided above,
+    // so success without an answer stays failed.
+    result.set(issue.id, presentation?.state === "resolved" && facts.run?.status === "succeeded" ? null : presentation);
     const run = facts.run;
     const runStatus = HEARTBEAT_RUN_STATUSES.find(status => status === run?.status);
     const changedAt = taskInterruptionChangedAt(facts);
