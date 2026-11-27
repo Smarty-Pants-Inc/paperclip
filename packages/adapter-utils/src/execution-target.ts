@@ -49,6 +49,7 @@ import {
   syncRemoteTextFileWithHashSkip,
   syncRemoteTextFilesWithHashSkip,
   syncSandboxCallbackBridgeEntrypoint,
+  type SandboxCallbackBridgeLogContext,
 } from "./sandbox-callback-bridge.js";
 import {
   createHttp2BridgeServer,
@@ -226,6 +227,8 @@ export interface AdapterSandboxExecutionTarget extends AdapterExecutionTargetWor
   readonly reusableLeaseConfigured?: boolean;
   /** Host-observed provenance for this exact sandbox acquisition. */
   readonly sandboxLeaseAcquisition?: SandboxLeaseAcquisition | null;
+  /** Host-only identifiers for callback-worker warnings; never sent to the sandbox. */
+  readonly callbackBridgeLogContext?: Pick<SandboxCallbackBridgeLogContext, "providerLeaseId" | "issueId">;
   shellCommand?: "bash" | "sh" | null;
   environmentId?: string | null;
   leaseId?: string | null;
@@ -5022,6 +5025,15 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     worker = await startSandboxCallbackBridgeWorker({
       client,
       queueDir,
+      logContext: {
+        ...(target.transport === "sandbox" ? target.callbackBridgeLogContext : {}),
+        environmentId: target.environmentId,
+        leaseId: target.leaseId,
+        providerLeaseId: target.transport === "sandbox"
+          ? target.callbackBridgeLogContext?.providerLeaseId ?? target.sandboxLeaseAcquisition?.providerLeaseId
+          : null,
+        runId: input.runId,
+      },
       pollIntervalMs: Number.isInteger(configuredPollIntervalMs)
         ? Math.min(5000, Math.max(25, configuredPollIntervalMs))
         : undefined,

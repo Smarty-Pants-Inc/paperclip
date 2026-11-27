@@ -489,8 +489,12 @@ describe("sandbox callback bridge", () => {
     const handleRequest = vi.fn(async () => ({ status: 200, body: "unexpected" }));
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
+      const logContext = {
+        environmentId: "environment-growing", leaseId: "lease-growing", providerLeaseId: "provider-growing",
+        runId: "run-growing", issueId: "issue-growing",
+      };
       const worker = await startSandboxCallbackBridgeWorker({
-        queueDir, handleRequest,
+        queueDir, handleRequest, logContext,
         client: { ...client, fileSize: async (file) => {
           const size = await client.fileSize!(file);
           if (file === requestPath && reserved === undefined) {
@@ -508,7 +512,10 @@ describe("sandbox callback bridge", () => {
       expect(JSON.parse(response.body)).toEqual({
         error: "Sandbox callback bridge worker failed: Bridge envelope exceeded the configured size limit.",
       });
-      expect(warn).toHaveBeenCalledWith(expect.stringContaining("Bridge envelope exceeded the configured size limit."));
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("Bridge envelope exceeded the configured size limit."),
+        { ...logContext, requestId: "growing", requestFileName: "growing.json" },
+      );
       expect(handleRequest).not.toHaveBeenCalled();
       await worker.stop();
     } finally {
@@ -767,7 +774,92 @@ describe("sandbox callback bridge", () => {
     }
   });
 
-  it("recovers from transient queue polling failures and keeps relaying requests", async () => {
+  it.each([
+    "Test sandbox lease is no longer active.",
+  ])("settles a worker after a terminal lease poll refusal: %s", async (refusal) => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-closed-"));
+    cleanupDirs.push(rootDir);
+    const queueDir = path.posix.join(rootDir, "queue");
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const baseClient = createFileSystemSandboxCallbackBridgeQueueClient();
+    await baseClient.makeDir(directories.requestsDir);
+    await publishBridgeRequest(path.join(directories.requestsDir, "closed-request.json"), bridgeRequestJson("closed-request"));
+    const logContext = {
+      environmentId: "environment-closed", leaseId: "lease-closed", providerLeaseId: "provider-closed",
+      runId: "run-closed", issueId: "issue-closed",
+    };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    cleanupFns.push(async () => { warn.mockRestore(); });
+    let listCalls = 0;
+    const handleRequest = vi.fn(async () => ({ status: 200, body: "ok" }));
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: { ...baseClient, listJsonFiles: async (dir) => {
+        listCalls += 1;
+        if (listCalls === 1) throw new Error(refusal);
+        return baseClient.listJsonFiles(dir);
+      } },
+      queueDir, logContext, pollIntervalMs: 5,
+      authorizeRequest: async () => null, handleRequest,
+    });
+    cleanupFns.push(async () => { await worker.stop(); });
+    const responseFile = await waitForJsonFile(directories.responsesDir, 2_000);
+    const response = JSON.parse(await readFile(path.join(directories.responsesDir, responseFile), "utf8"));
+    expect(response).toMatchObject({ id: "closed-request", status: 503 });
+    expect(handleRequest).not.toHaveBeenCalled();
+    // One failed poll and one bounded recovery listing, then no more polling.
+    expect(listCalls).toBe(2);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(listCalls).toBe(2);
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      `[paperclip] Sandbox callback bridge worker failed: ${refusal}`, logContext,
+    );
+  });
+
+  it("keeps a not-found lease poll refusal transient and serves a later request", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-missing-lease-"));
+    cleanupDirs.push(rootDir);
+    const queueDir = path.posix.join(rootDir, "queue");
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const baseClient = createFileSystemSandboxCallbackBridgeQueueClient();
+    const refusal = "Test sandbox lease missing-lease was not found.";
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    cleanupFns.push(async () => { warn.mockRestore(); });
+    let failedPolls = 0;
+    let successfulPolls = 0;
+    const seenRequests: string[] = [];
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: { ...baseClient, listJsonFiles: async (dir) => {
+        if (failedPolls < 3) {
+          failedPolls += 1;
+          throw new Error(refusal);
+        }
+        const files = await baseClient.listJsonFiles(dir);
+        successfulPolls += 1;
+        return files;
+      } },
+      queueDir, pollIntervalMs: 5,
+      authorizeRequest: async () => null,
+      handleRequest: async (request) => {
+        seenRequests.push(request.id);
+        return { status: 200, body: "recovered" };
+      },
+    });
+    cleanupFns.push(async () => { await worker.stop(); });
+    // Wait for multiple successful polls before publishing: terminal recovery
+    // can list once, but only a still-running worker can serve this later request.
+    await vi.waitFor(() => { expect(successfulPolls).toBeGreaterThanOrEqual(2); }, { timeout: 2_000 });
+    expect(failedPolls).toBe(3);
+    const requestId = "after-missing-lease";
+    await publishBridgeRequest(
+      path.join(directories.requestsDir, `${requestId}.json`), bridgeRequestJson(requestId),
+    );
+    const responseFile = await waitForJsonFile(directories.responsesDir, 2_000);
+    const response = JSON.parse(await readFile(path.join(directories.responsesDir, responseFile), "utf8"));
+    expect(response).toMatchObject({ id: requestId, status: 200, body: "recovered" });
+    expect(seenRequests).toEqual([requestId]);
+  });
+
+  it("logs correlation fields on transient poll timeouts and keeps relaying requests", async () => {
     // A single reset or slow sandbox exec used to unwind the poll loop into its
     // terminal catch, killing the relay for the rest of the run. The loop must
     // instead back off, retry, and still deliver requests queued after the
@@ -784,16 +876,23 @@ describe("sandbox callback bridge", () => {
       listJsonFiles: async (dirPath: string) => {
         listCalls += 1;
         if (listCalls <= 3) {
-          throw new Error("list requests failed: kex_exchange_identification: read: Connection reset by peer");
+          throw new Error("Sandbox callback bridge list requests timed out after 10000ms.");
         }
         return baseClient.listJsonFiles(dirPath);
       },
     };
 
+    const logContext = {
+      environmentId: "environment-transient", leaseId: "lease-transient", providerLeaseId: "provider-transient",
+      runId: "run-transient", issueId: "issue-transient",
+    };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    cleanupFns.push(async () => { warn.mockRestore(); });
     const seenPaths: string[] = [];
     const worker = await startSandboxCallbackBridgeWorker({
       client,
       queueDir,
+      logContext,
       authorizeRequest: async () => null,
       handleRequest: async (request) => {
         seenPaths.push(request.path);
@@ -826,6 +925,12 @@ describe("sandbox callback bridge", () => {
     expect(JSON.parse(raw)).toMatchObject({ id: requestId, status: 200 });
     expect(seenPaths).toEqual(["/api/agents/me"]);
     expect(listCalls).toBeGreaterThan(3);
+    for (const failure of [1, 2, 3]) {
+      expect(warn).toHaveBeenCalledWith(
+        `[paperclip] Sandbox callback bridge worker failed: Sandbox callback bridge list requests timed out after 10000ms. (transient poll failure ${failure}; retrying)`,
+        logContext,
+      );
+    }
   });
 
   it("keeps the queue-directory setup on the startup step but resets the poll loop store", async () => {
