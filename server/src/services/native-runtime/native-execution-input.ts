@@ -2,7 +2,7 @@ import type { PaperclipTurnContext } from "@paperclipai/adapter-utils/server-uti
 import { resolvePaperclipRunnerCursorMode, resolvePaperclipRunnerPiThinkingLevel } from "@paperclipai/adapter-utils";
 import { createHash } from "node:crypto";
 import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
-import { boundNativeExecutionContinuation, commandEnvelopeBytes, NATIVE_HANDOFF_CUT_NOTE_RESERVE_BYTES, NATIVE_TURN_KNOWN_MAX_BYTES, NativeTurnPromptExceedsCommandBoundError, type NativeContinuationReadState, type NativeContinuationCoverage, type NativePromptRefusalCause } from "./native-turn-budget.js";
+import { boundNativeExecutionContinuation, commandEnvelopeBytes, nativePromptRefusalRemedies, NATIVE_HANDOFF_CUT_NOTE_RESERVE_BYTES, NATIVE_TURN_KNOWN_MAX_BYTES, NativeTurnPromptExceedsCommandBoundError, type NativeContinuationReadState, type NativeContinuationCoverage, type NativePromptRefusalCause } from "./native-turn-budget.js";
 import { runnerApiOperation } from "./runner-api-catalog.js";
 import { buildNativeContinuationPrompt } from "./native-continuation.js";
 import { decideNativeContinuation, resolveSessionContinuity } from "./continued-session.js";
@@ -505,13 +505,13 @@ function protectedNativePromptCause(description: string, assignment: string, con
       part(message === newest ? "newest_message" : !read.has(message.id) ? "unread_message" : "protected_input", message.body, !read.has(message.id))) ?? []),
   ].filter(candidate => candidate.saving > 0).sort((a, b) => b.bytes - a.bytes);
   const single = candidates.find(candidate => totalBytes - candidate.saving <= NATIVE_TURN_KNOWN_MAX_BYTES);
-  if (single) return { kind: single.kind, bytes: single.bytes };
+  if (single) return { kind: single.kind, bytes: single.bytes, remedies: nativePromptRefusalRemedies(single.kind) };
   const unread = candidates.filter(candidate => candidate.unread);
   if (unread.length > 1 && totalBytes - unread.reduce((sum, candidate) => sum + candidate.saving, 0) <= NATIVE_TURN_KNOWN_MAX_BYTES)
-    return { kind: "unread_messages", bytes: unread.reduce((sum, candidate) => sum + candidate.bytes, 0), count: unread.length };
+    return { kind: "unread_messages", bytes: unread.reduce((sum, candidate) => sum + candidate.bytes, 0), count: unread.length, remedies: nativePromptRefusalRemedies("unread_messages") };
   const locatedBytes = candidates.reduce((sum, candidate) => sum + candidate.bytes, 0);
   return { kind: "protected_inputs", bytes: locatedBytes || totalBytes,
-    measure: locatedBytes ? "protected_parts" : "envelope_with_reserve" };
+    measure: locatedBytes ? "protected_parts" : "envelope_with_reserve", remedies: nativePromptRefusalRemedies("protected_inputs") };
 }
 
 /** Match rendered JSON data without depending on PostgreSQL JSONB key order.

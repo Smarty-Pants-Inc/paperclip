@@ -11,7 +11,7 @@ import { PROVIDER_TURN_ACCEPTED_EVENT_TYPES } from "./provider-attempt-outcome.j
 import { reconcileContinuousSessionInput } from "./continuous-session-input.js";
 import { queuedInteractionId, readQueuedInteractionResponse } from "../queued-interaction-response.js";
 import { resolveSessionContinuity } from "./continued-session.js";
-import { commandTextBytes, FIRST_TURN_QUEUED_INPUT_MAX_BYTES, NativeTurnPromptExceedsCommandBoundError } from "./native-turn-budget.js";
+import { commandTextBytes, FIRST_TURN_QUEUED_INPUT_MAX_BYTES, NativeTurnPromptExceedsCommandBoundError, nativePromptRefusalRemedies } from "./native-turn-budget.js";
 
 /**
  * Queued input for a run's first provider turn.
@@ -203,7 +203,7 @@ function renderWholeFirstTurnQueuedInput(messages: readonly QueuedMessage[], val
   const bytes = commandTextBytes(text);
   if (bytes > FIRST_TURN_QUEUED_INPUT_MAX_BYTES)
     throw new NativeTurnPromptExceedsCommandBoundError(messages.length === 1 && messages[0]!.kind === "interaction"
-      ? { kind: "human_response", bytes: Buffer.byteLength(messages[0]!.body) } : { kind: "queued_input", bytes });
+      ? { kind: "human_response", bytes: Buffer.byteLength(messages[0]!.body), remedies: nativePromptRefusalRemedies("human_response") } : { kind: "queued_input", bytes, remedies: nativePromptRefusalRemedies("queued_input") });
   return text;
 }
 
@@ -220,7 +220,7 @@ function selectFirstTurnQueuedInput(messages: readonly QueuedMessage[], validate
       // A large later message must not stall earlier whole messages. Only a
       // first message that cannot fit refuses; every unselected ID stays owed.
       if (count === 0 && error instanceof NativeTurnPromptExceedsCommandBoundError && error.promptCause?.kind === "queued_input" && messages[0]?.kind === "interaction")
-        throw new NativeTurnPromptExceedsCommandBoundError({ kind: "human_response", bytes: Buffer.byteLength(messages[0].body) });
+        throw new NativeTurnPromptExceedsCommandBoundError({ kind: "human_response", bytes: Buffer.byteLength(messages[0].body), remedies: nativePromptRefusalRemedies("human_response") });
       if (count === 0 || !(error instanceof NativeTurnPromptExceedsCommandBoundError)) throw error;
       break;
     }
@@ -368,7 +368,7 @@ export async function claimFirstTurnQueuedInput(
       // Passive handbacks have ONLY this first-turn route. Without either a
       // measured composition or a positively installed final guard, refuse
       // truthfully without consuming input; never guess a backend is guarded.
-      if (handback) throw new NativeTurnPromptExceedsCommandBoundError({ kind: "unmeasured_composition", bytes: 0 });
+      if (handback) throw new NativeTurnPromptExceedsCommandBoundError({ kind: "unmeasured_composition", bytes: 0, remedies: nativePromptRefusalRemedies("unmeasured_composition") });
       return null;
     }
     const selectedComments = selected.filter(message => message.kind !== "interaction");
