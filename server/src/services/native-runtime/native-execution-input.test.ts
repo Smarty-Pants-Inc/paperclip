@@ -13,7 +13,7 @@ import { DurablePrpControlPlane } from "../../vendor/paperclip-runner/index.js";
 import { renderFirstTurnQueuedInput } from "./first-turn-queued-input.js";
 import { shouldWakeAssigneeForIssueComment } from "../issue-comment-wakeup.js";
 import { buildQueuedCommentQueueSnapshot } from "../issue-queued-comment-queue.js";
-import { assertNativeTurnCommandBound } from "./native-turn-budget.js";
+import { assertNativeTurnCommandBound, boundNativeExecutionContinuation } from "./native-turn-budget.js";
 import { renderNativeRunnerStagedAttachmentPrompt } from "./native-runner-file-handoff.js";
 import { clearNativeFreshFallback, registerNativeFreshFallback, nativeFreshFallbackPayload, nativeQueuedTurnUpperBound, assertNativeQueuedTurnBound, nativeQueuedTurnCompositionMeasured, observeNativeTurnBudgetSession, guardNativeTurnCommands, commandEnvelopeBytes, NATIVE_TURN_KNOWN_MAX_BYTES, NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND } from "./native-turn-budget.js";
 import type { ExecutionContinuationEnvelope, AskUserQuestionsInteraction } from "@paperclipai/shared";
@@ -1171,9 +1171,9 @@ describe("native serialized-command budget", () => {
           name: `Resource ${i}`, title: `Saved ${i}`, url: `https://example.test/resources/${i}` } });
       if (result.resultOmittedForSize) {
         expect(result.resultSha256).toBe(`sha256:${createHash("sha256").update(JSON.stringify(original.result)).digest("hex")}`);
-        expect(result.note).toBe("Result omitted for size; the write is done. Re-read the target by id if needed.");
+        expect(result.note).toBe("Result omitted for size; the write succeeded. Re-read the target by its id if needed.");
         expect(result.data).not.toHaveProperty("body");
-        expect(result.data).not.toHaveProperty("nested");
+        expect(result.data).toHaveProperty("nested", { id: "not-the-resource" });
       }
     }
     console.info(JSON.stringify({ writeReceiptRegression: true, messagesRead, receipts: 64, receiptBytes, beforeBytes, afterBytes,
@@ -1212,20 +1212,87 @@ describe("native serialized-command budget", () => {
     expect(retained.completedActions![1]).toEqual(c.completedActions![1]);
     expect(retained.coverage).toMatchObject({ shortenedCompletedActions: 1, omittedMessages: 0 });
   });
-  it("shortens the largest write first and keeps top-level identity and failed status", () => {
+  it("shortens the largest successful write first and keeps top-level identity and status", () => {
     const c = shape(3, 100);
     c.completedActions = [
       { runId: "old-run", receiptId: "small", operationId: "POST /api/issues/{id}/comments", result: { id: "small", body: "s".repeat(20000) } },
       { runId: "old-run", receiptId: "large", operationId: "PATCH /api/companies/{companyId}/skill-sources/{sourceId}",
-        result: { ok: false, status: 409, id: "large", key: "source", identifier: "RESOURCE-0", number: 0,
+        result: { ok: true, status: 200, id: "large", key: "source", identifier: "RESOURCE-0", number: 0,
           name: "Source", title: "Saved source", url: "https://example.test/source", body: "l".repeat(330000) } },
     ];
     const { retained } = prepare(c);
     expect(retained.messages).toEqual(c.messages);
     expect(retained.completedActions![0]).toEqual(c.completedActions![0]);
-    expect(retained.completedActions![1]!.result).toMatchObject({ ok: false, status: 409, id: "large", key: "source",
+    expect(retained.completedActions![1]!.result).toMatchObject({ ok: true, status: 200, id: "large", key: "source",
       identifier: "RESOURCE-0", number: 0, name: "Source", title: "Saved source", url: "https://example.test/source", resultOmittedForSize: true });
     expect(retained.coverage).toMatchObject({ shortenedCompletedActions: 1, omittedMessages: 0, omittedCompletedActions: 0 });
+  });
+  // Pure budget rows: a second, smaller successful write allows inspection of
+  // an ineligible large result without omitting any message or receipt.
+  function receiptBudgetRow(result: Record<string, unknown>) {
+    const c = shape(3, 100);
+    c.completedActions = [
+      { runId: "old-run", receiptId: "candidate", operationId: "POST /api/issues/{id}/comments", result: { ...result, padding: "x".repeat(320000) } },
+      { runId: "old-run", receiptId: "saver", operationId: "POST /api/issues/{id}/comments", result: { ok: true, status: 201, data: { id: "saver", body: "s".repeat(50000) } } },
+    ];
+    const before = JSON.stringify(c);
+    const retained = boundNativeExecutionContinuation(c, value => commandEnvelopeBytes(value) + 10000,
+      undefined, () => false, undefined, () => true);
+    expect(JSON.stringify(c)).toBe(before);
+    expect(retained.messages).toEqual(c.messages);
+    expect(retained.completedActions).toHaveLength(2);
+    expect(retained.coverage).toMatchObject({ shortenedCompletedActions: 1, omittedMessages: 0, omittedCompletedActions: 0 });
+    return { original: c, retained, result: retained.completedActions![0]!.result as Record<string, unknown> };
+  }
+  it.each([
+    ["422 validation", { ok: false, status: 422, data: { id: "refused" }, error: "validation", details: { reason: "invalid input" } }],
+    ["500 unknown", { ok: false, status: 500, data: { id: "uncertain" }, error: "server_error", outcome: "unknown", guidance: "Inspect before retrying" }],
+    ["transport failure", { ok: false, status: null, error: "api_transport_failure", outcome: "unknown", guidance: "Inspect before retrying" }],
+    ["missing ok", { status: 200, id: "not-confirmed" }],
+    ["false ok with 2xx", { ok: false, status: 200, id: "not-confirmed" }],
+    ["true ok with 422", { ok: true, status: 422, id: "not-confirmed" }],
+    ["true ok with 500", { ok: true, status: 500, id: "not-confirmed" }],
+    ["null status", { ok: true, status: null, id: "not-confirmed" }],
+    ["redirect", { ok: true, status: 302, id: "not-confirmed" }],
+    ["no identity", { ok: true, status: 201, data: { name: "No target", title: "No target", status: "saved", companyId: "company" } }],
+    ["empty identity", { ok: true, status: 200, data: { id: "", key: null, identifier: {}, number: null } }],
+    ["21 element bulk", { ok: true, status: 200, data: Array.from({ length: 21 }, (_, i) => ({ id: `saved-${i}` })) }],
+    ["bulk element missing identity", { ok: true, status: 200, data: [{ id: "saved" }, { title: "Unfindable" }] }],
+  ])("keeps the entire %s write result, including errors and guidance", (_name, candidate) => {
+    const { original, retained, result } = receiptBudgetRow(candidate as Record<string, unknown>);
+    expect(result).toEqual(original.completedActions![0]!.result);
+    expect(result).not.toHaveProperty("resultOmittedForSize");
+    expect(result).not.toHaveProperty("note");
+    expect(retained.completedActions![1]!.result).toMatchObject({ resultOmittedForSize: true,
+      note: "Result omitted for size; the write succeeded. Re-read the target by its id if needed." });
+  });
+  it.each([
+    ["top-level id", { ok: true, status: 200, id: "saved" }, { id: "saved" }],
+    ["absent status", { ok: true, data: { id: "saved" } }, { data: { id: "saved" } }],
+    ["2xx upper edge", { ok: true, status: 299, data: { key: "saved" } }, { data: { key: "saved" } }],
+    ["number zero", { ok: true, status: 201, data: { number: 0 } }, { data: { number: 0 } }],
+    ["nested identities", { ok: true, status: 201, data: { comment: { id: "comment", body: "omitted" }, issue: { identifier: "RESOURCE-1" } } },
+      { data: { comment: { id: "comment" }, issue: { identifier: "RESOURCE-1" } } }],
+    ["20 element bulk", { ok: true, status: 200, data: Array.from({ length: 20 }, (_, i) => ({ id: `saved-${i}`, body: "omitted" })) },
+      { data: Array.from({ length: 20 }, (_, i) => ({ id: `saved-${i}` })) }],
+    ["document revision", { ok: true, status: 200, data: { id: "document", issueId: "issue", key: "plan", latestRevisionId: "revision", latestRevisionNumber: 3 } },
+      { data: { id: "document", issueId: "issue", key: "plan", latestRevisionId: "revision", latestRevisionNumber: 3 } }],
+    ["artifact", { ok: true, status: 201, artifact: { artifactId: "asset", url: "/api/assets/asset/content", byteSize: 400000, sha256: "a".repeat(64) } },
+      { artifact: { artifactId: "asset", url: "/api/assets/asset/content", byteSize: 400000, sha256: "a".repeat(64) } }],
+  ])("shortens a successful %s write while keeping its target and exact note", (_name, candidate, identity) => {
+    const { original, retained, result } = receiptBudgetRow(candidate as Record<string, unknown>);
+    expect(result).toMatchObject({ ...identity, resultOmittedForSize: true,
+      note: "Result omitted for size; the write succeeded. Re-read the target by its id if needed.",
+      resultSha256: `sha256:${createHash("sha256").update(JSON.stringify(original.completedActions![0]!.result)).digest("hex")}` });
+    expect(result).not.toHaveProperty("padding");
+    expect(retained.completedActions![1]).toEqual(original.completedActions![1]);
+    if (_name === "nested identities" || _name === "20 element bulk") expect(JSON.stringify(result)).not.toContain('"body"');
+  });
+  it("refuses by name rather than shortening an irreducible failed write", () => {
+    const c = shape(3, 100);
+    c.completedActions = [{ runId: "old-run", receiptId: "failed", operationId: "POST /api/issues/{id}/comments",
+      result: { ok: false, status: 422, data: { id: "refused", body: "x".repeat(400000) }, error: "validation" } }];
+    expect(() => prepare(c)).toThrow(expect.objectContaining({ code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND }));
   });
   it("preserves small write and unknown receipts and counts only shortened results", () => {
     const c = shape(30, 400000, 2);

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
+import { continuationResultIdentityKeys } from "../execution-continuation-identity.js";
 import type { DurablePrpControlPlane, NativeSession } from "../../vendor/paperclip-runner/index.js";
 
 // One split, in encoded UTF-8 journal-command bytes (not prompt characters).
@@ -210,19 +211,43 @@ export function boundNativeExecutionContinuation(
     serialized: JSON.stringify(receipt.result) ?? "null" }))
     .map(value => ({ ...value, bytes: commandTextBytes(value.serialized) }))
     .sort((a, b) => b.bytes - a.bytes);
-  const identityKeys = ["id", "key", "identifier", "number", "name", "title", "url"];
-  const pick = (value: Record<string, unknown>, keys: string[]) => Object.fromEntries(keys.filter(key => key in value).map(key => [key, value[key]]));
+  const pick = (value: Record<string, unknown>, keys: readonly string[]) => Object.fromEntries(keys.filter(key => key in value).map(key => [key, value[key]]));
+  const identity = (value: unknown) => pick(record(value), continuationResultIdentityKeys);
+  const locator = (value: unknown) => typeof value === "string" && value.trim().length > 0
+    || typeof value === "number" && Number.isSafeInteger(value);
+  const findable = (value: Record<string, unknown>) => locator(value.id) || locator(value.key)
+    || locator(value.identifier) || locator(value.number);
+  // Keep the wrapper shape and each child's identity, never its response body.
+  const resourceIdentity = (value: unknown) => {
+    const resource = record(value);
+    return { ...identity(resource), ...Object.fromEntries(Object.entries(resource)
+      .filter(([, child]) => findable(record(child))).map(([key, child]) => [key, identity(child)])) };
+  };
   for (const write of [false, true]) for (const { receipt, index, serialized, bytes } of receipts) {
     if (write ? isReadOperation(receipt.operationId) || !isWriteOperation(receipt.operationId) : !isReadOperation(receipt.operationId)) continue;
     const result = record(receipt.result);
     if (result.resultOmittedForSize === true) continue;
-    // REST responses wrap the resource in data; other tools return it directly.
-    // Keep only that resource's top-level identity, never nested response bodies.
-    const identity = write ? pick(record(result.data), identityKeys) : {};
-    const shortened = { ...pick(result, ["operationId", "ok", "status", "kind", "target", ...(write ? identityKeys : [])]),
-      ...(Object.keys(identity).length ? { data: identity } : {}),
+    // Failed/unknown writes are evidence, not successful save receipts. Keep
+    // their errors, outcome and retry guidance whole, even under size pressure.
+    if (write && (result.ok !== true || result.status !== undefined
+      && !(typeof result.status === "number" && result.status >= 200 && result.status < 300)
+      || result.outcome === "unknown" || result.error)) continue;
+    if (write && Array.isArray(result.data) && (result.data.length > 20 || result.data.length === 0)) continue;
+    const topIdentity = write ? identity(result) : {};
+    const dataIdentity = write ? (Array.isArray(result.data) ? result.data.map(resourceIdentity) : resourceIdentity(result.data)) : {};
+    const hasResourceIdentity = (value: Record<string, unknown>) => findable(value) || Object.values(value).some(child => findable(record(child)));
+    // Every bulk target must remain findable. In particular, never hide the
+    // targets after the 20-element cap behind a misleading re-read note.
+    if (write && Array.isArray(dataIdentity) && !dataIdentity.every(hasResourceIdentity)) continue;
+    const artifact = record(result.artifact);
+    if (write && !findable(topIdentity) && !(Array.isArray(dataIdentity)
+      ? dataIdentity.length > 0 : hasResourceIdentity(dataIdentity))
+      && !locator(artifact.artifactId) && !locator(artifact.url)) continue;
+    const shortened = { ...pick(result, ["operationId", "ok", "status", "kind", "target"]), ...topIdentity,
+      ...(Object.keys(dataIdentity).length ? { data: dataIdentity } : {}),
+      ...(write && result.artifact !== undefined ? { artifact: result.artifact } : {}),
       resultOmittedForSize: true, note: write
-        ? "Result omitted for size; the write is done. Re-read the target by id if needed."
+        ? "Result omitted for size; the write succeeded. Re-read the target by its id if needed."
         : "Result omitted for size; re-read if needed.",
       resultSha256: `sha256:${createHash("sha256").update(serialized).digest("hex")}` };
     if (commandTextBytes(JSON.stringify(shortened)) >= bytes) continue;
