@@ -72,10 +72,9 @@ describe("bounded fresh-session handoff", () => {
     });
     const normal = buildNativeModelEnvelope(promptFor("Continue the task"));
     const normalRoom = nativeSessionHandoffMaxBytes(normal);
-    expect(normalRoom).toBeLessThanOrEqual(NATIVE_WHOLE_HANDOFF_MAX_BYTES);
-    expect(normalRoom).toBeGreaterThan(300_000);
+    expect(normalRoom).toBe(NATIVE_WHOLE_HANDOFF_MAX_BYTES);
     expect(renderNativeSessionHandoff({ ...args, maxBytes: normalRoom })).toBe(renderNativeSessionHandoff(args));
-    const large = buildNativeModelEnvelope(promptFor('"'.repeat(75_000)));
+    const large = buildNativeModelEnvelope(promptFor('"'.repeat(100_000)));
     const room = nativeSessionHandoffMaxBytes(large);
     expect(room).toBeGreaterThanOrEqual(NATIVE_HANDOFF_MAX_BYTES);
     expect(room).toBeLessThan(NATIVE_WHOLE_HANDOFF_MAX_BYTES);
@@ -92,7 +91,7 @@ describe("bounded fresh-session handoff", () => {
     expect(handoff).toContain("earlier messages were not handed over.");
     expect(handoff).toContain("Keep the original objective");
     const encoded = (text: string) => Buffer.byteLength(JSON.stringify(JSON.stringify(text))) - 6;
-    const noRoom = nativeSessionHandoffMaxBytes('"'.repeat(80_000));
+    const noRoom = nativeSessionHandoffMaxBytes('"'.repeat(110_000));
     expect(noRoom).toBeLessThan(NATIVE_HANDOFF_MAX_BYTES);
     const stock = renderNativeSessionHandoff({ ...args, maxBytes: noRoom });
     expect(stock).toContain("using this bounded background");

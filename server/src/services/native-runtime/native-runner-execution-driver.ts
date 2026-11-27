@@ -4,7 +4,6 @@ import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/executio
 import { resolvePaperclipRunnerTransport, type PaperclipRunnerTransport } from "@paperclipai/adapter-utils/runner-connectivity";
 import type { RunnerExecutionDriver } from "../../vendor/paperclip-runner/index.js";
 import { registerRunnerPrpAuthority } from "../../realtime/runner-prp-ws.js";
-import { guardNativeTurnCommands } from "./native-turn-budget.js";
 import { connectRunnerPrpIngress } from "../../realtime/runner-prp-outbound.js";
 import type { NativeRunTrace } from "./native-run-trace.js";
 import type { Db } from "@paperclipai/db";
@@ -33,8 +32,6 @@ export interface NativeRunnerExecutionDriverInput {
   processStarted?: Promise<void>;
   processIdentityReady?: Promise<void>;
   beforeConnect?: (identity: RunnerIdentity, authority: Parameters<ConnectionRegistration>[0]) => Promise<void>;
-  /** Positive installation signal, emitted only after wrapping queueCommand. */
-  onFinalGuardInstalled?: () => void;
   controllerPersistence?: { db: Db; bootId: string; authorityRunId?: string | (() => string); onFailure?: (runId: string, leaseOwner: string) => Promise<void> };
   checkpoint?: Awaited<ReturnType<ConnectionRegistration>>["checkpoint"];
   process?: Omit<RunnerExecutionDriver, "controlPlaneRegistration">;
@@ -119,8 +116,6 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
         }
       : undefined,
     controlPlaneRegistration: async (authority, attachmentIdentity) => {
-      guardNativeTurnCommands(authority);
-      input.onFinalGuardInstalled?.();
       await measureNativeRunnerSpan(input.trace, "runner.checkpoint.register", async () => {
         await input.beforeConnect?.(attachmentIdentity, authority);
         if (input.controllerPersistence && input.binding.issueId) {

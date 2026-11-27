@@ -126,8 +126,7 @@ export async function readByEarlierTurnCommentIds(tx: Pick<Db, "select">, input:
     eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
     inArray(issueComments.id, input.commentIds),
     sql`(${historyReadSql(companyId, agentId, sql`reading_run.native_issue_id = ${issueId}`, notCurrent)}
-      or ${historyReadSql(companyId, agentId, sql`reading_run.context_snapshot->>'issueId' = ${issueId}`, notCurrent)}
-      or ${firstTurnDeliveredSql(companyId, issueId, agentId, input.currentRunId)})`));
+      or ${historyReadSql(companyId, agentId, sql`reading_run.context_snapshot->>'issueId' = ${issueId}`, notCurrent)})`));
   return new Set(rows.map(row => row.id));
 }
 
@@ -177,10 +176,9 @@ export function taskHistoryHandlingGuidance(commentIds: readonly string[],
  * The comment row was taken into an accepted first provider turn of a run of
  * this agent on this task, and not edited after that run sealed its input.
  */
-function firstTurnDeliveredSql(companyId: string, issueId: string, agentId: string, currentRunId?: string | null) {
+function firstTurnDeliveredSql(companyId: string, issueId: string, agentId: string) {
   return sql`exists (select 1 from ${heartbeatRuns} first_turn_run
       where first_turn_run.company_id = ${companyId} and first_turn_run.agent_id = ${agentId}
-        ${currentRunId ? sql`and first_turn_run.id <> ${currentRunId}` : sql``}
         and (first_turn_run.native_issue_id = ${issueId} or first_turn_run.context_snapshot->>'issueId' = ${issueId})
         and first_turn_run.context_snapshot->'firstTurnQueuedInput'->>'schema' = 'paperclip.first-turn-queued-input.v1'
         and first_turn_run.context_snapshot->'firstTurnQueuedInput'->>'runId' = first_turn_run.id::text

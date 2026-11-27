@@ -91,7 +91,6 @@ import { normalizePaperclipWakePayload, selectPaperclipTaskMarkdown } from "@pap
 import type { ProviderResourceDisposition } from "../environment-runtime.js";
 import { stageNativeRuntimeSkillAssets, bindStagedNativeRuntimeSkillAssets } from "../native-runtime/runtime-skill-preservation.js";
 import { configuredSecretGuidance } from "../native-runtime/configured-secret-guidance.js";
-import { nativeContinuationReadState } from "../native-runtime/native-turn-budget.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 type Agent = typeof agents.$inferSelect;
@@ -856,15 +855,6 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
               ].filter(Boolean).join("\n\n"),
               initialCommunicationGuidance: nativeReviewRequest ? null : readNonEmptyString(context.paperclipTaskCommunicationGuidance),
               wakePayload: context.paperclipWake,
-              boundCommandBytes: agent.adapterType === "paperclip_runner",
-              continuationReadState: nativeContinuationReadState(context.nativeContinuationReadState),
-              onContinuationBudgeted: bounded => {
-                // Called only for a full-render cut. Delta turns retain the
-                // unbounded snapshot so later deltas never resurrect old IDs.
-                // The lazy handoff loader retains this object; update in place.
-                Object.assign(parseObject(context.executionContinuation), bounded);
-                parseObject(context.paperclipWake).executionContinuation = bounded;
-              },
               caseContext: nativeReviewRequest ? null : context.paperclipCase as CaseExecutionContext | undefined,
               turnContext: context.paperclipTurnContext,
               githubInstructionSkillKeys: runScopedMentionedSkillKeys,
@@ -1061,9 +1051,6 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         .update(heartbeatRuns)
         .set({
           runtimeMode: "native",
-          // Full renders save their bounded projection; delta renders keep
-          // the full baseline of messages already held by the same session.
-          ...(!lockedProfile.nativeExecutionInput ? { contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ executionContinuation: context.executionContinuation })}::jsonb` } : {}),
           legacyProcessSettlement: null,
           controllerBootId: null,
           controllerLeaseExpiresAt: null,

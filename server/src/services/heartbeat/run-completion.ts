@@ -1,4 +1,3 @@
-import { NativeTurnPromptExceedsCommandBoundError, nativePromptCauseFromError } from "../native-runtime/native-turn-budget.js";
 import { PI_MODEL_PROVIDER_REQUIRED } from "../../adapters/pi-model-selection.js";
 import { ensurePiModelSelectionFailureNotice } from "../pi-model-selection-failure.js";
 import { resolveSessionContinuity } from "../native-runtime/continued-session.js";
@@ -1343,7 +1342,6 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       && run.nativeSessionId === null && run.runnerInstanceId === null && err instanceof RemoteWorkspacePreparationTimeoutError
       ? err : null;
     const failureErrorCode =
-      (err instanceof NativeTurnPromptExceedsCommandBoundError ? err.code : null) ??
       workspaceValidationFailure?.code ??
       configurationIncompleteFailure?.code ??
       nonRetryablePreflightFailureCode(err) ??
@@ -1408,7 +1406,6 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         resultJson: {
           ...parseObject(stopSnapshot?.resultJson),
           ...(failureCause && !stoppedDuringFailure ? { failureCause } : {}),
-          ...(nativePromptCauseFromError(err) ? { nativeTurnPromptRefusalCause: nativePromptCauseFromError(err) } : {}),
           ...(providerFailure ? { providerFailure: { ...providerFailure,
             message: redactCurrentUserText(identityRedactor.redact(providerFailure.message), currentUserRedactionOptions) } } : {}),
           ...(interruptedExactResume ? { nativeExactResumeRefusal: {
@@ -1702,7 +1699,6 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     const ownedAiSelectionRejection = isOwnedAiConnectionSelectionRejection(
       configurationIncompleteSetupFailure?.resultJson.configurationIncomplete);
     const setupFailureErrorCode =
-      (outerErr instanceof NativeTurnPromptExceedsCommandBoundError ? outerErr.code : null) ??
       (controllerLeaseLost && !ownedAiSelectionRejection ? CONTROLLER_LEASE_LOST_FAILURE_CODE : null) ??
       (storageUnavailable ? STORAGE_UNAVAILABLE_CODE : null) ??
       remoteWorkspacePreparationTimeout?.code ??
@@ -1772,7 +1768,6 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     const connectionFailure = readGitConnectionFailure(outerErr);
     const setupFailureResultJson = {
       ...setupFailureDetails,
-      ...(nativePromptCauseFromError(outerErr) ? { nativeTurnPromptRefusalCause: nativePromptCauseFromError(outerErr) } : {}),
       ...(nonRetryablePreflightCode === PI_MODEL_PROVIDER_REQUIRED && outerErr instanceof HttpError
         ? { modelSelection: { model: parseObject(outerErr.details).model, retryability: "requires_action" } } : {}),
       ...(failureCause ? { failureCause } : {}),
